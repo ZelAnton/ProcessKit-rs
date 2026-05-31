@@ -11,6 +11,8 @@ to a dated version section.
 
 ## [Unreleased]
 
+## [0.1.0]
+
 ### Added
 - `ProcessGroup` — a kill-on-drop container for a child-process tree, backed by
   Windows Job Objects, Linux cgroup v2 (with a POSIX process-group fallback), or
