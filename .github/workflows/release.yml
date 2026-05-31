@@ -1,25 +1,40 @@
 name: Release
 
-# OPT-IN: this file ships disabled (the `.disabled` extension means GitHub
-# ignores it). To enable automated releases, rename it to `release.yml` and add
-# a repository secret `CRATES_IO_TOKEN`.
+# Requires the `CRATES_IO_TOKEN` repository secret.
 #
-# Manual, single-crate release: bump the version, promote the curated
-# `[Unreleased]` changelog section, tag `v<version>`, and publish to crates.io.
-# See AGENTS.md "Releasing and the changelog". For a workspace of several
-# independently-versioned crates, model this on vcs-toolkit-rs's release.yml
-# instead (per-crate `crate`/`version` inputs and `<crate>-v<version>` tags).
+# Manual-trigger ONLY. There is no `push:`/tag trigger, so a release never starts
+# on its own — you click "Run workflow" in the Actions UI and pick a bump type.
+# The version number is never typed by hand: pick patch/minor/major and the
+# source-of-truth (`Cargo.toml`) drives everything, then gets committed back so
+# the manifest, the git tag, and the GitHub Release never drift apart. The first
+# release (no `v*` tag yet) ships the current `Cargo.toml` version as-is,
+# ignoring the bump.
+#
+# Single-crate release: bump the version, auto-fill an empty `[Unreleased]` from
+# git history via git-cliff, promote the curated changelog, tag `v<version>`,
+# publish a GitHub Release, and publish to crates.io. See AGENTS.md "Releasing
+# and the changelog".
 
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: New version, e.g. 0.2.0
+      bump:
+        description: Version bump type (ignored on the first release)
         required: true
-        type: string
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+
+# Never run two releases at once — they both bump + commit to the branch.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
-  contents: write # push the version-bump commit and the tag
+  contents: write # push the version-bump commit + tag, and create the Release
 
 jobs:
   release:
@@ -27,47 +42,264 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # full history + tags, for version math and git-cliff
 
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install tooling
         run: cargo install cargo-edit --locked
 
-      # `${{ inputs.* }}` is passed through `env:` and referenced as a shell
-      # variable rather than interpolated into the script text — interpolating
-      # untrusted input directly into `run:` is a script-injection risk.
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff@2
+
+      # Compute the next version from Cargo.toml — never typed by hand. `bump`
+      # is a fixed choice (not free-form), so interpolating it into the script
+      # is not a script-injection risk; the derived outputs are passed to later
+      # steps through `env:` rather than re-interpolated.
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          CURRENT=$(grep -m1 -oP '(?<=^version = ")[^"]+' Cargo.toml)
+          if [[ ! "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Could not parse version from Cargo.toml (got '$CURRENT')"
+            exit 1
+          fi
+          if git tag --list 'v*' | grep -q .; then
+            # A prior release exists: apply the chosen bump.
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+            case "${{ inputs.bump }}" in
+              major) NEW="$((MAJOR+1)).0.0" ;;
+              minor) NEW="${MAJOR}.$((MINOR+1)).0" ;;
+              patch) NEW="${MAJOR}.${MINOR}.$((PATCH+1))" ;;
+            esac
+            PREV="v$CURRENT"
+          else
+            # First release: ship the current Cargo.toml version as-is.
+            NEW="$CURRENT"
+            PREV=""
+          fi
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
+          echo "prev_tag=$PREV" >> "$GITHUB_OUTPUT"
+          echo "Releasing v$NEW (previous: ${PREV:-none})"
+
+      - name: Verify tag does not exist
+        run: |
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "::error::Tag ${{ steps.version.outputs.tag }} already exists"
+            exit 1
+          fi
+
+      # No-op on the first release (already at the current version).
       - name: Bump version
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: cargo set-version "$VERSION"
 
-      - name: Promote changelog
-        # Non-destructive: rename the curated `## [Unreleased]` heading to the new
-        # version + date and leave a fresh empty Unreleased above it. The manual
-        # bullets (the source of truth per AGENTS.md) are preserved verbatim. The
-        # `## [x.y.z]` compare-link reference at the bottom is added by hand.
+      # Manual bullets always win. Only when [Unreleased] has no real bullets do
+      # we fill it from commit subjects since the previous tag (or full history
+      # on the first release), using cliff.toml's prefix→section rules.
+      - name: Auto-fill empty [Unreleased] from git log
         env:
-          VERSION: ${{ inputs.version }}
+          PREV_TAG: ${{ steps.version.outputs.prev_tag }}
         run: |
-          date="$(date +%F)"
-          sed -i "0,/^## \[Unreleased\]\$/s//## [Unreleased]\n\n## [${VERSION}] - ${date}/" CHANGELOG.md
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          prev_tag = os.environ.get("PREV_TAG", "")
+          path = pathlib.Path("CHANGELOG.md")
+          text = path.read_text()
+
+          # Capture the [Unreleased] body up to the next version section, the
+          # reference-link block (`[Unreleased]: ...` / `[x.y.z]: ...`), or EOF.
+          # The link-block stop matters on a first release, where [Unreleased]
+          # is the last `##` section and the capture would otherwise swallow
+          # (and this step would then delete) the trailing link definitions.
+          m = re.search(r"^## \[Unreleased\]\s*\n(.*?)(?=^## \[|^\[[^\]]+\]:|\Z)", text, re.M | re.S)
+          if not m:
+              print("::error::Could not find '## [Unreleased]' header in CHANGELOG.md", file=sys.stderr)
+              sys.exit(1)
+
+          body = m.group(1)
+          has_real_bullets = any(re.match(r"^-\s+\S", ln) for ln in body.splitlines())
+          if has_real_bullets:
+              print("[Unreleased] already has manual entries; skipping auto-fill.")
+              sys.exit(0)
+
+          tag_exists = bool(prev_tag) and subprocess.run(
+              ["git", "rev-parse", "--verify", prev_tag], capture_output=True
+          ).returncode == 0
+
+          if tag_exists:
+              print(f"[Unreleased] is empty; generating from git log since {prev_tag}...")
+              cliff_cmd = ["git-cliff", "--config", "cliff.toml", "--strip", "all", f"{prev_tag}..HEAD"]
+          else:
+              print("[Unreleased] is empty; generating from full git history...")
+              cliff_cmd = ["git-cliff", "--config", "cliff.toml", "--strip", "all"]
+          empty_hint = (
+              "::error::No release-worthy commits found. Either add a manual entry to "
+              "[Unreleased] in CHANGELOG.md, or commit changes with a recognised prefix "
+              "(feat/fix/perf/ux/refactor/remove/...)."
+          )
+
+          result = subprocess.run(cliff_cmd, capture_output=True, text=True)
+          if result.returncode != 0:
+              # git-cliff itself failed (bad config, bad range, ...). Surface its
+              # stderr rather than a Python traceback or the misleading
+              # "no commits" hint below.
+              print(f"::error::git-cliff failed: {result.stderr.strip()}", file=sys.stderr)
+              sys.exit(1)
+          generated = result.stdout.strip()
+          if not generated:
+              print(empty_hint, file=sys.stderr)
+              sys.exit(1)
+
+          new_text = text[: m.start(1)] + generated + "\n\n" + text[m.end(1) :]
+          path.write_text(new_text)
+          print("----- auto-generated [Unreleased] body -----")
+          print(generated)
+          print("--------------------------------------------")
+          PY
+
+      # Curate release notes from [Unreleased]: keep only "### Header" sections
+      # that have at least one real bullet, dropping placeholder "-" lines.
+      - name: Extract release notes
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          text = pathlib.Path("CHANGELOG.md").read_text()
+          # Bound the body by the next version section, the reference-link block,
+          # or EOF (see the auto-fill step for why the link-block stop matters).
+          m = re.search(r"^## \[Unreleased\]\s*\n(.*?)(?=^## \[|^\[[^\]]+\]:|\Z)", text, re.M | re.S)
+          body = (m.group(1) if m else "").strip()
+
+          parts = re.split(r"(?m)(^### .+$)", body)
+          out = []
+          for i in range(1, len(parts), 2):
+              header = parts[i]
+              section = parts[i + 1] if i + 1 < len(parts) else ""
+              bullets = [ln for ln in section.splitlines() if re.match(r"^-\s+\S", ln)]
+              if bullets:
+                  if out:
+                      out.append("")
+                  out.append(header)
+                  out.extend(bullets)
+
+          result = "\n".join(out).strip()
+          if not result:
+              print(
+                  "::error::[Unreleased] section in CHANGELOG.md is empty. "
+                  "Add release notes before releasing.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          pathlib.Path("release-notes.md").write_text(result + "\n")
+          print("----- release-notes.md -----")
+          print(result)
+          print("----------------------------")
+          PY
+
+      # Rename the curated `## [Unreleased]` heading to the new version + date,
+      # leave a fresh empty Unreleased above it, and rewrite the reference links.
+      # On the first release (no previous tag) the new-version link points at the
+      # tag page; otherwise it's a compare link against the previous tag.
+      - name: Promote [Unreleased] in CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PREV_TAG: ${{ steps.version.outputs.prev_tag }}
+          REPO: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+          from datetime import datetime, timezone
+
+          version = os.environ["VERSION"]
+          tag = os.environ["TAG"]
+          prev_tag = os.environ.get("PREV_TAG", "")
+          repo = os.environ["REPO"]
+          date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+          path = pathlib.Path("CHANGELOG.md")
+          text = path.read_text()
+
+          new_unreleased = (
+              "## [Unreleased]\n\n"
+              "### Added\n-\n\n"
+              "### Changed\n-\n\n"
+              "### Fixed\n-\n\n"
+              f"## [{version}] - {date}"
+          )
+          text, n = re.subn(r"^## \[Unreleased\]$", new_unreleased, text, count=1, flags=re.M)
+          if n != 1:
+              print("::error::Could not find '## [Unreleased]' header in CHANGELOG.md", file=sys.stderr)
+              sys.exit(1)
+
+          if prev_tag:
+              version_link = f"[{version}]: {repo}/compare/{prev_tag}...{tag}"
+          else:
+              version_link = f"[{version}]: {repo}/releases/tag/{tag}"
+          link_replacement = f"[Unreleased]: {repo}/compare/{tag}...HEAD\n{version_link}"
+          text, n = re.subn(r"^\[Unreleased\]:.*$", link_replacement, text, count=1, flags=re.M)
+          if n != 1:
+              print("::error::Could not find '[Unreleased]: ...' reference link in CHANGELOG.md", file=sys.stderr)
+              sys.exit(1)
+
+          path.write_text(text)
+          print(f"Promoted [Unreleased] -> [{version}] - {date}")
+          PY
 
       - name: Commit, tag, push
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
           BRANCH: ${{ github.ref_name }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "release: v${VERSION}"
+          # Stage explicit paths only — `git add -A` would also commit the
+          # untracked `release-notes.md` the extract step wrote to the repo root.
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git commit -m "Release v${VERSION}"
           git tag "v${VERSION}"
-          # checkout@v5 leaves a detached HEAD, so push to the branch explicitly
-          # (`git push origin HEAD` can't resolve a branch when detached).
-          git push origin "HEAD:${BRANCH}"
-          git push origin "v${VERSION}"
+          # Push the commit and the tag atomically: if either ref is rejected,
+          # neither lands. A non-atomic push that left the branch advanced but
+          # the tag missing would make the next run bump from the already-bumped
+          # version and silently skip a release number. checkout@v5 leaves a
+          # detached HEAD, so the branch is named explicitly (`git push origin
+          # HEAD` can't resolve a branch when detached).
+          git push --atomic origin "HEAD:refs/heads/${BRANCH}" "refs/tags/v${VERSION}"
 
+      # The tag already exists (pushed above); attach the Release to it using the
+      # curated notes. gh is pre-installed on ubuntu-latest.
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh release create "$TAG" --title "$TAG" --notes-file release-notes.md
+
+      # Last, because publishing to crates.io is irreversible (a version can
+      # never be re-published). By now the version bump + tag are durably on the
+      # remote, so if `cargo publish` fails (e.g. a verification-build error) you
+      # recover by re-running `cargo publish` from the tagged commit by hand — no
+      # git state is lost. cargo reads the bumped version from Cargo.toml.
       - name: Publish to crates.io
         run: cargo publish
         env:

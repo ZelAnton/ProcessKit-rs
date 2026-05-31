@@ -111,12 +111,15 @@ committed.
   bucketing by prefix (`feat`→Added, `fix`→Fixed, `remove`→Removed,
   `perf`/`refactor`/`ci`/…→Changed, `docs`/`chore`/`test`→skipped). Clean
   conventional-commit subjects are what make that fallback useful.
-- This repository ships an **opt-in** release workflow at
-  `.github/workflows/release.yml.disabled` (a `workflow_dispatch` Action that
-  bumps the version, promotes `[Unreleased]`, tags `v<version>`, and runs
-  `cargo publish`). It is disabled by default — GitHub ignores the `.disabled`
-  extension. Enable it by renaming to `release.yml` and adding the
-  `CRATES_IO_TOKEN` repository secret.
+- Releases run through `.github/workflows/release.yml` — a **manual**
+  (`workflow_dispatch`) Action with no push/tag trigger, so a release never
+  starts on its own. You pick a `patch` / `minor` / `major` bump from a menu; the
+  next version is **computed** from `Cargo.toml` (never typed by hand) — the first
+  release (no `v*` tag yet) ships the current version as-is. The workflow then
+  auto-fills an empty `[Unreleased]` via git-cliff, promotes the changelog, commits
+  the bump, tags `v<version>`, publishes a **GitHub Release** with the curated
+  notes, and runs `cargo publish`. It needs the `CRATES_IO_TOKEN` repository
+  secret.
 
 ## Supply chain and MSRV
 
