@@ -27,6 +27,16 @@ pub trait ProcessRunner: Send + Sync {
     async fn output(&self, command: &Command) -> Result<ProcessResult<String>>;
 }
 
+/// A shared reference to a runner is itself a runner, so a borrowed
+/// [`RecordingRunner`](crate::RecordingRunner) (or any `&R`) can be injected
+/// where a `ProcessRunner` is expected.
+#[async_trait::async_trait]
+impl<R: ProcessRunner + ?Sized> ProcessRunner for &R {
+    async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+        (**self).output(command).await
+    }
+}
+
 /// Convenience methods available on every [`ProcessRunner`] (including
 /// `&dyn ProcessRunner`), layered over [`output`](ProcessRunner::output) —
 /// the analogue of the .NET `ProcessRunnerExtensions`.
@@ -41,6 +51,14 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// Run and return just the exit code.
     async fn exit_code(&self, command: &Command) -> Result<i32> {
         Ok(self.output(command).await?.exit_code())
+    }
+
+    /// Run, require a zero exit, and return the full captured result (untrimmed
+    /// stdout). The building block for the `parse`/`try_parse` helpers — use it
+    /// when you need the whole `ProcessResult` after success-checking, rather
+    /// than just trimmed stdout (`run`) or the raw result (`output`).
+    async fn checked(&self, command: &Command) -> Result<ProcessResult<String>> {
+        self.output(command).await?.ensure_success()
     }
 }
 
@@ -132,7 +150,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         stderr,
         stdin: stdin_pipe,
         stdin_task,
-        timeout: command.timeout_value(),
+        timeout: command.configured_timeout(),
         pid,
         stdout_encoding: command.out_encoding(),
         stderr_encoding: command.err_encoding(),

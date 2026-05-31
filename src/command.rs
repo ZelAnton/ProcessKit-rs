@@ -203,28 +203,48 @@ impl Command {
         self.program.to_string_lossy().into_owned()
     }
 
-    pub(crate) fn timeout_value(&self) -> Option<Duration> {
-        self.timeout
-    }
+    // ----- Public accessors -----------------------------------------------
+    // Exposed so external `ScriptedRunner::when(|cmd| …)` predicates and other
+    // inspection can read what a command will run. Named to avoid clashing with
+    // the same-named builder methods (`program` has no builder; `arguments` vs
+    // `args`, `working_dir` vs `current_dir`, etc.).
 
-    pub(crate) fn stdin_source(&self) -> Option<&Stdin> {
-        self.stdin.as_ref()
-    }
-
-    pub(crate) fn program_os(&self) -> &OsStr {
+    /// The program to launch.
+    pub fn program(&self) -> &OsStr {
         &self.program
     }
 
-    pub(crate) fn args_slice(&self) -> &[OsString] {
+    /// The arguments, in order.
+    pub fn arguments(&self) -> &[OsString] {
         &self.args
     }
 
-    pub(crate) fn cwd_os(&self) -> Option<&OsStr> {
-        self.cwd.as_deref()
+    /// The working-directory override, if one was set.
+    pub fn working_dir(&self) -> Option<&Path> {
+        self.cwd.as_deref().map(Path::new)
     }
 
-    pub(crate) fn envs_slice(&self) -> &[(OsString, Option<OsString>)] {
+    /// The environment overrides, in order (a `None` value removes the variable).
+    pub fn env_overrides(&self) -> &[(OsString, Option<OsString>)] {
         &self.envs
+    }
+
+    /// The configured stdin source, if any.
+    pub fn stdin_source(&self) -> Option<&Stdin> {
+        self.stdin.as_ref()
+    }
+
+    /// The configured timeout, if any.
+    pub fn configured_timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    /// Build a `tokio::process::Command` with this command's program, args,
+    /// working dir, and environment — stdio wired for capture. Use it to feed
+    /// the low-level [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) escape
+    /// hatch directly (which returns a raw [`tokio::process::Child`]).
+    pub fn to_tokio_command(&self) -> tokio::process::Command {
+        self.build_tokio()
     }
 
     /// Build the `tokio` command with stdio wired for capture. Containment

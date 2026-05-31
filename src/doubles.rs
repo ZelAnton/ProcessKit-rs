@@ -66,7 +66,7 @@ enum Rule {
 impl Rule {
     fn matches(&self, command: &Command) -> bool {
         match self {
-            Rule::Prefix(prefix) => command.args_slice().starts_with(prefix),
+            Rule::Prefix(prefix) => command.arguments().starts_with(prefix),
             Rule::Predicate(pred) => pred(command),
         }
     }
@@ -122,7 +122,7 @@ impl ScriptedRunner {
 #[async_trait::async_trait]
 impl ProcessRunner for ScriptedRunner {
     async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
-        let program = command.program_os().to_string_lossy().into_owned();
+        let program = command.program().to_string_lossy().into_owned();
         for (rule, reply) in &self.rules {
             if rule.matches(command) {
                 return Ok(reply.clone().into_result(program));
@@ -159,10 +159,10 @@ pub struct Invocation {
 impl Invocation {
     fn from_command(command: &Command) -> Self {
         Self {
-            program: command.program_os().to_os_string(),
-            args: command.args_slice().to_vec(),
-            cwd: command.cwd_os().map(OsStr::to_os_string),
-            envs: command.envs_slice().to_vec(),
+            program: command.program().to_os_string(),
+            args: command.arguments().to_vec(),
+            cwd: command.working_dir().map(|p| p.as_os_str().to_os_string()),
+            envs: command.env_overrides().to_vec(),
             has_stdin: command
                 .stdin_source()
                 .is_some_and(|stdin| !stdin.is_empty()),
@@ -173,6 +173,15 @@ impl Invocation {
     pub fn has_flag(&self, flag: impl AsRef<OsStr>) -> bool {
         let flag = flag.as_ref();
         self.args.iter().any(|a| a == flag)
+    }
+
+    /// The arguments as lossy UTF-8 strings, for ergonomic assertions
+    /// (e.g. `assert_eq!(call.args_str(), ["pr", "create"])`).
+    pub fn args_str(&self) -> Vec<String> {
+        self.args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
     }
 }
 
@@ -248,7 +257,7 @@ mod tests {
     async fn predicate_rule_and_fallback() {
         let runner = ScriptedRunner::new()
             .when(
-                |c| c.args_slice().iter().any(|a| a == "--version"),
+                |c| c.arguments().iter().any(|a| a == "--version"),
                 Reply::ok("v1"),
             )
             .fallback(Reply::fail(1, "unknown"));

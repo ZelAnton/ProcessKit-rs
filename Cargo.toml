@@ -19,10 +19,10 @@ exclude = [
   "deny.toml",
   "rust-toolchain.toml",
 ]
-# Minimum Supported Rust Version. 1.85 is the edition-2024 floor; raise it when
-# you adopt a newer language/std feature. The `msrv` CI job verifies it — keep
-# the two in sync.
-rust-version = "1.85"
+# Minimum Supported Rust Version. 1.88 is required for `let`-chains
+# (`if let … && let …`), used in the Linux cgroup/proc code. The `msrv` CI job
+# verifies it — keep the two in sync; raise both when adopting a newer feature.
+rust-version = "1.88"
 
 # ---------------------------------------------------------------------------
 # Dependencies — every entry carries a "why" (see AGENTS.md "Dependency

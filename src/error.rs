@@ -45,6 +45,17 @@ pub enum Error {
         timeout: Duration,
     },
 
+    /// The process succeeded but its output could not be parsed into the
+    /// expected shape (e.g. malformed `--json`). Produced by the fallible-parse
+    /// helpers on [`CliClient`](crate::CliClient).
+    #[error("failed to parse `{program}` output: {message}")]
+    Parse {
+        /// The program whose output failed to parse.
+        program: String,
+        /// What went wrong.
+        message: String,
+    },
+
     /// An IO error occurred while driving the process (reading a pipe, writing
     /// stdin, waiting for exit).
     #[error(transparent)]

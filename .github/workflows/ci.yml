@@ -60,19 +60,19 @@ jobs:
           command: check advisories bans
 
   msrv:
-    name: msrv (1.85)
+    name: msrv (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       # Verify the crate still builds on its declared Minimum Supported Rust
       # Version. Keep `toolchain` in sync with `rust-version` in Cargo.toml.
-      # (`@master` + the `toolchain` input accepts a two-component "1.85"; the
-      # version-branch refs require a full patch version like `@1.85.0`.)
+      # (`@master` + the `toolchain` input accepts a two-component "1.88"; the
+      # version-branch refs require a full patch version like `@1.88.0`.)
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.85"
+          toolchain: "1.88"
       # rust-toolchain.toml tracks stable and would otherwise win here; remove it
-      # so cargo uses the 1.85 toolchain installed above and truly tests the floor.
+      # so cargo uses the 1.88 toolchain installed above and truly tests the floor.
       - run: rm -f rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets

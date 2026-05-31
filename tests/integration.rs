@@ -281,3 +281,63 @@ async fn stdout_lines_streams_incrementally() {
         "lines: {collected:?}"
     );
 }
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess: stream stdout, then collect exit + stderr"]
+async fn finish_streamed_returns_code_and_stderr() {
+    use tokio_stream::StreamExt;
+
+    // Emit one stdout line and one stderr line, exit 0, per platform.
+    let cmd = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo out& echo err 1>&2"])
+    } else {
+        Command::new("sh").args(["-c", "echo out; echo err 1>&2"])
+    };
+    let mut process = cmd.start().await.expect("start");
+    let mut lines = process.stdout_lines();
+    let mut out = Vec::new();
+    while let Some(line) = lines.next().await {
+        out.push(line);
+    }
+    drop(lines);
+    let (code, stderr) = process.finish_streamed().await.expect("finish");
+    assert_eq!(code, 0);
+    assert!(out.iter().any(|l| l.contains("out")), "stdout: {out:?}");
+    assert!(stderr.contains("err"), "stderr: {stderr:?}");
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess via the top-level free functions"]
+async fn top_level_run_and_output() {
+    let v = processkit::run("cargo", ["--version"])
+        .await
+        .expect("run cargo --version");
+    assert!(v.to_lowercase().contains("cargo"), "unexpected: {v}");
+
+    let result = processkit::output("cargo", ["--version"])
+        .await
+        .expect("output cargo --version");
+    assert!(result.is_success());
+    assert!(result.stdout().to_lowercase().contains("cargo"));
+}
+
+#[tokio::test]
+#[ignore = "spawns a long-lived subprocess and kills it early"]
+async fn start_kill_terminates_a_running_process() {
+    let mut process = sleeper().start().await.expect("start sleeper");
+    assert!(process.pid().is_some());
+    process.start_kill().expect("start_kill");
+    // After an explicit kill, waiting returns far sooner than the sleeper's ~30s
+    // runtime. The exit code of a killed process is platform-dependent, so
+    // promptness is the guarantee under test.
+    let start = Instant::now();
+    let _ = tokio::time::timeout(Duration::from_secs(10), process.wait())
+        .await
+        .expect("killed process should be reaped promptly")
+        .expect("wait");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "kill was not prompt (took {:?})",
+        start.elapsed()
+    );
+}

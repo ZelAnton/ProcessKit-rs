@@ -60,6 +60,25 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
+## Wrapping a CLI tool
+
+`CliClient` + the `cli_client!` macro turn a typed wrapper around an external
+tool (`git`, `jj`, `gh`, …) into just its parsers — the runner is injectable, so
+the wrapper is hermetically testable with a `ScriptedRunner` (no subprocess):
+
+```rust,no_run
+use processkit::{cli_client, ProcessRunner, Result};
+use std::path::Path;
+
+cli_client!(pub struct Git => "git");
+
+impl<R: ProcessRunner> Git<R> {
+    async fn head(&self, dir: &Path) -> Result<String> {
+        self.core.text(self.core.command_in(dir, ["rev-parse", "HEAD"])).await
+    }
+}
+```
+
 ## Testing
 
 ```bash

@@ -70,6 +70,9 @@ pub struct RunningProcess {
     buffer: OutputBufferPolicy,
     stdout_sink: Option<Arc<SharedLines>>,
     stderr_sink: Option<Arc<SharedLines>>,
+    // The background stderr-drain task started by `stdout_lines`, awaited by
+    // `finish_streamed` so no trailing stderr line is missed.
+    stderr_pump: Option<JoinHandle<()>>,
     started: Instant,
     start_time: SystemTime,
 }
@@ -93,6 +96,7 @@ impl RunningProcess {
             buffer: s.buffer,
             stdout_sink: None,
             stderr_sink: None,
+            stderr_pump: None,
             started: Instant::now(),
             start_time: SystemTime::now(),
         }
@@ -154,15 +158,16 @@ impl RunningProcess {
     /// when you need both. Keep this `RunningProcess` in scope while consuming;
     /// dropping it tears the process down.
     pub fn stdout_lines(&mut self) -> StdoutLines {
-        // Background-drain stderr (counter + handler still apply).
+        // Background-drain stderr (counter + handler still apply). The handle is
+        // kept so `finish_streamed` can await the last line before draining.
         let stderr_sink = SharedLines::new(&self.buffer);
         if let Some(pipe) = self.stderr_pipe.take() {
-            tokio::spawn(pump_lines(
+            self.stderr_pump = Some(tokio::spawn(pump_lines(
                 pipe,
                 self.stderr_encoding,
                 self.stderr_handler.clone(),
                 stderr_sink.clone(),
-            ));
+            )));
         }
         self.stderr_sink = Some(stderr_sink);
 
@@ -285,20 +290,84 @@ impl RunningProcess {
     /// Wait for the child to exit, applying the timeout (killing the tree and
     /// flagging `timed_out` on elapse).
     async fn drive_to_exit(&mut self) -> Result<(i32, bool)> {
-        match self.timeout {
+        let outcome = match self.timeout {
             Some(limit) => match tokio::time::timeout(limit, self.child.wait()).await {
-                Ok(status) => Ok((exit_code(status?), false)),
+                Ok(status) => (exit_code(status?), false),
                 Err(_elapsed) => {
                     let _ = self.child.start_kill();
                     if let Some(group) = &self.own_group {
                         let _ = group.terminate_all();
                     }
                     let _ = self.child.wait().await;
-                    Ok((TIMEOUT_EXIT_CODE, true))
+                    (TIMEOUT_EXIT_CODE, true)
                 }
             },
-            None => Ok((exit_code(self.child.wait().await?), false)),
+            None => (exit_code(self.child.wait().await?), false),
+        };
+        #[cfg(feature = "tracing")]
+        {
+            let (code, timed_out) = outcome;
+            tracing::debug!(
+                target: "processkit",
+                program = %self.program,
+                code,
+                timed_out,
+                elapsed_ms = self.started.elapsed().as_millis() as u64,
+                "process exited"
+            );
         }
+        Ok(outcome)
+    }
+
+    /// Send a kill to the process without waiting for it to exit. The owning
+    /// group still governs the rest of the tree.
+    pub fn start_kill(&mut self) -> Result<()> {
+        self.child.start_kill()?;
+        Ok(())
+    }
+
+    /// Finish a streamed run: wait for exit and return the exit code plus the
+    /// stderr collected in the background by [`stdout_lines`](Self::stdout_lines).
+    ///
+    /// Designed to pair with `stdout_lines` (consume the stdout stream first),
+    /// but safe to call on its own — any pipe the stream didn't take is drained
+    /// here so the child can never block on a full pipe.
+    pub async fn finish_streamed(mut self) -> Result<(i32, String)> {
+        // Drain a stdout pipe a prior `stdout_lines` didn't take (and discard
+        // it) so the child can't block writing to it while we wait for exit.
+        if let Some(mut pipe) = self.stdout_pipe.take() {
+            tokio::spawn(async move {
+                let mut sink = Vec::new();
+                let _ = pipe.read_to_end(&mut sink).await;
+            });
+        }
+        // Likewise start a stderr pump if streaming never did (so its output is
+        // still captured and the pipe never fills).
+        if self.stderr_pump.is_none()
+            && let Some(pipe) = self.stderr_pipe.take()
+        {
+            let sink = SharedLines::new(&self.buffer);
+            self.stderr_pump = Some(tokio::spawn(pump_lines(
+                pipe,
+                self.stderr_encoding,
+                self.stderr_handler.clone(),
+                sink.clone(),
+            )));
+            self.stderr_sink = Some(sink);
+        }
+
+        let (code, _timed_out) = self.drive_to_exit().await?;
+        // The child has exited, so its stderr pipe is closed — await the pump so
+        // the final buffered line is captured before we drain.
+        if let Some(pump) = self.stderr_pump.take() {
+            let _ = pump.await;
+        }
+        let stderr = self
+            .stderr_sink
+            .as_ref()
+            .map(|sink| sink.drain().join("\n"))
+            .unwrap_or_default();
+        Ok((code, stderr))
     }
 }
 

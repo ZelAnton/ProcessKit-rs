@@ -26,6 +26,13 @@ management — a Rust port of the .NET ProcessKit. Two layers:
   process); live-handle/streaming runs use the concrete `start`/`JobRunner` methods.
   Diagnostics (`stats.rs` + `sys`): `ProcessGroup::stats` and per-process
   `cpu_time`/`peak_memory_bytes`.
+- **CLI-client layer** (`client.rs`) — `CliClient<R: ProcessRunner>` + the
+  `cli_client!` macro: a reusable core for typed wrappers around external CLI
+  tools (the role inherited from the sibling `vcs-process` crate, which
+  ProcessKit-rs supersedes). It owns a program + runner + default timeout and
+  offers `command`/`command_in` builders and `text`/`capture`/`unit`/`code`/
+  `parse`/`try_parse` helpers, all over the existing `Command`/`ProcessRunner`/
+  `ProcessResult` types. Top-level `run`/`output` free fns are thin shims.
 
 Features: `mock` (generated `MockRunner`), `tracing` (per-run events). Real
 platform code goes under `[target.'cfg(...)'.dependencies]`; keep the crate

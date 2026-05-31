@@ -81,6 +81,15 @@ impl<T> ProcessResult<T> {
     }
 }
 
+impl ProcessResult<String> {
+    /// Standard output followed by standard error, concatenated — handy when a
+    /// tool interleaves diagnostics across both streams. Mirrors the .NET / vcs
+    /// `combined()`.
+    pub fn combined(&self) -> String {
+        format!("{}{}", self.stdout(), self.stderr())
+    }
+}
+
 /// Cap the stderr carried in an error message so a giant dump can't poison logs
 /// (the full text remains available on the [`ProcessResult`]). Matches the
 /// 4 KiB cap the .NET library applies.
@@ -125,6 +134,12 @@ mod tests {
             }
             other => panic!("expected Exit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn combined_concatenates_stdout_then_stderr() {
+        let r = ProcessResult::new("p".into(), "out".to_owned(), "err".to_owned(), 0, false);
+        assert_eq!(r.combined(), "outerr");
     }
 
     #[test]

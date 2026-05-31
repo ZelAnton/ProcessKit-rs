@@ -36,6 +36,7 @@
 //! [cgroup v2]: https://docs.kernel.org/admin-guide/cgroup-v2.html
 
 mod buffer;
+mod client;
 mod command;
 mod doubles;
 mod error;
@@ -50,6 +51,7 @@ mod stdin;
 mod sys;
 
 pub use buffer::{OutputBufferPolicy, OverflowMode};
+pub use client::CliClient;
 pub use command::Command;
 pub use doubles::{Invocation, RecordingRunner, Reply, ScriptedRunner};
 pub use encoding_rs::Encoding;
@@ -61,6 +63,30 @@ pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
 pub use running::{RunningProcess, StdoutLines};
 pub use stats::ProcessGroupStats;
 pub use stdin::{ProcessStdin, Stdin};
+// `cli_client!` is exported at the crate root via `#[macro_export]`.
+
+use std::ffi::OsStr;
+
+/// Run `program` with `args` inside a private job and return trimmed stdout, or
+/// an [`Error`] on a non-zero exit / spawn failure / timeout. A thin shim over
+/// [`Command`]; use the builder for a working directory, env, stdin, or timeout.
+pub async fn run<I, S>(program: impl AsRef<OsStr>, args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Command::new(program).args(args).run().await
+}
+
+/// Run `program` with `args` inside a private job and capture the result
+/// without erroring on a non-zero exit — for commands whose exit code is meaningful.
+pub async fn output<I, S>(program: impl AsRef<OsStr>, args: I) -> Result<ProcessResult<String>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Command::new(program).args(args).output_string().await
+}
 
 /// The `mockall`-generated mock of [`ProcessRunner`] (enabled by the `mock`
 /// feature), re-exported under a friendlier name.

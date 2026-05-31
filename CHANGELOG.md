@@ -40,6 +40,21 @@ to a dated version section.
 - Diagnostics: `ProcessGroup::stats` → `ProcessGroupStats` (active count, and
   CPU/peak-memory where the platform reports them), and per-process
   `RunningProcess::cpu_time` / `peak_memory_bytes` / `elapsed`.
+- `CliClient<R>` + the `cli_client!` macro — a reusable core for building typed
+  wrappers around an external CLI tool (`command`/`command_in` builders;
+  `text`/`capture`/`unit`/`code`/`parse`/`try_parse` run helpers), with the
+  runner injectable for hermetic tests.
+- Top-level `processkit::run` / `processkit::output` free functions.
+- Public `Command` accessors (`program`/`arguments`/`working_dir`/
+  `env_overrides`/`stdin_source`/`configured_timeout`) so external
+  `ScriptedRunner::when` predicates can inspect a command; plus public
+  `Command::to_tokio_command`.
+- `ProcessRunnerExt::checked`, `ProcessResult::combined`, `Invocation::args_str`,
+  `RunningProcess::finish_streamed` (exit code + collected stderr after
+  streaming) and `RunningProcess::start_kill`.
+- `Error::Parse { program, message }` for fallible output parsing.
+- The `tracing` feature now emits a per-run `debug` event (program, exit code,
+  timed-out, elapsed) on the `processkit` target.
 
 ### Changed
 - Output capture is now line-oriented (pumped): captured text is normalized to
