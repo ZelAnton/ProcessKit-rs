@@ -16,12 +16,13 @@ use crate::error::Result;
 use crate::result::ProcessResult;
 use crate::runner::ProcessRunner;
 
-/// A canned reply: stdout/stderr text plus an exit code.
+/// A canned reply: stdout/stderr text plus an exit code (or a timed-out run).
 #[derive(Debug, Clone)]
 pub struct Reply {
     stdout: String,
     stderr: String,
     code: i32,
+    timed_out: bool,
 }
 
 impl Reply {
@@ -31,6 +32,7 @@ impl Reply {
             stdout: stdout.into(),
             stderr: String::new(),
             code: 0,
+            timed_out: false,
         }
     }
 
@@ -40,6 +42,20 @@ impl Reply {
             stdout: String::new(),
             stderr: stderr.into(),
             code,
+            timed_out: false,
+        }
+    }
+
+    /// A timed-out reply — drives the timeout path so a test can assert that a
+    /// command which exceeds its deadline surfaces as [`Error::Timeout`](crate::Error::Timeout).
+    pub fn timeout() -> Self {
+        Self {
+            stdout: String::new(),
+            stderr: String::new(),
+            // The conventional "killed by timeout" code; the result's `timed_out`
+            // flag is what the helpers actually key on.
+            code: -1,
+            timed_out: true,
         }
     }
 
@@ -50,7 +66,14 @@ impl Reply {
     }
 
     fn into_result(self, program: String) -> ProcessResult<String> {
-        ProcessResult::new(program, self.stdout, self.stderr, self.code, false)
+        ProcessResult::new(
+            program,
+            self.stdout,
+            self.stderr,
+            self.code,
+            self.timed_out,
+            None,
+        )
     }
 }
 
@@ -273,6 +296,24 @@ mod tests {
         let miss = runner.output(&Command::new("tool").arg("x")).await.unwrap();
         assert_eq!(miss.exit_code(), 1);
         assert!(!miss.is_success());
+    }
+
+    #[tokio::test]
+    async fn timeout_reply_surfaces_as_timeout_error() {
+        use crate::error::Error;
+        let runner = ScriptedRunner::new().fallback(Reply::timeout());
+        // capture/output exposes the flag without erroring …
+        let out = runner.output(&Command::new("git")).await.unwrap();
+        assert!(out.timed_out());
+        // … but the success-checking helpers raise a distinct Timeout.
+        assert!(matches!(
+            runner.run(&Command::new("git")).await.unwrap_err(),
+            Error::Timeout { .. }
+        ));
+        assert!(matches!(
+            runner.exit_code(&Command::new("git")).await.unwrap_err(),
+            Error::Timeout { .. }
+        ));
     }
 
     #[tokio::test]

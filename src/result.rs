@@ -1,5 +1,7 @@
 //! The captured outcome of a finished process run.
 
+use std::time::Duration;
+
 use crate::error::Error;
 
 /// The captured result of running a process to completion.
@@ -16,6 +18,9 @@ pub struct ProcessResult<T> {
     stderr: String,
     exit_code: i32,
     timed_out: bool,
+    /// The deadline that elapsed, when `timed_out` — carried so the
+    /// success-checking helpers can build a faithful [`Error::Timeout`].
+    timeout: Option<Duration>,
 }
 
 impl<T> ProcessResult<T> {
@@ -25,6 +30,7 @@ impl<T> ProcessResult<T> {
         stderr: String,
         exit_code: i32,
         timed_out: bool,
+        timeout: Option<Duration>,
     ) -> Self {
         Self {
             program,
@@ -32,6 +38,7 @@ impl<T> ProcessResult<T> {
             stderr,
             exit_code,
             timed_out,
+            timeout,
         }
     }
 
@@ -65,11 +72,17 @@ impl<T> ProcessResult<T> {
         self.exit_code == 0
     }
 
-    /// Return `self` unchanged when the exit code is 0, otherwise an
-    /// [`Error::Exit`] carrying the code and (truncated) standard error.
+    /// Return `self` unchanged when the run succeeded, otherwise the matching
+    /// error: [`Error::Timeout`] if the run was killed by its deadline (checked
+    /// first — a timed-out run has no meaningful exit code), else
+    /// [`Error::Exit`] for a non-zero exit, carrying the code and (truncated)
+    /// standard error.
     ///
     /// Mirrors the .NET `EnsureSuccess()` / `ProcessExitException`.
     pub fn ensure_success(self) -> Result<Self, Error> {
+        if let Some(err) = self.timeout_error() {
+            return Err(err);
+        }
         if self.is_success() {
             return Ok(self);
         }
@@ -77,6 +90,18 @@ impl<T> ProcessResult<T> {
             program: self.program.clone(),
             code: self.exit_code,
             stderr: truncate_stderr(&self.stderr),
+        })
+    }
+
+    /// The [`Error::Timeout`] this result represents, if it timed out. Lets the
+    /// convenience helpers (`ensure_success`, `ProcessRunnerExt::exit_code`)
+    /// surface a timeout as a distinct error rather than a synthetic `-1` exit,
+    /// while `output`/`capture` keep exposing the [`timed_out`](Self::timed_out)
+    /// flag for callers that want to inspect it without erroring.
+    pub(crate) fn timeout_error(&self) -> Option<Error> {
+        self.timed_out.then(|| Error::Timeout {
+            program: self.program.clone(),
+            timeout: self.timeout.unwrap_or_default(),
         })
     }
 }
@@ -112,14 +137,28 @@ mod tests {
 
     #[test]
     fn success_is_code_zero() {
-        let ok = ProcessResult::new("git".into(), "out".to_owned(), String::new(), 0, false);
+        let ok = ProcessResult::new(
+            "git".into(),
+            "out".to_owned(),
+            String::new(),
+            0,
+            false,
+            None,
+        );
         assert!(ok.is_success());
         assert!(ok.ensure_success().is_ok());
     }
 
     #[test]
     fn nonzero_exit_turns_into_error() {
-        let bad = ProcessResult::new("git".into(), "out".to_owned(), "boom".to_owned(), 2, false);
+        let bad = ProcessResult::new(
+            "git".into(),
+            "out".to_owned(),
+            "boom".to_owned(),
+            2,
+            false,
+            None,
+        );
         assert!(!bad.is_success());
         let err = bad.ensure_success().unwrap_err();
         match err {
@@ -137,15 +176,44 @@ mod tests {
     }
 
     #[test]
+    fn timed_out_takes_precedence_over_exit_code() {
+        // A timed-out run carries exit_code -1, but ensure_success must report it
+        // as a distinct Timeout, not a non-zero Exit.
+        let timed = ProcessResult::new(
+            "git".into(),
+            "out".to_owned(),
+            String::new(),
+            -1,
+            true,
+            Some(Duration::from_millis(500)),
+        );
+        assert!(timed.timed_out());
+        match timed.ensure_success().unwrap_err() {
+            Error::Timeout { program, timeout } => {
+                assert_eq!(program, "git");
+                assert_eq!(timeout, Duration::from_millis(500));
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn combined_concatenates_stdout_then_stderr() {
-        let r = ProcessResult::new("p".into(), "out".to_owned(), "err".to_owned(), 0, false);
+        let r = ProcessResult::new(
+            "p".into(),
+            "out".to_owned(),
+            "err".to_owned(),
+            0,
+            false,
+            None,
+        );
         assert_eq!(r.combined(), "outerr");
     }
 
     #[test]
     fn stderr_is_truncated_in_error_only() {
         let big = "x".repeat(10_000);
-        let bad = ProcessResult::new("p".into(), Vec::<u8>::new(), big.clone(), 1, false);
+        let bad = ProcessResult::new("p".into(), Vec::<u8>::new(), big.clone(), 1, false, None);
         let full = bad.stderr().to_owned();
         assert_eq!(full.len(), 10_000);
         let Error::Exit { stderr, .. } = bad.ensure_success().unwrap_err() else {

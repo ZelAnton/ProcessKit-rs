@@ -11,19 +11,25 @@ to a dated version section.
 
 ## [Unreleased]
 
-### Added
--
-
 ### Changed
--
+- **Timeouts are now a first-class `Error::Timeout`** on the success-checking
+  helpers. `ProcessResult::ensure_success` (hence `ProcessRunnerExt::run`/`checked`,
+  `CliClient::text`/`unit`/`parse`/`try_parse`, and `Command::run`) and
+  `ProcessRunnerExt::exit_code` / `CliClient::code` / `Command::exit_code` now return
+  `Error::Timeout` for a run killed by its deadline, instead of folding it into
+  `Error::Exit { code: -1 }` / a synthetic `-1`.
+  `capture`/`output` still expose the inspectable `ProcessResult::timed_out()`
+  without erroring. **Breaking:** a timeout that previously surfaced as `Error::Exit`
+  is now `Error::Timeout` (the variant was formerly unreachable).
 
-### Fixed
--
+### Added
+- `Reply::timeout()` — a canned `ScriptedRunner` reply that drives the timeout
+  path, so tests can assert that a command exceeding its deadline surfaces as
+  `Error::Timeout`.
 
 ## [0.2.0] - 2026-06-01
 
 ### Changed
-
 - Release workflow: bump-choice menu, auto-increment (rebased onto v0.1.2)
 
 ## [0.1.2] - 2026-05-31

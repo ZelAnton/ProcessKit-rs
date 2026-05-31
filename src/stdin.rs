@@ -21,8 +21,8 @@ type SharedLines = Arc<AsyncMutex<Option<Pin<Box<dyn Stream<Item = String> + Sen
 /// Ports the .NET `StandardInput` hierarchy. When a command has no `Stdin` (or
 /// [`Stdin::empty`]), stdin is closed at start so the child reads EOF
 /// immediately. The streaming sources ([`from_reader`](Self::from_reader),
-/// [`from_lines`](Self::from_lines)) are one-shot: a cloned [`Command`] reusing
-/// them sees an empty stdin on the second run.
+/// [`from_lines`](Self::from_lines)) are one-shot: a cloned
+/// [`Command`](crate::Command) reusing them sees an empty stdin on the second run.
 #[derive(Clone)]
 pub struct Stdin(Source);
 

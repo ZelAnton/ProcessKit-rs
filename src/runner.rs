@@ -48,9 +48,15 @@ pub trait ProcessRunnerExt: ProcessRunner {
         Ok(result.into_stdout().trim_end().to_owned())
     }
 
-    /// Run and return just the exit code.
+    /// Run and return just the exit code. A run killed by its timeout has no
+    /// meaningful code, so it surfaces as [`Error::Timeout`](crate::Error::Timeout)
+    /// rather than the synthetic `-1` — mirroring [`ensure_success`](crate::ProcessResult::ensure_success).
     async fn exit_code(&self, command: &Command) -> Result<i32> {
-        Ok(self.output(command).await?.exit_code())
+        let result = self.output(command).await?;
+        match result.timeout_error() {
+            Some(err) => Err(err),
+            None => Ok(result.exit_code()),
+        }
     }
 
     /// Run, require a zero exit, and return the full captured result (untrimmed

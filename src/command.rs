@@ -13,7 +13,7 @@ use crate::buffer::OutputBufferPolicy;
 use crate::error::Result;
 use crate::pump::LineHandler;
 use crate::result::ProcessResult;
-use crate::runner::JobRunner;
+use crate::runner::{JobRunner, ProcessRunnerExt};
 use crate::running::RunningProcess;
 use crate::stdin::Stdin;
 
@@ -311,9 +311,13 @@ impl Command {
         JobRunner::new().start(self).await?.output_bytes().await
     }
 
-    /// Run to completion and return just the exit code (output is discarded).
+    /// Run to completion and return just the exit code (output is discarded). A
+    /// run killed by its timeout has no meaningful code, so it surfaces as
+    /// [`Error::Timeout`](crate::Error::Timeout) — consistent with
+    /// [`ProcessRunnerExt::exit_code`](crate::ProcessRunnerExt::exit_code) and
+    /// [`CliClient::code`](crate::CliClient::code).
     pub async fn exit_code(&self) -> Result<i32> {
-        JobRunner::new().start(self).await?.wait().await
+        JobRunner::new().exit_code(self).await
     }
 
     /// Run to completion, requiring a zero exit, and return trimmed stdout.

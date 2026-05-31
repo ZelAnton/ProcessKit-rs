@@ -126,6 +126,22 @@ async fn timeout_kills_and_flags() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real subprocess and waits for the timeout"]
+async fn exit_code_surfaces_timeout_as_error() {
+    // `Command::exit_code` must report a timeout as `Error::Timeout`, not the
+    // synthetic `-1` — consistent with the runner/CliClient code paths.
+    let err = sleeper()
+        .timeout(Duration::from_millis(300))
+        .exit_code()
+        .await
+        .expect_err("a timed-out run has no meaningful exit code");
+    assert!(
+        matches!(err, processkit::Error::Timeout { .. }),
+        "expected Error::Timeout, got {err:?}"
+    );
+}
+
+#[tokio::test]
 #[ignore = "creates an OS job/cgroup"]
 async fn group_reports_a_known_mechanism() {
     let group = ProcessGroup::new().expect("create group");

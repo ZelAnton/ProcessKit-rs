@@ -209,6 +209,7 @@ impl RunningProcess {
             stderr_sink.drain().join("\n"),
             code,
             timed_out,
+            self.timeout,
         ))
     }
 
@@ -246,11 +247,19 @@ impl RunningProcess {
             stderr_sink.drain().join("\n"),
             code,
             timed_out,
+            self.timeout,
         ))
     }
 
     /// Wait for exit, returning just the exit code (output is drained and
     /// discarded so the child never blocks on a full pipe).
+    ///
+    /// This low-level handle method reports the **raw** outcome: a run killed by
+    /// its timeout returns `-1` (it is not raised as an error). For the
+    /// timeout-aware behavior use the one-shot helpers
+    /// ([`Command::exit_code`](crate::Command::exit_code) /
+    /// [`ProcessRunnerExt::exit_code`](crate::ProcessRunnerExt::exit_code)), which
+    /// surface a deadline as [`Error::Timeout`](crate::Error::Timeout).
     pub async fn wait(mut self) -> Result<i32> {
         let stdout_sink = SharedLines::new(&self.buffer);
         let stderr_sink = SharedLines::new(&self.buffer);

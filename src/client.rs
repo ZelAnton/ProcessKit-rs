@@ -300,6 +300,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn code_errors_on_timeout() {
+        // A timed-out run has no meaningful exit code: `code` must raise
+        // Error::Timeout, not return the synthetic -1 (so a consumer like
+        // `gh auth status` can't misread a timeout as "exited non-zero").
+        let client = CliClient::with_runner("gh", ScriptedRunner::new().fallback(Reply::timeout()));
+        assert!(matches!(
+            client
+                .code(client.command(["auth", "status"]))
+                .await
+                .unwrap_err(),
+            Error::Timeout { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn default_timeout_is_applied() {
         let client = CliClient::new("git").default_timeout(Duration::from_secs(7));
         assert_eq!(
