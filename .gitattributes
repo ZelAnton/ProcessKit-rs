@@ -1,0 +1,14 @@
+# Normalize line endings so Windows checkouts match the LF-stored blobs.
+# Without this, core.autocrlf=true rewrites files to CRLF on checkout, which
+# makes colocated `jj` see every file as modified (jj reads the working copy
+# raw, git compares against the LF blob).
+* text=auto eol=lf
+
+# Shell scripts must always be LF — required for execution on Unix.
+*.sh text eol=lf
+
+# Binary assets — never touch.
+*.jpg binary
+*.png binary
+*.gif binary
+*.ico binary

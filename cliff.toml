@@ -1,0 +1,49 @@
+# git-cliff configuration — used to auto-fill CHANGELOG.md's [Unreleased]
+# section from git history when no manual entries were curated. Manual entries
+# always take priority; this only fills in the blanks.
+#
+# Commits since the previous tag are categorised by the first word of the
+# message into Keep a Changelog buckets:
+#   feat..., add...                                                      -> Added
+#   fix..., bug...                                                       -> Fixed
+#   remove..., delete..., drop...                                        -> Removed
+#   refactor..., change..., update..., rename..., perf..., ux..., ci...  -> Changed
+#   doc..., chore..., test..., style...                                  -> skipped
+#   Release v..., Merge ...                                              -> skipped
+#   anything else                                                        -> Changed (fallback)
+#
+# Write conventional-commit subjects with optional scopes, e.g.
+# `feat(parser): ...`, `fix(cli): ...`, `perf(io): ...`, `ux(ui): ...`.
+# The `\b` word boundary in each parser matches the type even when a
+# `(scope)` or `!` immediately follows (e.g. `feat!(rename): ...`).
+# Only the first line of each commit message is used.
+
+[changelog]
+header = ""
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group }}
+{% for commit in commits %}
+- {{ commit.message | split(pat="\n") | first | trim }}
+{%- endfor %}
+
+{% endfor %}
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = false
+filter_unconventional = false
+sort_commits = "oldest"
+
+commit_parsers = [
+	{ message = "^[Rr]elease v?\\d", skip = true },
+	{ message = "^[Mm]erge ", skip = true },
+	{ message = "(?i)^(doc|docs|chore|test|tests|style)\\b", skip = true },
+	{ message = "(?i)^(feat|add)\\b", group = "Added" },
+	{ message = "(?i)^(fix|bug)\\b", group = "Fixed" },
+	{ message = "(?i)^(remove|delete|drop)\\b", group = "Removed" },
+	{ message = "(?i)^(refactor|change|update|rename|improv|enhance|perf|perf-test|ux|ci|cleanup|build|deps)\\b", group = "Changed" },
+	{ message = ".*", group = "Changed" },
+]

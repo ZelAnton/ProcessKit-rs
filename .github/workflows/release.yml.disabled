@@ -1,0 +1,74 @@
+name: Release
+
+# OPT-IN: this file ships disabled (the `.disabled` extension means GitHub
+# ignores it). To enable automated releases, rename it to `release.yml` and add
+# a repository secret `CRATES_IO_TOKEN`.
+#
+# Manual, single-crate release: bump the version, promote the curated
+# `[Unreleased]` changelog section, tag `v<version>`, and publish to crates.io.
+# See AGENTS.md "Releasing and the changelog". For a workspace of several
+# independently-versioned crates, model this on vcs-toolkit-rs's release.yml
+# instead (per-crate `crate`/`version` inputs and `<crate>-v<version>` tags).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: New version, e.g. 0.2.0
+        required: true
+        type: string
+
+permissions:
+  contents: write # push the version-bump commit and the tag
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tooling
+        run: cargo install cargo-edit --locked
+
+      # `${{ inputs.* }}` is passed through `env:` and referenced as a shell
+      # variable rather than interpolated into the script text — interpolating
+      # untrusted input directly into `run:` is a script-injection risk.
+      - name: Bump version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: cargo set-version "$VERSION"
+
+      - name: Promote changelog
+        # Non-destructive: rename the curated `## [Unreleased]` heading to the new
+        # version + date and leave a fresh empty Unreleased above it. The manual
+        # bullets (the source of truth per AGENTS.md) are preserved verbatim. The
+        # `## [x.y.z]` compare-link reference at the bottom is added by hand.
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          date="$(date +%F)"
+          sed -i "0,/^## \[Unreleased\]\$/s//## [Unreleased]\n\n## [${VERSION}] - ${date}/" CHANGELOG.md
+
+      - name: Commit, tag, push
+        env:
+          VERSION: ${{ inputs.version }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "release: v${VERSION}"
+          git tag "v${VERSION}"
+          # checkout@v5 leaves a detached HEAD, so push to the branch explicitly
+          # (`git push origin HEAD` can't resolve a branch when detached).
+          git push origin "HEAD:${BRANCH}"
+          git push origin "v${VERSION}"
+
+      - name: Publish to crates.io
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}

@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref so a new push doesn't queue behind stale CI.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-targets
+      - run: cargo test
+
+  audit:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Scan the dependency tree for security advisories and banned/duplicate crates.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans
+
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Verify the crate still builds on its declared Minimum Supported Rust
+      # Version. Keep `toolchain` in sync with `rust-version` in Cargo.toml.
+      # (`@master` + the `toolchain` input accepts a two-component "1.85"; the
+      # version-branch refs require a full patch version like `@1.85.0`.)
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      # rust-toolchain.toml tracks stable and would otherwise win here; remove it
+      # so cargo uses the 1.85 toolchain installed above and truly tests the floor.
+      - run: rm -f rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets

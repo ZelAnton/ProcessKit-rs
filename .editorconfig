@@ -1,0 +1,30 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Rust — rustfmt's defaults (4-space indent). rustfmt is the source of truth for
+# .rs formatting; this just keeps editors aligned before it runs.
+[*.rs]
+indent_style = space
+indent_size = 4
+
+[*.{toml,yml,yaml,json}]
+indent_style = space
+indent_size = 2
+
+# Shell scripts (hooks, and any compiled into binaries) must stay LF.
+[*.sh]
+indent_style = space
+indent_size = 2
+
+[*.{ps1,psm1,psd1}]
+indent_style = space
+indent_size = 4
+
+# Markdown uses trailing whitespace for hard line breaks — don't strip it.
+[*.md]
+trim_trailing_whitespace = false

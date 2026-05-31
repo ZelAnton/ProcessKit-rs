@@ -1,0 +1,12 @@
+# Pins the toolchain rustup uses for this repo, so every contributor and CI job
+# builds with the same compiler and has rustfmt/clippy available without an
+# explicit `rustup component add`.
+#
+# This tracks `stable`. The Minimum Supported Rust Version (MSRV) lives in
+# `Cargo.toml` (`rust-version`) and is verified by the `msrv` CI job, which
+# overrides this file. If you would rather pin a fixed compiler instead of
+# tracking stable, set `channel` to that version here (e.g. `channel = "1.85"`).
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

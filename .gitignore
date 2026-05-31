@@ -1,0 +1,19 @@
+/target
+
+# Per-user scratch notes — never committed. Use these names freely for
+# throwaway planning/working files.
+*.local.md
+task_plan.md
+findings.md
+progress.md
+
+# Override a global ~/.gitignore that excludes `.claude` — this repo ships
+# its own Claude Code hook configuration to contributors. Keep .local.json
+# excluded; it's per-user (machine paths, personal permission allowlists).
+!.claude/
+!.claude/**
+.claude/settings.local.json
+
+# Rust
+**/*.rs.bk
+*.pdb

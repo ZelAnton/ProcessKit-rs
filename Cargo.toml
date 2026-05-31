@@ -1,0 +1,45 @@
+[package]
+name = "processkit"
+version = "0.1.0"
+edition = "2024"
+description = "Child-process management: kill-on-dispose process trees and async run-and-capture"
+license = "MIT"
+repository = "https://github.com/ZelAnton/ProcessKit-rs"
+readme = "README.md"
+# Keep the published crate lean: ship code, docs, and license — not the
+# dev/CI/agent tooling that only matters in the repo.
+exclude = [
+  ".claude/",
+  ".github/",
+  ".editorconfig",
+  ".gitattributes",
+  "AGENTS.md",
+  "CLAUDE.md",
+  "cliff.toml",
+  "deny.toml",
+  "rust-toolchain.toml",
+]
+# Minimum Supported Rust Version. 1.85 is the edition-2024 floor; raise it when
+# you adopt a newer language/std feature. The `msrv` CI job verifies it — keep
+# the two in sync.
+rust-version = "1.85"
+
+# ---------------------------------------------------------------------------
+# Dependencies
+#
+# Convention (see AGENTS.md "Dependency management"): this project fixes NO
+# allow-list of crates. Add whatever your project needs — but give every new
+# dependency an inline comment explaining *why* it's here and what it's used
+# for, so the next reader (human or agent) doesn't have to guess. Pin major
+# versions, prefer well-maintained crates, and keep Cargo.lock committed.
+#
+# Example:
+#   serde = { version = "1", features = ["derive"] }  # (de)serialize config
+# ---------------------------------------------------------------------------
+[dependencies]
+
+[dev-dependencies]
+
+# Platform-specific dependencies go under a cfg target table, e.g.:
+# [target.'cfg(windows)'.dependencies]
+# winapi-util = "0.1"  # <why this Windows-only dependency is needed>

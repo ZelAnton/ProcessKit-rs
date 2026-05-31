@@ -1,0 +1,13 @@
+# cargo-deny configuration. CI runs `cargo deny check advisories bans`
+# (see .github/workflows/ci.yml). Licenses/sources are not gated for now.
+
+[advisories]
+# Fail on crates with a RustSec security advisory or that have been yanked.
+version = 2
+yanked = "deny"
+
+[bans]
+# Duplicate versions of the same crate are a warning, not a hard failure.
+multiple-versions = "warn"
+# Wildcard version requirements hide breakage; flag them.
+wildcards = "deny"
