@@ -6,6 +6,7 @@ use tokio::process::{Child, Command};
 
 use crate::error::{Error, Result};
 use crate::mechanism::Mechanism;
+use crate::stats::ProcessGroupStats;
 use crate::sys::Job;
 
 /// Tuning for a [`ProcessGroup`]'s graceful shutdown.
@@ -104,6 +105,14 @@ impl ProcessGroup {
         // `self` drops here; the job's Drop hard-kills any straggler (a no-op
         // after a successful graceful shutdown) and frees the OS handle/cgroup.
         Ok(())
+    }
+
+    /// Snapshot the group's resource usage (active process count and, where the
+    /// platform supports it, total CPU time and peak memory). See
+    /// [`ProcessGroupStats`].
+    pub fn stats(&self) -> Result<ProcessGroupStats> {
+        let stats = self.job.stats()?;
+        Ok(stats)
     }
 
     /// The containment mechanism actually in effect (see [`Mechanism`]).

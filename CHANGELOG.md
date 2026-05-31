@@ -24,11 +24,28 @@ to a dated version section.
   metadata.
 - `ProcessResult<T>` with `is_success` / `ensure_success`, and a structured
   `Error` (`Spawn` / `Exit` / `Timeout` / `Io`).
-- `Stdin` sources: `empty`, `from_string`, `from_bytes`, `from_file`.
+- `Stdin` sources: `empty`, `from_string`, `from_bytes`, `from_file`,
+  `from_iter_lines`, `from_reader`, and `from_lines` (async stream).
 - `ProcessRunner` mock seam with `JobRunner`, `ScriptedRunner`,
   `RecordingRunner`, and a `mock`-feature `MockRunner`.
+- Interactive stdin: `Command::keep_stdin_open` plus `RunningProcess::standard_input`
+  returning a `ProcessStdin` writer (`write`/`write_line`/`flush`/`finish`).
+- Push line-handlers: `Command::on_stdout_line` / `on_stderr_line`, invoked per
+  decoded line as it is read.
+- Output-buffer policy: `OutputBufferPolicy` (`bounded`/`unbounded`) with
+  `OverflowMode::{DropOldest, DropNewest}`, plus exact `RunningProcess::stdout_line_count`
+  / `stderr_line_count` (count survives dropped lines).
+- Encoding overrides: `Command::stdout_encoding` / `stderr_encoding` / `encoding`
+  to decode non-UTF-8 legacy output (via `encoding_rs`); default stays UTF-8.
+- Diagnostics: `ProcessGroup::stats` → `ProcessGroupStats` (active count, and
+  CPU/peak-memory where the platform reports them), and per-process
+  `RunningProcess::cpu_time` / `peak_memory_bytes` / `elapsed`.
 
 ### Changed
+- Output capture is now line-oriented (pumped): captured text is normalized to
+  `\n` line endings. `output_bytes` still returns exact raw stdout.
+
+### Fixed
 -
 
 ### Fixed

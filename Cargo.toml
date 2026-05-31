@@ -41,6 +41,10 @@ async-trait = "0.1"
 # Structured `Error` carrying program / exit code / stderr / timeout instead
 # of stringly-typed failures; `#[non_exhaustive]` so variants can grow.
 thiserror = "2"
+# Decode child stdout/stderr in non-UTF-8 legacy encodings (Shift-JIS,
+# Windows-1252, GBK, …) for the per-stream encoding-override option; default
+# stays UTF-8.
+encoding_rs = "0.8"
 # Adapt tokio's `Lines` reader into an `impl Stream` for the streaming-output
 # helper, so callers consume stdout with the standard `Stream` combinators.
 # `io-util` gates the `wrappers::LinesStream` adapter we use.
@@ -65,10 +69,12 @@ tracing = ["dep:tracing"]
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_System_JobObjects",
-  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION lives behind this.
+  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION + GetProcessTimes (per-process CPU).
   "Win32_System_Threading",
   # CreateJobObjectW's signature references SECURITY_ATTRIBUTES.
   "Win32_Security",
+  # K32GetProcessMemoryInfo (per-process peak working set) for diagnostics.
+  "Win32_System_ProcessStatus",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

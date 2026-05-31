@@ -35,26 +35,32 @@
 //! [Job Object]: https://learn.microsoft.com/windows/win32/procthread/job-objects
 //! [cgroup v2]: https://docs.kernel.org/admin-guide/cgroup-v2.html
 
+mod buffer;
 mod command;
 mod doubles;
 mod error;
 mod group;
 mod mechanism;
+mod pump;
 mod result;
 mod runner;
 mod running;
+mod stats;
 mod stdin;
 mod sys;
 
+pub use buffer::{OutputBufferPolicy, OverflowMode};
 pub use command::Command;
 pub use doubles::{Invocation, RecordingRunner, Reply, ScriptedRunner};
+pub use encoding_rs::Encoding;
 pub use error::{Error, Result};
 pub use group::{ProcessGroup, ProcessGroupOptions};
 pub use mechanism::Mechanism;
 pub use result::ProcessResult;
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
 pub use running::{RunningProcess, StdoutLines};
-pub use stdin::Stdin;
+pub use stats::ProcessGroupStats;
+pub use stdin::{ProcessStdin, Stdin};
 
 /// The `mockall`-generated mock of [`ProcessRunner`] (enabled by the `mock`
 /// feature), re-exported under a friendlier name.

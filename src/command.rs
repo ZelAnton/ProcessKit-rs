@@ -1,11 +1,17 @@
 //! [`Command`] — a builder describing a process to run.
 
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
+use encoding_rs::{Encoding, UTF_8};
+
+use crate::buffer::OutputBufferPolicy;
 use crate::error::Result;
+use crate::pump::LineHandler;
 use crate::result::ProcessResult;
 use crate::runner::JobRunner;
 use crate::running::RunningProcess;
@@ -19,7 +25,7 @@ use crate::stdin::Stdin;
 /// helper ([`output_string`](Self::output_string), [`run`](Self::run), …) or
 /// start it via a [`ProcessRunner`](crate::ProcessRunner) for streaming/shared
 /// groups.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Command {
     program: OsString,
     args: Vec<OsString>,
@@ -27,7 +33,13 @@ pub struct Command {
     envs: Vec<(OsString, Option<OsString>)>,
     env_clear: bool,
     stdin: Option<Stdin>,
+    keep_stdin_open: bool,
     timeout: Option<Duration>,
+    stdout_handler: Option<LineHandler>,
+    stderr_handler: Option<LineHandler>,
+    output_buffer: OutputBufferPolicy,
+    stdout_encoding: &'static Encoding,
+    stderr_encoding: &'static Encoding,
 }
 
 impl Command {
@@ -40,7 +52,13 @@ impl Command {
             envs: Vec::new(),
             env_clear: false,
             stdin: None,
+            keep_stdin_open: false,
             timeout: None,
+            stdout_handler: None,
+            stderr_handler: None,
+            output_buffer: OutputBufferPolicy::unbounded(),
+            stdout_encoding: UTF_8,
+            stderr_encoding: UTF_8,
         }
     }
 
@@ -100,7 +118,86 @@ impl Command {
         self
     }
 
+    /// Leave stdin open after start so the child can be driven interactively via
+    /// [`RunningProcess::standard_input`](crate::RunningProcess::standard_input).
+    /// Has no effect on the bulk run helpers (they always close stdin).
+    pub fn keep_stdin_open(mut self) -> Self {
+        self.keep_stdin_open = true;
+        self
+    }
+
+    /// Invoke `handler` for each decoded stdout line as it is read (in addition
+    /// to capture/streaming). Runs on the pump task; keep it cheap and panic-free.
+    pub fn on_stdout_line<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        self.stdout_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Invoke `handler` for each decoded stderr line as it is read.
+    pub fn on_stderr_line<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        self.stderr_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Cap the in-memory backlog of captured output lines (see
+    /// [`OutputBufferPolicy`]). The pump still drains the pipe; only retention is
+    /// bounded.
+    pub fn output_buffer(mut self, policy: OutputBufferPolicy) -> Self {
+        self.output_buffer = policy;
+        self
+    }
+
+    /// Decode stdout with `encoding` instead of UTF-8 (e.g.
+    /// `encoding_rs::SHIFT_JIS`).
+    pub fn stdout_encoding(mut self, encoding: &'static Encoding) -> Self {
+        self.stdout_encoding = encoding;
+        self
+    }
+
+    /// Decode stderr with `encoding` instead of UTF-8.
+    pub fn stderr_encoding(mut self, encoding: &'static Encoding) -> Self {
+        self.stderr_encoding = encoding;
+        self
+    }
+
+    /// Decode both stdout and stderr with `encoding`.
+    pub fn encoding(mut self, encoding: &'static Encoding) -> Self {
+        self.stdout_encoding = encoding;
+        self.stderr_encoding = encoding;
+        self
+    }
+
     // --- Accessors used by the runner layer --------------------------------
+
+    pub(crate) fn keeps_stdin_open(&self) -> bool {
+        self.keep_stdin_open
+    }
+
+    pub(crate) fn stdout_handler(&self) -> Option<LineHandler> {
+        self.stdout_handler.clone()
+    }
+
+    pub(crate) fn stderr_handler(&self) -> Option<LineHandler> {
+        self.stderr_handler.clone()
+    }
+
+    pub(crate) fn output_buffer_policy(&self) -> OutputBufferPolicy {
+        self.output_buffer
+    }
+
+    pub(crate) fn out_encoding(&self) -> &'static Encoding {
+        self.stdout_encoding
+    }
+
+    pub(crate) fn err_encoding(&self) -> &'static Encoding {
+        self.stderr_encoding
+    }
 
     pub(crate) fn program_name(&self) -> String {
         self.program.to_string_lossy().into_owned()
@@ -153,13 +250,18 @@ impl Command {
         }
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        match &self.stdin {
-            Some(src) => {
-                cmd.stdin(src.stdio());
-            }
-            // No source given: close stdin so the child reads EOF at start.
-            None => {
-                cmd.stdin(Stdio::null());
+        if self.keep_stdin_open {
+            // Interactive: keep a pipe open for the caller to write to.
+            cmd.stdin(Stdio::piped());
+        } else {
+            match &self.stdin {
+                Some(src) => {
+                    cmd.stdin(src.stdio());
+                }
+                // No source given: close stdin so the child reads EOF at start.
+                None => {
+                    cmd.stdin(Stdio::null());
+                }
             }
         }
         cmd
@@ -211,11 +313,30 @@ impl Command {
         let mut process = JobRunner::new().start(self).await?;
         let mut lines = process.stdout_lines();
         while let Some(line) = lines.next().await {
-            let line = line?;
             if predicate(&line) {
                 return Ok(Some(line));
             }
         }
         Ok(None)
+    }
+}
+
+impl fmt::Debug for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Command")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("envs", &self.envs)
+            .field("env_clear", &self.env_clear)
+            .field("stdin", &self.stdin)
+            .field("keep_stdin_open", &self.keep_stdin_open)
+            .field("timeout", &self.timeout)
+            .field("has_stdout_handler", &self.stdout_handler.is_some())
+            .field("has_stderr_handler", &self.stderr_handler.is_some())
+            .field("output_buffer", &self.output_buffer)
+            .field("stdout_encoding", &self.stdout_encoding.name())
+            .field("stderr_encoding", &self.stderr_encoding.name())
+            .finish()
     }
 }

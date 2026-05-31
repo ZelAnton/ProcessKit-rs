@@ -17,6 +17,20 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::Mechanism;
+use crate::stats::ProcessGroupStats;
+
+/// Per-process resource metrics sampled from the OS.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ProcMetrics {
+    pub cpu_time: Option<Duration>,
+    pub peak_memory_bytes: Option<u64>,
+}
+
+/// Sample CPU time and peak memory for a single process by pid. Returns
+/// defaults (all `None`) if the process is gone or the platform can't report.
+pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
+    imp::process_metrics(pid)
+}
 
 // Exactly one platform module is compiled per target. Each defines an `imp::Job`
 // with the same inherent methods plus a kill-on-close `Drop`.
@@ -71,6 +85,11 @@ impl Job {
         escalate: bool,
     ) -> io::Result<()> {
         self.0.graceful_shutdown(timeout, escalate).await
+    }
+
+    /// Snapshot the group's resource usage.
+    pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
+        self.0.stats()
     }
 
     /// The containment mechanism actually in effect.

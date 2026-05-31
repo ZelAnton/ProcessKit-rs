@@ -10,7 +10,7 @@ use crate::command::Command;
 use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::result::ProcessResult;
-use crate::running::RunningProcess;
+use crate::running::{RunningProcess, Spawned};
 
 /// Runs a [`Command`] to completion and returns its captured text output.
 ///
@@ -91,38 +91,53 @@ impl ProcessRunner for ProcessGroup {
     }
 }
 
-/// Build the OS command, spawn it into `group`, kick off the background stdin
-/// writer, and wrap everything in a [`RunningProcess`] (with no owned group).
+/// Build the OS command, spawn it into `group`, wire stdin, and wrap everything
+/// in a [`RunningProcess`] (with no owned group).
 pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<RunningProcess> {
     let mut tokio_cmd = command.build_tokio();
     let mut child = group.spawn(&mut tokio_cmd)?;
     let pid = child.id();
 
-    // Write buffered/file stdin on a background task so a large payload can't
-    // deadlock against the child's stdout; dropping the sink sends EOF.
-    let stdin_task = match command.stdin_source() {
-        Some(source) if !source.is_empty() => child.stdin.take().map(|mut sink| {
-            let source = source.clone();
-            tokio::spawn(async move {
-                let result = source.write_to(&mut sink).await;
-                drop(sink);
-                result
-            })
-        }),
-        _ => None,
+    let (stdin_pipe, stdin_task) = if command.keeps_stdin_open() {
+        // Interactive: hand the pipe to the caller via `standard_input`.
+        (child.stdin.take(), None)
+    } else {
+        match command.stdin_source() {
+            // Write buffered/file/stream stdin on a background task so a large
+            // payload can't deadlock against the child's stdout; dropping the
+            // sink sends EOF.
+            Some(source) if !source.is_empty() => {
+                let task = child.stdin.take().map(|mut sink| {
+                    let source = source.clone();
+                    tokio::spawn(async move {
+                        let result = source.write_to(&mut sink).await;
+                        drop(sink);
+                        result
+                    })
+                });
+                (None, task)
+            }
+            _ => (None, None),
+        }
     };
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    Ok(RunningProcess::new(
-        command.program_name(),
+    Ok(RunningProcess::from_spawned(Spawned {
+        program: command.program_name(),
         child,
-        None,
+        own_group: None,
         stdout,
         stderr,
+        stdin: stdin_pipe,
         stdin_task,
-        command.timeout_value(),
+        timeout: command.timeout_value(),
         pid,
-    ))
+        stdout_encoding: command.out_encoding(),
+        stderr_encoding: command.err_encoding(),
+        stdout_handler: command.stdout_handler(),
+        stderr_handler: command.stderr_handler(),
+        buffer: command.output_buffer_policy(),
+    }))
 }

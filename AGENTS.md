@@ -16,21 +16,25 @@ management — a Rust port of the .NET ProcessKit. Two layers:
   adds the graceful SIGTERM → wait → SIGKILL tier (Unix). The async-drop tension
   is why graceful teardown is a method, not `Drop`.
 - **Process runner** (`command.rs`, `runner.rs`, `running.rs`, `result.rs`,
-  `stdin.rs`) — a `Command` builder (collapsing .NET's `ProcessStartInfo` +
-  `ProcessRunOptions`) with run-and-capture helpers, a `RunningProcess` live
-  handle (streaming stdout; stderr drained in the background), `ProcessResult<T>`,
-  and `Stdin` sources. The mock seam is the `ProcessRunner` trait, returning a
-  finished `ProcessResult` (so `ScriptedRunner`/`RecordingRunner`/`MockRunner`
-  need no real process); live-handle/streaming runs use the concrete
-  `start`/`JobRunner` methods.
+  `stdin.rs`, `pump.rs`, `buffer.rs`, `stats.rs`) — a `Command` builder (collapsing
+  .NET's `ProcessStartInfo` + `ProcessRunOptions`) with run-and-capture helpers, a
+  `RunningProcess` live handle, `ProcessResult<T>`, and `Stdin` sources. Output is
+  line-pumped (`pump.rs`): each stream is drained into a shared bounded buffer
+  (`buffer.rs` policy), decoded per `encoding_rs`, fed to optional push handlers,
+  and counted. The mock seam is the `ProcessRunner` trait, returning a finished
+  `ProcessResult` (so `ScriptedRunner`/`RecordingRunner`/`MockRunner` need no real
+  process); live-handle/streaming runs use the concrete `start`/`JobRunner` methods.
+  Diagnostics (`stats.rs` + `sys`): `ProcessGroup::stats` and per-process
+  `cpu_time`/`peak_memory_bytes`.
 
 Features: `mock` (generated `MockRunner`), `tracing` (per-run events). Real
 platform code goes under `[target.'cfg(...)'.dependencies]`; keep the crate
-MSRV-clean and document every dependency's "why". **Scope so far:** foundation +
-common helpers. Not yet ported: interactive stdin writer, output-buffer
-drop policies, encoding overrides, push line-handlers, line counters, and rich
-CPU/memory stats. Real-subprocess and kill-on-drop tests are `#[ignore]`d (run
-`cargo test -- --ignored`); hermetic tests use the scripted/recording doubles.
+MSRV-clean and document every dependency's "why". The port is at parity with the
+.NET library (groups, runner, streaming, interactive stdin, handlers, buffer
+policies, encoding overrides, line counters, stats). Captured text is
+line-normalized to `\n`; `output_bytes` preserves exact stdout. Real-subprocess
+and kill-on-drop tests are `#[ignore]`d (run `cargo test -- --ignored`); hermetic
+tests use the pump unit tests and the scripted/recording doubles.
 
 ## Build, test, run
 

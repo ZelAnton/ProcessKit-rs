@@ -17,6 +17,8 @@ use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 
 use crate::Mechanism;
+use crate::stats::ProcessGroupStats;
+use crate::sys::ProcMetrics;
 
 /// How often the graceful path re-checks whether the tree has drained.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -163,12 +165,103 @@ impl Job {
         }
     }
 
+    pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
+        match &self.backend {
+            Backend::Cgroup(cg) => {
+                // Our cgroup has no controllers enabled (so `cgroup.kill` works
+                // without the "no internal processes" rule), so cpu/memory aren't
+                // available from the cgroup itself — sum per-process /proc
+                // counters of the live members instead.
+                let pids = cg.members();
+                let active = pids.len();
+                let mut cpu = Duration::ZERO;
+                let mut have_cpu = false;
+                let mut mem = 0u64;
+                let mut have_mem = false;
+                for pid in pids {
+                    let m = process_metrics(pid as u32);
+                    if let Some(c) = m.cpu_time {
+                        cpu += c;
+                        have_cpu = true;
+                    }
+                    if let Some(p) = m.peak_memory_bytes {
+                        mem += p;
+                        have_mem = true;
+                    }
+                }
+                Ok(ProcessGroupStats {
+                    active_process_count: active,
+                    total_cpu_time: have_cpu.then_some(cpu),
+                    peak_memory_bytes: have_mem.then_some(mem),
+                })
+            }
+            Backend::ProcessGroup(pgids) => {
+                // The fallback tracks group ids, not individual pids, so report
+                // the number of still-live groups and leave cpu/memory absent.
+                let active = match pgids.lock() {
+                    Ok(g) => g
+                        .iter()
+                        // SAFETY: signal 0 is a sound existence probe.
+                        .filter(|&&pgid| unsafe { libc::kill(-pgid, 0) == 0 })
+                        .count(),
+                    Err(_) => 0,
+                };
+                Ok(ProcessGroupStats {
+                    active_process_count: active,
+                    total_cpu_time: None,
+                    peak_memory_bytes: None,
+                })
+            }
+        }
+    }
+
     pub(crate) fn mechanism(&self) -> Mechanism {
         match &self.backend {
             Backend::Cgroup(_) => Mechanism::CgroupV2,
             Backend::ProcessGroup(_) => Mechanism::ProcessGroup,
         }
     }
+}
+
+pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
+    let mut metrics = ProcMetrics::default();
+
+    // CPU: /proc/<pid>/stat fields utime (14) + stime (15), in clock ticks.
+    // The comm field (2) may contain spaces/parens, so parse after the last ')'.
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        && let Some(idx) = stat.rfind(')')
+    {
+        let fields: Vec<&str> = stat[idx + 1..].split_whitespace().collect();
+        // After ')', index 0 is field 3 (state); utime=field14→idx11, stime→idx12.
+        if fields.len() > 12
+            && let (Ok(utime), Ok(stime)) = (fields[11].parse::<u64>(), fields[12].parse::<u64>())
+        {
+            // SAFETY: sysconf is a pure query with no preconditions.
+            let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+            if hz > 0 {
+                let nanos = (utime + stime) as u128 * 1_000_000_000u128 / hz as u128;
+                metrics.cpu_time = Some(Duration::from_nanos(nanos as u64));
+            }
+        }
+    }
+
+    // Peak memory: /proc/<pid>/status VmHWM (high-water resident set, in kB).
+    if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                if let Some(kb) = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    metrics.peak_memory_bytes = Some(kb * 1024);
+                }
+                break;
+            }
+        }
+    }
+
+    metrics
 }
 
 impl Drop for Job {

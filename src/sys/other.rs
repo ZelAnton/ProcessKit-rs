@@ -9,6 +9,8 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::Mechanism;
+use crate::stats::ProcessGroupStats;
+use crate::sys::ProcMetrics;
 
 pub(crate) struct Job;
 
@@ -41,7 +43,20 @@ impl Job {
         Ok(())
     }
 
+    pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
+        // No containment, so no group accounting is available.
+        Ok(ProcessGroupStats {
+            active_process_count: 0,
+            total_cpu_time: None,
+            peak_memory_bytes: None,
+        })
+    }
+
     pub(crate) fn mechanism(&self) -> Mechanism {
         Mechanism::None
     }
+}
+
+pub(crate) fn process_metrics(_pid: u32) -> ProcMetrics {
+    ProcMetrics::default()
 }

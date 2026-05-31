@@ -14,9 +14,10 @@ providing two layers:
 Async throughout. Errors are structured (`Error`); a non-zero exit is reported in
 the result, not raised, until you call `ProcessResult::ensure_success`.
 
-> **Status:** early development (foundation + common helpers). Interactive stdin,
-> output-buffer policies, encoding overrides, and rich CPU/memory stats are not
-> implemented yet — see [`CHANGELOG.md`](CHANGELOG.md).
+> **Status:** at parity with the .NET library — process groups, the runner and
+> capture helpers, streaming, interactive stdin, push line-handlers, output-buffer
+> policies, encoding overrides, line counters, and CPU/memory stats. See
+> [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Install
 

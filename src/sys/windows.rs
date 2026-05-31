@@ -6,14 +6,21 @@ use std::io;
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+};
+use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows_sys::Win32::System::Threading::{
+    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 use crate::Mechanism;
+use crate::stats::ProcessGroupStats;
+use crate::sys::ProcMetrics;
 
 pub(crate) struct Job {
     handle: HANDLE,
@@ -106,9 +113,91 @@ impl Job {
         self.kill_all()
     }
 
+    pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
+        let mut acct: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: out param matches the accounting info class and its size.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectBasicAccountingInformation,
+                std::ptr::from_mut(&mut acct).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut ext: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: out param matches the extended-limit info class and its size.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_mut(&mut ext).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Job accounting times are in 100-ns units.
+        let cpu_100ns = (acct.TotalUserTime as u64).saturating_add(acct.TotalKernelTime as u64);
+        Ok(ProcessGroupStats {
+            active_process_count: acct.ActiveProcesses as usize,
+            total_cpu_time: Some(Duration::from_nanos(cpu_100ns.saturating_mul(100))),
+            peak_memory_bytes: Some(ext.PeakJobMemoryUsed as u64),
+        })
+    }
+
     pub(crate) fn mechanism(&self) -> Mechanism {
         Mechanism::JobObject
     }
+}
+
+/// Combine a FILETIME (100-ns units) into nanoseconds.
+fn filetime_nanos(ft: FILETIME) -> u64 {
+    let units = ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
+    units.saturating_mul(100)
+}
+
+pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
+    let mut metrics = ProcMetrics::default();
+    // SAFETY: limited-information access; returns null on failure (e.g. gone).
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return metrics;
+    }
+
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    // SAFETY: valid handle; all four out params are owned locals.
+    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    if ok != 0 {
+        metrics.cpu_time = Some(Duration::from_nanos(
+            filetime_nanos(kernel) + filetime_nanos(user),
+        ));
+    }
+
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: valid handle; `counters` sized via its `cb` field.
+    let ok = unsafe { K32GetProcessMemoryInfo(handle, &mut counters, counters.cb) };
+    if ok != 0 {
+        metrics.peak_memory_bytes = Some(counters.PeakWorkingSetSize as u64);
+    }
+
+    // SAFETY: handle came from OpenProcess and is closed exactly once.
+    unsafe { CloseHandle(handle) };
+    metrics
 }
 
 impl Drop for Job {
