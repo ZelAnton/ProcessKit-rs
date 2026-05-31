@@ -25,21 +25,58 @@ exclude = [
 rust-version = "1.85"
 
 # ---------------------------------------------------------------------------
-# Dependencies
-#
-# Convention (see AGENTS.md "Dependency management"): this project fixes NO
-# allow-list of crates. Add whatever your project needs — but give every new
-# dependency an inline comment explaining *why* it's here and what it's used
-# for, so the next reader (human or agent) doesn't have to guess. Pin major
-# versions, prefer well-maintained crates, and keep Cargo.lock committed.
-#
-# Example:
-#   serde = { version = "1", features = ["derive"] }  # (de)serialize config
+# Dependencies — every entry carries a "why" (see AGENTS.md "Dependency
+# management"). Pin major versions, enable only the features used, keep
+# Cargo.lock committed.
 # ---------------------------------------------------------------------------
 [dependencies]
+# Async runtime + child-process management: `process` spawns children,
+# `time` enforces timeouts, `io-util` streams stdin/stdout line-by-line,
+# `rt` powers the background stderr-drain task, `macros` for `#[tokio::main]`
+# in examples, `sync` for the oneshot/Notify used in shutdown coordination.
+tokio = { version = "1", features = ["process", "time", "io-util", "rt", "macros", "sync", "fs"] }
+# `async fn` in the object-safe `ProcessRunner` trait so it stays `dyn`-able
+# and mockable (native async-in-trait isn't object-safe on our MSRV).
+async-trait = "0.1"
+# Structured `Error` carrying program / exit code / stderr / timeout instead
+# of stringly-typed failures; `#[non_exhaustive]` so variants can grow.
+thiserror = "2"
+# Adapt tokio's `Lines` reader into an `impl Stream` for the streaming-output
+# helper, so callers consume stdout with the standard `Stream` combinators.
+# `io-util` gates the `wrappers::LinesStream` adapter we use.
+tokio-stream = { version = "0.1", features = ["io-util"] }
+# Optional per-run observability (program/args/exit/duration). Off by default;
+# zero cost unless the `tracing` feature is enabled.
+tracing = { version = "0.1", optional = true }
+# Optional auto-generated `MockRunner` for downstream tests. Test-only; pulled
+# in solely behind the `mock` feature, never in production builds.
+mockall = { version = "0.13", optional = true }
+
+[features]
+# Expose the `mockall`-generated `MockRunner` for consumers' tests.
+mock = ["dep:mockall"]
+# Emit a `tracing` event per command run (program, args, exit code, duration).
+tracing = ["dep:tracing"]
+
+[target.'cfg(windows)'.dependencies]
+# Win32 Job Object FFI for kill-on-close process trees: CreateJobObjectW /
+# SetInformationJobObject / AssignProcessToJobObject / TerminateJobObject plus
+# the HANDLE type & CloseHandle.
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_JobObjects",
+  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION lives behind this.
+  "Win32_System_Threading",
+  # CreateJobObjectW's signature references SECURITY_ATTRIBUTES.
+  "Win32_Security",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Raw syscalls std can't express: join cgroup.procs in pre_exec
+# (async-signal-safe getpid/open/write/close) and kill/killpg for teardown
+# and the POSIX process-group fallback.
+libc = "0.2"
 
 [dev-dependencies]
-
-# Platform-specific dependencies go under a cfg target table, e.g.:
-# [target.'cfg(windows)'.dependencies]
-# winapi-util = "0.1"  # <why this Windows-only dependency is needed>
+# `#[tokio::test]` plus a multi-threaded runtime to drive the async tests.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util"] }

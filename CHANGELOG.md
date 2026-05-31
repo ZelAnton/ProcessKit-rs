@@ -12,7 +12,21 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- `ProcessGroup` — a kill-on-drop container for a child-process tree, backed by
+  Windows Job Objects, Linux cgroup v2 (with a POSIX process-group fallback), or
+  no containment elsewhere. Async `shutdown` performs a graceful
+  SIGTERM → wait → SIGKILL teardown on Unix; the mechanism in effect is
+  observable via `Mechanism`.
+- `Command` builder and async run-and-capture helpers: `output_string`,
+  `output_bytes`, `exit_code`, `run`, `first_line`, and `start` (live handle).
+- `RunningProcess` handle with incremental `stdout_lines` streaming (stderr
+  drained in the background), `output_string`/`output_bytes`/`wait`, and process
+  metadata.
+- `ProcessResult<T>` with `is_success` / `ensure_success`, and a structured
+  `Error` (`Spawn` / `Exit` / `Timeout` / `Io`).
+- `Stdin` sources: `empty`, `from_string`, `from_bytes`, `from_file`.
+- `ProcessRunner` mock seam with `JobRunner`, `ScriptedRunner`,
+  `RecordingRunner`, and a `mock`-feature `MockRunner`.
 
 ### Changed
 -

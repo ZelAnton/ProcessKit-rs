@@ -4,19 +4,33 @@ This file provides guidance to AI coding agents when working with code in this r
 
 ## Project
 
-`processkit` is a single **library** crate (`src/lib.rs`) for child-process
-management — a Rust port of the .NET ProcessKit. It has two layers:
+`processkit` is a single **async (tokio)** library crate for child-process
+management — a Rust port of the .NET ProcessKit. Two layers:
 
-- **Process groups** (`group` module) — spawn a child as the root of a process
-  tree that is killed as a unit on drop, via Windows **Job Objects** and POSIX
-  **process groups**. The goal is that no descendant outlives its owner.
-- **Process runner** (`runner` module) — async run-and-capture of a child's
-  `stdout`/`stderr` and exit status, built on the group layer.
+- **Process groups** (`group.rs` + `sys/`) — `ProcessGroup` is a kill-on-drop
+  container for a process tree. The platform `Job` lives in `sys/` and is
+  selected per-target by `#[cfg_attr(..., path = ...)]`: Windows **Job Object**
+  (`windows.rs`), Linux **cgroup v2** with a **process-group** fallback
+  (`linux.rs`), or no containment (`other.rs`). The mechanism in effect is
+  observable via `Mechanism`. `Drop` hard-kills; the async `ProcessGroup::shutdown`
+  adds the graceful SIGTERM → wait → SIGKILL tier (Unix). The async-drop tension
+  is why graceful teardown is a method, not `Drop`.
+- **Process runner** (`command.rs`, `runner.rs`, `running.rs`, `result.rs`,
+  `stdin.rs`) — a `Command` builder (collapsing .NET's `ProcessStartInfo` +
+  `ProcessRunOptions`) with run-and-capture helpers, a `RunningProcess` live
+  handle (streaming stdout; stderr drained in the background), `ProcessResult<T>`,
+  and `Stdin` sources. The mock seam is the `ProcessRunner` trait, returning a
+  finished `ProcessResult` (so `ScriptedRunner`/`RecordingRunner`/`MockRunner`
+  need no real process); live-handle/streaming runs use the concrete
+  `start`/`JobRunner` methods.
 
-The public surface is still being built out — `src/lib.rs` currently carries
-only crate docs and a smoke test. Platform-specific code (Job Objects vs POSIX
-process groups) goes under `[target.'cfg(...)'.dependencies]` cfg tables; keep
-the crate MSRV-clean and document every dependency's "why" (see below).
+Features: `mock` (generated `MockRunner`), `tracing` (per-run events). Real
+platform code goes under `[target.'cfg(...)'.dependencies]`; keep the crate
+MSRV-clean and document every dependency's "why". **Scope so far:** foundation +
+common helpers. Not yet ported: interactive stdin writer, output-buffer
+drop policies, encoding overrides, push line-handlers, line counters, and rich
+CPU/memory stats. Real-subprocess and kill-on-drop tests are `#[ignore]`d (run
+`cargo test -- --ignored`); hermetic tests use the scripted/recording doubles.
 
 ## Build, test, run
 

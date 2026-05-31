@@ -1,20 +1,62 @@
 //! `processkit` — child-process management for Rust.
 //!
-//! Two layers, mirroring the .NET ProcessKit they are ported from:
+//! A port of the .NET ProcessKit library, in two layers:
 //!
-//! - **process groups** — spawn a child as the root of a process tree that is
-//!   killed as a unit when the group is dropped (Windows Job Objects / POSIX
-//!   process groups), so no descendant outlives its owner.
-//! - **process runner** — async run-and-capture of a child's stdout/stderr and
-//!   exit status, built on the group layer.
+//! - **[`ProcessGroup`]** — a kill-on-drop container for a process *tree*. Every
+//!   child spawned into the group, and everything those children spawn, dies
+//!   with the group, so an exiting or panicking owner never leaks subprocesses.
+//!   Containment is a Windows [Job Object], a Linux [cgroup v2] (with a POSIX
+//!   process-group fallback), or nothing on other targets — observable via
+//!   [`Mechanism`].
+//! - **runner** — async run-and-capture built on the group. Describe a run with
+//!   [`Command`], then drive it to completion ([`Command::output_string`],
+//!   [`Command::run`], …) or start it via a [`ProcessRunner`] for streaming or a
+//!   shared group. The trait is the mock seam (see [`ScriptedRunner`]).
 //!
-//! The public surface is still being built out; track progress in `CHANGELOG.md`.
+//! Async throughout (tokio). Errors are the structured [`Error`]; a non-zero
+//! exit is reported in [`ProcessResult`], not raised, until you call
+//! [`ProcessResult::ensure_success`].
+//!
+//! ```no_run
+//! # async fn demo() -> processkit::Result<()> {
+//! use processkit::Command;
+//!
+//! // Capture output; a non-zero exit does not error on its own.
+//! let result = Command::new("git").args(["rev-parse", "HEAD"]).output_string().await?;
+//! println!("HEAD is {}", result.stdout().trim());
+//!
+//! // Or require success and get trimmed stdout directly.
+//! let version = Command::new("cargo").arg("--version").run().await?;
+//! # let _ = version;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [Job Object]: https://learn.microsoft.com/windows/win32/procthread/job-objects
+//! [cgroup v2]: https://docs.kernel.org/admin-guide/cgroup-v2.html
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_builds() {
-        // Smoke test until the public API lands; replaced as `group`/`runner` grow.
-        assert_eq!(2 + 2, 4);
-    }
-}
+mod command;
+mod doubles;
+mod error;
+mod group;
+mod mechanism;
+mod result;
+mod runner;
+mod running;
+mod stdin;
+mod sys;
+
+pub use command::Command;
+pub use doubles::{Invocation, RecordingRunner, Reply, ScriptedRunner};
+pub use error::{Error, Result};
+pub use group::{ProcessGroup, ProcessGroupOptions};
+pub use mechanism::Mechanism;
+pub use result::ProcessResult;
+pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
+pub use running::{RunningProcess, StdoutLines};
+pub use stdin::Stdin;
+
+/// The `mockall`-generated mock of [`ProcessRunner`] (enabled by the `mock`
+/// feature), re-exported under a friendlier name.
+#[cfg(feature = "mock")]
+pub use runner::MockProcessRunner as MockRunner;
