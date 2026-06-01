@@ -20,6 +20,12 @@ to a dated version section.
 ### Fixed
 -
 
+## [0.3.2] - 2026-06-01
+
+### Changed
+
+- Release: publish to crates.io before tagging + retry/idempotent publish & GitHub Release, --locked
+
 ## [0.3.1] - 2026-06-01
 
 ### Added
@@ -121,7 +127,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.1.2...v0.2.0
