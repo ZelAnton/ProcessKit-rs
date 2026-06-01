@@ -4,8 +4,10 @@ name: Release
 # publish to crates.io.
 #
 # `workflow_dispatch`-only with no `push:`/tag trigger, so it never runs on its
-# own — you click "Run workflow" in the Actions UI and pick a bump type. The
-# version number is never typed by hand: pick patch/minor/major and the
+# own — you click "Run workflow" in the Actions UI and pick a bump type. It
+# **always releases `main`**: the run checks out and pushes `main` regardless of
+# which ref the dispatch selector points at, so there is no branch to choose.
+# The version number is never typed by hand: pick patch/minor/major and the
 # source-of-truth (`Cargo.toml`) drives everything, then gets committed back so
 # the manifest, the git tag, and the GitHub Release never drift apart. The first
 # release (no `v*` tag yet) ships the current `Cargo.toml` version as-is.
@@ -29,7 +31,7 @@ on:
           - major
         default: patch
 
-# Never run two releases at once — they both bump + commit to the branch.
+# Never run two releases at once — they both bump + commit to main.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -43,6 +45,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          # Always release `main`, regardless of which ref the dispatch UI was
+          # pointed at — there is only one publish branch, so the selector is
+          # irrelevant and the bump/tag/push below all target `main`.
+          ref: main
           fetch-depth: 0 # full history + tags, for version math and git-cliff
 
       - uses: dtolnay/rust-toolchain@stable
@@ -349,17 +355,17 @@ jobs:
 
       # Only after the crate is live on crates.io: tag the release and push the
       # commit + tag atomically (if either ref is rejected, neither lands). A
-      # non-atomic push that advanced the branch but dropped the tag would make
-      # the next run bump from the already-bumped version and skip a release
-      # number. checkout@v5 leaves a detached HEAD, so the branch is named
-      # explicitly (`git push origin HEAD` can't resolve a branch when detached).
+      # non-atomic push that advanced main but dropped the tag would make the
+      # next run bump from the already-bumped version and skip a release number.
+      # The destination is spelled out as `refs/heads/main` (not `HEAD` or the
+      # current branch) so the push target is unambiguously main and works even
+      # if checkout left HEAD detached.
       - name: Tag and push
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          BRANCH: ${{ github.ref_name }}
         run: |
           git tag "v${VERSION}"
-          git push --atomic origin "HEAD:refs/heads/${BRANCH}" "refs/tags/v${VERSION}"
+          git push --atomic origin "HEAD:refs/heads/main" "refs/tags/v${VERSION}"
 
       # The tag now exists; attach the Release to it using the curated notes from
       # $RUNNER_TEMP. gh is pre-installed on ubuntu-latest. This runs AFTER the
