@@ -30,15 +30,19 @@ to a dated version section.
 ## [0.2.0] - 2026-06-01
 
 ### Changed
-- Release workflow: bump-choice menu, auto-increment (rebased onto v0.1.2)
+- Release workflow: pick the version bump from a menu, with auto-increment.
+  (Release tooling only — no changes to the published library.)
 
 ## [0.1.2] - 2026-05-31
 
+_No functional changes — republished to recover a failed crates.io upload; the
+first version to actually reach crates.io._
+
 ## [0.1.1] - 2026-05-31
 
-## [0.1.0] - 2026-05-31
+_No functional changes — republished to recover a failed crates.io upload._
 
-## [0.1.0]
+## [0.1.0] - 2026-05-31
 
 ### Added
 - `ProcessGroup` — a kill-on-drop container for a child-process tree, backed by
@@ -82,24 +86,15 @@ to a dated version section.
   `RunningProcess::finish_streamed` (exit code + collected stderr after
   streaming) and `RunningProcess::start_kill`.
 - `Error::Parse { program, message }` for fallible output parsing.
-- The `tracing` feature now emits a per-run `debug` event (program, exit code,
+- The `tracing` feature emits a per-run `debug` event (program, exit code,
   timed-out, elapsed) on the `processkit` target.
 
 ### Changed
-- Output capture is now line-oriented (pumped): captured text is normalized to
+- Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
-
-### Fixed
--
-
-### Fixed
--
-
-## [0.1.0] - 2026-05-31
-
-### Added
-- Initial project skeleton.
 
 [Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.1.2...v0.2.0
+[0.1.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ZelAnton/ProcessKit-rs/releases/tag/v0.1.0
