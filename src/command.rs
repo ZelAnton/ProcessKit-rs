@@ -10,7 +10,7 @@ use std::time::Duration;
 use encoding_rs::{Encoding, UTF_8};
 
 use crate::buffer::OutputBufferPolicy;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::pump::LineHandler;
 use crate::result::ProcessResult;
 use crate::runner::{JobRunner, ProcessRunnerExt};
@@ -334,14 +334,31 @@ impl Command {
     {
         use tokio_stream::StreamExt;
 
-        let mut process = JobRunner::new().start(self).await?;
-        let mut lines = process.stdout_lines();
-        while let Some(line) = lines.next().await {
-            if predicate(&line) {
-                return Ok(Some(line));
+        let process = JobRunner::new().start(self).await?;
+        let search = async move {
+            let mut process = process;
+            let mut lines = process.stdout_lines();
+            while let Some(line) = lines.next().await {
+                if predicate(&line) {
+                    return Some(line);
+                }
             }
+            None
+        };
+        match self.timeout {
+            // Bound the search by the configured deadline. On elapse, `search`
+            // is dropped — tearing the process tree down — and the timeout is
+            // surfaced as `Error::Timeout` (consistent with `run`/`exit_code`),
+            // never an indefinite hang on a process that stalls without exiting.
+            Some(limit) => match tokio::time::timeout(limit, search).await {
+                Ok(found) => Ok(found),
+                Err(_elapsed) => Err(Error::Timeout {
+                    program: self.program_name(),
+                    timeout: limit,
+                }),
+            },
+            None => Ok(search.await),
         }
-        Ok(None)
     }
 }
 

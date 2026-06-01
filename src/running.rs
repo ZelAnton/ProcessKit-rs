@@ -157,6 +157,13 @@ impl RunningProcess {
     /// full stderr pipe) and discarded — use [`output_string`](Self::output_string)
     /// when you need both. Keep this `RunningProcess` in scope while consuming;
     /// dropping it tears the process down.
+    ///
+    /// The command's [`timeout`](crate::Command::timeout) is **not** auto-enforced
+    /// while you pull lines from this stream (only the run-to-completion helpers —
+    /// `output_string`/`wait`/`finish_streamed` and `Command::first_line` — apply
+    /// it). To bound a manual stream, wrap your consumption in
+    /// [`tokio::time::timeout`] and drop this handle (which kills the tree) on
+    /// elapse.
     pub fn stdout_lines(&mut self) -> StdoutLines {
         // Background-drain stderr (counter + handler still apply). The handle is
         // kept so `finish_streamed` can await the last line before draining.

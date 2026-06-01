@@ -142,6 +142,34 @@ async fn exit_code_surfaces_timeout_as_error() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real subprocess that stalls; must not hang past the timeout"]
+async fn first_line_honors_timeout_instead_of_hanging() {
+    // A long-running command that emits NO stdout: without a timeout `first_line`
+    // would block forever waiting for a line. With a deadline it must give up and
+    // surface `Error::Timeout` promptly — never hang.
+    let silent = if cfg!(windows) {
+        Command::new("powershell").args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+    } else {
+        Command::new("sleep").arg("30")
+    };
+    let start = Instant::now();
+    let err = silent
+        .timeout(Duration::from_millis(300))
+        .first_line(|_| true)
+        .await
+        .expect_err("a stalled run should time out, not return Ok(None)");
+    assert!(
+        matches!(err, processkit::Error::Timeout { .. }),
+        "expected Error::Timeout, got {err:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "first_line did not honor the timeout (took {:?})",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
 #[ignore = "creates an OS job/cgroup"]
 async fn group_reports_a_known_mechanism() {
     let group = ProcessGroup::new().expect("create group");
