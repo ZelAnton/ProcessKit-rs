@@ -25,8 +25,16 @@ jobs:
       - run: cargo fmt --all --check
 
   clippy:
-    name: clippy
-    runs-on: ubuntu-latest
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Lint on every OS so each platform module is actually checked: cgroup /
+      # process-group (Linux), Job Object (Windows) and the macOS/BSD process
+      # group (macOS). Linting only on Linux would leave windows.rs and unix.rs
+      # unchecked.
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -40,14 +48,18 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # macOS exercises the POSIX process-group containment path (unix.rs); the
+      # BSDs use the same path but have no hosted runner, so macOS stands in.
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-targets
-      - run: cargo test
+      # `--include-ignored` runs the real-subprocess tests too, so kill-on-drop is
+      # actually exercised on each OS — including the macOS process-group teardown.
+      - run: cargo test -- --include-ignored
 
   audit:
     name: cargo-deny
