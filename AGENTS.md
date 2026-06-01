@@ -117,11 +117,12 @@ committed.
   next version is **computed** from `Cargo.toml` (never typed by hand) — the first
   release (no `v*` tag yet) ships the current version as-is. The workflow then
   auto-fills an empty `[Unreleased]` via git-cliff, promotes the changelog, commits
-  the bump, verifies the crate publishes (a `cargo publish --dry-run` gate
-  **before** the irreversible tag/push), tags `v<version>`, publishes a
-  **GitHub Release** with the curated notes, and runs `cargo publish`. It needs
-  the `CRATES_IO_TOKEN` repository secret (a preflight step fails fast if it is
-  missing).
+  the bump, runs a `cargo publish --dry-run` gate, publishes to crates.io
+  **first**, then tags `v<version>` and publishes a **GitHub Release** with the
+  curated notes. Publishing **before** the tag means a failed publish strands
+  nothing — you just re-run (the publish step retries transient errors and treats
+  an already-uploaded version as success). It needs the `CRATES_IO_TOKEN`
+  repository secret (a preflight step fails fast if it is missing).
 
 ## Supply chain and MSRV
 

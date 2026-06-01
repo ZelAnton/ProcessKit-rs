@@ -12,9 +12,9 @@ name: Release
 #
 # Single-crate release: bump the version, auto-fill an empty `[Unreleased]` from
 # git history via git-cliff, promote the curated changelog, verify the crate
-# publishes (dry run) before anything irreversible, tag `v<version>`, publish a
-# GitHub Release, and publish to crates.io. See AGENTS.md "Releasing and the
-# changelog".
+# publishes (dry run), publish to crates.io, then tag `v<version>` and publish a
+# GitHub Release. Publishing comes BEFORE the tag, so a failed publish strands
+# nothing (just re-run). See AGENTS.md "Releasing and the changelog".
 
 on:
   workflow_dispatch:
@@ -300,43 +300,94 @@ jobs:
           git commit -m "Release v${VERSION}"
 
       # Gate: build + package the crate exactly as `cargo publish` would, but
-      # without uploading. Runs on the now-clean committed tree and BEFORE the
-      # irreversible tag/push/Release, so a packaging or build failure can't
-      # strand a tag with no matching crates.io version. No token needed for a
-      # dry run; release-notes.md is outside the tree so it is not packaged.
+      # without uploading — catches build/packaging/metadata errors cleanly,
+      # before the irreversible publish below consumes a real attempt. No token
+      # needed for a dry run; release-notes.md is outside the tree so it is not
+      # packaged.
       - name: Verify the crate publishes (dry run)
-        run: cargo publish --dry-run
+        # `--locked` asserts Cargo.lock matches the (just-bumped) manifest, so
+        # the dry run can't silently re-resolve / rewrite the lockfile and dirty
+        # the tree (which would then make the real publish below fail its
+        # clean-tree check). cargo set-version already updated the lock.
+        run: cargo publish --locked --dry-run
 
+      # Publish FIRST — before the tag/push/Release. crates.io is the only
+      # irreversible step (a version can never be re-published), so doing it
+      # before anything is pushed means a failed publish leaves NO stranded tag:
+      # you just re-run. Retry to ride out transient registry/network errors; an
+      # "already uploaded" result (a prior run that published but failed before
+      # tagging) is treated as success, so the re-run proceeds to tag + Release.
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          set -uo pipefail
+          attempt=0
+          max=3
+          while :; do
+            attempt=$((attempt + 1))
+            if out="$(cargo publish --locked 2>&1)"; then
+              printf '%s\n' "$out"
+              break
+            fi
+            printf '%s\n' "$out"
+            # Treat "this exact version is already published" as success (a prior
+            # run that uploaded but failed before tagging). Match cargo's actual
+            # phrasings specifically — a broad "already exists" would risk a false
+            # positive that tags an unpublished version.
+            if printf '%s' "$out" | grep -qiE 'crate version .* is already uploaded|already exists on [^[:space:]]*crates\.io index'; then
+              echo "::notice::This version is already on crates.io — treating as published."
+              break
+            fi
+            if [ "$attempt" -ge "$max" ]; then
+              echo "::error::cargo publish failed after ${max} attempts."
+              exit 1
+            fi
+            echo "::warning::cargo publish attempt ${attempt} failed; retrying in 30s..."
+            sleep 30
+          done
+
+      # Only after the crate is live on crates.io: tag the release and push the
+      # commit + tag atomically (if either ref is rejected, neither lands). A
+      # non-atomic push that advanced the branch but dropped the tag would make
+      # the next run bump from the already-bumped version and skip a release
+      # number. checkout@v5 leaves a detached HEAD, so the branch is named
+      # explicitly (`git push origin HEAD` can't resolve a branch when detached).
       - name: Tag and push
         env:
           VERSION: ${{ steps.version.outputs.version }}
           BRANCH: ${{ github.ref_name }}
         run: |
           git tag "v${VERSION}"
-          # Push the commit and the tag atomically: if either ref is rejected,
-          # neither lands. A non-atomic push that left the branch advanced but
-          # the tag missing would make the next run bump from the already-bumped
-          # version and silently skip a release number. checkout@v5 leaves a
-          # detached HEAD, so the branch is named explicitly (`git push origin
-          # HEAD` can't resolve a branch when detached).
           git push --atomic origin "HEAD:refs/heads/${BRANCH}" "refs/tags/v${VERSION}"
 
-      # The tag already exists (pushed above); attach the Release to it using the
-      # curated notes from $RUNNER_TEMP. gh is pre-installed on ubuntu-latest.
+      # The tag now exists; attach the Release to it using the curated notes from
+      # $RUNNER_TEMP. gh is pre-installed on ubuntu-latest. This runs AFTER the
+      # crate is published and the tag pushed, so it must not be the step that
+      # fails the release: it is idempotent (edit if a prior attempt created it)
+      # and retried. If it still fails, the error tells you to finish by hand and
+      # NOT to re-run — a re-run would read the already-bumped version from main
+      # and ship the next version, stranding this one's Release.
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
           NOTES_FILE: ${{ runner.temp }}/release-notes.md
-        run: gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE"
-
-      # Last, because publishing to crates.io is irreversible (a version can
-      # never be re-published). The dry run above already validated the build, so
-      # this should only ever fail on a transient registry/network error — and by
-      # now the version bump + tag are durably on the remote, so you recover by
-      # re-running `cargo publish` from the tagged commit by hand. cargo reads the
-      # bumped version from Cargo.toml.
-      - name: Publish to crates.io
-        run: cargo publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          set -uo pipefail
+          attempt=0
+          max=3
+          while :; do
+            attempt=$((attempt + 1))
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release edit "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" && break
+            else
+              gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" && break
+            fi
+            if [ "$attempt" -ge "$max" ]; then
+              echo "::error::${TAG} is PUBLISHED to crates.io and the tag is pushed, but creating the GitHub Release failed. Finish it by hand: gh release create ${TAG} --notes-file <notes>. Do NOT re-run this workflow — it would bump to the next version and strand ${TAG}'s release."
+              exit 1
+            fi
+            echo "::warning::GitHub Release attempt ${attempt} failed; retrying in 15s..."
+            sleep 15
+          done
