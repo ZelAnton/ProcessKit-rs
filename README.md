@@ -59,6 +59,98 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
+## Async streaming and interactive I/O
+
+The one-shot helpers above buffer the whole output. For long-running or
+conversational children, `start()` returns a live [`RunningProcess`] you can
+drive asynchronously.
+
+### Stream stdout line by line
+
+Process each line as it arrives — no waiting for the child to exit, no buffering
+the full output. `StreamExt` (re-exported from `tokio-stream`) provides `.next()`:
+
+```rust,no_run
+use processkit::{Command, StreamExt};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let mut run = Command::new("git")
+        .args(["log", "--oneline", "-n", "50"])
+        .start()
+        .await?;
+
+    let mut lines = run.stdout_lines();
+    while let Some(line) = lines.next().await {
+        println!("commit: {line}");
+    }
+
+    // After the stream ends, collect the exit code and whatever went to stderr
+    // (drained in the background while you streamed stdout).
+    let (code, stderr) = run.finish_streamed().await?;
+    if code != 0 {
+        eprintln!("git exited {code}: {stderr}");
+    }
+    Ok(())
+}
+```
+
+> Streaming does **not** auto-enforce the command's [`timeout`]: it applies to the
+> run-to-completion helpers (`output_string`/`run`/`first_line`). To bound a manual
+> stream, wrap your loop in [`tokio::time::timeout`] and drop the handle (which
+> kills the tree) on elapse.
+
+### Interactive stdin — write requests, read responses
+
+Keep stdin open with `keep_stdin_open()`, take the writer with
+`standard_input()`, then interleave async writes and reads:
+
+```rust,no_run
+use processkit::{Command, StreamExt};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    // `bc` evaluates each stdin line and prints the result on stdout.
+    let mut run = Command::new("bc").keep_stdin_open().start().await?;
+
+    let mut stdin = run.standard_input().expect("stdin was kept open");
+    stdin.write_line("2 + 2").await?;
+    stdin.write_line("6 * 7").await?;
+    stdin.finish().await?; // send EOF so bc finishes
+
+    let mut answers = run.stdout_lines();
+    while let Some(answer) = answers.next().await {
+        println!("bc says: {answer}");
+    }
+    Ok(())
+}
+```
+
+### Feed stdin from an async stream, react to stdout as it's read
+
+`Stdin::from_lines` writes each item of any `Stream<Item = String>` as a line —
+back it with a channel, a file tail, or a network source. Pair it with
+`on_stdout_line` / `on_stderr_line` to handle output inline (the handler runs on
+the read pump, in addition to capture):
+
+```rust,no_run
+use processkit::{Command, Stdin};
+use tokio_stream::iter; // any `Stream<Item = String>` works
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let input = iter(vec!["banana".to_owned(), "apple".to_owned(), "cherry".to_owned()]);
+
+    let result = Command::new("sort")
+        .stdin(Stdin::from_lines(input))
+        .on_stdout_line(|line| println!("sorted: {line}"))
+        .output_string()
+        .await?;
+    let _ = result; // already printed line by line above
+    Ok(())
+}
+```
+
 ## Wrapping a CLI tool
 
 `CliClient` + the `cli_client!` macro turn a typed wrapper around an external
@@ -93,3 +185,6 @@ Licensed under the [MIT License](LICENSE).
 [`ProcessGroup`]: https://docs.rs/processkit/latest/processkit/struct.ProcessGroup.html
 [`Command`]: https://docs.rs/processkit/latest/processkit/struct.Command.html
 [`ProcessRunner`]: https://docs.rs/processkit/latest/processkit/trait.ProcessRunner.html
+[`RunningProcess`]: https://docs.rs/processkit/latest/processkit/struct.RunningProcess.html
+[`timeout`]: https://docs.rs/processkit/latest/processkit/struct.Command.html#method.timeout
+[`tokio::time::timeout`]: https://docs.rs/tokio/latest/tokio/time/fn.timeout.html
