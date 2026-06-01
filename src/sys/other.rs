@@ -1,7 +1,8 @@
-//! Fallback implementation for targets without a supported job mechanism
-//! (macOS, the BSDs, …): the child is spawned directly with no kernel
-//! containment, so there is no kill-on-close guarantee. [`Mechanism::None`]
-//! makes this observable to callers.
+//! Fallback implementation for non-unix, non-Windows targets without any
+//! supported job mechanism (e.g. wasm): the child is spawned directly with no
+//! kernel containment, so there is no kill-on-close guarantee. [`Mechanism::None`]
+//! makes this observable to callers. (macOS and the BSDs use the process-group
+//! backend in `sys::unix` instead, not this.)
 
 use std::io;
 use std::time::Duration;

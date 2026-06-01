@@ -6,8 +6,8 @@
 //!   child spawned into the group, and everything those children spawn, dies
 //!   with the group, so an exiting or panicking owner never leaks subprocesses.
 //!   Containment is a Windows [Job Object], a Linux [cgroup v2] (with a POSIX
-//!   process-group fallback), or nothing on other targets — observable via
-//!   [`Mechanism`].
+//!   process-group fallback), a POSIX process group on macOS/BSD, or nothing on
+//!   other targets — observable via [`Mechanism`].
 //! - **runner** — async run-and-capture built on the group. Describe a run with
 //!   [`Command`], then drive it to completion ([`Command::output_string`],
 //!   [`Command::run`], …) or start it via a [`ProcessRunner`] for streaming or a

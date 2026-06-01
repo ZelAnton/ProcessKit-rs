@@ -1,0 +1,63 @@
+//! Implementation for unix targets without cgroups or Job Objects (macOS, the
+//! BSDs): a [`ProcessGroup`](super::pgroup::ProcessGroup) per the shared POSIX
+//! backend. Every child leads its own process group, so dropping the job
+//! `killpg`s the whole tree — a real kill-on-close guarantee, weaker only
+//! against children that `setsid` away. Surfaced as [`Mechanism::ProcessGroup`].
+//!
+//! These targets have no `/proc`, so per-process CPU/memory metrics are not
+//! available; [`process_metrics`] returns defaults.
+
+use std::io;
+use std::time::Duration;
+
+use tokio::process::{Child, Command};
+
+use crate::Mechanism;
+use crate::stats::ProcessGroupStats;
+use crate::sys::ProcMetrics;
+use crate::sys::pgroup::ProcessGroup;
+
+pub(crate) struct Job {
+    group: ProcessGroup,
+}
+
+impl Job {
+    pub(crate) fn new() -> io::Result<Self> {
+        Ok(Job {
+            group: ProcessGroup::new(),
+        })
+    }
+
+    pub(crate) fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
+        self.group.spawn(cmd)
+    }
+
+    pub(crate) fn adopt(&self, child: &Child) -> io::Result<()> {
+        self.group.adopt(child)
+    }
+
+    pub(crate) fn kill_all(&self) -> io::Result<()> {
+        self.group.kill_all()
+    }
+
+    pub(crate) async fn graceful_shutdown(
+        &self,
+        timeout: Duration,
+        escalate: bool,
+    ) -> io::Result<()> {
+        self.group.graceful_shutdown(timeout, escalate).await
+    }
+
+    pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
+        self.group.stats()
+    }
+
+    pub(crate) fn mechanism(&self) -> Mechanism {
+        Mechanism::ProcessGroup
+    }
+}
+
+pub(crate) fn process_metrics(_pid: u32) -> ProcMetrics {
+    // No `/proc` on these targets; per-process accounting is not available.
+    ProcMetrics::default()
+}

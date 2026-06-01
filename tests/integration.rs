@@ -182,9 +182,10 @@ async fn group_reports_a_known_mechanism() {
 #[tokio::test]
 #[ignore = "spawns a long-lived subprocess and asserts kill-on-drop"]
 async fn dropping_group_kills_children() {
-    // Kill-on-close only exists on the containment platforms; the `other` path
-    // (macOS/BSD) has no job to kill, so the guarantee can't be asserted there.
-    if cfg!(not(any(windows, target_os = "linux"))) {
+    // Kill-on-close exists on Windows (Job Object), Linux (cgroup/process group)
+    // and other unix (macOS/BSD process group). Only targets with no containment
+    // at all (non-unix, non-Windows — `Mechanism::None`) can't assert it.
+    if cfg!(not(any(windows, unix))) {
         return;
     }
 

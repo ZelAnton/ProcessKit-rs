@@ -79,7 +79,7 @@ impl ProcessGroup {
     ///
     /// Only the child itself is moved into the group; processes it has *already*
     /// spawned keep their original containment (future forks are captured). On
-    /// targets without a job mechanism this is a no-op.
+    /// targets without a job mechanism (non-unix, non-Windows) this is a no-op.
     pub fn adopt(&self, child: &Child) -> Result<()> {
         self.job.adopt(child)?;
         Ok(())

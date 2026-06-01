@@ -4,8 +4,8 @@ Child-process management for Rust, in two layers:
 
 - **Process groups** ([`ProcessGroup`]) — spawn a child as the root of a process
   tree that is killed as a unit when the group is dropped, using Windows **Job
-  Objects** and Linux **cgroup v2** (with a POSIX **process-group** fallback), so
-  no descendant ever outlives its owner.
+  Objects**, Linux **cgroup v2** (with a POSIX **process-group** fallback) and a
+  POSIX **process group** on macOS/BSD, so no descendant ever outlives its owner.
 - **Process runner** ([`Command`]) — async (tokio) run-and-capture of a child's
   `stdout`/`stderr` and exit status, built on the group layer, with a mockable
   [`ProcessRunner`] seam for tests.

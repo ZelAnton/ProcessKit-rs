@@ -6,7 +6,10 @@
 //! - **Windows** — a [Job Object] with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
 //! - **Linux** — a [cgroup v2] killed via `cgroup.kill`, falling back to a POSIX
 //!   process group when no writable cgroup is available.
-//! - **other** — a plain spawn with no kernel containment.
+//! - **macOS / the BSDs** — a POSIX process group (`killpg` the tree on drop);
+//!   no cgroups or Job Objects exist there. See [`pgroup`].
+//! - **other** (non-unix, non-Windows — e.g. wasm) — a plain spawn with no
+//!   kernel containment.
 //!
 //! [Job Object]: https://learn.microsoft.com/windows/win32/procthread/job-objects
 //! [cgroup v2]: https://docs.kernel.org/admin-guide/cgroup-v2.html
@@ -32,11 +35,17 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
     imp::process_metrics(pid)
 }
 
+// The shared POSIX process-group backend, used by both the Linux fallback and
+// the macOS/BSD `imp`. Compiled on every unix target.
+#[cfg(unix)]
+pub(crate) mod pgroup;
+
 // Exactly one platform module is compiled per target. Each defines an `imp::Job`
 // with the same inherent methods plus a kill-on-close `Drop`.
 #[cfg_attr(windows, path = "windows.rs")]
 #[cfg_attr(target_os = "linux", path = "linux.rs")]
-#[cfg_attr(not(any(windows, target_os = "linux")), path = "other.rs")]
+#[cfg_attr(all(unix, not(target_os = "linux")), path = "unix.rs")]
+#[cfg_attr(not(any(windows, unix)), path = "other.rs")]
 mod imp;
 
 /// A handle to an OS job owning a tree of child processes.
@@ -63,7 +72,7 @@ impl Job {
     ///
     /// Only the child itself is moved into the job; descendants it already
     /// spawned keep their original containment. On targets without a job
-    /// mechanism this is a no-op.
+    /// mechanism (non-unix, non-Windows) this is a no-op.
     pub(crate) fn adopt(&self, child: &Child) -> io::Result<()> {
         self.0.adopt(child)
     }

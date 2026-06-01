@@ -9,7 +9,6 @@ use std::io;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -19,6 +18,7 @@ use tokio::time::{Instant, sleep};
 use crate::Mechanism;
 use crate::stats::ProcessGroupStats;
 use crate::sys::ProcMetrics;
+use crate::sys::pgroup::ProcessGroup;
 
 /// How often the graceful path re-checks whether the tree has drained.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -33,9 +33,10 @@ pub(crate) struct Job {
 enum Backend {
     /// All children live in this cgroup; killed via `cgroup.kill`.
     Cgroup(Cgroup),
-    /// Fallback: each spawned child leads its own process group; we track the
-    /// group ids (== child pids) and signal them on teardown.
-    ProcessGroup(Mutex<Vec<i32>>),
+    /// Fallback when no writable cgroup is available: the shared POSIX
+    /// process-group backend (each child leads its own group). Its own `Drop`
+    /// hard-kills the tracked groups.
+    ProcessGroup(ProcessGroup),
 }
 
 impl Job {
@@ -45,7 +46,7 @@ impl Job {
         // observable via `mechanism()` — never silent.
         let backend = match Cgroup::create() {
             Ok(cg) => Backend::Cgroup(cg),
-            Err(_) => Backend::ProcessGroup(Mutex::new(Vec::new())),
+            Err(_) => Backend::ProcessGroup(ProcessGroup::new()),
         };
         Ok(Job { backend })
     }
@@ -67,19 +68,7 @@ impl Job {
                 }
                 cmd.spawn()
             }
-            Backend::ProcessGroup(pgids) => {
-                // Own process group per child → killpg reaps it and its
-                // descendants. `process_group(0)` == setpgid(0, 0): the child
-                // becomes its own group leader.
-                cmd.as_std_mut().process_group(0);
-                let child = cmd.spawn()?;
-                if let Some(pid) = child.id()
-                    && let Ok(mut g) = pgids.lock()
-                {
-                    g.push(pid as i32);
-                }
-                Ok(child)
-            }
+            Backend::ProcessGroup(pg) => pg.spawn(cmd),
         }
     }
 
@@ -95,36 +84,14 @@ impl Job {
                 // not retroactively pulled in — only future forks).
                 std::fs::write(cg.path.join("cgroup.procs"), pid.to_string().as_bytes())
             }
-            Backend::ProcessGroup(pgids) => {
-                // Make the external child its own group leader and track it. As
-                // with the cgroup path, only the child itself is moved — already
-                // running descendants keep their original group.
-                // SAFETY: setpgid on a live pid is a sound call.
-                let rc = unsafe { libc::setpgid(pid, 0) };
-                if rc != 0 {
-                    let err = io::Error::last_os_error();
-                    // Benign races/permissions (process gone, already a session
-                    // leader, cross-session) are not fatal — swallow them.
-                    let code = err.raw_os_error().unwrap_or(0);
-                    if code != libc::ESRCH && code != libc::EPERM && code != libc::EACCES {
-                        return Err(err);
-                    }
-                }
-                if let Ok(mut g) = pgids.lock() {
-                    g.push(pid);
-                }
-                Ok(())
-            }
+            Backend::ProcessGroup(pg) => pg.adopt(child),
         }
     }
 
     pub(crate) fn kill_all(&self) -> io::Result<()> {
         match &self.backend {
             Backend::Cgroup(cg) => cg.kill(),
-            Backend::ProcessGroup(pgids) => {
-                signal_groups(pgids, libc::SIGKILL);
-                Ok(())
-            }
+            Backend::ProcessGroup(pg) => pg.kill_all(),
         }
     }
 
@@ -148,20 +115,7 @@ impl Job {
                 }
                 Ok(())
             }
-            Backend::ProcessGroup(pgids) => {
-                signal_groups(pgids, libc::SIGTERM);
-                let deadline = Instant::now() + timeout;
-                while groups_alive(pgids) {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    sleep(POLL_INTERVAL).await;
-                }
-                if escalate && groups_alive(pgids) {
-                    signal_groups(pgids, libc::SIGKILL);
-                }
-                Ok(())
-            }
+            Backend::ProcessGroup(pg) => pg.graceful_shutdown(timeout, escalate).await,
         }
     }
 
@@ -195,23 +149,7 @@ impl Job {
                     peak_memory_bytes: have_mem.then_some(mem),
                 })
             }
-            Backend::ProcessGroup(pgids) => {
-                // The fallback tracks group ids, not individual pids, so report
-                // the number of still-live groups and leave cpu/memory absent.
-                let active = match pgids.lock() {
-                    Ok(g) => g
-                        .iter()
-                        // SAFETY: signal 0 is a sound existence probe.
-                        .filter(|&&pgid| unsafe { libc::kill(-pgid, 0) == 0 })
-                        .count(),
-                    Err(_) => 0,
-                };
-                Ok(ProcessGroupStats {
-                    active_process_count: active,
-                    total_cpu_time: None,
-                    peak_memory_bytes: None,
-                })
-            }
+            Backend::ProcessGroup(pg) => pg.stats(),
         }
     }
 
@@ -272,40 +210,11 @@ impl Drop for Job {
                 // Best-effort: an emptied cgroup dir can be removed.
                 let _ = std::fs::remove_dir(&cg.path);
             }
-            Backend::ProcessGroup(pgids) => signal_groups(pgids, libc::SIGKILL),
+            // The `ProcessGroup` field hard-kills its tracked groups in its own
+            // `Drop`, which runs as this `Job` is torn down — nothing to do here.
+            Backend::ProcessGroup(_) => {}
         }
     }
-}
-
-/// Send `sig` to every tracked process group.
-///
-/// Caveat of this fallback (the cgroup path doesn't share it): a group id is the
-/// leader's pid, so if the leader was already reaped and its pid recycled before
-/// we fire, the signal could in theory hit an unrelated group. The window is a
-/// few instructions wide, so this is accepted for the no-cgroup degraded path.
-fn signal_groups(pgids: &Mutex<Vec<i32>>, sig: i32) {
-    if let Ok(g) = pgids.lock() {
-        for &pgid in g.iter() {
-            // SAFETY: killpg on a positive group id is always a sound call; a
-            // group that is already gone simply returns ESRCH.
-            unsafe {
-                libc::killpg(pgid, sig);
-            }
-        }
-    }
-}
-
-/// Whether any tracked process group still has at least one live member.
-fn groups_alive(pgids: &Mutex<Vec<i32>>) -> bool {
-    let Ok(g) = pgids.lock() else {
-        return false;
-    };
-    g.iter().any(|&pgid| {
-        // `kill(-pgid, 0)` performs no signal but reports existence: 0 if the
-        // group has a member, ESRCH otherwise.
-        // SAFETY: signal 0 to a negative pid is a sound existence probe.
-        unsafe { libc::kill(-pgid, 0) == 0 }
-    })
 }
 
 struct Cgroup {

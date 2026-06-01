@@ -12,7 +12,10 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- macOS and the BSDs now contain process trees with a POSIX process group
+  (`killpg` on drop) instead of a plain, uncontained spawn — `mechanism()`
+  reports `ProcessGroup` there rather than `None`. The shared backend is the same
+  one Linux already uses when no cgroup is writable.
 
 ### Changed
 -

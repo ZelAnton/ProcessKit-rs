@@ -84,10 +84,10 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_ProcessStatus",
 ] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# Raw syscalls std can't express: join cgroup.procs in pre_exec
-# (async-signal-safe getpid/open/write/close) and kill/killpg for teardown
-# and the POSIX process-group fallback.
+[target.'cfg(unix)'.dependencies]
+# Raw syscalls std can't express: the POSIX process-group backend (setpgid /
+# killpg / kill for teardown and liveness probes) on every unix, plus — on Linux
+# — joining cgroup.procs in pre_exec (async-signal-safe getpid/open/write/close).
 libc = "0.2"
 
 [dev-dependencies]
