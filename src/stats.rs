@@ -6,8 +6,7 @@ use std::time::Duration;
 ///
 /// `total_cpu_time` and `peak_memory_bytes` are `None` when the platform can't
 /// report them — notably the Linux POSIX process-group fallback (no cgroup
-/// accounting) and the no-containment `other` target. Mirrors the .NET
-/// `ProcessGroupStats`.
+/// accounting) and the no-containment `other` target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessGroupStats {
     /// Number of live processes currently in the group.

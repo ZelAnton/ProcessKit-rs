@@ -4,9 +4,9 @@ use std::time::Duration;
 
 /// Errors produced when launching or running a child process.
 ///
-/// Mirrors the .NET `ProcessExitException` (the [`Exit`](Error::Exit) variant)
-/// while folding spawn/timeout/IO failures into one structured enum, so callers
-/// can pattern-match on the failure mode instead of parsing strings.
+/// Spawn failures, a non-zero exit ([`Exit`](Error::Exit)), timeouts, and IO
+/// errors fold into one structured enum, so callers can pattern-match on the
+/// failure mode instead of parsing strings.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {

@@ -1,6 +1,6 @@
 //! `processkit` — child-process management for Rust.
 //!
-//! A port of the .NET ProcessKit library, in two layers:
+//! Two layers:
 //!
 //! - **[`ProcessGroup`]** — a kill-on-drop container for a process *tree*. Every
 //!   child spawned into the group, and everything those children spawn, dies

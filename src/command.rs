@@ -20,8 +20,8 @@ use crate::stdin::Stdin;
 /// A description of a child process to launch: program, arguments, working
 /// directory, environment, stdin source, and an optional timeout.
 ///
-/// This collapses the .NET `ProcessStartInfo` + `ProcessRunOptions` pair into a
-/// single Rust builder. Build it, then either drive it to completion with a
+/// A single builder for everything a run needs. Build it, then either drive it
+/// to completion with a
 /// helper ([`output_string`](Self::output_string), [`run`](Self::run), …) or
 /// start it via a [`ProcessRunner`](crate::ProcessRunner) for streaming/shared
 /// groups.

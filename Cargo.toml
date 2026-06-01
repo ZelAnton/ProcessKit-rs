@@ -2,7 +2,7 @@
 name = "processkit"
 version = "0.3.0"
 edition = "2024"
-description = "Child-process management: kill-on-dispose process trees and async run-and-capture"
+description = "Child-process management: kill-on-drop process trees and async run-and-capture"
 license = "MIT"
 repository = "https://github.com/ZelAnton/ProcessKit-rs"
 readme = "README.md"

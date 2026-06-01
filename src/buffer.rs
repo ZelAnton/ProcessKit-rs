@@ -16,7 +16,7 @@ pub enum OverflowMode {
 /// buffer); this policy only bounds the in-memory backlog. The line counters
 /// ([`RunningProcess::stdout_line_count`](crate::RunningProcess::stdout_line_count))
 /// still count every line, so `count > retained` reveals that lines were
-/// dropped. Mirrors the .NET `OutputBufferPolicy`.
+/// dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputBufferPolicy {
     /// Maximum retained lines: `None` is unbounded; `Some(0)` retains nothing;

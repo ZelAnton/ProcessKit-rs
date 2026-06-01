@@ -77,8 +77,6 @@ impl<T> ProcessResult<T> {
     /// first — a timed-out run has no meaningful exit code), else
     /// [`Error::Exit`] for a non-zero exit, carrying the code and (truncated)
     /// standard error.
-    ///
-    /// Mirrors the .NET `EnsureSuccess()` / `ProcessExitException`.
     pub fn ensure_success(self) -> Result<Self, Error> {
         if let Some(err) = self.timeout_error() {
             return Err(err);
@@ -108,16 +106,14 @@ impl<T> ProcessResult<T> {
 
 impl ProcessResult<String> {
     /// Standard output followed by standard error, concatenated — handy when a
-    /// tool interleaves diagnostics across both streams. Mirrors the .NET / vcs
-    /// `combined()`.
+    /// tool interleaves diagnostics across both streams.
     pub fn combined(&self) -> String {
         format!("{}{}", self.stdout(), self.stderr())
     }
 }
 
 /// Cap the stderr carried in an error message so a giant dump can't poison logs
-/// (the full text remains available on the [`ProcessResult`]). Matches the
-/// 4 KiB cap the .NET library applies.
+/// (the full text remains available on the [`ProcessResult`]). Capped at 4 KiB.
 fn truncate_stderr(stderr: &str) -> String {
     const MAX: usize = 4 * 1024;
     if stderr.len() <= MAX {

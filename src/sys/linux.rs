@@ -104,7 +104,7 @@ impl Job {
                 if rc != 0 {
                     let err = io::Error::last_os_error();
                     // Benign races/permissions (process gone, already a session
-                    // leader, cross-session) are not fatal — mirror .NET's `Add`.
+                    // leader, cross-session) are not fatal — swallow them.
                     let code = err.raw_os_error().unwrap_or(0);
                     if code != libc::ESRCH && code != libc::EPERM && code != libc::EACCES {
                         return Err(err);

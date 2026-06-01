@@ -5,7 +5,7 @@ This file provides guidance to AI coding agents when working with code in this r
 ## Project
 
 `processkit` is a single **async (tokio)** library crate for child-process
-management — a Rust port of the .NET ProcessKit. Two layers:
+management. Two layers:
 
 - **Process groups** (`group.rs` + `sys/`) — `ProcessGroup` is a kill-on-drop
   container for a process tree. The platform `Job` lives in `sys/` and is
@@ -16,8 +16,8 @@ management — a Rust port of the .NET ProcessKit. Two layers:
   adds the graceful SIGTERM → wait → SIGKILL tier (Unix). The async-drop tension
   is why graceful teardown is a method, not `Drop`.
 - **Process runner** (`command.rs`, `runner.rs`, `running.rs`, `result.rs`,
-  `stdin.rs`, `pump.rs`, `buffer.rs`, `stats.rs`) — a `Command` builder (collapsing
-  .NET's `ProcessStartInfo` + `ProcessRunOptions`) with run-and-capture helpers, a
+  `stdin.rs`, `pump.rs`, `buffer.rs`, `stats.rs`) — a `Command` builder (one builder
+  for program, args, environment, stdin, and run options) with run-and-capture helpers, a
   `RunningProcess` live handle, `ProcessResult<T>`, and `Stdin` sources. Output is
   line-pumped (`pump.rs`): each stream is drained into a shared bounded buffer
   (`buffer.rs` policy), decoded per `encoding_rs`, fed to optional push handlers,
@@ -36,9 +36,9 @@ management — a Rust port of the .NET ProcessKit. Two layers:
 
 Features: `mock` (generated `MockRunner`), `tracing` (per-run events). Real
 platform code goes under `[target.'cfg(...)'.dependencies]`; keep the crate
-MSRV-clean and document every dependency's "why". The port is at parity with the
-.NET library (groups, runner, streaming, interactive stdin, handlers, buffer
-policies, encoding overrides, line counters, stats). Captured text is
+MSRV-clean and document every dependency's "why". The crate is feature-complete
+(groups, runner, streaming, interactive stdin, handlers, buffer policies,
+encoding overrides, line counters, stats). Captured text is
 line-normalized to `\n`; `output_bytes` preserves exact stdout. Real-subprocess
 and kill-on-drop tests are `#[ignore]`d (run `cargo test -- --ignored`); hermetic
 tests use the pump unit tests and the scripted/recording doubles.

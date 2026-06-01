@@ -1,7 +1,6 @@
 # processkit
 
-Child-process management for Rust. A port of the .NET ProcessKit library,
-providing two layers:
+Child-process management for Rust, in two layers:
 
 - **Process groups** ([`ProcessGroup`]) — spawn a child as the root of a process
   tree that is killed as a unit when the group is dropped, using Windows **Job
@@ -14,9 +13,9 @@ providing two layers:
 Async throughout. Errors are structured (`Error`); a non-zero exit is reported in
 the result, not raised, until you call `ProcessResult::ensure_success`.
 
-> **Status:** at parity with the .NET library — process groups, the runner and
-> capture helpers, streaming, interactive stdin, push line-handlers, output-buffer
-> policies, encoding overrides, line counters, and CPU/memory stats. See
+> **Status:** feature-complete — process groups, the runner and capture helpers,
+> streaming, interactive stdin, push line-handlers, output-buffer policies,
+> encoding overrides, line counters, and CPU/memory stats. See
 > [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Install

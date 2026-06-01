@@ -14,8 +14,8 @@ use crate::running::{RunningProcess, Spawned};
 
 /// Runs a [`Command`] to completion and returns its captured text output.
 ///
-/// This one-method seam is the mock point (mirroring the .NET `IProcessRunner`):
-/// production code takes `&dyn ProcessRunner`; tests pass a
+/// This one-method seam is the mock point: production code takes
+/// `&dyn ProcessRunner`; tests pass a
 /// [`ScriptedRunner`](crate::ScriptedRunner) /
 /// [`RecordingRunner`](crate::RecordingRunner) (or, behind the `mock` feature,
 /// a generated `MockRunner`) instead of spawning real processes.
@@ -38,8 +38,7 @@ impl<R: ProcessRunner + ?Sized> ProcessRunner for &R {
 }
 
 /// Convenience methods available on every [`ProcessRunner`] (including
-/// `&dyn ProcessRunner`), layered over [`output`](ProcessRunner::output) —
-/// the analogue of the .NET `ProcessRunnerExtensions`.
+/// `&dyn ProcessRunner`), layered over [`output`](ProcessRunner::output).
 #[async_trait::async_trait]
 pub trait ProcessRunnerExt: ProcessRunner {
     /// Run, require a zero exit, and return trimmed stdout.

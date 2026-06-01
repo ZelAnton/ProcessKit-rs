@@ -18,7 +18,7 @@ type SharedLines = Arc<AsyncMutex<Option<Pin<Box<dyn Stream<Item = String> + Sen
 
 /// What to feed a child process on standard input.
 ///
-/// Ports the .NET `StandardInput` hierarchy. When a command has no `Stdin` (or
+/// When a command has no `Stdin` (or
 /// [`Stdin::empty`]), stdin is closed at start so the child reads EOF
 /// immediately. The streaming sources ([`from_reader`](Self::from_reader),
 /// [`from_lines`](Self::from_lines)) are one-shot: a cloned
@@ -164,8 +164,7 @@ impl fmt::Debug for Stdin {
 /// when the command was built with
 /// [`Command::keep_stdin_open`](crate::Command::keep_stdin_open). Write
 /// incrementally, then call [`finish`](Self::finish) to send EOF — dropping the
-/// writer (or the process handle) without finishing closes stdin too. Mirrors
-/// the .NET `IProcessStandardInput`.
+/// writer (or the process handle) without finishing closes stdin too.
 pub struct ProcessStdin {
     sink: tokio::process::ChildStdin,
 }
