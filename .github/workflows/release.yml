@@ -1,19 +1,20 @@
 name: Release
 
-# Requires the `CRATES_IO_TOKEN` repository secret.
+# Manual release workflow. Needs the `CRATES_IO_TOKEN` repository secret to
+# publish to crates.io.
 #
-# Manual-trigger ONLY. There is no `push:`/tag trigger, so a release never starts
-# on its own — you click "Run workflow" in the Actions UI and pick a bump type.
-# The version number is never typed by hand: pick patch/minor/major and the
+# `workflow_dispatch`-only with no `push:`/tag trigger, so it never runs on its
+# own — you click "Run workflow" in the Actions UI and pick a bump type. The
+# version number is never typed by hand: pick patch/minor/major and the
 # source-of-truth (`Cargo.toml`) drives everything, then gets committed back so
 # the manifest, the git tag, and the GitHub Release never drift apart. The first
-# release (no `v*` tag yet) ships the current `Cargo.toml` version as-is,
-# ignoring the bump.
+# release (no `v*` tag yet) ships the current `Cargo.toml` version as-is.
 #
 # Single-crate release: bump the version, auto-fill an empty `[Unreleased]` from
-# git history via git-cliff, promote the curated changelog, tag `v<version>`,
-# publish a GitHub Release, and publish to crates.io. See AGENTS.md "Releasing
-# and the changelog".
+# git history via git-cliff, promote the curated changelog, verify the crate
+# publishes (dry run) before anything irreversible, tag `v<version>`, publish a
+# GitHub Release, and publish to crates.io. See AGENTS.md "Releasing and the
+# changelog".
 
 on:
   workflow_dispatch:
@@ -45,6 +46,19 @@ jobs:
           fetch-depth: 0 # full history + tags, for version math and git-cliff
 
       - uses: dtolnay/rust-toolchain@stable
+
+      # Fail fast if the publish credential is missing, BEFORE any irreversible
+      # step (tag/push/GitHub Release). Otherwise a missing secret would only
+      # surface at the final `cargo publish`, stranding a tag + Release with no
+      # matching crates.io version.
+      - name: Preflight — require CRATES_IO_TOKEN
+        env:
+          TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          if [ -z "${TOKEN}" ]; then
+            echo "::error::CRATES_IO_TOKEN secret is not set. Add it under repo Settings → Secrets and variables → Actions before releasing."
+            exit 1
+          fi
 
       - name: Install tooling
         run: cargo install cargo-edit --locked
@@ -172,10 +186,15 @@ jobs:
 
       # Curate release notes from [Unreleased]: keep only "### Header" sections
       # that have at least one real bullet, dropping placeholder "-" lines.
+      # Written OUTSIDE the working tree ($RUNNER_TEMP) so it neither dirties the
+      # tree (which would abort `cargo publish`) nor lands in the packaged crate.
       - name: Extract release notes
+        env:
+          NOTES_FILE: ${{ runner.temp }}/release-notes.md
         run: |
           set -euo pipefail
           python3 <<'PY'
+          import os
           import pathlib
           import re
           import sys
@@ -207,10 +226,10 @@ jobs:
               )
               sys.exit(1)
 
-          pathlib.Path("release-notes.md").write_text(result + "\n")
-          print("----- release-notes.md -----")
+          pathlib.Path(os.environ["NOTES_FILE"]).write_text(result + "\n")
+          print("----- release notes -----")
           print(result)
-          print("----------------------------")
+          print("-------------------------")
           PY
 
       # Rename the curated `## [Unreleased]` heading to the new version + date,
@@ -267,17 +286,32 @@ jobs:
           print(f"Promoted [Unreleased] -> [{version}] - {date}")
           PY
 
-      - name: Commit, tag, push
+      # Commit the bump + changelog locally (NOT pushed yet) so the next step can
+      # verify against a clean tree, and the tag — once created — points at it.
+      - name: Commit version bump + changelog
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Stage exactly the release artifacts. (release-notes.md lives in
+          # $RUNNER_TEMP, outside the tree, so it is never a candidate here.)
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git commit -m "Release v${VERSION}"
+
+      # Gate: build + package the crate exactly as `cargo publish` would, but
+      # without uploading. Runs on the now-clean committed tree and BEFORE the
+      # irreversible tag/push/Release, so a packaging or build failure can't
+      # strand a tag with no matching crates.io version. No token needed for a
+      # dry run; release-notes.md is outside the tree so it is not packaged.
+      - name: Verify the crate publishes (dry run)
+        run: cargo publish --dry-run
+
+      - name: Tag and push
         env:
           VERSION: ${{ steps.version.outputs.version }}
           BRANCH: ${{ github.ref_name }}
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Stage explicit paths only — `git add -A` would also commit the
-          # untracked `release-notes.md` the extract step wrote to the repo root.
-          git add Cargo.toml Cargo.lock CHANGELOG.md
-          git commit -m "Release v${VERSION}"
           git tag "v${VERSION}"
           # Push the commit and the tag atomically: if either ref is rejected,
           # neither lands. A non-atomic push that left the branch advanced but
@@ -288,18 +322,20 @@ jobs:
           git push --atomic origin "HEAD:refs/heads/${BRANCH}" "refs/tags/v${VERSION}"
 
       # The tag already exists (pushed above); attach the Release to it using the
-      # curated notes. gh is pre-installed on ubuntu-latest.
+      # curated notes from $RUNNER_TEMP. gh is pre-installed on ubuntu-latest.
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
-        run: gh release create "$TAG" --title "$TAG" --notes-file release-notes.md
+          NOTES_FILE: ${{ runner.temp }}/release-notes.md
+        run: gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE"
 
       # Last, because publishing to crates.io is irreversible (a version can
-      # never be re-published). By now the version bump + tag are durably on the
-      # remote, so if `cargo publish` fails (e.g. a verification-build error) you
-      # recover by re-running `cargo publish` from the tagged commit by hand — no
-      # git state is lost. cargo reads the bumped version from Cargo.toml.
+      # never be re-published). The dry run above already validated the build, so
+      # this should only ever fail on a transient registry/network error — and by
+      # now the version bump + tag are durably on the remote, so you recover by
+      # re-running `cargo publish` from the tagged commit by hand. cargo reads the
+      # bumped version from Cargo.toml.
       - name: Publish to crates.io
         run: cargo publish
         env:

@@ -14,11 +14,6 @@ progress.md
 !.claude/**
 .claude/settings.local.json
 
-# Release artifact: the release workflow writes the curated notes here for the
-# GitHub Release body. Ignored so `cargo publish`'s clean-tree check (and the
-# packaged crate) don't trip over this untracked file.
-release-notes.md
-
 # Rust
 **/*.rs.bk
 *.pdb
