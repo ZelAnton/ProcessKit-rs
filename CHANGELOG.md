@@ -20,6 +20,13 @@ to a dated version section.
 ### Fixed
 -
 
+## [0.3.4] - 2026-06-01
+
+### Changed
+
+- Release: reject dispatch from any ref other than main
+- Stop tracking agent-instruction files (AGENTS.md, CLAUDE.md, .claude/) — keep them local only
+
 ## [0.3.3] - 2026-06-01
 
 ### Changed
@@ -133,7 +140,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.0...v0.3.1
