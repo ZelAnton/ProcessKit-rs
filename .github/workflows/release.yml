@@ -5,8 +5,10 @@ name: Release
 #
 # `workflow_dispatch`-only with no `push:`/tag trigger, so it never runs on its
 # own — you click "Run workflow" in the Actions UI and pick a bump type. It
-# **always releases `main`**: the run checks out and pushes `main` regardless of
-# which ref the dispatch selector points at, so there is no branch to choose.
+# **only releases `main`**: the Actions UI always shows a branch selector (that
+# dropdown is built into `workflow_dispatch` and cannot be hidden), so instead a
+# preflight step rejects any dispatch whose ref is not `main`. There is no branch
+# to choose — pick anything but `main` and the run fails fast before doing work.
 # The version number is never typed by hand: pick patch/minor/major and the
 # source-of-truth (`Cargo.toml`) drives everything, then gets committed back so
 # the manifest, the git tag, and the GitHub Release never drift apart. The first
@@ -43,11 +45,22 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      # There is only one publish branch. The Actions UI forces a branch selector
+      # onto every workflow_dispatch and it cannot be removed, so enforce it here:
+      # refuse to run unless dispatched from `main`. This guards the workflow file
+      # itself too — a non-main ref would otherwise run that branch's version of
+      # this file. Uses the github context (no checkout needed), so it fails
+      # before any work happens.
+      - name: Require dispatch from main
+        if: github.ref_name != 'main'
+        run: |
+          echo "::error::Releases run only from main, but this was dispatched from '${{ github.ref_name }}'. Re-run with 'main' selected in the branch dropdown."
+          exit 1
+
       - uses: actions/checkout@v5
         with:
-          # Always release `main`, regardless of which ref the dispatch UI was
-          # pointed at — there is only one publish branch, so the selector is
-          # irrelevant and the bump/tag/push below all target `main`.
+          # The guard above guarantees the dispatch ref is `main`; check it out
+          # explicitly so the bump/tag/push below unambiguously target `main`.
           ref: main
           fetch-depth: 0 # full history + tags, for version math and git-cliff
 
