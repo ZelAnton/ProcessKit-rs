@@ -1,6 +1,6 @@
 [package]
 name = "processkit"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 description = "Child-process management: kill-on-drop process trees and async run-and-capture"
 license = "MIT"

@@ -20,6 +20,12 @@ to a dated version section.
 ### Fixed
 -
 
+## [0.3.3] - 2026-06-01
+
+### Changed
+
+- Release: always target main (check out + push main regardless of the dispatch ref)
+
 ## [0.3.2] - 2026-06-01
 
 ### Changed
@@ -127,7 +133,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.2.0...v0.3.0
