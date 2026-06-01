@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [0.4.0] - 2026-06-01
+
+### Added
 - macOS and the BSDs now contain process trees with a POSIX process group
   (`killpg` on drop) instead of a plain, uncontained spawn — `mechanism()`
   reports `ProcessGroup` there rather than `None`. The shared backend is the same
@@ -143,7 +154,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.4...v0.4.0
 [0.3.4]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.1...v0.3.2
