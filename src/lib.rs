@@ -63,6 +63,10 @@ pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
 pub use running::{RunningProcess, StdoutLines};
 pub use stats::ProcessGroupStats;
 pub use stdin::{ProcessStdin, Stdin};
+// Re-exported so callers can `use processkit::StreamExt;` to consume
+// [`RunningProcess::stdout_lines`]'s [`StdoutLines`] stream (`.next().await`,
+// combinators) without depending on `tokio-stream` directly.
+pub use tokio_stream::StreamExt;
 // `cli_client!` is exported at the crate root via `#[macro_export]`.
 
 use std::ffi::OsStr;

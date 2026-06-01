@@ -12,13 +12,19 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- Async stdin/stdout usage examples on `RunningProcess::standard_input` and
+  `RunningProcess::stdout_lines`, plus a `StreamExt` re-export so callers can
+  consume the `stdout_lines` stream with `use processkit::StreamExt;` (no direct
+  `tokio-stream` dependency).
 
 ### Changed
 -
 
 ### Fixed
--
+- `Command::first_line` now honors the command's `timeout` while streaming. It
+  previously enforced the deadline only on the run-to-completion path, so a
+  command that produced no matching line (e.g. a silent long-running process)
+  could hang forever; it now returns `Error::Timeout` once the deadline elapses.
 
 ## [0.3.0] - 2026-06-01
 

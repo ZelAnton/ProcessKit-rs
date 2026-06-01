@@ -147,6 +147,31 @@ impl RunningProcess {
     /// Take the interactive stdin writer, if the command was built with
     /// [`keep_stdin_open`](crate::Command::keep_stdin_open). Returns `None` after
     /// the first call (or when stdin was not kept open).
+    ///
+    /// # Example
+    ///
+    /// Drive a process interactively — write requests on stdin, read answers
+    /// from stdout:
+    ///
+    /// ```no_run
+    /// use processkit::{Command, StreamExt};
+    ///
+    /// # async fn demo() -> processkit::Result<()> {
+    /// // `bc` evaluates each stdin line and prints the result on stdout.
+    /// let mut run = Command::new("bc").keep_stdin_open().start().await?;
+    ///
+    /// let mut stdin = run.standard_input().expect("stdin was kept open");
+    /// stdin.write_line("2 + 2").await?;
+    /// stdin.write_line("6 * 7").await?;
+    /// stdin.finish().await?; // send EOF so bc finishes
+    ///
+    /// let mut answers = run.stdout_lines();
+    /// while let Some(line) = answers.next().await {
+    ///     println!("bc says: {line}");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn standard_input(&mut self) -> Option<ProcessStdin> {
         self.stdin_pipe.take().map(ProcessStdin::new)
     }
@@ -164,6 +189,28 @@ impl RunningProcess {
     /// it). To bound a manual stream, wrap your consumption in
     /// [`tokio::time::timeout`] and drop this handle (which kills the tree) on
     /// elapse.
+    ///
+    /// # Example
+    ///
+    /// Stream stdout line by line as it is produced, then collect the exit code
+    /// and stderr:
+    ///
+    /// ```no_run
+    /// use processkit::{Command, StreamExt};
+    ///
+    /// # async fn demo() -> processkit::Result<()> {
+    /// let mut run = Command::new("git").args(["log", "--oneline", "-n", "20"]).start().await?;
+    ///
+    /// let mut lines = run.stdout_lines();
+    /// while let Some(line) = lines.next().await {
+    ///     println!("commit: {line}");
+    /// }
+    ///
+    /// let (code, stderr) = run.finish_streamed().await?;
+    /// # let _ = (code, stderr);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn stdout_lines(&mut self) -> StdoutLines {
         // Background-drain stderr (counter + handler still apply). The handle is
         // kept so `finish_streamed` can await the last line before draining.
