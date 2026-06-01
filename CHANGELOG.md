@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [0.3.1] - 2026-06-01
+
+### Added
 - Async stdin/stdout usage examples on `RunningProcess::standard_input` and
   `RunningProcess::stdout_lines`, plus a `StreamExt` re-export so callers can
   consume the `stdout_lines` stream with `use processkit::StreamExt;` (no direct
@@ -110,7 +121,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.1.1...v0.1.2
