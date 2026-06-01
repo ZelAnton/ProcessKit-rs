@@ -6,6 +6,8 @@ description = "Child-process management: kill-on-drop process trees and async ru
 license = "MIT"
 repository = "https://github.com/ZelAnton/ProcessKit-rs"
 readme = "README.md"
+keywords = ["process", "subprocess", "job-object", "cgroup", "tokio"]
+categories = ["os", "asynchronous", "command-line-utilities"]
 # Keep the published crate lean: ship code, docs, and license — not the
 # dev/CI/agent tooling that only matters in the repo.
 exclude = [
@@ -23,6 +25,11 @@ exclude = [
 # (`if let … && let …`), used in the Linux cgroup/proc code. The `msrv` CI job
 # verifies it — keep the two in sync; raise both when adopting a newer feature.
 rust-version = "1.88"
+
+# Build docs.rs with every feature so the `mock` MockRunner and the `tracing`
+# integration are documented (default features alone hide them).
+[package.metadata.docs.rs]
+all-features = true
 
 # ---------------------------------------------------------------------------
 # Dependencies — every entry carries a "why" (see AGENTS.md "Dependency
