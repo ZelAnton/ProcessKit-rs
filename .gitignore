@@ -7,12 +7,11 @@ task_plan.md
 findings.md
 progress.md
 
-# Override a global ~/.gitignore that excludes `.claude` — this repo ships
-# its own Claude Code hook configuration to contributors. Keep .local.json
-# excluded; it's per-user (machine paths, personal permission allowlists).
-!.claude/
-!.claude/**
-.claude/settings.local.json
+# Agent instruction / config files are kept local only — never shared via the
+# remote. Each contributor brings their own; the repo does not ship them.
+AGENTS.md
+CLAUDE.md
+.claude/
 
 # Rust
 **/*.rs.bk
