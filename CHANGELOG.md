@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [0.5.0] - 2026-06-02
+
+### Added
 - `Error::Exit` now carries `stdout` alongside `stderr` (each truncated to 4 KiB),
   so a failed `git`/`jj` run's stdout diagnostics (`CONFLICT (content): …`,
   `nothing to commit, working tree clean`) survive the typed error instead of
@@ -178,7 +189,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.4...v0.4.0
 [0.3.4]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.3...v0.3.4
