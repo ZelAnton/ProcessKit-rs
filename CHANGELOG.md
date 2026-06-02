@@ -15,6 +15,17 @@ to a dated version section.
 -
 
 ### Changed
+-
+
+### Fixed
+-
+
+## [0.5.1] - 2026-06-02
+
+### Added
+-
+
+### Changed
 - `Error::diagnostic()` and `ProcessResult::diagnostic()` now return the message
   trimmed of surrounding whitespace (the trailing newline a tool leaves on its
   output is noise for a human-facing message). For the raw streams, match
@@ -192,7 +203,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.4...v0.4.0
