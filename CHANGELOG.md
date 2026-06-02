@@ -20,6 +20,12 @@ to a dated version section.
 ### Fixed
 -
 
+## [0.4.1] - 2026-06-02
+
+### Changed
+
+- review: harden macOS/BSD process-group containment
+
 ## [0.4.0] - 2026-06-01
 
 ### Added
@@ -154,7 +160,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.4...v0.4.0
 [0.3.4]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.3.2...v0.3.3
