@@ -67,6 +67,15 @@ impl ProcessGroup {
     /// group and is reaped when the group is killed or dropped. The caller is
     /// responsible for configuring `cmd`'s stdio; the group only handles
     /// containment.
+    ///
+    /// **Windows:** to make containment race-free the child is created
+    /// `CREATE_SUSPENDED`, assigned to the job, then resumed. This **overwrites**
+    /// any process-creation flags the caller set on `cmd` (e.g.
+    /// `CREATE_NO_WINDOW`) — Win32 exposes no way to read them back and OR the
+    /// suspend bit in. Set such flags through a different launch path if you need
+    /// them, or accept that this escape hatch forces only `CREATE_SUSPENDED`.
+    /// **Unix:** the group likewise installs a `pre_exec` hook on `cmd` to join
+    /// the cgroup / process group.
     pub fn spawn(&self, cmd: &mut Command) -> Result<Child> {
         let child = self.job.spawn(cmd).map_err(|source| Error::Spawn {
             program: program_name(cmd),

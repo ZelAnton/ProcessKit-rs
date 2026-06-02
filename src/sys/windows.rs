@@ -6,7 +6,10 @@ use std::io;
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -15,7 +18,8 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    CREATE_SUSPENDED, GetProcessTimes, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
+    ResumeThread, THREAD_SUSPEND_RESUME,
 };
 
 use crate::Mechanism;
@@ -62,11 +66,17 @@ impl Job {
     }
 
     pub(crate) fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
-        // Spawn first, then assign. There is a narrow window between spawn and
-        // assignment in which the child could spawn its own children outside the
-        // job; acceptable for v1 (the binaries we drive don't fork that fast).
-        // Hardening via CREATE_SUSPENDED + ResumeThread is a follow-up.
+        // Race-free containment: start the child's primary thread SUSPENDED so no
+        // user code runs (and nothing can fork) before the process is in the job;
+        // assign it, then resume. This closes the old spawn→assign window in
+        // which a fast-forking child could have escaped the job.
+        use std::os::windows::process::CommandExt;
+        cmd.as_std_mut().creation_flags(CREATE_SUSPENDED);
+
         let mut child = cmd.spawn()?;
+        let pid = child.id().ok_or_else(|| {
+            io::Error::other("child exited before it could be assigned to the job")
+        })?;
         let handle = child.raw_handle().ok_or_else(|| {
             io::Error::other("child exited before it could be assigned to the job")
         })?;
@@ -75,7 +85,14 @@ impl Job {
         let ok = unsafe { AssignProcessToJobObject(self.handle, handle as HANDLE) };
         if ok == 0 {
             let err = io::Error::last_os_error();
-            // Don't leak a child we failed to contain.
+            // Don't leak a child we failed to contain (still suspended).
+            let _ = child.start_kill();
+            return Err(err);
+        }
+
+        // Contained — release the primary thread. A failure here would strand a
+        // suspended-but-contained process, so kill it rather than leak it.
+        if let Err(err) = resume_process_threads(pid) {
             let _ = child.start_kill();
             return Err(err);
         }
@@ -156,6 +173,63 @@ impl Job {
     pub(crate) fn mechanism(&self) -> Mechanism {
         Mechanism::JobObject
     }
+}
+
+/// Resume every thread of `pid`. A child spawned `CREATE_SUSPENDED` has exactly
+/// one thread (its primary); we walk a thread snapshot because std/tokio surface
+/// only the process handle, not the `PROCESS_INFORMATION` thread handle returned
+/// by `CreateProcess`.
+fn resume_process_threads(pid: u32) -> io::Result<()> {
+    // SAFETY: TH32CS_SNAPTHREAD always snapshots all threads system-wide (the
+    // pid argument is ignored for the thread list); returns INVALID_HANDLE_VALUE
+    // on failure.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+
+    let mut resumed = 0u32;
+    let mut last_err = None;
+    // SAFETY: valid snapshot; `entry` is sized via its `dwSize` field.
+    let mut ok = unsafe { Thread32First(snapshot, &mut entry) };
+    while ok != 0 {
+        if entry.th32OwnerProcessID == pid {
+            match resume_thread(entry.th32ThreadID) {
+                Ok(()) => resumed += 1,
+                Err(err) => last_err = Some(err),
+            }
+        }
+        // SAFETY: same valid snapshot and entry.
+        ok = unsafe { Thread32Next(snapshot, &mut entry) };
+    }
+    // SAFETY: handle came from CreateToolhelp32Snapshot; closed exactly once.
+    unsafe { CloseHandle(snapshot) };
+
+    if resumed == 0 {
+        return Err(last_err
+            .unwrap_or_else(|| io::Error::other("no thread found to resume the contained child")));
+    }
+    Ok(())
+}
+
+/// Resume a single thread by id (decrement its suspend count).
+fn resume_thread(tid: u32) -> io::Result<()> {
+    // SAFETY: opens the thread by id; returns null on failure.
+    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, tid) };
+    if thread.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: valid thread handle; a `u32::MAX` return signals failure.
+    let prev = unsafe { ResumeThread(thread) };
+    // SAFETY: handle came from OpenThread; closed exactly once.
+    unsafe { CloseHandle(thread) };
+    if prev == u32::MAX {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Combine a FILETIME (100-ns units) into nanoseconds.

@@ -23,9 +23,6 @@ use crate::stdin::ProcessStdin;
 /// surviving grandchild holding a pipe can't hang the run.
 const PUMP_TEARDOWN: Duration = Duration::from_secs(5);
 
-/// Exit code reported for a run that was killed by its timeout.
-const TIMEOUT_EXIT_CODE: i32 = -1;
-
 /// The fields produced by a spawn, handed to [`RunningProcess::from_spawned`].
 pub(crate) struct Spawned {
     pub program: String,
@@ -309,12 +306,12 @@ impl RunningProcess {
     /// discarded so the child never blocks on a full pipe).
     ///
     /// This low-level handle method reports the **raw** outcome: a run killed by
-    /// its timeout returns `-1` (it is not raised as an error). For the
-    /// timeout-aware behavior use the one-shot helpers
+    /// its timeout (or by a signal) returns `None` (it is not raised as an
+    /// error). For the timeout-aware behavior use the one-shot helpers
     /// ([`Command::exit_code`](crate::Command::exit_code) /
     /// [`ProcessRunnerExt::exit_code`](crate::ProcessRunnerExt::exit_code)), which
     /// surface a deadline as [`Error::Timeout`](crate::Error::Timeout).
-    pub async fn wait(mut self) -> Result<i32> {
+    pub async fn wait(mut self) -> Result<Option<i32>> {
         let stdout_sink = SharedLines::new(&self.buffer);
         let stderr_sink = SharedLines::new(&self.buffer);
         let pumps = self.spawn_line_pumps(&stdout_sink, &stderr_sink);
@@ -351,21 +348,22 @@ impl RunningProcess {
     }
 
     /// Wait for the child to exit, applying the timeout (killing the tree and
-    /// flagging `timed_out` on elapse).
-    async fn drive_to_exit(&mut self) -> Result<(i32, bool)> {
+    /// flagging `timed_out` on elapse). The code is `None` for a run that
+    /// produced none — a timeout, or a signal termination on Unix.
+    async fn drive_to_exit(&mut self) -> Result<(Option<i32>, bool)> {
         let outcome = match self.timeout {
             Some(limit) => match tokio::time::timeout(limit, self.child.wait()).await {
-                Ok(status) => (exit_code(status?), false),
+                Ok(status) => (status?.code(), false),
                 Err(_elapsed) => {
                     let _ = self.child.start_kill();
                     if let Some(group) = &self.own_group {
                         let _ = group.terminate_all();
                     }
                     let _ = self.child.wait().await;
-                    (TIMEOUT_EXIT_CODE, true)
+                    (None, true)
                 }
             },
-            None => (exit_code(self.child.wait().await?), false),
+            None => (self.child.wait().await?.code(), false),
         };
         #[cfg(feature = "tracing")]
         {
@@ -373,7 +371,7 @@ impl RunningProcess {
             tracing::debug!(
                 target: "processkit",
                 program = %self.program,
-                code,
+                code = ?code,
                 timed_out,
                 elapsed_ms = self.started.elapsed().as_millis() as u64,
                 "process exited"
@@ -395,7 +393,7 @@ impl RunningProcess {
     /// Designed to pair with `stdout_lines` (consume the stdout stream first),
     /// but safe to call on its own — any pipe the stream didn't take is drained
     /// here so the child can never block on a full pipe.
-    pub async fn finish_streamed(mut self) -> Result<(i32, String)> {
+    pub async fn finish_streamed(mut self) -> Result<(Option<i32>, String)> {
         // Drain a stdout pipe a prior `stdout_lines` didn't take (and discard
         // it) so the child can't block writing to it while we wait for exit.
         if let Some(mut pipe) = self.stdout_pipe.take() {
@@ -459,12 +457,6 @@ async fn join_pumps(tasks: Vec<JoinHandle<()>>) {
             abort.abort();
         }
     }
-}
-
-/// The numeric exit code, or `-1` when the process was terminated by a signal
-/// (which carries no exit code on Unix).
-fn exit_code(status: std::process::ExitStatus) -> i32 {
-    status.code().unwrap_or(-1)
 }
 
 /// A `Stream` of the child's standard-output lines (see

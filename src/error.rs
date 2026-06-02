@@ -25,14 +25,23 @@ pub enum Error {
     ///
     /// Produced by the `ensure_success` helpers; the raw exit code is otherwise
     /// reported without erroring (a non-zero exit is not inherently a failure).
+    ///
+    /// Both captured streams are carried (each truncated to 4 KiB): `git`/`jj`
+    /// write decisive diagnostics to **stdout** on failure (`CONFLICT (content):
+    /// …`, `nothing to commit, working tree clean`), so a caller building a
+    /// user-facing message wants stdout as a fallback when stderr is empty — see
+    /// [`diagnostic`](Self::diagnostic).
     #[error("`{program}` exited with code {code}")]
     Exit {
         /// The program that exited non-zero.
         program: String,
         /// The raw process exit code.
         code: i32,
-        /// Captured standard error (may be truncated in the `Display` message
-        /// by callers to avoid log poisoning; this field holds what was kept).
+        /// Captured standard output (truncated). Not shown in the `Display`
+        /// message; kept for callers that need a stdout-borne failure message.
+        stdout: String,
+        /// Captured standard error (truncated). Not shown in the `Display`
+        /// message to avoid log poisoning; this field holds what was kept.
         stderr: String,
     },
 
@@ -60,6 +69,23 @@ pub enum Error {
     /// stdin, waiting for exit).
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl Error {
+    /// The best human-facing message for a failed run: captured standard error
+    /// if it carries text, otherwise the captured standard output (where `git`
+    /// puts `CONFLICT …` and `git commit` puts `nothing to commit`). Returns
+    /// `None` when there is no captured output to show — a silent [`Exit`](Error::Exit)
+    /// (both streams blank) or any non-`Exit` variant ([`Spawn`](Error::Spawn),
+    /// [`Timeout`](Error::Timeout), [`Parse`](Error::Parse), [`Io`](Error::Io)) —
+    /// so a caller can fall back to the [`Display`](std::fmt::Display) message.
+    pub fn diagnostic(&self) -> Option<&str> {
+        match self {
+            Error::Exit { stderr, .. } if !stderr.trim().is_empty() => Some(stderr),
+            Error::Exit { stdout, .. } if !stdout.trim().is_empty() => Some(stdout),
+            _ => None,
+        }
+    }
 }
 
 /// Crate result alias.

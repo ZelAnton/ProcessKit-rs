@@ -86,10 +86,11 @@ async fn main() -> processkit::Result<()> {
     }
 
     // After the stream ends, collect the exit code and whatever went to stderr
-    // (drained in the background while you streamed stdout).
+    // (drained in the background while you streamed stdout). `code` is `None` if
+    // the run was killed (timeout / signal) and so produced no exit code.
     let (code, stderr) = run.finish_streamed().await?;
-    if code != 0 {
-        eprintln!("git exited {code}: {stderr}");
+    if code != Some(0) {
+        eprintln!("git exited {code:?}: {stderr}");
     }
     Ok(())
 }

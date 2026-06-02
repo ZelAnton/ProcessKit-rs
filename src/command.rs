@@ -312,8 +312,9 @@ impl Command {
     }
 
     /// Run to completion and return just the exit code (output is discarded). A
-    /// run killed by its timeout has no meaningful code, so it surfaces as
-    /// [`Error::Timeout`](crate::Error::Timeout) — consistent with
+    /// run that yields no code surfaces as an error — a timeout as
+    /// [`Error::Timeout`](crate::Error::Timeout), a signal-kill as an IO error —
+    /// consistent with
     /// [`ProcessRunnerExt::exit_code`](crate::ProcessRunnerExt::exit_code) and
     /// [`CliClient::code`](crate::CliClient::code).
     pub async fn exit_code(&self) -> Result<i32> {

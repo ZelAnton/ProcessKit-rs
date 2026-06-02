@@ -29,6 +29,10 @@ pub struct CliClient<R: ProcessRunner = JobRunner> {
     program: OsString,
     runner: R,
     timeout: Option<Duration>,
+    /// Environment overrides applied to every built command (`None` = remove),
+    /// in registration order — e.g. `GIT_TERMINAL_PROMPT=0` set once instead of
+    /// on every probe.
+    envs: Vec<(OsString, Option<OsString>)>,
 }
 
 impl CliClient<JobRunner> {
@@ -38,6 +42,7 @@ impl CliClient<JobRunner> {
             program: program.as_ref().to_os_string(),
             runner: JobRunner,
             timeout: None,
+            envs: Vec::new(),
         }
     }
 }
@@ -49,12 +54,31 @@ impl<R: ProcessRunner> CliClient<R> {
             program: program.as_ref().to_os_string(),
             runner,
             timeout: None,
+            envs: Vec::new(),
         }
     }
 
     /// Apply a default timeout to every command this client builds.
     pub fn default_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Set an environment variable on every command this client builds — e.g.
+    /// `GIT_TERMINAL_PROMPT=0` so a probe can never block on a credential
+    /// prompt. Per-command [`Command::env`] still works and is layered after.
+    pub fn default_env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
+        self.envs.push((
+            key.as_ref().to_os_string(),
+            Some(value.as_ref().to_os_string()),
+        ));
+        self
+    }
+
+    /// Remove an inherited environment variable on every command this client
+    /// builds.
+    pub fn default_env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
+        self.envs.push((key.as_ref().to_os_string(), None));
         self
     }
 
@@ -68,41 +92,54 @@ impl<R: ProcessRunner> CliClient<R> {
         self.timeout
     }
 
-    /// A [`Command`] for `program <args>` in the current directory, default
-    /// timeout pre-applied. Chain more builders (`.arg`, `.stdin`, …) for
+    /// A [`Command`] for `program <args>` in the current directory, defaults
+    /// (timeout, env) pre-applied. Chain more builders (`.arg`, `.stdin`, …) for
     /// dynamic-argument commands.
     pub fn command<I, S>(&self, args: I) -> Command
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.apply_timeout(Command::new(&self.program).args(args))
+        self.apply_defaults(Command::new(&self.program).args(args))
     }
 
-    /// A [`Command`] for `program <args>` run in `dir`, default timeout pre-applied.
+    /// A [`Command`] for `program <args>` run in `dir`, defaults (timeout, env)
+    /// pre-applied.
     pub fn command_in<I, S>(&self, dir: &Path, args: I) -> Command
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.apply_timeout(Command::new(&self.program).current_dir(dir).args(args))
+        self.apply_defaults(Command::new(&self.program).current_dir(dir).args(args))
     }
 
-    fn apply_timeout(&self, command: Command) -> Command {
-        match self.timeout {
+    /// Apply this client's defaults (timeout, then env overrides) to a freshly
+    /// built command.
+    fn apply_defaults(&self, command: Command) -> Command {
+        let mut command = match self.timeout {
             Some(timeout) => command.timeout(timeout),
             None => command,
+        };
+        for (key, value) in &self.envs {
+            command = match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
         }
+        command
     }
 
-    /// Run `command`, returning trimmed stdout on success (errors on a non-zero exit).
+    /// Run `command`, returning stdout (trailing whitespace trimmed) on success
+    /// (errors on a non-zero exit). Trims with `trim_end` to match
+    /// [`run`](crate::ProcessRunnerExt::run)/[`Command::run`](crate::Command::run):
+    /// the trailing newline is noise, but leading whitespace can be significant.
     pub async fn text(&self, command: Command) -> Result<String> {
         Ok(self
             .runner
             .checked(&command)
             .await?
             .into_stdout()
-            .trim()
+            .trim_end()
             .to_owned())
     }
 
@@ -181,6 +218,27 @@ macro_rules! cli_client {
                 self.core = self.core.default_timeout(timeout);
                 self
             }
+
+            /// Set an environment variable on every command this client builds
+            /// (e.g. `GIT_TERMINAL_PROMPT=0`).
+            pub fn default_env(
+                mut self,
+                key: impl ::core::convert::AsRef<::std::ffi::OsStr>,
+                value: impl ::core::convert::AsRef<::std::ffi::OsStr>,
+            ) -> Self {
+                self.core = self.core.default_env(key, value);
+                self
+            }
+
+            /// Remove an inherited environment variable on every command this
+            /// client builds.
+            pub fn default_env_remove(
+                mut self,
+                key: impl ::core::convert::AsRef<::std::ffi::OsStr>,
+            ) -> Self {
+                self.core = self.core.default_env_remove(key);
+                self
+            }
         }
     };
 }
@@ -220,10 +278,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_trims_and_drives_the_scripted_runner() {
+    async fn text_trims_trailing_whitespace_only() {
+        // `text` trims with `trim_end` (matching `run`): the trailing newline is
+        // dropped, but leading whitespace is significant and preserved.
         let demo =
-            Demo::with_runner(ScriptedRunner::new().on(["rev-parse"], Reply::ok("  abc123\n")));
-        assert_eq!(demo.head(Path::new(".")).await.unwrap(), "abc123");
+            Demo::with_runner(ScriptedRunner::new().on(["rev-parse"], Reply::ok("  abc123 \n")));
+        assert_eq!(demo.head(Path::new(".")).await.unwrap(), "  abc123");
     }
 
     #[tokio::test]
@@ -323,6 +383,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn default_env_is_applied_to_every_command() {
+        use std::ffi::OsString;
+        let client = CliClient::new("git").default_env("GIT_TERMINAL_PROMPT", "0");
+        // Set once on the client, present on each built command without a per-call
+        // `.env`.
+        for cmd in [
+            client.command(["status"]),
+            client.command_in(Path::new("."), ["fetch"]),
+        ] {
+            assert!(
+                cmd.env_overrides()
+                    .iter()
+                    .any(|(k, v)| k == "GIT_TERMINAL_PROMPT"
+                        && v.as_deref() == Some(OsString::from("0").as_os_str())),
+                "default env missing on built command",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn default_env_reaches_the_invocation() {
+        let rec = RecordingRunner::replying(Reply::ok("ok\n"));
+        let client = CliClient::with_runner("git", &rec).default_env("GIT_TERMINAL_PROMPT", "0");
+        let _ = client.text(client.command(["status"])).await.unwrap();
+        let call = rec.only_call();
+        assert!(
+            call.envs
+                .iter()
+                .any(|(k, v)| k == "GIT_TERMINAL_PROMPT" && v.is_some()),
+            "env override did not reach the runner: {:?}",
+            call.envs
+        );
+    }
+
     #[test]
     fn macro_generates_all_constructors() {
         // Exercises every method the `cli_client!` macro emits (these are public
@@ -330,7 +425,9 @@ mod tests {
         // dead code). Construction only — no subprocess is spawned.
         let _real = Demo::new();
         let _default = Demo::default();
-        let _fake =
-            Demo::with_runner(ScriptedRunner::new()).default_timeout(Duration::from_secs(1));
+        let _fake = Demo::with_runner(ScriptedRunner::new())
+            .default_timeout(Duration::from_secs(1))
+            .default_env("GIT_TERMINAL_PROMPT", "0")
+            .default_env_remove("GIT_PAGER");
     }
 }

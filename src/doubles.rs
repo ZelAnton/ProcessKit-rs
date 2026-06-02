@@ -52,25 +52,30 @@ impl Reply {
         Self {
             stdout: String::new(),
             stderr: String::new(),
-            // The conventional "killed by timeout" code; the result's `timed_out`
-            // flag is what the helpers actually key on.
-            code: -1,
+            // Unused — a timed-out result carries no code; `timed_out` is what
+            // the helpers key on.
+            code: 0,
             timed_out: true,
         }
     }
 
-    /// Attach stdout to a failing reply.
+    /// Attach stdout to a reply — e.g. the `CONFLICT …` text `git merge` writes
+    /// to stdout on a failing reply, so a test can exercise
+    /// [`Error::Exit`](crate::Error::Exit)'s stdout field /
+    /// [`ProcessResult::diagnostic`](crate::ProcessResult::diagnostic).
     pub fn with_stdout(mut self, stdout: impl Into<String>) -> Self {
         self.stdout = stdout.into();
         self
     }
 
     fn into_result(self, program: String) -> ProcessResult<String> {
+        // A timed-out run carries no code (`None`); otherwise the canned code.
+        let code = (!self.timed_out).then_some(self.code);
         ProcessResult::new(
             program,
             self.stdout,
             self.stderr,
-            self.code,
+            code,
             self.timed_out,
             None,
         )
@@ -294,7 +299,7 @@ mod tests {
             "v1"
         );
         let miss = runner.output(&Command::new("tool").arg("x")).await.unwrap();
-        assert_eq!(miss.exit_code(), 1);
+        assert_eq!(miss.code(), Some(1));
         assert!(!miss.is_success());
     }
 

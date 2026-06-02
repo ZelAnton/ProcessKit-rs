@@ -17,6 +17,19 @@
 //! exit is reported in [`ProcessResult`], not raised, until you call
 //! [`ProcessResult::ensure_success`].
 //!
+//! **Run vocabulary** — the same verb means the same thing at every layer
+//! ([`Command`], [`ProcessRunner`]/[`ProcessRunnerExt`], [`CliClient`]):
+//!
+//! - **`run` / `text`** — require a zero exit and return stdout as a `String`,
+//!   trailing whitespace trimmed (`trim_end`: the final newline is noise, but
+//!   leading whitespace can be significant).
+//! - **`output` / `capture` / `output_string` / `output_bytes`** — return the
+//!   full [`ProcessResult`]; a non-zero exit is *not* an error here.
+//! - **`exit_code` / `code`** — the exit code. On a [`ProcessResult`],
+//!   [`code`](ProcessResult::code) is `Option<i32>` (`None` for a run killed by
+//!   its timeout or a signal — there is no `-1` sentinel); the `exit_code`
+//!   helpers instead surface a missing code as an error.
+//!
 //! ```no_run
 //! # async fn demo() -> processkit::Result<()> {
 //! use processkit::Command;

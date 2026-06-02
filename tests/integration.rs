@@ -46,7 +46,7 @@ fn sleeper() -> Command {
 #[ignore = "spawns a real subprocess"]
 async fn output_string_captures_stdout() {
     let result = two_line_echo().output_string().await.expect("run echo");
-    assert!(result.is_success(), "exit was {}", result.exit_code());
+    assert!(result.is_success(), "exit was {:?}", result.code());
     assert!(
         result.stdout().contains("first"),
         "stdout: {:?}",
@@ -218,6 +218,112 @@ async fn dropping_group_kills_children() {
     );
 }
 
+/// Whether a process with `pid` is still alive (Windows): `OpenProcess` with
+/// limited-query access succeeds while it lives; once reaped the pid is invalid.
+#[cfg(windows)]
+fn windows_pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: limited-information access; returns null when the pid is gone.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: handle came from OpenProcess; closed exactly once.
+    unsafe { CloseHandle(handle) };
+    true
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns a real process tree; proves a grandchild is contained (race fix)"]
+async fn windows_grandchild_is_contained() {
+    // A parent that launches a detached grandchild which records its own PID and
+    // then sleeps ~30s; the parent exits as soon as the grandchild is launched.
+    // Before the CREATE_SUSPENDED fix the grandchild could be created in the
+    // spawn→assign window and escape the job; now the parent runs suspended until
+    // it is in the job, so whatever it spawns is contained too. Dropping the
+    // group must therefore reap the grandchild, not just the parent.
+    //
+    // Two small .ps1 files avoid nested-quoting fragility: parent.ps1 launches
+    // grandchild.ps1 via Start-Process (which returns immediately).
+    let tmp = std::env::temp_dir();
+    let tag = std::process::id();
+    let pidfile = tmp.join(format!("processkit_gc_{tag}.pid"));
+    let grandchild_ps1 = tmp.join(format!("processkit_gc_{tag}.ps1"));
+    let parent_ps1 = tmp.join(format!("processkit_parent_{tag}.ps1"));
+    let _ = std::fs::remove_file(&pidfile);
+
+    std::fs::write(
+        &grandchild_ps1,
+        format!(
+            "$PID | Set-Content -Encoding ascii '{}'\nStart-Sleep -Seconds 30\n",
+            pidfile.display()
+        ),
+    )
+    .expect("write grandchild script");
+    std::fs::write(
+        &parent_ps1,
+        format!(
+            "Start-Process -WindowStyle Hidden -FilePath powershell \
+             -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'\n",
+            grandchild_ps1.display()
+        ),
+    )
+    .expect("write parent script");
+
+    let group = ProcessGroup::new().expect("create group");
+    group
+        .start(&Command::new("powershell").args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            &parent_ps1.to_string_lossy(),
+        ]))
+        .await
+        .expect("spawn parent")
+        .wait()
+        .await
+        .expect("parent waits"); // parent exits promptly after launching grandchild
+
+    // Wait for the grandchild to publish its PID.
+    let mut grandchild_pid = None;
+    for _ in 0..50 {
+        if let Ok(text) = std::fs::read_to_string(&pidfile)
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            grandchild_pid = Some(pid);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let pid = grandchild_pid.expect("grandchild never recorded its PID");
+    assert!(
+        windows_pid_alive(pid),
+        "grandchild should be alive before drop"
+    );
+
+    drop(group); // kill-on-close must reap the whole tree, grandchild included
+
+    // Give the job a moment to tear the tree down.
+    let mut reaped = false;
+    for _ in 0..50 {
+        if !windows_pid_alive(pid) {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = std::fs::remove_file(&pidfile);
+    let _ = std::fs::remove_file(&grandchild_ps1);
+    let _ = std::fs::remove_file(&parent_ps1);
+    assert!(
+        reaped,
+        "grandchild {pid} outlived its job — containment leaked"
+    );
+}
+
 #[tokio::test]
 #[ignore = "spawns a real subprocess"]
 async fn stdout_line_handler_sees_every_line() {
@@ -346,7 +452,7 @@ async fn finish_streamed_returns_code_and_stderr() {
     }
     drop(lines);
     let (code, stderr) = process.finish_streamed().await.expect("finish");
-    assert_eq!(code, 0);
+    assert_eq!(code, Some(0));
     assert!(out.iter().any(|l| l.contains("out")), "stdout: {out:?}");
     assert!(stderr.contains("err"), "stderr: {stderr:?}");
 }

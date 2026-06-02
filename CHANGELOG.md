@@ -12,13 +12,31 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- `Error::Exit` now carries `stdout` alongside `stderr` (each truncated to 4 KiB),
+  so a failed `git`/`jj` run's stdout diagnostics (`CONFLICT (content): …`,
+  `nothing to commit, working tree clean`) survive the typed error instead of
+  being dropped.
+- `Error::diagnostic()` and `ProcessResult::diagnostic()` — the best human message
+  for a failed run: standard error if it has text, otherwise standard output.
+- `CliClient::default_env` / `default_env_remove` (and matching `cli_client!`
+  macro methods): set an environment variable on every command the client builds
+  (e.g. `GIT_TERMINAL_PROMPT=0`) instead of repeating it per call.
 
 ### Changed
--
+- `ProcessResult::exit_code() -> i32` is replaced by `code() -> Option<i32>`:
+  a run that yields no code (killed by its timeout, or by a signal on Unix) is
+  `None` — the synthetic `-1` sentinel is gone. `RunningProcess::wait` and
+  `finish_streamed` likewise return `Option<i32>`. The `exit_code` convenience
+  helpers (`Command`/`ProcessRunnerExt`/`CliClient`) still return `Result<i32>`,
+  now surfacing a signal-kill as an IO error rather than `-1`.
+- `CliClient::text` trims trailing whitespace only (`trim_end`), matching
+  `run` — previously it trimmed both ends.
 
 ### Fixed
--
+- Windows: closed the spawn→assign race in the kill-on-close guarantee. A child
+  is now created `CREATE_SUSPENDED`, assigned to the Job Object, then resumed, so
+  a fast-forking child can no longer escape containment in the window between
+  spawn and assignment.
 
 ## [0.4.1] - 2026-06-02
 

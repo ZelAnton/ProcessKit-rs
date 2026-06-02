@@ -1,6 +1,6 @@
 [package]
 name = "processkit"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 description = "Child-process management: kill-on-drop process trees and async run-and-capture"
 license = "MIT"
@@ -76,12 +76,18 @@ tracing = ["dep:tracing"]
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_System_JobObjects",
-  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION + GetProcessTimes (per-process CPU).
+  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION + GetProcessTimes (per-process CPU);
+  # also CREATE_SUSPENDED / OpenThread / ResumeThread for race-free containment
+  # (spawn suspended → assign to job → resume the primary thread).
   "Win32_System_Threading",
   # CreateJobObjectW's signature references SECURITY_ATTRIBUTES.
   "Win32_Security",
   # K32GetProcessMemoryInfo (per-process peak working set) for diagnostics.
   "Win32_System_ProcessStatus",
+  # Thread snapshot (CreateToolhelp32Snapshot / Thread32First/Next) to find a
+  # suspended child's primary thread for ResumeThread — std/tokio expose only
+  # the process handle, not the PROCESS_INFORMATION thread handle.
+  "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 [target.'cfg(unix)'.dependencies]
@@ -93,3 +99,8 @@ libc = "0.2"
 [dev-dependencies]
 # `#[tokio::test]` plus a multi-threaded runtime to drive the async tests.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# Liveness probe (OpenProcess) in the integration test that proves a grandchild
+# is reaped with its job — integration tests can't see the non-dev windows-sys.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
