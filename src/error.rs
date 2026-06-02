@@ -74,17 +74,19 @@ pub enum Error {
 }
 
 impl Error {
-    /// The best human-facing message for a failed run: captured standard error
-    /// if it carries text, otherwise the captured standard output (where `git`
-    /// puts `CONFLICT …` and `git commit` puts `nothing to commit`). Returns
-    /// `None` when there is no captured output to show — a silent [`Exit`](Error::Exit)
-    /// (both streams blank) or any non-`Exit` variant ([`Spawn`](Error::Spawn),
-    /// [`Timeout`](Error::Timeout), [`Parse`](Error::Parse), [`Io`](Error::Io)) —
-    /// so a caller can fall back to the [`Display`](std::fmt::Display) message.
+    /// The best human-facing message for a failed run, trimmed of surrounding
+    /// whitespace: captured standard error if it carries text, otherwise the
+    /// captured standard output (where `git` puts `CONFLICT …` and `git commit`
+    /// puts `nothing to commit`). Returns `None` when there is no captured output
+    /// to show — a silent [`Exit`](Error::Exit) (both streams blank) or any
+    /// non-`Exit` variant ([`Spawn`](Error::Spawn), [`Timeout`](Error::Timeout),
+    /// [`Parse`](Error::Parse), [`Io`](Error::Io)) — so a caller can fall back to
+    /// the [`Display`](std::fmt::Display) message. For the raw, untrimmed stream
+    /// match on [`Exit`](Error::Exit)'s fields directly.
     pub fn diagnostic(&self) -> Option<&str> {
         match self {
-            Error::Exit { stderr, .. } if !stderr.trim().is_empty() => Some(stderr),
-            Error::Exit { stdout, .. } if !stdout.trim().is_empty() => Some(stdout),
+            Error::Exit { stderr, .. } if !stderr.trim().is_empty() => Some(stderr.trim()),
+            Error::Exit { stdout, .. } if !stdout.trim().is_empty() => Some(stdout.trim()),
             _ => None,
         }
     }

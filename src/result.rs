@@ -145,16 +145,18 @@ impl ProcessResult<String> {
         format!("{}{}", self.stdout(), self.stderr())
     }
 
-    /// The best human-facing message from a captured run: standard error if it
-    /// carries text, otherwise standard output — `git`/`jj` put `CONFLICT …`
-    /// and `nothing to commit` on stdout, so a probe that captured the result
-    /// (rather than erroring) can build the same friendly message
-    /// [`Error::diagnostic`](crate::Error::diagnostic) gives the erroring path.
+    /// The best human-facing message from a captured run, trimmed of surrounding
+    /// whitespace: standard error if it carries text, otherwise standard output —
+    /// `git`/`jj` put `CONFLICT …` and `nothing to commit` on stdout, so a probe
+    /// that captured the result (rather than erroring) can build the same friendly
+    /// message [`Error::diagnostic`](crate::Error::diagnostic) gives the erroring
+    /// path. For the raw, untrimmed streams use [`stdout`](Self::stdout) /
+    /// [`stderr`](Self::stderr).
     pub fn diagnostic(&self) -> &str {
         if self.stderr.trim().is_empty() {
-            &self.stdout
+            self.stdout.trim()
         } else {
-            &self.stderr
+            self.stderr.trim()
         }
     }
 }
@@ -248,16 +250,20 @@ mod tests {
 
     #[test]
     fn diagnostic_prefers_stderr_then_falls_back_to_stdout() {
-        // stderr present → stderr wins.
+        // stderr present → stderr wins, trimmed of surrounding whitespace.
         let with_stderr = ProcessResult::new(
             "git".into(),
             "on stdout".into(),
-            "on stderr".into(),
+            "  on stderr \n".into(),
             Some(1),
             false,
             None,
         );
         assert_eq!(with_stderr.diagnostic(), "on stderr");
+        assert_eq!(
+            with_stderr.ensure_success().unwrap_err().diagnostic(),
+            Some("on stderr")
+        );
 
         // stderr blank → stdout (where `git merge` writes CONFLICT) is the message.
         let conflict = ProcessResult::new(

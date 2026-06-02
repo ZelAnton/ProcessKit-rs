@@ -15,7 +15,10 @@ to a dated version section.
 -
 
 ### Changed
--
+- `Error::diagnostic()` and `ProcessResult::diagnostic()` now return the message
+  trimmed of surrounding whitespace (the trailing newline a tool leaves on its
+  output is noise for a human-facing message). For the raw streams, match
+  `Error::Exit`'s fields or use `ProcessResult::stdout`/`stderr`.
 
 ### Fixed
 -
