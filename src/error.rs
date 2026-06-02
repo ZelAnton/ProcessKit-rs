@@ -39,6 +39,8 @@ pub enum Error {
         code: i32,
         /// Captured standard output (truncated). Not shown in the `Display`
         /// message; kept for callers that need a stdout-borne failure message.
+        /// For the raw-bytes helper (`output_bytes`) this is a lossy UTF-8 decode
+        /// of stdout — the exact bytes remain on the originating `ProcessResult`.
         stdout: String,
         /// Captured standard error (truncated). Not shown in the `Display`
         /// message to avoid log poisoning; this field holds what was kept.
@@ -90,3 +92,31 @@ impl Error {
 
 /// Crate result alias.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_display_omits_both_captured_streams() {
+        // Regression guard: adding `stdout` to `Error::Exit` must not change the
+        // one-line `Display` message — neither captured stream may leak into it
+        // (a multi-KiB dump would poison logs). The text is exactly program+code.
+        let err = Error::Exit {
+            program: "git".into(),
+            code: 2,
+            stdout: "CONFLICT (content): merge conflict in a.rs".into(),
+            stderr: "fatal: boom".into(),
+        };
+        assert_eq!(err.to_string(), "`git` exited with code 2");
+    }
+
+    #[test]
+    fn diagnostic_is_none_for_non_exit_variants() {
+        let timeout = Error::Timeout {
+            program: "git".into(),
+            timeout: Duration::from_secs(1),
+        };
+        assert_eq!(timeout.diagnostic(), None);
+    }
+}
