@@ -20,6 +20,12 @@ to a dated version section.
 ### Fixed
 -
 
+## [0.5.2] - 2026-06-03
+
+### Changed
+
+- ci(release): push the release commit via a GitHub App token (App bypasses branch protection; no PAT expiry); attribute commit to owner (#1)
+
 ## [0.5.1] - 2026-06-02
 
 ### Added
@@ -203,7 +209,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.4.0...v0.4.1
