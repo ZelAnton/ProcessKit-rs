@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [0.6.0] - 2026-06-03
+
+### Added
 - `probe` — run a predicate command and read its exit code as a `bool`: exit `0` →
   `Ok(true)`, exit `1` → `Ok(false)`, anything else → `Err` (other code / timeout /
   signal-kill). On `Command`, `CliClient`, and `ProcessRunnerExt`. Collapses the
@@ -232,7 +243,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.4.1...v0.5.0
