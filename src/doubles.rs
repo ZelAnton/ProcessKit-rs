@@ -68,16 +68,23 @@ impl Reply {
         self
     }
 
-    fn into_result(self, program: String) -> ProcessResult<String> {
+    fn into_result(
+        self,
+        program: String,
+        timeout: Option<std::time::Duration>,
+    ) -> ProcessResult<String> {
         // A timed-out run carries no code (`None`); otherwise the canned code.
         let code = (!self.timed_out).then_some(self.code);
+        // Carry the command's configured timeout so a timed-out reply surfaces as
+        // `Error::Timeout` with the *real* deadline (matching the live runner),
+        // not a zero duration.
         ProcessResult::new(
             program,
             self.stdout,
             self.stderr,
             code,
             self.timed_out,
-            None,
+            timeout,
         )
     }
 }
@@ -151,13 +158,14 @@ impl ScriptedRunner {
 impl ProcessRunner for ScriptedRunner {
     async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
         let program = command.program().to_string_lossy().into_owned();
+        let timeout = command.configured_timeout();
         for (rule, reply) in &self.rules {
             if rule.matches(command) {
-                return Ok(reply.clone().into_result(program));
+                return Ok(reply.clone().into_result(program, timeout));
             }
         }
         match &self.fallback {
-            Some(reply) => Ok(reply.clone().into_result(program)),
+            Some(reply) => Ok(reply.clone().into_result(program, timeout)),
             None => Err(crate::error::Error::Spawn {
                 program,
                 source: std::io::Error::new(
@@ -317,6 +325,43 @@ mod tests {
         ));
         assert!(matches!(
             runner.exit_code(&Command::new("git")).await.unwrap_err(),
+            Error::Timeout { .. }
+        ));
+        // The reply carries the command's *real* configured deadline, matching the
+        // live runner — not a zero duration.
+        let cmd = Command::new("git").timeout(std::time::Duration::from_secs(7));
+        match runner.run(&cmd).await.unwrap_err() {
+            Error::Timeout { timeout, .. } => {
+                assert_eq!(timeout, std::time::Duration::from_secs(7))
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_reads_exit_code_as_bool() {
+        use crate::error::Error;
+        let runner = ScriptedRunner::new()
+            .on(["yes"], Reply::ok(""))
+            .on(["no"], Reply::fail(1, ""))
+            .on(["boom"], Reply::fail(2, "bad"))
+            .fallback(Reply::timeout());
+        // 0 -> true, 1 -> false.
+        assert!(runner.probe(&Command::new("t").arg("yes")).await.unwrap());
+        assert!(!runner.probe(&Command::new("t").arg("no")).await.unwrap());
+        // Any other code -> Exit error; no code (timeout) -> Timeout error.
+        assert!(matches!(
+            runner
+                .probe(&Command::new("t").arg("boom"))
+                .await
+                .unwrap_err(),
+            Error::Exit { code: 2, .. }
+        ));
+        assert!(matches!(
+            runner
+                .probe(&Command::new("t").arg("other"))
+                .await
+                .unwrap_err(),
             Error::Timeout { .. }
         ));
     }

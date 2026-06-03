@@ -81,7 +81,14 @@ impl SharedLines {
     }
 
     fn close(&self) {
-        self.inner.lock().expect("SharedLines poisoned").closed = true;
+        // Recover a poisoned lock instead of panicking: `close` runs from a
+        // `Drop` guard on the pump task's unwind path (see `pump_lines`), where a
+        // second panic would abort the process. Only the `closed` flag is set
+        // here, and that is safe regardless of any prior poisoning.
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .closed = true;
         self.notify.notify_one();
     }
 
@@ -138,6 +145,17 @@ pub(crate) async fn pump_lines<R>(
 ) where
     R: AsyncRead + Unpin,
 {
+    // Close the sink on *every* exit from this task, including a panic unwind
+    // from a user `handler`. Without this, a panicking handler would leave the
+    // sink un-closed and a streaming `StdoutLines` consumer parked forever.
+    struct CloseOnDrop(Arc<SharedLines>);
+    impl Drop for CloseOnDrop {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let sink = CloseOnDrop(sink);
+
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::new();
     loop {
@@ -157,9 +175,9 @@ pub(crate) async fn pump_lines<R>(
         if let Some(handler) = &handler {
             handler(&line);
         }
-        sink.push(line);
+        sink.0.push(line);
     }
-    sink.close();
+    // `sink` (the guard) closes here on normal completion too.
 }
 
 #[cfg(test)]
@@ -231,5 +249,27 @@ mod tests {
             "retain-nothing policy keeps no lines"
         );
         assert_eq!(*seen.lock().unwrap(), vec!["x", "y"]);
+    }
+
+    #[tokio::test]
+    async fn panicking_handler_still_closes_the_sink() {
+        // A user handler that panics must not leave the sink un-closed — otherwise
+        // a streaming consumer would park on `changed()` forever.
+        let handler: LineHandler = Arc::new(|_: &str| panic!("boom"));
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        let task = tokio::spawn(pump_lines(
+            &b"one\ntwo\n"[..],
+            encoding_rs::UTF_8,
+            Some(handler),
+            sink.clone(),
+        ));
+        // The pump task unwinds from the handler panic...
+        assert!(task.await.is_err(), "the pump task should have panicked");
+        // ...but the sink is still closed, so a consumer wakes and ends.
+        sink.clone().changed().await;
+        assert!(
+            matches!(sink.try_pop(), Popped::Closed),
+            "sink must be closed after a handler panic"
+        );
     }
 }

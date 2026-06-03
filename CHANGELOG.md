@@ -12,13 +12,36 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- `probe` — run a predicate command and read its exit code as a `bool`: exit `0` →
+  `Ok(true)`, exit `1` → `Ok(false)`, anything else → `Err` (other code / timeout /
+  signal-kill). On `Command`, `CliClient`, and `ProcessRunnerExt`. Collapses the
+  `match code { 0 => …, 1 => …, _ => Err }` idiom (`git diff --quiet`, `grep -q`, …).
+- `Command::retry(max_attempts, backoff, retry_if)` — replay the run while
+  `retry_if(&Error)` accepts the failure, with fixed backoff. Honored by the
+  success-checking helpers (`run`/`exit_code`/`probe` and the `CliClient`
+  `text`/`unit`/`code`/`parse`/`try_parse` helpers); the non-erroring `output_string`/
+  `output_bytes`/`capture` paths don't retry. One-shot stdin sources can't replay.
 
 ### Changed
--
+- `RunningProcess::stdout_lines` now honors the command's `timeout`: at the deadline
+  the process tree is killed and the stream ends, so a streamed run can no longer hang
+  past its timeout (`finish_streamed` then reports the kill — `code` is `None` on a Unix
+  signal-kill, a platform code on a Windows Job kill). Previously the timeout applied
+  only to the run-to-completion helpers.
 
 ### Fixed
--
+- Linux (cgroup backend): `Drop` no longer leaks the cgroup directory. `cgroup.kill`
+  is asynchronous, so the immediate `rmdir` used to race the still-draining members
+  and fail with `EBUSY`; `Drop` now waits (bounded) for the subtree to drain first.
+- Linux (cgroup backend, pre-5.14 kernels): the per-pid SIGKILL fallback no longer
+  busy-spins — it sleeps briefly between sweeps.
+- Streaming: a panicking `on_stdout_line` / `on_stderr_line` handler no longer hangs a
+  `stdout_lines` consumer. The pump now closes its sink on any exit (including a panic
+  unwind), so the stream always ends instead of parking forever.
+- Streaming: a second `stdout_lines()` call no longer silently discards the first call's
+  stderr (it previously overwrote the stderr sink, so `finish_streamed` returned empty).
+- Test double: `Reply::timeout()` now reports the command's real configured deadline in
+  `Error::Timeout` (it previously surfaced a zero duration, diverging from the live runner).
 
 ## [0.5.2] - 2026-06-03
 
