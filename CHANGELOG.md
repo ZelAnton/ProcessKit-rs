@@ -15,6 +15,17 @@ to a dated version section.
 -
 
 ### Changed
+-
+
+### Fixed
+-
+
+## [0.6.1] - 2026-06-03
+
+### Added
+-
+
+### Changed
 - Move the Testing and Releasing guides out of `README.md` into a dedicated
   `CONTRIBUTING.md`, keeping the README focused on usage.
 
@@ -244,7 +255,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.0...v0.5.1
