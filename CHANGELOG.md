@@ -15,7 +15,8 @@ to a dated version section.
 -
 
 ### Changed
--
+- Move the Testing and Releasing guides out of `README.md` into a dedicated
+  `CONTRIBUTING.md`, keeping the README focused on usage.
 
 ### Fixed
 -
