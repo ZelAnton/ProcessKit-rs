@@ -57,12 +57,33 @@ jobs:
           echo "::error::Releases run only from main, but this was dispatched from '${{ github.ref_name }}'. Re-run with 'main' selected in the branch dropdown."
           exit 1
 
+      # Mint a short-lived GitHub App installation token. Pushing the release
+      # commit to `main` with it makes the **App** the actor — and the App sits in
+      # the branch-protection ruleset's bypass list, so the push is allowed. The
+      # default `github-actions[bot]` CANNOT be granted a ruleset bypass (it's a
+      # system actor, not an App), and a PAT would expire; an App token is
+      # short-lived, auto-revoked, and needs no rotation. Configure repo variable
+      # `RELEASE_APP_ID` + secret `RELEASE_APP_PRIVATE_KEY`; until then this step
+      # is skipped and the push falls back to the default `GITHUB_TOKEN` (fine
+      # while `main` is unprotected). See the release-token-bypass instruction.
+      - name: Mint GitHub App token
+        id: app-token
+        if: ${{ vars.RELEASE_APP_ID != '' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@v5
         with:
           # The guard above guarantees the dispatch ref is `main`; check it out
           # explicitly so the bump/tag/push below unambiguously target `main`.
           ref: main
           fetch-depth: 0 # full history + tags, for version math and git-cliff
+          # Persist the App token so the later `git push` to `main` uses it (and
+          # thus the App's ruleset bypass). Empty when the App isn't configured →
+          # fall back to the default token.
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -311,8 +332,11 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Attribute the release commit to the repo owner, so it reads as authored
+          # by a human (and counts toward their history) rather than the App/bot
+          # that pushes it. Author identity is independent of the push token.
+          git config user.name  "Anton Zhelezniakou"
+          git config user.email "github@zelanton.net"
           # Stage exactly the release artifacts. (release-notes.md lives in
           # $RUNNER_TEMP, outside the tree, so it is never a candidate here.)
           git add Cargo.toml Cargo.lock CHANGELOG.md
