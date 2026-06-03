@@ -6,7 +6,7 @@
 //! fabricated). Live-handle / streaming runs use the concrete
 //! [`start`](JobRunner::start) methods instead.
 
-use crate::command::Command;
+use crate::command::{Command, RetryPolicy};
 use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::result::ProcessResult;
@@ -43,8 +43,12 @@ impl<R: ProcessRunner + ?Sized> ProcessRunner for &R {
 pub trait ProcessRunnerExt: ProcessRunner {
     /// Run, require a zero exit, and return trimmed stdout.
     async fn run(&self, command: &Command) -> Result<String> {
-        let result = self.output(command).await?.ensure_success()?;
-        Ok(result.into_stdout().trim_end().to_owned())
+        Ok(self
+            .checked(command)
+            .await?
+            .into_stdout()
+            .trim_end()
+            .to_owned())
     }
 
     /// Run and return just the exit code. A run that produced no code surfaces as
@@ -52,7 +56,31 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// signal-kill as an IO error — rather than a synthetic sentinel, mirroring
     /// [`ensure_success`](crate::ProcessResult::ensure_success).
     async fn exit_code(&self, command: &Command) -> Result<i32> {
-        self.output(command).await?.require_code()
+        retrying(command.retry_policy(), || async {
+            self.output(command).await?.require_code()
+        })
+        .await
+    }
+
+    /// Run a predicate command and read its exit code as a boolean: exit `0` →
+    /// `Ok(true)`, exit `1` → `Ok(false)`, anything else → `Err` (other code as
+    /// [`Error::Exit`](crate::Error::Exit), timeout as
+    /// [`Error::Timeout`](crate::Error::Timeout), signal-kill as an IO error). For
+    /// commands whose exit code *is* the answer — `git diff --quiet`, `grep -q`, …
+    async fn probe(&self, command: &Command) -> Result<bool> {
+        retrying(command.retry_policy(), || async {
+            let result = self.output(command).await?;
+            match result.code() {
+                Some(0) => Ok(true),
+                Some(1) => Ok(false),
+                // Any other code (or no code: timeout / signal) is not a yes/no
+                // answer — reuse ensure_success to build the faithful error.
+                _ => Err(result
+                    .ensure_success()
+                    .expect_err("a non-{0,1} exit code is never success")),
+            }
+        })
+        .await
     }
 
     /// Run, require a zero exit, and return the full captured result (untrimmed
@@ -60,7 +88,34 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// when you need the whole `ProcessResult` after success-checking, rather
     /// than just trimmed stdout (`run`) or the raw result (`output`).
     async fn checked(&self, command: &Command) -> Result<ProcessResult<String>> {
-        self.output(command).await?.ensure_success()
+        retrying(command.retry_policy(), || async {
+            self.output(command).await?.ensure_success()
+        })
+        .await
+    }
+}
+
+/// Run `attempt` once, or — when the command carries a [`RetryPolicy`] — up to
+/// `max_attempts` times, retrying while the error is classified retryable and
+/// sleeping `backoff` between tries. The building block under the success-checking
+/// `ProcessRunnerExt` helpers; the non-erroring `output` path never retries.
+async fn retrying<T, Fut, F>(policy: Option<RetryPolicy>, mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: core::future::Future<Output = Result<T>>,
+{
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(err) => match &policy {
+                Some(p) if tries < p.max_attempts && (p.classifier)(&err) => {
+                    tokio::time::sleep(p.backoff).await;
+                }
+                _ => return Err(err),
+            },
+        }
     }
 }
 
@@ -160,4 +215,75 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         stderr_handler: command.stderr_handler(),
         buffer: command.output_buffer_policy(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Error;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    /// A fake runner that reports a non-zero exit for its first `fail_times`
+    /// calls, then a success — and counts total calls. No real process.
+    struct Flaky {
+        calls: AtomicU32,
+        fail_times: u32,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for Flaky {
+        async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let code = if n < self.fail_times { 1 } else { 0 };
+            Ok(ProcessResult::new(
+                command.program().to_string_lossy().into_owned(),
+                "out".to_owned(),
+                "transient".to_owned(),
+                Some(code),
+                false,
+                None,
+            ))
+        }
+    }
+
+    fn flaky(fail_times: u32) -> Flaky {
+        Flaky {
+            calls: AtomicU32::new(0),
+            fail_times,
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_retries_until_success() {
+        let runner = flaky(2);
+        let cmd = Command::new("x").retry(5, Duration::from_millis(0), |e| {
+            matches!(e, Error::Exit { .. })
+        });
+        assert_eq!(runner.run(&cmd).await.unwrap(), "out");
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 3); // 2 failures + 1 success
+    }
+
+    #[tokio::test]
+    async fn retry_stops_when_classifier_rejects() {
+        let runner = flaky(5);
+        let cmd = Command::new("x").retry(5, Duration::from_millis(0), |_| false);
+        assert!(runner.run(&cmd).await.is_err());
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 1); // no retry
+    }
+
+    #[tokio::test]
+    async fn retry_caps_at_max_attempts() {
+        let runner = flaky(10);
+        let cmd = Command::new("x").retry(3, Duration::from_millis(0), |_| true);
+        assert!(runner.run(&cmd).await.is_err());
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 3); // capped
+    }
+
+    #[tokio::test]
+    async fn no_policy_runs_once() {
+        let runner = flaky(10);
+        assert!(runner.run(&Command::new("x")).await.is_err());
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    }
 }

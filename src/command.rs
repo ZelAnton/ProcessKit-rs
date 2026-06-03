@@ -40,6 +40,16 @@ pub struct Command {
     output_buffer: OutputBufferPolicy,
     stdout_encoding: &'static Encoding,
     stderr_encoding: &'static Encoding,
+    retry: Option<RetryPolicy>,
+}
+
+/// A retry policy attached to a [`Command`] via [`Command::retry`], honored by
+/// the success-checking run helpers. Cheap to clone (the classifier is `Arc`'d).
+#[derive(Clone)]
+pub(crate) struct RetryPolicy {
+    pub(crate) max_attempts: u32,
+    pub(crate) backoff: Duration,
+    pub(crate) classifier: Arc<dyn Fn(&Error) -> bool + Send + Sync>,
 }
 
 impl Command {
@@ -59,6 +69,7 @@ impl Command {
             output_buffer: OutputBufferPolicy::unbounded(),
             stdout_encoding: UTF_8,
             stderr_encoding: UTF_8,
+            retry: None,
         }
     }
 
@@ -118,9 +129,50 @@ impl Command {
         self
     }
 
+    /// Retry the run while `retry_if` accepts the error, up to `max_attempts`
+    /// total attempts, sleeping `backoff` between tries.
+    ///
+    /// Applies to the **success-checking** helpers — [`run`](Self::run),
+    /// [`exit_code`](Self::exit_code), [`probe`](Self::probe), and the
+    /// [`CliClient`](crate::CliClient) `text`/`unit`/`code`/`parse`/`try_parse`
+    /// helpers — i.e. the ones that surface failure as an [`Error`] the classifier
+    /// can inspect (e.g. a transient network failure in `stderr`, or
+    /// [`Error::Timeout`](crate::Error::Timeout)). The non-erroring
+    /// `output_string`/`output_bytes`/`capture` paths don't retry.
+    ///
+    /// Each attempt **re-executes the whole command** — a fresh process. Only
+    /// retry operations that are safe to repeat: a side effect that already landed
+    /// before the failure (a `git push` that reached the server, then dropped the
+    /// connection) will be replayed. Prefer to gate retries on a classifier that
+    /// matches *pre-effect* failures (DNS/connection errors, [`Error::Timeout`]
+    /// while still connecting) rather than any non-zero exit.
+    ///
+    /// Because the command is replayed from scratch, a **one-shot** stdin source
+    /// ([`Stdin::from_reader`](crate::Stdin::from_reader) /
+    /// [`from_lines`](crate::Stdin::from_lines)) won't survive a retry — the second
+    /// attempt sees empty stdin. Use a reusable source
+    /// (`from_string`/`from_bytes`/`from_file`/`from_iter_lines`) when retrying.
+    ///
+    /// [`Error::Timeout`]: crate::Error::Timeout
+    pub fn retry(
+        mut self,
+        max_attempts: u32,
+        backoff: Duration,
+        retry_if: impl Fn(&Error) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.retry = Some(RetryPolicy {
+            max_attempts,
+            backoff,
+            classifier: Arc::new(retry_if),
+        });
+        self
+    }
+
     /// Leave stdin open after start so the child can be driven interactively via
     /// [`RunningProcess::standard_input`](crate::RunningProcess::standard_input).
-    /// Has no effect on the bulk run helpers (they always close stdin).
+    /// Has no effect on the bulk run helpers (they always close stdin). Takes
+    /// precedence over a [`stdin`](Self::stdin) source — when set, that source is
+    /// ignored and the pipe is handed to the caller instead.
     pub fn keep_stdin_open(mut self) -> Self {
         self.keep_stdin_open = true;
         self
@@ -189,6 +241,10 @@ impl Command {
 
     pub(crate) fn output_buffer_policy(&self) -> OutputBufferPolicy {
         self.output_buffer
+    }
+
+    pub(crate) fn retry_policy(&self) -> Option<RetryPolicy> {
+        self.retry.clone()
     }
 
     pub(crate) fn out_encoding(&self) -> &'static Encoding {
@@ -323,8 +379,16 @@ impl Command {
 
     /// Run to completion, requiring a zero exit, and return trimmed stdout.
     pub async fn run(&self) -> Result<String> {
-        let result = self.output_string().await?.ensure_success()?;
-        Ok(result.into_stdout().trim_end().to_owned())
+        JobRunner::new().run(self).await
+    }
+
+    /// Run a predicate command and read its exit code as a boolean: exit `0` →
+    /// `Ok(true)`, exit `1` → `Ok(false)`, anything else → `Err` (any other code
+    /// as [`Error::Exit`], a timeout as [`Error::Timeout`](crate::Error::Timeout),
+    /// a signal-kill as an IO error). For tools whose exit code *is* the answer —
+    /// `git diff --quiet`, `git show-ref --verify --quiet`, `grep -q`, …
+    pub async fn probe(&self) -> Result<bool> {
+        JobRunner::new().probe(self).await
     }
 
     /// Return the first stdout line matching `predicate` (or the first line when
@@ -379,6 +443,7 @@ impl fmt::Debug for Command {
             .field("output_buffer", &self.output_buffer)
             .field("stdout_encoding", &self.stdout_encoding.name())
             .field("stderr_encoding", &self.stderr_encoding.name())
+            .field("has_retry", &self.retry.is_some())
             .finish()
     }
 }

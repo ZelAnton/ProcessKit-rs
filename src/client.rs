@@ -159,6 +159,15 @@ impl<R: ProcessRunner> CliClient<R> {
         self.runner.exit_code(&command).await
     }
 
+    /// Run a predicate `command` and read its exit code as a boolean: exit `0` →
+    /// `Ok(true)`, exit `1` → `Ok(false)`, anything else → `Err`. Collapses the
+    /// `match code { 0 => …, 1 => …, _ => Err }` idiom for commands whose exit
+    /// code is the answer (`git diff --quiet`, `git show-ref --verify --quiet`,
+    /// `grep -q`, …); other codes / timeout / signal-kill all error.
+    pub async fn probe(&self, command: Command) -> Result<bool> {
+        self.runner.probe(&command).await
+    }
+
     /// Run `command` (errors on a non-zero exit) and feed its stdout to an
     /// infallible `parse` — the shape of git/jj struct-returning commands.
     pub async fn parse<T>(&self, command: Command, parse: impl FnOnce(&str) -> T) -> Result<T> {
@@ -381,6 +390,24 @@ mod tests {
             client.command(["status"]).configured_timeout(),
             Some(Duration::from_secs(7))
         );
+    }
+
+    #[tokio::test]
+    async fn probe_maps_exit_code_to_bool() {
+        let client = CliClient::with_runner(
+            "git",
+            ScriptedRunner::new()
+                .on(["diff"], Reply::fail(1, ""))
+                .fallback(Reply::ok("")),
+        );
+        // `git diff --quiet` exits 1 (dirty) -> false; anything else (0) -> true.
+        assert!(
+            !client
+                .probe(client.command(["diff", "--quiet"]))
+                .await
+                .unwrap()
+        );
+        assert!(client.probe(client.command(["status"])).await.unwrap());
     }
 
     #[tokio::test]

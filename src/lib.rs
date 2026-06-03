@@ -29,6 +29,8 @@
 //!   [`code`](ProcessResult::code) is `Option<i32>` (`None` for a run killed by
 //!   its timeout or a signal — there is no `-1` sentinel); the `exit_code`
 //!   helpers instead surface a missing code as an error.
+//! - **`probe`** — run a predicate and read its exit code as a `bool`: `0` →
+//!   `true`, `1` → `false`, anything else is an error (`git diff --quiet`, …).
 //!
 //! ```no_run
 //! # async fn demo() -> processkit::Result<()> {
@@ -41,6 +43,42 @@
 //! // Or require success and get trimmed stdout directly.
 //! let version = Command::new("cargo").arg("--version").run().await?;
 //! # let _ = version;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Recipes
+//!
+//! ```no_run
+//! # use std::time::Duration;
+//! # async fn demo() -> processkit::Result<()> {
+//! use processkit::{Command, Error};
+//!
+//! // Exit code *is* the answer (0 = yes, 1 = no; anything else errors):
+//! let clean = Command::new("git").args(["diff", "--quiet"]).probe().await?;
+//!
+//! // Retry a transient failure (replays the command; classifier inspects the error):
+//! let fetched = Command::new("git")
+//!     .args(["fetch", "--quiet"])
+//!     .timeout(Duration::from_secs(10))
+//!     .retry(3, Duration::from_millis(200), |e| {
+//!         matches!(e, Error::Timeout { .. })
+//!             || e.diagnostic().is_some_and(|m| m.contains("Could not resolve host"))
+//!     })
+//!     .run()
+//!     .await;
+//!
+//! // A friendly failure message — stderr, falling back to stdout (git writes
+//! // `CONFLICT …` / `nothing to commit` there):
+//! if let Err(e) = Command::new("git").args(["merge", "topic"]).run().await {
+//!     eprintln!("merge failed: {}", e.diagnostic().unwrap_or("(no output)"));
+//! }
+//!
+//! // Set an env var once for every command (typed CLI wrapper):
+//! use processkit::CliClient;
+//! let git = CliClient::new("git").default_env("GIT_TERMINAL_PROMPT", "0");
+//! let _ = git.text(git.command(["status", "--porcelain"])).await?;
+//! # let _ = (clean, fetched);
 //! # Ok(())
 //! # }
 //! ```

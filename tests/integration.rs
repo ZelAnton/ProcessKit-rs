@@ -325,6 +325,64 @@ async fn windows_grandchild_is_contained() {
 }
 
 #[tokio::test]
+#[ignore = "spawns real subprocesses"]
+async fn probe_reads_real_exit_codes() {
+    // Exit 0 -> Ok(true), exit 1 -> Ok(false), exit 2 -> Err.
+    let exits = |code: i32| {
+        if cfg!(windows) {
+            Command::new("cmd").args(["/c", "exit", &code.to_string()])
+        } else {
+            Command::new("sh").args(["-c", &format!("exit {code}")])
+        }
+    };
+    assert!(exits(0).probe().await.expect("exit 0 is a clean true"));
+    assert!(!exits(1).probe().await.expect("exit 1 is a clean false"));
+    assert!(
+        exits(2).probe().await.is_err(),
+        "any code other than 0/1 must be an error, not a silent bool"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess that outlives its timeout"]
+async fn streaming_honors_timeout() {
+    use tokio_stream::StreamExt;
+
+    // Emit one line, then idle well past the timeout. The deadline must end the
+    // stream (kill the tree) rather than hang.
+    let cmd = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo one& ping -n 30 127.0.0.1 >NUL"])
+    } else {
+        Command::new("sh").args(["-c", "echo one; sleep 30"])
+    }
+    .timeout(Duration::from_millis(500));
+
+    let start = Instant::now();
+    let mut run = cmd.start().await.expect("start");
+    let mut lines = run.stdout_lines();
+    let mut seen = Vec::new();
+    while let Some(line) = lines.next().await {
+        seen.push(line);
+    }
+    drop(lines);
+    let (code, _stderr) = run.finish_streamed().await.expect("finish");
+
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "stream did not end at the deadline (took {:?})",
+        start.elapsed()
+    );
+    // The tree was killed at the deadline. The exact code is platform-dependent
+    // (None on a Unix signal-kill, a nonzero code on a Windows Job kill), so the
+    // guarantee under test is "ended promptly and not a clean success".
+    assert!(
+        !matches!(code, Some(0)),
+        "a timed-out streamed run must not look successful (got {code:?})"
+    );
+    assert!(seen.iter().any(|l| l.contains("one")), "saw: {seen:?}");
+}
+
+#[tokio::test]
 #[ignore = "spawns a real subprocess"]
 async fn stdout_line_handler_sees_every_line() {
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));

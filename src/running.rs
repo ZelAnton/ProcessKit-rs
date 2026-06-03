@@ -53,7 +53,9 @@ pub(crate) struct Spawned {
 pub struct RunningProcess {
     program: String,
     child: Child,
-    own_group: Option<ProcessGroup>,
+    // `Arc` so a streaming deadline timer can hold a `Weak` to kill the tree
+    // without keeping the group alive (kill-on-close on drop stays prompt).
+    own_group: Option<Arc<ProcessGroup>>,
     stdout_pipe: Option<ChildStdout>,
     stderr_pipe: Option<ChildStderr>,
     stdin_pipe: Option<ChildStdin>,
@@ -70,6 +72,9 @@ pub struct RunningProcess {
     // The background stderr-drain task started by `stdout_lines`, awaited by
     // `finish_streamed` so no trailing stderr line is missed.
     stderr_pump: Option<JoinHandle<()>>,
+    // A timer started by `stdout_lines` when a timeout is set: kills the tree at
+    // the deadline so a streamed run can't hang forever. Aborted on drop.
+    deadline_task: Option<JoinHandle<()>>,
     started: Instant,
     start_time: SystemTime,
 }
@@ -79,7 +84,7 @@ impl RunningProcess {
         Self {
             program: s.program,
             child: s.child,
-            own_group: s.own_group,
+            own_group: s.own_group.map(Arc::new),
             stdout_pipe: s.stdout,
             stderr_pipe: s.stderr,
             stdin_pipe: s.stdin,
@@ -94,13 +99,14 @@ impl RunningProcess {
             stdout_sink: None,
             stderr_sink: None,
             stderr_pump: None,
+            deadline_task: None,
             started: Instant::now(),
             start_time: SystemTime::now(),
         }
     }
 
     pub(crate) fn attach_group(&mut self, group: ProcessGroup) {
-        self.own_group = Some(group);
+        self.own_group = Some(Arc::new(group));
     }
 
     /// The OS process id, or `None` if the child has already been reaped.
@@ -180,12 +186,16 @@ impl RunningProcess {
     /// when you need both. Keep this `RunningProcess` in scope while consuming;
     /// dropping it tears the process down.
     ///
-    /// The command's [`timeout`](crate::Command::timeout) is **not** auto-enforced
-    /// while you pull lines from this stream (only the run-to-completion helpers —
-    /// `output_string`/`wait`/`finish_streamed` and `Command::first_line` — apply
-    /// it). To bound a manual stream, wrap your consumption in
-    /// [`tokio::time::timeout`] and drop this handle (which kills the tree) on
-    /// elapse.
+    /// The command's [`timeout`](crate::Command::timeout), if set, **bounds the
+    /// stream**: at the deadline the process tree is killed, so the pipes close
+    /// and this stream ends — a streamed run can't hang past its timeout. A
+    /// following [`finish_streamed`](Self::finish_streamed) then reports the kill
+    /// (no clean exit: `code` is `None` on a Unix signal-kill, a platform code on
+    /// a Windows Job kill). With no timeout the stream is unbounded as before.
+    /// (Bounding applies to a run that owns its group — the
+    /// [`Command::start`](crate::Command::start) / [`JobRunner`](crate::JobRunner)
+    /// path. A handle from [`ProcessGroup::start`](crate::ProcessGroup::start)
+    /// shares its group, so the caller bounds the stream.)
     ///
     /// # Example
     ///
@@ -210,17 +220,21 @@ impl RunningProcess {
     /// ```
     pub fn stdout_lines(&mut self) -> StdoutLines {
         // Background-drain stderr (counter + handler still apply). The handle is
-        // kept so `finish_streamed` can await the last line before draining.
-        let stderr_sink = SharedLines::new(&self.buffer);
-        if let Some(pipe) = self.stderr_pipe.take() {
-            self.stderr_pump = Some(tokio::spawn(pump_lines(
-                pipe,
-                self.stderr_encoding,
-                self.stderr_handler.clone(),
-                stderr_sink.clone(),
-            )));
+        // kept so `finish_streamed` can await the last line before draining. Only
+        // set up once: a second `stdout_lines` call must not overwrite the first
+        // call's sink/pump, or `finish_streamed` would return empty stderr.
+        if self.stderr_sink.is_none() {
+            let stderr_sink = SharedLines::new(&self.buffer);
+            if let Some(pipe) = self.stderr_pipe.take() {
+                self.stderr_pump = Some(tokio::spawn(pump_lines(
+                    pipe,
+                    self.stderr_encoding,
+                    self.stderr_handler.clone(),
+                    stderr_sink.clone(),
+                )));
+            }
+            self.stderr_sink = Some(stderr_sink);
         }
-        self.stderr_sink = Some(stderr_sink);
 
         let stdout_sink = SharedLines::new(&self.buffer);
         match self.stdout_pipe.take() {
@@ -236,6 +250,23 @@ impl RunningProcess {
             None => stdout_sink.close_now(),
         }
         self.stdout_sink = Some(stdout_sink.clone());
+
+        // Bound the stream by the command's timeout: kill the tree at the deadline
+        // so the pipes close and this stream ends. A `Weak` to the group means the
+        // timer never delays kill-on-close when the handle is dropped early. Armed
+        // once (a second `stdout_lines` call won't spawn a duplicate timer).
+        if self.deadline_task.is_none()
+            && let (Some(limit), Some(group)) = (self.timeout, self.own_group.as_ref())
+        {
+            let group = Arc::downgrade(group);
+            self.deadline_task = Some(tokio::spawn(async move {
+                tokio::time::sleep(limit).await;
+                if let Some(group) = group.upgrade() {
+                    let _ = group.terminate_all();
+                }
+            }));
+        }
+
         StdoutLines {
             sink: stdout_sink,
             wait: None,
@@ -436,6 +467,11 @@ impl Drop for RunningProcess {
     fn drop(&mut self) {
         // Abort a still-running stdin writer; a finished one is unaffected.
         if let Some(task) = self.stdin_task.take() {
+            task.abort();
+        }
+        // Abort the streaming deadline timer (it holds only a `Weak` to the group,
+        // so this never blocks the group's kill-on-close).
+        if let Some(task) = self.deadline_task.take() {
             task.abort();
         }
     }

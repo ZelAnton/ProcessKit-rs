@@ -207,6 +207,18 @@ impl Drop for Job {
         match &self.backend {
             Backend::Cgroup(cg) => {
                 let _ = cg.kill();
+                // `cgroup.kill` is asynchronous: the kernel SIGKILLs the subtree,
+                // but `rmdir` returns `EBUSY` until the members have actually left
+                // (a process leaves `cgroup.procs` when it *exits*, before it is
+                // reaped — so this drains within milliseconds and doesn't depend on
+                // the async reaper). Wait, bounded, so we don't leak the dir; sleep
+                // rather than busy-spin.
+                for _ in 0..50 {
+                    if cg.is_empty() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
                 // Best-effort: an emptied cgroup dir can be removed.
                 let _ = std::fs::remove_dir(&cg.path);
             }
@@ -286,9 +298,10 @@ impl Cgroup {
         if std::fs::write(self.path.join("cgroup.kill"), b"1").is_ok() {
             return Ok(());
         }
-        // Older kernels: SIGKILL each member until the cgroup drains. Bounded so
-        // teardown (incl. Drop) can never hang on un-reaped zombies.
-        for _ in 0..100 {
+        // Older kernels: SIGKILL each member until the cgroup drains. Sleep
+        // between sweeps rather than busy-spin while the kernel reaps, and bound
+        // it so teardown (incl. Drop) can never hang on un-reaped zombies.
+        for _ in 0..50 {
             let members = self.members();
             if members.is_empty() {
                 break;
@@ -299,6 +312,7 @@ impl Cgroup {
                     libc::kill(pid, libc::SIGKILL);
                 }
             }
+            std::thread::sleep(Duration::from_millis(2));
         }
         Ok(())
     }

@@ -76,6 +76,12 @@ impl ProcessGroup {
     /// them, or accept that this escape hatch forces only `CREATE_SUSPENDED`.
     /// **Unix:** the group likewise installs a `pre_exec` hook on `cmd` to join
     /// the cgroup / process group.
+    ///
+    /// These mutations make `cmd` **single-use**: each call appends another
+    /// `pre_exec` hook (Unix) and re-sets the creation flags (Windows), so reusing
+    /// the same [`Command`] across spawns stacks them. Build a fresh `cmd` per
+    /// spawn. (The crate's own run helpers do this — every run rebuilds the OS
+    /// command — so this only concerns direct `spawn` callers.)
     pub fn spawn(&self, cmd: &mut Command) -> Result<Child> {
         let child = self.job.spawn(cmd).map_err(|source| Error::Spawn {
             program: program_name(cmd),
