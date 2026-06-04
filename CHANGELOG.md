@@ -12,7 +12,16 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- `ProcessGroupOptions` resource limits — `memory_max`, `max_processes`, and
+  `cpu_quota` cap a group's whole tree at creation, plus a public `limits:
+  ResourceLimits` field. Enforced by the Windows Job Object (job memory limit,
+  active-process limit, hard CPU-rate cap) and Linux cgroup v2 (`memory.max` /
+  `pids.max` / `cpu.max`, enabling the matching controllers). `cpu_quota` is a
+  fraction of one core (`0.5` = half a core); on Windows it is converted against the
+  host CPU count and is approximate. Where no real container exists (macOS/BSD, the
+  Linux process-group fallback, the no-containment target) — or a Linux cgroup lacks
+  controller delegation — `ProcessGroup::with_options` fails fast with the new
+  `Error::ResourceLimit` rather than handing back an unbounded group.
 
 ### Changed
 -

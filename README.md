@@ -15,8 +15,8 @@ the result, not raised, until you call `ProcessResult::ensure_success`.
 
 > **Status:** feature-complete — process groups, the runner and capture helpers,
 > streaming, interactive stdin, push line-handlers, output-buffer policies,
-> encoding overrides, line counters, and CPU/memory stats. See
-> [`CHANGELOG.md`](CHANGELOG.md).
+> encoding overrides, line counters, CPU/memory stats, and whole-tree resource
+> limits (memory / process-count / CPU). See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Install
 
@@ -58,6 +58,38 @@ async fn main() -> processkit::Result<()> {
     Ok(())
 }
 ```
+
+## Capping a group's resources
+
+`ProcessGroupOptions` can bound the whole tree's memory, process count, and CPU at
+creation. A runaway or untrusted child tree then can't exhaust the host:
+
+```rust,no_run
+use processkit::{Command, ProcessGroup, ProcessGroupOptions};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default()
+            .memory_max(512 * 1024 * 1024) // 512 MiB across the tree
+            .max_processes(64)
+            .cpu_quota(0.5),               // half of one core
+    )?;
+    let _job = group.start(&Command::new("untrusted-tool")).await?;
+    // ... work ...
+    Ok(())
+}
+```
+
+`cpu_quota` is a fraction of a **single** core (`0.5` = half a core, `2.0` = two
+cores); on Windows it is converted against the host's CPU count and is approximate.
+
+Limits need a real container — a **Windows Job Object** or a **Linux cgroup v2**.
+There is no whole-tree limit on macOS/the BSDs, the Linux process-group fallback, or
+the no-containment target, and a Linux cgroup must permit controller delegation (run
+as root, in a container, or under a systemd unit with `Delegate=yes`). When a
+requested limit can't be enforced, `with_options` returns `Error::ResourceLimit`
+instead of a silently-unbounded group — an unapplied cap is no protection.
 
 ## Async streaming and interactive I/O
 

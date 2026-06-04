@@ -5,16 +5,21 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::error::{Error, Result};
+use crate::limits::ResourceLimits;
 use crate::mechanism::Mechanism;
 use crate::stats::ProcessGroupStats;
 use crate::sys::Job;
 
-/// Tuning for a [`ProcessGroup`]'s graceful shutdown.
+/// Tuning for a [`ProcessGroup`] — graceful-shutdown timing and resource limits.
 ///
-/// These knobs only affect the Unix graceful path
+/// The `shutdown_*` knobs only affect the Unix graceful path
 /// ([`ProcessGroup::shutdown`]): give the tree `shutdown_timeout` to exit after
 /// `SIGTERM`, then `SIGKILL` survivors if `escalate_to_kill` is set. On Windows
 /// the job kill is atomic, so they are ignored.
+///
+/// [`limits`](Self::limits) caps the whole tree's memory, process count, and CPU;
+/// it is applied at group creation and only where a real container exists (Windows
+/// Job Object or Linux cgroup v2) — see [`ResourceLimits`].
 #[derive(Debug, Clone)]
 pub struct ProcessGroupOptions {
     /// How long to wait after `SIGTERM` before escalating. Default: 2 seconds.
@@ -22,6 +27,8 @@ pub struct ProcessGroupOptions {
     /// Whether to `SIGKILL` processes that outlive `shutdown_timeout`.
     /// Default: `true`.
     pub escalate_to_kill: bool,
+    /// Whole-tree resource caps applied at creation. Default: no limits.
+    pub limits: ResourceLimits,
 }
 
 impl Default for ProcessGroupOptions {
@@ -29,7 +36,33 @@ impl Default for ProcessGroupOptions {
         Self {
             shutdown_timeout: Duration::from_secs(2),
             escalate_to_kill: true,
+            limits: ResourceLimits::default(),
         }
+    }
+}
+
+impl ProcessGroupOptions {
+    /// Cap the tree's total memory at `bytes`. See [`ResourceLimits`] for platform
+    /// support.
+    #[must_use]
+    pub fn memory_max(mut self, bytes: u64) -> Self {
+        self.limits.memory_max = Some(bytes);
+        self
+    }
+
+    /// Cap the number of live processes in the tree at `n`.
+    #[must_use]
+    pub fn max_processes(mut self, n: u32) -> Self {
+        self.limits.max_processes = Some(n);
+        self
+    }
+
+    /// Cap the tree's CPU at `cores` cores' worth (`0.5` = half a core, `2.0` = two
+    /// cores). See [`ResourceLimits::cpu_quota`] for the Windows approximation.
+    #[must_use]
+    pub fn cpu_quota(mut self, cores: f64) -> Self {
+        self.limits.cpu_quota = Some(cores);
+        self
     }
 }
 
@@ -56,8 +89,22 @@ impl ProcessGroup {
     }
 
     /// Create an empty group with the given options.
+    ///
+    /// If `options.limits` sets any cap, it is enforced now. When the active
+    /// mechanism can't honor a requested limit (no cgroup/Job Object, or a Linux
+    /// cgroup without controller delegation) this returns
+    /// [`Error::ResourceLimit`] rather than handing back an unbounded group.
     pub fn with_options(options: ProcessGroupOptions) -> Result<Self> {
-        let job = Job::new()?;
+        validate_limits(&options.limits)?;
+        let job = Job::new(&options.limits).map_err(|source| {
+            // A failure while limits were requested means we could not enforce them
+            // — surface that distinctly so the caller never assumes a cap is live.
+            if options.limits.any() {
+                Error::ResourceLimit(source.to_string())
+            } else {
+                Error::Io(source)
+            }
+        })?;
         Ok(Self { job, options })
     }
 
@@ -139,4 +186,72 @@ impl ProcessGroup {
 /// Best-effort program name for error messages.
 fn program_name(cmd: &Command) -> String {
     cmd.as_std().get_program().to_string_lossy().into_owned()
+}
+
+/// Reject nonsensical limit values before touching the OS, so a typo surfaces as a
+/// clear [`Error::ResourceLimit`] rather than an opaque kernel error.
+fn validate_limits(limits: &ResourceLimits) -> Result<()> {
+    if limits.memory_max == Some(0) {
+        return Err(Error::ResourceLimit(
+            "memory_max must be greater than 0".into(),
+        ));
+    }
+    if limits.max_processes == Some(0) {
+        return Err(Error::ResourceLimit(
+            "max_processes must be greater than 0".into(),
+        ));
+    }
+    if let Some(cores) = limits.cpu_quota
+        && !(cores.is_finite() && cores > 0.0)
+    {
+        return Err(Error::ResourceLimit(
+            "cpu_quota must be a finite value greater than 0".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builders_set_limits() {
+        let opts = ProcessGroupOptions::default()
+            .memory_max(1024)
+            .max_processes(8)
+            .cpu_quota(0.5);
+        assert_eq!(opts.limits.memory_max, Some(1024));
+        assert_eq!(opts.limits.max_processes, Some(8));
+        assert_eq!(opts.limits.cpu_quota, Some(0.5));
+        assert!(opts.limits.any());
+    }
+
+    #[test]
+    fn default_options_have_no_limits() {
+        let opts = ProcessGroupOptions::default();
+        assert!(!opts.limits.any());
+    }
+
+    #[test]
+    fn validate_rejects_nonsense() {
+        for opts in [
+            ProcessGroupOptions::default().memory_max(0),
+            ProcessGroupOptions::default().max_processes(0),
+            ProcessGroupOptions::default().cpu_quota(0.0),
+            ProcessGroupOptions::default().cpu_quota(-1.0),
+            ProcessGroupOptions::default().cpu_quota(f64::NAN),
+            ProcessGroupOptions::default().cpu_quota(f64::INFINITY),
+        ] {
+            assert!(matches!(
+                validate_limits(&opts.limits),
+                Err(Error::ResourceLimit(_))
+            ));
+            // The public entry point rejects them too, before any OS work.
+            assert!(matches!(
+                ProcessGroup::with_options(opts),
+                Err(Error::ResourceLimit(_))
+            ));
+        }
+    }
 }

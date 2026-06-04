@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::Mechanism;
+use crate::limits::ResourceLimits;
 use crate::stats::ProcessGroupStats;
 use crate::sys::ProcMetrics;
 use crate::sys::pgroup::ProcessGroup;
@@ -22,7 +23,15 @@ pub(crate) struct Job {
 }
 
 impl Job {
-    pub(crate) fn new() -> io::Result<Self> {
+    pub(crate) fn new(limits: &ResourceLimits) -> io::Result<Self> {
+        // A POSIX process group has no resource accounting — there is no whole-tree
+        // memory/pids/cpu primitive here, so a requested limit can't be honored.
+        if limits.any() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "resource limits require a cgroup or Job Object; unavailable on this target",
+            ));
+        }
         Ok(Job {
             group: ProcessGroup::new(),
         })

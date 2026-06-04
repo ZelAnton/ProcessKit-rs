@@ -20,6 +20,7 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::Mechanism;
+use crate::limits::ResourceLimits;
 use crate::stats::ProcessGroupStats;
 
 /// Per-process resource metrics sampled from the OS.
@@ -55,9 +56,12 @@ mod imp;
 pub(crate) struct Job(imp::Job);
 
 impl Job {
-    /// Create a fresh, empty job.
-    pub(crate) fn new() -> io::Result<Self> {
-        imp::Job::new().map(Job)
+    /// Create a fresh, empty job, applying any resource `limits`.
+    ///
+    /// Errors if `limits` requests a cap the target's mechanism can't enforce (no
+    /// cgroup/Job Object, or a cgroup without controller delegation).
+    pub(crate) fn new(limits: &ResourceLimits) -> io::Result<Self> {
+        imp::Job::new(limits).map(Job)
     }
 
     /// Spawn `cmd` as a member of this job.

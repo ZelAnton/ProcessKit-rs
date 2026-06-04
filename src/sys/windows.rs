@@ -11,9 +11,12 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
+    JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+    JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
@@ -23,6 +26,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::Mechanism;
+use crate::limits::ResourceLimits;
 use crate::stats::ProcessGroupStats;
 use crate::sys::ProcMetrics;
 
@@ -36,7 +40,7 @@ unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
 impl Job {
-    pub(crate) fn new() -> io::Result<Self> {
+    pub(crate) fn new(limits: &ResourceLimits) -> io::Result<Self> {
         // SAFETY: null name/attributes request an unnamed job with defaults.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
@@ -46,9 +50,19 @@ impl Job {
 
         // Kill every process in the job once the last handle closes — i.e. when
         // this struct drops or the owning process dies. This is the Windows
-        // analogue of `cgroup.kill` / `killpg`.
+        // analogue of `cgroup.kill` / `killpg`. The memory and process-count caps
+        // ride along on the same extended-limit struct.
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Some(bytes) = limits.memory_max {
+            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+            // `JobMemoryLimit` is SIZE_T; saturate rather than wrap on a 32-bit host.
+            info.JobMemoryLimit = usize::try_from(bytes).unwrap_or(usize::MAX);
+        }
+        if let Some(n) = limits.max_processes {
+            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+            info.BasicLimitInformation.ActiveProcessLimit = n;
+        }
         // SAFETY: `info` is a fully-initialised struct matching the info class and
         // its size is passed explicitly.
         let ok = unsafe {
@@ -60,8 +74,35 @@ impl Job {
             )
         };
         if ok == 0 {
+            // `job` drops here, closing the handle — no leak.
             return Err(io::Error::last_os_error());
         }
+
+        // CPU quota is a separate info class. The hard cap is expressed in 1/100 of
+        // a percent of *total* system CPU (1..=10000), so convert our per-core
+        // fraction using the host's processor count.
+        if let Some(cores) = limits.cpu_quota {
+            let cpus = std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64);
+            let rate = cpu_hard_cap_rate(cores, cpus);
+            let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+            cpu.ControlFlags =
+                JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+            cpu.Anonymous.CpuRate = rate;
+            // SAFETY: fully-initialised struct matching the CPU-rate info class; size
+            // passed explicitly. `job` drops (closing the handle) on the error path.
+            let ok = unsafe {
+                SetInformationJobObject(
+                    job.handle,
+                    JobObjectCpuRateControlInformation,
+                    std::ptr::from_ref(&cpu).cast(),
+                    std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
         Ok(job)
     }
 
@@ -238,6 +279,18 @@ fn filetime_nanos(ft: FILETIME) -> u64 {
     units.saturating_mul(100)
 }
 
+/// Convert a per-core CPU quota into a Job Object hard-cap `CpuRate`: 1/100 of a
+/// percent of *total* system CPU, in `1..=10000`. `cores` is a fraction of one core
+/// (`0.5` = half a core); `cpus` is the host processor count. A quota meeting or
+/// exceeding the core count saturates at 100% (`10000`), and the result floors at
+/// `1` since the API rejects a zero rate.
+fn cpu_hard_cap_rate(cores: f64, cpus: f64) -> u32 {
+    let rate = ((cores / cpus) * 10_000.0).round();
+    // `f64 as u32` is saturating, but clamp first so the floor-at-1 (zero is invalid)
+    // and the 100% ceiling are explicit rather than relying on cast behaviour.
+    rate.clamp(1.0, 10_000.0) as u32
+}
+
 pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
     let mut metrics = ProcMetrics::default();
     // SAFETY: limited-information access; returns null on failure (e.g. gone).
@@ -279,5 +332,24 @@ impl Drop for Job {
         // Closing the last handle triggers KILL_ON_JOB_CLOSE → the tree is reaped.
         // SAFETY: handle came from CreateJobObjectW and is closed exactly once.
         unsafe { CloseHandle(self.handle) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cpu_hard_cap_rate;
+
+    #[test]
+    fn cpu_rate_maps_per_core_fraction_to_total_system_percent() {
+        // Half a core out of eight = 6.25% of the whole machine.
+        assert_eq!(cpu_hard_cap_rate(0.5, 8.0), 625);
+        // A whole single core on a 1-CPU host = 100%.
+        assert_eq!(cpu_hard_cap_rate(1.0, 1.0), 10_000);
+        // Asking for every core = 100%.
+        assert_eq!(cpu_hard_cap_rate(4.0, 4.0), 10_000);
+        // Over-subscribing (more cores than exist) saturates at 100%, never above.
+        assert_eq!(cpu_hard_cap_rate(8.0, 4.0), 10_000);
+        // A vanishingly small quota floors at 1 — the API rejects a zero rate.
+        assert_eq!(cpu_hard_cap_rate(0.0001, 64.0), 1);
     }
 }

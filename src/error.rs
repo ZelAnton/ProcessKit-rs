@@ -67,6 +67,18 @@ pub enum Error {
         message: String,
     },
 
+    /// A requested resource limit could not be enforced.
+    ///
+    /// Produced by [`ProcessGroup::with_options`](crate::ProcessGroup::with_options)
+    /// when a [`ResourceLimits`](crate::ResourceLimits) cap was set but the active
+    /// mechanism can't honor it — either the platform has no whole-tree container
+    /// (macOS/BSD, the Linux process-group fallback, the no-containment target), or
+    /// the OS rejected the request (e.g. a Linux cgroup without controller
+    /// delegation). An unenforced limit is no protection, so this is raised rather
+    /// than leaving the tree silently unbounded.
+    #[error("could not enforce resource limits: {0}")]
+    ResourceLimit(String),
+
     /// An IO error occurred while driving the process (reading a pipe, writing
     /// stdin, waiting for exit).
     #[error(transparent)]
@@ -120,5 +132,16 @@ mod tests {
             timeout: Duration::from_secs(1),
         };
         assert_eq!(timeout.diagnostic(), None);
+        let limit = Error::ResourceLimit("cgroup controller delegation unavailable".into());
+        assert_eq!(limit.diagnostic(), None);
+    }
+
+    #[test]
+    fn resource_limit_display_carries_reason() {
+        let err = Error::ResourceLimit("no cgroup or Job Object available".into());
+        assert_eq!(
+            err.to_string(),
+            "could not enforce resource limits: no cgroup or Job Object available"
+        );
     }
 }

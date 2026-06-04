@@ -16,6 +16,7 @@ use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 
 use crate::Mechanism;
+use crate::limits::ResourceLimits;
 use crate::stats::ProcessGroupStats;
 use crate::sys::ProcMetrics;
 use crate::sys::pgroup::ProcessGroup;
@@ -40,13 +41,21 @@ enum Backend {
 }
 
 impl Job {
-    pub(crate) fn new() -> io::Result<Self> {
+    pub(crate) fn new(limits: &ResourceLimits) -> io::Result<Self> {
         // Prefer a cgroup; degrade to a process group if we can't make one
         // (no cgroup v2, no delegation, read-only fs, …). The choice is
         // observable via `mechanism()` — never silent.
-        let backend = match Cgroup::create() {
+        let backend = match Cgroup::create(limits) {
             Ok(cg) => Backend::Cgroup(cg),
-            Err(_) => Backend::ProcessGroup(ProcessGroup::new()),
+            Err(e) => {
+                // The process-group fallback has no resource accounting, so it
+                // cannot honor a requested limit. Fail fast rather than hand back
+                // an unbounded tree the caller believes is capped.
+                if limits.any() {
+                    return Err(e);
+                }
+                Backend::ProcessGroup(ProcessGroup::new())
+            }
         };
         Ok(Job { backend })
     }
@@ -234,7 +243,7 @@ struct Cgroup {
 }
 
 impl Cgroup {
-    fn create() -> io::Result<Self> {
+    fn create(limits: &ResourceLimits) -> io::Result<Self> {
         // Only the cgroup v2 unified hierarchy exposes this file at the root.
         let root = Path::new("/sys/fs/cgroup");
         if !root.join("cgroup.controllers").exists() {
@@ -259,11 +268,65 @@ impl Cgroup {
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         );
         let path = parent.join(name);
-        // No controllers enabled — `cgroup.kill` needs none, and that sidesteps
-        // the "no internal processes" rule. mkdir is the permission gate that
-        // triggers the process-group fallback when delegation is absent.
+        // Without limits, no controllers are enabled — `cgroup.kill` needs none,
+        // and that sidesteps the "no internal processes" rule. mkdir is the
+        // permission gate that triggers the process-group fallback when delegation
+        // is absent.
         std::fs::create_dir(&path)?;
-        Ok(Cgroup { path })
+        let cg = Cgroup { path };
+
+        // With limits, enable the matching controllers and write the caps. If that
+        // fails (no delegation, or the parent holds processes so it can't carry
+        // subtree_control), don't leak the dir we just made — remove it and report.
+        if limits.any()
+            && let Err(e) = cg.apply_limits(&parent, limits)
+        {
+            let _ = std::fs::remove_dir(&cg.path);
+            return Err(e);
+        }
+        Ok(cg)
+    }
+
+    /// Enable the controllers each requested limit needs (in the *parent's*
+    /// `cgroup.subtree_control`, which is what makes the interface files appear in
+    /// our cgroup) and write the limit values.
+    fn apply_limits(&self, parent: &Path, limits: &ResourceLimits) -> io::Result<()> {
+        let mut spec = String::new();
+        if limits.memory_max.is_some() {
+            spec.push_str("+memory ");
+        }
+        if limits.max_processes.is_some() {
+            spec.push_str("+pids ");
+        }
+        if limits.cpu_quota.is_some() {
+            spec.push_str("+cpu ");
+        }
+        let spec = spec.trim_end();
+        if !spec.is_empty() {
+            let file = parent.join("cgroup.subtree_control");
+            std::fs::write(&file, spec).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "enabling cgroup controllers ({spec}) via {} failed: {e} — \
+                         resource limits require a delegated cgroup (run as root, in a \
+                         container, or under a systemd unit with Delegate=yes)",
+                        file.display()
+                    ),
+                )
+            })?;
+        }
+
+        if let Some(bytes) = limits.memory_max {
+            std::fs::write(self.path.join("memory.max"), bytes.to_string())?;
+        }
+        if let Some(n) = limits.max_processes {
+            std::fs::write(self.path.join("pids.max"), n.to_string())?;
+        }
+        if let Some(cores) = limits.cpu_quota {
+            std::fs::write(self.path.join("cpu.max"), cpu_max_value(cores))?;
+        }
+        Ok(())
     }
 
     /// Read the live member pids (empty if the file is gone).
@@ -318,6 +381,14 @@ impl Cgroup {
     }
 }
 
+/// Format a per-core CPU fraction as a cgroup v2 `cpu.max` value (`"quota period"`,
+/// microseconds). `0.5` → `"50000 100000"`, `2.0` → `"200000 100000"`.
+fn cpu_max_value(cores: f64) -> String {
+    const PERIOD: u64 = 100_000;
+    let quota = (cores * PERIOD as f64).round().max(1.0) as u64;
+    format!("{quota} {PERIOD}")
+}
+
 /// Append the calling process's own pid to the opened `cgroup.procs`, joining
 /// the cgroup. Runs in the forked child after `fork()` and before `exec()`.
 ///
@@ -355,5 +426,19 @@ fn write_self_pid(path: &CStr) -> io::Result<()> {
             return Err(werr);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cpu_max_value;
+
+    #[test]
+    fn cpu_max_formats_quota_and_period() {
+        // quota = cores * period(100000µs); period fixed at 100ms.
+        assert_eq!(cpu_max_value(0.5), "50000 100000");
+        assert_eq!(cpu_max_value(2.0), "200000 100000");
+        // A vanishingly small quota floors at 1µs (a zero quota would be invalid).
+        assert_eq!(cpu_max_value(0.000_001), "1 100000");
     }
 }

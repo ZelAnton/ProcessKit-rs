@@ -10,13 +10,21 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::Mechanism;
+use crate::limits::ResourceLimits;
 use crate::stats::ProcessGroupStats;
 use crate::sys::ProcMetrics;
 
 pub(crate) struct Job;
 
 impl Job {
-    pub(crate) fn new() -> io::Result<Self> {
+    pub(crate) fn new(limits: &ResourceLimits) -> io::Result<Self> {
+        // No kernel containment here, so there is nothing to enforce a limit with.
+        if limits.any() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "resource limits require a cgroup or Job Object; unavailable on this target",
+            ));
+        }
         Ok(Job)
     }
 
