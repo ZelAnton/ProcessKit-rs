@@ -236,6 +236,31 @@ impl ProcessGroup {
             .map_err(|source| map_unsupported(source, "resume"))
     }
 
+    /// The pids of the processes currently in the group.
+    ///
+    /// A point-in-time snapshot: a returned pid may belong to a process that
+    /// exits (or is reaped) immediately afterwards, and a process spawned during
+    /// the call may be missing. Useful for diagnostics, dashboards, and targeted
+    /// per-pid action.
+    ///
+    /// # Platform support
+    ///
+    /// - **Windows** — every pid assigned to the Job Object (the whole tree).
+    /// - **Linux cgroup** — every pid in the cgroup (`cgroup.procs`, whole tree).
+    /// - **Linux process-group fallback, macOS/BSD** — the tracked **group
+    ///   leaders** only (one pid per spawned/adopted child); their descendants
+    ///   are contained but not enumerated. An exited child still counts as a
+    ///   member until it is reaped (awaited): the liveness probe sees the
+    ///   not-yet-collected process.
+    /// - **No-containment target** — always empty: nothing is tracked.
+    ///   [`Mechanism::None`](crate::Mechanism::None) (via
+    ///   [`mechanism`](Self::mechanism)) is the cue that children are
+    ///   *unmanaged*, not absent.
+    pub fn members(&self) -> Result<Vec<u32>> {
+        let pids = self.job.members()?;
+        Ok(pids)
+    }
+
     /// Gracefully tear the group down, consuming it.
     ///
     /// On Unix: `SIGTERM` the tree, wait up to `shutdown_timeout`, then `SIGKILL`

@@ -16,8 +16,9 @@ the result, not raised, until you call `ProcessResult::ensure_success`.
 > **Status:** feature-complete — process groups, the runner and capture helpers,
 > streaming, interactive stdin, push line-handlers, output-buffer policies,
 > encoding overrides, line counters, CPU/memory stats, whole-tree resource
-> limits (memory / process-count / CPU), and whole-tree signals plus
-> suspend/resume. See [`CHANGELOG.md`](CHANGELOG.md).
+> limits (memory / process-count / CPU), whole-tree signals plus
+> suspend/resume, and tree inspection (`members`, `wait_any`).
+> See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Install
 
@@ -125,6 +126,35 @@ the Job Object terminate) and anything else returns `Error::Unsupported`.
 `cgroup.freeze` write covering the subtree on Linux, `SIGSTOP`/`SIGCONT` on
 macOS/BSD and the Linux process-group fallback, and per-thread suspension on
 Windows (best-effort; nested suspends stack and need matching resumes).
+
+## Inspecting the tree
+
+`members()` snapshots the live member pids, and `wait_any` races several running
+processes, reporting whichever exits first — the natural primitive for
+supervising a few long-lived children:
+
+```rust,no_run
+use processkit::{Command, ProcessGroup, wait_any};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::new()?;
+    let mut a = group.start(&Command::new("server-a")).await?;
+    let mut b = group.start(&Command::new("server-b")).await?;
+
+    println!("live pids: {:?}", group.members()?);
+
+    // Borrows only: the loser stays usable after the race.
+    let (idx, code) = wait_any(&mut [&mut a, &mut b]).await?;
+    println!("contender #{idx} exited first with {code:?}");
+    Ok(())
+}
+```
+
+`members()` lists the whole tree on Windows (Job Object) and Linux (cgroup); the
+POSIX process-group backends list the tracked group *leaders* only. `wait_any`
+applies no per-process timeout (bound the race with `tokio::time::timeout`) and
+does no output pumping — drain chatty children first.
 
 ## Async streaming and interactive I/O
 

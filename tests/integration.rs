@@ -15,7 +15,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use processkit::{Command, Mechanism, OutputBufferPolicy, ProcessGroup, Signal};
+use processkit::{Command, Mechanism, OutputBufferPolicy, ProcessGroup, Signal, wait_any};
 // Imported only by the `limits` tests; the other tests name `processkit::Error`
 // variants via their full path.
 #[cfg(feature = "limits")]
@@ -45,6 +45,20 @@ fn sleeper() -> Command {
         Command::new("cmd").args(["/c", "ping", "-n", "30", "127.0.0.1"])
     } else {
         Command::new("sleep").arg("30")
+    }
+}
+
+/// A command that sleeps ~`secs` seconds then exits 0, per platform.
+fn sleep_secs(secs: u32) -> Command {
+    if cfg!(windows) {
+        // ping waits ~1s between echoes, so n+1 echoes ≈ n seconds.
+        Command::new("ping").args([
+            "-n".to_string(),
+            (secs + 1).to_string(),
+            "127.0.0.1".to_string(),
+        ])
+    } else {
+        Command::new("sleep").arg(secs.to_string())
     }
 }
 
@@ -775,6 +789,119 @@ async fn windows_suspend_resume_stalls_output() {
     assert!(
         resumed.is_ok_and(|line| line.is_some()),
         "tree did not resume output"
+    );
+}
+
+// ----- Tree inspection: members() and wait_any -----
+
+#[tokio::test]
+#[ignore = "spawns real subprocesses and lists the group's members"]
+async fn members_lists_live_children() {
+    let group = ProcessGroup::new().expect("create group");
+    if matches!(group.mechanism(), Mechanism::None) {
+        eprintln!("skipping: no containment on this target");
+        return;
+    }
+    let _a = group.start(&sleeper()).await.expect("start first sleeper");
+    let _b = group.start(&sleeper()).await.expect("start second sleeper");
+
+    // Windows/cgroup list the whole tree (a started child may be a shell plus
+    // its own child); the pgroup backends list one leader per started child.
+    // Either way, two started children mean at least two live pids.
+    let members = group.members().expect("members");
+    assert!(members.len() >= 2, "members: {members:?}");
+}
+
+#[tokio::test]
+#[ignore = "spawns real subprocesses and watches the member list shrink"]
+async fn members_shrinks_when_a_child_dies() {
+    let group = ProcessGroup::new().expect("create group");
+    if matches!(group.mechanism(), Mechanism::None) {
+        eprintln!("skipping: no containment on this target");
+        return;
+    }
+    let _keep = group.start(&sleeper()).await.expect("start survivor");
+    let mut dying = group.start(&sleeper()).await.expect("start victim");
+    let before = group.members().expect("members").len();
+    assert!(before >= 2, "expected at least two members, got {before}");
+
+    dying.start_kill().expect("kill victim");
+    // Reap it (wait consumes the handle) so the kill is visible everywhere —
+    // an unreaped zombie still probes as alive on the pgroup backends.
+    let _ = tokio::time::timeout(Duration::from_secs(10), dying.wait())
+        .await
+        .expect("victim reaped in time");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let now = group.members().expect("members").len();
+        if now < before {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "member count never dropped below {before}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "creates an OS job/cgroup"]
+async fn members_on_empty_group_is_empty() {
+    let group = ProcessGroup::new().expect("create group");
+    let members = group.members().expect("members");
+    assert!(members.is_empty(), "fresh group has members: {members:?}");
+}
+
+#[tokio::test]
+#[ignore = "spawns real subprocesses and races their exits"]
+async fn wait_any_returns_first_finisher() {
+    let group = ProcessGroup::new().expect("create group");
+    let mut slow = group.start(&sleep_secs(15)).await.expect("start slow");
+    let mut fast = group.start(&sleep_secs(1)).await.expect("start fast");
+
+    let (idx, code) = tokio::time::timeout(
+        Duration::from_secs(10),
+        wait_any(&mut [&mut slow, &mut fast]),
+    )
+    .await
+    .expect("race finished in time")
+    .expect("race");
+    assert_eq!(idx, 1, "the 1-second sleeper should finish first");
+    assert_eq!(code, Some(0), "the fast sleeper exits cleanly");
+}
+
+#[tokio::test]
+#[ignore = "spawns real subprocesses; proves the race loser stays usable"]
+async fn wait_any_losers_still_waitable() {
+    let group = ProcessGroup::new().expect("create group");
+    // A single-process sleeper: `start_kill` must hit the process holding the
+    // pipes, or `wait` idles out the pump-teardown grace for an orphaned child.
+    let mut slow = group.start(&sleep_secs(30)).await.expect("start slow");
+    let mut fast = group.start(&sleep_secs(1)).await.expect("start fast");
+
+    let (idx, _code) = tokio::time::timeout(
+        Duration::from_secs(10),
+        wait_any(&mut [&mut slow, &mut fast]),
+    )
+    .await
+    .expect("race finished in time")
+    .expect("race");
+    assert_eq!(idx, 1);
+
+    // The loser was only borrowed by the race — kill it and reap it promptly to
+    // prove the handle still works end-to-end.
+    slow.start_kill().expect("kill the loser");
+    let start = Instant::now();
+    let _ = tokio::time::timeout(Duration::from_secs(10), slow.wait())
+        .await
+        .expect("loser reaped in time")
+        .expect("wait");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "loser wait was not prompt (took {:?})",
+        start.elapsed()
     );
 }
 

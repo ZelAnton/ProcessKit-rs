@@ -66,6 +66,13 @@ impl Job {
         Err(io::Error::new(io::ErrorKind::Unsupported, "resume"))
     }
 
+    pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
+        // No containment: nothing is tracked, so the membership of the
+        // (non-existent) container is honestly empty — `Mechanism::None` is the
+        // caller's cue that children are unmanaged, not absent.
+        Ok(Vec::new())
+    }
+
     pub(crate) async fn graceful_shutdown(
         &self,
         _timeout: Duration,

@@ -203,6 +203,11 @@ impl Job {
         self.for_each_member_thread(false)
     }
 
+    /// The pids currently assigned to the job (whole tree).
+    pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
+        job_member_pids(self.handle)
+    }
+
     /// Suspend or resume every thread of every process currently in the job.
     ///
     /// Best-effort, not atomic: the member list and the thread snapshot are

@@ -109,6 +109,19 @@ impl ProcessGroup {
         Ok(())
     }
 
+    /// The live tracked group **leaders** (one pid per spawned/adopted child) —
+    /// descendants inside those groups are not enumerated here. Dead groups are
+    /// pruned on the way.
+    pub(crate) fn members(&self) -> Vec<i32> {
+        match self.pgids.lock() {
+            Ok(mut g) => {
+                retain_live(&mut g);
+                g.clone()
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub(crate) async fn graceful_shutdown(
         &self,
         timeout: Duration,

@@ -138,6 +138,16 @@ impl Job {
         }
     }
 
+    pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
+        let pids = match &self.backend {
+            // Whole tree: every pid in cgroup.procs.
+            Backend::Cgroup(cg) => cg.members(),
+            // Fallback tracks group leaders only.
+            Backend::ProcessGroup(pg) => pg.members(),
+        };
+        Ok(pids.into_iter().map(|pid| pid as u32).collect())
+    }
+
     pub(crate) async fn graceful_shutdown(
         &self,
         timeout: Duration,

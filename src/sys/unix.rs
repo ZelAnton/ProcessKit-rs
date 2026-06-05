@@ -66,6 +66,16 @@ impl Job {
         self.group.resume()
     }
 
+    /// Tracked group leaders only — see the pgroup backend.
+    pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
+        Ok(self
+            .group
+            .members()
+            .into_iter()
+            .map(|pid| pid as u32)
+            .collect())
+    }
+
     pub(crate) async fn graceful_shutdown(
         &self,
         timeout: Duration,

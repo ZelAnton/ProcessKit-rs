@@ -12,6 +12,12 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- Tree inspection: `ProcessGroup::members()` snapshots the live member pids
+  (whole tree via the Windows Job Object pid list / Linux `cgroup.procs`;
+  tracked group leaders only on the POSIX process-group backends; always empty
+  with no containment), and a free `wait_any` races several `RunningProcess`es
+  and returns the index + exit code of whichever exits first — contenders are
+  only borrowed (the race is cancel-safe), so losers stay fully usable.
 - Whole-tree signals and suspend/resume: `ProcessGroup::signal(Signal)` broadcasts
   a signal to every member (new `Signal` enum — `Term`/`Kill`/`Int`/`Hup`/`Quit`/
   `Usr1`/`Usr2` plus an `Other(i32)` escape hatch), and

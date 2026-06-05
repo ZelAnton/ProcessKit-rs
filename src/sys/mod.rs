@@ -116,6 +116,12 @@ impl Job {
         self.0.resume()
     }
 
+    /// Snapshot the live member pids (whole tree on Windows/cgroup; tracked
+    /// group leaders on the POSIX fallback; always empty with no containment).
+    pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
+        self.0.members()
+    }
+
     /// Ask the tree to exit, then escalate.
     ///
     /// On Unix: signal `SIGTERM`, wait up to `timeout` for the members to leave,

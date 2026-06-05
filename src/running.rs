@@ -353,6 +353,15 @@ impl RunningProcess {
         Ok(code)
     }
 
+    /// Minimal non-consuming exit wait — the [`wait_any`](crate::wait_any) race
+    /// participant. Unlike [`wait`](Self::wait) it spawns no pumps and applies
+    /// no [`timeout`](crate::Command::timeout). Cancel-safe and re-awaitable:
+    /// tokio caches the exit status, so a raced-and-cancelled process can be
+    /// waited again (or consumed normally) afterwards.
+    pub(crate) async fn wait_exit(&mut self) -> Result<Option<i32>> {
+        Ok(self.child.wait().await?.code())
+    }
+
     /// Spawn line pumps for both streams into the given sinks; returns their
     /// task handles.
     fn spawn_line_pumps(

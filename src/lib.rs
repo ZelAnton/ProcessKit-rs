@@ -8,8 +8,10 @@
 //!   Containment is a Windows [Job Object], a Linux [cgroup v2] (with a POSIX
 //!   process-group fallback), a POSIX process group on macOS/BSD, or nothing on
 //!   other targets — observable via [`Mechanism`]. The whole tree can be
-//!   signalled ([`ProcessGroup::signal`], see [`Signal`]) and paused/resumed
-//!   ([`ProcessGroup::suspend`] / [`ProcessGroup::resume`]).
+//!   signalled ([`ProcessGroup::signal`], see [`Signal`]), paused/resumed
+//!   ([`ProcessGroup::suspend`] / [`ProcessGroup::resume`]), and inspected
+//!   ([`ProcessGroup::members`]); [`wait_any`] races several running processes
+//!   and reports the first to exit.
 //! - **runner** — async run-and-capture built on the group. Describe a run with
 //!   [`Command`], then drive it to completion ([`Command::output_string`],
 //!   [`Command::run`], …) or start it via a [`ProcessRunner`] for streaming or a
@@ -165,7 +167,86 @@ where
     Command::new(program).args(args).output_string().await
 }
 
+/// Wait for whichever of several running processes exits **first**, returning
+/// its index in `processes` and its exit code (`None` for a signal-killed run,
+/// matching [`RunningProcess::wait`]).
+///
+/// The processes are only *borrowed*: the race is cancel-safe, so the losers —
+/// and the winner, whose exit status tokio caches — remain fully usable
+/// afterwards ([`wait`](RunningProcess::wait), another `wait_any`, …). This is
+/// the natural primitive for supervising several long-lived children: race
+/// them, handle the one that finished, keep watching the rest.
+///
+/// ```no_run
+/// # async fn demo() -> processkit::Result<()> {
+/// use processkit::{Command, ProcessGroup, wait_any};
+///
+/// let group = ProcessGroup::new()?;
+/// let mut a = group.start(&Command::new("server-a")).await?;
+/// let mut b = group.start(&Command::new("server-b")).await?;
+/// let (idx, code) = wait_any(&mut [&mut a, &mut b]).await?;
+/// println!("contender #{idx} exited first with {code:?}");
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Two deliberate non-features:
+///
+/// - **No per-process [`timeout`](Command::timeout)** — the configured deadline
+///   is armed by the consuming wait paths, not here. Bound the whole race with
+///   [`tokio::time::timeout`] when a deadline is wanted.
+/// - **No output pumping** — a contender that fills its stdout/stderr pipe
+///   blocks and never exits. Drain chatty children first (e.g. via
+///   [`stdout_lines`](RunningProcess::stdout_lines)) or race low-output ones.
+///
+/// An empty `processes` slice is an error ([`Error::Io`] with
+/// [`InvalidInput`](std::io::ErrorKind::InvalidInput)) rather than a future
+/// that never resolves.
+pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, Option<i32>)> {
+    use std::future::Future;
+
+    if processes.is_empty() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "wait_any requires at least one process",
+        )));
+    }
+    // One future per contender; `iter_mut` hands out disjoint `&mut` borrows.
+    let mut waits: Vec<_> = processes
+        .iter_mut()
+        .map(|process| Box::pin(process.wait_exit()))
+        .collect();
+    // Hand-rolled race (no `futures` dependency): poll every contender; the
+    // first `Ready` wins, the rest are dropped — cancel-safe, so they stay
+    // waitable by the caller.
+    std::future::poll_fn(move |cx| {
+        for (idx, wait) in waits.iter_mut().enumerate() {
+            if let std::task::Poll::Ready(result) = wait.as_mut().poll(cx) {
+                return std::task::Poll::Ready(result.map(|code| (idx, code)));
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
 /// The `mockall`-generated mock of [`ProcessRunner`] (enabled by the `mock`
 /// feature), re-exported under a friendlier name.
 #[cfg(feature = "mock")]
 pub use runner::MockProcessRunner as MockRunner;
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn wait_any_on_an_empty_slice_errors_instead_of_pending() {
+        let err = super::wait_any(&mut [])
+            .await
+            .expect_err("an empty race must error, not pend forever");
+        match err {
+            crate::Error::Io(source) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected Error::Io(InvalidInput), got {other:?}"),
+        }
+    }
+}
