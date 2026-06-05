@@ -11,6 +11,11 @@ to a dated version section.
 
 ## [Unreleased]
 
+> **Release note:** this cycle contains a **breaking** change for
+> `default-features = false` consumers (resource measurement moved behind the
+> now-default `stats` feature — see *Changed*). Release it as **0.7.0**
+> (`minor`), not a patch.
+
 ### Added
 - Readiness probes on `RunningProcess` — wait until a started child is
   actually ready instead of sleeping: `wait_for_line(predicate, within)`

@@ -71,6 +71,23 @@ jobs:
       # consumer runs — which `--all-features` alone never executes.
       - run: cargo test -- --include-ignored
 
+  doc:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The crate's docs are intra-doc-link dense; a broken link degrades the
+      # docs.rs page silently (doctests don't catch it). Build both the
+      # docs.rs configuration (all features) and the minimal one.
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo doc --no-deps --no-default-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   audit:
     name: cargo-deny
     runs-on: ubuntu-latest

@@ -220,6 +220,16 @@ impl ProcessGroup {
     /// that a frozen tree cannot act on until thawed, so it waits out
     /// `shutdown_timeout` and then escalates; call [`resume`](Self::resume) first
     /// for a clean graceful shutdown.
+    ///
+    /// **Spawning into a suspended group is platform-divergent.** Under the
+    /// Linux cgroup mechanism the freeze is *group state*: a child spawned (or
+    /// adopted) while the group is suspended joins the frozen cgroup and
+    /// **starts frozen** — it does not run until [`resume`](Self::resume). The
+    /// Windows and POSIX process-group mechanisms freeze only the members
+    /// present at the call, so a later spawn runs normally. Don't start new
+    /// work in a suspended group (e.g. a
+    /// [`Supervisor::with_runner(&group)`](crate::Supervisor::with_runner)
+    /// restarting into it) — resume first.
     pub fn suspend(&self) -> Result<()> {
         self.job
             .suspend()

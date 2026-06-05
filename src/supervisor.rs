@@ -126,6 +126,13 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// Run every incarnation through `runner` instead of the default
     /// [`JobRunner`] — e.g. a `&ProcessGroup` for one shared kill-on-drop
     /// group, or a test double for hermetic supervision tests.
+    ///
+    /// With a shared group, the group's *state* applies to every incarnation:
+    /// notably, restarting into a
+    /// [`suspend`](crate::ProcessGroup::suspend)ed group on the Linux cgroup
+    /// mechanism spawns the new child **frozen** (see
+    /// [`ProcessGroup::suspend`](crate::ProcessGroup::suspend)) — resume the
+    /// group before supervising into it.
     #[must_use]
     pub fn with_runner<R2: ProcessRunner>(self, runner: R2) -> Supervisor<R2> {
         Supervisor {

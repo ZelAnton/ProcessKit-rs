@@ -1066,8 +1066,13 @@ async fn members_shrinks_when_a_child_dies() {
         eprintln!("skipping: no containment on this target");
         return;
     }
-    let _keep = group.start(&sleeper()).await.expect("start survivor");
-    let mut dying = group.start(&sleeper()).await.expect("start victim");
+    // Single-process sleepers, deliberately: the cmd-wrapped `sleeper()` is two
+    // processes whose second member spawns asynchronously, so a `before`
+    // snapshot can race it — and `start_kill` would hit only the wrapper,
+    // leaving its orphan in the job and the count above the threshold forever
+    // (seen on a cold CI runner).
+    let _keep = group.start(&sleep_secs(30)).await.expect("start survivor");
+    let mut dying = group.start(&sleep_secs(30)).await.expect("start victim");
     let before = group.members().expect("members").len();
     assert!(before >= 2, "expected at least two members, got {before}");
 
