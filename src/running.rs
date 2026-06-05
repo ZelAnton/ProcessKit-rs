@@ -362,6 +362,86 @@ impl RunningProcess {
         Ok(self.child.wait().await?.code())
     }
 
+    /// Run the process to completion while sampling its CPU and memory every
+    /// `every`, returning a [`RunProfile`](crate::stats::RunProfile) summary
+    /// (exit code, wall duration, last CPU reading, peak RSS, sample count).
+    ///
+    /// Behaves exactly like [`wait`](Self::wait) — output is pumped (and
+    /// dropped), the configured [`timeout`](crate::Command::timeout) applies —
+    /// with a sampling task alongside. Samples come from the started child
+    /// *process* (the [`cpu_time`](Self::cpu_time) /
+    /// [`peak_memory_bytes`](Self::peak_memory_bytes) source); for a series
+    /// covering a whole tree, sample the group via
+    /// [`ProcessGroup::sample_stats`](crate::ProcessGroup::sample_stats)
+    /// instead. The first sample lands immediately, so even a short run
+    /// usually reports; a child that exits faster still profiles `None`s.
+    #[cfg(feature = "stats")]
+    pub async fn profile(mut self, every: Duration) -> Result<crate::stats::RunProfile> {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Acc {
+            cpu_time: Option<Duration>,
+            peak_memory_bytes: Option<u64>,
+            samples: usize,
+        }
+
+        let started = self.started;
+        let acc = Arc::new(Mutex::new(Acc::default()));
+        // Sampling needs only the pid (process_metrics is a free query), so the
+        // task never borrows `self` and the consuming wait below stays intact.
+        let sampler = self.pid.map(|pid| {
+            let acc = Arc::clone(&acc);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(every);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    let metrics = crate::sys::process_metrics(pid);
+                    if let Ok(mut acc) = acc.lock() {
+                        acc.samples += 1;
+                        // Cumulative CPU only grows while the process lives;
+                        // keep the latest reading. Peak RSS keeps the maximum.
+                        if let Some(cpu) = metrics.cpu_time {
+                            acc.cpu_time = Some(cpu);
+                        }
+                        if let Some(peak) = metrics.peak_memory_bytes {
+                            acc.peak_memory_bytes =
+                                Some(acc.peak_memory_bytes.map_or(peak, |prev| prev.max(peak)));
+                        }
+                    }
+                }
+            })
+        });
+
+        // Inline `wait`'s steps so the sampler stops the moment the child is
+        // reaped: its pid is free for reuse from that point (Linux), and the
+        // pump drain below can idle out PUMP_TEARDOWN on a leaked pipe — long
+        // enough for a recycled pid to masquerade as the child and corrupt the
+        // readings.
+        let stdout_sink = SharedLines::new(&self.buffer);
+        let stderr_sink = SharedLines::new(&self.buffer);
+        let pumps = self.spawn_line_pumps(&stdout_sink, &stderr_sink);
+        let outcome = self.drive_to_exit().await;
+        if let Some(task) = &sampler {
+            task.abort();
+        }
+        let (exit_code, _timed_out) = outcome?;
+        join_pumps(pumps).await;
+        let duration = started.elapsed();
+        let (cpu_time, peak_memory_bytes, samples) = match acc.lock() {
+            Ok(acc) => (acc.cpu_time, acc.peak_memory_bytes, acc.samples),
+            Err(_) => (None, None, 0),
+        };
+        Ok(crate::stats::RunProfile {
+            exit_code,
+            duration,
+            cpu_time,
+            peak_memory_bytes,
+            samples,
+        })
+    }
+
     /// Spawn line pumps for both streams into the given sinks; returns their
     /// task handles.
     fn spawn_line_pumps(

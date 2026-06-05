@@ -12,6 +12,12 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- Stats sampling over time (`stats` feature): `ProcessGroup::sample_stats(every)`
+  yields a `Stream` of `ProcessGroupStats` snapshots (first sample immediate,
+  missed ticks skipped, series ends when the group can no longer report), and
+  `RunningProcess::profile(every)` runs a child to completion while sampling it,
+  returning a `RunProfile` summary (exit code, wall duration, last CPU reading,
+  peak RSS, sample count, derived `avg_cpu()`).
 - Tree inspection: `ProcessGroup::members()` snapshots the live member pids
   (whole tree via the Windows Job Object pid list / Linux `cgroup.procs`;
   tracked group leaders only on the POSIX process-group backends; always empty

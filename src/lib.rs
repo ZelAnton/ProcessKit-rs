@@ -90,8 +90,9 @@
 //! # Features
 //!
 //! - **`stats`** *(default)* — resource measurement: `ProcessGroupStats`,
-//!   `ProcessGroup::stats`, and the per-process
-//!   `RunningProcess::cpu_time`/`peak_memory_bytes` diagnostics. Disable
+//!   `ProcessGroup::stats` (plus the `sample_stats` time-series sampler), the
+//!   per-process `RunningProcess::cpu_time`/`peak_memory_bytes` diagnostics,
+//!   and the `RunningProcess::profile` run summary. Disable
 //!   (`default-features = false`) to compile the accounting code out.
 //! - **`limits`** — whole-tree resource caps: `ResourceLimits`, the
 //!   `memory_max`/`max_processes`/`cpu_quota` builders on
@@ -136,7 +137,7 @@ pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
 pub use running::{RunningProcess, StdoutLines};
 pub use signal::Signal;
 #[cfg(feature = "stats")]
-pub use stats::ProcessGroupStats;
+pub use stats::{ProcessGroupStats, RunProfile, StatsSampler};
 pub use stdin::{ProcessStdin, Stdin};
 // Re-exported so callers can `use processkit::StreamExt;` to consume
 // [`RunningProcess::stdout_lines`]'s [`StdoutLines`] stream (`.next().await`,

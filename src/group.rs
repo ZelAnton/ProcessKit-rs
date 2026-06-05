@@ -285,6 +285,35 @@ impl ProcessGroup {
         Ok(stats)
     }
 
+    /// Sample [`stats`](Self::stats) on an interval, as a
+    /// [`Stream`](tokio_stream::Stream) of snapshots — a time-series of the
+    /// group's CPU/memory/process-count for benchmarking and diagnostics.
+    ///
+    /// The first sample is taken immediately; the series ends on the first
+    /// snapshot the group fails to report. The sampler borrows the group, so it
+    /// never keeps the group (or its kill-on-drop guarantee) alive. What each
+    /// snapshot can report per platform is exactly [`stats`](Self::stats)'s
+    /// matrix.
+    ///
+    /// ```no_run
+    /// # async fn demo() -> processkit::Result<()> {
+    /// use processkit::{Command, ProcessGroup, StreamExt};
+    /// use std::time::Duration;
+    ///
+    /// let group = ProcessGroup::new()?;
+    /// let _worker = group.start(&Command::new("worker")).await?;
+    /// let mut samples = group.sample_stats(Duration::from_millis(250));
+    /// while let Some(s) = samples.next().await {
+    ///     println!("procs={} rss={:?}", s.active_process_count, s.peak_memory_bytes);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "stats")]
+    pub fn sample_stats(&self, every: Duration) -> crate::stats::StatsSampler<'_> {
+        crate::stats::StatsSampler::new(self, every)
+    }
+
     /// The containment mechanism actually in effect (see [`Mechanism`]).
     pub fn mechanism(&self) -> Mechanism {
         self.job.mechanism()

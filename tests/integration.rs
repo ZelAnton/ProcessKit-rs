@@ -792,6 +792,65 @@ async fn windows_suspend_resume_stalls_output() {
     );
 }
 
+// ----- Stats sampling: sample_stats() and profile() -----
+
+#[cfg(feature = "stats")]
+#[tokio::test]
+#[ignore = "spawns a real subprocess and samples the group's stats"]
+async fn sample_stats_yields_a_live_series() {
+    use tokio_stream::StreamExt;
+
+    let group = ProcessGroup::new().expect("create group");
+    if matches!(group.mechanism(), Mechanism::None) {
+        eprintln!("skipping: no containment on this target");
+        return;
+    }
+    let _child = group.start(&sleeper()).await.expect("start sleeper");
+
+    let mut samples = group.sample_stats(Duration::from_millis(50));
+    for n in 0..3 {
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), samples.next())
+            .await
+            .expect("sample in time")
+            .expect("series still live");
+        assert!(
+            snapshot.active_process_count >= 1,
+            "sample #{n} saw no live process: {snapshot:?}"
+        );
+    }
+}
+
+#[cfg(feature = "stats")]
+#[tokio::test]
+#[ignore = "spawns a real subprocess and profiles its run"]
+async fn profile_summarizes_a_run() {
+    let profile = group_started_short_run()
+        .await
+        .profile(Duration::from_millis(50))
+        .await
+        .expect("profile");
+
+    assert_eq!(profile.exit_code, Some(0), "profile: {profile:?}");
+    assert!(
+        profile.duration >= Duration::from_millis(500),
+        "a ~1s child reported {:?}",
+        profile.duration
+    );
+    assert!(profile.samples >= 1, "profile never sampled: {profile:?}");
+    if cfg!(any(windows, target_os = "linux")) {
+        assert!(
+            profile.peak_memory_bytes.is_some(),
+            "peak RSS should be readable on this platform: {profile:?}"
+        );
+    }
+}
+
+/// Start a ~1s single-process child directly (its own private group).
+#[cfg(feature = "stats")]
+async fn group_started_short_run() -> processkit::RunningProcess {
+    sleep_secs(1).start().await.expect("start short child")
+}
+
 // ----- Tree inspection: members() and wait_any -----
 
 #[tokio::test]

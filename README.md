@@ -15,10 +15,10 @@ the result, not raised, until you call `ProcessResult::ensure_success`.
 
 > **Status:** feature-complete — process groups, the runner and capture helpers,
 > streaming, interactive stdin, push line-handlers, output-buffer policies,
-> encoding overrides, line counters, CPU/memory stats, whole-tree resource
-> limits (memory / process-count / CPU), whole-tree signals plus
-> suspend/resume, and tree inspection (`members`, `wait_any`).
-> See [`CHANGELOG.md`](CHANGELOG.md).
+> encoding overrides, line counters, CPU/memory stats (with a time-series
+> sampler and per-run profiles), whole-tree resource limits
+> (memory / process-count / CPU), whole-tree signals plus suspend/resume, and
+> tree inspection (`members`, `wait_any`). See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Install
 
@@ -155,6 +155,43 @@ async fn main() -> processkit::Result<()> {
 POSIX process-group backends list the tracked group *leaders* only. `wait_any`
 applies no per-process timeout (bound the race with `tokio::time::timeout`) and
 does no output pumping — drain chatty children first.
+
+## Sampling stats over time
+
+A point-in-time `stats()` becomes a series with `sample_stats`, and a single run
+can be profiled end-to-end (requires the default-on `stats` feature):
+
+```rust,no_run
+use processkit::{Command, ProcessGroup, StreamExt};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    // A CPU/RSS/process-count series for a whole group:
+    let group = ProcessGroup::new()?;
+    let _worker = group.start(&Command::new("worker")).await?;
+    let mut samples = group.sample_stats(Duration::from_millis(250));
+    if let Some(s) = samples.next().await {
+        println!("procs={} rss={:?}", s.active_process_count, s.peak_memory_bytes);
+    }
+    drop(samples);
+
+    // …or a one-shot summary of a single run:
+    let profile = Command::new("crunch")
+        .start().await?
+        .profile(Duration::from_millis(100)).await?;
+    println!(
+        "exit={:?} took={:?} peak_rss={:?} avg_cpu={:?}",
+        profile.exit_code, profile.duration, profile.peak_memory_bytes, profile.avg_cpu(),
+    );
+    Ok(())
+}
+```
+
+The series inherits `stats()`'s platform matrix (full CPU/memory on Windows and
+Linux cgroup; counts only on the POSIX process-group backends); `profile`
+samples the started child process itself and applies the run's normal
+timeout/output handling.
 
 ## Async streaming and interactive I/O
 
