@@ -115,6 +115,22 @@ pub enum Error {
         operation: String,
     },
 
+    /// The run was cancelled via its `CancellationToken`
+    /// ([`Command::cancel_on`](crate::Command::cancel_on)) and its process
+    /// tree was killed.
+    ///
+    /// Asymmetric with [`Timeout`](Error::Timeout) by design: a timeout is
+    /// *captured* (`ProcessResult::timed_out`) on the non-checking paths,
+    /// whereas a cancellation is **always** raised on every consuming path.
+    /// When a run both times out and is cancelled, cancellation wins (it is
+    /// checked first).
+    #[cfg(feature = "cancellation")]
+    #[error("`{program}` was cancelled")]
+    Cancelled {
+        /// The program that was cancelled.
+        program: String,
+    },
+
     /// An IO error occurred while driving the process (reading a pipe, writing
     /// stdin, waiting for exit).
     #[error(transparent)]
@@ -177,11 +193,27 @@ mod tests {
             timeout: Duration::from_secs(10),
         };
         assert_eq!(not_ready.diagnostic(), None);
+        #[cfg(feature = "cancellation")]
+        {
+            let cancelled = Error::Cancelled {
+                program: "job".into(),
+            };
+            assert_eq!(cancelled.diagnostic(), None);
+        }
         #[cfg(feature = "limits")]
         {
             let limit = Error::ResourceLimit("cgroup controller delegation unavailable".into());
             assert_eq!(limit.diagnostic(), None);
         }
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[test]
+    fn cancelled_display_names_the_program() {
+        let err = Error::Cancelled {
+            program: "long-job".into(),
+        };
+        assert_eq!(err.to_string(), "`long-job` was cancelled");
     }
 
     #[test]

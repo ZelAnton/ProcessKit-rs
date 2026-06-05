@@ -235,6 +235,11 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// private group); with a shared-group runner
     /// ([`with_runner(&group)`](Self::with_runner)) the incarnation stays
     /// alive in the caller's group until the group tears it down.
+    ///
+    /// An incarnation cancelled via its token (`Command::cancel_on`, with the
+    /// `cancellation` feature) is **terminal**: supervision returns that
+    /// `Error::Cancelled` immediately, regardless of policy or budget — the
+    /// token stays cancelled, so a restart would only be cancelled again.
     pub async fn run(self) -> Result<SupervisionOutcome> {
         // Documented tolerance: a sub-1.0 or non-finite factor never shrinks
         // the delay or panics the Duration math — it decays to 1.0.
@@ -271,6 +276,13 @@ impl<R: ProcessRunner> Supervisor<R> {
                     restarts += 1;
                 }
                 Err(err) => {
+                    // A cancelled incarnation is terminal: the token stays
+                    // cancelled, so restarting would spin a futile loop of
+                    // instantly-cancelled runs. Ends supervision like `Never`.
+                    #[cfg(feature = "cancellation")]
+                    if matches!(err, crate::Error::Cancelled { .. }) {
+                        return Err(err);
+                    }
                     // The child never produced a result (spawn/IO failure). The
                     // predicate can't judge it; the policy treats it as a crash.
                     let wants_restart = !matches!(self.policy, RestartPolicy::Never);
@@ -532,6 +544,26 @@ mod tests {
             .expect("supervision");
         assert_eq!(outcome.restarts, 1);
         assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[tokio::test]
+    async fn cancelled_incarnation_is_terminal_under_always() {
+        // Always would restart any failure; Cancelled must end supervision at
+        // once — the second scripted reply is never consumed (SeqRunner would
+        // panic on depletion if a restart happened past it).
+        let err = supervise(SeqRunner::new(vec![
+            Err(crate::Error::Cancelled {
+                program: "fake".into(),
+            }),
+            ok(),
+        ]))
+        .restart(RestartPolicy::Always)
+        .max_restarts(5)
+        .run()
+        .await
+        .expect_err("a cancelled incarnation is terminal");
+        assert!(matches!(err, crate::Error::Cancelled { .. }), "got {err:?}");
     }
 
     #[tokio::test]

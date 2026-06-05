@@ -110,6 +110,10 @@
 //!   [`ProcessGroupOptions`], and `Error::ResourceLimit`. Implies `stats`.
 //! - **`mock`** — the `mockall`-generated `MockRunner` for consumers' tests.
 //! - **`tracing`** — a `tracing` event per command run.
+//! - **`cancellation`** — first-class run cancellation:
+//!   `Command::cancel_on` ties a run to a `CancellationToken`; cancelling it
+//!   kills the tree and every consuming path resolves to `Error::Cancelled`.
+//!   Re-exports `CancellationToken` (from `tokio-util`).
 //!
 //! [Job Object]: https://learn.microsoft.com/windows/win32/procthread/job-objects
 //! [cgroup v2]: https://docs.kernel.org/admin-guide/cgroup-v2.html
@@ -253,6 +257,12 @@ pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, O
 /// feature), re-exported under a friendlier name.
 #[cfg(feature = "mock")]
 pub use runner::MockProcessRunner as MockRunner;
+
+/// Re-exported (under the `cancellation` feature) so callers can
+/// `use processkit::CancellationToken;` without a direct `tokio-util`
+/// dependency. See [`Command::cancel_on`].
+#[cfg(feature = "cancellation")]
+pub use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 mod tests {

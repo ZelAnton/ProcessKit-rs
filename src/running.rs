@@ -50,6 +50,8 @@ pub(crate) struct Spawned {
     pub stdout_handler: Option<LineHandler>,
     pub stderr_handler: Option<LineHandler>,
     pub buffer: OutputBufferPolicy,
+    #[cfg(feature = "cancellation")]
+    pub cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// A handle to a process spawned by a runner.
@@ -87,6 +89,13 @@ pub struct RunningProcess {
     // A timer started by `stdout_lines` when a timeout is set: kills the tree at
     // the deadline so a streamed run can't hang forever. Aborted on drop.
     deadline_task: Option<JoinHandle<()>>,
+    #[cfg(feature = "cancellation")]
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
+    // Armed by `stdout_lines` when a token is set: kills the tree on cancel so
+    // a pure-streaming consumer's stream ends. Mirrors `deadline_task` (Weak
+    // to the group; aborted on drop).
+    #[cfg(feature = "cancellation")]
+    cancel_task: Option<JoinHandle<()>>,
     started: Instant,
     start_time: SystemTime,
 }
@@ -112,6 +121,10 @@ impl RunningProcess {
             stderr_sink: None,
             stderr_pump: None,
             deadline_task: None,
+            #[cfg(feature = "cancellation")]
+            cancel_token: s.cancel_token,
+            #[cfg(feature = "cancellation")]
+            cancel_task: None,
             started: Instant::now(),
             start_time: SystemTime::now(),
         }
@@ -309,6 +322,22 @@ impl RunningProcess {
             }));
         }
 
+        // Likewise bound it by the cancellation token, so a pure-streaming
+        // consumer's stream ends when the run is cancelled (same private-group
+        // asymmetry as the deadline timer).
+        #[cfg(feature = "cancellation")]
+        if self.cancel_task.is_none()
+            && let (Some(token), Some(group)) = (self.cancel_token.clone(), self.own_group.as_ref())
+        {
+            let group = Arc::downgrade(group);
+            self.cancel_task = Some(tokio::spawn(async move {
+                token.cancelled().await;
+                if let Some(group) = group.upgrade() {
+                    let _ = group.terminate_all();
+                }
+            }));
+        }
+
         StdoutLines {
             sink: stdout_sink,
             wait: None,
@@ -326,6 +355,10 @@ impl RunningProcess {
 
         let (code, timed_out) = self.drive_to_exit().await?;
         join_pumps(pumps).await;
+        #[cfg(feature = "cancellation")]
+        if let Some(err) = self.cancelled_error() {
+            return Err(err);
+        }
 
         Ok(ProcessResult::new(
             self.program.clone(),
@@ -364,6 +397,10 @@ impl RunningProcess {
         let (code, timed_out) = self.drive_to_exit().await?;
         let stdout = out_task.await.unwrap_or_default();
         join_pumps(err_pump.into_iter().collect()).await;
+        #[cfg(feature = "cancellation")]
+        if let Some(err) = self.cancelled_error() {
+            return Err(err);
+        }
 
         Ok(ProcessResult::new(
             self.program.clone(),
@@ -384,12 +421,19 @@ impl RunningProcess {
     /// ([`Command::exit_code`](crate::Command::exit_code) /
     /// [`ProcessRunnerExt::exit_code`](crate::ProcessRunnerExt::exit_code)), which
     /// surface a deadline as [`Error::Timeout`](crate::Error::Timeout).
+    /// One exception: a run cancelled via its token (`Command::cancel_on`)
+    /// errors with `Error::Cancelled` here too — cancellation is always an
+    /// error, on every consuming path.
     pub async fn wait(mut self) -> Result<Option<i32>> {
         let stdout_sink = SharedLines::new(&self.buffer);
         let stderr_sink = SharedLines::new(&self.buffer);
         let pumps = self.spawn_line_pumps(&stdout_sink, &stderr_sink);
         let (code, _timed_out) = self.drive_to_exit().await?;
         join_pumps(pumps).await;
+        #[cfg(feature = "cancellation")]
+        if let Some(err) = self.cancelled_error() {
+            return Err(err);
+        }
         Ok(code)
     }
 
@@ -602,6 +646,10 @@ impl RunningProcess {
         }
         let (exit_code, _timed_out) = outcome?;
         join_pumps(pumps).await;
+        #[cfg(feature = "cancellation")]
+        if let Some(err) = self.cancelled_error() {
+            return Err(err);
+        }
         let duration = started.elapsed();
         let (cpu_time, peak_memory_bytes, samples) = match acc.lock() {
             Ok(acc) => (acc.cpu_time, acc.peak_memory_bytes, acc.samples),
@@ -647,20 +695,7 @@ impl RunningProcess {
     /// flagging `timed_out` on elapse). The code is `None` for a run that
     /// produced none — a timeout, or a signal termination on Unix.
     async fn drive_to_exit(&mut self) -> Result<(Option<i32>, bool)> {
-        let outcome = match self.timeout {
-            Some(limit) => match tokio::time::timeout(limit, self.child.wait()).await {
-                Ok(status) => (status?.code(), false),
-                Err(_elapsed) => {
-                    let _ = self.child.start_kill();
-                    if let Some(group) = &self.own_group {
-                        let _ = group.terminate_all();
-                    }
-                    let _ = self.child.wait().await;
-                    (None, true)
-                }
-            },
-            None => (self.child.wait().await?.code(), false),
-        };
+        let outcome = self.drive_to_exit_inner().await?;
         #[cfg(feature = "tracing")]
         {
             let (code, timed_out) = outcome;
@@ -674,6 +709,80 @@ impl RunningProcess {
             );
         }
         Ok(outcome)
+    }
+
+    /// Without the `cancellation` feature: the plain timeout/no-timeout shape.
+    #[cfg(not(feature = "cancellation"))]
+    async fn drive_to_exit_inner(&mut self) -> Result<(Option<i32>, bool)> {
+        match self.timeout {
+            Some(limit) => match tokio::time::timeout(limit, self.child.wait()).await {
+                Ok(status) => Ok((status?.code(), false)),
+                Err(_elapsed) => {
+                    self.kill_tree().await;
+                    Ok((None, true))
+                }
+            },
+            None => Ok((self.child.wait().await?.code(), false)),
+        }
+    }
+
+    /// With the feature: race the cancellation token against the
+    /// (deadline-bounded) wait. Unset knobs become never-resolving arms, so one
+    /// `select!` covers the whole timeout × token matrix. The cancel arm does
+    /// NOT set `timed_out` — callers classify it via
+    /// [`cancelled_error`](Self::cancelled_error) afterwards.
+    #[cfg(feature = "cancellation")]
+    async fn drive_to_exit_inner(&mut self) -> Result<(Option<i32>, bool)> {
+        // Own the knobs so the helper futures borrow nothing from `self` —
+        // only `self.child.wait()` does, keeping the select! borrows disjoint.
+        let limit = self.timeout;
+        let token = self.cancel_token.clone();
+        let cancelled = async {
+            match &token {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let deadline = async {
+            match limit {
+                Some(limit) => tokio::time::sleep(limit).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            status = self.child.wait() => Ok((status?.code(), false)),
+            () = cancelled => {
+                self.kill_tree().await;
+                Ok((None, false))
+            }
+            () = deadline => {
+                self.kill_tree().await;
+                Ok((None, true))
+            }
+        }
+    }
+
+    /// Hard-kill the child and (for a private group) its tree, then reap —
+    /// the shared teardown of the timeout and cancellation arms.
+    async fn kill_tree(&mut self) {
+        let _ = self.child.start_kill();
+        if let Some(group) = &self.own_group {
+            let _ = group.terminate_all();
+        }
+        let _ = self.child.wait().await;
+    }
+
+    /// After [`drive_to_exit`](Self::drive_to_exit): the typed cancellation
+    /// error when the run's token fired — checked by every consuming path
+    /// BEFORE any timeout classification (an explicit cancel wins).
+    #[cfg(feature = "cancellation")]
+    fn cancelled_error(&self) -> Option<Error> {
+        match &self.cancel_token {
+            Some(token) if token.is_cancelled() => Some(Error::Cancelled {
+                program: self.program.clone(),
+            }),
+            _ => None,
+        }
     }
 
     /// Send a kill to the process without waiting for it to exit. The owning
@@ -714,6 +823,10 @@ impl RunningProcess {
         }
 
         let (code, _timed_out) = self.drive_to_exit().await?;
+        #[cfg(feature = "cancellation")]
+        if let Some(err) = self.cancelled_error() {
+            return Err(err);
+        }
         // The child has exited, so its stderr pipe is closed — await the pump so
         // the final buffered line is captured before we drain.
         if let Some(pump) = self.stderr_pump.take() {
@@ -737,6 +850,11 @@ impl Drop for RunningProcess {
         // Abort the streaming deadline timer (it holds only a `Weak` to the group,
         // so this never blocks the group's kill-on-close).
         if let Some(task) = self.deadline_task.take() {
+            task.abort();
+        }
+        // Likewise the streaming cancellation listener.
+        #[cfg(feature = "cancellation")]
+        if let Some(task) = self.cancel_task.take() {
             task.abort();
         }
     }

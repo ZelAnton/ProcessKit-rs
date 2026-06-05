@@ -51,6 +51,12 @@ pub struct Command {
     /// Extra Windows process-creation flags (e.g. `CREATE_NO_WINDOW`), OR'd
     /// into the spawn by the Command-driven launch paths.
     creation_flags_extra: u32,
+    /// When cancelled, the run's tree is killed and every consuming path
+    /// resolves to `Error::Cancelled`. Cheap to clone (internally `Arc`'d), so
+    /// a `Command` clone — including each `Pipeline` stage and each
+    /// `Supervisor` incarnation — shares the same cancel state.
+    #[cfg(feature = "cancellation")]
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// A retry policy attached to a [`Command`] via [`Command::retry`], honored by
@@ -85,6 +91,8 @@ impl Command {
             gid: None,
             setsid: false,
             creation_flags_extra: 0,
+            #[cfg(feature = "cancellation")]
+            cancel_token: None,
         }
     }
 
@@ -246,6 +254,37 @@ impl Command {
         self
     }
 
+    /// Tie this run to `token`: cancelling it kills the process tree and makes
+    /// every consuming path (`run`/`output_string`/`output_bytes`/`wait`/
+    /// `exit_code`/`probe`/`profile`/`finish_streamed` and the streamed
+    /// finishers) resolve to [`Error::Cancelled`](crate::Error::Cancelled).
+    /// In a [`Pipeline`](crate::Pipeline), a token on any stage cancels that
+    /// stage and the cancellation errors the whole pipeline (the private
+    /// pipeline group tears the other stages down).
+    ///
+    /// Unlike [`timeout`](Self::timeout) — which is *captured* in the
+    /// [`ProcessResult`] (`timed_out`) without erroring on the non-checking
+    /// paths — a cancellation is **always** an error, on every path. When both
+    /// fire, cancellation wins (it is checked first). An already-cancelled
+    /// token short-circuits before spawning. On a private group the whole tree
+    /// is killed; on a shared group
+    /// ([`ProcessGroup::start`](crate::ProcessGroup::start)) only the child
+    /// is, exactly like `timeout`. [`wait_any`](crate::wait_any) and
+    /// [`first_line`](Self::first_line) don't synthesize the error for a
+    /// *mid-run* cancel — their stream simply ends, mirroring how they treat
+    /// `timeout` — though a token that was already cancelled still surfaces
+    /// the pre-spawn `Err(Cancelled)` short-circuit.
+    ///
+    /// A cancelled run is never retried: [`retry`](Self::retry) policies and
+    /// [`Supervisor`](crate::Supervisor) restarts both treat
+    /// `Error::Cancelled` as terminal — the token stays cancelled forever, so
+    /// another attempt could only fail the same way.
+    #[cfg(feature = "cancellation")]
+    pub fn cancel_on(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel_token = Some(token);
+        self
+    }
+
     /// Retry the run while `retry_if` accepts the error, up to `max_attempts`
     /// total attempts, sleeping `backoff` between tries.
     ///
@@ -379,6 +418,12 @@ impl Command {
     /// Whether [`setsid`](Self::setsid) was requested (read by the spawn seam).
     pub(crate) fn wants_setsid(&self) -> bool {
         self.setsid
+    }
+
+    /// The cancellation token, if any (an `Arc`-cheap clone).
+    #[cfg(feature = "cancellation")]
+    pub(crate) fn cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.cancel_token.clone()
     }
 
     /// Extra Windows creation flags (read by the spawn seam on every target).
@@ -616,8 +661,8 @@ impl Command {
 
 impl fmt::Debug for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Command")
-            .field("program", &self.program)
+        let mut d = f.debug_struct("Command");
+        d.field("program", &self.program)
             .field("args", &self.args)
             .field("cwd", &self.cwd)
             .field("envs", &self.envs)
@@ -635,8 +680,10 @@ impl fmt::Debug for Command {
             .field("uid", &self.uid)
             .field("gid", &self.gid)
             .field("setsid", &self.setsid)
-            .field("creation_flags_extra", &self.creation_flags_extra)
-            .finish()
+            .field("creation_flags_extra", &self.creation_flags_extra);
+        #[cfg(feature = "cancellation")]
+        d.field("has_cancel_token", &self.cancel_token.is_some());
+        d.finish()
     }
 }
 
@@ -734,5 +781,25 @@ mod tests {
         let cmd = Command::new("x").create_no_window();
         assert_eq!(cmd.extra_creation_flags(), 0x0800_0000);
         assert_eq!(Command::new("x").extra_creation_flags(), 0);
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[test]
+    fn cancel_on_records_the_token() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let cmd = Command::new("x").cancel_on(token.clone());
+        // The accessor hands back a clone sharing the same cancel state.
+        let stored = cmd.cancel_token().expect("token recorded");
+        token.cancel();
+        assert!(stored.is_cancelled(), "clones share one cancel state");
+        assert!(Command::new("x").cancel_token().is_none());
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[test]
+    fn debug_reports_token_presence_not_contents() {
+        let with = Command::new("x").cancel_on(tokio_util::sync::CancellationToken::new());
+        assert!(format!("{with:?}").contains("has_cancel_token: true"));
+        assert!(format!("{:?}", Command::new("x")).contains("has_cancel_token: false"));
     }
 }

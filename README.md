@@ -333,6 +333,43 @@ no-op outside Windows and, unlike the raw `ProcessGroup::spawn` escape hatch,
 survives the group's `CREATE_SUSPENDED` containment flag (they are OR'd
 together).
 
+## Cancelling a run
+
+Requires the **`cancellation`** feature (off by default). Hand a command a
+[`CancellationToken`] (re-exported from `tokio-util`); cancelling the token
+kills the process tree, and every consuming path reports `Error::Cancelled`:
+
+```rust,no_run
+use processkit::{CancellationToken, Command};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let token = CancellationToken::new();
+
+    let job = tokio::spawn({
+        let token = token.child_token();
+        async move {
+            Command::new("long-job").cancel_on(token).run().await
+        }
+    });
+
+    // elsewhere — a shutdown signal, a sibling failure, a UI button:
+    token.cancel();
+
+    assert!(matches!(job.await.unwrap(), Err(processkit::Error::Cancelled { .. })));
+    Ok(())
+}
+```
+
+Unlike a timeout — whose expiry is *captured* in the result as `timed_out` —
+cancellation is **always an error**: the run was abandoned, so there is no
+result to inspect. When a cancel and a timeout land together, cancellation
+wins. A token cancelled *before* the run starts short-circuits without
+spawning anything. On a shared [`ProcessGroup`] handle, cancelling kills the
+child itself but leaves the group's siblings alone (same scope as a timeout),
+and a supervised command that gets cancelled stops its `Supervisor` for good —
+restarting into a still-cancelled token would loop futilely.
+
 ## Async streaming and interactive I/O
 
 The one-shot helpers above buffer the whole output. For long-running or
@@ -370,10 +407,13 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-> Streaming does **not** auto-enforce the command's [`timeout`]: it applies to the
-> run-to-completion helpers (`output_string`/`run`/`first_line`). To bound a manual
-> stream, wrap your loop in [`tokio::time::timeout`] and drop the handle (which
-> kills the tree) on elapse.
+> The command's [`timeout`] **bounds the stream**: at the deadline the tree is
+> killed, the pipes close, and the stream ends (on a handle that owns its group —
+> the `start()` path). A `cancel_on` token (with the `cancellation` feature) ends
+> the stream the same way, and the following `finish_streamed` reports
+> `Error::Cancelled`. For an ad-hoc bound, wrapping the loop in
+> [`tokio::time::timeout`] and dropping the handle (which kills the tree) still
+> works.
 
 ### Interactive stdin — write requests, read responses
 
@@ -460,3 +500,4 @@ Licensed under the [MIT License](LICENSE).
 [`RunningProcess`]: https://docs.rs/processkit/latest/processkit/struct.RunningProcess.html
 [`timeout`]: https://docs.rs/processkit/latest/processkit/struct.Command.html#method.timeout
 [`tokio::time::timeout`]: https://docs.rs/tokio/latest/tokio/time/fn.timeout.html
+[`CancellationToken`]: https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html

@@ -17,6 +17,20 @@ to a dated version section.
 > (`minor`), not a patch.
 
 ### Added
+- Cancellation (`cancellation` feature, off by default, pulls optional
+  `tokio-util`): `Command::cancel_on(token)` ties a run to a re-exported
+  `CancellationToken` — cancelling it kills the process tree and every
+  consuming path (`run`/`output_string`/`output_bytes`/`wait`/`profile`/
+  `finish_streamed`) reports the new `Error::Cancelled`. Asymmetric with
+  timeout by design: a timeout is *captured* in the result (`timed_out`), a
+  cancellation is always an error; when both land, cancellation wins. A token
+  cancelled before launch short-circuits without spawning. On a shared
+  `ProcessGroup` handle, cancel kills the child only — siblings are untouched
+  (same scope as timeout). A `stdout_lines` stream ends on cancel (own-group
+  runs); the raw `wait_any`/`first_line` primitives don't synthesize the error
+  for a mid-run cancel. A cancelled run is never re-attempted: `retry` policies
+  and `Supervisor` restarts both treat it as terminal — no retry into a
+  still-cancelled token.
 - Environment and privilege builders on `Command`: `inherit_env([names])`
   (allow-list on a cleared environment, copied from the parent at each spawn;
   explicit `env`/`env_remove` still win), `uid(u32)`/`gid(u32)` (Unix privilege

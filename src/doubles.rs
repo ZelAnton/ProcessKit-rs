@@ -7,6 +7,12 @@
 //!
 //! Behind the `mock` feature, [`mockall`] additionally generates a `MockRunner`
 //! (re-exported from the crate root) for expectation-style mocking.
+//!
+//! Doubles replay canned results without modeling the runtime machinery: a
+//! command's timeout never kills anything here (script a timed-out [`Reply`]
+//! instead), and a `cancel_on` token is not observed — script an
+//! `Err(Error::Cancelled { .. })` reply via a custom runner when a test needs
+//! to exercise cancel handling.
 
 use std::ffi::{OsStr, OsString};
 use std::sync::Mutex;

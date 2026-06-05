@@ -1532,6 +1532,164 @@ async fn wait_any_losers_still_waitable() {
     );
 }
 
+// ----- Cancellation: Command::cancel_on (feature `cancellation`) -----
+
+#[cfg(feature = "cancellation")]
+mod cancellation {
+    use super::*;
+    use processkit::CancellationToken;
+
+    /// Whether a process with `pid` is still alive, per platform.
+    fn pid_alive(pid: u32) -> bool {
+        #[cfg(windows)]
+        return super::windows_pid_alive(pid);
+        #[cfg(unix)]
+        // SAFETY: signal 0 is a sound liveness probe.
+        return unsafe { libc::kill(pid as i32, 0) == 0 };
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = pid;
+            false
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns real subprocesses and cancels one mid-run"]
+    async fn cancel_mid_run_errors_and_kills_only_the_cancelled_child() {
+        let group = ProcessGroup::new().expect("create group");
+        let token = CancellationToken::new();
+
+        // A sibling in the same shared group: cancellation must not touch it
+        // (same child-only scope as a timeout on a shared-group handle).
+        let sibling = group.start(&sleep_secs(30)).await.expect("start sibling");
+        let sibling_pid = sibling.pid().expect("sibling pid");
+
+        // Single-process sleeper, deliberately: the cmd-wrapped `sleeper()` is
+        // two processes on Windows, and the child-only cancel kill would leave
+        // the grandchild holding the stdout pipe — stalling teardown for the
+        // full pump grace instead of ending promptly.
+        let run = group
+            .start(&sleep_secs(30).cancel_on(token.clone()))
+            .await
+            .expect("start cancellable sleeper");
+        let pid = run.pid().expect("pid");
+
+        let canceller = tokio::spawn({
+            let token = token.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                token.cancel();
+            }
+        });
+
+        let start = Instant::now();
+        let err = run
+            .output_string()
+            .await
+            .expect_err("a cancelled run must error, not produce a result");
+        assert!(
+            matches!(err, processkit::Error::Cancelled { .. }),
+            "expected Error::Cancelled, got {err:?}"
+        );
+        // Promptness: the sleeper runs ~30s if cancellation is broken. Generous
+        // headroom for full-suite load (cf. the widened timeout-test bounds).
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "cancel was not prompt (took {:?})",
+            start.elapsed()
+        );
+        canceller.await.expect("canceller task");
+
+        // The cancelled child is killed and reaped...
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pid_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "cancelled child survived (pid {pid})"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // ...while the shared group's sibling is untouched.
+        assert!(
+            pid_alive(sibling_pid),
+            "cancel must kill the child only, not shared-group siblings"
+        );
+        drop(sibling);
+    }
+
+    #[tokio::test]
+    #[ignore = "exercises the pre-spawn short-circuit (no real subprocess)"]
+    async fn pre_cancelled_token_short_circuits_before_spawning() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let start = Instant::now();
+        // A program that doesn't exist: reaching the OS spawn would fail with
+        // an Io error, so getting Cancelled proves the short-circuit fired
+        // before any spawn was attempted.
+        let err = Command::new("processkit-no-such-program-424242")
+            .cancel_on(token)
+            .run()
+            .await
+            .expect_err("a pre-cancelled run must not start");
+        assert!(
+            matches!(err, processkit::Error::Cancelled { .. }),
+            "expected Error::Cancelled, got {err:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "short-circuit was not immediate (took {:?})",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess and cancels it mid-stream"]
+    async fn cancel_ends_the_stream_and_finish_streamed_reports_it() {
+        use tokio_stream::StreamExt;
+
+        let token = CancellationToken::new();
+        let mut run = banner_then_idle()
+            .cancel_on(token.clone())
+            .start()
+            .await
+            .expect("start banner child");
+
+        let mut lines = run.stdout_lines();
+        // Wait for the banner so the cancel provably lands mid-stream.
+        let first = tokio::time::timeout(Duration::from_secs(15), lines.next())
+            .await
+            .expect("banner in time")
+            .expect("banner line");
+        assert!(first.contains("ready"), "line: {first:?}");
+
+        token.cancel();
+
+        // The cancel tears the (handle-owned) tree down, the pipes close, and
+        // the stream ends — the child would otherwise idle ~30s.
+        let start = Instant::now();
+        while tokio::time::timeout(Duration::from_secs(10), lines.next())
+            .await
+            .expect("stream should end promptly after cancel")
+            .is_some()
+        {}
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "stream did not end promptly (took {:?})",
+            start.elapsed()
+        );
+
+        let err = run
+            .finish_streamed()
+            .await
+            .expect_err("finishing a cancelled streamed run must error");
+        assert!(
+            matches!(err, processkit::Error::Cancelled { .. }),
+            "expected Error::Cancelled, got {err:?}"
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "spawns a long-lived subprocess and kills it early"]
 async fn start_kill_terminates_a_running_process() {

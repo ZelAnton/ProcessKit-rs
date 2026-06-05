@@ -109,12 +109,21 @@ where
         tries += 1;
         match attempt().await {
             Ok(value) => return Ok(value),
-            Err(err) => match &policy {
-                Some(p) if tries < p.max_attempts && (p.classifier)(&err) => {
-                    tokio::time::sleep(p.backoff).await;
+            Err(err) => {
+                // A cancelled run is terminal regardless of the classifier: the
+                // token stays cancelled forever, so every retry would just hit
+                // the pre-spawn short-circuit again (mirrors the Supervisor).
+                #[cfg(feature = "cancellation")]
+                if matches!(err, crate::Error::Cancelled { .. }) {
+                    return Err(err);
                 }
-                _ => return Err(err),
-            },
+                match &policy {
+                    Some(p) if tries < p.max_attempts && (p.classifier)(&err) => {
+                        tokio::time::sleep(p.backoff).await;
+                    }
+                    _ => return Err(err),
+                }
+            }
         }
     }
 }
@@ -190,6 +199,18 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         }
     }
 
+    // A token already cancelled before launch: short-circuit without spawning —
+    // cheaper and cleaner than spawn-then-kill. (A cancel landing between this
+    // check and the first wait poll is caught by drive_to_exit's cancel branch.)
+    #[cfg(feature = "cancellation")]
+    if let Some(token) = command.cancel_token()
+        && token.is_cancelled()
+    {
+        return Err(crate::Error::Cancelled {
+            program: command.program_name(),
+        });
+    }
+
     let mut tokio_cmd = command.build_tokio();
     let opts = crate::sys::SpawnOptions {
         setsid: command.wants_setsid(),
@@ -239,6 +260,8 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         stdout_handler: command.stdout_handler(),
         stderr_handler: command.stderr_handler(),
         buffer: command.output_buffer_policy(),
+        #[cfg(feature = "cancellation")]
+        cancel_token: command.cancel_token(),
     }))
 }
 
@@ -310,5 +333,38 @@ mod tests {
         let runner = flaky(10);
         assert!(runner.run(&Command::new("x")).await.is_err());
         assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A runner whose every attempt fails with `Cancelled` — the token never
+    /// un-cancels, so this is exactly what real retries would see.
+    #[cfg(feature = "cancellation")]
+    struct AlwaysCancelled(AtomicU32);
+
+    #[cfg(feature = "cancellation")]
+    #[async_trait::async_trait]
+    impl ProcessRunner for AlwaysCancelled {
+        async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(Error::Cancelled {
+                program: command.program().to_string_lossy().into_owned(),
+            })
+        }
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[tokio::test]
+    async fn cancelled_is_terminal_even_when_the_classifier_accepts() {
+        let runner = AlwaysCancelled(AtomicU32::new(0));
+        let cmd = Command::new("x").retry(5, Duration::from_millis(0), |_| true);
+        let err = runner.run(&cmd).await.expect_err("cancelled run errors");
+        assert!(
+            matches!(err, Error::Cancelled { .. }),
+            "expected Cancelled, got {err:?}"
+        );
+        assert_eq!(
+            runner.0.load(Ordering::SeqCst),
+            1,
+            "a cancelled run must not be retried"
+        );
     }
 }

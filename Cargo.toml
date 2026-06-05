@@ -70,6 +70,11 @@ tracing = { version = "0.1", optional = true }
 # Optional auto-generated `MockRunner` for downstream tests. Test-only; pulled
 # in solely behind the `mock` feature, never in production builds.
 mockall = { version = "0.13", optional = true }
+# Optional `CancellationToken` for the `cancellation` feature: structured-
+# concurrency cancellation that tears a run's tree down. The `sync` module
+# (where CancellationToken lives) is always compiled in tokio-util — no inner
+# feature needed; default-features = false pulls in nothing else.
+tokio-util = { version = "0.7", default-features = false, optional = true }
 
 [features]
 # `stats` ships in the default set because `ProcessGroupStats` & friends predate
@@ -89,6 +94,9 @@ limits = ["stats"]
 mock = ["dep:mockall"]
 # Emit a `tracing` event per command run (program, args, exit code, duration).
 tracing = ["dep:tracing"]
+# First-class run cancellation: `Command::cancel_on(token)`, `Error::Cancelled`,
+# and the `CancellationToken` re-export. Off by default; pulls in `tokio-util`.
+cancellation = ["dep:tokio-util"]
 
 [target.'cfg(windows)'.dependencies]
 # Win32 Job Object FFI for kill-on-close process trees: CreateJobObjectW /
