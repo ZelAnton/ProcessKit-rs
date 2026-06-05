@@ -8,13 +8,14 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 #[cfg(feature = "stats")]
 use windows_sys::Win32::Foundation::FILETIME;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
 };
 #[cfg(feature = "limits")]
@@ -26,12 +27,11 @@ use windows_sys::Win32::System::JobObjects::{
 #[cfg(feature = "stats")]
 use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
-    QueryInformationJobObject,
 };
 #[cfg(feature = "stats")]
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+    CREATE_SUSPENDED, OpenThread, ResumeThread, SuspendThread, THREAD_SUSPEND_RESUME,
 };
 #[cfg(feature = "stats")]
 use windows_sys::Win32::System::Threading::{
@@ -39,6 +39,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::Mechanism;
+use crate::Signal;
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
 #[cfg(feature = "stats")]
@@ -181,6 +182,74 @@ impl Job {
         Ok(())
     }
 
+    /// A Job Object has no POSIX signals: only `Kill` is deliverable (it maps
+    /// to the job terminate); everything else is reported as unsupported so the
+    /// caller never believes a reload/interrupt was delivered.
+    pub(crate) fn signal(&self, sig: Signal) -> io::Result<()> {
+        match sig {
+            Signal::Kill => self.kill_all(),
+            other => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("signal({other:?})"),
+            )),
+        }
+    }
+
+    pub(crate) fn suspend(&self) -> io::Result<()> {
+        self.for_each_member_thread(true)
+    }
+
+    pub(crate) fn resume(&self) -> io::Result<()> {
+        self.for_each_member_thread(false)
+    }
+
+    /// Suspend or resume every thread of every process currently in the job.
+    ///
+    /// Best-effort, not atomic: the member list and the thread snapshot are
+    /// taken once, so threads or processes created mid-walk are missed, and
+    /// `SuspendThread`/`ResumeThread` maintain per-thread suspend *counts*
+    /// (nested suspends need matching resumes). A per-thread failure (e.g. a
+    /// thread exiting mid-walk) does not abort the walk; the last failure is
+    /// reported after every member has been attempted.
+    fn for_each_member_thread(&self, suspend: bool) -> io::Result<()> {
+        let members: std::collections::HashSet<u32> =
+            job_member_pids(self.handle)?.into_iter().collect();
+        if members.is_empty() {
+            // An empty job is trivially suspended/resumed.
+            return Ok(());
+        }
+
+        // SAFETY: TH32CS_SNAPTHREAD always snapshots all threads system-wide;
+        // returns INVALID_HANDLE_VALUE on failure.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+
+        let mut last_err = None;
+        // SAFETY: valid snapshot; `entry` is sized via its `dwSize` field.
+        let mut ok = unsafe { Thread32First(snapshot, &mut entry) };
+        while ok != 0 {
+            if members.contains(&entry.th32OwnerProcessID)
+                && let Err(err) = suspend_or_resume_thread(entry.th32ThreadID, suspend)
+            {
+                last_err = Some(err);
+            }
+            // SAFETY: same valid snapshot and entry.
+            ok = unsafe { Thread32Next(snapshot, &mut entry) };
+        }
+        // SAFETY: handle came from CreateToolhelp32Snapshot; closed exactly once.
+        unsafe { CloseHandle(snapshot) };
+
+        match last_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) async fn graceful_shutdown(
         &self,
         _timeout: Duration,
@@ -292,6 +361,78 @@ fn resume_thread(tid: u32) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Suspend (increment) or resume (decrement) a single thread's suspend count.
+fn suspend_or_resume_thread(tid: u32, suspend: bool) -> io::Result<()> {
+    // SAFETY: opens the thread by id; returns null on failure (e.g. exited).
+    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, tid) };
+    if thread.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: valid thread handle; both calls signal failure with `u32::MAX`.
+    let prev = unsafe {
+        if suspend {
+            SuspendThread(thread)
+        } else {
+            ResumeThread(thread)
+        }
+    };
+    // SAFETY: handle came from OpenThread; closed exactly once.
+    unsafe { CloseHandle(thread) };
+    if prev == u32::MAX {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Enumerate the pids currently assigned to the job.
+///
+/// Best-effort snapshot: a process created or reaped during the query may be
+/// briefly missing or present. The pid list is a variable-length struct (a
+/// two-`u32` header followed by an inline `usize` array), so query into a
+/// `u64`-backed buffer (alignment ≥ the struct's) and grow on `ERROR_MORE_DATA`.
+fn job_member_pids(handle: HANDLE) -> io::Result<Vec<u32>> {
+    // Seed generously so the common case is a single query.
+    let mut cap: usize = 64;
+    loop {
+        let bytes = std::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+            + cap.saturating_sub(1) * std::mem::size_of::<usize>();
+        // u64 alignment (8) ≥ the struct's (usize) on every Windows target, so
+        // casting the buffer to the struct pointer below is sound.
+        let mut buf = vec![0u64; bytes.div_ceil(std::mem::size_of::<u64>())];
+        // SAFETY: `buf` spans at least `bytes` writable bytes, the info class
+        // matches the out-struct, and the size is passed explicitly.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                handle,
+                JobObjectBasicProcessIdList,
+                buf.as_mut_ptr().cast(),
+                bytes as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        let list = buf.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
+        if ok == 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(ERROR_MORE_DATA as i32) {
+                // The header is populated even when the list didn't fit — size
+                // the retry from it (with headroom for races), and make sure we
+                // always grow so the loop can't spin in place.
+                // SAFETY: on ERROR_MORE_DATA the fixed header fields are valid.
+                let assigned = unsafe { (*list).NumberOfAssignedProcesses } as usize;
+                cap = assigned.max(cap).saturating_mul(2);
+                continue;
+            }
+            return Err(err);
+        }
+        // SAFETY: a successful query wrote the header and `NumberOfProcessIdsInList`
+        // pids contiguously from `ProcessIdList[0]`, all within `bytes`.
+        let n = unsafe { (*list).NumberOfProcessIdsInList } as usize;
+        // SAFETY: see above; `n <= cap` elements were written.
+        let ids = unsafe { std::slice::from_raw_parts((*list).ProcessIdList.as_ptr(), n) };
+        return Ok(ids.iter().map(|&pid| pid as u32).collect());
+    }
 }
 
 /// Combine a FILETIME (100-ns units) into nanoseconds.

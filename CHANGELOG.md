@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- Whole-tree signals and suspend/resume: `ProcessGroup::signal(Signal)` broadcasts
+  a signal to every member (new `Signal` enum — `Term`/`Kill`/`Int`/`Hup`/`Quit`/
+  `Usr1`/`Usr2` plus an `Other(i32)` escape hatch), and
+  `ProcessGroup::suspend`/`resume` freeze and thaw the tree. Per backend: Linux
+  cgroup uses a single whole-subtree `cgroup.freeze` write (falling back to
+  per-process `SIGSTOP`/`SIGCONT` on kernels without it), the POSIX process-group
+  backends
+  broadcast to each group, and Windows suspends/resumes every member thread
+  (best-effort; suspend counts nest). On Windows only `Signal::Kill` is
+  deliverable (Job Object terminate); any other signal — and these operations on
+  the no-containment target — return the new typed `Error::Unsupported`.
 - `ProcessGroupOptions` resource limits (behind the new, off-by-default `limits`
   Cargo feature) — `memory_max`, `max_processes`, and `cpu_quota` cap a group's
   whole tree at creation, plus a public `limits:

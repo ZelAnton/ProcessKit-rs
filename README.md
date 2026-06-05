@@ -15,8 +15,9 @@ the result, not raised, until you call `ProcessResult::ensure_success`.
 
 > **Status:** feature-complete — process groups, the runner and capture helpers,
 > streaming, interactive stdin, push line-handlers, output-buffer policies,
-> encoding overrides, line counters, CPU/memory stats, and whole-tree resource
-> limits (memory / process-count / CPU). See [`CHANGELOG.md`](CHANGELOG.md).
+> encoding overrides, line counters, CPU/memory stats, whole-tree resource
+> limits (memory / process-count / CPU), and whole-tree signals plus
+> suspend/resume. See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Install
 
@@ -96,6 +97,34 @@ the no-containment target, and a Linux cgroup must permit controller delegation 
 as root, in a container, or under a systemd unit with `Delegate=yes`). When a
 requested limit can't be enforced, `with_options` returns `Error::ResourceLimit`
 instead of a silently-unbounded group — an unapplied cap is no protection.
+
+## Signalling and pausing the whole tree
+
+Beyond the kill/shutdown teardown verbs, a group can broadcast a signal to every
+member or freeze and thaw the whole tree:
+
+```rust,no_run
+use processkit::{Command, ProcessGroup, Signal};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::new()?;
+    let _server = group.start(&Command::new("my-server")).await?;
+
+    group.signal(Signal::Hup)?; // e.g. "reload configuration"
+    group.suspend()?;           // freeze the whole tree…
+    group.resume()?;            // …and let it run again
+    Ok(())
+}
+```
+
+Signals are POSIX-only: on Windows just `Signal::Kill` is deliverable (it maps to
+the Job Object terminate) and anything else returns `Error::Unsupported`.
+`Signal::Kill` always takes the same whole-tree hard-kill path as
+`terminate_all()`. Suspend/resume work everywhere a container exists — one
+`cgroup.freeze` write covering the subtree on Linux, `SIGSTOP`/`SIGCONT` on
+macOS/BSD and the Linux process-group fallback, and per-thread suspension on
+Windows (best-effort; nested suspends stack and need matching resumes).
 
 ## Async streaming and interactive I/O
 

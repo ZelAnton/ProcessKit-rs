@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
 use crate::mechanism::Mechanism;
+use crate::signal::Signal;
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
 use crate::sys::Job;
@@ -172,6 +173,69 @@ impl ProcessGroup {
         Ok(())
     }
 
+    /// Broadcast `sig` to every process in the group.
+    ///
+    /// Best-effort: a member that has already exited is skipped, and an empty
+    /// group succeeds trivially.
+    ///
+    /// # Platform support
+    ///
+    /// - **Linux (cgroup or process-group fallback), macOS/BSD** — any signal,
+    ///   delivered to every live member of the tree.
+    /// - **Windows** — only [`Signal::Kill`]; any other signal — including
+    ///   [`Signal::Other`] — returns [`Error::Unsupported`].
+    /// - **No-containment target** — always [`Error::Unsupported`].
+    ///
+    /// `SIGKILL` ([`Signal::Kill`], or `Other(libc::SIGKILL)`) is routed through
+    /// the same whole-tree hard kill as [`terminate_all`](Self::terminate_all)
+    /// on every backend (`cgroup.kill` / `killpg` / Job Object terminate), so it
+    /// cannot miss a process forked mid-broadcast. Other signals are a per-member
+    /// broadcast.
+    pub fn signal(&self, sig: Signal) -> Result<()> {
+        self.job
+            .signal(sig)
+            .map_err(|source| map_unsupported(source, format!("signal({sig:?})")))
+    }
+
+    /// Suspend (freeze) every process in the group.
+    ///
+    /// # Platform support
+    ///
+    /// - **Linux cgroup** — one `cgroup.freeze` write covering the whole subtree
+    ///   (kernel ≥ 5.2; older kernels fall back to per-process `SIGSTOP`). The
+    ///   freeze is applied by the kernel shortly after the write returns, not
+    ///   instantaneously.
+    /// - **Linux process-group fallback, macOS/BSD** — `SIGSTOP` to every group.
+    /// - **Windows** — suspends every thread of every member process. Best-effort
+    ///   and not atomic: threads spawned mid-walk can be missed, and Windows keeps
+    ///   per-thread suspend *counts*, so nested `suspend` calls stack — N suspends
+    ///   need N [`resume`](Self::resume)s. On Unix suspend/resume are idempotent
+    ///   (level-triggered).
+    /// - **No-containment target** — [`Error::Unsupported`].
+    ///
+    /// A suspended tree can still be hard-killed
+    /// ([`terminate_all`](Self::terminate_all), or dropping the group) — SIGKILL,
+    /// `cgroup.kill`, and `TerminateJobObject` all act on frozen processes. The
+    /// graceful [`shutdown`](Self::shutdown), however, starts with a `SIGTERM`
+    /// that a frozen tree cannot act on until thawed, so it waits out
+    /// `shutdown_timeout` and then escalates; call [`resume`](Self::resume) first
+    /// for a clean graceful shutdown.
+    pub fn suspend(&self) -> Result<()> {
+        self.job
+            .suspend()
+            .map_err(|source| map_unsupported(source, "suspend"))
+    }
+
+    /// Resume a tree suspended by [`suspend`](Self::suspend).
+    ///
+    /// See [`suspend`](Self::suspend) for the platform matrix and the Windows
+    /// suspend-count nesting caveat.
+    pub fn resume(&self) -> Result<()> {
+        self.job
+            .resume()
+            .map_err(|source| map_unsupported(source, "resume"))
+    }
+
     /// Gracefully tear the group down, consuming it.
     ///
     /// On Unix: `SIGTERM` the tree, wait up to `shutdown_timeout`, then `SIGKILL`
@@ -205,6 +269,20 @@ impl ProcessGroup {
 /// Best-effort program name for error messages.
 fn program_name(cmd: &Command) -> String {
     cmd.as_std().get_program().to_string_lossy().into_owned()
+}
+
+/// Map a backend `ErrorKind::Unsupported` to the typed [`Error::Unsupported`],
+/// passing every other IO failure through unchanged. Unambiguous here: on the
+/// signal/suspend/resume paths the only producer of `Unsupported` is the
+/// backends' own "this platform can't do that" reporting.
+fn map_unsupported(source: std::io::Error, operation: impl Into<String>) -> Error {
+    if source.kind() == std::io::ErrorKind::Unsupported {
+        Error::Unsupported {
+            operation: operation.into(),
+        }
+    } else {
+        Error::Io(source)
+    }
 }
 
 /// Reject nonsensical limit values before touching the OS, so a typo surfaces as a

@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::Mechanism;
+use crate::Signal;
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
 #[cfg(feature = "stats")]
@@ -51,6 +52,18 @@ impl Job {
 
     pub(crate) fn kill_all(&self) -> io::Result<()> {
         self.group.kill_all()
+    }
+
+    pub(crate) fn signal(&self, sig: Signal) -> io::Result<()> {
+        self.group.signal(sig.raw())
+    }
+
+    pub(crate) fn suspend(&self) -> io::Result<()> {
+        self.group.suspend()
+    }
+
+    pub(crate) fn resume(&self) -> io::Result<()> {
+        self.group.resume()
     }
 
     pub(crate) async fn graceful_shutdown(

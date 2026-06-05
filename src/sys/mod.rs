@@ -20,6 +20,7 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::Mechanism;
+use crate::Signal;
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
 #[cfg(feature = "stats")]
@@ -95,6 +96,24 @@ impl Job {
     /// Immediately hard-kill every process in the job. Idempotent.
     pub(crate) fn kill_all(&self) -> io::Result<()> {
         self.0.kill_all()
+    }
+
+    /// Broadcast `sig` to every process in the job. On Windows only
+    /// [`Signal::Kill`] is deliverable (job terminate); other signals — and any
+    /// signal on the no-containment target — yield `ErrorKind::Unsupported`.
+    pub(crate) fn signal(&self, sig: Signal) -> io::Result<()> {
+        self.0.signal(sig)
+    }
+
+    /// Freeze the whole tree (cgroup.freeze / SIGSTOP / per-thread suspend).
+    /// `ErrorKind::Unsupported` on the no-containment target.
+    pub(crate) fn suspend(&self) -> io::Result<()> {
+        self.0.suspend()
+    }
+
+    /// Thaw a tree frozen by [`suspend`](Self::suspend).
+    pub(crate) fn resume(&self) -> io::Result<()> {
+        self.0.resume()
     }
 
     /// Ask the tree to exit, then escalate.

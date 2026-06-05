@@ -7,7 +7,9 @@
 //!   with the group, so an exiting or panicking owner never leaks subprocesses.
 //!   Containment is a Windows [Job Object], a Linux [cgroup v2] (with a POSIX
 //!   process-group fallback), a POSIX process group on macOS/BSD, or nothing on
-//!   other targets — observable via [`Mechanism`].
+//!   other targets — observable via [`Mechanism`]. The whole tree can be
+//!   signalled ([`ProcessGroup::signal`], see [`Signal`]) and paused/resumed
+//!   ([`ProcessGroup::suspend`] / [`ProcessGroup::resume`]).
 //! - **runner** — async run-and-capture built on the group. Describe a run with
 //!   [`Command`], then drive it to completion ([`Command::output_string`],
 //!   [`Command::run`], …) or start it via a [`ProcessRunner`] for streaming or a
@@ -111,6 +113,7 @@ mod pump;
 mod result;
 mod runner;
 mod running;
+mod signal;
 #[cfg(feature = "stats")]
 mod stats;
 mod stdin;
@@ -129,6 +132,7 @@ pub use mechanism::Mechanism;
 pub use result::ProcessResult;
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
 pub use running::{RunningProcess, StdoutLines};
+pub use signal::Signal;
 #[cfg(feature = "stats")]
 pub use stats::ProcessGroupStats;
 pub use stdin::{ProcessStdin, Stdin};

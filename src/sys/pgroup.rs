@@ -90,6 +90,25 @@ impl ProcessGroup {
         Ok(())
     }
 
+    /// Broadcast `sig` to every tracked process group. Best-effort: groups that
+    /// already drained are skipped (and pruned); an empty set is a no-op.
+    pub(crate) fn signal(&self, sig: i32) -> io::Result<()> {
+        signal_groups(&self.pgids, sig);
+        Ok(())
+    }
+
+    /// Freeze every tracked group (`SIGSTOP` — unblockable, idempotent).
+    pub(crate) fn suspend(&self) -> io::Result<()> {
+        signal_groups(&self.pgids, libc::SIGSTOP);
+        Ok(())
+    }
+
+    /// Thaw every tracked group (`SIGCONT`).
+    pub(crate) fn resume(&self) -> io::Result<()> {
+        signal_groups(&self.pgids, libc::SIGCONT);
+        Ok(())
+    }
+
     pub(crate) async fn graceful_shutdown(
         &self,
         timeout: Duration,

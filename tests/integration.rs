@@ -15,7 +15,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use processkit::{Command, Mechanism, OutputBufferPolicy, ProcessGroup};
+use processkit::{Command, Mechanism, OutputBufferPolicy, ProcessGroup, Signal};
 // Imported only by the `limits` tests; the other tests name `processkit::Error`
 // variants via their full path.
 #[cfg(feature = "limits")]
@@ -617,6 +617,165 @@ async fn windows_memory_and_cpu_limits_accept_and_run() {
         .expect("collect");
     assert!(out.is_success(), "exit {:?}", out.code());
     assert!(out.stdout().contains("hi"), "stdout: {:?}", out.stdout());
+}
+
+// ----- Whole-tree signals and suspend/resume -----
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess and signals it"]
+async fn unix_signal_reaches_the_tree() {
+    use tokio_stream::StreamExt;
+
+    let group = ProcessGroup::new().expect("create group");
+    // Print a readiness marker once the trap is installed, then idle; on SIGHUP
+    // the trap fires after the current `sleep` returns (it dies to the HUP too).
+    let cmd = Command::new("sh").args([
+        "-c",
+        "trap 'echo got-hup' HUP; echo ready; while :; do sleep 0.1; done",
+    ]);
+    let mut process = group.start(&cmd).await.expect("start trap child");
+    let mut lines = process.stdout_lines();
+
+    let ready = tokio::time::timeout(Duration::from_secs(10), lines.next())
+        .await
+        .expect("readiness line in time")
+        .expect("readiness line");
+    assert!(ready.contains("ready"), "line: {ready:?}");
+
+    group.signal(Signal::Hup).expect("broadcast SIGHUP");
+    let got = tokio::time::timeout(Duration::from_secs(10), lines.next())
+        .await
+        .expect("trap line in time")
+        .expect("trap line");
+    assert!(got.contains("got-hup"), "line: {got:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess and freezes it"]
+async fn unix_suspend_freezes_progress() {
+    use tokio_stream::StreamExt;
+
+    let group = ProcessGroup::new().expect("create group");
+    // A ticker: one line every ~50ms.
+    let cmd = Command::new("sh").args([
+        "-c",
+        "i=0; while :; do i=$((i+1)); echo $i; sleep 0.05; done",
+    ]);
+    let mut process = group.start(&cmd).await.expect("start ticker");
+    let mut lines = process.stdout_lines();
+
+    // Prove it is producing output, then freeze.
+    tokio::time::timeout(Duration::from_secs(10), lines.next())
+        .await
+        .expect("first tick in time")
+        .expect("first tick");
+    group.suspend().expect("suspend");
+
+    // Drain lines emitted before the freeze landed (pipe buffering), then
+    // require silence for a window several ticks long.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(100), lines.next()).await {}
+    let stalled = tokio::time::timeout(Duration::from_millis(400), lines.next()).await;
+    assert!(stalled.is_err(), "frozen tree kept producing output");
+
+    group.resume().expect("resume");
+    let resumed = tokio::time::timeout(Duration::from_secs(10), lines.next()).await;
+    assert!(
+        resumed.is_ok_and(|line| line.is_some()),
+        "tree did not resume ticking"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "creates an OS job/cgroup"]
+fn signal_on_empty_group_is_ok() {
+    // An empty group is trivially signalled/suspended/resumed — load-bearing
+    // for callers that broadcast before (or after) any member is alive.
+    let group = ProcessGroup::new().expect("create group");
+    group.signal(Signal::Term).expect("signal on empty group");
+    group.suspend().expect("suspend on empty group");
+    group.resume().expect("resume on empty group");
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "creates an OS job"]
+fn windows_signal_non_kill_is_unsupported() {
+    // Job Objects have no POSIX signals: everything except Kill must surface as
+    // the typed Unsupported error, never a silent no-op.
+    let group = ProcessGroup::new().expect("create group");
+    for sig in [Signal::Term, Signal::Hup, Signal::Other(9)] {
+        let err = group
+            .signal(sig)
+            .expect_err("a non-Kill signal must be rejected on Windows");
+        assert!(
+            matches!(err, processkit::Error::Unsupported { .. }),
+            "expected Error::Unsupported for {sig:?}, got {err:?}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess and kills it via Signal::Kill"]
+async fn windows_signal_kill_kills_tree() {
+    let group = ProcessGroup::new().expect("create group");
+    let process = group.start(&sleeper()).await.expect("start sleeper");
+    assert!(process.pid().is_some());
+
+    group
+        .signal(Signal::Kill)
+        .expect("Signal::Kill maps to job terminate");
+
+    // The ~30s sleeper waiting out promptly proves the whole tree was killed
+    // (pid liveness can't be probed here: our own RunningProcess still holds the
+    // child handle, which keeps the terminated process object around).
+    let start = Instant::now();
+    let _ = tokio::time::timeout(Duration::from_secs(10), process.wait())
+        .await
+        .expect("killed tree should be reaped promptly")
+        .expect("wait");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "Signal::Kill was not prompt (took {:?})",
+        start.elapsed()
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess and suspends/resumes its threads"]
+async fn windows_suspend_resume_stalls_output() {
+    use tokio_stream::StreamExt;
+
+    let group = ProcessGroup::new().expect("create group");
+    // ping prints one line per second — a slow ticker.
+    let cmd = Command::new("ping").args(["-n", "30", "127.0.0.1"]);
+    let mut process = group.start(&cmd).await.expect("start ping");
+    let mut lines = process.stdout_lines();
+
+    tokio::time::timeout(Duration::from_secs(10), lines.next())
+        .await
+        .expect("first ping line in time")
+        .expect("first ping line");
+    group.suspend().expect("suspend");
+
+    // Drain pre-freeze buffered lines, then require silence across what would
+    // be two ticks.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(100), lines.next()).await {}
+    let stalled = tokio::time::timeout(Duration::from_secs(2), lines.next()).await;
+    assert!(stalled.is_err(), "suspended tree kept producing output");
+
+    group.resume().expect("resume");
+    let resumed = tokio::time::timeout(Duration::from_secs(10), lines.next()).await;
+    assert!(
+        resumed.is_ok_and(|line| line.is_some()),
+        "tree did not resume output"
+    );
 }
 
 #[tokio::test]

@@ -16,6 +16,7 @@ use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 
 use crate::Mechanism;
+use crate::Signal;
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
 #[cfg(feature = "stats")]
@@ -112,6 +113,31 @@ impl Job {
         }
     }
 
+    pub(crate) fn signal(&self, sig: Signal) -> io::Result<()> {
+        match &self.backend {
+            // SIGKILL takes the atomic `cgroup.kill` path so `signal(Kill)` gives
+            // the same whole-tree guarantee as `kill_all` — the per-pid loop
+            // below could miss processes forked mid-broadcast.
+            Backend::Cgroup(cg) if sig.raw() == libc::SIGKILL => cg.kill(),
+            Backend::Cgroup(cg) => cg.signal(sig.raw()),
+            Backend::ProcessGroup(pg) => pg.signal(sig.raw()),
+        }
+    }
+
+    pub(crate) fn suspend(&self) -> io::Result<()> {
+        match &self.backend {
+            Backend::Cgroup(cg) => cg.freeze(true),
+            Backend::ProcessGroup(pg) => pg.suspend(),
+        }
+    }
+
+    pub(crate) fn resume(&self) -> io::Result<()> {
+        match &self.backend {
+            Backend::Cgroup(cg) => cg.freeze(false),
+            Backend::ProcessGroup(pg) => pg.resume(),
+        }
+    }
+
     pub(crate) async fn graceful_shutdown(
         &self,
         timeout: Duration,
@@ -119,7 +145,8 @@ impl Job {
     ) -> io::Result<()> {
         match &self.backend {
             Backend::Cgroup(cg) => {
-                cg.signal(libc::SIGTERM);
+                // Best-effort: the graceful tier proceeds to polling regardless.
+                let _ = cg.signal(libc::SIGTERM);
                 let deadline = Instant::now() + timeout;
                 while !cg.is_empty() {
                     if Instant::now() >= deadline {
@@ -356,8 +383,10 @@ impl Cgroup {
         self.members().is_empty()
     }
 
-    /// Send `sig` to every current member (used for the graceful SIGTERM tier).
-    fn signal(&self, sig: i32) {
+    /// Send `sig` to every current member (the graceful SIGTERM tier and the
+    /// public signal broadcast). Best-effort: an empty cgroup is trivially
+    /// signalled, and a member that exits mid-loop just yields `ESRCH`.
+    fn signal(&self, sig: i32) -> io::Result<()> {
         for pid in self.members() {
             // SAFETY: a plain signal to a pid read from cgroup.procs; a race
             // where the pid already exited just yields ESRCH.
@@ -365,6 +394,23 @@ impl Cgroup {
                 libc::kill(pid, sig);
             }
         }
+        Ok(())
+    }
+
+    /// Freeze (`true`) or thaw (`false`) the whole subtree.
+    ///
+    /// Prefers `cgroup.freeze` (cgroup v2 core file, kernel ≥ 5.2): one write
+    /// covers the whole subtree (the kernel applies the freeze shortly after the
+    /// write returns) and needs no controllers — the same family as the
+    /// `cgroup.kill` file used for teardown. On kernels without it, fall back to
+    /// per-pid `SIGSTOP`/`SIGCONT`, mirroring the `cgroup.kill` fallback idiom.
+    fn freeze(&self, frozen: bool) -> io::Result<()> {
+        let val: &[u8] = if frozen { b"1" } else { b"0" };
+        if std::fs::write(self.path.join("cgroup.freeze"), val).is_ok() {
+            return Ok(());
+        }
+        let sig = if frozen { libc::SIGSTOP } else { libc::SIGCONT };
+        self.signal(sig)
     }
 
     fn kill(&self) -> io::Result<()> {

@@ -80,6 +80,20 @@ pub enum Error {
     #[error("could not enforce resource limits: {0}")]
     ResourceLimit(String),
 
+    /// An operation is not supported by the active containment mechanism on
+    /// this platform.
+    ///
+    /// Raised by [`ProcessGroup::signal`](crate::ProcessGroup::signal) for any
+    /// signal other than [`Signal::Kill`](crate::Signal::Kill) on Windows (Job
+    /// Objects have no POSIX signals), and by `signal`/`suspend`/`resume` on
+    /// the no-containment target, which has no process tree to act on.
+    #[error("operation `{operation}` is not supported on this platform")]
+    Unsupported {
+        /// A short description of the operation, e.g. `"signal(Hup)"` or
+        /// `"suspend"`.
+        operation: String,
+    },
+
     /// An IO error occurred while driving the process (reading a pipe, writing
     /// stdin, waiting for exit).
     #[error(transparent)]
@@ -133,11 +147,26 @@ mod tests {
             timeout: Duration::from_secs(1),
         };
         assert_eq!(timeout.diagnostic(), None);
+        let unsupported = Error::Unsupported {
+            operation: "suspend".into(),
+        };
+        assert_eq!(unsupported.diagnostic(), None);
         #[cfg(feature = "limits")]
         {
             let limit = Error::ResourceLimit("cgroup controller delegation unavailable".into());
             assert_eq!(limit.diagnostic(), None);
         }
+    }
+
+    #[test]
+    fn unsupported_display_names_the_operation() {
+        let err = Error::Unsupported {
+            operation: "signal(Hup)".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "operation `signal(Hup)` is not supported on this platform"
+        );
     }
 
     #[cfg(feature = "limits")]

@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::Mechanism;
+use crate::Signal;
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
 #[cfg(feature = "stats")]
@@ -46,6 +47,23 @@ impl Job {
         // Nothing is tracked, so there is nothing to kill here. Individual
         // children are still killed via their own handles by the higher layers.
         Ok(())
+    }
+
+    pub(crate) fn signal(&self, sig: Signal) -> io::Result<()> {
+        // No containment and no signal facility — report it rather than letting
+        // the caller believe the tree was signalled.
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("signal({sig:?})"),
+        ))
+    }
+
+    pub(crate) fn suspend(&self) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "suspend"))
+    }
+
+    pub(crate) fn resume(&self) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "resume"))
     }
 
     pub(crate) async fn graceful_shutdown(
