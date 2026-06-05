@@ -17,6 +17,19 @@ to a dated version section.
 > (`minor`), not a patch.
 
 ### Added
+- Environment and privilege builders on `Command`: `inherit_env([names])`
+  (allow-list on a cleared environment, copied from the parent at each spawn;
+  explicit `env`/`env_remove` still win), `uid(u32)`/`gid(u32)` (Unix privilege
+  drop; gid applied before uid; on the Linux cgroup mechanism the spawn
+  currently fails with a permission error — the cgroup join runs after the
+  drop — while the process-group mechanism composes cleanly), `setsid()`
+  (Unix new session — containment is
+  preserved, the group tracks the new session's process group), and
+  `create_no_window()` (Windows `CREATE_NO_WINDOW`, now OR'd with the group's
+  `CREATE_SUSPENDED` on the Command-driven launch paths instead of being
+  clobbered; harmless no-op elsewhere). On non-Unix targets `uid`/`gid`/
+  `setsid` fail the run with `Error::Unsupported` — a requested privilege drop
+  is never silently skipped.
 - Shell-free pipelines: `Command::pipe(next)` starts a `Pipeline` (extend with
   `.pipe(...)`, bound with `.timeout(...)`, drive with `output_string()` /
   `run()`). Stages connect stdout→stdin through native pipes — no shell, no

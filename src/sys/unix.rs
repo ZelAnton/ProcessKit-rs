@@ -42,8 +42,12 @@ impl Job {
         })
     }
 
-    pub(crate) fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
-        self.group.spawn(cmd)
+    pub(crate) fn spawn(
+        &self,
+        cmd: &mut Command,
+        opts: &crate::sys::SpawnOptions,
+    ) -> io::Result<Child> {
+        self.group.spawn(cmd, opts)
     }
 
     pub(crate) fn adopt(&self, child: &Child) -> io::Result<()> {

@@ -33,8 +33,14 @@ impl Job {
         Ok(Job)
     }
 
-    pub(crate) fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
-        // No containment available — a plain spawn.
+    pub(crate) fn spawn(
+        &self,
+        cmd: &mut Command,
+        _opts: &crate::sys::SpawnOptions,
+    ) -> io::Result<Child> {
+        // No containment available — a plain spawn. The opts are moot here:
+        // setsid is rejected upstream on non-unix targets, and Windows
+        // creation flags don't exist on this target family.
         cmd.spawn()
     }
 

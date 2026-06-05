@@ -136,13 +136,20 @@ impl Job {
         Ok(job)
     }
 
-    pub(crate) fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
+    pub(crate) fn spawn(
+        &self,
+        cmd: &mut Command,
+        opts: &crate::sys::SpawnOptions,
+    ) -> io::Result<Child> {
         // Race-free containment: start the child's primary thread SUSPENDED so no
         // user code runs (and nothing can fork) before the process is in the job;
         // assign it, then resume. This closes the old spawn→assign window in
-        // which a fast-forking child could have escaped the job.
+        // which a fast-forking child could have escaped the job. Win32 exposes
+        // no flag getter, so this overwrite is also where the Command-carried
+        // extras (e.g. CREATE_NO_WINDOW) are OR'd back in.
         use std::os::windows::process::CommandExt;
-        cmd.as_std_mut().creation_flags(CREATE_SUSPENDED);
+        cmd.as_std_mut()
+            .creation_flags(CREATE_SUSPENDED | opts.creation_flags);
 
         let mut child = cmd.spawn()?;
         let pid = child.id().ok_or_else(|| {

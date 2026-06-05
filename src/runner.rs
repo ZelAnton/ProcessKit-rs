@@ -169,8 +169,33 @@ impl ProcessRunner for ProcessGroup {
 /// Build the OS command, spawn it into `group`, wire stdin, and wrap everything
 /// in a [`RunningProcess`] (with no owned group).
 pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<RunningProcess> {
+    // A requested privilege drop or session detach must never be silently
+    // skipped: on targets without the POSIX primitives, fail before spawning.
+    #[cfg(not(unix))]
+    {
+        if command.requested_uid().is_some() {
+            return Err(crate::Error::Unsupported {
+                operation: "uid".into(),
+            });
+        }
+        if command.requested_gid().is_some() {
+            return Err(crate::Error::Unsupported {
+                operation: "gid".into(),
+            });
+        }
+        if command.wants_setsid() {
+            return Err(crate::Error::Unsupported {
+                operation: "setsid".into(),
+            });
+        }
+    }
+
     let mut tokio_cmd = command.build_tokio();
-    let mut child = group.spawn(&mut tokio_cmd)?;
+    let opts = crate::sys::SpawnOptions {
+        setsid: command.wants_setsid(),
+        creation_flags: command.extra_creation_flags(),
+    };
+    let mut child = group.spawn_with_options(&mut tokio_cmd, &opts)?;
     let pid = child.id();
 
     let (stdin_pipe, stdin_task) = if command.keeps_stdin_open() {

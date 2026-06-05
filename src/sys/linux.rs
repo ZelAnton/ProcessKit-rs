@@ -69,9 +69,16 @@ impl Job {
         Ok(Job { backend })
     }
 
-    pub(crate) fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
+    pub(crate) fn spawn(
+        &self,
+        cmd: &mut Command,
+        opts: &crate::sys::SpawnOptions,
+    ) -> io::Result<Child> {
         match &self.backend {
             Backend::Cgroup(cg) => {
+                // The cgroup path never touches process groups, so a setsid
+                // pre-exec hook needs no coordination here.
+                let _ = opts;
                 let procs = CString::new(cg.path.join("cgroup.procs").into_os_string().into_vec())
                     .map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidInput, "cgroup path contains NUL")
@@ -86,7 +93,7 @@ impl Job {
                 }
                 cmd.spawn()
             }
-            Backend::ProcessGroup(pg) => pg.spawn(cmd),
+            Backend::ProcessGroup(pg) => pg.spawn(cmd, opts),
         }
     }
 

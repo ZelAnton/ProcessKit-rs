@@ -52,11 +52,21 @@ impl ProcessGroup {
         }
     }
 
-    pub(crate) fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
+    pub(crate) fn spawn(
+        &self,
+        cmd: &mut Command,
+        opts: &crate::sys::SpawnOptions,
+    ) -> io::Result<Child> {
         // Own process group per child → killpg reaps it and its descendants.
         // `process_group(0)` == setpgid(0, 0): the child becomes its own group
-        // leader.
-        cmd.as_std_mut().process_group(0);
+        // leader. EXCEPT when the command carries a `setsid()` pre-exec hook:
+        // std applies setpgid *before* pre-exec hooks, and setsid fails EPERM
+        // for a process that is already a group leader — so skip setpgid and
+        // let setsid create the session + group (pgid == pid). The tracking
+        // below is identical either way.
+        if !opts.setsid {
+            cmd.as_std_mut().process_group(0);
+        }
         let child = cmd.spawn()?;
         if let Some(pid) = child.id()
             && let Ok(mut g) = self.pgids.lock()

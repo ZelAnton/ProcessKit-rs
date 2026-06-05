@@ -42,6 +42,15 @@ pub struct Command {
     stdout_encoding: &'static Encoding,
     stderr_encoding: &'static Encoding,
     retry: Option<RetryPolicy>,
+    /// `Some` once `inherit_env` was called (even with an empty list): clear
+    /// the inherited environment and copy only these parent vars.
+    inherit_env: Option<Vec<OsString>>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    setsid: bool,
+    /// Extra Windows process-creation flags (e.g. `CREATE_NO_WINDOW`), OR'd
+    /// into the spawn by the Command-driven launch paths.
+    creation_flags_extra: u32,
 }
 
 /// A retry policy attached to a [`Command`] via [`Command::retry`], honored by
@@ -71,6 +80,11 @@ impl Command {
             stdout_encoding: UTF_8,
             stderr_encoding: UTF_8,
             retry: None,
+            inherit_env: None,
+            uid: None,
+            gid: None,
+            setsid: false,
+            creation_flags_extra: 0,
         }
     }
 
@@ -115,6 +129,87 @@ impl Command {
     /// Clear all inherited environment variables before applying any set here.
     pub fn env_clear(mut self) -> Self {
         self.env_clear = true;
+        self
+    }
+
+    /// Inherit **only** the named variables from the parent environment —
+    /// an allow-list on top of an implied [`env_clear`](Self::env_clear).
+    ///
+    /// The named vars are copied from the parent environment at each spawn
+    /// (vars the parent lacks are skipped); explicit [`env`](Self::env) /
+    /// [`env_remove`](Self::env_remove) overrides still apply afterwards.
+    /// Repeated calls extend the allow-list. Works on every platform.
+    pub fn inherit_env<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.inherit_env
+            .get_or_insert_with(Vec::new)
+            .extend(names.into_iter().map(|n| n.as_ref().to_os_string()));
+        self
+    }
+
+    /// Run the child as this user id (Unix privilege drop).
+    ///
+    /// Applied by the OS between fork and exec; combine with
+    /// [`gid`](Self::gid) — the group id is set **before** the user id (once
+    /// the uid drops, changing gid is no longer permitted), an ordering the
+    /// standard library guarantees. On non-Unix targets the run fails with
+    /// [`Error::Unsupported`](crate::Error::Unsupported) — a requested
+    /// privilege drop is never silently skipped.
+    ///
+    /// **Linux cgroup caveat:** under the cgroup v2 mechanism
+    /// ([`Mechanism::CgroupV2`](crate::Mechanism::CgroupV2)) the child joins
+    /// its cgroup *after* the OS has dropped the uid, by writing the
+    /// auto-created (and therefore not target-uid-writable) `cgroup.procs` —
+    /// so the spawn currently fails with a permission error rather than
+    /// producing an uncontained child. Privilege drop composes cleanly with
+    /// the POSIX process-group mechanism (macOS/BSD, or Linux without cgroup
+    /// delegation); making it compose with cgroups (e.g. chowning the cgroup
+    /// to the target uid) is tracked future work.
+    pub fn uid(mut self, uid: u32) -> Self {
+        self.uid = Some(uid);
+        self
+    }
+
+    /// Run the child under this group id (Unix privilege drop) — see
+    /// [`uid`](Self::uid) for ordering and platform notes.
+    pub fn gid(mut self, gid: u32) -> Self {
+        self.gid = Some(gid);
+        self
+    }
+
+    /// Detach the child into a **new session** (Unix `setsid()`): no
+    /// controlling terminal, its own session and process group.
+    ///
+    /// Containment is preserved: the group tracks the new session's process
+    /// group (whose id is the child's pid), so kill-on-drop and the teardown
+    /// verbs still reach it. On non-Unix targets the run fails with
+    /// [`Error::Unsupported`](crate::Error::Unsupported).
+    ///
+    /// Honored by the `Command`-driven launch paths (`run`/`output_*`/
+    /// `start`, [`ProcessGroup::start`](crate::ProcessGroup::start),
+    /// pipelines); the low-level raw-command
+    /// [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) escape hatch
+    /// bypasses these builders.
+    pub fn setsid(mut self) -> Self {
+        self.setsid = true;
+        self
+    }
+
+    /// Spawn without a console window (Windows `CREATE_NO_WINDOW`) — for a
+    /// GUI app launching a CLI tool without a flashing terminal.
+    ///
+    /// On non-Windows targets this is a harmless no-op (purely cosmetic — no
+    /// console windows exist to suppress). Honored by the `Command`-driven
+    /// launch paths; the raw
+    /// [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) escape hatch still
+    /// overwrites creation flags (see its docs).
+    pub fn create_no_window(mut self) -> Self {
+        // CREATE_NO_WINDOW = 0x0800_0000; spelled as a literal so the field
+        // exists (and tests compile) on every platform.
+        self.creation_flags_extra |= 0x0800_0000;
         self
     }
 
@@ -281,6 +376,29 @@ impl Command {
         self.program.to_string_lossy().into_owned()
     }
 
+    /// Whether [`setsid`](Self::setsid) was requested (read by the spawn seam).
+    pub(crate) fn wants_setsid(&self) -> bool {
+        self.setsid
+    }
+
+    /// Extra Windows creation flags (read by the spawn seam on every target).
+    pub(crate) fn extra_creation_flags(&self) -> u32 {
+        self.creation_flags_extra
+    }
+
+    /// The requested privilege-drop uid — read only by the non-Unix
+    /// unsupported gate (Unix consumes the field directly in `build_tokio`).
+    #[cfg(not(unix))]
+    pub(crate) fn requested_uid(&self) -> Option<u32> {
+        self.uid
+    }
+
+    /// See [`requested_uid`](Self::requested_uid).
+    #[cfg(not(unix))]
+    pub(crate) fn requested_gid(&self) -> Option<u32> {
+        self.gid
+    }
+
     // ----- Public accessors -----------------------------------------------
     // Exposed so external `ScriptedRunner::when(|cmd| …)` predicates and other
     // inspection can read what a command will run. Named to avoid clashing with
@@ -333,8 +451,18 @@ impl Command {
         if let Some(cwd) = &self.cwd {
             cmd.current_dir(cwd);
         }
-        if self.env_clear {
+        // An inherit_env allow-list implies a cleared environment.
+        if self.env_clear || self.inherit_env.is_some() {
             cmd.env_clear();
+        }
+        if let Some(names) = &self.inherit_env {
+            // Copy the allow-listed vars from the parent env at spawn time;
+            // vars the parent lacks are skipped. Explicit overrides below win.
+            for name in names {
+                if let Some(value) = std::env::var_os(name) {
+                    cmd.env(name, value);
+                }
+            }
         }
         for (key, value) in &self.envs {
             match value {
@@ -345,6 +473,43 @@ impl Command {
                     cmd.env_remove(key);
                 }
             }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // gid before uid (std orders them this way in the child too: once
+            // the uid drops, changing gid is no longer permitted).
+            if let Some(gid) = self.gid {
+                cmd.as_std_mut().gid(gid);
+            }
+            if let Some(uid) = self.uid {
+                cmd.as_std_mut().uid(uid);
+            }
+            if self.setsid {
+                // Registered before any backend hook (e.g. the Linux cgroup
+                // join), so the new session exists first. The pgroup backend
+                // skips its setpgid when setsid is requested — std applies
+                // setpgid before pre_exec hooks, and setsid fails EPERM for a
+                // process that is already a group leader.
+                // SAFETY: the closure calls only setsid() and reads errno —
+                // both async-signal-safe.
+                unsafe {
+                    cmd.as_std_mut().pre_exec(|| {
+                        if libc::setsid() == -1 {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            Ok(())
+                        }
+                    });
+                }
+            }
+        }
+        #[cfg(windows)]
+        if self.creation_flags_extra != 0 {
+            use std::os::windows::process::CommandExt;
+            // Covers non-group launch paths; the group spawn on Windows
+            // overwrites flags with CREATE_SUSPENDED | these extras.
+            cmd.as_std_mut().creation_flags(self.creation_flags_extra);
         }
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -466,6 +631,108 @@ impl fmt::Debug for Command {
             .field("stdout_encoding", &self.stdout_encoding.name())
             .field("stderr_encoding", &self.stderr_encoding.name())
             .field("has_retry", &self.retry.is_some())
+            .field("inherit_env", &self.inherit_env)
+            .field("uid", &self.uid)
+            .field("gid", &self.gid)
+            .field("setsid", &self.setsid)
+            .field("creation_flags_extra", &self.creation_flags_extra)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Command;
+    use std::ffi::OsStr;
+
+    /// The explicit env ops recorded on the built OS command, as
+    /// (key, Some(value)|None-for-remove) pairs.
+    fn built_envs(cmd: &Command) -> Vec<(String, Option<String>)> {
+        cmd.build_tokio()
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inherit_env_copies_named_parent_vars_onto_a_cleared_env() {
+        // PATH exists in every test environment — no global env mutation.
+        let parent_path = std::env::var_os("PATH").expect("PATH set in tests");
+        let cmd = Command::new("x").inherit_env(["PATH"]);
+        let built = cmd.build_tokio();
+        assert!(
+            built
+                .as_std()
+                .get_envs()
+                .any(|(k, v)| { k == OsStr::new("PATH") && v == Some(parent_path.as_os_str()) }),
+            "PATH should be copied from the parent env"
+        );
+        // inherit_env implies env_clear: only allow-listed/explicit ops remain.
+        assert_eq!(built.as_std().get_envs().count(), 1);
+    }
+
+    #[test]
+    fn inherit_env_skips_vars_the_parent_lacks() {
+        let cmd = Command::new("x").inherit_env(["PROCESSKIT_DEFINITELY_NOT_SET_424242"]);
+        assert!(
+            built_envs(&cmd).is_empty(),
+            "a var the parent lacks must be skipped, not set empty"
+        );
+    }
+
+    #[test]
+    fn explicit_env_ops_apply_after_the_allow_list() {
+        let cmd = Command::new("x")
+            .inherit_env(["PATH"])
+            .env("PATH", "overridden")
+            .env("EXTRA", "1");
+        let envs = built_envs(&cmd);
+        // The std Command keeps one entry per key, last write winning — so the
+        // explicit override (applied after the inherited copy) is what remains.
+        assert!(
+            envs.contains(&("PATH".to_string(), Some("overridden".to_string()))),
+            "explicit env must override the inherited value: {envs:?}"
+        );
+        assert!(
+            envs.contains(&("EXTRA".to_string(), Some("1".to_string()))),
+            "explicit extras apply too: {envs:?}"
+        );
+        assert_eq!(envs.len(), 2, "cleared env + two explicit keys: {envs:?}");
+    }
+
+    #[test]
+    fn inherit_env_calls_accumulate() {
+        // If a second call REPLACED the allow-list (instead of extending it),
+        // PATH from the first call would be lost.
+        let cmd = Command::new("x")
+            .inherit_env(["PATH"])
+            .inherit_env(["PROCESSKIT_DEFINITELY_NOT_SET_424242"]);
+        let envs = built_envs(&cmd);
+        assert!(
+            envs.iter().any(|(k, _)| k == "PATH"),
+            "the first call's names must survive a second call: {envs:?}"
+        );
+    }
+
+    #[test]
+    fn privilege_builders_record_their_requests() {
+        let cmd = Command::new("x").uid(1000).gid(1000).setsid();
+        assert!(cmd.wants_setsid());
+        let debug = format!("{cmd:?}");
+        assert!(debug.contains("uid: Some(1000)"), "debug: {debug}");
+        assert!(debug.contains("gid: Some(1000)"), "debug: {debug}");
+    }
+
+    #[test]
+    fn create_no_window_sets_the_flag_bit() {
+        let cmd = Command::new("x").create_no_window();
+        assert_eq!(cmd.extra_creation_flags(), 0x0800_0000);
+        assert_eq!(Command::new("x").extra_creation_flags(), 0);
     }
 }

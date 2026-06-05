@@ -23,7 +23,10 @@
 //!   [`wait_for`](RunningProcess::wait_for)) wait until a started child is
 //!   actually *ready* instead of sleeping. A [`Pipeline`]
 //!   ([`Command::pipe`]) chains commands stdout→stdin without a shell — one
-//!   shared group, pipefail outcome.
+//!   shared group, pipefail outcome. Spawn-time sandboxing knobs:
+//!   [`Command::inherit_env`] (env allow-list), [`Command::uid`] /
+//!   [`Command::gid`] (Unix privilege drop), [`Command::setsid`],
+//!   [`Command::create_no_window`].
 //!
 //! Async throughout (tokio). Errors are the structured [`Error`]; a non-zero
 //! exit is reported in [`ProcessResult`], not raised, until you call

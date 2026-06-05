@@ -46,6 +46,28 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
 #[cfg(unix)]
 pub(crate) mod pgroup;
 
+/// Per-spawn knobs that must reach the platform backend (the
+/// `tokio::process::Command` can't carry them: creation flags have no getter,
+/// and the pgroup backend must know about `setsid` *before* it sets a process
+/// group).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SpawnOptions {
+    /// The command carries a `setsid()` pre-exec hook: the pgroup backend must
+    /// skip its `process_group(0)` (std applies setpgid before pre-exec hooks,
+    /// and `setsid` fails `EPERM` for a process that is already a group
+    /// leader); the new session's group (pgid == pid) is tracked instead.
+    /// Only unix backends consult it — non-unix launches reject `setsid`
+    /// upstream before a `SpawnOptions` is ever built.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub setsid: bool,
+    /// Extra Windows creation flags (e.g. `CREATE_NO_WINDOW`), OR'd with the
+    /// containment-required `CREATE_SUSPENDED` on the Windows backend. Only
+    /// the Windows backend consults it — elsewhere the flag is a documented
+    /// no-op.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub creation_flags: u32,
+}
+
 // Exactly one platform module is compiled per target. Each defines an `imp::Job`
 // with the same inherent methods plus a kill-on-close `Drop`.
 #[cfg_attr(windows, path = "windows.rs")]
@@ -76,12 +98,12 @@ impl Job {
         imp::Job::new().map(Job)
     }
 
-    /// Spawn `cmd` as a member of this job.
+    /// Spawn `cmd` as a member of this job, honoring the per-spawn `opts`.
     ///
     /// The child — and any process it later spawns — belongs to the job and is
     /// reaped when the job is killed or dropped.
-    pub(crate) fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
-        self.0.spawn(cmd)
+    pub(crate) fn spawn(&self, cmd: &mut Command, opts: &SpawnOptions) -> io::Result<Child> {
+        self.0.spawn(cmd, opts)
     }
 
     /// Attach an already-started child to this job.

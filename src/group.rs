@@ -148,8 +148,11 @@ impl ProcessGroup {
     /// `CREATE_SUSPENDED`, assigned to the job, then resumed. This **overwrites**
     /// any process-creation flags the caller set on `cmd` (e.g.
     /// `CREATE_NO_WINDOW`) — Win32 exposes no way to read them back and OR the
-    /// suspend bit in. Set such flags through a different launch path if you need
-    /// them, or accept that this escape hatch forces only `CREATE_SUSPENDED`.
+    /// suspend bit in. The `Command`-driven launch paths (run helpers,
+    /// [`start`](Self::start), pipelines) don't have this limitation: their
+    /// [`Command::create_no_window`](crate::Command::create_no_window) flag
+    /// travels alongside the OS command and is OR'd in. Only this raw escape
+    /// hatch forces `CREATE_SUSPENDED` alone.
     /// **Unix:** the group likewise installs a `pre_exec` hook on `cmd` to join
     /// the cgroup / process group.
     ///
@@ -159,7 +162,18 @@ impl ProcessGroup {
     /// spawn. (The crate's own run helpers do this — every run rebuilds the OS
     /// command — so this only concerns direct `spawn` callers.)
     pub fn spawn(&self, cmd: &mut Command) -> Result<Child> {
-        let child = self.job.spawn(cmd).map_err(|source| Error::Spawn {
+        self.spawn_with_options(cmd, &crate::sys::SpawnOptions::default())
+    }
+
+    /// `spawn`, carrying the per-spawn knobs a raw `tokio::process::Command`
+    /// can't (extra Windows creation flags; the setsid/process-group
+    /// coordination). The `Command`-driven launch path.
+    pub(crate) fn spawn_with_options(
+        &self,
+        cmd: &mut Command,
+        opts: &crate::sys::SpawnOptions,
+    ) -> Result<Child> {
+        let child = self.job.spawn(cmd, opts).map_err(|source| Error::Spawn {
             program: program_name(cmd),
             source,
         })?;

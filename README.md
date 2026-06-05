@@ -295,6 +295,44 @@ source is honored; inner stages read from the pipe. `.timeout(d)` bounds the
 whole chain (killing every stage at the deadline), and `run()` requires every
 stage to succeed, returning the trimmed final stdout.
 
+## Environment and privileges
+
+Spawn-time controls for sandboxing and service launch:
+
+```rust,no_run
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    Command::new("worker")
+        .inherit_env(["PATH", "HOME", "LANG"]) // allow-list on a cleared env
+        .uid(1000).gid(1000)                   // Unix: drop privileges
+        .setsid()                              // Unix: new session
+        .run()
+        .await?;
+
+    Command::new("helper")
+        .create_no_window()                    // Windows: no console window
+        .run()
+        .await?;
+    Ok(())
+}
+```
+
+`inherit_env` clears the environment and copies only the named parent vars
+(explicit `env`/`env_remove` still apply on top); it works everywhere. `uid` /
+`gid` (group id is set before user id) and `setsid` are POSIX-only — on other
+targets the run fails with `Error::Unsupported` rather than silently skipping
+a privilege drop. One Linux caveat: under the **cgroup** mechanism the child
+joins its cgroup after the uid has already dropped, and the auto-created
+cgroup isn't writable by the target user — the spawn fails with a permission
+error (never an uncontained child); privilege drop currently composes cleanly
+with the process-group mechanism. `setsid` keeps containment: the group
+tracks the new session's process group. `create_no_window` is a harmless
+no-op outside Windows and, unlike the raw `ProcessGroup::spawn` escape hatch,
+survives the group's `CREATE_SUSPENDED` containment flag (they are OR'd
+together).
+
 ## Async streaming and interactive I/O
 
 The one-shot helpers above buffer the whole output. For long-running or
