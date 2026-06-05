@@ -12,6 +12,15 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- Readiness probes on `RunningProcess` — wait until a started child is
+  actually ready instead of sleeping: `wait_for_line(predicate, within)`
+  (stream stdout until a line matches, returning it; consumes stdout up to the
+  match), `wait_for_port(addr, within)` (until a TCP connect is accepted), and
+  `wait_for(check, within)` (until any async predicate passes; ~50 ms cadence).
+  All three fail with the new `Error::NotReady` when the deadline elapses — or
+  immediately once readiness can no longer happen (the child exits; for
+  `wait_for_line`, its stdout closes) — and never kill the child (a probe
+  deadline is separate from `Command::timeout`).
 - `Supervisor` — keep a child alive: restart per `RestartPolicy`
   (`Always`/`OnCrash`/`Never`, where a crash is any run without a clean exit —
   non-zero, timeout, signal, or spawn failure), bounded by `max_restarts`, with

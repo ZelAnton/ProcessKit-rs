@@ -41,8 +41,9 @@ all-features = true
 # Async runtime + child-process management: `process` spawns children,
 # `time` enforces timeouts, `io-util` streams stdin/stdout line-by-line,
 # `rt` powers the background stderr-drain task, `macros` for `#[tokio::main]`
-# in examples, `sync` for the oneshot/Notify used in shutdown coordination.
-tokio = { version = "1", features = ["process", "time", "io-util", "rt", "macros", "sync", "fs"] }
+# in examples, `sync` for the oneshot/Notify used in shutdown coordination,
+# `net` for the TcpStream the `wait_for_port` readiness probe connects with.
+tokio = { version = "1", features = ["process", "time", "io-util", "rt", "macros", "sync", "fs", "net"] }
 # `async fn` in the object-safe `ProcessRunner` trait so it stays `dyn`-able
 # and mockable (native async-in-trait isn't object-safe on our MSRV).
 async-trait = "0.1"
@@ -113,8 +114,9 @@ libc = "0.2"
 [dev-dependencies]
 # `#[tokio::test]` plus a multi-threaded runtime to drive the async tests;
 # `test-util` provides the paused clock for the supervisor's backoff-timing
-# tests (virtual time instead of real sleeps).
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "test-util"] }
+# tests (virtual time instead of real sleeps); `net` binds the ephemeral
+# TcpListener the `wait_for_port` integration test probes against.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "test-util", "net"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # Liveness probe (OpenProcess) in the integration test that proves a grandchild

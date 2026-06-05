@@ -18,6 +18,10 @@
 //!   shared group. The trait is the mock seam (see [`ScriptedRunner`]). A
 //!   [`Supervisor`] keeps a command *alive* — restarting it per policy with
 //!   backoff — where [`Command::retry`] merely replays one run to success.
+//!   Readiness probes ([`RunningProcess::wait_for_line`] /
+//!   [`wait_for_port`](RunningProcess::wait_for_port) /
+//!   [`wait_for`](RunningProcess::wait_for)) wait until a started child is
+//!   actually *ready* instead of sleeping.
 //!
 //! Async throughout (tokio). Errors are the structured [`Error`]; a non-zero
 //! exit is reported in [`ProcessResult`], not raised, until you call

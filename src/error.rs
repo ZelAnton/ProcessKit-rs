@@ -56,6 +56,27 @@ pub enum Error {
         timeout: Duration,
     },
 
+    /// A readiness probe ([`RunningProcess::wait_for_line`],
+    /// [`wait_for_port`](crate::RunningProcess::wait_for_port),
+    /// [`wait_for`](crate::RunningProcess::wait_for)) did not pass within its
+    /// deadline — the line never appeared, the port never accepted, the check
+    /// never returned `true`, or the child exited before becoming ready.
+    ///
+    /// Distinct from [`Timeout`](Error::Timeout): a probe deadline is separate
+    /// from the run's own [`Command::timeout`](crate::Command::timeout), and a
+    /// failed probe does **not** kill the child — the caller decides what
+    /// happens next.
+    ///
+    /// [`RunningProcess::wait_for_line`]: crate::RunningProcess::wait_for_line
+    #[error("`{program}` was not ready after {timeout:?}")]
+    NotReady {
+        /// The program that did not become ready.
+        program: String,
+        /// The probe deadline that elapsed (or would have — an early child
+        /// exit fails the probe immediately).
+        timeout: Duration,
+    },
+
     /// The process succeeded but its output could not be parsed into the
     /// expected shape (e.g. malformed `--json`). Produced by the fallible-parse
     /// helpers on [`CliClient`](crate::CliClient).
@@ -151,11 +172,25 @@ mod tests {
             operation: "suspend".into(),
         };
         assert_eq!(unsupported.diagnostic(), None);
+        let not_ready = Error::NotReady {
+            program: "server".into(),
+            timeout: Duration::from_secs(10),
+        };
+        assert_eq!(not_ready.diagnostic(), None);
         #[cfg(feature = "limits")]
         {
             let limit = Error::ResourceLimit("cgroup controller delegation unavailable".into());
             assert_eq!(limit.diagnostic(), None);
         }
+    }
+
+    #[test]
+    fn not_ready_display_names_program_and_timeout() {
+        let err = Error::NotReady {
+            program: "my-server".into(),
+            timeout: Duration::from_secs(10),
+        };
+        assert_eq!(err.to_string(), "`my-server` was not ready after 10s");
     }
 
     #[test]

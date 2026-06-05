@@ -224,6 +224,50 @@ through the `ProcessRunner` seam: pass `.with_runner(&group)` to keep every
 incarnation in one shared kill-on-drop group, or a `ScriptedRunner` to test
 supervision logic hermetically.
 
+## Waiting for a child to be ready
+
+"Start a server, then use it" needs the server to be *ready*, not merely
+started. Three probes replace the arbitrary sleep:
+
+```rust,no_run
+use processkit::Command;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let mut run = Command::new("my-server").start().await?;
+
+    // Wait for the startup banner (returns the matching line)…
+    let banner = run
+        .wait_for_line(|l| l.contains("listening on"), Duration::from_secs(10))
+        .await?;
+    println!("server says: {banner}");
+
+    // …or for the port to accept connections…
+    let addr = "127.0.0.1:8080".parse().expect("valid socket address");
+    run.wait_for_port(addr, Duration::from_secs(10)).await?;
+
+    // …or for any async health check to pass.
+    run.wait_for(|| async { health_check().await }, Duration::from_secs(10)).await?;
+
+    // ready — use the server …
+    Ok(())
+}
+
+async fn health_check() -> bool {
+    // e.g. probe an HTTP /health endpoint
+    true
+}
+```
+
+A probe that doesn't pass within its deadline — or that can no longer pass
+(the child exits; for `wait_for_line`, its stdout closes) — fails with
+`Error::NotReady` (distinct from `Error::Timeout`, which is the run's own
+`Command::timeout`) and **does not kill the child**: the caller decides what
+happens next. `wait_for_line` consumes stdout up to the match
+(continue with `finish_streamed`); `wait_for_port` / `wait_for` don't touch
+the pipes at all.
+
 ## Async streaming and interactive I/O
 
 The one-shot helpers above buffer the whole output. For long-running or
