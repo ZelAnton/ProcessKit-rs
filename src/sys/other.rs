@@ -10,15 +10,19 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::Mechanism;
+#[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
+#[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
+#[cfg(feature = "stats")]
 use crate::sys::ProcMetrics;
 
 pub(crate) struct Job;
 
 impl Job {
-    pub(crate) fn new(limits: &ResourceLimits) -> io::Result<Self> {
+    pub(crate) fn new(#[cfg(feature = "limits")] limits: &ResourceLimits) -> io::Result<Self> {
         // No kernel containment here, so there is nothing to enforce a limit with.
+        #[cfg(feature = "limits")]
         if limits.any() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -52,6 +56,7 @@ impl Job {
         Ok(())
     }
 
+    #[cfg(feature = "stats")]
     pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
         // No containment, so no group accounting is available.
         Ok(ProcessGroupStats {
@@ -66,6 +71,7 @@ impl Job {
     }
 }
 
+#[cfg(feature = "stats")]
 pub(crate) fn process_metrics(_pid: u32) -> ProcMetrics {
     ProcMetrics::default()
 }

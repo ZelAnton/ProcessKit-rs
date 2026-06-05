@@ -5,21 +5,27 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::error::{Error, Result};
+#[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
 use crate::mechanism::Mechanism;
+#[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
 use crate::sys::Job;
 
-/// Tuning for a [`ProcessGroup`] — graceful-shutdown timing and resource limits.
+/// Tuning for a [`ProcessGroup`] — graceful-shutdown timing and (with the
+/// `limits` feature) resource limits.
 ///
 /// The `shutdown_*` knobs only affect the Unix graceful path
 /// ([`ProcessGroup::shutdown`]): give the tree `shutdown_timeout` to exit after
 /// `SIGTERM`, then `SIGKILL` survivors if `escalate_to_kill` is set. On Windows
 /// the job kill is atomic, so they are ignored.
-///
-/// [`limits`](Self::limits) caps the whole tree's memory, process count, and CPU;
-/// it is applied at group creation and only where a real container exists (Windows
-/// Job Object or Linux cgroup v2) — see [`ResourceLimits`].
+#[cfg_attr(
+    feature = "limits",
+    doc = "",
+    doc = "[`limits`](Self::limits) caps the whole tree's memory, process count, and CPU;",
+    doc = "it is applied at group creation and only where a real container exists (Windows",
+    doc = "Job Object or Linux cgroup v2) — see [`ResourceLimits`]."
+)]
 #[derive(Debug, Clone)]
 pub struct ProcessGroupOptions {
     /// How long to wait after `SIGTERM` before escalating. Default: 2 seconds.
@@ -28,6 +34,7 @@ pub struct ProcessGroupOptions {
     /// Default: `true`.
     pub escalate_to_kill: bool,
     /// Whole-tree resource caps applied at creation. Default: no limits.
+    #[cfg(feature = "limits")]
     pub limits: ResourceLimits,
 }
 
@@ -36,11 +43,13 @@ impl Default for ProcessGroupOptions {
         Self {
             shutdown_timeout: Duration::from_secs(2),
             escalate_to_kill: true,
+            #[cfg(feature = "limits")]
             limits: ResourceLimits::default(),
         }
     }
 }
 
+#[cfg(feature = "limits")]
 impl ProcessGroupOptions {
     /// Cap the tree's total memory at `bytes`. See [`ResourceLimits`] for platform
     /// support.
@@ -89,22 +98,31 @@ impl ProcessGroup {
     }
 
     /// Create an empty group with the given options.
-    ///
-    /// If `options.limits` sets any cap, it is enforced now. When the active
-    /// mechanism can't honor a requested limit (no cgroup/Job Object, or a Linux
-    /// cgroup without controller delegation) this returns
-    /// [`Error::ResourceLimit`] rather than handing back an unbounded group.
+    #[cfg_attr(
+        feature = "limits",
+        doc = "",
+        doc = "If `options.limits` sets any cap, it is enforced now. When the active",
+        doc = "mechanism can't honor a requested limit (no cgroup/Job Object, or a Linux",
+        doc = "cgroup without controller delegation) this returns",
+        doc = "[`Error::ResourceLimit`] rather than handing back an unbounded group."
+    )]
     pub fn with_options(options: ProcessGroupOptions) -> Result<Self> {
-        validate_limits(&options.limits)?;
-        let job = Job::new(&options.limits).map_err(|source| {
-            // A failure while limits were requested means we could not enforce them
-            // — surface that distinctly so the caller never assumes a cap is live.
-            if options.limits.any() {
-                Error::ResourceLimit(source.to_string())
-            } else {
-                Error::Io(source)
-            }
-        })?;
+        #[cfg(feature = "limits")]
+        let job = {
+            validate_limits(&options.limits)?;
+            Job::new(&options.limits).map_err(|source| {
+                // A failure while limits were requested means we could not enforce
+                // them — surface that distinctly so the caller never assumes a cap
+                // is live.
+                if options.limits.any() {
+                    Error::ResourceLimit(source.to_string())
+                } else {
+                    Error::Io(source)
+                }
+            })?
+        };
+        #[cfg(not(feature = "limits"))]
+        let job = Job::new()?;
         Ok(Self { job, options })
     }
 
@@ -172,6 +190,7 @@ impl ProcessGroup {
     /// Snapshot the group's resource usage (active process count and, where the
     /// platform supports it, total CPU time and peak memory). See
     /// [`ProcessGroupStats`].
+    #[cfg(feature = "stats")]
     pub fn stats(&self) -> Result<ProcessGroupStats> {
         let stats = self.job.stats()?;
         Ok(stats)
@@ -190,6 +209,7 @@ fn program_name(cmd: &Command) -> String {
 
 /// Reject nonsensical limit values before touching the OS, so a typo surfaces as a
 /// clear [`Error::ResourceLimit`] rather than an opaque kernel error.
+#[cfg(feature = "limits")]
 fn validate_limits(limits: &ResourceLimits) -> Result<()> {
     if limits.memory_max == Some(0) {
         return Err(Error::ResourceLimit(
@@ -211,7 +231,7 @@ fn validate_limits(limits: &ResourceLimits) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "limits"))]
 mod tests {
     use super::*;
 

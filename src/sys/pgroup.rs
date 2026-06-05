@@ -22,6 +22,7 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 
+#[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
 
 /// How often the graceful path re-checks whether the tree has drained.
@@ -108,6 +109,7 @@ impl ProcessGroup {
         Ok(())
     }
 
+    #[cfg(feature = "stats")]
     pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
         // We track group ids, not individual pids, so report the number of
         // still-live groups and leave cpu/memory absent.

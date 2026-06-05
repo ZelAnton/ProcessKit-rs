@@ -4,8 +4,10 @@
 //! are `#[ignore]`d to keep `cargo test` hermetic on CI. Run them locally with:
 //!
 //! ```text
-//! cargo test -- --ignored
+//! cargo test --all-features -- --ignored
 //! ```
+//!
+//! (`--all-features` because the `limits` tests are compiled out by default.)
 //!
 //! The no-orphan kernel guarantee can only be proven against a real process
 //! tree, which is exactly what these cover.
@@ -13,9 +15,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use processkit::{
-    Command, Error, Mechanism, OutputBufferPolicy, ProcessGroup, ProcessGroupOptions,
-};
+use processkit::{Command, Mechanism, OutputBufferPolicy, ProcessGroup};
+// Imported only by the `limits` tests; the other tests name `processkit::Error`
+// variants via their full path.
+#[cfg(feature = "limits")]
+use processkit::{Error, ProcessGroupOptions};
 
 /// A command that prints five numbered lines and exits 0, per platform.
 fn five_lines() -> Command {
@@ -440,6 +444,7 @@ async fn interactive_stdin_round_trips() {
     assert_eq!(first, "apple", "sorted output: {:?}", result.stdout());
 }
 
+#[cfg(feature = "stats")]
 #[tokio::test]
 #[ignore = "creates an OS job/cgroup and reads accounting"]
 async fn group_stats_report_active_processes() {
@@ -452,6 +457,7 @@ async fn group_stats_report_active_processes() {
     );
 }
 
+#[cfg(feature = "stats")]
 #[tokio::test]
 #[ignore = "spawns a real subprocess and reads per-process metrics"]
 async fn process_diagnostics_are_available() {
@@ -534,6 +540,7 @@ async fn top_level_run_and_output() {
 
 // ----- Resource limits (memory / process count / CPU) -----
 
+#[cfg(feature = "limits")]
 #[tokio::test]
 #[ignore = "creates an OS job/cgroup with a resource limit"]
 async fn limits_are_enforced_or_rejected_per_platform() {
@@ -563,7 +570,7 @@ async fn limits_are_enforced_or_rejected_per_platform() {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "limits"))]
 #[tokio::test]
 #[ignore = "spawns real subprocesses to prove the active-process cap is enforced"]
 async fn windows_process_count_limit_is_enforced() {
@@ -586,7 +593,7 @@ async fn windows_process_count_limit_is_enforced() {
     );
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "limits"))]
 #[tokio::test]
 #[ignore = "creates a capped Job Object and runs a small child within it"]
 async fn windows_memory_and_cpu_limits_accept_and_run() {

@@ -16,8 +16,11 @@ use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 
 use crate::Mechanism;
+#[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
+#[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
+#[cfg(feature = "stats")]
 use crate::sys::ProcMetrics;
 use crate::sys::pgroup::ProcessGroup;
 
@@ -41,18 +44,23 @@ enum Backend {
 }
 
 impl Job {
-    pub(crate) fn new(limits: &ResourceLimits) -> io::Result<Self> {
+    pub(crate) fn new(#[cfg(feature = "limits")] limits: &ResourceLimits) -> io::Result<Self> {
         // Prefer a cgroup; degrade to a process group if we can't make one
         // (no cgroup v2, no delegation, read-only fs, …). The choice is
         // observable via `mechanism()` — never silent.
-        let backend = match Cgroup::create(limits) {
+        let backend = match Cgroup::create(
+            #[cfg(feature = "limits")]
+            limits,
+        ) {
             Ok(cg) => Backend::Cgroup(cg),
-            Err(e) => {
+            // The error is only consulted with `limits` on, hence the `_e` binding.
+            Err(_e) => {
                 // The process-group fallback has no resource accounting, so it
                 // cannot honor a requested limit. Fail fast rather than hand back
                 // an unbounded tree the caller believes is capped.
+                #[cfg(feature = "limits")]
                 if limits.any() {
-                    return Err(e);
+                    return Err(_e);
                 }
                 Backend::ProcessGroup(ProcessGroup::new())
             }
@@ -128,6 +136,7 @@ impl Job {
         }
     }
 
+    #[cfg(feature = "stats")]
     pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
         match &self.backend {
             Backend::Cgroup(cg) => {
@@ -170,6 +179,7 @@ impl Job {
     }
 }
 
+#[cfg(feature = "stats")]
 pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
     let mut metrics = ProcMetrics::default();
 
@@ -243,7 +253,7 @@ struct Cgroup {
 }
 
 impl Cgroup {
-    fn create(limits: &ResourceLimits) -> io::Result<Self> {
+    fn create(#[cfg(feature = "limits")] limits: &ResourceLimits) -> io::Result<Self> {
         // Only the cgroup v2 unified hierarchy exposes this file at the root.
         let root = Path::new("/sys/fs/cgroup");
         if !root.join("cgroup.controllers").exists() {
@@ -278,6 +288,7 @@ impl Cgroup {
         // With limits, enable the matching controllers and write the caps. If that
         // fails (no delegation, or the parent holds processes so it can't carry
         // subtree_control), don't leak the dir we just made — remove it and report.
+        #[cfg(feature = "limits")]
         if limits.any()
             && let Err(e) = cg.apply_limits(&parent, limits)
         {
@@ -290,6 +301,7 @@ impl Cgroup {
     /// Enable the controllers each requested limit needs (in the *parent's*
     /// `cgroup.subtree_control`, which is what makes the interface files appear in
     /// our cgroup) and write the limit values.
+    #[cfg(feature = "limits")]
     fn apply_limits(&self, parent: &Path, limits: &ResourceLimits) -> io::Result<()> {
         let mut spec = String::new();
         if limits.memory_max.is_some() {
@@ -383,6 +395,7 @@ impl Cgroup {
 
 /// Format a per-core CPU fraction as a cgroup v2 `cpu.max` value (`"quota period"`,
 /// microseconds). `0.5` → `"50000 100000"`, `2.0` → `"200000 100000"`.
+#[cfg(feature = "limits")]
 fn cpu_max_value(cores: f64) -> String {
     const PERIOD: u64 = 100_000;
     let quota = (cores * PERIOD as f64).round().max(1.0) as u64;
@@ -429,7 +442,7 @@ fn write_self_pid(path: &CStr) -> io::Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "limits"))]
 mod tests {
     use super::cpu_max_value;
 

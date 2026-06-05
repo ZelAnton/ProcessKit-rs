@@ -6,28 +6,44 @@ use std::io;
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
+#[cfg(feature = "stats")]
+use windows_sys::Win32::Foundation::FILETIME;
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
-    JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
-    JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
-    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject,
 };
+#[cfg(feature = "limits")]
+use windows_sys::Win32::System::JobObjects::{
+    JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JobObjectCpuRateControlInformation,
+};
+#[cfg(feature = "stats")]
+use windows_sys::Win32::System::JobObjects::{
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+    QueryInformationJobObject,
+};
+#[cfg(feature = "stats")]
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, GetProcessTimes, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
-    ResumeThread, THREAD_SUSPEND_RESUME,
+    CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+};
+#[cfg(feature = "stats")]
+use windows_sys::Win32::System::Threading::{
+    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 use crate::Mechanism;
+#[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
+#[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
+#[cfg(feature = "stats")]
 use crate::sys::ProcMetrics;
 
 pub(crate) struct Job {
@@ -40,7 +56,7 @@ unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
 impl Job {
-    pub(crate) fn new(limits: &ResourceLimits) -> io::Result<Self> {
+    pub(crate) fn new(#[cfg(feature = "limits")] limits: &ResourceLimits) -> io::Result<Self> {
         // SAFETY: null name/attributes request an unnamed job with defaults.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
@@ -54,14 +70,17 @@ impl Job {
         // ride along on the same extended-limit struct.
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if let Some(bytes) = limits.memory_max {
-            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
-            // `JobMemoryLimit` is SIZE_T; saturate rather than wrap on a 32-bit host.
-            info.JobMemoryLimit = usize::try_from(bytes).unwrap_or(usize::MAX);
-        }
-        if let Some(n) = limits.max_processes {
-            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-            info.BasicLimitInformation.ActiveProcessLimit = n;
+        #[cfg(feature = "limits")]
+        {
+            if let Some(bytes) = limits.memory_max {
+                info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+                // `JobMemoryLimit` is SIZE_T; saturate rather than wrap on a 32-bit host.
+                info.JobMemoryLimit = usize::try_from(bytes).unwrap_or(usize::MAX);
+            }
+            if let Some(n) = limits.max_processes {
+                info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+                info.BasicLimitInformation.ActiveProcessLimit = n;
+            }
         }
         // SAFETY: `info` is a fully-initialised struct matching the info class and
         // its size is passed explicitly.
@@ -81,6 +100,7 @@ impl Job {
         // CPU quota is a separate info class. The hard cap is expressed in 1/100 of
         // a percent of *total* system CPU (1..=10000), so convert our per-core
         // fraction using the host's processor count.
+        #[cfg(feature = "limits")]
         if let Some(cores) = limits.cpu_quota {
             let cpus = std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64);
             let rate = cpu_hard_cap_rate(cores, cpus);
@@ -171,6 +191,7 @@ impl Job {
         self.kill_all()
     }
 
+    #[cfg(feature = "stats")]
     pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
         let mut acct: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: out param matches the accounting info class and its size.
@@ -274,6 +295,7 @@ fn resume_thread(tid: u32) -> io::Result<()> {
 }
 
 /// Combine a FILETIME (100-ns units) into nanoseconds.
+#[cfg(feature = "stats")]
 fn filetime_nanos(ft: FILETIME) -> u64 {
     let units = ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
     units.saturating_mul(100)
@@ -284,6 +306,7 @@ fn filetime_nanos(ft: FILETIME) -> u64 {
 /// (`0.5` = half a core); `cpus` is the host processor count. A quota meeting or
 /// exceeding the core count saturates at 100% (`10000`), and the result floors at
 /// `1` since the API rejects a zero rate.
+#[cfg(feature = "limits")]
 fn cpu_hard_cap_rate(cores: f64, cpus: f64) -> u32 {
     let rate = ((cores / cpus) * 10_000.0).round();
     // `f64 as u32` is saturating, but clamp first so the floor-at-1 (zero is invalid)
@@ -291,6 +314,7 @@ fn cpu_hard_cap_rate(cores: f64, cpus: f64) -> u32 {
     rate.clamp(1.0, 10_000.0) as u32
 }
 
+#[cfg(feature = "stats")]
 pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
     let mut metrics = ProcMetrics::default();
     // SAFETY: limited-information access; returns null on failure (e.g. gone).
@@ -335,7 +359,7 @@ impl Drop for Job {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "limits"))]
 mod tests {
     use super::cpu_hard_cap_rate;
 

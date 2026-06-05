@@ -125,12 +125,14 @@ impl RunningProcess {
     }
 
     /// CPU time (user + kernel) consumed so far, if the platform can report it.
+    #[cfg(feature = "stats")]
     pub fn cpu_time(&self) -> Option<Duration> {
         self.pid
             .and_then(|pid| crate::sys::process_metrics(pid).cpu_time)
     }
 
     /// Peak resident memory in bytes, if the platform can report it.
+    #[cfg(feature = "stats")]
     pub fn peak_memory_bytes(&self) -> Option<u64> {
         self.pid
             .and_then(|pid| crate::sys::process_metrics(pid).peak_memory_bytes)

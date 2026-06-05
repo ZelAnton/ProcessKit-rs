@@ -20,10 +20,13 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::Mechanism;
+#[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
+#[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
 
 /// Per-process resource metrics sampled from the OS.
+#[cfg(feature = "stats")]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ProcMetrics {
     pub cpu_time: Option<Duration>,
@@ -32,6 +35,7 @@ pub(crate) struct ProcMetrics {
 
 /// Sample CPU time and peak memory for a single process by pid. Returns
 /// defaults (all `None`) if the process is gone or the platform can't report.
+#[cfg(feature = "stats")]
 pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
     imp::process_metrics(pid)
 }
@@ -60,8 +64,15 @@ impl Job {
     ///
     /// Errors if `limits` requests a cap the target's mechanism can't enforce (no
     /// cgroup/Job Object, or a cgroup without controller delegation).
+    #[cfg(feature = "limits")]
     pub(crate) fn new(limits: &ResourceLimits) -> io::Result<Self> {
         imp::Job::new(limits).map(Job)
+    }
+
+    /// Create a fresh, empty job.
+    #[cfg(not(feature = "limits"))]
+    pub(crate) fn new() -> io::Result<Self> {
+        imp::Job::new().map(Job)
     }
 
     /// Spawn `cmd` as a member of this job.
@@ -101,6 +112,7 @@ impl Job {
     }
 
     /// Snapshot the group's resource usage.
+    #[cfg(feature = "stats")]
     pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
         self.0.stats()
     }

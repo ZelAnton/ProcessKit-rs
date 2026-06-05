@@ -5,9 +5,11 @@ Contributions land via pull requests into `main` (branch-protected).
 ## Testing
 
 ```bash
-cargo test                  # hermetic unit tests (no subprocess)
-cargo test -- --ignored     # real-subprocess + kill-on-drop tests
-cargo test --features mock  # the generated MockRunner
+cargo test                              # hermetic unit tests (no subprocess)
+cargo test --all-features -- --ignored  # real-subprocess + kill-on-drop tests
+                                        # (--all-features: the `limits` tests are
+                                        #  compiled out by default)
+cargo test --features mock              # the generated MockRunner
 ```
 
 Before opening a PR:

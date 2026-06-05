@@ -83,6 +83,18 @@
 //! # }
 //! ```
 //!
+//! # Features
+//!
+//! - **`stats`** *(default)* — resource measurement: `ProcessGroupStats`,
+//!   `ProcessGroup::stats`, and the per-process
+//!   `RunningProcess::cpu_time`/`peak_memory_bytes` diagnostics. Disable
+//!   (`default-features = false`) to compile the accounting code out.
+//! - **`limits`** — whole-tree resource caps: `ResourceLimits`, the
+//!   `memory_max`/`max_processes`/`cpu_quota` builders on
+//!   [`ProcessGroupOptions`], and `Error::ResourceLimit`. Implies `stats`.
+//! - **`mock`** — the `mockall`-generated `MockRunner` for consumers' tests.
+//! - **`tracing`** — a `tracing` event per command run.
+//!
 //! [Job Object]: https://learn.microsoft.com/windows/win32/procthread/job-objects
 //! [cgroup v2]: https://docs.kernel.org/admin-guide/cgroup-v2.html
 
@@ -92,12 +104,14 @@ mod command;
 mod doubles;
 mod error;
 mod group;
+#[cfg(feature = "limits")]
 mod limits;
 mod mechanism;
 mod pump;
 mod result;
 mod runner;
 mod running;
+#[cfg(feature = "stats")]
 mod stats;
 mod stdin;
 mod sys;
@@ -109,11 +123,13 @@ pub use doubles::{Invocation, RecordingRunner, Reply, ScriptedRunner};
 pub use encoding_rs::Encoding;
 pub use error::{Error, Result};
 pub use group::{ProcessGroup, ProcessGroupOptions};
+#[cfg(feature = "limits")]
 pub use limits::ResourceLimits;
 pub use mechanism::Mechanism;
 pub use result::ProcessResult;
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
 pub use running::{RunningProcess, StdoutLines};
+#[cfg(feature = "stats")]
 pub use stats::ProcessGroupStats;
 pub use stdin::{ProcessStdin, Stdin};
 // Re-exported so callers can `use processkit::StreamExt;` to consume

@@ -13,8 +13,11 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::Mechanism;
+#[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
+#[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
+#[cfg(feature = "stats")]
 use crate::sys::ProcMetrics;
 use crate::sys::pgroup::ProcessGroup;
 
@@ -23,9 +26,10 @@ pub(crate) struct Job {
 }
 
 impl Job {
-    pub(crate) fn new(limits: &ResourceLimits) -> io::Result<Self> {
+    pub(crate) fn new(#[cfg(feature = "limits")] limits: &ResourceLimits) -> io::Result<Self> {
         // A POSIX process group has no resource accounting — there is no whole-tree
         // memory/pids/cpu primitive here, so a requested limit can't be honored.
+        #[cfg(feature = "limits")]
         if limits.any() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -57,6 +61,7 @@ impl Job {
         self.group.graceful_shutdown(timeout, escalate).await
     }
 
+    #[cfg(feature = "stats")]
     pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
         self.group.stats()
     }
@@ -66,6 +71,7 @@ impl Job {
     }
 }
 
+#[cfg(feature = "stats")]
 pub(crate) fn process_metrics(_pid: u32) -> ProcMetrics {
     // No `/proc` on these targets; per-process accounting is not available.
     ProcMetrics::default()

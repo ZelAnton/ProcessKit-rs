@@ -76,6 +76,7 @@ pub enum Error {
     /// the OS rejected the request (e.g. a Linux cgroup without controller
     /// delegation). An unenforced limit is no protection, so this is raised rather
     /// than leaving the tree silently unbounded.
+    #[cfg(feature = "limits")]
     #[error("could not enforce resource limits: {0}")]
     ResourceLimit(String),
 
@@ -132,10 +133,14 @@ mod tests {
             timeout: Duration::from_secs(1),
         };
         assert_eq!(timeout.diagnostic(), None);
-        let limit = Error::ResourceLimit("cgroup controller delegation unavailable".into());
-        assert_eq!(limit.diagnostic(), None);
+        #[cfg(feature = "limits")]
+        {
+            let limit = Error::ResourceLimit("cgroup controller delegation unavailable".into());
+            assert_eq!(limit.diagnostic(), None);
+        }
     }
 
+    #[cfg(feature = "limits")]
     #[test]
     fn resource_limit_display_carries_reason() {
         let err = Error::ResourceLimit("no cgroup or Job Object available".into());

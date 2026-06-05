@@ -26,8 +26,9 @@ exclude = [
 # CI job verifies it — keep the two in sync; raise both when adopting a newer feature.
 rust-version = "1.88"
 
-# Build docs.rs with every feature so the `mock` MockRunner and the `tracing`
-# integration are documented (default features alone hide them).
+# Build docs.rs with every feature so the optional surfaces — `limits`
+# (ResourceLimits), the `mock` MockRunner, the `tracing` integration — are
+# documented (default features alone hide them).
 [package.metadata.docs.rs]
 all-features = true
 
@@ -64,6 +65,19 @@ tracing = { version = "0.1", optional = true }
 mockall = { version = "0.13", optional = true }
 
 [features]
+# `stats` ships in the default set because `ProcessGroupStats` & friends predate
+# the feature split — released API must stay visible by default.
+default = ["stats"]
+# Resource measurement: `ProcessGroupStats`, `ProcessGroup::stats`, and the
+# per-process `RunningProcess::cpu_time`/`peak_memory_bytes` diagnostics.
+# Compile it out (`--no-default-features`) to drop the accounting code and, on
+# Windows, the ProcessStatus FFI used only for the peak-memory readout.
+stats = ["windows-sys/Win32_System_ProcessStatus"]
+# Whole-tree resource caps: `ResourceLimits`, the `memory_max`/`max_processes`/
+# `cpu_quota` builders on `ProcessGroupOptions`, and `Error::ResourceLimit`.
+# Implies `stats` as policy — resource read and write travel together toward the
+# possible `processkit-resource` split (see ideas/) — not as a code dependency.
+limits = ["stats"]
 # Expose the `mockall`-generated `MockRunner` for consumers' tests.
 mock = ["dep:mockall"]
 # Emit a `tracing` event per command run (program, args, exit code, duration).
@@ -82,8 +96,8 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Threading",
   # CreateJobObjectW's signature references SECURITY_ATTRIBUTES.
   "Win32_Security",
-  # K32GetProcessMemoryInfo (per-process peak working set) for diagnostics.
-  "Win32_System_ProcessStatus",
+  # Win32_System_ProcessStatus (K32GetProcessMemoryInfo, peak working set) is
+  # enabled by the `stats` feature above — it serves only the metrics readout.
   # Thread snapshot (CreateToolhelp32Snapshot / Thread32First/Next) to find a
   # suspended child's primary thread for ResumeThread — std/tokio expose only
   # the process handle, not the PROCESS_INFORMATION thread handle.

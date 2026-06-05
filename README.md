@@ -61,8 +61,14 @@ async fn main() -> processkit::Result<()> {
 
 ## Capping a group's resources
 
-`ProcessGroupOptions` can bound the whole tree's memory, process count, and CPU at
-creation. A runaway or untrusted child tree then can't exhaust the host:
+Requires the **`limits`** feature (off by default) — add it to the dependency:
+
+```toml
+processkit = { version = "…", features = ["limits"] }
+```
+
+`ProcessGroupOptions` can then bound the whole tree's memory, process count, and CPU
+at creation, so a runaway or untrusted child tree can't exhaust the host:
 
 ```rust,no_run
 use processkit::{Command, ProcessGroup, ProcessGroupOptions};

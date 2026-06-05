@@ -12,8 +12,9 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
-- `ProcessGroupOptions` resource limits — `memory_max`, `max_processes`, and
-  `cpu_quota` cap a group's whole tree at creation, plus a public `limits:
+- `ProcessGroupOptions` resource limits (behind the new, off-by-default `limits`
+  Cargo feature) — `memory_max`, `max_processes`, and `cpu_quota` cap a group's
+  whole tree at creation, plus a public `limits:
   ResourceLimits` field. Enforced by the Windows Job Object (job memory limit,
   active-process limit, hard CPU-rate cap) and Linux cgroup v2 (`memory.max` /
   `pids.max` / `cpu.max`, enabling the matching controllers). `cpu_quota` is a
@@ -24,7 +25,12 @@ to a dated version section.
   `Error::ResourceLimit` rather than handing back an unbounded group.
 
 ### Changed
--
+- Resource measurement (`ProcessGroupStats`, `ProcessGroup::stats`,
+  `RunningProcess::cpu_time`/`peak_memory_bytes`) now sits behind a default-on
+  `stats` Cargo feature: `default-features = false` compiles the accounting code
+  (and its Windows ProcessStatus FFI) out. Consumers on default features see no
+  change; consumers who already set `default-features = false` must add
+  `features = ["stats"]` to keep that API.
 
 ### Fixed
 -
