@@ -21,7 +21,9 @@
 //!   Readiness probes ([`RunningProcess::wait_for_line`] /
 //!   [`wait_for_port`](RunningProcess::wait_for_port) /
 //!   [`wait_for`](RunningProcess::wait_for)) wait until a started child is
-//!   actually *ready* instead of sleeping.
+//!   actually *ready* instead of sleeping. A [`Pipeline`]
+//!   ([`Command::pipe`]) chains commands stdout→stdin without a shell — one
+//!   shared group, pipefail outcome.
 //!
 //! Async throughout (tokio). Errors are the structured [`Error`]; a non-zero
 //! exit is reported in [`ProcessResult`], not raised, until you call
@@ -118,6 +120,7 @@ mod group;
 #[cfg(feature = "limits")]
 mod limits;
 mod mechanism;
+mod pipeline;
 mod pump;
 mod result;
 mod runner;
@@ -139,6 +142,7 @@ pub use group::{ProcessGroup, ProcessGroupOptions};
 #[cfg(feature = "limits")]
 pub use limits::ResourceLimits;
 pub use mechanism::Mechanism;
+pub use pipeline::Pipeline;
 pub use result::ProcessResult;
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
 pub use running::{RunningProcess, StdoutLines};

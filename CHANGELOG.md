@@ -17,6 +17,13 @@ to a dated version section.
 > (`minor`), not a patch.
 
 ### Added
+- Shell-free pipelines: `Command::pipe(next)` starts a `Pipeline` (extend with
+  `.pipe(...)`, bound with `.timeout(...)`, drive with `output_string()` /
+  `run()`). Stages connect stdout→stdin through native pipes — no shell, no
+  quoting/injection surface — and all run inside one shared kill-on-drop group.
+  Pipefail outcome: stdout is the last stage's, while code/stderr/program are
+  attributed to the first stage that didn't exit cleanly; `run()` requires
+  every stage to succeed.
 - Readiness probes on `RunningProcess` — wait until a started child is
   actually ready instead of sleeping: `wait_for_line(predicate, within)`
   (stream stdout until a line matches, returning it; consumes stdout up to the

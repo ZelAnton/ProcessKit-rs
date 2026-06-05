@@ -124,6 +124,27 @@ impl Command {
         self
     }
 
+    /// Chain this command's stdout into `next`'s stdin — the first link of a
+    /// shell-free [`Pipeline`](crate::Pipeline). Keep chaining with
+    /// [`Pipeline::pipe`](crate::Pipeline::pipe), then drive the whole thing
+    /// with [`Pipeline::output_string`](crate::Pipeline::output_string) /
+    /// [`Pipeline::run`](crate::Pipeline::run).
+    pub fn pipe(self, next: Command) -> crate::Pipeline {
+        crate::Pipeline::new(self, next)
+    }
+
+    /// Wire `reader` (the previous pipeline stage's stdout) as this command's
+    /// stdin, overriding any configured stdin source or `keep_stdin_open` —
+    /// inner stages of a [`Pipeline`](crate::Pipeline) read from the pipe, full
+    /// stop.
+    pub(crate) fn set_pipe_stdin<R>(&mut self, reader: R)
+    where
+        R: tokio::io::AsyncRead + Send + 'static,
+    {
+        self.stdin = Some(Stdin::from_reader(reader));
+        self.keep_stdin_open = false;
+    }
+
     /// Kill the run if it exceeds `timeout`.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);

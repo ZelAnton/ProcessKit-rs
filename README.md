@@ -268,6 +268,33 @@ happens next. `wait_for_line` consumes stdout up to the match
 (continue with `finish_streamed`); `wait_for_port` / `wait_for` don't touch
 the pipes at all.
 
+## Pipelines without a shell
+
+`a | b | c` without a shell string — native pipes, so no quoting or injection
+surface, and every stage lives in one shared kill-on-drop group:
+
+```rust,no_run
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let out = Command::new("git").args(["log", "--format=%an"])
+        .pipe(Command::new("sort"))
+        .pipe(Command::new("uniq").arg("-c"))
+        .output_string()
+        .await?;
+    println!("{}", out.stdout());
+    Ok(())
+}
+```
+
+The outcome is **pipefail**: `stdout` is the last stage's output, while the
+exit code, stderr, and reported program come from the first stage that didn't
+exit cleanly (or the last stage when all succeed). The first stage's `stdin`
+source is honored; inner stages read from the pipe. `.timeout(d)` bounds the
+whole chain (killing every stage at the deadline), and `run()` requires every
+stage to succeed, returning the trimmed final stdout.
+
 ## Async streaming and interactive I/O
 
 The one-shot helpers above buffer the whole output. For long-running or

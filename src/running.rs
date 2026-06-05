@@ -121,6 +121,19 @@ impl RunningProcess {
         self.own_group = Some(Arc::new(group));
     }
 
+    /// Take the raw stdout pipe — the [`Pipeline`](crate::Pipeline) plumbing
+    /// that feeds it into the next stage's stdin. Afterwards this handle can
+    /// still report exit + stderr via [`finish_streamed`](Self::finish_streamed)
+    /// (which tolerates a taken stdout), like after `stdout_lines`.
+    pub(crate) fn take_stdout_pipe(&mut self) -> Option<ChildStdout> {
+        self.stdout_pipe.take()
+    }
+
+    /// The program this handle is running (for error/outcome attribution).
+    pub(crate) fn program_name(&self) -> &str {
+        &self.program
+    }
+
     // (continued below)
 }
 
