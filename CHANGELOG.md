@@ -37,7 +37,8 @@ to a dated version section.
   supervises inside one shared kill-on-drop group; doubles make it hermetic.
 - Stats sampling over time (`stats` feature): `ProcessGroup::sample_stats(every)`
   yields a `Stream` of `ProcessGroupStats` snapshots (first sample immediate,
-  missed ticks skipped, series ends when the group can no longer report), and
+  missed ticks skipped, a zero interval clamped to 1 ms, series ends when the
+  group can no longer report), and
   `RunningProcess::profile(every)` runs a child to completion while sampling it,
   returning a `RunProfile` summary (exit code, wall duration, last CPU reading,
   peak RSS, sample count, derived `avg_cpu()`).
@@ -55,7 +56,9 @@ to a dated version section.
   per-process `SIGSTOP`/`SIGCONT` on kernels without it), the POSIX process-group
   backends
   broadcast to each group, and Windows suspends/resumes every member thread
-  (best-effort; suspend counts nest). On Windows only `Signal::Kill` is
+  (best-effort; suspend counts nest; the walks are mutually exclusive with a
+  concurrent `spawn`'s assign-and-resume, so a mid-spawn child can't be
+  stranded suspended). On Windows only `Signal::Kill` is
   deliverable (Job Object terminate); any other signal — and these operations on
   the no-containment target — return the new typed `Error::Unsupported`.
 - `ProcessGroupOptions` resource limits (behind the new, off-by-default `limits`
@@ -71,6 +74,8 @@ to a dated version section.
   `Error::ResourceLimit` rather than handing back an unbounded group.
 
 ### Changed
+- Every public type now implements `Debug` (enforced by a crate lint), and
+  `Command` is `#[must_use]` — building one and dropping it unused now warns.
 - Resource measurement (`ProcessGroupStats`, `ProcessGroup::stats`,
   `RunningProcess::cpu_time`/`peak_memory_bytes`) now sits behind a default-on
   `stats` Cargo feature: `default-features = false` compiles the accounting code
@@ -79,7 +84,15 @@ to a dated version section.
   `features = ["stats"]` to keep that API.
 
 ### Fixed
--
+- POSIX process-group `ProcessGroup::adopt` was a silent no-op for any child
+  that had already `exec`'d (the normal case): POSIX refuses `setpgid` there
+  (`EACCES`), and the pid was recorded as a process-*group* id that doesn't
+  exist, so teardown never reached the child. Such children are now tracked
+  and signalled individually — the adopted child is contained (killed with the
+  group), though its future forks are not (unlike Windows/cgroup adoption).
+  Adopting a child the group already tracks (a self-spawned leader, or a
+  repeated adopt) is also de-duplicated now, so `members()`/`stats()` no
+  longer over-report or grow per call.
 
 ## [0.6.1] - 2026-06-03
 

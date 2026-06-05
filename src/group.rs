@@ -92,6 +92,16 @@ pub struct ProcessGroup {
     options: ProcessGroupOptions,
 }
 
+// Manual: the platform `Job` is an opaque OS handle.
+impl std::fmt::Debug for ProcessGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessGroup")
+            .field("mechanism", &self.mechanism())
+            .field("options", &self.options)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ProcessGroup {
     /// Create an empty group with [default options](ProcessGroupOptions).
     pub fn new() -> Result<Self> {
@@ -161,6 +171,15 @@ impl ProcessGroup {
     /// Only the child itself is moved into the group; processes it has *already*
     /// spawned keep their original containment (future forks are captured). On
     /// targets without a job mechanism (non-unix, non-Windows) this is a no-op.
+    ///
+    /// On the POSIX process-group mechanism, a child that has already `exec`'d
+    /// cannot be re-grouped (POSIX forbids it), so it is tracked
+    /// *individually*: the child itself is signalled/killed with the group,
+    /// but — unlike on Windows/cgroup — its future forks are not captured.
+    /// The caller keeps the [`Child`] handle and is responsible for reaping:
+    /// an adopted child that exited but was never awaited probes as alive, so
+    /// a graceful [`shutdown`](Self::shutdown) can wait out its full timeout
+    /// on the zombie before escalating.
     pub fn adopt(&self, child: &Child) -> Result<()> {
         self.job.adopt(child)?;
         Ok(())
@@ -205,7 +224,10 @@ impl ProcessGroup {
     ///   (kernel ≥ 5.2; older kernels fall back to per-process `SIGSTOP`). The
     ///   freeze is applied by the kernel shortly after the write returns, not
     ///   instantaneously.
-    /// - **Linux process-group fallback, macOS/BSD** — `SIGSTOP` to every group.
+    /// - **Linux process-group fallback, macOS/BSD** — `SIGSTOP` to every
+    ///   group; an individually-tracked adopted child (see
+    ///   [`adopt`](Self::adopt)) is frozen alone — its own descendants keep
+    ///   running.
     /// - **Windows** — suspends every thread of every member process. Best-effort
     ///   and not atomic: threads spawned mid-walk can be missed, and Windows keeps
     ///   per-thread suspend *counts*, so nested `suspend` calls stack — N suspends
@@ -258,10 +280,11 @@ impl ProcessGroup {
     /// - **Windows** — every pid assigned to the Job Object (the whole tree).
     /// - **Linux cgroup** — every pid in the cgroup (`cgroup.procs`, whole tree).
     /// - **Linux process-group fallback, macOS/BSD** — the tracked **group
-    ///   leaders** only (one pid per spawned/adopted child); their descendants
-    ///   are contained but not enumerated. An exited child still counts as a
-    ///   member until it is reaped (awaited): the liveness probe sees the
-    ///   not-yet-collected process.
+    ///   leaders**, plus any individually-tracked adopted child (one pid per
+    ///   spawned/adopted child); descendants inside the groups are contained
+    ///   but not enumerated. An exited child still counts as a member until it
+    ///   is reaped (awaited): the liveness probe sees the not-yet-collected
+    ///   process.
     /// - **No-containment target** — always empty: nothing is tracked.
     ///   [`Mechanism::None`](crate::Mechanism::None) (via
     ///   [`mechanism`](Self::mechanism)) is the cue that children are
@@ -303,7 +326,7 @@ impl ProcessGroup {
     /// snapshot the group fails to report. The sampler borrows the group, so it
     /// never keeps the group (or its kill-on-drop guarantee) alive. What each
     /// snapshot can report per platform is exactly [`stats`](Self::stats)'s
-    /// matrix.
+    /// matrix. A zero `every` is clamped to 1 ms.
     ///
     /// ```no_run
     /// # async fn demo() -> processkit::Result<()> {

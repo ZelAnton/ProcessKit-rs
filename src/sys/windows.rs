@@ -49,6 +49,12 @@ use crate::sys::ProcMetrics;
 
 pub(crate) struct Job {
     handle: HANDLE,
+    /// Serializes `spawn`'s create-suspended → assign → resume sequence against
+    /// the [`suspend`](Self::suspend)/[`resume`](Self::resume) member-thread
+    /// walks. Without it, a walk landing between assign and `spawn`'s resume
+    /// double-suspends the new child's primary thread (per-thread suspend
+    /// *counts*), and `spawn`'s single resume leaves it suspended forever.
+    suspend_lock: std::sync::Mutex<()>,
 }
 
 // The handle is owned solely by this struct and every Win32 job API used here is
@@ -63,7 +69,10 @@ impl Job {
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
-        let job = Job { handle };
+        let job = Job {
+            handle,
+            suspend_lock: std::sync::Mutex::new(()),
+        };
 
         // Kill every process in the job once the last handle closes — i.e. when
         // this struct drops or the owning process dies. This is the Windows
@@ -142,6 +151,15 @@ impl Job {
         let handle = child.raw_handle().ok_or_else(|| {
             io::Error::other("child exited before it could be assigned to the job")
         })?;
+        // Hold the suspend lock across assign → resume: once assigned, the pid
+        // is visible to a concurrent suspend()/resume() member walk, which
+        // would otherwise skew the still-suspended primary thread's count
+        // (suspend counts nest) and strand or prematurely release the child.
+        // Poisoning is impossible to act on here — recover the guard.
+        let _guard = self
+            .suspend_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // SAFETY: the raw handle is valid until `child` is dropped, well after
         // this call returns.
         let ok = unsafe { AssignProcessToJobObject(self.handle, handle as HANDLE) };
@@ -217,6 +235,13 @@ impl Job {
     /// thread exiting mid-walk) does not abort the walk; the last failure is
     /// reported after every member has been attempted.
     fn for_each_member_thread(&self, suspend: bool) -> io::Result<()> {
+        // Mutually exclusive with `spawn`'s assign → resume window (see the
+        // `suspend_lock` field doc); held across the pid query AND the walk so
+        // the member set can't include a mid-spawn, still-suspended child.
+        let _guard = self
+            .suspend_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let members: std::collections::HashSet<u32> =
             job_member_pids(self.handle)?.into_iter().collect();
         if members.is_empty() {

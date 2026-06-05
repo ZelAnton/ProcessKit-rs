@@ -32,6 +32,11 @@ rust-version = "1.88"
 [package.metadata.docs.rs]
 all-features = true
 
+# Every public type must be `Debug` (consumers derive Debug on structs holding
+# ours); warn-level here becomes a hard error under CI's `-D warnings`.
+[lints.rust]
+missing_debug_implementations = "warn"
+
 # ---------------------------------------------------------------------------
 # Dependencies — every entry carries a "why" (see AGENTS.md "Dependency
 # management"). Pin major versions, enable only the features used, keep

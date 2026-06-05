@@ -117,6 +117,16 @@ pub struct ScriptedRunner {
     fallback: Option<Reply>,
 }
 
+// Manual: `Rule` holds an opaque predicate closure.
+impl std::fmt::Debug for ScriptedRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptedRunner")
+            .field("rules", &self.rules.len())
+            .field("has_fallback", &self.fallback.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl ScriptedRunner {
     /// An empty runner (every command misses until rules are added).
     pub fn new() -> Self {
@@ -178,6 +188,11 @@ impl ProcessRunner for ScriptedRunner {
 }
 
 /// A captured record of one command a runner was asked to run.
+///
+/// Captures the *routing* knobs — program, args, cwd, env overrides, whether
+/// stdin was supplied — not the I/O-shaping ones (`timeout`, encodings, buffer
+/// policy, line handlers, `keep_stdin_open`, retry). Tests that need to assert
+/// those inspect the built [`Command`] itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
     /// The program name.
@@ -226,6 +241,16 @@ impl Invocation {
 pub struct RecordingRunner<R: ProcessRunner = ScriptedRunner> {
     inner: R,
     calls: Mutex<Vec<Invocation>>,
+}
+
+// Manual: the inner runner type parameter carries no `Debug` bound.
+impl<R: ProcessRunner> std::fmt::Debug for RecordingRunner<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let calls = self.calls.lock().map(|c| c.len()).unwrap_or(0);
+        f.debug_struct("RecordingRunner")
+            .field("calls", &calls)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RecordingRunner<ScriptedRunner> {

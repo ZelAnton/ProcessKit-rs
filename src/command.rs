@@ -26,6 +26,7 @@ use crate::stdin::Stdin;
 /// start it via a [`ProcessRunner`](crate::ProcessRunner) for streaming/shared
 /// groups.
 #[derive(Clone)]
+#[must_use = "a Command does nothing until it is run or started"]
 pub struct Command {
     program: OsString,
     args: Vec<OsString>,

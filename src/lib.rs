@@ -207,6 +207,9 @@ where
 /// - **No output pumping** — a contender that fills its stdout/stderr pipe
 ///   blocks and never exits. Drain chatty children first (e.g. via
 ///   [`stdout_lines`](RunningProcess::stdout_lines)) or race low-output ones.
+///   Note the interplay: a [`tokio::time::timeout`] bounding the race fires,
+///   but leaves such pipe-blocked contenders alive and still wedged — kill or
+///   drain them afterwards; the timeout alone is not the mitigation.
 ///
 /// An empty `processes` slice is an error ([`Error::Io`] with
 /// [`InvalidInput`](std::io::ErrorKind::InvalidInput)) rather than a future

@@ -62,6 +62,7 @@ pub(crate) struct Spawned {
 /// [`keep_stdin_open`](crate::Command::keep_stdin_open), drive stdin via
 /// [`standard_input`](Self::standard_input).
 pub struct RunningProcess {
+    // (Debug: manual impl below — pipes/tasks/handlers are opaque.)
     program: String,
     child: Child,
     // `Arc` so a streaming deadline timer can hold a `Weak` to kill the tree
@@ -120,6 +121,21 @@ impl RunningProcess {
         self.own_group = Some(Arc::new(group));
     }
 
+    // (continued below)
+}
+
+// Manual: pipes, pump tasks, and line handlers are opaque.
+impl std::fmt::Debug for RunningProcess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunningProcess")
+            .field("program", &self.program)
+            .field("pid", &self.pid)
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunningProcess {
     /// The OS process id, or `None` if the child has already been reaped.
     pub fn pid(&self) -> Option<u32> {
         self.pid
@@ -515,7 +531,8 @@ impl RunningProcess {
     /// covering a whole tree, sample the group via
     /// [`ProcessGroup::sample_stats`](crate::ProcessGroup::sample_stats)
     /// instead. The first sample lands immediately, so even a short run
-    /// usually reports; a child that exits faster still profiles `None`s.
+    /// usually reports; a child that exits faster still profiles `None`s. A
+    /// zero `every` is clamped to 1 ms.
     #[cfg(feature = "stats")]
     pub async fn profile(mut self, every: Duration) -> Result<crate::stats::RunProfile> {
         use std::sync::{Arc, Mutex};
@@ -527,6 +544,9 @@ impl RunningProcess {
             samples: usize,
         }
 
+        // tokio panics on a zero interval period; clamp rather than panic a
+        // detached sampling task on a legal-looking input.
+        let every = every.max(Duration::from_millis(1));
         let started = self.started;
         let acc = Arc::new(Mutex::new(Acc::default()));
         // Sampling needs only the pid (process_metrics is a free query), so the
@@ -732,6 +752,13 @@ async fn join_pumps(tasks: Vec<JoinHandle<()>>) {
 pub struct StdoutLines {
     sink: Arc<SharedLines>,
     wait: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+}
+
+// Manual: the sink and the pending-wait future are opaque.
+impl std::fmt::Debug for StdoutLines {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StdoutLines").finish_non_exhaustive()
+    }
 }
 
 impl Stream for StdoutLines {

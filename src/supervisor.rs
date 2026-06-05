@@ -104,6 +104,21 @@ pub struct Supervisor<R: ProcessRunner = JobRunner> {
     stop_when: Option<Box<dyn Fn(&ProcessResult<String>) -> bool + Send + Sync>>,
 }
 
+// Manual: the runner type parameter and the boxed predicate are opaque.
+impl<R: ProcessRunner> std::fmt::Debug for Supervisor<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Supervisor")
+            .field("policy", &self.policy)
+            .field("max_restarts", &self.max_restarts)
+            .field("backoff_base", &self.backoff_base)
+            .field("backoff_factor", &self.backoff_factor)
+            .field("max_backoff", &self.max_backoff)
+            .field("jitter", &self.jitter)
+            .field("has_stop_when", &self.stop_when.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Supervisor<JobRunner> {
     /// Supervise `command` with the default [`JobRunner`] (a fresh private
     /// kill-on-drop group per incarnation).
@@ -212,6 +227,14 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// result at all (a spawn/IO failure when no further restart is allowed) —
     /// there is no final [`ProcessResult`] to report in that case. A spawn
     /// failure with restarts remaining counts as a crash and is retried.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future mid-run abandons the in-flight incarnation. With
+    /// the default [`JobRunner`] it is killed on drop (the incarnation owns a
+    /// private group); with a shared-group runner
+    /// ([`with_runner(&group)`](Self::with_runner)) the incarnation stays
+    /// alive in the caller's group until the group tears it down.
     pub async fn run(self) -> Result<SupervisionOutcome> {
         // Documented tolerance: a sub-1.0 or non-finite factor never shrinks
         // the delay or panics the Duration math — it decays to 1.0.

@@ -390,8 +390,11 @@ async fn streaming_honors_timeout() {
     drop(lines);
     let (code, _stderr) = run.finish_streamed().await.expect("finish");
 
+    // Generous anti-hang bound (the sleeper runs ~30s if the deadline is
+    // broken): under full-suite load cold spawns have been seen to push a
+    // 500ms-timeout run past 5s.
     assert!(
-        start.elapsed() < Duration::from_secs(5),
+        start.elapsed() < Duration::from_secs(15),
         "stream did not end at the deadline (took {:?})",
         start.elapsed()
     );
@@ -1012,6 +1015,71 @@ async fn wait_for_fails_fast_when_child_exits() {
 }
 
 // ----- Supervisor -----
+
+#[tokio::test]
+#[ignore = "spawns real subprocesses under supervision in a shared group"]
+async fn supervisor_runs_incarnations_in_a_shared_group() {
+    use processkit::{RestartPolicy, StopReason, Supervisor};
+
+    let exits_zero = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "exit", "0"])
+    } else {
+        Command::new("sh").args(["-c", "exit 0"])
+    };
+
+    // The headline `with_runner(&group)` path: every incarnation runs inside
+    // one caller-owned kill-on-drop group, and the group stays usable after.
+    let group = ProcessGroup::new().expect("create group");
+    let outcome = Supervisor::new(exits_zero)
+        .with_runner(&group)
+        .restart(RestartPolicy::OnCrash)
+        .backoff(Duration::from_millis(1), 1.0)
+        .jitter(false)
+        .run()
+        .await
+        .expect("supervision completes");
+    assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
+    assert!(outcome.final_result.is_success());
+
+    // The shared group survived supervision and still works.
+    let _after = group
+        .start(&sleep_secs(1))
+        .await
+        .expect("group still usable");
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess outside the group and adopts it"]
+async fn adopt_brings_an_external_child_under_containment() {
+    // Spawn OUTSIDE any processkit group, adopt, then prove the group's
+    // teardown reaps it — the adopt() containment claim, end-to-end.
+    let mut cmd = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("ping");
+        c.args(["-n", "30", "127.0.0.1"]);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sleep");
+        c.arg("30");
+        c
+    };
+    cmd.stdout(std::process::Stdio::null());
+    let mut child = cmd.spawn().expect("spawn external child");
+
+    let group = ProcessGroup::new().expect("create group");
+    group.adopt(&child).expect("adopt external child");
+    group.terminate_all().expect("terminate the adopted tree");
+
+    // The adopted child must die promptly — well under its ~30s natural run.
+    let start = Instant::now();
+    let _ = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("adopted child reaped in time");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "adopted child was not contained (took {:?})",
+        start.elapsed()
+    );
+}
 
 #[tokio::test]
 #[ignore = "spawns real subprocesses repeatedly under supervision"]

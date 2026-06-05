@@ -44,6 +44,7 @@ pub struct ProcessGroupStats {
 /// The sampler *borrows* the group, so it can neither outlive it nor keep it
 /// (and its kill-on-drop guarantee) alive.
 pub struct StatsSampler<'a> {
+    // (Debug: manual impl below.)
     group: &'a ProcessGroup,
     interval: tokio::time::Interval,
     /// Latched once a snapshot fails: the series has ended for good, and
@@ -54,6 +55,9 @@ pub struct StatsSampler<'a> {
 
 impl<'a> StatsSampler<'a> {
     pub(crate) fn new(group: &'a ProcessGroup, every: Duration) -> Self {
+        // tokio panics on a zero interval period; clamp instead of imposing a
+        // Result on an otherwise-infallible constructor.
+        let every = every.max(Duration::from_millis(1));
         let mut interval = tokio::time::interval(every);
         // Sampling wants the *current* state on each tick; replaying a backlog
         // of missed ticks would fabricate identical samples.
@@ -63,6 +67,15 @@ impl<'a> StatsSampler<'a> {
             interval,
             done: false,
         }
+    }
+}
+
+impl std::fmt::Debug for StatsSampler<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StatsSampler")
+            .field("period", &self.interval.period())
+            .field("done", &self.done)
+            .finish_non_exhaustive()
     }
 }
 
@@ -126,6 +139,13 @@ impl RunProfile {
 mod tests {
     use super::RunProfile;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn zero_interval_sampler_does_not_panic() {
+        // tokio's interval panics on a zero period; the constructor must clamp.
+        let group = crate::ProcessGroup::new().expect("create group");
+        let _sampler = group.sample_stats(Duration::ZERO);
+    }
 
     #[test]
     fn avg_cpu_is_cpu_time_over_duration() {

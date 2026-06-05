@@ -35,6 +35,17 @@ pub struct CliClient<R: ProcessRunner = JobRunner> {
     envs: Vec<(OsString, Option<OsString>)>,
 }
 
+// Manual: the runner type parameter carries no `Debug` bound.
+impl<R: ProcessRunner> std::fmt::Debug for CliClient<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CliClient")
+            .field("program", &self.program)
+            .field("timeout", &self.timeout)
+            .field("envs", &self.envs)
+            .finish_non_exhaustive()
+    }
+}
+
 impl CliClient<JobRunner> {
     /// A client driving `program` through the real job-backed runner.
     pub fn new(program: impl AsRef<OsStr>) -> Self {
