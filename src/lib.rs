@@ -15,7 +15,9 @@
 //! - **runner** — async run-and-capture built on the group. Describe a run with
 //!   [`Command`], then drive it to completion ([`Command::output_string`],
 //!   [`Command::run`], …) or start it via a [`ProcessRunner`] for streaming or a
-//!   shared group. The trait is the mock seam (see [`ScriptedRunner`]).
+//!   shared group. The trait is the mock seam (see [`ScriptedRunner`]). A
+//!   [`Supervisor`] keeps a command *alive* — restarting it per policy with
+//!   backoff — where [`Command::retry`] merely replays one run to success.
 //!
 //! Async throughout (tokio). Errors are the structured [`Error`]; a non-zero
 //! exit is reported in [`ProcessResult`], not raised, until you call
@@ -120,6 +122,7 @@ mod signal;
 #[cfg(feature = "stats")]
 mod stats;
 mod stdin;
+mod supervisor;
 mod sys;
 
 pub use buffer::{OutputBufferPolicy, OverflowMode};
@@ -139,6 +142,7 @@ pub use signal::Signal;
 #[cfg(feature = "stats")]
 pub use stats::{ProcessGroupStats, RunProfile, StatsSampler};
 pub use stdin::{ProcessStdin, Stdin};
+pub use supervisor::{RestartPolicy, StopReason, SupervisionOutcome, Supervisor};
 // Re-exported so callers can `use processkit::StreamExt;` to consume
 // [`RunningProcess::stdout_lines`]'s [`StdoutLines`] stream (`.next().await`,
 // combinators) without depending on `tokio-stream` directly.

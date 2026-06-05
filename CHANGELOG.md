@@ -12,6 +12,15 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- `Supervisor` — keep a child alive: restart per `RestartPolicy`
+  (`Always`/`OnCrash`/`Never`, where a crash is any run without a clean exit —
+  non-zero, timeout, signal, or spawn failure), bounded by `max_restarts`, with
+  exponential backoff (`backoff(base, factor)`, capped by `max_backoff`,
+  jittered ×[0.5, 1.5) by default — `jitter(false)` for determinism) and a
+  `stop_when` predicate that ends supervision regardless of policy. `run()`
+  reports a `SupervisionOutcome` (final result, restart count, `StopReason`).
+  Platform-agnostic, built on the `ProcessRunner` seam: `with_runner(&group)`
+  supervises inside one shared kill-on-drop group; doubles make it hermetic.
 - Stats sampling over time (`stats` feature): `ProcessGroup::sample_stats(every)`
   yields a `Stream` of `ProcessGroupStats` snapshots (first sample immediate,
   missed ticks skipped, series ends when the group can no longer report), and

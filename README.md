@@ -193,6 +193,37 @@ Linux cgroup; counts only on the POSIX process-group backends); `profile`
 samples the started child process itself and applies the run's normal
 timeout/output handling.
 
+## Supervising a long-lived child
+
+Where `Command::retry` replays one run until it succeeds, a `Supervisor` keeps a
+child **alive**: it restarts the command per policy whenever it exits, with
+bounded restarts and exponential backoff (jittered by default so a restarted
+fleet doesn't stampede):
+
+```rust,no_run
+use processkit::{Command, RestartPolicy, Supervisor};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let outcome = Supervisor::new(Command::new("my-server").args(["--port", "8080"]))
+        .restart(RestartPolicy::OnCrash)          // Always | OnCrash | Never
+        .max_restarts(5)
+        .backoff(Duration::from_millis(200), 2.0) // base, multiplier (cap: .max_backoff)
+        .stop_when(|res| res.code() == Some(0))   // a clean exit ends supervision
+        .run()
+        .await?;
+    println!("ended after {} restarts: {:?}", outcome.restarts, outcome.stopped);
+    Ok(())
+}
+```
+
+`run()` reports a `SupervisionOutcome` — the final run's result, the restart
+count, and why supervision stopped. Supervision is platform-agnostic and runs
+through the `ProcessRunner` seam: pass `.with_runner(&group)` to keep every
+incarnation in one shared kill-on-drop group, or a `ScriptedRunner` to test
+supervision logic hermetically.
+
 ## Async streaming and interactive I/O
 
 The one-shot helpers above buffer the whole output. For long-running or

@@ -111,8 +111,10 @@ windows-sys = { version = "0.59", features = [
 libc = "0.2"
 
 [dev-dependencies]
-# `#[tokio::test]` plus a multi-threaded runtime to drive the async tests.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util"] }
+# `#[tokio::test]` plus a multi-threaded runtime to drive the async tests;
+# `test-util` provides the paused clock for the supervisor's backoff-timing
+# tests (virtual time instead of real sleeps).
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "test-util"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # Liveness probe (OpenProcess) in the integration test that proves a grandchild

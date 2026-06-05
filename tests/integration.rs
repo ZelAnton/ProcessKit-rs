@@ -182,8 +182,11 @@ async fn first_line_honors_timeout_instead_of_hanging() {
         matches!(err, processkit::Error::Timeout { .. }),
         "expected Error::Timeout, got {err:?}"
     );
+    // Generous anti-hang bound (the sleeper runs ~30s if the timeout is
+    // broken): under full-suite load PowerShell's cold start alone has been
+    // seen to push a 300ms-timeout run past 5s.
     assert!(
-        start.elapsed() < Duration::from_secs(5),
+        start.elapsed() < Duration::from_secs(15),
         "first_line did not honor the timeout (took {:?})",
         start.elapsed()
     );
@@ -849,6 +852,33 @@ async fn profile_summarizes_a_run() {
 #[cfg(feature = "stats")]
 async fn group_started_short_run() -> processkit::RunningProcess {
     sleep_secs(1).start().await.expect("start short child")
+}
+
+// ----- Supervisor -----
+
+#[tokio::test]
+#[ignore = "spawns real subprocesses repeatedly under supervision"]
+async fn supervisor_exhausts_restarts_on_a_crashing_child() {
+    use processkit::{RestartPolicy, StopReason, Supervisor};
+
+    let always_fails = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "exit", "1"])
+    } else {
+        Command::new("sh").args(["-c", "exit 1"])
+    };
+
+    let outcome = Supervisor::new(always_fails)
+        .restart(RestartPolicy::OnCrash)
+        .max_restarts(2)
+        .backoff(Duration::from_millis(1), 1.0)
+        .jitter(false)
+        .run()
+        .await
+        .expect("supervision completes with a result");
+
+    assert_eq!(outcome.restarts, 2, "two restarts = three real runs");
+    assert_eq!(outcome.stopped, StopReason::RestartsExhausted);
+    assert_eq!(outcome.final_result.code(), Some(1));
 }
 
 // ----- Tree inspection: members() and wait_any -----
