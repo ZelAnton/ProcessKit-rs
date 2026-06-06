@@ -110,8 +110,9 @@ record = ["dep:serde", "dep:serde_json"]
 [target.'cfg(windows)'.dependencies]
 # Win32 Job Object FFI for kill-on-close process trees: CreateJobObjectW /
 # SetInformationJobObject / AssignProcessToJobObject / TerminateJobObject plus
-# the HANDLE type & CloseHandle.
-windows-sys = { version = "0.59", features = [
+# the HANDLE type & CloseHandle. Kept on the same major as tokio/mio's copy so
+# the lockfile carries a single windows-sys.
+windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_System_JobObjects",
   # JOBOBJECT_EXTENDED_LIMIT_INFORMATION + GetProcessTimes (per-process CPU);
@@ -147,7 +148,7 @@ tempfile = "3"
 [target.'cfg(windows)'.dev-dependencies]
 # Liveness probe (OpenProcess) in the integration test that proves a grandchild
 # is reaped with its job — integration tests can't see the non-dev windows-sys.
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # Liveness probe (kill(pid, 0)) and the root gate (geteuid) in the setsid /
