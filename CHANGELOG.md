@@ -17,6 +17,11 @@ to a dated version section.
 > (`minor`), not a patch.
 
 ### Added
+- `docs/` guide set — eight cross-linked, per-topic guides (running commands,
+  process groups, streaming & interactive I/O, pipelines, timeouts/retries/
+  cancellation, supervision, testing, platform support) with richer examples
+  and all capability matrices and platform caveats collected in one place;
+  linked from the README's new Documentation section.
 - Record/replay cassettes (`record` feature, off by default, pulls optional
   `serde` + `serde_json`): `RecordReplayRunner::record(path, inner)` captures
   real `Invocation → ProcessResult` pairs through any inner runner and writes

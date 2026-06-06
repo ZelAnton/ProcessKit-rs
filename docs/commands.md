@@ -1,0 +1,290 @@
+# Running commands
+
+[‹ docs index](README.md)
+
+`Command` is the entry point of the runner layer: a builder describing *what*
+to run and *how*, plus a family of consuming verbs that decide *what you get
+back*. Every one-shot verb spawns the child into a fresh, private kill-on-drop
+[process group](process-groups.md), so an early return, panic, or dropped
+future can never leak a process tree.
+
+- [Program, arguments, working directory](#program-arguments-working-directory)
+- [Environment](#environment)
+- [Standard input](#standard-input)
+- [Output handling](#output-handling)
+- [Timeouts and retries](#timeouts-and-retries)
+- [Privileges and spawn flags](#privileges-and-spawn-flags)
+- [Consuming verbs](#consuming-verbs)
+- [Results and errors](#results-and-errors)
+
+## Program, arguments, working directory
+
+```rust,no_run
+use processkit::Command;
+
+let out = Command::new("git")
+    .arg("log")                          // one at a time…
+    .args(["--oneline", "-n", "10"])     // …or in bulk
+    .current_dir("/path/to/repo")        // run there
+    .run()
+    .await?;
+```
+
+Arguments are passed as an array — there is **no shell** between you and the
+child, so there is no quoting, no word-splitting, and no injection surface.
+(When you actually want `a | b | c`, use a [pipeline](pipelines.md), which
+wires native pipes instead of invoking a shell.)
+
+For quick one-liners the free functions skip the builder:
+
+```rust,no_run
+let version = processkit::run("cargo", ["--version"]).await?;       // trimmed stdout, success required
+let result  = processkit::output("git", ["status", "-s"]).await?;   // full ProcessResult
+```
+
+## Environment
+
+Four builders compose, applied in a fixed order at spawn:
+
+```rust,no_run
+use processkit::Command;
+
+Command::new("worker")
+    .env("RUST_LOG", "debug")        // set one variable
+    .env_remove("GIT_DIR")           // unset one inherited variable
+    .run().await?;
+
+// Allow-list mode: clear everything, copy only the named parent variables.
+Command::new("sandboxed-tool")
+    .inherit_env(["PATH", "HOME", "LANG"])
+    .env("MODE", "ci")               // explicit env/env_remove still apply on top
+    .run().await?;
+
+// Scorched earth: the child starts with an empty environment.
+Command::new("hermetic-tool").env_clear().run().await?;
+```
+
+`inherit_env` is the sandboxing middle ground: it implies `env_clear`, then
+copies the listed variables *from the parent at each spawn* (so a retry sees
+fresh values), and repeated calls accumulate names. A name the parent doesn't
+have is skipped, not set to empty.
+
+## Standard input
+
+By default stdin is **closed at spawn** — the child reads EOF immediately and
+can never hang waiting for input. Everything else is opt-in via
+`stdin(Stdin::…)`:
+
+| Source | Reusable on re-run? | Use for |
+|---|---|---|
+| `Stdin::empty()` | — | The default, explicit |
+| `Stdin::from_string("…")` | ✅ | Text payloads |
+| `Stdin::from_bytes(vec![…])` | ✅ | Binary payloads |
+| `Stdin::from_iter_lines(["a", "b"])` | ✅ | Anything iterable; each item is written `\n`-terminated |
+| `Stdin::from_file(path)` | ✅ (re-opened per run) | Large inputs streamed from disk |
+| `Stdin::from_reader(reader)` | ❌ one-shot | Any `AsyncRead` — a socket, a decompressor, … |
+| `Stdin::from_lines(stream)` | ❌ one-shot | Any `Stream<Item = String>` — a channel, a tail, … |
+
+```rust,no_run
+use processkit::{Command, Stdin};
+
+let sorted = Command::new("sort")
+    .stdin(Stdin::from_iter_lines(["banana", "apple", "cherry"]))
+    .run()
+    .await?;
+assert_eq!(sorted, "apple\nbanana\ncherry");
+```
+
+The payload is written on a background task (so a large input can't deadlock
+against the child's output) and the pipe is dropped afterwards to signal EOF.
+The two *one-shot* sources are consumed by their first run: a retried or
+cloned command reusing them feeds an **empty** stdin the second time — prefer
+the reusable sources when a command may run more than once.
+
+For conversational, request/response stdin — write a line, read the answer,
+repeat — use `keep_stdin_open()` and the streaming API instead: see
+[Streaming & interactive I/O](streaming.md#interactive-stdin).
+
+## Output handling
+
+### Encodings
+
+Output is decoded line by line, UTF-8 by default (invalid bytes become
+`U+FFFD`, never an error). Legacy-encoding tools can override per stream:
+
+```rust,no_run
+use processkit::Command;
+
+let out = Command::new("legacy-tool")
+    .encoding(encoding_rs::SHIFT_JIS)          // both streams…
+    // .stdout_encoding(…) / .stderr_encoding(…) // …or each its own
+    .output_string()
+    .await?;
+```
+
+(`processkit::Encoding` re-exports `encoding_rs::Encoding`, so any of its
+encodings — `WINDOWS_1252`, `GBK`, … — works.)
+
+### Buffer policies — bounding memory on chatty children
+
+Captured lines are held in memory; a multi-gigabyte log would normally grow
+the buffer to match. `output_buffer` bounds *retention* (the pipe is always
+fully drained, so the child never blocks):
+
+```rust,no_run
+use processkit::{Command, OutputBufferPolicy, OverflowMode};
+
+let tail = Command::new("verbose-build")
+    .output_buffer(OutputBufferPolicy::bounded(1_000)) // keep the newest 1000 lines
+    .output_string()
+    .await?;
+
+// …or keep the head instead of the tail:
+let head_policy = OutputBufferPolicy::bounded(1_000).with_overflow(OverflowMode::DropNewest);
+```
+
+`DropOldest` (the default) keeps a rolling tail; `DropNewest` freezes the
+head. `bounded(0)` retains nothing — useful when a line handler (below) is the
+real consumer. Dropped or not, **every** line still feeds the handlers and the
+line counters.
+
+### Line handlers — tee output as it arrives
+
+`on_stdout_line` / `on_stderr_line` run a callback on each decoded line *in
+addition to* capture or streaming — logging, progress bars, metrics:
+
+```rust,no_run
+use processkit::Command;
+
+let result = Command::new("cargo")
+    .args(["build", "--release"])
+    .on_stderr_line(|line| eprintln!("[build] {line}"))
+    .output_string()
+    .await?;
+```
+
+The handler runs on the read pump — keep it cheap and panic-free (a panic ends
+that stream's pumping early; the run itself still completes).
+
+## Timeouts and retries
+
+```rust,no_run
+use processkit::{Command, Error};
+use std::time::Duration;
+
+let out = Command::new("flaky-network-tool")
+    .timeout(Duration::from_secs(30))                 // kill the tree at the deadline
+    .retry(3, Duration::from_millis(200), |e| {       // up to 3 attempts total
+        matches!(e, Error::Timeout { .. })            // …but only retry timeouts
+    })
+    .run()
+    .await?;
+```
+
+- **`timeout`** kills the whole process tree at the deadline. On the capturing
+  verbs the expiry is *captured* (`ProcessResult::timed_out`), on the
+  success-checking verbs it *raises* `Error::Timeout` — the full decision
+  table lives in [Timeouts, retries & cancellation](timeouts-and-cancellation.md).
+- **`retry`** applies to the success-checking verbs only (`run`, `exit_code`,
+  `probe`, and `ProcessRunnerExt::checked`); the classifier sees the typed
+  error and decides. The non-erroring `output_string` path never retries.
+
+## Privileges and spawn flags
+
+Spawn-time controls for sandboxing and service launch:
+
+```rust,no_run
+use processkit::Command;
+
+// Unix: drop privileges and detach into a new session.
+Command::new("worker")
+    .gid(1000)            // applied before uid (order matters for setgroups rights)
+    .uid(1000)
+    .setsid()             // new session: survives the controlling terminal
+    .run().await?;
+
+// Windows: no console window flashing up from a GUI app.
+Command::new("helper").create_no_window().run().await?;
+```
+
+`uid` / `gid` / `setsid` are POSIX-only — on other targets the run fails with
+`Error::Unsupported` rather than silently skipping a privilege drop.
+`create_no_window` is a harmless no-op outside Windows. Containment is
+preserved in every combination; the platform fine print (the Linux
+cgroup × `uid` interaction, `setsid` × process-group coordination) is collected
+in [Platform support](platform-support.md#caveats).
+
+## Consuming verbs
+
+| Verb | Returns | Non-zero exit | Timeout | Use when |
+|---|---|---|---|---|
+| `output_string()` | `ProcessResult<String>` | captured | captured (`timed_out`) | You want to inspect the outcome yourself |
+| `output_bytes()` | `ProcessResult<Vec<u8>>` | captured | captured | Binary stdout (images, archives, …) |
+| `run()` | trimmed stdout `String` | `Error::Exit` | `Error::Timeout` | "Give me the answer or fail" |
+| `exit_code()` | `i32` | the code, `Ok` | `Error::Timeout` | The code *is* the answer |
+| `probe()` | `bool` | `0`→`true`, `1`→`false`, else `Error::Exit` | `Error::Timeout` | Predicate commands: `git diff --quiet`, `grep -q` |
+| `first_line(pred)` | `Option<String>` | — (stream-based) | `Error::Timeout` | Grab one matching line, kill the rest |
+| `start()` | live `RunningProcess` | — | bounds the stream | [Streaming, interactive I/O, probes](streaming.md) |
+
+```rust,no_run
+use processkit::Command;
+
+// probe(): the exit code as a boolean.
+let clean = Command::new("git").args(["diff", "--quiet"]).probe().await?;
+
+// first_line(): stop as soon as the interesting line appears.
+let first_match = Command::new("git")
+    .args(["log", "--oneline"])
+    .first_line(|l| l.contains("fix:"))
+    .await?;
+```
+
+`first_line` returns `Ok(None)` when stdout closes without a match, and kills
+the (private-group) child once it has its answer — you never wait out a long
+log for one line.
+
+## Results and errors
+
+The capturing verbs hand back a `ProcessResult`:
+
+```rust,no_run
+use processkit::Command;
+
+let result = Command::new("git").args(["merge", "feature"]).output_string().await?;
+
+result.code();         // Option<i32> — None = killed (timeout/signal), no code
+result.is_success();   // code == Some(0)
+result.timed_out();    // the run's own deadline expired
+result.stdout();       // &str (or &[u8] from output_bytes)
+result.stderr();       // &str
+result.combined();     // stdout + stderr concatenated
+result.diagnostic();   // stderr if non-empty, else stdout — the human-facing line
+                       // (git/jj put "CONFLICT …" on stdout!)
+
+// Opt into erroring whenever you're ready:
+let ok = result.ensure_success()?; // Exit / Timeout / signal-kill Io as typed errors
+```
+
+The error enum is structured and `#[non_exhaustive]`:
+
+| Variant | Meaning |
+|---|---|
+| `Error::Spawn { program, source }` | The OS couldn't start the program (not found, permissions, …) |
+| `Error::Exit { program, code, stdout, stderr }` | Non-zero exit, both streams attached (truncated to 4 KiB each in the error; the full text stays on the `ProcessResult`) |
+| `Error::Timeout { program, timeout }` | The run's own deadline killed it |
+| `Error::NotReady { program, timeout }` | A [readiness probe](streaming.md#readiness-probes) gave up |
+| `Error::Parse { program, message }` | A `CliClient::try_parse` parser rejected the output |
+| `Error::Unsupported { operation }` | The platform can't do what was asked (and silently skipping would be wrong) |
+| `Error::Cancelled { program }` | (`cancellation` feature) the run's token was cancelled |
+| `Error::ResourceLimit(reason)` | (`limits` feature) a requested cap couldn't be enforced |
+| `Error::Io(source)` | Everything else from the OS, incl. signal-kills (no exit code, no timeout) |
+
+`Error::diagnostic()` mirrors `ProcessResult::diagnostic()` for the `Exit`
+variant — one method to get the most useful human-facing line out of a
+failure.
+
+---
+
+Next: [Streaming & interactive I/O](streaming.md) ·
+[Timeouts, retries & cancellation](timeouts-and-cancellation.md) ·
+[Process groups](process-groups.md)

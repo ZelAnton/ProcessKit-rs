@@ -28,6 +28,25 @@ cargo add processkit
 
 This crate requires a [tokio](https://tokio.rs/) runtime.
 
+## Documentation
+
+This README is the quick tour. The **[`docs/` guide set](docs/README.md)**
+goes deeper on every capability, with more examples and the platform fine
+print collected in one place:
+
+| Guide | Covers |
+|---|---|
+| [Running commands](docs/commands.md) | The full `Command` builder and every consuming verb, with error semantics |
+| [Process groups](docs/process-groups.md) | Containment, teardown, signals, suspend/resume, members, limits, stats |
+| [Streaming & interactive I/O](docs/streaming.md) | Line streaming, conversational stdin, readiness probes, `wait_any`, profiling |
+| [Pipelines](docs/pipelines.md) | Shell-free `a \| b \| c`, pipefail attribution, chain timeouts |
+| [Timeouts, retries & cancellation](docs/timeouts-and-cancellation.md) | Captured vs raised deadlines, retry classifiers, `CancellationToken` |
+| [Supervision](docs/supervision.md) | Restart policies, backoff & jitter, stop conditions, outcomes |
+| [Testing your code](docs/testing.md) | The `ProcessRunner` seam, scripted/recording/mock doubles, cassettes, `CliClient` |
+| [Platform support](docs/platform-support.md) | Mechanisms, all capability matrices, every caveat |
+
+API reference: [docs.rs/processkit](https://docs.rs/processkit).
+
 ## Usage
 
 ```rust,no_run
