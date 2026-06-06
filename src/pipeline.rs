@@ -287,6 +287,7 @@ mod tests {
             last_stage(Some(0), "final"),
             None,
         );
+        assert_eq!(result.program(), "b", "diagnostics from the failing stage");
         assert_eq!(result.code(), Some(2));
         assert_eq!(result.stderr(), "b broke");
         assert_eq!(
@@ -295,8 +296,7 @@ mod tests {
             "stdout is what the chain produced — the last stage's"
         );
         assert!(!result.timed_out());
-        // The reported program (visible via the error surface) is the failing
-        // stage's, not the last stage's.
+        // The same attribution must survive the public error surface too.
         match result.ensure_success() {
             Err(crate::Error::Exit {
                 program,
@@ -323,11 +323,12 @@ mod tests {
             last_stage(Some(0), "out"),
             None,
         );
+        assert_eq!(result.program(), "a", "pipefail blames the FIRST failure");
         assert_eq!(result.code(), Some(1));
         assert_eq!(result.stderr(), "first");
         match result.ensure_success() {
             Err(crate::Error::Exit { program, .. }) => {
-                assert_eq!(program, "a", "pipefail blames the FIRST failure");
+                assert_eq!(program, "a", "...and so does the error surface");
             }
             other => panic!("expected Error::Exit, got {other:?}"),
         }
@@ -342,6 +343,7 @@ mod tests {
             last_stage(Some(0), "out"),
             None,
         );
+        assert_eq!(result.program(), "a");
         assert_eq!(result.code(), None);
         assert_eq!(result.stderr(), "killed");
         assert!(!result.timed_out(), "a stage kill is not a chain timeout");

@@ -1,0 +1,95 @@
+//! Group and per-process accounting: stats(), sample_stats(), profile(), and
+//! the per-process diagnostics — `stats`-gated via the `mod` declaration in
+//! `main.rs`.
+
+use std::time::Duration;
+
+use processkit::{Mechanism, ProcessGroup};
+
+use crate::common::*;
+
+#[tokio::test]
+#[ignore = "creates an OS job/cgroup and reads accounting"]
+async fn group_stats_report_active_processes() {
+    let group = ProcessGroup::new().expect("create group");
+    let _process = group.start(&sleeper()).await.expect("spawn sleeper");
+    let stats = group.stats().expect("stats");
+    assert!(
+        stats.active_process_count >= 1,
+        "expected a live process, got {stats:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess and reads per-process metrics"]
+async fn process_diagnostics_are_available() {
+    // On the containment platforms CPU/memory are reported; elsewhere they may be
+    // None, so only assert the pid/elapsed basics universally.
+    let mut process = sleeper().start().await.expect("start sleeper");
+    assert!(process.pid().is_some());
+    assert!(process.elapsed() < Duration::from_secs(5));
+    if cfg!(any(windows, target_os = "linux")) {
+        // Give the child a moment to accrue something measurable.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            process.peak_memory_bytes().is_some(),
+            "peak memory should be readable on this platform"
+        );
+    }
+    let _ = process.standard_input(); // no-op (stdin not kept open)
+    drop(process);
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess and samples the group's stats"]
+async fn sample_stats_yields_a_live_series() {
+    use tokio_stream::StreamExt;
+
+    let group = ProcessGroup::new().expect("create group");
+    if matches!(group.mechanism(), Mechanism::None) {
+        eprintln!("skipping: no containment on this target");
+        return;
+    }
+    let _child = group.start(&sleeper()).await.expect("start sleeper");
+
+    let mut samples = group.sample_stats(Duration::from_millis(50));
+    for n in 0..3 {
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), samples.next())
+            .await
+            .expect("sample in time")
+            .expect("series still live");
+        assert!(
+            snapshot.active_process_count >= 1,
+            "sample #{n} saw no live process: {snapshot:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess and profiles its run"]
+async fn profile_summarizes_a_run() {
+    let profile = group_started_short_run()
+        .await
+        .profile(Duration::from_millis(50))
+        .await
+        .expect("profile");
+
+    assert_eq!(profile.exit_code, Some(0), "profile: {profile:?}");
+    assert!(
+        profile.duration >= Duration::from_millis(500),
+        "a ~1s child reported {:?}",
+        profile.duration
+    );
+    assert!(profile.samples >= 1, "profile never sampled: {profile:?}");
+    if cfg!(any(windows, target_os = "linux")) {
+        assert!(
+            profile.peak_memory_bytes.is_some(),
+            "peak RSS should be readable on this platform: {profile:?}"
+        );
+    }
+}
+
+/// Start a ~1s single-process child directly (its own private group).
+async fn group_started_short_run() -> processkit::RunningProcess {
+    sleep_secs(1).start().await.expect("start short child")
+}

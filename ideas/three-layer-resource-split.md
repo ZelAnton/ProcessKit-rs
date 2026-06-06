@@ -222,3 +222,28 @@ findings; the decisions below were taken explicitly.
 Start from fact 1 (tokio→FFI) and fact 3 (the cycle): any future split must
 be the sys-foundation shape (downward optional dep), and a "light" config
 must keep the tree guarantee or fail loudly — never silently degrade it.
+
+---
+
+## 2026-06-06 addendum — structural-refactor audit: rejected refactors
+
+A structural audit (post 0.6.1) pressed eight in-crate refactor candidates.
+Five small ones were adopted (post-exit `checked_outcome` checkpoint, pgroup
+`Tracked` set, `ProcessResult::program()`, tests/ and running/ module splits).
+Two were considered and **rejected** — recorded so they aren't re-litigated:
+
+- **Typed signal-kill error variant (e.g. `Error::Killed { signal }`) —
+  REJECTED (owner decision).** A Windows Job kill terminates the tree with an
+  *exit code* (we pass 1), not a signal — a `signal` field would either lie on
+  Windows or fork the variant per platform, leaking the exact divergence the
+  current shape absorbs: `code: None` on a Unix signal-kill, a platform code
+  on a Windows Job kill, both surfaced as "no clean exit". The unclean-death
+  asymmetry is real platform behavior; give it names only if a concrete
+  consumer needs to *dispatch* on the signal, not for symmetry.
+- **cfg-unifying the two `drive_to_exit_inner` bodies — REJECTED.** The
+  `cancellation`-gated body is a 3-arm `select!` with borrow-disjointness
+  obligations; the ungated body is a plain timeout match. One merged body
+  would carry never-resolving dummy arms and `cfg`-laced borrows into the
+  simple path to save ~20 lines. The split *is* the documentation: each
+  feature config reads as exactly what it does. Same "honest duplication"
+  principle that kept the have-Child vs have-pid kill paths separate.

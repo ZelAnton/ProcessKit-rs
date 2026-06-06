@@ -28,6 +28,119 @@ use crate::stats::ProcessGroupStats;
 /// How often the graceful path re-checks whether the tree has drained.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// One tracked id-set with its probe/signal primitives — either process
+/// **groups** (each id is a leader child's pid, probed and signalled
+/// negatively: `kill(-id, 0)` / `killpg`) or **solo** pids (adopted children
+/// that could not be re-grouped, probed and signalled directly).
+///
+/// This is the single place the recycled-pid hazard is reasoned about. A
+/// stale id whose process was reaped and whose pid got recycled could address
+/// an unrelated process: for a group entry the alias additionally requires
+/// the recycled pid to become a group *leader*, while a solo entry is a plain
+/// pid — any reuse aliases it (likelier on macOS's small pid space). The
+/// mitigations are uniform for both kinds:
+///
+/// - probe existence immediately before signalling, so the in-sweep window is
+///   a few instructions wide;
+/// - prune on `ESRCH` and never re-add a pruned id — an empty group can never
+///   regain members (new members only fork from existing ones), so the probe
+///   is terminal and a recyclable dead id is forgotten promptly;
+/// - treat `EPERM` as **exists**: the process/group is alive but may not be
+///   signalled (e.g. after a third-party uid change) — pruning it would
+///   silently orphan a live tree, so it is kept and signalled best-effort.
+///
+/// A tracked id stays until its process is *reaped* — an unreaped zombie
+/// probes alive (relevant for adopted children, which the caller reaps).
+struct Tracked {
+    ids: Mutex<Vec<i32>>,
+    /// Probe/signal the whole process group (negative id) instead of one pid.
+    group: bool,
+}
+
+impl Tracked {
+    const fn new(group: bool) -> Self {
+        Tracked {
+            ids: Mutex::new(Vec::new()),
+            group,
+        }
+    }
+
+    /// Whether `id` still exists (see the type doc for the `EPERM` rule).
+    fn exists(&self, id: i32) -> bool {
+        let probe = if self.group { -id } else { id };
+        // SAFETY: signal 0 is a sound existence probe (a negative target
+        // probes the process group).
+        if unsafe { libc::kill(probe, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    /// Track `id`, pruning drained entries and de-duplicating (re-adopting a
+    /// child this set already tracks must not make `members()`/`stats()`
+    /// over-report).
+    fn track(&self, id: i32) {
+        if let Ok(mut ids) = self.ids.lock() {
+            ids.retain(|&id| self.exists(id));
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+
+    /// Send `sig` to every still-existing entry, pruning the drained ones.
+    fn signal_all(&self, sig: i32) {
+        if let Ok(mut ids) = self.ids.lock() {
+            ids.retain(|&id| {
+                if !self.exists(id) {
+                    return false; // ESRCH: gone — forget it.
+                }
+                // SAFETY: killpg/kill to a probed-existing id; an exit between
+                // the probe and here just yields ESRCH, and EPERM stays
+                // best-effort — either way the sweep continues.
+                unsafe {
+                    if self.group {
+                        libc::killpg(id, sig);
+                    } else {
+                        libc::kill(id, sig);
+                    }
+                }
+                true
+            });
+        }
+    }
+
+    /// Whether any tracked entry still exists.
+    fn any_alive(&self) -> bool {
+        self.ids
+            .lock()
+            .map(|ids| ids.iter().any(|&id| self.exists(id)))
+            .unwrap_or(false)
+    }
+
+    /// The still-existing entries, pruning the drained ones on the way.
+    #[cfg(feature = "process-control")]
+    fn live_snapshot(&self) -> Vec<i32> {
+        match self.ids.lock() {
+            Ok(mut ids) => {
+                ids.retain(|&id| self.exists(id));
+                ids.clone()
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// How many tracked entries still exist (probe-only; no pruning — stats
+    /// must not mutate tracking state).
+    #[cfg(feature = "stats")]
+    fn count_alive(&self) -> usize {
+        self.ids
+            .lock()
+            .map(|ids| ids.iter().filter(|&&id| self.exists(id)).count())
+            .unwrap_or(0)
+    }
+}
+
 /// A set of process groups, one per spawned (or adopted) child.
 ///
 /// Tracks the group ids (each == its leader child's pid) so teardown can signal
@@ -35,20 +148,20 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// panicking owner never leaks subprocesses.
 pub(crate) struct ProcessGroup {
     /// Group ids we own. A group id is the leader child's pid.
-    pgids: Mutex<Vec<i32>>,
+    groups: Tracked,
     /// Adopted children that could not be re-grouped: POSIX forbids
     /// `setpgid` on a child that has already `exec`'d (`EACCES`) — the common
     /// case for [`adopt`](Self::adopt). These are tracked and signalled
     /// *individually*: the child itself is contained, but unlike a group
     /// leader, descendants it forks are not.
-    solo_pids: Mutex<Vec<i32>>,
+    solos: Tracked,
 }
 
 impl ProcessGroup {
     pub(crate) fn new() -> Self {
         ProcessGroup {
-            pgids: Mutex::new(Vec::new()),
-            solo_pids: Mutex::new(Vec::new()),
+            groups: Tracked::new(true),
+            solos: Tracked::new(false),
         }
     }
 
@@ -68,11 +181,8 @@ impl ProcessGroup {
             cmd.as_std_mut().process_group(0);
         }
         let child = cmd.spawn()?;
-        if let Some(pid) = child.id()
-            && let Ok(mut g) = self.pgids.lock()
-        {
-            retain_live(&mut g);
-            g.push(pid as i32);
+        if let Some(pid) = child.id() {
+            self.groups.track(pid as i32);
         }
         Ok(child)
     }
@@ -89,15 +199,10 @@ impl ProcessGroup {
         let rc = unsafe { libc::setpgid(pid, 0) };
         if rc == 0 {
             // It now leads group `pid` — track the group; future forks inherit
-            // it and are reaped with it. Dedup: adopting a child this group
-            // itself spawned (already a leader — setpgid is a no-op success)
-            // must not double-track it, or members()/stats() over-report.
-            if let Ok(mut g) = self.pgids.lock() {
-                retain_live(&mut g);
-                if !g.contains(&pid) {
-                    g.push(pid);
-                }
-            }
+            // it and are reaped with it. (`track` de-duplicates an adopt of a
+            // child this group itself spawned — setpgid is a no-op success
+            // for an existing leader.)
+            self.groups.track(pid);
             return Ok(());
         }
 
@@ -112,13 +217,7 @@ impl ProcessGroup {
             // no-op (no group `pid` exists); track it individually instead:
             // the child is contained, its future forks are not.
             code if code == libc::EACCES || code == libc::EPERM => {
-                if let Ok(mut solos) = self.solo_pids.lock() {
-                    retain_live_pids(&mut solos);
-                    // Dedup a repeated adopt of the same child.
-                    if !solos.contains(&pid) {
-                        solos.push(pid);
-                    }
-                }
+                self.solos.track(pid);
                 Ok(())
             }
             _ => Err(err),
@@ -155,13 +254,13 @@ impl ProcessGroup {
 
     /// One signal sweep over both tracking sets.
     fn broadcast(&self, sig: i32) {
-        signal_groups(&self.pgids, sig);
-        signal_pids(&self.solo_pids, sig);
+        self.groups.signal_all(sig);
+        self.solos.signal_all(sig);
     }
 
     /// Whether anything tracked is still alive.
     fn any_alive(&self) -> bool {
-        groups_alive(&self.pgids) || pids_alive(&self.solo_pids)
+        self.groups.any_alive() || self.solos.any_alive()
     }
 
     /// The live tracked group **leaders** (one pid per spawned child) plus the
@@ -169,17 +268,8 @@ impl ProcessGroup {
     /// here. Dead entries are pruned on the way.
     #[cfg(feature = "process-control")]
     pub(crate) fn members(&self) -> Vec<i32> {
-        let mut members = match self.pgids.lock() {
-            Ok(mut g) => {
-                retain_live(&mut g);
-                g.clone()
-            }
-            Err(_) => Vec::new(),
-        };
-        if let Ok(mut solos) = self.solo_pids.lock() {
-            retain_live_pids(&mut solos);
-            members.extend_from_slice(&solos);
-        }
+        let mut members = self.groups.live_snapshot();
+        members.extend_from_slice(&self.solos.live_snapshot());
         members
     }
 
@@ -207,16 +297,8 @@ impl ProcessGroup {
         // We track group ids (plus solo-adopted pids), not every individual
         // process, so report the number of live entries and leave cpu/memory
         // absent.
-        let active = match self.pgids.lock() {
-            Ok(g) => g.iter().filter(|&&pgid| group_exists(pgid)).count(),
-            Err(_) => 0,
-        };
-        let active_solo = match self.solo_pids.lock() {
-            Ok(solos) => solos.iter().filter(|&&pid| pid_exists(pid)).count(),
-            Err(_) => 0,
-        };
         Ok(ProcessGroupStats {
-            active_process_count: active + active_solo,
+            active_process_count: self.groups.count_alive() + self.solos.count_alive(),
             total_cpu_time: None,
             peak_memory_bytes: None,
         })
@@ -227,110 +309,4 @@ impl Drop for ProcessGroup {
     fn drop(&mut self) {
         self.broadcast(libc::SIGKILL);
     }
-}
-
-/// Whether the process group `pgid` still exists.
-///
-/// `kill(-pgid, 0)` returns 0 when the probe is permitted, and fails with
-/// `EPERM` when the group **exists** but contains only processes the caller
-/// may not signal — only `ESRCH` means "gone". Conflating the two would prune
-/// (and so never kill) a live tree that, say, changed its uid.
-fn group_exists(pgid: i32) -> bool {
-    // SAFETY: signal 0 to a negative pid is a sound existence probe.
-    if unsafe { libc::kill(-pgid, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Whether the process `pid` still exists (same `EPERM` caveat as
-/// [`group_exists`]).
-fn pid_exists(pid: i32) -> bool {
-    // SAFETY: signal 0 to a positive pid is a sound existence probe.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Send `sig` to every still-existing tracked process group, dropping the ones
-/// that have already drained.
-///
-/// A group id is the leader's pid, so a stale id whose leader was reaped and
-/// whose pid got recycled could in theory address an unrelated group. Probing
-/// existence immediately before `killpg` keeps that window just a few
-/// instructions wide, and pruning the dead ids stops the set from growing
-/// without bound over a long-lived group's lifetime. (Still best-effort against a
-/// child that `setsid`s out of its group entirely.)
-fn signal_groups(pgids: &Mutex<Vec<i32>>, sig: i32) {
-    if let Ok(mut g) = pgids.lock() {
-        g.retain(|&pgid| {
-            if !group_exists(pgid) {
-                return false; // ESRCH: the group is gone — forget it.
-            }
-            // SAFETY: killpg on a positive group id is always a sound call; a
-            // group that exits between the probe and here simply returns ESRCH,
-            // and one we may not signal returns EPERM — either way best-effort.
-            unsafe { libc::killpg(pgid, sig) };
-            true
-        });
-    }
-}
-
-/// Whether any tracked process group still has at least one member.
-fn groups_alive(pgids: &Mutex<Vec<i32>>) -> bool {
-    let Ok(g) = pgids.lock() else {
-        return false;
-    };
-    g.iter().any(|&pgid| group_exists(pgid))
-}
-
-/// Drop process groups that have already drained. An empty group can never
-/// regain members (new members only fork from existing ones), so an `ESRCH`
-/// probe is terminal — forgetting the id is sound and keeps a recyclable dead pid
-/// from later being mistaken for a live group.
-fn retain_live(pgids: &mut Vec<i32>) {
-    pgids.retain(|&pgid| group_exists(pgid));
-}
-
-/// `signal_groups`, but for the solo-adopted pids: probe each individually and
-/// signal the live ones, pruning the dead.
-///
-/// The recycled-pid hazard here is *stronger* than for groups: a stale group id
-/// only aliases if the recycled pid happens to become a group **leader**,
-/// whereas a solo entry is a plain pid — any unrelated process that reuses it
-/// (likelier on macOS's small pid space) would be probed "alive" and signalled.
-/// The exposure is the gap between the child's exit-and-reap and our next
-/// sweep; probe-then-signal keeps the in-sweep window a few instructions wide,
-/// and a pruned pid is never re-added. Note: a solo pid stays tracked until
-/// *reaped by its owner* (adopt borrows the child); an unreaped zombie probes
-/// alive, exactly like a zombie group leader.
-fn signal_pids(pids: &Mutex<Vec<i32>>, sig: i32) {
-    if let Ok(mut p) = pids.lock() {
-        p.retain(|&pid| {
-            if !pid_exists(pid) {
-                return false; // ESRCH: gone — forget it.
-            }
-            // SAFETY: a plain signal to a probed-existing pid; an exit between
-            // the probe and here just yields ESRCH (EPERM stays best-effort).
-            unsafe { libc::kill(pid, sig) };
-            true
-        });
-    }
-}
-
-/// Whether any solo-adopted pid still exists.
-fn pids_alive(pids: &Mutex<Vec<i32>>) -> bool {
-    let Ok(p) = pids.lock() else {
-        return false;
-    };
-    p.iter().any(|&pid| pid_exists(pid))
-}
-
-/// Drop solo-adopted pids that have already exited (and been reaped). (Solo
-/// tracking only ever gains entries through `adopt` — a `process-control`
-/// surface — so its pruner is gated with it.)
-#[cfg(feature = "process-control")]
-fn retain_live_pids(pids: &mut Vec<i32>) {
-    pids.retain(|&pid| pid_exists(pid));
 }

@@ -1,38 +1,35 @@
 //! [`RunningProcess`] — a live handle to a spawned child.
+//!
+//! Split by concern: this file owns the handle's state and the consuming
+//! capture paths (exit driving, kill/teardown, the post-exit checkpoint);
+//! [`probes`] holds the non-consuming readiness probes; [`stream`] holds the
+//! incremental stdout streaming surface.
 
-use std::future::Future;
-use std::net::SocketAddr;
-use std::pin::Pin;
+mod probes;
+mod stream;
+
+pub use stream::StdoutLines;
+
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
 use encoding_rs::Encoding;
 use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
-use tokio_stream::Stream;
 
 use crate::buffer::OutputBufferPolicy;
-use crate::error::{Error, Result};
+#[cfg(feature = "cancellation")]
+use crate::error::Error;
+use crate::error::Result;
 use crate::group::ProcessGroup;
-use crate::pump::{LineHandler, Popped, SharedLines, pump_lines};
+use crate::pump::{LineHandler, SharedLines, pump_lines};
 use crate::result::ProcessResult;
 use crate::stdin::ProcessStdin;
 
 /// How long teardown waits for output pumps to finish before aborting them, so a
 /// surviving grandchild holding a pipe can't hang the run.
 const PUMP_TEARDOWN: Duration = Duration::from_secs(5);
-
-/// How often [`RunningProcess::wait_for`] / [`wait_for_port`]
-/// (RunningProcess::wait_for_port) re-check readiness — responsive without
-/// busy-spinning; matches the 50 ms liveness-poll cadence used elsewhere.
-const READINESS_POLL: Duration = Duration::from_millis(50);
-
-/// Cap on a single `wait_for_port` connect attempt (clamped to the remaining
-/// budget), so one stalled connect can't overrun the probe deadline.
-const CONNECT_ATTEMPT_CAP: Duration = Duration::from_secs(1);
 
 /// The fields produced by a spawn, handed to [`RunningProcess::from_spawned`].
 pub(crate) struct Spawned {
@@ -146,8 +143,6 @@ impl RunningProcess {
     pub(crate) fn program_name(&self) -> &str {
         &self.program
     }
-
-    // (continued below)
 }
 
 // Manual: pipes, pump tasks, and line handlers are opaque.
@@ -234,120 +229,6 @@ impl RunningProcess {
         self.stdin_pipe.take().map(ProcessStdin::new)
     }
 
-    /// Stream the child's standard output line by line. Call this **once**.
-    ///
-    /// Standard error is drained in the background (so the child can't block on a
-    /// full stderr pipe) and discarded — use [`output_string`](Self::output_string)
-    /// when you need both. Keep this `RunningProcess` in scope while consuming;
-    /// dropping it tears the process down.
-    ///
-    /// The command's [`timeout`](crate::Command::timeout), if set, **bounds the
-    /// stream**: at the deadline the process tree is killed, so the pipes close
-    /// and this stream ends — a streamed run can't hang past its timeout. A
-    /// following [`finish_streamed`](Self::finish_streamed) then reports the kill
-    /// (no clean exit: `code` is `None` on a Unix signal-kill, a platform code on
-    /// a Windows Job kill). With no timeout the stream is unbounded as before.
-    /// (Bounding applies to a run that owns its group — the
-    /// [`Command::start`](crate::Command::start) / [`JobRunner`](crate::JobRunner)
-    /// path. A handle from [`ProcessGroup::start`](crate::ProcessGroup::start)
-    /// shares its group, so the caller bounds the stream.)
-    ///
-    /// # Example
-    ///
-    /// Stream stdout line by line as it is produced, then collect the exit code
-    /// and stderr:
-    ///
-    /// ```no_run
-    /// use processkit::{Command, StreamExt};
-    ///
-    /// # async fn demo() -> processkit::Result<()> {
-    /// let mut run = Command::new("git").args(["log", "--oneline", "-n", "20"]).start().await?;
-    ///
-    /// let mut lines = run.stdout_lines();
-    /// while let Some(line) = lines.next().await {
-    ///     println!("commit: {line}");
-    /// }
-    ///
-    /// let (code, stderr) = run.finish_streamed().await?;
-    /// # let _ = (code, stderr);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn stdout_lines(&mut self) -> StdoutLines {
-        // Background-drain stderr (counter + handler still apply). The handle is
-        // kept so `finish_streamed` can await the last line before draining. Only
-        // set up once: a second `stdout_lines` call must not overwrite the first
-        // call's sink/pump, or `finish_streamed` would return empty stderr.
-        if self.stderr_sink.is_none() {
-            let stderr_sink = SharedLines::new(&self.buffer);
-            if let Some(pipe) = self.stderr_pipe.take() {
-                self.stderr_pump = Some(tokio::spawn(pump_lines(
-                    pipe,
-                    self.stderr_encoding,
-                    self.stderr_handler.clone(),
-                    stderr_sink.clone(),
-                )));
-            }
-            self.stderr_sink = Some(stderr_sink);
-        }
-
-        let stdout_sink = SharedLines::new(&self.buffer);
-        match self.stdout_pipe.take() {
-            Some(pipe) => {
-                tokio::spawn(pump_lines(
-                    pipe,
-                    self.stdout_encoding,
-                    self.stdout_handler.clone(),
-                    stdout_sink.clone(),
-                ));
-            }
-            // Called more than once: hand back an immediately-finished stream.
-            None => stdout_sink.close_now(),
-        }
-        self.stdout_sink = Some(stdout_sink.clone());
-
-        // Bound the stream by the command's timeout: kill the tree at the deadline
-        // so the pipes close and this stream ends. A `Weak` to the group means the
-        // timer never delays kill-on-close when the handle is dropped early. Armed
-        // once (a second `stdout_lines` call won't spawn a duplicate timer).
-        if self.deadline_task.is_none()
-            && let (Some(limit), Some(group)) = (self.timeout, self.own_group.as_ref())
-        {
-            let group = Arc::downgrade(group);
-            let pid = self.pid;
-            self.deadline_task = Some(tokio::spawn(async move {
-                tokio::time::sleep(limit).await;
-                if let Some(group) = group.upgrade() {
-                    let _ = group.terminate_all();
-                }
-                kill_direct_child(pid);
-            }));
-        }
-
-        // Likewise bound it by the cancellation token, so a pure-streaming
-        // consumer's stream ends when the run is cancelled (same private-group
-        // asymmetry as the deadline timer).
-        #[cfg(feature = "cancellation")]
-        if self.cancel_task.is_none()
-            && let (Some(token), Some(group)) = (self.cancel_token.clone(), self.own_group.as_ref())
-        {
-            let group = Arc::downgrade(group);
-            let pid = self.pid;
-            self.cancel_task = Some(tokio::spawn(async move {
-                token.cancelled().await;
-                if let Some(group) = group.upgrade() {
-                    let _ = group.terminate_all();
-                }
-                kill_direct_child(pid);
-            }));
-        }
-
-        StdoutLines {
-            sink: stdout_sink,
-            wait: None,
-        }
-    }
-
     /// Drain both streams, wait for exit, and return the captured text output
     /// (line-normalized to `\n`).
     pub async fn output_string(mut self) -> Result<ProcessResult<String>> {
@@ -357,12 +238,9 @@ impl RunningProcess {
         self.stdout_sink = Some(stdout_sink.clone());
         self.stderr_sink = Some(stderr_sink.clone());
 
-        let (code, timed_out) = self.drive_to_exit().await?;
+        let outcome = self.drive_to_exit().await?;
         join_pumps(pumps).await;
-        #[cfg(feature = "cancellation")]
-        if let Some(err) = self.cancelled_error() {
-            return Err(err);
-        }
+        let (code, timed_out) = self.checked_outcome(outcome)?;
 
         Ok(ProcessResult::new(
             self.program.clone(),
@@ -426,10 +304,7 @@ impl RunningProcess {
         }
         let stdout = std::mem::take(&mut *out_buf.lock().expect("stdout buffer poisoned"));
         join_pumps(err_pump.into_iter().collect()).await;
-        #[cfg(feature = "cancellation")]
-        if let Some(err) = self.cancelled_error() {
-            return Err(err);
-        }
+        let (code, timed_out) = self.checked_outcome((code, timed_out))?;
 
         Ok(ProcessResult::new(
             self.program.clone(),
@@ -457,12 +332,9 @@ impl RunningProcess {
         let stdout_sink = SharedLines::new(&self.buffer);
         let stderr_sink = SharedLines::new(&self.buffer);
         let pumps = self.spawn_line_pumps(&stdout_sink, &stderr_sink);
-        let (code, _timed_out) = self.drive_to_exit().await?;
+        let outcome = self.drive_to_exit().await?;
         join_pumps(pumps).await;
-        #[cfg(feature = "cancellation")]
-        if let Some(err) = self.cancelled_error() {
-            return Err(err);
-        }
+        let (code, _timed_out) = self.checked_outcome(outcome)?;
         Ok(code)
     }
 
@@ -473,136 +345,6 @@ impl RunningProcess {
     /// waited again (or consumed normally) afterwards.
     pub(crate) async fn wait_exit(&mut self) -> Result<Option<i32>> {
         Ok(self.child.wait().await?.code())
-    }
-
-    /// Wait until a stdout line matches `predicate` (returning that line), or
-    /// fail with [`Error::NotReady`] when `within` elapses — or immediately
-    /// when stdout closes before a match (e.g. the child exited and no
-    /// descendant kept the pipe open), since no further line can arrive. A
-    /// child that exits while a descendant still holds its stdout keeps the
-    /// stream open, so that case waits out the deadline — the pipe, not the
-    /// process, is what this probe watches.
-    ///
-    /// The readiness idiom: start a server, wait for its "listening on …"
-    /// banner, then use it — no arbitrary sleeps.
-    ///
-    /// # Caveats
-    ///
-    /// - **Consumes stdout** up to and including the matching line (this is
-    ///   the one-shot [`stdout_lines`](Self::stdout_lines) stream underneath —
-    ///   if it was already called, the probe sees a closed stream and reports
-    ///   `NotReady` immediately). Continue with
-    ///   [`finish_streamed`](Self::finish_streamed) for the exit code and
-    ///   stderr; the other probes don't touch stdout.
-    /// - A failed probe does **not** kill the child — unlike
-    ///   [`Command::timeout`](crate::Command::timeout), whose deadline (if
-    ///   configured) is armed by this call exactly as `stdout_lines` always
-    ///   arms it, and still tears the tree down independently of the probe.
-    pub async fn wait_for_line(
-        &mut self,
-        predicate: impl Fn(&str) -> bool,
-        within: Duration,
-    ) -> Result<String> {
-        use tokio_stream::StreamExt;
-
-        // Bound the borrow: `StdoutLines` owns its sink (no borrow of self), so
-        // `self.program` stays readable after the search.
-        let mut lines = self.stdout_lines();
-        let search = async {
-            while let Some(line) = lines.next().await {
-                if predicate(&line) {
-                    return Some(line);
-                }
-            }
-            None // stdout closed before any match — readiness can't happen.
-        };
-        match tokio::time::timeout(within, search).await {
-            Ok(Some(line)) => Ok(line),
-            Ok(None) | Err(_) => Err(self.not_ready(within)),
-        }
-    }
-
-    /// Wait until `check` (re-invoked every ~50 ms, first attempt immediate)
-    /// returns `true`, or fail with [`Error::NotReady`] when `within` elapses —
-    /// or immediately when the child exits first (a dead process never becomes
-    /// ready).
-    ///
-    /// The check is any async predicate — an HTTP health endpoint, a file
-    /// appearing, a database accepting connections. Doesn't touch the child's
-    /// pipes, so it composes with any later consumption
-    /// ([`wait`](Self::wait), [`output_string`](Self::output_string), …). A
-    /// failed probe does not kill the child. The deadline bounds the polling
-    /// loop, not an in-flight check: a slow `check` future can overrun
-    /// `within` by its own duration.
-    pub async fn wait_for<F, Fut>(&mut self, check: F, within: Duration) -> Result<()>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = bool>,
-    {
-        self.poll_until(check, within).await
-    }
-
-    /// Wait until a TCP connection to `addr` is accepted, or fail with
-    /// [`Error::NotReady`] when `within` elapses — or immediately when the
-    /// child exits first.
-    ///
-    /// One connect attempt per ~50 ms tick (each attempt itself bounded so a
-    /// stalled connect can't overrun the deadline); the probe connection is
-    /// dropped as soon as it succeeds. Doesn't touch the child's pipes; a
-    /// failed probe does not kill the child.
-    pub async fn wait_for_port(&mut self, addr: SocketAddr, within: Duration) -> Result<()> {
-        let deadline = Instant::now() + within;
-        self.poll_until(
-            move || {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                async move {
-                    // Clamp the attempt to the remaining budget; floor at 1ms so
-                    // the final tick still makes a (brief) attempt.
-                    let cap = CONNECT_ATTEMPT_CAP
-                        .min(remaining)
-                        .max(Duration::from_millis(1));
-                    matches!(
-                        tokio::time::timeout(cap, TcpStream::connect(addr)).await,
-                        Ok(Ok(_))
-                    )
-                }
-            },
-            within,
-        )
-        .await
-    }
-
-    /// Re-run `check` on the readiness cadence until it passes, the child
-    /// exits, or the deadline elapses.
-    async fn poll_until<F, Fut>(&mut self, mut check: F, within: Duration) -> Result<()>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = bool>,
-    {
-        let deadline = Instant::now() + within;
-        loop {
-            if check().await {
-                return Ok(());
-            }
-            // An exited child can never become ready — fail fast rather than
-            // burning the rest of the deadline. (`Err` from try_wait means
-            // "couldn't tell"; keep polling, the deadline still bounds us.)
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return Err(self.not_ready(within));
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(self.not_ready(within));
-            }
-            tokio::time::sleep(READINESS_POLL.min(remaining)).await;
-        }
-    }
-
-    fn not_ready(&self, within: Duration) -> Error {
-        Error::NotReady {
-            program: self.program.clone(),
-            timeout: within,
-        }
     }
 
     /// Run the process to completion while sampling its CPU and memory every
@@ -673,12 +415,9 @@ impl RunningProcess {
         if let Some(task) = &sampler {
             task.abort();
         }
-        let (exit_code, _timed_out) = outcome?;
+        let outcome = outcome?;
         join_pumps(pumps).await;
-        #[cfg(feature = "cancellation")]
-        if let Some(err) = self.cancelled_error() {
-            return Err(err);
-        }
+        let (exit_code, _timed_out) = self.checked_outcome(outcome)?;
         let duration = started.elapsed();
         let (cpu_time, peak_memory_bytes, samples) = match acc.lock() {
             Ok(acc) => (acc.cpu_time, acc.peak_memory_bytes, acc.samples),
@@ -718,6 +457,20 @@ impl RunningProcess {
             )));
         }
         tasks
+    }
+
+    /// The single post-exit checkpoint **every consuming path passes
+    /// through** after its pumps settle: folds in the cancellation gate — a
+    /// cancelled run is *always* an error, and the check runs before any
+    /// `timed_out` classification, so cancellation beats a simultaneous
+    /// timeout. Centralizing it here makes the documented invariant
+    /// structural instead of per-consumer copy-paste discipline.
+    fn checked_outcome(&self, outcome: (Option<i32>, bool)) -> Result<(Option<i32>, bool)> {
+        #[cfg(feature = "cancellation")]
+        if let Some(err) = self.cancelled_error() {
+            return Err(err);
+        }
+        Ok(outcome)
     }
 
     /// Stop the streaming watchdog tasks (deadline/cancel) once the child's
@@ -836,59 +589,6 @@ impl RunningProcess {
         self.child.start_kill()?;
         Ok(())
     }
-
-    /// Finish a streamed run: wait for exit and return the exit code plus the
-    /// stderr collected in the background by [`stdout_lines`](Self::stdout_lines).
-    ///
-    /// Designed to pair with `stdout_lines` (consume the stdout stream first),
-    /// but safe to call on its own — any pipe the stream didn't take is drained
-    /// here so the child can never block on a full pipe.
-    pub async fn finish_streamed(mut self) -> Result<(Option<i32>, String)> {
-        // Drain a stdout pipe a prior `stdout_lines` didn't take (and discard
-        // it) so the child can't block writing to it while we wait for exit.
-        // Deliberately unbounded: a deadline here would cut the drain off
-        // under a still-running chatty child and re-create the blocked-pipe
-        // hang. The cost of the alternative — a shared-group descendant
-        // holding the pipe parks this one idle reader until it exits — is
-        // benign.
-        if let Some(mut pipe) = self.stdout_pipe.take() {
-            tokio::spawn(async move {
-                let mut sink = Vec::new();
-                let _ = pipe.read_to_end(&mut sink).await;
-            });
-        }
-        // Likewise start a stderr pump if streaming never did (so its output is
-        // still captured and the pipe never fills).
-        if self.stderr_pump.is_none()
-            && let Some(pipe) = self.stderr_pipe.take()
-        {
-            let sink = SharedLines::new(&self.buffer);
-            self.stderr_pump = Some(tokio::spawn(pump_lines(
-                pipe,
-                self.stderr_encoding,
-                self.stderr_handler.clone(),
-                sink.clone(),
-            )));
-            self.stderr_sink = Some(sink);
-        }
-
-        let (code, _timed_out) = self.drive_to_exit().await?;
-        #[cfg(feature = "cancellation")]
-        if let Some(err) = self.cancelled_error() {
-            return Err(err);
-        }
-        // The child has exited, so its stderr pipe is closed — await the pump so
-        // the final buffered line is captured before we drain.
-        if let Some(pump) = self.stderr_pump.take() {
-            let _ = pump.await;
-        }
-        let stderr = self
-            .stderr_sink
-            .as_ref()
-            .map(|sink| sink.drain().join("\n"))
-            .unwrap_or_default();
-        Ok((code, stderr))
-    }
 }
 
 impl Drop for RunningProcess {
@@ -910,38 +610,6 @@ impl Drop for RunningProcess {
     }
 }
 
-/// Best-effort kill of the direct child by pid, used by the streaming
-/// deadline/cancel tasks after the group teardown — parity with
-/// `kill_tree`'s `start_kill` + `terminate_all` pairing (the tasks can't
-/// reach the `Child` handle, so they signal by pid). The group kill usually
-/// makes this a no-op; it exists so a group-kill miss (e.g. a pgroup
-/// broadcast racing the tree) still closes the pipes and ends the stream.
-fn kill_direct_child(pid: Option<u32>) {
-    let Some(pid) = pid else { return };
-    #[cfg(unix)]
-    // SAFETY: SIGKILL to a specific live-or-zombie pid; an exited/reaped pid
-    // yields ESRCH, which is ignored.
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
-    #[cfg(windows)]
-    // SAFETY: opens the process by id with the narrowest right; both calls
-    // tolerate an already-exited process (open fails, handle closed once).
-    unsafe {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
-        };
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if !handle.is_null() {
-            TerminateProcess(handle, 1);
-            CloseHandle(handle);
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    let _ = pid;
-}
-
 /// Await the output pumps, bounded by [`PUMP_TEARDOWN`]; abort stragglers.
 async fn join_pumps(tasks: Vec<JoinHandle<()>>) {
     if tasks.is_empty() {
@@ -956,51 +624,6 @@ async fn join_pumps(tasks: Vec<JoinHandle<()>>) {
     if tokio::time::timeout(PUMP_TEARDOWN, join).await.is_err() {
         for abort in aborts {
             abort.abort();
-        }
-    }
-}
-
-/// A `Stream` of the child's standard-output lines (see
-/// [`RunningProcess::stdout_lines`]).
-pub struct StdoutLines {
-    sink: Arc<SharedLines>,
-    wait: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
-}
-
-// Manual: the sink and the pending-wait future are opaque.
-impl std::fmt::Debug for StdoutLines {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StdoutLines").finish_non_exhaustive()
-    }
-}
-
-impl Stream for StdoutLines {
-    type Item = String;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<String>> {
-        let this = self.get_mut();
-        loop {
-            match this.sink.try_pop() {
-                Popped::Line(line) => {
-                    this.wait = None;
-                    return Poll::Ready(Some(line));
-                }
-                Popped::Closed => return Poll::Ready(None),
-                Popped::Empty => {
-                    if this.wait.is_none() {
-                        this.wait = Some(Box::pin(this.sink.clone().changed()));
-                    }
-                    // `notify_one` stores a permit, so a push between the `try_pop`
-                    // above and registering here is not missed.
-                    match this.wait.as_mut().expect("just set").as_mut().poll(cx) {
-                        Poll::Ready(()) => {
-                            this.wait = None;
-                            continue;
-                        }
-                        Poll::Pending => return Poll::Pending,
-                    }
-                }
-            }
         }
     }
 }

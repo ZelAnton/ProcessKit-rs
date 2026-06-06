@@ -74,6 +74,9 @@ to a dated version section.
   one macOS CI run actually hit.)
 
 ### Added
+- `ProcessResult::program()` — the program a result is attributed to (for a
+  `Pipeline` outcome, the pipefail-attributed stage). Previously the name was
+  only recoverable by failing the result and matching the error.
 - `docs/` guide set — eight cross-linked, per-topic guides (running commands,
   process groups, streaming & interactive I/O, pipelines, timeouts/retries/
   cancellation, supervision, testing, platform support) with richer examples
