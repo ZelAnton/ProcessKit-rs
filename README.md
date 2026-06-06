@@ -15,6 +15,8 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
+![Cover](cover.png)
+
 ## Why processkit?
 
 `std::process` and `tokio::process` reach (at most) the direct child. The
