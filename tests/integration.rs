@@ -2004,13 +2004,18 @@ async fn shutdown_lets_a_term_handling_child_end_the_grace_early() {
     })
     .expect("create group");
 
-    // Exits 0 on SIGTERM. The sleep runs in the background (`wait` is
-    // interruptible; a foreground sleep would delay the trap until it ends).
-    // The `ready` banner orders the world: without it, shutdown's SIGTERM can
-    // land before the shell has even installed the trap (seen on cold CI
-    // runners), and the child dies to the default disposition instead.
+    // Exits 0 on SIGTERM, parked on an interruptible `read` of a stdin we keep
+    // open — deliberately ZERO forks. A background `sleep 30 &` here flaked on
+    // CI: the per-member TERM broadcast is documented best-effort against a
+    // tree that is forking, and the sleep forked right after the banner could
+    // miss the signal and hold the group alive for the whole grace. The
+    // `ready` banner still orders the trap installation before the shutdown.
     let mut run = group
-        .start(&Command::new("sh").args(["-c", "trap 'exit 0' TERM; echo ready; sleep 30 & wait"]))
+        .start(
+            &Command::new("sh")
+                .args(["-c", "trap 'exit 0' TERM; echo ready; read line"])
+                .keep_stdin_open(),
+        )
         .await
         .expect("start");
     run.wait_for_line(|l| l.contains("ready"), Duration::from_secs(10))
