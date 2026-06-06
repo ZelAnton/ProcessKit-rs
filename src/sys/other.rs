@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::Mechanism;
+#[cfg(feature = "process-control")]
 use crate::Signal;
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
@@ -44,6 +45,7 @@ impl Job {
         cmd.spawn()
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn adopt(&self, _child: &Child) -> io::Result<()> {
         // No containment available; nothing to attach the child to.
         Ok(())
@@ -55,6 +57,7 @@ impl Job {
         Ok(())
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn signal(&self, sig: Signal) -> io::Result<()> {
         // No containment and no signal facility — report it rather than letting
         // the caller believe the tree was signalled.
@@ -64,14 +67,17 @@ impl Job {
         ))
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "suspend"))
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn resume(&self) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "resume"))
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
         // No containment: nothing is tracked, so the membership of the
         // (non-existent) container is honestly empty — `Mechanism::None` is the

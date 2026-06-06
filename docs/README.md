@@ -39,9 +39,13 @@ test doubles never touch the OS at all.
 
 ## Feature flags
 
+Every flag is **additive** and only gates *visibility* — the kill-on-drop tree
+guarantee is unconditional in every configuration.
+
 | Feature | Default | Adds | Extra dependency |
 |---|---|---|---|
 | `stats` | **on** | `ProcessGroup::stats` / `sample_stats`, `RunningProcess::cpu_time` / `peak_memory_bytes` / `profile` | — |
+| `process-control` | **on** | `Signal`, `ProcessGroup::{signal, suspend, resume, members, adopt}` | — |
 | `limits` | off | Whole-tree resource caps on `ProcessGroupOptions` (`memory_max` / `max_processes` / `cpu_quota`), `Error::ResourceLimit`; implies `stats` | — |
 | `mock` | off | A `mockall`-generated `MockRunner` for expectation-style tests | `mockall` |
 | `tracing` | off | One `tracing` event per command run | `tracing` |

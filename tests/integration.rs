@@ -15,7 +15,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use processkit::{Command, Mechanism, OutputBufferPolicy, ProcessGroup, Signal, wait_any};
+#[cfg(feature = "process-control")]
+use processkit::Signal;
+use processkit::{Command, Mechanism, OutputBufferPolicy, ProcessGroup, wait_any};
 // Imported only by the `limits` tests; the other tests name `processkit::Error`
 // variants via their full path.
 #[cfg(feature = "limits")]
@@ -652,6 +654,7 @@ async fn windows_memory_and_cpu_limits_accept_and_run() {
 // ----- Whole-tree signals and suspend/resume -----
 
 #[cfg(unix)]
+#[cfg(feature = "process-control")]
 #[tokio::test]
 #[ignore = "spawns a real subprocess and signals it"]
 async fn unix_signal_reaches_the_tree() {
@@ -682,6 +685,7 @@ async fn unix_signal_reaches_the_tree() {
 }
 
 #[cfg(unix)]
+#[cfg(feature = "process-control")]
 #[tokio::test]
 #[ignore = "spawns a real subprocess and freezes it"]
 async fn unix_suspend_freezes_progress() {
@@ -719,6 +723,7 @@ async fn unix_suspend_freezes_progress() {
 }
 
 #[cfg(unix)]
+#[cfg(feature = "process-control")]
 #[test]
 #[ignore = "creates an OS job/cgroup"]
 fn signal_on_empty_group_is_ok() {
@@ -731,6 +736,7 @@ fn signal_on_empty_group_is_ok() {
 }
 
 #[cfg(windows)]
+#[cfg(feature = "process-control")]
 #[test]
 #[ignore = "creates an OS job"]
 fn windows_signal_non_kill_is_unsupported() {
@@ -749,6 +755,7 @@ fn windows_signal_non_kill_is_unsupported() {
 }
 
 #[cfg(windows)]
+#[cfg(feature = "process-control")]
 #[tokio::test]
 #[ignore = "spawns a real subprocess and kills it via Signal::Kill"]
 async fn windows_signal_kill_kills_tree() {
@@ -776,6 +783,7 @@ async fn windows_signal_kill_kills_tree() {
 }
 
 #[cfg(windows)]
+#[cfg(feature = "process-control")]
 #[tokio::test]
 #[ignore = "spawns a real subprocess and suspends/resumes its threads"]
 async fn windows_suspend_resume_stalls_output() {
@@ -1366,6 +1374,7 @@ async fn supervisor_runs_incarnations_in_a_shared_group() {
         .expect("group still usable");
 }
 
+#[cfg(feature = "process-control")]
 #[tokio::test]
 #[ignore = "spawns a real subprocess outside the group and adopts it"]
 async fn adopt_brings_an_external_child_under_containment() {
@@ -1426,6 +1435,7 @@ async fn supervisor_exhausts_restarts_on_a_crashing_child() {
 
 // ----- Tree inspection: members() and wait_any -----
 
+#[cfg(feature = "process-control")]
 #[tokio::test]
 #[ignore = "spawns real subprocesses and lists the group's members"]
 async fn members_lists_live_children() {
@@ -1444,6 +1454,7 @@ async fn members_lists_live_children() {
     assert!(members.len() >= 2, "members: {members:?}");
 }
 
+#[cfg(feature = "process-control")]
 #[tokio::test]
 #[ignore = "spawns real subprocesses and watches the member list shrink"]
 async fn members_shrinks_when_a_child_dies() {
@@ -1483,6 +1494,7 @@ async fn members_shrinks_when_a_child_dies() {
     }
 }
 
+#[cfg(feature = "process-control")]
 #[tokio::test]
 #[ignore = "creates an OS job/cgroup"]
 async fn members_on_empty_group_is_empty() {
@@ -1769,13 +1781,18 @@ async fn terminate_all_is_idempotent() {
         .terminate_all()
         .expect("second terminate must be a no-op success, not an error");
 
-    // The group stays usable after teardown.
-    let _ = group.members().expect("members after terminate");
+    // The group stays usable after teardown: a fresh spawn still lands in it.
+    let again = group
+        .start(&sleep_secs(1))
+        .await
+        .expect("group usable after terminate");
+    drop(again);
     let _ = tokio::time::timeout(Duration::from_secs(10), child.wait())
         .await
         .expect("child reaped");
 }
 
+#[cfg(feature = "process-control")]
 #[tokio::test]
 #[ignore = "spawns a short subprocess and adopts it after reaping"]
 async fn adopt_of_a_reaped_child_errors_instead_of_tracking_nothing() {
@@ -1810,6 +1827,7 @@ async fn adopt_of_a_reaped_child_errors_instead_of_tracking_nothing() {
     );
 }
 
+#[cfg(feature = "process-control")]
 #[tokio::test]
 #[ignore = "creates an OS job/cgroup"]
 async fn empty_group_accepts_lifecycle_calls() {
@@ -1845,6 +1863,7 @@ async fn empty_group_accepts_lifecycle_calls() {
 }
 
 #[cfg(windows)]
+#[cfg(feature = "process-control")]
 #[tokio::test]
 #[ignore = "spawns a real subprocess and nests suspend/resume"]
 async fn windows_nested_suspend_needs_matching_resumes() {
@@ -1892,6 +1911,7 @@ async fn windows_nested_suspend_needs_matching_resumes() {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(feature = "process-control")]
 #[tokio::test]
 #[ignore = "adopts a real subprocess into a suspended cgroup"]
 async fn linux_cgroup_adopt_into_suspended_group_freezes_the_child() {
@@ -1961,6 +1981,9 @@ async fn linux_cgroup_adopt_into_suspended_group_freezes_the_child() {
 #[tokio::test]
 #[ignore = "spawns a real subprocess and shuts it down gracefully"]
 async fn shutdown_lets_a_term_handling_child_end_the_grace_early() {
+    // The struct update covers the `limits`-gated field; without that feature
+    // every field is already named, which clippy would otherwise flag.
+    #[allow(clippy::needless_update)]
     let group = ProcessGroup::with_options(processkit::ProcessGroupOptions {
         shutdown_timeout: Duration::from_secs(10),
         ..Default::default()
@@ -1996,6 +2019,8 @@ async fn shutdown_lets_a_term_handling_child_end_the_grace_early() {
 #[tokio::test]
 #[ignore = "spawns a TERM-ignoring subprocess and escalates to SIGKILL"]
 async fn shutdown_escalates_to_kill_after_the_grace_window() {
+    // See above: the struct update exists for the `limits`-gated field.
+    #[allow(clippy::needless_update)]
     let group = ProcessGroup::with_options(processkit::ProcessGroupOptions {
         shutdown_timeout: Duration::from_millis(500),
         escalate_to_kill: true,

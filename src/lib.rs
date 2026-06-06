@@ -8,9 +8,9 @@
 //!   Containment is a Windows [Job Object], a Linux [cgroup v2] (with a POSIX
 //!   process-group fallback), a POSIX process group on macOS/BSD, or nothing on
 //!   other targets — observable via [`Mechanism`]. The whole tree can be
-//!   signalled ([`ProcessGroup::signal`], see [`Signal`]), paused/resumed
-//!   ([`ProcessGroup::suspend`] / [`ProcessGroup::resume`]), and inspected
-//!   ([`ProcessGroup::members`]); [`wait_any`] races several running processes
+//!   signalled (`ProcessGroup::signal`, see `Signal`), paused/resumed
+//!   (`ProcessGroup::suspend` / `ProcessGroup::resume`), and inspected
+//!   (`ProcessGroup::members`); [`wait_any`] races several running processes
 //!   and reports the first to exit.
 //! - **runner** — async run-and-capture built on the group. Describe a run with
 //!   [`Command`], then drive it to completion ([`Command::output_string`],
@@ -100,11 +100,16 @@
 //!
 //! # Features
 //!
+//! Every flag is *additive* and gates visibility only — the kill-on-drop tree
+//! guarantee is unconditional in every configuration.
+//!
 //! - **`stats`** *(default)* — resource measurement: `ProcessGroupStats`,
 //!   `ProcessGroup::stats` (plus the `sample_stats` time-series sampler), the
 //!   per-process `RunningProcess::cpu_time`/`peak_memory_bytes` diagnostics,
 //!   and the `RunningProcess::profile` run summary. Disable
 //!   (`default-features = false`) to compile the accounting code out.
+//! - **`process-control`** *(default)* — tree control beyond contain+kill:
+//!   `Signal` and `ProcessGroup::{signal, suspend, resume, members, adopt}`.
 //! - **`limits`** — whole-tree resource caps: `ResourceLimits`, the
 //!   `memory_max`/`max_processes`/`cpu_quota` builders on
 //!   [`ProcessGroupOptions`], and `Error::ResourceLimit`. Implies `stats`.
@@ -138,6 +143,7 @@ mod pump;
 mod result;
 mod runner;
 mod running;
+#[cfg(feature = "process-control")]
 mod signal;
 #[cfg(feature = "stats")]
 mod stats;
@@ -161,6 +167,7 @@ pub use pipeline::Pipeline;
 pub use result::ProcessResult;
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
 pub use running::{RunningProcess, StdoutLines};
+#[cfg(feature = "process-control")]
 pub use signal::Signal;
 #[cfg(feature = "stats")]
 pub use stats::{ProcessGroupStats, RunProfile, StatsSampler};

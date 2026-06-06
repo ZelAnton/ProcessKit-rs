@@ -143,10 +143,9 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// group, or a test double for hermetic supervision tests.
     ///
     /// With a shared group, the group's *state* applies to every incarnation:
-    /// notably, restarting into a
-    /// [`suspend`](crate::ProcessGroup::suspend)ed group on the Linux cgroup
-    /// mechanism spawns the new child **frozen** (see
-    /// [`ProcessGroup::suspend`](crate::ProcessGroup::suspend)) — resume the
+    /// notably, restarting into a `suspend`ed group on the Linux cgroup
+    /// mechanism spawns the new child **frozen** (see the
+    /// `ProcessGroup::suspend` docs, `process-control` feature) — resume the
     /// group before supervising into it.
     #[must_use]
     pub fn with_runner<R2: ProcessRunner>(self, runner: R2) -> Supervisor<R2> {

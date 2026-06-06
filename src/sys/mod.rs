@@ -20,6 +20,7 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::Mechanism;
+#[cfg(feature = "process-control")]
 use crate::Signal;
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
@@ -111,6 +112,7 @@ impl Job {
     /// Only the child itself is moved into the job; descendants it already
     /// spawned keep their original containment. On targets without a job
     /// mechanism (non-unix, non-Windows) this is a no-op.
+    #[cfg(feature = "process-control")]
     pub(crate) fn adopt(&self, child: &Child) -> io::Result<()> {
         self.0.adopt(child)
     }
@@ -123,23 +125,27 @@ impl Job {
     /// Broadcast `sig` to every process in the job. On Windows only
     /// [`Signal::Kill`] is deliverable (job terminate); other signals — and any
     /// signal on the no-containment target — yield `ErrorKind::Unsupported`.
+    #[cfg(feature = "process-control")]
     pub(crate) fn signal(&self, sig: Signal) -> io::Result<()> {
         self.0.signal(sig)
     }
 
     /// Freeze the whole tree (cgroup.freeze / SIGSTOP / per-thread suspend).
     /// `ErrorKind::Unsupported` on the no-containment target.
+    #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {
         self.0.suspend()
     }
 
     /// Thaw a tree frozen by [`suspend`](Self::suspend).
+    #[cfg(feature = "process-control")]
     pub(crate) fn resume(&self) -> io::Result<()> {
         self.0.resume()
     }
 
     /// Snapshot the live member pids (whole tree on Windows/cgroup; tracked
     /// group leaders on the POSIX fallback; always empty with no containment).
+    #[cfg(feature = "process-control")]
     pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
         self.0.members()
     }

@@ -6,16 +6,19 @@ use std::io;
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
+#[cfg(feature = "process-control")]
+use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
 #[cfg(feature = "stats")]
 use windows_sys::Win32::Foundation::FILETIME;
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
+#[cfg(any(feature = "process-control", feature = "stats"))]
+use windows_sys::Win32::System::JobObjects::QueryInformationJobObject;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
 #[cfg(feature = "limits")]
@@ -28,10 +31,16 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
 };
+#[cfg(feature = "process-control")]
+use windows_sys::Win32::System::JobObjects::{
+    JOBOBJECT_BASIC_PROCESS_ID_LIST, JobObjectBasicProcessIdList,
+};
 #[cfg(feature = "stats")]
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+#[cfg(feature = "process-control")]
+use windows_sys::Win32::System::Threading::SuspendThread;
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, OpenThread, ResumeThread, SuspendThread, THREAD_SUSPEND_RESUME,
+    CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
 };
 #[cfg(feature = "stats")]
 use windows_sys::Win32::System::Threading::{
@@ -39,6 +48,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::Mechanism;
+#[cfg(feature = "process-control")]
 use crate::Signal;
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
@@ -186,6 +196,7 @@ impl Job {
         Ok(child)
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn adopt(&self, child: &Child) -> io::Result<()> {
         let handle = child
             .raw_handle()
@@ -210,6 +221,7 @@ impl Job {
     /// A Job Object has no POSIX signals: only `Kill` is deliverable (it maps
     /// to the job terminate); everything else is reported as unsupported so the
     /// caller never believes a reload/interrupt was delivered.
+    #[cfg(feature = "process-control")]
     pub(crate) fn signal(&self, sig: Signal) -> io::Result<()> {
         match sig {
             Signal::Kill => self.kill_all(),
@@ -220,15 +232,18 @@ impl Job {
         }
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {
         self.for_each_member_thread(true)
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn resume(&self) -> io::Result<()> {
         self.for_each_member_thread(false)
     }
 
     /// The pids currently assigned to the job (whole tree).
+    #[cfg(feature = "process-control")]
     pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
         job_member_pids(self.handle)
     }
@@ -241,6 +256,7 @@ impl Job {
     /// (nested suspends need matching resumes). A per-thread failure (e.g. a
     /// thread exiting mid-walk) does not abort the walk; the last failure is
     /// reported after every member has been attempted.
+    #[cfg(feature = "process-control")]
     fn for_each_member_thread(&self, suspend: bool) -> io::Result<()> {
         // Mutually exclusive with `spawn`'s assign → resume window (see the
         // `suspend_lock` field doc); held across the pid query AND the walk so
@@ -401,6 +417,7 @@ fn resume_thread(tid: u32) -> io::Result<()> {
 }
 
 /// Suspend (increment) or resume (decrement) a single thread's suspend count.
+#[cfg(feature = "process-control")]
 fn suspend_or_resume_thread(tid: u32, suspend: bool) -> io::Result<()> {
     // SAFETY: opens the thread by id; returns null on failure (e.g. exited).
     let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, tid) };
@@ -429,6 +446,7 @@ fn suspend_or_resume_thread(tid: u32, suspend: bool) -> io::Result<()> {
 /// briefly missing or present. The pid list is a variable-length struct (a
 /// two-`u32` header followed by an inline `usize` array), so query into a
 /// `u64`-backed buffer (alignment ≥ the struct's) and grow on `ERROR_MORE_DATA`.
+#[cfg(feature = "process-control")]
 fn job_member_pids(handle: HANDLE) -> io::Result<Vec<u32>> {
     // Seed generously so the common case is a single query.
     let mut cap: usize = 64;

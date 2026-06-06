@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
 use crate::mechanism::Mechanism;
+#[cfg(feature = "process-control")]
 use crate::signal::Signal;
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
@@ -194,6 +195,7 @@ impl ProcessGroup {
     /// an adopted child that exited but was never awaited probes as alive, so
     /// a graceful [`shutdown`](Self::shutdown) can wait out its full timeout
     /// on the zombie before escalating.
+    #[cfg(feature = "process-control")]
     pub fn adopt(&self, child: &Child) -> Result<()> {
         self.job.adopt(child)?;
         Ok(())
@@ -224,6 +226,7 @@ impl ProcessGroup {
     /// on every backend (`cgroup.kill` / `killpg` / Job Object terminate), so it
     /// cannot miss a process forked mid-broadcast. Other signals are a per-member
     /// broadcast.
+    #[cfg(feature = "process-control")]
     pub fn signal(&self, sig: Signal) -> Result<()> {
         self.job
             .signal(sig)
@@ -269,6 +272,7 @@ impl ProcessGroup {
     /// suspended group (e.g. a
     /// [`Supervisor::with_runner(&group)`](crate::Supervisor::with_runner)
     /// restarting into it) — resume first.
+    #[cfg(feature = "process-control")]
     pub fn suspend(&self) -> Result<()> {
         self.job
             .suspend()
@@ -279,6 +283,7 @@ impl ProcessGroup {
     ///
     /// See [`suspend`](Self::suspend) for the platform matrix and the Windows
     /// suspend-count nesting caveat.
+    #[cfg(feature = "process-control")]
     pub fn resume(&self) -> Result<()> {
         self.job
             .resume()
@@ -306,6 +311,7 @@ impl ProcessGroup {
     ///   [`Mechanism::None`](crate::Mechanism::None) (via
     ///   [`mechanism`](Self::mechanism)) is the cue that children are
     ///   *unmanaged*, not absent.
+    #[cfg(feature = "process-control")]
     pub fn members(&self) -> Result<Vec<u32>> {
         let pids = self.job.members()?;
         Ok(pids)
@@ -379,6 +385,7 @@ fn program_name(cmd: &Command) -> String {
 /// passing every other IO failure through unchanged. Unambiguous here: on the
 /// signal/suspend/resume paths the only producer of `Unsupported` is the
 /// backends' own "this platform can't do that" reporting.
+#[cfg(feature = "process-control")]
 fn map_unsupported(source: std::io::Error, operation: impl Into<String>) -> Error {
     if source.kind() == std::io::ErrorKind::Unsupported {
         Error::Unsupported {

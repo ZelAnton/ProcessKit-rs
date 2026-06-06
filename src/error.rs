@@ -104,10 +104,10 @@ pub enum Error {
     /// An operation is not supported by the active containment mechanism on
     /// this platform.
     ///
-    /// Raised by [`ProcessGroup::signal`](crate::ProcessGroup::signal) for any
-    /// signal other than [`Signal::Kill`](crate::Signal::Kill) on Windows (Job
-    /// Objects have no POSIX signals), and by `signal`/`suspend`/`resume` on
-    /// the no-containment target, which has no process tree to act on.
+    /// Raised by `ProcessGroup::signal` for any signal other than
+    /// `Signal::Kill` on Windows (Job Objects have no POSIX signals), and by
+    /// `signal`/`suspend`/`resume` on the no-containment target, which has no
+    /// process tree to act on.
     #[error("operation `{operation}` is not supported on this platform")]
     Unsupported {
         /// A short description of the operation, e.g. `"signal(Hup)"` or

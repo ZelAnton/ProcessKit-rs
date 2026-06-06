@@ -117,6 +117,10 @@ hard kill.
 
 ## Signalling the whole tree
 
+> `signal`/`suspend`/`resume`/`members`/`adopt` — this section and the two
+> below — require the default-on **`process-control`** feature. The teardown
+> verbs above are core and always present.
+
 ```rust,no_run
 use processkit::{Command, ProcessGroup, Signal};
 

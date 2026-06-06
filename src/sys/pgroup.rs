@@ -77,6 +77,7 @@ impl ProcessGroup {
         Ok(child)
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn adopt(&self, child: &Child) -> io::Result<()> {
         let pid = child
             .id()
@@ -132,18 +133,21 @@ impl ProcessGroup {
     /// Broadcast `sig` to every tracked process group and solo-adopted child.
     /// Best-effort: entries that already drained are skipped (and pruned); an
     /// empty set is a no-op.
+    #[cfg(feature = "process-control")]
     pub(crate) fn signal(&self, sig: i32) -> io::Result<()> {
         self.broadcast(sig);
         Ok(())
     }
 
     /// Freeze every tracked group (`SIGSTOP` — unblockable, idempotent).
+    #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {
         self.broadcast(libc::SIGSTOP);
         Ok(())
     }
 
     /// Thaw every tracked group (`SIGCONT`).
+    #[cfg(feature = "process-control")]
     pub(crate) fn resume(&self) -> io::Result<()> {
         self.broadcast(libc::SIGCONT);
         Ok(())
@@ -163,6 +167,7 @@ impl ProcessGroup {
     /// The live tracked group **leaders** (one pid per spawned child) plus the
     /// solo-adopted pids — descendants inside the groups are not enumerated
     /// here. Dead entries are pruned on the way.
+    #[cfg(feature = "process-control")]
     pub(crate) fn members(&self) -> Vec<i32> {
         let mut members = match self.pgids.lock() {
             Ok(mut g) => {
@@ -314,7 +319,10 @@ fn pids_alive(pids: &Mutex<Vec<i32>>) -> bool {
     p.iter().any(|&pid| unsafe { libc::kill(pid, 0) == 0 })
 }
 
-/// Drop solo-adopted pids that have already exited (and been reaped).
+/// Drop solo-adopted pids that have already exited (and been reaped). (Solo
+/// tracking only ever gains entries through `adopt` — a `process-control`
+/// surface — so its pruner is gated with it.)
+#[cfg(feature = "process-control")]
 fn retain_live_pids(pids: &mut Vec<i32>) {
     // SAFETY: signal 0 to a positive pid is a sound existence probe.
     pids.retain(|&pid| unsafe { libc::kill(pid, 0) == 0 });

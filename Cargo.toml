@@ -13,6 +13,7 @@ categories = ["os", "asynchronous", "command-line-utilities"]
 exclude = [
   ".claude/",
   ".github/",
+  "ideas/",
   ".editorconfig",
   ".gitattributes",
   "AGENTS.md",
@@ -82,9 +83,11 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 
 [features]
-# `stats` ships in the default set because `ProcessGroupStats` & friends predate
-# the feature split — released API must stay visible by default.
-default = ["stats"]
+# Both default features are *visibility* gates: additive, hiding API without
+# changing the core's semantics — the kill-on-drop tree guarantee is
+# unconditional in every configuration. (A broader visibility split was tried
+# and deliberately rolled back: see ideas/three-layer-resource-split.md.)
+default = ["stats", "process-control"]
 # Resource measurement: `ProcessGroupStats`, `ProcessGroup::stats`, and the
 # per-process `RunningProcess::cpu_time`/`peak_memory_bytes` diagnostics.
 # Compile it out (`--no-default-features`) to drop the accounting code and, on
@@ -95,6 +98,10 @@ stats = ["windows-sys/Win32_System_ProcessStatus"]
 # Implies `stats` as policy — resource read and write travel together toward the
 # possible `processkit-resource` split (see ideas/) — not as a code dependency.
 limits = ["stats"]
+# Tree control beyond contain+kill: `Signal` and
+# `ProcessGroup::{signal, suspend, resume, members, adopt}`. Gated because it
+# matches the layer a future `processkit-sys` split would carve out.
+process-control = []
 # Expose the `mockall`-generated `MockRunner` for consumers' tests.
 mock = ["dep:mockall"]
 # Emit a `tracing` event per command run (program, args, exit code, duration).

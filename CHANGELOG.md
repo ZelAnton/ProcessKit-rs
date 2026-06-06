@@ -16,6 +16,22 @@ to a dated version section.
 > now-default `stats` feature — see *Changed*). Release it as **0.7.0**
 > (`minor`), not a patch.
 
+### Changed
+- The tree-control surface is now behind a **default-on** `process-control`
+  feature: `Signal` and
+  `ProcessGroup::{signal, suspend, resume, members, adopt}`. The flag is
+  additive and gates *visibility only* — the kill-on-drop tree guarantee
+  (and `terminate_all`/`shutdown`) is unconditional in every configuration.
+  **Migration note** for `default-features = false` consumers: previously
+  that disabled only `stats`; now it also hides the surface above —
+  re-enable it explicitly. (A broader visibility split — gating
+  pipelines/supervisor/CliClient/test doubles too — was implemented and
+  deliberately rolled back: those gates removed no dependencies while
+  costing cfg noise and doc quality; see `ideas/three-layer-resource-split.md`
+  for the full decision record.)
+- `windows-sys` bumped 0.59 → 0.61 to dedup with the copy tokio/mio already
+  ship — the lockfile now carries a single `windows-sys`.
+
 ### Added
 - `docs/` guide set — eight cross-linked, per-topic guides (running commands,
   process groups, streaming & interactive I/O, pipelines, timeouts/retries/

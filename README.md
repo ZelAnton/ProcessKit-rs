@@ -47,6 +47,21 @@ print collected in one place:
 
 API reference: [docs.rs/processkit](https://docs.rs/processkit).
 
+## Feature flags
+
+Each flag is **additive** and only gates *visibility* — the kill-on-drop tree
+guarantee is unconditional in every configuration.
+
+| Feature | Default | Adds |
+|---|---|---|
+| `stats` | ✅ | group/per-run resource measurement, `sample_stats`, `profile` |
+| `process-control` | ✅ | `Signal`, `ProcessGroup::{signal, suspend, resume, members, adopt}` |
+| `limits` | — | whole-tree resource caps (implies `stats`) |
+| `cancellation` | — | `CancellationToken` integration (pulls `tokio-util`) |
+| `record` | — | record/replay cassettes (pulls `serde`) |
+| `mock` | — | `mockall`-generated `MockRunner` |
+| `tracing` | — | a `tracing` event per run |
+
 ## Usage
 
 ```rust,no_run

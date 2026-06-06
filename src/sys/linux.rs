@@ -16,6 +16,7 @@ use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 
 use crate::Mechanism;
+#[cfg(feature = "process-control")]
 use crate::Signal;
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
@@ -97,6 +98,7 @@ impl Job {
         }
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn adopt(&self, child: &Child) -> io::Result<()> {
         let pid = child
             .id()
@@ -120,6 +122,7 @@ impl Job {
         }
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn signal(&self, sig: Signal) -> io::Result<()> {
         match &self.backend {
             // SIGKILL takes the atomic `cgroup.kill` path so `signal(Kill)` gives
@@ -131,6 +134,7 @@ impl Job {
         }
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {
         match &self.backend {
             Backend::Cgroup(cg) => cg.freeze(true),
@@ -138,6 +142,7 @@ impl Job {
         }
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn resume(&self) -> io::Result<()> {
         match &self.backend {
             Backend::Cgroup(cg) => cg.freeze(false),
@@ -145,6 +150,7 @@ impl Job {
         }
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
         let pids = match &self.backend {
             // Whole tree: every pid in cgroup.procs.
@@ -421,6 +427,7 @@ impl Cgroup {
     /// write returns) and needs no controllers — the same family as the
     /// `cgroup.kill` file used for teardown. On kernels without it, fall back to
     /// per-pid `SIGSTOP`/`SIGCONT`, mirroring the `cgroup.kill` fallback idiom.
+    #[cfg(feature = "process-control")]
     fn freeze(&self, frozen: bool) -> io::Result<()> {
         let val: &[u8] = if frozen { b"1" } else { b"0" };
         if std::fs::write(self.path.join("cgroup.freeze"), val).is_ok() {

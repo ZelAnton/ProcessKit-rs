@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::Mechanism;
+#[cfg(feature = "process-control")]
 use crate::Signal;
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
@@ -50,6 +51,7 @@ impl Job {
         self.group.spawn(cmd, opts)
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn adopt(&self, child: &Child) -> io::Result<()> {
         self.group.adopt(child)
     }
@@ -58,19 +60,23 @@ impl Job {
         self.group.kill_all()
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn signal(&self, sig: Signal) -> io::Result<()> {
         self.group.signal(sig.raw())
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {
         self.group.suspend()
     }
 
+    #[cfg(feature = "process-control")]
     pub(crate) fn resume(&self) -> io::Result<()> {
         self.group.resume()
     }
 
     /// Tracked group leaders only — see the pgroup backend.
+    #[cfg(feature = "process-control")]
     pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
         Ok(self
             .group
