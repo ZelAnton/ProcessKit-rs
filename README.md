@@ -158,8 +158,9 @@ the Job Object terminate) and anything else returns `Error::Unsupported`.
 `Signal::Kill` always takes the same whole-tree hard-kill path as
 `terminate_all()`. Suspend/resume work everywhere a container exists — one
 `cgroup.freeze` write covering the subtree on Linux, `SIGSTOP`/`SIGCONT` on
-macOS/BSD and the Linux process-group fallback, and per-thread suspension on
-Windows (best-effort; nested suspends stack and need matching resumes).
+macOS/BSD and the Linux process-group fallback (both idempotent), and
+per-thread suspension on Windows (best-effort; only there nested suspends
+stack and need matching resumes).
 
 ## Inspecting the tree
 
@@ -186,9 +187,11 @@ async fn main() -> processkit::Result<()> {
 ```
 
 `members()` lists the whole tree on Windows (Job Object) and Linux (cgroup); the
-POSIX process-group backends list the tracked group *leaders* only. `wait_any`
-applies no per-process timeout (bound the race with `tokio::time::timeout`) and
-does no output pumping — drain chatty children first.
+POSIX process-group backends list the tracked group *leaders* only. (`members`
+is part of the default-on `process-control` feature; `wait_any` is always
+available.) `wait_any` applies no per-process timeout (bound the race with
+`tokio::time::timeout`) and does no output pumping — drain chatty children
+first.
 
 ## Sampling stats over time
 

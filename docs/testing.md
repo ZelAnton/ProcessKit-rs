@@ -201,14 +201,22 @@ impl<R: ProcessRunner> Git<R> {
         self.core.probe(self.core.command_in(repo, ["diff", "--quiet"])).await
     }
 
-    /// Branch list, parsed — a parser failure is a typed `Error::Parse`.
+    /// Branch list, parsed — the parser is fallible and returns the crate's
+    /// `Result`, typically an `Error::Parse` naming the program.
     pub async fn branches(&self, repo: &Path) -> Result<Vec<String>> {
         self.core
             .try_parse(
                 self.core.command_in(repo, ["branch", "--format=%(refname:short)"]),
                 |out| {
                     let list: Vec<String> = out.lines().map(str::to_owned).collect();
-                    if list.is_empty() { Err("no branches".to_owned()) } else { Ok(list) }
+                    if list.is_empty() {
+                        Err(Error::Parse {
+                            program: "git".into(),
+                            message: "no branches".into(),
+                        })
+                    } else {
+                        Ok(list)
+                    }
                 },
             )
             .await

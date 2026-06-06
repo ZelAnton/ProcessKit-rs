@@ -388,18 +388,43 @@ impl RunningProcess {
         });
         self.stderr_sink = Some(stderr_sink.clone());
 
-        // Read stdout raw, concurrently, so it never blocks the child.
+        // Read stdout raw, concurrently, so it never blocks the child. The
+        // bytes accumulate in a shared buffer (not the task's return value) so
+        // the bounded teardown below can salvage a partial read.
         let mut stdout_pipe = self.stdout_pipe.take();
-        let out_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            if let Some(pipe) = &mut stdout_pipe {
-                let _ = pipe.read_to_end(&mut buf).await;
-            }
-            buf
-        });
+        let out_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let out_task = {
+            let out_buf = out_buf.clone();
+            tokio::spawn(async move {
+                if let Some(pipe) = &mut stdout_pipe {
+                    let mut chunk = [0u8; 8 * 1024];
+                    loop {
+                        match pipe.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => out_buf
+                                .lock()
+                                .expect("stdout buffer poisoned")
+                                .extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                }
+            })
+        };
 
         let (code, timed_out) = self.drive_to_exit().await?;
-        let stdout = out_task.await.unwrap_or_default();
+        // Bound the drain by the same teardown grace as the line pumps: on a
+        // shared-group handle a surviving descendant can hold stdout open past
+        // the child's death, and an unbounded `read_to_end` here would park
+        // this call forever (`output_string`/`wait` are bounded via
+        // `join_pumps` — `output_bytes` must be too).
+        let abort = out_task.abort_handle();
+        if tokio::time::timeout(PUMP_TEARDOWN, out_task).await.is_err() {
+            // The reader is still parked on a held-open pipe: abort it (like
+            // `join_pumps` aborts stragglers) and keep whatever arrived —
+            // parity with the line pumps' partial capture.
+            abort.abort();
+        }
+        let stdout = std::mem::take(&mut *out_buf.lock().expect("stdout buffer poisoned"));
         join_pumps(err_pump.into_iter().collect()).await;
         #[cfg(feature = "cancellation")]
         if let Some(err) = self.cancelled_error() {
@@ -695,11 +720,27 @@ impl RunningProcess {
         tasks
     }
 
+    /// Stop the streaming watchdog tasks (deadline/cancel) once the child's
+    /// fate is settled — mirroring the `profile` sampler's early abort, so a
+    /// late firing can't `kill_direct_child` a pid the consuming method has
+    /// already reaped. (`Drop` remains the backstop for non-consuming exits.)
+    fn abort_watchdogs(&mut self) {
+        if let Some(task) = self.deadline_task.take() {
+            task.abort();
+        }
+        #[cfg(feature = "cancellation")]
+        if let Some(task) = self.cancel_task.take() {
+            task.abort();
+        }
+    }
+
     /// Wait for the child to exit, applying the timeout (killing the tree and
     /// flagging `timed_out` on elapse). The code is `None` for a run that
     /// produced none — a timeout, or a signal termination on Unix.
     async fn drive_to_exit(&mut self) -> Result<(Option<i32>, bool)> {
         let outcome = self.drive_to_exit_inner().await?;
+        // The child is reaped (or being reaped) — the watchdogs' job is done.
+        self.abort_watchdogs();
         #[cfg(feature = "tracing")]
         {
             let (code, timed_out) = outcome;
@@ -805,6 +846,11 @@ impl RunningProcess {
     pub async fn finish_streamed(mut self) -> Result<(Option<i32>, String)> {
         // Drain a stdout pipe a prior `stdout_lines` didn't take (and discard
         // it) so the child can't block writing to it while we wait for exit.
+        // Deliberately unbounded: a deadline here would cut the drain off
+        // under a still-running chatty child and re-create the blocked-pipe
+        // hang. The cost of the alternative — a shared-group descendant
+        // holding the pipe parks this one idle reader until it exits — is
+        // benign.
         if let Some(mut pipe) = self.stdout_pipe.take() {
             tokio::spawn(async move {
                 let mut sink = Vec::new();

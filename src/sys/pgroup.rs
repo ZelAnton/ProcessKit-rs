@@ -208,19 +208,11 @@ impl ProcessGroup {
         // process, so report the number of live entries and leave cpu/memory
         // absent.
         let active = match self.pgids.lock() {
-            Ok(g) => g
-                .iter()
-                // SAFETY: signal 0 is a sound existence probe.
-                .filter(|&&pgid| unsafe { libc::kill(-pgid, 0) == 0 })
-                .count(),
+            Ok(g) => g.iter().filter(|&&pgid| group_exists(pgid)).count(),
             Err(_) => 0,
         };
         let active_solo = match self.solo_pids.lock() {
-            Ok(solos) => solos
-                .iter()
-                // SAFETY: signal 0 is a sound existence probe.
-                .filter(|&&pid| unsafe { libc::kill(pid, 0) == 0 })
-                .count(),
+            Ok(solos) => solos.iter().filter(|&&pid| pid_exists(pid)).count(),
             Err(_) => 0,
         };
         Ok(ProcessGroupStats {
@@ -237,41 +229,60 @@ impl Drop for ProcessGroup {
     }
 }
 
-/// Send `sig` to every still-live tracked process group, dropping the ones that
-/// have already drained.
+/// Whether the process group `pgid` still exists.
+///
+/// `kill(-pgid, 0)` returns 0 when the probe is permitted, and fails with
+/// `EPERM` when the group **exists** but contains only processes the caller
+/// may not signal — only `ESRCH` means "gone". Conflating the two would prune
+/// (and so never kill) a live tree that, say, changed its uid.
+fn group_exists(pgid: i32) -> bool {
+    // SAFETY: signal 0 to a negative pid is a sound existence probe.
+    if unsafe { libc::kill(-pgid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Whether the process `pid` still exists (same `EPERM` caveat as
+/// [`group_exists`]).
+fn pid_exists(pid: i32) -> bool {
+    // SAFETY: signal 0 to a positive pid is a sound existence probe.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Send `sig` to every still-existing tracked process group, dropping the ones
+/// that have already drained.
 ///
 /// A group id is the leader's pid, so a stale id whose leader was reaped and
 /// whose pid got recycled could in theory address an unrelated group. Probing
-/// liveness (`kill(-pgid, 0)`) immediately before `killpg` keeps that window just
-/// a few instructions wide, and pruning the dead ids stops the set from growing
+/// existence immediately before `killpg` keeps that window just a few
+/// instructions wide, and pruning the dead ids stops the set from growing
 /// without bound over a long-lived group's lifetime. (Still best-effort against a
 /// child that `setsid`s out of its group entirely.)
 fn signal_groups(pgids: &Mutex<Vec<i32>>, sig: i32) {
     if let Ok(mut g) = pgids.lock() {
         g.retain(|&pgid| {
-            // SAFETY: signal 0 to a negative pid is a sound existence probe.
-            if unsafe { libc::kill(-pgid, 0) } != 0 {
+            if !group_exists(pgid) {
                 return false; // ESRCH: the group is gone — forget it.
             }
             // SAFETY: killpg on a positive group id is always a sound call; a
-            // group that exits between the probe and here simply returns ESRCH.
+            // group that exits between the probe and here simply returns ESRCH,
+            // and one we may not signal returns EPERM — either way best-effort.
             unsafe { libc::killpg(pgid, sig) };
             true
         });
     }
 }
 
-/// Whether any tracked process group still has at least one live member.
+/// Whether any tracked process group still has at least one member.
 fn groups_alive(pgids: &Mutex<Vec<i32>>) -> bool {
     let Ok(g) = pgids.lock() else {
         return false;
     };
-    g.iter().any(|&pgid| {
-        // `kill(-pgid, 0)` performs no signal but reports existence: 0 if the
-        // group has a member, ESRCH otherwise.
-        // SAFETY: signal 0 to a negative pid is a sound existence probe.
-        unsafe { libc::kill(-pgid, 0) == 0 }
-    })
+    g.iter().any(|&pgid| group_exists(pgid))
 }
 
 /// Drop process groups that have already drained. An empty group can never
@@ -279,8 +290,7 @@ fn groups_alive(pgids: &Mutex<Vec<i32>>) -> bool {
 /// probe is terminal — forgetting the id is sound and keeps a recyclable dead pid
 /// from later being mistaken for a live group.
 fn retain_live(pgids: &mut Vec<i32>) {
-    // SAFETY: signal 0 to a negative pid is a sound existence probe.
-    pgids.retain(|&pgid| unsafe { libc::kill(-pgid, 0) == 0 });
+    pgids.retain(|&pgid| group_exists(pgid));
 }
 
 /// `signal_groups`, but for the solo-adopted pids: probe each individually and
@@ -298,25 +308,23 @@ fn retain_live(pgids: &mut Vec<i32>) {
 fn signal_pids(pids: &Mutex<Vec<i32>>, sig: i32) {
     if let Ok(mut p) = pids.lock() {
         p.retain(|&pid| {
-            // SAFETY: signal 0 to a positive pid is a sound existence probe.
-            if unsafe { libc::kill(pid, 0) } != 0 {
+            if !pid_exists(pid) {
                 return false; // ESRCH: gone — forget it.
             }
-            // SAFETY: a plain signal to a probed-live pid; an exit between the
-            // probe and here just yields ESRCH.
+            // SAFETY: a plain signal to a probed-existing pid; an exit between
+            // the probe and here just yields ESRCH (EPERM stays best-effort).
             unsafe { libc::kill(pid, sig) };
             true
         });
     }
 }
 
-/// Whether any solo-adopted pid is still alive.
+/// Whether any solo-adopted pid still exists.
 fn pids_alive(pids: &Mutex<Vec<i32>>) -> bool {
     let Ok(p) = pids.lock() else {
         return false;
     };
-    // SAFETY: signal 0 to a positive pid is a sound existence probe.
-    p.iter().any(|&pid| unsafe { libc::kill(pid, 0) == 0 })
+    p.iter().any(|&pid| pid_exists(pid))
 }
 
 /// Drop solo-adopted pids that have already exited (and been reaped). (Solo
@@ -324,6 +332,5 @@ fn pids_alive(pids: &Mutex<Vec<i32>>) -> bool {
 /// surface — so its pruner is gated with it.)
 #[cfg(feature = "process-control")]
 fn retain_live_pids(pids: &mut Vec<i32>) {
-    // SAFETY: signal 0 to a positive pid is a sound existence probe.
-    pids.retain(|&pid| unsafe { libc::kill(pid, 0) == 0 });
+    pids.retain(|&pid| pid_exists(pid));
 }

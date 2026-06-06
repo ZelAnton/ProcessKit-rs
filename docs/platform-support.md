@@ -108,9 +108,10 @@ with `CREATE_SUSPENDED` (the `Command`-driven paths handle this for you, incl.
 threads mid-walk.
 
 **Spawning into a suspended cgroup group.** The freeze is group *state*: a
-child spawned or adopted while suspended joins frozen — and the spawn call
-itself can **block until resume** (the child freezes before the spawn
-handshake completes). Resume before starting new work; details in
+child spawned or adopted while suspended joins frozen — the forked child
+joins the cgroup *before* `exec`, so it can freeze before completing the
+spawn handshake and **`start()` may never return until resume**. Resume
+before starting new work; details in
 [Process groups](process-groups.md#suspending-and-resuming).
 
 **Frozen trees and graceful shutdown.** Hard kills penetrate a frozen tree

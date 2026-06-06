@@ -44,6 +44,7 @@ impl OutputBufferPolicy {
     }
 
     /// Set the overflow behavior.
+    #[must_use]
     pub fn with_overflow(mut self, overflow: OverflowMode) -> Self {
         self.overflow = overflow;
         self

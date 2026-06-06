@@ -70,6 +70,10 @@ jobs:
       # it takes the `limits`-free `Job::new()` path — the one every default
       # consumer runs — which `--all-features` alone never executes.
       - run: cargo test -- --include-ignored
+      # And the bare core (no default features): clippy/doc only compile this
+      # configuration — running its tests guards the lean runtime path (and the
+      # cfg-gated arms in the suite) against bit-rot.
+      - run: cargo test --no-default-features -- --include-ignored
 
   doc:
     name: rustdoc

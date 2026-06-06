@@ -107,7 +107,7 @@ backoff shape, different loop condition.
 Off by default — enable the **`cancellation`** feature (pulls `tokio-util`):
 
 ```toml
-processkit = { version = "0.7", features = ["cancellation"] }
+processkit = { version = "…", features = ["cancellation"] }
 ```
 
 Hand any command a `CancellationToken` (re-exported at the crate root);

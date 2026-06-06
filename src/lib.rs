@@ -14,8 +14,9 @@
 //!   and reports the first to exit.
 //! - **runner** — async run-and-capture built on the group. Describe a run with
 //!   [`Command`], then drive it to completion ([`Command::output_string`],
-//!   [`Command::run`], …) or start it via a [`ProcessRunner`] for streaming or a
-//!   shared group. The trait is the mock seam (see [`ScriptedRunner`]). A
+//!   [`Command::run`], …) or [`start`](Command::start) it for streaming and
+//!   interactive I/O. The [`ProcessRunner`] trait runs commands to completion
+//!   and is the mock seam (see [`ScriptedRunner`]). A
 //!   [`Supervisor`] keeps a command *alive* — restarting it per policy with
 //!   backoff — where [`Command::retry`] merely replays one run to success.
 //!   Readiness probes ([`RunningProcess::wait_for_line`] /

@@ -54,7 +54,7 @@ guarantee is unconditional in every configuration.
 
 ```toml
 [dependencies]
-processkit = { version = "0.7", features = ["limits", "cancellation"] }
+processkit = { version = "…", features = ["limits", "cancellation"] }
 ```
 
 ## The 60-second tour

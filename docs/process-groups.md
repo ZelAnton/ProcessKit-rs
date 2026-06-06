@@ -172,10 +172,10 @@ Two caveats that bite in practice:
 
 - **Spawning into a suspended group diverges.** Under the cgroup mechanism a
   child spawned or adopted while the group is frozen **starts frozen** — and
-  the *spawn call itself can block* until `resume` (the child joins the cgroup
-  before `exec`, so it can freeze before the spawn handshake completes).
-  Windows and the pgroup backends freeze only members present at the call.
-  Rule of thumb: resume before starting new work.
+  `start()` *may never return* until `resume` (the forked child joins the
+  cgroup before `exec`, so it can freeze before completing the spawn
+  handshake). Windows and the pgroup backends freeze only members present at
+  the call. Rule of thumb: resume before starting new work.
 - A suspended tree can still be **hard-killed** (drop / `terminate_all` /
   `Signal::Kill` all act on frozen processes), but a graceful `shutdown`
   starts with a `SIGTERM` the frozen tree can't act on — it would wait out the

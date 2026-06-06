@@ -70,6 +70,7 @@ impl<R: ProcessRunner> CliClient<R> {
     }
 
     /// Apply a default timeout to every command this client builds.
+    #[must_use]
     pub fn default_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -78,6 +79,7 @@ impl<R: ProcessRunner> CliClient<R> {
     /// Set an environment variable on every command this client builds — e.g.
     /// `GIT_TERMINAL_PROMPT=0` so a probe can never block on a credential
     /// prompt. Per-command [`Command::env`] still works and is layered after.
+    #[must_use]
     pub fn default_env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
         self.envs.push((
             key.as_ref().to_os_string(),
@@ -88,6 +90,7 @@ impl<R: ProcessRunner> CliClient<R> {
 
     /// Remove an inherited environment variable on every command this client
     /// builds.
+    #[must_use]
     pub fn default_env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
         self.envs.push((key.as_ref().to_os_string(), None));
         self

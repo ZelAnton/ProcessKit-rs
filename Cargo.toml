@@ -65,8 +65,9 @@ encoding_rs = "0.8"
 # helper, so callers consume stdout with the standard `Stream` combinators.
 # `io-util` gates the `wrappers::LinesStream` adapter we use.
 tokio-stream = { version = "0.1", features = ["io-util"] }
-# Optional per-run observability (program/args/exit/duration). Off by default;
-# zero cost unless the `tracing` feature is enabled.
+# Optional per-run observability (program/exit code/duration — deliberately
+# NOT argv or env, which routinely carry secrets). Off by default; zero cost
+# unless the `tracing` feature is enabled.
 tracing = { version = "0.1", optional = true }
 # Optional auto-generated `MockRunner` for downstream tests. Test-only; pulled
 # in solely behind the `mock` feature, never in production builds.
@@ -104,7 +105,8 @@ limits = ["stats"]
 process-control = []
 # Expose the `mockall`-generated `MockRunner` for consumers' tests.
 mock = ["dep:mockall"]
-# Emit a `tracing` event per command run (program, args, exit code, duration).
+# Emit a `tracing` event per command run (program, exit code, duration —
+# argv/env are deliberately not logged: they routinely carry secrets).
 tracing = ["dep:tracing"]
 # First-class run cancellation: `Command::cancel_on(token)`, `Error::Cancelled`,
 # and the `CancellationToken` re-export. Off by default; pulls in `tokio-util`.

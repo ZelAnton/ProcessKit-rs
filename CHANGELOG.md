@@ -31,8 +31,38 @@ to a dated version section.
   for the full decision record.)
 - `windows-sys` bumped 0.59 → 0.61 to dedup with the copy tokio/mio already
   ship — the lockfile now carries a single `windows-sys`.
+- Every public type now implements `Debug` (enforced by a crate lint), and
+  `Command` is `#[must_use]` — building one and dropping it unused now warns.
+- Resource measurement (`ProcessGroupStats`, `ProcessGroup::stats`,
+  `RunningProcess::cpu_time`/`peak_memory_bytes`) now sits behind a default-on
+  `stats` Cargo feature: `default-features = false` compiles the accounting code
+  (and its Windows ProcessStatus FFI) out. Consumers on default features see no
+  change; consumers who already set `default-features = false` must add
+  `features = ["stats"]` to keep that API.
 
 ### Fixed
+- POSIX process-group liveness probes treated `EPERM` as "process gone": a
+  live tree whose members the caller may no longer signal (e.g. after a
+  third-party uid change) was silently pruned from tracking — and therefore
+  never killed on drop. Probes now distinguish `ESRCH` (gone — prune) from
+  `EPERM` (exists — keep and still attempt the best-effort signal).
+- `output_bytes` awaited an **unbounded** raw stdout drain: on a shared-group
+  handle whose timeout/cancel kills only the direct child, a surviving
+  descendant holding the pipe could park the call forever. The drain is now
+  bounded by the same pump-teardown grace as every other consumer, aborting
+  the straggler and returning the partial bytes read so far.
+- The streaming deadline/cancel watchdog tasks are now stopped as soon as the
+  child's fate is settled (not only on handle drop), closing a narrow window
+  where a late firing could signal an already-reaped pid.
+- POSIX process-group `ProcessGroup::adopt` was a silent no-op for any child
+  that had already `exec`'d (the normal case): POSIX refuses `setpgid` there
+  (`EACCES`), and the pid was recorded as a process-*group* id that doesn't
+  exist, so teardown never reached the child. Such children are now tracked
+  and signalled individually — the adopted child is contained (killed with the
+  group), though its future forks are not (unlike Windows/cgroup adoption).
+  Adopting a child the group already tracks (a self-spawned leader, or a
+  repeated adopt) is also de-duplicated now, so `members()`/`stats()` no
+  longer over-report or grow per call.
 - The streaming deadline/cancellation kill paths now also kill the **direct
   child by pid** after the group teardown — parity with the run-to-completion
   path's `start_kill` + `terminate_all` pairing, so a group-kill miss on the
@@ -150,27 +180,6 @@ to a dated version section.
   Linux process-group fallback, the no-containment target) — or a Linux cgroup lacks
   controller delegation — `ProcessGroup::with_options` fails fast with the new
   `Error::ResourceLimit` rather than handing back an unbounded group.
-
-### Changed
-- Every public type now implements `Debug` (enforced by a crate lint), and
-  `Command` is `#[must_use]` — building one and dropping it unused now warns.
-- Resource measurement (`ProcessGroupStats`, `ProcessGroup::stats`,
-  `RunningProcess::cpu_time`/`peak_memory_bytes`) now sits behind a default-on
-  `stats` Cargo feature: `default-features = false` compiles the accounting code
-  (and its Windows ProcessStatus FFI) out. Consumers on default features see no
-  change; consumers who already set `default-features = false` must add
-  `features = ["stats"]` to keep that API.
-
-### Fixed
-- POSIX process-group `ProcessGroup::adopt` was a silent no-op for any child
-  that had already `exec`'d (the normal case): POSIX refuses `setpgid` there
-  (`EACCES`), and the pid was recorded as a process-*group* id that doesn't
-  exist, so teardown never reached the child. Such children are now tracked
-  and signalled individually — the adopted child is contained (killed with the
-  group), though its future forks are not (unlike Windows/cgroup adoption).
-  Adopting a child the group already tracks (a self-spawned leader, or a
-  repeated adopt) is also de-duplicated now, so `members()`/`stats()` no
-  longer over-report or grow per call.
 
 ## [0.6.1] - 2026-06-03
 

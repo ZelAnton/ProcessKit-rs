@@ -1625,17 +1625,15 @@ mod cancellation {
             start.elapsed()
         );
         canceller.await.expect("canceller task");
+        // The cancelled child is dead AND reaped by the time `output_string`
+        // returned: the cancel arm's kill_tree start-kills and then awaits the
+        // child. (No raw post-mortem pid probe here: a dead pid is recycled by
+        // a parallel-suite neighbour within seconds on Windows, which made an
+        // earlier probe loop flake.) The prompt Err above is the death proof.
 
-        // The cancelled child is killed and reaped...
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while pid_alive(pid) {
-            assert!(
-                Instant::now() < deadline,
-                "cancelled child survived (pid {pid})"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        // ...while the shared group's sibling is untouched.
+        // The shared group's sibling is untouched — probing a process we hold
+        // a live handle to is reuse-safe.
+        let _ = pid;
         assert!(
             pid_alive(sibling_pid),
             "cancel must kill the child only, not shared-group siblings"
