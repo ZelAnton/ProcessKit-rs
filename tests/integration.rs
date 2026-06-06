@@ -1098,21 +1098,25 @@ async fn setsid_spawns_and_stays_contained() {
     let pid = process.pid().expect("pid") as i32;
 
     // …and the new session's process group must still be contained: dropping
-    // the group reaps the child.
+    // the group kills the child. Reap it via wait() — a raw pid probe would
+    // see the unreaped zombie as alive forever (the handle holds the child).
     drop(group);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        // SAFETY: signal 0 is a sound liveness probe.
-        let alive = unsafe { libc::kill(pid, 0) == 0 };
-        if !alive {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "setsid child survived the group drop — containment broke"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let start = Instant::now();
+    let _ = tokio::time::timeout(Duration::from_secs(10), process.wait())
+        .await
+        .expect("setsid child outlived the group drop — containment broke")
+        .expect("wait");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "setsid child was not reaped promptly (took {:?})",
+        start.elapsed()
+    );
+    // Reaped: the pid is genuinely gone, not a lingering zombie.
+    // SAFETY: signal 0 is a sound liveness probe.
+    assert!(
+        unsafe { libc::kill(pid, 0) != 0 },
+        "pid still probes alive after reap"
+    );
 }
 
 #[cfg(unix)]
@@ -1677,6 +1681,7 @@ mod cancellation {
             .await
             .expect("start banner child");
 
+        let pid = run.pid().expect("pid");
         let mut lines = run.stdout_lines();
         // Wait for the banner so the cancel provably lands mid-stream.
         let first = tokio::time::timeout(Duration::from_secs(15), lines.next())
@@ -1688,15 +1693,24 @@ mod cancellation {
         token.cancel();
 
         // The cancel tears the (handle-owned) tree down, the pipes close, and
-        // the stream ends — the child would otherwise idle ~30s.
+        // the stream ends — the child would otherwise idle ~30s. On a timeout,
+        // report whether the direct child is even dead — that separates "the
+        // kill never landed" from "the pipe stayed open" (seen once on macOS
+        // CI; the probe makes the next occurrence diagnosable).
         let start = Instant::now();
-        while tokio::time::timeout(Duration::from_secs(10), lines.next())
-            .await
-            .expect("stream should end promptly after cancel")
-            .is_some()
-        {}
+        loop {
+            match tokio::time::timeout(Duration::from_secs(15), lines.next()).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => panic!(
+                    "stream did not end within 15s of the cancel \
+                     (direct child still alive: {})",
+                    pid_alive(pid)
+                ),
+            }
+        }
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < Duration::from_secs(15),
             "stream did not end promptly (took {:?})",
             start.elapsed()
         );
@@ -1992,10 +2006,16 @@ async fn shutdown_lets_a_term_handling_child_end_the_grace_early() {
 
     // Exits 0 on SIGTERM. The sleep runs in the background (`wait` is
     // interruptible; a foreground sleep would delay the trap until it ends).
-    let run = group
-        .start(&Command::new("sh").args(["-c", "trap 'exit 0' TERM; sleep 30 & wait"]))
+    // The `ready` banner orders the world: without it, shutdown's SIGTERM can
+    // land before the shell has even installed the trap (seen on cold CI
+    // runners), and the child dies to the default disposition instead.
+    let mut run = group
+        .start(&Command::new("sh").args(["-c", "trap 'exit 0' TERM; echo ready; sleep 30 & wait"]))
         .await
         .expect("start");
+    run.wait_for_line(|l| l.contains("ready"), Duration::from_secs(10))
+        .await
+        .expect("trap installed");
     // Reap concurrently: the graceful path's liveness probe sees a zombie as
     // alive, so the child must actually be collected for the early return.
     let waiter = tokio::spawn(run.wait());
@@ -2029,11 +2049,16 @@ async fn shutdown_escalates_to_kill_after_the_grace_window() {
     .expect("create group");
 
     // Ignores SIGTERM and busy-waits (a foreground `sleep` would itself die to
-    // the broadcast TERM and end the script cleanly — defeating the test).
-    let run = group
-        .start(&Command::new("sh").args(["-c", "trap '' TERM; while :; do :; done"]))
+    // the broadcast TERM and end the script cleanly — defeating the test). The
+    // `ready` banner proves the trap is installed before shutdown fires — a
+    // TERM landing earlier would kill the child and end the grace instantly.
+    let mut run = group
+        .start(&Command::new("sh").args(["-c", "trap '' TERM; echo ready; while :; do :; done"]))
         .await
         .expect("start");
+    run.wait_for_line(|l| l.contains("ready"), Duration::from_secs(10))
+        .await
+        .expect("trap installed");
     let waiter = tokio::spawn(run.wait());
 
     let start = Instant::now();
