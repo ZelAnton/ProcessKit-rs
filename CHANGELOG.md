@@ -39,6 +39,12 @@ to a dated version section.
   (and its Windows ProcessStatus FFI) out. Consumers on default features see no
   change; consumers who already set `default-features = false` must add
   `features = ["stats"]` to keep that API.
+- `ProcessGroupStats` and `RunProfile` are now `#[non_exhaustive]`: they are
+  read-only outputs the crate produces, so future metrics can be added without
+  a breaking change. Reading fields is unaffected; struct-literal construction
+  and exhaustive destructuring outside the crate no longer compile.
+  (`ProcessGroupOptions`, `ResourceLimits`, and `Invocation` deliberately stay
+  exhaustive — constructing them is their intended use.)
 
 ### Fixed
 - POSIX process-group liveness probes treated `EPERM` as "process gone": a

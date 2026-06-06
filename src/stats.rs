@@ -14,6 +14,10 @@ use crate::group::ProcessGroup;
 /// report them — notably the POSIX process-group mechanism (no cgroup
 /// accounting), i.e. macOS/BSD and the Linux fallback, and the no-containment
 /// `other` target.
+///
+/// Non-exhaustive: a read-only snapshot the crate produces — new metrics can
+/// be added without a breaking change.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessGroupStats {
     /// Number of live processes currently in the group.
@@ -106,6 +110,10 @@ impl tokio_stream::Stream for StatsSampler<'_> {
 /// [`peak_memory_bytes`](crate::RunningProcess::peak_memory_bytes)), so they
 /// are `None` where per-process metrics are unavailable (macOS/BSD) or when
 /// the run exited before the first sample landed.
+///
+/// Non-exhaustive: a read-only summary the crate produces — new metrics can
+/// be added without a breaking change.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RunProfile {
     /// The exit code; `None` for a run killed by its timeout or a signal

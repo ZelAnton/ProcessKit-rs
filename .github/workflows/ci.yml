@@ -114,6 +114,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88"
+          targets: x86_64-pc-windows-msvc, aarch64-apple-darwin
       # rust-toolchain.toml tracks stable and would otherwise win here; remove it
       # so cargo uses the 1.88 toolchain installed above and truly tests the floor.
       - run: rm -f rust-toolchain.toml
@@ -121,3 +122,9 @@ jobs:
       # `--all-features` so the feature-gated stats/limits code is held to the
       # same MSRV floor as the default build.
       - run: cargo check --all-targets --all-features
+      # Cross-`check` the other platform modules against the same floor: this
+      # Linux job alone never compiles windows.rs (Job Objects) or unix.rs
+      # (macOS/BSD pgroup), so a newer-than-MSRV API there would slip through.
+      # `check` doesn't link, so no foreign linkers are needed.
+      - run: cargo check --target x86_64-pc-windows-msvc --all-targets --all-features
+      - run: cargo check --target aarch64-apple-darwin --all-targets --all-features

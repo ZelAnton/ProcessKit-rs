@@ -351,6 +351,12 @@ impl Cgroup {
     /// Enable the controllers each requested limit needs (in the *parent's*
     /// `cgroup.subtree_control`, which is what makes the interface files appear in
     /// our cgroup) and write the limit values.
+    ///
+    /// The parent's controller enablement is deliberately NOT reverted on
+    /// `Drop`: the parent cgroup is shared (sibling groups, other processes
+    /// of this same user), so disabling controllers there could yank the
+    /// interface files out from under unrelated trees. Enabled-but-unused
+    /// controllers cost nothing.
     #[cfg(feature = "limits")]
     fn apply_limits(&self, parent: &Path, limits: &ResourceLimits) -> io::Result<()> {
         let mut spec = String::new();

@@ -273,7 +273,11 @@ impl Command {
     /// [`first_line`](Self::first_line) don't synthesize the error for a
     /// *mid-run* cancel — their stream simply ends, mirroring how they treat
     /// `timeout` — though a token that was already cancelled still surfaces
-    /// the pre-spawn `Err(Cancelled)` short-circuit.
+    /// the pre-spawn `Err(Cancelled)` short-circuit. Likewise a mid-run cancel
+    /// during [`wait_for_line`](crate::RunningProcess::wait_for_line) closes
+    /// the stream and surfaces as that probe's
+    /// [`Error::NotReady`](crate::Error::NotReady), not `Cancelled` — the
+    /// consuming finisher afterwards still reports `Cancelled`.
     ///
     /// A cancelled run is never retried: [`retry`](Self::retry) policies and
     /// [`Supervisor`](crate::Supervisor) restarts both treat
