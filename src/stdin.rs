@@ -109,11 +109,12 @@ impl Stdin {
     }
 
     /// Write this source to the child's stdin pipe, then return so the caller
-    /// can drop the sink to signal EOF.
-    pub(crate) async fn write_to(
-        &self,
-        sink: &mut tokio::process::ChildStdin,
-    ) -> std::io::Result<()> {
+    /// can drop the sink to signal EOF. (Generic over the sink so the one-shot
+    /// semantics are unit-testable against an in-memory writer.)
+    pub(crate) async fn write_to<W>(&self, sink: &mut W) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
         match &self.0 {
             Source::Empty => Ok(()),
             Source::Bytes(bytes) => sink.write_all(bytes).await,
@@ -201,5 +202,67 @@ impl ProcessStdin {
 impl fmt::Debug for ProcessStdin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProcessStdin").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive `write_to` into an in-memory sink and return what was written.
+    async fn written(stdin: &Stdin) -> Vec<u8> {
+        let mut sink = Vec::new();
+        stdin.write_to(&mut sink).await.expect("write_to");
+        sink
+    }
+
+    #[tokio::test]
+    async fn reader_source_is_one_shot() {
+        let stdin = Stdin::from_reader(&b"payload"[..]);
+        assert_eq!(written(&stdin).await, b"payload");
+        assert!(
+            written(&stdin).await.is_empty(),
+            "a second run must see empty stdin — the reader was consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn lines_source_is_one_shot_and_newline_terminated() {
+        let stdin = Stdin::from_lines(tokio_stream::iter(vec![
+            "first".to_owned(),
+            "second".to_owned(),
+        ]));
+        assert_eq!(written(&stdin).await, b"first\nsecond\n");
+        assert!(
+            written(&stdin).await.is_empty(),
+            "the stream was consumed by the first run"
+        );
+    }
+
+    #[tokio::test]
+    async fn iter_lines_is_reusable_and_newline_terminated() {
+        let stdin = Stdin::from_iter_lines(["a", "b"]);
+        assert_eq!(written(&stdin).await, b"a\nb\n");
+        assert_eq!(
+            written(&stdin).await,
+            b"a\nb\n",
+            "eagerly-collected lines replay on every run"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_file_surfaces_not_found() {
+        let stdin = Stdin::from_file("processkit-definitely-missing-424242.txt");
+        let mut sink = Vec::new();
+        let err = stdin
+            .write_to(&mut sink)
+            .await
+            .expect_err("a missing stdin file must error, not feed silence");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn empty_source_writes_nothing() {
+        assert!(written(&Stdin::empty()).await.is_empty());
     }
 }

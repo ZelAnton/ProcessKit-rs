@@ -376,4 +376,28 @@ mod tests {
         assert!(stderr.len() < 10_000 && stderr.ends_with("… (truncated)"));
         assert!(stdout.len() < 10_000 && stdout.ends_with("… (truncated)"));
     }
+
+    #[test]
+    fn truncation_backs_off_to_a_char_boundary() {
+        // A 2-byte char straddling the 4 KiB cap: a naive byte slice at the
+        // cap would split it and panic. 4095 ASCII bytes put the first `é`
+        // at bytes 4095..4097 — exactly across the boundary.
+        let text = format!("{}{}", "a".repeat(4_095), "é".repeat(100));
+        let truncated = truncate_output(&text);
+        assert!(truncated.ends_with("… (truncated)"));
+        let kept = truncated.strip_suffix("… (truncated)").unwrap();
+        assert_eq!(
+            kept.len(),
+            4_095,
+            "the straddling char is dropped, not split"
+        );
+        assert!(kept.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn truncation_leaves_text_at_the_cap_untouched() {
+        let exactly = "x".repeat(4 * 1024);
+        assert_eq!(truncate_output(&exactly), exactly, "<= cap is verbatim");
+        assert_eq!(truncate_output(""), "");
+    }
 }

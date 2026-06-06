@@ -234,3 +234,124 @@ fn join_error(err: tokio::task::JoinError) -> crate::Error {
         "pipeline stage task failed: {err}"
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clean(program: &str) -> StageOutcome {
+        StageOutcome {
+            program: program.into(),
+            code: Some(0),
+            stderr: String::new(),
+        }
+    }
+
+    fn unclean(program: &str, code: Option<i32>, stderr: &str) -> StageOutcome {
+        StageOutcome {
+            program: program.into(),
+            code,
+            stderr: stderr.into(),
+        }
+    }
+
+    fn last_stage(code: Option<i32>, stdout: &str) -> ProcessResult<String> {
+        ProcessResult::new(
+            "last".into(),
+            stdout.into(),
+            "last-err".into(),
+            code,
+            false,
+            None,
+        )
+    }
+
+    #[test]
+    fn all_clean_inner_stages_let_the_last_stage_speak() {
+        // Success and failure of the last stage alike pass through untouched.
+        let ok = pipefail(
+            vec![clean("a"), clean("b")],
+            last_stage(Some(0), "final"),
+            None,
+        );
+        assert_eq!(ok, last_stage(Some(0), "final"));
+
+        let failing_last = pipefail(vec![clean("a")], last_stage(Some(3), "partial"), None);
+        assert_eq!(failing_last, last_stage(Some(3), "partial"));
+    }
+
+    #[test]
+    fn failing_inner_stage_wins_but_stdout_stays_the_chains() {
+        let result = pipefail(
+            vec![clean("a"), unclean("b", Some(2), "b broke")],
+            last_stage(Some(0), "final"),
+            None,
+        );
+        assert_eq!(result.code(), Some(2));
+        assert_eq!(result.stderr(), "b broke");
+        assert_eq!(
+            result.stdout(),
+            "final",
+            "stdout is what the chain produced — the last stage's"
+        );
+        assert!(!result.timed_out());
+        // The reported program (visible via the error surface) is the failing
+        // stage's, not the last stage's.
+        match result.ensure_success() {
+            Err(crate::Error::Exit {
+                program,
+                code,
+                stdout,
+                stderr,
+            }) => {
+                assert_eq!(program, "b", "diagnostics from the failing stage");
+                assert_eq!(code, 2);
+                assert_eq!(stdout, "final");
+                assert_eq!(stderr, "b broke");
+            }
+            other => panic!("expected Error::Exit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_of_several_failures_is_attributed() {
+        let result = pipefail(
+            vec![
+                unclean("a", Some(1), "first"),
+                unclean("b", Some(2), "second"),
+            ],
+            last_stage(Some(0), "out"),
+            None,
+        );
+        assert_eq!(result.code(), Some(1));
+        assert_eq!(result.stderr(), "first");
+        match result.ensure_success() {
+            Err(crate::Error::Exit { program, .. }) => {
+                assert_eq!(program, "a", "pipefail blames the FIRST failure");
+            }
+            other => panic!("expected Error::Exit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signal_killed_inner_stage_counts_as_unclean() {
+        // A signal-kill (or per-stage timeout kill) reports no code — that is
+        // not a clean exit, so the stage must win the attribution.
+        let result = pipefail(
+            vec![unclean("a", None, "killed")],
+            last_stage(Some(0), "out"),
+            None,
+        );
+        assert_eq!(result.code(), None);
+        assert_eq!(result.stderr(), "killed");
+        assert!(!result.timed_out(), "a stage kill is not a chain timeout");
+        // No code + no timeout surfaces as the signal-kill IO error, naming
+        // the attributed (failing) stage.
+        match result.ensure_success() {
+            Err(crate::Error::Io(e)) => {
+                assert!(e.to_string().contains("`a`"), "got: {e}");
+            }
+            other => panic!("expected Error::Io, got {other:?}"),
+        }
+    }
+}

@@ -194,12 +194,22 @@ async fn first_line_honors_timeout_instead_of_hanging() {
 
 #[tokio::test]
 #[ignore = "creates an OS job/cgroup"]
-async fn group_reports_a_known_mechanism() {
+async fn group_reports_the_platforms_mechanism() {
     let group = ProcessGroup::new().expect("create group");
-    assert!(matches!(
-        group.mechanism(),
-        Mechanism::JobObject | Mechanism::CgroupV2 | Mechanism::ProcessGroup | Mechanism::None
-    ));
+    let mechanism = group.mechanism();
+    // Tightened per platform: a silently-degraded backend (e.g. JobObject
+    // creation failing over to nothing) must not pass as "known".
+    #[cfg(windows)]
+    assert_eq!(mechanism, Mechanism::JobObject);
+    #[cfg(target_os = "linux")]
+    assert!(
+        matches!(mechanism, Mechanism::CgroupV2 | Mechanism::ProcessGroup),
+        "linux is cgroup v2 or its pgroup fallback, got {mechanism:?}"
+    );
+    #[cfg(all(unix, not(target_os = "linux")))]
+    assert_eq!(mechanism, Mechanism::ProcessGroup);
+    #[cfg(not(any(unix, windows)))]
+    assert_eq!(mechanism, Mechanism::None);
 }
 
 #[tokio::test]
@@ -1688,6 +1698,332 @@ mod cancellation {
             "expected Error::Cancelled, got {err:?}"
         );
     }
+}
+
+// ----- Coverage-gap sweeps: stream edges, group idempotency, platform semantics -----
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess"]
+async fn first_line_returns_none_when_the_stream_ends_without_a_match() {
+    // stdout closing without a matching line is Ok(None) — not a hang and not
+    // an error (the timeout path is covered separately).
+    let found = tokio::time::timeout(
+        Duration::from_secs(15),
+        two_line_echo().first_line(|l| l.contains("never-printed")),
+    )
+    .await
+    .expect("first_line must end when stdout closes, not hang")
+    .expect("run succeeds");
+    assert_eq!(found, None);
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess"]
+async fn second_stdout_lines_call_ends_immediately() {
+    use tokio_stream::StreamExt;
+
+    let mut process = five_lines().start().await.expect("start");
+    let mut first = process.stdout_lines();
+    let mut seen = 0;
+    while tokio::time::timeout(Duration::from_secs(10), first.next())
+        .await
+        .expect("first stream ends")
+        .is_some()
+    {
+        seen += 1;
+    }
+    assert_eq!(seen, 5);
+
+    // Documented: "Call this once." A second call must hand back an
+    // immediately-finished stream, not hang or panic.
+    let mut second = process.stdout_lines();
+    let next = tokio::time::timeout(Duration::from_secs(5), second.next())
+        .await
+        .expect("the second stream must end immediately");
+    assert!(next.is_none(), "second stream yields nothing: {next:?}");
+
+    let _ = process.finish_streamed().await;
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess"]
+async fn finish_streamed_without_streaming_first_drains_and_exits() {
+    // Skipping stdout_lines() leaves both pipes untaken — finish_streamed must
+    // drain them itself or a chatty child would block forever.
+    let process = two_line_echo().start().await.expect("start");
+    let (code, _stderr) = tokio::time::timeout(Duration::from_secs(15), process.finish_streamed())
+        .await
+        .expect("finish_streamed must not hang without a prior stdout_lines")
+        .expect("finish");
+    assert_eq!(code, Some(0));
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess and kills it twice"]
+async fn terminate_all_is_idempotent() {
+    let group = ProcessGroup::new().expect("create group");
+    let child = group.start(&sleep_secs(30)).await.expect("start sleeper");
+
+    group.terminate_all().expect("first terminate");
+    group
+        .terminate_all()
+        .expect("second terminate must be a no-op success, not an error");
+
+    // The group stays usable after teardown.
+    let _ = group.members().expect("members after terminate");
+    let _ = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("child reaped");
+}
+
+#[tokio::test]
+#[ignore = "spawns a short subprocess and adopts it after reaping"]
+async fn adopt_of_a_reaped_child_errors_instead_of_tracking_nothing() {
+    let group = ProcessGroup::new().expect("create group");
+    if matches!(group.mechanism(), Mechanism::None) {
+        eprintln!("skipping: no containment on this target");
+        return;
+    }
+
+    let mut cmd = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.args(["/c", "exit", "0"]);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.args(["-c", "exit 0"]);
+        c
+    };
+    let mut child = cmd.spawn().expect("spawn short child");
+    let _ = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("short child exits");
+
+    // A reaped child has no pid/handle left — adopting it must say so loudly
+    // rather than silently tracking nothing.
+    let err = group
+        .adopt(&child)
+        .expect_err("adopting a reaped child must error");
+    assert!(
+        matches!(err, processkit::Error::Io(_)),
+        "expected the no-pid Io error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "creates an OS job/cgroup"]
+async fn empty_group_accepts_lifecycle_calls() {
+    let group = ProcessGroup::new().expect("create group");
+    if matches!(group.mechanism(), Mechanism::None) {
+        eprintln!("skipping: no containment on this target");
+        return;
+    }
+
+    // Signalling, freezing, and thawing nobody must succeed trivially…
+    group.signal(Signal::Kill).expect("Kill on an empty group");
+    if cfg!(windows) {
+        // …except non-Kill signals on Windows, which are typed as unsupported
+        // (a Job Object has no POSIX signals) even with no members.
+        let err = group
+            .signal(Signal::Term)
+            .expect_err("only Kill is deliverable on Windows");
+        assert!(
+            matches!(err, processkit::Error::Unsupported { .. }),
+            "expected Unsupported, got {err:?}"
+        );
+    } else {
+        group.signal(Signal::Term).expect("Term on an empty group");
+    }
+    group.suspend().expect("suspend an empty group");
+    group.resume().expect("resume an empty group");
+
+    #[cfg(feature = "stats")]
+    {
+        let stats = group.stats().expect("stats on an empty group");
+        assert_eq!(stats.active_process_count, 0);
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess and nests suspend/resume"]
+async fn windows_nested_suspend_needs_matching_resumes() {
+    use tokio_stream::StreamExt;
+
+    // Documented Windows semantics: suspend/resume are per-thread *counts*, so
+    // two suspends need two resumes. A bare ping prints ~one line per second —
+    // line flow is the freeze probe.
+    let group = ProcessGroup::new().expect("create group");
+    let mut run = group
+        .start(&Command::new("ping").args(["-n", "31", "127.0.0.1"]))
+        .await
+        .expect("start ticker");
+    let mut lines = run.stdout_lines();
+    tokio::time::timeout(Duration::from_secs(15), lines.next())
+        .await
+        .expect("ticker prints")
+        .expect("first line");
+
+    group.suspend().expect("suspend #1");
+    group.suspend().expect("suspend #2");
+    group.resume().expect("resume #1 of 2");
+
+    // Drain lines emitted before the freeze landed; 2s of silence (double the
+    // ticker period) means the tree is genuinely frozen.
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), lines.next()).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("ticker exited while suspended"),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), lines.next())
+            .await
+            .is_err(),
+        "one resume must not thaw two suspends"
+    );
+
+    group.resume().expect("resume #2 of 2");
+    let line = tokio::time::timeout(Duration::from_secs(15), lines.next())
+        .await
+        .expect("a balanced resume thaws the tree");
+    assert!(line.is_some(), "ticker resumed output");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "adopts a real subprocess into a suspended cgroup"]
+async fn linux_cgroup_adopt_into_suspended_group_freezes_the_child() {
+    use tokio::io::AsyncBufReadExt;
+
+    // Documented cgroup divergence: the freeze is *group state*, so a child
+    // joining while the group is suspended freezes on attach. (Windows/pgroup
+    // freeze only the members present at the call.) The join is exercised via
+    // `adopt` — the parent writes the pid itself. `group.start()` would test
+    // the same kernel behavior but can BLOCK here: the pre-exec cgroup join
+    // freezes the child before the spawn handshake completes (see the
+    // `suspend` rustdoc), which would hang this very test.
+    let group = ProcessGroup::new().expect("create group");
+    if !matches!(group.mechanism(), Mechanism::CgroupV2) {
+        eprintln!("skipping: needs the cgroup mechanism");
+        return;
+    }
+
+    // A free-running ticker, spawned OUTSIDE the group.
+    let mut ticker = tokio::process::Command::new("sh")
+        .args(["-c", "while :; do echo tick; sleep 0.25; done"])
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn ticker");
+    let stdout = ticker.stdout.take().expect("ticker stdout");
+    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .expect("ticker prints")
+        .expect("read line")
+        .expect("a tick before adoption");
+
+    group.suspend().expect("suspend the empty group");
+    group
+        .adopt(&ticker)
+        .expect("adopt the ticker into the frozen cgroup");
+
+    // Drain ticks emitted before the freeze landed; 1s of silence (4× the
+    // tick period) means the child is genuinely frozen…
+    loop {
+        match tokio::time::timeout(Duration::from_secs(1), lines.next_line()).await {
+            Ok(Ok(Some(_))) => continue,
+            Ok(_) => panic!("ticker exited while frozen"),
+            Err(_) => break,
+        }
+    }
+    // …and stays frozen.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+            .await
+            .is_err(),
+        "a child adopted into a suspended cgroup must freeze on attach"
+    );
+
+    group.resume().expect("resume");
+    let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .expect("thawed ticker resumes output")
+        .expect("read line");
+    assert_eq!(line.as_deref(), Some("tick"));
+
+    let _ = ticker.kill().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess and shuts it down gracefully"]
+async fn shutdown_lets_a_term_handling_child_end_the_grace_early() {
+    let group = ProcessGroup::with_options(processkit::ProcessGroupOptions {
+        shutdown_timeout: Duration::from_secs(10),
+        ..Default::default()
+    })
+    .expect("create group");
+
+    // Exits 0 on SIGTERM. The sleep runs in the background (`wait` is
+    // interruptible; a foreground sleep would delay the trap until it ends).
+    let run = group
+        .start(&Command::new("sh").args(["-c", "trap 'exit 0' TERM; sleep 30 & wait"]))
+        .await
+        .expect("start");
+    // Reap concurrently: the graceful path's liveness probe sees a zombie as
+    // alive, so the child must actually be collected for the early return.
+    let waiter = tokio::spawn(run.wait());
+
+    let start = Instant::now();
+    tokio::time::timeout(Duration::from_secs(20), group.shutdown())
+        .await
+        .expect("shutdown bounded")
+        .expect("shutdown ok");
+    assert!(
+        start.elapsed() < Duration::from_secs(8),
+        "a TERM-handling child must end the 10s grace early (took {:?})",
+        start.elapsed()
+    );
+
+    let code = waiter.await.expect("join").expect("wait");
+    assert_eq!(code, Some(0), "the child exited via its TERM trap");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a TERM-ignoring subprocess and escalates to SIGKILL"]
+async fn shutdown_escalates_to_kill_after_the_grace_window() {
+    let group = ProcessGroup::with_options(processkit::ProcessGroupOptions {
+        shutdown_timeout: Duration::from_millis(500),
+        escalate_to_kill: true,
+        ..Default::default()
+    })
+    .expect("create group");
+
+    // Ignores SIGTERM and busy-waits (a foreground `sleep` would itself die to
+    // the broadcast TERM and end the script cleanly — defeating the test).
+    let run = group
+        .start(&Command::new("sh").args(["-c", "trap '' TERM; while :; do :; done"]))
+        .await
+        .expect("start");
+    let waiter = tokio::spawn(run.wait());
+
+    let start = Instant::now();
+    tokio::time::timeout(Duration::from_secs(15), group.shutdown())
+        .await
+        .expect("escalation keeps shutdown bounded")
+        .expect("shutdown ok");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "the grace window must be waited out before escalating ({elapsed:?})"
+    );
+
+    let code = waiter.await.expect("join").expect("wait");
+    assert_eq!(code, None, "SIGKILL leaves no exit code, got {code:?}");
 }
 
 #[tokio::test]

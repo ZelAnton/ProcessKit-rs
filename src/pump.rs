@@ -252,6 +252,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn crlf_only_line_is_one_empty_line() {
+        // A bare Windows line ending must read as one (empty) line — the
+        // terminator strip may not under- or over-consume.
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(&b"\r\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(sink.count(), 1);
+        assert_eq!(sink.drain(), vec![""]);
+    }
+
+    #[tokio::test]
+    async fn empty_reader_closes_with_no_lines() {
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(&b""[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(sink.count(), 0);
+        assert!(sink.drain().is_empty());
+        assert!(
+            matches!(sink.try_pop(), Popped::Closed),
+            "the sink must close on EOF so a streaming consumer ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_multibyte_decodes_lossily_not_fatally() {
+        // A lone Shift-JIS lead byte is an invalid sequence: the decode must
+        // produce a replacement character, never panic or drop the line.
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(
+            &[0x82, b'\n'][..],
+            encoding_rs::SHIFT_JIS,
+            None,
+            sink.clone(),
+        )
+        .await;
+        let lines = sink.drain();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains('\u{FFFD}'),
+            "invalid bytes decode to the replacement char: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn panicking_handler_still_closes_the_sink() {
         // A user handler that panics must not leave the sink un-closed — otherwise
         // a streaming consumer would park on `changed()` forever.

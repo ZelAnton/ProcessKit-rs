@@ -346,6 +346,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_match_without_fallback_is_a_not_found_spawn_error() {
+        let runner = ScriptedRunner::new().on(["status"], Reply::ok("clean"));
+        let err = runner
+            .output(&Command::new("git").arg("log"))
+            .await
+            .expect_err("an unmatched command with no fallback must error");
+        match err {
+            crate::error::Error::Spawn { program, source } => {
+                assert_eq!(program, "git");
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected Error::Spawn, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prefix_matches_whole_elements_not_substrings() {
+        let runner = ScriptedRunner::new().on(["foo"], Reply::ok("hit"));
+        // ["foo", anything…] matches — element-wise prefix.
+        assert!(
+            runner
+                .output(&Command::new("tool").args(["foo", "bar"]))
+                .await
+                .is_ok()
+        );
+        // ["foobar"] must NOT: "foo" is a substring, not an args prefix.
+        assert!(
+            runner
+                .output(&Command::new("tool").arg("foobar"))
+                .await
+                .is_err(),
+            "substring of an element is not a prefix match"
+        );
+    }
+
+    #[tokio::test]
     async fn timeout_reply_surfaces_as_timeout_error() {
         use crate::error::Error;
         let runner = ScriptedRunner::new().fallback(Reply::timeout());

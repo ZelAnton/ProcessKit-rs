@@ -456,6 +456,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_max_restarts_means_a_single_run() {
+        // `max_restarts(0)` = a zero restart budget: one run, reported as
+        // exhausted when the policy wanted more. A restart slipping through
+        // would consume the second (clean) reply and report PolicySatisfied
+        // with restarts=1 — the assertions below rule that out.
+        let outcome = supervise(SeqRunner::new(vec![fail(1), ok()]))
+            .max_restarts(0)
+            .run()
+            .await
+            .expect("supervision completes with the single run's result");
+        assert_eq!(outcome.restarts, 0);
+        assert_eq!(outcome.stopped, StopReason::RestartsExhausted);
+        assert_eq!(outcome.final_result.code(), Some(1));
+    }
+
+    #[tokio::test]
     async fn on_crash_accepts_a_clean_first_run() {
         let outcome = supervise(SeqRunner::new(vec![ok()]))
             .run()

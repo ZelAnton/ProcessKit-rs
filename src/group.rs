@@ -260,10 +260,13 @@ impl ProcessGroup {
     /// **Spawning into a suspended group is platform-divergent.** Under the
     /// Linux cgroup mechanism the freeze is *group state*: a child spawned (or
     /// adopted) while the group is suspended joins the frozen cgroup and
-    /// **starts frozen** — it does not run until [`resume`](Self::resume). The
-    /// Windows and POSIX process-group mechanisms freeze only the members
-    /// present at the call, so a later spawn runs normally. Don't start new
-    /// work in a suspended group (e.g. a
+    /// **starts frozen** — it does not run until [`resume`](Self::resume).
+    /// Worse, the *spawn call itself* can block until then: the child joins
+    /// the cgroup before `exec`, so it can freeze before the spawn handshake
+    /// completes and [`start`](Self::start) never returns. The Windows and
+    /// POSIX process-group mechanisms freeze only the members present at the
+    /// call, so a later spawn runs normally. Don't start new work in a
+    /// suspended group (e.g. a
     /// [`Supervisor::with_runner(&group)`](crate::Supervisor::with_runner)
     /// restarting into it) — resume first.
     pub fn suspend(&self) -> Result<()> {

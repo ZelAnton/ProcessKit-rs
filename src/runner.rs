@@ -335,6 +335,28 @@ mod tests {
         assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn retry_sleeps_the_backoff_between_attempts() {
+        // Two failures before success → exactly two backoff sleeps. The paused
+        // clock advances only through tokio sleeps, so elapsed virtual time
+        // proves the backoff is actually awaited (not silently skipped).
+        let runner = flaky(2);
+        let cmd = Command::new("x").retry(5, Duration::from_millis(100), |e| {
+            matches!(e, Error::Exit { .. })
+        });
+        let start = tokio::time::Instant::now();
+        assert_eq!(runner.run(&cmd).await.unwrap(), "out");
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(200),
+            "two retries must sleep two backoffs, waited {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_millis(400),
+            "no extra sleeps expected, waited {waited:?}"
+        );
+    }
+
     /// A runner whose every attempt fails with `Cancelled` — the token never
     /// un-cancels, so this is exactly what real retries would see.
     #[cfg(feature = "cancellation")]
