@@ -1,24 +1,48 @@
 # processkit
 
-Child-process management for Rust, in two layers:
+Async child-process management for Rust with a **kernel-backed no-orphan
+guarantee**: every process you start — and everything *it* spawns — lives in a
+kill-on-drop container, so no descendant outlives your program.
 
-- **Process groups** ([`ProcessGroup`]) — spawn a child as the root of a process
-  tree that is killed as a unit when the group is dropped, using Windows **Job
-  Objects**, Linux **cgroup v2** (with a POSIX **process-group** fallback) and a
-  POSIX **process group** on macOS/BSD, so no descendant ever outlives its owner.
-- **Process runner** ([`Command`]) — async (tokio) run-and-capture of a child's
-  `stdout`/`stderr` and exit status, built on the group layer, with a mockable
-  [`ProcessRunner`] seam for tests.
+```rust,no_run
+use processkit::Command;
 
-Async throughout. Errors are structured (`Error`); a non-zero exit is reported in
-the result, not raised, until you call `ProcessResult::ensure_success`.
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let version = Command::new("cargo").arg("--version").run().await?;
+    println!("{version}");
+    Ok(())
+}
+```
 
-> **Status:** feature-complete — process groups, the runner and capture helpers,
-> streaming, interactive stdin, push line-handlers, output-buffer policies,
-> encoding overrides, line counters, CPU/memory stats (with a time-series
-> sampler and per-run profiles), whole-tree resource limits
-> (memory / process-count / CPU), whole-tree signals plus suspend/resume, and
-> tree inspection (`members`, `wait_any`). See [`CHANGELOG.md`](CHANGELOG.md).
+## Why processkit?
+
+`std::process` and `tokio::process` reach (at most) the direct child. The
+processes *it* spawned — a build tool's compiler children, the real payload
+behind a wrapper (`cmd /c …`, `sh -c …`), a test's helper servers — survive a
+timeout, a panic, or a dropped future, and keep running as orphans.
+
+`processkit` spawns every child into the operating system's own containment
+primitive — a **Job Object** on Windows, a **cgroup v2** on Linux (with a
+process-group fallback), a POSIX **process group** on macOS/BSD — so teardown
+is a kernel operation over the whole tree, not a best-effort signal to one pid:
+
+- **Nothing escapes silently.** Dropping the handle or group reaps every
+  descendant, grandchildren included. Where a mechanism has a genuine weakness
+  (a `setsid` child escapes a POSIX process group), the active
+  [`Mechanism`](https://docs.rs/processkit/latest/processkit/enum.Mechanism.html)
+  is reported instead of pretending — never a silent downgrade.
+- **Async-first.** Run-and-capture, line streaming, interactive stdin,
+  readiness probes, shell-free pipelines, supervision — all tokio futures.
+- **Honest results.** A non-zero exit is data ([`ProcessResult`]) until you ask
+  for success; a timeout is *captured* in the result; a cancellation is always
+  an error; every platform divergence is typed or documented.
+- **Testable.** One trait seam ([`ProcessRunner`]) swaps the real spawner for
+  scripted doubles or record/replay cassettes — no subprocess in your tests.
+
+> **Status:** feature-complete — every capability below ships today; pre-1.0,
+> so the API can still move between minor versions. See
+> [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Install
 
@@ -28,41 +52,25 @@ cargo add processkit
 
 This crate requires a [tokio](https://tokio.rs/) runtime.
 
-## Documentation
+## Picking a verb
 
-This README is the quick tour. The **[`docs/` guide set](docs/README.md)**
-goes deeper on every capability, with more examples and the platform fine
-print collected in one place:
+Every run starts with the same builder; the verb you finish with decides what
+you get back:
 
-| Guide | Covers |
-|---|---|
-| [Running commands](docs/commands.md) | The full `Command` builder and every consuming verb, with error semantics |
-| [Process groups](docs/process-groups.md) | Containment, teardown, signals, suspend/resume, members, limits, stats |
-| [Streaming & interactive I/O](docs/streaming.md) | Line streaming, conversational stdin, readiness probes, `wait_any`, profiling |
-| [Pipelines](docs/pipelines.md) | Shell-free `a \| b \| c`, pipefail attribution, chain timeouts |
-| [Timeouts, retries & cancellation](docs/timeouts-and-cancellation.md) | Captured vs raised deadlines, retry classifiers, `CancellationToken` |
-| [Supervision](docs/supervision.md) | Restart policies, backoff & jitter, stop conditions, outcomes |
-| [Testing your code](docs/testing.md) | The `ProcessRunner` seam, scripted/recording/mock doubles, cassettes, `CliClient` |
-| [Platform support](docs/platform-support.md) | Mechanisms, all capability matrices, every caveat |
-
-API reference: [docs.rs/processkit](https://docs.rs/processkit).
-
-## Feature flags
-
-Each flag is **additive** and only gates *visibility* — the kill-on-drop tree
-guarantee is unconditional in every configuration.
-
-| Feature | Default | Adds |
+| You want | Call | You get |
 |---|---|---|
-| `stats` | ✅ | group/per-run resource measurement, `sample_stats`, `profile` |
-| `process-control` | ✅ | `Signal`, `ProcessGroup::{signal, suspend, resume, members, adopt}` |
-| `limits` | — | whole-tree resource caps (implies `stats`) |
-| `cancellation` | — | `CancellationToken` integration (pulls `tokio-util`) |
-| `record` | — | record/replay cassettes (pulls `serde`) |
-| `mock` | — | `mockall`-generated `MockRunner` |
-| `tracing` | — | a `tracing` event per run |
+| stdout, success required | [`.run()`] | trimmed `String`; non-zero exit / timeout / kill → typed `Error` |
+| the full outcome, exit code as data | `.output_string()` / `.output_bytes()` | [`ProcessResult`] — code, stdout, stderr, `timed_out`; never errors on non-zero |
+| just the exit code | `.exit_code()` | `i32` (a timed-out / killed run errors instead of inventing `-1`) |
+| a yes/no answer | `.probe()` | `bool` — exit 0 → `true`, 1 → `false`, anything else errors |
+| the first matching output line | `.first_line(\|l\| …)` | `Option<String>` — `None` when stdout closes without a match |
+| a live handle — streaming, stdin, probes | `.start()` | [`RunningProcess`] |
 
-## Usage
+The same vocabulary repeats on every layer (`ProcessRunner`, `CliClient`), and
+`processkit::run("git", ["status"])` / `processkit::output(…)` skip the builder
+for one-liners.
+
+## Quick start
 
 ```rust,no_run
 use processkit::{Command, ProcessGroup, Stdin};
@@ -94,6 +102,43 @@ async fn main() -> processkit::Result<()> {
     Ok(())
 }
 ```
+
+## Documentation
+
+This README is the quick tour. The **[`docs/` guide set](docs/README.md)**
+goes deeper on every capability, with more examples and the platform fine
+print collected in one place. New here? Skim the [Cookbook](docs/cookbook.md)
+first — it maps "I want to …" tasks to working snippets — then read
+[Running commands](docs/commands.md) end to end:
+
+| Guide | Covers |
+|---|---|
+| [Cookbook](docs/cookbook.md) | Task → snippet recipes for everything below; the fastest way in |
+| [Running commands](docs/commands.md) | The full `Command` builder and every consuming verb, with error semantics |
+| [Process groups](docs/process-groups.md) | Containment, teardown, signals, suspend/resume, members, limits, stats |
+| [Streaming & interactive I/O](docs/streaming.md) | Line streaming, conversational stdin, readiness probes, `wait_any`, profiling |
+| [Pipelines](docs/pipelines.md) | Shell-free `a \| b \| c`, pipefail attribution, chain timeouts |
+| [Timeouts, retries & cancellation](docs/timeouts-and-cancellation.md) | Captured vs raised deadlines, retry classifiers, `CancellationToken` |
+| [Supervision](docs/supervision.md) | Restart policies, backoff & jitter, stop conditions, outcomes |
+| [Testing your code](docs/testing.md) | The `ProcessRunner` seam, scripted/recording/mock doubles, cassettes, `CliClient` |
+| [Platform support](docs/platform-support.md) | Mechanisms, all capability matrices, every caveat |
+
+API reference: [docs.rs/processkit](https://docs.rs/processkit).
+
+## Feature flags
+
+Each flag is **additive** and only gates *visibility* — the kill-on-drop tree
+guarantee is unconditional in every configuration.
+
+| Feature | Default | Adds |
+|---|---|---|
+| `stats` | ✅ | group/per-run resource measurement, `sample_stats`, `profile` |
+| `process-control` | ✅ | `Signal`, `ProcessGroup::{signal, suspend, resume, members, adopt}` |
+| `limits` | — | whole-tree resource caps (implies `stats`) |
+| `cancellation` | — | `CancellationToken` integration (pulls `tokio-util`) |
+| `record` | — | record/replay cassettes (pulls `serde`) |
+| `mock` | — | `mockall`-generated `MockRunner` |
+| `tracing` | — | a `tracing` event per run |
 
 ## Capping a group's resources
 
@@ -133,6 +178,8 @@ as root, in a container, or under a systemd unit with `Delegate=yes`). When a
 requested limit can't be enforced, `with_options` returns `Error::ResourceLimit`
 instead of a silently-unbounded group — an unapplied cap is no protection.
 
+*Deeper: [Process groups → resource limits](docs/process-groups.md).*
+
 ## Signalling and pausing the whole tree
 
 Beyond the kill/shutdown teardown verbs, a group can broadcast a signal to every
@@ -161,6 +208,8 @@ the Job Object terminate) and anything else returns `Error::Unsupported`.
 macOS/BSD and the Linux process-group fallback (both idempotent), and
 per-thread suspension on Windows (best-effort; only there nested suspends
 stack and need matching resumes).
+
+*Deeper: [Process groups → signals, suspend/resume](docs/process-groups.md).*
 
 ## Inspecting the tree
 
@@ -192,6 +241,9 @@ is part of the default-on `process-control` feature; `wait_any` is always
 available.) `wait_any` applies no per-process timeout (bound the race with
 `tokio::time::timeout`) and does no output pumping — drain chatty children
 first.
+
+*Deeper: [Process groups → members](docs/process-groups.md) ·
+[Streaming → racing children](docs/streaming.md).*
 
 ## Sampling stats over time
 
@@ -230,6 +282,9 @@ Linux cgroup; counts only on the POSIX process-group backends); `profile`
 samples the started child process itself and applies the run's normal
 timeout/output handling.
 
+*Deeper: [Process groups → stats](docs/process-groups.md) ·
+[Streaming → profiling a run](docs/streaming.md).*
+
 ## Supervising a long-lived child
 
 Where `Command::retry` replays one run until it succeeds, a `Supervisor` keeps a
@@ -260,6 +315,8 @@ count, and why supervision stopped. Supervision is platform-agnostic and runs
 through the `ProcessRunner` seam: pass `.with_runner(&group)` to keep every
 incarnation in one shared kill-on-drop group, or a `ScriptedRunner` to test
 supervision logic hermetically.
+
+*Deeper: [Supervision](docs/supervision.md).*
 
 ## Waiting for a child to be ready
 
@@ -305,6 +362,8 @@ happens next. `wait_for_line` consumes stdout up to the match
 (continue with `finish_streamed`); `wait_for_port` / `wait_for` don't touch
 the pipes at all.
 
+*Deeper: [Streaming → readiness probes](docs/streaming.md).*
+
 ## Pipelines without a shell
 
 `a | b | c` without a shell string — native pipes, so no quoting or injection
@@ -331,6 +390,8 @@ exit cleanly (or the last stage when all succeed). The first stage's `stdin`
 source is honored; inner stages read from the pipe. `.timeout(d)` bounds the
 whole chain (killing every stage at the deadline), and `run()` requires every
 stage to succeed, returning the trimmed final stdout.
+
+*Deeper: [Pipelines](docs/pipelines.md).*
 
 ## Environment and privileges
 
@@ -370,6 +431,8 @@ no-op outside Windows and, unlike the raw `ProcessGroup::spawn` escape hatch,
 survives the group's `CREATE_SUSPENDED` containment flag (they are OR'd
 together).
 
+*Deeper: [Running commands → privileges and spawn flags](docs/commands.md).*
+
 ## Cancelling a run
 
 Requires the **`cancellation`** feature (off by default). Hand a command a
@@ -406,6 +469,8 @@ spawning anything. On a shared [`ProcessGroup`] handle, cancelling kills the
 child itself but leaves the group's siblings alone (same scope as a timeout),
 and a supervised command that gets cancelled stops its `Supervisor` for good —
 restarting into a still-cancelled token would loop futilely.
+
+*Deeper: [Timeouts, retries & cancellation](docs/timeouts-and-cancellation.md).*
 
 ## Async streaming and interactive I/O
 
@@ -503,6 +568,8 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
+*Deeper: [Streaming & interactive I/O](docs/streaming.md).*
+
 ## Wrapping a CLI tool
 
 `CliClient` + the `cli_client!` macro turn a typed wrapper around an external
@@ -521,6 +588,8 @@ impl<R: ProcessRunner> Git<R> {
     }
 }
 ```
+
+*Deeper: [Testing your code → CliClient](docs/testing.md).*
 
 ## Recording and replaying runs
 
@@ -555,6 +624,8 @@ stable final answer. An invocation absent from the cassette is a strict error
 (replay never spawns a surprise subprocess), and the file carries a format
 `version` so future readers fail loudly instead of misreading old fixtures.
 
+*Deeper: [Testing your code → record/replay](docs/testing.md).*
+
 ## Contributing
 
 Running the tests and the (maintainer-only) release process are documented in
@@ -566,6 +637,8 @@ Licensed under the [MIT License](LICENSE).
 
 [`ProcessGroup`]: https://docs.rs/processkit/latest/processkit/struct.ProcessGroup.html
 [`Command`]: https://docs.rs/processkit/latest/processkit/struct.Command.html
+[`ProcessResult`]: https://docs.rs/processkit/latest/processkit/struct.ProcessResult.html
+[`.run()`]: https://docs.rs/processkit/latest/processkit/struct.Command.html#method.run
 [`ProcessRunner`]: https://docs.rs/processkit/latest/processkit/trait.ProcessRunner.html
 [`RunningProcess`]: https://docs.rs/processkit/latest/processkit/struct.RunningProcess.html
 [`timeout`]: https://docs.rs/processkit/latest/processkit/struct.Command.html#method.timeout

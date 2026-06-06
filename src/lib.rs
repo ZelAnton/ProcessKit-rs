@@ -33,6 +33,13 @@
 //! exit is reported in [`ProcessResult`], not raised, until you call
 //! [`ProcessResult::ensure_success`].
 //!
+//! Beyond this page, the repository ships a narrative [guide set] — a
+//! task-oriented [cookbook] ("I want to …" → snippet), a deep guide per
+//! capability, and every per-platform caveat collected in one place.
+//!
+//! [guide set]: https://github.com/ZelAnton/ProcessKit-rs/tree/main/docs#readme
+//! [cookbook]: https://github.com/ZelAnton/ProcessKit-rs/blob/main/docs/cookbook.md
+//!
 //! **Run vocabulary** — the same verb means the same thing at every layer
 //! ([`Command`], [`ProcessRunner`]/[`ProcessRunnerExt`], [`CliClient`]):
 //!

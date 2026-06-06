@@ -26,8 +26,16 @@ test doubles never touch the OS at all.
 
 ## Guides
 
+**New to the crate?** Start with the [Cookbook](cookbook.md) — short
+task-to-snippet recipes for everything the crate does — then read
+[Running commands](commands.md) end to end (it's the vocabulary every other
+guide builds on). Reach for the rest as the need arises, and keep
+[Platform support](platform-support.md) handy before you ship: it collects
+every per-OS caveat in one place.
+
 | Guide | Covers |
 |---|---|
+| [Cookbook](cookbook.md) | "I want to …" → working snippet, for every capability; each recipe links to its deep guide |
 | [Running commands](commands.md) | The `Command` builder end to end: args, env, stdin sources, encodings, buffer policies, line handlers, timeouts, retry, privileges — and every consuming verb (`run`, `output_string`, `probe`, …) with its error semantics |
 | [Process groups](process-groups.md) | Kill-on-drop containment: creating groups, spawning/adopting, teardown verbs, whole-tree signals, suspend/resume, member listing, resource limits, stats sampling |
 | [Streaming & interactive I/O](streaming.md) | `start()` and the live `RunningProcess`: line streaming, interactive stdin, readiness probes (`wait_for_line` / `wait_for_port` / `wait_for`), racing children with `wait_any`, per-run profiling |
