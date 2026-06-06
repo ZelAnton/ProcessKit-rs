@@ -114,11 +114,17 @@
 //!   `Command::cancel_on` ties a run to a `CancellationToken`; cancelling it
 //!   kills the tree and every consuming path resolves to `Error::Cancelled`.
 //!   Re-exports `CancellationToken` (from `tokio-util`).
+//! - **`record`** — record/replay cassettes over the [`ProcessRunner`] seam:
+//!   `RecordReplayRunner` records real `Invocation → ProcessResult` pairs to a
+//!   JSON fixture once, then replays them hermetically — no subprocess in CI.
+//!   Pulls in `serde` + `serde_json`.
 //!
 //! [Job Object]: https://learn.microsoft.com/windows/win32/procthread/job-objects
 //! [cgroup v2]: https://docs.kernel.org/admin-guide/cgroup-v2.html
 
 mod buffer;
+#[cfg(feature = "record")]
+mod cassette;
 mod client;
 mod command;
 mod doubles;
@@ -140,6 +146,8 @@ mod supervisor;
 mod sys;
 
 pub use buffer::{OutputBufferPolicy, OverflowMode};
+#[cfg(feature = "record")]
+pub use cassette::RecordReplayRunner;
 pub use client::CliClient;
 pub use command::Command;
 pub use doubles::{Invocation, RecordingRunner, Reply, ScriptedRunner};

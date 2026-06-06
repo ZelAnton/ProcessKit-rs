@@ -17,6 +17,18 @@ to a dated version section.
 > (`minor`), not a patch.
 
 ### Added
+- Record/replay cassettes (`record` feature, off by default, pulls optional
+  `serde` + `serde_json`): `RecordReplayRunner::record(path, inner)` captures
+  real `Invocation → ProcessResult` pairs through any inner runner and writes
+  a human-diffable JSON cassette (`save()`, or best-effort on drop);
+  `RecordReplayRunner::replay(path)` serves them back hermetically — no
+  subprocess. Matching is by program + args + cwd + has-stdin; env override
+  values are never written (sorted names only — a committed fixture can't
+  leak secrets) and env is not part of the match key. Duplicates of one
+  invocation replay in capture order, then the last entry repeats. A miss in
+  replay is a strict `Error::Spawn` (NotFound) — replay never spawns. The
+  cassette carries a format `version` for forward evolution; non-UTF-8
+  program/args/cwd are stored lossily (documented).
 - Cancellation (`cancellation` feature, off by default, pulls optional
   `tokio-util`): `Command::cancel_on(token)` ties a run to a re-exported
   `CancellationToken` — cancelling it kills the process tree and every

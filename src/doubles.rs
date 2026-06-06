@@ -214,7 +214,10 @@ pub struct Invocation {
 }
 
 impl Invocation {
-    fn from_command(command: &Command) -> Self {
+    // pub(crate): the `record` feature's cassette runner captures inputs
+    // through this same single path, so recordings and `RecordingRunner`
+    // assertions can never disagree on what an invocation is.
+    pub(crate) fn from_command(command: &Command) -> Self {
         Self {
             program: command.program().to_os_string(),
             args: command.arguments().to_vec(),

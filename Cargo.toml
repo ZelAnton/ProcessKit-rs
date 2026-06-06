@@ -75,6 +75,11 @@ mockall = { version = "0.13", optional = true }
 # (where CancellationToken lives) is always compiled in tokio-util — no inner
 # feature needed; default-features = false pulls in nothing else.
 tokio-util = { version = "0.7", default-features = false, optional = true }
+# Optional serialization for the `record` feature's JSON cassettes
+# (RecordReplayRunner): `derive` for the cassette structs, serde_json for the
+# human-diffable on-disk format. Never in production builds without `record`.
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [features]
 # `stats` ships in the default set because `ProcessGroupStats` & friends predate
@@ -97,6 +102,10 @@ tracing = ["dep:tracing"]
 # First-class run cancellation: `Command::cancel_on(token)`, `Error::Cancelled`,
 # and the `CancellationToken` re-export. Off by default; pulls in `tokio-util`.
 cancellation = ["dep:tokio-util"]
+# Record/replay cassettes over the `ProcessRunner` seam: `RecordReplayRunner`
+# records real `Invocation → ProcessResult` pairs to a JSON fixture and replays
+# them hermetically. Off by default; pulls in serde + serde_json.
+record = ["dep:serde", "dep:serde_json"]
 
 [target.'cfg(windows)'.dependencies]
 # Win32 Job Object FFI for kill-on-close process trees: CreateJobObjectW /
@@ -131,6 +140,9 @@ libc = "0.2"
 # tests (virtual time instead of real sleeps); `net` binds the ephemeral
 # TcpListener the `wait_for_port` integration test probes against.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "test-util", "net"] }
+# Auto-cleaned, parallel-safe temp files for the `record` cassette round-trip
+# tests (hand-rolled temp_dir paths leak and race under parallel test runs).
+tempfile = "3"
 
 [target.'cfg(windows)'.dev-dependencies]
 # Liveness probe (OpenProcess) in the integration test that proves a grandchild
