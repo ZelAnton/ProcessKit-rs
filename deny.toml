@@ -1,10 +1,23 @@
-# cargo-deny configuration. CI runs `cargo deny check advisories bans`
-# (see .github/workflows/ci.yml). Licenses/sources are not gated for now.
+# cargo-deny configuration. CI runs `cargo deny check advisories bans licenses`
+# (see .github/workflows/ci.yml). Sources are not gated for now.
 
 [advisories]
 # Fail on crates with a RustSec security advisory or that have been yanked.
 version = 2
 yanked = "deny"
+
+[licenses]
+# This crate is MIT; the dependency tree must stay on permissive licenses a
+# downstream MIT/Apache consumer can absorb. A new transitive dependency with
+# anything outside this list (copyleft, source-available, unknown) fails CI
+# loudly instead of slipping into a release.
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+]
 
 [bans]
 # Duplicate versions of the same crate are a warning, not a hard failure.

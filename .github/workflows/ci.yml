@@ -97,10 +97,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      # Scan the dependency tree for security advisories and banned/duplicate crates.
+      # Scan the dependency tree for security advisories, banned/duplicate
+      # crates, and licenses outside the permissive allow-list (deny.toml).
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check advisories bans
+          command: check advisories bans licenses
 
   msrv:
     name: msrv (1.88)

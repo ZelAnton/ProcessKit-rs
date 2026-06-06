@@ -12,6 +12,11 @@ use crate::common::*;
 #[ignore = "creates an OS job/cgroup and reads accounting"]
 async fn group_stats_report_active_processes() {
     let group = ProcessGroup::new().expect("create group");
+    if matches!(group.mechanism(), Mechanism::None) {
+        // No containment → stats() honestly reports zero live processes.
+        eprintln!("skipping: no containment on this target");
+        return;
+    }
     let _process = group.start(&sleeper()).await.expect("spawn sleeper");
     let stats = group.stats().expect("stats");
     assert!(
