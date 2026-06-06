@@ -1675,7 +1675,20 @@ mod cancellation {
         use tokio_stream::StreamExt;
 
         let token = CancellationToken::new();
-        let mut run = banner_then_idle()
+        // Windows: the Job kill is atomic — the cmd-wrapped banner child is
+        // fine. Unix: deliberately FORK-FREE (`read` parks the shell itself,
+        // stdin kept open) — a `sleep 30` forked at cancel time escaped the
+        // pgroup broadcast on macOS CI (killpg is documented best-effort
+        // against a forking tree) and held the stdout pipe open past the
+        // stream bound.
+        let child = if cfg!(windows) {
+            banner_then_idle()
+        } else {
+            Command::new("sh")
+                .args(["-c", "echo ready; read line"])
+                .keep_stdin_open()
+        };
+        let mut run = child
             .cancel_on(token.clone())
             .start()
             .await

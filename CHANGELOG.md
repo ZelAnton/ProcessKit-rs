@@ -32,6 +32,17 @@ to a dated version section.
 - `windows-sys` bumped 0.59 → 0.61 to dedup with the copy tokio/mio already
   ship — the lockfile now carries a single `windows-sys`.
 
+### Fixed
+- The streaming deadline/cancellation kill paths now also kill the **direct
+  child by pid** after the group teardown — parity with the run-to-completion
+  path's `start_kill` + `terminate_all` pairing, so a group-kill miss on the
+  direct child can't leave a bounded stream running. Safe against pid reuse:
+  the tasks are aborted when the handle drops, so they can only fire while
+  the child is live or an unreaped zombie (its pid still held). (Note: this
+  cannot rescue a *grandchild* forked mid-broadcast — the POSIX group
+  broadcast is documented best-effort against a forking tree, which is what
+  one macOS CI run actually hit.)
+
 ### Added
 - `docs/` guide set — eight cross-linked, per-topic guides (running commands,
   process groups, streaming & interactive I/O, pipelines, timeouts/retries/

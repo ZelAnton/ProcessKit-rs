@@ -314,11 +314,13 @@ impl RunningProcess {
             && let (Some(limit), Some(group)) = (self.timeout, self.own_group.as_ref())
         {
             let group = Arc::downgrade(group);
+            let pid = self.pid;
             self.deadline_task = Some(tokio::spawn(async move {
                 tokio::time::sleep(limit).await;
                 if let Some(group) = group.upgrade() {
                     let _ = group.terminate_all();
                 }
+                kill_direct_child(pid);
             }));
         }
 
@@ -330,11 +332,13 @@ impl RunningProcess {
             && let (Some(token), Some(group)) = (self.cancel_token.clone(), self.own_group.as_ref())
         {
             let group = Arc::downgrade(group);
+            let pid = self.pid;
             self.cancel_task = Some(tokio::spawn(async move {
                 token.cancelled().await;
                 if let Some(group) = group.upgrade() {
                     let _ = group.terminate_all();
                 }
+                kill_direct_child(pid);
             }));
         }
 
@@ -858,6 +862,38 @@ impl Drop for RunningProcess {
             task.abort();
         }
     }
+}
+
+/// Best-effort kill of the direct child by pid, used by the streaming
+/// deadline/cancel tasks after the group teardown — parity with
+/// `kill_tree`'s `start_kill` + `terminate_all` pairing (the tasks can't
+/// reach the `Child` handle, so they signal by pid). The group kill usually
+/// makes this a no-op; it exists so a group-kill miss (e.g. a pgroup
+/// broadcast racing the tree) still closes the pipes and ends the stream.
+fn kill_direct_child(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    #[cfg(unix)]
+    // SAFETY: SIGKILL to a specific live-or-zombie pid; an exited/reaped pid
+    // yields ESRCH, which is ignored.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    // SAFETY: opens the process by id with the narrowest right; both calls
+    // tolerate an already-exited process (open fails, handle closed once).
+    unsafe {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+        };
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if !handle.is_null() {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
 }
 
 /// Await the output pumps, bounded by [`PUMP_TEARDOWN`]; abort stragglers.
