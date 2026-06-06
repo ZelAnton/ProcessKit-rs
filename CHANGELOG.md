@@ -20,6 +20,17 @@ to a dated version section.
 ### Fixed
 -
 
+## [0.7.1] - 2026-06-06
+
+### Fixed
+
+- fix: repair main after the v0.7.0 release commit was dropped (manifest, changelog, release guard)
+
+
+### Added
+
+- Add cover art to the project overview
+
 ## [0.6.2] - 2026-06-06 [YANKED]
 
 - **Yanked on crates.io — use 0.7.0.** A force-push had dropped the
@@ -447,7 +458,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.7.0...v0.7.1
 [0.6.2]: https://github.com/ZelAnton/ProcessKit-rs/releases/tag/v0.6.2
 [0.7.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.6.0...v0.6.1
