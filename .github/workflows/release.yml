@@ -123,6 +123,17 @@ jobs:
             exit 1
           fi
           if git tag --list 'v*' | grep -q .; then
+            # GUARD: the manifest must not be BEHIND the newest release tag.
+            # That state means a release commit was dropped from main (e.g. a
+            # force-push landed a commit based on a pre-release main) — bumping
+            # from the stale manifest would re-release old numbers and ship
+            # newer content under a semver-compatible version (this exact
+            # accident published 0.7.0's content as 0.6.2 once).
+            MAX_TAG=$(git tag --list 'v*' | sort -V | tail -n1)
+            if [ "$(printf '%s\n' "$MAX_TAG" "v$CURRENT" | sort -V | tail -n1)" != "v$CURRENT" ]; then
+              echo "::error::Cargo.toml says $CURRENT but the newest release tag is $MAX_TAG — main is behind the latest release. A release commit was probably dropped from main (force-push?). Restore the manifest/changelog to the released state before releasing."
+              exit 1
+            fi
             # A prior release exists: apply the chosen bump.
             IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
             case "${{ inputs.bump }}" in
@@ -130,6 +141,12 @@ jobs:
               minor) NEW="${MAJOR}.$((MINOR+1)).0" ;;
               patch) NEW="${MAJOR}.${MINOR}.$((PATCH+1))" ;;
             esac
+            # GUARD: the computed version must sort strictly above every
+            # existing tag (belt to the check above's braces).
+            if [ "$(printf '%s\n' "$MAX_TAG" "v$NEW" | sort -V | tail -n1)" != "v$NEW" ] || [ "v$NEW" = "$MAX_TAG" ]; then
+              echo "::error::Computed next version v$NEW does not sort above the newest existing tag $MAX_TAG. Refusing to release."
+              exit 1
+            fi
             PREV="v$CURRENT"
           else
             # First release: ship the current Cargo.toml version as-is.

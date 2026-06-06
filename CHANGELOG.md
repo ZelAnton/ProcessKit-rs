@@ -20,12 +20,23 @@ to a dated version section.
 ### Fixed
 -
 
-## [0.6.2] - 2026-06-06
+## [0.6.2] - 2026-06-06 [YANKED]
+
+- **Yanked on crates.io — use 0.7.0.** A force-push had dropped the
+  `Release v0.7.0` commit from `main` before this patch release ran, so the
+  release workflow computed the next version from the stale `0.6.1` manifest
+  and published the **entire 0.7.0 content below under a `^0.6`-compatible
+  patch version** — including the changes that are breaking for
+  `default-features = false` consumers. The `v0.6.2` tag and GitHub Release
+  remain for the record; the crates.io version is yanked. (The release
+  workflow now refuses to run when the manifest is behind the latest release
+  tag, so this failure mode is caught before publishing.)
+
+## [0.7.0] - 2026-06-06
 
 > **Release note:** this cycle contains a **breaking** change for
 > `default-features = false` consumers (resource measurement moved behind the
-> now-default `stats` feature — see *Changed*). Release it as **0.7.0**
-> (`minor`), not a patch.
+> now-default `stats` feature — see *Changed*).
 
 ### Changed
 - The tree-control surface is now behind a **default-on** `process-control`
@@ -436,8 +447,9 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.6.2...HEAD
-[0.6.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.6.1...v0.6.2
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.7.0...HEAD
+[0.6.2]: https://github.com/ZelAnton/ProcessKit-rs/releases/tag/v0.6.2
+[0.7.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.5.1...v0.5.2
