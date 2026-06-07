@@ -124,6 +124,15 @@ where
                 }
                 match &policy {
                     Some(p) if tries < p.max_attempts && (p.classifier)(&err) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!(
+                            target: "processkit",
+                            attempt = tries,
+                            max_attempts = p.max_attempts,
+                            backoff_ms = p.backoff.as_millis() as u64,
+                            error = %err,
+                            "retrying after a retryable failure"
+                        );
                         tokio::time::sleep(p.backoff).await;
                     }
                     _ => return Err(err),
@@ -224,6 +233,14 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     };
     let mut child = group.spawn_with_options(&mut tokio_cmd, &opts)?;
     let pid = child.id();
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        target: "processkit",
+        program = %command.program_name(),
+        pid = ?pid,
+        mechanism = ?group.mechanism(),
+        "child spawned"
+    );
 
     let (stdin_pipe, stdin_task) = if command.keeps_stdin_open() {
         // Interactive: hand the pipe to the caller via `standard_input`.

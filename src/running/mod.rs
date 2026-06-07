@@ -313,6 +313,7 @@ impl RunningProcess {
         };
 
         let (code, timed_out) = self.drive_to_exit().await?;
+        self.observe_stdin_task().await;
         // Bound the drain by the same teardown grace as the line pumps: on a
         // shared-group handle a surviving descendant can hold stdout open past
         // the child's death, and an unbounded `read_to_end` here would park
@@ -482,6 +483,7 @@ impl RunningProcess {
         let outcome = self.drive_to_exit().await;
         on_exit();
         let outcome = outcome?;
+        self.observe_stdin_task().await;
         join_pumps(pumps).await;
         let (code, timed_out) = self.checked_outcome(outcome)?;
 
@@ -538,6 +540,38 @@ impl RunningProcess {
         Ok(outcome)
     }
 
+    /// Surface a stdin writer that failed for a reason other than the normal
+    /// broken pipe (the child exiting before reading all of stdin is routine
+    /// and tested). Only a writer that already **finished** is observed — a
+    /// task still parked (e.g. on a slow `from_reader` source) is left for
+    /// `Drop`'s abort, so teardown timing is unchanged. Diagnostics only:
+    /// never alters the run's result.
+    async fn observe_stdin_task(&mut self) {
+        let Some(task) = self.stdin_task.take() else {
+            return;
+        };
+        if !task.is_finished() {
+            self.stdin_task = Some(task);
+            return;
+        }
+        // The task is finished, so this await is immediate.
+        match task.await {
+            Ok(Err(e)) if !is_broken_pipe(&e) => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    target: "processkit",
+                    program = %self.program,
+                    error = %e,
+                    "stdin writer failed"
+                );
+                #[cfg(not(feature = "tracing"))]
+                let _ = e;
+            }
+            // Clean completion, the routine broken pipe, or an abort.
+            _ => {}
+        }
+    }
+
     /// Stop the streaming watchdog tasks (deadline/cancel) once the child's
     /// fate is settled — mirroring the `profile` sampler's early abort, so a
     /// late firing can't `kill_direct_child` a pid the consuming method has
@@ -581,6 +615,13 @@ impl RunningProcess {
             Some(limit) => match tokio::time::timeout(limit, self.child.wait()).await {
                 Ok(status) => Ok((status?.code(), false)),
                 Err(_elapsed) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        target: "processkit",
+                        program = %self.program,
+                        timeout_ms = limit.as_millis() as u64,
+                        "timeout elapsed; killing the tree"
+                    );
                     self.kill_tree().await;
                     Ok((None, true))
                 }
@@ -615,10 +656,23 @@ impl RunningProcess {
         tokio::select! {
             status = self.child.wait() => Ok((status?.code(), false)),
             () = cancelled => {
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    target: "processkit",
+                    program = %self.program,
+                    "cancellation fired; killing the tree"
+                );
                 self.kill_tree().await;
                 Ok((None, false))
             }
             () = deadline => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    target: "processkit",
+                    program = %self.program,
+                    timeout_ms = limit.map(|l| l.as_millis() as u64).unwrap_or(0),
+                    "timeout elapsed; killing the tree"
+                );
                 self.kill_tree().await;
                 Ok((None, true))
             }
@@ -628,10 +682,14 @@ impl RunningProcess {
     /// Hard-kill the child and (for a private group) its tree, then reap —
     /// the shared teardown of the timeout and cancellation arms.
     async fn kill_tree(&mut self) {
+        // Best-effort: the child may already be exiting or reaped.
         let _ = self.child.start_kill();
         if let Some(group) = &self.own_group {
+            // Best-effort whole-tree kill; the group's Drop backstops it.
             let _ = group.terminate_all();
         }
+        // Reap after the kill; a wait error here cannot change the outcome
+        // the caller is about to report.
         let _ = self.child.wait().await;
     }
 
@@ -675,6 +733,13 @@ impl Drop for RunningProcess {
     }
 }
 
+/// Whether `e` is the routine pipe-closed write error — `BrokenPipe`, plus the
+/// raw Windows encodings (`ERROR_BROKEN_PIPE` = 109, `ERROR_NO_DATA` = 232)
+/// that don't always map to the kind.
+fn is_broken_pipe(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::BrokenPipe || matches!(e.raw_os_error(), Some(109 | 232))
+}
+
 /// Await the output pumps, bounded by [`PUMP_TEARDOWN`]; abort stragglers.
 async fn join_pumps(tasks: Vec<JoinHandle<()>>) {
     if tasks.is_empty() {
@@ -683,10 +748,29 @@ async fn join_pumps(tasks: Vec<JoinHandle<()>>) {
     let aborts: Vec<_> = tasks.iter().map(|t| t.abort_handle()).collect();
     let join = async {
         for task in tasks {
+            // A pump that panicked (e.g. a panicking user line-handler) has
+            // already closed its sink via its close-on-drop guard, so partial
+            // output is intact — the documented contract. Surface the panic
+            // for diagnostics, never as a run error.
+            #[cfg(feature = "tracing")]
+            if let Err(e) = task.await {
+                tracing::warn!(target: "processkit", error = %e, "output pump task ended abnormally");
+            }
+            #[cfg(not(feature = "tracing"))]
             let _ = task.await;
         }
     };
     if tokio::time::timeout(PUMP_TEARDOWN, join).await.is_err() {
+        // A pipe is still held open past the child's death (the surviving-
+        // grandchild case PUMP_TEARDOWN exists for) — abort and keep what
+        // arrived.
+        #[cfg(feature = "tracing")]
+        tracing::warn!(
+            target: "processkit",
+            timeout_ms = PUMP_TEARDOWN.as_millis() as u64,
+            aborted = aborts.len(),
+            "output pumps overran teardown grace; aborting stragglers"
+        );
         for abort in aborts {
             abort.abort();
         }

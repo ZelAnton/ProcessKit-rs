@@ -141,6 +141,8 @@ impl RunningProcess {
         if let Some(mut pipe) = self.stdout_pipe.take() {
             tokio::spawn(async move {
                 let mut sink = Vec::new();
+                // Result ignored on purpose: the drain exists only to unblock
+                // the child; the bytes are discarded either way.
                 let _ = pipe.read_to_end(&mut sink).await;
             });
         }
@@ -160,9 +162,12 @@ impl RunningProcess {
         }
 
         let outcome = self.drive_to_exit().await?;
+        self.observe_stdin_task().await;
         let (code, _timed_out) = self.checked_outcome(outcome)?;
         // The child has exited, so its stderr pipe is closed — await the pump so
-        // the final buffered line is captured before we drain.
+        // the final buffered line is captured before we drain. (The pump
+        // returns `()`; a JoinError here means it panicked, and its
+        // close-on-drop guard already preserved the captured lines.)
         if let Some(pump) = self.stderr_pump.take() {
             let _ = pump.await;
         }

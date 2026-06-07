@@ -68,6 +68,42 @@ async fn early_exiting_child_does_not_fail_a_large_stdin_feed() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real subprocess fed a failing stdin source"]
+async fn failing_stdin_source_does_not_fail_the_run() {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A stdin source whose read fails immediately with a non-broken-pipe
+    /// error — the stdin writer's failure must stay diagnostics-only (a
+    /// `tracing` warn when enabled), never the run's result.
+    struct FailingReader;
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::other("stdin source failed")))
+        }
+    }
+
+    // `sort` (Windows) / `cat` (Unix): both read stdin and exit 0 on EOF.
+    let reads_stdin = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "sort"])
+    } else {
+        Command::new("cat")
+    };
+    let result = reads_stdin
+        .stdin(processkit::Stdin::from_reader(FailingReader))
+        .output_string()
+        .await
+        .expect("a failed stdin writer must not surface as Err");
+    // The child saw immediate EOF (the sink is dropped on the writer's
+    // error) and exited cleanly with empty output.
+    assert!(result.is_success(), "result: {result:?}");
+}
+
+#[tokio::test]
 #[ignore = "spawns a real subprocess echoing 256 KiB through both pipes"]
 async fn large_stdin_and_large_output_do_not_deadlock() {
     // duct's gotcha #10 as a spec: stdin is fed and both outputs are drained

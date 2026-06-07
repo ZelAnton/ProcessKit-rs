@@ -13,6 +13,11 @@ to a dated version section.
 
 ### Added
 
+- More `tracing` events (behind the `tracing` feature, `processkit` target):
+  child spawn (program/pid/mechanism), timeout and cancellation firing, group
+  terminate/shutdown, retry attempts, stdin-writer failures, output-pump
+  panics and teardown overruns, and `adopt`. Still never logs argv or
+  environment values.
 - `ProcessResult::outcome() -> Outcome` — how the run ended as an explicit
   `Exited(i32) | Signalled | TimedOut` enum, now the internal representation
   behind the `code()`/`timed_out()`/`is_success()` accessors (which are

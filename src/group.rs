@@ -206,12 +206,25 @@ impl ProcessGroup {
     #[cfg(feature = "process-control")]
     pub fn adopt(&self, child: &Child) -> Result<()> {
         self.job.adopt(child)?;
+        #[cfg(feature = "tracing")]
+        tracing::trace!(
+            target: "processkit",
+            mechanism = ?self.mechanism(),
+            pid = ?child.id(),
+            "adopted an externally spawned child"
+        );
         Ok(())
     }
 
     /// Immediately hard-kill every process currently in the group. Idempotent;
     /// the group remains usable for further spawns afterwards.
     pub fn terminate_all(&self) -> Result<()> {
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            target: "processkit",
+            mechanism = ?self.mechanism(),
+            "terminating every process in the group"
+        );
         self.job.kill_all()?;
         Ok(())
     }
@@ -332,6 +345,14 @@ impl ProcessGroup {
     /// Dropping the group instead (without calling this) performs only the hard
     /// kill.
     pub async fn shutdown(self) -> Result<()> {
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            target: "processkit",
+            mechanism = ?self.mechanism(),
+            timeout_ms = self.options.shutdown_timeout.as_millis() as u64,
+            escalate = self.options.escalate_to_kill,
+            "graceful shutdown: TERM, grace, then KILL"
+        );
         self.job
             .graceful_shutdown(self.options.shutdown_timeout, self.options.escalate_to_kill)
             .await?;

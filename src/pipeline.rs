@@ -170,6 +170,7 @@ impl Pipeline {
                     // Deadline: kill the whole chain. The stages exit promptly,
                     // so the moved-out drain tasks finish on their own; report
                     // the timeout in the result like `Command::timeout` does.
+                    // Best-effort kill: the group's Drop backstops a failure.
                     let _ = group.terminate_all();
                     return Ok(ProcessResult::new(
                         self.pipeline_name(),
