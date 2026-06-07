@@ -31,6 +31,24 @@ use crate::stdin::ProcessStdin;
 /// surviving grandchild holding a pipe can't hang the run.
 const PUMP_TEARDOWN: Duration = Duration::from_secs(5);
 
+/// What [`RunningProcess::finish_lines`] hands back to its thin public verbs.
+struct Finished {
+    code: Option<i32>,
+    timed_out: bool,
+    stdout_lines: Vec<String>,
+    stderr_lines: Vec<String>,
+}
+
+/// How [`RunningProcess::finish_lines`] treats the pumped lines.
+#[derive(Clone, Copy)]
+enum CaptureMode {
+    /// Retain both streams' lines (`output_string`).
+    Lines,
+    /// Pump — so the child can never block on a full pipe — but drop the
+    /// lines (`wait`, `profile`).
+    Discard,
+}
+
 /// The fields produced by a spawn, handed to [`RunningProcess::from_spawned`].
 pub(crate) struct Spawned {
     pub program: String,
@@ -62,6 +80,15 @@ pub(crate) struct Spawned {
 /// [`standard_input`](Self::standard_input).
 pub struct RunningProcess {
     // (Debug: manual impl below — pipes/tasks/handlers are opaque.)
+    //
+    // The Option fields below encode the handle's de-facto states (fresh /
+    // streaming / consumed) implicitly. No runtime state enum on purpose:
+    // every consuming verb takes `self` BY VALUE (double consumption is a
+    // compile error), and the two &mut entry points (`stdout_lines`,
+    // `standard_input`) have explicit, tested, non-panicking handling for
+    // repeat calls (`second_stdout_lines_call_ends_immediately`,
+    // `finish_streamed_without_streaming_first…`). A state enum would add
+    // panic paths to guard doors the borrow checker already locks.
     program: String,
     child: Child,
     // `Arc` so a streaming deadline timer can hold a `Weak` to kill the tree
@@ -232,28 +259,24 @@ impl RunningProcess {
     /// Drain both streams, wait for exit, and return the captured text output
     /// (line-normalized to `\n`).
     pub async fn output_string(mut self) -> Result<ProcessResult<String>> {
-        let stdout_sink = SharedLines::new(&self.buffer);
-        let stderr_sink = SharedLines::new(&self.buffer);
-        let pumps = self.spawn_line_pumps(&stdout_sink, &stderr_sink);
-        self.stdout_sink = Some(stdout_sink.clone());
-        self.stderr_sink = Some(stderr_sink.clone());
-
-        let outcome = self.drive_to_exit().await?;
-        join_pumps(pumps).await;
-        let (code, timed_out) = self.checked_outcome(outcome)?;
-
+        let finished = self
+            .finish_lines(CaptureMode::Lines, /* expose_counts */ true, || {})
+            .await?;
         Ok(ProcessResult::new(
             self.program.clone(),
-            stdout_sink.drain().join("\n"),
-            stderr_sink.drain().join("\n"),
-            code,
-            timed_out,
+            finished.stdout_lines.join("\n"),
+            finished.stderr_lines.join("\n"),
+            finished.code,
+            finished.timed_out,
             self.timeout,
         ))
     }
 
     /// Drain both streams, wait for exit, and return the raw stdout bytes
     /// (exact; stderr is captured as text).
+    ///
+    /// Deliberately NOT routed through `finish_lines`: stdout is a raw byte
+    /// reader (no line pump), with its own bounded drain-then-abort teardown.
     pub async fn output_bytes(mut self) -> Result<ProcessResult<Vec<u8>>> {
         let stderr_sink = SharedLines::new(&self.buffer);
         let err_pump = self.stderr_pipe.take().map(|pipe| {
@@ -329,13 +352,10 @@ impl RunningProcess {
     /// errors with `Error::Cancelled` here too — cancellation is always an
     /// error, on every consuming path.
     pub async fn wait(mut self) -> Result<Option<i32>> {
-        let stdout_sink = SharedLines::new(&self.buffer);
-        let stderr_sink = SharedLines::new(&self.buffer);
-        let pumps = self.spawn_line_pumps(&stdout_sink, &stderr_sink);
-        let outcome = self.drive_to_exit().await?;
-        join_pumps(pumps).await;
-        let (code, _timed_out) = self.checked_outcome(outcome)?;
-        Ok(code)
+        Ok(self
+            .finish_lines(CaptureMode::Discard, /* expose_counts */ false, || {})
+            .await?
+            .code)
     }
 
     /// Minimal non-consuming exit wait — the [`wait_any`](crate::wait_any) race
@@ -403,21 +423,18 @@ impl RunningProcess {
             })
         });
 
-        // Inline `wait`'s steps so the sampler stops the moment the child is
-        // reaped: its pid is free for reuse from that point (Linux), and the
-        // pump drain below can idle out PUMP_TEARDOWN on a leaked pipe — long
-        // enough for a recycled pid to masquerade as the child and corrupt the
-        // readings.
-        let stdout_sink = SharedLines::new(&self.buffer);
-        let stderr_sink = SharedLines::new(&self.buffer);
-        let pumps = self.spawn_line_pumps(&stdout_sink, &stderr_sink);
-        let outcome = self.drive_to_exit().await;
-        if let Some(task) = &sampler {
-            task.abort();
-        }
-        let outcome = outcome?;
-        join_pumps(pumps).await;
-        let (exit_code, _timed_out) = self.checked_outcome(outcome)?;
+        // The `on_exit` hook stops the sampler the moment the child is reaped:
+        // its pid is free for reuse from that point (Linux), and the pump
+        // drain can idle out PUMP_TEARDOWN on a leaked pipe — long enough for
+        // a recycled pid to masquerade as the child and corrupt the readings.
+        let exit_code = self
+            .finish_lines(CaptureMode::Discard, /* expose_counts */ false, || {
+                if let Some(task) = &sampler {
+                    task.abort();
+                }
+            })
+            .await?
+            .code;
         let duration = started.elapsed();
         let (cpu_time, peak_memory_bytes, samples) = match acc.lock() {
             Ok(acc) => (acc.cpu_time, acc.peak_memory_bytes, acc.samples),
@@ -429,6 +446,54 @@ impl RunningProcess {
             cpu_time,
             peak_memory_bytes,
             samples,
+        })
+    }
+
+    /// The shared line-pumped consuming core behind [`output_string`](Self::output_string),
+    /// [`wait`](Self::wait), and [`profile`](Self::profile): spawn both line
+    /// pumps, drive to exit, run `on_exit` in the slot **between the exit
+    /// await and the `?`** (so it fires even when the drive errored — this is
+    /// where `profile` aborts its pid sampler before a recycled pid could be
+    /// read), join the pumps (bounded by `PUMP_TEARDOWN`), pass the
+    /// cancellation gate, and drain per `capture`.
+    ///
+    /// `expose_counts` stores the sinks on `self` so the live
+    /// `stdout_line_count`/`stderr_line_count` accessors read — only
+    /// `output_string` does (today's behavior, preserved).
+    ///
+    /// `output_bytes` (raw stdout reader, its own bounded teardown) and
+    /// `finish_streamed` (already-streaming state, late stderr pump)
+    /// deliberately do NOT route through this core — their spines differ by
+    /// nature, not by copy-paste.
+    async fn finish_lines(
+        &mut self,
+        capture: CaptureMode,
+        expose_counts: bool,
+        on_exit: impl FnOnce(),
+    ) -> Result<Finished> {
+        let stdout_sink = SharedLines::new(&self.buffer);
+        let stderr_sink = SharedLines::new(&self.buffer);
+        let pumps = self.spawn_line_pumps(&stdout_sink, &stderr_sink);
+        if expose_counts {
+            self.stdout_sink = Some(stdout_sink.clone());
+            self.stderr_sink = Some(stderr_sink.clone());
+        }
+
+        let outcome = self.drive_to_exit().await;
+        on_exit();
+        let outcome = outcome?;
+        join_pumps(pumps).await;
+        let (code, timed_out) = self.checked_outcome(outcome)?;
+
+        let (stdout_lines, stderr_lines) = match capture {
+            CaptureMode::Lines => (stdout_sink.drain(), stderr_sink.drain()),
+            CaptureMode::Discard => (Vec::new(), Vec::new()),
+        };
+        Ok(Finished {
+            code,
+            timed_out,
+            stdout_lines,
+            stderr_lines,
         })
     }
 
