@@ -74,13 +74,16 @@ async fn pipeline_three_stages_end_to_end() {
 #[tokio::test]
 #[ignore = "spawns a real pipeline with a failing inner stage"]
 async fn pipeline_pipefail_attributes_the_first_failure() {
-    // A tiny producer exits 0 (its few bytes fit the pipe buffer even though
-    // the next stage never reads); the middle stage fails with a distinctive
-    // code; the final stage succeeds reading EOF.
+    // A SILENT producer that exits 0: it writes nothing, so it can never die
+    // of SIGPIPE when the fast-failing middle stage closes the pipe first —
+    // a real race seen on CI (a writing producer is sometimes the first
+    // unclean stage, by signal, stealing the attribution this test pins).
+    // The middle stage fails with a distinctive code; the final stage
+    // succeeds reading EOF.
     let producer = if cfg!(windows) {
-        Command::new("cmd").args(["/c", "echo x"])
+        Command::new("cmd").args(["/c", "exit", "0"])
     } else {
-        Command::new("sh").args(["-c", "printf 'x\\n'"])
+        Command::new("sh").args(["-c", "exit 0"])
     };
     let failing = if cfg!(windows) {
         Command::new("cmd").args(["/c", "exit", "3"])
@@ -99,9 +102,9 @@ async fn pipeline_pipefail_attributes_the_first_failure() {
 
     // run() surfaces the same attribution as a typed error.
     let producer = if cfg!(windows) {
-        Command::new("cmd").args(["/c", "echo x"])
+        Command::new("cmd").args(["/c", "exit", "0"])
     } else {
-        Command::new("sh").args(["-c", "printf 'x\\n'"])
+        Command::new("sh").args(["-c", "exit 0"])
     };
     let failing = if cfg!(windows) {
         Command::new("cmd").args(["/c", "exit", "3"])
