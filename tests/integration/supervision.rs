@@ -41,6 +41,38 @@ async fn supervisor_runs_incarnations_in_a_shared_group() {
 
 #[tokio::test]
 #[ignore = "spawns real subprocesses repeatedly under supervision"]
+async fn storm_guard_pauses_a_real_failure_storm() {
+    use processkit::{RestartPolicy, Supervisor};
+
+    let always_fails = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "exit", "1"])
+    } else {
+        Command::new("sh").args(["-c", "exit 1"])
+    };
+
+    // Real-subprocess wiring only — exact timing/decay semantics live in the
+    // hermetic unit tests. A crash storm with a low threshold must report at
+    // least one storm pause.
+    let outcome = Supervisor::new(always_fails)
+        .restart(RestartPolicy::OnCrash)
+        .max_restarts(4)
+        .backoff(Duration::from_millis(1), 1.0)
+        .jitter(false)
+        .storm_pause(Duration::from_millis(20))
+        .failure_threshold(1.5)
+        .failure_decay(Duration::from_secs(60))
+        .run()
+        .await
+        .expect("supervision completes with a result");
+    assert_eq!(outcome.restarts, 4);
+    assert!(
+        outcome.storm_pauses >= 1,
+        "a real crash storm must trip the guard: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns real subprocesses repeatedly under supervision"]
 async fn supervisor_exhausts_restarts_on_a_crashing_child() {
     use processkit::{RestartPolicy, StopReason, Supervisor};
 

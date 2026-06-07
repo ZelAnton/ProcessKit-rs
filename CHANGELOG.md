@@ -12,10 +12,22 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+
+- `Supervisor::storm_pause` / `failure_decay` / `failure_threshold` — an
+  opt-in failure-storm guard (design borrowed from Go's `suture`): each
+  failure feeds a score that halves every `failure_decay`
+  (`score = score × 0.5^(Δt/decay) + 1`); past `failure_threshold` the
+  supervisor takes one jittered `storm_pause` and resets the score,
+  distinguishing "fails rarely" from "crash-looping". Off by default;
+  pauses taken are reported in `SupervisionOutcome::storm_pauses`.
 
 ### Changed
--
+
+- `SupervisionOutcome` is now `#[non_exhaustive]` (it gained the
+  `storm_pauses` field; like `ProcessGroupStats`/`RunProfile` it is a
+  read-only report the crate produces, so future telemetry can be added
+  without another breaking change). **Breaking** for exhaustive
+  destructuring or struct-literal construction outside the crate.
 
 ### Fixed
 -

@@ -12,6 +12,7 @@ keeper, platform-agnostic because it sits entirely on the
 - [The shape](#the-shape)
 - [Policies: what counts as a crash](#policies-what-counts-as-a-crash)
 - [Backoff and jitter](#backoff-and-jitter)
+- [Failure storms](#failure-storms)
 - [Stopping](#stopping)
 - [Outcomes](#outcomes)
 - [Supervising inside a shared group](#supervising-inside-a-shared-group)
@@ -78,6 +79,47 @@ base=200ms, factor=2.0, cap=30s:
 restart #0 → ~200ms   #1 → ~400ms   #2 → ~800ms … #7 → ~25.6s   #8+ → 30s (cap)
 ```
 
+## Failure storms
+
+Backoff spaces *individual* restarts; `max_restarts` is a *lifetime* cap.
+Neither distinguishes a service that fails once a day from one that is
+suddenly crash-looping. The opt-in **storm guard** does (a design borrowed
+from Go's [`suture`](https://github.com/thejerf/suture) supervisor — the
+idea, not the code):
+
+```rust,no_run
+use processkit::{Command, Supervisor};
+use std::time::Duration;
+
+let outcome = Supervisor::new(Command::new("worker"))
+    .storm_pause(Duration::from_secs(15))     // master switch — off by default
+    .failure_decay(Duration::from_secs(30))   // score half-life (default 30s)
+    .failure_threshold(5.0)                   // trip point (default 5.0)
+    .run()
+    .await?;
+
+println!("storm pauses taken: {}", outcome.storm_pauses);
+```
+
+Each failed run adds `1` to a score that **halves every `failure_decay`**:
+
+```text
+score = score × 0.5^(Δt / failure_decay) + 1
+```
+
+- *Fails rarely*: the score decays back toward `1` between failures and never
+  reaches the threshold — the guard stays out of the way.
+- *Failure storm*: failures arrive faster than the half-life drains them, the
+  score climbs past `failure_threshold`, and the supervisor takes **one
+  collective pause** of `storm_pause` (jittered into `[0.5, 1.5)` like the
+  backoff), resets the score, and resumes.
+
+Only failures feed the score — crashes and spawn errors, not clean exits
+restarted under `RestartPolicy::Always`. The pause stacks with (runs before)
+the per-restart backoff, and the `max_restarts` budget is checked first, so a
+storm pause never extends an exhausted budget. Pauses taken are reported in
+`SupervisionOutcome::storm_pauses`.
+
 ## Stopping
 
 Three gates, checked in this order after every completed run:
@@ -101,6 +143,7 @@ let outcome = Supervisor::new(Command::new("job")).run().await?;
 outcome.final_result; // ProcessResult<String> of the LAST run
 outcome.restarts;     // how many restarts happened (not counting run #1)
 outcome.stopped;      // StopReason::{Predicate, PolicySatisfied, RestartsExhausted}
+outcome.storm_pauses; // failure-storm pauses taken (0 unless storm_pause is set)
 ```
 
 Note `run()` returning `Ok` does **not** mean the child succeeded — it means

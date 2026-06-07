@@ -50,7 +50,11 @@ pub enum StopReason {
 
 /// What a finished supervision reports — the last run plus the keeper's
 /// telemetry.
+///
+/// Non-exhaustive: a read-only report the crate produces — new telemetry can
+/// be added without a breaking change.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct SupervisionOutcome {
     /// The result of the final run (the one that ended supervision).
     pub final_result: ProcessResult<String>,
@@ -59,6 +63,9 @@ pub struct SupervisionOutcome {
     pub restarts: u32,
     /// Why supervision stopped.
     pub stopped: StopReason,
+    /// How many times the failure-storm guard paused restarts (always `0`
+    /// unless [`storm_pause`](Supervisor::storm_pause) is set).
+    pub storm_pauses: u32,
 }
 
 /// Keeps a [`Command`] alive: runs it, classifies every exit against the
@@ -83,7 +90,9 @@ pub struct SupervisionOutcome {
 /// ```
 ///
 /// Defaults: [`OnCrash`](RestartPolicy::OnCrash), unlimited restarts, backoff
-/// `200ms × 2.0` capped at 30 s, jitter on.
+/// `200ms × 2.0` capped at 30 s, jitter on, failure-storm guard off (enable
+/// with [`storm_pause`](Self::storm_pause); once enabled, failure-score
+/// half-life 30 s and threshold 5.0).
 ///
 /// Runs go through a [`ProcessRunner`] — [`JobRunner`] by default (each
 /// incarnation in its own private kill-on-drop group). Inject another with
@@ -100,6 +109,9 @@ pub struct Supervisor<R: ProcessRunner = JobRunner> {
     backoff_factor: f64,
     max_backoff: Duration,
     jitter: bool,
+    failure_decay: Duration,
+    failure_threshold: f64,
+    storm_pause: Option<Duration>,
     #[allow(clippy::type_complexity)]
     stop_when: Option<Box<dyn Fn(&ProcessResult<String>) -> bool + Send + Sync>>,
 }
@@ -114,6 +126,9 @@ impl<R: ProcessRunner> std::fmt::Debug for Supervisor<R> {
             .field("backoff_factor", &self.backoff_factor)
             .field("max_backoff", &self.max_backoff)
             .field("jitter", &self.jitter)
+            .field("failure_decay", &self.failure_decay)
+            .field("failure_threshold", &self.failure_threshold)
+            .field("storm_pause", &self.storm_pause)
             .field("has_stop_when", &self.stop_when.is_some())
             .finish_non_exhaustive()
     }
@@ -132,6 +147,9 @@ impl Supervisor<JobRunner> {
             backoff_factor: 2.0,
             max_backoff: Duration::from_secs(30),
             jitter: true,
+            failure_decay: Duration::from_secs(30),
+            failure_threshold: 5.0,
+            storm_pause: None,
             stop_when: None,
         }
     }
@@ -158,6 +176,9 @@ impl<R: ProcessRunner> Supervisor<R> {
             backoff_factor: self.backoff_factor,
             max_backoff: self.max_backoff,
             jitter: self.jitter,
+            failure_decay: self.failure_decay,
+            failure_threshold: self.failure_threshold,
+            storm_pause: self.storm_pause,
             stop_when: self.stop_when,
         }
     }
@@ -201,6 +222,54 @@ impl<R: ProcessRunner> Supervisor<R> {
     #[must_use]
     pub fn jitter(mut self, enabled: bool) -> Self {
         self.jitter = enabled;
+        self
+    }
+
+    /// Enable the **failure-storm guard**: when crash-restarts cluster faster
+    /// than the failure score can decay (see
+    /// [`failure_decay`](Self::failure_decay) /
+    /// [`failure_threshold`](Self::failure_threshold)), pause restarts once
+    /// for `pause` — jittered into `[0.5, 1.5)` of the nominal value per
+    /// [`jitter`](Self::jitter) — then reset the score and resume. Off by
+    /// default; this is the master switch, the other two knobs only tune it.
+    ///
+    /// Each failed run adds `1` to a score that halves every
+    /// `failure_decay`: `score = score × 0.5^(Δt / failure_decay) + 1`. A
+    /// service that fails *rarely* never accumulates past the threshold; a
+    /// *storm* trips it and gets one collective pause instead of hammering
+    /// restarts at backoff speed. (Design borrowed from Go's `suture`
+    /// supervisor — the idea, not the code.)
+    ///
+    /// Only failures feed the score: crashes and spawn errors. A clean exit
+    /// restarted under [`Always`](RestartPolicy::Always) is not a failure.
+    /// The storm pause *stacks with* (runs before) the per-restart backoff,
+    /// and [`max_restarts`](Self::max_restarts) is checked first — a storm
+    /// pause never resurrects an exhausted budget. Pauses taken are reported
+    /// in [`SupervisionOutcome::storm_pauses`].
+    #[must_use]
+    pub fn storm_pause(mut self, pause: Duration) -> Self {
+        self.storm_pause = Some(pause);
+        self
+    }
+
+    /// Half-life of the failure score used by the storm guard (default: 30 s):
+    /// every `decay` seconds without a failure, the accumulated score halves.
+    /// A zero half-life keeps no history — every failure scores exactly `1`,
+    /// so the guard trips only with a threshold below `1.0`. No effect unless
+    /// [`storm_pause`](Self::storm_pause) is set.
+    #[must_use]
+    pub fn failure_decay(mut self, decay: Duration) -> Self {
+        self.failure_decay = decay;
+        self
+    }
+
+    /// Failure score above which the storm guard trips (default: `5.0` —
+    /// roughly "more than five failures inside one half-life"). A non-finite
+    /// threshold never trips. No effect unless
+    /// [`storm_pause`](Self::storm_pause) is set.
+    #[must_use]
+    pub fn failure_threshold(mut self, threshold: f64) -> Self {
+        self.failure_threshold = threshold;
         self
     }
 
@@ -249,13 +318,14 @@ impl<R: ProcessRunner> Supervisor<R> {
         };
 
         let mut restarts: u32 = 0;
+        let mut storm = StormState::new();
         loop {
             match self.runner.output(&self.command).await {
                 Ok(result) => {
                     if let Some(predicate) = &self.stop_when
                         && predicate(&result)
                     {
-                        return Ok(self.outcome(result, restarts, StopReason::Predicate));
+                        return Ok(self.outcome(result, restarts, &storm, StopReason::Predicate));
                     }
                     // A crash is any run without a clean exit: non-zero code,
                     // timeout, or signal kill (both of the latter have no code).
@@ -266,10 +336,25 @@ impl<R: ProcessRunner> Supervisor<R> {
                         RestartPolicy::Never => false,
                     };
                     if !wants_restart {
-                        return Ok(self.outcome(result, restarts, StopReason::PolicySatisfied));
+                        return Ok(self.outcome(
+                            result,
+                            restarts,
+                            &storm,
+                            StopReason::PolicySatisfied,
+                        ));
                     }
                     if self.max_restarts.is_some_and(|max| restarts >= max) {
-                        return Ok(self.outcome(result, restarts, StopReason::RestartsExhausted));
+                        return Ok(self.outcome(
+                            result,
+                            restarts,
+                            &storm,
+                            StopReason::RestartsExhausted,
+                        ));
+                    }
+                    // Only failures feed the storm score: a clean exit
+                    // restarted under `Always` is churn, not a failure.
+                    if crashed {
+                        self.storm_gate(&mut storm).await;
                     }
                     self.sleep_backoff(restarts, factor).await;
                     restarts += 1;
@@ -288,6 +373,7 @@ impl<R: ProcessRunner> Supervisor<R> {
                     if !wants_restart || self.max_restarts.is_some_and(|max| restarts >= max) {
                         return Err(err);
                     }
+                    self.storm_gate(&mut storm).await;
                     self.sleep_backoff(restarts, factor).await;
                     restarts += 1;
                 }
@@ -299,13 +385,51 @@ impl<R: ProcessRunner> Supervisor<R> {
         &self,
         final_result: ProcessResult<String>,
         restarts: u32,
+        storm: &StormState,
         stopped: StopReason,
     ) -> SupervisionOutcome {
         SupervisionOutcome {
             final_result,
             restarts,
             stopped,
+            storm_pauses: storm.pauses,
         }
+    }
+
+    /// The failure-storm gate, run before the backoff of every *failure*-
+    /// driven restart: fold the failure into the decaying score and, past the
+    /// threshold, sleep out one jittered [`storm_pause`](Self::storm_pause)
+    /// and reset the score (a fresh window — the pause itself must not count
+    /// as elapsed decay time for the *next* failure).
+    async fn storm_gate(&self, storm: &mut StormState) {
+        let Some(pause) = self.storm_pause else {
+            return;
+        };
+        let now = tokio::time::Instant::now();
+        let elapsed = storm
+            .last_failure_at
+            .map(|at| now.saturating_duration_since(at))
+            .unwrap_or(Duration::ZERO);
+        storm.last_failure_at = Some(now);
+        storm.score = decayed_failure_score(storm.score, elapsed, self.failure_decay);
+        // A non-finite threshold never trips (NaN comparisons are false).
+        let tripped = storm.score > self.failure_threshold;
+        if !tripped {
+            return;
+        }
+        let pause = apply_jitter(pause, self.jitter);
+        #[cfg(feature = "tracing")]
+        tracing::warn!(
+            target: "processkit",
+            pause_ms = pause.as_millis() as u64,
+            "supervisor failure storm — pausing restarts"
+        );
+        if !pause.is_zero() {
+            tokio::time::sleep(pause).await;
+        }
+        storm.score = 0.0;
+        storm.last_failure_at = None;
+        storm.pauses += 1;
     }
 
     /// Sleep out the delay before the `restarts`-th (0-based) restart.
@@ -322,6 +446,43 @@ impl<R: ProcessRunner> Supervisor<R> {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
+    }
+}
+
+/// The storm guard's running state — one per `run()` call.
+struct StormState {
+    /// The decaying failure score (see [`decayed_failure_score`]).
+    score: f64,
+    /// When the previous failure was folded in (`None` = fresh window).
+    last_failure_at: Option<tokio::time::Instant>,
+    /// How many storm pauses were taken (reported in the outcome).
+    pauses: u32,
+}
+
+impl StormState {
+    fn new() -> Self {
+        StormState {
+            score: 0.0,
+            last_failure_at: None,
+            pauses: 0,
+        }
+    }
+}
+
+/// Fold one failure into the decaying score: the previous score halves every
+/// `half_life` of elapsed time, then the new failure adds `1`. A zero
+/// half-life keeps no history (every failure scores exactly `1.0`); a
+/// non-finite previous score resets rather than propagating.
+fn decayed_failure_score(prev: f64, elapsed: Duration, half_life: Duration) -> f64 {
+    if half_life.is_zero() {
+        return 1.0;
+    }
+    let halflives = elapsed.as_secs_f64() / half_life.as_secs_f64();
+    let decayed = prev * 0.5_f64.powf(halflives);
+    if decayed.is_finite() {
+        decayed + 1.0
+    } else {
+        1.0
     }
 }
 
@@ -661,6 +822,174 @@ mod tests {
             let f = jitter_factor();
             assert!((0.5..1.5).contains(&f), "factor out of band: {f}");
         }
+    }
+
+    #[test]
+    fn decayed_failure_score_math() {
+        let hl = Duration::from_secs(30);
+        // First failure on a fresh window.
+        assert_eq!(decayed_failure_score(0.0, Duration::ZERO, hl), 1.0);
+        // Back-to-back failures accumulate undecayed.
+        assert_eq!(decayed_failure_score(1.0, Duration::ZERO, hl), 2.0);
+        // Exactly one half-life: the previous score halves, then +1.
+        assert_eq!(decayed_failure_score(2.0, hl, hl), 2.0);
+        assert_eq!(decayed_failure_score(4.0, hl, hl), 3.0);
+        // Many half-lives: history all but vanishes.
+        let aged = decayed_failure_score(8.0, Duration::from_secs(3000), hl);
+        assert!((aged - 1.0).abs() < 1e-9, "got {aged}");
+        // Zero half-life keeps no history.
+        assert_eq!(
+            decayed_failure_score(100.0, Duration::ZERO, Duration::ZERO),
+            1.0
+        );
+        // A poisoned previous score resets instead of propagating.
+        assert_eq!(decayed_failure_score(f64::NAN, Duration::ZERO, hl), 1.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn storm_guard_is_off_by_default() {
+        let start = tokio::time::Instant::now();
+        let outcome = supervise(SeqRunner::new(vec![
+            fail(1),
+            fail(1),
+            fail(1),
+            fail(1),
+            ok(),
+        ]))
+        .run()
+        .await
+        .expect("supervision");
+        assert_eq!(outcome.storm_pauses, 0);
+        assert_eq!(start.elapsed(), Duration::ZERO, "no hidden pauses");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn storm_trips_past_the_threshold() {
+        // Zero backoff → zero decay time between failures: scores run 1, 2, 3;
+        // the third crosses 2.5 and takes exactly one 1 s pause.
+        let start = tokio::time::Instant::now();
+        let outcome = supervise(SeqRunner::new(vec![fail(1), fail(1), fail(1), ok()]))
+            .storm_pause(Duration::from_secs(1))
+            .failure_threshold(2.5)
+            .failure_decay(Duration::from_secs(1000))
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.restarts, 3);
+        assert_eq!(outcome.storm_pauses, 1);
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spaced_failures_decay_below_the_threshold() {
+        // The 10 s backoff between failures is 10 half-lives of decay — each
+        // failure scores ≈1, never reaching 2.5: same failure count as the
+        // tripping test above, zero pauses.
+        let outcome = Supervisor::new(Command::new("fake"))
+            .with_runner(SeqRunner::new(vec![fail(1), fail(1), fail(1), ok()]))
+            .backoff(Duration::from_secs(10), 1.0)
+            .jitter(false)
+            .storm_pause(Duration::from_secs(1))
+            .failure_threshold(2.5)
+            .failure_decay(Duration::from_secs(1))
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.restarts, 3);
+        assert_eq!(outcome.storm_pauses, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn storm_pause_resets_the_score() {
+        // Threshold 1.5, no meaningful decay: failures score 1, 2(pause),
+        // 1, 2(pause) — the reset after each pause is what keeps the second
+        // failure from tripping immediately.
+        let outcome = supervise(SeqRunner::new(vec![
+            fail(1),
+            fail(1),
+            fail(1),
+            fail(1),
+            ok(),
+        ]))
+        .storm_pause(Duration::from_secs(1))
+        .failure_threshold(1.5)
+        .failure_decay(Duration::from_secs(1000))
+        .run()
+        .await
+        .expect("supervision");
+        assert_eq!(outcome.restarts, 4);
+        assert_eq!(outcome.storm_pauses, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_budget_wins_over_the_storm_gate() {
+        // The budget check runs first: the second failure terminates before
+        // its storm bookkeeping, so no pause is taken or reported.
+        let start = tokio::time::Instant::now();
+        let outcome = supervise(SeqRunner::new(vec![fail(1), fail(1)]))
+            .max_restarts(1)
+            .storm_pause(Duration::from_secs(60))
+            .failure_threshold(1.5)
+            .failure_decay(Duration::from_secs(1000))
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.stopped, StopReason::RestartsExhausted);
+        assert_eq!(outcome.storm_pauses, 0);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn storm_pause_is_jittered_within_the_band() {
+        let start = tokio::time::Instant::now();
+        let outcome = Supervisor::new(Command::new("fake"))
+            .with_runner(SeqRunner::new(vec![fail(1), ok()]))
+            .backoff(Duration::ZERO, 1.0)
+            .storm_pause(Duration::from_millis(1000))
+            .failure_threshold(0.5)
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.storm_pauses, 1);
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(500) && waited < Duration::from_millis(1500),
+            "jittered storm pause out of [0.5, 1.5) band: {waited:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clean_restarts_under_always_do_not_feed_the_storm_score() {
+        // Three clean exits restarted by Always would trip threshold 1.5 if
+        // they counted as failures; they must not.
+        let seen = AtomicU32::new(0);
+        let outcome = supervise(SeqRunner::new(vec![ok(), ok(), ok()]))
+            .restart(RestartPolicy::Always)
+            .storm_pause(Duration::from_secs(60))
+            .failure_threshold(1.5)
+            .failure_decay(Duration::from_secs(1000))
+            .stop_when(move |_| seen.fetch_add(1, Ordering::SeqCst) == 2)
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.restarts, 2);
+        assert_eq!(outcome.storm_pauses, 0);
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_is_terminal_before_any_storm_pause() {
+        let start = tokio::time::Instant::now();
+        let err = supervise(SeqRunner::new(vec![Err(crate::Error::Cancelled {
+            program: "fake".into(),
+        })]))
+        .storm_pause(Duration::from_secs(60))
+        .failure_threshold(0.0)
+        .run()
+        .await
+        .expect_err("cancelled is terminal");
+        assert!(matches!(err, crate::Error::Cancelled { .. }), "got {err:?}");
+        assert_eq!(start.elapsed(), Duration::ZERO, "no storm pause was taken");
     }
 
     #[test]
