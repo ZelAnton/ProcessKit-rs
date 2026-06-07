@@ -172,7 +172,7 @@ pub use group::{ProcessGroup, ProcessGroupOptions};
 pub use limits::ResourceLimits;
 pub use mechanism::Mechanism;
 pub use pipeline::Pipeline;
-pub use result::ProcessResult;
+pub use result::{Outcome, ProcessResult};
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
 pub use running::{RunningProcess, StdoutLines};
 #[cfg(feature = "process-control")]

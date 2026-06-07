@@ -13,6 +13,11 @@ to a dated version section.
 
 ### Added
 
+- `ProcessResult::outcome() -> Outcome` — how the run ended as an explicit
+  `Exited(i32) | Signalled | TimedOut` enum, now the internal representation
+  behind the `code()`/`timed_out()`/`is_success()` accessors (which are
+  unchanged, derived, and remain the everyday surface). `Outcome` is
+  `#[non_exhaustive]`. Cassette wire format is untouched.
 - `CliClient::default_cancel_on(token)` (`cancellation` feature) — a
   client-level cancellation default, completing the run-control default set
   (`default_timeout`/`default_env`): every command the client builds carries

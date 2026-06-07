@@ -4,6 +4,24 @@ use std::time::Duration;
 
 use crate::error::Error;
 
+/// How a run ended — the explicit form of the `code()`/`timed_out()` pair.
+///
+/// Non-exhaustive: a future disposition (e.g. a richer platform-specific
+/// termination) can be added without a breaking change. The convenience
+/// accessors [`ProcessResult::code`] / [`ProcessResult::timed_out`] /
+/// [`ProcessResult::is_success`] derive from this and remain the everyday
+/// surface; match on `Outcome` when the three-way distinction matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Outcome {
+    /// The process exited on its own with this code.
+    Exited(i32),
+    /// Terminated by a signal (Unix) — no exit code exists.
+    Signalled,
+    /// Killed because it exceeded its configured timeout.
+    TimedOut,
+}
+
 /// The captured result of running a process to completion.
 ///
 /// `T` is the standard-output payload: [`String`] for the text helpers
@@ -16,17 +34,19 @@ pub struct ProcessResult<T> {
     program: String,
     stdout: T,
     stderr: String,
-    /// The exit code, or `None` when the run produced no code — it was killed by
-    /// its timeout, or terminated by a signal (Unix). Distinguish the two via
-    /// [`timed_out`](Self::timed_out).
-    code: Option<i32>,
-    timed_out: bool,
-    /// The deadline that elapsed, when `timed_out` — carried so the
+    /// How the run ended (see [`Outcome`]); `code()`/`timed_out()` derive
+    /// from it.
+    outcome: Outcome,
+    /// The deadline that elapsed, when timed out — carried so the
     /// success-checking helpers can build a faithful [`Error::Timeout`].
     timeout: Option<Duration>,
 }
 
 impl<T> ProcessResult<T> {
+    /// Build a result from the raw `code`/`timed_out` pair every producing
+    /// path naturally has in hand. The pair folds into an [`Outcome`]
+    /// (timeout wins, matching the check order in
+    /// [`ensure_success`](Self::ensure_success)).
     pub(crate) fn new(
         program: String,
         stdout: T,
@@ -35,12 +55,16 @@ impl<T> ProcessResult<T> {
         timed_out: bool,
         timeout: Option<Duration>,
     ) -> Self {
+        let outcome = match (code, timed_out) {
+            (_, true) => Outcome::TimedOut,
+            (Some(code), false) => Outcome::Exited(code),
+            (None, false) => Outcome::Signalled,
+        };
         Self {
             program,
             stdout,
             stderr,
-            code,
-            timed_out,
+            outcome,
             timeout,
         }
     }
@@ -69,22 +93,32 @@ impl<T> ProcessResult<T> {
         &self.stderr
     }
 
+    /// How the run ended, as the explicit three-way [`Outcome`].
+    pub fn outcome(&self) -> Outcome {
+        self.outcome
+    }
+
     /// The process exit code, or `None` when the run yielded no code — killed by
     /// its timeout ([`timed_out`](Self::timed_out) is then `true`) or terminated
     /// by a signal on Unix (`timed_out` is `false`). There is no synthetic
-    /// sentinel: a missing code is `None`, never `-1`.
+    /// sentinel: a missing code is `None`, never `-1`. Derived from
+    /// [`outcome`](Self::outcome).
     pub fn code(&self) -> Option<i32> {
-        self.code
+        match self.outcome {
+            Outcome::Exited(code) => Some(code),
+            _ => None,
+        }
     }
 
-    /// Whether the run was killed because it exceeded its timeout.
+    /// Whether the run was killed because it exceeded its timeout. Derived
+    /// from [`outcome`](Self::outcome).
     pub fn timed_out(&self) -> bool {
-        self.timed_out
+        matches!(self.outcome, Outcome::TimedOut)
     }
 
     /// Whether the process exited with code 0.
     pub fn is_success(&self) -> bool {
-        self.code == Some(0)
+        matches!(self.outcome, Outcome::Exited(0))
     }
 
     /// Return `self` unchanged when the run succeeded, otherwise the matching
@@ -96,34 +130,23 @@ impl<T> ProcessResult<T> {
     where
         T: StdoutText,
     {
-        if let Some(err) = self.timeout_error() {
-            return Err(err);
-        }
-        match self.code {
-            Some(0) => Ok(self),
-            // No code, but not a timeout → terminated by a signal. Surface it as
-            // an IO error (consistent with `require_code`) rather than a
-            // synthetic `Error::Exit { code: -1 }`.
-            None => Err(self.signal_error()),
-            Some(code) => Err(Error::Exit {
+        match self.outcome {
+            Outcome::Exited(0) => Ok(self),
+            Outcome::TimedOut => Err(Error::Timeout {
+                program: self.program.clone(),
+                timeout: self.timeout.unwrap_or_default(),
+            }),
+            // Terminated by a signal. Surface it as an IO error (consistent
+            // with `require_code`) rather than a synthetic
+            // `Error::Exit { code: -1 }`.
+            Outcome::Signalled => Err(self.signal_error()),
+            Outcome::Exited(code) => Err(Error::Exit {
                 program: self.program.clone(),
                 code,
                 stdout: truncate_output(&self.stdout.as_text()),
                 stderr: truncate_output(&self.stderr),
             }),
         }
-    }
-
-    /// The [`Error::Timeout`] this result represents, if it timed out. Lets the
-    /// convenience helpers (`ensure_success`, `ProcessRunnerExt::exit_code`)
-    /// surface a timeout as a distinct error rather than a missing code, while
-    /// `output`/`capture` keep exposing the [`timed_out`](Self::timed_out) flag
-    /// for callers that want to inspect it without erroring.
-    pub(crate) fn timeout_error(&self) -> Option<Error> {
-        self.timed_out.then(|| Error::Timeout {
-            program: self.program.clone(),
-            timeout: self.timeout.unwrap_or_default(),
-        })
     }
 
     /// The error for a run that was killed by a signal and so produced no exit
@@ -140,10 +163,14 @@ impl<T> ProcessResult<T> {
     /// a timeout surfaces as [`Error::Timeout`], a signal-kill (no code) as an
     /// IO error, otherwise the code.
     pub(crate) fn require_code(&self) -> Result<i32, Error> {
-        if let Some(err) = self.timeout_error() {
-            return Err(err);
+        match self.outcome {
+            Outcome::Exited(code) => Ok(code),
+            Outcome::TimedOut => Err(Error::Timeout {
+                program: self.program.clone(),
+                timeout: self.timeout.unwrap_or_default(),
+            }),
+            Outcome::Signalled => Err(self.signal_error()),
         }
-        self.code.ok_or_else(|| self.signal_error())
     }
 }
 
@@ -212,6 +239,75 @@ fn truncate_output(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outcome_reflects_the_three_terminal_states() {
+        let exited = ProcessResult::new(
+            "x".into(),
+            String::new(),
+            String::new(),
+            Some(3),
+            false,
+            None,
+        );
+        assert_eq!(exited.outcome(), Outcome::Exited(3));
+
+        let signalled =
+            ProcessResult::new("x".into(), String::new(), String::new(), None, false, None);
+        assert_eq!(signalled.outcome(), Outcome::Signalled);
+
+        let timed_out =
+            ProcessResult::new("x".into(), String::new(), String::new(), None, true, None);
+        assert_eq!(timed_out.outcome(), Outcome::TimedOut);
+
+        // A code alongside `timed_out` folds to TimedOut — the same precedence
+        // ensure_success has always applied.
+        let both = ProcessResult::new(
+            "x".into(),
+            String::new(),
+            String::new(),
+            Some(0),
+            true,
+            None,
+        );
+        assert_eq!(both.outcome(), Outcome::TimedOut);
+    }
+
+    #[test]
+    fn derived_accessors_agree_with_outcome() {
+        for (code, timed_out) in [
+            (Some(0), false),
+            (Some(7), false),
+            (None, false),
+            (None, true),
+        ] {
+            let r = ProcessResult::new(
+                "x".into(),
+                String::new(),
+                String::new(),
+                code,
+                timed_out,
+                None,
+            );
+            match r.outcome() {
+                Outcome::Exited(c) => {
+                    assert_eq!(r.code(), Some(c));
+                    assert!(!r.timed_out());
+                    assert_eq!(r.is_success(), c == 0);
+                }
+                Outcome::Signalled => {
+                    assert_eq!(r.code(), None);
+                    assert!(!r.timed_out());
+                    assert!(!r.is_success());
+                }
+                Outcome::TimedOut => {
+                    assert_eq!(r.code(), None);
+                    assert!(r.timed_out());
+                    assert!(!r.is_success());
+                }
+            }
+        }
+    }
 
     #[test]
     fn success_is_code_zero() {
