@@ -941,6 +941,12 @@ impl RunningProcess {
 
     /// Send a kill to the process without waiting for it to exit. The owning
     /// group still governs the rest of the tree.
+    ///
+    /// The exit *code* reported afterwards (by [`wait`](Self::wait) /
+    /// [`wait_any`](crate::wait_any)) for a killed child is platform-dependent
+    /// — `None` on a Unix signal kill, a platform code on Windows
+    /// `TerminateProcess`; a [`ScriptedRunner`](crate::ScriptedRunner) handle
+    /// reports `None` (matching Unix).
     pub fn start_kill(&mut self) -> Result<()> {
         match &mut self.backend {
             Backend::Real(real) => {

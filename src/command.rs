@@ -353,11 +353,11 @@ impl Command {
     ///
     /// Applies to the **success-checking** helpers — [`run`](Self::run),
     /// [`exit_code`](Self::exit_code), [`probe`](Self::probe), and the
-    /// [`CliClient`](crate::CliClient) `text`/`unit`/`code`/`parse`/`try_parse`
+    /// [`CliClient`](crate::CliClient) `run`/`run_unit`/`exit_code`/`parse`/`try_parse`
     /// helpers — i.e. the ones that surface failure as an [`Error`] the classifier
     /// can inspect (e.g. a transient network failure in `stderr`, or
     /// [`Error::Timeout`](crate::Error::Timeout)). The non-erroring
-    /// `output_string`/`output_bytes`/`capture` paths don't retry.
+    /// `output_string`/`output_bytes`/`output` paths don't retry.
     ///
     /// Each attempt **re-executes the whole command** — a fresh process. Only
     /// retry operations that are safe to repeat: a side effect that already landed
@@ -732,6 +732,10 @@ impl Command {
         let process = JobRunner::new().start(self).await?;
         let search = async move {
             let mut process = process;
+            // Close an untaken `keep_stdin_open` pipe (taking it here drops it →
+            // EOF), so a stdin-reading filter isn't left blocking — `first_line`
+            // gives no way to write to it. A no-op for the usual case.
+            let _ = process.standard_input();
             let mut lines = process.stdout_lines();
             while let Some(line) = lines.next().await {
                 if predicate(&line) {

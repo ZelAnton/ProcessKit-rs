@@ -134,6 +134,22 @@ jobs:
               echo "::error::Cargo.toml says $CURRENT but the newest release tag is $MAX_TAG — main is behind the latest release. A release commit was probably dropped from main (force-push?). Restore the manifest/changelog to the released state before releasing."
               exit 1
             fi
+            # GUARD: a `patch` bump must not ship a Breaking change. The
+            # [Unreleased] section marks breaking entries with "**Breaking**"
+            # (see AGENTS.md); pre-1.0, those require at least a *minor* bump
+            # (0.x → 0.(x+1).0). A patch pick here would publish a breaking
+            # release under a semver-compatible number — exactly the class of
+            # mistake the manifest-ordering guard above also defends against.
+            if [ "${{ inputs.bump }}" = "patch" ]; then
+              UNREL=$(awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f' CHANGELOG.md)
+              # Match the literal `**Breaking**` marker (the AGENTS.md
+              # convention), not the bare word — so prose like "a non-breaking
+              # change" can't false-positive and block a valid patch.
+              if printf '%s' "$UNREL" | grep -qF '**Breaking**'; then
+                echo "::error::[Unreleased] contains a **Breaking** change but the requested bump is 'patch'. Pre-1.0, breaking changes need a 'minor' bump. Re-run with bump=minor (or major)."
+                exit 1
+              fi
+            fi
             # A prior release exists: apply the chosen bump.
             IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
             case "${{ inputs.bump }}" in

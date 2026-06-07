@@ -254,6 +254,36 @@ async fn first_line_honors_timeout_instead_of_hanging() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real stdin-reading subprocess via first_line"]
+async fn first_line_closes_an_untaken_keep_stdin_open_pipe() {
+    // `first_line` gives no way to write stdin, so a `keep_stdin_open` filter
+    // must still see EOF — otherwise `cat` blocks reading stdin forever and
+    // the stream never yields. The streaming verb closes the untaken pipe.
+    let filter = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "sort"])
+    } else {
+        Command::new("cat")
+    };
+    let start = Instant::now();
+    // No timeout: a regression would hang indefinitely, caught by the outer
+    // test harness — the assertion below documents the intent.
+    let found = filter
+        .keep_stdin_open()
+        .first_line(|_| true)
+        .await
+        .expect("first_line completes");
+    assert_eq!(
+        found, None,
+        "an empty stdin filter emits nothing: {found:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(15),
+        "first_line hung on an untaken stdin pipe (took {:?})",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns real subprocesses"]
 async fn probe_reads_real_exit_codes() {
     // Exit 0 -> Ok(true), exit 1 -> Ok(false), exit 2 -> Err.

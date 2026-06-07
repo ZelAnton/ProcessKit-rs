@@ -193,6 +193,11 @@ enum Mode<R> {
 ///   [`timeout`](Command::timeout) configuration, exactly like the live
 ///   runner — so a recorded timed-out run surfaces as
 ///   [`Error::Timeout`](crate::Error::Timeout) with the real deadline.
+/// - Covers the **`output`** shape only. The streaming half of the seam
+///   ([`start`](crate::ProcessRunner::start)) inherits the default and returns
+///   [`Error::Unsupported`](crate::Error::Unsupported) — recording line timing
+///   and stream shape is future work; use
+///   [`ScriptedRunner`](crate::ScriptedRunner) for hermetic streaming tests.
 ///
 /// Cassettes are pretty-printed JSON with a `version` field; loading an
 /// unknown version (or a corrupt file) is an [`Error::Io`] with
