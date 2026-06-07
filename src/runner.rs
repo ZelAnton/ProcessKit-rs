@@ -1,10 +1,10 @@
 //! The [`ProcessRunner`] seam and its real implementations.
 //!
-//! The mock seam is at the *captured-output* level: [`ProcessRunner::output`]
-//! returns a finished [`ProcessResult`], so a test double can return canned
-//! output without a real OS process (a live [`RunningProcess`] can't be
-//! fabricated). Live-handle / streaming runs use the concrete
-//! [`start`](JobRunner::start) methods instead.
+//! The seam covers both shapes of a run: [`ProcessRunner::output`] (a finished
+//! [`ProcessResult`]) and [`ProcessRunner::start`] (a live [`RunningProcess`]
+//! for streaming/probes). A [`ScriptedRunner`](crate::ScriptedRunner) fakes
+//! both — its `start` hands back a scripted handle that feeds canned lines
+//! through the same pump machinery a real child uses.
 
 use crate::command::{Command, RetryPolicy};
 use crate::error::Result;
@@ -12,9 +12,10 @@ use crate::group::ProcessGroup;
 use crate::result::ProcessResult;
 use crate::running::{RunningProcess, Spawned};
 
-/// Runs a [`Command`] to completion and returns its captured text output.
+/// Runs a [`Command`] — to a captured result ([`output`](Self::output)) or a
+/// live handle ([`start`](Self::start)).
 ///
-/// This one-method seam is the mock point: production code takes
+/// This two-method seam is the mock point: production code takes
 /// `&dyn ProcessRunner`; tests pass a
 /// [`ScriptedRunner`](crate::ScriptedRunner) /
 /// [`RecordingRunner`](crate::RecordingRunner) (or, behind the `mock` feature,
@@ -25,6 +26,20 @@ pub trait ProcessRunner: Send + Sync {
     /// Run `command` to completion, capturing stdout/stderr and the exit code.
     /// A non-zero exit is reported in the result, not raised.
     async fn output(&self, command: &Command) -> Result<ProcessResult<String>>;
+
+    /// Start `command` and return a live [`RunningProcess`] for streaming,
+    /// readiness probes, or incremental consumption.
+    ///
+    /// Defaulted to [`Error::Unsupported`](crate::Error::Unsupported) so an
+    /// `output`-only runner (a hand-rolled double, a cassette runner) keeps
+    /// compiling; the real runners ([`JobRunner`], `&ProcessGroup`) and
+    /// [`ScriptedRunner`](crate::ScriptedRunner) override it.
+    async fn start(&self, command: &Command) -> Result<RunningProcess> {
+        let _ = command;
+        Err(crate::Error::Unsupported {
+            operation: "start".into(),
+        })
+    }
 }
 
 /// A shared reference to a runner is itself a runner, so a borrowed
@@ -34,6 +49,10 @@ pub trait ProcessRunner: Send + Sync {
 impl<R: ProcessRunner + ?Sized> ProcessRunner for &R {
     async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
         (**self).output(command).await
+    }
+
+    async fn start(&self, command: &Command) -> Result<RunningProcess> {
+        (**self).start(command).await
     }
 }
 
@@ -169,7 +188,11 @@ impl JobRunner {
 #[async_trait::async_trait]
 impl ProcessRunner for JobRunner {
     async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
-        self.start(command).await?.output_string().await
+        JobRunner::start(self, command).await?.output_string().await
+    }
+
+    async fn start(&self, command: &Command) -> Result<RunningProcess> {
+        JobRunner::start(self, command).await
     }
 }
 
@@ -185,7 +208,14 @@ impl ProcessGroup {
 #[async_trait::async_trait]
 impl ProcessRunner for ProcessGroup {
     async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
-        self.start(command).await?.output_string().await
+        ProcessGroup::start(self, command)
+            .await?
+            .output_string()
+            .await
+    }
+
+    async fn start(&self, command: &Command) -> Result<RunningProcess> {
+        ProcessGroup::start(self, command).await
     }
 }
 

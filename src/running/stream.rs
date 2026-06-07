@@ -62,7 +62,7 @@ impl RunningProcess {
         // call's sink/pump, or `finish_streamed` would return empty stderr.
         if self.stderr_sink.is_none() {
             let stderr_sink = SharedLines::new(&self.buffer);
-            if let Some(pipe) = self.stderr_pipe.take() {
+            if let Some(pipe) = self.backend.take_stderr_reader() {
                 self.stderr_pump = Some(tokio::spawn(pump_lines(
                     pipe,
                     self.stderr_encoding,
@@ -74,7 +74,7 @@ impl RunningProcess {
         }
 
         let stdout_sink = SharedLines::new(&self.buffer);
-        match self.stdout_pipe.take() {
+        match self.backend.take_stdout_reader() {
             Some(pipe) => {
                 tokio::spawn(pump_lines(
                     pipe,
@@ -93,7 +93,7 @@ impl RunningProcess {
         // timer never delays kill-on-close when the handle is dropped early. Armed
         // once (a second `stdout_lines` call won't spawn a duplicate timer).
         if self.deadline_task.is_none()
-            && let (Some(limit), Some(group)) = (self.timeout, self.own_group.as_ref())
+            && let (Some(limit), Some(group)) = (self.timeout, self.backend.own_group())
         {
             let group = Arc::downgrade(group);
             let pid = self.pid;
@@ -108,7 +108,8 @@ impl RunningProcess {
         // asymmetry as the deadline timer).
         #[cfg(feature = "cancellation")]
         if self.cancel_task.is_none()
-            && let (Some(token), Some(group)) = (self.cancel_token.clone(), self.own_group.as_ref())
+            && let (Some(token), Some(group)) =
+                (self.cancel_token.clone(), self.backend.own_group())
         {
             let group = Arc::downgrade(group);
             let pid = self.pid;
@@ -138,7 +139,7 @@ impl RunningProcess {
         // hang. The cost of the alternative — a shared-group descendant
         // holding the pipe parks this one idle reader until it exits — is
         // benign.
-        if let Some(mut pipe) = self.stdout_pipe.take() {
+        if let Some(mut pipe) = self.backend.take_stdout_reader() {
             tokio::spawn(async move {
                 let mut sink = Vec::new();
                 // Result ignored on purpose: the drain exists only to unblock
@@ -149,7 +150,7 @@ impl RunningProcess {
         // Likewise start a stderr pump if streaming never did (so its output is
         // still captured and the pipe never fills).
         if self.stderr_pump.is_none()
-            && let Some(pipe) = self.stderr_pipe.take()
+            && let Some(pipe) = self.backend.take_stderr_reader()
         {
             let sink = SharedLines::new(&self.buffer);
             self.stderr_pump = Some(tokio::spawn(pump_lines(

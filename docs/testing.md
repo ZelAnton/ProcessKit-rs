@@ -33,9 +33,18 @@ giving ownership away.
 
 Every runner — real or double — gets the convenience helpers of
 `ProcessRunnerExt` for free: `run` (trimmed stdout, success required),
-`exit_code`, `probe` (exit code as a boolean), `checked` (success-checked full
-result). [Retry policies](timeouts-and-cancellation.md#retries) work through
-the seam too, so a double exercises your retry handling hermetically.
+`run_unit`, `exit_code`, `probe` (exit code as a boolean), `checked`
+(success-checked full result). [Retry
+policies](timeouts-and-cancellation.md#retries) work through the seam too, so
+a double exercises your retry handling hermetically.
+
+The seam covers **streaming as well as bulk runs**: `ProcessRunner::start`
+returns a live `RunningProcess`, and a `ScriptedRunner`'s `start` hands back a
+scripted handle whose canned lines flow through the same pump machinery a real
+child uses — `stdout_lines`, `wait_for_line`, and `finish_streamed` behave
+identically, with no subprocess (see
+[Scripted streaming](#scripted-streaming) below). An `output`-only custom
+runner keeps compiling: `start` is defaulted to `Error::Unsupported`.
 
 ```rust,no_run
 use processkit::{Command, ProcessRunner, ProcessRunnerExt, Result};
@@ -91,6 +100,44 @@ The pieces:
   not `["foobar"]`.
 - **No match and no fallback is a loud error** (`Error::Spawn`, not-found) —
   an unexpected invocation can't slip through a test silently.
+- Bulk runs also **replay the canned lines through the command's
+  `on_stdout_line`/`on_stderr_line` handlers**, so a wrapper's
+  progress-reporting path is exercised without a subprocess.
+
+## Scripted streaming
+
+`ScriptedRunner::start` returns a live `RunningProcess` backed by the canned
+reply instead of an OS child. The canned stdout/stderr feed the **same pump
+machinery** a real child uses, so the whole streaming surface works
+hermetically — `stdout_lines` yields the lines, `wait_for_line` probes them,
+`finish_streamed` reports the canned exit and stderr:
+
+```rust,no_run
+use processkit::{Command, ProcessRunner, Reply, ScriptedRunner, StreamExt};
+use std::time::Duration;
+
+#[tokio::test]
+async fn server_becomes_ready() {
+    let runner = ScriptedRunner::new()
+        .on(["serve"], Reply::lines(["booting", "listening on 8080"]));
+
+    let mut run = runner.start(&Command::new("server").arg("serve")).await.unwrap();
+    run.wait_for_line(|l| l.contains("listening"), Duration::from_secs(5))
+        .await
+        .unwrap(); // satisfied by the canned banner — no subprocess
+
+    let (code, _stderr) = run.finish_streamed().await.unwrap();
+    assert_eq!(code, Some(0));
+}
+```
+
+`Reply::lines([...])` scripts the stdout lines; `.with_line_delay(d)` paces
+them (deterministic under `#[tokio::test(start_paused = true)]`), and the
+scripted run "exits" after the last line. The honest boundaries: a scripted
+handle has no OS identity (`pid()` is `None`, `profile` reports empty
+samples), does not compose into a real `Pipeline`, and does not model
+interactive stdin. `Reply::pending()` scripts a run that never exits on its
+own — cancel or time it out through the command's own knobs.
 
 ## Asserting invocations
 

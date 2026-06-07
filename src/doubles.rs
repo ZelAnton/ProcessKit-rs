@@ -8,14 +8,23 @@
 //! Behind the `mock` feature, [`mockall`] additionally generates a `MockRunner`
 //! (re-exported from the crate root) for expectation-style mocking.
 //!
-//! Doubles replay canned results without modeling the runtime machinery: a
-//! command's timeout never kills anything here (script a timed-out [`Reply`]
-//! instead), and the *instant* replies never observe a `cancel_on` token (they
-//! resolve before any cancellation could race them). To exercise cancellation
-//! **behaviour** — a call that genuinely blocks until its token fires — script
-//! [`Reply::pending`] (`cancellation` feature): it parks the call until the
-//! command's token (per-command or
-//! [`CliClient::default_cancel_on`](crate::CliClient::default_cancel_on))
+//! The seam covers **both shapes of a run**. The bulk verbs (`output` and the
+//! helpers over it) replay canned results — and feed the command's
+//! `on_stdout_line`/`on_stderr_line` handlers, so progress-reporting paths
+//! test hermetically. A scripted [`start`](crate::ProcessRunner::start) hands
+//! back a live [`RunningProcess`](crate::RunningProcess) whose canned output
+//! flows through the **same pump machinery** as a real child: `stdout_lines`,
+//! `wait_for_line`/`wait_for`, and `finish_streamed` all behave identically
+//! (per-line pacing via [`Reply::with_line_delay`]). Scripted handles have no
+//! OS identity (`pid()` is `None`), don't compose into a real
+//! [`Pipeline`](crate::Pipeline), and don't model interactive stdin.
+//!
+//! Instant replies never observe a `cancel_on` token (they resolve before any
+//! cancellation could race them). To exercise cancellation **behaviour** — a
+//! call that genuinely blocks until its token fires — script
+//! [`Reply::pending`] (`cancellation` feature): it parks the call (or never
+//! "exits", on `start`) until the command's token — per-command or
+//! [`CliClient::default_cancel_on`](crate::CliClient::default_cancel_on) —
 //! cancels, then resolves with `Err(Error::Cancelled { .. })`, mirroring the
 //! live contract.
 
@@ -38,6 +47,9 @@ pub struct Reply {
     /// Park the call until the command's cancellation token fires (see
     /// [`pending`](Self::pending)); the other fields are unused then.
     pending: bool,
+    /// On a scripted `start`, sleep this long before each stdout line (see
+    /// [`with_line_delay`](Self::with_line_delay)). Bulk `output` ignores it.
+    line_delay: Option<std::time::Duration>,
 }
 
 impl Reply {
@@ -49,6 +61,7 @@ impl Reply {
             code: 0,
             timed_out: false,
             pending: false,
+            line_delay: None,
         }
     }
 
@@ -60,6 +73,7 @@ impl Reply {
             code,
             timed_out: false,
             pending: false,
+            line_delay: None,
         }
     }
 
@@ -74,6 +88,7 @@ impl Reply {
             code: 0,
             timed_out: true,
             pending: false,
+            line_delay: None,
         }
     }
 
@@ -97,7 +112,38 @@ impl Reply {
             code: 0,
             timed_out: false,
             pending: true,
+            line_delay: None,
         }
+    }
+
+    /// A successful reply whose stdout is `lines` joined with `\n` — reads
+    /// naturally for scripted **streaming** (`start` → `stdout_lines` yields
+    /// exactly these lines), and is equivalent to [`ok`](Self::ok) with the
+    /// joined text for the bulk path.
+    pub fn lines<I, S>(lines: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut text = lines
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        Self::ok(text)
+    }
+
+    /// On a scripted `start`, sleep `delay` before each stdout line — so a
+    /// hermetic streaming test can observe genuinely incremental delivery
+    /// (deterministic under `#[tokio::test(start_paused = true)]`). The
+    /// scripted run "exits" after the last line. Ignored by the bulk `output`
+    /// path.
+    pub fn with_line_delay(mut self, delay: std::time::Duration) -> Self {
+        self.line_delay = Some(delay);
+        self
     }
 
     /// Attach stdout to a reply — e.g. the `CONFLICT …` text `git merge` writes
@@ -107,6 +153,34 @@ impl Reply {
     pub fn with_stdout(mut self, stdout: impl Into<String>) -> Self {
         self.stdout = stdout.into();
         self
+    }
+
+    /// Build a scripted live handle for `command` from this reply — the
+    /// `start` analogue of [`into_result`](Self::into_result). The canned
+    /// stdout/stderr feed the command's real pump machinery (handlers,
+    /// encodings, buffer policy all apply); the scripted "process" exits with
+    /// the canned code after the last delayed line (immediately without
+    /// delays), or never for a [`pending`](Self::pending) reply.
+    fn into_running(self, command: &Command) -> crate::RunningProcess {
+        // A pending reply never exits on its own; everything else exits after
+        // its (possibly zero) total line-delay budget. A canned timeout exits
+        // immediately as a timed-out outcome, mirroring `into_result`.
+        let lifetime = if self.pending {
+            None
+        } else {
+            let per_line = self.line_delay.unwrap_or_default();
+            let lines = self.stdout.split_inclusive('\n').count() as u32;
+            Some(per_line * lines)
+        };
+        let scripted = crate::running::ScriptedProc::new(
+            self.stdout,
+            self.stderr,
+            (!self.timed_out).then_some(self.code),
+            self.timed_out,
+            lifetime,
+            self.line_delay,
+        );
+        crate::RunningProcess::from_scripted(command, scripted)
     }
 
     fn into_result(
@@ -203,6 +277,42 @@ impl ScriptedRunner {
         self.fallback = Some(reply);
         self
     }
+
+    /// The first reply matching `command` (rules in registration order, then
+    /// the fallback), or the loud not-found spawn error.
+    fn matched_reply(&self, command: &Command, program: &str) -> Result<&Reply> {
+        for (rule, reply) in &self.rules {
+            if rule.matches(command) {
+                return Ok(reply);
+            }
+        }
+        self.fallback
+            .as_ref()
+            .ok_or_else(|| crate::error::Error::Spawn {
+                program: program.to_owned(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "ScriptedRunner: no rule matched and no fallback set",
+                ),
+            })
+    }
+}
+
+/// Replay the canned streams through the command's `on_stdout_line` /
+/// `on_stderr_line` handlers, so a wrapper's progress-reporting path is
+/// exercised hermetically on the bulk `output` verbs too (on a scripted
+/// `start`, the real pumps already invoke them).
+fn replay_line_handlers(command: &Command, reply: &Reply) {
+    if let Some(handler) = command.stdout_handler() {
+        for line in reply.stdout.lines() {
+            handler(line);
+        }
+    }
+    if let Some(handler) = command.stderr_handler() {
+        for line in reply.stderr.lines() {
+            handler(line);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -210,29 +320,22 @@ impl ProcessRunner for ScriptedRunner {
     async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
         let program = command.program().to_string_lossy().into_owned();
         let timeout = command.configured_timeout();
-        for (rule, reply) in &self.rules {
-            if rule.matches(command) {
-                if reply.pending {
-                    return park_until_cancelled(command, program).await;
-                }
-                return Ok(reply.clone().into_result(program, timeout));
-            }
+        let reply = self.matched_reply(command, &program)?;
+        if reply.pending {
+            return park_until_cancelled(command, program).await;
         }
-        match &self.fallback {
-            Some(reply) => {
-                if reply.pending {
-                    return park_until_cancelled(command, program).await;
-                }
-                Ok(reply.clone().into_result(program, timeout))
-            }
-            None => Err(crate::error::Error::Spawn {
-                program,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "ScriptedRunner: no rule matched and no fallback set",
-                ),
-            }),
-        }
+        replay_line_handlers(command, reply);
+        Ok(reply.clone().into_result(program, timeout))
+    }
+
+    /// Start a scripted live handle: the canned stdout/stderr flow through the
+    /// command's **real** pump machinery (handlers, encodings, buffer policy),
+    /// so `stdout_lines` / `wait_for_line` / `finish_streamed` behave exactly
+    /// as on a real child — no subprocess involved.
+    async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
+        let program = command.program().to_string_lossy().into_owned();
+        let reply = self.matched_reply(command, &program)?;
+        Ok(reply.clone().into_running(command))
     }
 }
 
@@ -363,12 +466,164 @@ impl<R: ProcessRunner> ProcessRunner for RecordingRunner<R> {
             .push(Invocation::from_command(command));
         self.inner.output(command).await
     }
+
+    async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
+        // Recorded BEFORE delegating (like `output`), so a streamed run is
+        // captured even if its stream is never consumed.
+        self.calls
+            .lock()
+            .expect("recorder lock poisoned")
+            .push(Invocation::from_command(command));
+        self.inner.start(command).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runner::ProcessRunnerExt;
+
+    #[tokio::test]
+    async fn scripted_start_streams_canned_lines_through_real_pumps() {
+        use tokio_stream::StreamExt;
+        let runner = ScriptedRunner::new().on(["log"], Reply::lines(["first", "second", "third"]));
+        let cmd = Command::new("git").arg("log");
+        let mut run = runner.start(&cmd).await.expect("scripted start");
+        assert_eq!(run.pid(), None, "a scripted child has no OS identity");
+
+        let mut lines = run.stdout_lines();
+        let mut seen = Vec::new();
+        while let Some(line) = lines.next().await {
+            seen.push(line);
+        }
+        assert_eq!(seen, ["first", "second", "third"]);
+
+        let (code, stderr) = run.finish_streamed().await.expect("finish");
+        assert_eq!(code, Some(0));
+        assert_eq!(stderr, "");
+    }
+
+    #[tokio::test]
+    async fn scripted_start_supports_probes_and_failing_finish() {
+        let runner = ScriptedRunner::new().fallback(
+            Reply::fail(7, "boom: detail\n").with_stdout("starting up\nready to serve\n"),
+        );
+        let cmd = Command::new("server");
+        let mut run = runner.start(&cmd).await.expect("scripted start");
+        run.wait_for_line(|l| l.contains("ready"), std::time::Duration::from_secs(5))
+            .await
+            .expect("the canned banner satisfies the probe");
+        let (code, stderr) = run.finish_streamed().await.expect("finish");
+        assert_eq!(code, Some(7));
+        assert_eq!(stderr, "boom: detail");
+    }
+
+    #[tokio::test]
+    async fn scripted_start_consumed_by_output_string() {
+        // The whole consuming surface works on a scripted handle, not just
+        // streaming: output_string drains the same pumps.
+        let runner = ScriptedRunner::new().fallback(Reply::lines(["a", "b"]));
+        let run = runner.start(&Command::new("x")).await.expect("start");
+        let result = run.output_string().await.expect("consume");
+        assert!(result.is_success());
+        assert_eq!(result.stdout(), "a\nb");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scripted_line_delay_delivers_incrementally() {
+        use tokio_stream::StreamExt;
+        let runner = ScriptedRunner::new().fallback(
+            Reply::lines(["tick", "tock"]).with_line_delay(std::time::Duration::from_secs(10)),
+        );
+        let mut run = runner
+            .start(&Command::new("clock"))
+            .await
+            .expect("scripted start");
+        let mut lines = run.stdout_lines();
+
+        // Nothing arrives before the first delay elapses…
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), lines.next())
+                .await
+                .is_err(),
+            "no line may arrive before its scripted delay"
+        );
+        // …then the paused clock advances and both lines flow.
+        assert_eq!(lines.next().await.as_deref(), Some("tick"));
+        assert_eq!(lines.next().await.as_deref(), Some("tock"));
+        assert_eq!(lines.next().await, None);
+    }
+
+    #[tokio::test]
+    async fn scripted_timeout_reply_surfaces_through_start() {
+        let runner = ScriptedRunner::new().fallback(Reply::timeout());
+        let cmd = Command::new("slow").timeout(std::time::Duration::from_secs(9));
+        let run = runner.start(&cmd).await.expect("start");
+        let result = run.output_string().await.expect("a timeout is captured");
+        assert!(result.timed_out());
+        assert!(!result.is_success());
+    }
+
+    #[tokio::test]
+    async fn output_replays_canned_lines_through_handlers() {
+        // The bulk path fires `on_stdout_line`/`on_stderr_line` for canned
+        // replies, so a wrapper's progress reporting tests hermetically.
+        use std::sync::{Arc, Mutex};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let errs = Arc::new(Mutex::new(Vec::new()));
+        let runner = ScriptedRunner::new().on(["fetch"], Reply::ok("a\nb\n").with_stdout("a\nb\n"));
+        let cmd = Command::new("git")
+            .arg("fetch")
+            .on_stdout_line({
+                let seen = seen.clone();
+                move |l| seen.lock().unwrap().push(l.to_owned())
+            })
+            .on_stderr_line({
+                let errs = errs.clone();
+                move |l| errs.lock().unwrap().push(l.to_owned())
+            });
+        let result = runner.output(&cmd).await.expect("scripted run");
+        assert!(result.is_success());
+        assert_eq!(*seen.lock().unwrap(), ["a", "b"]);
+        assert!(errs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recording_runner_records_start_invocations() {
+        let rec = RecordingRunner::new(ScriptedRunner::new().fallback(Reply::lines(["x"])));
+        let run = rec
+            .start(&Command::new("gh").args(["run", "watch"]))
+            .await
+            .expect("recorded start");
+        drop(run); // recorded even though the stream was never consumed
+        assert_eq!(rec.only_call().args_str(), ["run", "watch"]);
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[tokio::test(start_paused = true)]
+    async fn scripted_pending_start_is_cancellable() {
+        let token = crate::CancellationToken::new();
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let cmd = Command::new("watch").cancel_on(token.clone());
+        let run = runner.start(&cmd).await.expect("start");
+        let consume = run.output_string();
+        tokio::pin!(consume);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3600), &mut consume)
+                .await
+                .is_err(),
+            "a pending scripted run must not resolve before cancellation"
+        );
+        token.cancel();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(3600), consume)
+            .await
+            .expect("the token resolves the run")
+            .expect_err("cancellation is always an error");
+        assert!(
+            matches!(err, crate::error::Error::Cancelled { .. }),
+            "got {err:?}"
+        );
+    }
 
     #[tokio::test]
     async fn prefix_rule_matches_and_replies() {

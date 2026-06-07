@@ -13,6 +13,22 @@ to a dated version section.
 
 ### Added
 
+- `ProcessRunner::start` — the live-handle half of a run joins the seam (with
+  an `Error::Unsupported` default, so `output`-only runners keep compiling).
+  `ScriptedRunner::start` returns a **scripted `RunningProcess`** whose canned
+  output flows through the same pump machinery as a real child: streaming
+  (`stdout_lines`), readiness probes, and `finish_streamed` are now
+  hermetically testable. `Reply::lines([...])` scripts the lines;
+  `Reply::with_line_delay(d)` paces them (paused-clock friendly);
+  `RecordingRunner` records `start` invocations. Scripted handles have no pid,
+  don't compose into a real `Pipeline`, and don't model interactive stdin
+  (documented). Cassette record/replay does not yet cover streaming runs.
+- `ScriptedRunner::output` now replays canned stdout/stderr through the
+  command's `on_stdout_line`/`on_stderr_line` handlers, so progress-reporting
+  wrappers test hermetically (requested by a downstream wrapper crate's
+  streaming spec).
+- `ProcessRunnerExt::run_unit` — run for the side effect, require a zero
+  exit, discard the output (the verb `CliClient::run_unit` delegates to).
 - More `tracing` events (behind the `tracing` feature, `processkit` target):
   child spawn (program/pid/mechanism), timeout and cancellation firing, group
   terminate/shutdown, retry attempts, stdin-writer failures, output-pump

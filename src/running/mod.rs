@@ -90,14 +90,9 @@ pub struct RunningProcess {
     // `finish_streamed_without_streaming_first…`). A state enum would add
     // panic paths to guard doors the borrow checker already locks.
     program: String,
-    child: Child,
-    // `Arc` so a streaming deadline timer can hold a `Weak` to kill the tree
-    // without keeping the group alive (kill-on-close on drop stays prompt).
-    own_group: Option<Arc<ProcessGroup>>,
-    stdout_pipe: Option<ChildStdout>,
-    stderr_pipe: Option<ChildStderr>,
-    stdin_pipe: Option<ChildStdin>,
-    stdin_task: Option<JoinHandle<std::io::Result<()>>>,
+    /// The I/O-bearing half: a real OS child, or a scripted double feeding the
+    /// same pump machinery (see [`Backend`]).
+    backend: Backend,
     timeout: Option<Duration>,
     pid: Option<u32>,
     stdout_encoding: &'static Encoding,
@@ -124,16 +119,155 @@ pub struct RunningProcess {
     start_time: SystemTime,
 }
 
+/// A boxed output reader the pumps consume — a real `ChildStdout`/`ChildStderr`
+/// or a scripted in-memory stream; `pump_lines` is generic over `AsyncRead`,
+/// so both flow through the *same* machinery.
+type OutputReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+
+/// The I/O-bearing half of a [`RunningProcess`]: a real OS child, or a
+/// scripted double ([`ScriptedRunner::start`](crate::ScriptedRunner)) that
+/// feeds canned bytes through the same pumps/sinks — which is what makes
+/// streaming, probes, and `finish_streamed` hermetically testable. Platform
+/// code only ever constructs `Real`.
+enum Backend {
+    // Boxed: both variants are large, and the enum lives in every handle.
+    Real(Box<RealProc>),
+    Scripted(Box<ScriptedProc>),
+}
+
+/// The real-child fields — exactly the ones that touch the OS.
+struct RealProc {
+    child: Child,
+    // `Arc` so a streaming deadline timer can hold a `Weak` to kill the tree
+    // without keeping the group alive (kill-on-close on drop stays prompt).
+    own_group: Option<Arc<ProcessGroup>>,
+    stdout_pipe: Option<ChildStdout>,
+    stderr_pipe: Option<ChildStderr>,
+    stdin_pipe: Option<ChildStdin>,
+    stdin_task: Option<JoinHandle<std::io::Result<()>>>,
+}
+
+/// A scripted "child": canned output readers (fed by detached writer tasks so
+/// per-line delays work under a paused clock) plus a canned exit.
+pub(crate) struct ScriptedProc {
+    /// Canned stdout/stderr, taken once like real pipes.
+    stdout: Option<tokio::io::DuplexStream>,
+    stderr: Option<tokio::io::DuplexStream>,
+    /// The writer tasks feeding the duplex streams; aborted on kill/drop
+    /// (dropping the writer EOFs the reader, ending pumps and streams).
+    feeders: Vec<JoinHandle<()>>,
+    /// Canned exit: code + timed-out flag.
+    code: Option<i32>,
+    timed_out: bool,
+    /// When the scripted child "exits": `Some(at)` resolves at that instant
+    /// (now = immediately), `None` never exits on its own (`Reply::pending` —
+    /// cancel/timeout still end it).
+    exit_at: Option<tokio::time::Instant>,
+    /// Set by `kill_tree`/`start_kill`: the scripted child is dead now.
+    killed: bool,
+}
+
+impl ScriptedProc {
+    /// Assemble a scripted child. Each output's text is fed through a duplex
+    /// pipe by a detached writer task — with `line_delay`, the writer sleeps
+    /// before each line (virtual-time friendly under a paused clock). The
+    /// "process" exits after `lifetime` (`None` = never on its own).
+    pub(crate) fn new(
+        stdout_text: String,
+        stderr_text: String,
+        code: Option<i32>,
+        timed_out: bool,
+        lifetime: Option<Duration>,
+        line_delay: Option<Duration>,
+    ) -> Self {
+        let mut feeders = Vec::new();
+        let mut feed = |text: String| {
+            let (mut tx, rx) = tokio::io::duplex(64 * 1024);
+            if text.is_empty() {
+                // Dropping the writer immediately EOFs the reader.
+                return rx;
+            }
+            feeders.push(tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                match line_delay {
+                    None => {
+                        let _ = tx.write_all(text.as_bytes()).await;
+                    }
+                    Some(delay) => {
+                        for line in text.split_inclusive('\n') {
+                            tokio::time::sleep(delay).await;
+                            if tx.write_all(line.as_bytes()).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                // tx drops here → EOF.
+            }));
+            rx
+        };
+        let stdout = feed(stdout_text);
+        let stderr = feed(stderr_text);
+        Self {
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            feeders,
+            code,
+            timed_out,
+            exit_at: lifetime.map(|d| tokio::time::Instant::now() + d),
+            killed: false,
+        }
+    }
+
+    /// The scripted kill: mark dead and hang up the feeders (aborting a
+    /// writer drops its end, EOF-ing the matching reader — pumps and streams
+    /// end exactly as when a real tree dies and its pipes close).
+    fn kill(&mut self) {
+        self.killed = true;
+        for task in self.feeders.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+impl Backend {
+    /// The owning group, when this is a real child with a private group.
+    fn own_group(&self) -> Option<&Arc<ProcessGroup>> {
+        match self {
+            Backend::Real(real) => real.own_group.as_ref(),
+            Backend::Scripted(_) => None,
+        }
+    }
+
+    /// Take the stdout reader for pumping (boxed: real pipe or scripted bytes).
+    fn take_stdout_reader(&mut self) -> Option<OutputReader> {
+        match self {
+            Backend::Real(real) => real.stdout_pipe.take().map(|p| Box::new(p) as OutputReader),
+            Backend::Scripted(s) => s.stdout.take().map(|p| Box::new(p) as OutputReader),
+        }
+    }
+
+    /// Take the stderr reader for pumping.
+    fn take_stderr_reader(&mut self) -> Option<OutputReader> {
+        match self {
+            Backend::Real(real) => real.stderr_pipe.take().map(|p| Box::new(p) as OutputReader),
+            Backend::Scripted(s) => s.stderr.take().map(|p| Box::new(p) as OutputReader),
+        }
+    }
+}
+
 impl RunningProcess {
     pub(crate) fn from_spawned(s: Spawned) -> Self {
         Self {
             program: s.program,
-            child: s.child,
-            own_group: s.own_group.map(Arc::new),
-            stdout_pipe: s.stdout,
-            stderr_pipe: s.stderr,
-            stdin_pipe: s.stdin,
-            stdin_task: s.stdin_task,
+            backend: Backend::Real(Box::new(RealProc {
+                child: s.child,
+                own_group: s.own_group.map(Arc::new),
+                stdout_pipe: s.stdout,
+                stderr_pipe: s.stderr,
+                stdin_pipe: s.stdin,
+                stdin_task: s.stdin_task,
+            })),
             timeout: s.timeout,
             pid: s.pid,
             stdout_encoding: s.stdout_encoding,
@@ -154,16 +288,51 @@ impl RunningProcess {
         }
     }
 
+    /// Build a scripted handle for `command` (the seam doubles' `start`): the
+    /// command's encodings/handlers/buffer/timeout/token apply exactly as on a
+    /// real run, so a hermetic streamed run exercises the same pump machinery.
+    /// `pid()` is `None` — a scripted child has no OS identity.
+    pub(crate) fn from_scripted(command: &crate::command::Command, scripted: ScriptedProc) -> Self {
+        Self {
+            program: command.program_name(),
+            backend: Backend::Scripted(Box::new(scripted)),
+            timeout: command.configured_timeout(),
+            pid: None,
+            stdout_encoding: command.out_encoding(),
+            stderr_encoding: command.err_encoding(),
+            stdout_handler: command.stdout_handler(),
+            stderr_handler: command.stderr_handler(),
+            buffer: command.output_buffer_policy(),
+            stdout_sink: None,
+            stderr_sink: None,
+            stderr_pump: None,
+            deadline_task: None,
+            #[cfg(feature = "cancellation")]
+            cancel_token: command.cancel_token(),
+            #[cfg(feature = "cancellation")]
+            cancel_task: None,
+            started: Instant::now(),
+            start_time: SystemTime::now(),
+        }
+    }
+
     pub(crate) fn attach_group(&mut self, group: ProcessGroup) {
-        self.own_group = Some(Arc::new(group));
+        if let Backend::Real(real) = &mut self.backend {
+            real.own_group = Some(Arc::new(group));
+        }
     }
 
     /// Take the raw stdout pipe — the [`Pipeline`](crate::Pipeline) plumbing
     /// that feeds it into the next stage's stdin. Afterwards this handle can
     /// still report exit + stderr via [`finish_streamed`](Self::finish_streamed)
     /// (which tolerates a taken stdout), like after `stdout_lines`.
+    /// `None` for a scripted backend — scripted doubles don't compose into a
+    /// real pipeline (pipelines are a real-process concern).
     pub(crate) fn take_stdout_pipe(&mut self) -> Option<ChildStdout> {
-        self.stdout_pipe.take()
+        match &mut self.backend {
+            Backend::Real(real) => real.stdout_pipe.take(),
+            Backend::Scripted(_) => None,
+        }
     }
 
     /// The program this handle is running (for error/outcome attribution).
@@ -253,7 +422,13 @@ impl RunningProcess {
     /// # }
     /// ```
     pub fn standard_input(&mut self) -> Option<ProcessStdin> {
-        self.stdin_pipe.take().map(ProcessStdin::new)
+        match &mut self.backend {
+            Backend::Real(real) => real.stdin_pipe.take().map(ProcessStdin::new),
+            // Scripted doubles don't model interactive stdin (yet): the
+            // writer would need a scripted reader on the other end. `None`
+            // matches the "stdin wasn't kept open" contract.
+            Backend::Scripted(_) => None,
+        }
     }
 
     /// Drain both streams, wait for exit, and return the captured text output
@@ -279,7 +454,7 @@ impl RunningProcess {
     /// reader (no line pump), with its own bounded drain-then-abort teardown.
     pub async fn output_bytes(mut self) -> Result<ProcessResult<Vec<u8>>> {
         let stderr_sink = SharedLines::new(&self.buffer);
-        let err_pump = self.stderr_pipe.take().map(|pipe| {
+        let err_pump = self.backend.take_stderr_reader().map(|pipe| {
             tokio::spawn(pump_lines(
                 pipe,
                 self.stderr_encoding,
@@ -292,7 +467,7 @@ impl RunningProcess {
         // Read stdout raw, concurrently, so it never blocks the child. The
         // bytes accumulate in a shared buffer (not the task's return value) so
         // the bounded teardown below can salvage a partial read.
-        let mut stdout_pipe = self.stdout_pipe.take();
+        let mut stdout_pipe = self.backend.take_stdout_reader();
         let out_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
         let out_task = {
             let out_buf = out_buf.clone();
@@ -365,7 +540,7 @@ impl RunningProcess {
     /// tokio caches the exit status, so a raced-and-cancelled process can be
     /// waited again (or consumed normally) afterwards.
     pub(crate) async fn wait_exit(&mut self) -> Result<Option<i32>> {
-        Ok(self.child.wait().await?.code())
+        Ok(self.backend_wait().await?.0)
     }
 
     /// Run the process to completion while sampling its CPU and memory every
@@ -507,7 +682,7 @@ impl RunningProcess {
         stderr_sink: &Arc<SharedLines>,
     ) -> Vec<JoinHandle<()>> {
         let mut tasks = Vec::new();
-        if let Some(pipe) = self.stdout_pipe.take() {
+        if let Some(pipe) = self.backend.take_stdout_reader() {
             tasks.push(tokio::spawn(pump_lines(
                 pipe,
                 self.stdout_encoding,
@@ -515,7 +690,7 @@ impl RunningProcess {
                 stdout_sink.clone(),
             )));
         }
-        if let Some(pipe) = self.stderr_pipe.take() {
+        if let Some(pipe) = self.backend.take_stderr_reader() {
             tasks.push(tokio::spawn(pump_lines(
                 pipe,
                 self.stderr_encoding,
@@ -547,11 +722,14 @@ impl RunningProcess {
     /// `Drop`'s abort, so teardown timing is unchanged. Diagnostics only:
     /// never alters the run's result.
     async fn observe_stdin_task(&mut self) {
-        let Some(task) = self.stdin_task.take() else {
+        let Backend::Real(real) = &mut self.backend else {
+            return;
+        };
+        let Some(task) = real.stdin_task.take() else {
             return;
         };
         if !task.is_finished() {
-            self.stdin_task = Some(task);
+            real.stdin_task = Some(task);
             return;
         }
         // The task is finished, so this await is immediate.
@@ -608,25 +786,54 @@ impl RunningProcess {
         Ok(outcome)
     }
 
+    /// The raw exit wait — no timeout/cancel applied. Real: the child's
+    /// `wait()`. Scripted: resolve at the canned `exit_at` (never, for a
+    /// pending script) with the canned `(code, timed_out)`; a killed script
+    /// resolves immediately codeless, like a killed child.
+    async fn backend_wait(&mut self) -> Result<(Option<i32>, bool)> {
+        match &mut self.backend {
+            Backend::Real(real) => Ok((real.child.wait().await?.code(), false)),
+            Backend::Scripted(s) => {
+                if s.killed {
+                    return Ok((None, false));
+                }
+                match s.exit_at {
+                    Some(at) => {
+                        tokio::time::sleep_until(at).await;
+                        Ok((s.code, s.timed_out))
+                    }
+                    None => std::future::pending().await,
+                }
+            }
+        }
+    }
+
     /// Without the `cancellation` feature: the plain timeout/no-timeout shape.
     #[cfg(not(feature = "cancellation"))]
     async fn drive_to_exit_inner(&mut self) -> Result<(Option<i32>, bool)> {
         match self.timeout {
-            Some(limit) => match tokio::time::timeout(limit, self.child.wait()).await {
-                Ok(status) => Ok((status?.code(), false)),
-                Err(_elapsed) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!(
-                        target: "processkit",
-                        program = %self.program,
-                        timeout_ms = limit.as_millis() as u64,
-                        "timeout elapsed; killing the tree"
-                    );
-                    self.kill_tree().await;
-                    Ok((None, true))
+            Some(limit) => {
+                let waited = {
+                    let wait = self.backend_wait();
+                    tokio::pin!(wait);
+                    tokio::time::timeout(limit, &mut wait).await
+                };
+                match waited {
+                    Ok(outcome) => outcome,
+                    Err(_elapsed) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(
+                            target: "processkit",
+                            program = %self.program,
+                            timeout_ms = limit.as_millis() as u64,
+                            "timeout elapsed; killing the tree"
+                        );
+                        self.kill_tree().await;
+                        Ok((None, true))
+                    }
                 }
-            },
-            None => Ok((self.child.wait().await?.code(), false)),
+            }
+            None => self.backend_wait().await,
         }
     }
 
@@ -638,7 +845,7 @@ impl RunningProcess {
     #[cfg(feature = "cancellation")]
     async fn drive_to_exit_inner(&mut self) -> Result<(Option<i32>, bool)> {
         // Own the knobs so the helper futures borrow nothing from `self` —
-        // only `self.child.wait()` does, keeping the select! borrows disjoint.
+        // only `self.backend_wait()` does, keeping the select! borrows disjoint.
         let limit = self.timeout;
         let token = self.cancel_token.clone();
         let cancelled = async {
@@ -654,7 +861,7 @@ impl RunningProcess {
             }
         };
         tokio::select! {
-            status = self.child.wait() => Ok((status?.code(), false)),
+            outcome = self.backend_wait() => outcome,
             () = cancelled => {
                 #[cfg(feature = "tracing")]
                 tracing::debug!(
@@ -682,15 +889,33 @@ impl RunningProcess {
     /// Hard-kill the child and (for a private group) its tree, then reap —
     /// the shared teardown of the timeout and cancellation arms.
     async fn kill_tree(&mut self) {
-        // Best-effort: the child may already be exiting or reaped.
-        let _ = self.child.start_kill();
-        if let Some(group) = &self.own_group {
-            // Best-effort whole-tree kill; the group's Drop backstops it.
-            let _ = group.terminate_all();
+        match &mut self.backend {
+            Backend::Real(real) => {
+                // Best-effort: the child may already be exiting or reaped.
+                let _ = real.child.start_kill();
+                if let Some(group) = &real.own_group {
+                    // Best-effort whole-tree kill; the group's Drop backstops it.
+                    let _ = group.terminate_all();
+                }
+                // Reap after the kill; a wait error here cannot change the
+                // outcome the caller is about to report.
+                let _ = real.child.wait().await;
+            }
+            Backend::Scripted(s) => s.kill(),
         }
-        // Reap after the kill; a wait error here cannot change the outcome
-        // the caller is about to report.
-        let _ = self.child.wait().await;
+    }
+
+    /// Whether the child has already exited, polled without blocking — the
+    /// readiness probes' early-exit check.
+    fn has_exited_now(&mut self) -> bool {
+        match &mut self.backend {
+            Backend::Real(real) => matches!(real.child.try_wait(), Ok(Some(_))),
+            Backend::Scripted(s) => {
+                s.killed
+                    || s.exit_at
+                        .is_some_and(|at| tokio::time::Instant::now() >= at)
+            }
+        }
     }
 
     /// After [`drive_to_exit`](Self::drive_to_exit): the typed cancellation
@@ -709,16 +934,28 @@ impl RunningProcess {
     /// Send a kill to the process without waiting for it to exit. The owning
     /// group still governs the rest of the tree.
     pub fn start_kill(&mut self) -> Result<()> {
-        self.child.start_kill()?;
+        match &mut self.backend {
+            Backend::Real(real) => {
+                real.child.start_kill()?;
+            }
+            Backend::Scripted(s) => s.kill(),
+        }
         Ok(())
     }
 }
 
 impl Drop for RunningProcess {
     fn drop(&mut self) {
-        // Abort a still-running stdin writer; a finished one is unaffected.
-        if let Some(task) = self.stdin_task.take() {
-            task.abort();
+        match &mut self.backend {
+            Backend::Real(real) => {
+                // Abort a still-running stdin writer; a finished one is unaffected.
+                if let Some(task) = real.stdin_task.take() {
+                    task.abort();
+                }
+            }
+            // Hang up the scripted feeders so no detached writer outlives the
+            // handle.
+            Backend::Scripted(s) => s.kill(),
         }
         // Abort the streaming deadline timer (it holds only a `Weak` to the group,
         // so this never blocks the group's kill-on-close).

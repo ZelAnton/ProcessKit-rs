@@ -131,9 +131,9 @@ impl RunningProcess {
                 return Ok(());
             }
             // An exited child can never become ready — fail fast rather than
-            // burning the rest of the deadline. (`Err` from try_wait means
-            // "couldn't tell"; keep polling, the deadline still bounds us.)
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
+            // burning the rest of the deadline. (A "couldn't tell" probe keeps
+            // polling; the deadline still bounds us.)
+            if self.has_exited_now() {
                 return Err(self.not_ready(within));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
