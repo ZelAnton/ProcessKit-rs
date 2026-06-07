@@ -415,6 +415,11 @@ async fn main() -> processkit::Result<()> {
         .create_no_window()                    // Windows: no console window
         .run()
         .await?;
+
+    Command::new("daemonish")
+        .kill_on_parent_death()                // die with a SIGKILLed parent
+        .start()
+        .await?;
     Ok(())
 }
 ```
@@ -431,7 +436,10 @@ with the process-group mechanism. `setsid` keeps containment: the group
 tracks the new session's process group. `create_no_window` is a harmless
 no-op outside Windows and, unlike the raw `ProcessGroup::spawn` escape hatch,
 survives the group's `CREATE_SUSPENDED` containment flag (they are OR'd
-together).
+together). `kill_on_parent_death` hardens the one case `Drop` can't cover —
+the parent dying abruptly (`SIGKILL`): Windows already guarantees it (the job
+handle closes with the process), Linux arms `PDEATHSIG` on the direct child,
+macOS/BSD have no equivalent (documented no-op).
 
 *Deeper: [Running commands → privileges and spawn flags](docs/commands.md).*
 

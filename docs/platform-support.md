@@ -69,6 +69,7 @@ quietly falls back to `ProcessGroup` — unless you requested
 | `uid` / `gid` drop | ❌ `Unsupported` | ✅ |
 | `setsid` | ❌ `Unsupported` | ✅ |
 | `create_no_window` | ✅ | no-op |
+| `kill_on_parent_death` | ✅ always on (kernel) | Linux: direct child; macOS/BSD: no-op |
 
 Everything not listed — capture, streaming, interactive stdin, encodings,
 buffer policies, timeouts, retry, pipelines, supervision, readiness probes,
@@ -94,6 +95,15 @@ composes cleanly with the process-group mechanism.
 the crate coordinates the two (the containment tracking follows the new
 session's group), so `setsid` keeps the kill-on-drop guarantee instead of
 breaking out of it.
+
+**`kill_on_parent_death()` is thread-scoped on Linux.** `PR_SET_PDEATHSIG`
+fires when the spawning *thread* dies, not only the process. On a
+multi-threaded tokio runtime a retired worker thread could kill the child
+early; spawn from a current-thread runtime for the strongest guarantee. It
+covers the **direct child only** — with the parent SIGKILLed, nothing tears
+the cgroup/pgroup down, so grandchildren survive. The
+parent-died-before-arming race is closed by a `getppid()` re-check in the
+child (imperfect inside PID namespaces where the reaper isn't PID 1).
 
 **Windows: the suspended-spawn handshake.** Children are created
 `CREATE_SUSPENDED`, assigned to the job, then resumed — closing the classic

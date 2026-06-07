@@ -75,11 +75,21 @@ impl Job {
         cmd: &mut Command,
         opts: &crate::sys::SpawnOptions,
     ) -> io::Result<Child> {
+        // Arm the parent-death signal last, after containment hooks: pre-exec
+        // hooks run in registration order, and a child that dies unprotected
+        // inside its container beats one protected outside it.
+        // SAFETY: see `arm_pdeathsig` — async-signal-safe calls only.
+        let arm = |cmd: &mut Command| {
+            if opts.kill_on_parent_death {
+                unsafe {
+                    cmd.as_std_mut().pre_exec(arm_pdeathsig);
+                }
+            }
+        };
         match &self.backend {
             Backend::Cgroup(cg) => {
                 // The cgroup path never touches process groups, so a setsid
                 // pre-exec hook needs no coordination here.
-                let _ = opts;
                 let procs = CString::new(cg.path.join("cgroup.procs").into_os_string().into_vec())
                     .map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidInput, "cgroup path contains NUL")
@@ -92,9 +102,13 @@ impl Job {
                     cmd.as_std_mut()
                         .pre_exec(move || write_self_pid(procs.as_c_str()));
                 }
+                arm(cmd);
                 cmd.spawn()
             }
-            Backend::ProcessGroup(pg) => pg.spawn(cmd, opts),
+            Backend::ProcessGroup(pg) => {
+                arm(cmd);
+                pg.spawn(cmd, opts)
+            }
         }
     }
 
@@ -485,6 +499,29 @@ fn cpu_max_value(cores: f64) -> String {
 ///
 /// Must stay async-signal-safe: it calls only `open`/`getpid`/`write`/`close`
 /// and formats the pid into a stack buffer — no allocation, no locks.
+/// Arm `PR_SET_PDEATHSIG(SIGKILL)` so the kernel kills this child when the
+/// spawning thread dies, then close the parent-died-before-arming race: if
+/// `getppid()` already reports the reaper (PID 1 outside PID namespaces), the
+/// parent is gone and the signal will never fire — exit immediately instead.
+/// Runs in the forked child after `fork()` and before `exec()`.
+///
+/// # Safety
+///
+/// Must stay async-signal-safe: it calls only `prctl`/`getppid`/`_exit` —
+/// no allocation, no locks.
+fn arm_pdeathsig() -> io::Result<()> {
+    // SAFETY: prctl(PR_SET_PDEATHSIG)/getppid/_exit are async-signal-safe.
+    unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::getppid() == 1 {
+            libc::_exit(0);
+        }
+    }
+    Ok(())
+}
+
 fn write_self_pid(path: &CStr) -> io::Result<()> {
     // SAFETY: all calls below are async-signal-safe and operate on a valid,
     // NUL-terminated path; the fd is closed on every return path.

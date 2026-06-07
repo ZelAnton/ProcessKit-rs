@@ -67,6 +67,12 @@ pub(crate) struct SpawnOptions {
     /// no-op.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub creation_flags: u32,
+    /// Arm `PR_SET_PDEATHSIG(SIGKILL)` on the direct child. Only the Linux
+    /// backend consults it — Windows already kills the tree when the parent
+    /// dies (job handle closes), macOS/BSD have no equivalent; both are
+    /// documented on [`Command::kill_on_parent_death`](crate::Command::kill_on_parent_death).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub kill_on_parent_death: bool,
 }
 
 // Exactly one platform module is compiled per target. Each defines an `imp::Job`

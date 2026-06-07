@@ -58,6 +58,12 @@ use crate::stats::ProcessGroupStats;
 use crate::sys::ProcMetrics;
 
 pub(crate) struct Job {
+    /// The job handle — deliberately non-inheritable and never duplicated:
+    /// when this process dies (however abruptly), the kernel closes the last
+    /// handle and `KILL_ON_JOB_CLOSE` takes the whole tree. That free
+    /// kill-on-parent-death guarantee (documented on
+    /// `Command::kill_on_parent_death`) breaks if a refactor ever duplicates
+    /// or inherits this handle.
     handle: HANDLE,
     /// Serializes `spawn`'s create-suspended → assign → resume sequence against
     /// the [`suspend`](Self::suspend)/[`resume`](Self::resume) member-thread

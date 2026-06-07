@@ -88,6 +88,14 @@ impl ProcessGroupOptions {
 /// `SIGTERM` → wait → `SIGKILL` teardown (Unix), call
 /// [`shutdown`](Self::shutdown) instead — `Drop` cannot `await`, so the graceful
 /// tier lives in that async method.
+///
+/// The drop guarantee covers every exit that runs destructors (returns,
+/// panics with unwinding). If the owner dies **abruptly** — `SIGKILL`,
+/// `std::process::abort` — `Drop` never runs: on Windows the kernel still
+/// kills the tree (the job handle closes with the process), elsewhere that
+/// hardening is the opt-in
+/// [`Command::kill_on_parent_death`](crate::Command::kill_on_parent_death)
+/// (Linux, direct child only; unavailable on macOS/BSD).
 pub struct ProcessGroup {
     job: Job,
     options: ProcessGroupOptions,

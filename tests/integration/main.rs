@@ -24,6 +24,8 @@ mod env_privileges;
 mod groups;
 #[cfg(feature = "limits")]
 mod limits;
+#[cfg(target_os = "linux")]
+mod parent_death;
 mod pipeline;
 #[cfg(feature = "process-control")]
 mod process_control;

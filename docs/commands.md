@@ -205,14 +205,22 @@ Command::new("worker")
 
 // Windows: no console window flashing up from a GUI app.
 Command::new("helper").create_no_window().run().await?;
+
+// Hardening: take the direct child down even if THIS process is SIGKILLed
+// (Drop never runs). Windows has this for free; Linux arms PDEATHSIG.
+Command::new("worker").kill_on_parent_death().start().await?;
 ```
 
 `uid` / `gid` / `setsid` are POSIX-only — on other targets the run fails with
 `Error::Unsupported` rather than silently skipping a privilege drop.
-`create_no_window` is a harmless no-op outside Windows. Containment is
-preserved in every combination; the platform fine print (the Linux
-cgroup × `uid` interaction, `setsid` × process-group coordination) is collected
-in [Platform support](platform-support.md#caveats).
+`create_no_window` is a harmless no-op outside Windows.
+`kill_on_parent_death` is best-effort by design: guaranteed on Windows
+(regardless of the knob), direct-child-only on Linux, unavailable on
+macOS/BSD — the graceful-exit guarantee via `Drop` holds everywhere either
+way. Containment is preserved in every combination; the platform fine print
+(the Linux cgroup × `uid` interaction, `setsid` × process-group coordination,
+the pdeathsig thread caveat) is collected in
+[Platform support](platform-support.md#caveats).
 
 ## Consuming verbs
 

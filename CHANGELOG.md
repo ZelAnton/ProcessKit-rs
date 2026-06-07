@@ -13,6 +13,13 @@ to a dated version section.
 
 ### Added
 
+- `Command::kill_on_parent_death()` — opt-in hardening so an abruptly-dying
+  parent (`SIGKILL`, where `Drop` never runs) still takes its child down:
+  Linux arms `PR_SET_PDEATHSIG(SIGKILL)` on the direct child (with a
+  `getppid` re-check closing the parent-died-first race); Windows already
+  guarantees the whole tree via the job handle closing; macOS/BSD have no
+  equivalent (documented no-op). Idea borrowed from `execa`'s
+  cleanup-on-exit, mapped to native primitives.
 - `Command::unchecked()` — exempt a pipeline stage from pipefail attribution
   (design borrowed from `duct`): its unclean exit (non-zero, signal kill
   including SIGPIPE, or its per-stage-timeout kill) is skipped when blaming

@@ -50,6 +50,9 @@ pub struct Command {
     uid: Option<u32>,
     gid: Option<u32>,
     setsid: bool,
+    /// Kill the direct child if this process dies abruptly (see
+    /// [`Self::kill_on_parent_death`]).
+    kill_on_parent_death: bool,
     /// Extra Windows process-creation flags (e.g. `CREATE_NO_WINDOW`), OR'd
     /// into the spawn by the Command-driven launch paths.
     creation_flags_extra: u32,
@@ -93,6 +96,7 @@ impl Command {
             uid: None,
             gid: None,
             setsid: false,
+            kill_on_parent_death: false,
             creation_flags_extra: 0,
             #[cfg(feature = "cancellation")]
             cancel_token: None,
@@ -206,6 +210,31 @@ impl Command {
     /// bypasses these builders.
     pub fn setsid(mut self) -> Self {
         self.setsid = true;
+        self
+    }
+
+    /// Kill the **direct child** if *this* process dies abruptly — including
+    /// a `SIGKILL` of the parent, where `Drop` never runs to tear the group
+    /// down. An opt-in hardening **on top of** the unconditional kill-on-drop
+    /// containment, best-effort by design:
+    ///
+    /// | Platform | Effect |
+    /// |---|---|
+    /// | Windows | Already guaranteed regardless of this knob: the kernel closes the Job Object handle when the parent dies, and kill-on-close takes the whole tree. Documented no-op. |
+    /// | Linux | `prctl(PR_SET_PDEATHSIG, SIGKILL)` on the **direct child only** — grandchildren are not covered (with the parent gone, nothing tears the cgroup/pgroup down). |
+    /// | macOS / BSD / other | No `pdeathsig` equivalent — does nothing (the graceful-exit guarantee via `Drop` still holds). |
+    ///
+    /// Two honest Linux caveats: the death signal fires when the spawning
+    /// **thread** dies, not only the process — on a multi-threaded tokio
+    /// runtime, a worker thread retired while the child lives would kill it
+    /// early (for the strongest guarantee spawn from a current-thread
+    /// runtime); and the parent-died-before-arming race is closed by an
+    /// immediate-exit `getppid()` re-check in the child (in a PID namespace
+    /// where the reaper isn't PID 1 that re-check can miss — an accepted
+    /// edge). (Idea borrowed from `execa`'s cleanup-on-exit, mapped to
+    /// native primitives.)
+    pub fn kill_on_parent_death(mut self) -> Self {
+        self.kill_on_parent_death = true;
         self
     }
 
@@ -459,6 +488,12 @@ impl Command {
     /// Whether [`setsid`](Self::setsid) was requested (read by the spawn seam).
     pub(crate) fn wants_setsid(&self) -> bool {
         self.setsid
+    }
+
+    /// Whether [`kill_on_parent_death`](Self::kill_on_parent_death) was
+    /// requested (read by the spawn seam).
+    pub(crate) fn wants_kill_on_parent_death(&self) -> bool {
+        self.kill_on_parent_death
     }
 
     /// The cancellation token, if any (an `Arc`-cheap clone).
@@ -722,6 +757,7 @@ impl fmt::Debug for Command {
             .field("uid", &self.uid)
             .field("gid", &self.gid)
             .field("setsid", &self.setsid)
+            .field("kill_on_parent_death", &self.kill_on_parent_death)
             .field("creation_flags_extra", &self.creation_flags_extra);
         #[cfg(feature = "cancellation")]
         d.field("has_cancel_token", &self.cancel_token.is_some());
@@ -816,6 +852,16 @@ mod tests {
         let debug = format!("{cmd:?}");
         assert!(debug.contains("uid: Some(1000)"), "debug: {debug}");
         assert!(debug.contains("gid: Some(1000)"), "debug: {debug}");
+    }
+
+    #[test]
+    fn kill_on_parent_death_records_the_request() {
+        assert!(
+            Command::new("x")
+                .kill_on_parent_death()
+                .wants_kill_on_parent_death()
+        );
+        assert!(!Command::new("x").wants_kill_on_parent_death());
     }
 
     #[test]

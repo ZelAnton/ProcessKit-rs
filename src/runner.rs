@@ -215,6 +215,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     let opts = crate::sys::SpawnOptions {
         setsid: command.wants_setsid(),
         creation_flags: command.extra_creation_flags(),
+        kill_on_parent_death: command.wants_kill_on_parent_death(),
     };
     let mut child = group.spawn_with_options(&mut tokio_cmd, &opts)?;
     let pid = child.id();
