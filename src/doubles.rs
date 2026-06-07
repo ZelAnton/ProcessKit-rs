@@ -589,6 +589,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handler_calls_happen_before_the_consuming_verb_resolves() {
+        // Pins the documented ordering guarantee: by the time a consuming
+        // verb's future resolves, every line handler invocation has happened
+        // (the pumps are joined before the result is assembled).
+        use std::sync::{Arc, Mutex};
+        let seen = Arc::new(Mutex::new(0usize));
+        let lines: Vec<String> = (1..=100).map(|n| format!("line {n}")).collect();
+        let runner = ScriptedRunner::new().fallback(Reply::lines(lines));
+        let cmd = Command::new("x").on_stdout_line({
+            let seen = seen.clone();
+            move |_| *seen.lock().unwrap() += 1
+        });
+        let run = runner.start(&cmd).await.expect("scripted start");
+        let result = run.output_string().await.expect("consume");
+        assert!(result.is_success());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            100,
+            "all handler calls happen-before the verb resolves"
+        );
+    }
+
+    #[tokio::test]
     async fn recording_runner_records_start_invocations() {
         let rec = RecordingRunner::new(ScriptedRunner::new().fallback(Reply::lines(["x"])));
         let run = rec

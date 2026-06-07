@@ -133,6 +133,13 @@ impl SharedLines {
 /// and invoking `handler` (if any). Always reads to EOF so the child never
 /// blocks on a full pipe; on an IO error it stops and closes the sink.
 ///
+/// A **panicking handler does not poison the run**: the panic is caught, the
+/// handler is disabled for the rest of the run (and the fact surfaced as a
+/// `tracing` warn when the feature is on), and pumping continues — the child
+/// is still drained and the final result still carries every line. The
+/// callback seam is handed to consumers' consumers, so "panic-free or else"
+/// is not a re-exportable contract.
+///
 /// Lines are split on byte `\n` and stripped of a trailing `\r`, then decoded —
 /// correct for UTF-8 and the ASCII-compatible legacy encodings `encoding_rs`
 /// exposes (Windows-1252, Shift-JIS, GBK, …), whose multibyte sequences never
@@ -145,9 +152,9 @@ pub(crate) async fn pump_lines<R>(
 ) where
     R: AsyncRead + Unpin,
 {
-    // Close the sink on *every* exit from this task, including a panic unwind
-    // from a user `handler`. Without this, a panicking handler would leave the
-    // sink un-closed and a streaming `StdoutLines` consumer parked forever.
+    // Close the sink on *every* exit from this task — including the
+    // can't-happen-anymore handler unwind (defense in depth: a panic out of
+    // this loop must never leave a streaming `StdoutLines` consumer parked).
     struct CloseOnDrop(Arc<SharedLines>);
     impl Drop for CloseOnDrop {
         fn drop(&mut self) {
@@ -155,6 +162,7 @@ pub(crate) async fn pump_lines<R>(
         }
     }
     let sink = CloseOnDrop(sink);
+    let mut handler = handler;
 
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::new();
@@ -172,8 +180,21 @@ pub(crate) async fn pump_lines<R>(
         }
         let (decoded, _, _) = encoding.decode(&buf);
         let line = decoded.into_owned();
-        if let Some(handler) = &handler {
-            handler(&line);
+        if let Some(h) = &handler {
+            // Isolate a panicking user handler: disable it for the rest of
+            // the run and keep pumping (capture is never the casualty of a
+            // progress callback). AssertUnwindSafe is sound here: the handler
+            // is `Fn` (no &mut state to observe torn) and is dropped right
+            // after the panic.
+            let invoked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(&line)));
+            if invoked.is_err() {
+                handler = None;
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    target: "processkit",
+                    "line handler panicked; disabled for the rest of the run"
+                );
+            }
         }
         sink.0.push(line);
     }
@@ -294,24 +315,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn panicking_handler_still_closes_the_sink() {
-        // A user handler that panics must not leave the sink un-closed — otherwise
-        // a streaming consumer would park on `changed()` forever.
-        let handler: LineHandler = Arc::new(|_: &str| panic!("boom"));
+    async fn panicking_handler_is_isolated_and_capture_completes() {
+        // The panic-isolation contract: a user handler that panics is caught
+        // and disabled; the pump keeps draining, EVERY line is still captured,
+        // and the sink closes normally. (Capture is never the casualty of a
+        // progress callback.)
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler: LineHandler = {
+            let calls = calls.clone();
+            Arc::new(move |_: &str| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    panic!("boom on the second line");
+                }
+            })
+        };
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
         let task = tokio::spawn(pump_lines(
-            &b"one\ntwo\n"[..],
+            &b"1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n"[..],
             encoding_rs::UTF_8,
             Some(handler),
             sink.clone(),
         ));
-        // The pump task unwinds from the handler panic...
-        assert!(task.await.is_err(), "the pump task should have panicked");
-        // ...but the sink is still closed, so a consumer wakes and ends.
-        sink.clone().changed().await;
+        task.await
+            .expect("the pump task must survive a handler panic");
+        assert_eq!(sink.count(), 10, "every line captured despite the panic");
+        assert_eq!(
+            sink.drain(),
+            (1..=10).map(|n| n.to_string()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the handler is disabled after its panic (called for lines 1 and 2 only)"
+        );
         assert!(
             matches!(sink.try_pop(), Popped::Closed),
-            "sink must be closed after a handler panic"
+            "sink closes normally after the drain"
         );
     }
 }

@@ -79,6 +79,14 @@ to a dated version section.
 
 ### Changed
 
+- A **panicking line handler no longer poisons the run**: the panic is caught,
+  the handler is disabled for the rest of the run (surfaced as a `tracing`
+  warn), and the child keeps being drained — the final result still carries
+  every line. Previously the pump died with the panic and capture was cut at
+  that point. The `on_stdout_line`/`on_stderr_line` docs now also state the
+  ordering guarantees: FIFO within a stream, no cross-stream order, and all
+  handler calls happen-before the consuming verb resolves (requested by a
+  downstream wrapper crate's streaming spec).
 - **Breaking**: `CliClient`'s run helpers renamed to the crate-wide verb
   vocabulary — `text → run`, `capture → output`, `unit → run_unit`,
   `code → exit_code` (`probe`/`parse`/`try_parse` unchanged). The same verb

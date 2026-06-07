@@ -398,7 +398,21 @@ impl Command {
     }
 
     /// Invoke `handler` for each decoded stdout line as it is read (in addition
-    /// to capture/streaming). Runs on the pump task; keep it cheap and panic-free.
+    /// to capture/streaming). Runs on the pump task; keep it cheap. A handler
+    /// that **panics** is caught and disabled for the rest of the run — the
+    /// child is still drained and the result still carries every line (the
+    /// panic is reported as a `tracing` warn when that feature is on).
+    ///
+    /// **Ordering guarantees:** invocations are FIFO *within* a stream; there
+    /// is no ordering between stdout and stderr handlers (two independent
+    /// pumps). On the consuming verbs (`run`/`output_*`/`wait`/`profile`/
+    /// `finish_streamed`) all handler invocations happen-before the awaited
+    /// future resolves — a progress bar can be finalized the moment the call
+    /// returns. (One documented exception: when a leaked pipe is held open
+    /// past the child's death, teardown aborts the pump after a bounded
+    /// grace, cutting any not-yet-delivered lines along with their handler
+    /// calls.) On a streamed run, stdout handlers quiesce when the
+    /// [`stdout_lines`](crate::RunningProcess::stdout_lines) stream ends.
     ///
     /// At most one handler per stream: a repeat call replaces the previous one
     /// (builder semantics, like [`timeout`](Self::timeout)). To fan out, compose
