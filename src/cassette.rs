@@ -255,6 +255,9 @@ impl<R: ProcessRunner> RecordReplayRunner<R> {
         // Hold the entries lock until `dirty` is cleared, so a run recorded
         // concurrently with the save can't be marked clean without being in
         // the written file (it blocks, then lands as dirty again).
+        // `expect`, not poison-recovery: no user code ever runs under the
+        // cassette locks, so poisoning is a logic bug worth failing loudly on
+        // (the crate-wide rule lives in AGENTS.md "Code style").
         let entries = recorded.lock().expect("cassette mutex poisoned");
         let cassette = Cassette {
             version: CASSETTE_VERSION,
