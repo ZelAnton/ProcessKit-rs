@@ -8,6 +8,11 @@
 > tracing pass, `ProcessRunner::start` + scripted streaming, handler panic
 > isolation). This note records what was REJECTED, and why, so the next
 > audit doesn't re-derive it.
+>
+> This note also supersedes the retired `ideas/three-layer-resource-split.md`
+> and `ideas/dotnet-process-lib-comparison.md` (removed by owner call; full
+> texts remain in git history) — their standing conclusions are restated
+> below where still load-bearing.
 
 ## Rejected, with reasons
 
