@@ -173,9 +173,21 @@ let authors = Command::new("git").args(["log", "--format=%an"])
 Native pipes — no shell string, no quoting, no injection surface. The outcome
 is **pipefail**: stdout comes from the last stage, the reported failure from
 the first stage that didn't exit cleanly. All stages share one kill-on-drop
-group.
+group. The `|` operator is equivalent sugar:
+`(a | b | c).output_string()`.
 
-*Fine print: [Pipelines](pipelines.md).*
+For a consumer that legitimately stops reading early — the `| head -1` shape,
+where the producer's `SIGPIPE` death is expected — mark the producer
+`unchecked()` so that death doesn't fail the chain:
+
+```rust,no_run
+let first = (Command::new("seq").args(["1", "1000000"]).unchecked()
+    | Command::new("head").args(["-n", "1"]))
+    .run()
+    .await?;
+```
+
+*Fine print: [Pipelines → unchecked stages](pipelines.md#unchecked-stages).*
 
 ## Start a server and wait until it's ready
 

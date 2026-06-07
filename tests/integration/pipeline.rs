@@ -121,6 +121,74 @@ async fn pipeline_pipefail_attributes_the_first_failure() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real producer|head pipeline killed by the closing pipe"]
+async fn unchecked_producer_forgives_the_head_pattern() {
+    // The motivating case for `unchecked()`: the consumer takes one line and
+    // exits, the endless producer dies of the closed pipe — that death must
+    // not fail the chain. (The per-stage timeout is a safety net; a healthy
+    // run never reaches it, and `unchecked` forgives that kill too.)
+    let result = endless_yes()
+        .unchecked()
+        .timeout(Duration::from_secs(10))
+        .pipe(first_line_consumer())
+        .output_string()
+        .await
+        .expect("run pipeline");
+    assert!(result.is_success(), "pipeline result: {result:?}");
+    assert!(
+        result.stdout().contains('y'),
+        "the consumed line is the chain's output: {:?}",
+        result.stdout()
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real producer|head pipeline killed by the closing pipe"]
+async fn checked_producer_reports_the_head_pattern_as_failure() {
+    // The contrast `unchecked()` exists to fix: strict pipefail blames the
+    // producer's perfectly normal pipe-closed death.
+    let result = endless_yes()
+        .timeout(Duration::from_secs(10))
+        .pipe(first_line_consumer())
+        .output_string()
+        .await
+        .expect("pipeline completes with a result");
+    assert!(
+        !result.is_success(),
+        "strict pipefail must report the producer's death: {result:?}"
+    );
+    assert_ne!(result.code(), Some(0));
+}
+
+#[tokio::test]
+#[ignore = "spawns a real pipeline with a failing consumer"]
+async fn unchecked_producer_does_not_mask_a_failing_consumer() {
+    let failing_consumer = if cfg!(windows) {
+        Command::new("powershell").args([
+            "-NoProfile",
+            "-Command",
+            "$null = [Console]::In.ReadLine(); exit 7",
+        ])
+    } else {
+        Command::new("sh").args(["-c", "head -n 1 >/dev/null; exit 7"])
+    };
+
+    let result = endless_yes()
+        .unchecked()
+        .timeout(Duration::from_secs(10))
+        .pipe(failing_consumer)
+        .output_string()
+        .await
+        .expect("pipeline completes with a result");
+    assert_eq!(
+        result.code(),
+        Some(7),
+        "the CHECKED consumer's failure must still be reported: {result:?}"
+    );
+    assert!(!result.is_success());
+}
+
+#[tokio::test]
 #[ignore = "spawns a real pipeline and kills it at the deadline"]
 async fn pipeline_timeout_kills_the_whole_chain() {
     let producer = if cfg!(windows) {

@@ -39,7 +39,11 @@ use crate::result::ProcessResult;
 /// - **Pipefail** — `stdout` is always the *last* stage's output; `code`,
 ///   `stderr`, and the reported program come from the **first** stage that
 ///   didn't exit cleanly (non-zero, signal-killed, or timed out), or from the
-///   last stage when every stage succeeded.
+///   last stage when every stage succeeded. Stages marked
+///   [`unchecked`](Command::unchecked) are exempt: their unclean exits are
+///   skipped during attribution (checked failures always trump unchecked
+///   ones; a chain whose only failures are unchecked reports success) — the
+///   `producer | head -1` escape hatch.
 /// - **Stdin/stdout at the ends** — the *first* stage's configured
 ///   [`stdin`](Command::stdin) source is honored; inner stages' stdin is the
 ///   pipe (any configured source or `keep_stdin_open` on them is overridden).
@@ -77,6 +81,8 @@ struct StageOutcome {
     program: String,
     code: Option<i32>,
     stderr: String,
+    /// The stage opted out of pipefail attribution ([`Command::unchecked`]).
+    unchecked: bool,
 }
 
 impl Pipeline {
@@ -124,14 +130,16 @@ impl Pipeline {
             if index + 1 < self.stages.len() {
                 upstream = process.take_stdout_pipe();
             }
-            running.push(process);
+            // Carry the stage's unchecked flag with its handle: the last stage
+            // is popped off below, so positional lookups would be fragile.
+            running.push((process, stage.is_unchecked()));
         }
 
         // Drain every stage concurrently: a stderr-chatty inner stage must not
         // block on a full pipe while we wait on its neighbours.
-        let last = running.pop().expect("a pipeline has at least two stages");
+        let (last, last_unchecked) = running.pop().expect("a pipeline has at least two stages");
         let mut inner_tasks = Vec::with_capacity(running.len());
-        for process in running {
+        for (process, unchecked) in running {
             let program = process.program_name().to_owned();
             inner_tasks.push(tokio::spawn(async move {
                 let (code, stderr) = process.finish_streamed().await?;
@@ -139,6 +147,7 @@ impl Pipeline {
                     program,
                     code,
                     stderr,
+                    unchecked,
                 })
             }));
         }
@@ -174,7 +183,12 @@ impl Pipeline {
             },
         };
 
-        Ok(pipefail(outcomes, last_result, self.timeout))
+        Ok(pipefail(
+            outcomes,
+            last_result,
+            last_unchecked,
+            self.timeout,
+        ))
     }
 
     /// Run the chain, require **every** stage to exit cleanly, and return the
@@ -205,27 +219,91 @@ impl Pipeline {
 }
 
 /// Fold the per-stage outcomes into one pipefail result: the last stage's
-/// stdout, with code/stderr/program attributed to the first unclean stage (or
-/// the last stage when all are clean).
+/// stdout, with code/stderr/program attributed to the first **checked**
+/// unclean stage (or the last stage when no checked stage failed).
+///
+/// `unchecked` rules (duct's precedence, kept on OUR first-failure
+/// attribution where duct ties go right): a checked failure always trumps an
+/// unchecked one, regardless of position; an unchecked stage's unclean exit
+/// neither speaks for the chain nor shields anyone else's failure. When the
+/// only failures are unchecked, the chain reports success. An unchecked
+/// *last* stage's unclean exit is likewise forgiven — but a timeout never is
+/// (a deadline violation is not an exit status).
 fn pipefail(
     outcomes: Vec<StageOutcome>,
     last: ProcessResult<String>,
+    last_unchecked: bool,
     pipeline_timeout: Option<Duration>,
 ) -> ProcessResult<String> {
-    match outcomes.into_iter().find(|stage| stage.code != Some(0)) {
-        // An inner stage failed first — its diagnostics win; the last stage's
-        // stdout is still what the chain produced.
-        Some(stage) => ProcessResult::new(
+    // "Unclean" is any `code != Some(0)`: non-zero, and the `None` of a
+    // signal kill (SIGPIPE included) or per-stage-timeout kill — no
+    // platform-specific cases needed.
+    if let Some(stage) = outcomes
+        .into_iter()
+        .find(|stage| stage.code != Some(0) && !stage.unchecked)
+    {
+        // A checked inner stage failed first — its diagnostics win; the last
+        // stage's stdout is still what the chain produced.
+        return ProcessResult::new(
             stage.program,
             last.into_stdout(),
             stage.stderr,
             stage.code,
             false,
             pipeline_timeout,
-        ),
-        // All inner stages clean: the last stage speaks for the chain,
-        // succeeding or not.
-        None => last,
+        );
+    }
+    if last_unchecked && !last.timed_out() && last.code() != Some(0) {
+        // The last stage failed but opted out: report the chain as a success
+        // carrying its output and (for the curious) its stderr.
+        let program = last.program().to_owned();
+        let stderr = last.stderr().to_owned();
+        return ProcessResult::new(
+            program,
+            last.into_stdout(),
+            stderr,
+            Some(0),
+            false,
+            pipeline_timeout,
+        );
+    }
+    // No checked inner failure: the last stage speaks for the chain,
+    // succeeding or not.
+    last
+}
+
+/// `a | b` — sugar for [`Command::pipe`]: the same shell-free, one-group,
+/// pipefail pipeline. Parenthesize the chain before a terminal verb, since
+/// method calls bind tighter than `|`:
+///
+/// ```no_run
+/// # async fn demo() -> processkit::Result<()> {
+/// use processkit::Command;
+///
+/// let out = (Command::new("git").args(["log", "--format=%an"])
+///     | Command::new("sort")
+///     | Command::new("uniq").arg("-c"))
+///     .output_string()
+///     .await?;
+/// println!("{}", out.stdout());
+/// # Ok(())
+/// # }
+/// ```
+impl std::ops::BitOr<Command> for Command {
+    type Output = Pipeline;
+
+    fn bitor(self, rhs: Command) -> Pipeline {
+        self.pipe(rhs)
+    }
+}
+
+/// `pipeline | c` — sugar for [`Pipeline::pipe`], so `a | b | c` chains
+/// left-associatively into one pipeline.
+impl std::ops::BitOr<Command> for Pipeline {
+    type Output = Pipeline;
+
+    fn bitor(self, rhs: Command) -> Pipeline {
+        self.pipe(rhs)
     }
 }
 
@@ -244,6 +322,7 @@ mod tests {
             program: program.into(),
             code: Some(0),
             stderr: String::new(),
+            unchecked: false,
         }
     }
 
@@ -252,6 +331,15 @@ mod tests {
             program: program.into(),
             code,
             stderr: stderr.into(),
+            unchecked: false,
+        }
+    }
+
+    /// An unclean stage that opted out of attribution.
+    fn unchecked_fail(program: &str, code: Option<i32>) -> StageOutcome {
+        StageOutcome {
+            unchecked: true,
+            ..unclean(program, code, "forgiven")
         }
     }
 
@@ -272,11 +360,17 @@ mod tests {
         let ok = pipefail(
             vec![clean("a"), clean("b")],
             last_stage(Some(0), "final"),
+            false,
             None,
         );
         assert_eq!(ok, last_stage(Some(0), "final"));
 
-        let failing_last = pipefail(vec![clean("a")], last_stage(Some(3), "partial"), None);
+        let failing_last = pipefail(
+            vec![clean("a")],
+            last_stage(Some(3), "partial"),
+            false,
+            None,
+        );
         assert_eq!(failing_last, last_stage(Some(3), "partial"));
     }
 
@@ -285,6 +379,7 @@ mod tests {
         let result = pipefail(
             vec![clean("a"), unclean("b", Some(2), "b broke")],
             last_stage(Some(0), "final"),
+            false,
             None,
         );
         assert_eq!(result.program(), "b", "diagnostics from the failing stage");
@@ -321,6 +416,7 @@ mod tests {
                 unclean("b", Some(2), "second"),
             ],
             last_stage(Some(0), "out"),
+            false,
             None,
         );
         assert_eq!(result.program(), "a", "pipefail blames the FIRST failure");
@@ -335,12 +431,124 @@ mod tests {
     }
 
     #[test]
+    fn all_unchecked_failures_report_success() {
+        // The head-pattern: the producer's SIGPIPE death (code None) is
+        // forgiven, the chain succeeds with the consumer's output.
+        let result = pipefail(
+            vec![unchecked_fail("producer", None)],
+            last_stage(Some(0), "first line"),
+            false,
+            None,
+        );
+        assert!(result.is_success(), "got {result:?}");
+        assert_eq!(result.stdout(), "first line");
+        assert_eq!(result.program(), "last", "the clean last stage speaks");
+    }
+
+    #[test]
+    fn checked_failure_trumps_unchecked_regardless_of_order() {
+        // unchecked-then-checked: the later checked failure wins.
+        let result = pipefail(
+            vec![
+                unchecked_fail("a", Some(141)),
+                unclean("b", Some(2), "real"),
+            ],
+            last_stage(Some(0), "out"),
+            false,
+            None,
+        );
+        assert_eq!(result.program(), "b", "unchecked never shields a failure");
+        assert_eq!(result.code(), Some(2));
+
+        // checked-then-unchecked: the first (checked) failure wins, as today.
+        let result = pipefail(
+            vec![unclean("a", Some(1), "real"), unchecked_fail("b", Some(2))],
+            last_stage(Some(0), "out"),
+            false,
+            None,
+        );
+        assert_eq!(result.program(), "a");
+        assert_eq!(result.code(), Some(1));
+    }
+
+    #[test]
+    fn attribution_skips_unchecked_to_the_first_checked_failure() {
+        let result = pipefail(
+            vec![
+                clean("a"),
+                unchecked_fail("b", Some(1)),
+                unclean("c", Some(3), "c broke"),
+                unclean("d", Some(4), "d broke"),
+            ],
+            last_stage(Some(0), "out"),
+            false,
+            None,
+        );
+        assert_eq!(result.program(), "c", "first CHECKED failure is blamed");
+        assert_eq!(result.code(), Some(3));
+        assert_eq!(result.stderr(), "c broke");
+    }
+
+    #[test]
+    fn unchecked_last_stage_failure_is_forgiven() {
+        let result = pipefail(
+            vec![clean("a")],
+            last_stage(Some(141), "partial"),
+            true,
+            None,
+        );
+        assert!(result.is_success(), "got {result:?}");
+        assert_eq!(result.code(), Some(0));
+        assert_eq!(result.stdout(), "partial", "output is preserved");
+        assert_eq!(result.stderr(), "last-err", "stderr kept for the curious");
+        assert!(result.ensure_success().is_ok());
+    }
+
+    #[test]
+    fn checked_last_stage_failure_still_speaks_verbatim() {
+        // Regression guard: without the marker nothing changes.
+        let result = pipefail(
+            vec![clean("a")],
+            last_stage(Some(3), "partial"),
+            false,
+            None,
+        );
+        assert_eq!(result, last_stage(Some(3), "partial"));
+    }
+
+    #[test]
+    fn unchecked_never_forgives_a_timeout() {
+        // An unchecked LAST stage that timed out still reports the timeout —
+        // a deadline violation is not an exit status.
+        let timed_out_last = ProcessResult::new(
+            "last".into(),
+            String::new(),
+            String::new(),
+            None,
+            true,
+            None,
+        );
+        let result = pipefail(vec![clean("a")], timed_out_last, true, None);
+        assert!(result.timed_out());
+        assert!(!result.is_success());
+    }
+
+    #[test]
+    fn bitor_chains_like_pipe() {
+        let chain = Command::new("a") | Command::new("b") | Command::new("c");
+        assert_eq!(chain.stages.len(), 3, "a | b | c is one three-stage chain");
+        assert_eq!(chain.pipeline_name(), "a | b | c");
+        assert!(chain.timeout.is_none());
+    }
+
+    #[test]
     fn signal_killed_inner_stage_counts_as_unclean() {
         // A signal-kill (or per-stage timeout kill) reports no code — that is
         // not a clean exit, so the stage must win the attribution.
         let result = pipefail(
             vec![unclean("a", None, "killed")],
             last_stage(Some(0), "out"),
+            false,
             None,
         );
         assert_eq!(result.program(), "a");

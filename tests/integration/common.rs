@@ -55,6 +55,27 @@ pub(crate) fn banner_then_idle() -> Command {
     }
 }
 
+/// An endless line producer, per platform: emits `y` lines until its consumer
+/// goes away, then dies of `SIGPIPE` (Unix) or a broken-pipe write error
+/// (PowerShell terminates on the failed write).
+pub(crate) fn endless_yes() -> Command {
+    if cfg!(windows) {
+        Command::new("powershell").args(["-NoProfile", "-Command", "while($true){'y'}"])
+    } else {
+        Command::new("yes")
+    }
+}
+
+/// A consumer that reads one line, prints it, and exits 0, per platform — the
+/// `| head -1` shape that kills its producer by closing the pipe early.
+pub(crate) fn first_line_consumer() -> Command {
+    if cfg!(windows) {
+        Command::new("powershell").args(["-NoProfile", "-Command", "[Console]::In.ReadLine()"])
+    } else {
+        Command::new("head").args(["-n", "1"])
+    }
+}
+
 /// A child that prints its whole environment, per platform.
 pub(crate) fn print_env() -> Command {
     if cfg!(windows) {

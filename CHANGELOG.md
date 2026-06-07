@@ -13,6 +13,16 @@ to a dated version section.
 
 ### Added
 
+- `Command::unchecked()` — exempt a pipeline stage from pipefail attribution
+  (design borrowed from `duct`): its unclean exit (non-zero, signal kill
+  including SIGPIPE, or its per-stage-timeout kill) is skipped when blaming
+  the chain, fixing the `producer | head -1` false failure. Checked failures
+  always trump unchecked ones; a chain whose only failures are unchecked
+  reports success. No-op outside a pipeline; never relaxes a whole-chain
+  `Pipeline::timeout`.
+- `|` operator on `Command`/`Pipeline` — `a | b | c` is sugar for
+  `a.pipe(b).pipe(c)`: the same shell-free, one-group, pipefail pipeline.
+  Parenthesize the chain before a terminal verb.
 - `Supervisor::storm_pause` / `failure_decay` / `failure_threshold` — an
   opt-in failure-storm guard (design borrowed from Go's `suture`): each
   failure feeds a score that halves every `failure_decay`

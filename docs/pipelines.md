@@ -10,6 +10,7 @@ dies as a unit.
 
 - [Building and running](#building-and-running)
 - [Semantics: pipefail and the ends](#semantics-pipefail-and-the-ends)
+- [Unchecked stages](#unchecked-stages)
 - [Timeouts](#timeouts)
 - [Re-running a pipeline](#re-running-a-pipeline)
 
@@ -43,6 +44,20 @@ The two verbs mirror `Command`'s:
 
 `Err` from `output_string` itself means a stage couldn't be *started or
 driven* at all (spawn failure, broken plumbing) — never a mere non-zero exit.
+
+The `|` operator is sugar for the same thing — `a | b | c` ≡
+`a.pipe(b).pipe(c)`. Parenthesize the chain before a terminal verb, since
+method calls bind tighter than `|`:
+
+```rust,no_run
+use processkit::Command;
+
+let authors = (Command::new("git").args(["log", "--format=%an"])
+    | Command::new("sort")
+    | Command::new("uniq").arg("-c"))
+    .run()
+    .await?;
+```
 
 ## Semantics: pipefail and the ends
 
@@ -89,6 +104,40 @@ let unique_count = Command::new("sort")
     .await?;
 assert_eq!(unique_count.trim(), "3");
 ```
+
+## Unchecked stages
+
+Strict pipefail has one classic false positive: a consumer that legitimately
+stops reading early. In `producer | head -1` the consumer exits `0` after one
+line and closes the pipe; the producer dies of `SIGPIPE` (a broken-pipe write
+error on Windows) — a perfectly normal death that strict pipefail would blame
+the chain for. Mark that stage [`unchecked()`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.unchecked):
+
+```rust,no_run
+use processkit::Command;
+
+// seq 1 1000000 | head -1 — the producer's SIGPIPE death is expected.
+let first = (Command::new("seq").args(["1", "1000000"]).unchecked()
+    | Command::new("head").args(["-n", "1"]))
+    .run()
+    .await?;
+assert_eq!(first.trim(), "1");
+```
+
+The rules (a design borrowed from `duct`'s `unchecked()` — the idea, not the
+code):
+
+- An unchecked stage's unclean exit — non-zero, signal kill (`SIGPIPE`
+  included), or its own per-stage timeout kill — is **skipped** when the
+  chain decides what to report.
+- A **checked** failure always trumps an unchecked one, regardless of
+  position: `unchecked` never shields another stage's real failure.
+- A chain whose only failures are unchecked reports **success** (the last
+  stage's stdout, `code 0`).
+- `unchecked` forgives exit *status* only — never a whole-chain
+  [`Pipeline::timeout`](#timeouts), and it has no effect on a `Command` run
+  outside a pipeline (a single run's status is already plain data in its
+  `ProcessResult`).
 
 ## Timeouts
 

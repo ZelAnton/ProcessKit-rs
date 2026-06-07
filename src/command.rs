@@ -35,6 +35,8 @@ pub struct Command {
     env_clear: bool,
     stdin: Option<Stdin>,
     keep_stdin_open: bool,
+    /// Exempt this stage from pipefail attribution (see [`Self::unchecked`]).
+    unchecked: bool,
     timeout: Option<Duration>,
     stdout_handler: Option<LineHandler>,
     stderr_handler: Option<LineHandler>,
@@ -79,6 +81,7 @@ impl Command {
             env_clear: false,
             stdin: None,
             keep_stdin_open: false,
+            unchecked: false,
             timeout: None,
             stdout_handler: None,
             stderr_handler: None,
@@ -229,11 +232,38 @@ impl Command {
 
     /// Chain this command's stdout into `next`'s stdin — the first link of a
     /// shell-free [`Pipeline`](crate::Pipeline). Keep chaining with
-    /// [`Pipeline::pipe`](crate::Pipeline::pipe), then drive the whole thing
-    /// with [`Pipeline::output_string`](crate::Pipeline::output_string) /
+    /// [`Pipeline::pipe`](crate::Pipeline::pipe) (or the `|` operator), then
+    /// drive the whole thing with
+    /// [`Pipeline::output_string`](crate::Pipeline::output_string) /
     /// [`Pipeline::run`](crate::Pipeline::run).
     pub fn pipe(self, next: Command) -> crate::Pipeline {
         crate::Pipeline::new(self, next)
+    }
+
+    /// Exempt this command, **as a pipeline stage**, from pipefail
+    /// attribution: its unclean exit (non-zero code, signal kill — including
+    /// SIGPIPE — or its own per-stage [`timeout`](Self::timeout) kill) is
+    /// skipped when the chain decides what to report, and never shields a
+    /// *checked* stage's failure. The motivating pattern is
+    /// `producer | head -1`: the consumer exits early, the producer dies of
+    /// `SIGPIPE`/`EPIPE`, and without this marker strict pipefail reports
+    /// that perfectly normal death as the chain's failure. (Design borrowed
+    /// from `duct`'s `unchecked()` — the idea, not the code.)
+    ///
+    /// Outside a [`Pipeline`](crate::Pipeline) this is a **no-op**: a single
+    /// run's status is already plain data in its
+    /// [`ProcessResult`](crate::ProcessResult), and
+    /// [`ensure_success`](crate::ProcessResult::ensure_success) stays opt-in
+    /// — `unchecked` does not relax it, nor a whole-chain
+    /// [`Pipeline::timeout`](crate::Pipeline::timeout).
+    pub fn unchecked(mut self) -> Self {
+        self.unchecked = true;
+        self
+    }
+
+    /// Whether this stage opted out of pipefail attribution.
+    pub(crate) fn is_unchecked(&self) -> bool {
+        self.unchecked
     }
 
     /// Wire `reader` (the previous pipeline stage's stdout) as this command's
@@ -680,6 +710,7 @@ impl fmt::Debug for Command {
             .field("env_clear", &self.env_clear)
             .field("stdin", &self.stdin)
             .field("keep_stdin_open", &self.keep_stdin_open)
+            .field("unchecked", &self.unchecked)
             .field("timeout", &self.timeout)
             .field("has_stdout_handler", &self.stdout_handler.is_some())
             .field("has_stderr_handler", &self.stderr_handler.is_some())
