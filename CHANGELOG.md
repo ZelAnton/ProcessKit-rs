@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [0.8.0] - 2026-06-07
+
+### Added
 
 - `ProcessRunner::start` — the live-handle half of a run joins the seam (with
   an `Error::Unsupported` default, so `output`-only runners keep compiling).
@@ -553,7 +564,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.7.0...v0.7.1
 [0.6.2]: https://github.com/ZelAnton/ProcessKit-rs/releases/tag/v0.6.2
 [0.7.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.6.1...v0.7.0
