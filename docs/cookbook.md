@@ -340,7 +340,18 @@ Cancellation is always an error (the run was abandoned, there is no result),
 beats a simultaneous timeout, and is terminal for `retry` and `Supervisor`
 alike.
 
-*Fine print: [Timeouts, retries & cancellation → cancellation](timeouts-and-cancellation.md).*
+For a typed wrapper whose commands never cross your code, set the token once
+on the client — every command it builds carries it:
+
+```rust,no_run
+use processkit::{CancellationToken, CliClient};
+
+let token = CancellationToken::new();
+let gh = CliClient::new("gh").default_cancel_on(token.child_token());
+// token.cancel() → every in-flight command of THIS client dies.
+```
+
+*Fine print: [Timeouts, retries & cancellation → cancellation](timeouts-and-cancellation.md), [client-level default](timeouts-and-cancellation.md#client-level-default).*
 
 ## Measure what a run cost
 

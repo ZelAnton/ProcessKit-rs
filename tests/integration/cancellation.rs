@@ -84,6 +84,46 @@ async fn cancel_mid_run_errors_and_kills_only_the_cancelled_child() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real subprocess through a client-level cancellation default"]
+async fn client_default_cancel_on_cancels_a_real_run() {
+    use processkit::CliClient;
+
+    // The client-level default (`default_cancel_on`) acceptance: a hanging
+    // child run through a client configured once is killed — tree and all —
+    // when the token fires, surfacing Error::Cancelled to the awaiting call.
+    let token = CancellationToken::new();
+    let sleeper = sleep_secs(30);
+    let client = CliClient::new(sleeper.program()).default_cancel_on(token.clone());
+    let cmd = client.command(sleeper.arguments().iter().map(|a| a.to_os_string()));
+
+    let canceller = tokio::spawn({
+        let token = token.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            token.cancel();
+        }
+    });
+
+    let start = Instant::now();
+    let err = client
+        .capture(cmd)
+        .await
+        .expect_err("a cancelled run must error, not produce a result");
+    assert!(
+        matches!(err, processkit::Error::Cancelled { .. }),
+        "expected Error::Cancelled, got {err:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "client-default cancel was not prompt (took {:?})",
+        start.elapsed()
+    );
+    canceller.await.expect("canceller task");
+    // Death proof: the prompt Cancelled return (the cancel arm kills the tree
+    // and awaits the child) — same rationale as the per-command test above.
+}
+
+#[tokio::test]
 #[ignore = "exercises the pre-spawn short-circuit (no real subprocess)"]
 async fn pre_cancelled_token_short_circuits_before_spawning() {
     let token = CancellationToken::new();

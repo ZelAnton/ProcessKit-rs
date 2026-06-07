@@ -33,16 +33,22 @@ pub struct CliClient<R: ProcessRunner = JobRunner> {
     /// in registration order — e.g. `GIT_TERMINAL_PROMPT=0` set once instead of
     /// on every probe.
     envs: Vec<(OsString, Option<OsString>)>,
+    /// A cancellation token applied to every built command (see
+    /// [`default_cancel_on`](Self::default_cancel_on)).
+    #[cfg(feature = "cancellation")]
+    cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 // Manual: the runner type parameter carries no `Debug` bound.
 impl<R: ProcessRunner> std::fmt::Debug for CliClient<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CliClient")
-            .field("program", &self.program)
+        let mut d = f.debug_struct("CliClient");
+        d.field("program", &self.program)
             .field("timeout", &self.timeout)
-            .field("envs", &self.envs)
-            .finish_non_exhaustive()
+            .field("envs", &self.envs);
+        #[cfg(feature = "cancellation")]
+        d.field("has_default_cancel", &self.cancel.is_some());
+        d.finish_non_exhaustive()
     }
 }
 
@@ -54,6 +60,8 @@ impl CliClient<JobRunner> {
             runner: JobRunner,
             timeout: None,
             envs: Vec::new(),
+            #[cfg(feature = "cancellation")]
+            cancel: None,
         }
     }
 }
@@ -66,6 +74,8 @@ impl<R: ProcessRunner> CliClient<R> {
             runner,
             timeout: None,
             envs: Vec::new(),
+            #[cfg(feature = "cancellation")]
+            cancel: None,
         }
     }
 
@@ -93,6 +103,30 @@ impl<R: ProcessRunner> CliClient<R> {
     #[must_use]
     pub fn default_env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
         self.envs.push((key.as_ref().to_os_string(), None));
+        self
+    }
+
+    /// Cancel every command this client builds when `token` fires: each built
+    /// command gets [`cancel_on(token.clone())`](Command::cancel_on), so
+    /// cancelling the token kills every in-flight run of **this client** (the
+    /// whole tree, surfacing [`Error::Cancelled`](crate::Error::Cancelled) on
+    /// the awaiting call — same semantics as the per-command builder).
+    ///
+    /// **Precedence:** a per-command [`Command::cancel_on`] chained on a built
+    /// command *replaces* the default (an explicit setting beats a default,
+    /// like a per-command [`timeout`](Command::timeout) after
+    /// [`default_timeout`](Self::default_timeout)). When both sources should
+    /// fire, wire it explicitly — derive a child of the default
+    /// (`let c = default.child_token()`), hand the command `cancel_on(c.clone())`,
+    /// and have the second source call `c.cancel()` — or simply build a
+    /// dedicated client per scope.
+    ///
+    /// Scope cancellation by client, not by call: clients are cheap — build
+    /// one per cancellable scope and hand each its own token.
+    #[cfg(feature = "cancellation")]
+    #[must_use]
+    pub fn default_cancel_on(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = Some(token);
         self
     }
 
@@ -127,8 +161,8 @@ impl<R: ProcessRunner> CliClient<R> {
         self.apply_defaults(Command::new(&self.program).current_dir(dir).args(args))
     }
 
-    /// Apply this client's defaults (timeout, then env overrides) to a freshly
-    /// built command.
+    /// Apply this client's defaults (timeout, env overrides, cancellation
+    /// token) to a freshly built command.
     fn apply_defaults(&self, command: Command) -> Command {
         let mut command = match self.timeout {
             Some(timeout) => command.timeout(timeout),
@@ -139,6 +173,12 @@ impl<R: ProcessRunner> CliClient<R> {
                 Some(value) => command.env(key, value),
                 None => command.env_remove(key),
             };
+        }
+        // Applied at build time, so a later per-command `cancel_on` chained on
+        // the returned command replaces it — the documented override precedence.
+        #[cfg(feature = "cancellation")]
+        if let Some(token) = &self.cancel {
+            command = command.cancel_on(token.clone());
         }
         command
     }
@@ -263,7 +303,40 @@ macro_rules! cli_client {
                 self
             }
         }
+
+        $crate::__cli_client_cancellation!($name);
     };
+}
+
+/// Internal helper for [`cli_client!`]: emits the `default_cancel_on` builder
+/// when **processkit** was built with the `cancellation` feature. A plain
+/// `#[cfg]` inside the macro body would be evaluated against the *downstream*
+/// crate's features (which may not even declare `cancellation`), so the gate
+/// must live here, on which definition processkit exports.
+#[cfg(feature = "cancellation")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __cli_client_cancellation {
+    ($name:ident) => {
+        impl<R: $crate::ProcessRunner> $name<R> {
+            /// Cancel every command this client builds when `token` fires (a
+            /// per-command `cancel_on` replaces the default — see
+            /// `CliClient::default_cancel_on`).
+            pub fn default_cancel_on(mut self, token: $crate::CancellationToken) -> Self {
+                self.core = self.core.default_cancel_on(token);
+                self
+            }
+        }
+    };
+}
+
+/// Counterpart of the gated definition above: without the `cancellation`
+/// feature the helper expands to nothing.
+#[cfg(not(feature = "cancellation"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __cli_client_cancellation {
+    ($name:ident) => {};
 }
 
 #[cfg(test)]
@@ -457,6 +530,94 @@ mod tests {
             "env override did not reach the runner: {:?}",
             call.envs
         );
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[tokio::test]
+    async fn default_cancel_on_is_applied_to_every_command() {
+        let token = crate::CancellationToken::new();
+        let client = CliClient::new("git").default_cancel_on(token);
+        for cmd in [
+            client.command(["status"]),
+            client.command_in(Path::new("."), ["fetch"]),
+        ] {
+            assert!(
+                cmd.cancel_token().is_some(),
+                "default token missing on built command"
+            );
+        }
+        assert!(format!("{client:?}").contains("has_default_cancel: true"));
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[tokio::test(start_paused = true)]
+    async fn per_command_cancel_on_overrides_the_default() {
+        use crate::CancellationToken;
+        // Pins the documented precedence: an explicit `cancel_on` on a built
+        // command REPLACES the client default — the default token firing must
+        // not resolve the call, the explicit one must.
+        let default_token = CancellationToken::new();
+        let explicit = CancellationToken::new();
+        let client = CliClient::with_runner("gh", ScriptedRunner::new().fallback(Reply::pending()))
+            .default_cancel_on(default_token.clone());
+        let cmd = client.command(["run", "watch"]).cancel_on(explicit.clone());
+
+        let call = client.capture(cmd);
+        tokio::pin!(call);
+        default_token.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3600), &mut call)
+                .await
+                .is_err(),
+            "the replaced default token must not cancel the call"
+        );
+        explicit.cancel();
+        // Guarded await: a compound regression (no token at all) would park
+        // forever — fail cleanly instead of hanging the suite.
+        let err = tokio::time::timeout(Duration::from_secs(3600), call)
+            .await
+            .expect("the explicit token must resolve the call")
+            .expect_err("explicit token cancels");
+        assert!(matches!(err, Error::Cancelled { .. }), "got {err:?}");
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[tokio::test(start_paused = true)]
+    async fn acceptance_pending_reply_with_client_default_cancel() {
+        use crate::CancellationToken;
+        // The vcs-toolkit spec's R2 acceptance, verbatim: a pending reply +
+        // `default_cancel_on` — the call parks until the token fires, then
+        // yields Cancelled naming the program, and the invocation is recorded.
+        let token = CancellationToken::new();
+        let rec =
+            RecordingRunner::new(ScriptedRunner::new().on(["run", "watch"], Reply::pending()));
+        let client = CliClient::with_runner("gh", &rec).default_cancel_on(token.clone());
+
+        let call = client.capture(client.command(["run", "watch", "123"]));
+        tokio::pin!(call);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3600), &mut call)
+                .await
+                .is_err(),
+            "must not resolve before the token fires"
+        );
+        token.cancel();
+        // Guarded await: see per_command_cancel_on_overrides_the_default.
+        match tokio::time::timeout(Duration::from_secs(3600), call)
+            .await
+            .expect("the cancelled token must resolve the call")
+        {
+            Err(Error::Cancelled { program }) => assert_eq!(program, "gh"),
+            other => panic!("expected Error::Cancelled, got {other:?}"),
+        }
+        assert_eq!(rec.only_call().args_str(), ["run", "watch", "123"]);
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[test]
+    fn macro_emits_default_cancel_on() {
+        let _client = Demo::with_runner(ScriptedRunner::new())
+            .default_cancel_on(crate::CancellationToken::new());
     }
 
     #[test]

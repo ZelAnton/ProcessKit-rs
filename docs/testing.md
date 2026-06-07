@@ -80,6 +80,12 @@ The pieces:
   raise `Error::Timeout` from it, carrying the command's own configured
   deadline). **`.with_stdout(text)`** — attach stdout to any of them (e.g.
   the `CONFLICT …` text git prints on a failing merge).
+- **`Reply::pending()`** (`cancellation` feature) — parks the call until the
+  command's cancellation token (per-command `cancel_on` or the client-level
+  [`default_cancel_on`](timeouts-and-cancellation.md#client-level-default))
+  fires, then resolves with `Error::Cancelled` — so a test can prove an
+  orchestration *actually cancels* a blocked call, not just that it formats a
+  canned error. With no token it parks forever, like a hung child.
 - Rules are tried in **registration order**; first match wins. Prefix
   matching is element-wise — `on(["foo"])` matches args `["foo", "bar"]` but
   not `["foobar"]`.

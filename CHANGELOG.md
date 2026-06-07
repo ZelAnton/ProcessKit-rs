@@ -13,6 +13,18 @@ to a dated version section.
 
 ### Added
 
+- `CliClient::default_cancel_on(token)` (`cancellation` feature) — a
+  client-level cancellation default, completing the run-control default set
+  (`default_timeout`/`default_env`): every command the client builds carries
+  the token, so cancelling it kills all of that client's in-flight runs. A
+  per-command `cancel_on` *replaces* the default (explicit beats default).
+  The `cli_client!` macro re-emits the builder on generated wrappers.
+  Requested by a downstream wrapper crate.
+- `Reply::pending()` (`cancellation` feature) — a `ScriptedRunner` reply that
+  parks the call until the command's cancellation token fires, then resolves
+  with `Error::Cancelled`, making cancellation *behaviour* (not just its
+  aftermath) hermetically testable. With no token it parks forever, like a
+  hung child.
 - `Command::kill_on_parent_death()` — opt-in hardening so an abruptly-dying
   parent (`SIGKILL`, where `Drop` never runs) still takes its child down:
   Linux arms `PR_SET_PDEATHSIG(SIGKILL)` on the direct child (the

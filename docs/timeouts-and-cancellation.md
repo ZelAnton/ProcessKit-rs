@@ -153,6 +153,35 @@ The contract, path by path:
 | Under a [`Supervisor`](supervision.md) | terminal — supervision returns `Err(Cancelled)` instead of restarting into a still-cancelled token |
 | `wait_any` / `first_line` mid-run | the raw primitives don't synthesize the error — the stream just ends (a *pre-cancelled* token still hits the pre-spawn short-circuit) |
 
+### Client-level default
+
+A typed wrapper built on [`CliClient`](testing.md#wrapping-a-cli-tool) usually constructs
+and consumes its `Command`s internally — there is no place to chain a
+per-call `cancel_on`. Set the token **once on the client**; every command it
+builds carries it:
+
+```rust,no_run
+use processkit::{CancellationToken, CliClient};
+
+let token = CancellationToken::new();
+let gh = CliClient::new("gh").default_cancel_on(token.child_token());
+// ... controller cancels `token` → every in-flight command of THIS client
+// dies (whole tree), surfacing Error::Cancelled to the awaiting call.
+```
+
+Clients are cheap — scope cancellation by building **one client per
+cancellable scope** with its own (child) token, instead of threading tokens
+through call signatures. `cli_client!`-generated wrappers re-emit the builder,
+so `Git::new().default_cancel_on(t)` works for downstream crates too.
+
+**Precedence:** a per-command `cancel_on` chained on a built command
+*replaces* the client default (explicit beats default, like a per-command
+`timeout` after `default_timeout`). To honor **both** sources, wire it
+explicitly — `CancellationToken` has no built-in merge: derive a child of the
+default (`let c = default.child_token()`), hand the command
+`cancel_on(c.clone())`, and have the second source call `c.cancel()`. Or
+simpler: build a dedicated client per scope.
+
 ## Precedence and interactions
 
 **Timeout vs. cancellation.** A timeout is *captured*; a cancellation is

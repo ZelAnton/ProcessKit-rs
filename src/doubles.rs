@@ -10,9 +10,14 @@
 //!
 //! Doubles replay canned results without modeling the runtime machinery: a
 //! command's timeout never kills anything here (script a timed-out [`Reply`]
-//! instead), and a `cancel_on` token is not observed — script an
-//! `Err(Error::Cancelled { .. })` reply via a custom runner when a test needs
-//! to exercise cancel handling.
+//! instead), and the *instant* replies never observe a `cancel_on` token (they
+//! resolve before any cancellation could race them). To exercise cancellation
+//! **behaviour** — a call that genuinely blocks until its token fires — script
+//! [`Reply::pending`] (`cancellation` feature): it parks the call until the
+//! command's token (per-command or
+//! [`CliClient::default_cancel_on`](crate::CliClient::default_cancel_on))
+//! cancels, then resolves with `Err(Error::Cancelled { .. })`, mirroring the
+//! live contract.
 
 use std::ffi::{OsStr, OsString};
 use std::sync::Mutex;
@@ -22,13 +27,17 @@ use crate::error::Result;
 use crate::result::ProcessResult;
 use crate::runner::ProcessRunner;
 
-/// A canned reply: stdout/stderr text plus an exit code (or a timed-out run).
+/// A canned reply: stdout/stderr text plus an exit code (or a timed-out run,
+/// or a parked-until-cancelled call).
 #[derive(Debug, Clone)]
 pub struct Reply {
     stdout: String,
     stderr: String,
     code: i32,
     timed_out: bool,
+    /// Park the call until the command's cancellation token fires (see
+    /// [`pending`](Self::pending)); the other fields are unused then.
+    pending: bool,
 }
 
 impl Reply {
@@ -39,6 +48,7 @@ impl Reply {
             stderr: String::new(),
             code: 0,
             timed_out: false,
+            pending: false,
         }
     }
 
@@ -49,6 +59,7 @@ impl Reply {
             stderr: stderr.into(),
             code,
             timed_out: false,
+            pending: false,
         }
     }
 
@@ -62,6 +73,30 @@ impl Reply {
             // the helpers key on.
             code: 0,
             timed_out: true,
+            pending: false,
+        }
+    }
+
+    /// A reply that **parks the call until its cancellation token fires**,
+    /// then resolves with [`Error::Cancelled`](crate::Error::Cancelled) naming
+    /// the program — the hermetic mirror of cancelling a live long-runner, for
+    /// testing that an orchestration genuinely cancels (and cleans up), not
+    /// just that it formats a canned error.
+    ///
+    /// The token is the matched command's — set per command
+    /// ([`Command::cancel_on`]) or client-wide
+    /// ([`CliClient::default_cancel_on`](crate::CliClient::default_cancel_on)).
+    /// A pending reply for a command **without** a token parks forever, like a
+    /// hung child nobody can cancel — deliberate; pair it with a token (or a
+    /// test timeout) by design.
+    #[cfg(feature = "cancellation")]
+    pub fn pending() -> Self {
+        Self {
+            stdout: String::new(),
+            stderr: String::new(),
+            code: 0,
+            timed_out: false,
+            pending: true,
         }
     }
 
@@ -177,11 +212,19 @@ impl ProcessRunner for ScriptedRunner {
         let timeout = command.configured_timeout();
         for (rule, reply) in &self.rules {
             if rule.matches(command) {
+                if reply.pending {
+                    return park_until_cancelled(command, program).await;
+                }
                 return Ok(reply.clone().into_result(program, timeout));
             }
         }
         match &self.fallback {
-            Some(reply) => Ok(reply.clone().into_result(program, timeout)),
+            Some(reply) => {
+                if reply.pending {
+                    return park_until_cancelled(command, program).await;
+                }
+                Ok(reply.clone().into_result(program, timeout))
+            }
             None => Err(crate::error::Error::Spawn {
                 program,
                 source: std::io::Error::new(
@@ -191,6 +234,21 @@ impl ProcessRunner for ScriptedRunner {
             }),
         }
     }
+}
+
+/// Drive a [`Reply::pending`] match: wait for the command's cancellation token
+/// and resolve as the live runner would — `Err(Error::Cancelled)`. With no
+/// token (or without the `cancellation` feature, where `pending` replies can't
+/// even be constructed) the call parks forever, like a hung child.
+async fn park_until_cancelled(command: &Command, program: String) -> Result<ProcessResult<String>> {
+    #[cfg(feature = "cancellation")]
+    if let Some(token) = command.cancel_token() {
+        token.cancelled().await;
+        return Err(crate::error::Error::Cancelled { program });
+    }
+    #[cfg(not(feature = "cancellation"))]
+    let _ = (command, program);
+    std::future::pending().await
 }
 
 /// A captured record of one command a runner was asked to run.
@@ -406,6 +464,47 @@ mod tests {
             }
             other => panic!("expected Timeout, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[tokio::test(start_paused = true)]
+    async fn pending_parks_until_the_token_fires_then_cancels() {
+        use crate::error::Error;
+        let token = crate::CancellationToken::new();
+        let runner = ScriptedRunner::new().on(["run", "watch"], Reply::pending());
+        let cmd = Command::new("gh")
+            .args(["run", "watch"])
+            .cancel_on(token.clone());
+
+        let call = runner.output(&cmd);
+        tokio::pin!(call);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3600), &mut call)
+                .await
+                .is_err(),
+            "a pending reply must not resolve before cancellation"
+        );
+        token.cancel();
+        match call.await {
+            Err(Error::Cancelled { program }) => assert_eq!(program, "gh"),
+            other => panic!("expected Error::Cancelled, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[tokio::test(start_paused = true)]
+    async fn pending_without_a_token_parks_forever() {
+        // Documented: a pending reply for a command with no token behaves like
+        // a hung child nobody can cancel.
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let cmd = Command::new("gh");
+        let call = runner.output(&cmd);
+        tokio::pin!(call);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3600), &mut call)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
