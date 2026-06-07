@@ -106,7 +106,7 @@ async fn client_default_cancel_on_cancels_a_real_run() {
 
     let start = Instant::now();
     let err = client
-        .capture(cmd)
+        .output(cmd)
         .await
         .expect_err("a cancelled run must error, not produce a result");
     assert!(

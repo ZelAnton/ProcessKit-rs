@@ -58,6 +58,13 @@ to a dated version section.
 
 ### Changed
 
+- **Breaking**: `CliClient`'s run helpers renamed to the crate-wide verb
+  vocabulary — `text → run`, `capture → output`, `unit → run_unit`,
+  `code → exit_code` (`probe`/`parse`/`try_parse` unchanged). The same verb
+  now means the same thing on `Command`, `ProcessRunnerExt`, and `CliClient`;
+  `ProcessRunnerExt` gained `run_unit` for full symmetry. No deprecated
+  aliases (pre-1.0). `ProcessResult::code()` — the plain accessor — is
+  unrelated and unchanged.
 - `Error::Exit`'s `Display` now appends a bounded diagnostic excerpt — the
   last non-empty line of stderr (or stdout as fallback), capped at 200
   bytes: `` `git` exited with code 2: fatal: boom `` (idea borrowed from

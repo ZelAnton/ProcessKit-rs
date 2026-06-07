@@ -594,7 +594,7 @@ cli_client!(pub struct Git => "git");
 
 impl<R: ProcessRunner> Git<R> {
     async fn head(&self, dir: &Path) -> Result<String> {
-        self.core.text(self.core.command_in(dir, ["rev-parse", "HEAD"])).await
+        self.core.run(self.core.command_in(dir, ["rev-parse", "HEAD"])).await
     }
 }
 ```

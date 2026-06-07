@@ -184,10 +184,12 @@ impl<R: ProcessRunner> CliClient<R> {
     }
 
     /// Run `command`, returning stdout (trailing whitespace trimmed) on success
-    /// (errors on a non-zero exit). Trims with `trim_end` to match
-    /// [`run`](crate::ProcessRunnerExt::run)/[`Command::run`](crate::Command::run):
-    /// the trailing newline is noise, but leading whitespace can be significant.
-    pub async fn text(&self, command: Command) -> Result<String> {
+    /// (errors on a non-zero exit) — the same verb, with the same semantics, as
+    /// [`Command::run`](crate::Command::run) and
+    /// [`ProcessRunnerExt::run`](crate::ProcessRunnerExt::run). Trims with
+    /// `trim_end`: the trailing newline is noise, but leading whitespace can be
+    /// significant.
+    pub async fn run(&self, command: Command) -> Result<String> {
         Ok(self
             .runner
             .checked(&command)
@@ -197,19 +199,23 @@ impl<R: ProcessRunner> CliClient<R> {
             .to_owned())
     }
 
-    /// Run `command`, capturing the result without erroring on a non-zero exit.
-    pub async fn capture(&self, command: Command) -> Result<ProcessResult<String>> {
+    /// Run `command`, capturing the full result without erroring on a non-zero
+    /// exit — the same verb as [`ProcessRunner::output`].
+    pub async fn output(&self, command: Command) -> Result<ProcessResult<String>> {
         self.runner.output(&command).await
     }
 
-    /// Run `command` for its side effect, discarding stdout (errors on a non-zero exit).
-    pub async fn unit(&self, command: Command) -> Result<()> {
-        self.runner.checked(&command).await.map(drop)
+    /// Run `command` for its side effect, discarding stdout (errors on a
+    /// non-zero exit) — the same verb as
+    /// [`ProcessRunnerExt::run_unit`](crate::ProcessRunnerExt::run_unit).
+    pub async fn run_unit(&self, command: Command) -> Result<()> {
+        self.runner.run_unit(&command).await
     }
 
     /// Run `command` and return its exit code (e.g. `git diff --quiet`,
-    /// `gh auth status`) — never errors on a non-zero exit.
-    pub async fn code(&self, command: Command) -> Result<i32> {
+    /// `gh auth status`) — never errors on a non-zero exit. The same verb as
+    /// [`Command::exit_code`](crate::Command::exit_code).
+    pub async fn exit_code(&self, command: Command) -> Result<i32> {
         self.runner.exit_code(&command).await
     }
 
@@ -354,13 +360,13 @@ mod tests {
     impl<R: ProcessRunner> Demo<R> {
         async fn head(&self, dir: &Path) -> Result<String> {
             self.core
-                .text(self.core.command_in(dir, ["rev-parse", "HEAD"]))
+                .run(self.core.command_in(dir, ["rev-parse", "HEAD"]))
                 .await
         }
         async fn is_clean(&self, dir: &Path) -> Result<bool> {
             Ok(self
                 .core
-                .code(self.core.command_in(dir, ["diff", "--quiet"]))
+                .exit_code(self.core.command_in(dir, ["diff", "--quiet"]))
                 .await?
                 == 0)
         }
@@ -374,16 +380,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_trims_trailing_whitespace_only() {
-        // `text` trims with `trim_end` (matching `run`): the trailing newline is
-        // dropped, but leading whitespace is significant and preserved.
+    async fn run_trims_trailing_whitespace_only() {
+        // `run` trims with `trim_end`: the trailing newline is dropped, but
+        // leading whitespace is significant and preserved.
         let demo =
             Demo::with_runner(ScriptedRunner::new().on(["rev-parse"], Reply::ok("  abc123 \n")));
         assert_eq!(demo.head(Path::new(".")).await.unwrap(), "  abc123");
     }
 
     #[tokio::test]
-    async fn code_maps_exit_status() {
+    async fn exit_code_maps_exit_status() {
         let demo = Demo::with_runner(ScriptedRunner::new().on(["diff"], Reply::fail(1, "")));
         assert!(!demo.is_clean(Path::new(".")).await.unwrap());
     }
@@ -429,13 +435,13 @@ mod tests {
         let client = CliClient::with_runner("git", runner);
         assert_eq!(
             client
-                .text(client.command_in(Path::new("/repo"), ["status"]))
+                .run(client.command_in(Path::new("/repo"), ["status"]))
                 .await
                 .unwrap(),
             "in-repo"
         );
         assert_eq!(
-            client.text(client.command(["status"])).await.unwrap(),
+            client.run(client.command(["status"])).await.unwrap(),
             "elsewhere"
         );
     }
@@ -445,7 +451,7 @@ mod tests {
         let rec = RecordingRunner::replying(Reply::ok("https://gh/pr/2\n"));
         let client = CliClient::with_runner("gh", &rec);
         let _ = client
-            .text(client.command_in(Path::new("/repo"), ["pr", "create", "--title", "T"]))
+            .run(client.command_in(Path::new("/repo"), ["pr", "create", "--title", "T"]))
             .await
             .unwrap();
 
@@ -456,14 +462,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn code_errors_on_timeout() {
+    async fn exit_code_errors_on_timeout() {
         // A timed-out run has no meaningful exit code: `code` must raise
         // Error::Timeout, not return the synthetic -1 (so a consumer like
         // `gh auth status` can't misread a timeout as "exited non-zero").
         let client = CliClient::with_runner("gh", ScriptedRunner::new().fallback(Reply::timeout()));
         assert!(matches!(
             client
-                .code(client.command(["auth", "status"]))
+                .exit_code(client.command(["auth", "status"]))
                 .await
                 .unwrap_err(),
             Error::Timeout { .. }
@@ -521,7 +527,7 @@ mod tests {
     async fn default_env_reaches_the_invocation() {
         let rec = RecordingRunner::replying(Reply::ok("ok\n"));
         let client = CliClient::with_runner("git", &rec).default_env("GIT_TERMINAL_PROMPT", "0");
-        let _ = client.text(client.command(["status"])).await.unwrap();
+        let _ = client.run(client.command(["status"])).await.unwrap();
         let call = rec.only_call();
         assert!(
             call.envs
@@ -562,7 +568,7 @@ mod tests {
             .default_cancel_on(default_token.clone());
         let cmd = client.command(["run", "watch"]).cancel_on(explicit.clone());
 
-        let call = client.capture(cmd);
+        let call = client.output(cmd);
         tokio::pin!(call);
         default_token.cancel();
         assert!(
@@ -593,7 +599,7 @@ mod tests {
             RecordingRunner::new(ScriptedRunner::new().on(["run", "watch"], Reply::pending()));
         let client = CliClient::with_runner("gh", &rec).default_cancel_on(token.clone());
 
-        let call = client.capture(client.command(["run", "watch", "123"]));
+        let call = client.output(client.command(["run", "watch", "123"]));
         tokio::pin!(call);
         assert!(
             tokio::time::timeout(Duration::from_secs(3600), &mut call)

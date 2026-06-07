@@ -51,6 +51,11 @@ pub trait ProcessRunnerExt: ProcessRunner {
             .to_owned())
     }
 
+    /// Run for the side effect: require a zero exit, discard the output.
+    async fn run_unit(&self, command: &Command) -> Result<()> {
+        self.checked(command).await.map(drop)
+    }
+
     /// Run and return just the exit code. A run that produced no code surfaces as
     /// an error — a timeout as [`Error::Timeout`](crate::Error::Timeout), a
     /// signal-kill as an IO error — rather than a synthetic sentinel, mirroring

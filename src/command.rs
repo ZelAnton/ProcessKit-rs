@@ -680,7 +680,7 @@ impl Command {
     /// [`Error::Timeout`](crate::Error::Timeout), a signal-kill as an IO error —
     /// consistent with
     /// [`ProcessRunnerExt::exit_code`](crate::ProcessRunnerExt::exit_code) and
-    /// [`CliClient::code`](crate::CliClient::code).
+    /// [`CliClient::exit_code`](crate::CliClient::exit_code).
     pub async fn exit_code(&self) -> Result<i32> {
         JobRunner::new().exit_code(self).await
     }

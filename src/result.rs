@@ -159,7 +159,7 @@ impl<T> ProcessResult<T> {
     }
 
     /// The exit code for the code-returning convenience helpers
-    /// (`Command::exit_code`, `ProcessRunnerExt::exit_code`, `CliClient::code`):
+    /// (`Command::exit_code`, `ProcessRunnerExt::exit_code`, `CliClient::exit_code`):
     /// a timeout surfaces as [`Error::Timeout`], a signal-kill (no code) as an
     /// IO error, otherwise the code.
     pub(crate) fn require_code(&self) -> Result<i32, Error> {

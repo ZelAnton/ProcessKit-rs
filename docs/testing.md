@@ -199,7 +199,7 @@ cli_client!(
 impl<R: ProcessRunner> Git<R> {
     /// HEAD's commit id.
     pub async fn head(&self, repo: &Path) -> Result<String> {
-        self.core.text(self.core.command_in(repo, ["rev-parse", "HEAD"])).await
+        self.core.run(self.core.command_in(repo, ["rev-parse", "HEAD"])).await
     }
 
     /// Is the work tree clean? (exit code IS the answer)
@@ -237,9 +237,9 @@ let head = git.head(Path::new(".")).await?;
 The generated type is `Git<R: ProcessRunner = JobRunner>` with `Git::new()`,
 `Git::with_runner(runner)`, `default_timeout` / `default_env` /
 `default_env_remove` builders, and a public `core: CliClient<R>` whose helpers
-cover the spectrum: `text` (trimmed stdout), `capture` (full result), `unit`
-(success only), `code`, `probe`, `parse` (infallible), `try_parse` (fallible →
-`Error::Parse`).
+speak the crate-wide verb vocabulary: `run` (trimmed stdout), `output` (full
+result), `run_unit` (success only), `exit_code`, `probe`, plus `parse`
+(infallible) and `try_parse` (fallible → `Error::Parse`).
 
 And the payoff — the wrapper tests hermetically with any double:
 
