@@ -51,6 +51,28 @@ async fn inherit_env_whitelists_parent_env() {
     );
 }
 
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess to compare environments"]
+async fn inherit_env_matches_windows_names_case_insensitively() {
+    // Pins a Windows guarantee the allow-list inherits from the OS: the
+    // parent lookup goes through `GetEnvironmentVariableW`, which is
+    // case-insensitive — `inherit_env(["path"])` must copy `Path`/`PATH`
+    // whatever the canonical spelling is. (duct's gotchas list flags env-name
+    // casing as a classic Windows trap; this is the regression guard.)
+    let result = print_env()
+        .inherit_env(["path", "systemroot"]) // deliberately the "wrong" case
+        .output_string()
+        .await
+        .expect("run env printer");
+    assert!(result.is_success(), "result: {result:?}");
+    assert!(
+        result.stdout().to_uppercase().contains("PATH="),
+        "lowercase allow-list entry must still copy PATH: {:?}",
+        result.stdout()
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "spawns a real subprocess in a new session"]

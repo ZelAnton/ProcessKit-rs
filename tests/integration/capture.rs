@@ -48,6 +48,55 @@ async fn output_bytes_returns_raw_stdout() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real subprocess fed stdin it never reads"]
+async fn early_exiting_child_does_not_fail_a_large_stdin_feed() {
+    // duct's gotcha #2 as a spec: the child exits without reading stdin while
+    // the writer still has ~1 MiB to push — the resulting broken-pipe write
+    // (EPIPE / Windows pipe error) must not fail the run or hang the feed.
+    let big = "x".repeat(1024 * 1024);
+    let exits_zero = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "exit", "0"])
+    } else {
+        Command::new("sh").args(["-c", "exit 0"])
+    };
+    let result = exits_zero
+        .stdin(processkit::Stdin::from_string(big))
+        .output_string()
+        .await
+        .expect("the stdin writer's broken pipe must not surface as Err");
+    assert!(result.is_success(), "result: {result:?}");
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess echoing 256 KiB through both pipes"]
+async fn large_stdin_and_large_output_do_not_deadlock() {
+    // duct's gotcha #10 as a spec: stdin is fed and both outputs are drained
+    // concurrently, so a child echoing more than a pipe buffer (~64 KiB) in
+    // each direction can neither stall writing (full stdout pipe nobody
+    // drains) nor starve reading (stdin writer blocked behind us).
+    let line = "0123456789abcdef".repeat(64); // 1 KiB
+    let big = format!("{line}\n").repeat(256); // 256 KiB + newlines
+    let echo_all = if cfg!(windows) {
+        // findstr "^" passes every line through.
+        Command::new("cmd").args(["/c", "findstr", "^^"])
+    } else {
+        Command::new("cat")
+    };
+    let result = echo_all
+        .stdin(processkit::Stdin::from_string(big.clone()))
+        .timeout(std::time::Duration::from_secs(60)) // deadlock tripwire
+        .output_string()
+        .await
+        .expect("echo run");
+    assert!(result.is_success(), "result: {result:?}");
+    assert_eq!(
+        result.stdout().lines().count(),
+        256,
+        "every line must round-trip"
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a real subprocess"]
 async fn stdin_is_fed_to_the_child() {
     // `cat` (Unix) / `findstr` echo of stdin (Windows `sort` reads stdin).

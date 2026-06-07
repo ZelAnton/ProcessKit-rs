@@ -7,7 +7,9 @@ value: every process spawned into the group — and everything *those* processes
 spawn — is killed when the group is dropped. An exiting, panicking, or
 `?`-returning owner never leaks subprocesses; the kernel object enforcing this
 (Job Object / cgroup / POSIX process group) catches even grandchildren you
-never knew about.
+never knew about. (Killing grandchildren is the problem `duct.py`'s gotchas
+list files under "currently unsolved" for pipe-based designs — kernel
+containment is the solution, and the reason this crate exists.)
 
 - [Creating a group](#creating-a-group)
 - [Putting processes in](#putting-processes-in)

@@ -35,6 +35,14 @@ child, so there is no quoting, no word-splitting, and no injection surface.
 (When you actually want `a | b | c`, use a [pipeline](pipelines.md), which
 wires native pipes instead of invoking a shell.)
 
+The program name reaches the OS **verbatim** — two deliberate non-goals
+(conveniences some libraries layer on, e.g. `duct`): a bare name is resolved
+on `PATH` by the OS, never rewritten to `./name`; and `current_dir` does not
+re-anchor a *relative* program path against the new directory — whether
+`Command::new("./tool").current_dir(dir)` resolves `tool` relative to `dir`
+is the platform's behavior (Unix: yes; Windows: the parent's directory may
+win). Pass absolute program paths when combining the two.
+
 For quick one-liners the free functions skip the builder:
 
 ```rust,no_run
