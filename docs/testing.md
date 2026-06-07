@@ -85,10 +85,13 @@ async fn detects_the_branch() {
 The pieces:
 
 - **`Reply::ok(stdout)`** — exit 0. **`Reply::fail(code, stderr)`** — non-zero
-  with stderr. **`Reply::timeout()`** — a timed-out run (the checking helpers
-  raise `Error::Timeout` from it, carrying the command's own configured
-  deadline). **`.with_stdout(text)`** — attach stdout to any of them (e.g.
-  the `CONFLICT …` text git prints on a failing merge).
+  with stderr. **`Reply::lines(["a", "b"])`** — exit 0 with the lines joined
+  (and streamed one by one on a scripted [`start`](#scripted-streaming)).
+  **`Reply::timeout()`** — a timed-out run (the checking helpers raise
+  `Error::Timeout` from it, carrying the command's own configured deadline).
+  **`.with_stdout(text)`** — attach stdout to any of them (e.g. the
+  `CONFLICT …` text git prints on a failing merge).
+  **`.with_line_delay(d)`** — pace a scripted stream's lines.
 - **`Reply::pending()`** (`cancellation` feature) — parks the call until the
   command's cancellation token (per-command `cancel_on` or the client-level
   [`default_cancel_on`](timeouts-and-cancellation.md#client-level-default))

@@ -140,7 +140,7 @@ guarantee is unconditional in every configuration.
 | `cancellation` | — | `CancellationToken` integration (pulls `tokio-util`) |
 | `record` | — | record/replay cassettes (pulls `serde`) |
 | `mock` | — | `mockall`-generated `MockRunner` |
-| `tracing` | — | a `tracing` event per run |
+| `tracing` | — | lifecycle events: spawn/exit, timeout/cancel, teardown, retries, storms (never argv/env) |
 
 ## Capping a group's resources
 
@@ -304,6 +304,7 @@ async fn main() -> processkit::Result<()> {
         .restart(RestartPolicy::OnCrash)          // Always | OnCrash | Never
         .max_restarts(5)
         .backoff(Duration::from_millis(200), 2.0) // base, multiplier (cap: .max_backoff)
+        .storm_pause(Duration::from_secs(15))     // crash-loop guard (off by default)
         .stop_when(|res| res.code() == Some(0))   // a clean exit ends supervision
         .run()
         .await?;
@@ -313,10 +314,14 @@ async fn main() -> processkit::Result<()> {
 ```
 
 `run()` reports a `SupervisionOutcome` — the final run's result, the restart
-count, and why supervision stopped. Supervision is platform-agnostic and runs
-through the `ProcessRunner` seam: pass `.with_runner(&group)` to keep every
-incarnation in one shared kill-on-drop group, or a `ScriptedRunner` to test
-supervision logic hermetically.
+count, and why supervision stopped. The opt-in **failure-storm guard**
+distinguishes "fails rarely" from "crash-looping": each failure feeds a score
+that halves every `failure_decay`; past `failure_threshold` the supervisor
+takes one collective `storm_pause` instead of hammering restarts at backoff
+speed. Supervision is platform-agnostic and runs through the `ProcessRunner`
+seam: pass `.with_runner(&group)` to keep every incarnation in one shared
+kill-on-drop group, or a `ScriptedRunner` to test supervision logic
+hermetically.
 
 *Deeper: [Supervision](docs/supervision.md).*
 
@@ -386,12 +391,18 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
+The `|` operator is equivalent sugar: `(a | b | c).run()`.
+
 The outcome is **pipefail**: `stdout` is the last stage's output, while the
 exit code, stderr, and reported program come from the first stage that didn't
-exit cleanly (or the last stage when all succeed). The first stage's `stdin`
-source is honored; inner stages read from the pipe. `.timeout(d)` bounds the
-whole chain (killing every stage at the deadline), and `run()` requires every
-stage to succeed, returning the trimmed final stdout.
+exit cleanly (or the last stage when all succeed). For a consumer that
+legitimately stops reading early — the `producer | head -1` shape, where the
+producer's `SIGPIPE` death is expected — mark that stage
+`.unchecked()` and pipefail skips it (a *checked* failure still always wins).
+The first stage's `stdin` source is honored; inner stages read from the pipe.
+`.timeout(d)` bounds the whole chain (killing every stage at the deadline),
+and `run()` requires every stage to succeed, returning the trimmed final
+stdout.
 
 *Deeper: [Pipelines](docs/pipelines.md).*
 
@@ -479,6 +490,10 @@ spawning anything. On a shared [`ProcessGroup`] handle, cancelling kills the
 child itself but leaves the group's siblings alone (same scope as a timeout),
 and a supervised command that gets cancelled stops its `Supervisor` for good —
 restarting into a still-cancelled token would loop futilely.
+
+For a typed wrapper whose commands never cross your code, set the token once
+on the client: `CliClient::new("gh").default_cancel_on(token.child_token())`
+— cancelling it kills every in-flight command of that client.
 
 *Deeper: [Timeouts, retries & cancellation](docs/timeouts-and-cancellation.md).*
 
@@ -584,7 +599,10 @@ async fn main() -> processkit::Result<()> {
 
 `CliClient` + the `cli_client!` macro turn a typed wrapper around an external
 tool (`git`, `jj`, `gh`, …) into just its parsers — the runner is injectable, so
-the wrapper is hermetically testable with a `ScriptedRunner` (no subprocess):
+the wrapper is hermetically testable with a `ScriptedRunner` (no subprocess).
+The seam covers **streaming too**: a scripted `start()` feeds canned lines
+through the same pump machinery, so `stdout_lines`/`wait_for_line`-based
+orchestration tests hermetically as well:
 
 ```rust,no_run
 use processkit::{cli_client, ProcessRunner, Result};

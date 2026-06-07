@@ -124,7 +124,11 @@
 //!   `memory_max`/`max_processes`/`cpu_quota` builders on
 //!   [`ProcessGroupOptions`], and `Error::ResourceLimit`. Implies `stats`.
 //! - **`mock`** — the `mockall`-generated `MockRunner` for consumers' tests.
-//! - **`tracing`** — a `tracing` event per command run.
+//! - **`tracing`** — `tracing` events on the `processkit` target: spawn and
+//!   exit (program/pid/mechanism), timeout and cancellation firing, group
+//!   terminate/shutdown, retry attempts, supervisor restarts and storm
+//!   pauses, and teardown anomalies (stdin-writer failures, pump overruns).
+//!   Never logs argv or environment values.
 //! - **`cancellation`** — first-class run cancellation:
 //!   `Command::cancel_on` ties a run to a `CancellationToken`; cancelling it
 //!   kills the tree and every consuming path resolves to `Error::Cancelled`.

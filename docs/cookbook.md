@@ -25,6 +25,7 @@ runtime and `use processkit::Command;` unless shown otherwise.
 - [Measure what a run cost](#measure-what-a-run-cost)
 - [Contain a process you didn't spawn](#contain-a-process-you-didnt-spawn)
 - [Test code that runs processes — without processes](#test-code-that-runs-processes--without-processes)
+- [Test streaming code — without processes](#test-streaming-code--without-processes)
 - [Wrap a CLI tool behind a typed API](#wrap-a-cli-tool-behind-a-typed-api)
 
 ## Run a command and get its output
@@ -285,16 +286,23 @@ let outcome = Supervisor::new(Command::new("my-service"))
     .restart(RestartPolicy::OnCrash)
     .max_restarts(5)
     .backoff(Duration::from_millis(200), 2.0)
+    .storm_pause(Duration::from_secs(15)) // crash-loop guard (off by default)
     .run()
     .await?;
-println!("stopped after {} restarts: {:?}", outcome.restarts, outcome.stopped);
+println!(
+    "stopped after {} restarts ({} storm pauses): {:?}",
+    outcome.restarts, outcome.storm_pauses, outcome.stopped
+);
 ```
 
 Exponential backoff with jitter by default; `stop_when(…)` ends supervision on
 a condition; `.with_runner(&group)` keeps every incarnation inside one shared
-kill-on-drop group.
+kill-on-drop group. `storm_pause` arms the failure-storm guard: failures feed
+a decaying score, and past the threshold the supervisor takes one collective
+pause instead of hammering restarts — "fails rarely" and "crash-looping" stop
+being the same case.
 
-*Fine print: [Supervision](supervision.md).*
+*Fine print: [Supervision](supervision.md), [failure storms](supervision.md#failure-storms).*
 
 ## Retry a flaky command
 
@@ -412,6 +420,31 @@ the `record` feature's `RecordReplayRunner` records real runs into a JSON
 cassette once and replays them hermetically in CI.
 
 *Fine print: [Testing your code](testing.md).*
+
+## Test streaming code — without processes
+
+```rust,no_run
+use processkit::{Command, ProcessRunner, Reply, ScriptedRunner};
+use std::time::Duration;
+
+let runner = ScriptedRunner::new()
+    .on(["run", "watch"], Reply::lines(["queued", "in_progress", "completed"])
+        .with_line_delay(Duration::from_millis(50))); // paced delivery
+
+let mut run = runner.start(&Command::new("gh").args(["run", "watch", "123"])).await?;
+run.wait_for_line(|l| l.contains("completed"), Duration::from_secs(5)).await?;
+let (code, _stderr) = run.finish_streamed().await?;
+assert_eq!(code, Some(0));
+```
+
+A scripted `start()` feeds the canned lines through the **same pump
+machinery** a real child uses, so `stdout_lines`, the readiness probes, and
+`finish_streamed` behave identically — and `with_line_delay` is deterministic
+under `#[tokio::test(start_paused = true)]`. Canned output also replays
+through `on_stdout_line`/`on_stderr_line` handlers on the bulk verbs, so
+progress-reporting paths test hermetically too.
+
+*Fine print: [Testing → scripted streaming](testing.md#scripted-streaming).*
 
 ## Wrap a CLI tool behind a typed API
 

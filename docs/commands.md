@@ -171,8 +171,23 @@ let result = Command::new("cargo")
     .await?;
 ```
 
-The handler runs on the read pump — keep it cheap and panic-free (a panic ends
-that stream's pumping early; the run itself still completes).
+The handler runs on the read pump — keep it cheap. The contract is forgiving
+and precisely specified:
+
+- **A panicking handler does not poison the run.** The panic is caught, the
+  handler is disabled for the rest of the run (surfaced as a `tracing` warn
+  when that feature is on), and pumping continues — the final result still
+  carries **every** line. You can safely re-export this callback seam to your
+  own users without auditing their closures.
+- **Ordering:** invocations are FIFO within a stream; there is no ordering
+  between stdout and stderr handlers (two independent pumps). On the
+  consuming verbs, **all handler calls happen-before the awaited future
+  resolves** — finalize a progress bar the moment the call returns. (One
+  documented exception: a leaked pipe held open past the child's death is cut
+  off after a bounded teardown grace.)
+- Handlers are **hermetically testable**: `ScriptedRunner` replays canned
+  output through them — see
+  [Testing → scripting replies](testing.md#scripting-replies).
 
 ## Timeouts and retries
 
@@ -271,6 +286,7 @@ let result = Command::new("git").args(["merge", "feature"]).output_string().awai
 result.code();         // Option<i32> — None = killed (timeout/signal), no code
 result.is_success();   // code == Some(0)
 result.timed_out();    // the run's own deadline expired
+result.outcome();      // the explicit three-way enum behind the two above
 result.stdout();       // &str (or &[u8] from output_bytes)
 result.stderr();       // &str
 result.combined();     // stdout + stderr concatenated
@@ -279,6 +295,21 @@ result.diagnostic();   // stderr if non-empty, else stdout — the human-facing 
 
 // Opt into erroring whenever you're ready:
 let ok = result.ensure_success()?; // Exit / Timeout / signal-kill Io as typed errors
+```
+
+When the three-way distinction matters, match on `Outcome` instead of
+mentally decoding the `code()`/`timed_out()` pair:
+
+```rust,no_run
+use processkit::Outcome;
+
+match result.outcome() {
+    Outcome::Exited(0) => println!("clean"),
+    Outcome::Exited(code) => println!("failed with {code}"),
+    Outcome::Signalled => println!("killed by a signal"),
+    Outcome::TimedOut => println!("hit its deadline"),
+    _ => {} // non_exhaustive: future dispositions
+}
 ```
 
 The error enum is structured and `#[non_exhaustive]`:
@@ -297,7 +328,10 @@ The error enum is structured and `#[non_exhaustive]`:
 
 `Error::diagnostic()` mirrors `ProcessResult::diagnostic()` for the `Exit`
 variant — one method to get the most useful human-facing line out of a
-failure.
+failure. `Error::Exit`'s one-line `Display` already appends a bounded excerpt
+of that diagnostic (the last non-empty line, capped at 200 bytes), so a bare
+`eprintln!("{e}")` reads `` `git` exited with code 2: fatal: boom `` —
+actionable in a log line without dumping multi-KiB streams into it.
 
 ---
 

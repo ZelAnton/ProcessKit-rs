@@ -88,6 +88,11 @@ Things to know:
 - The [buffer policy and line handlers](commands.md#output-handling) apply to
   streamed runs too — a handler sees each line on the pump, in addition to
   your loop.
+- The whole streaming surface is **hermetically testable**: a
+  `ScriptedRunner`'s `start()` returns a handle whose canned lines flow
+  through the same pump machinery — `stdout_lines`, the readiness probes, and
+  `finish_streamed` behave identically with no subprocess. See
+  [Testing → scripted streaming](testing.md#scripted-streaming).
 
 ## Interactive stdin
 
