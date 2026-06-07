@@ -51,6 +51,29 @@ Revisit only when a real cross-process coordination consumer shows up; the
 API would likely be an opt-in `ProcessGroupOptions` knob plus an
 `open-by-name` constructor, both documented as Windows-mechanism-specific.
 
+**Addendum (2026-06-07): "name it via an internal key-value registry"
+evaluated and rejected.** The idea — make naming an internal dictionary so
+Linux gets it too — fails in both readings. *In-process map*: doesn't serve
+the motivating cross-process scenario at all (within one process you pass
+the `Arc`), and a strong-ref registry silently disables kill-on-drop — the
+crate's core guarantee — while global library state breaks parallel tests
+and has no resolvable lifecycle; an app that wants a registry writes its own
+ten-line `HashMap`. *Cross-process file registry* (`%TEMP%`/
+`XDG_RUNTIME_DIR`): reinvents the kernel namespace in userspace and inherits
+exactly the hazards kernel objects exist to solve — stale entries after a
+SIGKILLed owner, name squatting, and "open by name" on the pgroup mechanism
+yielding a bare pgid whose `kill(-pgid)` can hit recycled pids (the precise
+hazard `Tracked` is built to avoid; a registry has no handle, so it cannot
+probe-and-prune safely). It would make the API symmetric in *name* but not
+in *guarantee* — hidden mechanism divergence, against the honest-`Mechanism`
+principle. The defensible shape, IF a consumer ever appears, is **real
+kernel names only**: Windows named Job Object; on the Linux cgroup mechanism
+the cgroup *directory path* (cgroupfs is the registry — permissions,
+atomicity, and `cgroup.kill` come built in); pgroup-fallback and macOS get
+an honest `Error::Unsupported`. The residual macOS asymmetry is the OS's,
+not the design's; `adopt(pid)` already covers the observer story from the
+other side.
+
 ## Confirmed non-goals
 
 - **Windows run-as credentials** (`PasswordInClearText`, `LoadUserProfile`
