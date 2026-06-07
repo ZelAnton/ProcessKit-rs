@@ -794,9 +794,12 @@ mod tests {
             .expect("supervision");
         assert_eq!(outcome.restarts, 1);
         let waited = start.elapsed();
+        // `<=` upper bound: the factor is in [0.5, 1.5), but `mul_f64` rounds
+        // to the nearest nanosecond — a factor just under 1.5 can round the
+        // delay up to exactly 1.5× (observed as a rare flake).
         assert!(
-            waited >= Duration::from_millis(500) && waited < Duration::from_millis(1500),
-            "jittered delay out of [0.5, 1.5) band: {waited:?}"
+            waited >= Duration::from_millis(500) && waited <= Duration::from_millis(1500),
+            "jittered delay out of [0.5, 1.5] band: {waited:?}"
         );
     }
 
@@ -952,9 +955,11 @@ mod tests {
             .expect("supervision");
         assert_eq!(outcome.storm_pauses, 1);
         let waited = start.elapsed();
+        // `<=` upper bound: ns-rounding can land exactly on 1.5× (see
+        // jitter_stays_within_its_band).
         assert!(
-            waited >= Duration::from_millis(500) && waited < Duration::from_millis(1500),
-            "jittered storm pause out of [0.5, 1.5) band: {waited:?}"
+            waited >= Duration::from_millis(500) && waited <= Duration::from_millis(1500),
+            "jittered storm pause out of [0.5, 1.5] band: {waited:?}"
         );
     }
 
