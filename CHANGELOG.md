@@ -107,7 +107,13 @@ to a dated version section.
   destructuring or struct-literal construction outside the crate.
 
 ### Fixed
--
+
+- `keep_stdin_open` combined with a **bulk** verb (`output_string`/`run`/…)
+  no longer hangs a stdin-reading child: a consuming verb now closes an
+  **untaken** interactive stdin pipe (nothing could ever write to it again),
+  so the child sees EOF instead of blocking to its timeout. A writer taken
+  via `standard_input()` is unaffected. The `keep_stdin_open` docs previously
+  claimed bulk helpers "always close stdin" — now they actually do.
 
 ## [0.7.1] - 2026-06-06
 

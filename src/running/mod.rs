@@ -768,6 +768,14 @@ impl RunningProcess {
     /// flagging `timed_out` on elapse). The code is `None` for a run that
     /// produced none — a timeout, or a signal termination on Unix.
     async fn drive_to_exit(&mut self) -> Result<(Option<i32>, bool)> {
+        // A `keep_stdin_open` pipe nobody took can never be taken once a
+        // consuming verb is driving (the verbs own `self`): close it NOW so a
+        // stdin-reading child sees EOF instead of blocking to its timeout. A
+        // writer the caller did take via `standard_input()` is unaffected —
+        // the pipe moved out of `self` then.
+        if let Backend::Real(real) = &mut self.backend {
+            drop(real.stdin_pipe.take());
+        }
         let outcome = self.drive_to_exit_inner().await?;
         // The child is reaped (or being reaped) — the watchdogs' job is done.
         self.abort_watchdogs();

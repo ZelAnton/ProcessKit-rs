@@ -389,9 +389,17 @@ impl Command {
 
     /// Leave stdin open after start so the child can be driven interactively via
     /// [`RunningProcess::standard_input`](crate::RunningProcess::standard_input).
-    /// Has no effect on the bulk run helpers (they always close stdin). Takes
-    /// precedence over a [`stdin`](Self::stdin) source — when set, that source is
-    /// ignored and the pipe is handed to the caller instead.
+    /// Takes precedence over a [`stdin`](Self::stdin) source — when set, that
+    /// source is ignored and the pipe is handed to the caller instead.
+    ///
+    /// The open pipe lives until the caller takes it (`standard_input`) or a
+    /// consuming verb runs: at consume time an **untaken** pipe is closed
+    /// (nothing could ever write to it again), so a stdin-reading child sees
+    /// EOF instead of blocking — combining `keep_stdin_open` with a bulk
+    /// helper (`output_string`, `run`, …) without ever taking the writer is
+    /// equivalent to not setting it. A writer the caller *did* take is
+    /// unaffected and keeps the pipe until dropped or
+    /// [`finish`](crate::ProcessStdin::finish)ed.
     pub fn keep_stdin_open(mut self) -> Self {
         self.keep_stdin_open = true;
         self

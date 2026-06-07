@@ -68,6 +68,37 @@ async fn early_exiting_child_does_not_fail_a_large_stdin_feed() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real stdin-reading subprocess on the bulk path"]
+async fn untaken_keep_stdin_open_pipe_is_closed_by_bulk_verbs() {
+    // Regression (audit-found hang): `keep_stdin_open` + a bulk verb used to
+    // leave the stdin pipe open forever — a stdin-reading child (`sort`)
+    // blocked to its timeout instead of seeing EOF. The consuming verb must
+    // close an untaken pipe, so this returns promptly and cleanly.
+    let reads_stdin = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "sort"])
+    } else {
+        Command::new("cat")
+    };
+    let start = std::time::Instant::now();
+    let result = reads_stdin
+        .keep_stdin_open()
+        .timeout(std::time::Duration::from_secs(20)) // tripwire, must not be hit
+        .output_string()
+        .await
+        .expect("run completes");
+    assert!(result.is_success(), "result: {result:?}");
+    assert!(
+        !result.timed_out(),
+        "the child must see EOF, not hang to the deadline: {result:?}"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(15),
+        "bulk verb did not close the untaken stdin pipe (took {:?})",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a real subprocess fed a failing stdin source"]
 async fn failing_stdin_source_does_not_fail_the_run() {
     use std::pin::Pin;
