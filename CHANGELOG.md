@@ -40,6 +40,12 @@ to a dated version section.
 
 ### Changed
 
+- `Error::Exit`'s `Display` now appends a bounded diagnostic excerpt — the
+  last non-empty line of stderr (or stdout as fallback), capped at 200
+  bytes: `` `git` exited with code 2: fatal: boom `` (idea borrowed from
+  `execa`'s error messages). Display text is not part of the semver
+  contract; the carried `stdout`/`stderr` fields and `diagnostic()` are
+  unchanged.
 - `SupervisionOutcome` is now `#[non_exhaustive]` (it gained the
   `storm_pauses` field; like `ProcessGroupStats`/`RunProfile` it is a
   read-only report the crate produces, so future telemetry can be added

@@ -31,7 +31,12 @@ pub enum Error {
     /// …`, `nothing to commit, working tree clean`), so a caller building a
     /// user-facing message wants stdout as a fallback when stderr is empty — see
     /// [`diagnostic`](Self::diagnostic).
-    #[error("`{program}` exited with code {code}")]
+    ///
+    /// The one-line `Display` message appends the **last non-empty line** of
+    /// [`diagnostic`](Self::diagnostic), capped at 200 bytes — `` `git` exited
+    /// with code 2: fatal: boom `` — actionable in a log line without dumping
+    /// multi-KiB streams into it.
+    #[error("{}", display_exit(program, *code, stdout, stderr))]
     Exit {
         /// The program that exited non-zero.
         program: String,
@@ -42,8 +47,9 @@ pub enum Error {
         /// For the raw-bytes helper (`output_bytes`) this is a lossy UTF-8 decode
         /// of stdout — the exact bytes remain on the originating `ProcessResult`.
         stdout: String,
-        /// Captured standard error (truncated). Not shown in the `Display`
-        /// message to avoid log poisoning; this field holds what was kept.
+        /// Captured standard error (truncated). Only its **last non-empty
+        /// line** (bounded) appears in the `Display` message — the full
+        /// captured text lives here, never poisoning a log line.
         stderr: String,
     },
 
@@ -149,11 +155,45 @@ impl Error {
     /// match on [`Exit`](Error::Exit)'s fields directly.
     pub fn diagnostic(&self) -> Option<&str> {
         match self {
-            Error::Exit { stderr, .. } if !stderr.trim().is_empty() => Some(stderr.trim()),
-            Error::Exit { stdout, .. } if !stdout.trim().is_empty() => Some(stdout.trim()),
+            Error::Exit { stdout, stderr, .. } => exit_diagnostic(stdout, stderr),
             _ => None,
         }
     }
+}
+
+/// The stream a failed run's message should quote: stderr when it carries
+/// text, else stdout (where `git` puts `CONFLICT …`), else nothing.
+fn exit_diagnostic<'a>(stdout: &'a str, stderr: &'a str) -> Option<&'a str> {
+    [stderr, stdout]
+        .into_iter()
+        .map(str::trim)
+        .find(|text| !text.is_empty())
+}
+
+/// `Exit`'s one-line `Display`: program + code, plus a bounded excerpt of the
+/// diagnostic — its **last** non-empty line (the actionable one: `git push`
+/// ends with `remote: permission denied`, not starts), capped at 200 bytes on
+/// a char boundary so a binary-garbage or one-enormous-line stream can never
+/// poison a log line.
+fn display_exit(program: &str, code: i32, stdout: &str, stderr: &str) -> String {
+    const TAIL_CAP: usize = 200;
+    let mut message = format!("`{program}` exited with code {code}");
+    let tail = exit_diagnostic(stdout, stderr)
+        .and_then(|text| text.lines().rev().map(str::trim).find(|l| !l.is_empty()));
+    if let Some(tail) = tail {
+        message.push_str(": ");
+        if tail.len() <= TAIL_CAP {
+            message.push_str(tail);
+        } else {
+            let mut cut = TAIL_CAP;
+            while !tail.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            message.push_str(&tail[..cut]);
+            message.push('…');
+        }
+    }
+    message
 }
 
 /// Crate result alias.
@@ -164,17 +204,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exit_display_omits_both_captured_streams() {
-        // Regression guard: adding `stdout` to `Error::Exit` must not change the
-        // one-line `Display` message — neither captured stream may leak into it
-        // (a multi-KiB dump would poison logs). The text is exactly program+code.
+    fn exit_display_appends_a_bounded_diagnostic_tail() {
+        // The policy guard (deliberately rewritten when the tail was added):
+        // the Display stays one actionable line — program + code + the LAST
+        // non-empty diagnostic line — never the full captured streams.
         let err = Error::Exit {
             program: "git".into(),
             code: 2,
             stdout: "CONFLICT (content): merge conflict in a.rs".into(),
-            stderr: "fatal: boom".into(),
+            stderr: "warning: something\nfatal: boom\n".into(),
+        };
+        assert_eq!(err.to_string(), "`git` exited with code 2: fatal: boom");
+
+        // stderr blank → the stdout-borne message (git's CONFLICT) is used.
+        let err = Error::Exit {
+            program: "git".into(),
+            code: 2,
+            stdout: "CONFLICT (content): merge conflict in a.rs".into(),
+            stderr: "   ".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "`git` exited with code 2: CONFLICT (content): merge conflict in a.rs"
+        );
+    }
+
+    #[test]
+    fn exit_display_with_blank_streams_has_no_trailing_colon() {
+        let err = Error::Exit {
+            program: "git".into(),
+            code: 2,
+            stdout: String::new(),
+            stderr: "  \n ".into(),
         };
         assert_eq!(err.to_string(), "`git` exited with code 2");
+    }
+
+    #[test]
+    fn exit_display_tail_is_capped_and_never_leaks_the_stream() {
+        // A multi-KiB single-line stderr must not poison the log line: the
+        // tail is cut at 200 bytes on a char boundary, with an ellipsis.
+        let huge = "é".repeat(3000); // 2 bytes per char — exercises the boundary
+        let err = Error::Exit {
+            program: "x".into(),
+            code: 1,
+            stdout: String::new(),
+            stderr: huge,
+        };
+        let message = err.to_string();
+        assert!(message.len() < 250, "capped, got {} bytes", message.len());
+        assert!(message.ends_with('…'), "got: {message}");
+        assert!(message.starts_with("`x` exited with code 1: éé"));
     }
 
     #[test]
