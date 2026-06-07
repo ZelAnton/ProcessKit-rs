@@ -340,6 +340,10 @@ impl Command {
 
     /// Invoke `handler` for each decoded stdout line as it is read (in addition
     /// to capture/streaming). Runs on the pump task; keep it cheap and panic-free.
+    ///
+    /// At most one handler per stream: a repeat call replaces the previous one
+    /// (builder semantics, like [`timeout`](Self::timeout)). To fan out, compose
+    /// inside a single closure.
     pub fn on_stdout_line<F>(mut self, handler: F) -> Self
     where
         F: Fn(&str) + Send + Sync + 'static,
@@ -349,6 +353,9 @@ impl Command {
     }
 
     /// Invoke `handler` for each decoded stderr line as it is read.
+    ///
+    /// Same contract as [`on_stdout_line`](Self::on_stdout_line): runs on the
+    /// pump task, and a repeat call replaces the previous handler.
     pub fn on_stderr_line<F>(mut self, handler: F) -> Self
     where
         F: Fn(&str) + Send + Sync + 'static,
