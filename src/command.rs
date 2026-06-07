@@ -224,15 +224,15 @@ impl Command {
     /// | Linux | `prctl(PR_SET_PDEATHSIG, SIGKILL)` on the **direct child only** — grandchildren are not covered (with the parent gone, nothing tears the cgroup/pgroup down). |
     /// | macOS / BSD / other | No `pdeathsig` equivalent — does nothing (the graceful-exit guarantee via `Drop` still holds). |
     ///
-    /// Two honest Linux caveats: the death signal fires when the spawning
+    /// One honest Linux caveat: the death signal fires when the spawning
     /// **thread** dies, not only the process — on a multi-threaded tokio
     /// runtime, a worker thread retired while the child lives would kill it
     /// early (for the strongest guarantee spawn from a current-thread
-    /// runtime); and the parent-died-before-arming race is closed by an
-    /// immediate-exit `getppid()` re-check in the child (in a PID namespace
-    /// where the reaper isn't PID 1 that re-check can miss — an accepted
-    /// edge). (Idea borrowed from `execa`'s cleanup-on-exit, mapped to
-    /// native primitives.)
+    /// runtime). The parent-died-before-arming race is closed in the child
+    /// by re-checking `getppid()` against the spawner's pid captured before
+    /// the fork — safe in containers where the spawner itself is PID 1.
+    /// (Idea borrowed from `execa`'s cleanup-on-exit, mapped to native
+    /// primitives.)
     pub fn kill_on_parent_death(mut self) -> Self {
         self.kill_on_parent_death = true;
         self

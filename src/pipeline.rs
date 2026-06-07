@@ -193,7 +193,9 @@ impl Pipeline {
 
     /// Run the chain, require **every** stage to exit cleanly, and return the
     /// last stage's trimmed stdout. A failure surfaces as the first failing
-    /// stage's [`Error::Exit`](crate::Error::Exit) (pipefail attribution).
+    /// stage's [`Error::Exit`](crate::Error::Exit) (pipefail attribution;
+    /// [`unchecked`](Command::unchecked) stages are exempt, so a chain whose
+    /// only failures are unchecked returns `Ok`).
     /// [`Error::Timeout`](crate::Error::Timeout) is produced by the
     /// whole-chain [`timeout`](Self::timeout) or the *last* stage's own
     /// deadline; an **inner** stage's [`Command::timeout`] kills just that

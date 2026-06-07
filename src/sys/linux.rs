@@ -77,12 +77,16 @@ impl Job {
     ) -> io::Result<Child> {
         // Arm the parent-death signal last, after containment hooks: pre-exec
         // hooks run in registration order, and a child that dies unprotected
-        // inside its container beats one protected outside it.
+        // inside its container beats one protected outside it. The spawner's
+        // pid is captured HERE, pre-fork, so the child can detect a parent
+        // that died before the prctl ran (see `arm_pdeathsig`).
         // SAFETY: see `arm_pdeathsig` — async-signal-safe calls only.
         let arm = |cmd: &mut Command| {
             if opts.kill_on_parent_death {
+                let spawner_pid = std::process::id();
                 unsafe {
-                    cmd.as_std_mut().pre_exec(arm_pdeathsig);
+                    cmd.as_std_mut()
+                        .pre_exec(move || arm_pdeathsig(spawner_pid));
                 }
             }
         };
@@ -492,6 +496,32 @@ fn cpu_max_value(cores: f64) -> String {
     format!("{quota} {PERIOD}")
 }
 
+/// Arm `PR_SET_PDEATHSIG(SIGKILL)` so the kernel kills this child when the
+/// spawning thread dies, then close the parent-died-before-arming race: if
+/// `getppid()` no longer reports `spawner_pid` (captured in the parent before
+/// the fork), the parent died in the window and the signal will never fire —
+/// exit immediately instead. Comparing against the captured pid (never the
+/// literal `1`) keeps the guard correct when the spawner itself *is* PID 1 —
+/// a container entrypoint, exactly where this hardening matters most.
+/// Runs in the forked child after `fork()` and before `exec()`.
+///
+/// # Safety
+///
+/// Must stay async-signal-safe: it calls only `prctl`/`getppid`/`_exit` —
+/// no allocation, no locks.
+fn arm_pdeathsig(spawner_pid: u32) -> io::Result<()> {
+    // SAFETY: prctl(PR_SET_PDEATHSIG)/getppid/_exit are async-signal-safe.
+    unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::getppid() as u32 != spawner_pid {
+            libc::_exit(0);
+        }
+    }
+    Ok(())
+}
+
 /// Append the calling process's own pid to the opened `cgroup.procs`, joining
 /// the cgroup. Runs in the forked child after `fork()` and before `exec()`.
 ///
@@ -499,29 +529,6 @@ fn cpu_max_value(cores: f64) -> String {
 ///
 /// Must stay async-signal-safe: it calls only `open`/`getpid`/`write`/`close`
 /// and formats the pid into a stack buffer — no allocation, no locks.
-/// Arm `PR_SET_PDEATHSIG(SIGKILL)` so the kernel kills this child when the
-/// spawning thread dies, then close the parent-died-before-arming race: if
-/// `getppid()` already reports the reaper (PID 1 outside PID namespaces), the
-/// parent is gone and the signal will never fire — exit immediately instead.
-/// Runs in the forked child after `fork()` and before `exec()`.
-///
-/// # Safety
-///
-/// Must stay async-signal-safe: it calls only `prctl`/`getppid`/`_exit` —
-/// no allocation, no locks.
-fn arm_pdeathsig() -> io::Result<()> {
-    // SAFETY: prctl(PR_SET_PDEATHSIG)/getppid/_exit are async-signal-safe.
-    unsafe {
-        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::getppid() == 1 {
-            libc::_exit(0);
-        }
-    }
-    Ok(())
-}
-
 fn write_self_pid(path: &CStr) -> io::Result<()> {
     // SAFETY: all calls below are async-signal-safe and operate on a valid,
     // NUL-terminated path; the fd is closed on every return path.

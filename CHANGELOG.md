@@ -15,8 +15,9 @@ to a dated version section.
 
 - `Command::kill_on_parent_death()` — opt-in hardening so an abruptly-dying
   parent (`SIGKILL`, where `Drop` never runs) still takes its child down:
-  Linux arms `PR_SET_PDEATHSIG(SIGKILL)` on the direct child (with a
-  `getppid` re-check closing the parent-died-first race); Windows already
+  Linux arms `PR_SET_PDEATHSIG(SIGKILL)` on the direct child (the
+  parent-died-first race is closed by re-checking `getppid` against the
+  spawner's pre-fork pid — PID-1-entrypoint-safe); Windows already
   guarantees the whole tree via the job handle closing; macOS/BSD have no
   equivalent (documented no-op). Idea borrowed from `execa`'s
   cleanup-on-exit, mapped to native primitives.

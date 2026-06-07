@@ -102,8 +102,9 @@ multi-threaded tokio runtime a retired worker thread could kill the child
 early; spawn from a current-thread runtime for the strongest guarantee. It
 covers the **direct child only** — with the parent SIGKILLed, nothing tears
 the cgroup/pgroup down, so grandchildren survive. The
-parent-died-before-arming race is closed by a `getppid()` re-check in the
-child (imperfect inside PID namespaces where the reaper isn't PID 1).
+parent-died-before-arming race is closed by re-checking `getppid()` in the
+child against the spawner's pid captured before the fork — which stays
+correct when the spawner itself is PID 1 (a container entrypoint).
 
 **Windows: the suspended-spawn handshake.** Children are created
 `CREATE_SUSPENDED`, assigned to the job, then resumed — closing the classic

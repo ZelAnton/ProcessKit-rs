@@ -56,8 +56,10 @@ pub(crate) fn banner_then_idle() -> Command {
 }
 
 /// An endless line producer, per platform: emits `y` lines until its consumer
-/// goes away, then dies of `SIGPIPE` (Unix) or a broken-pipe write error
-/// (PowerShell terminates on the failed write).
+/// goes away. On Unix it then dies of `SIGPIPE` promptly; on Windows
+/// PowerShell may keep buffering without observing the closed pipe, so pair
+/// it with a per-stage `timeout` — that kill is the load-bearing teardown
+/// there (and is equally "unclean" to pipefail).
 pub(crate) fn endless_yes() -> Command {
     if cfg!(windows) {
         Command::new("powershell").args(["-NoProfile", "-Command", "while($true){'y'}"])

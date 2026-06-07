@@ -71,8 +71,8 @@ kernel names only**: Windows named Job Object; on the Linux cgroup mechanism
 the cgroup *directory path* (cgroupfs is the registry — permissions,
 atomicity, and `cgroup.kill` come built in); pgroup-fallback and macOS get
 an honest `Error::Unsupported`. The residual macOS asymmetry is the OS's,
-not the design's; `adopt(pid)` already covers the observer story from the
-other side.
+not the design's; `adopt` (`process-control`) already covers the observer
+story from the other side.
 
 ## Confirmed non-goals
 
