@@ -20,6 +20,12 @@ to a dated version section.
 ### Fixed
 -
 
+## [0.8.1] - 2026-06-08
+
+### Fixed
+
+- fix(readme): use direct raw.githubusercontent URL for cover so crates.io stops generating a CSP-blocked github.com/raw redirect
+
 ## [0.8.0] - 2026-06-07
 
 ### Added
@@ -564,7 +570,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.7.0...v0.7.1
 [0.6.2]: https://github.com/ZelAnton/ProcessKit-rs/releases/tag/v0.6.2
