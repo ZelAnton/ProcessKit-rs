@@ -138,6 +138,65 @@ async fn uid_gid_drop_privileges() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "sets supplementary groups; meaningful only as root"]
+async fn groups_set_supplementary_groups() {
+    // SAFETY: geteuid is a pure query.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipping: setting supplementary groups requires root");
+        return;
+    }
+    // setgroups replaces the inherited set; `id -G` lists the egid plus the
+    // supplementary groups. No uid drop here, so the cgroup join (written as
+    // root) still succeeds on every mechanism — this isolates the setgroups
+    // pre_exec from the documented uid-vs-cgroup caveat.
+    let out = Command::new("id")
+        .arg("-G")
+        .groups([1, 2])
+        .run()
+        .await
+        .expect("run id -G with supplementary groups set");
+    let ids: std::collections::HashSet<&str> = out.split_whitespace().collect();
+    assert!(
+        ids.contains("1") && ids.contains("2"),
+        "the requested supplementary groups should be present: id -G = {out:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "drops privileges with supplementary groups; meaningful only as root"]
+async fn groups_with_uid_drop_respects_the_cgroup_caveat() {
+    // SAFETY: geteuid is a pure query.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipping: privilege drop requires root");
+        return;
+    }
+    // With `groups` present the whole drop (setgroups → setgid → setuid) runs in
+    // one pre_exec that *precedes* the cgroup-join hook — so the documented
+    // uid×cgroup caveat must apply exactly as it does for uid alone: the spawn
+    // fails under cgroup v2 (join as the dropped uid is refused) and succeeds,
+    // with the uid dropped, on the process-group mechanism.
+    let result = Command::new("id")
+        .arg("-u")
+        .uid(1)
+        .gid(1)
+        .groups([1])
+        .run()
+        .await;
+    match ProcessGroup::new().expect("probe group").mechanism() {
+        Mechanism::CgroupV2 => assert!(
+            result.is_err(),
+            "uid drop with groups on the cgroup mechanism must fail the spawn, got {result:?}"
+        ),
+        _ => {
+            let out = result.expect("run id -u as uid 1 with groups");
+            assert_eq!(out.trim(), "1", "child should report the dropped uid");
+        }
+    }
+}
+
 #[cfg(windows)]
 #[tokio::test]
 #[ignore = "exercises the non-unix unsupported gate"]
@@ -145,6 +204,10 @@ async fn windows_unix_only_builders_are_unsupported() {
     for (command, what) in [
         (Command::new("cmd").args(["/c", "exit 0"]).uid(1000), "uid"),
         (Command::new("cmd").args(["/c", "exit 0"]).gid(1000), "gid"),
+        (
+            Command::new("cmd").args(["/c", "exit 0"]).groups([1000]),
+            "groups",
+        ),
         (
             Command::new("cmd").args(["/c", "exit 0"]).setsid(),
             "setsid",

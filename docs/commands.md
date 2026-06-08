@@ -219,10 +219,11 @@ Spawn-time controls for sandboxing and service launch:
 ```rust,no_run
 use processkit::Command;
 
-// Unix: drop privileges and detach into a new session.
+// Unix: drop privileges (uid + gid + supplementary groups) and detach.
 Command::new("worker")
-    .gid(1000)            // applied before uid (order matters for setgroups rights)
-    .uid(1000)
+    .gid(1000)            // applied before uid (a gid change needs privilege)
+    .groups([1000])       // replace the inherited (often root's) supplementary groups
+    .uid(1000)            // dropped last
     .setsid()             // new session: survives the controlling terminal
     .run().await?;
 
@@ -234,8 +235,10 @@ Command::new("helper").create_no_window().run().await?;
 Command::new("worker").kill_on_parent_death().start().await?;
 ```
 
-`uid` / `gid` / `setsid` are POSIX-only — on other targets the run fails with
-`Error::Unsupported` rather than silently skipping a privilege drop.
+`uid` / `gid` / `groups` / `setsid` are POSIX-only — on other targets the run
+fails with `Error::Unsupported` rather than silently skipping a privilege drop.
+A correct drop sets all three of `uid`/`gid`/`groups`: dropping the uid alone
+leaves the child holding the parent's (often root's) supplementary groups.
 `create_no_window` is a harmless no-op outside Windows.
 `kill_on_parent_death` is best-effort by design: guaranteed on Windows
 (regardless of the knob), direct-child-only on Linux, unavailable on
@@ -244,6 +247,16 @@ way. Containment is preserved in every combination; the platform fine print
 (the Linux cgroup × `uid` interaction, `setsid` × process-group coordination,
 the pdeathsig thread caveat) is collected in
 [Platform support](platform-support.md#caveats).
+
+**Interactive auth / TTY.** processkit wires **pipes**, not a pseudo-terminal,
+so a tool that *demands* a tty — an `ssh`/`sudo` **password** prompt, some
+credential helpers — won't get one (PTY support is not implemented; the
+trade-off is recorded in `ideas/permissions-privileges-pty-network.md`). Drive
+such tools **non-interactively** instead: key-based auth, `ssh -o
+BatchMode=yes`, `GIT_SSH_COMMAND` / `GIT_TERMINAL_PROMPT=0`, or feed a known
+answer over [interactive stdin](streaming.md#interactive-stdin). Conversational
+tools that read stdin without needing a tty already work today via
+`keep_stdin_open` + `stdout_lines`.
 
 ## Consuming verbs
 

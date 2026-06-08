@@ -159,6 +159,84 @@ impl Error {
             _ => None,
         }
     }
+
+    /// Whether this is a spawn/IO **"not found"** — the program (or a path it
+    /// needs) doesn't exist (`ENOENT`). True for [`Spawn`](Error::Spawn) /
+    /// [`Io`](Error::Io) carrying [`NotFound`](std::io::ErrorKind::NotFound);
+    /// `false` for every other variant. Lets a caller surface a "command not
+    /// installed?" hint without reaching into the raw [`std::io::Error`].
+    pub fn is_not_found(&self) -> bool {
+        self.io_source()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    }
+
+    /// Whether this is a spawn/IO **permission denial** (`EACCES`/`EPERM`): the
+    /// binary isn't executable, or the OS refused the launch. True for
+    /// [`Spawn`](Error::Spawn) / [`Io`](Error::Io) carrying
+    /// [`PermissionDenied`](std::io::ErrorKind::PermissionDenied); `false`
+    /// otherwise.
+    pub fn is_permission_denied(&self) -> bool {
+        self.io_source()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+    }
+
+    /// Whether this is a **transient** spawn/IO condition a bare retry can clear
+    /// — interrupted (`EINTR`), would-block (`EAGAIN`), a busy resource, a
+    /// text-file-busy executable mid-write (`ETXTBSY`), or a Windows sharing/lock
+    /// violation. Classifies the [`Spawn`](Error::Spawn)/[`Io`](Error::Io) IO
+    /// error only.
+    ///
+    /// **Scope: IO/spawn-level, never exit codes.** Whether a tool's non-zero
+    /// [`Exit`](Error::Exit) is retryable is domain-specific (a `git` 128 is not
+    /// generically transient) — that stays the caller's call. [`Timeout`](Error::Timeout)
+    /// is also excluded by design; compose it if wanted:
+    /// `e.is_transient() || matches!(e, Error::Timeout { .. })`.
+    ///
+    /// Pairs with [`Command::retry`](crate::Command::retry):
+    /// `cmd.retry(3, backoff, |e| e.is_transient())`.
+    pub fn is_transient(&self) -> bool {
+        self.io_source().is_some_and(is_transient_io)
+    }
+
+    /// The underlying [`std::io::Error`] for the variants that carry one
+    /// ([`Spawn`](Error::Spawn), [`Io`](Error::Io)) — the basis for the io-level
+    /// classifiers above.
+    fn io_source(&self) -> Option<&std::io::Error> {
+        match self {
+            Error::Spawn { source, .. } => Some(source),
+            Error::Io(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// io-level "retry as-is" conditions: transient kernel/filesystem states a bare
+/// retry can clear, distinct from a permanent failure (not-found, permission).
+/// Kept deliberately narrow.
+fn is_transient_io(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    // `ExecutableFileBusy` is std's stable mapping of `ETXTBSY` — the executable
+    // is being written; the launch clears once the writer closes it.
+    if matches!(
+        e.kind(),
+        ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::ResourceBusy
+            | ErrorKind::ExecutableFileBusy
+    ) {
+        return true;
+    }
+    // Windows sharing/lock violations std leaves `Uncategorized`, so match the
+    // raw codes: ERROR_SHARING_VIOLATION (32) / ERROR_LOCK_VIOLATION (33) — a
+    // file the launch needs is briefly locked by another process.
+    #[cfg(windows)]
+    {
+        matches!(e.raw_os_error(), Some(32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 /// The stream a failed run's message should quote: stderr when it carries
@@ -323,6 +401,92 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "could not enforce resource limits: no cgroup or Job Object available"
+        );
+    }
+
+    fn spawn(kind: std::io::ErrorKind) -> Error {
+        Error::Spawn {
+            program: "x".into(),
+            source: std::io::Error::from(kind),
+        }
+    }
+
+    #[test]
+    fn not_found_and_permission_denied_are_classified_on_spawn_and_io() {
+        use std::io::ErrorKind::{NotFound, PermissionDenied};
+        assert!(spawn(NotFound).is_not_found());
+        assert!(Error::Io(std::io::Error::from(NotFound)).is_not_found());
+        assert!(!spawn(NotFound).is_permission_denied());
+
+        assert!(spawn(PermissionDenied).is_permission_denied());
+        assert!(!spawn(PermissionDenied).is_not_found());
+        // Neither permanent failure counts as transient.
+        assert!(!spawn(NotFound).is_transient());
+        assert!(!spawn(PermissionDenied).is_transient());
+    }
+
+    #[test]
+    fn transient_kinds_are_classified() {
+        // Includes ExecutableFileBusy built straight from the kind (no raw
+        // errno) — the classifier must recognize it by `ErrorKind` alone.
+        for kind in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::ResourceBusy,
+            std::io::ErrorKind::ExecutableFileBusy,
+        ] {
+            assert!(spawn(kind).is_transient(), "{kind:?} should be transient");
+            assert!(
+                Error::Io(std::io::Error::from(kind)).is_transient(),
+                "{kind:?} (Io) should be transient"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn etxtbsy_is_transient_on_unix() {
+        let err = Error::Spawn {
+            program: "busy".into(),
+            source: std::io::Error::from_raw_os_error(libc::ETXTBSY),
+        };
+        assert!(err.is_transient());
+        assert!(!err.is_not_found() && !err.is_permission_denied());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sharing_and_lock_violations_are_transient_on_windows() {
+        for code in [32, 33] {
+            let err = Error::Spawn {
+                program: "locked".into(),
+                source: std::io::Error::from_raw_os_error(code),
+            };
+            assert!(
+                err.is_transient(),
+                "raw os error {code} should be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn classifiers_are_false_for_non_io_variants() {
+        // A tool's non-zero exit is never an io-level classification (its
+        // retryability is the caller's domain), and Timeout is excluded too.
+        let exit = Error::Exit {
+            program: "git".into(),
+            code: 128,
+            stdout: String::new(),
+            stderr: "could not resolve host".into(),
+        };
+        assert!(!exit.is_not_found() && !exit.is_permission_denied() && !exit.is_transient());
+        let timeout = Error::Timeout {
+            program: "x".into(),
+            timeout: Duration::from_secs(1),
+        };
+        assert!(
+            !timeout.is_transient(),
+            "Timeout is excluded from is_transient by design"
         );
     }
 }

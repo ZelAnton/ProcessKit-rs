@@ -12,7 +12,19 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+
+- `Error::is_not_found()` / `is_permission_denied()` / `is_transient()` — io-level
+  classifiers over the `Spawn`/`Io` error: distinguish a missing binary (`ENOENT`),
+  a permission denial (`EACCES`/`EPERM`), and a transient condition a bare retry can
+  clear (`EINTR`/`EAGAIN`/busy, `ETXTBSY`, Windows sharing/lock violation) without
+  matching raw `io::ErrorKind`. Pairs with `Command::retry(.., |e| e.is_transient())`.
+  Scope is io/spawn-level only — exit-code retryability stays the caller's domain,
+  and `Error::Timeout` is excluded (compose it explicitly if wanted).
+- `Command::groups([gid, ..])` — set the child's supplementary groups (Unix
+  privilege drop), the missing third leg beside `uid`/`gid`: dropping the uid alone
+  leaves the child holding the parent's (often root's) supplementary groups. The OS
+  applies `setgroups → setgid → setuid`. POSIX-only — non-Unix fails with
+  `Error::Unsupported`, never a silent skip.
 
 ### Changed
 -

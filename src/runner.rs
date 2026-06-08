@@ -236,6 +236,11 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
                 operation: "gid".into(),
             });
         }
+        if command.requested_groups() {
+            return Err(crate::Error::Unsupported {
+                operation: "groups".into(),
+            });
+        }
         if command.wants_setsid() {
             return Err(crate::Error::Unsupported {
                 operation: "setsid".into(),

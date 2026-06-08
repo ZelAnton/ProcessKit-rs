@@ -49,6 +49,9 @@ pub struct Command {
     inherit_env: Option<Vec<OsString>>,
     uid: Option<u32>,
     gid: Option<u32>,
+    /// Supplementary group ids to set (Unix privilege drop); `Some` replaces the
+    /// inherited set. See [`Self::groups`].
+    groups: Option<Vec<u32>>,
     setsid: bool,
     /// Kill the direct child if this process dies abruptly (see
     /// [`Self::kill_on_parent_death`]).
@@ -95,6 +98,7 @@ impl Command {
             inherit_env: None,
             uid: None,
             gid: None,
+            groups: None,
             setsid: false,
             kill_on_parent_death: false,
             creation_flags_extra: 0,
@@ -192,6 +196,34 @@ impl Command {
     /// [`uid`](Self::uid) for ordering and platform notes.
     pub fn gid(mut self, gid: u32) -> Self {
         self.gid = Some(gid);
+        self
+    }
+
+    /// Set the child's **supplementary groups** (Unix privilege drop),
+    /// *replacing* the inherited set.
+    ///
+    /// This is the missing third leg of a correct privilege drop: dropping the
+    /// [`uid`](Self::uid)/[`gid`](Self::gid) alone leaves the child holding the
+    /// **parent's** supplementary groups (often root's), so it could still reach
+    /// group-owned resources the target user shouldn't. Pass the target user's
+    /// groups (or `[]` to drop all extras) alongside `uid`/`gid`.
+    ///
+    /// Ordering is handled for you: the OS applies `setgroups` → `setgid` →
+    /// `setuid` (groups and gid must be set while still privileged, before the
+    /// uid drops). On non-Unix targets the run fails with
+    /// [`Error::Unsupported`](crate::Error::Unsupported) — never silently
+    /// skipped. The Linux cgroup-v2 caveat from [`uid`](Self::uid) applies
+    /// unchanged.
+    ///
+    /// ```no_run
+    /// # fn demo() -> processkit::Command {
+    /// use processkit::Command;
+    /// // Drop to uid/gid 1000 with exactly that user's groups.
+    /// Command::new("worker").uid(1000).gid(1000).groups([1000, 27])
+    /// # }
+    /// ```
+    pub fn groups(mut self, gids: impl AsRef<[u32]>) -> Self {
+        self.groups = Some(gids.as_ref().to_vec());
         self
     }
 
@@ -542,6 +574,13 @@ impl Command {
         self.gid
     }
 
+    /// Whether supplementary groups were requested — read only by the non-Unix
+    /// unsupported gate (Unix consumes the field directly in `build_tokio`).
+    #[cfg(not(unix))]
+    pub(crate) fn requested_groups(&self) -> bool {
+        self.groups.is_some()
+    }
+
     // ----- Public accessors -----------------------------------------------
     // Exposed so external `ScriptedRunner::when(|cmd| …)` predicates and other
     // inspection can read what a command will run. Named to avoid clashing with
@@ -620,13 +659,52 @@ impl Command {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            // gid before uid (std orders them this way in the child too: once
-            // the uid drops, changing gid is no longer permitted).
-            if let Some(gid) = self.gid {
-                cmd.as_std_mut().gid(gid);
-            }
-            if let Some(uid) = self.uid {
-                cmd.as_std_mut().uid(uid);
+            match &self.groups {
+                // Supplementary groups requested: do the *whole* privilege drop
+                // (setgroups → setgid → setuid) in one async-signal-safe
+                // pre_exec. std applies its own setgid/setuid BEFORE any user
+                // pre_exec hook, so a separate setgroups hook would run after the
+                // uid already dropped and fail EPERM — setgroups must precede
+                // setuid while still privileged. (`CommandExt::groups` is still
+                // unstable, so it can't carry this for us.)
+                Some(groups) => {
+                    let groups = groups.clone();
+                    let gid = self.gid;
+                    let uid = self.uid;
+                    // SAFETY: setgroups/setgid/setuid are async-signal-safe; the
+                    // captured gid buffer is read-only in the forked child.
+                    unsafe {
+                        cmd.as_std_mut().pre_exec(move || {
+                            let n = groups.len();
+                            if libc::setgroups(n as _, groups.as_ptr().cast::<libc::gid_t>()) == -1
+                            {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            if let Some(gid) = gid
+                                && libc::setgid(gid) == -1
+                            {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            if let Some(uid) = uid
+                                && libc::setuid(uid) == -1
+                            {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            Ok(())
+                        });
+                    }
+                }
+                // No supplementary groups: keep std's path — it applies gid
+                // before uid (once the uid drops, changing gid is no longer
+                // permitted), before any user pre_exec hook. Unchanged.
+                None => {
+                    if let Some(gid) = self.gid {
+                        cmd.as_std_mut().gid(gid);
+                    }
+                    if let Some(uid) = self.uid {
+                        cmd.as_std_mut().uid(uid);
+                    }
+                }
             }
             if self.setsid {
                 // Registered before any backend hook (e.g. the Linux cgroup
