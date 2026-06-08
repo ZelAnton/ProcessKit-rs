@@ -1,3 +1,9 @@
+// On docs.rs (which builds with `--cfg docsrs`, see `[package.metadata.docs.rs]`)
+// derive the "Available on crate feature `X`" badges from the existing `#[cfg]`
+// gates. `doc_cfg` (which absorbed `doc_auto_cfg` in 1.92) is nightly-only, so
+// it is gated behind `docsrs` — stable/CI `cargo doc` ignores it.
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 //! `processkit` — child-process management for Rust.
 //!
 //! Two layers:

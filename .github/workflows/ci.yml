@@ -91,6 +91,16 @@ jobs:
       - run: cargo doc --no-deps --no-default-features
         env:
           RUSTDOCFLAGS: -D warnings
+      # docs.rs builds on nightly with `--cfg docsrs` (activating
+      # `feature(doc_cfg)` for the per-item "Available on feature X" badges).
+      # The stable builds above leave that attribute inert, so they would NOT
+      # catch a docs.rs-only break (a renamed/removed nightly feature, a bad
+      # doc(cfg)). Build the docs.rs way too, so such a break fails here instead
+      # of silently degrading the published page.
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo +nightly doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
 
   audit:
     name: cargo-deny

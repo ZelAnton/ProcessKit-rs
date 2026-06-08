@@ -32,6 +32,9 @@ rust-version = "1.88"
 # documented (default features alone hide them).
 [package.metadata.docs.rs]
 all-features = true
+# `--cfg docsrs` activates `feature(doc_cfg)` (see src/lib.rs) so the rendered
+# docs carry per-item "Available on crate feature `X`" badges.
+rustdoc-args = ["--cfg", "docsrs"]
 
 # Every public type must be `Debug` (consumers derive Debug on structs holding
 # ours); warn-level here becomes a hard error under CI's `-D warnings`.
