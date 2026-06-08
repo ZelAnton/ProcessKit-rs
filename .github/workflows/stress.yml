@@ -1,0 +1,38 @@
+name: stress
+
+# The stress tier is heavy (50–100 processes at once, 100k-line floods, restart
+# storms) and load-sensitive, so it runs OUTSIDE the PR matrix: nightly on a
+# schedule and on-demand via the Actions tab. The normal CI compiles the stress
+# binary (catching breakage) but skips its scenarios — they are gated behind the
+# `PROCESSKIT_STRESS` env var, set only here.
+on:
+  schedule:
+    # 03:17 UTC daily — off the top of the hour to dodge the scheduler rush.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  PROCESSKIT_STRESS: '1'
+
+jobs:
+  stress:
+    name: stress (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      # Each OS exercises a different containment backend at scale: cgroup /
+      # process-group (Linux), Job Object (Windows), POSIX process group (macOS).
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `--all-features` so the cancellation-storm scenario is compiled and run.
+      # `--test-threads=1` serializes the scenarios: each spawns 50–100 real
+      # processes (and a 100k-line flood), so running them in parallel would
+      # oversubscribe a 2–4 vCPU hosted runner and blow the per-scenario
+      # timeouts. Serial execution also matches how the tier is verified locally.
+      - run: cargo test --all-features --test stress -- --test-threads=1
