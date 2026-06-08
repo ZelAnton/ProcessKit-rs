@@ -15,7 +15,7 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-![Cover](cover.png)
+![Cover](https://raw.githubusercontent.com/ZelAnton/ProcessKit-rs/main/cover.png)
 
 ## Why processkit?
 
