@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [0.9.0] - 2026-06-08
+
+### Added
 
 - `Error::is_not_found()` / `is_permission_denied()` / `is_transient()` — io-level
   classifiers over the `Spawn`/`Io` error: distinguish a missing binary (`ENOENT`),
@@ -603,7 +614,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.7.1...v0.8.0
