@@ -141,6 +141,7 @@
 //! [Job Object]: https://learn.microsoft.com/windows/win32/procthread/job-objects
 //! [cgroup v2]: https://docs.kernel.org/admin-guide/cgroup-v2.html
 
+mod batch;
 mod buffer;
 #[cfg(feature = "record")]
 mod cassette;
@@ -165,6 +166,7 @@ mod stdin;
 mod supervisor;
 mod sys;
 
+pub use batch::output_all;
 pub use buffer::{OutputBufferPolicy, OverflowMode};
 #[cfg(feature = "record")]
 pub use cassette::RecordReplayRunner;
@@ -282,6 +284,77 @@ pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, O
     .await
 }
 
+/// Wait for **all** of several running processes to exit, returning their exit
+/// codes (`None` for a signal-killed run) in the same order as `processes`.
+///
+/// The companion to [`wait_any`]: where `wait_any` races and returns the first
+/// finisher, `wait_all` drives every contender to completion concurrently and
+/// collects them. The processes are only *borrowed* and stay usable afterwards
+/// (the exit status tokio caches remains re-readable). This is the natural
+/// primitive for fanning a fixed set of children out and joining on the lot.
+///
+/// ```no_run
+/// # async fn demo() -> processkit::Result<()> {
+/// use processkit::{Command, ProcessGroup, wait_all};
+///
+/// let group = ProcessGroup::new()?;
+/// let mut a = group.start(&Command::new("worker-a")).await?;
+/// let mut b = group.start(&Command::new("worker-b")).await?;
+/// let codes = wait_all(&mut [&mut a, &mut b]).await?;
+/// assert_eq!(codes.len(), 2); // one entry per process, in input order
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Same two non-features as [`wait_any`]: **no per-process
+/// [`timeout`](Command::timeout)** (bound the whole batch with
+/// [`tokio::time::timeout`]) and **no output pumping** (a contender that fills
+/// its stdout/stderr pipe blocks forever — drain chatty children first). Unlike
+/// `wait_any`, an empty slice resolves immediately to an empty `Vec`: collecting
+/// zero outcomes is well-defined, where racing none is not.
+///
+/// If a contender fails to reap (an OS I/O error), that `Err` is returned and
+/// the remaining processes stay waitable (cancel-safe).
+pub async fn wait_all(processes: &mut [&mut RunningProcess]) -> Result<Vec<Option<i32>>> {
+    use std::future::Future;
+    use std::task::Poll;
+
+    // One future per contender; `iter_mut` hands out disjoint `&mut` borrows.
+    // A slot goes `None` once it has resolved, so finishers aren't re-polled.
+    let mut waits: Vec<_> = processes
+        .iter_mut()
+        .map(|process| Some(Box::pin(process.wait_exit())))
+        .collect();
+    let mut codes: Vec<Option<i32>> = vec![None; waits.len()];
+    let mut remaining = waits.len();
+
+    // Hand-rolled join (no `futures` dependency): poll every unfinished
+    // contender each wake, store its code at the input-order index, and resolve
+    // once all have exited. Cancel-safe, mirroring `wait_any`.
+    std::future::poll_fn(move |cx| {
+        for (idx, slot) in waits.iter_mut().enumerate() {
+            if let Some(wait) = slot.as_mut()
+                && let Poll::Ready(result) = wait.as_mut().poll(cx)
+            {
+                match result {
+                    Ok(code) => {
+                        codes[idx] = code;
+                        *slot = None;
+                        remaining -= 1;
+                    }
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+            }
+        }
+        if remaining == 0 {
+            Poll::Ready(Ok(std::mem::take(&mut codes)))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
 /// The `mockall`-generated mock of [`ProcessRunner`] (enabled by the `mock`
 /// feature), re-exported under a friendlier name.
 #[cfg(feature = "mock")]
@@ -306,5 +379,15 @@ mod tests {
             }
             other => panic!("expected Error::Io(InvalidInput), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn wait_all_on_an_empty_slice_is_an_empty_vec() {
+        // Unlike `wait_any`, joining zero processes is well-defined: it
+        // resolves immediately to an empty `Vec`, not an error or a hang.
+        let codes = super::wait_all(&mut [])
+            .await
+            .expect("an empty join resolves cleanly");
+        assert!(codes.is_empty());
     }
 }

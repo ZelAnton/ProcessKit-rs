@@ -12,7 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+
+- `wait_all(&mut [&mut RunningProcess])` — the join companion to `wait_any`:
+  drives every handle to exit and returns the exit codes in input order (an
+  empty slice resolves to an empty `Vec`). Cancel-safe and borrow-only, like
+  `wait_any`.
+- `output_all(commands, concurrency, runner)` — run a batch of commands with a
+  concurrency cap, collecting every `Result<ProcessResult<String>>` in input
+  order (collect-all: a non-zero exit is data, never a short-circuit). The
+  back-pressure the one-shot verbs lack when fanning out many commands. Pass
+  `&group` to share one kill-on-drop group, or `&JobRunner` for private groups.
+  Not a pool/scheduler/retrier by design.
 
 ### Changed
 -

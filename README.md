@@ -247,6 +247,40 @@ first.
 *Deeper: [Process groups → members](docs/process-groups.md) ·
 [Streaming → racing children](docs/streaming.md).*
 
+## Running many at once
+
+`wait_any`'s siblings cover the *join* and *fan-out* cases. `wait_all` joins a
+fixed set of handles you already hold, returning every exit code in order;
+`output_all` runs a whole batch of commands with a **concurrency cap**, so
+fanning out hundreds of commands can't exhaust file descriptors or the process
+table:
+
+```rust,no_run
+use processkit::{Command, JobRunner, wait_all, output_all};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = processkit::ProcessGroup::new()?;
+    let mut a = group.start(&Command::new("worker-a")).await?;
+    let mut b = group.start(&Command::new("worker-b")).await?;
+    let codes = wait_all(&mut [&mut a, &mut b]).await?; // both, in input order
+
+    // 200 conversions, but never more than 8 processes alive at once.
+    let cmds = (0..200).map(|i| Command::new("convert").arg(format!("{i}.png")));
+    let results = output_all(cmds, 8, &JobRunner).await;
+    let failed = results.iter().filter(|r| !matches!(r, Ok(o) if o.is_success())).count();
+    println!("{:?}; {failed} conversions failed", codes);
+    Ok(())
+}
+```
+
+`output_all` is **collect-all**: each element is one command's independent
+`Result`, so a non-zero exit (an `Ok` with a non-zero code) never short-circuits
+the batch — the caller folds the outcomes. Pass `&group` instead of `&JobRunner`
+to keep every child in one shared kill-on-drop group. It is deliberately not a
+pool, scheduler, or retrier. `wait_all` shares `wait_any`'s two non-features (no
+per-process timeout, no output pumping).
+
 ## Sampling stats over time
 
 A point-in-time `stats()` becomes a series with `sample_stats`, and a single run

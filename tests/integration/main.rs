@@ -17,6 +17,7 @@
 
 mod common;
 
+mod batch;
 #[cfg(feature = "cancellation")]
 mod cancellation;
 mod capture;

@@ -78,6 +78,15 @@ pub(crate) fn first_line_consumer() -> Command {
     }
 }
 
+/// A command that exits with `code` and no output, per platform.
+pub(crate) fn failing_exit(code: i32) -> Command {
+    if cfg!(windows) {
+        Command::new("cmd").args(["/c", "exit", &code.to_string()])
+    } else {
+        Command::new("sh").args(["-c", &format!("exit {code}")])
+    }
+}
+
 /// A child that prints its whole environment, per platform.
 pub(crate) fn print_env() -> Command {
     if cfg!(windows) {
