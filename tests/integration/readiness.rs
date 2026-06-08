@@ -89,16 +89,21 @@ async fn wait_for_port_succeeds_against_a_late_listener() {
             .expect("bind ephemeral listener");
         let addr = listener.local_addr().expect("local addr");
         let _ = addr_tx.send(addr);
-        // Keep the listener alive long enough for the probe to connect.
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        // Keep the listener alive past the outer deadline (35s) so a
+        // CPU-starved probe still has a target. Deadlines are nested
+        // inner(30) < outer(35) < listener(40) < child(45) so no ceiling can
+        // fire before the probe under load — the source of the old flake.
+        tokio::time::sleep(Duration::from_secs(40)).await;
         drop(listener);
     });
 
-    let mut process = sleeper().start().await.expect("start context child");
+    // The child must outlive the outer deadline too: `wait_for_port` returns
+    // early if the child exits first, which would fail the probe assertion.
+    let mut process = sleep_secs(45).start().await.expect("start context child");
     let addr = addr_rx.await.expect("listener address");
     tokio::time::timeout(
-        Duration::from_secs(15),
-        process.wait_for_port(addr, Duration::from_secs(10)),
+        Duration::from_secs(35),
+        process.wait_for_port(addr, Duration::from_secs(30)),
     )
     .await
     .expect("probe finished in time")
