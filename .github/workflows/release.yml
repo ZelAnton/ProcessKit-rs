@@ -393,6 +393,8 @@ jobs:
       # you just re-run. Retry to ride out transient registry/network errors; an
       # "already uploaded" result (a prior run that published but failed before
       # tagging) is treated as success, so the re-run proceeds to tag + Release.
+      # docs.rs has no separate deploy path: the successful crates.io upload
+      # queues the rustdoc build for this exact published package.
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
