@@ -50,7 +50,11 @@ to a dated version section.
   the grace-window fields now have builders, matching the `limits` knobs.
 
 ### Fixed
--
+
+- `Error::Exit` now carries the **full** captured `stdout`/`stderr` instead of truncating
+  each to 4 KiB. Truncation happened before the caller could classify on the streams
+  (grep for a marker, parse a sub-code), silently destroying the data they needed. The
+  one-line `Display` message is still bounded, so logs stay tidy — only the fields grew.
 
 ## [0.9.0] - 2026-06-08
 

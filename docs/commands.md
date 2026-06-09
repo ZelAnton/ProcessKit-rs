@@ -330,7 +330,7 @@ The error enum is structured and `#[non_exhaustive]`:
 | Variant | Meaning |
 |---|---|
 | `Error::Spawn { program, source }` | The OS couldn't start the program (not found, permissions, …) |
-| `Error::Exit { program, code, stdout, stderr }` | Non-zero exit, both streams attached (truncated to 4 KiB each in the error; the full text stays on the `ProcessResult`) |
+| `Error::Exit { program, code, stdout, stderr }` | Non-zero exit, both streams attached in full (the `Display` message is bounded, but the fields carry the complete captured text for classification) |
 | `Error::Timeout { program, timeout }` | The run's own deadline killed it |
 | `Error::NotReady { program, timeout }` | A [readiness probe](streaming.md#readiness-probes) gave up |
 | `Error::Parse { program, message }` | A `CliClient::try_parse` parser rejected the output |

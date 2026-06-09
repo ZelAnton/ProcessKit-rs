@@ -161,7 +161,8 @@ impl<T> ProcessResult<T> {
     /// first), an IO error if it was killed by a signal (no exit code), else
     /// [`Error::Exit`] for an exit code outside the accepted set (code `0` by
     /// default — see [`Command::ok_codes`](crate::Command::ok_codes)), carrying
-    /// the code and both (truncated) captured streams.
+    /// the code and both captured streams in full (the [`Display`](std::fmt::Display)
+    /// impl bounds what it prints; the fields stay complete for classification).
     pub fn ensure_success(self) -> Result<Self, Error>
     where
         T: StdoutText,
@@ -179,8 +180,8 @@ impl<T> ProcessResult<T> {
             Outcome::Exited(code) => Err(Error::Exit {
                 program: self.program.clone(),
                 code,
-                stdout: truncate_output(&self.stdout.as_text()),
-                stderr: truncate_output(&self.stderr),
+                stdout: self.stdout.as_text(),
+                stderr: self.stderr.clone(),
             }),
         }
     }
@@ -291,21 +292,6 @@ impl StdoutText for Vec<u8> {
     fn as_text(&self) -> String {
         String::from_utf8_lossy(self).into_owned()
     }
-}
-
-/// Cap a captured stream carried in an error so a giant dump can't poison logs
-/// (the full text remains available on the [`ProcessResult`]). Capped at 4 KiB.
-fn truncate_output(text: &str) -> String {
-    const MAX: usize = 4 * 1024;
-    if text.len() <= MAX {
-        return text.to_owned();
-    }
-    // Truncate on a char boundary at or below the cap.
-    let mut end = MAX;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}… (truncated)", &text[..end])
 }
 
 #[cfg(test)]
@@ -536,7 +522,11 @@ mod tests {
     }
 
     #[test]
-    fn output_is_truncated_in_error_only() {
+    fn error_exit_carries_full_streams() {
+        // The error fields must carry the complete captured streams — consumers
+        // classify on them (grep for a marker, parse a code), and truncating
+        // before classification destroyed data. The `Display` impl bounds what
+        // it *prints*; the fields stay whole.
         let big = "x".repeat(10_000);
         let bad = ProcessResult::new(
             "p".into(),
@@ -550,32 +540,10 @@ mod tests {
         let Error::Exit { stdout, stderr, .. } = bad.ensure_success().unwrap_err() else {
             panic!("expected Exit");
         };
-        assert!(stderr.len() < 10_000 && stderr.ends_with("… (truncated)"));
-        assert!(stdout.len() < 10_000 && stdout.ends_with("… (truncated)"));
-    }
-
-    #[test]
-    fn truncation_backs_off_to_a_char_boundary() {
-        // A 2-byte char straddling the 4 KiB cap: a naive byte slice at the
-        // cap would split it and panic. 4095 ASCII bytes put the first `é`
-        // at bytes 4095..4097 — exactly across the boundary.
-        let text = format!("{}{}", "a".repeat(4_095), "é".repeat(100));
-        let truncated = truncate_output(&text);
-        assert!(truncated.ends_with("… (truncated)"));
-        let kept = truncated.strip_suffix("… (truncated)").unwrap();
-        assert_eq!(
-            kept.len(),
-            4_095,
-            "the straddling char is dropped, not split"
-        );
-        assert!(kept.chars().all(|c| c == 'a'));
-    }
-
-    #[test]
-    fn truncation_leaves_text_at_the_cap_untouched() {
-        let exactly = "x".repeat(4 * 1024);
-        assert_eq!(truncate_output(&exactly), exactly, "<= cap is verbatim");
-        assert_eq!(truncate_output(""), "");
+        assert_eq!(stdout.len(), 10_000, "full stdout carried, untruncated");
+        assert_eq!(stderr.len(), 10_000, "full stderr carried, untruncated");
+        assert!(stdout.chars().all(|c| c == 'x'));
+        assert!(stderr.chars().all(|c| c == 'x'));
     }
 
     #[test]

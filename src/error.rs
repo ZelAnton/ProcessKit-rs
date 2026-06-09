@@ -26,11 +26,13 @@ pub enum Error {
     /// Produced by the `ensure_success` helpers; the raw exit code is otherwise
     /// reported without erroring (a non-zero exit is not inherently a failure).
     ///
-    /// Both captured streams are carried (each truncated to 4 KiB): `git`/`jj`
-    /// write decisive diagnostics to **stdout** on failure (`CONFLICT (content):
-    /// …`, `nothing to commit, working tree clean`), so a caller building a
-    /// user-facing message wants stdout as a fallback when stderr is empty — see
-    /// [`diagnostic`](Self::diagnostic).
+    /// Both captured streams are carried **in full**: `git`/`jj` write decisive
+    /// diagnostics to **stdout** on failure (`CONFLICT (content): …`, `nothing to
+    /// commit, working tree clean`), so a caller building a user-facing message
+    /// wants stdout as a fallback when stderr is empty — see
+    /// [`diagnostic`](Self::diagnostic). Consumers also classify on these fields
+    /// (grep for a marker, parse a sub-code), so they are never truncated before
+    /// the caller sees them; only the `Display` message below is bounded.
     ///
     /// The one-line `Display` message appends the **last non-empty line** of
     /// [`diagnostic`](Self::diagnostic), capped at 200 bytes — `` `git` exited
@@ -42,13 +44,13 @@ pub enum Error {
         program: String,
         /// The raw process exit code.
         code: i32,
-        /// Captured standard output (truncated). Not shown in the `Display`
+        /// Captured standard output, in full. Not shown in the `Display`
         /// message; kept for callers that need a stdout-borne failure message.
         /// For the raw-bytes helper (`output_bytes`) this is a lossy UTF-8 decode
         /// of stdout — the exact bytes remain on the originating `ProcessResult`.
         stdout: String,
-        /// Captured standard error (truncated). Only its **last non-empty
-        /// line** (bounded) appears in the `Display` message — the full
+        /// Captured standard error, in full. Only its **last non-empty
+        /// line** (bounded) appears in the `Display` message — the complete
         /// captured text lives here, never poisoning a log line.
         stderr: String,
     },
