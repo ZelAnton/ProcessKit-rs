@@ -6,9 +6,9 @@
 > async-process`, accepting the executor from outside or hiding it behind a runtime
 > feature flag, so today's tokio consumers are preserved. No concrete blocker drove
 > it — it's a "what's in scope" sweep, like the sibling records. Sibling decision
-> records: [`architecture-audit-2026-06.md`](architecture-audit-2026-06.md) (the
+> records: [`architecture-audit-2026-06.md`](../decisions/architecture-audit-2026-06.md) (the
 > standing rejected/confirmed-sound list) and
-> [`permissions-privileges-pty-network.md`](permissions-privileges-pty-network.md)
+> [`permissions-privileges-pty-network.md`](../decisions/permissions-privileges-pty-network.md)
 > (whose §3 "no credential seam through `tokio::process::Command`" finding is
 > load-bearing here too).
 
@@ -100,7 +100,7 @@ directly into the tokio `Child`'s raw OS handle:
 A non-tokio backend (`async-process` / smol) must reproduce **all** of: create the
 child suspended, extract its raw handle/pid *before* it runs, and resume after the
 Job assignment. If its `Child` doesn't expose that seam — and §3 of
-[`permissions-privileges-pty-network.md`](permissions-privileges-pty-network.md)
+[`permissions-privileges-pty-network.md`](../decisions/permissions-privileges-pty-network.md)
 already records that `tokio::process::Command` itself has "no credential seam" for
 the analogous run-as-user case — then kill-on-drop over the whole tree silently
 degrades on that backend. That is not a refactor risk; it is a correctness risk to

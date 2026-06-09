@@ -127,6 +127,10 @@ first — it maps "I want to …" tasks to working snippets — then read
 
 API reference: [docs.rs/processkit](https://docs.rs/processkit).
 
+Where the project is headed: the **[roadmap](ROADMAP.md)** (committed near-term
+work). Open proposals and settled decisions live in [`ideas/`](ideas/) and
+[`decisions/`](decisions/).
+
 ## Feature flags
 
 Each flag is **additive** and only gates *visibility* — the kill-on-drop tree

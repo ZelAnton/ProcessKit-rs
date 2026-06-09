@@ -4,9 +4,9 @@
 > **lite version of the package** — trimmed to the most basic functionality, with
 > lower requirements for the user — make sense? No concrete blocker drove it; it's
 > a "what's in scope" sweep, like the siblings. Sibling decision records:
-> [`runtime-agnostic-vs-tokio.md`](runtime-agnostic-vs-tokio.md) (the other facet of
-> "lower the tokio floor"), [`architecture-audit-2026-06.md`](architecture-audit-2026-06.md),
-> and [`permissions-privileges-pty-network.md`](permissions-privileges-pty-network.md).
+> [`runtime-agnostic-vs-tokio.md`](later-runtime-agnostic.md) (the other facet of
+> "lower the tokio floor"), [`architecture-audit-2026-06.md`](../decisions/architecture-audit-2026-06.md),
+> and [`permissions-privileges-pty-network.md`](../decisions/permissions-privileges-pty-network.md).
 
 ## TL;DR verdicts
 
@@ -53,13 +53,13 @@ boundaries a lite crate would cut along:
 - `process-control` "matches the layer a future **`processkit-sys` split** would
   carve out" (Cargo.toml:109).
 - The broader visibility split that was tried and rolled back is recorded in
-  [`architecture-audit-2026-06.md`](architecture-audit-2026-06.md) (Cargo.toml:92-95).
+  [`architecture-audit-2026-06.md`](../decisions/architecture-audit-2026-06.md) (Cargo.toml:92-95).
 
 A lite/core crate would carve along these existing gates, not invent new ones.
 
 ## 4. Why a sync core is feasible where runtime-agnostic was not
 
-The decisive contrast with [`runtime-agnostic-vs-tokio.md`](runtime-agnostic-vs-tokio.md):
+The decisive contrast with [`runtime-agnostic-vs-tokio.md`](later-runtime-agnostic.md):
 that idea died because async `child.wait()` needs a runtime-specific reactor
 (SIGCHLD / handle). **A sync core never awaits a child**, so the reactor problem
 does not arise:

@@ -1,0 +1,52 @@
+# `ideas/` — open proposals not yet committed
+
+This directory holds **open** development ideas: things worth doing eventually but
+not committed to the near-term [`ROADMAP.md`](../ROADMAP.md). Each file is a small
+decision record (status header → TL;DR → critical assessment → revisit condition).
+
+## The four buckets
+
+A development sweep classifies every candidate into one of four homes:
+
+| Bucket | Meaning | Lives in |
+|---|---|---|
+| **Today** (сегодня) | Committed; will do | [`../ROADMAP.md`](../ROADMAP.md) |
+| **Next** (завтра) | Open; reconsider **first** when the roadmap drains | `ideas/next-*.md` |
+| **Later** (потом) | Open; further out, lower urgency | `ideas/later-*.md` |
+| **Won't do** | Settled against (or won't change) | [`../decisions/`](../decisions/) |
+
+"Завтра / потом" are hyperbole for ordering, not calendar dates — **next-** items
+are simply the first re-examined once committed work is done.
+
+## Filename marker
+
+The horizon is encoded in the **filename prefix**:
+
+- `next-<topic>.md` — reconsider first (high value, just below the cut).
+- `later-<topic>.md` — further out, or gated on a concrete consumer.
+
+When an idea graduates to committed work, move its substance into `ROADMAP.md` and
+either delete the file or leave a one-line pointer. When an idea is rejected
+outright, move it to [`../decisions/`](../decisions/).
+
+## Current contents
+
+**Next:**
+- `next-output-handling.md` — Stdio inherit/null modes, output tee, merged
+  stdout+stderr ordering, unified event stream.
+- `next-launch-ergonomics.md` — `which`/PATH resolution, bulk env, cwd
+  conveniences, `send_control`.
+- `next-scheduling-knobs.md` — nice/priority, ionice, umask, Windows priority class.
+- `next-ci-and-quality-hardening.md` — cargo-semver-checks, cargo-hack
+  feature-powerset, minimal-versions, coverage, clippy pedantic.
+
+**Later:**
+- `later-runtime-agnostic.md` — decouple from tokio (gated on a non-tokio consumer).
+- `later-lite-build-sys-split.md` — a sync, no-tokio `processkit-sys` core.
+- `later-pty-support.md` — pseudo-terminal for prompt-driven tools (design sketch in
+  `decisions/permissions-privileges-pty-network.md`).
+- `later-extensibility-hooks.md` — `before_spawn` raw-Command mutator, dry-run mode.
+- `later-advanced-testing.md` — proptest/fuzz/loom, cross-platform leak checks, the
+  full risk-zone inventory.
+- `later-observability-and-docs-site.md` — `metrics` feature, mdBook docs site.
+- `later-detached-handoff.md` — one deliberate "outlive the parent" escape hatch.
