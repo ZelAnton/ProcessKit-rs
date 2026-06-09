@@ -14,12 +14,16 @@
 > constraint on any item below — getting the shape right *before* 1.0 is the point.
 >
 > Items are roughly ordered by leverage, not strict sequence. Cost is a gut
-> estimate (trivial / moderate / major). None are started yet.
+> estimate (trivial / moderate / major).
+>
+> **Status (2026-06-09).** Items **1–9 shipped in `0.9.1`** (Phase A: 1–4; Phase B:
+> 5–9 — see [`CHANGELOG.md`](CHANGELOG.md) `[0.9.0]`/`[0.9.1]`). **Item 10** (highest-risk
+> test gaps) is the only one still open.
 
 ## The ten
 
-### 1. README polish — badges, alternatives comparison, MSRV up front
-*Dimension: docs / conventions · Cost: trivial*
+### 1. ✅ README polish — badges, alternatives comparison, MSRV up front
+*Dimension: docs / conventions · Cost: trivial* — **Shipped 0.9.1** (badge block, "How it compares" table, MSRV line).
 
 The README has a strong "why" and a feature table but **no badges** (crates.io,
 docs.rs, CI, license, MSRV) and **no positioning vs alternatives**
@@ -29,8 +33,8 @@ are the first things an evaluating user looks for. Add the badge block, a short
 explicit MSRV line in the intro. The 3.6 MB `cover.png` should also be checked —
 consider a lighter asset.
 
-### 2. Community-health files — SECURITY, CODE_OF_CONDUCT, templates, dependabot
-*Dimension: conventions · Cost: trivial*
+### 2. ✅ Community-health files — SECURITY, CODE_OF_CONDUCT, templates, dependabot
+*Dimension: conventions · Cost: trivial* — **Shipped 0.9.1** (`SECURITY.md`, `CODE_OF_CONDUCT.md`, issue/PR templates, `dependabot.yml`).
 
 Missing: `SECURITY.md`, `CODE_OF_CONDUCT.md`, `.github/ISSUE_TEMPLATE/`,
 `.github/PULL_REQUEST_TEMPLATE.md`, `.github/dependabot.yml`. `SECURITY.md` is not
@@ -39,8 +43,8 @@ Objects**, so a disclosure path matters. The PR template should carry the existi
 pre-PR checklist from `CONTRIBUTING.md` (fmt, clippy `-D warnings`, changelog
 bullet). Dependabot complements the manual `cargo deny` scan.
 
-### 3. Enforce doc coverage + manifest metadata
-*Dimension: stabilization / conventions · Cost: trivial*
+### 3. ✅ Enforce doc coverage + manifest metadata
+*Dimension: stabilization / conventions · Cost: trivial* — **Shipped 0.9.1** (`#![warn(missing_docs)]`, `documentation`/`homepage` filled, `unsafe_op_in_unsafe_fn = deny`).
 
 Doc quality is high in practice but **not enforced**. Add `#![warn(missing_docs)]`
 (promote to `deny` in CI) to lock it in before 1.0, and fill the `documentation`
@@ -48,16 +52,16 @@ and `homepage` `Cargo.toml` fields. Decide and document the unsafe-code posture:
 the crate can't `#![forbid(unsafe_code)]` (FFI in `sys/`), so adopt
 `#![deny(unsafe_op_in_unsafe_fn)]` + a `# Safety` comment convention instead.
 
-### 4. `examples/` directory, built in CI
-*Dimension: docs / adoption · Cost: moderate*
+### 4. ✅ `examples/` directory, built in CI
+*Dimension: docs / adoption · Cost: moderate* — **Shipped 0.9.1** (`run_and_capture`, `process_group`, `streaming`, `pipeline`, `cli_client`).
 
 There are doc snippets but no `examples/`. Add a handful of runnable, focused
 examples (basic run-and-capture, kill-on-drop process group, streaming with a line
 handler, a pipeline, a `CliClient` wrapper) and build them in CI so they can't rot.
 They double as adoption on-ramps and smoke tests.
 
-### 5. Pre-1.0 public-API review pass
-*Dimension: stabilization / simplification · Cost: moderate*
+### 5. ✅ Pre-1.0 public-API review pass
+*Dimension: stabilization / simplification · Cost: moderate* — **Shipped 0.9.1** (`#[non_exhaustive]` added to the five option structs; full sweep in [`decisions/pre-1.0-api-review.md`](decisions/pre-1.0-api-review.md)).
 
 The single highest-leverage pre-1.0 task. A deliberate sweep of the public surface
 for: naming consistency, **`#[non_exhaustive]` on every public enum/struct that
@@ -69,8 +73,8 @@ the breadth of the verb surface (`output_string`/`output_bytes`/`run`/`probe`/
 each earns its place; the audit already rejected collapsing some). Deliverable: a
 `decisions/` record + the uncontentious renames/`non_exhaustive` additions applied.
 
-### 6. Enrich `ProcessResult` — duration, rendered command, truncation flag
-*Dimension: user-scenario / honesty · Cost: trivial–moderate*
+### 6. ✅ Enrich `ProcessResult` — duration, rendered command, truncation flag
+*Dimension: user-scenario / honesty · Cost: trivial–moderate* — **Shipped 0.9.1** (`ProcessResult::duration()`, `Command::command_line()`, `ProcessResult::truncated()`).
 
 Three gaps competitors (execa, CliWrap) cover and callers currently hand-roll:
 - **`duration`** — `RunningProcess::elapsed()` is live-only; the finished result
@@ -83,16 +87,16 @@ Three gaps competitors (execa, CliWrap) cover and callers currently hand-roll:
   closes the same gap for callers who *do* bound. (Uses the shared quoting helper
   from item 9.)
 
-### 7. Tolerant exit-code checking — `ok_codes` / accepted-status set
-*Dimension: user-scenario · Cost: trivial*
+### 7. ✅ Tolerant exit-code checking — `ok_codes` / accepted-status set
+*Dimension: user-scenario · Cost: trivial* — **Shipped 0.9.1** (`Command::ok_codes([..])` feeding the checking verbs).
 
 `ensure_success` is zero-only; `probe` is 0/1. Tools like `grep` (1 = no match),
 `diff` (1 = differs), and rsync code families force callers to hand-match. Add an
 accepted-exit-code set (e.g. `Command::ok_codes([0, 1])`) feeding the checking
 verbs. Borrowed from mixlib-shellout `valid_exit_codes` / zx `nothrow`.
 
-### 8. Run-level graceful timeout — SIGTERM-then-force-kill, configurable signal
-*Dimension: user-scenario / correctness · Cost: moderate*
+### 8. ✅ Run-level graceful timeout — SIGTERM-then-force-kill, configurable signal
+*Dimension: user-scenario / correctness · Cost: moderate* — **Shipped 0.9.1** (`Command::timeout_grace(Duration)` + `timeout_signal(Signal)`; Windows = atomic kill).
 
 Today `ProcessGroup::shutdown` has the graceful SIGTERM → wait → SIGKILL tier, but
 a plain `Command::timeout` **hard-kills** — a child loses in-flight work on
@@ -101,8 +105,8 @@ timeout path (`grace`/`force_kill_after` knob) and allow choosing the signal
 (`Signal` already exists). Borrowed from GNU `timeout --kill-after/--signal`, execa
 `forceKillAfterDelay`. Containment is unchanged — this is signal policy on teardown.
 
-### 9. Spawn-error quality — rendered command, cwd pre-check, quoting helper
-*Dimension: user-scenario / ergonomics · Cost: trivial*
+### 9. ✅ Spawn-error quality — rendered command, cwd pre-check, quoting helper
+*Dimension: user-scenario / ergonomics · Cost: trivial* — **Shipped 0.9.1** (`command_line()` quoting helper, `current_dir` pre-check with clear error). Also fixed: `Error::Exit` now carries full streams.
 
 Make failures self-explanatory: embed the rendered (quoted) command in
 `Error::Spawn`'s `Display`; validate `current_dir` exists up front (clear error
@@ -111,7 +115,7 @@ both this and item 6 share (per-platform argv → quoted string, for display onl
 the crate stays shell-free). Builds on the already-shipped `is_not_found()` /
 `is_permission_denied()` classifiers.
 
-### 10. Close the highest-risk test gaps
+### 10. ⬜ Close the highest-risk test gaps — **OPEN** (the only remaining item)
 *Dimension: testing · Cost: moderate*
 
 Two concrete risk zones the suite under-covers (full inventory in
