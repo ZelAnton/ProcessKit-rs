@@ -50,3 +50,8 @@ outright, move it to [`../decisions/`](../decisions/).
   full risk-zone inventory.
 - `later-observability-and-docs-site.md` — `metrics` feature, mdBook docs site.
 - `later-detached-handoff.md` — one deliberate "outlive the parent" escape hatch.
+- `later-cassette-cwd-portability.md` — make the `record` cassette match key
+  portable across machines (gated on a cross-machine replay consumer; from
+  vcs-toolkit-rs feedback).
+- `later-retry-jitter.md` — optional, default-zero jitter on `retrying()` backoff
+  (from vcs-toolkit-rs feedback).
