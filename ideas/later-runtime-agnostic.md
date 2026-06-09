@@ -1,6 +1,6 @@
 # Runtime-agnostic vs the tokio coupling — what's worth doing
 
-> **Status:** decision record. Assessed 2026-06-09 after an owner question: rather
+> **Status:** open idea (later). Assessed 2026-06-09 after an owner question: rather
 > than port the crate from tokio to smol ("just another hard dependency"), make it
 > **runtime-agnostic** — abstract the seam over `spawn + timer + io (futures-io) +
 > async-process`, accepting the executor from outside or hiding it behind a runtime

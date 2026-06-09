@@ -5,6 +5,8 @@ edition = "2024"
 description = "Child-process management: kill-on-drop process trees and async run-and-capture"
 license = "MIT"
 repository = "https://github.com/ZelAnton/ProcessKit-rs"
+documentation = "https://docs.rs/processkit"
+homepage = "https://github.com/ZelAnton/ProcessKit-rs"
 readme = "README.md"
 keywords = ["process", "subprocess", "job-object", "cgroup", "tokio"]
 categories = ["os", "asynchronous", "command-line-utilities"]
@@ -41,6 +43,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 # ours); warn-level here becomes a hard error under CI's `-D warnings`.
 [lints.rust]
 missing_debug_implementations = "warn"
+# All `unsafe` lives in explicit `unsafe {}` blocks inside safe fns (the FFI in
+# `sys/`); there are no `unsafe fn` today. Deny the day someone adds one and
+# forgets to keep that discipline. (`missing_docs` is enforced lib-scoped in
+# `src/lib.rs` so it doesn't burden examples/tests.)
+unsafe_op_in_unsafe_fn = "deny"
 
 # ---------------------------------------------------------------------------
 # Dependencies — every entry carries a "why" (see AGENTS.md "Dependency

@@ -4,6 +4,12 @@ Async child-process management for Rust with a **kernel-backed no-orphan
 guarantee**: every process you start — and everything *it* spawns — lives in a
 kill-on-drop container, so no descendant outlives your program.
 
+[![Crates.io](https://img.shields.io/crates/v/processkit.svg)](https://crates.io/crates/processkit)
+[![Docs.rs](https://docs.rs/processkit/badge.svg)](https://docs.rs/processkit)
+[![CI](https://github.com/ZelAnton/ProcessKit-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/ZelAnton/ProcessKit-rs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/crates/l/processkit.svg)](LICENSE)
+[![MSRV](https://img.shields.io/crates/msrv/processkit.svg)](Cargo.toml)
+
 ```rust,no_run
 use processkit::Command;
 
@@ -42,6 +48,21 @@ is a kernel operation over the whole tree, not a best-effort signal to one pid:
 - **Testable.** One trait seam ([`ProcessRunner`]) swaps the real spawner for
   scripted doubles or record/replay cassettes — no subprocess in your tests.
 
+### How it compares
+
+| | whole-tree kill-on-drop | async | limits / stats | streaming · pipelines · supervision |
+|---|:---:|:---:|:---:|:---:|
+| `std::process` | — | — | — | — |
+| `tokio::process` | — | ✓ | — | — |
+| [`command-group`](https://crates.io/crates/command-group) | ✓ | ✓ | — | — |
+| [`async-process`](https://crates.io/crates/async-process) | — | ✓ (smol) | — | — |
+| [`duct`](https://crates.io/crates/duct) | — | — | — | pipelines |
+| **`processkit`** | **✓** | **✓** (tokio) | **✓** | **✓** |
+
+The first column is the differentiator: a child's *descendants* are contained
+and reaped as a unit (Job Object / cgroup v2 / process group), not just the
+direct child.
+
 > **Status:** feature-complete — every capability below ships today; pre-1.0,
 > so the API can still move between minor versions. See
 > [`CHANGELOG.md`](CHANGELOG.md).
@@ -52,7 +73,8 @@ is a kernel operation over the whole tree, not a best-effort signal to one pid:
 cargo add processkit
 ```
 
-This crate requires a [tokio](https://tokio.rs/) runtime.
+This crate requires a [tokio](https://tokio.rs/) runtime. Minimum Supported Rust
+Version: **1.88**.
 
 ## Picking a verb
 

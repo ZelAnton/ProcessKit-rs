@@ -1,0 +1,6 @@
+# Keep blank issues available, but steer security reports to private disclosure.
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/ZelAnton/ProcessKit-rs/security/advisories/new
+    about: Report security issues privately — please do NOT open a public issue. See SECURITY.md.

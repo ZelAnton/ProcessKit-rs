@@ -3,6 +3,10 @@
 // gates. `doc_cfg` (which absorbed `doc_auto_cfg` in 1.92) is nightly-only, so
 // it is gated behind `docsrs` — stable/CI `cargo doc` ignores it.
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// Enforce that every public item carries docs — the crate's public surface is
+// fully documented today, and this keeps it that way. Lib-scoped (examples and
+// tests are exempt); CI's `-D warnings` promotes it to a hard error.
+#![warn(missing_docs)]
 
 //! `processkit` — child-process management for Rust.
 //!

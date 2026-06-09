@@ -1,0 +1,20 @@
+# Automated dependency updates. Complements the manual `cargo deny` advisory/ban
+# scan in CI — dependabot proposes version bumps; cargo-deny gates what's allowed.
+version: 2
+updates:
+  # Crate dependencies (Cargo.lock is committed, so updates are reproducible).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+
+  # The GitHub Actions pinned in .github/workflows/* (checkout, toolchain, cache, …).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci(deps)"

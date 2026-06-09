@@ -1,10 +1,10 @@
 # A "lite" build / lower-requirement subset — what's worth doing
 
-> **Status:** decision record. Assessed 2026-06-09 after an owner question: would a
+> **Status:** open idea (later). Assessed 2026-06-09 after an owner question: would a
 > **lite version of the package** — trimmed to the most basic functionality, with
 > lower requirements for the user — make sense? No concrete blocker drove it; it's
 > a "what's in scope" sweep, like the siblings. Sibling decision records:
-> [`runtime-agnostic-vs-tokio.md`](later-runtime-agnostic.md) (the other facet of
+> [`later-runtime-agnostic.md`](later-runtime-agnostic.md) (the other facet of
 > "lower the tokio floor"), [`architecture-audit-2026-06.md`](../decisions/architecture-audit-2026-06.md),
 > and [`permissions-privileges-pty-network.md`](../decisions/permissions-privileges-pty-network.md).
 
@@ -59,7 +59,7 @@ A lite/core crate would carve along these existing gates, not invent new ones.
 
 ## 4. Why a sync core is feasible where runtime-agnostic was not
 
-The decisive contrast with [`runtime-agnostic-vs-tokio.md`](later-runtime-agnostic.md):
+The decisive contrast with [`later-runtime-agnostic.md`](later-runtime-agnostic.md):
 that idea died because async `child.wait()` needs a runtime-specific reactor
 (SIGCHLD / handle). **A sync core never awaits a child**, so the reactor problem
 does not arise:
