@@ -8,13 +8,9 @@ use processkit::{Command, ProcessGroup};
 #[tokio::test]
 #[ignore = "spawns a real subprocess and shuts it down gracefully"]
 async fn shutdown_lets_a_term_handling_child_end_the_grace_early() {
-    // The struct update covers the `limits`-gated field; without that feature
-    // every field is already named, which clippy would otherwise flag.
-    #[allow(clippy::needless_update)]
-    let group = ProcessGroup::with_options(processkit::ProcessGroupOptions {
-        shutdown_timeout: Duration::from_secs(10),
-        ..Default::default()
-    })
+    let group = ProcessGroup::with_options(
+        processkit::ProcessGroupOptions::default().shutdown_timeout(Duration::from_secs(10)),
+    )
     .expect("create group");
 
     // Exits 0 on SIGTERM, parked on an interruptible `read` of a stdin we keep
@@ -56,13 +52,11 @@ async fn shutdown_lets_a_term_handling_child_end_the_grace_early() {
 #[tokio::test]
 #[ignore = "spawns a TERM-ignoring subprocess and escalates to SIGKILL"]
 async fn shutdown_escalates_to_kill_after_the_grace_window() {
-    // See above: the struct update exists for the `limits`-gated field.
-    #[allow(clippy::needless_update)]
-    let group = ProcessGroup::with_options(processkit::ProcessGroupOptions {
-        shutdown_timeout: Duration::from_millis(500),
-        escalate_to_kill: true,
-        ..Default::default()
-    })
+    let group = ProcessGroup::with_options(
+        processkit::ProcessGroupOptions::default()
+            .shutdown_timeout(Duration::from_millis(500))
+            .escalate_to_kill(true),
+    )
     .expect("create group");
 
     // Ignores SIGTERM and busy-waits (a foreground `sleep` would itself die to

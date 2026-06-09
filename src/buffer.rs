@@ -2,6 +2,7 @@
 
 /// What to drop when a bounded output buffer is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OverflowMode {
     /// Ring-buffer / "tail" semantics: discard the oldest line so the most
     /// recent output survives.
@@ -24,6 +25,7 @@ pub enum OverflowMode {
 /// [`output_bytes`](crate::Command::output_bytes) (raw, no line splitting)
 /// when the output is not line-structured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OutputBufferPolicy {
     /// Maximum retained lines: `None` is unbounded; `Some(0)` retains nothing;
     /// `Some(n)` keeps at most `n`.

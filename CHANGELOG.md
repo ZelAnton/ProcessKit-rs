@@ -38,7 +38,14 @@ to a dated version section.
   `Error::Unsupported`, never a silent skip.
 
 ### Changed
--
+
+- **Breaking:** `RestartPolicy`, `OverflowMode`, `OutputBufferPolicy`, `ResourceLimits`,
+  and `ProcessGroupOptions` are now `#[non_exhaustive]` — they may gain variants/fields
+  later without another breaking change. Build the structs via their
+  constructors/builders (`ProcessGroupOptions::default()`, `OutputBufferPolicy::bounded(..)`,
+  …) instead of struct literals.
+- `ProcessGroupOptions::shutdown_timeout(Duration)` / `escalate_to_kill(bool)` builders —
+  the grace-window fields now have builders, matching the `limits` knobs.
 
 ### Fixed
 -

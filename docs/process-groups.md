@@ -30,11 +30,11 @@ use std::time::Duration;
 let group = ProcessGroup::new()?;
 
 // Tuned:
-let group = ProcessGroup::with_options(ProcessGroupOptions {
-    shutdown_timeout: Duration::from_secs(10),
-    escalate_to_kill: true,
-    ..Default::default()
-})?;
+let group = ProcessGroup::with_options(
+    ProcessGroupOptions::default()
+        .shutdown_timeout(Duration::from_secs(10))
+        .escalate_to_kill(true),
+)?;
 
 // Which kernel mechanism is actually containing the tree?
 println!("{:?}", group.mechanism()); // JobObject | CgroupV2 | ProcessGroup | None
@@ -98,11 +98,11 @@ edges worth knowing:
 use processkit::{Command, ProcessGroup, ProcessGroupOptions};
 use std::time::Duration;
 
-let group = ProcessGroup::with_options(ProcessGroupOptions {
-    shutdown_timeout: Duration::from_secs(5),
-    escalate_to_kill: true,
-    ..Default::default()
-})?;
+let group = ProcessGroup::with_options(
+    ProcessGroupOptions::default()
+        .shutdown_timeout(Duration::from_secs(5))
+        .escalate_to_kill(true),
+)?;
 let _service = group.start(&Command::new("my-service")).await?;
 
 // SIGTERM, give it 5s to flush and exit, SIGKILL stragglers:

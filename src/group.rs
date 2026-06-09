@@ -29,6 +29,7 @@ use crate::sys::Job;
     doc = "Job Object or Linux cgroup v2) — see [`ResourceLimits`]."
 )]
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ProcessGroupOptions {
     /// How long to wait after `SIGTERM` before escalating. Default: 2 seconds.
     pub shutdown_timeout: Duration,
@@ -48,6 +49,24 @@ impl Default for ProcessGroupOptions {
             #[cfg(feature = "limits")]
             limits: ResourceLimits::default(),
         }
+    }
+}
+
+impl ProcessGroupOptions {
+    /// How long to wait after `SIGTERM` before escalating to `SIGKILL` (Unix;
+    /// default 2 seconds). See [`shutdown`](ProcessGroup::shutdown).
+    #[must_use]
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
+        self
+    }
+
+    /// Whether to `SIGKILL` processes that outlive the shutdown grace window
+    /// (default `true`).
+    #[must_use]
+    pub fn escalate_to_kill(mut self, escalate: bool) -> Self {
+        self.escalate_to_kill = escalate;
+        self
     }
 }
 

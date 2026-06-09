@@ -3,8 +3,8 @@
 /// Resource limits enforced on a process group as a whole.
 ///
 /// Set these via [`ProcessGroupOptions`](crate::ProcessGroupOptions) (the
-/// `memory_max` / `max_processes` / `cpu_quota` builders, or the public fields)
-/// before creating the group. Every limit bounds the **whole tree**, not a single
+/// `memory_max` / `max_processes` / `cpu_quota` builders, or by setting the
+/// public fields on a `ResourceLimits::default()` value) before creating the group. Every limit bounds the **whole tree**, not a single
 /// process, and is applied to the kernel container at creation time.
 ///
 /// # Platform support
@@ -21,6 +21,7 @@
 /// surrounding cgroup can't carry the controllers, creation fails fast with the same
 /// error — an unenforced limit is no protection, so it is never silently dropped.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[non_exhaustive]
 pub struct ResourceLimits {
     /// Maximum total memory for the tree, in bytes. `None` leaves memory
     /// unbounded.

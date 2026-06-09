@@ -23,6 +23,7 @@ use crate::runner::{JobRunner, ProcessRunner};
 /// case [`stop_when`](Supervisor::stop_when) and
 /// [`max_restarts`](Supervisor::max_restarts) can end supervision first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RestartPolicy {
     /// Restart after every completed run, clean or not.
     Always,
