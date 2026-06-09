@@ -283,6 +283,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_line_without_a_trailing_newline_is_emitted() {
+        // A last line that ends at EOF with no `\n` must still be delivered:
+        // `read_until` returns the un-terminated tail, and the terminator strip
+        // must be a no-op rather than dropping the line. (`echo -n`-style output,
+        // and many tools whose final line lacks a newline.)
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(&b"alpha\nomega"[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(sink.count(), 2, "the un-terminated tail still counts");
+        assert_eq!(sink.drain(), vec!["alpha", "omega"]);
+    }
+
+    #[tokio::test]
     async fn empty_reader_closes_with_no_lines() {
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
         pump_lines(&b""[..], encoding_rs::UTF_8, None, sink.clone()).await;

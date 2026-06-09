@@ -341,6 +341,67 @@ async fn probe_reads_real_exit_codes() {
 }
 
 #[tokio::test]
+#[ignore = "spawns real subprocesses; ok_codes through the real verbs"]
+async fn ok_codes_widens_success_through_output_string_and_bytes() {
+    // A non-zero exit the caller declares OK must flow through the REAL spawn
+    // path to is_success() — for BOTH output_string and output_bytes (the bytes
+    // verb carries ok_codes too, and had no test at any layer).
+    let s = failing_exit(1)
+        .ok_codes([0, 1])
+        .output_string()
+        .await
+        .expect("run completes");
+    assert!(
+        s.is_success(),
+        "exit 1 is success under ok_codes([0,1]) (output_string)"
+    );
+    assert_eq!(s.code(), Some(1), "the raw code is still reported");
+
+    let b = failing_exit(1)
+        .ok_codes([0, 1])
+        .output_bytes()
+        .await
+        .expect("run completes");
+    assert!(
+        b.is_success(),
+        "exit 1 is success under ok_codes([0,1]) (output_bytes)"
+    );
+    assert_eq!(b.code(), Some(1));
+
+    // The widening is bounded: a code outside the set is still a failure.
+    let outside = failing_exit(2)
+        .ok_codes([0, 1])
+        .output_string()
+        .await
+        .expect("run completes");
+    assert!(
+        !outside.is_success(),
+        "exit 2 is outside ok_codes([0,1]) — still a failure"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "Windows has no signal tier: timeout_grace must degrade to a prompt atomic kill"]
+async fn graceful_timeout_degrades_to_a_prompt_kill_on_windows() {
+    // Windows has no SIGTERM tier, so timeout_grace/timeout_signal degrade to the
+    // atomic Job kill at the deadline — it must NOT wait out a phantom grace.
+    let start = Instant::now();
+    let result = sleeper() // ~30s child
+        .timeout(Duration::from_millis(500))
+        .timeout_grace(Duration::from_secs(30))
+        .output_string()
+        .await
+        .expect("run completes");
+    assert!(result.timed_out(), "the deadline fired");
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "Windows must hard-kill promptly at the deadline, not wait the 30s grace (took {:?})",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a real subprocess via the top-level free functions"]
 async fn top_level_run_and_output() {
     let v = processkit::run("cargo", ["--version"])

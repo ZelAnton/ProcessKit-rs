@@ -133,6 +133,93 @@ async fn graceful_timeout_escalates_to_kill_after_the_grace() {
     );
 }
 
+#[tokio::test]
+#[ignore = "spawns a real subprocess and times out a streamed run gracefully"]
+async fn graceful_timeout_on_a_streamed_run_signals_and_ends_the_stream() {
+    use tokio_stream::StreamExt;
+
+    // The streaming deadline path (`stdout_lines` watchdog) arms its OWN graceful
+    // branch, distinct from the bulk `teardown_on_timeout`. A `Command::start`
+    // handle owns its group, so the deadline bounds the stream: at 500ms the tree
+    // is sent SIGTERM, the trap exits the child, its pipes close, and the stream
+    // ends — well within the long grace, proving the graceful (not hard) teardown.
+    let mut run = Command::new("sh")
+        .args(["-c", "trap 'exit 0' TERM; echo ready; while :; do :; done"])
+        .timeout(Duration::from_millis(500))
+        .timeout_grace(Duration::from_secs(10))
+        .start()
+        .await
+        .expect("start");
+
+    let start = Instant::now();
+    let mut lines = run.stdout_lines();
+    let first = tokio::time::timeout(Duration::from_secs(10), lines.next())
+        .await
+        .expect("the ready banner arrives before the deadline");
+    assert_eq!(first.as_deref(), Some("ready"), "trap installed");
+
+    // The deadline fires, SIGTERM hits the trap, the child exits, the pipe closes
+    // → the stream must end promptly (this is the primary signal: a wired graceful
+    // branch ends it within the grace; an *unwired* one — the busy-loop never
+    // signalled — would hang past this 5s bound and fail here). We drain the stream
+    // to completion FIRST so the child is already dead before `finish_streamed`.
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        while lines.next().await.is_some() {}
+    })
+    .await;
+    assert!(
+        ended.is_ok(),
+        "the graceful-timeout signal must end the stream well within the grace"
+    );
+
+    // The exit code distinguishes graceful from hard teardown: the TERM trap runs
+    // `exit 0`, so a *graceful* SIGTERM yields `Some(0)`; a hard SIGKILL (the
+    // no-grace path) is uncatchable and would yield `None`. Robust here because the
+    // child is already reaped (stream fully drained above), so `finish_streamed`'s
+    // own re-armed deadline never races the wait. (If a refactor ever made that
+    // deadline spawn-relative, this would surface as a `None` mismatch, not a hang.)
+    let (code, _stderr) = run.finish_streamed().await.expect("finish");
+    assert_eq!(
+        code,
+        Some(0),
+        "graceful SIGTERM let the trap exit 0; a hard SIGKILL would be None"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(8),
+        "a TERM-handling streamed child must end the 10s grace early (took {:?})",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a TERM-ignoring child in a SHARED group; escalates to SIGKILL"]
+async fn graceful_timeout_in_a_shared_group_escalates_to_kill() {
+    // A handle from `ProcessGroup::start` SHARES its group, so the run-level
+    // graceful timeout tears down the single child via `graceful_kill_pid`
+    // (bare-pid signal → liveness poll → SIGKILL), not the owned-group path. A
+    // TERM-ignoring child must be SIGKILL'd only after the deadline + grace.
+    let group = ProcessGroup::new().expect("create group");
+    let start = Instant::now();
+    let result = group
+        .start(
+            &Command::new("sh")
+                .args(["-c", "trap '' TERM; echo ready; while :; do :; done"])
+                .timeout(Duration::from_millis(500))
+                .timeout_grace(Duration::from_millis(500)),
+        )
+        .await
+        .expect("start")
+        .output_string()
+        .await
+        .expect("run completes");
+    assert!(result.timed_out(), "the deadline fired");
+    assert!(
+        start.elapsed() >= Duration::from_millis(900),
+        "must wait deadline + grace before SIGKILL in a shared group (took {:?})",
+        start.elapsed()
+    );
+}
+
 #[cfg(feature = "process-control")]
 #[tokio::test]
 #[ignore = "spawns a real subprocess; verifies the configurable timeout signal"]
