@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [0.9.1] - 2026-06-09
+
+### Added
 
 - `Command::ok_codes([..])` — treat the given exit codes (not just `0`) as success for
   the checking verbs (`run`/`run_unit` and `ProcessResult::is_success`/`ensure_success`),
@@ -650,7 +661,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.8.0...v0.8.1
