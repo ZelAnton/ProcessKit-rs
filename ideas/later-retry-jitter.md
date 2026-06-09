@@ -14,18 +14,29 @@ limited registry, say), fixed backoff lets their retries stay phase-aligned — 
 thundering herd that re-collides on each wave instead of spreading out.
 
 The standard fix is **jitter**: perturb each wait by a random fraction so retries
-decorrelate. The ask is to make it an opt-in knob, **defaulting to zero** (today's
-deterministic behavior, which keeps the backoff-timing tests on the paused clock
-reproducible).
+decorrelate.
+
+**Prior art — the crate already jitters, just not on this path.** `Supervisor`'s
+restart backoff has a `jitter(bool)` knob (`src/supervisor.rs`, **default on**) backed
+by a dependency-free `jitter_factor()` PRNG that multiplies each delay by a uniform
+`[0.5, 1.5)` — built on `RandomState`'s fresh per-instance keys, no `rand` crate. So
+this idea is **not** greenfield: it's extending the existing `jitter_factor()` to the
+`retrying()` path, which today sleeps `RetryPolicy.backoff` verbatim with no
+randomization.
 
 ## Shape (when built)
 
-- A `RetryPolicy`-level `jitter` knob (e.g. a fraction `0.0..=1.0` of the computed
-  delay, or full/equal jitter à la the AWS "Exponential Backoff and Jitter" note).
-- **Default zero** — no behavior change for current callers; the
-  virtual-time supervisor tests that assert exact backoff intervals stay green.
-- Randomness source: a small, dependency-free PRNG seeded per-run, or gate the RNG
-  so the core stays lean. Avoid pulling `rand` into the default build for one knob.
+- A `RetryPolicy`-level `jitter` knob (`src/command.rs` `RetryPolicy` has only
+  `max_attempts` / `backoff` / `classifier` today). Reuse the supervisor's
+  `jitter_factor()` (factor multiply, the band the crate already uses) rather than
+  inventing a second jitter scheme.
+- **Mind the default-direction mismatch:** the supervisor jitters **on** by default
+  (a restart storm is the common case there); `retrying()` should default jitter
+  **off/zero** so the virtual-time backoff tests stay deterministic and current
+  callers see no behavior change. Two subsystems, opposite defaults — deliberately,
+  because the contention case differs. Document that when shipped.
+- Randomness source: the existing `jitter_factor()` (no new dependency). If it moves
+  out of `supervisor.rs` to be shared, keep it crate-private.
 
 ## Why low priority
 
