@@ -65,6 +65,8 @@ pub(crate) struct Spawned {
     pub stdout_handler: Option<LineHandler>,
     pub stderr_handler: Option<LineHandler>,
     pub buffer: OutputBufferPolicy,
+    /// Exit codes treated as success (default `[0]`), carried onto the result.
+    pub ok_codes: Vec<i32>,
     #[cfg(feature = "cancellation")]
     pub cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
@@ -100,6 +102,7 @@ pub struct RunningProcess {
     stdout_handler: Option<LineHandler>,
     stderr_handler: Option<LineHandler>,
     buffer: OutputBufferPolicy,
+    ok_codes: Vec<i32>,
     stdout_sink: Option<Arc<SharedLines>>,
     stderr_sink: Option<Arc<SharedLines>>,
     // The background stderr-drain task started by `stdout_lines`, awaited by
@@ -275,6 +278,7 @@ impl RunningProcess {
             stdout_handler: s.stdout_handler,
             stderr_handler: s.stderr_handler,
             buffer: s.buffer,
+            ok_codes: s.ok_codes,
             stdout_sink: None,
             stderr_sink: None,
             stderr_pump: None,
@@ -303,6 +307,7 @@ impl RunningProcess {
             stdout_handler: command.stdout_handler(),
             stderr_handler: command.stderr_handler(),
             buffer: command.output_buffer_policy(),
+            ok_codes: command.ok_codes_vec(),
             stdout_sink: None,
             stderr_sink: None,
             stderr_pump: None,
@@ -437,6 +442,17 @@ impl RunningProcess {
         let finished = self
             .finish_lines(CaptureMode::Lines, /* expose_counts */ true, || {})
             .await?;
+        // `count > retained` on either sink means a bounded buffer dropped lines
+        // (the counters tally every line; the sinks were exposed by finish_lines).
+        let truncated = self
+            .stdout_sink
+            .as_ref()
+            .is_some_and(|s| s.count() > finished.stdout_lines.len())
+            || self
+                .stderr_sink
+                .as_ref()
+                .is_some_and(|s| s.count() > finished.stderr_lines.len());
+        let duration = self.started.elapsed();
         Ok(ProcessResult::new(
             self.program.clone(),
             finished.stdout_lines.join("\n"),
@@ -444,7 +460,10 @@ impl RunningProcess {
             finished.code,
             finished.timed_out,
             self.timeout,
-        ))
+        )
+        .with_duration(duration)
+        .with_truncated(truncated)
+        .with_ok_codes(self.ok_codes.clone()))
     }
 
     /// Drain both streams, wait for exit, and return the raw stdout bytes
@@ -505,14 +524,22 @@ impl RunningProcess {
         join_pumps(err_pump.into_iter().collect()).await;
         let (code, timed_out) = self.checked_outcome((code, timed_out))?;
 
+        // stdout is raw bytes (not line-buffered), so only the line-pumped stderr
+        // can be truncated by the buffer policy here.
+        let stderr_lines = stderr_sink.drain();
+        let truncated = stderr_sink.count() > stderr_lines.len();
+        let duration = self.started.elapsed();
         Ok(ProcessResult::new(
             self.program.clone(),
             stdout,
-            stderr_sink.drain().join("\n"),
+            stderr_lines.join("\n"),
             code,
             timed_out,
             self.timeout,
-        ))
+        )
+        .with_duration(duration)
+        .with_truncated(truncated)
+        .with_ok_codes(self.ok_codes.clone()))
     }
 
     /// Wait for exit, returning just the exit code (output is drained and

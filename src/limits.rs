@@ -4,8 +4,9 @@
 ///
 /// Set these via [`ProcessGroupOptions`](crate::ProcessGroupOptions) (the
 /// `memory_max` / `max_processes` / `cpu_quota` builders, or by setting the
-/// public fields on a `ResourceLimits::default()` value) before creating the group. Every limit bounds the **whole tree**, not a single
-/// process, and is applied to the kernel container at creation time.
+/// public fields on a `ResourceLimits::default()` value) before creating the
+/// group. Every limit bounds the **whole tree**, not a single process, and is
+/// applied to the kernel container at creation time.
 ///
 /// # Platform support
 ///

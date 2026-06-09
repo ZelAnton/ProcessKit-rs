@@ -270,9 +270,12 @@ fn pipefail(
             pipeline_timeout,
         );
     }
-    // No checked inner failure: the last stage speaks for the chain,
-    // succeeding or not.
-    last
+    // No checked inner failure: the last stage speaks for the chain, succeeding
+    // or not. A pipeline's success is pure pipefail (every stage exits 0), so a
+    // stage's `ok_codes` does not widen it — reset to the default, consistent with
+    // the rebuild paths above. (`ok_codes` is a single-run feature; for an
+    // expected SIGPIPE / non-zero last stage use `unchecked()`.)
+    last.with_ok_codes(vec![0])
 }
 
 /// `a | b` — sugar for [`Command::pipe`]: the same shell-free, one-group,

@@ -9,6 +9,7 @@ runtime and `use processkit::Command;` unless shown otherwise.
 - [Run a command and get its output](#run-a-command-and-get-its-output)
 - [Inspect a failure instead of erroring](#inspect-a-failure-instead-of-erroring)
 - [Ask a yes/no question](#ask-a-yesno-question)
+- [Accept non-zero exit codes as success](#accept-non-zero-exit-codes-as-success)
 - [Bound a run with a timeout](#bound-a-run-with-a-timeout)
 - [Show a useful error message](#show-a-useful-error-message)
 - [Feed the child's stdin](#feed-the-childs-stdin)
@@ -65,6 +66,24 @@ let dirty = !Command::new("git").args(["diff", "--quiet"]).probe().await?;
 `probe()` maps exit 0 → `true`, exit 1 → `false`, and anything else to an
 error — the `git diff --quiet` / `grep -q` convention without manual code
 matching.
+
+## Accept non-zero exit codes as success
+
+```rust,no_run
+// `grep` exits 1 when it finds no match — not a failure for this call.
+let found = Command::new("grep")
+    .args(["needle", "haystack.txt"])
+    .ok_codes([0, 1])
+    .output_string()
+    .await?;
+let matched = found.code() == Some(0); // 0 = matched, 1 = no match (both "success")
+```
+
+`ok_codes` widens what the checking verbs (`run`/`run_unit`) and
+`is_success`/`ensure_success` treat as success — for tools whose non-zero exit is a
+normal result (`grep` 1 = no match, `diff` 1 = differs, rsync's code families). It
+does **not** change `exit_code` (always the raw code) or `probe` (always the 0/1
+convention). An empty set is ignored, so the default stays exit `0`.
 
 ## Bound a run with a timeout
 

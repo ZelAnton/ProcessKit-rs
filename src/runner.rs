@@ -99,7 +99,12 @@ pub trait ProcessRunnerExt: ProcessRunner {
                 Some(1) => Ok(false),
                 // Any other code (or no code: timeout / signal) is not a yes/no
                 // answer — reuse ensure_success to build the faithful error.
+                // Reset `ok_codes` to the default {0} first: `probe` keeps its
+                // strict 0/1 contract regardless of a command's `ok_codes`, and
+                // an *accepted* non-{0,1} code would otherwise make
+                // `ensure_success` return `Ok` and panic the `expect_err`.
                 _ => Err(result
+                    .with_ok_codes(vec![0])
                     .ensure_success()
                     .expect_err("a non-{0,1} exit code is never success")),
             }
@@ -318,6 +323,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         stdout_handler: command.stdout_handler(),
         stderr_handler: command.stderr_handler(),
         buffer: command.output_buffer_policy(),
+        ok_codes: command.ok_codes_vec(),
         #[cfg(feature = "cancellation")]
         cancel_token: command.cancel_token(),
     }))
@@ -391,6 +397,21 @@ mod tests {
         let runner = flaky(10);
         assert!(runner.run(&Command::new("x")).await.is_err());
         assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn probe_with_ok_codes_does_not_panic_on_a_non_binary_exit() {
+        // Regression: `probe` reuses `ensure_success` to build its error for a
+        // non-{0,1} exit. With `ok_codes` widening success, an accepted code like
+        // 2 would make `ensure_success` return `Ok` and panic the `expect_err` —
+        // probe must keep its strict 0/1 contract regardless of `ok_codes`.
+        use crate::{Reply, ScriptedRunner};
+        let runner = ScriptedRunner::new().on(["x"], Reply::fail(2, "boom"));
+        let cmd = Command::new("tool").args(["x"]).ok_codes([0, 1, 2]);
+        assert!(matches!(
+            runner.probe(&cmd).await,
+            Err(Error::Exit { code: 2, .. })
+        ));
     }
 
     #[tokio::test(start_paused = true)]

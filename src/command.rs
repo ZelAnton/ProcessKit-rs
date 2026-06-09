@@ -38,6 +38,9 @@ pub struct Command {
     /// Exempt this stage from pipefail attribution (see [`Self::unchecked`]).
     unchecked: bool,
     timeout: Option<Duration>,
+    /// Exit codes treated as success by the checking verbs (`run`/`run_unit`/
+    /// `checked` via [`ProcessResult::ensure_success`]). `None` accepts only `0`.
+    ok_codes: Option<Vec<i32>>,
     stdout_handler: Option<LineHandler>,
     stderr_handler: Option<LineHandler>,
     output_buffer: OutputBufferPolicy,
@@ -89,6 +92,7 @@ impl Command {
             keep_stdin_open: false,
             unchecked: false,
             timeout: None,
+            ok_codes: None,
             stdout_handler: None,
             stderr_handler: None,
             output_buffer: OutputBufferPolicy::unbounded(),
@@ -342,6 +346,22 @@ impl Command {
     /// Kill the run if it exceeds `timeout`.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Treat these exit codes (not just `0`) as success for the checking verbs —
+    /// [`run`](Self::run) (and `run_unit`/`checked` via
+    /// [`ProcessRunnerExt`](crate::ProcessRunnerExt)) and
+    /// [`ProcessResult::ensure_success`] / [`is_success`](ProcessResult::is_success).
+    /// For tools whose non-zero exit is a normal result — `grep` (1 = no match),
+    /// `diff` (1 = differs), rsync's code families — so callers don't hand-match.
+    ///
+    /// An empty set is ignored (it would make every exit a failure); the default
+    /// stays `[0]`. Does not change [`exit_code`](Self::exit_code) (always the raw
+    /// code) or [`probe`](Self::probe) (always the 0/1 convention).
+    pub fn ok_codes(mut self, codes: impl IntoIterator<Item = i32>) -> Self {
+        let codes: Vec<i32> = codes.into_iter().collect();
+        self.ok_codes = (!codes.is_empty()).then_some(codes);
         self
     }
 
@@ -615,6 +635,11 @@ impl Command {
     /// The configured timeout, if any.
     pub fn configured_timeout(&self) -> Option<Duration> {
         self.timeout
+    }
+
+    /// The exit codes this command treats as success (defaults to `[0]`).
+    pub(crate) fn ok_codes_vec(&self) -> Vec<i32> {
+        self.ok_codes.clone().unwrap_or_else(|| vec![0])
     }
 
     /// Build a `tokio::process::Command` with this command's program, args,

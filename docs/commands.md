@@ -251,7 +251,7 @@ the pdeathsig thread caveat) is collected in
 **Interactive auth / TTY.** processkit wires **pipes**, not a pseudo-terminal,
 so a tool that *demands* a tty — an `ssh`/`sudo` **password** prompt, some
 credential helpers — won't get one (PTY support is not implemented; the
-trade-off is recorded in `ideas/permissions-privileges-pty-network.md`). Drive
+trade-off is recorded in `decisions/permissions-privileges-pty-network.md`). Drive
 such tools **non-interactively** instead: key-based auth, `ssh -o
 BatchMode=yes`, `GIT_SSH_COMMAND` / `GIT_TERMINAL_PROMPT=0`, or feed a known
 answer over [interactive stdin](streaming.md#interactive-stdin). Conversational

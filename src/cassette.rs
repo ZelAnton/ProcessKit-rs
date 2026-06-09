@@ -357,7 +357,8 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                     entry.code,
                     entry.timed_out,
                     command.configured_timeout(),
-                ))
+                )
+                .with_ok_codes(command.ok_codes_vec()))
             }
         }
     }

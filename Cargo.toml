@@ -99,7 +99,7 @@ serde_json = { version = "1", optional = true }
 # changing the core's semantics — the kill-on-drop tree guarantee is
 # unconditional in every configuration. (A broader visibility split was tried
 # and deliberately rolled back — decision recorded in
-# ideas/architecture-audit-2026-06.md; full analysis in git history,
+# decisions/architecture-audit-2026-06.md; full analysis in git history,
 # ideas/three-layer-resource-split.md.)
 default = ["stats", "process-control"]
 # Resource measurement: `ProcessGroupStats`, `ProcessGroup::stats`, and the

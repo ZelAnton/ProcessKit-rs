@@ -29,7 +29,7 @@ pub enum Outcome {
 /// Standard error is always captured as text. A non-zero exit code is **not**
 /// treated as an error on its own — inspect [`code`](Self::code) or call
 /// [`ensure_success`](Self::ensure_success).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ProcessResult<T> {
     program: String,
     stdout: T,
@@ -40,7 +40,35 @@ pub struct ProcessResult<T> {
     /// The deadline that elapsed, when timed out — carried so the
     /// success-checking helpers can build a faithful [`Error::Timeout`].
     timeout: Option<Duration>,
+    /// Wall-clock duration of the run; `Duration::ZERO` for synthetic results
+    /// (a scripted/replayed bulk `output` that didn't time a real process).
+    duration: Duration,
+    /// Whether a bounded [`OutputBufferPolicy`](crate::OutputBufferPolicy)
+    /// dropped captured output lines.
+    truncated: bool,
+    /// Exit codes treated as success by [`is_success`](Self::is_success) /
+    /// [`ensure_success`](Self::ensure_success). Default `[0]`; widened via
+    /// [`Command::ok_codes`](crate::Command::ok_codes).
+    ok_codes: Vec<i32>,
 }
+
+// Equality is over the *logical* outcome, not incidental measurement: `duration`
+// (wall-clock timing) and `truncated` (buffer state) are deliberately excluded.
+// This keeps the cassette's round-trip contract — a result and its replay compare
+// equal — true even when the recording ran on a real runner (non-zero duration)
+// while replay rebuilds it as `Duration::ZERO`. See `cassette.rs`.
+impl<T: PartialEq> PartialEq for ProcessResult<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.program == other.program
+            && self.stdout == other.stdout
+            && self.stderr == other.stderr
+            && self.outcome == other.outcome
+            && self.timeout == other.timeout
+            && self.ok_codes == other.ok_codes
+    }
+}
+
+impl<T: Eq> Eq for ProcessResult<T> {}
 
 impl<T> ProcessResult<T> {
     /// Build a result from the raw `code`/`timed_out` pair every producing
@@ -66,6 +94,11 @@ impl<T> ProcessResult<T> {
             stderr,
             outcome,
             timeout,
+            // Producer-only setters fill these on the real run paths; the
+            // defaults keep synthetic results (doubles, pipeline, tests) correct.
+            duration: Duration::ZERO,
+            truncated: false,
+            ok_codes: vec![0],
         }
     }
 
@@ -116,22 +149,25 @@ impl<T> ProcessResult<T> {
         matches!(self.outcome, Outcome::TimedOut)
     }
 
-    /// Whether the process exited with code 0.
+    /// Whether the process exited with an **accepted** code — `0` by default, or
+    /// any code in the set configured via
+    /// [`Command::ok_codes`](crate::Command::ok_codes).
     pub fn is_success(&self) -> bool {
-        matches!(self.outcome, Outcome::Exited(0))
+        matches!(self.outcome, Outcome::Exited(code) if self.ok_codes.contains(&code))
     }
 
     /// Return `self` unchanged when the run succeeded, otherwise the matching
     /// error: [`Error::Timeout`] if the run was killed by its deadline (checked
     /// first), an IO error if it was killed by a signal (no exit code), else
-    /// [`Error::Exit`] for a non-zero exit, carrying the code and both
-    /// (truncated) captured streams.
+    /// [`Error::Exit`] for an exit code outside the accepted set (code `0` by
+    /// default — see [`Command::ok_codes`](crate::Command::ok_codes)), carrying
+    /// the code and both (truncated) captured streams.
     pub fn ensure_success(self) -> Result<Self, Error>
     where
         T: StdoutText,
     {
         match self.outcome {
-            Outcome::Exited(0) => Ok(self),
+            Outcome::Exited(code) if self.ok_codes.contains(&code) => Ok(self),
             Outcome::TimedOut => Err(Error::Timeout {
                 program: self.program.clone(),
                 timeout: self.timeout.unwrap_or_default(),
@@ -171,6 +207,42 @@ impl<T> ProcessResult<T> {
             }),
             Outcome::Signalled => Err(self.signal_error()),
         }
+    }
+
+    /// The wall-clock duration of the run — spawn to exit (or kill). It is
+    /// `Duration::ZERO` for synthetic results that didn't time a real process
+    /// (a scripted/replayed bulk `output`).
+    pub fn duration(&self) -> Duration {
+        self.duration
+    }
+
+    /// Whether a bounded [`OutputBufferPolicy`](crate::OutputBufferPolicy) dropped
+    /// captured output lines (the line counter exceeded what the buffer retained).
+    /// Always `false` under the default unbounded policy, and for the raw stdout
+    /// of [`output_bytes`](crate::Command::output_bytes) (not line-buffered).
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Stamp the run's wall-clock duration (producer-only).
+    pub(crate) fn with_duration(mut self, duration: Duration) -> Self {
+        self.duration = duration;
+        self
+    }
+
+    /// Record that a bounded buffer dropped captured lines (producer-only).
+    pub(crate) fn with_truncated(mut self, truncated: bool) -> Self {
+        self.truncated = truncated;
+        self
+    }
+
+    /// Set the exit codes treated as success (producer-only). An empty set is
+    /// ignored — it would make every exit a failure — so the default `[0]` stands.
+    pub(crate) fn with_ok_codes(mut self, ok_codes: Vec<i32>) -> Self {
+        if !ok_codes.is_empty() {
+            self.ok_codes = ok_codes;
+        }
+        self
     }
 }
 
@@ -504,5 +576,116 @@ mod tests {
         let exactly = "x".repeat(4 * 1024);
         assert_eq!(truncate_output(&exactly), exactly, "<= cap is verbatim");
         assert_eq!(truncate_output(""), "");
+    }
+
+    #[test]
+    fn ok_codes_widen_success_without_masking_other_failures() {
+        let one = ProcessResult::new(
+            "grep".into(),
+            "out".to_owned(),
+            String::new(),
+            Some(1),
+            false,
+            None,
+        )
+        .with_ok_codes(vec![0, 1]);
+        assert!(one.is_success(), "exit 1 is success when accepted");
+        assert!(one.ensure_success().is_ok());
+
+        let two = ProcessResult::new(
+            "grep".into(),
+            "out".to_owned(),
+            String::new(),
+            Some(2),
+            false,
+            None,
+        )
+        .with_ok_codes(vec![0, 1]);
+        assert!(!two.is_success(), "an unaccepted code is still a failure");
+        assert!(matches!(
+            two.ensure_success().unwrap_err(),
+            Error::Exit { code: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn new_defaults_zero_duration_untruncated_and_zero_only_success() {
+        let r = ProcessResult::new(
+            "x".into(),
+            String::new(),
+            String::new(),
+            Some(1),
+            false,
+            None,
+        );
+        assert_eq!(r.duration(), Duration::ZERO);
+        assert!(!r.truncated());
+        assert!(!r.is_success(), "the default accepts only code 0");
+
+        let stamped = ProcessResult::new(
+            "x".into(),
+            String::new(),
+            String::new(),
+            Some(0),
+            false,
+            None,
+        )
+        .with_duration(Duration::from_millis(5))
+        .with_truncated(true);
+        assert_eq!(stamped.duration(), Duration::from_millis(5));
+        assert!(stamped.truncated());
+        assert!(stamped.is_success());
+    }
+
+    #[test]
+    fn empty_ok_codes_is_ignored() {
+        let r = ProcessResult::new(
+            "x".into(),
+            String::new(),
+            String::new(),
+            Some(0),
+            false,
+            None,
+        )
+        .with_ok_codes(vec![]);
+        assert!(
+            r.is_success(),
+            "an empty accepted set falls back to the default [0]"
+        );
+    }
+
+    #[test]
+    fn equality_ignores_duration_and_truncation() {
+        // The cassette round-trip relies on this: a recorded result (real,
+        // non-zero duration) must compare equal to its replay (Duration::ZERO).
+        let base = ProcessResult::new(
+            "p".into(),
+            "out".to_owned(),
+            String::new(),
+            Some(0),
+            false,
+            None,
+        );
+        let measured = base
+            .clone()
+            .with_duration(Duration::from_secs(5))
+            .with_truncated(true);
+        assert_eq!(
+            base, measured,
+            "duration and truncation are not part of identity"
+        );
+
+        // …but the logical fields still distinguish results.
+        let different = ProcessResult::new(
+            "p".into(),
+            "DIFF".to_owned(),
+            String::new(),
+            Some(0),
+            false,
+            None,
+        );
+        assert_ne!(base, different);
+        let widened = base.clone().with_ok_codes(vec![0, 1]);
+        assert_ne!(base, widened, "ok_codes is part of identity");
     }
 }

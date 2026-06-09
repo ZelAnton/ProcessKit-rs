@@ -36,6 +36,17 @@ to a dated version section.
   leaves the child holding the parent's (often root's) supplementary groups. The OS
   applies `setgroups → setgid → setuid`. POSIX-only — non-Unix fails with
   `Error::Unsupported`, never a silent skip.
+- `Command::ok_codes([..])` — treat the given exit codes (not just `0`) as success for
+  the checking verbs (`run`/`run_unit` and `ProcessResult::is_success`/`ensure_success`),
+  for tools whose non-zero exit is a normal result — `grep` (1 = no match), `diff`
+  (1 = differs), rsync's code families. `exit_code` (raw code) and `probe` (0/1
+  convention) are unchanged; an empty set is ignored.
+- `ProcessResult::duration()` — the run's wall-clock time (spawn → exit/kill), carried
+  on the result instead of making callers wrap each run in their own `Instant::now()`.
+  `Duration::ZERO` for synthetic results (scripted/replayed bulk `output`).
+- `ProcessResult::truncated()` — whether a bounded `OutputBufferPolicy` dropped captured
+  output lines, so a caller that bounds the buffer can tell when output was lost
+  (the unbounded default never truncates).
 
 ### Changed
 

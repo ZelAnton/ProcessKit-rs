@@ -325,7 +325,10 @@ impl ProcessRunner for ScriptedRunner {
             return park_until_cancelled(command, program).await;
         }
         replay_line_handlers(command, reply);
-        Ok(reply.clone().into_result(program, timeout))
+        Ok(reply
+            .clone()
+            .into_result(program, timeout)
+            .with_ok_codes(command.ok_codes_vec()))
     }
 
     /// Start a scripted live handle: the canned stdout/stderr flow through the
