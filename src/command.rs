@@ -617,6 +617,24 @@ impl Command {
         &self.args
     }
 
+    /// Render this command as a single shell-quoted line for **display** — logs,
+    /// error messages, a dry-run echo. Quoting is per-platform (POSIX
+    /// single-quote / Windows double-quote) and is for readability, **not
+    /// execution**: the crate never invokes a shell, and the rendering is not
+    /// guaranteed to round-trip through one.
+    ///
+    /// The line includes the arguments, which may carry secrets (a `--token=…`
+    /// flag). Unlike the `tracing` feature — which never logs argv — this is
+    /// opt-in: render it only into a sink you control.
+    pub fn command_line(&self) -> String {
+        let mut line = quote_arg(&self.program.to_string_lossy());
+        for arg in &self.args {
+            line.push(' ');
+            line.push_str(&quote_arg(&arg.to_string_lossy()));
+        }
+        line
+    }
+
     /// The working-directory override, if one was set.
     pub fn working_dir(&self) -> Option<&Path> {
         self.cwd.as_deref().map(Path::new)
@@ -894,6 +912,61 @@ impl fmt::Debug for Command {
     }
 }
 
+/// Render one argument shell-quoted for **display** (POSIX single-quote rules).
+/// Not a security boundary — the crate never invokes a shell; this only makes a
+/// `command_line()` echo readable and unambiguous.
+#[cfg(unix)]
+fn quote_arg(arg: &str) -> String {
+    // Bare when entirely shell-safe; otherwise single-quote, rewriting an
+    // embedded `'` as the classic `'\''`.
+    let safe = !arg.is_empty()
+        && arg.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'@' | b'%' | b'_' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-'
+                )
+        });
+    if safe {
+        return arg.to_owned();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('\'');
+    for ch in arg.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Render one argument quoted for **display** on Windows (double-quote rules).
+/// Not a security boundary — the crate never invokes a shell.
+#[cfg(not(unix))]
+fn quote_arg(arg: &str) -> String {
+    let needs_quote = arg.is_empty()
+        || arg
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '"' | '^' | '&' | '|' | '<' | '>' | '%'));
+    if !needs_quote {
+        return arg.to_owned();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    for ch in arg.chars() {
+        if ch == '"' {
+            out.push_str("\\\"");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::Command;
@@ -1018,5 +1091,22 @@ mod tests {
         let with = Command::new("x").cancel_on(tokio_util::sync::CancellationToken::new());
         assert!(format!("{with:?}").contains("has_cancel_token: true"));
         assert!(format!("{:?}", Command::new("x")).contains("has_cancel_token: false"));
+    }
+
+    #[test]
+    fn command_line_quotes_args_for_display() {
+        let cmd = Command::new("git").args(["commit", "-m", "hello world"]);
+        #[cfg(unix)]
+        assert_eq!(cmd.command_line(), "git commit -m 'hello world'");
+        #[cfg(not(unix))]
+        assert_eq!(cmd.command_line(), "git commit -m \"hello world\"");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_line_single_quotes_specials_and_empty_args() {
+        // empty -> ''; embedded `'` -> '\''; the safe `x=1` stays bare.
+        let cmd = Command::new("tool").args(["", "a'b", "x=1"]);
+        assert_eq!(cmd.command_line(), r#"tool '' 'a'\''b' x=1"#);
     }
 }

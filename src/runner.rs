@@ -265,6 +265,30 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         });
     }
 
+    // A working directory that doesn't exist (or isn't a directory) makes the OS
+    // spawn fail with a bare ENOENT — indistinguishable from "program not found".
+    // Check it up front so the error names the real cause. Best-effort: a TOCTOU
+    // race where it vanishes after this check just falls back to the OS error.
+    if let Some(cwd) = command.working_dir()
+        && !cwd.is_dir()
+    {
+        // Distinguish "missing" from "exists but isn't a directory" so the
+        // message is accurate and `is_not_found()` stays honest (a file at the
+        // path is found, just not usable as a cwd).
+        let (kind, what) = if cwd.exists() {
+            (std::io::ErrorKind::NotADirectory, "is not a directory")
+        } else {
+            (std::io::ErrorKind::NotFound, "does not exist")
+        };
+        return Err(crate::Error::Spawn {
+            program: command.program_name(),
+            source: std::io::Error::new(
+                kind,
+                format!("working directory {what}: {}", cwd.display()),
+            ),
+        });
+    }
+
     let mut tokio_cmd = command.build_tokio();
     let opts = crate::sys::SpawnOptions {
         setsid: command.wants_setsid(),

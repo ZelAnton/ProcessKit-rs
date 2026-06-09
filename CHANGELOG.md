@@ -47,6 +47,13 @@ to a dated version section.
 - `ProcessResult::truncated()` — whether a bounded `OutputBufferPolicy` dropped captured
   output lines, so a caller that bounds the buffer can tell when output was lost
   (the unbounded default never truncates).
+- `Command::command_line()` — render the command as a single shell-quoted line for
+  logs, error messages, or a dry-run echo (per-platform quoting; **display only** —
+  the crate never invokes a shell). It includes argv (which may carry secrets), so —
+  unlike the `tracing` feature, which never logs argv — it is opt-in.
+- A `current_dir` that does not exist now fails with a clear *"working directory does
+  not exist"* error (`Error::is_not_found()` is `true`) instead of the opaque `ENOENT`
+  that looked like the program itself was missing.
 
 ### Changed
 

@@ -8,6 +8,44 @@ use processkit::Command;
 use crate::common::*;
 
 #[tokio::test]
+#[ignore = "exercises the real spawn path (creates a process group)"]
+async fn missing_working_directory_errors_clearly() {
+    // A cwd that doesn't exist must surface as a clear, not-found error that
+    // names the working directory — not the opaque ENOENT that looks like the
+    // program is missing. The check fires before any child is spawned.
+    let err = Command::new("echo")
+        .arg("hi")
+        .current_dir("does-not-exist-processkit-xyz")
+        .output_string()
+        .await
+        .expect_err("a missing cwd must error");
+    assert!(err.is_not_found(), "got {err:?}");
+    assert!(
+        format!("{err}").contains("working directory does not exist"),
+        "message should name the cwd: {err}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "exercises the real spawn path (creates a process group)"]
+async fn working_directory_that_is_a_file_errors_as_not_a_directory() {
+    // A cwd that exists but is a regular file is reported distinctly — it is
+    // *found*, just not a directory, so `is_not_found()` must be false. (Cargo.toml
+    // exists at the package root, which is the test process's working directory.)
+    let err = Command::new("echo")
+        .arg("hi")
+        .current_dir("Cargo.toml")
+        .output_string()
+        .await
+        .expect_err("a file as cwd must error");
+    assert!(!err.is_not_found(), "a file is found, not missing: {err:?}");
+    assert!(
+        format!("{err}").contains("is not a directory"),
+        "message should say not-a-directory: {err}"
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a real subprocess"]
 async fn output_string_captures_stdout() {
     let result = two_line_echo().output_string().await.expect("run echo");
