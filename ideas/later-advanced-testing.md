@@ -4,9 +4,11 @@
 > already has strong coverage: ~89 `#[ignore]`d real-subprocess integration tests, a
 > nightly stress tier (`PROCESSKIT_STRESS=1`), and solid unit tests for the parsing
 > hot spots (`pump.rs` line-splitting/encoding/handler-panic isolation, `result.rs`,
-> `error.rs`). **The two cheapest, highest-risk gaps graduated to the roadmap**
-> (item 10: cancellation races + pump edge cases). This file is the backlog of the
-> rest — heavier infrastructure or lower-probability zones.
+> `error.rs`). **The cheapest, highest-risk gaps graduated to the roadmap** (now
+> ROADMAP item 1: cancellation races + pump edge cases + the 0.9.1 graceful-timeout
+> coverage). The arbitrary-chunk-boundary multibyte case is best *proved* by the
+> property test sketched here (the line is reassembled by `BufReader` in practice).
+> This file is the backlog of the rest — heavier infrastructure or lower-probability zones.
 
 ## Risk zones & candidate tests
 

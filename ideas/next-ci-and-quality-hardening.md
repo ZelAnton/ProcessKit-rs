@@ -13,7 +13,8 @@
 
 Detect accidental SemVer-breaking API changes between releases. **Deliberately
 `next-`, not now:** pre-1.0 we break the API freely, so it has little value until the
-1.0 line is cut (it pairs with roadmap item 5, the API review). Wire it in
+1.0 line is cut (the pre-1.0 API review already shipped in 0.9.1; semver-checks is the
+*post*-freeze enforcement tool). Wire it in
 informational mode around 1.0, enforcing after.
 
 ### B. `cargo-hack` feature-powerset
@@ -45,10 +46,30 @@ to be meaningful, and platform-specific `sys/` code only shows on its own OS.
 Opt into `clippy::pedantic` (selectively — pedantic is noisy) and a `clippy.toml` for
 complexity thresholds. One-time triage cost; ongoing quality signal.
 
+**Cherry-pick first: `# Errors` / `# Panics` doc sections.** The highest-value slice of
+pedantic for *this* crate is `clippy::missing_errors_doc` + `missing_panics_doc` — it has
+a rich typed `Error` with documented invariants (Timeout *captured* vs Cancelled *raised*,
+NotReady ≠ Timeout) that live in the guides but not in the per-item rustdoc a docs.rs
+reader hits first (Rust API Guidelines C-FAILURE). Worth enabling these two lints and
+adding the blocks even if full pedantic isn't adopted.
+
+### F. `cargo-public-api` surface snapshot (the pre-1.0 complement to A)
+*Borrow: de-facto pre-1.0 surface-tracking tool · Cost: trivial · Value: now*
+
+Commit a `cargo-public-api` snapshot (`public-api.txt`) and diff it in CI, so every PR
+shows the public-surface delta as a reviewable artifact **while we still break freely**.
+It's a *review aid*, not a gate (a changed snapshot is expected pre-1.0) — value is
+visibility, directly serving the "get the shape right before 1.0" mandate. Distinct from
+(A) `cargo-semver-checks`, which *enforces* and pays off only post-freeze: F is for now,
+A is for ~1.0. The two are complementary, not redundant.
+
 ## Assessment
 
-**(B) is the standout** — cheap, immediate, catches a real gap. (C) and (D) are easy
-wins. (A) is genuinely valuable but timed to 1.0. (E) is the most effort for the
-softest benefit. Suggested order when picked up: B → C → D → A (at 1.0) → E.
+**(B) and (F) are the standouts** — both cheap, immediate, and serve the pre-1.0 window:
+(B) catches a real feature-gate gap, (F) makes API drift visible. (C) and (D) are easy
+wins. (A) is genuinely valuable but timed to 1.0. (E) is the most effort for the softest
+benefit — but its `# Errors`/`# Panics` slice is worth cherry-picking early. Suggested
+order when picked up: B → F → C → D → A (at 1.0) → E.
 
-**Revisit:** (B)(C)(D) anytime; (A) when approaching the 1.0 API freeze (roadmap item 5).
+**Revisit:** (B)(C)(D)(F) anytime — promoted to ROADMAP item 4; (A) when approaching the
+1.0 API freeze.

@@ -37,8 +37,10 @@ outright, move it to [`../decisions/`](../decisions/).
 - `next-launch-ergonomics.md` — `which`/PATH resolution, bulk env, cwd
   conveniences, `send_control`.
 - `next-scheduling-knobs.md` — nice/priority, ionice, umask, Windows priority class.
-- `next-ci-and-quality-hardening.md` — cargo-semver-checks, cargo-hack
-  feature-powerset, minimal-versions, coverage, clippy pedantic.
+- `next-ci-and-quality-hardening.md` — cargo-hack feature-powerset, minimal-versions,
+  coverage, cargo-public-api snapshot, cargo-semver-checks (at 1.0), clippy pedantic.
+- `next-doctests-hermetic.md` — make the most-read `no_run` doctests *execute* through
+  `ScriptedRunner` (ROADMAP item 5).
 
 **Later:**
 - `later-runtime-agnostic.md` — decouple from tokio (gated on a non-tokio consumer).
@@ -55,3 +57,7 @@ outright, move it to [`../decisions/`](../decisions/).
   vcs-toolkit-rs feedback).
 - `later-retry-jitter.md` — optional, default-zero jitter on `retrying()` backoff
   (from vcs-toolkit-rs feedback).
+- `later-buffer-policy-seam.md` — a consumer-pluggable `BufferPolicy` seam
+  (redaction-at-capture; gated on a concrete consumer).
+- `later-internal-simplifications.md` — minor internal dedup + doc-only clarifications
+  (the public surface was found 1.0-ready; these are the residuals).

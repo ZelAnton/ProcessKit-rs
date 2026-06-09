@@ -12,8 +12,9 @@
 No way to resolve a program to an absolute path before spawn, or to report *which*
 PATH was searched on failure. Cross-platform correctness is the cost (PATHEXT and
 `.exe`/`.cmd`/`.bat` resolution on Windows). Pairs with the already-shipped
-`is_not_found()` classifier (item 9 on the roadmap) to turn an opaque ENOENT into
-"`foo` not found on PATH (searched: …)".
+`is_not_found()` classifier + `command_line()` quoting + cwd pre-check (all in 0.9.1) to
+turn an opaque ENOENT into "`foo` not found on PATH (searched: …)". **(A) is promoted to
+ROADMAP item 3** (the 2026-06-10 sweep — its 0.9.1 dependencies shipped); B/E wait here.
 
 ### B. `prefer_local` — prepend a project-local bin dir
 *Borrow: execa `preferLocal`/`localDir`, node `.bin` · Cost: moderate*
@@ -32,7 +33,7 @@ formats vary) — just accept the parsed pairs.
 *Borrow: xshell `pushd`, zx `cd`/`within`, plumbum `with_cwd` · Cost: trivial–moderate*
 
 Beyond setting the path: **validate it exists up front** (clear error vs opaque spawn
-failure — this part is on the roadmap as item 9). A scoped pushd-style RAII guard is
+failure — this part shipped in 0.9.1). A scoped pushd-style RAII guard is
 the moderate, optional extension.
 
 ### E. `send_control(char)` on the live handle
@@ -46,5 +47,6 @@ helps drive REPLs and interactive tools the caller already keeps stdin open for.
 
 All low-risk and additive. (A)+(B) are the only non-trivial pieces (Windows PATH
 resolution); (C)(D-validate)(E) are nearly free. **The cwd-validate and quoting parts
-already graduated to the roadmap** (item 9); the rest waits here. Ship opportunistically
-when touching the `Command` builder.
+shipped in 0.9.1; (A) which/PATH resolution is now ROADMAP item 3** (with bulk env (C)
+riding along); B/E wait here. Ship the rest opportunistically when touching the `Command`
+builder.

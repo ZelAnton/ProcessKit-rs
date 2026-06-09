@@ -23,5 +23,10 @@ constraint) can reopen one by moving its substance back into `ideas/`.
   **PTY design sketch** (deferred — the open follow-up lives at
   [`../ideas/later-pty-support.md`](../ideas/later-pty-support.md)) and the declined
   Windows run-as-user.
-- **`wont-do-2026-06.md`** — the "won't do" verdicts from the 2026-06-09 development
-  sweep (built-in shell mode, IPC, detached-as-default, miri, object-mode streams).
+- **`wont-do-2026-06.md`** — the "won't do" verdicts from the 2026-06 development
+  sweeps. 2026-06-09: built-in shell mode, IPC, detached-as-default, miri, object-mode
+  streams. 2026-06-10: a `clear_env()` verb (redundant with `inherit_env([])`), `arg_if`
+  builder sugar, env-var-*name* redaction, finer stdin flush knobs (PTY-subsumed).
+- **`pre-1.0-api-review.md`** — the pre-1.0 public-API sweep: the `#[non_exhaustive]`
+  additions (shipped 0.9.1) and the deliberate re-export-leak decisions
+  (`CancellationToken`/`encoding_rs::Encoding` kept).

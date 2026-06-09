@@ -43,13 +43,32 @@ fits the existing two-pump model better.
 current streaming API; ideal for TUIs/dashboards. Subsumes much of (C) if the event
 carries a stream tag and arrives in order.
 
+### E. `OverflowMode::Error` — a fail-loud capture ceiling (fold-in)
+*Borrow: GNU `head -c` ceiling semantics; ties to the existing `OverflowMode` · Cost: trivial*
+
+`OverflowMode` today has only `DropOldest`/`DropNewest` (`src/buffer.rs`) — both *silently
+lose* lines, surfaced after the fact via `truncated()`. For an **untrusted** child whose
+unbounded output is itself a DoS, a consumer wants to **abort at a ceiling**, not drop. A
+third `Error` variant (→ a typed `Error::OutputTooLarge`, say) is a different, legitimate
+point on the same axis the audit settled (it kept the unbounded default + drop modes;
+erroring is the sandbox case). Confirmed missing on 2026-06-10, and now **non-breaking** to
+add (`OverflowMode` became `#[non_exhaustive]` in 0.9.1). Fits the `limits`/sandbox theme.
+Folded into the design pass because it touches the same buffer/pump core.
+
+> **Decode policy — checked, not a gap.** A sibling idea (typed invalid-UTF-8 handling on
+> the string verbs) was assessed and dropped: the pump already decodes **lossily** via
+> `encoding_rs` (`src/pump.rs` `encoding.decode`), so `output_string` never hard-errors on
+> bad bytes (test: `invalid bytes decode to the replacement char`). A hard-error mode has
+> no asking consumer and inverts the safe default — left out. Documented here so it isn't
+> re-proposed.
+
 ## Assessment
 
 High real-world value (these are among the most-requested subprocess ergonomics),
 but the right move is **one design pass** that decides the `StdioMode` model first
-(A), then layers tee (B) and an ordered event stream (D, which subsumes C's tagging).
-Rushing any one of them risks a second incompatible knob later. Pre-1.0, we can
-reshape `RunningProcess`/`ProcessResult` freely — so do it deliberately, together.
+(A), then layers tee (B) and an ordered event stream (D, which subsumes C's tagging),
+and adds the cheap (E) ceiling. Rushing any one of them risks a second incompatible knob
+later. Pre-1.0, we can reshape `RunningProcess`/`ProcessResult` freely — so do it
+deliberately, together.
 
-**Revisit:** first thing after the roadmap drains, or sooner if a consumer hits the
-interactive-child (A) or live-transcript (B) wall.
+**Revisit:** **now** — the roadmap drained, so this is promoted to ROADMAP item 2.

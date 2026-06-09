@@ -39,5 +39,5 @@ up **rejected** (moved to `decisions/`) on the same inspectability grounds as
 `on_command`, or accepted as a deliberately-narrow escape hatch. Either way, don't
 add it casually.
 
-**Revisit:** (B) opportunistically after the quoting helper (roadmap item 9); (A)
+**Revisit:** (B) opportunistically — the quoting helper it builds on shipped in 0.9.1; (A)
 when a consumer hits a platform knob the crate genuinely can't model — then decide.
