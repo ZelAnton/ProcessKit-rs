@@ -181,13 +181,14 @@ impl Job {
 
     pub(crate) async fn graceful_shutdown(
         &self,
+        signal: i32,
         timeout: Duration,
         escalate: bool,
     ) -> io::Result<()> {
         match &self.backend {
             Backend::Cgroup(cg) => {
                 // Best-effort: the graceful tier proceeds to polling regardless.
-                let _ = cg.signal(libc::SIGTERM);
+                let _ = cg.signal(signal);
                 let deadline = Instant::now() + timeout;
                 while !cg.is_empty() {
                     if Instant::now() >= deadline {
@@ -200,7 +201,7 @@ impl Job {
                 }
                 Ok(())
             }
-            Backend::ProcessGroup(pg) => pg.graceful_shutdown(timeout, escalate).await,
+            Backend::ProcessGroup(pg) => pg.graceful_shutdown(signal, timeout, escalate).await,
         }
     }
 

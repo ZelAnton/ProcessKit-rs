@@ -88,10 +88,13 @@ impl Job {
 
     pub(crate) async fn graceful_shutdown(
         &self,
+        signal: i32,
         timeout: Duration,
         escalate: bool,
     ) -> io::Result<()> {
-        self.group.graceful_shutdown(timeout, escalate).await
+        self.group
+            .graceful_shutdown(signal, timeout, escalate)
+            .await
     }
 
     #[cfg(feature = "stats")]

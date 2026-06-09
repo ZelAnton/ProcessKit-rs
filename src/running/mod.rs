@@ -59,6 +59,10 @@ pub(crate) struct Spawned {
     pub stdin: Option<ChildStdin>,
     pub stdin_task: Option<JoinHandle<std::io::Result<()>>>,
     pub timeout: Option<Duration>,
+    /// Grace window for a graceful timeout (`None` = hard kill at the deadline).
+    pub timeout_grace: Option<Duration>,
+    /// Raw signal for the graceful-timeout phase (default `SIGTERM`).
+    pub timeout_signal: i32,
     pub pid: Option<u32>,
     pub stdout_encoding: &'static Encoding,
     pub stderr_encoding: &'static Encoding,
@@ -96,6 +100,8 @@ pub struct RunningProcess {
     /// same pump machinery (see [`Backend`]).
     backend: Backend,
     timeout: Option<Duration>,
+    timeout_grace: Option<Duration>,
+    timeout_signal: i32,
     pid: Option<u32>,
     stdout_encoding: &'static Encoding,
     stderr_encoding: &'static Encoding,
@@ -272,6 +278,8 @@ impl RunningProcess {
                 stdin_task: s.stdin_task,
             })),
             timeout: s.timeout,
+            timeout_grace: s.timeout_grace,
+            timeout_signal: s.timeout_signal,
             pid: s.pid,
             stdout_encoding: s.stdout_encoding,
             stderr_encoding: s.stderr_encoding,
@@ -301,6 +309,8 @@ impl RunningProcess {
             program: command.program_name(),
             backend: Backend::Scripted(Box::new(scripted)),
             timeout: command.configured_timeout(),
+            timeout_grace: command.configured_timeout_grace(),
+            timeout_signal: command.timeout_signal_raw(),
             pid: None,
             stdout_encoding: command.out_encoding(),
             stderr_encoding: command.err_encoding(),
@@ -863,7 +873,7 @@ impl RunningProcess {
                             timeout_ms = limit.as_millis() as u64,
                             "timeout elapsed; killing the tree"
                         );
-                        self.kill_tree().await;
+                        self.teardown_on_timeout().await;
                         Ok((None, true))
                     }
                 }
@@ -915,7 +925,7 @@ impl RunningProcess {
                     timeout_ms = limit.map(|l| l.as_millis() as u64).unwrap_or(0),
                     "timeout elapsed; killing the tree"
                 );
-                self.kill_tree().await;
+                self.teardown_on_timeout().await;
                 Ok((None, true))
             }
         }
@@ -935,6 +945,43 @@ impl RunningProcess {
                 // Reap after the kill; a wait error here cannot change the
                 // outcome the caller is about to report.
                 let _ = real.child.wait().await;
+            }
+            Backend::Scripted(s) => s.kill(),
+        }
+    }
+
+    /// Teardown when the deadline elapses. With a grace window (`timeout_grace`),
+    /// gracefully tear the run down — signal, wait up to the grace, then
+    /// `SIGKILL` — reusing the same tier as `ProcessGroup::shutdown`, reaping
+    /// concurrently so a child that exits on the signal ends the grace early
+    /// instead of looking alive as an unreaped zombie. Without a grace, the hard
+    /// `kill_tree`. (Windows has no signal tier: graceful degrades to the atomic
+    /// kill.) Cancellation never routes here — it always hard-kills.
+    async fn teardown_on_timeout(&mut self) {
+        let Some(grace) = self.timeout_grace else {
+            self.kill_tree().await;
+            return;
+        };
+        let signal = self.timeout_signal;
+        match &mut self.backend {
+            Backend::Real(real) => {
+                let pid = real.child.id();
+                let own = real.own_group.clone();
+                let teardown = async {
+                    match &own {
+                        // Own private group: gracefully tear the whole tree down.
+                        Some(group) => {
+                            let _ = group.graceful_terminate(grace, signal).await;
+                        }
+                        // Shared group: gracefully terminate only our direct child.
+                        None => {
+                            crate::running::stream::graceful_kill_pid(pid, grace, signal).await;
+                        }
+                    }
+                };
+                // Reap concurrently so the liveness probe sees a signal-handling
+                // child leave, ending the grace early (see ProcessGroup::shutdown).
+                let _ = tokio::join!(teardown, real.child.wait());
             }
             Backend::Scripted(s) => s.kill(),
         }

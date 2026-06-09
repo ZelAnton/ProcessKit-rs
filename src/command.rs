@@ -38,6 +38,12 @@ pub struct Command {
     /// Exempt this stage from pipefail attribution (see [`Self::unchecked`]).
     unchecked: bool,
     timeout: Option<Duration>,
+    /// Grace window after the deadline before `SIGKILL`; its presence makes the
+    /// timeout graceful (see [`Self::timeout_grace`]).
+    timeout_grace: Option<Duration>,
+    /// Signal sent at the start of a graceful timeout (default `SIGTERM`).
+    #[cfg(feature = "process-control")]
+    timeout_signal: Option<crate::Signal>,
     /// Exit codes treated as success by the checking verbs (`run`/`run_unit`/
     /// `checked` via [`ProcessResult::ensure_success`]). `None` accepts only `0`.
     ok_codes: Option<Vec<i32>>,
@@ -92,6 +98,9 @@ impl Command {
             keep_stdin_open: false,
             unchecked: false,
             timeout: None,
+            timeout_grace: None,
+            #[cfg(feature = "process-control")]
+            timeout_signal: None,
             ok_codes: None,
             stdout_handler: None,
             stderr_handler: None,
@@ -346,6 +355,31 @@ impl Command {
     /// Kill the run if it exceeds `timeout`.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Make the [`timeout`](Self::timeout) **graceful**: at the deadline the run's
+    /// tree is sent `SIGTERM` (or the signal chosen via `timeout_signal`, with the
+    /// `process-control` feature), given up to `grace` to exit, then `SIGKILL`ed.
+    /// Without it the deadline hard-kills at once. No effect unless
+    /// [`timeout`](Self::timeout) is also set.
+    ///
+    /// **Windows** has no signal tier: the deadline kills the job atomically
+    /// regardless of `grace`. Either way
+    /// [`timed_out`](crate::ProcessResult::timed_out) stays `true` (the deadline
+    /// was exceeded), graceful or not.
+    pub fn timeout_grace(mut self, grace: Duration) -> Self {
+        self.timeout_grace = Some(grace);
+        self
+    }
+
+    /// The signal sent at the start of a graceful
+    /// [`timeout_grace`](Self::timeout_grace) window (default
+    /// [`Signal::Term`](crate::Signal::Term)). Unix-only in effect; ignored on
+    /// Windows (no signal tier).
+    #[cfg(feature = "process-control")]
+    pub fn timeout_signal(mut self, signal: crate::Signal) -> Self {
+        self.timeout_signal = Some(signal);
         self
     }
 
@@ -653,6 +687,20 @@ impl Command {
     /// The configured timeout, if any.
     pub fn configured_timeout(&self) -> Option<Duration> {
         self.timeout
+    }
+
+    /// The graceful-timeout grace window, if set.
+    pub(crate) fn configured_timeout_grace(&self) -> Option<Duration> {
+        self.timeout_grace
+    }
+
+    /// The raw signal for the graceful-timeout phase (default `SIGTERM`).
+    pub(crate) fn timeout_signal_raw(&self) -> i32 {
+        #[cfg(all(unix, feature = "process-control"))]
+        if let Some(sig) = self.timeout_signal {
+            return sig.raw();
+        }
+        crate::sys::SIGTERM_RAW
     }
 
     /// The exit codes this command treats as success (defaults to `[0]`).
@@ -1108,5 +1156,31 @@ mod tests {
         // empty -> ''; embedded `'` -> '\''; the safe `x=1` stays bare.
         let cmd = Command::new("tool").args(["", "a'b", "x=1"]);
         assert_eq!(cmd.command_line(), r#"tool '' 'a'\''b' x=1"#);
+    }
+
+    #[test]
+    fn timeout_grace_records_its_value() {
+        use std::time::Duration;
+        let cmd = Command::new("x").timeout_grace(Duration::from_secs(5));
+        assert_eq!(cmd.configured_timeout_grace(), Some(Duration::from_secs(5)));
+        assert_eq!(Command::new("x").configured_timeout_grace(), None);
+    }
+
+    #[cfg(all(unix, feature = "process-control"))]
+    #[test]
+    fn timeout_signal_defaults_to_term_and_is_configurable() {
+        use crate::Signal;
+        // Default (no `timeout_signal`) resolves to SIGTERM…
+        assert_eq!(
+            Command::new("x").timeout_signal_raw(),
+            crate::sys::SIGTERM_RAW
+        );
+        // …and an explicit signal overrides it.
+        assert_eq!(
+            Command::new("x")
+                .timeout_signal(Signal::Int)
+                .timeout_signal_raw(),
+            Signal::Int.raw(),
+        );
     }
 }

@@ -11,6 +11,7 @@ runtime and `use processkit::Command;` unless shown otherwise.
 - [Ask a yes/no question](#ask-a-yesno-question)
 - [Accept non-zero exit codes as success](#accept-non-zero-exit-codes-as-success)
 - [Bound a run with a timeout](#bound-a-run-with-a-timeout)
+- [Let a tool clean up on timeout](#let-a-tool-clean-up-on-timeout)
 - [Show a useful error message](#show-a-useful-error-message)
 - [Feed the child's stdin](#feed-the-childs-stdin)
 - [Stream output as it arrives](#stream-output-as-it-arrives)
@@ -102,6 +103,25 @@ if result.timed_out() {
 At the deadline the whole tree is killed. On the capture verbs the timeout is
 *captured* (`timed_out()`, partial output kept); on the success-checking verbs
 (`run`, `exit_code`) it surfaces as `Error::Timeout`.
+
+## Let a tool clean up on timeout
+
+```rust,no_run
+use std::time::Duration;
+
+let result = Command::new("dev-server")
+    .timeout(Duration::from_secs(30))
+    .timeout_grace(Duration::from_secs(5)) // SIGTERM, wait up to 5s, then SIGKILL
+    .output_string()
+    .await?;
+```
+
+`timeout_grace` turns the hard deadline kill into a graceful one: `SIGTERM` (or the
+signal from `timeout_signal`, with the `process-control` feature), up to the grace
+window to exit, then `SIGKILL`. A signal-handling child exits early; `timed_out()`
+stays `true`. Windows has no signal tier — the deadline kills atomically.
+
+*Fine print: [Timeouts → graceful timeout](timeouts-and-cancellation.md#graceful-timeout).*
 
 *Fine print: [Timeouts, retries & cancellation](timeouts-and-cancellation.md).*
 

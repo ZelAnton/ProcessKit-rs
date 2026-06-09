@@ -86,3 +86,73 @@ async fn shutdown_escalates_to_kill_after_the_grace_window() {
     let code = waiter.await.expect("join").expect("wait");
     assert_eq!(code, None, "SIGKILL leaves no exit code, got {code:?}");
 }
+
+// --- Run-level graceful timeout (`Command::timeout` + `timeout_grace`) ---
+//
+// Children busy-wait in the shell (no separate `sleep` child to die to the
+// broadcast signal); the generous deadline (500ms) leaves time for the trap to
+// install before it fires.
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess and times it out gracefully"]
+async fn graceful_timeout_lets_a_term_handling_child_end_the_grace_early() {
+    // Deadline fires → SIGTERM → the trap exits the child well within the long
+    // grace (concurrent reap ends it early). `timed_out()` is still true.
+    let start = Instant::now();
+    let result = Command::new("sh")
+        .args(["-c", "trap 'exit 0' TERM; while :; do :; done"])
+        .timeout(Duration::from_millis(500))
+        .timeout_grace(Duration::from_secs(10))
+        .output_string()
+        .await
+        .expect("run completes");
+    assert!(result.timed_out(), "the deadline fired");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "a TERM-handling child must end the 10s grace early (took {:?})",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a TERM-ignoring subprocess; escalates to SIGKILL after the grace"]
+async fn graceful_timeout_escalates_to_kill_after_the_grace() {
+    let start = Instant::now();
+    let result = Command::new("sh")
+        .args(["-c", "trap '' TERM; while :; do :; done"])
+        .timeout(Duration::from_millis(500))
+        .timeout_grace(Duration::from_millis(500))
+        .output_string()
+        .await
+        .expect("run completes");
+    assert!(result.timed_out());
+    assert!(
+        start.elapsed() >= Duration::from_millis(900),
+        "must wait the deadline + grace before SIGKILL (took {:?})",
+        start.elapsed()
+    );
+}
+
+#[cfg(feature = "process-control")]
+#[tokio::test]
+#[ignore = "spawns a real subprocess; verifies the configurable timeout signal"]
+async fn graceful_timeout_uses_the_configured_signal() {
+    use processkit::Signal;
+    // Traps INT (exits) and ignores TERM: only a *configured* SIGINT ends it
+    // early — a default-SIGTERM graceful timeout would wait the full 10s grace.
+    let start = Instant::now();
+    let result = Command::new("sh")
+        .args(["-c", "trap 'exit 0' INT; trap '' TERM; while :; do :; done"])
+        .timeout(Duration::from_millis(500))
+        .timeout_grace(Duration::from_secs(10))
+        .timeout_signal(Signal::Int)
+        .output_string()
+        .await
+        .expect("run completes");
+    assert!(result.timed_out());
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "the INT trap must end it early — the signal is configurable (took {:?})",
+        start.elapsed()
+    );
+}

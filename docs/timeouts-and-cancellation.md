@@ -62,6 +62,30 @@ Two distinct deadline families to keep apart:
 - The [readiness probes](streaming.md#readiness-probes)' `within` parameter —
   gives `Error::NotReady` and **never kills the child**.
 
+### Graceful timeout
+
+By default the deadline **hard-kills** at once. Add `timeout_grace(d)` to give the
+tree a chance to clean up: at the deadline it is sent `SIGTERM` (or the signal chosen
+with `timeout_signal`, which needs the `process-control` feature), allowed up to the
+grace window to exit, then `SIGKILL`ed — the same SIGTERM → wait → SIGKILL tier as
+[`ProcessGroup::shutdown`](process-groups.md). A signal-handling child that exits ends
+the grace early.
+
+```rust,no_run
+use processkit::Command;
+use std::time::Duration;
+
+let result = Command::new("slow-tool")
+    .timeout(Duration::from_secs(30))
+    .timeout_grace(Duration::from_secs(5)) // SIGTERM, wait up to 5s, then SIGKILL
+    .output_string()
+    .await?;
+```
+
+`timed_out()` is `true` regardless of whether the child exited on the signal or was
+`SIGKILL`ed after the grace — the deadline is what fired. **Windows** has no signal
+tier: `timeout_grace` is accepted but the deadline kills the job atomically.
+
 ## Retries
 
 `retry(max_attempts, backoff, classifier)` replays a failed run — up to

@@ -275,10 +275,11 @@ impl ProcessGroup {
 
     pub(crate) async fn graceful_shutdown(
         &self,
+        signal: i32,
         timeout: Duration,
         escalate: bool,
     ) -> io::Result<()> {
-        self.broadcast(libc::SIGTERM);
+        self.broadcast(signal);
         let deadline = Instant::now() + timeout;
         while self.any_alive() {
             if Instant::now() >= deadline {

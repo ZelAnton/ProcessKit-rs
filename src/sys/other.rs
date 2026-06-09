@@ -87,6 +87,7 @@ impl Job {
 
     pub(crate) async fn graceful_shutdown(
         &self,
+        _signal: i32,
         _timeout: Duration,
         _escalate: bool,
     ) -> io::Result<()> {

@@ -27,6 +27,15 @@ use crate::limits::ResourceLimits;
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
 
+/// The raw `SIGTERM` signal number — the default signal for the graceful
+/// teardown tier (`graceful_shutdown` and the run-level graceful timeout).
+/// Defined cross-platform; only *used* on unix (Windows' graceful tier ignores
+/// the signal and kills the job atomically).
+#[cfg(unix)]
+pub(crate) const SIGTERM_RAW: i32 = libc::SIGTERM;
+#[cfg(not(unix))]
+pub(crate) const SIGTERM_RAW: i32 = 15;
+
 /// Per-process resource metrics sampled from the OS.
 #[cfg(feature = "stats")]
 #[derive(Debug, Clone, Copy, Default)]
@@ -158,16 +167,17 @@ impl Job {
 
     /// Ask the tree to exit, then escalate.
     ///
-    /// On Unix: signal `SIGTERM`, wait up to `timeout` for the members to leave,
-    /// then `SIGKILL` survivors when `escalate` is set. On Windows the job kill is
-    /// atomic, so this is equivalent to [`kill_all`](Self::kill_all) and the
-    /// arguments are ignored.
+    /// On Unix: send `signal` (typically `SIGTERM`), wait up to `timeout` for the
+    /// members to leave, then `SIGKILL` survivors when `escalate` is set. On
+    /// Windows the job kill is atomic, so this is equivalent to
+    /// [`kill_all`](Self::kill_all) and the arguments are ignored.
     pub(crate) async fn graceful_shutdown(
         &self,
+        signal: i32,
         timeout: Duration,
         escalate: bool,
     ) -> io::Result<()> {
-        self.0.graceful_shutdown(timeout, escalate).await
+        self.0.graceful_shutdown(signal, timeout, escalate).await
     }
 
     /// Snapshot the group's resource usage.

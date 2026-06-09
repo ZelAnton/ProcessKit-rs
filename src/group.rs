@@ -373,10 +373,26 @@ impl ProcessGroup {
             "graceful shutdown: TERM, grace, then KILL"
         );
         self.job
-            .graceful_shutdown(self.options.shutdown_timeout, self.options.escalate_to_kill)
+            .graceful_shutdown(
+                crate::sys::SIGTERM_RAW,
+                self.options.shutdown_timeout,
+                self.options.escalate_to_kill,
+            )
             .await?;
         // `self` drops here; the job's Drop hard-kills any straggler (a no-op
         // after a successful graceful shutdown) and frees the OS handle/cgroup.
+        Ok(())
+    }
+
+    /// Gracefully tear the tree down **without consuming** the group — the
+    /// run-level graceful-timeout path holds an `Arc`/`Weak`, not an owned group.
+    /// Sends `signal`, waits up to `grace`, then `SIGKILL`s survivors. On Windows
+    /// the signal/grace are ignored (atomic job kill). Best-effort: the caller
+    /// reaps the child and the group's `Drop` backstops any straggler.
+    pub(crate) async fn graceful_terminate(&self, grace: Duration, signal: i32) -> Result<()> {
+        self.job
+            .graceful_shutdown(signal, grace, /* escalate */ true)
+            .await?;
         Ok(())
     }
 

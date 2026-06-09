@@ -89,17 +89,37 @@ impl RunningProcess {
         self.stdout_sink = Some(stdout_sink.clone());
 
         // Bound the stream by the command's timeout: kill the tree at the deadline
-        // so the pipes close and this stream ends. A `Weak` to the group means the
-        // timer never delays kill-on-close when the handle is dropped early. Armed
-        // once (a second `stdout_lines` call won't spawn a duplicate timer).
+        // so the pipes close and this stream ends. A `Weak` to the group means a
+        // hard-kill timer never delays kill-on-close when the handle is dropped
+        // early (the graceful branch below holds the upgraded `Arc` only until its
+        // next poll await, so a dropped handle delays the Drop by at most one poll
+        // interval). Armed once (a second `stdout_lines` call won't duplicate it).
         if self.deadline_task.is_none()
             && let (Some(limit), Some(group)) = (self.timeout, self.backend.own_group())
         {
             let group = Arc::downgrade(group);
             let pid = self.pid;
+            let grace = self.timeout_grace;
+            let signal = self.timeout_signal;
             self.deadline_task = Some(tokio::spawn(async move {
                 tokio::time::sleep(limit).await;
-                kill_via_weak(&group, pid);
+                match grace {
+                    // Graceful: signal the (still-owned) group, wait the grace,
+                    // then KILL. This detached watchdog doesn't hold the `Child`,
+                    // so it can't reap concurrently — a child that exits on the
+                    // signal closes its pipes (ending the stream promptly), but this
+                    // task still waits the full grace before its no-op SIGKILL. The
+                    // early-grace-exit reaping lives in the bulk `finish_streamed` /
+                    // `drive_to_exit` path (`teardown_on_timeout`), not here.
+                    Some(grace) => match group.upgrade() {
+                        Some(group) => {
+                            let _ = group.graceful_terminate(grace, signal).await;
+                        }
+                        // Group already gone (handle dropped) → tree torn down.
+                        None => kill_direct_child(pid),
+                    },
+                    None => kill_via_weak(&group, pid),
+                }
             }));
         }
 
@@ -190,6 +210,53 @@ fn kill_via_weak(group: &Weak<ProcessGroup>, pid: Option<u32>) {
         let _ = group.terminate_all();
     }
     kill_direct_child(pid);
+}
+
+/// Gracefully terminate a single child by pid — the **shared-group** timeout
+/// case (no owned group to tear down). Send `signal`, poll liveness up to
+/// `grace`, then `SIGKILL`. The caller reaps the child concurrently, so a child
+/// that exits on the signal is collected and the poll ends early instead of
+/// seeing an unreaped zombie as still-alive. Windows has no signal tier — hard
+/// kill.
+///
+/// Like any bare-pid signal (cf. `kill_direct_child`), this relies on the
+/// concurrent reap winning the race: a pid recycled between the reap and the
+/// next poll could in principle receive the final `SIGKILL`. The window is
+/// narrow and the alternative (no force-kill) is worse; kernel-handle
+/// mechanisms (Job/cgroup) take the own-group path instead.
+pub(crate) async fn graceful_kill_pid(pid: Option<u32>, grace: std::time::Duration, signal: i32) {
+    #[cfg(unix)]
+    {
+        let Some(pid) = pid else { return };
+        let pid = pid as i32;
+        // SAFETY: sending a signal to a pid is safe; ESRCH (gone) is ignored.
+        unsafe {
+            libc::kill(pid, signal);
+        }
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            // SAFETY: signal 0 only probes existence/permission. Non-zero => gone.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
+            }
+            let poll = std::time::Duration::from_millis(20);
+            tokio::time::sleep(poll.min(deadline - now)).await;
+        }
+        // SAFETY: as above; force the survivor down (a no-op if already gone).
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No signal tier off unix: hard kill (Windows TerminateProcess).
+        let _ = (grace, signal);
+        kill_direct_child(pid);
+    }
 }
 
 /// Best-effort kill of the direct child by pid, used by the streaming

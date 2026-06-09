@@ -12,10 +12,42 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+
+- `Command::ok_codes([..])` — treat the given exit codes (not just `0`) as success for
+  the checking verbs (`run`/`run_unit` and `ProcessResult::is_success`/`ensure_success`),
+  for tools whose non-zero exit is a normal result — `grep` (1 = no match), `diff`
+  (1 = differs), rsync's code families. `exit_code` (raw code) and `probe` (0/1
+  convention) are unchanged; an empty set is ignored.
+- `ProcessResult::duration()` — the run's wall-clock time (spawn → exit/kill), carried
+  on the result instead of making callers wrap each run in their own `Instant::now()`.
+  `Duration::ZERO` for synthetic results (scripted/replayed bulk `output`).
+- `ProcessResult::truncated()` — whether a bounded `OutputBufferPolicy` dropped captured
+  output lines, so a caller that bounds the buffer can tell when output was lost
+  (the unbounded default never truncates).
+- `Command::command_line()` — render the command as a single shell-quoted line for
+  logs, error messages, or a dry-run echo (per-platform quoting; **display only** —
+  the crate never invokes a shell). It includes argv (which may carry secrets), so —
+  unlike the `tracing` feature, which never logs argv — it is opt-in.
+- A `current_dir` that does not exist now fails with a clear *"working directory does
+  not exist"* error (`Error::is_not_found()` is `true`) instead of the opaque `ENOENT`
+  that looked like the program itself was missing.
+- `Command::timeout_grace(Duration)` + `Command::timeout_signal(Signal)` — a **graceful
+  run-level timeout**: at the deadline the tree is signalled (`SIGTERM` by default, or
+  the chosen signal), given up to the grace window to exit, then `SIGKILL`ed — instead
+  of the immediate hard kill. Reuses the `ProcessGroup::shutdown` tier and reaps
+  concurrently, so a signal-handling child ends the grace early. Applies to bulk and
+  streaming runs, own- and shared-group; `timed_out()` stays `true`. Windows has no
+  signal tier (atomic kill at the deadline). `timeout_signal` needs `process-control`.
 
 ### Changed
--
+
+- **Breaking:** `RestartPolicy`, `OverflowMode`, `OutputBufferPolicy`, `ResourceLimits`,
+  and `ProcessGroupOptions` are now `#[non_exhaustive]` — they may gain variants/fields
+  later without another breaking change. Build the structs via their
+  constructors/builders (`ProcessGroupOptions::default()`, `OutputBufferPolicy::bounded(..)`,
+  …) instead of struct literals.
+- `ProcessGroupOptions::shutdown_timeout(Duration)` / `escalate_to_kill(bool)` builders —
+  the grace-window fields now have builders, matching the `limits` knobs.
 
 ### Fixed
 -
@@ -36,34 +68,9 @@ to a dated version section.
   leaves the child holding the parent's (often root's) supplementary groups. The OS
   applies `setgroups → setgid → setuid`. POSIX-only — non-Unix fails with
   `Error::Unsupported`, never a silent skip.
-- `Command::ok_codes([..])` — treat the given exit codes (not just `0`) as success for
-  the checking verbs (`run`/`run_unit` and `ProcessResult::is_success`/`ensure_success`),
-  for tools whose non-zero exit is a normal result — `grep` (1 = no match), `diff`
-  (1 = differs), rsync's code families. `exit_code` (raw code) and `probe` (0/1
-  convention) are unchanged; an empty set is ignored.
-- `ProcessResult::duration()` — the run's wall-clock time (spawn → exit/kill), carried
-  on the result instead of making callers wrap each run in their own `Instant::now()`.
-  `Duration::ZERO` for synthetic results (scripted/replayed bulk `output`).
-- `ProcessResult::truncated()` — whether a bounded `OutputBufferPolicy` dropped captured
-  output lines, so a caller that bounds the buffer can tell when output was lost
-  (the unbounded default never truncates).
-- `Command::command_line()` — render the command as a single shell-quoted line for
-  logs, error messages, or a dry-run echo (per-platform quoting; **display only** —
-  the crate never invokes a shell). It includes argv (which may carry secrets), so —
-  unlike the `tracing` feature, which never logs argv — it is opt-in.
-- A `current_dir` that does not exist now fails with a clear *"working directory does
-  not exist"* error (`Error::is_not_found()` is `true`) instead of the opaque `ENOENT`
-  that looked like the program itself was missing.
 
 ### Changed
-
-- **Breaking:** `RestartPolicy`, `OverflowMode`, `OutputBufferPolicy`, `ResourceLimits`,
-  and `ProcessGroupOptions` are now `#[non_exhaustive]` — they may gain variants/fields
-  later without another breaking change. Build the structs via their
-  constructors/builders (`ProcessGroupOptions::default()`, `OutputBufferPolicy::bounded(..)`,
-  …) instead of struct literals.
-- `ProcessGroupOptions::shutdown_timeout(Duration)` / `escalate_to_kill(bool)` builders —
-  the grace-window fields now have builders, matching the `limits` knobs.
+-
 
 ### Fixed
 -

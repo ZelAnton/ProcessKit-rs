@@ -341,6 +341,8 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         stdin: stdin_pipe,
         stdin_task,
         timeout: command.configured_timeout(),
+        timeout_grace: command.configured_timeout_grace(),
+        timeout_signal: command.timeout_signal_raw(),
         pid,
         stdout_encoding: command.out_encoding(),
         stderr_encoding: command.err_encoding(),
