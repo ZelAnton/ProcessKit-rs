@@ -236,10 +236,20 @@ impl<T> ProcessResult<T> {
 }
 
 impl ProcessResult<String> {
-    /// Standard output followed by standard error, concatenated — handy when a
-    /// tool interleaves diagnostics across both streams.
+    /// Standard output followed by standard error, joined — handy when a tool
+    /// interleaves diagnostics across both streams.
+    ///
+    /// A `\n` separator is inserted between the streams when stdout is
+    /// non-empty and does not already end with a newline, preventing the last
+    /// stdout line from being glued to the first stderr line.
     pub fn combined(&self) -> String {
-        format!("{}{}", self.stdout(), self.stderr())
+        let out = self.stdout();
+        let err = self.stderr();
+        if !out.is_empty() && !err.is_empty() && !out.ends_with('\n') {
+            format!("{out}\n{err}")
+        } else {
+            format!("{out}{err}")
+        }
     }
 
     /// The best human-facing message from a captured run, trimmed of surrounding
@@ -517,7 +527,43 @@ mod tests {
             Outcome::Exited(0),
             None,
         );
-        assert_eq!(r.combined(), "outerr");
+        // L16: when stdout doesn't end with \n, a newline separator is inserted
+        // so the last stdout line is not glued to the first stderr line.
+        assert_eq!(r.combined(), "out\nerr");
+    }
+
+    #[test]
+    fn combined_no_extra_newline_when_stdout_already_ends_with_newline() {
+        // When stdout ends with \n, no extra newline is added.
+        let r = ProcessResult::new(
+            "p".into(),
+            "out\n".to_owned(),
+            "err".to_owned(),
+            Outcome::Exited(0),
+            None,
+        );
+        assert_eq!(r.combined(), "out\nerr");
+    }
+
+    #[test]
+    fn combined_no_separator_when_one_stream_is_empty() {
+        let stdout_only = ProcessResult::new(
+            "p".into(),
+            "out".to_owned(),
+            String::new(),
+            Outcome::Exited(0),
+            None,
+        );
+        assert_eq!(stdout_only.combined(), "out");
+
+        let stderr_only = ProcessResult::new(
+            "p".into(),
+            String::new(),
+            "err".to_owned(),
+            Outcome::Exited(0),
+            None,
+        );
+        assert_eq!(stderr_only.combined(), "err");
     }
 
     #[test]

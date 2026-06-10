@@ -74,6 +74,19 @@ to a dated version section.
 
 ### Fixed
 
+- `ProcessResult::combined()` now inserts a `\n` separator between stdout and stderr when
+  stdout is non-empty and does not already end with a newline, preventing the last stdout
+  line from being glued to the first stderr line.
+- Pipeline `pipefail` attribution now honors per-stage `ok_codes`: an inner stage that
+  exits with a code in its `ok_codes` set is considered clean and does not trigger
+  attribution, instead of checking only for `Exited(0)`.
+- Pipeline `pipefail` now attributes to the first **non-SIGPIPE** checked failure rather
+  than the first checked failure of any kind. A SIGPIPE-killed upstream stage is typically
+  a victim of a downstream failure; the downstream culprit is now correctly attributed.
+  When all failures are SIGPIPE, the leftmost is still attributed as before.
+- Pipeline `pipefail` now preserves the real exit code of an `unchecked()` last stage
+  instead of fabricating `Exited(0)`. `is_success()` remains `true` and `ensure_success()`
+  still passes; `code()` now returns the actual exit code for callers that inspect it.
 - `Error::NotFound` `Display` no longer includes the raw `PATH` environment value
   (e.g. `searched: /usr/bin:/usr/local/bin`). The `searched` field remains accessible for
   programmatic use. `PATH` is an environment value and must not appear in logs.

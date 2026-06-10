@@ -84,6 +84,8 @@ struct StageOutcome {
     stderr: String,
     /// The stage opted out of pipefail attribution ([`Command::unchecked`]).
     unchecked: bool,
+    /// Exit codes the stage treats as success ([`Command::ok_codes`]).
+    ok_codes: Vec<i32>,
 }
 
 impl Pipeline {
@@ -140,8 +142,9 @@ impl Pipeline {
         // block on a full pipe while we wait on its neighbours.
         let (last, last_unchecked) = running.pop().expect("a pipeline has at least two stages");
         let mut inner_tasks = Vec::with_capacity(running.len());
-        for (process, unchecked) in running {
+        for ((process, unchecked), stage) in running.into_iter().zip(self.stages.iter()) {
             let program = process.program_name().to_owned();
+            let ok_codes = stage.ok_codes_vec();
             inner_tasks.push(tokio::spawn(async move {
                 let StreamedFinish { outcome, stderr } = process.finish_streamed().await?;
                 Ok::<_, crate::Error>(StageOutcome {
@@ -149,6 +152,7 @@ impl Pipeline {
                     outcome,
                     stderr,
                     unchecked,
+                    ok_codes,
                 })
             }));
         }
@@ -233,41 +237,69 @@ impl Pipeline {
 /// only failures are unchecked, the chain reports success. An unchecked
 /// *last* stage's unclean exit is likewise forgiven — but a timeout never is
 /// (a deadline violation is not an exit status).
+/// Whether an outcome is SIGPIPE (Unix signal 13) — the usual symptom of an
+/// upstream stage whose downstream consumer exited, not the actual culprit.
+fn is_sigpipe(outcome: &Outcome) -> bool {
+    #[cfg(unix)]
+    return matches!(outcome, Outcome::Signalled(Some(13)));
+    #[cfg(not(unix))]
+    let _ = outcome;
+    #[cfg(not(unix))]
+    false
+}
+
 fn pipefail(
     outcomes: Vec<StageOutcome>,
     last: ProcessResult<String>,
     last_unchecked: bool,
     pipeline_timeout: Option<Duration>,
 ) -> ProcessResult<String> {
-    // "Unclean" is any outcome that is not `Exited(0)`: non-zero exit, signal
-    // kill (SIGPIPE included), or per-stage-timeout kill — no platform-specific
-    // cases needed.
-    if let Some(stage) = outcomes
-        .into_iter()
-        .find(|stage| !matches!(stage.outcome, Outcome::Exited(0)) && !stage.unchecked)
+    // "Unclean" is any outcome whose exit code is not in the stage's ok_codes,
+    // plus any signal-kill or timeout (B11: honor per-stage ok_codes).
+    let is_clean = |stage: &StageOutcome| match stage.outcome {
+        Outcome::Exited(code) => stage.ok_codes.contains(&code),
+        _ => false, // signal kill or timeout → unclean regardless
+    };
+
+    // Collect all checked failures. Prefer non-SIGPIPE over SIGPIPE (L19):
+    // a SIGPIPE-killed stage is typically the upstream victim whose downstream
+    // consumer exited with a real error — attribute to the non-SIGPIPE culprit.
+    let checked_failures: Vec<_> = outcomes
+        .iter()
+        .filter(|s| !s.unchecked && !is_clean(s))
+        .collect();
+
+    if let Some(stage) = checked_failures
+        .iter()
+        .find(|s| !is_sigpipe(&s.outcome)) // first non-SIGPIPE culprit (skip SIGPIPE victims)
+        .or_else(|| checked_failures.first()) // fallback: first (leftmost) failure
+        .copied()
     {
-        // A checked inner stage failed first — its diagnostics win; the last
+        // A checked inner stage failed — its diagnostics win; the last
         // stage's stdout is still what the chain produced.
         return ProcessResult::new(
-            stage.program,
+            stage.program.clone(),
             last.into_stdout(),
-            stage.stderr,
+            stage.stderr.clone(),
             stage.outcome,
             pipeline_timeout,
         );
     }
     if last_unchecked && matches!(last.outcome(), Outcome::Exited(c) if c != 0) {
-        // The last stage failed but opted out: report the chain as a success
-        // carrying its output and (for the curious) its stderr.
+        // L15: the last stage failed but opted out — report the chain as a
+        // success, preserving the real exit code (not fabricating 0).
         let program = last.program().to_owned();
         let stderr = last.stderr().to_owned();
+        let outcome = last.outcome();
+        let code = last.code().unwrap_or(0);
         return ProcessResult::new(
             program,
             last.into_stdout(),
             stderr,
-            Outcome::Exited(0),
+            outcome,
             pipeline_timeout,
-        );
+        )
+        .with_ok_codes(vec![code]);
     }
     // No checked inner failure: the last stage speaks for the chain, succeeding
     // or not. A pipeline's success is pure pipefail (every stage exits 0), so a
@@ -328,6 +360,7 @@ mod tests {
             outcome: Outcome::Exited(0),
             stderr: String::new(),
             unchecked: false,
+            ok_codes: vec![0],
         }
     }
 
@@ -337,6 +370,7 @@ mod tests {
             outcome,
             stderr: stderr.into(),
             unchecked: false,
+            ok_codes: vec![0],
         }
     }
 
@@ -505,10 +539,68 @@ mod tests {
             None,
         );
         assert!(result.is_success(), "got {result:?}");
-        assert_eq!(result.code(), Some(0));
+        // L15: preserve the real exit code, don't fabricate 0.
+        assert_eq!(result.code(), Some(141), "real exit code preserved");
         assert_eq!(result.stdout(), "partial", "output is preserved");
         assert_eq!(result.stderr(), "last-err", "stderr kept for the curious");
         assert!(result.ensure_success().is_ok());
+    }
+
+    #[test]
+    fn inner_stage_ok_codes_are_honoured_in_pipefail_cleanliness() {
+        // B11: an inner stage with ok_codes([0,1]) that exits 1 must not
+        // trigger pipefail attribution — exit 1 is clean per its ok_codes.
+        let with_ok = StageOutcome {
+            program: "grep".into(),
+            outcome: Outcome::Exited(1),
+            stderr: String::new(),
+            unchecked: false,
+            ok_codes: vec![0, 1],
+        };
+        let result = pipefail(
+            vec![with_ok],
+            last_stage(Outcome::Exited(0), "out"),
+            false,
+            None,
+        );
+        assert!(
+            result.is_success(),
+            "exit 1 in ok_codes should be clean: {result:?}"
+        );
+        assert_eq!(result.program(), "last", "clean inner → last stage speaks");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigpipe_victim_not_blamed_when_downstream_non_sigpipe_failure_exists() {
+        // L19: the SIGPIPE-killed upstream stage is the victim, not the culprit;
+        // the downstream non-SIGPIPE failure should be attributed instead.
+        let sigpipe_victim = StageOutcome {
+            program: "producer".into(),
+            outcome: Outcome::Signalled(Some(13)),
+            stderr: "pipe broken".into(),
+            unchecked: false,
+            ok_codes: vec![0],
+        };
+        let real_failure = StageOutcome {
+            program: "consumer".into(),
+            outcome: Outcome::Exited(2),
+            stderr: "consumer broke".into(),
+            unchecked: false,
+            ok_codes: vec![0],
+        };
+        let result = pipefail(
+            vec![sigpipe_victim, real_failure],
+            last_stage(Outcome::Exited(0), "out"),
+            false,
+            None,
+        );
+        assert_eq!(
+            result.program(),
+            "consumer",
+            "downstream non-SIGPIPE culprit, not upstream SIGPIPE victim"
+        );
+        assert_eq!(result.code(), Some(2));
     }
 
     #[test]
