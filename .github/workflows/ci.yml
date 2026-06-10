@@ -156,3 +156,24 @@ jobs:
       # `check` doesn't link, so no foreign linkers are needed.
       - run: cargo check --target x86_64-pc-windows-msvc --all-targets --all-features
       - run: cargo check --target aarch64-apple-darwin --all-targets --all-features
+
+  public-api:
+    name: public-api diff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-public-api
+        run: cargo install cargo-public-api --locked
+      # Review aid, not a gate: show which public items changed vs the committed
+      # baseline so "did this PR move the surface?" becomes a reviewable diff.
+      # Pre-1.0 freedom means the surface CAN change freely; this makes it
+      # explicit and auditable while we still break. The step never fails CI —
+      # it only annotates the run with what moved.
+      - name: Diff public API vs baseline
+        continue-on-error: true
+        run: |
+          cargo public-api --simplified --all-features > /tmp/current-api.txt
+          echo "=== Changes to the public API surface vs public-api.txt ==="
+          diff public-api.txt /tmp/current-api.txt && echo "(no changes)"

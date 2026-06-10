@@ -33,7 +33,7 @@ items below. The sweep deliberately stops at six rather than padding to ten — 
 remaining backlog stays consumer-gated in `ideas/`, which is the honest "nothing more
 worth committing yet" state.
 
-### 1. Close the highest-risk test gaps + 0.9.1 graceful-timeout coverage
+### 1. Close the highest-risk test gaps + 0.9.1 graceful-timeout coverage ✅ SHIPPED (2026-06-10)
 *Dimension: testing · Cost: moderate*
 
 The 0.9.1 graceful timeout (`timeout_grace`/`timeout_signal`) shipped with the **bulk**
@@ -57,18 +57,20 @@ pre-existing item-10 gaps:
   The multibyte-split-across-chunks case is largely reassembled by `BufReader` already —
   prove it with the property test in [`ideas/later-advanced-testing.md`](ideas/later-advanced-testing.md), not a hand-rolled unit case.
 
-### 2. Output-handling design pass — Stdio modes, tee, ordered event stream
+**Shipped:** streaming graceful-teardown test (unix `#[ignore]`); shared-group graceful-timeout
+test; Windows graceful-degrade test (`#[cfg(windows)]` `#[ignore]`); `ok_codes` e2e through
+`output_bytes`; cancel-race (spawn→first-poll window) with hermetic `ScriptedRunner`; pump
+no-trailing-newline unit test. Verified fmt/clippy/doc/test/cross-compile.
+
+### 2. Output-handling design pass — Stdio modes, tee, ordered event stream ✅ SHIPPED (2026-06-10)
 *Dimension: user-scenario · Cost: major (one deliberate design)*
 
-Promote [`ideas/next-output-handling.md`](ideas/next-output-handling.md): its own trigger
-("first thing after the roadmap drains") has fired. Decide the per-stream `StdioMode`
-model first (inherit / null / piped — relaxing the always-piped assumption), then layer
-output **tee** (capture *and* inherit) and an ordered **event stream** (which subsumes
-merged stdout+stderr ordering). Do it as one design, not four bolt-ons. **Fold in here**
-(same pump/capture core): an `OverflowMode::Error` "fail-loud ceiling" variant for
-untrusted children whose unbounded output is itself a DoS — confirmed missing today
-(`src/buffer.rs` has only `DropOldest`/`DropNewest`), and now non-breaking to add
-(`OverflowMode` is `#[non_exhaustive]`).
+**Shipped:** `StdioMode { Piped, Inherit, Null }` + `Command::stdout(mode)` /
+`Command::stderr(mode)` builders; `Command::stdout_tee<W>()` / `stderr_tee<W>()` tee
+to any `Write + Send`; `OutputEvent { Stdout(String), Stderr(String) }` + `OutputEvents`
+merged stream + `RunningProcess::output_events()` / `finish_events()`; `OverflowMode::Error`
++ `OutputBufferPolicy::fail_loud(n)` + `Error::OutputTooLarge { program, limit, total_lines }`.
+Verified fmt/clippy/doc/test/cross-compile.
 
 ### 3. Program resolution & error-quality completion — `which`/PATH + cwd-relative clarity ✅ SHIPPED (2026-06-10)
 *Dimension: user-scenario / ergonomics · Cost: moderate*
@@ -87,7 +89,7 @@ pre-spawn PATH search in `launch()` for bare program names; `Command::envs([…]
 `current_dir` doc with the relative-program warning. Cross-platform (Unix execute-bit check +
 Windows PATHEXT expansion). Verified fmt/clippy/doc/test/cross-compile.
 
-### 4. CI quality hardening — the pre-1.0 wins
+### 4. CI quality hardening — the pre-1.0 wins ✅ SHIPPED (2026-06-10)
 *Dimension: stabilization / conventions · Cost: trivial each*
 
 The "now" subset of [`ideas/next-ci-and-quality-hardening.md`](ideas/next-ci-and-quality-hardening.md),
@@ -101,7 +103,12 @@ plus one new tool:
   public surface?" into a reviewable diff *while we still break freely*. The pre-1.0
   complement to `cargo-semver-checks` (which stays deferred to ~1.0, post-freeze).
 
-### 5. Executable doctests through the hermetic seam
+**Shipped:** `hack` job (`--feature-powerset --depth 2`); `public-api` CI diff job +
+`public-api.txt` baseline snapshot. (`-Z minimal-versions` and `llvm-cov` deferred — both
+require nightly/extra toolchain install in CI and no concrete coverage goal yet.)
+Verified fmt/clippy/doc/test.
+
+### 5. Executable doctests through the hermetic seam ✅ SHIPPED (2026-06-10)
 *Dimension: docs / testing · Cost: trivial–moderate*
 
 All 13 fenced examples in `src/` are `no_run` — they catch signature breaks but never run.
@@ -110,7 +117,12 @@ most-read examples (e.g. `output_string`/`probe`/pipefail attribution) to **exec
 through `ScriptedRunner`, so they run in `cargo test` on every OS with no subprocess.
 The crate's own `docs/testing.md` sells that seam — the API docs should eat the dog food.
 
-### 6. Resolve the README ↔ crate-doc duplication
+**Shipped:** `src/doubles.rs` extended with `Reply::ok()`, `Reply::lines()`, and
+`MockRunner::on(prefix, reply)` for fine-grained per-call routing; `no_run` removed from
+the four most-read `src/lib.rs` / `src/running/stream.rs` examples — they now execute
+hermetically via `ScriptedRunner`. Verified all doctests pass on all platforms.
+
+### 6. Resolve the README ↔ crate-doc duplication ✅ SHIPPED (2026-06-10)
 *Dimension: docs / stabilization · Cost: trivial (decide) / moderate (if adopting)*
 
 `lib.rs`'s `//!` crate doc substantially duplicates the README intro, verb table, and
@@ -120,6 +132,10 @@ make a naive include lossy from docs.rs. So this is a **decision**, not a slam-d
 restructure the README links to be include-safe and adopt it, or trim the crate doc to a
 concise intro that *defers* to the README/guides instead of duplicating them — and record
 the choice. Right now it's drift-by-default with no rationale on file.
+
+**Shipped:** Option B chosen — `src/lib.rs` crate-doc trimmed to a concise intro pointing at
+the README and docs guides; duplicated verb table / feature list removed. Decision rationale
+recorded in `decisions/readme-crate-doc-sourcing.md`. Verified fmt/clippy/doc/test.
 
 ---
 

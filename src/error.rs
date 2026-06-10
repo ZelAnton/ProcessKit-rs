@@ -82,6 +82,24 @@ pub enum Error {
         timeout: Duration,
     },
 
+    /// The captured output exceeded the
+    /// [`OutputBufferPolicy::fail_loud`](crate::OutputBufferPolicy::fail_loud)
+    /// ceiling — the child produced more lines than allowed. The run itself
+    /// may have succeeded; this error is raised by the consuming path after
+    /// the run completes.
+    ///
+    /// The pipe is still fully drained (the child never blocks); excess lines
+    /// are counted (in the total) but not retained.
+    #[error("`{program}` output exceeded {limit}-line limit ({total_lines} lines total)")]
+    OutputTooLarge {
+        /// The program whose output exceeded the limit.
+        program: String,
+        /// The configured cap (`OutputBufferPolicy::max_lines`).
+        limit: usize,
+        /// Total lines that arrived (retained + dropped).
+        total_lines: usize,
+    },
+
     /// A readiness probe ([`RunningProcess::wait_for_line`],
     /// [`wait_for_port`](crate::RunningProcess::wait_for_port),
     /// [`wait_for`](crate::RunningProcess::wait_for)) did not pass within its

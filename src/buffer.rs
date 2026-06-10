@@ -1,5 +1,29 @@
 //! Policy for capping the in-memory backlog of captured output lines.
 
+/// How a child process's standard output or error stream is connected.
+///
+/// Set per-stream on [`Command`](crate::Command) via
+/// [`Command::stdout`](crate::Command::stdout) /
+/// [`Command::stderr`](crate::Command::stderr). The default is
+/// [`Piped`](StdioMode::Piped), matching the crate's pre-1.0 behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum StdioMode {
+    /// Capture the stream into a pipe (the default). Enables line buffering,
+    /// per-line handlers, and all output-retrieval verbs. Required for
+    /// [`stdout_lines`](crate::RunningProcess::stdout_lines),
+    /// [`output_events`](crate::RunningProcess::output_events), and
+    /// `output_string` / `output_bytes` to see any output.
+    #[default]
+    Piped,
+    /// Let the child share the parent's stream: output appears in the
+    /// parent's terminal or log. Cannot be captured.
+    Inherit,
+    /// Redirect the stream to `/dev/null` (or the OS equivalent), suppressing
+    /// output entirely without tying up a pipe.
+    Null,
+}
+
 /// What to drop when a bounded output buffer is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -9,6 +33,19 @@ pub enum OverflowMode {
     DropOldest,
     /// "Head" semantics: keep what is already buffered and discard new lines.
     DropNewest,
+    /// Fail-loud ceiling: once the buffer is full, the run errors with
+    /// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge) rather than
+    /// silently dropping lines. The pipe is still drained (so the child never
+    /// blocks); excess lines are counted but not retained.
+    ///
+    /// The error fires on **every consuming verb**, including `wait` and
+    /// `profile` (which discard output) — if you set this limit, the run
+    /// always errors when it is exceeded, regardless of whether you read the
+    /// captured lines.
+    ///
+    /// Use this when unbounded output is itself a misbehavior — an untrusted
+    /// tool flooding its stdout is a denial-of-service, not a policy choice.
+    Error,
 }
 
 /// Caps how many captured/streamed output lines are retained in memory.
@@ -48,6 +85,18 @@ impl OutputBufferPolicy {
         Self {
             max_lines: Some(max_lines),
             overflow: OverflowMode::DropOldest,
+        }
+    }
+
+    /// Retain at most `max_lines` and error when full — a fail-loud ceiling.
+    ///
+    /// Equivalent to `bounded(max_lines).with_overflow(OverflowMode::Error)`.
+    /// The run errors with [`Error::OutputTooLarge`](crate::Error::OutputTooLarge)
+    /// once this limit is reached; excess lines are counted but not retained.
+    pub fn fail_loud(max_lines: usize) -> Self {
+        Self {
+            max_lines: Some(max_lines),
+            overflow: OverflowMode::Error,
         }
     }
 

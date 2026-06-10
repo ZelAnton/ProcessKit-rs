@@ -8,7 +8,7 @@
 mod probes;
 mod stream;
 
-pub use stream::StdoutLines;
+pub use stream::{OutputEvent, OutputEvents, StdoutLines};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -111,8 +111,12 @@ pub struct RunningProcess {
     ok_codes: Vec<i32>,
     stdout_sink: Option<Arc<SharedLines>>,
     stderr_sink: Option<Arc<SharedLines>>,
-    // The background stderr-drain task started by `stdout_lines`, awaited by
-    // `finish_streamed` so no trailing stderr line is missed.
+    // The background stdout-pump task started by `output_events`, joined by
+    // `finish_events` before the overflow check (ensures the pump has written
+    // its last lines before `overflowed()` is queried).
+    stdout_pump: Option<JoinHandle<()>>,
+    // The background stderr-drain task started by `stdout_lines`/`output_events`,
+    // awaited by `finish_streamed`/`finish_events` so no trailing line is missed.
     stderr_pump: Option<JoinHandle<()>>,
     // A timer started by `stdout_lines` when a timeout is set: kills the tree at
     // the deadline so a streamed run can't hang forever. Aborted on drop.
@@ -289,6 +293,7 @@ impl RunningProcess {
             ok_codes: s.ok_codes,
             stdout_sink: None,
             stderr_sink: None,
+            stdout_pump: None,
             stderr_pump: None,
             deadline_task: None,
             #[cfg(feature = "cancellation")]
@@ -320,6 +325,7 @@ impl RunningProcess {
             ok_codes: command.ok_codes_vec(),
             stdout_sink: None,
             stderr_sink: None,
+            stdout_pump: None,
             stderr_pump: None,
             deadline_task: None,
             #[cfg(feature = "cancellation")]
@@ -534,6 +540,15 @@ impl RunningProcess {
         join_pumps(err_pump.into_iter().collect()).await;
         let (code, timed_out) = self.checked_outcome((code, timed_out))?;
 
+        // Fail-loud ceiling check for the line-pumped stderr.
+        if stderr_sink.overflowed() {
+            return Err(crate::Error::OutputTooLarge {
+                program: self.program.clone(),
+                limit: self.buffer.max_lines.unwrap_or(0),
+                total_lines: stderr_sink.count(),
+            });
+        }
+
         // stdout is raw bytes (not line-buffered), so only the line-pumped stderr
         // can be truncated by the buffer policy here.
         let stderr_lines = stderr_sink.drain();
@@ -698,6 +713,17 @@ impl RunningProcess {
         self.observe_stdin_task().await;
         join_pumps(pumps).await;
         let (code, timed_out) = self.checked_outcome(outcome)?;
+
+        // Fail-loud ceiling: OverflowMode::Error hit during pumping.
+        for sink in [&stdout_sink, &stderr_sink] {
+            if sink.overflowed() {
+                return Err(crate::Error::OutputTooLarge {
+                    program: self.program.clone(),
+                    limit: self.buffer.max_lines.unwrap_or(0),
+                    total_lines: sink.count(),
+                });
+            }
+        }
 
         let (stdout_lines, stderr_lines) = match capture {
             CaptureMode::Lines => (stdout_sink.drain(), stderr_sink.drain()),
@@ -1053,6 +1079,17 @@ impl Drop for RunningProcess {
         // Likewise the streaming cancellation listener.
         #[cfg(feature = "cancellation")]
         if let Some(task) = self.cancel_task.take() {
+            task.abort();
+        }
+        // Abort streaming output pumps. For a private-group handle the tree kill
+        // (above) closes the pipes promptly, so these tasks are already near EOF;
+        // abort is a cheap backstop. For a shared-group handle the group is NOT
+        // torn down on drop, so a surviving grandchild holding the pipe could keep
+        // a pump alive indefinitely without this abort.
+        if let Some(task) = self.stdout_pump.take() {
+            task.abort();
+        }
+        if let Some(task) = self.stderr_pump.take() {
             task.abort();
         }
     }

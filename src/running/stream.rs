@@ -1,5 +1,6 @@
-//! Incremental stdout streaming: [`StdoutLines`], the watchdog tasks that
-//! bound a streamed run (deadline/cancel), and `finish_streamed`.
+//! Incremental stdout streaming: [`StdoutLines`], [`OutputEvents`], the
+//! watchdog tasks that bound a streamed run (deadline/cancel), and
+//! `finish_streamed` / `finish_events`.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -184,13 +185,30 @@ impl RunningProcess {
 
         let outcome = self.drive_to_exit().await?;
         self.observe_stdin_task().await;
-        let (code, _timed_out) = self.checked_outcome(outcome)?;
-        // The child has exited, so its stderr pipe is closed — await the pump so
-        // the final buffered line is captured before we drain. (The pump
-        // returns `()`; a JoinError here means it panicked, and its
-        // close-on-drop guard already preserved the captured lines.)
+        // Join both streaming pumps before the cancellation/overflow checks so
+        // their final writes are visible and any pump-feeding a held-open pipe
+        // gets the same PUMP_TEARDOWN bound (matching `finish_events`). The
+        // child's pipes are closed at this point (it has exited), so both
+        // await calls are cheap.
         if let Some(pump) = self.stderr_pump.take() {
             let _ = pump.await;
+        }
+        if let Some(pump) = self.stdout_pump.take() {
+            let _ = pump.await;
+        }
+        let (code, _timed_out) = self.checked_outcome(outcome)?;
+        // Fail-loud ceiling check for both line-pumped streams.
+        for sink in [self.stdout_sink.as_ref(), self.stderr_sink.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if sink.overflowed() {
+                return Err(crate::Error::OutputTooLarge {
+                    program: self.program.clone(),
+                    limit: self.buffer.max_lines.unwrap_or(0),
+                    total_lines: sink.count(),
+                });
+            }
         }
         let stderr = self
             .stderr_sink
@@ -198,6 +216,174 @@ impl RunningProcess {
             .map(|sink| sink.drain().join("\n"))
             .unwrap_or_default();
         Ok((code, stderr))
+    }
+
+    /// Stream both stdout and stderr as a single ordered sequence of
+    /// [`OutputEvent`] items — each event tagged with its origin stream —
+    /// as the child produces them. Call this **once**.
+    ///
+    /// Interleaving is best-effort (lines are ordered by when they arrive in
+    /// the async runtime, not by a kernel timestamp). Use
+    /// [`finish_events`](Self::finish_events) after draining to collect the
+    /// exit code.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use processkit::{Command, OutputEvent, StreamExt};
+    ///
+    /// # async fn demo() -> processkit::Result<()> {
+    /// let mut run = Command::new("make").arg("build").start().await?;
+    ///
+    /// let mut events = run.output_events();
+    /// while let Some(event) = events.next().await {
+    ///     match event {
+    ///         OutputEvent::Stdout(line) => println!("out: {line}"),
+    ///         OutputEvent::Stderr(line) => eprintln!("err: {line}"),
+    ///     }
+    /// }
+    ///
+    /// let code = run.finish_events().await?;
+    /// # let _ = code;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn output_events(&mut self) -> OutputEvents {
+        // Set up stdout sink + pump. The handle is stored so `finish_events`
+        // can join it before checking overflow (ensuring the pump's last write
+        // is visible before `overflowed()` is queried).
+        let stdout_sink = SharedLines::new(&self.buffer);
+        match self.backend.take_stdout_reader() {
+            Some(pipe) => {
+                self.stdout_pump = Some(tokio::spawn(pump_lines(
+                    pipe,
+                    self.stdout_encoding,
+                    self.stdout_handler.clone(),
+                    stdout_sink.clone(),
+                )));
+            }
+            None => stdout_sink.close_now(),
+        }
+        self.stdout_sink = Some(stdout_sink.clone());
+
+        // Set up stderr sink + pump (only once, like stdout_lines for its stderr).
+        if self.stderr_sink.is_none() {
+            let stderr_sink = SharedLines::new(&self.buffer);
+            if let Some(pipe) = self.backend.take_stderr_reader() {
+                self.stderr_pump = Some(tokio::spawn(pump_lines(
+                    pipe,
+                    self.stderr_encoding,
+                    self.stderr_handler.clone(),
+                    stderr_sink.clone(),
+                )));
+            } else {
+                stderr_sink.close_now();
+            }
+            self.stderr_sink = Some(stderr_sink);
+        }
+        let stderr_sink = self.stderr_sink.clone().unwrap();
+
+        // Arm the deadline watchdog (same as stdout_lines — bounds the stream).
+        if self.deadline_task.is_none()
+            && let (Some(limit), Some(group)) = (self.timeout, self.backend.own_group())
+        {
+            let group = Arc::downgrade(group);
+            let pid = self.pid;
+            let grace = self.timeout_grace;
+            let signal = self.timeout_signal;
+            self.deadline_task = Some(tokio::spawn(async move {
+                tokio::time::sleep(limit).await;
+                match grace {
+                    Some(grace) => match group.upgrade() {
+                        Some(group) => {
+                            let _ = group.graceful_terminate(grace, signal).await;
+                        }
+                        None => kill_direct_child(pid),
+                    },
+                    None => kill_via_weak(&group, pid),
+                }
+            }));
+        }
+
+        #[cfg(feature = "cancellation")]
+        if self.cancel_task.is_none()
+            && let (Some(token), Some(group)) =
+                (self.cancel_token.clone(), self.backend.own_group())
+        {
+            let group = Arc::downgrade(group);
+            let pid = self.pid;
+            self.cancel_task = Some(tokio::spawn(async move {
+                token.cancelled().await;
+                kill_via_weak(&group, pid);
+            }));
+        }
+
+        OutputEvents {
+            stdout_sink,
+            stderr_sink,
+            stdout_wait: None,
+            stderr_wait: None,
+            stdout_done: false,
+            stderr_done: false,
+        }
+    }
+
+    /// Finish a run after its [`output_events`](Self::output_events) stream has
+    /// been drained: wait for the child to exit and return the exit code.
+    ///
+    /// Designed to pair with `output_events` (consume the events stream first),
+    /// but safe to call on its own — any untaken pipes are drained so the child
+    /// never blocks.
+    pub async fn finish_events(mut self) -> crate::error::Result<Option<i32>> {
+        // Drain any untaken pipes.
+        if let Some(mut pipe) = self.backend.take_stdout_reader() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut sink = Vec::new();
+                let _ = pipe.read_to_end(&mut sink).await;
+            });
+        }
+        if self.stderr_pump.is_none()
+            && let Some(pipe) = self.backend.take_stderr_reader()
+        {
+            let sink = SharedLines::new(&self.buffer);
+            self.stderr_pump = Some(tokio::spawn(pump_lines(
+                pipe,
+                self.stderr_encoding,
+                self.stderr_handler.clone(),
+                sink.clone(),
+            )));
+            self.stderr_sink = Some(sink);
+        }
+
+        let outcome = self.drive_to_exit().await?;
+        self.observe_stdin_task().await;
+        // Join both pumps so their final writes are visible before the
+        // overflow check (the child's pipes closed when it exited, so both
+        // pumps are already at or near EOF — these awaits are cheap).
+        if let Some(pump) = self.stdout_pump.take() {
+            let _ = pump.await;
+        }
+        if let Some(pump) = self.stderr_pump.take() {
+            let _ = pump.await;
+        }
+        let (code, _timed_out) = self.checked_outcome(outcome)?;
+
+        // Fail-loud ceiling check for both sinks.
+        for sink in [self.stdout_sink.as_ref(), self.stderr_sink.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if sink.overflowed() {
+                return Err(crate::Error::OutputTooLarge {
+                    program: self.program.clone(),
+                    limit: self.buffer.max_lines.unwrap_or(0),
+                    total_lines: sink.count(),
+                });
+            }
+        }
+
+        Ok(code)
     }
 }
 
@@ -332,6 +518,125 @@ impl Stream for StdoutLines {
                     }
                 }
             }
+        }
+    }
+}
+
+/// An event produced by a child process: a decoded line from stdout or stderr.
+///
+/// Yielded by [`RunningProcess::output_events`], which merges both streams into
+/// a single, ordered sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputEvent {
+    /// A line from the child's standard output.
+    Stdout(String),
+    /// A line from the child's standard error.
+    Stderr(String),
+}
+
+/// A merged `Stream` of both stdout and stderr lines (see
+/// [`RunningProcess::output_events`]).
+///
+/// Lines are interleaved in the order they arrive at the async runtime.
+pub struct OutputEvents {
+    stdout_sink: Arc<SharedLines>,
+    stderr_sink: Arc<SharedLines>,
+    stdout_wait: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    stderr_wait: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    stdout_done: bool,
+    stderr_done: bool,
+}
+
+// Manual: the sinks and pending-wait futures are opaque.
+impl std::fmt::Debug for OutputEvents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputEvents").finish_non_exhaustive()
+    }
+}
+
+impl Stream for OutputEvents {
+    type Item = OutputEvent;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<OutputEvent>> {
+        let this = self.get_mut();
+        loop {
+            // Try stdout, then stderr, on each iteration so progress on
+            // either stream is returned promptly.
+            if !this.stdout_done {
+                match this.stdout_sink.try_pop() {
+                    Popped::Line(line) => {
+                        this.stdout_wait = None;
+                        return Poll::Ready(Some(OutputEvent::Stdout(line)));
+                    }
+                    Popped::Closed => {
+                        this.stdout_done = true;
+                        this.stdout_wait = None;
+                    }
+                    Popped::Empty => {}
+                }
+            }
+            if !this.stderr_done {
+                match this.stderr_sink.try_pop() {
+                    Popped::Line(line) => {
+                        this.stderr_wait = None;
+                        return Poll::Ready(Some(OutputEvent::Stderr(line)));
+                    }
+                    Popped::Closed => {
+                        this.stderr_done = true;
+                        this.stderr_wait = None;
+                    }
+                    Popped::Empty => {}
+                }
+            }
+
+            // Both streams are closed and drained.
+            if this.stdout_done && this.stderr_done {
+                return Poll::Ready(None);
+            }
+
+            // At least one stream is open but currently empty: register wait
+            // futures for each open stream and return Pending.  Both futures
+            // are polled so wakeups from *either* stream are registered —
+            // whichever fires first re-enters the loop above.
+            let mut any_ready = false;
+            if !this.stdout_done {
+                if this.stdout_wait.is_none() {
+                    this.stdout_wait = Some(Box::pin(this.stdout_sink.clone().changed()));
+                }
+                if this
+                    .stdout_wait
+                    .as_mut()
+                    .expect("just set")
+                    .as_mut()
+                    .poll(cx)
+                    .is_ready()
+                {
+                    this.stdout_wait = None;
+                    any_ready = true;
+                }
+            }
+            if !this.stderr_done {
+                if this.stderr_wait.is_none() {
+                    this.stderr_wait = Some(Box::pin(this.stderr_sink.clone().changed()));
+                }
+                if this
+                    .stderr_wait
+                    .as_mut()
+                    .expect("just set")
+                    .as_mut()
+                    .poll(cx)
+                    .is_ready()
+                {
+                    this.stderr_wait = None;
+                    any_ready = true;
+                }
+            }
+            if any_ready {
+                // At least one notification arrived: re-enter the loop to
+                // drain whatever arrived.
+                continue;
+            }
+            return Poll::Pending;
         }
     }
 }

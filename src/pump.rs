@@ -32,6 +32,9 @@ struct Inner {
     max: Option<usize>,
     mode: OverflowMode,
     closed: bool,
+    /// Set when `OverflowMode::Error` is active and the buffer fills — the
+    /// consuming path turns this into [`Error::OutputTooLarge`](crate::Error::OutputTooLarge).
+    overflowed: bool,
 }
 
 /// Result of a non-blocking pop from a [`SharedLines`].
@@ -52,6 +55,7 @@ impl SharedLines {
                 max: policy.max_lines,
                 mode: policy.overflow,
                 closed: false,
+                overflowed: false,
             }),
             notify: Notify::new(),
             count: AtomicUsize::new(0),
@@ -71,6 +75,11 @@ impl SharedLines {
                         inner.lines.push_back(line);
                     }
                     OverflowMode::DropNewest => {} // drop the incoming line
+                    OverflowMode::Error => {
+                        // Mark overflow and drop the incoming line; the pipe
+                        // is still drained so the child never blocks.
+                        inner.overflowed = true;
+                    }
                 },
                 _ => inner.lines.push_back(line),
             }
@@ -101,6 +110,15 @@ impl SharedLines {
     /// Total lines seen by the pump (including dropped ones).
     pub(crate) fn count(&self) -> usize {
         self.count.load(Ordering::Relaxed)
+    }
+
+    /// Whether the `OverflowMode::Error` ceiling was hit during pumping.
+    /// Always `false` for `DropOldest`/`DropNewest` buffers.
+    pub(crate) fn overflowed(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .overflowed
     }
 
     /// Take all currently-retained lines (used by the bulk collectors once the

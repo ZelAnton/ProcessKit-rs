@@ -177,7 +177,7 @@ mod supervisor;
 mod sys;
 
 pub use batch::output_all;
-pub use buffer::{OutputBufferPolicy, OverflowMode};
+pub use buffer::{OutputBufferPolicy, OverflowMode, StdioMode};
 #[cfg(feature = "record")]
 pub use cassette::RecordReplayRunner;
 pub use client::CliClient;
@@ -192,7 +192,7 @@ pub use mechanism::Mechanism;
 pub use pipeline::Pipeline;
 pub use result::{Outcome, ProcessResult};
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
-pub use running::{RunningProcess, StdoutLines};
+pub use running::{OutputEvent, OutputEvents, RunningProcess, StdoutLines};
 #[cfg(feature = "process-control")]
 pub use signal::Signal;
 #[cfg(feature = "stats")]

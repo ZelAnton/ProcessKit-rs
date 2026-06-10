@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use encoding_rs::{Encoding, UTF_8};
 
-use crate::buffer::OutputBufferPolicy;
+use crate::buffer::{OutputBufferPolicy, StdioMode};
 use crate::error::{Error, Result};
 use crate::pump::LineHandler;
 use crate::result::ProcessResult;
@@ -49,6 +49,8 @@ pub struct Command {
     ok_codes: Option<Vec<i32>>,
     stdout_handler: Option<LineHandler>,
     stderr_handler: Option<LineHandler>,
+    stdout_mode: StdioMode,
+    stderr_mode: StdioMode,
     output_buffer: OutputBufferPolicy,
     stdout_encoding: &'static Encoding,
     stderr_encoding: &'static Encoding,
@@ -104,6 +106,8 @@ impl Command {
             ok_codes: None,
             stdout_handler: None,
             stderr_handler: None,
+            stdout_mode: StdioMode::Piped,
+            stderr_mode: StdioMode::Piped,
             output_buffer: OutputBufferPolicy::unbounded(),
             stdout_encoding: UTF_8,
             stderr_encoding: UTF_8,
@@ -559,6 +563,67 @@ impl Command {
         self
     }
 
+    /// Set how the child's standard output stream is connected (default:
+    /// [`StdioMode::Piped`](crate::StdioMode::Piped)).
+    ///
+    /// - **`Piped`** (default) — captured into a pipe; all output-retrieval
+    ///   verbs (`output_string`, `stdout_lines`, …) read from it.
+    /// - **`Inherit`** — the child shares the parent's stdout; output appears
+    ///   in the terminal/log but is not captured. `output_string` returns an
+    ///   empty stdout; `stdout_lines` / `output_events` yield nothing.
+    /// - **`Null`** — suppressed entirely (redirected to `/dev/null`).
+    pub fn stdout(mut self, mode: crate::StdioMode) -> Self {
+        self.stdout_mode = mode;
+        self
+    }
+
+    /// Set how the child's standard error stream is connected (default:
+    /// [`StdioMode::Piped`](crate::StdioMode::Piped)).
+    ///
+    /// Same semantics as [`stdout`](Self::stdout): `Piped` captures,
+    /// `Inherit` passes through, `Null` suppresses.
+    pub fn stderr(mut self, mode: crate::StdioMode) -> Self {
+        self.stderr_mode = mode;
+        self
+    }
+
+    /// Tee every decoded stdout line to `writer` as it is produced —
+    /// capture *and* stream to `writer` simultaneously.
+    ///
+    /// Equivalent to [`on_stdout_line`](Self::on_stdout_line) with a
+    /// `writeln!` handler. Replaces any previously set stdout handler.
+    /// Compose multiple sinks inside a single [`on_stdout_line`](Self::on_stdout_line)
+    /// handler when you need more than one.
+    pub fn stdout_tee<W>(mut self, writer: W) -> Self
+    where
+        W: std::io::Write + Send + 'static,
+    {
+        let writer = Arc::new(std::sync::Mutex::new(writer));
+        self.stdout_handler = Some(Arc::new(move |line: &str| {
+            if let Ok(mut w) = writer.lock() {
+                let _ = writeln!(w, "{line}");
+            }
+        }));
+        self
+    }
+
+    /// Tee every decoded stderr line to `writer` as it is produced.
+    ///
+    /// Same contract as [`stdout_tee`](Self::stdout_tee). Replaces any
+    /// previously set stderr handler.
+    pub fn stderr_tee<W>(mut self, writer: W) -> Self
+    where
+        W: std::io::Write + Send + 'static,
+    {
+        let writer = Arc::new(std::sync::Mutex::new(writer));
+        self.stderr_handler = Some(Arc::new(move |line: &str| {
+            if let Ok(mut w) = writer.lock() {
+                let _ = writeln!(w, "{line}");
+            }
+        }));
+        self
+    }
+
     /// Cap the in-memory backlog of captured output lines (see
     /// [`OutputBufferPolicy`]). The pump still drains the pipe; only retention is
     /// bounded.
@@ -851,8 +916,16 @@ impl Command {
             // overwrites flags with CREATE_SUSPENDED | these extras.
             cmd.as_std_mut().creation_flags(self.creation_flags_extra);
         }
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        cmd.stdout(match self.stdout_mode {
+            StdioMode::Piped => Stdio::piped(),
+            StdioMode::Inherit => Stdio::inherit(),
+            StdioMode::Null => Stdio::null(),
+        });
+        cmd.stderr(match self.stderr_mode {
+            StdioMode::Piped => Stdio::piped(),
+            StdioMode::Inherit => Stdio::inherit(),
+            StdioMode::Null => Stdio::null(),
+        });
         if self.keep_stdin_open {
             // Interactive: keep a pipe open for the caller to write to.
             cmd.stdin(Stdio::piped());
@@ -970,6 +1043,8 @@ impl fmt::Debug for Command {
             .field("keep_stdin_open", &self.keep_stdin_open)
             .field("unchecked", &self.unchecked)
             .field("timeout", &self.timeout)
+            .field("stdout_mode", &self.stdout_mode)
+            .field("stderr_mode", &self.stderr_mode)
             .field("has_stdout_handler", &self.stdout_handler.is_some())
             .field("has_stderr_handler", &self.stderr_handler.is_some())
             .field("output_buffer", &self.output_buffer)

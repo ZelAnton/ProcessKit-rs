@@ -13,6 +13,26 @@ to a dated version section.
 
 ### Added
 
+- `StdioMode` enum (`Piped` / `Inherit` / `Null`) + `Command::stdout(mode)` /
+  `Command::stderr(mode)` builders — control per-stream connection independently.
+  `Piped` (the default) captures as before; `Inherit` lets the child share the parent's
+  terminal/log; `Null` suppresses output entirely without tying up a pipe.
+- `OutputEvent` enum (`Stdout(String)` / `Stderr(String)`) and `OutputEvents` stream —
+  merge both stdout and stderr into a single ordered sequence of tagged lines.
+  `RunningProcess::output_events()` starts both pumps and returns the stream;
+  `RunningProcess::finish_events()` waits for exit and returns the exit code.
+  Lines interleave in arrival order (best-effort; no kernel timestamp).
+- `OverflowMode::Error` variant and `OutputBufferPolicy::fail_loud(n)` builder — a
+  fail-loud capture ceiling: once `n` lines are buffered, subsequent lines are counted
+  but not retained, and the consuming verb errors with `Error::OutputTooLarge` after the
+  run. The pipe is still fully drained so the child never blocks on a full pipe.
+  Use this when unbounded output is a misbehavior rather than a policy choice.
+- `Error::OutputTooLarge { program, limit, total_lines }` — produced by the fail-loud
+  overflow path when the captured line count exceeds the configured ceiling.
+- `Command::stdout_tee<W: Write + Send>(writer)` / `Command::stderr_tee<W>(writer)` —
+  simultaneously capture *and* write each decoded line to `writer` (a `Vec<u8>`, a
+  `File`, a locked stdout — any `std::io::Write + Send`). Replaces any previously set
+  per-stream handler; compose inside `on_stdout_line` when multiple sinks are needed.
 - `Error::NotFound { program, searched }` — a bare program name (no path separators)
   not found on `PATH` now surfaces a distinct, structured error that names the searched
   directories: `` `git` not found on PATH (searched: /usr/bin:/usr/local/bin) ``.
