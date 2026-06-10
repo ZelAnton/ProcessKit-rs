@@ -1123,8 +1123,10 @@ fn quote_arg(arg: &str) -> String {
     out
 }
 
-/// Render one argument quoted for **display** on Windows (double-quote rules).
-/// Not a security boundary — the crate never invokes a shell.
+/// Render one argument quoted for **display** on Windows (double-quote rules,
+/// best-effort). Not a security boundary — the crate never invokes a shell.
+/// Handles common cases: whitespace, `"`, and trailing backslashes. CMD-special
+/// characters (`%`, `!`, `(`, `)`) inside a quoted argument are not escaped.
 #[cfg(not(unix))]
 fn quote_arg(arg: &str) -> String {
     let needs_quote = arg.is_empty()
@@ -1134,7 +1136,7 @@ fn quote_arg(arg: &str) -> String {
     if !needs_quote {
         return arg.to_owned();
     }
-    let mut out = String::with_capacity(arg.len() + 2);
+    let mut out = String::with_capacity(arg.len() + 4);
     out.push('"');
     for ch in arg.chars() {
         if ch == '"' {
@@ -1142,6 +1144,12 @@ fn quote_arg(arg: &str) -> String {
         } else {
             out.push(ch);
         }
+    }
+    // L13: double any trailing backslashes before the closing quote so they
+    // don't escape it (e.g. `C:\tools\` → `"C:\tools\\"` not `"C:\tools\"`).
+    let trailing = out.chars().rev().take_while(|&c| c == '\\').count();
+    for _ in 0..trailing {
+        out.push('\\');
     }
     out.push('"');
     out
@@ -1160,6 +1168,12 @@ fn quote_arg(arg: &str) -> String {
 /// the location.
 pub(crate) fn is_bare_name(program: &OsStr) -> bool {
     use std::path::{Component, Path};
+    // Path::components() normalizes trailing separators away ("git/" → Normal("git")),
+    // so check the raw bytes first: any separator makes it path-ish.
+    let bytes = program.as_encoded_bytes();
+    if bytes.contains(&b'/') || bytes.contains(&b'\\') {
+        return false;
+    }
     let mut comps = Path::new(program).components();
     matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
 }
@@ -1358,6 +1372,22 @@ mod tests {
         assert!(!is_bare_name(OsStr::new("subdir/tool")));
         #[cfg(windows)]
         assert!(!is_bare_name(OsStr::new("C:\\git.exe")));
+        // L20: a trailing separator is path-ish (Path normalizes it away).
+        assert!(!is_bare_name(OsStr::new("git/")));
+        assert!(!is_bare_name(OsStr::new("git\\")));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn quote_arg_handles_trailing_backslash() {
+        use super::quote_arg;
+        // Single trailing backslash (space triggers quoting):
+        // `C:\my tools\` → `"C:\my tools\\"`, not `"C:\my tools\"`.
+        assert_eq!(quote_arg("C:\\my tools\\"), "\"C:\\my tools\\\\\"");
+        // Two trailing backslashes: both must be doubled → four before the quote.
+        assert_eq!(quote_arg("C:\\my tools\\\\"), "\"C:\\my tools\\\\\\\\\"");
+        // No trailing backslash: no doubling needed.
+        assert_eq!(quote_arg("C:\\my tools"), "\"C:\\my tools\"");
     }
 
     #[test]

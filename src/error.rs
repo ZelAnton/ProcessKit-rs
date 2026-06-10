@@ -31,13 +31,18 @@ pub enum Error {
     /// once the executable location is known (permission denied, busy, etc.).
     ///
     /// [`is_not_found`](Error::is_not_found) returns `true` for this variant.
-    #[error("`{program}` not found on PATH (searched: {searched})")]
+    ///
+    /// The `Display` message intentionally omits `searched` — `PATH` is an
+    /// environment value and must never appear in logs per the crate's
+    /// security policy. Access `searched` directly for a diagnostic.
+    #[error("`{program}` not found on PATH")]
     NotFound {
         /// The program name that was looked up.
         program: String,
         /// The `PATH` directories that were searched, joined by the
         /// platform separator (`:` on Unix, `;` on Windows). Empty when
-        /// `PATH` is not set.
+        /// `PATH` is not set. Not included in `Display` — use this field
+        /// directly when building a user-facing diagnostic.
         searched: String,
     },
 
@@ -226,6 +231,13 @@ impl Error {
     ///
     /// `false` for every other variant. Lets a caller surface a "command not
     /// installed?" hint without matching on the underlying IO error.
+    ///
+    /// **Note:** On Windows, a bare program name (e.g. `git`) that resolves
+    /// only to a `.cmd`/`.bat` file on PATH cannot be executed directly — the
+    /// OS itself returns a `NotFound` error at the exec layer. In that case
+    /// this method returns `true` via the `Spawn(NotFound)` branch even though
+    /// the file was found on PATH. The program is installed; it just needs to
+    /// be invoked through `cmd.exe`.
     pub fn is_not_found(&self) -> bool {
         matches!(self, Error::NotFound { .. })
             || self
@@ -501,9 +513,13 @@ mod tests {
             program: "my-tool".into(),
             searched: "/usr/bin:/usr/local/bin".into(),
         };
-        assert_eq!(
-            err.to_string(),
-            "`my-tool` not found on PATH (searched: /usr/bin:/usr/local/bin)"
+        // L21: Display must NOT include the raw PATH value (env values are
+        // never logged per the security policy); searched is still accessible.
+        let display = err.to_string();
+        assert_eq!(display, "`my-tool` not found on PATH");
+        assert!(
+            !display.contains("/usr/bin"),
+            "Display must not expose PATH value: {display}"
         );
         assert!(err.is_not_found(), "NotFound must satisfy is_not_found()");
         assert!(!err.is_permission_denied());

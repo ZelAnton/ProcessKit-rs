@@ -322,7 +322,16 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
                 && is_bare_name(command.program())
                 && !command.customizes_path() =>
         {
-            let (_found, searched) = find_in_path(command.program());
+            let (found, searched) = find_in_path(command.program());
+            if found.is_some() {
+                // B8: program is on PATH but the OS can't exec it directly
+                // (e.g. a .cmd/.bat on Windows needs cmd.exe). Return the
+                // original spawn error — NotFound is misleading here.
+                return Err(crate::Error::Spawn {
+                    program: command.program_name(),
+                    source,
+                });
+            }
             return Err(crate::Error::NotFound {
                 program: command.program_name(),
                 searched,

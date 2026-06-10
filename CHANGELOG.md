@@ -34,12 +34,12 @@ to a dated version section.
   `File`, a locked stdout — any `std::io::Write + Send`). Replaces any previously set
   per-stream handler; compose inside `on_stdout_line` when multiple sinks are needed.
 - `Error::NotFound { program, searched }` — a bare program name (no path separators)
-  not found now surfaces a distinct, structured error that names the searched
-  directories: `` `git` not found on PATH (searched: /usr/bin:/usr/local/bin) ``.
+  not found now surfaces a distinct, structured error: `` `git` not found on PATH ``.
   Enriched from the OS's opaque not-found error rather than a `PATH` pre-check, so a
   program the OS resolves by another route (e.g. the application directory on Windows)
   is never falsely reported missing. `Error::is_not_found()` returns `true` for this
   variant (as it does for the existing `Error::Spawn(NotFound)` / missing-cwd case).
+  The `searched` field carries the `PATH` directories for programmatic diagnostics.
 - `Command::envs([(key, val), …])` — set multiple environment variables in one call.
   Equivalent to chaining `env()` calls; order is preserved and a later entry for the
   same key wins.
@@ -74,9 +74,44 @@ to a dated version section.
 
 ### Fixed
 
+- `Error::NotFound` `Display` no longer includes the raw `PATH` environment value
+  (e.g. `searched: /usr/bin:/usr/local/bin`). The `searched` field remains accessible for
+  programmatic use. `PATH` is an environment value and must not appear in logs.
+- When a bare program name is on `PATH` but the OS cannot execute it directly (e.g. a
+  `.cmd`/`.bat` script on Windows that requires `cmd.exe`), the error is now the raw
+  `Error::Spawn` rather than the misleading `Error::NotFound` — the program was found.
+- `is_bare_name("git/")` now correctly returns `false`; a trailing path separator makes
+  a name path-ish and it should not be looked up on `PATH` as a bare name.
+- Windows `command_line()` display: a path argument ending with a backslash (e.g.
+  `C:\my tools\`) now doubles the trailing backslash before the closing `"` so it does
+  not escape the closing quote (was: `"C:\my tools\"`, now: `"C:\my tools\\"`).
 - A signal-killed process is no longer reported as a generic `Error::Io("terminated by
   signal")`; the checking verbs now raise the structured `Error::Signalled` (carrying the
   signal number on Unix), and `Outcome::Signalled` preserves it for inspection.
+- `finish_streamed` and `finish_events` previously drained an untaken stdout pipe into an
+  unbounded `Vec`, bypassing any configured `OutputBufferPolicy`. They now route the pipe
+  through the normal pumping path, respecting the buffer policy (including `fail_loud`).
+- `wait` and `profile` previously accumulated all output in the user-configured buffer even
+  though output is discarded on those paths, causing O(total-lines) peak heap use. Both now
+  use a retain-nothing sink that keeps the pipe drained without buffering any lines.
+  **Behavior note:** `OverflowMode::Error` (via `fail_loud`) no longer fires during `wait`
+  or `profile` — it fires only on the capturing verbs (`output_string`, `output_bytes`,
+  `finish_streamed`, `finish_events`). If you need the DoS guard on a run you don't capture,
+  use a capturing verb.
+- `output_string` / `output_bytes` called after `stdout_lines` previously returned empty
+  output because they created fresh empty sinks and ignored the running streaming pump.
+  They now reuse the existing pump's sink and join its handle, capturing all buffered and
+  in-flight output correctly.
+- Calling `stdout_lines` or `output_events` a second time on the same `RunningProcess` now
+  returns an empty stream instead of silently replacing the first call's sink reference,
+  which previously caused the overflow flag to be lost.
+- A second `output_events` call no longer shares the same stderr `SharedLines` as the first;
+  it receives a fresh already-closed sink, preventing a `notify_one` race that could leave
+  the first consumer's internal task permanently parked.
+- Pump task handles previously held in a frame-local `Vec` were leaked (left as detached
+  tasks) if an early `?` exit occurred between the pump spawns and the explicit join. Handles
+  are now stored on `RunningProcess` fields and aborted by `Drop`, bounding the leak to
+  the process handle's lifetime.
 
 ## [0.9.1] - 2026-06-09
 

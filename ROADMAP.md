@@ -77,7 +77,7 @@ Verified fmt/clippy/doc/test/cross-compile.
 
 Promote the lead candidate of [`ideas/next-launch-ergonomics.md`](ideas/next-launch-ergonomics.md)
 (A): resolve a program to an absolute path before spawn and report *which* PATH was
-searched on failure — `"foo not found on PATH (searched: …)"`. 0.9.1 shipped the three
+searched on failure — `` `foo` not found on PATH ``. 0.9.1 shipped the three
 pieces this completes: `is_not_found()`, `command_line()` quoting, and the `current_dir`
 pre-check. Cross-platform PATH/PATHEXT resolution is the real cost. Same design pass:
 document/guard the **cwd-relative-program gotcha** — `Command::new("./tool")` with a
