@@ -307,7 +307,7 @@ result.diagnostic();   // stderr if non-empty, else stdout — the human-facing 
                        // (git/jj put "CONFLICT …" on stdout!)
 
 // Opt into erroring whenever you're ready:
-let ok = result.ensure_success()?; // Exit / Timeout / signal-kill Io as typed errors
+let ok = result.ensure_success()?; // Exit / Timeout / Signalled (signal-kill) as typed errors
 ```
 
 When the three-way distinction matters, match on `Outcome` instead of
@@ -319,7 +319,7 @@ use processkit::Outcome;
 match result.outcome() {
     Outcome::Exited(0) => println!("clean"),
     Outcome::Exited(code) => println!("failed with {code}"),
-    Outcome::Signalled => println!("killed by a signal"),
+    Outcome::Signalled(signal) => println!("killed by signal {signal:?}"),
     Outcome::TimedOut => println!("hit its deadline"),
     _ => {} // non_exhaustive: future dispositions
 }
@@ -329,15 +329,18 @@ The error enum is structured and `#[non_exhaustive]`:
 
 | Variant | Meaning |
 |---|---|
-| `Error::Spawn { program, source }` | The OS couldn't start the program (not found, permissions, …) |
+| `Error::Spawn { program, source }` | The OS couldn't start the program (permissions, …) |
+| `Error::NotFound { program, searched }` | A bare program name was not found; `searched` names the `PATH` directories looked at |
 | `Error::Exit { program, code, stdout, stderr }` | Non-zero exit, both streams attached in full (the `Display` message is bounded, but the fields carry the complete captured text for classification) |
+| `Error::Signalled { program, signal }` | The process was killed by a signal (no exit code); `signal` carries the number on Unix, `None` elsewhere |
+| `Error::OutputTooLarge { program, limit, total_lines }` | A `fail_loud` buffer's line ceiling was exceeded |
 | `Error::Timeout { program, timeout }` | The run's own deadline killed it |
 | `Error::NotReady { program, timeout }` | A [readiness probe](streaming.md#readiness-probes) gave up |
 | `Error::Parse { program, message }` | A `CliClient::try_parse` parser rejected the output |
 | `Error::Unsupported { operation }` | The platform can't do what was asked (and silently skipping would be wrong) |
 | `Error::Cancelled { program }` | (`cancellation` feature) the run's token was cancelled |
 | `Error::ResourceLimit(reason)` | (`limits` feature) a requested cap couldn't be enforced |
-| `Error::Io(source)` | Everything else from the OS, incl. signal-kills (no exit code, no timeout) |
+| `Error::Io(source)` | Everything else from the OS (no exit code, no timeout) |
 
 `Error::diagnostic()` mirrors `ProcessResult::diagnostic()` for the `Exit`
 variant — one method to get the most useful human-facing line out of a

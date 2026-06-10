@@ -13,8 +13,23 @@ use tokio_stream::Stream;
 use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::pump::{Popped, SharedLines, pump_lines};
+use crate::result::Outcome;
 
 use super::RunningProcess;
+
+/// The outcome of a run driven via
+/// [`stdout_lines`](RunningProcess::stdout_lines) or
+/// [`output_events`](RunningProcess::output_events): how the run ended plus
+/// the captured standard error. Returned by
+/// [`RunningProcess::finish_streamed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamedFinish {
+    /// How the run ended.
+    pub outcome: Outcome,
+    /// Standard error captured in the background while stdout was streaming.
+    /// `String::new()` when no stderr was produced or stderr was not piped.
+    pub stderr: String,
+}
 
 impl RunningProcess {
     /// Stream the child's standard output line by line. Call this **once**.
@@ -37,11 +52,11 @@ impl RunningProcess {
     ///
     /// # Example
     ///
-    /// Stream stdout line by line as it is produced, then collect the exit code
+    /// Stream stdout line by line as it is produced, then collect the outcome
     /// and stderr:
     ///
     /// ```no_run
-    /// use processkit::{Command, StreamExt};
+    /// use processkit::{Command, StreamExt, StreamedFinish};
     ///
     /// # async fn demo() -> processkit::Result<()> {
     /// let mut run = Command::new("git").args(["log", "--oneline", "-n", "20"]).start().await?;
@@ -51,8 +66,8 @@ impl RunningProcess {
     ///     println!("commit: {line}");
     /// }
     ///
-    /// let (code, stderr) = run.finish_streamed().await?;
-    /// # let _ = (code, stderr);
+    /// let StreamedFinish { outcome, stderr } = run.finish_streamed().await?;
+    /// # let _ = (outcome, stderr);
     /// # Ok(())
     /// # }
     /// ```
@@ -145,13 +160,14 @@ impl RunningProcess {
         }
     }
 
-    /// Finish a streamed run: wait for exit and return the exit code plus the
-    /// stderr collected in the background by [`stdout_lines`](Self::stdout_lines).
+    /// Finish a streamed run: wait for exit and return a [`StreamedFinish`]
+    /// carrying the [`Outcome`] and the stderr collected in the background by
+    /// [`stdout_lines`](Self::stdout_lines).
     ///
     /// Designed to pair with `stdout_lines` (consume the stdout stream first),
     /// but safe to call on its own — any pipe the stream didn't take is drained
     /// here so the child can never block on a full pipe.
-    pub async fn finish_streamed(mut self) -> Result<(Option<i32>, String)> {
+    pub async fn finish_streamed(mut self) -> Result<StreamedFinish> {
         // Drain a stdout pipe a prior `stdout_lines` didn't take (and discard
         // it) so the child can't block writing to it while we wait for exit.
         // Deliberately unbounded: a deadline here would cut the drain off
@@ -182,7 +198,7 @@ impl RunningProcess {
             self.stderr_sink = Some(sink);
         }
 
-        let outcome = self.drive_to_exit().await?;
+        let raw_outcome = self.drive_to_exit().await?;
         self.observe_stdin_task().await;
         // Join both streaming pumps before the cancellation/overflow checks so
         // their final writes are visible. `join_pumps` bounds the wait by
@@ -195,7 +211,7 @@ impl RunningProcess {
             .flatten()
             .collect();
         super::join_pumps(pumps).await;
-        let (code, _timed_out) = self.checked_outcome(outcome)?;
+        let outcome = self.checked_outcome(raw_outcome)?;
         // Fail-loud ceiling check for both line-pumped streams.
         for sink in [self.stdout_sink.as_ref(), self.stderr_sink.as_ref()]
             .into_iter()
@@ -214,7 +230,7 @@ impl RunningProcess {
             .as_ref()
             .map(|sink| sink.drain().join("\n"))
             .unwrap_or_default();
-        Ok((code, stderr))
+        Ok(StreamedFinish { outcome, stderr })
     }
 
     /// Stream both stdout and stderr as a single ordered sequence of
@@ -228,7 +244,7 @@ impl RunningProcess {
     /// stderr can lose lines (or trip its [`fail_loud`](crate::OutputBufferPolicy::fail_loud)
     /// ceiling) while stdout monopolizes. Use
     /// [`finish_events`](Self::finish_events) after draining to collect the
-    /// exit code.
+    /// run's [`Outcome`](crate::Outcome).
     ///
     /// # Example
     ///
@@ -246,8 +262,8 @@ impl RunningProcess {
     ///     }
     /// }
     ///
-    /// let code = run.finish_events().await?;
-    /// # let _ = code;
+    /// let outcome = run.finish_events().await?;
+    /// # let _ = outcome;
     /// # Ok(())
     /// # }
     /// ```
@@ -325,12 +341,12 @@ impl RunningProcess {
     }
 
     /// Finish a run after its [`output_events`](Self::output_events) stream has
-    /// been drained: wait for the child to exit and return the exit code.
+    /// been drained: wait for the child to exit and return the [`Outcome`].
     ///
     /// Designed to pair with `output_events` (consume the events stream first),
     /// but safe to call on its own — any untaken pipes are drained so the child
     /// never blocks.
-    pub async fn finish_events(mut self) -> crate::error::Result<Option<i32>> {
+    pub async fn finish_events(mut self) -> crate::error::Result<Outcome> {
         // Drain any untaken pipes.
         if let Some(mut pipe) = self.backend.take_stdout_reader() {
             tokio::spawn(async move {
@@ -352,7 +368,7 @@ impl RunningProcess {
             self.stderr_sink = Some(sink);
         }
 
-        let outcome = self.drive_to_exit().await?;
+        let raw_outcome = self.drive_to_exit().await?;
         self.observe_stdin_task().await;
         // Join both pumps so their final writes are visible before the overflow
         // check. `join_pumps` bounds the wait by `PUMP_TEARDOWN` and aborts
@@ -365,7 +381,7 @@ impl RunningProcess {
             .flatten()
             .collect();
         super::join_pumps(pumps).await;
-        let (code, _timed_out) = self.checked_outcome(outcome)?;
+        let outcome = self.checked_outcome(raw_outcome)?;
 
         // Fail-loud ceiling check for both sinks.
         for sink in [self.stdout_sink.as_ref(), self.stderr_sink.as_ref()]
@@ -381,7 +397,7 @@ impl RunningProcess {
             }
         }
 
-        Ok(code)
+        Ok(outcome)
     }
 }
 

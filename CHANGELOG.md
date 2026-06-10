@@ -20,7 +20,7 @@ to a dated version section.
 - `OutputEvent` enum (`Stdout(String)` / `Stderr(String)`) and `OutputEvents` stream —
   merge both stdout and stderr into a single ordered sequence of tagged lines.
   `RunningProcess::output_events()` starts both pumps and returns the stream;
-  `RunningProcess::finish_events()` waits for exit and returns the exit code.
+  `RunningProcess::finish_events()` waits for exit and returns the run's `Outcome`.
   Lines interleave in arrival order (best-effort; no kernel timestamp).
 - `OverflowMode::Error` variant and `OutputBufferPolicy::fail_loud(n)` builder — a
   fail-loud capture ceiling: once `n` lines are buffered, subsequent lines are counted
@@ -43,16 +43,40 @@ to a dated version section.
 - `Command::envs([(key, val), …])` — set multiple environment variables in one call.
   Equivalent to chaining `env()` calls; order is preserved and a later entry for the
   same key wins.
+- `Error::Signalled { program, signal }` — a process terminated by a signal now surfaces
+  a distinct, structured error (was an opaque `Error::Io`). `signal` is the Unix signal
+  number when the platform reports it, `None` otherwise (e.g. on Windows). The checking
+  verbs (`run`, `exit_code`, `probe`, `ensure_success`, `require_code`) raise it.
+- `StreamedFinish { outcome, stderr }` — the named return of
+  `RunningProcess::finish_streamed()` (was a bare `(Option<i32>, String)` tuple).
+  Derives `Debug`, `Clone`, `PartialEq`, `Eq`.
+- `Reply::signalled(Option<i32>)` on the test-double seam — script a signal-killed reply
+  so a hermetic test can exercise `Outcome::Signalled` / `Error::Signalled` handling
+  without a real subprocess.
 
 ### Changed
 
+- **Breaking:** `Outcome::Signalled` now carries the Unix signal number as
+  `Signalled(Option<i32>)` (was a unit variant). `Some(n)` is the signal that killed the
+  process when the platform reports it; `None` when unavailable (e.g. on Windows).
+- **Breaking:** `RunningProcess::wait()`, `wait_any()`, and `wait_all()` now return the
+  run's `Outcome` (`Outcome`, `(usize, Outcome)`, and `Vec<Outcome>` respectively) instead
+  of the raw `Option<i32>` exit code — distinguishing a clean exit, a signal kill, and a
+  timeout instead of collapsing the last two to `None`. A cancelled run raises
+  `Error::Cancelled` on every one of these paths.
+- **Breaking:** `RunningProcess::finish_streamed()` returns `StreamedFinish { outcome,
+  stderr }` instead of `(Option<i32>, String)`; `finish_events()` returns `Outcome`
+  instead of `Option<i32>`.
 - `Command::current_dir` doc now explicitly calls out that a relative-path program
   (e.g. `"./tool"`) passed to `Command::new` resolves against the *caller's* cwd, not
   the directory set here — use an absolute path for the program when combining
   `current_dir` with a relative-path executable.
 
 ### Fixed
--
+
+- A signal-killed process is no longer reported as a generic `Error::Io("terminated by
+  signal")`; the checking verbs now raise the structured `Error::Signalled` (carrying the
+  signal number on Unix), and `Outcome::Signalled` preserves it for inspection.
 
 ## [0.9.1] - 2026-06-09
 

@@ -257,8 +257,8 @@ async fn main() -> processkit::Result<()> {
     println!("live pids: {:?}", group.members()?);
 
     // Borrows only: the loser stays usable after the race.
-    let (idx, code) = wait_any(&mut [&mut a, &mut b]).await?;
-    println!("contender #{idx} exited first with {code:?}");
+    let (idx, outcome) = wait_any(&mut [&mut a, &mut b]).await?;
+    println!("contender #{idx} exited first with {outcome:?}");
     Ok(())
 }
 ```
@@ -276,7 +276,7 @@ first.
 ## Running many at once
 
 `wait_any`'s siblings cover the *join* and *fan-out* cases. `wait_all` joins a
-fixed set of handles you already hold, returning every exit code in order;
+fixed set of handles you already hold, returning every outcome in order;
 `output_all` runs a whole batch of commands with a **concurrency cap**, so
 fanning out hundreds of commands can't exhaust file descriptors or the process
 table:
@@ -289,13 +289,13 @@ async fn main() -> processkit::Result<()> {
     let group = processkit::ProcessGroup::new()?;
     let mut a = group.start(&Command::new("worker-a")).await?;
     let mut b = group.start(&Command::new("worker-b")).await?;
-    let codes = wait_all(&mut [&mut a, &mut b]).await?; // both, in input order
+    let outcomes = wait_all(&mut [&mut a, &mut b]).await?; // both, in input order
 
     // 200 conversions, but never more than 8 processes alive at once.
     let cmds = (0..200).map(|i| Command::new("convert").arg(format!("{i}.png")));
     let results = output_all(cmds, 8, &JobRunner).await;
     let failed = results.iter().filter(|r| !matches!(r, Ok(o) if o.is_success())).count();
-    println!("{:?}; {failed} conversions failed", codes);
+    println!("{:?}; {failed} conversions failed", outcomes);
     Ok(())
 }
 ```
@@ -569,7 +569,7 @@ Process each line as it arrives — no waiting for the child to exit, no bufferi
 the full output. `StreamExt` (re-exported from `tokio-stream`) provides `.next()`:
 
 ```rust,no_run
-use processkit::{Command, StreamExt};
+use processkit::{Command, Outcome, StreamExt, StreamedFinish};
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {
@@ -583,12 +583,12 @@ async fn main() -> processkit::Result<()> {
         println!("commit: {line}");
     }
 
-    // After the stream ends, collect the exit code and whatever went to stderr
-    // (drained in the background while you streamed stdout). `code` is `None` if
-    // the run was killed (timeout / signal) and so produced no exit code.
-    let (code, stderr) = run.finish_streamed().await?;
-    if code != Some(0) {
-        eprintln!("git exited {code:?}: {stderr}");
+    // After the stream ends, collect the outcome and whatever went to stderr
+    // (drained in the background while you streamed stdout). The `Outcome`
+    // distinguishes a clean exit, a signal kill, and a timeout.
+    let StreamedFinish { outcome, stderr } = run.finish_streamed().await?;
+    if outcome != Outcome::Exited(0) {
+        eprintln!("git ended {outcome:?}: {stderr}");
     }
     Ok(())
 }

@@ -52,7 +52,7 @@ Where each verb lands:
 | `output_string()` / `output_bytes()` | `Ok` result with `timed_out() == true`, `code() == None`, partial output kept |
 | `run()` / `exit_code()` / `probe()` / `checked()` | `Error::Timeout { program, timeout }` |
 | `first_line(pred)` | `Error::Timeout` (the line never arrived in time) |
-| `start()` + streaming | the stream **ends** at the deadline (tree killed, pipes closed); `finish_streamed` then reports the kill (`code == None`) |
+| `start()` + streaming | the stream **ends** at the deadline (tree killed, pipes closed); `finish_streamed` then reports the kill (`outcome == Outcome::TimedOut`) |
 | `ensure_success()` on a captured result | `Error::Timeout`, checked *before* the exit code |
 | [`Pipeline`](pipelines.md#timeouts) | chain deadline → `timed_out` result; per-stage deadlines fold into pipefail |
 

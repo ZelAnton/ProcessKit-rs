@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use processkit::{Command, ProcessGroup, output_all, wait_all};
+use processkit::{Command, Outcome, ProcessGroup, output_all, wait_all};
 
 use crate::common::*;
 
@@ -26,7 +26,7 @@ async fn wait_all_collects_every_exit_code_in_order() {
 
     assert_eq!(codes.len(), 3, "one code per process, in input order");
     assert!(
-        codes.iter().all(|c| *c == Some(0)),
+        codes.iter().all(|c| *c == Outcome::Exited(0)),
         "every child exits cleanly: {codes:?}"
     );
 }

@@ -192,7 +192,7 @@ pub use mechanism::Mechanism;
 pub use pipeline::Pipeline;
 pub use result::{Outcome, ProcessResult};
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
-pub use running::{OutputEvent, OutputEvents, RunningProcess, StdoutLines};
+pub use running::{OutputEvent, OutputEvents, RunningProcess, StdoutLines, StreamedFinish};
 #[cfg(feature = "process-control")]
 pub use signal::Signal;
 #[cfg(feature = "stats")]
@@ -229,8 +229,8 @@ where
 }
 
 /// Wait for whichever of several running processes exits **first**, returning
-/// its index in `processes` and its exit code (`None` for a signal-killed run,
-/// matching [`RunningProcess::wait`]).
+/// its index in `processes` and its [`Outcome`] (matching
+/// [`RunningProcess::wait`]).
 ///
 /// The processes are only *borrowed*: the race is cancel-safe, so the losers —
 /// and the winner, whose exit status tokio caches — remain fully usable
@@ -245,8 +245,8 @@ where
 /// let group = ProcessGroup::new()?;
 /// let mut a = group.start(&Command::new("server-a")).await?;
 /// let mut b = group.start(&Command::new("server-b")).await?;
-/// let (idx, code) = wait_any(&mut [&mut a, &mut b]).await?;
-/// println!("contender #{idx} exited first with {code:?}");
+/// let (idx, outcome) = wait_any(&mut [&mut a, &mut b]).await?;
+/// println!("contender #{idx} exited first with {outcome:?}");
 /// # Ok(())
 /// # }
 /// ```
@@ -266,7 +266,7 @@ where
 /// An empty `processes` slice is an error ([`Error::Io`] with
 /// [`InvalidInput`](std::io::ErrorKind::InvalidInput)) rather than a future
 /// that never resolves.
-pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, Option<i32>)> {
+pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, Outcome)> {
     use std::future::Future;
 
     if processes.is_empty() {
@@ -286,7 +286,7 @@ pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, O
     std::future::poll_fn(move |cx| {
         for (idx, wait) in waits.iter_mut().enumerate() {
             if let std::task::Poll::Ready(result) = wait.as_mut().poll(cx) {
-                return std::task::Poll::Ready(result.map(|code| (idx, code)));
+                return std::task::Poll::Ready(result.map(|outcome| (idx, outcome)));
             }
         }
         std::task::Poll::Pending
@@ -294,8 +294,8 @@ pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, O
     .await
 }
 
-/// Wait for **all** of several running processes to exit, returning their exit
-/// codes (`None` for a signal-killed run) in the same order as `processes`.
+/// Wait for **all** of several running processes to exit, returning their
+/// [`Outcome`]s in the same order as `processes`.
 ///
 /// The companion to [`wait_any`]: where `wait_any` races and returns the first
 /// finisher, `wait_all` drives every contender to completion concurrently and
@@ -310,8 +310,8 @@ pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, O
 /// let group = ProcessGroup::new()?;
 /// let mut a = group.start(&Command::new("worker-a")).await?;
 /// let mut b = group.start(&Command::new("worker-b")).await?;
-/// let codes = wait_all(&mut [&mut a, &mut b]).await?;
-/// assert_eq!(codes.len(), 2); // one entry per process, in input order
+/// let outcomes = wait_all(&mut [&mut a, &mut b]).await?;
+/// assert_eq!(outcomes.len(), 2); // one entry per process, in input order
 /// # Ok(())
 /// # }
 /// ```
@@ -325,7 +325,7 @@ pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, O
 ///
 /// If a contender fails to reap (an OS I/O error), that `Err` is returned and
 /// the remaining processes stay waitable (cancel-safe).
-pub async fn wait_all(processes: &mut [&mut RunningProcess]) -> Result<Vec<Option<i32>>> {
+pub async fn wait_all(processes: &mut [&mut RunningProcess]) -> Result<Vec<Outcome>> {
     use std::future::Future;
     use std::task::Poll;
 
@@ -335,20 +335,23 @@ pub async fn wait_all(processes: &mut [&mut RunningProcess]) -> Result<Vec<Optio
         .iter_mut()
         .map(|process| Some(Box::pin(process.wait_exit())))
         .collect();
-    let mut codes: Vec<Option<i32>> = vec![None; waits.len()];
+    // `None` is the "not yet resolved" sentinel; replaced by `Some(Outcome)` on
+    // completion. All slots are `Some` when `remaining == 0`, so the final
+    // `unwrap` below is always safe.
+    let mut outcomes: Vec<Option<Outcome>> = vec![None; waits.len()];
     let mut remaining = waits.len();
 
     // Hand-rolled join (no `futures` dependency): poll every unfinished
-    // contender each wake, store its code at the input-order index, and resolve
-    // once all have exited. Cancel-safe, mirroring `wait_any`.
+    // contender each wake, store its outcome at the input-order index, and
+    // resolve once all have exited. Cancel-safe, mirroring `wait_any`.
     std::future::poll_fn(move |cx| {
         for (idx, slot) in waits.iter_mut().enumerate() {
             if let Some(wait) = slot.as_mut()
                 && let Poll::Ready(result) = wait.as_mut().poll(cx)
             {
                 match result {
-                    Ok(code) => {
-                        codes[idx] = code;
+                    Ok(outcome) => {
+                        outcomes[idx] = Some(outcome);
                         *slot = None;
                         remaining -= 1;
                     }
@@ -357,7 +360,10 @@ pub async fn wait_all(processes: &mut [&mut RunningProcess]) -> Result<Vec<Optio
             }
         }
         if remaining == 0 {
-            Poll::Ready(Ok(std::mem::take(&mut codes)))
+            Poll::Ready(Ok(std::mem::take(&mut outcomes)
+                .into_iter()
+                .map(|o| o.expect("all slots filled when remaining == 0"))
+                .collect()))
         } else {
             Poll::Pending
         }
@@ -378,11 +384,12 @@ pub use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 mod tests {
+    use super::Outcome;
+
     // Regression: wait_exit (used by wait_any/wait_all) did not snapshot
     // cancel_at_exit, so a .wait()/.output_string()/etc. on the winner after
     // wait_any returned — with the token now cancelled — would re-run
     // drive_to_exit_inner whose biased cancel arm fires (token already cancelled),
-    // returning Ok((None, false)) and then snapshotting cancel_at_exit = true,
     // converting a natural exit to Err(Cancelled).
     #[cfg(feature = "cancellation")]
     #[tokio::test]
@@ -398,11 +405,11 @@ mod tests {
             .expect("start scripted process");
 
         // Race the single process — scripted Reply::ok exits immediately (code 0).
-        let (idx, code) = super::wait_any(&mut [&mut process])
+        let (idx, outcome) = super::wait_any(&mut [&mut process])
             .await
             .expect("wait_any");
         assert_eq!(idx, 0);
-        assert_eq!(code, Some(0), "process exited naturally");
+        assert_eq!(outcome, Outcome::Exited(0), "process exited naturally");
 
         // Cancel the token AFTER the natural exit.
         token.cancel();
@@ -411,8 +418,121 @@ mod tests {
         let result = process.wait().await.expect("wait after wait_any");
         assert_eq!(
             result,
-            Some(0),
+            Outcome::Exited(0),
             "natural exit must not be converted to Err(Cancelled)"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_returns_outcome() {
+        use crate::doubles::{Reply, ScriptedRunner};
+        use crate::runner::ProcessRunner;
+        let runner = ScriptedRunner::new().fallback(Reply::ok(""));
+        let process = runner
+            .start(&crate::Command::new("prog"))
+            .await
+            .expect("start");
+        let outcome = process.wait().await.expect("wait");
+        assert_eq!(outcome, Outcome::Exited(0));
+    }
+
+    #[tokio::test]
+    async fn wait_any_returns_outcome() {
+        use crate::doubles::{Reply, ScriptedRunner};
+        use crate::runner::ProcessRunner;
+        let runner = ScriptedRunner::new().fallback(Reply::ok(""));
+        let mut process = runner
+            .start(&crate::Command::new("prog"))
+            .await
+            .expect("start");
+        let (idx, outcome) = super::wait_any(&mut [&mut process])
+            .await
+            .expect("wait_any");
+        assert_eq!(idx, 0);
+        assert_eq!(outcome, Outcome::Exited(0));
+    }
+
+    #[tokio::test]
+    async fn wait_all_returns_outcomes() {
+        use crate::doubles::{Reply, ScriptedRunner};
+        use crate::runner::ProcessRunner;
+        let runner = ScriptedRunner::new().fallback(Reply::ok(""));
+        let mut a = runner
+            .start(&crate::Command::new("a"))
+            .await
+            .expect("start a");
+        let mut b = runner
+            .start(&crate::Command::new("b"))
+            .await
+            .expect("start b");
+        let outcomes = super::wait_all(&mut [&mut a, &mut b])
+            .await
+            .expect("wait_all");
+        assert_eq!(outcomes, vec![Outcome::Exited(0), Outcome::Exited(0)]);
+    }
+
+    #[tokio::test]
+    async fn wait_all_collects_a_mix_of_outcomes_in_order() {
+        use crate::doubles::{Reply, ScriptedRunner};
+        use crate::runner::ProcessRunner;
+        // Three distinct terminal states must each surface as their own Outcome,
+        // in input order — not collapse to a single shape.
+        let runner = ScriptedRunner::new()
+            .on(["clean"], Reply::ok(""))
+            .on(["fail"], Reply::fail(3, "boom"))
+            .on(["killed"], Reply::signalled(Some(9)));
+        let mut a = runner
+            .start(&crate::Command::new("p").arg("clean"))
+            .await
+            .expect("start a");
+        let mut b = runner
+            .start(&crate::Command::new("p").arg("fail"))
+            .await
+            .expect("start b");
+        let mut c = runner
+            .start(&crate::Command::new("p").arg("killed"))
+            .await
+            .expect("start c");
+        let outcomes = super::wait_all(&mut [&mut a, &mut b, &mut c])
+            .await
+            .expect("wait_all");
+        assert_eq!(
+            outcomes,
+            vec![
+                Outcome::Exited(0),
+                Outcome::Exited(3),
+                Outcome::Signalled(Some(9)),
+            ]
+        );
+    }
+
+    // Regression: wait_exit now calls checked_outcome, so a run whose
+    // cancel token was fired before exit snapshots cancel_at_exit=Some(true)
+    // and wait_any correctly raises Err(Cancelled) instead of Ok(Signalled(None)).
+    #[cfg(feature = "cancellation")]
+    #[tokio::test]
+    async fn wait_any_cancelled_run_surfaces_as_err_cancelled() {
+        use crate::doubles::{Reply, ScriptedRunner};
+        use crate::runner::ProcessRunner;
+
+        let token = crate::CancellationToken::new();
+        // Reply::ok exits immediately so backend_wait() returns right away and
+        // the cancel_at_exit snapshot captures the already-cancelled token.
+        let runner = ScriptedRunner::new().fallback(Reply::ok(""));
+        let mut process = runner
+            .start(&crate::Command::new("prog").cancel_on(token.clone()))
+            .await
+            .expect("start");
+
+        // Cancel before wait_any so the snapshot sees is_cancelled()=true.
+        token.cancel();
+
+        let err = super::wait_any(&mut [&mut process])
+            .await
+            .expect_err("cancelled run must error");
+        assert!(
+            matches!(err, crate::Error::Cancelled { .. }),
+            "expected Error::Cancelled, got {err:?}"
         );
     }
 
@@ -433,9 +553,9 @@ mod tests {
     async fn wait_all_on_an_empty_slice_is_an_empty_vec() {
         // Unlike `wait_any`, joining zero processes is well-defined: it
         // resolves immediately to an empty `Vec`, not an error or a hang.
-        let codes = super::wait_all(&mut [])
+        let outcomes = super::wait_all(&mut [])
             .await
             .expect("an empty join resolves cleanly");
-        assert!(codes.is_empty());
+        assert!(outcomes.is_empty());
     }
 }

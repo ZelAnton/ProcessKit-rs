@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::command::Command;
 use crate::doubles::Invocation;
 use crate::error::{Error, Result};
-use crate::result::ProcessResult;
+use crate::result::{Outcome, ProcessResult};
 use crate::runner::{JobRunner, ProcessRunner};
 
 /// The on-disk format revision. Bumped if the cassette schema ever changes
@@ -57,6 +57,10 @@ struct Entry {
     code: Option<i32>,
     #[serde(default, skip_serializing_if = "is_false")]
     timed_out: bool,
+    // Signal number for Signalled outcomes; absent for Exited/TimedOut and in
+    // cassettes written before this field was added (loaded as None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signal: Option<i32>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // signature dictated by serde
@@ -93,6 +97,10 @@ impl Entry {
             stderr: result.stderr().to_owned(),
             code: result.code(),
             timed_out: result.timed_out(),
+            signal: match result.outcome() {
+                Outcome::Signalled(s) => s,
+                _ => None,
+            },
         }
     }
 }
@@ -348,14 +356,18 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                     });
                 };
                 let entry = slot.play();
+                let outcome = match (entry.code, entry.timed_out) {
+                    (_, true) => Outcome::TimedOut,
+                    (Some(code), false) => Outcome::Exited(code),
+                    (None, false) => Outcome::Signalled(entry.signal),
+                };
                 Ok(ProcessResult::new(
                     // Same value the live runner reports — the lossy program
                     // name — so a round trip is comparison-identical.
                     entry.program.clone(),
                     entry.stdout.clone(),
                     entry.stderr.clone(),
-                    entry.code,
-                    entry.timed_out,
+                    outcome,
                     command.configured_timeout(),
                 )
                 .with_ok_codes(command.ok_codes_vec()))
@@ -412,6 +424,7 @@ impl<R: ProcessRunner> Drop for RecordReplayRunner<R> {
 mod tests {
     use super::*;
     use crate::doubles::{Reply, ScriptedRunner};
+    use crate::result::Outcome;
     use crate::runner::ProcessRunnerExt;
     use std::time::Duration;
 
@@ -571,6 +584,38 @@ mod tests {
             .await
             .expect("env is not part of the match key");
         assert_eq!(out, "done");
+    }
+
+    #[tokio::test]
+    async fn signal_number_survives_round_trip() {
+        // Write a cassette JSON that encodes a signal-killed run (signal 9).
+        // Then replay it and verify the outcome carries the signal number.
+        let (_dir, path) = temp_cassette();
+        let json = r#"{"version":1,"entries":[{"program":"tool","args":[],"stdout":"","stderr":"","code":null,"signal":9}]}"#;
+        std::fs::write(&path, json).expect("write cassette");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load cassette");
+        let result = replayer
+            .output(&Command::new("tool"))
+            .await
+            .expect("replay");
+        assert_eq!(result.outcome(), Outcome::Signalled(Some(9)));
+    }
+
+    #[tokio::test]
+    async fn cassette_without_signal_field_loads_as_signalled_none() {
+        // Old cassettes have no `signal` field; they should replay as
+        // Signalled(None) for a code:null entry, not fail to load.
+        let (_dir, path) = temp_cassette();
+        let json = r#"{"version":1,"entries":[{"program":"tool","args":[],"stdout":"","stderr":"","code":null}]}"#;
+        std::fs::write(&path, json).expect("write cassette");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load cassette");
+        let result = replayer
+            .output(&Command::new("tool"))
+            .await
+            .expect("replay");
+        assert_eq!(result.outcome(), Outcome::Signalled(None));
     }
 
     #[tokio::test]

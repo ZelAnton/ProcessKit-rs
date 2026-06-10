@@ -17,7 +17,9 @@ pub enum Outcome {
     /// The process exited on its own with this code.
     Exited(i32),
     /// Terminated by a signal (Unix) — no exit code exists.
-    Signalled,
+    /// The inner value is the signal number when the platform reports one;
+    /// `None` on Windows or when the kernel does not expose the signal.
+    Signalled(Option<i32>),
     /// Killed because it exceeded its configured timeout.
     TimedOut,
 }
@@ -71,23 +73,14 @@ impl<T: PartialEq> PartialEq for ProcessResult<T> {
 impl<T: Eq> Eq for ProcessResult<T> {}
 
 impl<T> ProcessResult<T> {
-    /// Build a result from the raw `code`/`timed_out` pair every producing
-    /// path naturally has in hand. The pair folds into an [`Outcome`]
-    /// (timeout wins, matching the check order in
-    /// [`ensure_success`](Self::ensure_success)).
+    /// Build a result from the [`Outcome`] every producing path has in hand.
     pub(crate) fn new(
         program: String,
         stdout: T,
         stderr: String,
-        code: Option<i32>,
-        timed_out: bool,
+        outcome: Outcome,
         timeout: Option<Duration>,
     ) -> Self {
-        let outcome = match (code, timed_out) {
-            (_, true) => Outcome::TimedOut,
-            (Some(code), false) => Outcome::Exited(code),
-            (None, false) => Outcome::Signalled,
-        };
         Self {
             program,
             stdout,
@@ -158,11 +151,12 @@ impl<T> ProcessResult<T> {
 
     /// Return `self` unchanged when the run succeeded, otherwise the matching
     /// error: [`Error::Timeout`] if the run was killed by its deadline (checked
-    /// first), an IO error if it was killed by a signal (no exit code), else
-    /// [`Error::Exit`] for an exit code outside the accepted set (code `0` by
-    /// default — see [`Command::ok_codes`](crate::Command::ok_codes)), carrying
-    /// the code and both captured streams in full (the [`Display`](std::fmt::Display)
-    /// impl bounds what it prints; the fields stay complete for classification).
+    /// first), [`Error::Signalled`](crate::Error::Signalled) if it was terminated
+    /// by a signal (no exit code), else [`Error::Exit`] for an exit code outside
+    /// the accepted set (code `0` by default — see
+    /// [`Command::ok_codes`](crate::Command::ok_codes)), carrying the code and
+    /// both captured streams in full (the [`Display`](std::fmt::Display) impl
+    /// bounds what it prints; the fields stay complete for classification).
     pub fn ensure_success(self) -> Result<Self, Error>
     where
         T: StdoutText,
@@ -173,10 +167,10 @@ impl<T> ProcessResult<T> {
                 program: self.program.clone(),
                 timeout: self.timeout.unwrap_or_default(),
             }),
-            // Terminated by a signal. Surface it as an IO error (consistent
-            // with `require_code`) rather than a synthetic
-            // `Error::Exit { code: -1 }`.
-            Outcome::Signalled => Err(self.signal_error()),
+            Outcome::Signalled(signal) => Err(Error::Signalled {
+                program: self.program.clone(),
+                signal,
+            }),
             Outcome::Exited(code) => Err(Error::Exit {
                 program: self.program.clone(),
                 code,
@@ -186,19 +180,10 @@ impl<T> ProcessResult<T> {
         }
     }
 
-    /// The error for a run that was killed by a signal and so produced no exit
-    /// code (a non-timeout `None` code).
-    fn signal_error(&self) -> Error {
-        Error::Io(std::io::Error::other(format!(
-            "`{}` was terminated by a signal without an exit code",
-            self.program
-        )))
-    }
-
     /// The exit code for the code-returning convenience helpers
     /// (`Command::exit_code`, `ProcessRunnerExt::exit_code`, `CliClient::exit_code`):
-    /// a timeout surfaces as [`Error::Timeout`], a signal-kill (no code) as an
-    /// IO error, otherwise the code.
+    /// a timeout surfaces as [`Error::Timeout`], a signal-kill (no code) as
+    /// [`Error::Signalled`], otherwise the code.
     pub(crate) fn require_code(&self) -> Result<i32, Error> {
         match self.outcome {
             Outcome::Exited(code) => Ok(code),
@@ -206,7 +191,10 @@ impl<T> ProcessResult<T> {
                 program: self.program.clone(),
                 timeout: self.timeout.unwrap_or_default(),
             }),
-            Outcome::Signalled => Err(self.signal_error()),
+            Outcome::Signalled(signal) => Err(Error::Signalled {
+                program: self.program.clone(),
+                signal,
+            }),
         }
     }
 
@@ -304,56 +292,68 @@ mod tests {
             "x".into(),
             String::new(),
             String::new(),
-            Some(3),
-            false,
+            Outcome::Exited(3),
             None,
         );
         assert_eq!(exited.outcome(), Outcome::Exited(3));
 
-        let signalled =
-            ProcessResult::new("x".into(), String::new(), String::new(), None, false, None);
-        assert_eq!(signalled.outcome(), Outcome::Signalled);
-
-        let timed_out =
-            ProcessResult::new("x".into(), String::new(), String::new(), None, true, None);
-        assert_eq!(timed_out.outcome(), Outcome::TimedOut);
-
-        // A code alongside `timed_out` folds to TimedOut — the same precedence
-        // ensure_success has always applied.
-        let both = ProcessResult::new(
+        let signalled = ProcessResult::new(
             "x".into(),
             String::new(),
             String::new(),
-            Some(0),
-            true,
+            Outcome::Signalled(None),
             None,
         );
-        assert_eq!(both.outcome(), Outcome::TimedOut);
+        assert_eq!(signalled.outcome(), Outcome::Signalled(None));
+
+        let timed_out = ProcessResult::new(
+            "x".into(),
+            String::new(),
+            String::new(),
+            Outcome::TimedOut,
+            None,
+        );
+        assert_eq!(timed_out.outcome(), Outcome::TimedOut);
+    }
+
+    #[test]
+    fn signalled_carries_signal_number() {
+        let killed = ProcessResult::new(
+            "git".into(),
+            "out".to_owned(),
+            String::new(),
+            Outcome::Signalled(Some(9)),
+            None,
+        );
+        assert_eq!(killed.code(), None);
+        assert!(!killed.timed_out());
+        assert!(!killed.is_success());
+        assert_eq!(killed.outcome(), Outcome::Signalled(Some(9)));
+        match killed.ensure_success().unwrap_err() {
+            Error::Signalled { program, signal } => {
+                assert_eq!(program, "git");
+                assert_eq!(signal, Some(9));
+            }
+            other => panic!("expected Signalled, got {other:?}"),
+        }
     }
 
     #[test]
     fn derived_accessors_agree_with_outcome() {
-        for (code, timed_out) in [
-            (Some(0), false),
-            (Some(7), false),
-            (None, false),
-            (None, true),
+        for outcome in [
+            Outcome::Exited(0),
+            Outcome::Exited(7),
+            Outcome::Signalled(None),
+            Outcome::TimedOut,
         ] {
-            let r = ProcessResult::new(
-                "x".into(),
-                String::new(),
-                String::new(),
-                code,
-                timed_out,
-                None,
-            );
+            let r = ProcessResult::new("x".into(), String::new(), String::new(), outcome, None);
             match r.outcome() {
                 Outcome::Exited(c) => {
                     assert_eq!(r.code(), Some(c));
                     assert!(!r.timed_out());
                     assert_eq!(r.is_success(), c == 0);
                 }
-                Outcome::Signalled => {
+                Outcome::Signalled(_) => {
                     assert_eq!(r.code(), None);
                     assert!(!r.timed_out());
                     assert!(!r.is_success());
@@ -373,8 +373,7 @@ mod tests {
             "git".into(),
             "out".to_owned(),
             String::new(),
-            Some(0),
-            false,
+            Outcome::Exited(0),
             None,
         );
         assert!(ok.is_success());
@@ -388,8 +387,7 @@ mod tests {
             "git".into(),
             "CONFLICT (content): merge conflict in a.rs".to_owned(),
             "boom".to_owned(),
-            Some(2),
-            false,
+            Outcome::Exited(2),
             None,
         );
         assert!(!bad.is_success());
@@ -418,8 +416,7 @@ mod tests {
             "git".into(),
             "on stdout".into(),
             "  on stderr \n".into(),
-            Some(1),
-            false,
+            Outcome::Exited(1),
             None,
         );
         assert_eq!(with_stderr.diagnostic(), "on stderr");
@@ -433,8 +430,7 @@ mod tests {
             "git".into(),
             "CONFLICT (content): merge conflict in a.rs".into(),
             "   \n".into(),
-            Some(1),
-            false,
+            Outcome::Exited(1),
             None,
         );
         assert_eq!(
@@ -456,8 +452,7 @@ mod tests {
             "git".into(),
             String::new(),
             "  \n".into(),
-            Some(1),
-            false,
+            Outcome::Exited(1),
             None,
         );
         assert_eq!(silent.ensure_success().unwrap_err().diagnostic(), None);
@@ -471,8 +466,7 @@ mod tests {
             "git".into(),
             "out".to_owned(),
             String::new(),
-            None,
-            true,
+            Outcome::TimedOut,
             Some(Duration::from_millis(500)),
         );
         assert!(timed.timed_out());
@@ -487,24 +481,30 @@ mod tests {
     }
 
     #[test]
-    fn signal_kill_has_no_code_and_never_yields_minus_one() {
-        // A signal-terminated run (no code, not a timeout) reports `None`. Both
-        // `require_code` and `ensure_success` must surface an IO error — never a
-        // synthetic `Error::Exit { code: -1 }`, which would resurrect the sentinel.
+    fn signal_kill_surfaces_as_signalled_error() {
+        // A signal-terminated run (no code, not a timeout) reports `None` code.
+        // Both `require_code` and `ensure_success` must surface `Error::Signalled`
+        // — never a synthetic `Error::Exit { code: -1 }`, which would resurrect
+        // the sentinel, and no longer `Error::Io` (which was the old stand-in).
         let killed = ProcessResult::new(
             "git".into(),
             "out".to_owned(),
             String::new(),
-            None,
-            false,
+            Outcome::Signalled(None),
             None,
         );
         assert_eq!(killed.code(), None);
         assert!(!killed.is_success());
-        assert!(matches!(killed.require_code().unwrap_err(), Error::Io(_)));
+        assert!(matches!(
+            killed.require_code().unwrap_err(),
+            Error::Signalled { .. }
+        ));
         match killed.ensure_success().unwrap_err() {
-            Error::Io(_) => {}
-            other => panic!("expected Io for a signal-kill, got {other:?}"),
+            Error::Signalled { program, signal } => {
+                assert_eq!(program, "git");
+                assert_eq!(signal, None);
+            }
+            other => panic!("expected Signalled for a signal-kill, got {other:?}"),
         }
     }
 
@@ -514,8 +514,7 @@ mod tests {
             "p".into(),
             "out".to_owned(),
             "err".to_owned(),
-            Some(0),
-            false,
+            Outcome::Exited(0),
             None,
         );
         assert_eq!(r.combined(), "outerr");
@@ -532,8 +531,7 @@ mod tests {
             "p".into(),
             big.clone().into_bytes(),
             big.clone(),
-            Some(1),
-            false,
+            Outcome::Exited(1),
             None,
         );
         assert_eq!(bad.stderr().len(), 10_000);
@@ -552,8 +550,7 @@ mod tests {
             "grep".into(),
             "out".to_owned(),
             String::new(),
-            Some(1),
-            false,
+            Outcome::Exited(1),
             None,
         )
         .with_ok_codes(vec![0, 1]);
@@ -564,8 +561,7 @@ mod tests {
             "grep".into(),
             "out".to_owned(),
             String::new(),
-            Some(2),
-            false,
+            Outcome::Exited(2),
             None,
         )
         .with_ok_codes(vec![0, 1]);
@@ -582,8 +578,7 @@ mod tests {
             "x".into(),
             String::new(),
             String::new(),
-            Some(1),
-            false,
+            Outcome::Exited(1),
             None,
         );
         assert_eq!(r.duration(), Duration::ZERO);
@@ -594,8 +589,7 @@ mod tests {
             "x".into(),
             String::new(),
             String::new(),
-            Some(0),
-            false,
+            Outcome::Exited(0),
             None,
         )
         .with_duration(Duration::from_millis(5))
@@ -611,8 +605,7 @@ mod tests {
             "x".into(),
             String::new(),
             String::new(),
-            Some(0),
-            false,
+            Outcome::Exited(0),
             None,
         )
         .with_ok_codes(vec![]);
@@ -630,8 +623,7 @@ mod tests {
             "p".into(),
             "out".to_owned(),
             String::new(),
-            Some(0),
-            false,
+            Outcome::Exited(0),
             None,
         );
         let measured = base
@@ -648,8 +640,7 @@ mod tests {
             "p".into(),
             "DIFF".to_owned(),
             String::new(),
-            Some(0),
-            false,
+            Outcome::Exited(0),
             None,
         );
         assert_ne!(base, different);

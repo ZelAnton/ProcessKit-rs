@@ -177,6 +177,23 @@ pub enum Error {
         program: String,
     },
 
+    /// The process was terminated by a signal (Unix) without producing an exit
+    /// code. `signal` carries the signal number when the platform reports one
+    /// (`None` on Windows or when the kernel does not expose it).
+    ///
+    /// Distinct from [`Exit`](Error::Exit): a signal-terminated run has no exit
+    /// code to check — it is always a failure. Produced by
+    /// [`ensure_success`](crate::ProcessResult::ensure_success) and the
+    /// `require_code` path when the outcome is
+    /// [`Outcome::Signalled`](crate::Outcome::Signalled).
+    #[error("{}", display_signalled(program, *signal))]
+    Signalled {
+        /// The program that was killed by a signal.
+        program: String,
+        /// The signal number, when reported by the platform.
+        signal: Option<i32>,
+    },
+
     /// An IO error occurred while driving the process (reading a pipe, writing
     /// stdin, waiting for exit).
     #[error(transparent)]
@@ -253,6 +270,15 @@ impl Error {
             Error::Io(source) => Some(source),
             _ => None,
         }
+    }
+}
+
+/// `Signalled`'s one-line Display: `` `{program}` was terminated by signal {n} ``
+/// when a number is known, `` `{program}` was terminated by a signal `` otherwise.
+fn display_signalled(program: &str, signal: Option<i32>) -> String {
+    match signal {
+        Some(n) => format!("`{program}` was terminated by signal {n}"),
+        None => format!("`{program}` was terminated by a signal"),
     }
 }
 
@@ -448,6 +474,25 @@ mod tests {
             err.to_string(),
             "could not enforce resource limits: no cgroup or Job Object available"
         );
+    }
+
+    #[test]
+    fn signalled_display_and_diagnostic() {
+        let with_signal = Error::Signalled {
+            program: "git".into(),
+            signal: Some(9),
+        };
+        assert_eq!(with_signal.to_string(), "`git` was terminated by signal 9");
+        assert_eq!(with_signal.diagnostic(), None);
+        assert!(!with_signal.is_not_found());
+        assert!(!with_signal.is_permission_denied());
+        assert!(!with_signal.is_transient());
+
+        let no_signal = Error::Signalled {
+            program: "git".into(),
+            signal: None,
+        };
+        assert_eq!(no_signal.to_string(), "`git` was terminated by a signal");
     }
 
     #[test]

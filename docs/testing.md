@@ -113,10 +113,10 @@ The pieces:
 reply instead of an OS child. The canned stdout/stderr feed the **same pump
 machinery** a real child uses, so the whole streaming surface works
 hermetically — `stdout_lines` yields the lines, `wait_for_line` probes them,
-`finish_streamed` reports the canned exit and stderr:
+`finish_streamed` reports the canned outcome and stderr:
 
 ```rust,no_run
-use processkit::{Command, ProcessRunner, Reply, ScriptedRunner, StreamExt};
+use processkit::{Command, Outcome, ProcessRunner, Reply, ScriptedRunner, StreamExt, StreamedFinish};
 use std::time::Duration;
 
 #[tokio::test]
@@ -129,8 +129,8 @@ async fn server_becomes_ready() {
         .await
         .unwrap(); // satisfied by the canned banner — no subprocess
 
-    let (code, _stderr) = run.finish_streamed().await.unwrap();
-    assert_eq!(code, Some(0));
+    let StreamedFinish { outcome, .. } = run.finish_streamed().await.unwrap();
+    assert_eq!(outcome, Outcome::Exited(0));
 }
 ```
 

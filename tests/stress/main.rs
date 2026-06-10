@@ -169,7 +169,7 @@ async fn large_group_teardown_kills_the_whole_tree() {
 /// With ~90s children, prompt reaping is the teardown signal: a child the
 /// teardown missed would block its waiter past the grace.
 async fn assert_all_reaped_within(
-    waiters: Vec<tokio::task::JoinHandle<processkit::Result<Option<i32>>>>,
+    waiters: Vec<tokio::task::JoinHandle<processkit::Result<processkit::Outcome>>>,
     grace: Duration,
     how: &str,
 ) {

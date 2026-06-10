@@ -1,8 +1,11 @@
 pub mod processkit
+pub use processkit::CancellationToken
 pub use processkit::Encoding
 pub use processkit::StreamExt
 pub macro processkit::cli_client!
 #[non_exhaustive] pub enum processkit::Error
+pub processkit::Error::Cancelled
+pub processkit::Error::Cancelled::program: alloc::string::String
 pub processkit::Error::Exit
 pub processkit::Error::Exit::code: i32
 pub processkit::Error::Exit::program: alloc::string::String
@@ -22,6 +25,10 @@ pub processkit::Error::OutputTooLarge::total_lines: usize
 pub processkit::Error::Parse
 pub processkit::Error::Parse::message: alloc::string::String
 pub processkit::Error::Parse::program: alloc::string::String
+pub processkit::Error::ResourceLimit(alloc::string::String)
+pub processkit::Error::Signalled
+pub processkit::Error::Signalled::program: alloc::string::String
+pub processkit::Error::Signalled::signal: core::option::Option<i32>
 pub processkit::Error::Spawn
 pub processkit::Error::Spawn::program: alloc::string::String
 pub processkit::Error::Spawn::source: std::io::error::Error
@@ -50,24 +57,6 @@ impl core::marker::Unpin for processkit::Error
 impl core::marker::UnsafeUnpin for processkit::Error
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Error
 impl !core::panic::unwind_safe::UnwindSafe for processkit::Error
-impl<T, U> core::convert::Into<U> for processkit::Error where U: core::convert::From<T>
-pub fn processkit::Error::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::Error where U: core::convert::Into<T>
-pub type processkit::Error::Error = core::convert::Infallible
-pub fn processkit::Error::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::Error where U: core::convert::TryFrom<T>
-pub type processkit::Error::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::Error::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::string::ToString for processkit::Error where T: core::fmt::Display + ?core::marker::Sized
-pub fn processkit::Error::to_string(&self) -> alloc::string::String
-impl<T> core::any::Any for processkit::Error where T: 'static + ?core::marker::Sized
-pub fn processkit::Error::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::Error where T: ?core::marker::Sized
-pub fn processkit::Error::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::Error where T: ?core::marker::Sized
-pub fn processkit::Error::borrow_mut(&mut self) -> &mut T
-impl<T> core::convert::From<T> for processkit::Error
-pub fn processkit::Error::from(T) -> T
 #[non_exhaustive] pub enum processkit::Mechanism
 pub processkit::Mechanism::CgroupV2
 pub processkit::Mechanism::JobObject
@@ -89,31 +78,9 @@ impl core::marker::Unpin for processkit::Mechanism
 impl core::marker::UnsafeUnpin for processkit::Mechanism
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::Mechanism
 impl core::panic::unwind_safe::UnwindSafe for processkit::Mechanism
-impl<T, U> core::convert::Into<U> for processkit::Mechanism where U: core::convert::From<T>
-pub fn processkit::Mechanism::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::Mechanism where U: core::convert::Into<T>
-pub type processkit::Mechanism::Error = core::convert::Infallible
-pub fn processkit::Mechanism::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::Mechanism where U: core::convert::TryFrom<T>
-pub type processkit::Mechanism::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::Mechanism::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::Mechanism where T: core::clone::Clone
-pub type processkit::Mechanism::Owned = T
-pub fn processkit::Mechanism::clone_into(&self, &mut T)
-pub fn processkit::Mechanism::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::Mechanism where T: 'static + ?core::marker::Sized
-pub fn processkit::Mechanism::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::Mechanism where T: ?core::marker::Sized
-pub fn processkit::Mechanism::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::Mechanism where T: ?core::marker::Sized
-pub fn processkit::Mechanism::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::Mechanism where T: core::clone::Clone
-pub unsafe fn processkit::Mechanism::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::Mechanism
-pub fn processkit::Mechanism::from(T) -> T
 #[non_exhaustive] pub enum processkit::Outcome
 pub processkit::Outcome::Exited(i32)
-pub processkit::Outcome::Signalled
+pub processkit::Outcome::Signalled(core::option::Option<i32>)
 pub processkit::Outcome::TimedOut
 impl core::clone::Clone for processkit::Outcome
 pub fn processkit::Outcome::clone(&self) -> processkit::Outcome
@@ -131,28 +98,6 @@ impl core::marker::Unpin for processkit::Outcome
 impl core::marker::UnsafeUnpin for processkit::Outcome
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::Outcome
 impl core::panic::unwind_safe::UnwindSafe for processkit::Outcome
-impl<T, U> core::convert::Into<U> for processkit::Outcome where U: core::convert::From<T>
-pub fn processkit::Outcome::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::Outcome where U: core::convert::Into<T>
-pub type processkit::Outcome::Error = core::convert::Infallible
-pub fn processkit::Outcome::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::Outcome where U: core::convert::TryFrom<T>
-pub type processkit::Outcome::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::Outcome::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::Outcome where T: core::clone::Clone
-pub type processkit::Outcome::Owned = T
-pub fn processkit::Outcome::clone_into(&self, &mut T)
-pub fn processkit::Outcome::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::Outcome where T: 'static + ?core::marker::Sized
-pub fn processkit::Outcome::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::Outcome where T: ?core::marker::Sized
-pub fn processkit::Outcome::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::Outcome where T: ?core::marker::Sized
-pub fn processkit::Outcome::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::Outcome where T: core::clone::Clone
-pub unsafe fn processkit::Outcome::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::Outcome
-pub fn processkit::Outcome::from(T) -> T
 pub enum processkit::OutputEvent
 pub processkit::OutputEvent::Stderr(alloc::string::String)
 pub processkit::OutputEvent::Stdout(alloc::string::String)
@@ -171,28 +116,6 @@ impl core::marker::Unpin for processkit::OutputEvent
 impl core::marker::UnsafeUnpin for processkit::OutputEvent
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::OutputEvent
 impl core::panic::unwind_safe::UnwindSafe for processkit::OutputEvent
-impl<T, U> core::convert::Into<U> for processkit::OutputEvent where U: core::convert::From<T>
-pub fn processkit::OutputEvent::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::OutputEvent where U: core::convert::Into<T>
-pub type processkit::OutputEvent::Error = core::convert::Infallible
-pub fn processkit::OutputEvent::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::OutputEvent where U: core::convert::TryFrom<T>
-pub type processkit::OutputEvent::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::OutputEvent::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::OutputEvent where T: core::clone::Clone
-pub type processkit::OutputEvent::Owned = T
-pub fn processkit::OutputEvent::clone_into(&self, &mut T)
-pub fn processkit::OutputEvent::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::OutputEvent where T: 'static + ?core::marker::Sized
-pub fn processkit::OutputEvent::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::OutputEvent where T: ?core::marker::Sized
-pub fn processkit::OutputEvent::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::OutputEvent where T: ?core::marker::Sized
-pub fn processkit::OutputEvent::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::OutputEvent where T: core::clone::Clone
-pub unsafe fn processkit::OutputEvent::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::OutputEvent
-pub fn processkit::OutputEvent::from(T) -> T
 #[non_exhaustive] pub enum processkit::OverflowMode
 pub processkit::OverflowMode::DropNewest
 pub processkit::OverflowMode::DropOldest
@@ -213,28 +136,6 @@ impl core::marker::Unpin for processkit::OverflowMode
 impl core::marker::UnsafeUnpin for processkit::OverflowMode
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::OverflowMode
 impl core::panic::unwind_safe::UnwindSafe for processkit::OverflowMode
-impl<T, U> core::convert::Into<U> for processkit::OverflowMode where U: core::convert::From<T>
-pub fn processkit::OverflowMode::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::OverflowMode where U: core::convert::Into<T>
-pub type processkit::OverflowMode::Error = core::convert::Infallible
-pub fn processkit::OverflowMode::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::OverflowMode where U: core::convert::TryFrom<T>
-pub type processkit::OverflowMode::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::OverflowMode::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::OverflowMode where T: core::clone::Clone
-pub type processkit::OverflowMode::Owned = T
-pub fn processkit::OverflowMode::clone_into(&self, &mut T)
-pub fn processkit::OverflowMode::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::OverflowMode where T: 'static + ?core::marker::Sized
-pub fn processkit::OverflowMode::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::OverflowMode where T: ?core::marker::Sized
-pub fn processkit::OverflowMode::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::OverflowMode where T: ?core::marker::Sized
-pub fn processkit::OverflowMode::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::OverflowMode where T: core::clone::Clone
-pub unsafe fn processkit::OverflowMode::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::OverflowMode
-pub fn processkit::OverflowMode::from(T) -> T
 #[non_exhaustive] pub enum processkit::RestartPolicy
 pub processkit::RestartPolicy::Always
 pub processkit::RestartPolicy::Never
@@ -255,28 +156,6 @@ impl core::marker::Unpin for processkit::RestartPolicy
 impl core::marker::UnsafeUnpin for processkit::RestartPolicy
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::RestartPolicy
 impl core::panic::unwind_safe::UnwindSafe for processkit::RestartPolicy
-impl<T, U> core::convert::Into<U> for processkit::RestartPolicy where U: core::convert::From<T>
-pub fn processkit::RestartPolicy::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::RestartPolicy where U: core::convert::Into<T>
-pub type processkit::RestartPolicy::Error = core::convert::Infallible
-pub fn processkit::RestartPolicy::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::RestartPolicy where U: core::convert::TryFrom<T>
-pub type processkit::RestartPolicy::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::RestartPolicy::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::RestartPolicy where T: core::clone::Clone
-pub type processkit::RestartPolicy::Owned = T
-pub fn processkit::RestartPolicy::clone_into(&self, &mut T)
-pub fn processkit::RestartPolicy::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::RestartPolicy where T: 'static + ?core::marker::Sized
-pub fn processkit::RestartPolicy::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::RestartPolicy where T: ?core::marker::Sized
-pub fn processkit::RestartPolicy::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::RestartPolicy where T: ?core::marker::Sized
-pub fn processkit::RestartPolicy::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::RestartPolicy where T: core::clone::Clone
-pub unsafe fn processkit::RestartPolicy::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::RestartPolicy
-pub fn processkit::RestartPolicy::from(T) -> T
 #[non_exhaustive] pub enum processkit::Signal
 pub processkit::Signal::Hup
 pub processkit::Signal::Int
@@ -304,28 +183,6 @@ impl core::marker::Unpin for processkit::Signal
 impl core::marker::UnsafeUnpin for processkit::Signal
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::Signal
 impl core::panic::unwind_safe::UnwindSafe for processkit::Signal
-impl<T, U> core::convert::Into<U> for processkit::Signal where U: core::convert::From<T>
-pub fn processkit::Signal::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::Signal where U: core::convert::Into<T>
-pub type processkit::Signal::Error = core::convert::Infallible
-pub fn processkit::Signal::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::Signal where U: core::convert::TryFrom<T>
-pub type processkit::Signal::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::Signal::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::Signal where T: core::clone::Clone
-pub type processkit::Signal::Owned = T
-pub fn processkit::Signal::clone_into(&self, &mut T)
-pub fn processkit::Signal::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::Signal where T: 'static + ?core::marker::Sized
-pub fn processkit::Signal::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::Signal where T: ?core::marker::Sized
-pub fn processkit::Signal::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::Signal where T: ?core::marker::Sized
-pub fn processkit::Signal::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::Signal where T: core::clone::Clone
-pub unsafe fn processkit::Signal::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::Signal
-pub fn processkit::Signal::from(T) -> T
 #[non_exhaustive] pub enum processkit::StdioMode
 pub processkit::StdioMode::Inherit
 pub processkit::StdioMode::Null
@@ -348,28 +205,6 @@ impl core::marker::Unpin for processkit::StdioMode
 impl core::marker::UnsafeUnpin for processkit::StdioMode
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::StdioMode
 impl core::panic::unwind_safe::UnwindSafe for processkit::StdioMode
-impl<T, U> core::convert::Into<U> for processkit::StdioMode where U: core::convert::From<T>
-pub fn processkit::StdioMode::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::StdioMode where U: core::convert::Into<T>
-pub type processkit::StdioMode::Error = core::convert::Infallible
-pub fn processkit::StdioMode::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::StdioMode where U: core::convert::TryFrom<T>
-pub type processkit::StdioMode::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::StdioMode::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::StdioMode where T: core::clone::Clone
-pub type processkit::StdioMode::Owned = T
-pub fn processkit::StdioMode::clone_into(&self, &mut T)
-pub fn processkit::StdioMode::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::StdioMode where T: 'static + ?core::marker::Sized
-pub fn processkit::StdioMode::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::StdioMode where T: ?core::marker::Sized
-pub fn processkit::StdioMode::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::StdioMode where T: ?core::marker::Sized
-pub fn processkit::StdioMode::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::StdioMode where T: core::clone::Clone
-pub unsafe fn processkit::StdioMode::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::StdioMode
-pub fn processkit::StdioMode::from(T) -> T
 #[non_exhaustive] pub enum processkit::StopReason
 pub processkit::StopReason::PolicySatisfied
 pub processkit::StopReason::Predicate
@@ -390,34 +225,13 @@ impl core::marker::Unpin for processkit::StopReason
 impl core::marker::UnsafeUnpin for processkit::StopReason
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::StopReason
 impl core::panic::unwind_safe::UnwindSafe for processkit::StopReason
-impl<T, U> core::convert::Into<U> for processkit::StopReason where U: core::convert::From<T>
-pub fn processkit::StopReason::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::StopReason where U: core::convert::Into<T>
-pub type processkit::StopReason::Error = core::convert::Infallible
-pub fn processkit::StopReason::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::StopReason where U: core::convert::TryFrom<T>
-pub type processkit::StopReason::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::StopReason::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::StopReason where T: core::clone::Clone
-pub type processkit::StopReason::Owned = T
-pub fn processkit::StopReason::clone_into(&self, &mut T)
-pub fn processkit::StopReason::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::StopReason where T: 'static + ?core::marker::Sized
-pub fn processkit::StopReason::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::StopReason where T: ?core::marker::Sized
-pub fn processkit::StopReason::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::StopReason where T: ?core::marker::Sized
-pub fn processkit::StopReason::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::StopReason where T: core::clone::Clone
-pub unsafe fn processkit::StopReason::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::StopReason
-pub fn processkit::StopReason::from(T) -> T
 pub struct processkit::CliClient<R: processkit::ProcessRunner>
 impl processkit::CliClient<processkit::JobRunner>
 pub fn processkit::CliClient<processkit::JobRunner>::new(impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
 impl<R: processkit::ProcessRunner> processkit::CliClient<R>
 pub fn processkit::CliClient<R>::command<I, S>(&self, I) -> processkit::Command where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub fn processkit::CliClient<R>::command_in<I, S>(&self, &std::path::Path, I) -> processkit::Command where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
+pub fn processkit::CliClient<R>::default_cancel_on(self, tokio_util::sync::cancellation_token::CancellationToken) -> Self
 pub fn processkit::CliClient<R>::default_env(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
 pub fn processkit::CliClient<R>::default_env_remove(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
 pub fn processkit::CliClient<R>::default_timeout(self, core::time::Duration) -> Self
@@ -440,27 +254,12 @@ impl<R> core::marker::Unpin for processkit::CliClient<R> where R: core::marker::
 impl<R> core::marker::UnsafeUnpin for processkit::CliClient<R> where R: core::marker::UnsafeUnpin
 impl<R> core::panic::unwind_safe::RefUnwindSafe for processkit::CliClient<R> where R: core::panic::unwind_safe::RefUnwindSafe
 impl<R> core::panic::unwind_safe::UnwindSafe for processkit::CliClient<R> where R: core::panic::unwind_safe::UnwindSafe
-impl<T, U> core::convert::Into<U> for processkit::CliClient<R> where U: core::convert::From<T>
-pub fn processkit::CliClient<R>::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::CliClient<R> where U: core::convert::Into<T>
-pub type processkit::CliClient<R>::Error = core::convert::Infallible
-pub fn processkit::CliClient<R>::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::CliClient<R> where U: core::convert::TryFrom<T>
-pub type processkit::CliClient<R>::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::CliClient<R>::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> core::any::Any for processkit::CliClient<R> where T: 'static + ?core::marker::Sized
-pub fn processkit::CliClient<R>::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::CliClient<R> where T: ?core::marker::Sized
-pub fn processkit::CliClient<R>::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::CliClient<R> where T: ?core::marker::Sized
-pub fn processkit::CliClient<R>::borrow_mut(&mut self) -> &mut T
-impl<T> core::convert::From<T> for processkit::CliClient<R>
-pub fn processkit::CliClient<R>::from(T) -> T
 pub struct processkit::Command
 impl processkit::Command
 pub fn processkit::Command::arg(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
 pub fn processkit::Command::args<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub fn processkit::Command::arguments(&self) -> &[std::ffi::os_str::OsString]
+pub fn processkit::Command::cancel_on(self, tokio_util::sync::cancellation_token::CancellationToken) -> Self
 pub fn processkit::Command::command_line(&self) -> alloc::string::String
 pub fn processkit::Command::configured_timeout(&self) -> core::option::Option<core::time::Duration>
 pub fn processkit::Command::create_no_window(self) -> Self
@@ -524,28 +323,6 @@ impl core::marker::Unpin for processkit::Command
 impl core::marker::UnsafeUnpin for processkit::Command
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Command
 impl !core::panic::unwind_safe::UnwindSafe for processkit::Command
-impl<T, U> core::convert::Into<U> for processkit::Command where U: core::convert::From<T>
-pub fn processkit::Command::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::Command where U: core::convert::Into<T>
-pub type processkit::Command::Error = core::convert::Infallible
-pub fn processkit::Command::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::Command where U: core::convert::TryFrom<T>
-pub type processkit::Command::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::Command::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::Command where T: core::clone::Clone
-pub type processkit::Command::Owned = T
-pub fn processkit::Command::clone_into(&self, &mut T)
-pub fn processkit::Command::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::Command where T: 'static + ?core::marker::Sized
-pub fn processkit::Command::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::Command where T: ?core::marker::Sized
-pub fn processkit::Command::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::Command where T: ?core::marker::Sized
-pub fn processkit::Command::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::Command where T: core::clone::Clone
-pub unsafe fn processkit::Command::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::Command
-pub fn processkit::Command::from(T) -> T
 pub struct processkit::Invocation
 pub processkit::Invocation::args: alloc::vec::Vec<std::ffi::os_str::OsString>
 pub processkit::Invocation::cwd: core::option::Option<std::ffi::os_str::OsString>
@@ -570,28 +347,6 @@ impl core::marker::Unpin for processkit::Invocation
 impl core::marker::UnsafeUnpin for processkit::Invocation
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::Invocation
 impl core::panic::unwind_safe::UnwindSafe for processkit::Invocation
-impl<T, U> core::convert::Into<U> for processkit::Invocation where U: core::convert::From<T>
-pub fn processkit::Invocation::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::Invocation where U: core::convert::Into<T>
-pub type processkit::Invocation::Error = core::convert::Infallible
-pub fn processkit::Invocation::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::Invocation where U: core::convert::TryFrom<T>
-pub type processkit::Invocation::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::Invocation::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::Invocation where T: core::clone::Clone
-pub type processkit::Invocation::Owned = T
-pub fn processkit::Invocation::clone_into(&self, &mut T)
-pub fn processkit::Invocation::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::Invocation where T: 'static + ?core::marker::Sized
-pub fn processkit::Invocation::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::Invocation where T: ?core::marker::Sized
-pub fn processkit::Invocation::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::Invocation where T: ?core::marker::Sized
-pub fn processkit::Invocation::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::Invocation where T: core::clone::Clone
-pub unsafe fn processkit::Invocation::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::Invocation
-pub fn processkit::Invocation::from(T) -> T
 pub struct processkit::JobRunner
 impl processkit::JobRunner
 pub fn processkit::JobRunner::new() -> Self
@@ -612,34 +367,27 @@ impl core::marker::Unpin for processkit::JobRunner
 impl core::marker::UnsafeUnpin for processkit::JobRunner
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::JobRunner
 impl core::panic::unwind_safe::UnwindSafe for processkit::JobRunner
-impl<T, U> core::convert::Into<U> for processkit::JobRunner where U: core::convert::From<T>
-pub fn processkit::JobRunner::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::JobRunner where U: core::convert::Into<T>
-pub type processkit::JobRunner::Error = core::convert::Infallible
-pub fn processkit::JobRunner::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::JobRunner where U: core::convert::TryFrom<T>
-pub type processkit::JobRunner::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::JobRunner::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::JobRunner where T: core::clone::Clone
-pub type processkit::JobRunner::Owned = T
-pub fn processkit::JobRunner::clone_into(&self, &mut T)
-pub fn processkit::JobRunner::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::JobRunner where T: 'static + ?core::marker::Sized
-pub fn processkit::JobRunner::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::JobRunner where T: ?core::marker::Sized
-pub fn processkit::JobRunner::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::JobRunner where T: ?core::marker::Sized
-pub fn processkit::JobRunner::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::JobRunner where T: core::clone::Clone
-pub unsafe fn processkit::JobRunner::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::JobRunner
-pub fn processkit::JobRunner::from(T) -> T
-impl<T> processkit::ProcessRunnerExt for processkit::JobRunner where T: processkit::ProcessRunner + ?core::marker::Sized
-pub fn processkit::JobRunner::checked<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::JobRunner::exit_code<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<i32>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::JobRunner::probe<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<bool>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::JobRunner::run<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<alloc::string::String>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::JobRunner::run_unit<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<()>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub struct processkit::MockRunner
+impl processkit::MockRunner
+pub fn processkit::MockRunner::checkpoint(&mut self)
+pub fn processkit::MockRunner::new() -> Self
+impl processkit::MockRunner
+pub fn processkit::MockRunner::expect_output(&mut self) -> &mut processkit::runner::__mock_MockProcessRunner_ProcessRunner::__output::Expectation
+pub fn processkit::MockRunner::expect_start(&mut self) -> &mut processkit::runner::__mock_MockProcessRunner_ProcessRunner::__start::Expectation
+impl core::default::Default for processkit::MockRunner
+pub fn processkit::MockRunner::default() -> Self
+impl core::fmt::Debug for processkit::MockRunner
+pub fn processkit::MockRunner::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::result::Result<(), core::fmt::Error>
+impl processkit::ProcessRunner for processkit::MockRunner
+pub fn processkit::MockRunner::output<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn processkit::MockRunner::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::RunningProcess>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+impl core::marker::Freeze for processkit::MockRunner
+impl core::marker::Send for processkit::MockRunner
+impl core::marker::Sync for processkit::MockRunner
+impl core::marker::Unpin for processkit::MockRunner
+impl core::marker::UnsafeUnpin for processkit::MockRunner
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::MockRunner
+impl core::panic::unwind_safe::UnwindSafe for processkit::MockRunner
 #[non_exhaustive] pub struct processkit::OutputBufferPolicy
 pub processkit::OutputBufferPolicy::max_lines: core::option::Option<usize>
 pub processkit::OutputBufferPolicy::overflow: processkit::OverflowMode
@@ -666,28 +414,6 @@ impl core::marker::Unpin for processkit::OutputBufferPolicy
 impl core::marker::UnsafeUnpin for processkit::OutputBufferPolicy
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::OutputBufferPolicy
 impl core::panic::unwind_safe::UnwindSafe for processkit::OutputBufferPolicy
-impl<T, U> core::convert::Into<U> for processkit::OutputBufferPolicy where U: core::convert::From<T>
-pub fn processkit::OutputBufferPolicy::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::OutputBufferPolicy where U: core::convert::Into<T>
-pub type processkit::OutputBufferPolicy::Error = core::convert::Infallible
-pub fn processkit::OutputBufferPolicy::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::OutputBufferPolicy where U: core::convert::TryFrom<T>
-pub type processkit::OutputBufferPolicy::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::OutputBufferPolicy::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::OutputBufferPolicy where T: core::clone::Clone
-pub type processkit::OutputBufferPolicy::Owned = T
-pub fn processkit::OutputBufferPolicy::clone_into(&self, &mut T)
-pub fn processkit::OutputBufferPolicy::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::OutputBufferPolicy where T: 'static + ?core::marker::Sized
-pub fn processkit::OutputBufferPolicy::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::OutputBufferPolicy where T: ?core::marker::Sized
-pub fn processkit::OutputBufferPolicy::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::OutputBufferPolicy where T: ?core::marker::Sized
-pub fn processkit::OutputBufferPolicy::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::OutputBufferPolicy where T: core::clone::Clone
-pub unsafe fn processkit::OutputBufferPolicy::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::OutputBufferPolicy
-pub fn processkit::OutputBufferPolicy::from(T) -> T
 pub struct processkit::OutputEvents
 impl core::fmt::Debug for processkit::OutputEvents
 pub fn processkit::OutputEvents::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -701,23 +427,6 @@ impl core::marker::Unpin for processkit::OutputEvents
 impl core::marker::UnsafeUnpin for processkit::OutputEvents
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::OutputEvents
 impl !core::panic::unwind_safe::UnwindSafe for processkit::OutputEvents
-impl<St> tokio_stream::stream_ext::StreamExt for processkit::OutputEvents where St: futures_core::stream::Stream + ?core::marker::Sized
-impl<T, U> core::convert::Into<U> for processkit::OutputEvents where U: core::convert::From<T>
-pub fn processkit::OutputEvents::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::OutputEvents where U: core::convert::Into<T>
-pub type processkit::OutputEvents::Error = core::convert::Infallible
-pub fn processkit::OutputEvents::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::OutputEvents where U: core::convert::TryFrom<T>
-pub type processkit::OutputEvents::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::OutputEvents::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> core::any::Any for processkit::OutputEvents where T: 'static + ?core::marker::Sized
-pub fn processkit::OutputEvents::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::OutputEvents where T: ?core::marker::Sized
-pub fn processkit::OutputEvents::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::OutputEvents where T: ?core::marker::Sized
-pub fn processkit::OutputEvents::borrow_mut(&mut self) -> &mut T
-impl<T> core::convert::From<T> for processkit::OutputEvents
-pub fn processkit::OutputEvents::from(T) -> T
 pub struct processkit::Pipeline
 impl processkit::Pipeline
 pub async fn processkit::Pipeline::output_string(&self) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
@@ -738,28 +447,6 @@ impl core::marker::Unpin for processkit::Pipeline
 impl core::marker::UnsafeUnpin for processkit::Pipeline
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Pipeline
 impl !core::panic::unwind_safe::UnwindSafe for processkit::Pipeline
-impl<T, U> core::convert::Into<U> for processkit::Pipeline where U: core::convert::From<T>
-pub fn processkit::Pipeline::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::Pipeline where U: core::convert::Into<T>
-pub type processkit::Pipeline::Error = core::convert::Infallible
-pub fn processkit::Pipeline::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::Pipeline where U: core::convert::TryFrom<T>
-pub type processkit::Pipeline::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::Pipeline::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::Pipeline where T: core::clone::Clone
-pub type processkit::Pipeline::Owned = T
-pub fn processkit::Pipeline::clone_into(&self, &mut T)
-pub fn processkit::Pipeline::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::Pipeline where T: 'static + ?core::marker::Sized
-pub fn processkit::Pipeline::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::Pipeline where T: ?core::marker::Sized
-pub fn processkit::Pipeline::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::Pipeline where T: ?core::marker::Sized
-pub fn processkit::Pipeline::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::Pipeline where T: core::clone::Clone
-pub unsafe fn processkit::Pipeline::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::Pipeline
-pub fn processkit::Pipeline::from(T) -> T
 pub struct processkit::ProcessGroup
 impl processkit::ProcessGroup
 pub fn processkit::ProcessGroup::adopt(&self, &tokio::process::Child) -> processkit::Result<()>
@@ -789,31 +476,14 @@ impl core::marker::Unpin for processkit::ProcessGroup
 impl core::marker::UnsafeUnpin for processkit::ProcessGroup
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::ProcessGroup
 impl core::panic::unwind_safe::UnwindSafe for processkit::ProcessGroup
-impl<T, U> core::convert::Into<U> for processkit::ProcessGroup where U: core::convert::From<T>
-pub fn processkit::ProcessGroup::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::ProcessGroup where U: core::convert::Into<T>
-pub type processkit::ProcessGroup::Error = core::convert::Infallible
-pub fn processkit::ProcessGroup::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::ProcessGroup where U: core::convert::TryFrom<T>
-pub type processkit::ProcessGroup::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::ProcessGroup::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> core::any::Any for processkit::ProcessGroup where T: 'static + ?core::marker::Sized
-pub fn processkit::ProcessGroup::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::ProcessGroup where T: ?core::marker::Sized
-pub fn processkit::ProcessGroup::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::ProcessGroup where T: ?core::marker::Sized
-pub fn processkit::ProcessGroup::borrow_mut(&mut self) -> &mut T
-impl<T> core::convert::From<T> for processkit::ProcessGroup
-pub fn processkit::ProcessGroup::from(T) -> T
-impl<T> processkit::ProcessRunnerExt for processkit::ProcessGroup where T: processkit::ProcessRunner + ?core::marker::Sized
-pub fn processkit::ProcessGroup::checked<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::ProcessGroup::exit_code<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<i32>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::ProcessGroup::probe<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<bool>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::ProcessGroup::run<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<alloc::string::String>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::ProcessGroup::run_unit<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<()>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 #[non_exhaustive] pub struct processkit::ProcessGroupOptions
 pub processkit::ProcessGroupOptions::escalate_to_kill: bool
+pub processkit::ProcessGroupOptions::limits: processkit::ResourceLimits
 pub processkit::ProcessGroupOptions::shutdown_timeout: core::time::Duration
+impl processkit::ProcessGroupOptions
+pub fn processkit::ProcessGroupOptions::cpu_quota(self, f64) -> Self
+pub fn processkit::ProcessGroupOptions::max_processes(self, u32) -> Self
+pub fn processkit::ProcessGroupOptions::memory_max(self, u64) -> Self
 impl processkit::ProcessGroupOptions
 pub fn processkit::ProcessGroupOptions::escalate_to_kill(self, bool) -> Self
 pub fn processkit::ProcessGroupOptions::shutdown_timeout(self, core::time::Duration) -> Self
@@ -830,28 +500,6 @@ impl core::marker::Unpin for processkit::ProcessGroupOptions
 impl core::marker::UnsafeUnpin for processkit::ProcessGroupOptions
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::ProcessGroupOptions
 impl core::panic::unwind_safe::UnwindSafe for processkit::ProcessGroupOptions
-impl<T, U> core::convert::Into<U> for processkit::ProcessGroupOptions where U: core::convert::From<T>
-pub fn processkit::ProcessGroupOptions::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::ProcessGroupOptions where U: core::convert::Into<T>
-pub type processkit::ProcessGroupOptions::Error = core::convert::Infallible
-pub fn processkit::ProcessGroupOptions::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::ProcessGroupOptions where U: core::convert::TryFrom<T>
-pub type processkit::ProcessGroupOptions::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::ProcessGroupOptions::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::ProcessGroupOptions where T: core::clone::Clone
-pub type processkit::ProcessGroupOptions::Owned = T
-pub fn processkit::ProcessGroupOptions::clone_into(&self, &mut T)
-pub fn processkit::ProcessGroupOptions::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::ProcessGroupOptions where T: 'static + ?core::marker::Sized
-pub fn processkit::ProcessGroupOptions::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::ProcessGroupOptions where T: ?core::marker::Sized
-pub fn processkit::ProcessGroupOptions::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::ProcessGroupOptions where T: ?core::marker::Sized
-pub fn processkit::ProcessGroupOptions::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::ProcessGroupOptions where T: core::clone::Clone
-pub unsafe fn processkit::ProcessGroupOptions::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::ProcessGroupOptions
-pub fn processkit::ProcessGroupOptions::from(T) -> T
 #[non_exhaustive] pub struct processkit::ProcessGroupStats
 pub processkit::ProcessGroupStats::active_process_count: usize
 pub processkit::ProcessGroupStats::peak_memory_bytes: core::option::Option<u64>
@@ -872,28 +520,6 @@ impl core::marker::Unpin for processkit::ProcessGroupStats
 impl core::marker::UnsafeUnpin for processkit::ProcessGroupStats
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::ProcessGroupStats
 impl core::panic::unwind_safe::UnwindSafe for processkit::ProcessGroupStats
-impl<T, U> core::convert::Into<U> for processkit::ProcessGroupStats where U: core::convert::From<T>
-pub fn processkit::ProcessGroupStats::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::ProcessGroupStats where U: core::convert::Into<T>
-pub type processkit::ProcessGroupStats::Error = core::convert::Infallible
-pub fn processkit::ProcessGroupStats::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::ProcessGroupStats where U: core::convert::TryFrom<T>
-pub type processkit::ProcessGroupStats::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::ProcessGroupStats::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::ProcessGroupStats where T: core::clone::Clone
-pub type processkit::ProcessGroupStats::Owned = T
-pub fn processkit::ProcessGroupStats::clone_into(&self, &mut T)
-pub fn processkit::ProcessGroupStats::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::ProcessGroupStats where T: 'static + ?core::marker::Sized
-pub fn processkit::ProcessGroupStats::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::ProcessGroupStats where T: ?core::marker::Sized
-pub fn processkit::ProcessGroupStats::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::ProcessGroupStats where T: ?core::marker::Sized
-pub fn processkit::ProcessGroupStats::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::ProcessGroupStats where T: core::clone::Clone
-pub unsafe fn processkit::ProcessGroupStats::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::ProcessGroupStats
-pub fn processkit::ProcessGroupStats::from(T) -> T
 pub struct processkit::ProcessResult<T>
 impl processkit::ProcessResult<alloc::string::String>
 pub fn processkit::ProcessResult<alloc::string::String>::combined(&self) -> alloc::string::String
@@ -924,28 +550,6 @@ impl<T> core::marker::Unpin for processkit::ProcessResult<T> where T: core::mark
 impl<T> core::marker::UnsafeUnpin for processkit::ProcessResult<T> where T: core::marker::UnsafeUnpin
 impl<T> core::panic::unwind_safe::RefUnwindSafe for processkit::ProcessResult<T> where T: core::panic::unwind_safe::RefUnwindSafe
 impl<T> core::panic::unwind_safe::UnwindSafe for processkit::ProcessResult<T> where T: core::panic::unwind_safe::UnwindSafe
-impl<T, U> core::convert::Into<U> for processkit::ProcessResult<T> where U: core::convert::From<T>
-pub fn processkit::ProcessResult<T>::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::ProcessResult<T> where U: core::convert::Into<T>
-pub type processkit::ProcessResult<T>::Error = core::convert::Infallible
-pub fn processkit::ProcessResult<T>::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::ProcessResult<T> where U: core::convert::TryFrom<T>
-pub type processkit::ProcessResult<T>::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::ProcessResult<T>::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::ProcessResult<T> where T: core::clone::Clone
-pub type processkit::ProcessResult<T>::Owned = T
-pub fn processkit::ProcessResult<T>::clone_into(&self, &mut T)
-pub fn processkit::ProcessResult<T>::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::ProcessResult<T> where T: 'static + ?core::marker::Sized
-pub fn processkit::ProcessResult<T>::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::ProcessResult<T> where T: ?core::marker::Sized
-pub fn processkit::ProcessResult<T>::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::ProcessResult<T> where T: ?core::marker::Sized
-pub fn processkit::ProcessResult<T>::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::ProcessResult<T> where T: core::clone::Clone
-pub unsafe fn processkit::ProcessResult<T>::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::ProcessResult<T>
-pub fn processkit::ProcessResult<T>::from(T) -> T
 pub struct processkit::ProcessStdin
 impl processkit::ProcessStdin
 pub async fn processkit::ProcessStdin::finish(self) -> std::io::error::Result<()>
@@ -961,22 +565,26 @@ impl core::marker::Unpin for processkit::ProcessStdin
 impl core::marker::UnsafeUnpin for processkit::ProcessStdin
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::ProcessStdin
 impl core::panic::unwind_safe::UnwindSafe for processkit::ProcessStdin
-impl<T, U> core::convert::Into<U> for processkit::ProcessStdin where U: core::convert::From<T>
-pub fn processkit::ProcessStdin::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::ProcessStdin where U: core::convert::Into<T>
-pub type processkit::ProcessStdin::Error = core::convert::Infallible
-pub fn processkit::ProcessStdin::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::ProcessStdin where U: core::convert::TryFrom<T>
-pub type processkit::ProcessStdin::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::ProcessStdin::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> core::any::Any for processkit::ProcessStdin where T: 'static + ?core::marker::Sized
-pub fn processkit::ProcessStdin::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::ProcessStdin where T: ?core::marker::Sized
-pub fn processkit::ProcessStdin::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::ProcessStdin where T: ?core::marker::Sized
-pub fn processkit::ProcessStdin::borrow_mut(&mut self) -> &mut T
-impl<T> core::convert::From<T> for processkit::ProcessStdin
-pub fn processkit::ProcessStdin::from(T) -> T
+pub struct processkit::RecordReplayRunner<R: processkit::ProcessRunner>
+impl processkit::RecordReplayRunner<processkit::JobRunner>
+pub fn processkit::RecordReplayRunner<processkit::JobRunner>::replay(impl core::convert::AsRef<std::path::Path>) -> processkit::Result<Self>
+impl<R: processkit::ProcessRunner> processkit::RecordReplayRunner<R>
+pub fn processkit::RecordReplayRunner<R>::record(impl core::convert::Into<std::path::PathBuf>, R) -> Self
+pub fn processkit::RecordReplayRunner<R>::save(&self) -> processkit::Result<()>
+impl<R: processkit::ProcessRunner> core::fmt::Debug for processkit::RecordReplayRunner<R>
+pub fn processkit::RecordReplayRunner<R>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<R: processkit::ProcessRunner> core::ops::drop::Drop for processkit::RecordReplayRunner<R>
+pub fn processkit::RecordReplayRunner<R>::drop(&mut self)
+impl<R: processkit::ProcessRunner> processkit::ProcessRunner for processkit::RecordReplayRunner<R>
+pub fn processkit::RecordReplayRunner<R>::output<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn processkit::RecordReplayRunner<R>::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::RunningProcess>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+impl<R> !core::marker::Freeze for processkit::RecordReplayRunner<R>
+impl<R> core::marker::Send for processkit::RecordReplayRunner<R>
+impl<R> core::marker::Sync for processkit::RecordReplayRunner<R>
+impl<R> core::marker::Unpin for processkit::RecordReplayRunner<R> where R: core::marker::Unpin
+impl<R> core::marker::UnsafeUnpin for processkit::RecordReplayRunner<R> where R: core::marker::UnsafeUnpin
+impl<R> core::panic::unwind_safe::RefUnwindSafe for processkit::RecordReplayRunner<R> where R: core::panic::unwind_safe::RefUnwindSafe
+impl<R> core::panic::unwind_safe::UnwindSafe for processkit::RecordReplayRunner<R> where R: core::panic::unwind_safe::UnwindSafe
 pub struct processkit::RecordingRunner<R: processkit::ProcessRunner>
 impl processkit::RecordingRunner<processkit::ScriptedRunner>
 pub fn processkit::RecordingRunner<processkit::ScriptedRunner>::replying(processkit::Reply) -> Self
@@ -996,33 +604,13 @@ impl<R> core::marker::Unpin for processkit::RecordingRunner<R> where R: core::ma
 impl<R> core::marker::UnsafeUnpin for processkit::RecordingRunner<R> where R: core::marker::UnsafeUnpin
 impl<R> core::panic::unwind_safe::RefUnwindSafe for processkit::RecordingRunner<R> where R: core::panic::unwind_safe::RefUnwindSafe
 impl<R> core::panic::unwind_safe::UnwindSafe for processkit::RecordingRunner<R> where R: core::panic::unwind_safe::UnwindSafe
-impl<T, U> core::convert::Into<U> for processkit::RecordingRunner<R> where U: core::convert::From<T>
-pub fn processkit::RecordingRunner<R>::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::RecordingRunner<R> where U: core::convert::Into<T>
-pub type processkit::RecordingRunner<R>::Error = core::convert::Infallible
-pub fn processkit::RecordingRunner<R>::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::RecordingRunner<R> where U: core::convert::TryFrom<T>
-pub type processkit::RecordingRunner<R>::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::RecordingRunner<R>::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> core::any::Any for processkit::RecordingRunner<R> where T: 'static + ?core::marker::Sized
-pub fn processkit::RecordingRunner<R>::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::RecordingRunner<R> where T: ?core::marker::Sized
-pub fn processkit::RecordingRunner<R>::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::RecordingRunner<R> where T: ?core::marker::Sized
-pub fn processkit::RecordingRunner<R>::borrow_mut(&mut self) -> &mut T
-impl<T> core::convert::From<T> for processkit::RecordingRunner<R>
-pub fn processkit::RecordingRunner<R>::from(T) -> T
-impl<T> processkit::ProcessRunnerExt for processkit::RecordingRunner<R> where T: processkit::ProcessRunner + ?core::marker::Sized
-pub fn processkit::RecordingRunner<R>::checked<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::RecordingRunner<R>::exit_code<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<i32>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::RecordingRunner<R>::probe<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<bool>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::RecordingRunner<R>::run<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<alloc::string::String>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::RecordingRunner<R>::run_unit<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<()>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub struct processkit::Reply
 impl processkit::Reply
 pub fn processkit::Reply::fail(i32, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn processkit::Reply::lines<I, S>(I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn processkit::Reply::ok(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn processkit::Reply::pending() -> Self
+pub fn processkit::Reply::signalled(core::option::Option<i32>) -> Self
 pub fn processkit::Reply::timeout() -> Self
 pub fn processkit::Reply::with_line_delay(self, core::time::Duration) -> Self
 pub fn processkit::Reply::with_stdout(self, impl core::convert::Into<alloc::string::String>) -> Self
@@ -1037,28 +625,27 @@ impl core::marker::Unpin for processkit::Reply
 impl core::marker::UnsafeUnpin for processkit::Reply
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::Reply
 impl core::panic::unwind_safe::UnwindSafe for processkit::Reply
-impl<T, U> core::convert::Into<U> for processkit::Reply where U: core::convert::From<T>
-pub fn processkit::Reply::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::Reply where U: core::convert::Into<T>
-pub type processkit::Reply::Error = core::convert::Infallible
-pub fn processkit::Reply::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::Reply where U: core::convert::TryFrom<T>
-pub type processkit::Reply::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::Reply::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::Reply where T: core::clone::Clone
-pub type processkit::Reply::Owned = T
-pub fn processkit::Reply::clone_into(&self, &mut T)
-pub fn processkit::Reply::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::Reply where T: 'static + ?core::marker::Sized
-pub fn processkit::Reply::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::Reply where T: ?core::marker::Sized
-pub fn processkit::Reply::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::Reply where T: ?core::marker::Sized
-pub fn processkit::Reply::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::Reply where T: core::clone::Clone
-pub unsafe fn processkit::Reply::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::Reply
-pub fn processkit::Reply::from(T) -> T
+#[non_exhaustive] pub struct processkit::ResourceLimits
+pub processkit::ResourceLimits::cpu_quota: core::option::Option<f64>
+pub processkit::ResourceLimits::max_processes: core::option::Option<u32>
+pub processkit::ResourceLimits::memory_max: core::option::Option<u64>
+impl core::clone::Clone for processkit::ResourceLimits
+pub fn processkit::ResourceLimits::clone(&self) -> processkit::ResourceLimits
+impl core::cmp::PartialEq for processkit::ResourceLimits
+pub fn processkit::ResourceLimits::eq(&self, &processkit::ResourceLimits) -> bool
+impl core::default::Default for processkit::ResourceLimits
+pub fn processkit::ResourceLimits::default() -> processkit::ResourceLimits
+impl core::fmt::Debug for processkit::ResourceLimits
+pub fn processkit::ResourceLimits::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for processkit::ResourceLimits
+impl core::marker::StructuralPartialEq for processkit::ResourceLimits
+impl core::marker::Freeze for processkit::ResourceLimits
+impl core::marker::Send for processkit::ResourceLimits
+impl core::marker::Sync for processkit::ResourceLimits
+impl core::marker::Unpin for processkit::ResourceLimits
+impl core::marker::UnsafeUnpin for processkit::ResourceLimits
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::ResourceLimits
+impl core::panic::unwind_safe::UnwindSafe for processkit::ResourceLimits
 #[non_exhaustive] pub struct processkit::RunProfile
 pub processkit::RunProfile::cpu_time: core::option::Option<core::time::Duration>
 pub processkit::RunProfile::duration: core::time::Duration
@@ -1082,28 +669,6 @@ impl core::marker::Unpin for processkit::RunProfile
 impl core::marker::UnsafeUnpin for processkit::RunProfile
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::RunProfile
 impl core::panic::unwind_safe::UnwindSafe for processkit::RunProfile
-impl<T, U> core::convert::Into<U> for processkit::RunProfile where U: core::convert::From<T>
-pub fn processkit::RunProfile::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::RunProfile where U: core::convert::Into<T>
-pub type processkit::RunProfile::Error = core::convert::Infallible
-pub fn processkit::RunProfile::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::RunProfile where U: core::convert::TryFrom<T>
-pub type processkit::RunProfile::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::RunProfile::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::RunProfile where T: core::clone::Clone
-pub type processkit::RunProfile::Owned = T
-pub fn processkit::RunProfile::clone_into(&self, &mut T)
-pub fn processkit::RunProfile::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::RunProfile where T: 'static + ?core::marker::Sized
-pub fn processkit::RunProfile::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::RunProfile where T: ?core::marker::Sized
-pub fn processkit::RunProfile::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::RunProfile where T: ?core::marker::Sized
-pub fn processkit::RunProfile::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::RunProfile where T: core::clone::Clone
-pub unsafe fn processkit::RunProfile::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::RunProfile
-pub fn processkit::RunProfile::from(T) -> T
 pub struct processkit::RunningProcess
 impl processkit::RunningProcess
 pub fn processkit::RunningProcess::cpu_time(&self) -> core::option::Option<core::time::Duration>
@@ -1118,10 +683,10 @@ pub fn processkit::RunningProcess::start_kill(&mut self) -> processkit::Result<(
 pub fn processkit::RunningProcess::start_time(&self) -> std::time::SystemTime
 pub fn processkit::RunningProcess::stderr_line_count(&self) -> usize
 pub fn processkit::RunningProcess::stdout_line_count(&self) -> usize
-pub async fn processkit::RunningProcess::wait(self) -> processkit::Result<core::option::Option<i32>>
+pub async fn processkit::RunningProcess::wait(self) -> processkit::Result<processkit::Outcome>
 impl processkit::RunningProcess
-pub async fn processkit::RunningProcess::finish_events(self) -> processkit::Result<core::option::Option<i32>>
-pub async fn processkit::RunningProcess::finish_streamed(self) -> processkit::Result<(core::option::Option<i32>, alloc::string::String)>
+pub async fn processkit::RunningProcess::finish_events(self) -> processkit::Result<processkit::Outcome>
+pub async fn processkit::RunningProcess::finish_streamed(self) -> processkit::Result<processkit::StreamedFinish>
 pub fn processkit::RunningProcess::output_events(&mut self) -> processkit::OutputEvents
 pub fn processkit::RunningProcess::stdout_lines(&mut self) -> processkit::StdoutLines
 impl processkit::RunningProcess
@@ -1139,22 +704,6 @@ impl core::marker::Unpin for processkit::RunningProcess
 impl core::marker::UnsafeUnpin for processkit::RunningProcess
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::RunningProcess
 impl !core::panic::unwind_safe::UnwindSafe for processkit::RunningProcess
-impl<T, U> core::convert::Into<U> for processkit::RunningProcess where U: core::convert::From<T>
-pub fn processkit::RunningProcess::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::RunningProcess where U: core::convert::Into<T>
-pub type processkit::RunningProcess::Error = core::convert::Infallible
-pub fn processkit::RunningProcess::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::RunningProcess where U: core::convert::TryFrom<T>
-pub type processkit::RunningProcess::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::RunningProcess::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> core::any::Any for processkit::RunningProcess where T: 'static + ?core::marker::Sized
-pub fn processkit::RunningProcess::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::RunningProcess where T: ?core::marker::Sized
-pub fn processkit::RunningProcess::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::RunningProcess where T: ?core::marker::Sized
-pub fn processkit::RunningProcess::borrow_mut(&mut self) -> &mut T
-impl<T> core::convert::From<T> for processkit::RunningProcess
-pub fn processkit::RunningProcess::from(T) -> T
 pub struct processkit::ScriptedRunner
 impl processkit::ScriptedRunner
 pub fn processkit::ScriptedRunner::fallback(self, processkit::Reply) -> Self
@@ -1175,28 +724,6 @@ impl core::marker::Unpin for processkit::ScriptedRunner
 impl core::marker::UnsafeUnpin for processkit::ScriptedRunner
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::ScriptedRunner
 impl !core::panic::unwind_safe::UnwindSafe for processkit::ScriptedRunner
-impl<T, U> core::convert::Into<U> for processkit::ScriptedRunner where U: core::convert::From<T>
-pub fn processkit::ScriptedRunner::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::ScriptedRunner where U: core::convert::Into<T>
-pub type processkit::ScriptedRunner::Error = core::convert::Infallible
-pub fn processkit::ScriptedRunner::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::ScriptedRunner where U: core::convert::TryFrom<T>
-pub type processkit::ScriptedRunner::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::ScriptedRunner::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> core::any::Any for processkit::ScriptedRunner where T: 'static + ?core::marker::Sized
-pub fn processkit::ScriptedRunner::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::ScriptedRunner where T: ?core::marker::Sized
-pub fn processkit::ScriptedRunner::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::ScriptedRunner where T: ?core::marker::Sized
-pub fn processkit::ScriptedRunner::borrow_mut(&mut self) -> &mut T
-impl<T> core::convert::From<T> for processkit::ScriptedRunner
-pub fn processkit::ScriptedRunner::from(T) -> T
-impl<T> processkit::ProcessRunnerExt for processkit::ScriptedRunner where T: processkit::ProcessRunner + ?core::marker::Sized
-pub fn processkit::ScriptedRunner::checked<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::ScriptedRunner::exit_code<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<i32>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::ScriptedRunner::probe<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<bool>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::ScriptedRunner::run<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<alloc::string::String>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn processkit::ScriptedRunner::run_unit<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<()>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub struct processkit::StatsSampler<'a>
 impl core::fmt::Debug for processkit::StatsSampler<'_>
 pub fn processkit::StatsSampler<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -1210,23 +737,6 @@ impl<'a> core::marker::Unpin for processkit::StatsSampler<'a>
 impl<'a> core::marker::UnsafeUnpin for processkit::StatsSampler<'a>
 impl<'a> !core::panic::unwind_safe::RefUnwindSafe for processkit::StatsSampler<'a>
 impl<'a> !core::panic::unwind_safe::UnwindSafe for processkit::StatsSampler<'a>
-impl<St> tokio_stream::stream_ext::StreamExt for processkit::StatsSampler<'a> where St: futures_core::stream::Stream + ?core::marker::Sized
-impl<T, U> core::convert::Into<U> for processkit::StatsSampler<'a> where U: core::convert::From<T>
-pub fn processkit::StatsSampler<'a>::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::StatsSampler<'a> where U: core::convert::Into<T>
-pub type processkit::StatsSampler<'a>::Error = core::convert::Infallible
-pub fn processkit::StatsSampler<'a>::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::StatsSampler<'a> where U: core::convert::TryFrom<T>
-pub type processkit::StatsSampler<'a>::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::StatsSampler<'a>::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> core::any::Any for processkit::StatsSampler<'a> where T: 'static + ?core::marker::Sized
-pub fn processkit::StatsSampler<'a>::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::StatsSampler<'a> where T: ?core::marker::Sized
-pub fn processkit::StatsSampler<'a>::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::StatsSampler<'a> where T: ?core::marker::Sized
-pub fn processkit::StatsSampler<'a>::borrow_mut(&mut self) -> &mut T
-impl<T> core::convert::From<T> for processkit::StatsSampler<'a>
-pub fn processkit::StatsSampler<'a>::from(T) -> T
 pub struct processkit::Stdin(_)
 impl processkit::Stdin
 pub fn processkit::Stdin::empty() -> Self
@@ -1247,28 +757,6 @@ impl core::marker::Unpin for processkit::Stdin
 impl core::marker::UnsafeUnpin for processkit::Stdin
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Stdin
 impl !core::panic::unwind_safe::UnwindSafe for processkit::Stdin
-impl<T, U> core::convert::Into<U> for processkit::Stdin where U: core::convert::From<T>
-pub fn processkit::Stdin::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::Stdin where U: core::convert::Into<T>
-pub type processkit::Stdin::Error = core::convert::Infallible
-pub fn processkit::Stdin::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::Stdin where U: core::convert::TryFrom<T>
-pub type processkit::Stdin::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::Stdin::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for processkit::Stdin where T: core::clone::Clone
-pub type processkit::Stdin::Owned = T
-pub fn processkit::Stdin::clone_into(&self, &mut T)
-pub fn processkit::Stdin::to_owned(&self) -> T
-impl<T> core::any::Any for processkit::Stdin where T: 'static + ?core::marker::Sized
-pub fn processkit::Stdin::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::Stdin where T: ?core::marker::Sized
-pub fn processkit::Stdin::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::Stdin where T: ?core::marker::Sized
-pub fn processkit::Stdin::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for processkit::Stdin where T: core::clone::Clone
-pub unsafe fn processkit::Stdin::clone_to_uninit(&self, *mut u8)
-impl<T> core::convert::From<T> for processkit::Stdin
-pub fn processkit::Stdin::from(T) -> T
 pub struct processkit::StdoutLines
 impl core::fmt::Debug for processkit::StdoutLines
 pub fn processkit::StdoutLines::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -1282,23 +770,24 @@ impl core::marker::Unpin for processkit::StdoutLines
 impl core::marker::UnsafeUnpin for processkit::StdoutLines
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::StdoutLines
 impl !core::panic::unwind_safe::UnwindSafe for processkit::StdoutLines
-impl<St> tokio_stream::stream_ext::StreamExt for processkit::StdoutLines where St: futures_core::stream::Stream + ?core::marker::Sized
-impl<T, U> core::convert::Into<U> for processkit::StdoutLines where U: core::convert::From<T>
-pub fn processkit::StdoutLines::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::StdoutLines where U: core::convert::Into<T>
-pub type processkit::StdoutLines::Error = core::convert::Infallible
-pub fn processkit::StdoutLines::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::StdoutLines where U: core::convert::TryFrom<T>
-pub type processkit::StdoutLines::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::StdoutLines::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> core::any::Any for processkit::StdoutLines where T: 'static + ?core::marker::Sized
-pub fn processkit::StdoutLines::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::StdoutLines where T: ?core::marker::Sized
-pub fn processkit::StdoutLines::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::StdoutLines where T: ?core::marker::Sized
-pub fn processkit::StdoutLines::borrow_mut(&mut self) -> &mut T
-impl<T> core::convert::From<T> for processkit::StdoutLines
-pub fn processkit::StdoutLines::from(T) -> T
+pub struct processkit::StreamedFinish
+pub processkit::StreamedFinish::outcome: processkit::Outcome
+pub processkit::StreamedFinish::stderr: alloc::string::String
+impl core::clone::Clone for processkit::StreamedFinish
+pub fn processkit::StreamedFinish::clone(&self) -> processkit::StreamedFinish
+impl core::cmp::Eq for processkit::StreamedFinish
+impl core::cmp::PartialEq for processkit::StreamedFinish
+pub fn processkit::StreamedFinish::eq(&self, &processkit::StreamedFinish) -> bool
+impl core::fmt::Debug for processkit::StreamedFinish
+pub fn processkit::StreamedFinish::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for processkit::StreamedFinish
+impl core::marker::Freeze for processkit::StreamedFinish
+impl core::marker::Send for processkit::StreamedFinish
+impl core::marker::Sync for processkit::StreamedFinish
+impl core::marker::Unpin for processkit::StreamedFinish
+impl core::marker::UnsafeUnpin for processkit::StreamedFinish
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::StreamedFinish
+impl core::panic::unwind_safe::UnwindSafe for processkit::StreamedFinish
 #[non_exhaustive] pub struct processkit::SupervisionOutcome
 pub processkit::SupervisionOutcome::final_result: processkit::ProcessResult<alloc::string::String>
 pub processkit::SupervisionOutcome::restarts: u32
@@ -1313,22 +802,6 @@ impl core::marker::Unpin for processkit::SupervisionOutcome
 impl core::marker::UnsafeUnpin for processkit::SupervisionOutcome
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::SupervisionOutcome
 impl core::panic::unwind_safe::UnwindSafe for processkit::SupervisionOutcome
-impl<T, U> core::convert::Into<U> for processkit::SupervisionOutcome where U: core::convert::From<T>
-pub fn processkit::SupervisionOutcome::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::SupervisionOutcome where U: core::convert::Into<T>
-pub type processkit::SupervisionOutcome::Error = core::convert::Infallible
-pub fn processkit::SupervisionOutcome::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::SupervisionOutcome where U: core::convert::TryFrom<T>
-pub type processkit::SupervisionOutcome::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::SupervisionOutcome::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> core::any::Any for processkit::SupervisionOutcome where T: 'static + ?core::marker::Sized
-pub fn processkit::SupervisionOutcome::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::SupervisionOutcome where T: ?core::marker::Sized
-pub fn processkit::SupervisionOutcome::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::SupervisionOutcome where T: ?core::marker::Sized
-pub fn processkit::SupervisionOutcome::borrow_mut(&mut self) -> &mut T
-impl<T> core::convert::From<T> for processkit::SupervisionOutcome
-pub fn processkit::SupervisionOutcome::from(T) -> T
 pub struct processkit::Supervisor<R: processkit::ProcessRunner>
 impl processkit::Supervisor<processkit::JobRunner>
 pub fn processkit::Supervisor<processkit::JobRunner>::new(processkit::Command) -> Self
@@ -1353,28 +826,15 @@ impl<R> core::marker::Unpin for processkit::Supervisor<R> where R: core::marker:
 impl<R> core::marker::UnsafeUnpin for processkit::Supervisor<R> where R: core::marker::UnsafeUnpin
 impl<R> !core::panic::unwind_safe::RefUnwindSafe for processkit::Supervisor<R>
 impl<R> !core::panic::unwind_safe::UnwindSafe for processkit::Supervisor<R>
-impl<T, U> core::convert::Into<U> for processkit::Supervisor<R> where U: core::convert::From<T>
-pub fn processkit::Supervisor<R>::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for processkit::Supervisor<R> where U: core::convert::Into<T>
-pub type processkit::Supervisor<R>::Error = core::convert::Infallible
-pub fn processkit::Supervisor<R>::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for processkit::Supervisor<R> where U: core::convert::TryFrom<T>
-pub type processkit::Supervisor<R>::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn processkit::Supervisor<R>::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> core::any::Any for processkit::Supervisor<R> where T: 'static + ?core::marker::Sized
-pub fn processkit::Supervisor<R>::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for processkit::Supervisor<R> where T: ?core::marker::Sized
-pub fn processkit::Supervisor<R>::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for processkit::Supervisor<R> where T: ?core::marker::Sized
-pub fn processkit::Supervisor<R>::borrow_mut(&mut self) -> &mut T
-impl<T> core::convert::From<T> for processkit::Supervisor<R>
-pub fn processkit::Supervisor<R>::from(T) -> T
 pub trait processkit::ProcessRunner: core::marker::Send + core::marker::Sync
 pub fn processkit::ProcessRunner::output<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn processkit::ProcessRunner::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::RunningProcess>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 impl processkit::ProcessRunner for processkit::JobRunner
 pub fn processkit::JobRunner::output<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn processkit::JobRunner::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::RunningProcess>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+impl processkit::ProcessRunner for processkit::MockRunner
+pub fn processkit::MockRunner::output<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn processkit::MockRunner::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::RunningProcess>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 impl processkit::ProcessRunner for processkit::ProcessGroup
 pub fn processkit::ProcessGroup::output<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn processkit::ProcessGroup::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::RunningProcess>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
@@ -1384,6 +844,9 @@ pub fn processkit::ScriptedRunner::start<'life0, 'life1, 'async_trait>(&'life0 s
 impl<R: processkit::ProcessRunner + ?core::marker::Sized> processkit::ProcessRunner for &R
 pub fn &R::output<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn &R::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::RunningProcess>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+impl<R: processkit::ProcessRunner> processkit::ProcessRunner for processkit::RecordReplayRunner<R>
+pub fn processkit::RecordReplayRunner<R>::output<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn processkit::RecordReplayRunner<R>::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::RunningProcess>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 impl<R: processkit::ProcessRunner> processkit::ProcessRunner for processkit::RecordingRunner<R>
 pub fn processkit::RecordingRunner<R>::output<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn processkit::RecordingRunner<R>::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::RunningProcess>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
@@ -1402,6 +865,6 @@ pub fn T::run_unit<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processki
 pub async fn processkit::output<I, S>(impl core::convert::AsRef<std::ffi::os_str::OsStr>, I) -> processkit::Result<processkit::ProcessResult<alloc::string::String>> where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub async fn processkit::output_all<R, I>(I, usize, &R) -> alloc::vec::Vec<processkit::Result<processkit::ProcessResult<alloc::string::String>>> where R: processkit::ProcessRunner + ?core::marker::Sized, I: core::iter::traits::collect::IntoIterator<Item = processkit::Command>
 pub async fn processkit::run<I, S>(impl core::convert::AsRef<std::ffi::os_str::OsStr>, I) -> processkit::Result<alloc::string::String> where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
-pub async fn processkit::wait_all(&mut [&mut processkit::RunningProcess]) -> processkit::Result<alloc::vec::Vec<core::option::Option<i32>>>
-pub async fn processkit::wait_any(&mut [&mut processkit::RunningProcess]) -> processkit::Result<(usize, core::option::Option<i32>)>
+pub async fn processkit::wait_all(&mut [&mut processkit::RunningProcess]) -> processkit::Result<alloc::vec::Vec<processkit::Outcome>>
+pub async fn processkit::wait_any(&mut [&mut processkit::RunningProcess]) -> processkit::Result<(usize, processkit::Outcome)>
 pub type processkit::Result<T> = core::result::Result<T, processkit::Error>

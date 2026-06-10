@@ -8,7 +8,7 @@
 mod probes;
 mod stream;
 
-pub use stream::{OutputEvent, OutputEvents, StdoutLines};
+pub use stream::{OutputEvent, OutputEvents, StdoutLines, StreamedFinish};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -24,7 +24,7 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::pump::{LineHandler, SharedLines, pump_lines};
-use crate::result::ProcessResult;
+use crate::result::{Outcome, ProcessResult};
 use crate::stdin::ProcessStdin;
 
 /// How long teardown waits for output pumps to finish before aborting them, so a
@@ -33,8 +33,7 @@ const PUMP_TEARDOWN: Duration = Duration::from_secs(5);
 
 /// What [`RunningProcess::finish_lines`] hands back to its thin public verbs.
 struct Finished {
-    code: Option<i32>,
-    timed_out: bool,
+    outcome: Outcome,
     stdout_lines: Vec<String>,
     stderr_lines: Vec<String>,
 }
@@ -176,9 +175,10 @@ pub(crate) struct ScriptedProc {
     /// The writer tasks feeding the duplex streams; aborted on kill/drop
     /// (dropping the writer EOFs the reader, ending pumps and streams).
     feeders: Vec<JoinHandle<()>>,
-    /// Canned exit: code + timed-out flag.
+    /// Canned exit: code + timed-out flag + optional signal number.
     code: Option<i32>,
     timed_out: bool,
+    signal: Option<i32>,
     /// When the scripted child "exits": `Some(at)` resolves at that instant
     /// (now = immediately), `None` never exits on its own (`Reply::pending` —
     /// cancel/timeout still end it).
@@ -197,6 +197,7 @@ impl ScriptedProc {
         stderr_text: String,
         code: Option<i32>,
         timed_out: bool,
+        signal: Option<i32>,
         lifetime: Option<Duration>,
         line_delay: Option<Duration>,
     ) -> Self {
@@ -234,6 +235,7 @@ impl ScriptedProc {
             feeders,
             code,
             timed_out,
+            signal,
             exit_at: lifetime.map(|d| tokio::time::Instant::now() + d),
             killed: false,
         }
@@ -519,8 +521,7 @@ impl RunningProcess {
             self.program.clone(),
             finished.stdout_lines.join("\n"),
             finished.stderr_lines.join("\n"),
-            finished.code,
-            finished.timed_out,
+            finished.outcome,
             self.timeout,
         )
         .with_duration(duration)
@@ -568,7 +569,7 @@ impl RunningProcess {
             })
         };
 
-        let (code, timed_out) = self.drive_to_exit().await?;
+        let outcome = self.drive_to_exit().await?;
         self.observe_stdin_task().await;
         // Bound the drain by the same teardown grace as the line pumps: on a
         // shared-group handle a surviving descendant can hold stdout open past
@@ -584,7 +585,7 @@ impl RunningProcess {
         }
         let stdout = std::mem::take(&mut *out_buf.lock().expect("stdout buffer poisoned"));
         join_pumps(err_pump.into_iter().collect()).await;
-        let (code, timed_out) = self.checked_outcome((code, timed_out))?;
+        let outcome = self.checked_outcome(outcome)?;
 
         // Fail-loud ceiling check for the line-pumped stderr.
         if stderr_sink.overflowed() {
@@ -604,8 +605,7 @@ impl RunningProcess {
             self.program.clone(),
             stdout,
             stderr_lines.join("\n"),
-            code,
-            timed_out,
+            outcome,
             self.timeout,
         )
         .with_duration(duration)
@@ -613,23 +613,25 @@ impl RunningProcess {
         .with_ok_codes(self.ok_codes.clone()))
     }
 
-    /// Wait for exit, returning just the exit code (output is drained and
-    /// discarded so the child never blocks on a full pipe).
+    /// Wait for exit, returning how the run ended as an [`Outcome`] (output is
+    /// drained and discarded so the child never blocks on a full pipe).
     ///
     /// This low-level handle method reports the **raw** outcome: a run killed by
-    /// its timeout (or by a signal) returns `None` (it is not raised as an
-    /// error). For the timeout-aware behavior use the one-shot helpers
+    /// its timeout returns [`Outcome::TimedOut`](crate::Outcome::TimedOut); a
+    /// signal-terminated run returns [`Outcome::Signalled`](crate::Outcome::Signalled)
+    /// with the signal number when the platform reports one. Neither is raised as
+    /// an error here — use the one-shot helpers
     /// ([`Command::exit_code`](crate::Command::exit_code) /
-    /// [`ProcessRunnerExt::exit_code`](crate::ProcessRunnerExt::exit_code)), which
-    /// surface a deadline as [`Error::Timeout`](crate::Error::Timeout).
+    /// [`ProcessRunnerExt::exit_code`](crate::ProcessRunnerExt::exit_code)) for
+    /// the timeout-as-error behavior.
     /// One exception: a run cancelled via its token (`Command::cancel_on`)
     /// errors with `Error::Cancelled` here too — cancellation is always an
     /// error, on every consuming path.
-    pub async fn wait(mut self) -> Result<Option<i32>> {
+    pub async fn wait(mut self) -> Result<Outcome> {
         Ok(self
             .finish_lines(CaptureMode::Discard, /* expose_counts */ false, || {})
             .await?
-            .code)
+            .outcome)
     }
 
     /// Minimal non-consuming exit wait — the [`wait_any`](crate::wait_any) race
@@ -640,8 +642,8 @@ impl RunningProcess {
     ///
     /// Aborts watchdog tasks after reap to prevent late-firing deadline/cancel
     /// tasks from sending signals to a recycled pid (B1/B2 fix).
-    pub(crate) async fn wait_exit(&mut self) -> Result<Option<i32>> {
-        let result = self.backend_wait().await?;
+    pub(crate) async fn wait_exit(&mut self) -> Result<Outcome> {
+        let outcome = self.backend_wait().await?;
         // Reap happened: abort watchdogs and clear pid before returning.
         // This mirrors the `abort_watchdogs` call in `drive_to_exit` and
         // prevents a streaming deadline/cancel task from waking up minutes
@@ -657,7 +659,7 @@ impl RunningProcess {
             self.cancel_at_exit =
                 Some(self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()));
         }
-        Ok(result.0)
+        self.checked_outcome(outcome)
     }
 
     /// Run the process to completion while sampling its CPU and memory every
@@ -734,14 +736,18 @@ impl RunningProcess {
         // its pid is free for reuse from that point (Linux), and the pump
         // drain can idle out PUMP_TEARDOWN on a leaked pipe — long enough for
         // a recycled pid to masquerade as the child and corrupt the readings.
-        let exit_code = self
+        let outcome = self
             .finish_lines(CaptureMode::Discard, /* expose_counts */ false, || {
                 if let Some(task) = &sampler {
                     task.abort();
                 }
             })
             .await?
-            .code;
+            .outcome;
+        let exit_code = match outcome {
+            Outcome::Exited(c) => Some(c),
+            _ => None,
+        };
         let duration = started.elapsed();
         let (cpu_time, peak_memory_bytes, samples) = match acc.lock() {
             Ok(acc) => (acc.cpu_time, acc.peak_memory_bytes, acc.samples),
@@ -791,7 +797,7 @@ impl RunningProcess {
         let outcome = outcome?;
         self.observe_stdin_task().await;
         join_pumps(pumps).await;
-        let (code, timed_out) = self.checked_outcome(outcome)?;
+        let outcome = self.checked_outcome(outcome)?;
 
         // Fail-loud ceiling: OverflowMode::Error hit during pumping.
         for sink in [&stdout_sink, &stderr_sink] {
@@ -809,8 +815,7 @@ impl RunningProcess {
             CaptureMode::Discard => (Vec::new(), Vec::new()),
         };
         Ok(Finished {
-            code,
-            timed_out,
+            outcome,
             stdout_lines,
             stderr_lines,
         })
@@ -846,10 +851,10 @@ impl RunningProcess {
     /// The single post-exit checkpoint **every consuming path passes
     /// through** after its pumps settle: folds in the cancellation gate — a
     /// cancelled run is *always* an error, and the check runs before any
-    /// `timed_out` classification, so cancellation beats a simultaneous
-    /// timeout. Centralizing it here makes the documented invariant
-    /// structural instead of per-consumer copy-paste discipline.
-    fn checked_outcome(&self, outcome: (Option<i32>, bool)) -> Result<(Option<i32>, bool)> {
+    /// outcome classification, so cancellation beats a simultaneous timeout.
+    /// Centralizing it here makes the documented invariant structural instead
+    /// of per-consumer copy-paste discipline.
+    fn checked_outcome(&self, outcome: Outcome) -> Result<Outcome> {
         // Use the pre-pump snapshot rather than a live token read: prevents
         // a cancel that fires during `join_pumps` from discarding real output.
         // `unwrap_or(false)`: None means not yet snapshotted — only reachable
@@ -918,10 +923,9 @@ impl RunningProcess {
         }
     }
 
-    /// Wait for the child to exit, applying the timeout (killing the tree and
-    /// flagging `timed_out` on elapse). The code is `None` for a run that
-    /// produced none — a timeout, or a signal termination on Unix.
-    async fn drive_to_exit(&mut self) -> Result<(Option<i32>, bool)> {
+    /// Wait for the child to exit, applying the timeout (killing the tree on
+    /// elapse). Returns the [`Outcome`] of the run.
+    async fn drive_to_exit(&mut self) -> Result<Outcome> {
         // A `keep_stdin_open` pipe nobody took can never be taken once a
         // consuming verb is driving (the verbs own `self`): close it NOW so a
         // stdin-reading child sees EOF instead of blocking to its timeout. A
@@ -950,49 +954,63 @@ impl RunningProcess {
         // fired during the run, the select! cancel arm already ran kill_tree,
         // so this snapshot will be `true` and the error is correct.
         //
-        // Narrow known race (Issue 7): on the `multi_thread` runtime, another
-        // thread could cancel the token in the synchronous window between
-        // `abort_watchdogs` returning and the `is_cancelled()` read below.
-        // The window is a single atomic read with no await between the two
-        // operations; on a `current_thread` runtime the window is not
-        // reachable. Fully closing it would require changing the return type
-        // of `drive_to_exit_inner` to carry an "exit was due to cancel" flag
-        // (planned as part of the Phase B result-shape reshape).
+        // Narrow known race (Issue 7, documented): on the `multi_thread`
+        // runtime, another thread could cancel the token in the synchronous
+        // window between `abort_watchdogs` returning and the `is_cancelled()`
+        // read below. Fully closing it requires the cancel arm of
+        // `drive_to_exit_inner` to carry an "exit was due to cancel" flag
+        // through the return type, which Phase B (result-shape reshape) enables.
         #[cfg(feature = "cancellation")]
         {
             self.cancel_at_exit =
                 Some(self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()));
         }
         #[cfg(feature = "tracing")]
-        {
-            let (code, timed_out) = outcome;
-            tracing::debug!(
-                target: "processkit",
-                program = %self.program,
-                code = ?code,
-                timed_out,
-                elapsed_ms = self.started.elapsed().as_millis() as u64,
-                "process exited"
-            );
-        }
+        tracing::debug!(
+            target: "processkit",
+            program = %self.program,
+            outcome = ?outcome,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            "process exited"
+        );
         Ok(outcome)
     }
 
     /// The raw exit wait — no timeout/cancel applied. Real: the child's
-    /// `wait()`. Scripted: resolve at the canned `exit_at` (never, for a
-    /// pending script) with the canned `(code, timed_out)`; a killed script
-    /// resolves immediately codeless, like a killed child.
-    async fn backend_wait(&mut self) -> Result<(Option<i32>, bool)> {
+    /// `wait()`, mapping the exit status to an [`Outcome`] (capturing the Unix
+    /// signal number when the platform reports one). Scripted: resolve at the
+    /// canned `exit_at` (never, for a pending script); a killed script
+    /// resolves immediately as `Signalled`, like a killed child.
+    async fn backend_wait(&mut self) -> Result<Outcome> {
         match &mut self.backend {
-            Backend::Real(real) => Ok((real.child.wait().await?.code(), false)),
+            Backend::Real(real) => {
+                let status = real.child.wait().await?;
+                let outcome = match status.code() {
+                    Some(code) => Outcome::Exited(code),
+                    None => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::process::ExitStatusExt;
+                            Outcome::Signalled(status.signal())
+                        }
+                        #[cfg(not(unix))]
+                        Outcome::Signalled(None)
+                    }
+                };
+                Ok(outcome)
+            }
             Backend::Scripted(s) => {
                 if s.killed {
-                    return Ok((None, false));
+                    return Ok(Outcome::Signalled(None));
                 }
                 match s.exit_at {
                     Some(at) => {
                         tokio::time::sleep_until(at).await;
-                        Ok((s.code, s.timed_out))
+                        Ok(match (s.code, s.timed_out) {
+                            (_, true) => Outcome::TimedOut,
+                            (Some(code), false) => Outcome::Exited(code),
+                            (None, false) => Outcome::Signalled(s.signal),
+                        })
                     }
                     None => std::future::pending().await,
                 }
@@ -1002,7 +1020,7 @@ impl RunningProcess {
 
     /// Without the `cancellation` feature: the plain timeout/no-timeout shape.
     #[cfg(not(feature = "cancellation"))]
-    async fn drive_to_exit_inner(&mut self) -> Result<(Option<i32>, bool)> {
+    async fn drive_to_exit_inner(&mut self) -> Result<Outcome> {
         match self.timeout {
             Some(limit) => {
                 // Anchor the deadline to spawn time (`self.started`): consuming
@@ -1026,7 +1044,7 @@ impl RunningProcess {
                             "timeout elapsed; killing the tree"
                         );
                         self.teardown_on_timeout().await;
-                        Ok((None, true))
+                        Ok(Outcome::TimedOut)
                     }
                 }
             }
@@ -1037,14 +1055,15 @@ impl RunningProcess {
     /// With the feature: race the cancellation token against the
     /// (deadline-bounded) wait. Unset knobs become never-resolving arms, so one
     /// `select!` covers the whole timeout × token matrix. The cancel arm does
-    /// NOT set `timed_out` — callers classify it via `cancel_at_exit` afterwards.
+    /// NOT set the outcome to `TimedOut` — callers classify cancellation via
+    /// `cancel_at_exit` afterwards.
     ///
     /// `biased` with cancel first ensures cancel always beats a simultaneously-
     /// ready deadline (L4: prevents routing through the graceful teardown tier
     /// when both fire on the same poll, which would delay the promised
     /// immediate hard kill by up to `timeout_grace`).
     #[cfg(feature = "cancellation")]
-    async fn drive_to_exit_inner(&mut self) -> Result<(Option<i32>, bool)> {
+    async fn drive_to_exit_inner(&mut self) -> Result<Outcome> {
         // Own the knobs so the helper futures borrow nothing from `self` —
         // only `self.backend_wait()` does, keeping the select! borrows disjoint.
         let limit = self.timeout;
@@ -1079,7 +1098,12 @@ impl RunningProcess {
                     "cancellation fired; killing the tree"
                 );
                 self.kill_tree().await;
-                Ok((None, false))
+                // Outcome is Signalled(None): the tree was killed by us (SIGKILL).
+                // The caller snapshots `cancel_at_exit` from `is_cancelled()` after
+                // this returns; because the token IS cancelled (it fired the arm),
+                // the snapshot is always `Some(true)` and `checked_outcome` converts
+                // this to `Err(Cancelled)` before the caller ever sees the outcome.
+                Ok(Outcome::Signalled(None))
             }
             outcome = self.backend_wait() => outcome,
             () = deadline => {
@@ -1091,7 +1115,7 @@ impl RunningProcess {
                     "timeout elapsed; killing the tree"
                 );
                 self.teardown_on_timeout().await;
-                Ok((None, true))
+                Ok(Outcome::TimedOut)
             }
         }
     }
@@ -1181,11 +1205,12 @@ impl RunningProcess {
     /// Send a kill to the process without waiting for it to exit. The owning
     /// group still governs the rest of the tree.
     ///
-    /// The exit *code* reported afterwards (by [`wait`](Self::wait) /
+    /// The [`Outcome`] reported afterwards (by [`wait`](Self::wait) /
     /// [`wait_any`](crate::wait_any)) for a killed child is platform-dependent
-    /// — `None` on a Unix signal kill, a platform code on Windows
-    /// `TerminateProcess`; a [`ScriptedRunner`](crate::ScriptedRunner) handle
-    /// reports `None` (matching Unix).
+    /// — `Outcome::Signalled` on a Unix signal kill, `Outcome::Exited` with a
+    /// platform code on Windows `TerminateProcess`; a
+    /// [`ScriptedRunner`](crate::ScriptedRunner) handle reports
+    /// `Outcome::Signalled(None)` (matching Unix).
     pub fn start_kill(&mut self) -> Result<()> {
         match &mut self.backend {
             Backend::Real(real) => {

@@ -526,6 +526,7 @@ fn jitter_factor() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::result::Outcome;
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -561,8 +562,7 @@ mod tests {
             "fake".into(),
             "out".into(),
             String::new(),
-            Some(0),
-            false,
+            Outcome::Exited(0),
             None,
         ))
     }
@@ -572,8 +572,7 @@ mod tests {
             "fake".into(),
             String::new(),
             "boom".into(),
-            Some(code),
-            false,
+            Outcome::Exited(code),
             None,
         ))
     }
@@ -583,8 +582,7 @@ mod tests {
             "fake".into(),
             String::new(),
             String::new(),
-            None,
-            true,
+            Outcome::TimedOut,
             Some(Duration::from_secs(1)),
         ))
     }

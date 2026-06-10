@@ -162,14 +162,14 @@ recipe but one.
 ## Stream output as it arrives
 
 ```rust,no_run
-use processkit::StreamExt; // re-exported; provides `.next()`
+use processkit::{StreamExt, StreamedFinish}; // StreamExt re-exported; provides `.next()`
 
 let mut run = Command::new("cargo").args(["build", "--verbose"]).start().await?;
 let mut lines = run.stdout_lines();
 while let Some(line) = lines.next().await {
     println!("build: {line}");
 }
-let (code, stderr) = run.finish_streamed().await?; // exit code + buffered stderr
+let StreamedFinish { outcome, stderr } = run.finish_streamed().await?; // outcome + buffered stderr
 ```
 
 No waiting for exit, no full-output buffering; stderr is drained in the
@@ -277,8 +277,8 @@ let group = ProcessGroup::new()?;
 let mut a = group.start(&Command::new("worker-a")).await?;
 let mut b = group.start(&Command::new("worker-b")).await?;
 
-let (idx, code) = wait_any(&mut [&mut a, &mut b]).await?;
-println!("worker #{idx} exited first with {code:?}");
+let (idx, outcome) = wait_any(&mut [&mut a, &mut b]).await?;
+println!("worker #{idx} exited first with {outcome:?}");
 // `a` and `b` are only borrowed — the loser is still usable here.
 ```
 
@@ -463,7 +463,7 @@ cassette once and replays them hermetically in CI.
 ## Test streaming code — without processes
 
 ```rust,no_run
-use processkit::{Command, ProcessRunner, Reply, ScriptedRunner};
+use processkit::{Command, Outcome, ProcessRunner, Reply, ScriptedRunner, StreamedFinish};
 use std::time::Duration;
 
 let runner = ScriptedRunner::new()
@@ -472,8 +472,8 @@ let runner = ScriptedRunner::new()
 
 let mut run = runner.start(&Command::new("gh").args(["run", "watch", "123"])).await?;
 run.wait_for_line(|l| l.contains("completed"), Duration::from_secs(5)).await?;
-let (code, _stderr) = run.finish_streamed().await?;
-assert_eq!(code, Some(0));
+let StreamedFinish { outcome, .. } = run.finish_streamed().await?;
+assert_eq!(outcome, Outcome::Exited(0));
 ```
 
 A scripted `start()` feeds the canned lines through the **same pump

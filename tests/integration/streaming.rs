@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use processkit::{Command, OutputBufferPolicy};
+use processkit::{Command, Outcome, OutputBufferPolicy, StreamedFinish};
 
 use crate::common::*;
 
@@ -30,7 +30,7 @@ async fn streaming_honors_timeout() {
         seen.push(line);
     }
     drop(lines);
-    let (code, _stderr) = run.finish_streamed().await.expect("finish");
+    let StreamedFinish { outcome, .. } = run.finish_streamed().await.expect("finish");
 
     // Generous anti-hang bound (the sleeper runs ~30s if the deadline is
     // broken): under full-suite load cold spawns have been seen to push a
@@ -44,8 +44,8 @@ async fn streaming_honors_timeout() {
     // (None on a Unix signal-kill, a nonzero code on a Windows Job kill), so the
     // guarantee under test is "ended promptly and not a clean success".
     assert!(
-        !matches!(code, Some(0)),
-        "a timed-out streamed run must not look successful (got {code:?})"
+        !matches!(outcome, Outcome::Exited(0)),
+        "a timed-out streamed run must not look successful (got {outcome:?})"
     );
     assert!(seen.iter().any(|l| l.contains("one")), "saw: {seen:?}");
 }
@@ -145,8 +145,8 @@ async fn finish_streamed_returns_code_and_stderr() {
         out.push(line);
     }
     drop(lines);
-    let (code, stderr) = process.finish_streamed().await.expect("finish");
-    assert_eq!(code, Some(0));
+    let StreamedFinish { outcome, stderr } = process.finish_streamed().await.expect("finish");
+    assert_eq!(outcome, Outcome::Exited(0));
     assert!(out.iter().any(|l| l.contains("out")), "stdout: {out:?}");
     assert!(stderr.contains("err"), "stderr: {stderr:?}");
 }
@@ -185,9 +185,9 @@ async fn finish_streamed_without_streaming_first_drains_and_exits() {
     // Skipping stdout_lines() leaves both pipes untaken — finish_streamed must
     // drain them itself or a chatty child would block forever.
     let process = two_line_echo().start().await.expect("start");
-    let (code, _stderr) = tokio::time::timeout(Duration::from_secs(15), process.finish_streamed())
+    let finish = tokio::time::timeout(Duration::from_secs(15), process.finish_streamed())
         .await
         .expect("finish_streamed must not hang without a prior stdout_lines")
         .expect("finish");
-    assert_eq!(code, Some(0));
+    assert_eq!(finish.outcome, Outcome::Exited(0));
 }

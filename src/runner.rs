@@ -77,7 +77,8 @@ pub trait ProcessRunnerExt: ProcessRunner {
 
     /// Run and return just the exit code. A run that produced no code surfaces as
     /// an error — a timeout as [`Error::Timeout`](crate::Error::Timeout), a
-    /// signal-kill as an IO error — rather than a synthetic sentinel, mirroring
+    /// signal-kill as [`Error::Signalled`](crate::Error::Signalled) — rather than a
+    /// synthetic sentinel, mirroring
     /// [`ensure_success`](crate::ProcessResult::ensure_success).
     async fn exit_code(&self, command: &Command) -> Result<i32> {
         retrying(command.retry_policy(), || async {
@@ -89,7 +90,8 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// Run a predicate command and read its exit code as a boolean: exit `0` →
     /// `Ok(true)`, exit `1` → `Ok(false)`, anything else → `Err` (other code as
     /// [`Error::Exit`](crate::Error::Exit), timeout as
-    /// [`Error::Timeout`](crate::Error::Timeout), signal-kill as an IO error). For
+    /// [`Error::Timeout`](crate::Error::Timeout), signal-kill as
+    /// [`Error::Signalled`](crate::Error::Signalled)). For
     /// commands whose exit code *is* the answer — `git diff --quiet`, `grep -q`, …
     async fn probe(&self, command: &Command) -> Result<bool> {
         retrying(command.retry_policy(), || async {
@@ -398,6 +400,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
 mod tests {
     use super::*;
     use crate::error::Error;
+    use crate::result::Outcome;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
@@ -417,8 +420,7 @@ mod tests {
                 command.program().to_string_lossy().into_owned(),
                 "out".to_owned(),
                 "transient".to_owned(),
-                Some(code),
-                false,
+                Outcome::Exited(code),
                 None,
             ))
         }

@@ -26,10 +26,10 @@ run.elapsed();    // time since spawn
 
 // Consume the handle exactly one way:
 //   output_string() / output_bytes()  → capture everything (same as the one-shot verbs)
-//   wait()                            → just the exit code; output is discarded
+//   wait()                            → just the Outcome; output is discarded
 //   finish_streamed()                 → after streaming stdout (below)
 //   profile(every)                    → capture + resource samples (stats feature)
-let code = run.wait().await?;   // Option<i32>; None = killed without a code
+let outcome = run.wait().await?;   // Outcome: Exited(code) / Signalled(sig) / TimedOut
 ```
 
 `start()` puts the child in a **private group the handle owns**: dropping the
@@ -48,7 +48,7 @@ for exit, no full-output buffering. `StreamExt` (re-exported from
 `tokio-stream`) provides `.next()`:
 
 ```rust,no_run
-use processkit::{Command, StreamExt};
+use processkit::{Command, Outcome, StreamExt, StreamedFinish};
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {
@@ -62,12 +62,12 @@ async fn main() -> processkit::Result<()> {
         println!("build: {line}");
     }
 
-    // The stream ended (stdout closed). Collect the exit code and stderr —
+    // The stream ended (stdout closed). Collect the outcome and stderr —
     // stderr was drained in the background the whole time, so a noisy child
     // could never block on a full pipe.
-    let (code, stderr) = run.finish_streamed().await?;
-    if code != Some(0) {
-        eprintln!("build failed ({code:?}):\n{stderr}");
+    let StreamedFinish { outcome, stderr } = run.finish_streamed().await?;
+    if outcome != Outcome::Exited(0) {
+        eprintln!("build failed ({outcome:?}):\n{stderr}");
     }
     Ok(())
 }
@@ -100,7 +100,7 @@ Conversational tools — write a request, read the response, repeat. Keep stdin
 open with `keep_stdin_open()`, take the writer with `standard_input()`:
 
 ```rust,no_run
-use processkit::{Command, StreamExt};
+use processkit::{Command, Outcome, StreamExt, StreamedFinish};
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {
@@ -116,8 +116,8 @@ async fn main() -> processkit::Result<()> {
     println!("= {}", answers.next().await.unwrap());
 
     stdin.finish().await?;                        // send EOF — bc exits
-    let (code, _stderr) = run.finish_streamed().await?;
-    assert_eq!(code, Some(0));
+    let StreamedFinish { outcome, .. } = run.finish_streamed().await?;
+    assert_eq!(outcome, Outcome::Exited(0));
     Ok(())
 }
 ```
@@ -185,8 +185,8 @@ let group = ProcessGroup::new()?;
 let mut a = group.start(&Command::new("replica-a")).await?;
 let mut b = group.start(&Command::new("replica-b")).await?;
 
-let (index, code) = wait_any(&mut [&mut a, &mut b]).await?;
-println!("contender #{index} exited first with {code:?}");
+let (index, outcome) = wait_any(&mut [&mut a, &mut b]).await?;
+println!("contender #{index} exited first with {outcome:?}");
 
 // Only borrows: the loser is still usable.
 let survivor = if index == 0 { &mut b } else { &mut a };

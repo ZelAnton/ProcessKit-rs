@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use processkit::{ProcessGroup, wait_any};
+use processkit::{Outcome, ProcessGroup, wait_any};
 
 use crate::common::*;
 
@@ -13,7 +13,7 @@ async fn wait_any_returns_first_finisher() {
     let mut slow = group.start(&sleep_secs(15)).await.expect("start slow");
     let mut fast = group.start(&sleep_secs(1)).await.expect("start fast");
 
-    let (idx, code) = tokio::time::timeout(
+    let (idx, outcome) = tokio::time::timeout(
         Duration::from_secs(10),
         wait_any(&mut [&mut slow, &mut fast]),
     )
@@ -21,7 +21,11 @@ async fn wait_any_returns_first_finisher() {
     .expect("race finished in time")
     .expect("race");
     assert_eq!(idx, 1, "the 1-second sleeper should finish first");
-    assert_eq!(code, Some(0), "the fast sleeper exits cleanly");
+    assert_eq!(
+        outcome,
+        Outcome::Exited(0),
+        "the fast sleeper exits cleanly"
+    );
 }
 
 #[tokio::test]
@@ -33,7 +37,7 @@ async fn wait_any_losers_still_waitable() {
     let mut slow = group.start(&sleep_secs(30)).await.expect("start slow");
     let mut fast = group.start(&sleep_secs(1)).await.expect("start fast");
 
-    let (idx, _code) = tokio::time::timeout(
+    let (idx, _outcome) = tokio::time::timeout(
         Duration::from_secs(10),
         wait_any(&mut [&mut slow, &mut fast]),
     )

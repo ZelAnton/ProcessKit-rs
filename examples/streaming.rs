@@ -4,7 +4,7 @@
 //!
 //! Run with: `cargo run --example streaming`
 
-use processkit::{Command, StreamExt};
+use processkit::{Command, StreamExt, StreamedFinish};
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {
@@ -15,8 +15,8 @@ async fn main() -> processkit::Result<()> {
         println!("stdout: {line}");
     }
 
-    let (code, stderr) = run.finish_streamed().await?;
-    println!("exit={code:?}");
+    let StreamedFinish { outcome, stderr } = run.finish_streamed().await?;
+    println!("exit={outcome:?}");
     if !stderr.is_empty() {
         eprintln!("stderr: {stderr}");
     }

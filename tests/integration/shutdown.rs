@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use processkit::{Command, ProcessGroup};
+use processkit::{Command, Outcome, ProcessGroup, StreamedFinish};
 
 #[tokio::test]
 #[ignore = "spawns a real subprocess and shuts it down gracefully"]
@@ -45,8 +45,12 @@ async fn shutdown_lets_a_term_handling_child_end_the_grace_early() {
         start.elapsed()
     );
 
-    let code = waiter.await.expect("join").expect("wait");
-    assert_eq!(code, Some(0), "the child exited via its TERM trap");
+    let outcome = waiter.await.expect("join").expect("wait");
+    assert_eq!(
+        outcome,
+        Outcome::Exited(0),
+        "the child exited via its TERM trap"
+    );
 }
 
 #[tokio::test]
@@ -83,8 +87,11 @@ async fn shutdown_escalates_to_kill_after_the_grace_window() {
         "the grace window must be waited out before escalating ({elapsed:?})"
     );
 
-    let code = waiter.await.expect("join").expect("wait");
-    assert_eq!(code, None, "SIGKILL leaves no exit code, got {code:?}");
+    let outcome = waiter.await.expect("join").expect("wait");
+    assert!(
+        matches!(outcome, Outcome::Signalled(_)),
+        "SIGKILL surfaces as a signal kill, got {outcome:?}"
+    );
 }
 
 // --- Run-level graceful timeout (`Command::timeout` + `timeout_grace`) ---
@@ -172,17 +179,17 @@ async fn graceful_timeout_on_a_streamed_run_signals_and_ends_the_stream() {
         "the graceful-timeout signal must end the stream well within the grace"
     );
 
-    // The exit code distinguishes graceful from hard teardown: the TERM trap runs
-    // `exit 0`, so a *graceful* SIGTERM yields `Some(0)`; a hard SIGKILL (the
-    // no-grace path) is uncatchable and would yield `None`. Robust here because the
-    // child is already reaped (stream fully drained above), so `finish_streamed`'s
-    // own re-armed deadline never races the wait. (If a refactor ever made that
-    // deadline spawn-relative, this would surface as a `None` mismatch, not a hang.)
-    let (code, _stderr) = run.finish_streamed().await.expect("finish");
+    // The outcome distinguishes graceful from hard teardown: the TERM trap runs
+    // `exit 0`, so a *graceful* SIGTERM yields `Outcome::Exited(0)`; a hard SIGKILL
+    // (the no-grace path) is uncatchable and would yield `Outcome::Signalled`. Robust
+    // here because the child is already reaped (stream fully drained above), so
+    // `finish_streamed`'s own re-armed deadline never races the wait. (If a refactor
+    // ever made that deadline spawn-relative, this would surface as a mismatch, not a hang.)
+    let StreamedFinish { outcome, .. } = run.finish_streamed().await.expect("finish");
     assert_eq!(
-        code,
-        Some(0),
-        "graceful SIGTERM let the trap exit 0; a hard SIGKILL would be None"
+        outcome,
+        Outcome::Exited(0),
+        "graceful SIGTERM let the trap exit 0; a hard SIGKILL would be Signalled"
     );
     assert!(
         start.elapsed() < Duration::from_secs(8),

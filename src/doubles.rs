@@ -33,7 +33,7 @@ use std::sync::Mutex;
 
 use crate::command::Command;
 use crate::error::Result;
-use crate::result::ProcessResult;
+use crate::result::{Outcome, ProcessResult};
 use crate::runner::ProcessRunner;
 
 /// A canned reply: stdout/stderr text plus an exit code (or a timed-out run,
@@ -44,6 +44,12 @@ pub struct Reply {
     stderr: String,
     code: i32,
     timed_out: bool,
+    /// Set by [`signalled`](Self::signalled): the reply is a signal kill. Kept
+    /// separate from `signal` so `signalled(None)` (killed, number unknown) is
+    /// distinct from a plain successful reply (both would have `signal: None`).
+    signalled: bool,
+    /// Signal number for a signal-killed reply (see [`signalled`](Self::signalled)).
+    signal: Option<i32>,
     /// Park the call until the command's cancellation token fires (see
     /// [`pending`](Self::pending)); the other fields are unused then.
     pending: bool,
@@ -60,6 +66,8 @@ impl Reply {
             stderr: String::new(),
             code: 0,
             timed_out: false,
+            signalled: false,
+            signal: None,
             pending: false,
             line_delay: None,
         }
@@ -72,6 +80,8 @@ impl Reply {
             stderr: stderr.into(),
             code,
             timed_out: false,
+            signalled: false,
+            signal: None,
             pending: false,
             line_delay: None,
         }
@@ -87,6 +97,25 @@ impl Reply {
             // the helpers key on.
             code: 0,
             timed_out: true,
+            signalled: false,
+            signal: None,
+            pending: false,
+            line_delay: None,
+        }
+    }
+
+    /// A signal-killed reply — the process was terminated by a signal. Drives
+    /// the `Outcome::Signalled` path so a test can assert signal-kill handling.
+    /// Pass `Some(n)` when the specific signal number matters (e.g. `Some(9)`
+    /// for SIGKILL); pass `None` when only "killed by a signal" matters.
+    pub fn signalled(signal: Option<i32>) -> Self {
+        Self {
+            stdout: String::new(),
+            stderr: String::new(),
+            code: 0,
+            timed_out: false,
+            signalled: true,
+            signal,
             pending: false,
             line_delay: None,
         }
@@ -111,6 +140,8 @@ impl Reply {
             stderr: String::new(),
             code: 0,
             timed_out: false,
+            signalled: false,
+            signal: None,
             pending: true,
             line_delay: None,
         }
@@ -172,11 +203,17 @@ impl Reply {
             let lines = self.stdout.split_inclusive('\n').count() as u32;
             Some(per_line * lines)
         };
+        let code_for_scripted = if self.timed_out || self.signalled {
+            None
+        } else {
+            Some(self.code)
+        };
         let scripted = crate::running::ScriptedProc::new(
             self.stdout,
             self.stderr,
-            (!self.timed_out).then_some(self.code),
+            code_for_scripted,
             self.timed_out,
+            self.signal,
             lifetime,
             self.line_delay,
         );
@@ -188,19 +225,17 @@ impl Reply {
         program: String,
         timeout: Option<std::time::Duration>,
     ) -> ProcessResult<String> {
-        // A timed-out run carries no code (`None`); otherwise the canned code.
-        let code = (!self.timed_out).then_some(self.code);
         // Carry the command's configured timeout so a timed-out reply surfaces as
         // `Error::Timeout` with the *real* deadline (matching the live runner),
         // not a zero duration.
-        ProcessResult::new(
-            program,
-            self.stdout,
-            self.stderr,
-            code,
-            self.timed_out,
-            timeout,
-        )
+        let outcome = if self.timed_out {
+            Outcome::TimedOut
+        } else if self.signalled {
+            Outcome::Signalled(self.signal)
+        } else {
+            Outcome::Exited(self.code)
+        };
+        ProcessResult::new(program, self.stdout, self.stderr, outcome, timeout)
     }
 }
 
@@ -527,9 +562,9 @@ mod tests {
         }
         assert_eq!(seen, ["first", "second", "third"]);
 
-        let (code, stderr) = run.finish_streamed().await.expect("finish");
-        assert_eq!(code, Some(0));
-        assert_eq!(stderr, "");
+        let finish = run.finish_streamed().await.expect("finish");
+        assert_eq!(finish.outcome, Outcome::Exited(0));
+        assert_eq!(finish.stderr, "");
     }
 
     #[tokio::test]
@@ -542,9 +577,9 @@ mod tests {
         run.wait_for_line(|l| l.contains("ready"), std::time::Duration::from_secs(5))
             .await
             .expect("the canned banner satisfies the probe");
-        let (code, stderr) = run.finish_streamed().await.expect("finish");
-        assert_eq!(code, Some(7));
-        assert_eq!(stderr, "boom: detail");
+        let finish = run.finish_streamed().await.expect("finish");
+        assert_eq!(finish.outcome, Outcome::Exited(7));
+        assert_eq!(finish.stderr, "boom: detail");
     }
 
     #[tokio::test]
@@ -771,6 +806,33 @@ mod tests {
             }
             other => panic!("expected Timeout, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn signalled_reply_carries_signal_number() {
+        use crate::error::Error;
+        let runner = ScriptedRunner::new().fallback(Reply::signalled(Some(9)));
+        let result = runner.output(&Command::new("tool")).await.unwrap();
+        assert_eq!(result.outcome(), crate::Outcome::Signalled(Some(9)));
+        assert!(matches!(
+            runner.run(&Command::new("tool")).await.unwrap_err(),
+            Error::Signalled {
+                signal: Some(9),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn signalled_reply_without_a_number_is_signalled_none() {
+        use crate::error::Error;
+        let runner = ScriptedRunner::new().fallback(Reply::signalled(None));
+        let result = runner.output(&Command::new("tool")).await.unwrap();
+        assert_eq!(result.outcome(), crate::Outcome::Signalled(None));
+        assert!(matches!(
+            runner.run(&Command::new("tool")).await.unwrap_err(),
+            Error::Signalled { signal: None, .. }
+        ));
     }
 
     #[cfg(feature = "cancellation")]

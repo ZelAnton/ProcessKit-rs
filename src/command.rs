@@ -997,8 +997,8 @@ impl Command {
 
     /// Run to completion and return just the exit code (output is discarded). A
     /// run that yields no code surfaces as an error — a timeout as
-    /// [`Error::Timeout`](crate::Error::Timeout), a signal-kill as an IO error —
-    /// consistent with
+    /// [`Error::Timeout`](crate::Error::Timeout), a signal-kill as
+    /// [`Error::Signalled`](crate::Error::Signalled) — consistent with
     /// [`ProcessRunnerExt::exit_code`](crate::ProcessRunnerExt::exit_code) and
     /// [`CliClient::exit_code`](crate::CliClient::exit_code).
     pub async fn exit_code(&self) -> Result<i32> {
@@ -1013,7 +1013,8 @@ impl Command {
     /// Run a predicate command and read its exit code as a boolean: exit `0` →
     /// `Ok(true)`, exit `1` → `Ok(false)`, anything else → `Err` (any other code
     /// as [`Error::Exit`], a timeout as [`Error::Timeout`](crate::Error::Timeout),
-    /// a signal-kill as an IO error). For tools whose exit code *is* the answer —
+    /// a signal-kill as [`Error::Signalled`](crate::Error::Signalled)). For tools
+    /// whose exit code *is* the answer —
     /// `git diff --quiet`, `git show-ref --verify --quiet`, `grep -q`, …
     pub async fn probe(&self) -> Result<bool> {
         JobRunner::new().probe(self).await

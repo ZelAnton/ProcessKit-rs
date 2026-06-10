@@ -160,8 +160,8 @@ let out = Command::new("producer")
   unlike a single command's captured timeout).
 - A **per-stage `Command::timeout`** kills just that stage. The stage shows up
   in the pipefail fold as its unclean exit; on `run()` an *inner* stage's
-  deadline surfaces as that stage's signal-kill IO error, while the *last*
-  stage's own deadline (or the chain deadline) is a proper `Error::Timeout`.
+  deadline surfaces as that stage's signal-kill `Error::Signalled`, while the
+  *last* stage's own deadline (or the chain deadline) is a proper `Error::Timeout`.
 
 With the `cancellation` feature, a `cancel_on` token on **any** stage cancels
 that stage; the cancellation errors the whole pipeline and the private group

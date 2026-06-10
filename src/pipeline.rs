@@ -11,7 +11,8 @@ use std::time::Duration;
 use crate::command::Command;
 use crate::error::Result;
 use crate::group::ProcessGroup;
-use crate::result::ProcessResult;
+use crate::result::{Outcome, ProcessResult};
+use crate::running::StreamedFinish;
 
 /// A chain of [`Command`]s connected stdout→stdin — built with
 /// [`Command::pipe`], extended with [`pipe`](Self::pipe), driven with
@@ -79,7 +80,7 @@ impl std::fmt::Debug for Pipeline {
 /// unclean exit code, not as a separate timed-out flag.)
 struct StageOutcome {
     program: String,
-    code: Option<i32>,
+    outcome: Outcome,
     stderr: String,
     /// The stage opted out of pipefail attribution ([`Command::unchecked`]).
     unchecked: bool,
@@ -142,10 +143,10 @@ impl Pipeline {
         for (process, unchecked) in running {
             let program = process.program_name().to_owned();
             inner_tasks.push(tokio::spawn(async move {
-                let (code, stderr) = process.finish_streamed().await?;
+                let StreamedFinish { outcome, stderr } = process.finish_streamed().await?;
                 Ok::<_, crate::Error>(StageOutcome {
                     program,
-                    code,
+                    outcome,
                     stderr,
                     unchecked,
                 })
@@ -176,8 +177,7 @@ impl Pipeline {
                         self.pipeline_name(),
                         String::new(),
                         String::new(),
-                        None,
-                        true,
+                        Outcome::TimedOut,
                         Some(limit),
                     ));
                 }
@@ -200,7 +200,8 @@ impl Pipeline {
     /// [`Error::Timeout`](crate::Error::Timeout) is produced by the
     /// whole-chain [`timeout`](Self::timeout) or the *last* stage's own
     /// deadline; an **inner** stage's [`Command::timeout`] kills just that
-    /// stage and surfaces as its signal-kill IO error.
+    /// stage and surfaces as that stage's
+    /// [`Error::Signalled`](crate::Error::Signalled).
     pub async fn run(&self) -> Result<String> {
         Ok(self
             .output_string()
@@ -238,12 +239,12 @@ fn pipefail(
     last_unchecked: bool,
     pipeline_timeout: Option<Duration>,
 ) -> ProcessResult<String> {
-    // "Unclean" is any `code != Some(0)`: non-zero, and the `None` of a
-    // signal kill (SIGPIPE included) or per-stage-timeout kill — no
-    // platform-specific cases needed.
+    // "Unclean" is any outcome that is not `Exited(0)`: non-zero exit, signal
+    // kill (SIGPIPE included), or per-stage-timeout kill — no platform-specific
+    // cases needed.
     if let Some(stage) = outcomes
         .into_iter()
-        .find(|stage| stage.code != Some(0) && !stage.unchecked)
+        .find(|stage| !matches!(stage.outcome, Outcome::Exited(0)) && !stage.unchecked)
     {
         // A checked inner stage failed first — its diagnostics win; the last
         // stage's stdout is still what the chain produced.
@@ -251,12 +252,11 @@ fn pipefail(
             stage.program,
             last.into_stdout(),
             stage.stderr,
-            stage.code,
-            false,
+            stage.outcome,
             pipeline_timeout,
         );
     }
-    if last_unchecked && !last.timed_out() && last.code() != Some(0) {
+    if last_unchecked && matches!(last.outcome(), Outcome::Exited(c) if c != 0) {
         // The last stage failed but opted out: report the chain as a success
         // carrying its output and (for the curious) its stderr.
         let program = last.program().to_owned();
@@ -265,8 +265,7 @@ fn pipefail(
             program,
             last.into_stdout(),
             stderr,
-            Some(0),
-            false,
+            Outcome::Exited(0),
             pipeline_timeout,
         );
     }
@@ -326,36 +325,35 @@ mod tests {
     fn clean(program: &str) -> StageOutcome {
         StageOutcome {
             program: program.into(),
-            code: Some(0),
+            outcome: Outcome::Exited(0),
             stderr: String::new(),
             unchecked: false,
         }
     }
 
-    fn unclean(program: &str, code: Option<i32>, stderr: &str) -> StageOutcome {
+    fn unclean(program: &str, outcome: Outcome, stderr: &str) -> StageOutcome {
         StageOutcome {
             program: program.into(),
-            code,
+            outcome,
             stderr: stderr.into(),
             unchecked: false,
         }
     }
 
     /// An unclean stage that opted out of attribution.
-    fn unchecked_fail(program: &str, code: Option<i32>) -> StageOutcome {
+    fn unchecked_fail(program: &str, outcome: Outcome) -> StageOutcome {
         StageOutcome {
             unchecked: true,
-            ..unclean(program, code, "forgiven")
+            ..unclean(program, outcome, "forgiven")
         }
     }
 
-    fn last_stage(code: Option<i32>, stdout: &str) -> ProcessResult<String> {
+    fn last_stage(outcome: Outcome, stdout: &str) -> ProcessResult<String> {
         ProcessResult::new(
             "last".into(),
             stdout.into(),
             "last-err".into(),
-            code,
-            false,
+            outcome,
             None,
         )
     }
@@ -365,26 +363,26 @@ mod tests {
         // Success and failure of the last stage alike pass through untouched.
         let ok = pipefail(
             vec![clean("a"), clean("b")],
-            last_stage(Some(0), "final"),
+            last_stage(Outcome::Exited(0), "final"),
             false,
             None,
         );
-        assert_eq!(ok, last_stage(Some(0), "final"));
+        assert_eq!(ok, last_stage(Outcome::Exited(0), "final"));
 
         let failing_last = pipefail(
             vec![clean("a")],
-            last_stage(Some(3), "partial"),
+            last_stage(Outcome::Exited(3), "partial"),
             false,
             None,
         );
-        assert_eq!(failing_last, last_stage(Some(3), "partial"));
+        assert_eq!(failing_last, last_stage(Outcome::Exited(3), "partial"));
     }
 
     #[test]
     fn failing_inner_stage_wins_but_stdout_stays_the_chains() {
         let result = pipefail(
-            vec![clean("a"), unclean("b", Some(2), "b broke")],
-            last_stage(Some(0), "final"),
+            vec![clean("a"), unclean("b", Outcome::Exited(2), "b broke")],
+            last_stage(Outcome::Exited(0), "final"),
             false,
             None,
         );
@@ -418,10 +416,10 @@ mod tests {
     fn first_of_several_failures_is_attributed() {
         let result = pipefail(
             vec![
-                unclean("a", Some(1), "first"),
-                unclean("b", Some(2), "second"),
+                unclean("a", Outcome::Exited(1), "first"),
+                unclean("b", Outcome::Exited(2), "second"),
             ],
-            last_stage(Some(0), "out"),
+            last_stage(Outcome::Exited(0), "out"),
             false,
             None,
         );
@@ -438,11 +436,11 @@ mod tests {
 
     #[test]
     fn all_unchecked_failures_report_success() {
-        // The head-pattern: the producer's SIGPIPE death (code None) is
+        // The head-pattern: the producer's SIGPIPE death (Signalled(None)) is
         // forgiven, the chain succeeds with the consumer's output.
         let result = pipefail(
-            vec![unchecked_fail("producer", None)],
-            last_stage(Some(0), "first line"),
+            vec![unchecked_fail("producer", Outcome::Signalled(None))],
+            last_stage(Outcome::Exited(0), "first line"),
             false,
             None,
         );
@@ -456,10 +454,10 @@ mod tests {
         // unchecked-then-checked: the later checked failure wins.
         let result = pipefail(
             vec![
-                unchecked_fail("a", Some(141)),
-                unclean("b", Some(2), "real"),
+                unchecked_fail("a", Outcome::Exited(141)),
+                unclean("b", Outcome::Exited(2), "real"),
             ],
-            last_stage(Some(0), "out"),
+            last_stage(Outcome::Exited(0), "out"),
             false,
             None,
         );
@@ -468,8 +466,11 @@ mod tests {
 
         // checked-then-unchecked: the first (checked) failure wins, as today.
         let result = pipefail(
-            vec![unclean("a", Some(1), "real"), unchecked_fail("b", Some(2))],
-            last_stage(Some(0), "out"),
+            vec![
+                unclean("a", Outcome::Exited(1), "real"),
+                unchecked_fail("b", Outcome::Exited(2)),
+            ],
+            last_stage(Outcome::Exited(0), "out"),
             false,
             None,
         );
@@ -482,11 +483,11 @@ mod tests {
         let result = pipefail(
             vec![
                 clean("a"),
-                unchecked_fail("b", Some(1)),
-                unclean("c", Some(3), "c broke"),
-                unclean("d", Some(4), "d broke"),
+                unchecked_fail("b", Outcome::Exited(1)),
+                unclean("c", Outcome::Exited(3), "c broke"),
+                unclean("d", Outcome::Exited(4), "d broke"),
             ],
-            last_stage(Some(0), "out"),
+            last_stage(Outcome::Exited(0), "out"),
             false,
             None,
         );
@@ -499,7 +500,7 @@ mod tests {
     fn unchecked_last_stage_failure_is_forgiven() {
         let result = pipefail(
             vec![clean("a")],
-            last_stage(Some(141), "partial"),
+            last_stage(Outcome::Exited(141), "partial"),
             true,
             None,
         );
@@ -515,11 +516,11 @@ mod tests {
         // Regression guard: without the marker nothing changes.
         let result = pipefail(
             vec![clean("a")],
-            last_stage(Some(3), "partial"),
+            last_stage(Outcome::Exited(3), "partial"),
             false,
             None,
         );
-        assert_eq!(result, last_stage(Some(3), "partial"));
+        assert_eq!(result, last_stage(Outcome::Exited(3), "partial"));
     }
 
     #[test]
@@ -530,12 +531,27 @@ mod tests {
             "last".into(),
             String::new(),
             String::new(),
-            None,
-            true,
+            Outcome::TimedOut,
             None,
         );
         let result = pipefail(vec![clean("a")], timed_out_last, true, None);
         assert!(result.timed_out());
+        assert!(!result.is_success());
+    }
+
+    #[test]
+    fn unchecked_never_forgives_a_signal_kill() {
+        // An unchecked LAST stage killed by a signal is not forgiven — a signal
+        // kill is not a voluntary exit with a code, just like a timeout.
+        let signalled_last = ProcessResult::new(
+            "last".into(),
+            String::new(),
+            String::new(),
+            Outcome::Signalled(Some(9)),
+            None,
+        );
+        let result = pipefail(vec![clean("a")], signalled_last, true, None);
+        assert!(matches!(result.outcome(), Outcome::Signalled(Some(9))));
         assert!(!result.is_success());
     }
 
@@ -549,11 +565,11 @@ mod tests {
 
     #[test]
     fn signal_killed_inner_stage_counts_as_unclean() {
-        // A signal-kill (or per-stage timeout kill) reports no code — that is
+        // A signal-kill (or per-stage timeout kill) reports Signalled — that is
         // not a clean exit, so the stage must win the attribution.
         let result = pipefail(
-            vec![unclean("a", None, "killed")],
-            last_stage(Some(0), "out"),
+            vec![unclean("a", Outcome::Signalled(None), "killed")],
+            last_stage(Outcome::Exited(0), "out"),
             false,
             None,
         );
@@ -561,13 +577,13 @@ mod tests {
         assert_eq!(result.code(), None);
         assert_eq!(result.stderr(), "killed");
         assert!(!result.timed_out(), "a stage kill is not a chain timeout");
-        // No code + no timeout surfaces as the signal-kill IO error, naming
-        // the attributed (failing) stage.
+        // Signalled outcome surfaces as Error::Signalled naming the attributed stage.
         match result.ensure_success() {
-            Err(crate::Error::Io(e)) => {
-                assert!(e.to_string().contains("`a`"), "got: {e}");
+            Err(crate::Error::Signalled { program, signal }) => {
+                assert_eq!(program, "a");
+                assert_eq!(signal, None);
             }
-            other => panic!("expected Error::Io, got {other:?}"),
+            other => panic!("expected Error::Signalled, got {other:?}"),
         }
     }
 }

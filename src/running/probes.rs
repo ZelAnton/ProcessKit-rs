@@ -38,7 +38,7 @@ impl RunningProcess {
     ///   the one-shot [`stdout_lines`](Self::stdout_lines) stream underneath —
     ///   if it was already called, the probe sees a closed stream and reports
     ///   `NotReady` immediately). Continue with
-    ///   [`finish_streamed`](Self::finish_streamed) for the exit code and
+    ///   [`finish_streamed`](Self::finish_streamed) for the outcome and
     ///   stderr; the other probes don't touch stdout.
     /// - A failed probe does **not** kill the child — unlike
     ///   [`Command::timeout`](crate::Command::timeout), whose deadline (if
