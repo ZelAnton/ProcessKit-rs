@@ -137,7 +137,13 @@ impl Command {
         self
     }
 
-    /// Set the working directory.
+    /// Set the working directory for the child process.
+    ///
+    /// **Relative-path programs and `current_dir`:** if the program passed to
+    /// [`Command::new`] is a relative path (e.g. `"./tool"` or `"../bin/x"`),
+    /// it is resolved against the *caller's* current directory at spawn time —
+    /// not against the directory set here. Use an absolute path for the program
+    /// when combining `current_dir` with a relative-path executable.
     pub fn current_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.cwd = Some(dir.as_ref().as_os_str().to_os_string());
         self
@@ -155,6 +161,28 @@ impl Command {
     /// Remove an environment variable inherited from the parent.
     pub fn env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
         self.envs.push((key.as_ref().to_os_string(), None));
+        self
+    }
+
+    /// Set multiple environment variables at once.
+    ///
+    /// Equivalent to chaining [`env`](Self::env) calls; order is preserved and
+    /// later entries win on a duplicated key.
+    ///
+    /// ```
+    /// use processkit::Command;
+    /// Command::new("tool").envs([("FOO", "1"), ("BAR", "2")]);
+    /// ```
+    pub fn envs<I, K, V>(mut self, vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        self.envs.extend(
+            vars.into_iter()
+                .map(|(k, v)| (k.as_ref().to_os_string(), Some(v.as_ref().to_os_string()))),
+        );
         self
     }
 
@@ -1015,6 +1043,77 @@ fn quote_arg(arg: &str) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// PATH resolution helpers (used by the pre-spawn check in runner.rs)
+// ---------------------------------------------------------------------------
+
+/// Whether `program` is a bare name that should be looked up on `PATH`.
+///
+/// Returns `true` when `program` has exactly one path component and that
+/// component is a `Normal` segment (no `/`, `\`, `.`, or `..` prefix).
+/// Absolute paths (`/usr/bin/git`, `C:\git.exe`) and relative paths
+/// (`./tool`, `../bin/x`) return `false` — the caller already spelled out
+/// the location.
+pub(crate) fn is_bare_name(program: &OsStr) -> bool {
+    use std::path::{Component, Path};
+    let mut comps = Path::new(program).components();
+    matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
+}
+
+/// Search `PATH` for an executable named `program` (bare name, no separators).
+///
+/// Returns `(found, searched)`:
+/// - `found` — the resolved absolute path when the program is on `PATH`.
+/// - `searched` — the raw `PATH` value (for the error message when not found).
+pub(crate) fn find_in_path(program: &OsStr) -> (Option<std::path::PathBuf>, String) {
+    let path_var = match std::env::var_os("PATH") {
+        Some(p) if !p.is_empty() => p,
+        _ => return (None, String::new()),
+    };
+    let searched = path_var.to_string_lossy().into_owned();
+    for dir in std::env::split_paths(&path_var) {
+        if let Some(found) = probe_dir(&dir, program) {
+            return (Some(found), searched);
+        }
+    }
+    (None, searched)
+}
+
+/// Check whether `program` is an executable in `dir`.
+#[cfg(unix)]
+fn probe_dir(dir: &std::path::Path, program: &OsStr) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let candidate = dir.join(program);
+    std::fs::metadata(&candidate)
+        .ok()
+        .filter(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .map(|_| candidate)
+}
+
+/// Check whether `program` (with PATHEXT expansion) exists in `dir`.
+#[cfg(not(unix))]
+fn probe_dir(dir: &std::path::Path, program: &OsStr) -> Option<std::path::PathBuf> {
+    // Try the name exactly as given first (handles `git.exe` already having an ext).
+    let candidate = dir.join(program);
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    // Then try each PATHEXT extension (.EXE, .CMD, .BAT, …).
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    for ext in pathext.split(';') {
+        if ext.is_empty() {
+            continue;
+        }
+        let mut name = program.to_os_string();
+        name.push(ext);
+        let candidate = dir.join(&name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::Command;
@@ -1139,6 +1238,56 @@ mod tests {
         let with = Command::new("x").cancel_on(tokio_util::sync::CancellationToken::new());
         assert!(format!("{with:?}").contains("has_cancel_token: true"));
         assert!(format!("{:?}", Command::new("x")).contains("has_cancel_token: false"));
+    }
+
+    #[test]
+    fn is_bare_name_distinguishes_bare_from_path() {
+        use super::is_bare_name;
+        // Bare names — should be looked up on PATH.
+        assert!(is_bare_name(OsStr::new("git")));
+        assert!(is_bare_name(OsStr::new("git.exe")));
+        assert!(is_bare_name(OsStr::new("python3")));
+        // Relative / absolute paths — caller already located the program.
+        assert!(!is_bare_name(OsStr::new("./tool")));
+        assert!(!is_bare_name(OsStr::new("../bin/x")));
+        assert!(!is_bare_name(OsStr::new("/usr/bin/git")));
+        assert!(!is_bare_name(OsStr::new("subdir/tool")));
+        #[cfg(windows)]
+        assert!(!is_bare_name(OsStr::new("C:\\git.exe")));
+    }
+
+    #[test]
+    fn envs_builder_adds_multiple_vars() {
+        let cmd = Command::new("x").env("EXISTING", "old").envs([
+            ("FOO", "1"),
+            ("BAR", "2"),
+            ("EXISTING", "new"),
+        ]);
+        let envs: Vec<_> = cmd
+            .env_overrides()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.as_ref().map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.contains(&("FOO".into(), Some("1".into()))),
+            "FOO not found: {envs:?}"
+        );
+        assert!(
+            envs.contains(&("BAR".into(), Some("2".into()))),
+            "BAR not found: {envs:?}"
+        );
+        // Last writer wins on the built command; we just check that envs()
+        // appended the overriding entry (std Command keeps last-write).
+        assert_eq!(
+            envs.iter().filter(|(k, _)| k == "EXISTING").count(),
+            2,
+            "should have two EXISTING entries (original + override): {envs:?}"
+        );
     }
 
     #[test]

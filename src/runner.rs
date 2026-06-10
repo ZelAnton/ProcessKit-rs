@@ -6,7 +6,7 @@
 //! both — its `start` hands back a scripted handle that feeds canned lines
 //! through the same pump machinery a real child uses.
 
-use crate::command::{Command, RetryPolicy};
+use crate::command::{Command, RetryPolicy, find_in_path, is_bare_name};
 use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::result::ProcessResult;
@@ -287,6 +287,23 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
                 format!("working directory {what}: {}", cwd.display()),
             ),
         });
+    }
+
+    // For a bare program name (no path separators), search PATH before
+    // spawning so a missing program surfaces a rich error naming the searched
+    // directories — the OS's bare ENOENT is otherwise indistinguishable from
+    // a missing cwd or other filesystem error.  Best-effort: a TOCTOU race
+    // where the program vanishes after this check just falls back to the OS
+    // error.  Absolute/relative paths bypass this; the caller already located
+    // the executable.
+    if is_bare_name(command.program()) {
+        let (found, searched) = find_in_path(command.program());
+        if found.is_none() {
+            return Err(crate::Error::NotFound {
+                program: command.program_name(),
+                searched,
+            });
+        }
     }
 
     let mut tokio_cmd = command.build_tokio();

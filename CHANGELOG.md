@@ -12,10 +12,23 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+
+- `Error::NotFound { program, searched }` — a bare program name (no path separators)
+  not found on `PATH` now surfaces a distinct, structured error that names the searched
+  directories: `` `git` not found on PATH (searched: /usr/bin:/usr/local/bin) ``.
+  Produced before spawning, so no process group is left dangling.
+  `Error::is_not_found()` returns `true` for this variant (as it does for the
+  existing `Error::Spawn(NotFound)` / missing-cwd case).
+- `Command::envs([(key, val), …])` — set multiple environment variables in one call.
+  Equivalent to chaining `env()` calls; order is preserved and a later entry for the
+  same key wins.
 
 ### Changed
--
+
+- `Command::current_dir` doc now explicitly calls out that a relative-path program
+  (e.g. `"./tool"`) passed to `Command::new` resolves against the *caller's* cwd, not
+  the directory set here — use an absolute path for the program when combining
+  `current_dir` with a relative-path executable.
 
 ### Fixed
 -

@@ -70,7 +70,7 @@ untrusted children whose unbounded output is itself a DoS — confirmed missing 
 (`src/buffer.rs` has only `DropOldest`/`DropNewest`), and now non-breaking to add
 (`OverflowMode` is `#[non_exhaustive]`).
 
-### 3. Program resolution & error-quality completion — `which`/PATH + cwd-relative clarity
+### 3. Program resolution & error-quality completion — `which`/PATH + cwd-relative clarity ✅ SHIPPED (2026-06-10)
 *Dimension: user-scenario / ergonomics · Cost: moderate*
 
 Promote the lead candidate of [`ideas/next-launch-ergonomics.md`](ideas/next-launch-ergonomics.md)
@@ -81,6 +81,11 @@ pre-check. Cross-platform PATH/PATHEXT resolution is the real cost. Same design 
 document/guard the **cwd-relative-program gotcha** — `Command::new("./tool")` with a
 `current_dir` set resolves `./tool` against the *parent's* cwd, not the child's (a classic
 silent surprise). Bulk env loaders (C — `IntoIterator<(K,V)>`, trivial) can ride along.
+
+**Shipped:** `Error::NotFound { program, searched }` (new variant, `is_not_found()` updated);
+pre-spawn PATH search in `launch()` for bare program names; `Command::envs([…])` bulk builder;
+`current_dir` doc with the relative-program warning. Cross-platform (Unix execute-bit check +
+Windows PATHEXT expansion). Verified fmt/clippy/doc/test/cross-compile.
 
 ### 4. CI quality hardening — the pre-1.0 wins
 *Dimension: stabilization / conventions · Cost: trivial each*

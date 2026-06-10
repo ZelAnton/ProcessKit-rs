@@ -46,6 +46,28 @@ async fn working_directory_that_is_a_file_errors_as_not_a_directory() {
 }
 
 #[tokio::test]
+#[ignore = "exercises the real spawn path (creates a process group)"]
+async fn missing_program_surfaces_not_found_with_searched_path() {
+    // A bare program name that isn't on PATH must produce Error::NotFound
+    // with a message that names the searched directories — not the opaque
+    // OS ENOENT that would otherwise be indistinguishable from a missing cwd.
+    let err = Command::new("processkit-definitely-not-installed-424242")
+        .output_string()
+        .await
+        .expect_err("an unknown program must error");
+    assert!(
+        matches!(err, processkit::Error::NotFound { .. }),
+        "expected Error::NotFound, got {err:?}"
+    );
+    assert!(err.is_not_found(), "is_not_found() must be true: {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not found on PATH"),
+        "message should name the PATH search: {msg}"
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a real subprocess"]
 async fn output_string_captures_stdout() {
     let result = two_line_echo().output_string().await.expect("run echo");

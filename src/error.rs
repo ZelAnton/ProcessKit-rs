@@ -21,6 +21,24 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// A bare program name (no path separators) was not found on `PATH` — it
+    /// is not installed or the directory holding it is not on `PATH`. Produced
+    /// before spawning so the error names the searched directories.
+    ///
+    /// Distinct from [`Spawn`](Error::Spawn), which covers OS-level failures
+    /// once the executable location is known (permission denied, busy, etc.).
+    ///
+    /// [`is_not_found`](Error::is_not_found) returns `true` for this variant.
+    #[error("`{program}` not found on PATH (searched: {searched})")]
+    NotFound {
+        /// The program name that was looked up.
+        program: String,
+        /// The `PATH` directories that were searched, joined by the
+        /// platform separator (`:` on Unix, `;` on Windows). Empty when
+        /// `PATH` is not set.
+        searched: String,
+    },
+
     /// The process ran to completion but exited with a non-zero status.
     ///
     /// Produced by the `ensure_success` helpers; the raw exit code is otherwise
@@ -162,14 +180,20 @@ impl Error {
         }
     }
 
-    /// Whether this is a spawn/IO **"not found"** — the program (or a path it
-    /// needs) doesn't exist (`ENOENT`). True for [`Spawn`](Error::Spawn) /
-    /// [`Io`](Error::Io) carrying [`NotFound`](std::io::ErrorKind::NotFound);
+    /// Whether this is a **"not found"** failure — the program doesn't exist
+    /// on `PATH` or a needed path is missing. True for:
+    ///
+    /// - [`NotFound`](Error::NotFound) (bare name absent from `PATH`),
+    /// - [`Spawn`](Error::Spawn) / [`Io`](Error::Io) carrying
+    ///   [`NotFound`](std::io::ErrorKind::NotFound) (e.g. missing `cwd`).
+    ///
     /// `false` for every other variant. Lets a caller surface a "command not
-    /// installed?" hint without reaching into the raw [`std::io::Error`].
+    /// installed?" hint without matching on the underlying IO error.
     pub fn is_not_found(&self) -> bool {
-        self.io_source()
-            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        matches!(self, Error::NotFound { .. })
+            || self
+                .io_source()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
     }
 
     /// Whether this is a spawn/IO **permission denial** (`EACCES`/`EPERM`): the
@@ -404,6 +428,22 @@ mod tests {
             err.to_string(),
             "could not enforce resource limits: no cgroup or Job Object available"
         );
+    }
+
+    #[test]
+    fn not_found_display_and_classifier() {
+        let err = Error::NotFound {
+            program: "my-tool".into(),
+            searched: "/usr/bin:/usr/local/bin".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "`my-tool` not found on PATH (searched: /usr/bin:/usr/local/bin)"
+        );
+        assert!(err.is_not_found(), "NotFound must satisfy is_not_found()");
+        assert!(!err.is_permission_denied());
+        assert!(!err.is_transient());
+        assert_eq!(err.diagnostic(), None);
     }
 
     fn spawn(kind: std::io::ErrorKind) -> Error {
