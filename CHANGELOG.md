@@ -34,11 +34,12 @@ to a dated version section.
   `File`, a locked stdout — any `std::io::Write + Send`). Replaces any previously set
   per-stream handler; compose inside `on_stdout_line` when multiple sinks are needed.
 - `Error::NotFound { program, searched }` — a bare program name (no path separators)
-  not found on `PATH` now surfaces a distinct, structured error that names the searched
+  not found now surfaces a distinct, structured error that names the searched
   directories: `` `git` not found on PATH (searched: /usr/bin:/usr/local/bin) ``.
-  Produced before spawning, so no process group is left dangling.
-  `Error::is_not_found()` returns `true` for this variant (as it does for the
-  existing `Error::Spawn(NotFound)` / missing-cwd case).
+  Enriched from the OS's opaque not-found error rather than a `PATH` pre-check, so a
+  program the OS resolves by another route (e.g. the application directory on Windows)
+  is never falsely reported missing. `Error::is_not_found()` returns `true` for this
+  variant (as it does for the existing `Error::Spawn(NotFound)` / missing-cwd case).
 - `Command::envs([(key, val), …])` — set multiple environment variables in one call.
   Equivalent to chaining `env()` calls; order is preserved and a later entry for the
   same key wins.

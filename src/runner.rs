@@ -289,30 +289,45 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         });
     }
 
-    // For a bare program name (no path separators), search PATH before
-    // spawning so a missing program surfaces a rich error naming the searched
-    // directories — the OS's bare ENOENT is otherwise indistinguishable from
-    // a missing cwd or other filesystem error.  Best-effort: a TOCTOU race
-    // where the program vanishes after this check just falls back to the OS
-    // error.  Absolute/relative paths bypass this; the caller already located
-    // the executable.
-    if is_bare_name(command.program()) {
-        let (found, searched) = find_in_path(command.program());
-        if found.is_none() {
-            return Err(crate::Error::NotFound {
-                program: command.program_name(),
-                searched,
-            });
-        }
-    }
-
     let mut tokio_cmd = command.build_tokio();
     let opts = crate::sys::SpawnOptions {
         setsid: command.wants_setsid(),
         creation_flags: command.extra_creation_flags(),
         kill_on_parent_death: command.wants_kill_on_parent_death(),
     };
-    let mut child = group.spawn_with_options(&mut tokio_cmd, &opts)?;
+    // Enrich the OS's opaque "not found" for a *bare* program name into a rich
+    // Error::NotFound naming the searched directories — the bare ENOENT is
+    // otherwise indistinguishable from a missing cwd or other filesystem error.
+    // (Absolute/relative paths skip this: the caller already located the file,
+    // and `find_in_path` only knows PATH.)
+    //
+    // Done *after* the spawn attempt rather than as a pre-check so the OS stays
+    // the source of truth — a program the OS can launch by a path we don't model
+    // is never falsely reported missing. This matters on Windows, where std also
+    // searches the *application directory* (the running exe's dir), not just
+    // PATH: a helper shipped beside the binary spawns fine, and a PATH-only
+    // pre-check would have rejected it. The cwd was already validated above, so a
+    // NotFound here is genuinely the program, not the directory.
+    //
+    // Skip the enrichment when the command customizes PATH (explicit PATH
+    // override/removal, env_clear, inherit_env): `find_in_path` reads the
+    // *process* PATH, so its "searched" list would name the wrong directories.
+    // The plain Error::Spawn (NotFound kind) still reports is_not_found() == true.
+    let mut child = match group.spawn_with_options(&mut tokio_cmd, &opts) {
+        Ok(child) => child,
+        Err(crate::Error::Spawn { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound
+                && is_bare_name(command.program())
+                && !command.customizes_path() =>
+        {
+            let (_found, searched) = find_in_path(command.program());
+            return Err(crate::Error::NotFound {
+                program: command.program_name(),
+                searched,
+            });
+        }
+        Err(other) => return Err(other),
+    };
     let pid = child.id();
     #[cfg(feature = "tracing")]
     tracing::debug!(

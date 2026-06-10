@@ -543,6 +543,10 @@ impl Command {
     /// At most one handler per stream: a repeat call replaces the previous one
     /// (builder semantics, like [`timeout`](Self::timeout)). To fan out, compose
     /// inside a single closure.
+    ///
+    /// Requires stdout to be [`Piped`](crate::StdioMode::Piped) (the default):
+    /// the handler runs on the capture pump, so it never fires under
+    /// [`stdout(Inherit)`](Self::stdout) / [`stdout(Null)`](Self::stdout).
     pub fn on_stdout_line<F>(mut self, handler: F) -> Self
     where
         F: Fn(&str) + Send + Sync + 'static,
@@ -594,6 +598,11 @@ impl Command {
     /// `writeln!` handler. Replaces any previously set stdout handler.
     /// Compose multiple sinks inside a single [`on_stdout_line`](Self::on_stdout_line)
     /// handler when you need more than one.
+    ///
+    /// Requires stdout to be [`Piped`](crate::StdioMode::Piped) (the default):
+    /// the tee fires from the capture pump, so it is a no-op under
+    /// [`stdout(Inherit)`](Self::stdout) / [`stdout(Null)`](Self::stdout), which
+    /// run no pump.
     pub fn stdout_tee<W>(mut self, writer: W) -> Self
     where
         W: std::io::Write + Send + 'static,
@@ -609,8 +618,9 @@ impl Command {
 
     /// Tee every decoded stderr line to `writer` as it is produced.
     ///
-    /// Same contract as [`stdout_tee`](Self::stdout_tee). Replaces any
-    /// previously set stderr handler.
+    /// Same contract as [`stdout_tee`](Self::stdout_tee) — including the
+    /// requirement that stderr be [`Piped`](crate::StdioMode::Piped). Replaces
+    /// any previously set stderr handler.
     pub fn stderr_tee<W>(mut self, writer: W) -> Self
     where
         W: std::io::Write + Send + 'static,
@@ -684,6 +694,24 @@ impl Command {
 
     pub(crate) fn program_name(&self) -> String {
         self.program.to_string_lossy().into_owned()
+    }
+
+    /// Whether the command customizes the environment in a way that could move
+    /// `PATH` away from the process `PATH` — an explicit `PATH` override/removal,
+    /// [`env_clear`](Self::env_clear), or [`inherit_env`](Self::inherit_env)
+    /// (which clears the inherited set). When true, the rich
+    /// [`Error::NotFound`](crate::Error::NotFound) enrichment is skipped: it
+    /// names the directories `find_in_path` searched, but `find_in_path` reads
+    /// the *process* `PATH`, so against a custom child `PATH` that list would be
+    /// wrong. The runner lets the plain OS spawn error surface instead (still
+    /// [`is_not_found`](crate::Error::is_not_found) when the program is missing).
+    pub(crate) fn customizes_path(&self) -> bool {
+        self.env_clear
+            || self.inherit_env.is_some()
+            || self
+                .envs
+                .iter()
+                .any(|(k, _)| k.to_str().is_some_and(|k| k.eq_ignore_ascii_case("PATH")))
     }
 
     /// Whether [`setsid`](Self::setsid) was requested (read by the spawn seam).
@@ -1119,7 +1147,7 @@ fn quote_arg(arg: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// PATH resolution helpers (used by the pre-spawn check in runner.rs)
+// PATH resolution helpers (used to enrich a not-found spawn error in runner.rs)
 // ---------------------------------------------------------------------------
 
 /// Whether `program` is a bare name that should be looked up on `PATH`.
@@ -1329,6 +1357,29 @@ mod tests {
         assert!(!is_bare_name(OsStr::new("subdir/tool")));
         #[cfg(windows)]
         assert!(!is_bare_name(OsStr::new("C:\\git.exe")));
+    }
+
+    #[test]
+    fn customizes_path_gates_the_not_found_enrichment() {
+        // A plain command does not customize PATH — the rich NotFound applies.
+        assert!(!Command::new("git").customizes_path());
+        assert!(!Command::new("git").env("FOO", "1").customizes_path());
+        // Anything that can move PATH away from the process PATH disables the
+        // process-PATH enrichment (else its "searched" list would be wrong).
+        assert!(
+            Command::new("git")
+                .env("PATH", "/opt/bin")
+                .customizes_path()
+        );
+        assert!(
+            Command::new("git")
+                .env("path", "/opt/bin")
+                .customizes_path(),
+            "PATH match is case-insensitive (Windows uses `Path`)"
+        );
+        assert!(Command::new("git").env_remove("PATH").customizes_path());
+        assert!(Command::new("git").env_clear().customizes_path());
+        assert!(Command::new("git").inherit_env(["HOME"]).customizes_path());
     }
 
     #[test]

@@ -84,10 +84,12 @@ document/guard the **cwd-relative-program gotcha** — `Command::new("./tool")` 
 `current_dir` set resolves `./tool` against the *parent's* cwd, not the child's (a classic
 silent surprise). Bulk env loaders (C — `IntoIterator<(K,V)>`, trivial) can ride along.
 
-**Shipped:** `Error::NotFound { program, searched }` (new variant, `is_not_found()` updated);
-pre-spawn PATH search in `launch()` for bare program names; `Command::envs([…])` bulk builder;
-`current_dir` doc with the relative-program warning. Cross-platform (Unix execute-bit check +
-Windows PATHEXT expansion). Verified fmt/clippy/doc/test/cross-compile.
+**Shipped:** `Error::NotFound { program, searched }` (new variant, `is_not_found()` updated),
+enriched from the OS's not-found error in `launch()` for bare program names (the OS stays the
+source of truth, so a program it resolves by another route — e.g. the application directory on
+Windows — is never falsely rejected); `Command::envs([…])` bulk builder; `current_dir` doc
+with the relative-program warning. Cross-platform `searched`-PATH formatting (Unix execute-bit
+check + Windows PATHEXT expansion). Verified fmt/clippy/doc/test/cross-compile.
 
 ### 4. CI quality hardening — the pre-1.0 wins ✅ SHIPPED (2026-06-10)
 *Dimension: stabilization / conventions · Cost: trivial each*
@@ -117,10 +119,15 @@ most-read examples (e.g. `output_string`/`probe`/pipefail attribution) to **exec
 through `ScriptedRunner`, so they run in `cargo test` on every OS with no subprocess.
 The crate's own `docs/testing.md` sells that seam — the API docs should eat the dog food.
 
-**Shipped:** `src/doubles.rs` extended with `Reply::ok()`, `Reply::lines()`, and
-`MockRunner::on(prefix, reply)` for fine-grained per-call routing; `no_run` removed from
-the four most-read `src/lib.rs` / `src/running/stream.rs` examples — they now execute
-hermetically via `ScriptedRunner`. Verified all doctests pass on all platforms.
+**Shipped (partial — scope trimmed on review):** a new **executing** doctest on the
+`ScriptedRunner` type (`src/doubles.rs`) driving a command through scripted replies — the
+test seam eating its own dog food, hermetic on every OS — plus a runnable `Command::envs`
+example (`src/command.rs`). The ergonomic-intro examples (`src/lib.rs`, `stdout_lines` /
+`output_events` in `src/running/stream.rs`, `src/pipeline.rs`) were **deliberately left
+`no_run`**: they teach the real `Command::new(...).verb()` / `.start()` surface, and routing
+them through a mock runner to make them execute would misrepresent the very API they
+demonstrate. Net: 2 of 16 doctests now execute (the two that *should*); the rest stay
+compile-checked. Verified all doctests pass on all platforms.
 
 ### 6. Resolve the README ↔ crate-doc duplication ✅ SHIPPED (2026-06-10)
 *Dimension: docs / stabilization · Cost: trivial (decide) / moderate (if adopting)*

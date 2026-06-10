@@ -77,12 +77,16 @@ impl RunningProcess {
         let stdout_sink = SharedLines::new(&self.buffer);
         match self.backend.take_stdout_reader() {
             Some(pipe) => {
-                tokio::spawn(pump_lines(
+                // Store the handle (like `output_events`) so `finish_streamed`
+                // joins it before the fail-loud overflow check and `Drop` aborts
+                // it on a shared-group handle — a discarded handle would leave
+                // both as no-ops for the stdout stream.
+                self.stdout_pump = Some(tokio::spawn(pump_lines(
                     pipe,
                     self.stdout_encoding,
                     self.stdout_handler.clone(),
                     stdout_sink.clone(),
-                ));
+                )));
             }
             // Called more than once: hand back an immediately-finished stream.
             None => stdout_sink.close_now(),
@@ -186,16 +190,16 @@ impl RunningProcess {
         let outcome = self.drive_to_exit().await?;
         self.observe_stdin_task().await;
         // Join both streaming pumps before the cancellation/overflow checks so
-        // their final writes are visible and any pump-feeding a held-open pipe
-        // gets the same PUMP_TEARDOWN bound (matching `finish_events`). The
-        // child's pipes are closed at this point (it has exited), so both
-        // await calls are cheap.
-        if let Some(pump) = self.stderr_pump.take() {
-            let _ = pump.await;
-        }
-        if let Some(pump) = self.stdout_pump.take() {
-            let _ = pump.await;
-        }
+        // their final writes are visible. `join_pumps` bounds the wait by
+        // `PUMP_TEARDOWN` and aborts stragglers, so a surviving grandchild
+        // holding a pipe open past the child's death can't park this finisher
+        // forever (parity with the bulk verbs). The child's own pipes are
+        // closed at this point, so the common case completes immediately.
+        let pumps: Vec<_> = [self.stdout_pump.take(), self.stderr_pump.take()]
+            .into_iter()
+            .flatten()
+            .collect();
+        super::join_pumps(pumps).await;
         let (code, _timed_out) = self.checked_outcome(outcome)?;
         // Fail-loud ceiling check for both line-pumped streams.
         for sink in [self.stdout_sink.as_ref(), self.stderr_sink.as_ref()]
@@ -223,7 +227,11 @@ impl RunningProcess {
     /// as the child produces them. Call this **once**.
     ///
     /// Interleaving is best-effort (lines are ordered by when they arrive in
-    /// the async runtime, not by a kernel timestamp). Use
+    /// the async runtime, not by a kernel timestamp). Each poll checks stdout
+    /// before stderr, so under a sustained stdout flood stderr lines drain only
+    /// when stdout briefly empties — with a bounded buffer a slow-draining
+    /// stderr can lose lines (or trip its [`fail_loud`](crate::OutputBufferPolicy::fail_loud)
+    /// ceiling) while stdout monopolizes. Use
     /// [`finish_events`](Self::finish_events) after draining to collect the
     /// exit code.
     ///
@@ -358,15 +366,17 @@ impl RunningProcess {
 
         let outcome = self.drive_to_exit().await?;
         self.observe_stdin_task().await;
-        // Join both pumps so their final writes are visible before the
-        // overflow check (the child's pipes closed when it exited, so both
-        // pumps are already at or near EOF — these awaits are cheap).
-        if let Some(pump) = self.stdout_pump.take() {
-            let _ = pump.await;
-        }
-        if let Some(pump) = self.stderr_pump.take() {
-            let _ = pump.await;
-        }
+        // Join both pumps so their final writes are visible before the overflow
+        // check. `join_pumps` bounds the wait by `PUMP_TEARDOWN` and aborts
+        // stragglers, so a surviving grandchild holding a pipe open past the
+        // child's death can't park this finisher forever (parity with the bulk
+        // verbs). The child's own pipes closed when it exited, so the common
+        // case completes immediately.
+        let pumps: Vec<_> = [self.stdout_pump.take(), self.stderr_pump.take()]
+            .into_iter()
+            .flatten()
+            .collect();
+        super::join_pumps(pumps).await;
         let (code, _timed_out) = self.checked_outcome(outcome)?;
 
         // Fail-loud ceiling check for both sinks.

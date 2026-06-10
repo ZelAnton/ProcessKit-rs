@@ -45,6 +45,14 @@ pub enum OverflowMode {
     ///
     /// Use this when unbounded output is itself a misbehavior — an untrusted
     /// tool flooding its stdout is a denial-of-service, not a policy choice.
+    ///
+    /// **Requires a cap to do anything.** This mode fires only when the buffer
+    /// is *full*, so it is inert on an unbounded buffer (`max_lines: None`) —
+    /// there is no ceiling to exceed. Reach for it via
+    /// [`fail_loud`](OutputBufferPolicy::fail_loud) (which sets the cap for you),
+    /// or pair [`with_overflow`](OutputBufferPolicy::with_overflow) with a
+    /// `bounded`/`Some(n)` `max_lines`; `unbounded().with_overflow(Error)` never
+    /// errors.
     Error,
 }
 
@@ -101,6 +109,11 @@ impl OutputBufferPolicy {
     }
 
     /// Set the overflow behavior.
+    ///
+    /// Note that [`OverflowMode::Error`] only takes effect when `max_lines` is
+    /// `Some(_)`: it fires when the buffer is full, so on an unbounded buffer
+    /// (`max_lines: None`) it is a no-op. Combine it with a `bounded` cap, or
+    /// use [`fail_loud`](Self::fail_loud) which sets both at once.
     #[must_use]
     pub fn with_overflow(mut self, overflow: OverflowMode) -> Self {
         self.overflow = overflow;

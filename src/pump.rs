@@ -68,7 +68,15 @@ impl SharedLines {
         {
             let mut inner = self.inner.lock().expect("SharedLines poisoned");
             match inner.max {
-                Some(0) => {} // retain nothing
+                // Retain-nothing ceiling: still trips the fail-loud flag — with a
+                // 0-line cap, *any* line is already over it. (`fail_loud(0)` =
+                // "tolerate no output; error on the first line.") DropOldest /
+                // DropNewest just discard silently as before.
+                Some(0) => {
+                    if matches!(inner.mode, OverflowMode::Error) {
+                        inner.overflowed = true;
+                    }
+                }
                 Some(n) if inner.lines.len() >= n => match inner.mode {
                     OverflowMode::DropOldest => {
                         inner.lines.pop_front();
@@ -266,6 +274,42 @@ mod tests {
         let sink = SharedLines::new(&policy);
         pump_lines(&b"a\nb\nc\nd\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
         assert_eq!(sink.drain(), vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn fail_loud_sets_overflow_once_full_but_retains_the_cap() {
+        let sink = SharedLines::new(&OutputBufferPolicy::fail_loud(2));
+        pump_lines(&b"a\nb\nc\nd\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert!(sink.overflowed(), "third line must trip the fail-loud flag");
+        assert_eq!(sink.count(), 4, "every line is still counted");
+        assert_eq!(sink.drain(), vec!["a", "b"], "retains up to the cap");
+    }
+
+    #[tokio::test]
+    async fn fail_loud_under_the_cap_does_not_overflow() {
+        let sink = SharedLines::new(&OutputBufferPolicy::fail_loud(5));
+        pump_lines(&b"a\nb\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert!(!sink.overflowed(), "two lines under a 5-line cap is fine");
+    }
+
+    #[tokio::test]
+    async fn fail_loud_zero_errors_on_the_first_line() {
+        // `fail_loud(0)` = "tolerate no output, error on the first line." The
+        // retain-nothing fast-path must still trip the flag (regression: it
+        // used to short-circuit before the overflow-mode check).
+        let sink = SharedLines::new(&OutputBufferPolicy::fail_loud(0));
+        pump_lines(&b"oops\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert!(sink.overflowed(), "any line is over a 0-line ceiling");
+        assert!(sink.drain().is_empty(), "still retains nothing");
+    }
+
+    #[tokio::test]
+    async fn bounded_zero_without_error_mode_never_overflows() {
+        // A plain `bounded(0)` (DropOldest) retains nothing and must NOT flag
+        // overflow — only the fail-loud variant errors.
+        let sink = SharedLines::new(&OutputBufferPolicy::bounded(0));
+        pump_lines(&b"a\nb\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert!(!sink.overflowed());
     }
 
     #[tokio::test]

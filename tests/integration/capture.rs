@@ -67,6 +67,41 @@ async fn missing_program_surfaces_not_found_with_searched_path() {
     );
 }
 
+// Regression: a bare program name that the OS resolves by a route we don't model
+// must NOT be falsely rejected as `NotFound`. On Windows std also searches the
+// *application directory* (the running exe's dir), not just PATH — a helper
+// shipped beside the binary spawns fine. An earlier PATH-only pre-check rejected
+// it before ever attempting the spawn; the rich error is now enriched from the
+// OS's actual not-found, so the OS stays the source of truth. (Unix `execvp`
+// searches PATH only, so there is no equivalent app-dir case to regress there.)
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "exercises the real spawn path; writes a temp exe beside the test binary"]
+async fn bare_name_in_the_application_directory_is_not_falsely_not_found() {
+    // Place a uniquely-named copy of a real system exe next to THIS test binary
+    // (the application directory) — deliberately *not* on PATH and *not* in cwd.
+    let app_dir = std::env::current_exe()
+        .expect("current_exe")
+        .parent()
+        .expect("exe has a parent dir")
+        .to_path_buf();
+    let unique = "pk_appdir_regression_probe_77321";
+    let dst = app_dir.join(format!("{unique}.exe"));
+    std::fs::copy(r"C:\Windows\System32\where.exe", &dst).expect("copy where.exe beside test exe");
+
+    // `where /?` prints help and exits 0 — so a clean success proves the OS both
+    // *found* (via the app dir) and *ran* the bare-named program.
+    let result = Command::new(unique).arg("/?").output_string().await;
+    let _ = std::fs::remove_file(&dst); // best-effort cleanup before asserting
+
+    let result = result.expect("a program in the application dir must spawn, not error");
+    assert!(
+        result.is_success(),
+        "`where /?` exits 0; got {:?}",
+        result.code()
+    );
+}
+
 #[tokio::test]
 #[ignore = "spawns a real subprocess"]
 async fn output_string_captures_stdout() {
@@ -81,6 +116,64 @@ async fn output_string_captures_stdout() {
         result.stdout().contains("second"),
         "stdout: {:?}",
         result.stdout()
+    );
+}
+
+// StdioMode::Null on stdout: the command still runs to completion (the exit code
+// is real), but nothing is captured — the pump is skipped, so `output_string`
+// returns empty stdout. Pins the documented "no-op capture under Null" contract.
+#[tokio::test]
+#[ignore = "spawns a real subprocess"]
+async fn stdout_null_suppresses_capture_but_runs_the_command() {
+    let result = two_line_echo()
+        .stdout(processkit::StdioMode::Null)
+        .output_string()
+        .await
+        .expect("a stdout(Null) run still completes");
+    assert!(result.is_success(), "exit was {:?}", result.code());
+    assert!(
+        result.stdout().is_empty(),
+        "stdout(Null) must capture nothing, got {:?}",
+        result.stdout()
+    );
+}
+
+// stdout_tee: each decoded line is written to the sink *and* still captured.
+// A shared in-memory sink lets the test read back what the tee received without
+// depending on file-handle flush/close timing.
+#[tokio::test]
+#[ignore = "spawns a real subprocess"]
+async fn stdout_tee_writes_to_the_sink_while_capturing() {
+    #[derive(Clone)]
+    struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("sink mutex").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let sink = SharedSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let result = two_line_echo()
+        .stdout_tee(sink.clone())
+        .output_string()
+        .await
+        .expect("a stdout_tee run completes");
+
+    // Capture still happens alongside the tee.
+    assert!(
+        result.stdout().contains("first") && result.stdout().contains("second"),
+        "capture must still see both lines: {:?}",
+        result.stdout()
+    );
+    // The tee received the same lines (writeln! per decoded line).
+    let teed = String::from_utf8(sink.0.lock().expect("sink mutex").clone()).expect("tee is utf-8");
+    assert!(
+        teed.contains("first") && teed.contains("second"),
+        "tee sink must receive both lines: {teed:?}"
     );
 }
 
@@ -400,6 +493,39 @@ async fn ok_codes_widens_success_through_output_string_and_bytes() {
         !outside.is_success(),
         "exit 2 is outside ok_codes([0,1]) — still a failure"
     );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess that overflows a fail-loud buffer"]
+async fn fail_loud_buffer_surfaces_output_too_large() {
+    // A child that prints more lines than a fail-loud ceiling must surface
+    // Error::OutputTooLarge through the real spawn+pump path — the fail-loud
+    // DoS guard, end-to-end. `five_lines` prints 5 lines; the cap is 2, so the
+    // run errors even though the child exited 0. (The pipe is still drained, so
+    // the child never blocks.)
+    use processkit::OutputBufferPolicy;
+    let err = five_lines()
+        .output_buffer(OutputBufferPolicy::fail_loud(2))
+        .output_string()
+        .await
+        .expect_err("5 lines over a 2-line fail-loud cap must error");
+    match err {
+        processkit::Error::OutputTooLarge {
+            limit, total_lines, ..
+        } => {
+            assert_eq!(limit, 2, "the configured cap is reported: {err:?}");
+            assert!(total_lines >= 5, "every line is counted: {total_lines}");
+        }
+        other => panic!("expected Error::OutputTooLarge, got {other:?}"),
+    }
+
+    // A run that stays under the cap must NOT error (control case).
+    let ok = two_line_echo()
+        .output_buffer(OutputBufferPolicy::fail_loud(10))
+        .output_string()
+        .await
+        .expect("2 lines under a 10-line cap is fine");
+    assert!(ok.is_success());
 }
 
 #[cfg(windows)]

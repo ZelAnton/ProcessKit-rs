@@ -21,9 +21,11 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    /// A bare program name (no path separators) was not found on `PATH` — it
-    /// is not installed or the directory holding it is not on `PATH`. Produced
-    /// before spawning so the error names the searched directories.
+    /// A bare program name (no path separators) was not found — it is not
+    /// installed or the directory holding it is not on `PATH`. Enriched from the
+    /// OS's opaque not-found error so the message names the searched directories,
+    /// rather than pre-checking `PATH` (which would falsely reject a program the
+    /// OS resolves by another route — e.g. the application directory on Windows).
     ///
     /// Distinct from [`Spawn`](Error::Spawn), which covers OS-level failures
     /// once the executable location is known (permission denied, busy, etc.).
