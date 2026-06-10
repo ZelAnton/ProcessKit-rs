@@ -123,11 +123,18 @@ pub struct RunningProcess {
     deadline_task: Option<JoinHandle<()>>,
     #[cfg(feature = "cancellation")]
     cancel_token: Option<tokio_util::sync::CancellationToken>,
-    // Armed by `stdout_lines` when a token is set: kills the tree on cancel so
-    // a pure-streaming consumer's stream ends. Mirrors `deadline_task` (Weak
-    // to the group; aborted on drop).
+    // Armed by `arm_cancel_watchdog` at spawn time (via `launch`/`attach_group`)
+    // so that *every* consuming path — including `wait_any`, probes, and pure
+    // streaming — kills the tree when the token fires, not just `drive_to_exit`.
     #[cfg(feature = "cancellation")]
     cancel_task: Option<JoinHandle<()>>,
+    // Snapshotted at the first reap (by `wait_exit`, `has_exited_now`, or
+    // `drive_to_exit`) from the live token so no later cancel can reclassify a
+    // natural exit. `None` = not yet snapshotted; `Some(v)` = snapshotted.
+    // `drive_to_exit` short-circuits (skipping the cancel/deadline select) when
+    // already `Some`, preserving the snapshot taken at the true reap point.
+    #[cfg(feature = "cancellation")]
+    cancel_at_exit: Option<bool>,
     started: Instant,
     start_time: SystemTime,
 }
@@ -300,6 +307,8 @@ impl RunningProcess {
             cancel_token: s.cancel_token,
             #[cfg(feature = "cancellation")]
             cancel_task: None,
+            #[cfg(feature = "cancellation")]
+            cancel_at_exit: None,
             started: Instant::now(),
             start_time: SystemTime::now(),
         }
@@ -332,6 +341,8 @@ impl RunningProcess {
             cancel_token: command.cancel_token(),
             #[cfg(feature = "cancellation")]
             cancel_task: None,
+            #[cfg(feature = "cancellation")]
+            cancel_at_exit: None,
             started: Instant::now(),
             start_time: SystemTime::now(),
         }
@@ -340,6 +351,41 @@ impl RunningProcess {
     pub(crate) fn attach_group(&mut self, group: ProcessGroup) {
         if let Backend::Real(real) = &mut self.backend {
             real.own_group = Some(Arc::new(group));
+        }
+        // Re-arm the cancel watchdog now that the group is known: upgrade from
+        // the pid-only task armed in `launch` to a full group+pid kill.
+        self.arm_cancel_watchdog();
+    }
+
+    /// Arm (or re-arm) the spawn-time cancel kill task. Called from `launch`
+    /// (pid-only, for shared-group runs) and `attach_group` (group+pid, for
+    /// own-group runs). If a task is already armed it is aborted and replaced —
+    /// `attach_group` upgrades the initial pid-only version to the group-aware
+    /// one. No-op when no cancel token is configured.
+    ///
+    /// Storing the handle in `self.cancel_task` means `Drop` / `abort_watchdogs`
+    /// will abort it on the normal paths, limiting the recycled-pid window to a
+    /// brief scheduler quantum.
+    pub(crate) fn arm_cancel_watchdog(&mut self) {
+        #[cfg(feature = "cancellation")]
+        {
+            if let Some(old) = self.cancel_task.take() {
+                old.abort();
+            }
+            let Some(token) = self.cancel_token.clone() else {
+                return;
+            };
+            let group_weak = self.backend.own_group().map(Arc::downgrade);
+            let pid = self.pid;
+            self.cancel_task = Some(tokio::spawn(async move {
+                token.cancelled().await;
+                // Full tree kill when we own the group; direct child kill as
+                // backstop for shared-group runs or after the group is gone.
+                if let Some(g) = group_weak.and_then(|w| w.upgrade()) {
+                    let _ = g.terminate_all();
+                }
+                stream::kill_direct_child(pid);
+            }));
         }
     }
 
@@ -591,8 +637,27 @@ impl RunningProcess {
     /// no [`timeout`](crate::Command::timeout). Cancel-safe and re-awaitable:
     /// tokio caches the exit status, so a raced-and-cancelled process can be
     /// waited again (or consumed normally) afterwards.
+    ///
+    /// Aborts watchdog tasks after reap to prevent late-firing deadline/cancel
+    /// tasks from sending signals to a recycled pid (B1/B2 fix).
     pub(crate) async fn wait_exit(&mut self) -> Result<Option<i32>> {
-        Ok(self.backend_wait().await?.0)
+        let result = self.backend_wait().await?;
+        // Reap happened: abort watchdogs and clear pid before returning.
+        // This mirrors the `abort_watchdogs` call in `drive_to_exit` and
+        // prevents a streaming deadline/cancel task from waking up minutes
+        // later and killing an unrelated process that recycled this pid.
+        self.abort_watchdogs();
+        // Snapshot the cancel state at the true reap point (before any pump
+        // teardown or caller code runs). A consuming verb called on the winner
+        // after `wait_any` must see this snapshot — not re-query the live
+        // token — so a cancel that fires after natural exit doesn't convert
+        // success to `Err(Cancelled)` (Issue 1 / L14 companion fix).
+        #[cfg(feature = "cancellation")]
+        {
+            self.cancel_at_exit =
+                Some(self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()));
+        }
+        Ok(result.0)
     }
 
     /// Run the process to completion while sampling its CPU and memory every
@@ -650,6 +715,20 @@ impl RunningProcess {
                 }
             })
         });
+
+        // Guard against future-drop (e.g. `tokio::time::timeout(d, p.profile(e))`):
+        // dropping the `profile()` future before it returns would leave the
+        // sampler ticking forever against a pid that may be recycled after reap.
+        // `AbortOnDrop` ensures the task is aborted whether we exit via `on_exit`,
+        // via `?`, or via a future-drop. The `on_exit` abort below is still the
+        // primary path; this is the fallback for the drop case.
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _sampler_guard = sampler.as_ref().map(|h| AbortOnDrop(h.abort_handle()));
 
         // The `on_exit` hook stops the sampler the moment the child is reaped:
         // its pid is free for reuse from that point (Linux), and the pump
@@ -771,9 +850,16 @@ impl RunningProcess {
     /// timeout. Centralizing it here makes the documented invariant
     /// structural instead of per-consumer copy-paste discipline.
     fn checked_outcome(&self, outcome: (Option<i32>, bool)) -> Result<(Option<i32>, bool)> {
+        // Use the pre-pump snapshot rather than a live token read: prevents
+        // a cancel that fires during `join_pumps` from discarding real output.
+        // `unwrap_or(false)`: None means not yet snapshotted — only reachable
+        // if a future code path calls checked_outcome without drive_to_exit,
+        // which is not possible today; treat as "not cancelled" conservatively.
         #[cfg(feature = "cancellation")]
-        if let Some(err) = self.cancelled_error() {
-            return Err(err);
+        if self.cancel_at_exit.unwrap_or(false) {
+            return Err(Error::Cancelled {
+                program: self.program.clone(),
+            });
         }
         Ok(outcome)
     }
@@ -813,11 +899,16 @@ impl RunningProcess {
         }
     }
 
-    /// Stop the streaming watchdog tasks (deadline/cancel) once the child's
-    /// fate is settled — mirroring the `profile` sampler's early abort, so a
-    /// late firing can't `kill_direct_child` a pid the consuming method has
-    /// already reaped. (`Drop` remains the backstop for non-consuming exits.)
+    /// Abort all watchdog tasks and clear the recorded pid once the child has
+    /// been reaped. Aborting before the pid is freed limits the window in which
+    /// a watchdog could SIGKILL an innocent process that recycled the pid
+    /// (though an already-executing kill in a task cannot be recalled — the
+    /// window is a scheduler quantum, mirroring the acknowledged tradeoff in
+    /// `graceful_kill_pid`). Clearing `self.pid` also makes `pid()`/`cpu_time()`/
+    /// `peak_memory_bytes()` report correctly after reap. (`Drop` is still the
+    /// backstop for handles that are dropped without consuming.)
     fn abort_watchdogs(&mut self) {
+        self.pid = None;
         if let Some(task) = self.deadline_task.take() {
             task.abort();
         }
@@ -839,9 +930,39 @@ impl RunningProcess {
         if let Backend::Real(real) = &mut self.backend {
             drop(real.stdin_pipe.take());
         }
+        // Short-circuit when the child was already reaped by `wait_exit` or
+        // a probe (`has_exited_now`): those paths snapshot `cancel_at_exit` at
+        // the true reap point. Re-running the cancel/deadline select here would
+        // fire the cancel arm immediately (token already cancelled), overwriting
+        // the correct snapshot and converting a natural exit to `Err(Cancelled)`.
+        // `backend_wait` returns the Tokio-cached exit status instantly for an
+        // already-reaped child — safe and cheap.
+        #[cfg(feature = "cancellation")]
+        if self.cancel_at_exit.is_some() {
+            return self.backend_wait().await;
+        }
         let outcome = self.drive_to_exit_inner().await?;
         // The child is reaped (or being reaped) — the watchdogs' job is done.
         self.abort_watchdogs();
+        // Snapshot cancel state NOW (before the ≤5 s pump teardown in the
+        // caller): a token that fires during `join_pumps` must not convert a
+        // real success into `Err(Cancelled)` (L14 fix). If the token already
+        // fired during the run, the select! cancel arm already ran kill_tree,
+        // so this snapshot will be `true` and the error is correct.
+        //
+        // Narrow known race (Issue 7): on the `multi_thread` runtime, another
+        // thread could cancel the token in the synchronous window between
+        // `abort_watchdogs` returning and the `is_cancelled()` read below.
+        // The window is a single atomic read with no await between the two
+        // operations; on a `current_thread` runtime the window is not
+        // reachable. Fully closing it would require changing the return type
+        // of `drive_to_exit_inner` to carry an "exit was due to cancel" flag
+        // (planned as part of the Phase B result-shape reshape).
+        #[cfg(feature = "cancellation")]
+        {
+            self.cancel_at_exit =
+                Some(self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()));
+        }
         #[cfg(feature = "tracing")]
         {
             let (code, timed_out) = outcome;
@@ -884,10 +1005,15 @@ impl RunningProcess {
     async fn drive_to_exit_inner(&mut self) -> Result<(Option<i32>, bool)> {
         match self.timeout {
             Some(limit) => {
+                // Anchor the deadline to spawn time (`self.started`): consuming
+                // verbs called long after spawn must not re-grant the full limit.
+                let remaining = limit
+                    .checked_sub(self.started.elapsed())
+                    .unwrap_or(Duration::ZERO);
                 let waited = {
                     let wait = self.backend_wait();
                     tokio::pin!(wait);
-                    tokio::time::timeout(limit, &mut wait).await
+                    tokio::time::timeout(remaining, &mut wait).await
                 };
                 match waited {
                     Ok(outcome) => outcome,
@@ -911,28 +1037,40 @@ impl RunningProcess {
     /// With the feature: race the cancellation token against the
     /// (deadline-bounded) wait. Unset knobs become never-resolving arms, so one
     /// `select!` covers the whole timeout × token matrix. The cancel arm does
-    /// NOT set `timed_out` — callers classify it via
-    /// [`cancelled_error`](Self::cancelled_error) afterwards.
+    /// NOT set `timed_out` — callers classify it via `cancel_at_exit` afterwards.
+    ///
+    /// `biased` with cancel first ensures cancel always beats a simultaneously-
+    /// ready deadline (L4: prevents routing through the graceful teardown tier
+    /// when both fire on the same poll, which would delay the promised
+    /// immediate hard kill by up to `timeout_grace`).
     #[cfg(feature = "cancellation")]
     async fn drive_to_exit_inner(&mut self) -> Result<(Option<i32>, bool)> {
         // Own the knobs so the helper futures borrow nothing from `self` —
         // only `self.backend_wait()` does, keeping the select! borrows disjoint.
         let limit = self.timeout;
         let token = self.cancel_token.clone();
+        let started = self.started;
         let cancelled = async {
             match &token {
                 Some(token) => token.cancelled().await,
                 None => std::future::pending::<()>().await,
             }
         };
-        let deadline = async {
+        // Anchor deadline to spawn time: consuming verbs called long after
+        // spawn must not re-grant the full limit (B7 fix).
+        let deadline = async move {
             match limit {
-                Some(limit) => tokio::time::sleep(limit).await,
+                Some(limit) => {
+                    let remaining = limit
+                        .checked_sub(started.elapsed())
+                        .unwrap_or(Duration::ZERO);
+                    tokio::time::sleep(remaining).await
+                }
                 None => std::future::pending::<()>().await,
             }
         };
         tokio::select! {
-            outcome = self.backend_wait() => outcome,
+            biased; // cancel arm checked first: always beats a simultaneous deadline
             () = cancelled => {
                 #[cfg(feature = "tracing")]
                 tracing::debug!(
@@ -943,6 +1081,7 @@ impl RunningProcess {
                 self.kill_tree().await;
                 Ok((None, false))
             }
+            outcome = self.backend_wait() => outcome,
             () = deadline => {
                 #[cfg(feature = "tracing")]
                 tracing::warn!(
@@ -1014,29 +1153,29 @@ impl RunningProcess {
     }
 
     /// Whether the child has already exited, polled without blocking — the
-    /// readiness probes' early-exit check.
+    /// readiness probes' early-exit check. Aborts watchdogs on true so a
+    /// probe-then-idle-handle doesn't leave a stale-pid deadline task running.
     fn has_exited_now(&mut self) -> bool {
-        match &mut self.backend {
+        let exited = match &mut self.backend {
             Backend::Real(real) => matches!(real.child.try_wait(), Ok(Some(_))),
             Backend::Scripted(s) => {
                 s.killed
                     || s.exit_at
                         .is_some_and(|at| tokio::time::Instant::now() >= at)
             }
+        };
+        if exited {
+            self.abort_watchdogs();
+            // Same snapshot logic as `wait_exit`: a consuming verb called after
+            // a probe that observed the exit must not be misclassified as Cancelled
+            // by a token that fires in the interim.
+            #[cfg(feature = "cancellation")]
+            {
+                self.cancel_at_exit =
+                    Some(self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()));
+            }
         }
-    }
-
-    /// After [`drive_to_exit`](Self::drive_to_exit): the typed cancellation
-    /// error when the run's token fired — checked by every consuming path
-    /// BEFORE any timeout classification (an explicit cancel wins).
-    #[cfg(feature = "cancellation")]
-    fn cancelled_error(&self) -> Option<Error> {
-        match &self.cancel_token {
-            Some(token) if token.is_cancelled() => Some(Error::Cancelled {
-                program: self.program.clone(),
-            }),
-            _ => None,
-        }
+        exited
     }
 
     /// Send a kill to the process without waiting for it to exit. The owning

@@ -106,8 +106,14 @@ impl RunningProcess {
             let pid = self.pid;
             let grace = self.timeout_grace;
             let signal = self.timeout_signal;
+            // Anchor to spawn time so a late stream call can't re-grant the
+            // full limit (B7 fix). `started` is std::time::Instant (Copy).
+            let started = self.started;
             self.deadline_task = Some(tokio::spawn(async move {
-                tokio::time::sleep(limit).await;
+                let remaining = limit
+                    .checked_sub(started.elapsed())
+                    .unwrap_or(std::time::Duration::ZERO);
+                tokio::time::sleep(remaining).await;
                 match grace {
                     // Graceful: signal the (still-owned) group, wait the grace,
                     // then KILL. This detached watchdog doesn't hold the `Child`,
@@ -128,21 +134,10 @@ impl RunningProcess {
             }));
         }
 
-        // Likewise bound it by the cancellation token, so a pure-streaming
-        // consumer's stream ends when the run is cancelled (same private-group
-        // asymmetry as the deadline timer).
-        #[cfg(feature = "cancellation")]
-        if self.cancel_task.is_none()
-            && let (Some(token), Some(group)) =
-                (self.cancel_token.clone(), self.backend.own_group())
-        {
-            let group = Arc::downgrade(group);
-            let pid = self.pid;
-            self.cancel_task = Some(tokio::spawn(async move {
-                token.cancelled().await;
-                kill_via_weak(&group, pid);
-            }));
-        }
+        // The cancel watchdog is armed at spawn time by `arm_cancel_watchdog`
+        // (via `launch`/`attach_group`), so streaming consumers don't need to
+        // re-arm it here. The stored `cancel_task` is already `Some` if a token
+        // was configured; `abort_watchdogs` will abort it on reap or drop.
 
         StdoutLines {
             sink: stdout_sink,
@@ -299,8 +294,12 @@ impl RunningProcess {
             let pid = self.pid;
             let grace = self.timeout_grace;
             let signal = self.timeout_signal;
+            let started = self.started;
             self.deadline_task = Some(tokio::spawn(async move {
-                tokio::time::sleep(limit).await;
+                let remaining = limit
+                    .checked_sub(started.elapsed())
+                    .unwrap_or(std::time::Duration::ZERO);
+                tokio::time::sleep(remaining).await;
                 match grace {
                     Some(grace) => match group.upgrade() {
                         Some(group) => {
@@ -313,18 +312,7 @@ impl RunningProcess {
             }));
         }
 
-        #[cfg(feature = "cancellation")]
-        if self.cancel_task.is_none()
-            && let (Some(token), Some(group)) =
-                (self.cancel_token.clone(), self.backend.own_group())
-        {
-            let group = Arc::downgrade(group);
-            let pid = self.pid;
-            self.cancel_task = Some(tokio::spawn(async move {
-                token.cancelled().await;
-                kill_via_weak(&group, pid);
-            }));
-        }
+        // Cancel watchdog is now armed at spawn time — no re-arm needed here.
 
         OutputEvents {
             stdout_sink,
@@ -401,7 +389,7 @@ impl RunningProcess {
 /// listener): tear down the group if it is still around, then best-effort kill
 /// the direct child. The `Weak` means a watchdog never delays the group's
 /// kill-on-close when the handle is dropped early.
-fn kill_via_weak(group: &Weak<ProcessGroup>, pid: Option<u32>) {
+pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, pid: Option<u32>) {
     if let Some(group) = group.upgrade() {
         let _ = group.terminate_all();
     }
@@ -435,9 +423,15 @@ pub(crate) async fn graceful_kill_pid(pid: Option<u32>, grace: std::time::Durati
             if now >= deadline {
                 break;
             }
-            // SAFETY: signal 0 only probes existence/permission. Non-zero => gone.
-            if unsafe { libc::kill(pid, 0) } != 0 {
-                return;
+            // SAFETY: signal 0 only probes existence/permission.
+            // ESRCH (non-zero, non-EPERM) → gone: exit the grace early.
+            // EPERM → alive but can't be signalled (e.g. after a uid change) —
+            // treat as exists, matching `Tracked::exists`'s convention; the
+            // final SIGKILL is still sent best-effort. Any other non-zero (rare)
+            // is treated conservatively as "still alive".
+            let probe = unsafe { libc::kill(pid, 0) };
+            if probe != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
+                return; // ESRCH: gone
             }
             let poll = std::time::Duration::from_millis(20);
             tokio::time::sleep(poll.min(deadline - now)).await;
@@ -461,7 +455,8 @@ pub(crate) async fn graceful_kill_pid(pid: Option<u32>, grace: std::time::Durati
 /// reach the `Child` handle, so they signal by pid). The group kill usually
 /// makes this a no-op; it exists so a group-kill miss (e.g. a pgroup
 /// broadcast racing the tree) still closes the pipes and ends the stream.
-fn kill_direct_child(pid: Option<u32>) {
+/// Also called by the spawn-time cancel watchdog in `mod.rs`.
+pub(super) fn kill_direct_child(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     #[cfg(unix)]
     // SAFETY: SIGKILL to a specific live-or-zombie pid; an exited/reaped pid

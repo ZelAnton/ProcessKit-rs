@@ -378,6 +378,44 @@ pub use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 mod tests {
+    // Regression: wait_exit (used by wait_any/wait_all) did not snapshot
+    // cancel_at_exit, so a .wait()/.output_string()/etc. on the winner after
+    // wait_any returned — with the token now cancelled — would re-run
+    // drive_to_exit_inner whose biased cancel arm fires (token already cancelled),
+    // returning Ok((None, false)) and then snapshotting cancel_at_exit = true,
+    // converting a natural exit to Err(Cancelled).
+    #[cfg(feature = "cancellation")]
+    #[tokio::test]
+    async fn wait_any_winner_natural_exit_preserved_after_late_cancel() {
+        use crate::doubles::{Reply, ScriptedRunner};
+        use crate::runner::ProcessRunner;
+
+        let token = crate::CancellationToken::new();
+        let runner = ScriptedRunner::new().fallback(Reply::ok(""));
+        let mut process = runner
+            .start(&crate::Command::new("test-prog").cancel_on(token.clone()))
+            .await
+            .expect("start scripted process");
+
+        // Race the single process — scripted Reply::ok exits immediately (code 0).
+        let (idx, code) = super::wait_any(&mut [&mut process])
+            .await
+            .expect("wait_any");
+        assert_eq!(idx, 0);
+        assert_eq!(code, Some(0), "process exited naturally");
+
+        // Cancel the token AFTER the natural exit.
+        token.cancel();
+
+        // A bulk verb on the winner must return the natural exit, not Err(Cancelled).
+        let result = process.wait().await.expect("wait after wait_any");
+        assert_eq!(
+            result,
+            Some(0),
+            "natural exit must not be converted to Err(Cancelled)"
+        );
+    }
+
     #[tokio::test]
     async fn wait_any_on_an_empty_slice_errors_instead_of_pending() {
         let err = super::wait_any(&mut [])

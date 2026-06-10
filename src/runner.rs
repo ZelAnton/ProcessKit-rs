@@ -364,7 +364,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    Ok(RunningProcess::from_spawned(Spawned {
+    let mut process = RunningProcess::from_spawned(Spawned {
         program: command.program_name(),
         child,
         own_group: None,
@@ -384,7 +384,14 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         ok_codes: command.ok_codes_vec(),
         #[cfg(feature = "cancellation")]
         cancel_token: command.cancel_token(),
-    }))
+    });
+    // Arm the spawn-time cancel watchdog with a pid-only kill. For own-group
+    // runs, `attach_group` (called immediately after `launch` in `JobRunner`)
+    // will re-arm with the full group+pid kill. For shared-group runs, this
+    // pid-only kill is the permanent watchdog — ensuring the cancel token kills
+    // the child even when no consuming verb has been called (B2 fix).
+    process.arm_cancel_watchdog();
+    Ok(process)
 }
 
 #[cfg(test)]
