@@ -47,6 +47,23 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  hack:
+    name: feature-powerset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-hack
+      # The clippy/test matrix exercises three FIXED feature configs
+      # (no-default / default / all). With 7 features, combinations the fixed set
+      # never builds — `limits` without `stats`, `cancellation` + `record` alone —
+      # can break compilation undetected. `--feature-powerset --depth 2` checks
+      # every ≤2-feature combination (34 today), catching feature-gate mistakes
+      # the fixed configs miss. Platform-specific `sys/` gates stay covered by the
+      # 3-OS clippy matrix; this runs on Linux for the feature dimension only.
+      - run: cargo hack --feature-powerset --depth 2 check --all-targets
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

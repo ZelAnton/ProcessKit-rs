@@ -226,6 +226,32 @@ impl Rule {
 ///
 /// Rules are tried in registration order; the first match wins. With no match,
 /// the [`fallback`](Self::fallback) reply is used, or an error is returned.
+///
+/// # Example
+///
+/// Drive a command through scripted replies — hermetic (no real subprocess), so
+/// this example actually runs in `cargo test` on every OS:
+///
+/// ```
+/// use processkit::{Command, ProcessRunner, Reply, ScriptedRunner};
+///
+/// let rt = tokio::runtime::Builder::new_current_thread()
+///     .enable_all()
+///     .build()
+///     .unwrap();
+/// rt.block_on(async {
+///     let runner = ScriptedRunner::new()
+///         .on(["--version"], Reply::ok("tool 1.2.3"))
+///         .fallback(Reply::fail(1, "unexpected command"));
+///
+///     let out = runner
+///         .output(&Command::new("tool").arg("--version"))
+///         .await
+///         .expect("scripted reply");
+///     assert!(out.is_success());
+///     assert_eq!(out.stdout().trim(), "tool 1.2.3");
+/// });
+/// ```
 #[derive(Default)]
 pub struct ScriptedRunner {
     rules: Vec<(Rule, Reply)>,

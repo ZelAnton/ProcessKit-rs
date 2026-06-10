@@ -30,3 +30,6 @@ constraint) can reopen one by moving its substance back into `ideas/`.
 - **`pre-1.0-api-review.md`** — the pre-1.0 public-API sweep: the `#[non_exhaustive]`
   additions (shipped 0.9.1) and the deliberate re-export-leak decisions
   (`CancellationToken`/`encoding_rs::Encoding` kept).
+- **`readme-crate-doc-sourcing.md`** — why the README and the `lib.rs` crate doc stay
+  separate (not `#![doc = include_str!]`): `include_str!` is lossy on docs.rs (relative
+  links, cover image) and the two serve different audiences. Drift managed by review.
