@@ -502,6 +502,11 @@ impl RunningProcess {
 
     /// Drain both streams, wait for exit, and return the captured text output
     /// (line-normalized to `\n`).
+    ///
+    /// If you previously called [`stdout_lines`](Self::stdout_lines) and
+    /// consumed some lines from the stream, those already-consumed lines are
+    /// gone from the buffer; `output_string` returns only the unconsumed tail.
+    /// To capture the full output, avoid mixing streaming and `output_string`.
     pub async fn output_string(mut self) -> Result<ProcessResult<String>> {
         let finished = self
             .finish_lines(CaptureMode::Lines, /* expose_counts */ true, || {})
@@ -784,29 +789,68 @@ impl RunningProcess {
         expose_counts: bool,
         on_exit: impl FnOnce(),
     ) -> Result<Finished> {
-        let stdout_sink = SharedLines::new(&self.buffer);
-        let stderr_sink = SharedLines::new(&self.buffer);
-        let pumps = self.spawn_line_pumps(&stdout_sink, &stderr_sink);
+        // B10: reuse a sink already populated by a prior streaming call so that
+        // output_string called after stdout_lines/output_events sees the lines
+        // the streaming pump wrote rather than silently returning empty output.
+        // B9: for the discard path, create a retain-nothing sink (bounded(0),
+        // DropOldest) rather than the user's policy, so a chatty long-running
+        // child never accumulates O(total) heap in wait/profile.
+        let discard_policy = OutputBufferPolicy::bounded(0);
+        let sink_policy: &OutputBufferPolicy = match capture {
+            CaptureMode::Discard => &discard_policy,
+            CaptureMode::Lines => &self.buffer,
+        };
+        let stdout_sink = self
+            .stdout_sink
+            .clone()
+            .unwrap_or_else(|| SharedLines::new(sink_policy));
+        let stderr_sink = self
+            .stderr_sink
+            .clone()
+            .unwrap_or_else(|| SharedLines::new(sink_policy));
+        // Spawn pumps for any still-untaken pipes.  L3: handles are stored on
+        // self (not a frame-local Vec), so Drop aborts them if drive_to_exit
+        // errors and the future propagates before join_pumps can run — orphaned
+        // pumps on a shared-group handle would otherwise buffer unboundedly.
+        self.spawn_line_pumps(&stdout_sink, &stderr_sink);
         if expose_counts {
-            self.stdout_sink = Some(stdout_sink.clone());
-            self.stderr_sink = Some(stderr_sink.clone());
+            // Keep the first sink when one was set by a prior streaming call
+            // (B10: same Arc, same overflow state, same count).
+            if self.stdout_sink.is_none() {
+                self.stdout_sink = Some(stdout_sink.clone());
+            }
+            if self.stderr_sink.is_none() {
+                self.stderr_sink = Some(stderr_sink.clone());
+            }
         }
 
         let outcome = self.drive_to_exit().await;
         on_exit();
         let outcome = outcome?;
         self.observe_stdin_task().await;
+        // Take the pump handles stored by spawn_line_pumps (or a prior streaming
+        // call) and join them so their final writes are visible before the
+        // overflow check and drain.
+        let pumps: Vec<_> = [self.stdout_pump.take(), self.stderr_pump.take()]
+            .into_iter()
+            .flatten()
+            .collect();
         join_pumps(pumps).await;
         let outcome = self.checked_outcome(outcome)?;
 
-        // Fail-loud ceiling: OverflowMode::Error hit during pumping.
-        for sink in [&stdout_sink, &stderr_sink] {
-            if sink.overflowed() {
-                return Err(crate::Error::OutputTooLarge {
-                    program: self.program.clone(),
-                    limit: self.buffer.max_lines.unwrap_or(0),
-                    total_lines: sink.count(),
-                });
+        // Fail-loud ceiling: only meaningful for capturing verbs.  The discard
+        // path (wait/profile) uses a retain-nothing sink that never sets
+        // overflowed, so this check is a structural no-op there.  Gate it on
+        // CaptureMode::Lines for clarity.
+        if matches!(capture, CaptureMode::Lines) {
+            for sink in [&stdout_sink, &stderr_sink] {
+                if sink.overflowed() {
+                    return Err(crate::Error::OutputTooLarge {
+                        program: self.program.clone(),
+                        limit: self.buffer.max_lines.unwrap_or(0),
+                        total_lines: sink.count(),
+                    });
+                }
             }
         }
 
@@ -821,16 +865,13 @@ impl RunningProcess {
         })
     }
 
-    /// Spawn line pumps for both streams into the given sinks; returns their
-    /// task handles.
-    fn spawn_line_pumps(
-        &mut self,
-        stdout_sink: &Arc<SharedLines>,
-        stderr_sink: &Arc<SharedLines>,
-    ) -> Vec<JoinHandle<()>> {
-        let mut tasks = Vec::new();
+    /// Spawn line pumps for any still-untaken pipes into the given sinks.
+    /// Stores the task handles on `self` (`stdout_pump` / `stderr_pump`)
+    /// rather than returning them, so [`Drop`] aborts them if a consuming
+    /// verb propagates an error before `join_pumps` runs (L3 fix).
+    fn spawn_line_pumps(&mut self, stdout_sink: &Arc<SharedLines>, stderr_sink: &Arc<SharedLines>) {
         if let Some(pipe) = self.backend.take_stdout_reader() {
-            tasks.push(tokio::spawn(pump_lines(
+            self.stdout_pump = Some(tokio::spawn(pump_lines(
                 pipe,
                 self.stdout_encoding,
                 self.stdout_handler.clone(),
@@ -838,14 +879,13 @@ impl RunningProcess {
             )));
         }
         if let Some(pipe) = self.backend.take_stderr_reader() {
-            tasks.push(tokio::spawn(pump_lines(
+            self.stderr_pump = Some(tokio::spawn(pump_lines(
                 pipe,
                 self.stderr_encoding,
                 self.stderr_handler.clone(),
                 stderr_sink.clone(),
             )));
         }
-        tasks
     }
 
     /// The single post-exit checkpoint **every consuming path passes

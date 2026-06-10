@@ -7,7 +7,6 @@ use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
-use tokio::io::AsyncReadExt;
 use tokio_stream::Stream;
 
 use crate::error::Result;
@@ -106,7 +105,12 @@ impl RunningProcess {
             // Called more than once: hand back an immediately-finished stream.
             None => stdout_sink.close_now(),
         }
-        self.stdout_sink = Some(stdout_sink.clone());
+        // L1: only store on the first call — a repeat call's stdout_sink is a
+        // fresh closed empty sink; overwriting self.stdout_sink with it would
+        // silently discard the first pump's overflow flag and line count.
+        if self.stdout_sink.is_none() {
+            self.stdout_sink = Some(stdout_sink.clone());
+        }
 
         // Bound the stream by the command's timeout: kill the tree at the deadline
         // so the pipes close and this stream ends. A `Weak` to the group means a
@@ -168,20 +172,20 @@ impl RunningProcess {
     /// but safe to call on its own — any pipe the stream didn't take is drained
     /// here so the child can never block on a full pipe.
     pub async fn finish_streamed(mut self) -> Result<StreamedFinish> {
-        // Drain a stdout pipe a prior `stdout_lines` didn't take (and discard
-        // it) so the child can't block writing to it while we wait for exit.
-        // Deliberately unbounded: a deadline here would cut the drain off
-        // under a still-running chatty child and re-create the blocked-pipe
-        // hang. The cost of the alternative — a shared-group descendant
-        // holding the pipe parks this one idle reader until it exits — is
-        // benign.
-        if let Some(mut pipe) = self.backend.take_stdout_reader() {
-            tokio::spawn(async move {
-                let mut sink = Vec::new();
-                // Result ignored on purpose: the drain exists only to unblock
-                // the child; the bytes are discarded either way.
-                let _ = pipe.read_to_end(&mut sink).await;
-            });
+        // B5: drain an untaken stdout pipe through the policy-aware line pump
+        // instead of read_to_end into an unbounded Vec.  This applies the
+        // buffer policy (including fail_loud), counts lines, calls handlers,
+        // and stores the handle in self.stdout_pump so join_pumps (below)
+        // joins it and Drop aborts it on an early-error exit.
+        if let Some(pipe) = self.backend.take_stdout_reader() {
+            let sink = crate::pump::SharedLines::new(&self.buffer);
+            self.stdout_pump = Some(tokio::spawn(crate::pump::pump_lines(
+                pipe,
+                self.stdout_encoding,
+                self.stdout_handler.clone(),
+                sink.clone(),
+            )));
+            self.stdout_sink = Some(sink);
         }
         // Likewise start a stderr pump if streaming never did (so its output is
         // still captured and the pipe never fills).
@@ -283,24 +287,38 @@ impl RunningProcess {
             }
             None => stdout_sink.close_now(),
         }
-        self.stdout_sink = Some(stdout_sink.clone());
+        // L1: only store on the first call — a repeat call's stdout_sink is a
+        // fresh closed empty sink; overwriting self.stdout_sink would discard
+        // the first pump's overflow flag and line count.
+        if self.stdout_sink.is_none() {
+            self.stdout_sink = Some(stdout_sink.clone());
+        }
 
-        // Set up stderr sink + pump (only once, like stdout_lines for its stderr).
-        if self.stderr_sink.is_none() {
-            let stderr_sink = SharedLines::new(&self.buffer);
+        // Set up stderr sink + pump on the first call only.  On a repeat call
+        // give the returned OutputEvents its own immediately-closed stderr so the
+        // two consumers don't share a SharedLines — a shared sink's notify_one
+        // on close wakes only one waiter, leaving the other parked forever (L2).
+        let stderr_sink = if self.stderr_sink.is_none() {
+            let sink = SharedLines::new(&self.buffer);
             if let Some(pipe) = self.backend.take_stderr_reader() {
                 self.stderr_pump = Some(tokio::spawn(pump_lines(
                     pipe,
                     self.stderr_encoding,
                     self.stderr_handler.clone(),
-                    stderr_sink.clone(),
+                    sink.clone(),
                 )));
             } else {
-                stderr_sink.close_now();
+                sink.close_now();
             }
-            self.stderr_sink = Some(stderr_sink);
-        }
-        let stderr_sink = self.stderr_sink.clone().unwrap();
+            self.stderr_sink = Some(sink.clone());
+            sink
+        } else {
+            // Repeat call: return a fresh closed sink so this OutputEvents'
+            // stderr stream ends immediately without racing the first sink.
+            let closed = SharedLines::new(&self.buffer);
+            closed.close_now();
+            closed
+        };
 
         // Arm the deadline watchdog (same as stdout_lines — bounds the stream).
         if self.deadline_task.is_none()
@@ -347,13 +365,18 @@ impl RunningProcess {
     /// but safe to call on its own — any untaken pipes are drained so the child
     /// never blocks.
     pub async fn finish_events(mut self) -> crate::error::Result<Outcome> {
-        // Drain any untaken pipes.
-        if let Some(mut pipe) = self.backend.take_stdout_reader() {
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut sink = Vec::new();
-                let _ = pipe.read_to_end(&mut sink).await;
-            });
+        // B5: drain any untaken pipes through the policy-aware line pump so
+        // that the buffer policy (including fail_loud) and handlers apply.
+        // The handle is stored in self.stdout_pump and joined below.
+        if let Some(pipe) = self.backend.take_stdout_reader() {
+            let sink = crate::pump::SharedLines::new(&self.buffer);
+            self.stdout_pump = Some(tokio::spawn(crate::pump::pump_lines(
+                pipe,
+                self.stdout_encoding,
+                self.stdout_handler.clone(),
+                sink.clone(),
+            )));
+            self.stdout_sink = Some(sink);
         }
         if self.stderr_pump.is_none()
             && let Some(pipe) = self.backend.take_stderr_reader()

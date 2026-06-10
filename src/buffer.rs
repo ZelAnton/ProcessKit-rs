@@ -38,10 +38,15 @@ pub enum OverflowMode {
     /// silently dropping lines. The pipe is still drained (so the child never
     /// blocks); excess lines are counted but not retained.
     ///
-    /// The error fires on **every consuming verb**, including `wait` and
-    /// `profile` (which discard output) — if you set this limit, the run
-    /// always errors when it is exceeded, regardless of whether you read the
-    /// captured lines.
+    /// The error fires on **capturing verbs** —
+    /// [`output_string`](crate::Command::output_string),
+    /// [`output_bytes`](crate::Command::output_bytes),
+    /// [`finish_streamed`](crate::RunningProcess::finish_streamed), and
+    /// [`finish_events`](crate::RunningProcess::finish_events). Discard-only
+    /// verbs ([`wait`](crate::RunningProcess::wait),
+    /// [`profile`](crate::RunningProcess::profile)) use a retain-nothing sink
+    /// internally and are not affected — use a capturing verb if you need the
+    /// DoS guard on a run you don't otherwise capture.
     ///
     /// Use this when unbounded output is itself a misbehavior — an untrusted
     /// tool flooding its stdout is a denial-of-service, not a policy choice.
