@@ -72,6 +72,27 @@ to a dated version section.
   the directory set here — use an absolute path for the program when combining
   `current_dir` with a relative-path executable.
 
+### Security (Phase G — security / hygiene)
+
+- `Command`, `CliClient`, and `Invocation` now have a redacted `Debug`: it surfaces the
+  argument *count* and the env variable *names* (sorted), never argv or env *values* — so a
+  `{cmd:?}` log line or an `assert_eq!` failure can't leak a secret. `command_line()` stays
+  the documented, explicitly-secret-bearing escape hatch for the real argv.
+- `Error` now has a manual `Debug` (was derived): the `Exit` variant's captured streams are
+  bounded to a 200-byte preview (mirroring the `Display` tail cap) so `{e:?}` / `.unwrap()`
+  can't dump a multi-MiB stream, and `NotFound`'s `searched` (the `PATH` env value) is
+  redacted to a directory count rather than logged. The size-bound is deliberately
+  `Error`-only — the reflexive `{e:?}` / `.unwrap()` logging vector; `ProcessResult` keeps
+  full streams in its `Debug` for test inspection (and its stdout/stderr are policy-verbatim
+  regardless).
+- Cassette (`RecordReplayRunner`) hardening: the file is written owner-only (`0600`) on Unix;
+  the best-effort drop-flush is skipped while unwinding, so a panic mid-recording no longer
+  persists a surprise cassette; and the docs now scope the "no secrets" guarantee to env
+  *values* only — argv, cwd, stdout, and stderr are stored verbatim and may carry secrets.
+- Documented the cassette's lossy-key limitation: two distinct non-UTF-8 invocations that
+  differ only in their invalid bytes decode to the same match key and collide on replay
+  (valid-UTF-8 invocations never collide).
+
 ### Fixed (Phase F — group / limits / sys layer)
 
 - `ProcessGroup::shutdown` with `escalate_to_kill(false)` now actually preserves survivors:

@@ -1,5 +1,6 @@
 //! The crate's error type.
 
+use std::fmt;
 use std::time::Duration;
 
 /// Errors produced when launching or running a child process.
@@ -7,7 +8,17 @@ use std::time::Duration;
 /// Spawn failures, a non-zero exit ([`Exit`](Error::Exit)), timeouts, and IO
 /// errors fold into one structured enum, so callers can pattern-match on the
 /// failure mode instead of parsing strings.
-#[derive(Debug, thiserror::Error)]
+///
+/// `Debug` is **manual, not derived** (L22): the [`Exit`](Error::Exit) variant
+/// carries both captured streams in full, and a derived `Debug` would dump them
+/// — potentially multi-MiB — into a `{e:?}` log line or an `.unwrap()` panic
+/// message. The manual impl bounds each stream to a 200-byte preview (mirroring
+/// the [`Display`](std::fmt::Display) tail cap) and redacts
+/// [`NotFound`](Error::NotFound)'s
+/// `searched` (the `PATH` env value) to a directory count, honoring the crate's
+/// "never log environment values" rule. The exact streams remain reachable via
+/// the public fields.
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// The child process could not be started (binary not found, permission
@@ -285,6 +296,122 @@ impl Error {
     }
 }
 
+/// Manual `Debug` (L22): bounds the [`Exit`](Error::Exit) streams and redacts
+/// the `PATH` value, so `{e:?}` / `.unwrap()` neither dumps a multi-MiB stream
+/// nor logs an environment value. Every other variant mirrors what the derive
+/// would print.
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Spawn { program, source } => f
+                .debug_struct("Spawn")
+                .field("program", program)
+                .field("source", source)
+                .finish(),
+            Error::NotFound { program, searched } => f
+                .debug_struct("NotFound")
+                .field("program", program)
+                // `searched` is the `PATH` env value — never rendered (the
+                // crate's secret-safety rule). Summarize as a directory count.
+                .field("searched", &SearchedRedaction(searched))
+                .finish(),
+            Error::Exit {
+                program,
+                code,
+                stdout,
+                stderr,
+            } => f
+                .debug_struct("Exit")
+                .field("program", program)
+                .field("code", code)
+                .field("stdout", &StreamPreview(stdout))
+                .field("stderr", &StreamPreview(stderr))
+                .finish(),
+            Error::Timeout { program, timeout } => f
+                .debug_struct("Timeout")
+                .field("program", program)
+                .field("timeout", timeout)
+                .finish(),
+            Error::OutputTooLarge {
+                program,
+                limit,
+                total_lines,
+            } => f
+                .debug_struct("OutputTooLarge")
+                .field("program", program)
+                .field("limit", limit)
+                .field("total_lines", total_lines)
+                .finish(),
+            Error::NotReady { program, timeout } => f
+                .debug_struct("NotReady")
+                .field("program", program)
+                .field("timeout", timeout)
+                .finish(),
+            Error::Parse { program, message } => f
+                .debug_struct("Parse")
+                .field("program", program)
+                .field("message", message)
+                .finish(),
+            #[cfg(feature = "limits")]
+            Error::ResourceLimit(reason) => f.debug_tuple("ResourceLimit").field(reason).finish(),
+            Error::Unsupported { operation } => f
+                .debug_struct("Unsupported")
+                .field("operation", operation)
+                .finish(),
+            #[cfg(feature = "cancellation")]
+            Error::Cancelled { program } => f
+                .debug_struct("Cancelled")
+                .field("program", program)
+                .finish(),
+            Error::Signalled { program, signal } => f
+                .debug_struct("Signalled")
+                .field("program", program)
+                .field("signal", signal)
+                .finish(),
+            Error::Io(source) => f.debug_tuple("Io").field(source).finish(),
+        }
+    }
+}
+
+/// `Debug` for a captured stream, bounded to a 200-byte char-boundary preview
+/// with a `(+N bytes)` note — the [`Exit`](Error::Exit) streams can be multi-MiB
+/// and must never flood a `{e:?}` log line or `.unwrap()` panic message. Mirrors
+/// the [`Display`](std::fmt::Display) tail cap in [`display_exit`].
+struct StreamPreview<'a>(&'a str);
+
+impl fmt::Debug for StreamPreview<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const CAP: usize = 200;
+        let s = self.0;
+        if s.len() <= CAP {
+            return fmt::Debug::fmt(s, f);
+        }
+        let mut cut = CAP;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        write!(f, "{:?}… (+{} bytes)", &s[..cut], s.len() - cut)
+    }
+}
+
+/// `Debug` for [`NotFound`](Error::NotFound)'s `searched`: the `PATH` value is an
+/// environment value and must never be logged, so it renders only as a directory
+/// count (`<N directories>`) — never the directories themselves.
+struct SearchedRedaction<'a>(&'a str);
+
+impl fmt::Debug for SearchedRedaction<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The platform `PATH` list separator (`:` on Unix, `;` on Windows) — the
+        // same join `searched` is built with.
+        const SEP: char = if cfg!(windows) { ';' } else { ':' };
+        // Count non-empty segments only: empty PATH → 0, and a trailing or
+        // doubled separator (which `std::env::split_paths` skips) must not
+        // inflate the redacted count.
+        let n = self.0.split(SEP).filter(|s| !s.is_empty()).count();
+        write!(f, "<{n} directories>")
+    }
+}
+
 /// `Signalled`'s one-line Display: `` `{program}` was terminated by signal {n} ``
 /// when a number is known, `` `{program}` was terminated by a signal `` otherwise.
 fn display_signalled(program: &str, signal: Option<i32>) -> String {
@@ -364,6 +491,63 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_bounds_exit_streams_so_unwrap_cannot_dump_them() {
+        // L22: a derived Debug would dump both full streams into `{e:?}` /
+        // `.unwrap()`. The manual Debug bounds each to a 200-byte preview.
+        let huge = "x".repeat(10_000);
+        let err = Error::Exit {
+            program: "tool".into(),
+            code: 1,
+            stdout: huge.clone(),
+            stderr: huge,
+        };
+        let dbg = format!("{err:?}");
+        assert!(
+            dbg.len() < 700,
+            "Debug must be bounded (two 200-byte previews + struct), got {} bytes",
+            dbg.len()
+        );
+        assert!(
+            !dbg.contains(&"x".repeat(300)),
+            "must not dump the full multi-KiB stream"
+        );
+        // The bounded preview is still present and marked as truncated.
+        assert!(dbg.contains("(+9800 bytes)"), "got: {dbg}");
+        // A short stream is shown verbatim (no truncation note).
+        let small = Error::Exit {
+            program: "tool".into(),
+            code: 2,
+            stdout: "hello".into(),
+            stderr: String::new(),
+        };
+        let dbg = format!("{small:?}");
+        assert!(dbg.contains("\"hello\""), "got: {dbg}");
+        assert!(
+            !dbg.contains("bytes)"),
+            "no truncation note for a short stream: {dbg}"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_the_path_value_in_not_found() {
+        // L22 + security policy: `searched` is the PATH env value and must never
+        // appear in Debug (which feeds `{e:?}` logs and `.unwrap()` panics).
+        let err = Error::NotFound {
+            program: "tool".into(),
+            searched: "/secret/bin:/another/private/dir".into(),
+        };
+        let dbg = format!("{err:?}");
+        assert!(
+            !dbg.contains("/secret/bin") && !dbg.contains("/another/private/dir"),
+            "PATH value must not appear in Debug: {dbg}"
+        );
+        assert!(
+            dbg.contains("directories"),
+            "should summarize as a count: {dbg}"
+        );
+    }
 
     #[test]
     fn exit_display_appends_a_bounded_diagnostic_tail() {

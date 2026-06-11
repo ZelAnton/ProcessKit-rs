@@ -35,10 +35,13 @@ struct Cassette {
 
 /// One captured `Invocation → ProcessResult` pair.
 ///
-/// Strings are lossy UTF-8 (the cassette is a text fixture); env overrides are
-/// stored as **names only** — a committed fixture must never leak secret
-/// values. `timeout` is deliberately absent: it is the *command's*
-/// configuration, re-read at replay time, exactly like the live runner.
+/// Strings are lossy UTF-8 (the cassette is a text fixture). **Only env
+/// *values* are redacted** — overrides are stored as variable *names* only.
+/// Everything else (`program`, `args`, `cwd`, `stdout`, `stderr`) is stored
+/// **verbatim** and can carry secrets — a `--password=…` argv, a token echoed
+/// to stdout — so review a cassette before committing it. `timeout` is
+/// deliberately absent: it is the *command's* configuration, re-read at replay
+/// time, exactly like the live runner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Entry {
     // --- the match key ---
@@ -66,6 +69,38 @@ struct Entry {
 #[allow(clippy::trivially_copy_pass_by_ref)] // signature dictated by serde
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// Write `json` to `path`, restricting the file to owner-only (`0600`) on Unix.
+///
+/// B18: a cassette redacts env *values* (it stores names only), but argv, cwd,
+/// stdout, and stderr are stored **verbatim** — any of which can carry a secret.
+/// So the file is created owner-only rather than inheriting a world-readable
+/// umask. On Windows it inherits the directory ACL (the unit of access control
+/// there); restrict the containing directory if the fixture is sensitive.
+fn write_cassette(path: &Path, json: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // `mode(0o600)` applies only at *creation*, closing the create-time
+        // window. For a pre-existing (possibly world-readable) cassette being
+        // rewritten, `open` truncates it but keeps its old perms — so tighten
+        // the fd *before* writing the content, never holding it at loose perms.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(json.as_bytes())?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, json)
+    }
 }
 
 impl Entry {
@@ -108,6 +143,12 @@ impl Entry {
 /// What an invocation is matched on: program + args + cwd + has_stdin. Env
 /// overrides are excluded so an irrelevant env difference between the record
 /// and replay environments can't cause a spurious miss.
+///
+/// L23: the string components are *lossy* UTF-8 decodes, so two distinct
+/// non-UTF-8 invocations that differ only in their invalid bytes produce the
+/// same key and collide on replay (the first recorded one answers for both).
+/// Accepted: keying on raw bytes would defeat the human-diffable text fixture,
+/// and valid-UTF-8 invocations (the common case) never collide.
 type Key = (String, Vec<String>, Option<String>, bool);
 
 /// The key of a live invocation — must decode exactly like
@@ -187,8 +228,11 @@ enum Mode<R> {
 /// anything:
 ///
 /// - **Matching** is by program + args + cwd + has-stdin. Env overrides are
-///   *not* matched (and their values are never written to the file — only the
-///   sorted variable names, so a committed fixture can't leak secrets).
+///   *not* matched, and their **values** are never written — only the sorted
+///   variable *names*. Everything else (argv, cwd, stdout, stderr) is stored
+///   **verbatim**, so a cassette can still carry secrets in those fields:
+///   review fixtures before committing. The file is written owner-only
+///   (`0600`) on Unix.
 /// - **Duplicates** of one key replay in capture order, then the last entry
 ///   repeats forever — a recorded sequence (`git rev-parse HEAD` twice with
 ///   different heads) replays faithfully, while a retry loop that outlives the
@@ -212,6 +256,19 @@ enum Mode<R> {
 /// `InvalidData`. Non-UTF-8 programs/args/paths are stored *lossily* (the
 /// fixture is text); both record and replay apply the same conversion, so
 /// matching still works — the rare non-UTF-8 byte just round-trips as `�`.
+///
+/// **Lossy-key limitation (exotic input):** because the match key is the
+/// lossy-decoded program/args/cwd, two *distinct* non-UTF-8 invocations that
+/// differ only in their invalid bytes decode to the same key and are
+/// indistinguishable on replay (the first recorded one answers for both). This
+/// affects only commands whose program/args/cwd contain invalid UTF-8; keying
+/// on raw bytes is intentionally avoided to keep the fixture human-diffable
+/// text, and valid-UTF-8 invocations never collide.
+///
+/// **Persistence:** [`save`](Self::save) is the explicit write; record mode also
+/// flushes best-effort on drop (so a forgotten `save()` still leaves a complete
+/// cassette) — **except while unwinding**, so a panic mid-recording never
+/// persists a surprise file (it may carry secrets in argv/stdout).
 ///
 /// ```no_run
 /// use processkit::{Command, JobRunner, ProcessRunnerExt, RecordReplayRunner};
@@ -278,7 +335,7 @@ impl<R: ProcessRunner> RecordReplayRunner<R> {
         };
         let json = serde_json::to_string_pretty(&cassette)
             .map_err(|e| Error::Io(std::io::Error::from(e)))?;
-        std::fs::write(path, json)?;
+        write_cassette(path, &json)?;
         dirty.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -412,8 +469,15 @@ impl<R: ProcessRunner> Drop for RecordReplayRunner<R> {
         // record run that forgot `save()` (or recorded more after one) still
         // leaves a complete cassette behind; errors are deliberately swallowed
         // (a Drop can't surface them) — call `save()` to observe failures.
+        //
+        // B18: skip the flush while *unwinding* (`thread::panicking()`). A test
+        // that panics mid-recording should not silently persist a surprise
+        // cassette — which stores argv/cwd/stdout/stderr verbatim and may carry
+        // secrets — as a side effect of the panic. Normal scope-exit still
+        // flushes; call `save()` for explicit control on the panic path.
         if let Mode::Record { dirty, .. } = &self.mode
             && dirty.load(Ordering::SeqCst)
+            && !std::thread::panicking()
         {
             let _ = self.save();
         }
@@ -693,6 +757,56 @@ mod tests {
             .await
             .expect("the recorded cwd matches");
         assert_eq!(out, "from-a");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cassette_file_is_written_owner_only() {
+        // B18: a cassette stores argv/cwd/stdout/stderr verbatim, so it must not
+        // inherit a world-readable umask — it is created 0600 on Unix.
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, path) = temp_cassette();
+        let recorder = RecordReplayRunner::record(&path, scripted());
+        recorder
+            .output(&Command::new("tool").arg("--version"))
+            .await
+            .expect("record");
+        recorder.save().expect("save");
+
+        let mode = std::fs::metadata(&path)
+            .expect("stat cassette")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "cassette must be owner-only, got {:o}",
+            mode & 0o777
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_while_unwinding_does_not_persist_a_surprise_cassette() {
+        // B18: a panic mid-recording must not flush a cassette as a side effect
+        // (it may carry secrets in argv/stdout). The Drop guard skips on unwind.
+        let (_dir, path) = temp_cassette();
+        let recorder = RecordReplayRunner::record(&path, scripted());
+        recorder
+            .output(&Command::new("tool").arg("--version"))
+            .await
+            .expect("record (now dirty, unsaved)");
+
+        // Move the dirty recorder into a panicking scope; its Drop runs during
+        // unwind and must NOT write the file.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _hold = recorder;
+            panic!("boom mid-recording");
+        }));
+        assert!(outcome.is_err(), "the scope must have panicked");
+        assert!(
+            !path.exists(),
+            "a recorder dropped during unwind must not persist a cassette: {path:?}"
+        );
     }
 
     #[tokio::test]

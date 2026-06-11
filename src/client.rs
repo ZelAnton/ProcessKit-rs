@@ -39,13 +39,15 @@ pub struct CliClient<R: ProcessRunner = JobRunner> {
     cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
-// Manual: the runner type parameter carries no `Debug` bound.
+// Manual: the runner type parameter carries no `Debug` bound, and (B4) the env
+// *values* are never rendered — only the sorted variable names (the crate-wide
+// secret-safety rule; see `lib.rs`).
 impl<R: ProcessRunner> std::fmt::Debug for CliClient<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("CliClient");
         d.field("program", &self.program)
             .field("timeout", &self.timeout)
-            .field("envs", &self.envs);
+            .field("env_names", &crate::command::redacted_env_names(&self.envs));
         #[cfg(feature = "cancellation")]
         d.field("has_default_cancel", &self.cancel.is_some());
         d.finish_non_exhaustive()
@@ -352,6 +354,23 @@ mod tests {
 
     use super::*;
     use crate::{Error, RecordingRunner, Reply, ScriptedRunner};
+
+    #[test]
+    fn debug_redacts_default_env_values_keeping_names() {
+        // B4: CliClient Debug must surface default-env *names*, never values.
+        let client = CliClient::new("git")
+            .default_env("API_TOKEN", "topsecret-value")
+            .default_env_remove("GIT_PAGER");
+        let dbg = format!("{client:?}");
+        assert!(
+            !dbg.contains("topsecret-value"),
+            "env value must not appear in Debug: {dbg}"
+        );
+        assert!(
+            dbg.contains("API_TOKEN") && dbg.contains("GIT_PAGER"),
+            "env names should appear: {dbg}"
+        );
+    }
 
     // A `vcs-git`-shaped wrapper, expressed on ProcessKit-rs with zero process
     // plumbing — the proof that the convenience layer fits a real consumer.

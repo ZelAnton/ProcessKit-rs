@@ -424,7 +424,12 @@ async fn park_until_cancelled(command: &Command, program: String) -> Result<Proc
 /// stdin was supplied — not the I/O-shaping ones (`timeout`, encodings, buffer
 /// policy, line handlers, `keep_stdin_open`, retry). Tests that need to assert
 /// those inspect the built [`Command`] itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is **manual, not derived** (B4): it surfaces the argument *count* and
+/// the env variable *names* (sorted), never the argv or env *values* — a
+/// `{inv:?}` log line or an `assert_eq!` failure must not leak a secret. The
+/// public fields stay available for tests that assert on exact values.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Invocation {
     /// The program name.
     pub program: OsString,
@@ -436,6 +441,20 @@ pub struct Invocation {
     pub envs: Vec<(OsString, Option<OsString>)>,
     /// Whether a (non-empty) stdin source was provided.
     pub has_stdin: bool,
+}
+
+// B4 (Decision 3): never render argv or env *values* — only the arg count and
+// the sorted env names. Mirrors the `Command`/`CliClient` redaction.
+impl std::fmt::Debug for Invocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Invocation")
+            .field("program", &self.program)
+            .field("args", &self.args.len())
+            .field("cwd", &self.cwd)
+            .field("env_names", &crate::command::redacted_env_names(&self.envs))
+            .field("has_stdin", &self.has_stdin)
+            .finish()
+    }
 }
 
 impl Invocation {
@@ -546,6 +565,36 @@ impl<R: ProcessRunner> ProcessRunner for RecordingRunner<R> {
 mod tests {
     use super::*;
     use crate::runner::ProcessRunnerExt;
+
+    #[test]
+    fn invocation_debug_redacts_argv_and_env_values() {
+        // B4 (Decision 3): a `{inv:?}` log line or an `assert_eq!` failure must
+        // not leak argv or env values — only the arg count and env names.
+        let inv = Invocation {
+            program: "git".into(),
+            args: vec!["--token=secret123".into(), "another-secret".into()],
+            cwd: None,
+            envs: vec![
+                ("API_KEY".into(), Some("topsecret-value".into())),
+                ("GIT_PAGER".into(), None),
+            ],
+            has_stdin: false,
+        };
+        let dbg = format!("{inv:?}");
+        assert!(
+            !dbg.contains("secret123") && !dbg.contains("another-secret"),
+            "argv values must not appear: {dbg}"
+        );
+        assert!(
+            !dbg.contains("topsecret-value"),
+            "env values must not appear: {dbg}"
+        );
+        assert!(
+            dbg.contains("API_KEY") && dbg.contains("GIT_PAGER"),
+            "env names should appear: {dbg}"
+        );
+        assert!(dbg.contains("args: 2"), "arg count should appear: {dbg}");
+    }
 
     #[tokio::test]
     async fn scripted_start_streams_canned_lines_through_real_pumps() {

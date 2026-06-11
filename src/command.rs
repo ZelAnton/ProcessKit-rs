@@ -1062,11 +1062,15 @@ impl Command {
 
 impl fmt::Debug for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // B4 (Decision 3): never render argv or env *values* in Debug — they may
+        // carry secrets (the crate-wide rule, see `lib.rs`). Surface the argument
+        // *count* and the env variable *names* (sorted); `command_line()` is the
+        // documented, explicitly-secret-bearing escape hatch for the real argv.
         let mut d = f.debug_struct("Command");
         d.field("program", &self.program)
-            .field("args", &self.args)
+            .field("args", &self.args.len())
             .field("cwd", &self.cwd)
-            .field("envs", &self.envs)
+            .field("env_names", &redacted_env_names(&self.envs))
             .field("env_clear", &self.env_clear)
             .field("stdin", &self.stdin)
             .field("keep_stdin_open", &self.keep_stdin_open)
@@ -1090,6 +1094,24 @@ impl fmt::Debug for Command {
         d.field("has_cancel_token", &self.cancel_token.is_some());
         d.finish()
     }
+}
+
+/// Render env *names* (sorted, deduped) for a redacted `Debug` — the env
+/// *values* are never shown (the crate-wide secret-safety rule; see `lib.rs`).
+/// Shared by the [`Command`], `CliClient`, and `Invocation` `Debug` impls so the
+/// redaction lives in exactly one audited place. A repeated override of one
+/// variable collapses to a single name (its repetition is a `command_line()`
+/// concern, not a Debug one).
+pub(crate) fn redacted_env_names(
+    envs: &[(OsString, Option<OsString>)],
+) -> Vec<std::borrow::Cow<'_, str>> {
+    let mut names: Vec<std::borrow::Cow<'_, str>> = envs
+        .iter()
+        .map(|(name, _value)| name.to_string_lossy())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Render one argument shell-quoted for **display** (POSIX single-quote rules).
@@ -1236,6 +1258,37 @@ fn probe_dir(dir: &std::path::Path, program: &OsStr) -> Option<std::path::PathBu
 mod tests {
     use super::Command;
     use std::ffi::OsStr;
+
+    #[test]
+    fn debug_redacts_argv_and_env_values_keeping_names_and_count() {
+        // B4 (Decision 3): the manual Debug must never expose argv or env
+        // *values* — only the arg count and the sorted env *names*.
+        let cmd = Command::new("git")
+            .arg("--password=hunter2")
+            .arg("secret-positional")
+            .env("API_TOKEN", "deadbeef-secret")
+            .env("MODE", "fast-but-secret");
+        let dbg = format!("{cmd:?}");
+        assert!(
+            !dbg.contains("hunter2")
+                && !dbg.contains("secret-positional")
+                && !dbg.contains("password"),
+            "argv values must not appear in Debug: {dbg}"
+        );
+        assert!(
+            !dbg.contains("deadbeef-secret") && !dbg.contains("fast-but-secret"),
+            "env values must not appear in Debug: {dbg}"
+        );
+        assert!(
+            dbg.contains("API_TOKEN") && dbg.contains("MODE"),
+            "env names should appear: {dbg}"
+        );
+        assert!(dbg.contains("args: 2"), "arg count should appear: {dbg}");
+        assert!(
+            dbg.contains("env_names"),
+            "env_names field should appear: {dbg}"
+        );
+    }
 
     /// The explicit env ops recorded on the built OS command, as
     /// (key, Some(value)|None-for-remove) pairs.
