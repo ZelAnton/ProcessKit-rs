@@ -72,6 +72,30 @@ to a dated version section.
   the directory set here — use an absolute path for the program when combining
   `current_dir` with a relative-path executable.
 
+### Fixed (Phase F — group / limits / sys layer)
+
+- `ProcessGroup::shutdown` with `escalate_to_kill(false)` now actually preserves survivors:
+  the `Drop` impls for all three backends (Linux cgroup, POSIX process-group, Windows Job
+  Object) no longer hard-kill the tree when `graceful_shutdown` was invoked with
+  `escalate=false`. Previously, the per-platform `Drop` backstop unconditionally killed
+  regardless of the escalation setting. (The run-level `timeout_grace` path always escalates,
+  so it is unaffected.)
+- Fixed a provenance UB in the Windows `job_member_pids` helper: the flexible-array
+  `ProcessIdList` field in `JOBOBJECT_BASIC_PROCESS_ID_LIST` is now addressed via
+  `std::ptr::addr_of!((*list).ProcessIdList[0])` instead of `.as_ptr()` on the `[ULONG_PTR;1]`
+  field, which previously created a reference with incorrect provenance over the out-of-bounds
+  elements.
+- `ProcessGroupStats::total_cpu_time` doc now explains the semantic divergence: the Windows
+  Job Object accumulates CPU time historically (including terminated processes), while the
+  Linux cgroup path sums only currently-live processes' `/proc` counters.
+- POSIX process-group `exists()` probe no longer permanently prunes a just-spawned pid
+  whose process group does not yet exist: `ESRCH` on the negative group-id probe now falls
+  back to a direct pid probe, so a child between fork and its `setpgid(0,0)` call is not
+  incorrectly evicted from the tracking set. The teardown sweep mirrors this — when
+  `killpg` finds no group it falls back to a direct pid signal, so such an entry is actually
+  delivered to and drains instead of being retained-but-never-signalled (which would have
+  stalled `shutdown` to its full timeout).
+
 ### Fixed
 
 - `ProcessResult::combined()` now inserts a `\n` separator between stdout and stderr when

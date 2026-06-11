@@ -169,8 +169,10 @@ impl Job {
     ///
     /// On Unix: send `signal` (typically `SIGTERM`), wait up to `timeout` for the
     /// members to leave, then `SIGKILL` survivors when `escalate` is set. On
-    /// Windows the job kill is atomic, so this is equivalent to
-    /// [`kill_all`](Self::kill_all) and the arguments are ignored.
+    /// Windows the job kill is atomic, so `signal` and `timeout` are ignored, but
+    /// `escalate` is still honored: `true` kills the tree immediately (equivalent
+    /// to [`kill_all`](Self::kill_all)), while `false` leaves survivors alive
+    /// (`Drop` then closes the handle without `KILL_ON_JOB_CLOSE`).
     pub(crate) async fn graceful_shutdown(
         &self,
         signal: i32,

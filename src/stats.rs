@@ -31,6 +31,16 @@ pub struct ProcessGroupStats {
     /// [`Mechanism::ProcessGroup`]: crate::Mechanism::ProcessGroup
     pub active_process_count: usize,
     /// Total CPU time (user + kernel) accumulated by the group, if available.
+    ///
+    /// **Semantic divergence by backend:**
+    /// - **Windows Job Object** — cumulative across all processes that have ever
+    ///   been part of the job, including already-terminated ones. Reflects the
+    ///   full historical cost of the tree.
+    /// - **Linux cgroup v2** — sum of `/proc/<pid>/stat` times for *currently
+    ///   live* members only; terminated processes are not accounted once they
+    ///   leave the cgroup.
+    /// - **POSIX process-group / macOS** — always `None`; no kernel accumulator
+    ///   is available without a cgroup or Job Object.
     pub total_cpu_time: Option<Duration>,
     /// Peak memory used by the group in bytes, if available.
     pub peak_memory_bytes: Option<u64>,

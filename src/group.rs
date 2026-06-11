@@ -17,10 +17,11 @@ use crate::sys::Job;
 /// Tuning for a [`ProcessGroup`] — graceful-shutdown timing and (with the
 /// `limits` feature) resource limits.
 ///
-/// The `shutdown_*` knobs only affect the Unix graceful path
-/// ([`ProcessGroup::shutdown`]): give the tree `shutdown_timeout` to exit after
-/// `SIGTERM`, then `SIGKILL` survivors if `escalate_to_kill` is set. On Windows
-/// the job kill is atomic, so they are ignored.
+/// On the Unix graceful path ([`ProcessGroup::shutdown`]): give the tree
+/// `shutdown_timeout` to exit after `SIGTERM`, then `SIGKILL` survivors if
+/// `escalate_to_kill` is set. On Windows the job kill is atomic, so
+/// `shutdown_timeout` is ignored; `escalate_to_kill` is still honored — `false`
+/// preserves survivors (the handle closes without `KILL_ON_JOB_CLOSE`).
 #[cfg_attr(
     feature = "limits",
     doc = "",

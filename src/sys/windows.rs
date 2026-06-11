@@ -3,6 +3,7 @@
 //! [Job Object]: https://learn.microsoft.com/windows/win32/procthread/job-objects
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -71,6 +72,9 @@ pub(crate) struct Job {
     /// double-suspends the new child's primary thread (per-thread suspend
     /// *counts*), and `spawn`'s single resume leaves it suspended forever.
     suspend_lock: std::sync::Mutex<()>,
+    /// B12: set by `graceful_shutdown(escalate=false)` so `Drop` clears
+    /// `KILL_ON_JOB_CLOSE` before closing the handle, leaving survivors alive.
+    skip_drop_kill: AtomicBool,
 }
 
 // The handle is owned solely by this struct and every Win32 job API used here is
@@ -88,6 +92,7 @@ impl Job {
         let job = Job {
             handle,
             suspend_lock: std::sync::Mutex::new(()),
+            skip_drop_kill: AtomicBool::new(false),
         };
 
         // Kill every process in the job once the last handle closes — i.e. when
@@ -313,11 +318,20 @@ impl Job {
         &self,
         _signal: i32,
         _timeout: Duration,
-        _escalate: bool,
+        escalate: bool,
     ) -> io::Result<()> {
-        // A Job Object has no graceful tier: closing the handle (or terminating
-        // it) kills the tree atomically. The timeout/escalate knobs are Unix-only.
-        self.kill_all()
+        // A Job Object has no graceful tier: there is no Windows equivalent of
+        // SIGTERM, and the kill is atomic. When `escalate=true`, kill the tree
+        // immediately. When `escalate=false`, skip the kill and let survivors
+        // run; `Drop` will clear `KILL_ON_JOB_CLOSE` before closing the handle
+        // so the tree is not implicitly killed then either.
+        if escalate {
+            self.kill_all()
+        } else {
+            // B12: mark Drop to preserve survivors.
+            self.skip_drop_kill.store(true, Ordering::Relaxed);
+            Ok(())
+        }
     }
 
     #[cfg(feature = "stats")]
@@ -491,8 +505,16 @@ fn job_member_pids(handle: HANDLE) -> io::Result<Vec<u32>> {
         // SAFETY: a successful query wrote the header and `NumberOfProcessIdsInList`
         // pids contiguously from `ProcessIdList[0]`, all within `bytes`.
         let n = unsafe { (*list).NumberOfProcessIdsInList } as usize;
-        // SAFETY: see above; `n <= cap` elements were written.
-        let ids = unsafe { std::slice::from_raw_parts((*list).ProcessIdList.as_ptr(), n) };
+        // SAFETY: a successful query wrote `n` pids starting at `ProcessIdList[0]`.
+        // `addr_of!` avoids creating a reference to the `[ULONG_PTR;1]` field
+        // (which would have incorrect provenance for the out-of-bounds elements),
+        // taking the raw address of its first element directly instead.
+        // `ProcessIdList[0]` is always within the struct definition (the field
+        // is declared as a 1-element array), so `addr_of!` is valid even when
+        // `n == 0`; `from_raw_parts(ptr, 0)` is a zero-length slice, which is
+        // always sound for any non-null aligned pointer.
+        let ids =
+            unsafe { std::slice::from_raw_parts(std::ptr::addr_of!((*list).ProcessIdList[0]), n) };
         return Ok(ids.iter().map(|&pid| pid as u32).collect());
     }
 }
@@ -556,8 +578,31 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
 
 impl Drop for Job {
     fn drop(&mut self) {
-        // Closing the last handle triggers KILL_ON_JOB_CLOSE → the tree is reaped.
-        // SAFETY: handle came from CreateJobObjectW and is closed exactly once.
+        // Relaxed is sufficient: `graceful_shutdown` returns before `Drop` runs,
+        // so the store happens-before the load via the single-threaded call boundary.
+        if self.skip_drop_kill.load(Ordering::Relaxed) {
+            // B12: clear KILL_ON_JOB_CLOSE so closing the handle does not kill the
+            // tree. `SetInformationJobObject` with `JobObjectExtendedLimitInformation`
+            // *replaces* the entire extended-limit structure, so passing a zeroed
+            // struct sets `LimitFlags = 0`, which drops `KILL_ON_JOB_CLOSE` and all
+            // other resource caps. This is intentional — this path only runs when
+            // the caller chose `escalate=false`, so orphaning survivors is the
+            // desired outcome and the caps are no longer meaningful.
+            let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            // Best-effort: if clearing fails the handle close will still kill —
+            // a safe fallback (unexpected kill is better than orphaning ambiguity).
+            let _ = unsafe {
+                SetInformationJobObject(
+                    self.handle,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_ref(&info).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+        }
+        // Closing the last handle triggers KILL_ON_JOB_CLOSE → the tree is reaped
+        // (unless cleared above). SAFETY: handle came from CreateJobObjectW and is
+        // closed exactly once.
         unsafe { CloseHandle(self.handle) };
     }
 }

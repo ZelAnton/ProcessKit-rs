@@ -17,6 +17,7 @@
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -73,7 +74,31 @@ impl Tracked {
         if unsafe { libc::kill(probe, 0) } == 0 {
             return true;
         }
-        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        let err = std::io::Error::last_os_error().raw_os_error();
+        if err == Some(libc::EPERM) {
+            return true;
+        }
+        // L6 — group-mode ESRCH on the negative group-id does not prove the
+        // process is gone: a just-forked child may not have called setpgid(0,0)
+        // yet (the between-fork-and-exec window, reachable on the `setsid` spawn
+        // path). Fall back to a direct pid probe so we don't permanently prune a
+        // still-live entry. `signal_all` mirrors this with a direct-pid *signal*
+        // fallback, so an entry kept alive here is still delivered to and drains
+        // — without that companion it would be probed-by-pid but signalled-by-
+        // group (`killpg` → ESRCH), retained forever and stalling shutdown.
+        //
+        // TOCTOU note: the pid could be reaped and recycled between the two
+        // probes (the same sub-µs window documented in the `Tracked` type doc
+        // for all pid probes). The hazard is the same as the existing solo-pid
+        // tracking and is accepted there; this adds no new risk surface.
+        if self.group && err == Some(libc::ESRCH) {
+            // SAFETY: probing pid directly; EPERM means alive-but-unsignallable.
+            if unsafe { libc::kill(id, 0) } == 0 {
+                return true;
+            }
+            return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        }
+        false
     }
 
     /// Track `id`, pruning drained entries and de-duplicating (re-adopting a
@@ -100,7 +125,23 @@ impl Tracked {
                 // best-effort — either way the sweep continues.
                 unsafe {
                     if self.group {
-                        libc::killpg(id, sig);
+                        // killpg reaches the leader and every descendant. But if
+                        // the group doesn't exist yet — a child kept alive by the
+                        // L6 direct-pid fallback in `exists` (forked but not yet
+                        // `setpgid`'d), or a recycled pid — killpg yields ESRCH
+                        // and reaches nothing. Fall back to a direct pid signal so
+                        // the entry actually drains; otherwise it stays alive to
+                        // `exists` (by pid) yet is never delivered to, pinning it
+                        // in the set and stalling `graceful_shutdown` to its full
+                        // timeout. The not-yet-`setpgid`'d child has no
+                        // descendants, so a pid signal fully contains it; the
+                        // recycled-pid case is the same sub-µs window the type doc
+                        // already accepts for every probe/signal here.
+                        if libc::killpg(id, sig) == -1
+                            && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                        {
+                            libc::kill(id, sig);
+                        }
                     } else {
                         libc::kill(id, sig);
                     }
@@ -155,6 +196,9 @@ pub(crate) struct ProcessGroup {
     /// *individually*: the child itself is contained, but unlike a group
     /// leader, descendants it forks are not.
     solos: Tracked,
+    /// B12: set by `graceful_shutdown(escalate=false)` to tell `Drop` not to
+    /// hard-kill survivors (the caller deliberately chose not to escalate).
+    skip_drop_kill: AtomicBool,
 }
 
 impl ProcessGroup {
@@ -162,6 +206,7 @@ impl ProcessGroup {
         ProcessGroup {
             groups: Tracked::new(true),
             solos: Tracked::new(false),
+            skip_drop_kill: AtomicBool::new(false),
         }
     }
 
@@ -289,6 +334,11 @@ impl ProcessGroup {
         }
         if escalate && self.any_alive() {
             self.broadcast(libc::SIGKILL);
+        } else if !escalate {
+            // B12: tell Drop not to hard-kill the survivors the caller chose
+            // to leave alive. Relaxed is sufficient: this store happens-before
+            // Drop runs via the single-threaded call boundary.
+            self.skip_drop_kill.store(true, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -308,6 +358,90 @@ impl ProcessGroup {
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        self.broadcast(libc::SIGKILL);
+        if !self.skip_drop_kill.load(Ordering::Relaxed) {
+            self.broadcast(libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::process::Command;
+
+    use super::*;
+
+    /// B12: `graceful_shutdown(escalate=false)` must not kill survivors — neither
+    /// during the call nor when the `ProcessGroup` itself drops.
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn escalate_false_does_not_kill_survivors() {
+        let pg = ProcessGroup::new();
+        let opts = crate::sys::SpawnOptions::default();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("trap '' TERM; while :; do :; done");
+        // Reap the child on any early panic path so the test never orphans it.
+        cmd.kill_on_drop(true);
+        let mut child = pg.spawn(&mut cmd, &opts).unwrap();
+        let pid = child.id().unwrap() as i32;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        pg.graceful_shutdown(libc::SIGTERM, Duration::from_millis(100), false)
+            .await
+            .unwrap();
+        // Drop the group explicitly — this is where the bug fires.
+        drop(pg);
+
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        // Cleanup the orphaned child regardless.
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait().await;
+
+        assert!(alive, "child must survive when escalate_to_kill=false");
+    }
+
+    /// L6: a pid that exists as a process but not as a process-group leader must
+    /// not be pruned from a group-mode `Tracked` set — ESRCH on the group probe
+    /// does not mean the process is gone.
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn esrch_on_group_probe_does_not_prune_a_live_pid() {
+        let tracked = Tracked::new(true);
+
+        // Spawn without `process_group(0)` so the child inherits the current
+        // process group and is NOT its own leader — kill(-pid,0) is ESRCH.
+        // `kill_on_drop` reaps it on any early panic path (e.g. the `pid_ok`
+        // assert) so the test never orphans the `sleep 60`.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap() as i32;
+
+        // Verify precondition: group probe is ESRCH, pid probe is alive.
+        let group_ok = unsafe { libc::kill(-pid, 0) } == 0;
+        let pid_ok = unsafe { libc::kill(pid, 0) } == 0;
+        if group_ok {
+            // Pid happened to become a group leader (process_group set elsewhere).
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = child.wait().await;
+            return;
+        }
+        assert!(pid_ok, "spawned child must be alive");
+
+        // The fixed `exists()` must return true — the pid is alive as a process.
+        let exists = tracked.exists(pid);
+
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait().await;
+
+        assert!(
+            exists,
+            "a process that exists as a pid but not as a group leader \
+             must be considered alive by exists()"
+        );
     }
 }

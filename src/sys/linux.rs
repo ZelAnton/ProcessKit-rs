@@ -9,7 +9,7 @@ use std::io;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -34,6 +34,9 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct Job {
     backend: Backend,
+    /// B12: set by `graceful_shutdown(escalate=false)` so `Drop` skips the
+    /// hard kill when the caller chose not to escalate.
+    skip_drop_kill: AtomicBool,
 }
 
 enum Backend {
@@ -67,7 +70,10 @@ impl Job {
                 Backend::ProcessGroup(ProcessGroup::new())
             }
         };
-        Ok(Job { backend })
+        Ok(Job {
+            backend,
+            skip_drop_kill: AtomicBool::new(false),
+        })
     }
 
     pub(crate) fn spawn(
@@ -198,9 +204,18 @@ impl Job {
                 }
                 if escalate && !cg.is_empty() {
                     cg.kill()?;
+                } else if !escalate {
+                    // B12: tell Drop not to cgroup.kill the survivors.
+                    // Relaxed is sufficient: store happens-before Drop via the
+                    // single-threaded call boundary.
+                    self.skip_drop_kill.store(true, Ordering::Relaxed);
                 }
                 Ok(())
             }
+            // The ProcessGroup backend carries its own `skip_drop_kill` flag;
+            // `pg.graceful_shutdown` sets it when `escalate=false`. `Job::drop`
+            // for the ProcessGroup arm does nothing — the pgroup's own `Drop`
+            // fires when the `Backend` enum is dropped.
             Backend::ProcessGroup(pg) => pg.graceful_shutdown(signal, timeout, escalate).await,
         }
     }
@@ -294,20 +309,31 @@ impl Drop for Job {
     fn drop(&mut self) {
         match &self.backend {
             Backend::Cgroup(cg) => {
-                let _ = cg.kill();
-                // `cgroup.kill` is asynchronous: the kernel SIGKILLs the subtree,
-                // but `rmdir` returns `EBUSY` until the members have actually left
-                // (a process leaves `cgroup.procs` when it *exits*, before it is
-                // reaped — so this drains within milliseconds and doesn't depend on
-                // the async reaper). Wait, bounded, so we don't leak the dir; sleep
-                // rather than busy-spin.
-                for _ in 0..50 {
-                    if cg.is_empty() {
-                        break;
+                if !self.skip_drop_kill.load(Ordering::Relaxed) {
+                    // B12: only hard-kill when the caller didn't choose escalate=false.
+                    let _ = cg.kill();
+                    // `cgroup.kill` is asynchronous: the kernel SIGKILLs the subtree,
+                    // but `rmdir` returns `EBUSY` until the members have actually left
+                    // (a process leaves `cgroup.procs` when it *exits*, before it is
+                    // reaped — so this drains within milliseconds and doesn't depend on
+                    // the async reaper). Wait, bounded, so we don't leak the dir; sleep
+                    // rather than busy-spin.
+                    for _ in 0..50 {
+                        if cg.is_empty() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
                     }
-                    std::thread::sleep(Duration::from_millis(2));
                 }
-                // Best-effort: an emptied cgroup dir can be removed.
+                // Best-effort: an emptied cgroup dir is removed here — the common
+                // case, plus the escalate=false case where survivors all drained
+                // during the grace. When survivors remain under escalate=false
+                // this `rmdir` fails with EBUSY and the dir is intentionally left
+                // to keep containing the orphaned tree; it is then *not* reclaimed
+                // even after that tree later exits, because the owning `Job` is
+                // already gone. That permanent empty-dir leak is the accepted cost
+                // of choosing not to escalate — symmetric with the Windows backend
+                // deliberately orphaning its survivors.
                 let _ = std::fs::remove_dir(&cg.path);
             }
             // The `ProcessGroup` field hard-kills its tracked groups in its own
