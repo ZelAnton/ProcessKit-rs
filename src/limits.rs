@@ -17,10 +17,25 @@
 /// [`Error::ResourceLimit`](crate::Error::ResourceLimit) rather than silently
 /// leaving the tree unbounded.
 ///
-/// On Linux the cgroup must permit controller delegation (typically running as
-/// root, inside a container, or under a systemd unit with `Delegate=yes`). When the
-/// surrounding cgroup can't carry the controllers, creation fails fast with the same
-/// error — an unenforced limit is no protection, so it is never silently dropped.
+/// **Linux (cgroup v2): limits need this process at the *real* cgroup root.**
+/// The crate creates the limit cgroup as a **child of this process's own cgroup**
+/// and enables the controllers in *that* cgroup's `cgroup.subtree_control`. cgroup
+/// v2's "no internal processes" rule permits enabling controllers in a cgroup that
+/// holds member processes only for the **root of the real hierarchy** — the one
+/// exempt cgroup. A cgroup *namespace* root does **not** qualify: it only
+/// virtualizes the view (`/proc/self/cgroup` reads `0::/`), but the cgroup still
+/// isn't the real root, so a container with a private cgroup namespace (the
+/// Docker/Kubernetes default) hits `EBUSY` exactly like a systemd scope. So in
+/// practice these limits apply only when this process is a direct member of the
+/// real hierarchy root (a minimal init not managed by systemd) — **not** under any
+/// systemd session/scope/service, and **not** in an ordinary container. When the
+/// controllers can't be enabled, group creation **fails fast**
+/// ([`Error::ResourceLimit`](crate::Error::ResourceLimit)) rather than silently
+/// leaving the tree unbounded — an unenforced limit is no protection. The crate
+/// deliberately does **not** migrate your process into a sub-cgroup to make limits
+/// work elsewhere (the create-leaf→migrate-self→enable dance); do that externally
+/// if you need them. (When the controllers are already enabled — at the root — no
+/// `subtree_control` write is attempted.)
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 #[non_exhaustive]
 pub struct ResourceLimits {
@@ -29,6 +44,19 @@ pub struct ResourceLimits {
     pub memory_max: Option<u64>,
     /// Maximum number of live processes in the tree. `None` leaves the count
     /// unbounded.
+    ///
+    /// **B14 — cross-platform enforcement differs for direct `spawn`s.** On
+    /// **Windows** the Job Object's `ActiveProcessLimit` rejects the *(n+1)*th
+    /// process assigned to the job, so `max_processes(n)` caps even repeated
+    /// [`ProcessGroup::start`](crate::ProcessGroup::start) calls into one group.
+    /// On **Linux** the kernel checks `pids.max` only when a process forks
+    /// *inside* the cgroup; the crate's children fork in the parent cgroup and
+    /// migrate in during pre-exec, so the cap reliably bounds the **descendants**
+    /// a contained child forks, but does **not** reject additional `start()` calls
+    /// that each place one more top-level child into the group. Treat
+    /// `max_processes` as a bound on a tree's own fork bomb, not as an exact
+    /// admission limit on how many children *you* start into a shared group on
+    /// Linux. (Memory and CPU caps are whole-cgroup and do not have this caveat.)
     pub max_processes: Option<u32>,
     /// CPU quota as a fraction of a **single** core: `0.5` is half a core, `2.0`
     /// is two cores' worth. `None` leaves CPU unbounded.

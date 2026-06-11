@@ -143,8 +143,9 @@ impl ProcessGroup {
         doc = "",
         doc = "If `options.limits` sets any cap, it is enforced now. When the active",
         doc = "mechanism can't honor a requested limit (no cgroup/Job Object, or a Linux",
-        doc = "cgroup without controller delegation) this returns",
-        doc = "[`Error::ResourceLimit`] rather than handing back an unbounded group."
+        doc = "cgroup whose controllers can't be enabled — see [`ResourceLimits`] for the",
+        doc = "cgroup-v2 real-root requirement) this returns [`Error::ResourceLimit`]",
+        doc = "rather than handing back an unbounded group."
     )]
     pub fn with_options(options: ProcessGroupOptions) -> Result<Self> {
         #[cfg(feature = "limits")]
@@ -368,6 +369,19 @@ impl ProcessGroup {
     /// survivors when `escalate_to_kill` is set. On Windows the kill is atomic.
     /// Dropping the group instead (without calling this) performs only the hard
     /// kill.
+    ///
+    /// **B16 — reap your children, or the grace is wasted (POSIX process-group
+    /// mechanism only).** On the [`Mechanism::ProcessGroup`](crate::Mechanism)
+    /// fallback (macOS/the BSDs, and Linux without a usable cgroup), liveness is
+    /// probed by signalling the group id, and an **unreaped zombie still answers**
+    /// — its process-group entry survives until the child is `wait`ed. So a child
+    /// that exits promptly on `SIGTERM` but whose [`RunningProcess`](crate::RunningProcess)
+    /// handle was dropped without being awaited (or is still held un-awaited) reads
+    /// as alive for the full `shutdown_timeout`, and `shutdown` then burns the
+    /// whole grace plus a pointless `SIGKILL` escalation. Await each child you
+    /// start into the group (any consuming verb, or `wait`) so its handle reaps it.
+    /// The Windows Job Object and Linux cgroup mechanisms are immune (a process
+    /// leaves `cgroup.procs` / the job on *exit*, before reaping).
     pub async fn shutdown(self) -> Result<()> {
         #[cfg(feature = "tracing")]
         tracing::debug!(

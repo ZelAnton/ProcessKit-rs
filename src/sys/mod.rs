@@ -102,7 +102,8 @@ impl Job {
     /// Create a fresh, empty job, applying any resource `limits`.
     ///
     /// Errors if `limits` requests a cap the target's mechanism can't enforce (no
-    /// cgroup/Job Object, or a cgroup without controller delegation).
+    /// cgroup/Job Object, or a Linux cgroup whose controllers can't be enabled —
+    /// see `ResourceLimits` for the cgroup-v2 real-root requirement).
     #[cfg(feature = "limits")]
     pub(crate) fn new(limits: &ResourceLimits) -> io::Result<Self> {
         imp::Job::new(limits).map(Job)

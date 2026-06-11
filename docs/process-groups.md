@@ -232,10 +232,16 @@ let _sandboxed = group.start(&Command::new("untrusted-tool")).await?;
 
 `cpu_quota` is a fraction of a **single** core (`2.0` = two cores). Limits
 need a real container; when a requested cap can't be enforced — no Job
-Object/cgroup, or a Linux cgroup without controller delegation —
+Object/cgroup, or a Linux cgroup whose controllers can't be enabled —
 `with_options` returns `Error::ResourceLimit` instead of handing back a
-silently-unbounded group. Delegation prerequisites and the `uid()`-drop
-interaction live in [Platform support](platform-support.md#caveats).
+silently-unbounded group. On Linux this needs the process to run at the
+**real cgroup-v2 root**: the crate enables the controllers in this process's own
+cgroup, which cgroup v2's "no internal processes" rule allows only for the real
+hierarchy root — *not* a cgroup-namespace root (so an ordinary container fails
+too), *not* under systemd — and the crate doesn't migrate your process. See the
+limits prerequisites in
+[Platform support](platform-support.md#containment-mechanisms). The `uid()`-drop
+interaction lives under its [Caveats](platform-support.md#caveats).
 
 ## Stats and sampling
 

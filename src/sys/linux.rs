@@ -393,37 +393,73 @@ impl Cgroup {
         Ok(cg)
     }
 
-    /// Enable the controllers each requested limit needs (in the *parent's*
-    /// `cgroup.subtree_control`, which is what makes the interface files appear in
-    /// our cgroup) and write the limit values.
+    /// Enable the controllers each requested limit needs — but only the ones not
+    /// *already* enabled — in `parent`'s `cgroup.subtree_control` (which is what
+    /// makes the limit interface files appear in our child cgroup), then write the
+    /// limit values. Here `parent` is this process's own cgroup (the child is
+    /// created under it), so per cgroup v2's "no internal processes" rule the
+    /// enable succeeds only when `parent` is the *real* cgroup-v2 hierarchy root (a
+    /// cgroup namespace root does not count); otherwise it fails fast with an
+    /// honest error. The crate does not migrate this process out of its cgroup to
+    /// work around the rule.
     ///
-    /// The parent's controller enablement is deliberately NOT reverted on
-    /// `Drop`: the parent cgroup is shared (sibling groups, other processes
-    /// of this same user), so disabling controllers there could yank the
-    /// interface files out from under unrelated trees. Enabled-but-unused
-    /// controllers cost nothing.
+    /// Any controller enablement is deliberately NOT reverted on `Drop`: the
+    /// parent cgroup is shared (sibling groups, other processes of this same
+    /// user), so disabling controllers there could yank the interface files out
+    /// from under unrelated trees. Enabled-but-unused controllers cost nothing.
     #[cfg(feature = "limits")]
     fn apply_limits(&self, parent: &Path, limits: &ResourceLimits) -> io::Result<()> {
-        let mut spec = String::new();
+        // The controllers each requested limit needs.
+        let mut needed: Vec<&str> = Vec::new();
         if limits.memory_max.is_some() {
-            spec.push_str("+memory ");
+            needed.push("memory");
         }
         if limits.max_processes.is_some() {
-            spec.push_str("+pids ");
+            needed.push("pids");
         }
         if limits.cpu_quota.is_some() {
-            spec.push_str("+cpu ");
+            needed.push("cpu");
         }
-        let spec = spec.trim_end();
-        if !spec.is_empty() {
+
+        // B13: enable only the controllers not ALREADY in the parent's
+        // `subtree_control`. When they are present (the parent is the *real*
+        // cgroup-v2 hierarchy root — the one cgroup that may carry controllers
+        // despite holding this process), the write is skipped, and that is also
+        // the only way the limit interface files (`memory.max`, …) can already
+        // exist in our child. Otherwise the write below enables them. Writing
+        // `subtree_control` while the parent holds member processes (this process
+        // lives there) is forbidden by cgroup v2's "no internal processes" rule
+        // and fails `EBUSY` for any non-root cgroup — a cgroup *namespace* root
+        // does NOT count (it only virtualizes the view; the cgroup still isn't the
+        // real root), so a private-cgroupns container EBUSYs just like a systemd
+        // scope. processkit does not migrate this process out of its cgroup to
+        // work around that, so when controllers are missing the write fails
+        // loudly with an honest error.
+        let enabled =
+            std::fs::read_to_string(parent.join("cgroup.subtree_control")).unwrap_or_default();
+        let to_enable = controllers_to_enable(&needed, &enabled);
+        if !to_enable.is_empty() {
+            let spec = to_enable
+                .iter()
+                .map(|c| format!("+{c}"))
+                .collect::<Vec<_>>()
+                .join(" ");
             let file = parent.join("cgroup.subtree_control");
-            std::fs::write(&file, spec).map_err(|e| {
+            std::fs::write(&file, &spec).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!(
-                        "enabling cgroup controllers ({spec}) via {} failed: {e} — \
-                         resource limits require a delegated cgroup (run as root, in a \
-                         container, or under a systemd unit with Delegate=yes)",
+                        "enabling cgroup controllers ({spec}) in {} failed: {e}. cgroup v2's \
+                         'no internal processes' rule forbids enabling controllers in a cgroup \
+                         that holds member processes (except the real hierarchy root), and this \
+                         process is a member of that cgroup — so processkit's resource limits \
+                         apply only when this process runs at the real cgroup-v2 root, not under \
+                         a systemd session/scope/service nor an ordinary (private-cgroupns) \
+                         container, both of which place it in a non-root cgroup. (A cgroup \
+                         namespace root does not count — it only virtualizes the view.) processkit \
+                         does not migrate your process into a sub-cgroup to satisfy the rule; \
+                         arrange that externally (the create-leaf/migrate-self/enable dance) if \
+                         you need limits there.",
                         file.display()
                     ),
                 )
@@ -514,6 +550,22 @@ impl Cgroup {
     }
 }
 
+/// B13: which of the `needed` cgroup controllers are not already present in a
+/// `cgroup.subtree_control` value (a space-separated list of enabled controller
+/// names). Returns the ones that still need enabling — so the caller writes
+/// `subtree_control` only when something is missing, never redundantly (a
+/// redundant write can spuriously `EBUSY` under the no-internal-process rule, so
+/// skipping it is what lets limits work in an already-delegated environment).
+#[cfg(feature = "limits")]
+fn controllers_to_enable<'a>(needed: &[&'a str], subtree_control: &str) -> Vec<&'a str> {
+    let already: std::collections::HashSet<&str> = subtree_control.split_whitespace().collect();
+    needed
+        .iter()
+        .copied()
+        .filter(|c| !already.contains(c))
+        .collect()
+}
+
 /// Format a per-core CPU fraction as a cgroup v2 `cpu.max` value (`"quota period"`,
 /// microseconds). `0.5` → `"50000 100000"`, `2.0` → `"200000 100000"`.
 #[cfg(feature = "limits")]
@@ -591,7 +643,7 @@ fn write_self_pid(path: &CStr) -> io::Result<()> {
 
 #[cfg(all(test, feature = "limits"))]
 mod tests {
-    use super::cpu_max_value;
+    use super::{controllers_to_enable, cpu_max_value};
 
     #[test]
     fn cpu_max_formats_quota_and_period() {
@@ -600,5 +652,21 @@ mod tests {
         assert_eq!(cpu_max_value(2.0), "200000 100000");
         // A vanishingly small quota floors at 1µs (a zero quota would be invalid).
         assert_eq!(cpu_max_value(0.000_001), "1 100000");
+    }
+
+    #[test]
+    fn controllers_to_enable_skips_already_enabled_ones() {
+        // B13: nothing missing → empty (skip the redundant subtree_control write,
+        // which is what makes limits work in an already-delegated environment).
+        assert!(controllers_to_enable(&["memory", "pids"], "cpu memory pids").is_empty());
+        // Only the genuinely-missing controllers are returned, order preserved.
+        assert_eq!(
+            controllers_to_enable(&["memory", "pids", "cpu"], "memory"),
+            ["pids", "cpu"]
+        );
+        // An empty / absent subtree_control means all are needed.
+        assert_eq!(controllers_to_enable(&["memory"], ""), ["memory"]);
+        // Extra controllers in subtree_control are ignored.
+        assert!(controllers_to_enable(&["pids"], "pids io hugetlb").is_empty());
     }
 }

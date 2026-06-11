@@ -201,10 +201,15 @@ cores); on Windows it is converted against the host's CPU count and is approxima
 
 Limits need a real container — a **Windows Job Object** or a **Linux cgroup v2**.
 There is no whole-tree limit on macOS/the BSDs, the Linux process-group fallback, or
-the no-containment target, and a Linux cgroup must permit controller delegation (run
-as root, in a container, or under a systemd unit with `Delegate=yes`). When a
-requested limit can't be enforced, `with_options` returns `Error::ResourceLimit`
-instead of a silently-unbounded group — an unapplied cap is no protection.
+the no-containment target. A Linux cgroup limit additionally needs this process to run
+at the **real cgroup-v2 root**: the crate creates the limit cgroup under this process's
+own cgroup and enables the controllers there, which cgroup v2's "no internal processes"
+rule allows only for the real hierarchy root — *not* a cgroup-namespace root (so an
+ordinary container EBUSYs too), and *not* under a systemd session/scope/service. The crate
+does not migrate your process to work around it, so in practice limits apply only at a
+minimal non-systemd init. When a requested limit can't be enforced, `with_options`
+returns `Error::ResourceLimit` instead of a silently-unbounded group — an unapplied cap
+is no protection.
 
 *Deeper: [Process groups → resource limits](docs/process-groups.md).*
 

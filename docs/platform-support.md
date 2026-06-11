@@ -22,11 +22,18 @@ collects all the matrices and fine print in one place.
 | `ProcessGroup` | macOS, BSDs, Linux fallback | POSIX process groups (`setpgid`); teardown is `killpg`; tracked per started/adopted child |
 | `None` | anything else | No containment facility — children are *unmanaged*, not absent |
 
-On Linux the cgroup backend requires controller **delegation** (root, a
-container, or a systemd unit with `Delegate=yes`); without it the crate
-quietly falls back to `ProcessGroup` — unless you requested
-[resource limits](#capability-matrices), which fail fast instead
-(`Error::ResourceLimit`), because an unapplied cap is no protection.
+On Linux the cgroup backend requires controller **delegation**, and resource
+limits specifically need this process to run at the **real cgroup-v2 root**. The
+crate creates the limit cgroup under this process's own cgroup and enables the
+controllers in that cgroup's `subtree_control`, which cgroup v2's "no internal
+processes" rule allows only for the real hierarchy root (the one exempt cgroup). A
+cgroup *namespace* root does **not** qualify — it only virtualizes the view — so an
+ordinary (private-cgroupns) container fails `EBUSY` just like a systemd
+session/scope/service. The crate does not migrate your process into a sub-cgroup
+to work around it, so in practice limits apply only at a minimal non-systemd init
+sitting at the real root. Without a usable cgroup it quietly falls back to `ProcessGroup` —
+unless you requested [resource limits](#capability-matrices), which fail fast
+instead (`Error::ResourceLimit`), because an unapplied cap is no protection.
 
 ## Capability matrices
 

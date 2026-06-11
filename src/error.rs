@@ -156,9 +156,10 @@ pub enum Error {
     /// when a [`ResourceLimits`](crate::ResourceLimits) cap was set but the active
     /// mechanism can't honor it — either the platform has no whole-tree container
     /// (macOS/BSD, the Linux process-group fallback, the no-containment target), or
-    /// the OS rejected the request (e.g. a Linux cgroup without controller
-    /// delegation). An unenforced limit is no protection, so this is raised rather
-    /// than leaving the tree silently unbounded.
+    /// the OS rejected the request (on Linux, the cgroup controllers can't be
+    /// enabled — see [`ResourceLimits`](crate::ResourceLimits) for the cgroup-v2
+    /// "real root only" requirement). An unenforced limit is no protection, so this
+    /// is raised rather than leaving the tree silently unbounded.
     #[cfg(feature = "limits")]
     #[error("could not enforce resource limits: {0}")]
     ResourceLimit(String),

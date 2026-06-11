@@ -159,6 +159,28 @@ to a dated version section.
 
 ### Fixed (Phase F — group / limits / sys layer)
 
+- Linux cgroup resource limits (B13): made the `cgroup.subtree_control` controller-enable
+  conditional (it now writes only the controllers not *already* enabled, skipping a redundant
+  write) and corrected the previously **misleading** error/docs. The honest story: the crate
+  creates the limit cgroup as a child of this process's own cgroup and enables the controllers
+  there, which cgroup v2's "no internal processes" rule permits only at the **real cgroup-v2
+  hierarchy root** (the one exempt cgroup) — so limits apply only when this process is a direct
+  member of that real root, and fail fast (`Error::ResourceLimit`) under a systemd
+  session/scope/service or an ordinary (private-cgroupns) container, both of which place it in a
+  non-root cgroup. A cgroup *namespace* root does **not** count. The crate deliberately does not
+  migrate your process into a sub-cgroup to work around the rule. (The previous error/docs
+  recommended `Delegate=yes` / `systemd-run --scope` and a "delegated leaf", which all still
+  `EBUSY` — that advice is removed.) Docs (`ResourceLimits`, README, platform-support,
+  process-groups) corrected to match.
+- Documented the Linux `max_processes` cross-platform divergence (B14): the kernel checks
+  `pids.max` only for forks *inside* the cgroup, so on Linux the cap bounds a contained tree's own
+  forks but does not reject additional `ProcessGroup::start` calls that each add a top-level child
+  (Windows' `ActiveProcessLimit` does). `ResourceLimits::max_processes` now spells this out.
+- Documented the POSIX process-group graceful-shutdown zombie caveat (B16): on the
+  `ProcessGroup` mechanism (macOS/BSD, Linux fallback) an unreaped zombie still answers the
+  liveness probe, so `ProcessGroup::shutdown` burns the full `shutdown_timeout` on a child that
+  exited on `SIGTERM` but whose handle was never awaited — await each child you start into the
+  group. The Job Object / cgroup mechanisms are immune.
 - `ProcessGroup::shutdown` with `escalate_to_kill(false)` now actually preserves survivors:
   the `Drop` impls for all three backends (Linux cgroup, POSIX process-group, Windows Job
   Object) no longer hard-kill the tree when `graceful_shutdown` was invoked with
