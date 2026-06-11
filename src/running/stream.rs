@@ -49,6 +49,14 @@ impl RunningProcess {
     /// path. A handle from [`ProcessGroup::start`](crate::ProcessGroup::start)
     /// shares its group, so the caller bounds the stream.)
     ///
+    /// **D5:** if `stdout` was set to [`Inherit`](crate::StdioMode::Inherit) or
+    /// [`Null`](crate::StdioMode::Null) (not the default
+    /// [`Piped`](crate::StdioMode::Piped)), there is no pipe to read, so this
+    /// stream is **empty** (ends immediately). Unlike the bulk verbs
+    /// (`output_string`/`output_bytes`), which error loudly on a non-piped
+    /// stdout, a streaming verb returns no `Result` to carry that error — so the
+    /// empty stream is the signal. Use `Piped` to stream output.
+    ///
     /// # Example
     ///
     /// Stream stdout line by line as it is produced, then collect the outcome
@@ -242,11 +250,11 @@ impl RunningProcess {
     /// as the child produces them. Call this **once**.
     ///
     /// Interleaving is best-effort (lines are ordered by when they arrive in
-    /// the async runtime, not by a kernel timestamp). Each poll checks stdout
-    /// before stderr, so under a sustained stdout flood stderr lines drain only
-    /// when stdout briefly empties — with a bounded buffer a slow-draining
-    /// stderr can lose lines (or trip its [`fail_loud`](crate::OutputBufferPolicy::fail_loud)
-    /// ceiling) while stdout monopolizes. Use
+    /// the async runtime, not by a kernel timestamp). D9d: the two streams are
+    /// polled **fairly** — the first-look alternates each poll, so a
+    /// continuously-ready stream can't starve the other (neither monopolizes
+    /// while the peer loses lines or trips its
+    /// [`fail_loud`](crate::OutputBufferPolicy::fail_loud) ceiling). Use
     /// [`finish_events`](Self::finish_events) after draining to collect the
     /// run's [`Outcome`](crate::Outcome).
     ///
@@ -355,6 +363,7 @@ impl RunningProcess {
             stderr_wait: None,
             stdout_done: false,
             stderr_done: false,
+            prefer_stdout: true,
         }
     }
 
@@ -589,6 +598,9 @@ pub struct OutputEvents {
     stderr_wait: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     stdout_done: bool,
     stderr_done: bool,
+    /// D9d: which stream gets the first look each poll. Flipped after every
+    /// emitted line so a continuously-ready stream can't starve the other.
+    prefer_stdout: bool,
 }
 
 // Manual: the sinks and pending-wait futures are opaque.
@@ -604,32 +616,36 @@ impl Stream for OutputEvents {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<OutputEvent>> {
         let this = self.get_mut();
         loop {
-            // Try stdout, then stderr, on each iteration so progress on
-            // either stream is returned promptly.
-            if !this.stdout_done {
-                match this.stdout_sink.try_pop() {
-                    Popped::Line(line) => {
-                        this.stdout_wait = None;
-                        return Poll::Ready(Some(OutputEvent::Stdout(line)));
+            // D9d: give each stream the first look on alternating polls so a
+            // continuously-ready stream can't starve the other. `prefer_stdout`
+            // flips after every emitted line; `[pref, !pref]` visits both.
+            for stdout_turn in [this.prefer_stdout, !this.prefer_stdout] {
+                if stdout_turn && !this.stdout_done {
+                    match this.stdout_sink.try_pop() {
+                        Popped::Line(line) => {
+                            this.stdout_wait = None;
+                            this.prefer_stdout = false; // stderr gets the next first look
+                            return Poll::Ready(Some(OutputEvent::Stdout(line)));
+                        }
+                        Popped::Closed => {
+                            this.stdout_done = true;
+                            this.stdout_wait = None;
+                        }
+                        Popped::Empty => {}
                     }
-                    Popped::Closed => {
-                        this.stdout_done = true;
-                        this.stdout_wait = None;
+                } else if !stdout_turn && !this.stderr_done {
+                    match this.stderr_sink.try_pop() {
+                        Popped::Line(line) => {
+                            this.stderr_wait = None;
+                            this.prefer_stdout = true;
+                            return Poll::Ready(Some(OutputEvent::Stderr(line)));
+                        }
+                        Popped::Closed => {
+                            this.stderr_done = true;
+                            this.stderr_wait = None;
+                        }
+                        Popped::Empty => {}
                     }
-                    Popped::Empty => {}
-                }
-            }
-            if !this.stderr_done {
-                match this.stderr_sink.try_pop() {
-                    Popped::Line(line) => {
-                        this.stderr_wait = None;
-                        return Poll::Ready(Some(OutputEvent::Stderr(line)));
-                    }
-                    Popped::Closed => {
-                        this.stderr_done = true;
-                        this.stderr_wait = None;
-                    }
-                    Popped::Empty => {}
                 }
             }
 
@@ -682,5 +698,53 @@ impl Stream for OutputEvents {
             }
             return Poll::Pending;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::OutputBufferPolicy;
+    use tokio_stream::StreamExt;
+
+    /// D9d: when both streams are continuously ready, the merged event stream
+    /// alternates between them rather than draining all of stdout first — so a
+    /// chatty stdout can't starve stderr (or vice versa).
+    #[tokio::test]
+    async fn output_events_interleaves_fairly_between_two_ready_streams() {
+        let policy = OutputBufferPolicy::unbounded();
+        let stdout_sink = SharedLines::new(&policy);
+        let stderr_sink = SharedLines::new(&policy);
+        for line in ["o1", "o2", "o3"] {
+            stdout_sink.push(line.to_owned());
+        }
+        for line in ["e1", "e2", "e3"] {
+            stderr_sink.push(line.to_owned());
+        }
+        // Closed and pre-filled, so every poll finds both ready — deterministic.
+        stdout_sink.close_now();
+        stderr_sink.close_now();
+
+        let mut events = OutputEvents {
+            stdout_sink,
+            stderr_sink,
+            stdout_wait: None,
+            stderr_wait: None,
+            stdout_done: false,
+            stderr_done: false,
+            prefer_stdout: true,
+        };
+        let mut seq = Vec::new();
+        while let Some(ev) = events.next().await {
+            seq.push(match ev {
+                OutputEvent::Stdout(l) => format!("O:{l}"),
+                OutputEvent::Stderr(l) => format!("E:{l}"),
+            });
+        }
+        assert_eq!(
+            seq,
+            ["O:o1", "E:e1", "O:o2", "E:e2", "O:o3", "E:e3"],
+            "merged stream must interleave, not drain stdout first"
+        );
     }
 }

@@ -411,6 +411,13 @@ impl Command {
     /// [`timeout_grace`](Self::timeout_grace) window (default
     /// [`Signal::Term`](crate::Signal::Term)). Unix-only in effect; ignored on
     /// Windows (no signal tier).
+    ///
+    /// D9b: this builder lives behind the `process-control` feature because the
+    /// [`Signal`](crate::Signal) type does — the divergence is **accepted, not an
+    /// oversight**. Without `process-control` the graceful timeout always uses
+    /// `SIGTERM` (the default); the feature is only needed to *choose a different*
+    /// teardown signal. Promoting `Signal` into the base API would be the
+    /// alternative, but it enlarges the always-on 1.0 surface for a niche knob.
     #[cfg(feature = "process-control")]
     pub fn timeout_signal(mut self, signal: crate::Signal) -> Self {
         self.timeout_signal = Some(signal);
@@ -575,9 +582,14 @@ impl Command {
     /// - **`Piped`** (default) — captured into a pipe; all output-retrieval
     ///   verbs (`output_string`, `stdout_lines`, …) read from it.
     /// - **`Inherit`** — the child shares the parent's stdout; output appears
-    ///   in the terminal/log but is not captured. `output_string` returns an
-    ///   empty stdout; `stdout_lines` / `output_events` yield nothing.
+    ///   in the terminal/log but is not captured.
     /// - **`Null`** — suppressed entirely (redirected to `/dev/null`).
+    ///
+    /// With `Inherit`/`Null` there is no pipe to read, so (D5) the bulk capture
+    /// verbs (`output_string`/`output_bytes`) **error** rather than return
+    /// silently-empty output, and the streaming verbs (`stdout_lines`/
+    /// `output_events`) yield an empty stream. Use a discard verb (`wait`) to run
+    /// a command whose stdout you don't want to capture.
     pub fn stdout(mut self, mode: crate::StdioMode) -> Self {
         self.stdout_mode = mode;
         self
@@ -692,6 +704,13 @@ impl Command {
 
     pub(crate) fn err_encoding(&self) -> &'static Encoding {
         self.stderr_encoding
+    }
+
+    /// D5: whether stdout is captured into a pipe (vs `Inherit`/`Null`). The bulk
+    /// capture verbs use this to fail loudly instead of returning silently-empty
+    /// output when stdout wasn't piped.
+    pub(crate) fn stdout_is_piped(&self) -> bool {
+        matches!(self.stdout_mode, StdioMode::Piped)
     }
 
     pub(crate) fn program_name(&self) -> String {
@@ -835,6 +854,12 @@ impl Command {
     /// working dir, and environment — stdio wired for capture. Use it to feed
     /// the low-level [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) escape
     /// hatch directly (which returns a raw [`tokio::process::Child`]).
+    ///
+    /// D8: `#[doc(hidden)]` — this is a raw-tokio escape hatch, not part of the
+    /// advertised 1.0 surface. It stays public and callable for power users
+    /// bridging to `ProcessGroup::spawn`, but the recommended path is the
+    /// `start`/`output`/run verbs.
+    #[doc(hidden)]
     pub fn to_tokio_command(&self) -> tokio::process::Command {
         self.build_tokio()
     }
@@ -1028,39 +1053,13 @@ impl Command {
     /// the predicate is trivial), then tear the process down.
     pub async fn first_line<F>(&self, predicate: F) -> Result<Option<String>>
     where
-        F: Fn(&str) -> bool,
+        F: Fn(&str) -> bool + Send,
     {
-        use tokio_stream::StreamExt;
-
-        let process = JobRunner::new().start(self).await?;
-        let search = async move {
-            let mut process = process;
-            // Close an untaken `keep_stdin_open` pipe (taking it here drops it →
-            // EOF), so a stdin-reading filter isn't left blocking — `first_line`
-            // gives no way to write to it. A no-op for the usual case.
-            let _ = process.standard_input();
-            let mut lines = process.stdout_lines();
-            while let Some(line) = lines.next().await {
-                if predicate(&line) {
-                    return Some(line);
-                }
-            }
-            None
-        };
-        match self.timeout {
-            // Bound the search by the configured deadline. On elapse, `search`
-            // is dropped — tearing the process tree down — and the timeout is
-            // surfaced as `Error::Timeout` (consistent with `run`/`exit_code`),
-            // never an indefinite hang on a process that stalls without exiting.
-            Some(limit) => match tokio::time::timeout(limit, search).await {
-                Ok(found) => Ok(found),
-                Err(_elapsed) => Err(Error::Timeout {
-                    program: self.program_name(),
-                    timeout: limit,
-                }),
-            },
-            None => Ok(search.await),
-        }
+        // D6: delegate to the `ProcessRunnerExt` seam (real `JobRunner` here) so
+        // the streaming-search logic lives in one place and is exercisable with
+        // any runner — see `ProcessRunnerExt::first_line`. The deadline is read
+        // from `self` there via `configured_timeout()`.
+        JobRunner::new().first_line(self, predicate).await
     }
 }
 

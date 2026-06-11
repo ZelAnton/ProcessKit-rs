@@ -74,6 +74,51 @@ to a dated version section.
   the directory set here — use an absolute path for the program when combining
   `current_dir` with a relative-path executable.
 
+### Changed (Phase I — design block)
+
+- `ProcessGroup::spawn` now takes its `tokio::process::Command` **by value** (D8) instead of
+  `&mut`: reusing one command across spawns would stack `pre_exec` hooks / re-set creation
+  flags, so by-value makes that a compile error rather than a silent footgun. The crate's own
+  run helpers already rebuild the command per run, so only direct `spawn` callers are affected.
+- `Command::to_tokio_command` is now `#[doc(hidden)]` (D8) — it remains public and callable as
+  a raw-tokio bridge to `ProcessGroup::spawn`, but is no longer advertised as 1.0 surface.
+- `Invocation::cwd` is now `Option<PathBuf>` instead of `Option<OsString>` (D9) — a working
+  directory is a path.
+- The bulk capture verbs (`output_string`/`output_bytes`) now **error loudly** when `stdout` was
+  set to `StdioMode::Inherit`/`Null` (D5) — there is no pipe to read, so returning silently-empty
+  output was a footgun; the streaming verbs document that the stream is empty instead. The
+  discard verbs (`wait`/`profile`) are unaffected.
+- `OutputBufferPolicy::Error` overflow on an **unbounded** buffer is no longer a silent no-op (D9c):
+  `unbounded().with_overflow(Error)` is a misconfiguration (a ceiling with no ceiling), so it now
+  fails loud on any **line-pumped** output (`Error::OutputTooLarge`). (`output_bytes` captures stdout
+  raw, so its stdout is exempt — only its line-pumped stderr trips the ceiling.) Use `fail_loud(n)`
+  for a real cap.
+- `Supervisor` now defaults to a **bounded-tail** capture per incarnation (D3) instead of the
+  unbounded one-shot default — a long-lived chatty supervised process no longer accumulates its
+  entire output in memory. An explicit bounded/`fail_loud` command policy is respected; override
+  via the new `Supervisor::capture`.
+- `OutputEvents` (the merged stdout+stderr stream) now alternates which stream it polls first (D9d),
+  so a continuously-ready stream can't starve the other.
+- `Command::first_line`'s predicate now requires `F: Send` (D6) — it delegates through the new
+  `ProcessRunnerExt::first_line` seam (see Added).
+
+### Added (Phase I — design block)
+
+- `RunningProcess::kills_tree_on_drop()` (D10) — reports whether dropping the handle tears down
+  the process tree: `true` for a private-group handle (kill-on-close leak-safety), `false` for a
+  shared-`ProcessGroup` handle (the group owner tears down). Lets a receiving function reason
+  about whether dropping the handle is sufficient cleanup.
+- `ProcessRunnerExt::first_line` (D6) — the streaming first-matching-line search, routed through
+  the `start` seam so it is exercisable with any runner (a `ScriptedRunner` in tests), not just the
+  real `JobRunner`. `Command::first_line` now delegates to it.
+- `Supervisor::capture(policy)` (D3) — override the per-incarnation output-capture policy (the
+  default is a bounded tail; see Changed).
+- Documented the deliberate design choices the block confirmed: `ProcessRunner::start` stays a
+  defaulted runtime capability (`Error::Unsupported`) rather than a compile-time `ProcessStarter`
+  split (D4); the `cli_client!` macro is kept and documented as committed public API (D7); and
+  `Command::timeout_signal` stays behind `process-control` because the `Signal` type does — the
+  divergence is accepted rather than enlarging the always-on surface (D9b).
+
 ### Fixed (Phase H — stdin)
 
 - A stdin-writer failure is no longer silently swallowed: a non-broken-pipe error feeding the

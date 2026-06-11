@@ -119,22 +119,38 @@ async fn output_string_captures_stdout() {
     );
 }
 
-// StdioMode::Null on stdout: the command still runs to completion (the exit code
-// is real), but nothing is captured — the pump is skipped, so `output_string`
-// returns empty stdout. Pins the documented "no-op capture under Null" contract.
+// StdioMode::Null on stdout: D5 makes the bulk capture verbs ERROR (there is no
+// pipe to read, so returning silently-empty output was a footgun). To run a
+// command with a suppressed stdout, use a discard verb (`wait`), which captures
+// nothing by design.
 #[tokio::test]
 #[ignore = "spawns a real subprocess"]
-async fn stdout_null_suppresses_capture_but_runs_the_command() {
-    let result = two_line_echo()
+async fn stdout_null_makes_capture_verbs_error_but_discard_verbs_run() {
+    // D5: a capture verb on a non-piped stdout errors loudly.
+    let err = two_line_echo()
         .stdout(processkit::StdioMode::Null)
         .output_string()
         .await
-        .expect("a stdout(Null) run still completes");
-    assert!(result.is_success(), "exit was {:?}", result.code());
-    assert!(
-        result.stdout().is_empty(),
-        "stdout(Null) must capture nothing, got {:?}",
-        result.stdout()
+        .expect_err("output_string on a non-piped stdout must error (D5)");
+    match err {
+        processkit::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        other => panic!("expected Io(InvalidInput), got {other:?}"),
+    }
+
+    // A discard verb still runs the command to completion (nothing to capture is
+    // fine there) — the exit code is real.
+    let outcome = two_line_echo()
+        .stdout(processkit::StdioMode::Null)
+        .start()
+        .await
+        .expect("start")
+        .wait()
+        .await
+        .expect("wait() runs a stdout(Null) command fine");
+    assert_eq!(
+        outcome,
+        processkit::Outcome::Exited(0),
+        "the command still ran"
     );
 }
 

@@ -62,7 +62,9 @@ impl SharedLines {
         })
     }
 
-    fn push(&self, line: String) {
+    // pub(crate): the pump feeds lines through here; tests also pre-fill a sink
+    // directly (e.g. the `OutputEvents` fairness test). Crate-internal only.
+    pub(crate) fn push(&self, line: String) {
         // Count every line, even one we are about to drop.
         self.count.fetch_add(1, Ordering::Relaxed);
         {
@@ -89,6 +91,15 @@ impl SharedLines {
                         inner.overflowed = true;
                     }
                 },
+                // D9c: `Error` overflow with NO cap (`unbounded().with_overflow(Error)`)
+                // used to be a silent no-op. It is a misconfiguration — a fail-loud
+                // ceiling with no ceiling — so treat it as zero-tolerance: mark
+                // overflow on any line (dropped; the pipe is still drained) and let
+                // the consuming verb surface `Error::OutputTooLarge`. Use
+                // `fail_loud(n)` for a real cap.
+                None if matches!(inner.mode, OverflowMode::Error) => {
+                    inner.overflowed = true;
+                }
                 _ => inner.lines.push_back(line),
             }
         }
@@ -301,6 +312,29 @@ mod tests {
         pump_lines(&b"oops\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
         assert!(sink.overflowed(), "any line is over a 0-line ceiling");
         assert!(sink.drain().is_empty(), "still retains nothing");
+    }
+
+    #[tokio::test]
+    async fn unbounded_with_error_mode_is_zero_tolerance_not_inert() {
+        // D9c: `unbounded().with_overflow(Error)` was a silent no-op; it must now
+        // fail loud on any output (and retain nothing, like fail_loud(0)).
+        let sink =
+            SharedLines::new(&OutputBufferPolicy::unbounded().with_overflow(OverflowMode::Error));
+        pump_lines(&b"anything\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert!(
+            sink.overflowed(),
+            "unbounded + Error must fail loud on any output, not be inert"
+        );
+        assert!(sink.drain().is_empty(), "zero-tolerance retains nothing");
+    }
+
+    #[tokio::test]
+    async fn unbounded_without_error_mode_retains_everything() {
+        // The default unbounded (DropOldest) is unchanged: retain all, no overflow.
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(&b"a\nb\nc\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert!(!sink.overflowed());
+        assert_eq!(sink.drain(), ["a", "b", "c"]);
     }
 
     #[tokio::test]

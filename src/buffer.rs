@@ -38,26 +38,31 @@ pub enum OverflowMode {
     /// silently dropping lines. The pipe is still drained (so the child never
     /// blocks); excess lines are counted but not retained.
     ///
-    /// The error fires on **capturing verbs** —
-    /// [`output_string`](crate::Command::output_string),
-    /// [`output_bytes`](crate::Command::output_bytes),
+    /// The ceiling applies to **line-pumped** output. It fires on the
+    /// line-capturing verbs — [`output_string`](crate::Command::output_string)
+    /// (stdout *and* stderr),
     /// [`finish_streamed`](crate::RunningProcess::finish_streamed), and
-    /// [`finish_events`](crate::RunningProcess::finish_events). Discard-only
-    /// verbs ([`wait`](crate::RunningProcess::wait),
-    /// [`profile`](crate::RunningProcess::profile)) use a retain-nothing sink
-    /// internally and are not affected — use a capturing verb if you need the
-    /// DoS guard on a run you don't otherwise capture.
+    /// [`finish_events`](crate::RunningProcess::finish_events). On
+    /// [`output_bytes`](crate::Command::output_bytes) stdout is captured **raw**
+    /// (no line buffer), so the cap applies only to its line-pumped *stderr* —
+    /// the raw stdout is never line-capped (bound a flooding child with a
+    /// [`timeout`](crate::Command::timeout) instead). Discard-only verbs
+    /// ([`wait`](crate::RunningProcess::wait), and `profile` under the `stats`
+    /// feature) use a retain-nothing sink internally and are not affected.
     ///
-    /// Use this when unbounded output is itself a misbehavior — an untrusted
-    /// tool flooding its stdout is a denial-of-service, not a policy choice.
+    /// Use this when unbounded *line* output is itself a misbehavior — an
+    /// untrusted tool flooding its stdout through the line verbs is a
+    /// denial-of-service, not a policy choice.
     ///
-    /// **Requires a cap to do anything.** This mode fires only when the buffer
-    /// is *full*, so it is inert on an unbounded buffer (`max_lines: None`) —
-    /// there is no ceiling to exceed. Reach for it via
-    /// [`fail_loud`](OutputBufferPolicy::fail_loud) (which sets the cap for you),
-    /// or pair [`with_overflow`](OutputBufferPolicy::with_overflow) with a
-    /// `bounded`/`Some(n)` `max_lines`; `unbounded().with_overflow(Error)` never
-    /// errors.
+    /// **Pair it with a cap.** With a `bounded`/`Some(n)` `max_lines` it fires
+    /// when the buffer fills — reach for it via
+    /// [`fail_loud`](OutputBufferPolicy::fail_loud) (which sets the cap for you)
+    /// or [`with_overflow`](OutputBufferPolicy::with_overflow). **D9c:** on an
+    /// *unbounded* buffer (`max_lines: None`) this mode is a misconfiguration — a
+    /// fail-loud ceiling with no ceiling — so it is treated as **zero-tolerance**:
+    /// the run errors on *any* line-pumped output (`Error::OutputTooLarge`),
+    /// rather than silently retaining everything. (Previously it was an inert
+    /// no-op.) Use `fail_loud(n)` when you want a real cap.
     Error,
 }
 
@@ -115,10 +120,12 @@ impl OutputBufferPolicy {
 
     /// Set the overflow behavior.
     ///
-    /// Note that [`OverflowMode::Error`] only takes effect when `max_lines` is
-    /// `Some(_)`: it fires when the buffer is full, so on an unbounded buffer
-    /// (`max_lines: None`) it is a no-op. Combine it with a `bounded` cap, or
-    /// use [`fail_loud`](Self::fail_loud) which sets both at once.
+    /// With a `bounded` cap, [`OverflowMode::Error`] fires when the buffer fills.
+    /// On an *unbounded* buffer (`max_lines: None`) — D9c — `with_overflow(Error)`
+    /// is treated as **zero-tolerance**: the run errors on any line-pumped output
+    /// (it is a fail-loud ceiling with no ceiling, i.e. a misconfiguration; see
+    /// [`OverflowMode::Error`] for which streams the ceiling covers). For a real
+    /// cap use [`fail_loud`](Self::fail_loud), which sets both at once.
     #[must_use]
     pub fn with_overflow(mut self, overflow: OverflowMode) -> Self {
         self.overflow = overflow;

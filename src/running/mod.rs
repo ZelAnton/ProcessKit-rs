@@ -69,6 +69,8 @@ pub(crate) struct Spawned {
     pub buffer: OutputBufferPolicy,
     /// Exit codes treated as success (default `[0]`), carried onto the result.
     pub ok_codes: Vec<i32>,
+    /// D5: whether stdout is `Piped` (capturable) vs `Inherit`/`Null`.
+    pub stdout_piped: bool,
     #[cfg(feature = "cancellation")]
     pub cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
@@ -121,6 +123,10 @@ pub struct RunningProcess {
     // succeeded (a non-zero exit / signal / timeout wins). `None` = no failure
     // (or the routine broken pipe, which never stashes).
     stdin_error: Option<std::io::Error>,
+    // D5: whether stdout was captured into a pipe (vs `Inherit`/`Null`). The bulk
+    // capture verbs fail loudly instead of returning silently-empty output when
+    // stdout wasn't piped.
+    stdout_piped: bool,
     // A timer started by `stdout_lines` when a timeout is set: kills the tree at
     // the deadline so a streamed run can't hang forever. Aborted on drop.
     deadline_task: Option<JoinHandle<()>>,
@@ -309,6 +315,7 @@ impl RunningProcess {
             stdout_pump: None,
             stderr_pump: None,
             stdin_error: None,
+            stdout_piped: s.stdout_piped,
             deadline_task: None,
             #[cfg(feature = "cancellation")]
             cancel_token: s.cancel_token,
@@ -344,6 +351,7 @@ impl RunningProcess {
             stdout_pump: None,
             stderr_pump: None,
             stdin_error: None,
+            stdout_piped: command.stdout_is_piped(),
             deadline_task: None,
             #[cfg(feature = "cancellation")]
             cancel_token: command.cancel_token(),
@@ -506,6 +514,47 @@ impl RunningProcess {
         }
     }
 
+    /// Whether **dropping** this handle will tear down (hard-kill) the process
+    /// tree (D10).
+    ///
+    /// `true` — the handle owns a **private** process group, so dropping it
+    /// without a graceful [`wait`](Self::wait) / shutdown hard-kills the whole
+    /// tree via kill-on-close (the crate's leak-safety guarantee). Dropping it on
+    /// an error path is therefore sufficient cleanup.
+    ///
+    /// `false` — the handle runs inside a **shared**
+    /// [`ProcessGroup`](crate::ProcessGroup) (started via
+    /// [`ProcessGroup::start`](crate::ProcessGroup::start)) whose lifetime the
+    /// group owns: dropping this handle does *not* kill the tree — the group's
+    /// owner does, on its own drop or [`shutdown`](crate::ProcessGroup::shutdown).
+    /// (Also `false` for a scripted test double, which has no OS tree.)
+    ///
+    /// A function handed a `RunningProcess` can use this to reason about whether
+    /// letting it drop is enough to contain the child, or whether the shared
+    /// group must be torn down separately.
+    pub fn kills_tree_on_drop(&self) -> bool {
+        self.backend.own_group().is_some()
+    }
+
+    /// D5: a bulk capture verb on a stdout that wasn't piped (`Inherit`/`Null`)
+    /// would return silently-empty output — surface it as a clear error instead.
+    /// `stdout_piped` reflects the command's `stdout` mode for *both* real and
+    /// scripted handles, so a scripted run with `stdout(Null)` errors here too
+    /// (the mode is honored uniformly, not special-cased per backend).
+    fn ensure_stdout_capturable(&self) -> Result<()> {
+        if self.stdout_piped {
+            return Ok(());
+        }
+        Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "`{}`: stdout is not piped (Command::stdout was set to Inherit/Null), so the \
+                 capture verbs have nothing to read — use StdioMode::Piped to capture it",
+                self.program
+            ),
+        )))
+    }
+
     /// Drain both streams, wait for exit, and return the captured text output
     /// (line-normalized to `\n`).
     ///
@@ -546,6 +595,7 @@ impl RunningProcess {
     /// Deliberately NOT routed through `finish_lines`: stdout is a raw byte
     /// reader (no line pump), with its own bounded drain-then-abort teardown.
     pub async fn output_bytes(mut self) -> Result<ProcessResult<Vec<u8>>> {
+        self.ensure_stdout_capturable()?; // D5
         let stderr_sink = SharedLines::new(&self.buffer);
         let err_pump = self.backend.take_stderr_reader().map(|pipe| {
             tokio::spawn(pump_lines(
@@ -804,6 +854,12 @@ impl RunningProcess {
         expose_counts: bool,
         on_exit: impl FnOnce(),
     ) -> Result<Finished> {
+        // D5: the capturing path needs a piped stdout; fail loudly rather than
+        // returning empty. The discard path (wait/profile) reads nothing, so it
+        // is exempt — a non-piped stream is fine there.
+        if matches!(capture, CaptureMode::Lines) {
+            self.ensure_stdout_capturable()?;
+        }
         // B10: reuse a sink already populated by a prior streaming call so that
         // output_string called after stdout_lines/output_events sees the lines
         // the streaming pump wrote rather than silently returning empty output.
@@ -1449,5 +1505,60 @@ mod tests {
             run.checked_outcome(Outcome::Exited(0)),
             Ok(Outcome::Exited(0))
         ));
+    }
+
+    /// D10: a scripted double owns no private group, so it never kills a tree on
+    /// drop (the real own-group vs shared-group distinction is covered by the
+    /// integration suite, which needs real subprocesses).
+    #[tokio::test]
+    async fn scripted_handle_does_not_kill_a_tree_on_drop() {
+        let run = scripted_handle(&[0]).await;
+        assert!(
+            !run.kills_tree_on_drop(),
+            "a scripted double has no OS tree to tear down"
+        );
+    }
+
+    /// D5: a bulk capture verb on a non-piped stdout (`Inherit`/`Null`) must fail
+    /// loudly instead of returning silently-empty output; the discard verbs
+    /// (`wait`) are exempt.
+    #[tokio::test]
+    async fn capture_verbs_error_on_a_non_piped_stdout() {
+        let runner = ScriptedRunner::new().fallback(Reply::ok("ignored"));
+
+        // output_string on a Null stdout → Io(InvalidInput).
+        let run = runner
+            .start(&Command::new("tool").stdout(crate::StdioMode::Null))
+            .await
+            .unwrap();
+        match run.output_string().await {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+            other => panic!("expected Io(InvalidInput), got {other:?}"),
+        }
+
+        // output_bytes on an Inherit stdout → also errors.
+        let run = runner
+            .start(&Command::new("tool").stdout(crate::StdioMode::Inherit))
+            .await
+            .unwrap();
+        assert!(matches!(run.output_bytes().await, Err(Error::Io(_))));
+
+        // The default piped stdout still captures.
+        let run = ScriptedRunner::new()
+            .fallback(Reply::ok("hi"))
+            .start(&Command::new("tool"))
+            .await
+            .unwrap();
+        assert_eq!(run.output_string().await.unwrap().stdout(), "hi");
+
+        // wait() discards output, so a non-piped stdout is fine there.
+        let run = runner
+            .start(&Command::new("tool").stdout(crate::StdioMode::Null))
+            .await
+            .unwrap();
+        assert!(
+            run.wait().await.is_ok(),
+            "discard verbs do not require a piped stdout"
+        );
     }
 }

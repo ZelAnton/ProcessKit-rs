@@ -67,8 +67,9 @@ let server = group.start(&Command::new("dev-server")).await?;
 
 // 2. spawn(): the raw escape hatch for a tokio::process::Command you already
 //    have. You get the bare Child back; pipes and reaping are your problem.
-let mut raw = tokio::process::Command::new("background-helper");
-let child = group.spawn(&mut raw)?;
+//    spawn() takes the command BY VALUE (reuse would stack pre-exec hooks).
+let raw = tokio::process::Command::new("background-helper");
+let child = group.spawn(raw)?;
 
 // 3. adopt(): contain a child that was spawned OUTSIDE the group.
 let external = tokio::process::Command::new("legacy-launcher").spawn()?;

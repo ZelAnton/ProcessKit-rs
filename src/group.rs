@@ -171,7 +171,9 @@ impl ProcessGroup {
     /// The returned [`Child`] — and any process it later spawns — belongs to the
     /// group and is reaped when the group is killed or dropped. The caller is
     /// responsible for configuring `cmd`'s stdio; the group only handles
-    /// containment.
+    /// containment. To build a capture-wired `tokio::process::Command` from a
+    /// [`Command`](crate::Command), use its `to_tokio_command()` bridge (a hidden
+    /// raw-tokio helper), or construct the `tokio::process::Command` directly.
     ///
     /// **Windows:** to make containment race-free the child is created
     /// `CREATE_SUSPENDED`, assigned to the job, then resumed. This **overwrites**
@@ -185,13 +187,15 @@ impl ProcessGroup {
     /// **Unix:** the group likewise installs a `pre_exec` hook on `cmd` to join
     /// the cgroup / process group.
     ///
-    /// These mutations make `cmd` **single-use**: each call appends another
-    /// `pre_exec` hook (Unix) and re-sets the creation flags (Windows), so reusing
-    /// the same [`Command`] across spawns stacks them. Build a fresh `cmd` per
-    /// spawn. (The crate's own run helpers do this — every run rebuilds the OS
-    /// command — so this only concerns direct `spawn` callers.)
-    pub fn spawn(&self, cmd: &mut Command) -> Result<Child> {
-        self.spawn_with_options(cmd, &crate::sys::SpawnOptions::default())
+    /// These mutations make `cmd` **single-use**: the spawn appends a `pre_exec`
+    /// hook (Unix) and re-sets the creation flags (Windows), which would stack if
+    /// the same command were spawned twice. **D8: `spawn` takes `cmd` by value**
+    /// so that reuse is a compile error rather than a silent hook-stacking
+    /// footgun — build a fresh `Command` per spawn. (The crate's own run helpers
+    /// already rebuild the OS command per run, so this only ever concerned direct
+    /// `spawn` callers.)
+    pub fn spawn(&self, mut cmd: Command) -> Result<Child> {
+        self.spawn_with_options(&mut cmd, &crate::sys::SpawnOptions::default())
     }
 
     /// `spawn`, carrying the per-spawn knobs a raw `tokio::process::Command`

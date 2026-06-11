@@ -29,6 +29,7 @@
 //! live contract.
 
 use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::command::Command;
@@ -436,7 +437,7 @@ pub struct Invocation {
     /// The arguments, in order.
     pub args: Vec<OsString>,
     /// The working directory, if one was set.
-    pub cwd: Option<OsString>,
+    pub cwd: Option<PathBuf>,
     /// Environment overrides (`None` value = removal), in order.
     pub envs: Vec<(OsString, Option<OsString>)>,
     /// Whether a (non-empty) stdin source was provided.
@@ -465,7 +466,7 @@ impl Invocation {
         Self {
             program: command.program().to_os_string(),
             args: command.arguments().to_vec(),
-            cwd: command.working_dir().map(|p| p.as_os_str().to_os_string()),
+            cwd: command.working_dir().map(std::path::Path::to_path_buf),
             envs: command.env_overrides().to_vec(),
             has_stdin: command
                 .stdin_source()
@@ -594,6 +595,26 @@ mod tests {
             "env names should appear: {dbg}"
         );
         assert!(dbg.contains("args: 2"), "arg count should appear: {dbg}");
+    }
+
+    #[tokio::test]
+    async fn first_line_is_reachable_through_the_scripted_seam() {
+        // D6: `ProcessRunnerExt::first_line` routes through `start`, so it runs
+        // hermetically on a `ScriptedRunner` — no real subprocess.
+        use crate::runner::ProcessRunnerExt;
+        let runner =
+            ScriptedRunner::new().on(["log"], Reply::lines(["alpha", "beta ready", "gamma"]));
+        let found = runner
+            .first_line(&Command::new("git").arg("log"), |l| l.contains("ready"))
+            .await
+            .expect("first_line");
+        assert_eq!(found.as_deref(), Some("beta ready"));
+
+        let none = runner
+            .first_line(&Command::new("git").arg("log"), |l| l.contains("zzz"))
+            .await
+            .expect("first_line");
+        assert_eq!(none, None, "no matching line yields None");
     }
 
     #[tokio::test]
@@ -974,7 +995,7 @@ mod tests {
 
         let call = recorder.only_call();
         assert_eq!(call.program, OsString::from("gh"));
-        assert_eq!(call.cwd, Some(OsString::from("/repo")));
+        assert_eq!(call.cwd, Some(PathBuf::from("/repo")));
         assert!(call.has_flag("--title"));
         assert!(!call.has_flag("--base"), "no --base flag was passed");
     }

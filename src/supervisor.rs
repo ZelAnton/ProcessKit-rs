@@ -14,10 +14,31 @@
 
 use std::time::Duration;
 
+use crate::buffer::OutputBufferPolicy;
 use crate::command::Command;
 use crate::error::Result;
 use crate::result::ProcessResult;
 use crate::runner::{JobRunner, ProcessRunner};
+
+/// D3: default per-incarnation capture tail for a supervised command whose own
+/// policy is unbounded. A supervised process can be long-lived and chatty, so
+/// capturing its *entire* output risks unbounded heap — keep a bounded tail (the
+/// most recent lines, the ones that matter for a crash) by default instead.
+const DEFAULT_SUPERVISION_TAIL: usize = 1000;
+
+/// The capture policy to apply to each incarnation: respect an explicit
+/// bounded/fail-loud command policy, but bound an unbounded one to a tail (D3).
+/// The overflow *mode* is preserved when bounding, so an unbounded
+/// `Error` ("fail loud") command becomes a bounded fail-loud rather than
+/// silently switching to `DropOldest` and losing the intent.
+fn default_supervision_capture(command: &Command) -> OutputBufferPolicy {
+    let policy = command.output_buffer_policy();
+    if policy.max_lines.is_none() {
+        OutputBufferPolicy::bounded(DEFAULT_SUPERVISION_TAIL).with_overflow(policy.overflow)
+    } else {
+        policy
+    }
+}
 
 /// When the supervisor restarts an exited child. See each variant; in every
 /// case [`stop_when`](Supervisor::stop_when) and
@@ -115,6 +136,10 @@ pub struct Supervisor<R: ProcessRunner = JobRunner> {
     storm_pause: Option<Duration>,
     #[allow(clippy::type_complexity)]
     stop_when: Option<Box<dyn Fn(&ProcessResult<String>) -> bool + Send + Sync>>,
+    /// D3: the output-capture policy applied to every incarnation. Defaults to a
+    /// bounded tail (see [`default_supervision_capture`]); override with
+    /// [`capture`](Self::capture).
+    capture: OutputBufferPolicy,
 }
 
 // Manual: the runner type parameter and the boxed predicate are opaque.
@@ -131,6 +156,7 @@ impl<R: ProcessRunner> std::fmt::Debug for Supervisor<R> {
             .field("failure_threshold", &self.failure_threshold)
             .field("storm_pause", &self.storm_pause)
             .field("has_stop_when", &self.stop_when.is_some())
+            .field("capture", &self.capture)
             .finish_non_exhaustive()
     }
 }
@@ -139,6 +165,7 @@ impl Supervisor<JobRunner> {
     /// Supervise `command` with the default [`JobRunner`] (a fresh private
     /// kill-on-drop group per incarnation).
     pub fn new(command: Command) -> Self {
+        let capture = default_supervision_capture(&command);
         Supervisor {
             command,
             runner: JobRunner::new(),
@@ -152,6 +179,7 @@ impl Supervisor<JobRunner> {
             failure_threshold: 5.0,
             storm_pause: None,
             stop_when: None,
+            capture,
         }
     }
 }
@@ -181,7 +209,33 @@ impl<R: ProcessRunner> Supervisor<R> {
             failure_threshold: self.failure_threshold,
             storm_pause: self.storm_pause,
             stop_when: self.stop_when,
+            capture: self.capture,
         }
+    }
+
+    /// Bound (or widen) the output captured from each incarnation (D3).
+    ///
+    /// A supervised process is often long-lived and chatty, so the default is a
+    /// **bounded tail** ([`OutputBufferPolicy::bounded`] of the most recent lines)
+    /// rather than the unbounded capture a one-shot command uses — capturing a
+    /// server's entire lifetime of output would grow without bound. An explicit
+    /// bounded/`fail_loud` policy on the [`Command`] is respected as-is; an
+    /// *unbounded* one is bounded to the tail while **preserving its overflow
+    /// mode** (so an `unbounded().with_overflow(Error)` command becomes a bounded
+    /// fail-loud, not a silent `DropOldest`). Pass a policy here to override
+    /// either (including [`unbounded`](OutputBufferPolicy::unbounded) if you truly
+    /// want every line).
+    ///
+    /// This caps *retention*, not the stdio mode: supervision captures each
+    /// incarnation's output (to evaluate [`stop_when`](Self::stop_when) and the
+    /// final result), so the command's `stdout` must stay
+    /// [`Piped`](crate::StdioMode::Piped) (the default). A command with a
+    /// non-piped `stdout` (`Inherit`/`Null`) errors every incarnation (D5) and
+    /// would just spin the restart loop.
+    #[must_use]
+    pub fn capture(mut self, policy: OutputBufferPolicy) -> Self {
+        self.capture = policy;
+        self
     }
 
     /// When to restart (default: [`OnCrash`](RestartPolicy::OnCrash)).
@@ -318,10 +372,15 @@ impl<R: ProcessRunner> Supervisor<R> {
             1.0
         };
 
+        // D3: apply the supervisor's capture policy (a bounded tail by default)
+        // to the command once, so a long-lived chatty incarnation can't grow
+        // unbounded heap. Cloned, so `self` (and `self.outcome`) stay intact.
+        let command = self.command.clone().output_buffer(self.capture);
+
         let mut restarts: u32 = 0;
         let mut storm = StormState::new();
         loop {
-            match self.runner.output(&self.command).await {
+            match self.runner.output(&command).await {
                 Ok(result) => {
                     if let Some(predicate) = &self.stop_when
                         && predicate(&result)
@@ -601,6 +660,83 @@ mod tests {
             .with_runner(runner)
             .backoff(Duration::ZERO, 1.0)
             .jitter(false)
+    }
+
+    /// D3: the capture default — an unbounded command is bounded to a tail
+    /// (preserving its overflow mode); an explicit bounded/fail-loud policy is
+    /// respected.
+    #[test]
+    fn supervision_capture_default_bounds_an_unbounded_command() {
+        // Default unbounded (DropOldest) → bounded tail, DropOldest preserved.
+        let unbounded = Command::new("server");
+        let policy = default_supervision_capture(&unbounded);
+        assert_eq!(
+            policy.max_lines,
+            Some(DEFAULT_SUPERVISION_TAIL),
+            "an unbounded supervised command must default to a bounded tail"
+        );
+        assert_eq!(policy.overflow, crate::OverflowMode::DropOldest);
+
+        // Unbounded + Error → bounded fail-loud (overflow mode preserved, not
+        // silently dropped to DropOldest).
+        let unbounded_fail_loud = Command::new("server").output_buffer(
+            crate::OutputBufferPolicy::unbounded().with_overflow(crate::OverflowMode::Error),
+        );
+        let policy = default_supervision_capture(&unbounded_fail_loud);
+        assert_eq!(policy.max_lines, Some(DEFAULT_SUPERVISION_TAIL));
+        assert_eq!(
+            policy.overflow,
+            crate::OverflowMode::Error,
+            "an unbounded+Error command must become a bounded fail-loud"
+        );
+
+        // An explicit bounded fail_loud policy is respected as-is.
+        let explicit =
+            Command::new("server").output_buffer(crate::OutputBufferPolicy::fail_loud(50));
+        let policy = default_supervision_capture(&explicit);
+        assert_eq!(policy.max_lines, Some(50), "an explicit cap is respected");
+        assert_eq!(policy.overflow, crate::OverflowMode::Error);
+    }
+
+    /// D3: `run` actually applies the capture policy to the incarnation — by
+    /// default a bounded tail, overridable via `capture()`.
+    #[tokio::test]
+    async fn run_applies_the_capture_policy_to_each_incarnation() {
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct CapturingRunner(Arc<Mutex<Option<OutputBufferPolicy>>>);
+        #[async_trait::async_trait]
+        impl ProcessRunner for CapturingRunner {
+            async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+                *self.0.lock().expect("seen lock") = Some(command.output_buffer_policy());
+                ok()
+            }
+        }
+
+        // Default: an unbounded command is bounded to the tail.
+        let seen = Arc::new(Mutex::new(None));
+        Supervisor::new(Command::new("server"))
+            .restart(RestartPolicy::Never)
+            .with_runner(CapturingRunner(seen.clone()))
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(
+            seen.lock().unwrap().expect("ran").max_lines,
+            Some(DEFAULT_SUPERVISION_TAIL)
+        );
+
+        // `capture()` overrides — here back to unbounded.
+        let seen = Arc::new(Mutex::new(None));
+        Supervisor::new(Command::new("server"))
+            .restart(RestartPolicy::Never)
+            .capture(crate::OutputBufferPolicy::unbounded())
+            .with_runner(CapturingRunner(seen.clone()))
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(seen.lock().unwrap().expect("ran").max_lines, None);
     }
 
     #[tokio::test]

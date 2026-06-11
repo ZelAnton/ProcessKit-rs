@@ -32,6 +32,28 @@ async fn wait_all_collects_every_exit_code_in_order() {
 }
 
 #[tokio::test]
+#[ignore = "spawns real subprocesses to compare kill-on-drop provenance"]
+async fn kill_on_drop_provenance_distinguishes_private_and_shared_groups() {
+    // D10: a `Command::start()` handle owns a private group → it kills its tree
+    // on drop; a `ProcessGroup::start()` handle lives in a shared group → it does
+    // not (the group owner tears the tree down).
+    let private = sleep_secs(5).start().await.expect("private start");
+    assert!(
+        private.kills_tree_on_drop(),
+        "a private-group handle must kill its tree on drop"
+    );
+    drop(private);
+
+    let group = ProcessGroup::new().expect("create group");
+    let shared = group.start(&sleep_secs(5)).await.expect("shared start");
+    assert!(
+        !shared.kills_tree_on_drop(),
+        "a shared-group handle must not kill the tree on drop"
+    );
+    group.shutdown().await.expect("shutdown the shared group");
+}
+
+#[tokio::test]
 #[ignore = "spawns a stdin-reading subprocess joined via wait_all"]
 async fn wait_all_closes_an_untaken_keep_stdin_open_pipe() {
     // L5: a `keep_stdin_open` child whose stdin pipe was never taken must see

@@ -34,6 +34,14 @@ pub trait ProcessRunner: Send + Sync {
     /// `output`-only runner (a hand-rolled double, a cassette runner) keeps
     /// compiling; the real runners ([`JobRunner`], `&ProcessGroup`) and
     /// [`ScriptedRunner`](crate::ScriptedRunner) override it.
+    ///
+    /// D4: this is deliberately a **runtime** capability (a default that errors)
+    /// rather than a compile-time split (e.g. a separate `ProcessStarter:
+    /// ProcessRunner` supertrait). The trade-off is intentional: an output-only
+    /// runner stays a one-method `impl`, at the cost that calling a streaming
+    /// verb on one surfaces `Unsupported` at run time instead of failing to
+    /// compile. Check [`RunningProcess`] support out-of-band if you need the
+    /// guarantee statically.
     async fn start(&self, command: &Command) -> Result<RunningProcess> {
         let _ = command;
         Err(crate::Error::Unsupported {
@@ -126,6 +134,50 @@ pub trait ProcessRunnerExt: ProcessRunner {
             self.output(command).await?.ensure_success()
         })
         .await
+    }
+
+    /// Stream `command`'s stdout and return the first line matching `predicate`
+    /// (`None` if the stream ends first), bounded by the command's
+    /// [`timeout`](crate::Command::timeout) (a `Some` deadline surfaces as
+    /// [`Error::Timeout`](crate::Error::Timeout) and tears the tree down).
+    ///
+    /// D6: routes through [`start`](ProcessRunner::start) — the streaming seam —
+    /// so it is exercisable with **any** runner (a
+    /// [`ScriptedRunner`](crate::ScriptedRunner) in tests), unlike the
+    /// real-runner-only [`Command::first_line`](crate::Command::first_line),
+    /// which now delegates here.
+    async fn first_line<F>(&self, command: &Command, predicate: F) -> Result<Option<String>>
+    where
+        F: Fn(&str) -> bool + Send,
+    {
+        use tokio_stream::StreamExt;
+        let process = self.start(command).await?;
+        let program = command.program_name();
+        let timeout = command.configured_timeout();
+        let search = async move {
+            let mut process = process;
+            // Close an untaken `keep_stdin_open` pipe (taking it here drops it →
+            // EOF) so a stdin-reading filter isn't left blocking — `first_line`
+            // gives no way to write to it. A no-op for the usual case.
+            let _ = process.standard_input();
+            let mut lines = process.stdout_lines();
+            while let Some(line) = lines.next().await {
+                if predicate(&line) {
+                    return Some(line);
+                }
+            }
+            None
+        };
+        match timeout {
+            Some(limit) => match tokio::time::timeout(limit, search).await {
+                Ok(found) => Ok(found),
+                Err(_elapsed) => Err(crate::Error::Timeout {
+                    program,
+                    timeout: limit,
+                }),
+            },
+            None => Ok(search.await),
+        }
     }
 }
 
@@ -396,6 +448,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         stderr_handler: command.stderr_handler(),
         buffer: command.output_buffer_policy(),
         ok_codes: command.ok_codes_vec(),
+        stdout_piped: command.stdout_is_piped(),
         #[cfg(feature = "cancellation")]
         cancel_token: command.cancel_token(),
     });

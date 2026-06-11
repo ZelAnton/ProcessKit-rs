@@ -257,6 +257,12 @@ impl<R: ProcessRunner> CliClient<R> {
 /// `new()` (real runner), a `Default` impl, `with_runner(runner)`, and
 /// `default_timeout(d)`. Implement the tool's typed methods on it, delegating to
 /// `self.core` — see the crate docs for an example.
+///
+/// D7: this macro is **committed public API**. Because it is `#[macro_export]`,
+/// it lives at the crate root and is a stable part of the surface — kept (rather
+/// than removed in favor of the hand-rolled wrapper) as the supported scaffold
+/// for typed CLI wrappers. The hand-rolled equivalent (a struct wrapping
+/// [`CliClient`]) remains valid and interchangeable.
 #[macro_export]
 macro_rules! cli_client {
     ($(#[$meta:meta])* $vis:vis struct $name:ident => $binary:expr) => {
@@ -475,7 +481,7 @@ mod tests {
             .unwrap();
 
         let call = rec.only_call();
-        assert_eq!(call.cwd.as_deref(), Some(std::ffi::OsStr::new("/repo")));
+        assert_eq!(call.cwd.as_deref(), Some(std::path::Path::new("/repo")));
         assert_eq!(call.args_str(), ["pr", "create", "--title", "T"]);
         assert!(!call.has_flag("--base"), "no --base flag was passed");
     }
