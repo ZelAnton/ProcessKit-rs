@@ -32,6 +32,9 @@ pub processkit::Error::Signalled::signal: core::option::Option<i32>
 pub processkit::Error::Spawn
 pub processkit::Error::Spawn::program: alloc::string::String
 pub processkit::Error::Spawn::source: std::io::error::Error
+pub processkit::Error::Stdin
+pub processkit::Error::Stdin::program: alloc::string::String
+pub processkit::Error::Stdin::source: std::io::error::Error
 pub processkit::Error::Timeout
 pub processkit::Error::Timeout::program: alloc::string::String
 pub processkit::Error::Timeout::timeout: core::time::Duration

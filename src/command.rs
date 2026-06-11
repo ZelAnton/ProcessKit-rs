@@ -153,7 +153,9 @@ impl Command {
         self
     }
 
-    /// Set (or, with a `None` value, remove) an environment variable.
+    /// Set an environment variable for the child. To *remove* an inherited
+    /// variable, use [`env_remove`](Self::env_remove) — `value` here is always a
+    /// value, never `None`.
     pub fn env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
         self.envs.push((
             key.as_ref().to_os_string(),
@@ -1005,7 +1007,9 @@ impl Command {
         JobRunner::new().exit_code(self).await
     }
 
-    /// Run to completion, requiring a zero exit, and return trimmed stdout.
+    /// Run to completion, requiring an **accepted** exit (`0` by default, widened
+    /// by [`ok_codes`](Self::ok_codes)), and return trimmed stdout. Any other
+    /// code is [`Error::Exit`](crate::Error::Exit).
     pub async fn run(&self) -> Result<String> {
         JobRunner::new().run(self).await
     }

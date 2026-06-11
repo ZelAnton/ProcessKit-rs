@@ -123,15 +123,22 @@ impl Stdin {
                 tokio::io::copy(&mut file, sink).await.map(|_| ())
             }
             Source::Reader(reader) => {
-                let mut guard = reader.lock().await;
-                match guard.take() {
+                // B17: take the reader out and release the lock *before* the
+                // copy — the guard temporary drops at the end of this statement.
+                // A concurrent second run then sees `None` (consumed) and gets
+                // prompt EOF instead of blocking for the whole copy.
+                let taken = reader.lock().await.take();
+                match taken {
                     Some(mut r) => tokio::io::copy(&mut r, sink).await.map(|_| ()),
                     None => Ok(()), // already consumed by an earlier run
                 }
             }
             Source::Lines(lines) => {
-                let mut guard = lines.lock().await;
-                match guard.take() {
+                // B17: release the lock before draining the stream (same as
+                // `Reader` above) so a concurrent run isn't held for the whole
+                // stream lifetime.
+                let taken = lines.lock().await.take();
+                match taken {
                     Some(mut stream) => {
                         while let Some(line) = stream.next().await {
                             sink.write_all(line.as_bytes()).await?;
@@ -264,5 +271,42 @@ mod tests {
     #[tokio::test]
     async fn empty_source_writes_nothing() {
         assert!(written(&Stdin::empty()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn second_run_is_not_blocked_by_a_slow_first_run() {
+        // B17: while one run is parked mid-copy on a slow reader, a concurrent
+        // second run on the same (cloned) source must see it already taken and
+        // return promptly — not block on the source mutex for the whole copy.
+        // Before the fix, the guard was held across the copy and this would hang.
+        use std::time::Duration;
+
+        // A reader whose data never arrives and never EOFs: the writer parks.
+        let (_tx, rx) = tokio::io::duplex(64);
+        let stdin = Stdin::from_reader(rx);
+        let stdin2 = stdin.clone();
+
+        // Run 1 takes the reader and parks in the copy (no data, no EOF).
+        let run1 = tokio::spawn(async move {
+            let mut sink = Vec::new();
+            let _ = stdin.write_to(&mut sink).await;
+        });
+        // Let run 1 win the take.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Run 2 must observe the consumed source and finish quickly.
+        let mut sink2 = Vec::new();
+        let second =
+            tokio::time::timeout(Duration::from_secs(2), stdin2.write_to(&mut sink2)).await;
+        assert!(
+            second.is_ok(),
+            "the second run must not block on the source mutex held by the slow first run"
+        );
+        assert!(
+            sink2.is_empty(),
+            "the second run sees the already-consumed source"
+        );
+
+        run1.abort();
     }
 }

@@ -253,13 +253,12 @@ async fn untaken_keep_stdin_open_pipe_is_closed_by_bulk_verbs() {
 
 #[tokio::test]
 #[ignore = "spawns a real subprocess fed a failing stdin source"]
-async fn failing_stdin_source_does_not_fail_the_run() {
+async fn failing_stdin_source_surfaces_as_error_stdin_on_a_successful_run() {
+    use processkit::Error;
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    /// A stdin source whose read fails immediately with a non-broken-pipe
-    /// error — the stdin writer's failure must stay diagnostics-only (a
-    /// `tracing` warn when enabled), never the run's result.
+    /// A stdin source whose read fails immediately with a non-broken-pipe error.
     struct FailingReader;
     impl tokio::io::AsyncRead for FailingReader {
         fn poll_read(
@@ -277,14 +276,62 @@ async fn failing_stdin_source_does_not_fail_the_run() {
     } else {
         Command::new("cat")
     };
-    let result = reads_stdin
+    // B3 (Decision 2): the child sees EOF (the sink is dropped on the writer's
+    // error) and exits 0 — a success — so the stashed non-broken-pipe stdin
+    // failure now surfaces as `Error::Stdin` instead of being swallowed.
+    let err = reads_stdin
         .stdin(processkit::Stdin::from_reader(FailingReader))
         .output_string()
         .await
-        .expect("a failed stdin writer must not surface as Err");
-    // The child saw immediate EOF (the sink is dropped on the writer's
-    // error) and exited cleanly with empty output.
-    assert!(result.is_success(), "result: {result:?}");
+        .expect_err("a failed stdin writer on a successful run must surface as Error::Stdin");
+    assert!(matches!(err, Error::Stdin { .. }), "got: {err:?}");
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess that exits non-zero while its stdin source fails"]
+async fn nonzero_exit_wins_over_a_failing_stdin_source() {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// Yields one line, then fails (non-broken-pipe) — the child consumes the
+    /// line and still exits non-zero.
+    struct OneLineThenFail(bool);
+    impl tokio::io::AsyncRead for OneLineThenFail {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.0 {
+                Poll::Ready(Err(std::io::Error::other("stdin source failed")))
+            } else {
+                self.0 = true;
+                buf.put_slice(b"x\n");
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    // grep/findstr of an absent pattern reads stdin, then exits 1 (no match).
+    let nonzero = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "findstr", "zzz-no-match"])
+    } else {
+        Command::new("grep").arg("zzz-no-match")
+    };
+    // B3 (Decision 2): exit 1 is outside `ok_codes`, so the run is NOT a success
+    // — the stdin failure is dropped, not surfaced. `output_string` returns the
+    // result carrying the real exit code rather than `Err(Error::Stdin)`.
+    let result = nonzero
+        .stdin(processkit::Stdin::from_reader(OneLineThenFail(false)))
+        .output_string()
+        .await
+        .expect("a non-zero exit is a result on output_string, not Err(Stdin)");
+    assert_eq!(
+        result.code(),
+        Some(1),
+        "the real exit code is preserved: {result:?}"
+    );
+    assert!(!result.is_success());
 }
 
 #[tokio::test]

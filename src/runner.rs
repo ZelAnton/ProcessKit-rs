@@ -60,7 +60,9 @@ impl<R: ProcessRunner + ?Sized> ProcessRunner for &R {
 /// `&dyn ProcessRunner`), layered over [`output`](ProcessRunner::output).
 #[async_trait::async_trait]
 pub trait ProcessRunnerExt: ProcessRunner {
-    /// Run, require a zero exit, and return trimmed stdout.
+    /// Run, require an **accepted** exit, and return trimmed stdout. Accepted is
+    /// `0` by default, widened by [`Command::ok_codes`](crate::Command::ok_codes);
+    /// any other code is [`Error::Exit`](crate::Error::Exit).
     async fn run(&self, command: &Command) -> Result<String> {
         Ok(self
             .checked(command)
@@ -70,7 +72,8 @@ pub trait ProcessRunnerExt: ProcessRunner {
             .to_owned())
     }
 
-    /// Run for the side effect: require a zero exit, discard the output.
+    /// Run for the side effect: require an **accepted** exit (`0`, or any code in
+    /// [`Command::ok_codes`](crate::Command::ok_codes)), discard the output.
     async fn run_unit(&self, command: &Command) -> Result<()> {
         self.checked(command).await.map(drop)
     }

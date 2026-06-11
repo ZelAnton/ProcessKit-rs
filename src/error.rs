@@ -210,6 +210,35 @@ pub enum Error {
         signal: Option<i32>,
     },
 
+    /// The child ran but feeding its standard input failed for a reason other
+    /// than the routine broken pipe.
+    ///
+    /// Per [Decision 2], this is raised by the consuming paths **only when the
+    /// run otherwise succeeded** — a non-zero [`Exit`](Error::Exit), a
+    /// [`Signalled`](Error::Signalled), or a [`Timeout`](Error::Timeout) is the
+    /// "realer" failure and wins (the stdin error is then dropped). A broken
+    /// pipe (`EPIPE` / `ERROR_BROKEN_PIPE` — the child closing stdin before
+    /// reading all of it) is routine and **never** surfaces. Diagnoses a
+    /// silently-truncated input the otherwise-successful child may have acted on.
+    ///
+    /// [Decision 2]: the stdin source ([`Command::stdin`](crate::Command::stdin))
+    /// is written on a background task; this carries that task's failure.
+    ///
+    /// The io-level classifiers ([`is_transient`](Error::is_transient),
+    /// [`is_not_found`](Error::is_not_found),
+    /// [`is_permission_denied`](Error::is_permission_denied)) deliberately return
+    /// `false` here: they classify spawn/launch conditions, and the run already
+    /// *succeeded* — a blanket retry would re-run a command that worked. Inspect
+    /// `source` directly if a stdin-specific retry is wanted.
+    #[error("failed to write to `{program}` stdin: {source}")]
+    Stdin {
+        /// The program whose standard-input write failed.
+        program: String,
+        /// The underlying IO error (never a broken pipe).
+        #[source]
+        source: std::io::Error,
+    },
+
     /// An IO error occurred while driving the process (reading a pipe, writing
     /// stdin, waiting for exit).
     #[error(transparent)]
@@ -367,6 +396,11 @@ impl fmt::Debug for Error {
                 .debug_struct("Signalled")
                 .field("program", program)
                 .field("signal", signal)
+                .finish(),
+            Error::Stdin { program, source } => f
+                .debug_struct("Stdin")
+                .field("program", program)
+                .field("source", source)
                 .finish(),
             Error::Io(source) => f.debug_tuple("Io").field(source).finish(),
         }

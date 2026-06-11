@@ -13,6 +13,8 @@ to a dated version section.
 
 ### Added
 
+- `Error::Stdin { program, source }` — a non-broken-pipe stdin-writer failure surfaced on an
+  otherwise-successful run (see the Phase H stdin fixes below).
 - `StdioMode` enum (`Piped` / `Inherit` / `Null`) + `Command::stdout(mode)` /
   `Command::stderr(mode)` builders — control per-stream connection independently.
   `Piped` (the default) captures as before; `Inherit` lets the child share the parent's
@@ -71,6 +73,23 @@ to a dated version section.
   (e.g. `"./tool"`) passed to `Command::new` resolves against the *caller's* cwd, not
   the directory set here — use an absolute path for the program when combining
   `current_dir` with a relative-path executable.
+
+### Fixed (Phase H — stdin)
+
+- A stdin-writer failure is no longer silently swallowed: a non-broken-pipe error feeding the
+  child's standard input now surfaces as the new `Error::Stdin { program, source }` — **but
+  only when the run otherwise succeeded** (a non-zero exit, signal, or timeout is the "realer"
+  failure and wins; a broken pipe, the child closing stdin early, never surfaces). Diagnoses a
+  silently-truncated input the otherwise-successful child may have acted on.
+- `Stdin::write_to` now releases the one-shot source mutex *before* the copy/stream (B17), so a
+  concurrent second run on a cloned `Stdin` sees the consumed source and gets prompt EOF instead
+  of blocking on the lock for the whole copy.
+- `wait_any` / `wait_all` now close an untaken `keep_stdin_open` pipe (L5), matching the bulk
+  verbs — a stdin-reading child joined via the race path sees EOF instead of blocking forever
+  (the race path applies no timeout).
+- Doc fixes (L12): `run` / `run_unit` document that `ok_codes` widens the accepted exit set;
+  `Command::env`'s doc no longer falsely claims a `None` value removes a variable (use
+  `env_remove`).
 
 ### Security (Phase G — security / hygiene)
 

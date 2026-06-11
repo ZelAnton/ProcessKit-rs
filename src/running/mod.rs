@@ -19,7 +19,6 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
 
 use crate::buffer::OutputBufferPolicy;
-#[cfg(feature = "cancellation")]
 use crate::error::Error;
 use crate::error::Result;
 use crate::group::ProcessGroup;
@@ -117,6 +116,11 @@ pub struct RunningProcess {
     // The background stderr-drain task started by `stdout_lines`/`output_events`,
     // awaited by `finish_streamed`/`finish_events` so no trailing line is missed.
     stderr_pump: Option<JoinHandle<()>>,
+    // B3: a non-broken-pipe stdin-writer failure stashed by `observe_stdin_task`,
+    // surfaced as `Error::Stdin` by `checked_outcome` when the run otherwise
+    // succeeded (a non-zero exit / signal / timeout wins). `None` = no failure
+    // (or the routine broken pipe, which never stashes).
+    stdin_error: Option<std::io::Error>,
     // A timer started by `stdout_lines` when a timeout is set: kills the tree at
     // the deadline so a streamed run can't hang forever. Aborted on drop.
     deadline_task: Option<JoinHandle<()>>,
@@ -304,6 +308,7 @@ impl RunningProcess {
             stderr_sink: None,
             stdout_pump: None,
             stderr_pump: None,
+            stdin_error: None,
             deadline_task: None,
             #[cfg(feature = "cancellation")]
             cancel_token: s.cancel_token,
@@ -338,6 +343,7 @@ impl RunningProcess {
             stderr_sink: None,
             stdout_pump: None,
             stderr_pump: None,
+            stdin_error: None,
             deadline_task: None,
             #[cfg(feature = "cancellation")]
             cancel_token: command.cancel_token(),
@@ -648,6 +654,15 @@ impl RunningProcess {
     /// Aborts watchdog tasks after reap to prevent late-firing deadline/cancel
     /// tasks from sending signals to a recycled pid (B1/B2 fix).
     pub(crate) async fn wait_exit(&mut self) -> Result<Outcome> {
+        // L5: close a `keep_stdin_open` pipe nobody took, so a stdin-reading
+        // child sees EOF instead of blocking forever — `wait_exit` (the
+        // `wait_any`/`wait_all` path) applies no timeout, so a held-open stdin
+        // would hang the race. A writer the caller took via `standard_input()`
+        // moved the pipe out of `self`, making this a no-op. Mirrors
+        // `drive_to_exit`'s close.
+        if let Backend::Real(real) = &mut self.backend {
+            drop(real.stdin_pipe.take());
+        }
         let outcome = self.backend_wait().await?;
         // Reap happened: abort watchdogs and clear pid before returning.
         // This mirrors the `abort_watchdogs` call in `drive_to_exit` and
@@ -894,7 +909,7 @@ impl RunningProcess {
     /// outcome classification, so cancellation beats a simultaneous timeout.
     /// Centralizing it here makes the documented invariant structural instead
     /// of per-consumer copy-paste discipline.
-    fn checked_outcome(&self, outcome: Outcome) -> Result<Outcome> {
+    fn checked_outcome(&mut self, outcome: Outcome) -> Result<Outcome> {
         // Use the pre-pump snapshot rather than a live token read: prevents
         // a cancel that fires during `join_pumps` from discarding real output.
         // `unwrap_or(false)`: None means not yet snapshotted — only reachable
@@ -906,41 +921,63 @@ impl RunningProcess {
                 program: self.program.clone(),
             });
         }
+        // B3 (Decision 2): a stashed non-broken-pipe stdin-writer failure
+        // surfaces as `Error::Stdin` — but **only when the run otherwise
+        // succeeded**. A non-zero exit, signal, or timeout is the "realer"
+        // failure and wins: it stays in `outcome` for the caller's helpers
+        // (`ensure_success`/`require_code`) to classify, and the stdin error is
+        // dropped. Cancellation already returned above. (Surfacing here, before
+        // the per-verb fail-loud overflow check, means a run that both
+        // overflowed *and* failed stdin reports `Stdin` — both are valid
+        // "otherwise-succeeded" errors and the case is pathological.)
+        let succeeded = matches!(outcome, Outcome::Exited(code) if self.ok_codes.contains(&code));
+        if succeeded && let Some(source) = self.stdin_error.take() {
+            return Err(Error::Stdin {
+                program: self.program.clone(),
+                source,
+            });
+        }
         Ok(outcome)
     }
 
-    /// Surface a stdin writer that failed for a reason other than the normal
+    /// Observe a stdin writer that failed for a reason other than the normal
     /// broken pipe (the child exiting before reading all of stdin is routine
-    /// and tested). Only a writer that already **finished** is observed — a
-    /// task still parked (e.g. on a slow `from_reader` source) is left for
-    /// `Drop`'s abort, so teardown timing is unchanged. Diagnostics only:
-    /// never alters the run's result.
+    /// and tested), stashing it in `self.stdin_error` for `checked_outcome` to
+    /// surface as [`Error::Stdin`] (B3). Only a writer that already **finished**
+    /// is observed — a task still parked (e.g. on a slow `from_reader` source)
+    /// is left for `Drop`'s abort, so teardown timing is unchanged.
     async fn observe_stdin_task(&mut self) {
-        let Backend::Real(real) = &mut self.backend else {
-            return;
+        // Take the task out (dropping the `&mut self.backend` borrow before we
+        // touch `self.program`/`self.stdin_error`).
+        let task = match &mut self.backend {
+            Backend::Real(real) => real.stdin_task.take(),
+            Backend::Scripted(_) => None,
         };
-        let Some(task) = real.stdin_task.take() else {
+        let Some(task) = task else {
             return;
         };
         if !task.is_finished() {
-            real.stdin_task = Some(task);
+            // Not done — put it back for `Drop` to abort; only a finished
+            // writer is observed, so teardown timing is unchanged.
+            if let Backend::Real(real) = &mut self.backend {
+                real.stdin_task = Some(task);
+            }
             return;
         }
         // The task is finished, so this await is immediate.
-        match task.await {
-            Ok(Err(e)) if !is_broken_pipe(&e) => {
-                #[cfg(feature = "tracing")]
-                tracing::warn!(
-                    target: "processkit",
-                    program = %self.program,
-                    error = %e,
-                    "stdin writer failed"
-                );
-                #[cfg(not(feature = "tracing"))]
-                let _ = e;
-            }
-            // Clean completion, the routine broken pipe, or an abort.
-            _ => {}
+        if let Ok(Err(e)) = task.await
+            && !is_broken_pipe(&e)
+        {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                target: "processkit",
+                program = %self.program,
+                error = %e,
+                "stdin writer failed"
+            );
+            // B3: stash so `checked_outcome` surfaces it as `Error::Stdin` when
+            // the run otherwise succeeded.
+            self.stdin_error = Some(e);
         }
     }
 
@@ -1340,5 +1377,77 @@ async fn join_pumps(tasks: Vec<JoinHandle<()>>) {
         for abort in aborts {
             abort.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::command::Command;
+    use crate::doubles::{Reply, ScriptedRunner};
+    use crate::runner::ProcessRunner;
+
+    /// A scripted (hermetic) handle for `tool`, with the given `ok_codes`.
+    async fn scripted_handle(ok_codes: &[i32]) -> RunningProcess {
+        let cmd = Command::new("tool").ok_codes(ok_codes.iter().copied());
+        ScriptedRunner::new()
+            .fallback(Reply::ok(""))
+            .start(&cmd)
+            .await
+            .expect("scripted start")
+    }
+
+    /// B3 (Decision 2): a stashed non-broken-pipe stdin failure surfaces as
+    /// `Error::Stdin` only on an otherwise-successful outcome; a non-zero exit
+    /// or a signal is the "realer" failure and wins (outcome passed through).
+    #[tokio::test]
+    async fn stdin_error_surfaces_only_on_a_successful_outcome() {
+        let mut run = scripted_handle(&[0]).await;
+        run.stdin_error = Some(std::io::Error::other("boom"));
+        match run.checked_outcome(Outcome::Exited(0)) {
+            Err(Error::Stdin { program, source }) => {
+                assert_eq!(program, "tool");
+                assert_eq!(source.to_string(), "boom");
+            }
+            other => panic!("expected Error::Stdin, got {other:?}"),
+        }
+
+        // Non-zero exit wins: outcome returned for the caller's classifier.
+        let mut run = scripted_handle(&[0]).await;
+        run.stdin_error = Some(std::io::Error::other("boom"));
+        assert!(matches!(
+            run.checked_outcome(Outcome::Exited(7)),
+            Ok(Outcome::Exited(7))
+        ));
+
+        // A signal wins too (not a success).
+        let mut run = scripted_handle(&[0]).await;
+        run.stdin_error = Some(std::io::Error::other("boom"));
+        assert!(matches!(
+            run.checked_outcome(Outcome::Signalled(Some(9))),
+            Ok(Outcome::Signalled(Some(9)))
+        ));
+    }
+
+    /// The success gate honors `ok_codes`: a code widened to "accepted" is a
+    /// success, so the stdin failure surfaces there too.
+    #[tokio::test]
+    async fn stdin_error_respects_ok_codes_widened_success() {
+        let mut run = scripted_handle(&[0, 3]).await;
+        run.stdin_error = Some(std::io::Error::other("boom"));
+        assert!(matches!(
+            run.checked_outcome(Outcome::Exited(3)),
+            Err(Error::Stdin { .. })
+        ));
+    }
+
+    /// With no stashed stdin error, `checked_outcome` is a clean passthrough.
+    #[tokio::test]
+    async fn no_stdin_error_is_a_clean_passthrough() {
+        let mut run = scripted_handle(&[0]).await;
+        assert!(matches!(
+            run.checked_outcome(Outcome::Exited(0)),
+            Ok(Outcome::Exited(0))
+        ));
     }
 }
