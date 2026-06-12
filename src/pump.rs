@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use encoding_rs::Encoding;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Notify;
 
 use crate::buffer::{OutputBufferPolicy, OverflowMode};
@@ -192,9 +192,9 @@ impl SharedLines {
     }
 }
 
-/// Drain `reader` line by line into `sink`, decoding each line with `encoding`
-/// and invoking `handler` (if any). Always reads to EOF so the child never
-/// blocks on a full pipe; on an IO error it stops and closes the sink.
+/// Drain `reader` into `sink` line by line, decoding text with `encoding` and
+/// invoking `handler` (if any). Always reads to EOF so the child never blocks
+/// on a full pipe; on an IO error it flushes what it has and closes the sink.
 ///
 /// A **panicking handler does not poison the run**: the panic is caught, the
 /// handler is disabled for the rest of the run (and the fact surfaced as a
@@ -203,12 +203,21 @@ impl SharedLines {
 /// callback seam is handed to consumers' consumers, so "panic-free or else"
 /// is not a re-exportable contract.
 ///
-/// Lines are split on byte `\n` and stripped of a trailing `\r`, then decoded —
-/// correct for UTF-8 and the ASCII-compatible legacy encodings `encoding_rs`
-/// exposes (Windows-1252, Shift-JIS, GBK, …), whose multibyte sequences never
-/// contain `0x0A`.
+/// **Decoding (Б7/Э3):** bytes are fed through a single persistent
+/// `encoding_rs::Decoder` and the *decoded* text is split on the `\n`
+/// character — correct for every encoding, including non-ASCII-compatible ones
+/// (UTF-16LE/BE, whose code units contain `0x0A` bytes that are *not* line
+/// breaks) and stateful ones (ISO-2022-JP shift state carries across reads).
+/// One persistent decoder also means a byte-order mark is handled once at the
+/// stream start (`with_bom_removal`: a leading BOM *of the chosen encoding* is
+/// stripped, never a foreign one — so a legacy line that happens to start with
+/// BOM-looking bytes is not silently re-decoded as UTF-16). Each line is
+/// stripped of its `\n` and, if present, exactly **one** preceding `\r`
+/// (Э1: a CRLF terminator — not every trailing CR). The final line is emitted
+/// even without a trailing newline, on both EOF and a mid-stream read error
+/// (Э2: the partial tail is flushed, not dropped).
 pub(crate) async fn pump_lines<R>(
-    reader: R,
+    mut reader: R,
     encoding: &'static Encoding,
     handler: Option<LineHandler>,
     sink: Arc<SharedLines>,
@@ -227,31 +236,14 @@ pub(crate) async fn pump_lines<R>(
     let sink = CloseOnDrop(sink);
     let mut handler = handler;
 
-    let mut reader = BufReader::new(reader);
-    let mut buf = Vec::new();
-    loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf).await {
-            Ok(0) => break,
-            Ok(_) => {}
-            // An IO error mid-stream: stop draining; the child will be reaped by
-            // its group. Treat as end-of-output.
-            Err(_) => break,
-        }
-        while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
-            buf.pop();
-        }
-        let (decoded, _, _) = encoding.decode(&buf);
-        let line = decoded.into_owned();
-        if let Some(h) = &handler {
-            // Isolate a panicking user handler: disable it for the rest of
-            // the run and keep pumping (capture is never the casualty of a
-            // progress callback). AssertUnwindSafe is sound here: the handler
-            // is `Fn` (no &mut state to observe torn) and is dropped right
-            // after the panic.
+    // Emit one decoded line: run the (panic-isolated) handler, then buffer it.
+    fn emit(handler: &mut Option<LineHandler>, sink: &SharedLines, line: String) {
+        if let Some(h) = handler {
+            // AssertUnwindSafe is sound: the handler is `Fn` (no `&mut` state to
+            // observe torn) and is dropped right after a panic.
             let invoked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(&line)));
             if invoked.is_err() {
-                handler = None;
+                *handler = None;
                 #[cfg(feature = "tracing")]
                 tracing::warn!(
                     target: "processkit",
@@ -259,9 +251,47 @@ pub(crate) async fn pump_lines<R>(
                 );
             }
         }
-        sink.0.push(line);
+        sink.push(line);
     }
-    // `sink` (the guard) closes here on normal completion too.
+
+    let mut decoder = encoding.new_decoder_with_bom_removal();
+    let mut pending = String::new(); // decoded text not yet split into a line
+    let mut chunk = [0u8; 8192];
+    loop {
+        // Treat a read error like EOF: flush what we have and stop (the child is
+        // reaped by its group). `last` triggers the decoder's end-of-stream
+        // flush (a trailing incomplete sequence becomes one replacement char).
+        let (n, last) = match reader.read(&mut chunk).await {
+            Ok(0) => (0, true),
+            Ok(n) => (n, false),
+            Err(_) => (0, true),
+        };
+        // Reserve the decoder's worst-case output up front so `decode_to_string`
+        // (which uses the `String`'s spare capacity as its output limit, never
+        // reallocating) consumes the whole chunk in one call.
+        if let Some(need) = decoder.max_utf8_buffer_length(n) {
+            pending.reserve(need);
+        }
+        let _ = decoder.decode_to_string(&chunk[..n], &mut pending, last);
+
+        // Split out every complete line decoded so far.
+        while let Some(nl) = pending.find('\n') {
+            let mut line: String = pending.drain(..=nl).collect();
+            line.pop(); // drop the '\n'
+            if line.ends_with('\r') {
+                line.pop(); // drop exactly one preceding '\r' (CRLF)
+            }
+            emit(&mut handler, &sink.0, line);
+        }
+        if last {
+            // Flush a final line that ended at EOF/error without a newline.
+            if !pending.is_empty() {
+                emit(&mut handler, &sink.0, std::mem::take(&mut pending));
+            }
+            break;
+        }
+    }
+    // `sink` (the guard) closes here.
 }
 
 #[cfg(test)]
@@ -536,5 +566,139 @@ mod tests {
             matches!(sink.try_pop(), Popped::Closed),
             "sink closes normally after the drain"
         );
+    }
+
+    /// A reader that yields predefined byte chunks one `poll_read` at a time,
+    /// then EOFs (or returns one IO error) — to exercise cross-read decoding and
+    /// the mid-stream-error flush deterministically.
+    struct ChunkedReader {
+        chunks: VecDeque<Vec<u8>>,
+        err_at_end: bool,
+    }
+
+    impl ChunkedReader {
+        fn new(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self {
+                chunks: chunks.into_iter().collect(),
+                err_at_end: false,
+            }
+        }
+
+        fn erroring(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self {
+                chunks: chunks.into_iter().collect(),
+                err_at_end: true,
+            }
+        }
+    }
+
+    impl AsyncRead for ChunkedReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if let Some(chunk) = self.chunks.pop_front() {
+                let n = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..n]);
+                if n < chunk.len() {
+                    self.chunks.push_front(chunk[n..].to_vec());
+                }
+                std::task::Poll::Ready(Ok(()))
+            } else if self.err_at_end {
+                self.err_at_end = false;
+                std::task::Poll::Ready(Err(std::io::Error::other("boom")))
+            } else {
+                std::task::Poll::Ready(Ok(())) // 0 bytes filled == EOF
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn utf16le_lines_decode_and_split_correctly() {
+        // Б7: "AB\nCD\n" in UTF-16LE. Each `\n` is the byte pair `0A 00`; the
+        // `0A` is a real newline but the trailing `00` is part of the code unit.
+        // A byte-level split on `0A` would graft that `00` onto the next line —
+        // the streaming decoder splits the *decoded* text instead.
+        let bytes = [
+            0x41, 0x00, 0x42, 0x00, 0x0A, 0x00, // A B \n
+            0x43, 0x00, 0x44, 0x00, 0x0A, 0x00, // C D \n
+        ];
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(&bytes[..], encoding_rs::UTF_16LE, None, sink.clone()).await;
+        assert_eq!(sink.drain(), vec!["AB", "CD"]);
+    }
+
+    #[tokio::test]
+    async fn utf16le_code_unit_split_across_reads_is_reassembled() {
+        // Б7: a 2-byte code unit straddles a read boundary. A per-read decode
+        // would mangle it; the persistent decoder holds the partial unit until
+        // the next chunk. Chunks: [41 00 42] then [00 0A 00] → "AB".
+        let reader = ChunkedReader::new([vec![0x41, 0x00, 0x42], vec![0x00, 0x0A, 0x00]]);
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(reader, encoding_rs::UTF_16LE, None, sink.clone()).await;
+        assert_eq!(sink.drain(), vec!["AB"]);
+    }
+
+    #[tokio::test]
+    async fn utf16le_leading_bom_is_removed_once() {
+        // FF FE is the UTF-16LE BOM; `with_bom_removal` strips it once at the
+        // stream start, leaving the content line.
+        let bytes = [0xFF, 0xFE, 0x41, 0x00, 0x0A, 0x00];
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(&bytes[..], encoding_rs::UTF_16LE, None, sink.clone()).await;
+        assert_eq!(sink.drain(), vec!["A"]);
+    }
+
+    #[tokio::test]
+    async fn utf8_leading_bom_is_removed_once_not_per_line() {
+        // A leading UTF-8 BOM (EF BB BF) is stripped once at the start; later
+        // lines are untouched (the BOM handling is not re-run per line).
+        let bytes = [0xEF, 0xBB, 0xBF, b'h', b'i', b'\n', b'b', b'y', b'e', b'\n'];
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(&bytes[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(sink.drain(), vec!["hi", "bye"]);
+    }
+
+    #[tokio::test]
+    async fn strips_exactly_one_trailing_cr_not_all() {
+        // Э1: in "data\r\r\n" only the CR forming the CRLF is a terminator; the
+        // earlier CR is content. Must yield "data\r", not "data".
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(&b"data\r\r\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(sink.drain(), vec!["data\r"]);
+    }
+
+    #[tokio::test]
+    async fn lone_trailing_cr_at_eof_is_kept_as_content() {
+        // A `\r` with no following `\n` is data, not a terminator (`read_until`
+        // never split on it; the decoded-split must not either).
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(&b"tail\r"[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(sink.drain(), vec!["tail\r"]);
+    }
+
+    #[tokio::test]
+    async fn mid_stream_read_error_flushes_the_partial_tail() {
+        // Э2: a complete line, then a partial line, then an IO error. The partial
+        // tail must still be emitted, not silently dropped (the EOF path already
+        // flushed it; the error path must too).
+        let reader = ChunkedReader::erroring([b"done\npart".to_vec()]);
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(sink.count(), 2, "the partial tail still counts");
+        assert_eq!(sink.drain(), vec!["done", "part"]);
+    }
+
+    #[tokio::test]
+    async fn legacy_line_starting_with_bom_bytes_is_not_resniffed() {
+        // Э3: a Windows-1252 line legitimately starting with FF FE (ÿþ) must stay
+        // Windows-1252, not be silently re-decoded as UTF-16LE. The old per-line
+        // `Encoding::decode` sniffed a BOM on every line; one persistent decoder
+        // (with_bom_removal of *this* encoding only) does not.
+        let bytes = [0xFF, 0xFE, b'x', b'\n'];
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(&bytes[..], encoding_rs::WINDOWS_1252, None, sink.clone()).await;
+        assert_eq!(sink.drain(), vec!["\u{00FF}\u{00FE}x"]);
     }
 }
