@@ -40,12 +40,14 @@ async fn streaming_honors_timeout() {
         "stream did not end at the deadline (took {:?})",
         start.elapsed()
     );
-    // The tree was killed at the deadline. The exact code is platform-dependent
-    // (None on a Unix signal-kill, a nonzero code on a Windows Job kill), so the
-    // guarantee under test is "ended promptly and not a clean success".
-    assert!(
-        !matches!(outcome, Outcome::Exited(0)),
-        "a timed-out streamed run must not look successful (got {outcome:?})"
+    // Б1: a timed-out streamed run reports `Outcome::TimedOut` deterministically
+    // on every platform — the watchdog sets the shared `timed_out` flag before
+    // killing the tree, even on this no-grace path — so we assert it exactly
+    // rather than just "not a clean success".
+    assert_eq!(
+        outcome,
+        Outcome::TimedOut,
+        "a timed-out streamed run must report TimedOut (got {outcome:?})"
     );
     assert!(seen.iter().any(|l| l.contains("one")), "saw: {seen:?}");
 }

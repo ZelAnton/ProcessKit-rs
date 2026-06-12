@@ -11,6 +11,7 @@ mod stream;
 pub use stream::{OutputEvent, OutputEvents, StdoutLines, StreamedFinish};
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use encoding_rs::Encoding;
@@ -29,6 +30,16 @@ use crate::stdin::ProcessStdin;
 /// How long teardown waits for output pumps to finish before aborting them, so a
 /// surviving grandchild holding a pipe can't hang the run.
 const PUMP_TEARDOWN: Duration = Duration::from_secs(5);
+
+// Timeout-arbitration states for `RunningProcess::timeout_state` (Б1/F1).
+// `PENDING` until the run resolves; whichever of the natural reap (claims
+// `EXITED` in `backend_wait`) or a fired deadline (the streaming watchdog / the
+// bulk deadline arm claim `TIMED_OUT`) first `compare_exchange`s from `PENDING`
+// wins. This single CAS arbiter makes "timed out vs exited" race-free even when
+// the child exits within a scheduler quantum of the deadline.
+const TS_PENDING: u8 = 0;
+const TS_EXITED: u8 = 1;
+const TS_TIMED_OUT: u8 = 2;
 
 /// What [`RunningProcess::finish_lines`] hands back to its thin public verbs.
 struct Finished {
@@ -130,6 +141,17 @@ pub struct RunningProcess {
     // A timer started by `stdout_lines` when a timeout is set: kills the tree at
     // the deadline so a streamed run can't hang forever. Aborted on drop.
     deadline_task: Option<JoinHandle<()>>,
+    // Б1/F1: timeout arbitration (`TS_PENDING`/`TS_EXITED`/`TS_TIMED_OUT`).
+    // Whichever of the natural reap (`backend_wait` claims `EXITED`) or a fired
+    // deadline (the streaming `deadline_task` watchdog / the bulk
+    // `drive_to_exit_inner` deadline arm claim `TIMED_OUT`) first
+    // `compare_exchange`s from `PENDING` wins; `classify_timed_out` reports
+    // `Outcome::TimedOut` iff the deadline won. The single CAS arbiter makes the
+    // streamed-timeout-vs-natural-exit boundary race-free (a child that exits on
+    // its own within a scheduler quantum of the deadline reports its real exit,
+    // not a spurious TimedOut, even though the detached watchdog's timer fired).
+    // Shared (`Arc`) because the watchdog is a detached task.
+    timeout_state: Arc<AtomicU8>,
     #[cfg(feature = "cancellation")]
     cancel_token: Option<tokio_util::sync::CancellationToken>,
     // Armed by `arm_cancel_watchdog` at spawn time (via `launch`/`attach_group`)
@@ -317,6 +339,7 @@ impl RunningProcess {
             stdin_error: None,
             stdout_piped: s.stdout_piped,
             deadline_task: None,
+            timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
             #[cfg(feature = "cancellation")]
             cancel_token: s.cancel_token,
             #[cfg(feature = "cancellation")]
@@ -353,6 +376,7 @@ impl RunningProcess {
             stdin_error: None,
             stdout_piped: command.stdout_is_piped(),
             deadline_task: None,
+            timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
             #[cfg(feature = "cancellation")]
             cancel_token: command.cancel_token(),
             #[cfg(feature = "cancellation")]
@@ -769,6 +793,16 @@ impl RunningProcess {
         #[cfg(feature = "cancellation")]
         if self.cancel_at_exit.is_some() {
             let outcome = self.backend_wait().await?;
+            // Э8/F2: observe the stdin writer here too. If the first observation
+            // was a readiness probe (`has_exited_now`, which snapshots
+            // `cancel_at_exit` but does not observe stdin), this repeat path is
+            // where a genuine `Error::Stdin` surfaces. Idempotent: once the task
+            // was taken (a prior `wait_exit`/consuming verb), this is a no-op.
+            self.observe_stdin_task().await;
+            // Б1: classify a streamed timeout (the watchdog claimed `TimedOut`) as
+            // TimedOut here too — `wait_any`/`wait_all` must match `drive_to_exit`
+            // (classify before checked_outcome so cancellation still wins).
+            let outcome = self.classify_timed_out(outcome);
             return self.checked_outcome(outcome);
         }
         let outcome = self.backend_wait().await?;
@@ -792,6 +826,11 @@ impl RunningProcess {
         // `wait_all` path too (parity with `finish_lines`' B3 contract;
         // previously this path never observed the writer, silently losing it).
         self.observe_stdin_task().await;
+        // Б1: a streamed run whose deadline fired (the watchdog set `timed_out`)
+        // must report `Outcome::TimedOut` through `wait_any`/`wait_all` too —
+        // matching `drive_to_exit`. Classify before `checked_outcome` so
+        // cancellation still takes precedence.
+        let outcome = self.classify_timed_out(outcome);
         self.checked_outcome(outcome)
     }
 
@@ -1139,7 +1178,8 @@ impl RunningProcess {
         // already-reaped child — safe and cheap.
         #[cfg(feature = "cancellation")]
         if self.cancel_at_exit.is_some() {
-            return self.backend_wait().await;
+            let outcome = self.backend_wait().await?;
+            return Ok(self.classify_timed_out(outcome));
         }
         let outcome = self.drive_to_exit_inner().await?;
         // The child is reaped (or being reaped) — the watchdogs' job is done.
@@ -1161,6 +1201,7 @@ impl RunningProcess {
             self.cancel_at_exit =
                 Some(self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()));
         }
+        let outcome = self.classify_timed_out(outcome);
         #[cfg(feature = "tracing")]
         tracing::debug!(
             target: "processkit",
@@ -1172,16 +1213,32 @@ impl RunningProcess {
         Ok(outcome)
     }
 
+    /// Б1: a run whose deadline fired (set by the streaming `deadline_task`
+    /// watchdog or the bulk deadline arm) is `Outcome::TimedOut` regardless of
+    /// what `backend_wait` observed — a child that catches the signal and exits
+    /// cleanly within the grace still timed out. Deterministic and consistent
+    /// across the bulk and streamed paths. Cancellation still wins: it is
+    /// classified later in `checked_outcome` (which runs after this).
+    fn classify_timed_out(&self, outcome: Outcome) -> Outcome {
+        // Acquire pairs with the arbiter's AcqRel `compare_exchange`s. The run is
+        // TimedOut iff a deadline won the CAS race against the natural reap (F1).
+        if self.timeout_state.load(Ordering::Acquire) == TS_TIMED_OUT {
+            Outcome::TimedOut
+        } else {
+            outcome
+        }
+    }
+
     /// The raw exit wait — no timeout/cancel applied. Real: the child's
     /// `wait()`, mapping the exit status to an [`Outcome`] (capturing the Unix
     /// signal number when the platform reports one). Scripted: resolve at the
     /// canned `exit_at` (never, for a pending script); a killed script
     /// resolves immediately as `Signalled`, like a killed child.
     async fn backend_wait(&mut self) -> Result<Outcome> {
-        match &mut self.backend {
+        let outcome = match &mut self.backend {
             Backend::Real(real) => {
                 let status = real.child.wait().await?;
-                let outcome = match status.code() {
+                match status.code() {
                     Some(code) => Outcome::Exited(code),
                     None => {
                         #[cfg(unix)]
@@ -1192,33 +1249,49 @@ impl RunningProcess {
                         #[cfg(not(unix))]
                         Outcome::Signalled(None)
                     }
-                };
-                Ok(outcome)
+                }
             }
             Backend::Scripted(s) => {
                 if s.killed {
-                    return Ok(Outcome::Signalled(None));
-                }
-                match s.exit_at {
-                    Some(at) => {
-                        tokio::time::sleep_until(at).await;
-                        Ok(match (s.code, s.timed_out) {
-                            (_, true) => Outcome::TimedOut,
-                            (Some(code), false) => Outcome::Exited(code),
-                            (None, false) => Outcome::Signalled(s.signal),
-                        })
+                    Outcome::Signalled(None)
+                } else {
+                    match s.exit_at {
+                        Some(at) => {
+                            tokio::time::sleep_until(at).await;
+                            match (s.code, s.timed_out) {
+                                (_, true) => Outcome::TimedOut,
+                                (Some(code), false) => Outcome::Exited(code),
+                                (None, false) => Outcome::Signalled(s.signal),
+                            }
+                        }
+                        None => std::future::pending().await,
                     }
-                    None => std::future::pending().await,
                 }
             }
-        }
+        };
+        // F1: claim the natural reap (PENDING -> EXITED). If a streaming deadline
+        // watchdog whose timer fired in the same instant already won the race
+        // (PENDING -> TIMED_OUT), this CAS fails and the run stays TimedOut — so a
+        // child that exits on its own near the deadline is never misclassified.
+        let _ = self.timeout_state.compare_exchange(
+            TS_PENDING,
+            TS_EXITED,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+        Ok(outcome)
     }
 
     /// Without the `cancellation` feature: the plain timeout/no-timeout shape.
     #[cfg(not(feature = "cancellation"))]
     async fn drive_to_exit_inner(&mut self) -> Result<Outcome> {
         match self.timeout {
-            Some(limit) => {
+            // Э10: when a streaming `deadline_task` watchdog already owns the
+            // deadline, do NOT arm a second timeout here — it would deliver the
+            // graceful signal a second time. Fall through to a plain wait; the
+            // watchdog kills at the deadline and sets `timed_out`, which
+            // `drive_to_exit` reads to classify the run as `TimedOut` (Б1).
+            Some(limit) if self.deadline_task.is_none() => {
                 // Anchor the deadline to spawn time (`self.started`): consuming
                 // verbs called long after spawn must not re-grant the full limit.
                 let remaining = limit
@@ -1239,12 +1312,19 @@ impl RunningProcess {
                             timeout_ms = limit.as_millis() as u64,
                             "timeout elapsed; killing the tree"
                         );
+                        let _ = self.timeout_state.compare_exchange(
+                            TS_PENDING,
+                            TS_TIMED_OUT,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        );
                         self.teardown_on_timeout().await;
                         Ok(Outcome::TimedOut)
                     }
                 }
             }
-            None => self.backend_wait().await,
+            // No timeout, or the streaming watchdog owns it: just wait.
+            _ => self.backend_wait().await,
         }
     }
 
@@ -1265,6 +1345,11 @@ impl RunningProcess {
         let limit = self.timeout;
         let token = self.cancel_token.clone();
         let started = self.started;
+        // Э10: when a streaming `deadline_task` watchdog already owns the
+        // deadline, disable this select's deadline arm — otherwise the graceful
+        // signal is delivered twice (watchdog + here). The watchdog kills at the
+        // deadline and sets `timed_out`, which `drive_to_exit` reads to classify.
+        let watchdog_owns_deadline = self.deadline_task.is_some();
         let cancelled = async {
             match &token {
                 Some(token) => token.cancelled().await,
@@ -1275,13 +1360,13 @@ impl RunningProcess {
         // spawn must not re-grant the full limit (B7 fix).
         let deadline = async move {
             match limit {
-                Some(limit) => {
+                Some(limit) if !watchdog_owns_deadline => {
                     let remaining = limit
                         .checked_sub(started.elapsed())
                         .unwrap_or(Duration::ZERO);
                     tokio::time::sleep(remaining).await
                 }
-                None => std::future::pending::<()>().await,
+                _ => std::future::pending::<()>().await,
             }
         };
         tokio::select! {
@@ -1309,6 +1394,12 @@ impl RunningProcess {
                     program = %self.program,
                     timeout_ms = limit.map(|l| l.as_millis() as u64).unwrap_or(0),
                     "timeout elapsed; killing the tree"
+                );
+                let _ = self.timeout_state.compare_exchange(
+                    TS_PENDING,
+                    TS_TIMED_OUT,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
                 );
                 self.teardown_on_timeout().await;
                 Ok(Outcome::TimedOut)
@@ -1669,6 +1760,92 @@ mod tests {
             .expect("output_bytes");
         assert_eq!(result.stdout(), b"raw\x00bytes\nno trailing newline");
         assert!(!result.truncated(), "no policy drop: {result:?}");
+    }
+
+    /// Б1 (core): once the `timed_out` flag is set (as the streaming deadline
+    /// watchdog does when it fires), a consuming verb classifies the run as
+    /// `Outcome::TimedOut` even though `backend_wait` observed a clean exit 0 —
+    /// the same deterministic contract the bulk `output_string` path already had.
+    #[tokio::test]
+    async fn timed_out_flag_classifies_a_clean_exit_as_timed_out() {
+        let run = scripted_handle(&[0]).await; // Reply::ok -> Exited(0)
+        run.timeout_state.store(TS_TIMED_OUT, Ordering::Release); // simulate the watchdog firing
+        let outcome = run.wait().await.expect("wait");
+        assert_eq!(
+            outcome,
+            Outcome::TimedOut,
+            "a run whose deadline fired must report TimedOut, not the in-grace exit"
+        );
+    }
+
+    /// Cancellation still wins over a timed-out run: `checked_outcome` classifies
+    /// cancellation after `classify_timed_out`, so a run that both timed out and
+    /// was cancelled surfaces as `Err(Cancelled)` (cancellation is terminal).
+    #[cfg(feature = "cancellation")]
+    #[tokio::test]
+    async fn cancellation_beats_the_timed_out_flag() {
+        let token = crate::CancellationToken::new();
+        let run = ScriptedRunner::new()
+            .fallback(Reply::ok(""))
+            .start(&Command::new("tool").cancel_on(token.clone()))
+            .await
+            .expect("scripted start");
+        run.timeout_state.store(TS_TIMED_OUT, Ordering::Release);
+        token.cancel();
+        match run.wait().await {
+            Err(Error::Cancelled { .. }) => {}
+            other => panic!("expected Err(Cancelled), got {other:?}"),
+        }
+    }
+
+    /// Б1 (wait path): a streamed run whose deadline fired must report
+    /// `Outcome::TimedOut` through `wait_any`/`wait_all` too — `wait_exit` applies
+    /// `classify_timed_out` just like `drive_to_exit`, so the streamed-then-raced
+    /// composition (`stdout_lines` → `wait_any`) is consistent with `finish_streamed`.
+    #[tokio::test]
+    async fn wait_any_classifies_a_timed_out_run() {
+        let mut run = scripted_handle(&[0]).await; // Reply::ok -> Exited(0)
+        run.timeout_state.store(TS_TIMED_OUT, Ordering::Release); // simulate the watchdog firing
+        let (idx, outcome) = crate::wait_any(&mut [&mut run]).await.expect("wait_any");
+        assert_eq!(idx, 0);
+        assert_eq!(
+            outcome,
+            Outcome::TimedOut,
+            "a timed-out run must report TimedOut through wait_any, not the raw exit"
+        );
+    }
+
+    /// F1: the timeout arbiter is race-free. Once the natural reap claims
+    /// `EXITED`, a watchdog whose timer fires late cannot flip the run to
+    /// `TimedOut` (its CAS from `PENDING` fails), so a child that exits on its own
+    /// within a scheduler quantum of the deadline keeps its real outcome. (The
+    /// reverse — the deadline claiming `TIMED_OUT` first — is covered by
+    /// `timed_out_flag_classifies_a_clean_exit_as_timed_out`.)
+    #[tokio::test]
+    async fn natural_reap_claim_beats_a_late_timeout_cas() {
+        let run = scripted_handle(&[0]).await;
+        // The finisher reaps first and claims EXITED.
+        assert!(
+            run.timeout_state
+                .compare_exchange(TS_PENDING, TS_EXITED, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        );
+        // A late watchdog tries to claim the timeout — it must lose.
+        assert!(
+            run.timeout_state
+                .compare_exchange(
+                    TS_PENDING,
+                    TS_TIMED_OUT,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed
+                )
+                .is_err()
+        );
+        // classify therefore preserves the real exit, not TimedOut.
+        assert_eq!(
+            run.classify_timed_out(Outcome::Exited(0)),
+            Outcome::Exited(0)
+        );
     }
 
     /// D10: a scripted double owns no private group, so it never kills a tree on

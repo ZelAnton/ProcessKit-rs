@@ -39,11 +39,14 @@ impl RunningProcess {
     /// dropping it tears the process down.
     ///
     /// The command's [`timeout`](crate::Command::timeout), if set, **bounds the
-    /// stream**: at the deadline the process tree is killed, so the pipes close
-    /// and this stream ends — a streamed run can't hang past its timeout. A
-    /// following [`finish_streamed`](Self::finish_streamed) then reports the kill
-    /// (no clean exit: `code` is `None` on a Unix signal-kill, a platform code on
-    /// a Windows Job kill). With no timeout the stream is unbounded as before.
+    /// stream**: at the deadline the process tree is killed (gracefully if a
+    /// [`timeout_grace`](crate::Command::timeout_grace) is set), so the pipes
+    /// close and this stream ends — a streamed run can't hang past its timeout. A
+    /// following [`finish_streamed`](Self::finish_streamed) then reports
+    /// [`Outcome::TimedOut`](crate::Outcome::TimedOut) — deterministically, and
+    /// even if the child caught the signal and exited cleanly within the grace —
+    /// consistent with the bulk `output_string` path. With no timeout the stream
+    /// is unbounded as before.
     /// (Bounding applies to a run that owns its group — the
     /// [`Command::start`](crate::Command::start) / [`JobRunner`](crate::JobRunner)
     /// path. A handle from [`ProcessGroup::start`](crate::ProcessGroup::start)
@@ -136,11 +139,29 @@ impl RunningProcess {
             // Anchor to spawn time so a late stream call can't re-grant the
             // full limit (B7 fix). `started` is std::time::Instant (Copy).
             let started = self.started;
+            // Б1/F1: claim the timeout via the shared arbiter so the finisher
+            // classifies the run as `TimedOut` even if the child then exits
+            // cleanly within the grace. Only kill if we WON the race against the
+            // natural reap (which claims `EXITED` in `backend_wait`): if the child
+            // already exited on its own, the CAS fails and we skip the kill —
+            // leaving the real exit and avoiding a signal to a recycled pid.
+            let timeout_state = self.timeout_state.clone();
             self.deadline_task = Some(tokio::spawn(async move {
                 let remaining = limit
                     .checked_sub(started.elapsed())
                     .unwrap_or(std::time::Duration::ZERO);
                 tokio::time::sleep(remaining).await;
+                if timeout_state
+                    .compare_exchange(
+                        super::TS_PENDING,
+                        super::TS_TIMED_OUT,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_err()
+                {
+                    return; // the child already exited on its own — no kill
+                }
                 match grace {
                     // Graceful: signal the (still-owned) group, wait the grace,
                     // then KILL. This detached watchdog doesn't hold the `Child`,
@@ -175,6 +196,10 @@ impl RunningProcess {
     /// Finish a streamed run: wait for exit and return a [`StreamedFinish`]
     /// carrying the [`Outcome`] and the stderr collected in the background by
     /// [`stdout_lines`](Self::stdout_lines).
+    ///
+    /// A run killed by its [`timeout`](crate::Command::timeout) reports
+    /// [`Outcome::TimedOut`](crate::Outcome::TimedOut), even if the child caught
+    /// the signal and exited cleanly within the grace — matching the bulk verbs.
     ///
     /// Designed to pair with `stdout_lines` (consume the stdout stream first),
     /// but safe to call on its own — any pipe the stream didn't take is drained
@@ -337,11 +362,25 @@ impl RunningProcess {
             let grace = self.timeout_grace;
             let signal = self.timeout_signal;
             let started = self.started;
+            // Б1/F1: see `stdout_lines` — claim the timeout via the arbiter and
+            // kill only if we won the race against the natural reap.
+            let timeout_state = self.timeout_state.clone();
             self.deadline_task = Some(tokio::spawn(async move {
                 let remaining = limit
                     .checked_sub(started.elapsed())
                     .unwrap_or(std::time::Duration::ZERO);
                 tokio::time::sleep(remaining).await;
+                if timeout_state
+                    .compare_exchange(
+                        super::TS_PENDING,
+                        super::TS_TIMED_OUT,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_err()
+                {
+                    return; // the child already exited on its own — no kill
+                }
                 match grace {
                     Some(grace) => match group.upgrade() {
                         Some(group) => {
@@ -369,6 +408,10 @@ impl RunningProcess {
 
     /// Finish a run after its [`output_events`](Self::output_events) stream has
     /// been drained: wait for the child to exit and return the [`Outcome`].
+    ///
+    /// A run killed by its [`timeout`](crate::Command::timeout) reports
+    /// [`Outcome::TimedOut`](crate::Outcome::TimedOut), even if the child caught
+    /// the signal and exited cleanly within the grace — matching the bulk verbs.
     ///
     /// Designed to pair with `output_events` (consume the events stream first),
     /// but safe to call on its own — any untaken pipes are drained so the child

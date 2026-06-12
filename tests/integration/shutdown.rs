@@ -150,8 +150,14 @@ async fn graceful_timeout_on_a_streamed_run_signals_and_ends_the_stream() {
     // handle owns its group, so the deadline bounds the stream: at 500ms the tree
     // is sent SIGTERM, the trap exits the child, its pipes close, and the stream
     // ends — well within the long grace, proving the graceful (not hard) teardown.
+    // The trap echoes to stderr *before* exiting 0: that side-effect is the
+    // positive proof the graceful SIGTERM was delivered and the handler ran — a
+    // hard SIGKILL is uncatchable, so "bye" would never appear.
     let mut run = Command::new("sh")
-        .args(["-c", "trap 'exit 0' TERM; echo ready; while :; do :; done"])
+        .args([
+            "-c",
+            "trap 'echo bye 1>&2; exit 0' TERM; echo ready; while :; do :; done",
+        ])
         .timeout(Duration::from_millis(500))
         .timeout_grace(Duration::from_secs(10))
         .start()
@@ -179,21 +185,81 @@ async fn graceful_timeout_on_a_streamed_run_signals_and_ends_the_stream() {
         "the graceful-timeout signal must end the stream well within the grace"
     );
 
-    // The outcome distinguishes graceful from hard teardown: the TERM trap runs
-    // `exit 0`, so a *graceful* SIGTERM yields `Outcome::Exited(0)`; a hard SIGKILL
-    // (the no-grace path) is uncatchable and would yield `Outcome::Signalled`. Robust
-    // here because the child is already reaped (stream fully drained above), so
-    // `finish_streamed`'s own re-armed deadline never races the wait. (If a refactor
-    // ever made that deadline spawn-relative, this would surface as a mismatch, not a hang.)
-    let StreamedFinish { outcome, .. } = run.finish_streamed().await.expect("finish");
+    // Б1: the streamed run TIMED OUT — the deadline fired and triggered the
+    // teardown — so `finish_streamed` reports `Outcome::TimedOut`, matching the
+    // bulk `output_string` path (which reports `timed_out()` for this same
+    // scenario), not the child's in-grace `exit 0`. This is deterministic now:
+    // the streaming watchdog sets a shared `timed_out` flag when it fires, and
+    // the finisher classifies from that flag rather than racing the reaped exit.
+    let StreamedFinish { outcome, stderr } = run.finish_streamed().await.expect("finish");
     assert_eq!(
         outcome,
-        Outcome::Exited(0),
-        "graceful SIGTERM let the trap exit 0; a hard SIGKILL would be Signalled"
+        Outcome::TimedOut,
+        "a streamed run whose deadline fired must report TimedOut (consistent with the bulk path)"
     );
+    // The graceful-vs-hard distinction now rests on this stderr side-effect, NOT
+    // the outcome (both graceful and hard end well under the 8s bound, so timing
+    // alone cannot tell them apart): "bye" appears only if the TERM trap ran.
+    assert!(
+        stderr.contains("bye"),
+        "the graceful SIGTERM must have run the trap (stderr: {stderr:?})"
+    );
+    // The timing assertion proves the teardown is *wired* and the signal was
+    // honored — the child didn't ride out the full grace to SIGKILL.
     assert!(
         start.elapsed() < Duration::from_secs(8),
         "a TERM-handling streamed child must end the 10s grace early (took {:?})",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess and times out an output_events run gracefully"]
+async fn graceful_timeout_on_an_events_run_reports_timed_out() {
+    use processkit::OutputEvent;
+    use tokio_stream::StreamExt;
+
+    // Б1 parity for the events path: `output_events` arms the same deadline
+    // watchdog as `stdout_lines`, and `finish_events` classifies via the same
+    // `timed_out` flag, so a graceful streamed timeout must report
+    // `Outcome::TimedOut` here too — not the child's in-grace `exit 0`.
+    let mut run = Command::new("sh")
+        .args(["-c", "trap 'exit 0' TERM; echo ready; while :; do :; done"])
+        .timeout(Duration::from_millis(500))
+        .timeout_grace(Duration::from_secs(10))
+        .start()
+        .await
+        .expect("start");
+
+    let start = Instant::now();
+    let mut events = run.output_events();
+    let mut saw_ready = false;
+    let drained = tokio::time::timeout(Duration::from_secs(8), async {
+        while let Some(ev) = events.next().await {
+            if let OutputEvent::Stdout(l) = ev {
+                saw_ready |= l.contains("ready");
+            }
+        }
+    })
+    .await;
+    assert!(
+        drained.is_ok(),
+        "the events stream must end within the grace"
+    );
+    assert!(
+        saw_ready,
+        "the ready banner must arrive before the deadline"
+    );
+
+    let outcome = run.finish_events().await.expect("finish_events");
+    assert_eq!(
+        outcome,
+        Outcome::TimedOut,
+        "an events run whose deadline fired must report TimedOut (parity with finish_streamed)"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(8),
+        "a TERM-handling events child must end the 10s grace early (took {:?})",
         start.elapsed()
     );
 }
