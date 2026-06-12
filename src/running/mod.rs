@@ -816,6 +816,32 @@ impl RunningProcess {
             let outcome = self.classify_timed_out(outcome);
             return self.checked_outcome(outcome);
         }
+        // Ф1: honor cancellation DURING the wait so `wait_any`/`wait_all` don't
+        // hang on a never-exiting handle (e.g. a scripted `Reply::pending`, whose
+        // `backend_wait` parks forever) when the token fires. Mirrors
+        // `drive_to_exit_inner`'s cancel arm — kill the tree and resolve as
+        // `Signalled(None)`, which the `cancel_at_exit` snapshot below turns into
+        // `Err(Cancelled)`. No deadline arm: this path applies no timeout by
+        // contract (a streamed run's deadline is owned by its watchdog).
+        #[cfg(feature = "cancellation")]
+        let outcome = {
+            let token = self.cancel_token.clone();
+            let cancelled = async {
+                match &token {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                biased; // cancel arm first: a cancel that fires mid-wait wins
+                () = cancelled => {
+                    self.kill_tree().await;
+                    Ok(Outcome::Signalled(None))
+                }
+                outcome = self.backend_wait() => outcome,
+            }?
+        };
+        #[cfg(not(feature = "cancellation"))]
         let outcome = self.backend_wait().await?;
         // First reap: abort watchdogs and clear pid before returning. This
         // mirrors the `abort_watchdogs` call in `drive_to_exit` and prevents a
@@ -1267,7 +1293,13 @@ impl RunningProcess {
                 }
             }
             Backend::Scripted(s) => {
-                if s.killed {
+                // Ф5: a kill AFTER the scripted child already exited naturally
+                // must still report the cached natural outcome — a real child's
+                // exit status survives a post-exit kill. Only an un-exited (or
+                // never-exiting `pending`) script that is killed is `Signalled`.
+                let already_exited =
+                    matches!(s.exit_at, Some(at) if at <= tokio::time::Instant::now());
+                if s.killed && !already_exited {
                     Outcome::Signalled(None)
                 } else {
                     match s.exit_at {

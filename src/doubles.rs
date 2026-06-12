@@ -776,8 +776,8 @@ mod tests {
         // Б6: a panicking handler on the bulk `output` path is caught and
         // disabled, and the run still completes — matching the live pump's
         // panic-isolation contract (the doubles must not diverge on it).
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = Arc::new(AtomicUsize::new(0));
         let runner = ScriptedRunner::new().fallback(Reply::ok("one\ntwo\nthree\n"));
         let cmd = Command::new("x").on_stdout_line({
@@ -916,6 +916,54 @@ mod tests {
             .await
             .expect("the token resolves the run")
             .expect_err("cancellation is always an error");
+        assert!(
+            matches!(err, crate::error::Error::Cancelled { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_kill_after_natural_exit_keeps_the_cached_outcome() {
+        // Ф5: a kill that lands AFTER the scripted child already exited must not
+        // overwrite the cached exit with `Signalled` — a real child's status
+        // survives a post-exit kill, and the double must match.
+        let runner = ScriptedRunner::new().fallback(Reply::fail(5, "boom"));
+        let mut run = runner.start(&Command::new("x")).await.expect("start");
+        // No line_delay → the scripted child's exit instant is `now` (it has
+        // already exited); a kill here is post-mortem.
+        run.start_kill().expect("kill is best-effort");
+        let outcome = run.wait().await.expect("wait after a post-exit kill");
+        assert_eq!(
+            outcome,
+            Outcome::Exited(5),
+            "a post-exit kill keeps the cached exit code, not Signalled"
+        );
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[tokio::test(start_paused = true)]
+    async fn wait_any_on_a_pending_scripted_handle_is_cancellable() {
+        // Ф1: a never-exiting (pending) scripted handle raced in `wait_any` must
+        // resolve to `Cancelled` when the token fires — previously it hung
+        // forever because `wait_exit` never selected on the token.
+        let token = crate::CancellationToken::new();
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let cmd = Command::new("watch").cancel_on(token.clone());
+        let mut run = runner.start(&cmd).await.expect("start");
+        let mut handles = [&mut run];
+        let race = crate::wait_any(&mut handles);
+        tokio::pin!(race);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3600), &mut race)
+                .await
+                .is_err(),
+            "a pending scripted run must not resolve before cancellation"
+        );
+        token.cancel();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(3600), race)
+            .await
+            .expect("the token resolves the race")
+            .expect_err("a cancelled run surfaces as an error");
         assert!(
             matches!(err, crate::error::Error::Cancelled { .. }),
             "got {err:?}"
