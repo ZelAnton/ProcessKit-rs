@@ -201,7 +201,14 @@ impl Reply {
             None
         } else {
             let per_line = self.line_delay.unwrap_or_default();
-            let lines = self.stdout.split_inclusive('\n').count() as u32;
+            // Ф8: both streams are fed concurrently at `line_delay`, so the
+            // scripted "process" only finishes once the LONGER stream has
+            // drained — count the max of stdout/stderr lines. Counting stdout
+            // alone truncates a lagging stderr when `join_pumps` stops at the
+            // (shorter) stdout-derived lifetime, which a real child never does.
+            let stdout_lines = self.stdout.split_inclusive('\n').count() as u32;
+            let stderr_lines = self.stderr.split_inclusive('\n').count() as u32;
+            let lines = stdout_lines.max(stderr_lines);
             // Э15: saturate the multiply and clamp to MAX_DEADLINE so a test that
             // hands a `Duration::MAX`-ish `line_delay` can't overflow the multiply
             // or the later `Instant + lifetime` deadline. (A single line — `lines
@@ -370,14 +377,30 @@ impl ScriptedRunner {
 /// exercised hermetically on the bulk `output` verbs too (on a scripted
 /// `start`, the real pumps already invoke them).
 fn replay_line_handlers(command: &Command, reply: &Reply) {
-    if let Some(handler) = command.stdout_handler() {
-        for line in reply.stdout.lines() {
-            handler(line);
-        }
+    let mut stdout_handler = command.stdout_handler();
+    for line in reply.stdout.lines() {
+        invoke_isolated(&mut stdout_handler, line);
     }
-    if let Some(handler) = command.stderr_handler() {
-        for line in reply.stderr.lines() {
-            handler(line);
+    let mut stderr_handler = command.stderr_handler();
+    for line in reply.stderr.lines() {
+        invoke_isolated(&mut stderr_handler, line);
+    }
+}
+
+/// Invoke a line handler with the same panic-isolation contract as the live
+/// pump (Б6): a panicking handler is caught, disabled for the rest of the run,
+/// and replay continues. The scripted bulk path must not diverge from the live
+/// path on the very contract the doubles exist to exercise.
+fn invoke_isolated(handler: &mut Option<crate::pump::LineHandler>, line: &str) {
+    if let Some(h) = handler {
+        let invoked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(line)));
+        if invoked.is_err() {
+            *handler = None;
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                target: "processkit",
+                "line handler panicked; disabled for the rest of the run"
+            );
         }
     }
 }
@@ -386,10 +409,31 @@ fn replay_line_handlers(command: &Command, reply: &Reply) {
 impl ProcessRunner for ScriptedRunner {
     async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
         let program = command.program().to_string_lossy().into_owned();
+        // Ф4: a token already cancelled short-circuits with `Cancelled`, exactly
+        // as the live runner does pre-spawn — not a canned reply.
+        #[cfg(feature = "cancellation")]
+        if let Some(token) = command.cancel_token()
+            && token.is_cancelled()
+        {
+            return Err(crate::error::Error::Cancelled { program });
+        }
         let timeout = command.configured_timeout();
         let reply = self.matched_reply(command, &program)?;
         if reply.pending {
             return park_until_cancelled(command, program).await;
+        }
+        // Ф3: honor the D5 non-piped-stdout contract that the live bulk path and
+        // the scripted `start` path both enforce — a capture verb on
+        // `stdout(Inherit/Null)` errors, it does not hand back canned output it
+        // could never have captured.
+        if !command.stdout_is_piped() {
+            return Err(crate::error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "`{program}`: stdout is not piped (Command::stdout was set to Inherit/Null), \
+                     so the capture verbs have nothing to read — use StdioMode::Piped to capture it"
+                ),
+            )));
         }
         replay_line_handlers(command, reply);
         Ok(reply
@@ -725,6 +769,97 @@ mod tests {
         assert!(result.is_success());
         assert_eq!(*seen.lock().unwrap(), ["a", "b"]);
         assert!(errs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn output_isolates_a_panicking_line_handler() {
+        // Б6: a panicking handler on the bulk `output` path is caught and
+        // disabled, and the run still completes — matching the live pump's
+        // panic-isolation contract (the doubles must not diverge on it).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner = ScriptedRunner::new().fallback(Reply::ok("one\ntwo\nthree\n"));
+        let cmd = Command::new("x").on_stdout_line({
+            let calls = calls.clone();
+            move |_| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    panic!("boom on the second line");
+                }
+            }
+        });
+        let result = runner
+            .output(&cmd)
+            .await
+            .expect("a handler panic must not fail the scripted run");
+        assert!(result.is_success());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "handler disabled after its panic (called for lines 1 and 2 only)"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_on_non_piped_stdout_errors_like_the_live_path() {
+        // Ф3: a capture verb on `stdout(Null)` must error (Io(InvalidInput)), not
+        // hand back canned output — matching the live bulk path and the scripted
+        // `start` path (which both enforce the D5 contract).
+        let runner = ScriptedRunner::new().fallback(Reply::ok("canned"));
+        let cmd = Command::new("x").stdout(crate::StdioMode::Null);
+        let err = runner
+            .output(&cmd)
+            .await
+            .expect_err("a non-piped stdout must error on a capture verb");
+        match err {
+            crate::error::Error::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput)
+            }
+            other => panic!("expected Io(InvalidInput), got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[tokio::test]
+    async fn output_with_an_already_cancelled_token_short_circuits() {
+        // Ф4: a token cancelled before the call returns `Cancelled`, exactly as
+        // the live runner does pre-spawn — not a canned reply.
+        let token = crate::CancellationToken::new();
+        token.cancel();
+        let runner = ScriptedRunner::new().fallback(Reply::ok("must not be returned"));
+        let cmd = Command::new("x").cancel_on(token);
+        let err = runner
+            .output(&cmd)
+            .await
+            .expect_err("a pre-cancelled token short-circuits");
+        assert!(
+            matches!(err, crate::error::Error::Cancelled { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scripted_line_delay_does_not_truncate_a_longer_stderr() {
+        // Ф8: stderr is fed concurrently at the same `line_delay`, so the
+        // scripted lifetime must cover the LONGER stream. With only 1 stdout
+        // line, a stderr that drains well past the (short) stdout-derived
+        // lifetime + the pump-teardown grace would be cut off — count the max.
+        let stderr_text = (1..=10)
+            .map(|n| format!("e{n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let reply = Reply::fail(3, stderr_text)
+            .with_stdout("out\n")
+            .with_line_delay(std::time::Duration::from_secs(1));
+        let runner = ScriptedRunner::new().fallback(reply);
+        let run = runner.start(&Command::new("x")).await.expect("start");
+        let result = run.output_string().await.expect("consume");
+        assert_eq!(
+            result.stderr(),
+            "e1\ne2\ne3\ne4\ne5\ne6\ne7\ne8\ne9\ne10",
+            "all 10 stderr lines survive despite only 1 stdout line"
+        );
     }
 
     #[tokio::test]
