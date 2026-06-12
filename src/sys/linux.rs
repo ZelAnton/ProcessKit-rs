@@ -32,6 +32,23 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Process-wide counter so concurrent jobs get distinct cgroup names.
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Э20: a per-process salt mixed into the cgroup dir name so a pid recycled long
+/// after a *crashed* ProcessKit process (whose `Drop` never cleaned up its
+/// `processkit-<pid>-…` dirs) does not collide with those leftovers and silently
+/// downgrade to the process-group fallback. Derived from the wall-clock time of
+/// its first use (effectively a per-process value, computed once via `OnceLock`);
+/// concurrent jobs / two crate versions in one process share the salt but differ
+/// by the monotonic counter.
+fn cgroup_name_salt() -> u64 {
+    static SALT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SALT.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    })
+}
+
 pub(crate) struct Job {
     backend: Backend,
     /// B12: set by `graceful_shutdown(escalate=false)` so `Drop` skips the
@@ -367,17 +384,43 @@ impl Cgroup {
             .trim();
         let parent = root.join(rel.trim_start_matches('/'));
 
-        let name = format!(
-            "processkit-{}-{}",
-            std::process::id(),
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
-        );
-        let path = parent.join(name);
         // Without limits, no controllers are enabled — `cgroup.kill` needs none,
         // and that sidesteps the "no internal processes" rule. mkdir is the
         // permission gate that triggers the process-group fallback when delegation
         // is absent.
-        std::fs::create_dir(&path)?;
+        //
+        // Э20: retry with a fresh counter when the dir already exists — a leftover
+        // from a crashed run whose pid was recycled, or two crate versions sharing
+        // the namespace — rather than letting `EEXIST` masquerade as a delegation
+        // failure and silently downgrade. The salt makes a real collision
+        // astronomically unlikely; the bounded retry is the backstop. A genuine
+        // permission failure (`EACCES`/`EPERM`) is NOT retried — it propagates and
+        // triggers the process-group fallback promptly.
+        let salt = cgroup_name_salt();
+        let mut created = None;
+        for _ in 0..32 {
+            let name = format!(
+                "processkit-{}-{:x}-{}",
+                std::process::id(),
+                salt,
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            );
+            let path = parent.join(name);
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    created = Some(path);
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        let path = created.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not create a unique cgroup directory after retries",
+            )
+        })?;
         let cg = Cgroup { path };
 
         // With limits, enable the matching controllers and write the caps. If that
@@ -530,9 +573,19 @@ impl Cgroup {
         if std::fs::write(self.path.join("cgroup.kill"), b"1").is_ok() {
             return Ok(());
         }
-        // Older kernels: SIGKILL each member until the cgroup drains. Sleep
-        // between sweeps rather than busy-spin while the kernel reaps, and bound
-        // it so teardown (incl. Drop) can never hang on un-reaped zombies.
+        // Older kernels (no `cgroup.kill`): a per-pid SIGKILL sweep. First FREEZE
+        // the subtree (cgroup v2 `cgroup.freeze`, kernel ≥ 5.2; best-effort — the
+        // write is a no-op if absent) so a fork bomb can't out-spawn the sweep:
+        // frozen tasks can't fork. Crucially this relies on the cgroup *v2*
+        // freezer being killable — "processes in the frozen cgroup can be killed
+        // by a fatal signal" (kernel cgroup-v2 docs), so each SIGKILL'd task wakes,
+        // takes the fatal signal, and leaves `cgroup.procs` even while the subtree
+        // is still frozen (the sweep below therefore drains and breaks normally).
+        // This is the deliberate v2 redesign: the v1 freezer blocked SIGKILL until
+        // thaw (the root of runc#2105) — that hazard does NOT apply to `cgroup.freeze`.
+        // Sleep between sweeps rather than busy-spin while the kernel reaps, and
+        // bound it so teardown (incl. Drop) can never hang on un-reaped zombies.
+        let _ = std::fs::write(self.path.join("cgroup.freeze"), b"1");
         for _ in 0..50 {
             let members = self.members();
             if members.is_empty() {
@@ -546,7 +599,25 @@ impl Cgroup {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        Ok(())
+        // Thaw (best-effort): the freeze only halted forking DURING the sweep.
+        // Restore the cgroup unfrozen so it stays reusable for further spawns
+        // (`terminate_all` keeps the group usable; a child spawned into a frozen
+        // cgroup would itself start frozen and the spawn could block) — and so a
+        // SIGKILL'd-but-frozen straggler can run its pending fatal signal and exit.
+        // (This unconditionally clears any freeze a prior `suspend()` set; a kill
+        // verb resurrecting-then-killing a deliberately-suspended group is benign.)
+        let _ = std::fs::write(self.path.join("cgroup.freeze"), b"0");
+        // Э18: report a real drain failure instead of a false success, so the
+        // caller (`kill_all`/`signal`/`terminate_all`/`shutdown`) knows the tree
+        // may still be alive — a fork bomb still out-spawning, or un-reapable
+        // zombies (a D-state task ignores SIGKILL until it unblocks).
+        if self.members().is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "cgroup did not drain after the bounded SIGKILL sweep (kernel < 5.14 fallback)",
+            ))
+        }
     }
 }
 

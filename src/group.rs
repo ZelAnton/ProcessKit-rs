@@ -243,6 +243,12 @@ impl ProcessGroup {
 
     /// Immediately hard-kill every process currently in the group. Idempotent;
     /// the group remains usable for further spawns afterwards.
+    ///
+    /// On the legacy per-pid kill fallback (a Linux kernel without `cgroup.kill`,
+    /// pre-5.14), a tree that won't drain within the bounded sweep — a fork bomb
+    /// still out-spawning, or un-reapable `D`-state zombies — surfaces as an `Err`
+    /// rather than a false success; the atomic backends (`cgroup.kill`, Windows
+    /// Job Object) and the process-group fallback do not report this.
     pub fn terminate_all(&self) -> Result<()> {
         #[cfg(feature = "tracing")]
         tracing::debug!(
@@ -382,6 +388,10 @@ impl ProcessGroup {
     /// start into the group (any consuming verb, or `wait`) so its handle reaps it.
     /// The Windows Job Object and Linux cgroup mechanisms are immune (a process
     /// leaves `cgroup.procs` / the job on *exit*, before reaping).
+    ///
+    /// When `escalate_to_kill` is set, the final hard kill can surface the same
+    /// undrained-tree `Err` as [`terminate_all`](Self::terminate_all) on the
+    /// legacy pre-5.14 per-pid fallback.
     pub async fn shutdown(self) -> Result<()> {
         #[cfg(feature = "tracing")]
         tracing::debug!(
