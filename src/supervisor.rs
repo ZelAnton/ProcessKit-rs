@@ -27,17 +27,18 @@ use crate::runner::{JobRunner, ProcessRunner};
 const DEFAULT_SUPERVISION_TAIL: usize = 1000;
 
 /// The capture policy to apply to each incarnation: respect an explicit
-/// bounded/fail-loud command policy, but bound an unbounded one to a tail (D3).
-/// The overflow *mode* is preserved when bounding, so an unbounded
-/// `Error` ("fail loud") command becomes a bounded fail-loud rather than
-/// silently switching to `DropOldest` and losing the intent.
+/// bounded/fail-loud command policy, but bound an unbounded line count to a
+/// tail (D3). Only the line cap is filled in — the overflow *mode* and any
+/// byte cap ([`with_max_bytes`](OutputBufferPolicy::with_max_bytes), Д8) the
+/// command set are preserved, so an unbounded `Error` ("fail loud") command
+/// stays fail-loud rather than silently switching to `DropOldest`, and a
+/// byte-capped command keeps its memory bound.
 fn default_supervision_capture(command: &Command) -> OutputBufferPolicy {
-    let policy = command.output_buffer_policy();
+    let mut policy = command.output_buffer_policy();
     if policy.max_lines.is_none() {
-        OutputBufferPolicy::bounded(DEFAULT_SUPERVISION_TAIL).with_overflow(policy.overflow)
-    } else {
-        policy
+        policy.max_lines = Some(DEFAULT_SUPERVISION_TAIL);
     }
+    policy
 }
 
 /// When the supervisor restarts an exited child. See each variant; in every

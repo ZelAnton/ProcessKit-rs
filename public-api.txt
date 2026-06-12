@@ -19,8 +19,10 @@ pub processkit::Error::NotReady
 pub processkit::Error::NotReady::program: alloc::string::String
 pub processkit::Error::NotReady::timeout: core::time::Duration
 pub processkit::Error::OutputTooLarge
-pub processkit::Error::OutputTooLarge::limit: usize
+pub processkit::Error::OutputTooLarge::byte_limit: core::option::Option<usize>
+pub processkit::Error::OutputTooLarge::line_limit: core::option::Option<usize>
 pub processkit::Error::OutputTooLarge::program: alloc::string::String
+pub processkit::Error::OutputTooLarge::total_bytes: usize
 pub processkit::Error::OutputTooLarge::total_lines: usize
 pub processkit::Error::Parse
 pub processkit::Error::Parse::message: alloc::string::String
@@ -296,12 +298,12 @@ pub fn processkit::Command::setsid(self) -> Self
 pub async fn processkit::Command::start(&self) -> processkit::Result<processkit::RunningProcess>
 pub fn processkit::Command::stderr(self, processkit::StdioMode) -> Self
 pub fn processkit::Command::stderr_encoding(self, &'static encoding_rs::Encoding) -> Self
-pub fn processkit::Command::stderr_tee<W>(self, W) -> Self where W: std::io::Write + core::marker::Send + 'static
+pub fn processkit::Command::stderr_tee<W>(self, W) -> Self where W: tokio::io::async_write::AsyncWrite + core::marker::Send + core::marker::Unpin + 'static
 pub fn processkit::Command::stdin(self, processkit::Stdin) -> Self
 pub fn processkit::Command::stdin_source(&self) -> core::option::Option<&processkit::Stdin>
 pub fn processkit::Command::stdout(self, processkit::StdioMode) -> Self
 pub fn processkit::Command::stdout_encoding(self, &'static encoding_rs::Encoding) -> Self
-pub fn processkit::Command::stdout_tee<W>(self, W) -> Self where W: std::io::Write + core::marker::Send + 'static
+pub fn processkit::Command::stdout_tee<W>(self, W) -> Self where W: tokio::io::async_write::AsyncWrite + core::marker::Send + core::marker::Unpin + 'static
 pub fn processkit::Command::timeout(self, core::time::Duration) -> Self
 pub fn processkit::Command::timeout_grace(self, core::time::Duration) -> Self
 pub fn processkit::Command::timeout_signal(self, processkit::Signal) -> Self
@@ -391,12 +393,14 @@ impl core::marker::UnsafeUnpin for processkit::MockRunner
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::MockRunner
 impl core::panic::unwind_safe::UnwindSafe for processkit::MockRunner
 #[non_exhaustive] pub struct processkit::OutputBufferPolicy
+pub processkit::OutputBufferPolicy::max_bytes: core::option::Option<usize>
 pub processkit::OutputBufferPolicy::max_lines: core::option::Option<usize>
 pub processkit::OutputBufferPolicy::overflow: processkit::OverflowMode
 impl processkit::OutputBufferPolicy
 pub fn processkit::OutputBufferPolicy::bounded(usize) -> Self
 pub fn processkit::OutputBufferPolicy::fail_loud(usize) -> Self
 pub fn processkit::OutputBufferPolicy::unbounded() -> Self
+pub fn processkit::OutputBufferPolicy::with_max_bytes(self, usize) -> Self
 pub fn processkit::OutputBufferPolicy::with_overflow(self, processkit::OverflowMode) -> Self
 impl core::clone::Clone for processkit::OutputBufferPolicy
 pub fn processkit::OutputBufferPolicy::clone(&self) -> processkit::OutputBufferPolicy

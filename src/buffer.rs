@@ -54,15 +54,33 @@ pub enum OverflowMode {
     /// untrusted tool flooding its stdout through the line verbs is a
     /// denial-of-service, not a policy choice.
     ///
-    /// **Pair it with a cap.** With a `bounded`/`Some(n)` `max_lines` it fires
-    /// when the buffer fills — reach for it via
+    /// **Memory, not wall-time (Э5).** The ceiling bounds how much output is
+    /// *retained*, and the error is surfaced when the consuming verb finishes —
+    /// it does **not** tear the child down the instant it trips. A flooding
+    /// child with no [`timeout`](crate::Command::timeout) keeps running (its
+    /// pipe is still drained, into nothing) until it exits on its own. Pair the
+    /// ceiling with a `timeout` when you need to bound wall-time too.
+    ///
+    /// **Pair it with a cap.** With a `bounded`/`Some(n)` `max_lines` (or a
+    /// [`with_max_bytes`](OutputBufferPolicy::with_max_bytes) byte cap) it fires
+    /// when the ceiling is reached — reach for it via
     /// [`fail_loud`](OutputBufferPolicy::fail_loud) (which sets the cap for you)
     /// or [`with_overflow`](OutputBufferPolicy::with_overflow). **D9c:** on an
-    /// *unbounded* buffer (`max_lines: None`) this mode is a misconfiguration — a
-    /// fail-loud ceiling with no ceiling — so it is treated as **zero-tolerance**:
-    /// the run errors on *any* line-pumped output (`Error::OutputTooLarge`),
-    /// rather than silently retaining everything. (Previously it was an inert
-    /// no-op.) Use `fail_loud(n)` when you want a real cap.
+    /// *unbounded* buffer (no `max_lines` and no `max_bytes`) this mode is a
+    /// misconfiguration — a fail-loud ceiling with no ceiling — so it is treated
+    /// as **zero-tolerance**: the run errors on *any* line-pumped output
+    /// (`Error::OutputTooLarge`), rather than silently retaining everything.
+    /// (Previously it was an inert no-op.) Use `fail_loud(n)` when you want a
+    /// real cap.
+    ///
+    /// **Counts the total, not the backlog (Э4).** The ceiling fires on the
+    /// *cumulative* output the pump has seen — total lines and total bytes — not
+    /// on how much is currently buffered. A streaming consumer
+    /// ([`stdout_lines`](crate::RunningProcess::stdout_lines)) draining lines as
+    /// they arrive frees buffer space but does **not** reset the ceiling, so
+    /// `fail_loud(100)` errors on the 101st line whether it is read through
+    /// `output_string` or streamed. (`DropOldest`/`DropNewest` still bound the
+    /// retained *backlog*, the ring-buffer semantics they imply.)
     Error,
 }
 
@@ -74,17 +92,28 @@ pub enum OverflowMode {
 /// still count every line, so `count > retained` reveals that lines were
 /// dropped.
 ///
-/// The unit is **lines, not bytes**: a line is held whole until its newline
-/// arrives, so one enormous newline-free "line" (e.g. `base64 -w0` output)
-/// occupies memory in full regardless of the policy. Use
-/// [`output_bytes`](crate::Command::output_bytes) (raw, no line splitting)
-/// when the output is not line-structured.
+/// Two independent ceilings — **lines** ([`max_lines`](Self::max_lines)) and
+/// **bytes** ([`max_bytes`](Self::max_bytes)) — either or both of which may be
+/// set; the buffer stays within whichever are present. The line cap alone does
+/// not bound memory: a line is held whole until its newline arrives, so one
+/// enormous newline-free "line" (e.g. `base64 -w0` output) occupies memory in
+/// full under a `max_lines`-only policy (Д8). Add
+/// [`with_max_bytes`](Self::with_max_bytes) to bound the actual retained memory,
+/// or use [`output_bytes`](crate::Command::output_bytes) (raw, no line
+/// splitting) when the output is not line-structured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OutputBufferPolicy {
     /// Maximum retained lines: `None` is unbounded; `Some(0)` retains nothing;
     /// `Some(n)` keeps at most `n`.
     pub max_lines: Option<usize>,
+    /// Maximum retained bytes (sum of the retained lines' UTF-8 lengths): `None`
+    /// is unbounded; `Some(n)` keeps the retained backlog at or under `n` bytes
+    /// (Д8). A single line longer than `n` cannot fit and is dropped whole under
+    /// the drop modes (which sets the truncation signal,
+    /// [`ProcessResult::truncated`](crate::ProcessResult::truncated)); under
+    /// [`OverflowMode::Error`] it trips the fail-loud ceiling.
+    pub max_bytes: Option<usize>,
     /// Which line to drop when full.
     pub overflow: OverflowMode,
 }
@@ -94,6 +123,7 @@ impl OutputBufferPolicy {
     pub fn unbounded() -> Self {
         Self {
             max_lines: None,
+            max_bytes: None,
             overflow: OverflowMode::DropOldest,
         }
     }
@@ -102,6 +132,7 @@ impl OutputBufferPolicy {
     pub fn bounded(max_lines: usize) -> Self {
         Self {
             max_lines: Some(max_lines),
+            max_bytes: None,
             overflow: OverflowMode::DropOldest,
         }
     }
@@ -114,8 +145,26 @@ impl OutputBufferPolicy {
     pub fn fail_loud(max_lines: usize) -> Self {
         Self {
             max_lines: Some(max_lines),
+            max_bytes: None,
             overflow: OverflowMode::Error,
         }
+    }
+
+    /// Set the retained-byte ceiling (Д8), composable with any policy.
+    ///
+    /// Bounds the actual memory the buffer holds — the sum of the retained
+    /// lines' UTF-8 byte lengths — independently of [`max_lines`](Self::max_lines).
+    /// Use it to cap a stream whose line *count* is modest but whose lines can be
+    /// huge (one `base64 -w0` line evades a line cap but not a byte cap):
+    /// `unbounded().with_max_bytes(1 << 20)` is a 1 MiB byte-bounded ring buffer;
+    /// `fail_loud(100).with_max_bytes(1 << 20)` errors on whichever ceiling — 100
+    /// lines or 1 MiB — is reached first. Under the drop modes a single line
+    /// larger than the cap is dropped whole (it cannot fit); under
+    /// [`OverflowMode::Error`] it trips the fail-loud ceiling.
+    #[must_use]
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = Some(max_bytes);
+        self
     }
 
     /// Set the overflow behavior.

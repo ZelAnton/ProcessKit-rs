@@ -66,11 +66,15 @@ no-trailing-newline unit test. Verified fmt/clippy/doc/test/cross-compile.
 *Dimension: user-scenario · Cost: major (one deliberate design)*
 
 **Shipped:** `StdioMode { Piped, Inherit, Null }` + `Command::stdout(mode)` /
-`Command::stderr(mode)` builders; `Command::stdout_tee<W>()` / `stderr_tee<W>()` tee
-to any `Write + Send`; `OutputEvent { Stdout(String), Stderr(String) }` + `OutputEvents`
+`Command::stderr(mode)` builders; `Command::stdout_tee<W>()` / `stderr_tee<W>()` tee;
+`OutputEvent { Stdout(String), Stderr(String) }` + `OutputEvents`
 merged stream + `RunningProcess::output_events()` / `finish_events()`; `OverflowMode::Error`
-+ `OutputBufferPolicy::fail_loud(n)` + `Error::OutputTooLarge { program, limit, total_lines }`.
++ `OutputBufferPolicy::fail_loud(n)` + `Error::OutputTooLarge`.
 Verified fmt/clippy/doc/test/cross-compile.
+*(Revised by the 0.9.2 inspection sweep: the tee now takes a `tokio::io::AsyncWrite`
+sink — async, backpressuring, error-surfacing, independent of `on_*_line`; the buffer
+gained a `with_max_bytes` ceiling; and `Error::OutputTooLarge` became
+`{ program, line_limit, byte_limit, total_lines, total_bytes }`. See the CHANGELOG.)*
 
 ### 3. Program resolution & error-quality completion — `which`/PATH + cwd-relative clarity ✅ SHIPPED (2026-06-10)
 *Dimension: user-scenario / ergonomics · Cost: moderate*

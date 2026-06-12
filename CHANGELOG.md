@@ -12,13 +12,56 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+
+- `OutputBufferPolicy::with_max_bytes(n)` (and a `max_bytes` field) — a retained-byte
+  ceiling, independent of `max_lines`, so one enormous newline-free line can no longer
+  evade the line cap and exhaust memory. Composes with `bounded`/`fail_loud`/`unbounded`;
+  under `OverflowMode::Error` it is a fail-loud byte ceiling.
 
 ### Changed
--
+
+- **Breaking:** `Error::OutputTooLarge` fields changed from `{ program, limit, total_lines }`
+  to `{ program, line_limit: Option<usize>, byte_limit: Option<usize>, total_lines,
+  total_bytes }` — the ceiling can now be a line cap, a byte cap, or both, so the error
+  reports each configured cap and both totals. The `Display` message changed to match.
+- **Breaking:** `Command::stdout_tee<W>` / `stderr_tee<W>` now take a
+  `tokio::io::AsyncWrite` sink (was `std::io::Write`). The write is awaited on the capture
+  pump, so a slow sink applies backpressure rather than blocking the runtime, and a write
+  error disables the tee with a `tracing` warn instead of being silently swallowed. The
+  tee now runs **independently** of `on_stdout_line` (it no longer replaces the handler).
+- The fail-loud `OverflowMode::Error` ceiling now fires on the **cumulative** output the
+  pump has seen (total lines / bytes), not the current backlog — so a streaming consumer
+  draining lines as they arrive can no longer evade it.
+- `ProcessGroup::terminate_all` / `shutdown` / `signal` now return `Err` when the pre-5.14
+  Linux cgroup per-pid `SIGKILL` fallback cannot drain the tree (a fork bomb still
+  out-spawning, or `D`-state zombies) — previously a false success. The atomic backends
+  (cgroup `kill`, Windows Job Objects, the POSIX process-group fallback) never report this.
+- `ProcessGroup::adopt` of a child that has exited but is **not yet reaped** is now a
+  successful no-op (`Ok`) on the containment backends, instead of surfacing the backend's
+  raw assign/write error. (An already-*reaped* child still errors — no pid/handle left.)
 
 ### Fixed
--
+
+- **Non-ASCII-compatible encodings no longer corrupt output.** Bytes are fed through one
+  persistent decoder and the *decoded* text is split on newlines, so UTF-16LE/BE (whose
+  code units contain `0x0A` bytes that are not line breaks) and stateful encodings decode
+  correctly instead of being mangled by a raw-byte split.
+- A byte-order mark is handled once at the stream start (the chosen encoding's own BOM
+  only), so a legacy line that merely begins with BOM-looking bytes is no longer silently
+  re-decoded as UTF-16.
+- A CRLF terminator now strips exactly one trailing `\r`, not every trailing `\r`, so
+  `"data\r\r\n"` yields `"data\r"`.
+- A mid-stream read error now flushes the partial final line instead of dropping it
+  (matching the EOF path).
+- Sys-layer safety hardening: the POSIX process-group fallback no longer risks signalling
+  a **recycled PID**'s group (a latch gates the whole-group fallback) and recovers from a
+  poisoned lock instead of panicking; on Windows, `suspend()`/`resume()` no longer return a
+  false error when a member thread exits between the snapshot and the walk, and a `Drop`
+  that skips the kill now clears the Job Object CPU-rate cap; on Linux, cgroup directory
+  names carry a per-process salt so a recycled PID can't collide with a crashed run's
+  leftover directory and silently downgrade to the process-group fallback.
+- Deadline computations are clamped so a `Duration::MAX`-ish timeout/grace can no longer
+  overflow `Instant` arithmetic and panic.
 
 ## [0.9.2] - 2026-06-11
 

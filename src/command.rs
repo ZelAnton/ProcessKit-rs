@@ -49,6 +49,10 @@ pub struct Command {
     ok_codes: Option<Vec<i32>>,
     stdout_handler: Option<LineHandler>,
     stderr_handler: Option<LineHandler>,
+    /// Async tee sinks (Э6): each decoded line is also written here. Independent
+    /// of the line handlers above — both run.
+    stdout_tee: Option<crate::pump::TeeSink>,
+    stderr_tee: Option<crate::pump::TeeSink>,
     stdout_mode: StdioMode,
     stderr_mode: StdioMode,
     output_buffer: OutputBufferPolicy,
@@ -106,6 +110,8 @@ impl Command {
             ok_codes: None,
             stdout_handler: None,
             stderr_handler: None,
+            stdout_tee: None,
+            stderr_tee: None,
             stdout_mode: StdioMode::Piped,
             stderr_mode: StdioMode::Piped,
             output_buffer: OutputBufferPolicy::unbounded(),
@@ -605,46 +611,58 @@ impl Command {
         self
     }
 
-    /// Tee every decoded stdout line to `writer` as it is produced —
-    /// capture *and* stream to `writer` simultaneously.
+    /// Tee every decoded stdout line to `writer` as it is produced — capture
+    /// *and* stream to `writer` simultaneously.
     ///
-    /// Equivalent to [`on_stdout_line`](Self::on_stdout_line) with a
-    /// `writeln!` handler. Replaces any previously set stdout handler.
-    /// Compose multiple sinks inside a single [`on_stdout_line`](Self::on_stdout_line)
-    /// handler when you need more than one.
+    /// `writer` is an async sink ([`tokio::io::AsyncWrite`]); each decoded line
+    /// is written to it followed by `\n`. The write is **awaited on the capture
+    /// pump**, so a slow sink applies backpressure (the pump slows, the OS pipe
+    /// fills, the child blocks on its next write) rather than blocking the
+    /// runtime (Э6). The sink must make forward progress, though: a destination
+    /// that blocks *forever* (not merely slow) stalls the pump — no further
+    /// lines are buffered and a live `stdout_lines`/`output_events` consumer
+    /// parks — until the run's teardown grace aborts the pump. A write error
+    /// disables the tee for the rest of the run — surfaced as a `tracing` warn
+    /// under the `tracing` feature, not silently swallowed — and capture is
+    /// unaffected.
+    ///
+    /// Runs **independently** of [`on_stdout_line`](Self::on_stdout_line): set
+    /// both and both fire per line (the tee no longer replaces the handler).
+    /// A second `stdout_tee` replaces an earlier one.
+    ///
+    /// The tee fires **before** the buffer policy decides retention, so it sees
+    /// *every* decoded line — including ones the capture buffer then drops or
+    /// rejects, e.g. output past a [`fail_loud`](crate::OutputBufferPolicy::fail_loud)
+    /// ceiling (that ceiling bounds retained memory, not what streams past).
     ///
     /// Requires stdout to be [`Piped`](crate::StdioMode::Piped) (the default):
     /// the tee fires from the capture pump, so it is a no-op under
     /// [`stdout(Inherit)`](Self::stdout) / [`stdout(Null)`](Self::stdout), which
-    /// run no pump.
+    /// run no pump. It is likewise inert under
+    /// [`output_bytes`](Self::output_bytes), which captures stdout **raw** (no
+    /// line pump) — reach for a stdout tee with the line verbs (`output_string`,
+    /// `start` + `stdout_lines`, `output_events`).
     pub fn stdout_tee<W>(mut self, writer: W) -> Self
     where
-        W: std::io::Write + Send + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
-        let writer = Arc::new(std::sync::Mutex::new(writer));
-        self.stdout_handler = Some(Arc::new(move |line: &str| {
-            if let Ok(mut w) = writer.lock() {
-                let _ = writeln!(w, "{line}");
-            }
-        }));
+        let boxed: Box<dyn tokio::io::AsyncWrite + Send + Unpin> = Box::new(writer);
+        self.stdout_tee = Some(Arc::new(tokio::sync::Mutex::new(boxed)));
         self
     }
 
     /// Tee every decoded stderr line to `writer` as it is produced.
     ///
-    /// Same contract as [`stdout_tee`](Self::stdout_tee) — including the
-    /// requirement that stderr be [`Piped`](crate::StdioMode::Piped). Replaces
-    /// any previously set stderr handler.
+    /// Same contract as [`stdout_tee`](Self::stdout_tee) — an async
+    /// [`tokio::io::AsyncWrite`] sink, awaited on the pump (backpressure, not
+    /// runtime-blocking), independent of [`on_stderr_line`](Self::on_stderr_line),
+    /// and requiring stderr to be [`Piped`](crate::StdioMode::Piped).
     pub fn stderr_tee<W>(mut self, writer: W) -> Self
     where
-        W: std::io::Write + Send + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
-        let writer = Arc::new(std::sync::Mutex::new(writer));
-        self.stderr_handler = Some(Arc::new(move |line: &str| {
-            if let Ok(mut w) = writer.lock() {
-                let _ = writeln!(w, "{line}");
-            }
-        }));
+        let boxed: Box<dyn tokio::io::AsyncWrite + Send + Unpin> = Box::new(writer);
+        self.stderr_tee = Some(Arc::new(tokio::sync::Mutex::new(boxed)));
         self
     }
 
@@ -688,6 +706,14 @@ impl Command {
 
     pub(crate) fn stderr_handler(&self) -> Option<LineHandler> {
         self.stderr_handler.clone()
+    }
+
+    pub(crate) fn stdout_tee_sink(&self) -> Option<crate::pump::TeeSink> {
+        self.stdout_tee.clone()
+    }
+
+    pub(crate) fn stderr_tee_sink(&self) -> Option<crate::pump::TeeSink> {
+        self.stderr_tee.clone()
     }
 
     pub(crate) fn output_buffer_policy(&self) -> OutputBufferPolicy {

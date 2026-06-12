@@ -131,7 +131,12 @@ let out = Command::new("legacy-tool")
 ```
 
 (`processkit::Encoding` re-exports `encoding_rs::Encoding`, so any of its
-encodings — `WINDOWS_1252`, `GBK`, … — works.)
+encodings works — the single-byte and ASCII-compatible multibyte ones
+(`WINDOWS_1252`, `GBK`, `SHIFT_JIS`, …) **and** the non-ASCII-compatible ones
+(`UTF_16LE`/`UTF_16BE`): output is fed through one persistent decoder and split
+on decoded newlines, so a `0x0A` byte inside a UTF-16 code unit is not mistaken
+for a line break. A leading byte-order mark of the chosen encoding is stripped
+once at the stream start.)
 
 ### Buffer policies — bounding memory on chatty children
 
@@ -155,6 +160,21 @@ let head_policy = OutputBufferPolicy::bounded(1_000).with_overflow(OverflowMode:
 head. `bounded(0)` retains nothing — useful when a line handler (below) is the
 real consumer. Dropped or not, **every** line still feeds the handlers and the
 line counters.
+
+The line cap alone does not bound memory — one enormous newline-free "line"
+(`base64 -w0`) is held whole. Add `with_max_bytes` to cap the *retained bytes*
+too (either ceiling, or both):
+
+```rust,no_run
+# use processkit::{Command, OutputBufferPolicy};
+let policy = OutputBufferPolicy::unbounded().with_max_bytes(8 << 20); // 8 MiB ring
+let strict = OutputBufferPolicy::fail_loud(10_000).with_max_bytes(8 << 20); // error on either
+```
+
+`fail_loud` makes the ceiling **error** instead of dropping: the run fails with
+`Error::OutputTooLarge` once the cumulative output (lines *or* bytes) crosses the
+cap — even when a streaming consumer is draining lines as they arrive. It bounds
+memory, not wall-time, so pair it with `timeout` against a flooding child.
 
 ### Line handlers — tee output as it arrives
 
@@ -188,6 +208,15 @@ and precisely specified:
 - Handlers are **hermetically testable**: `ScriptedRunner` replays canned
   output through them — see
   [Testing → scripting replies](testing.md#scripting-replies).
+
+For a ready-made tee to an async sink — a file, socket, or any
+[`tokio::io::AsyncWrite`] — reach for `stdout_tee` / `stderr_tee` instead of
+hand-writing a handler. Each decoded line is written to the sink (plus a `\n`)
+as it is produced, **awaited on the pump** so a slow sink applies backpressure
+(the pump slows, the pipe fills, the child blocks) rather than blocking the
+runtime; a write error disables the tee with a `tracing` warn instead of being
+swallowed. It runs **independently** of `on_stdout_line` — set both and both
+fire per line.
 
 ## Timeouts and retries
 
@@ -333,7 +362,7 @@ The error enum is structured and `#[non_exhaustive]`:
 | `Error::NotFound { program, searched }` | A bare program name was not found; `searched` names the `PATH` directories looked at |
 | `Error::Exit { program, code, stdout, stderr }` | Non-zero exit, both streams attached in full (the `Display` message is bounded, but the fields carry the complete captured text for classification) |
 | `Error::Signalled { program, signal }` | The process was killed by a signal (no exit code); `signal` carries the number on Unix, `None` elsewhere |
-| `Error::OutputTooLarge { program, limit, total_lines }` | A `fail_loud` buffer's line ceiling was exceeded |
+| `Error::OutputTooLarge { program, line_limit, byte_limit, total_lines, total_bytes }` | A `fail_loud` buffer's line or byte ceiling was exceeded |
 | `Error::Timeout { program, timeout }` | The run's own deadline killed it |
 | `Error::NotReady { program, timeout }` | A [readiness probe](streaming.md#readiness-probes) gave up |
 | `Error::Parse { program, message }` | A `CliClient::try_parse` parser rejected the output |

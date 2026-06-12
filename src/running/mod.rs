@@ -23,7 +23,7 @@ use crate::buffer::OutputBufferPolicy;
 use crate::error::Error;
 use crate::error::Result;
 use crate::group::ProcessGroup;
-use crate::pump::{LineHandler, SharedLines, pump_lines};
+use crate::pump::{LineHandler, SharedLines, pump_lines_core};
 use crate::result::{Outcome, ProcessResult};
 use crate::stdin::ProcessStdin;
 
@@ -77,6 +77,8 @@ pub(crate) struct Spawned {
     pub stderr_encoding: &'static Encoding,
     pub stdout_handler: Option<LineHandler>,
     pub stderr_handler: Option<LineHandler>,
+    pub stdout_tee: Option<crate::pump::TeeSink>,
+    pub stderr_tee: Option<crate::pump::TeeSink>,
     pub buffer: OutputBufferPolicy,
     /// Exit codes treated as success (default `[0]`), carried onto the result.
     pub ok_codes: Vec<i32>,
@@ -118,6 +120,8 @@ pub struct RunningProcess {
     stderr_encoding: &'static Encoding,
     stdout_handler: Option<LineHandler>,
     stderr_handler: Option<LineHandler>,
+    stdout_tee: Option<crate::pump::TeeSink>,
+    stderr_tee: Option<crate::pump::TeeSink>,
     buffer: OutputBufferPolicy,
     ok_codes: Vec<i32>,
     stdout_sink: Option<Arc<SharedLines>>,
@@ -330,6 +334,8 @@ impl RunningProcess {
             stderr_encoding: s.stderr_encoding,
             stdout_handler: s.stdout_handler,
             stderr_handler: s.stderr_handler,
+            stdout_tee: s.stdout_tee,
+            stderr_tee: s.stderr_tee,
             buffer: s.buffer,
             ok_codes: s.ok_codes,
             stdout_sink: None,
@@ -367,6 +373,8 @@ impl RunningProcess {
             stderr_encoding: command.err_encoding(),
             stdout_handler: command.stdout_handler(),
             stderr_handler: command.stderr_handler(),
+            stdout_tee: command.stdout_tee_sink(),
+            stderr_tee: command.stderr_tee_sink(),
             buffer: command.output_buffer_policy(),
             ok_codes: command.ok_codes_vec(),
             stdout_sink: None,
@@ -654,10 +662,11 @@ impl RunningProcess {
         // we join — an orphaned pump on a shared-group handle would otherwise
         // buffer unboundedly for the child's remaining lifetime.
         self.stderr_pump = self.backend.take_stderr_reader().map(|pipe| {
-            tokio::spawn(pump_lines(
+            tokio::spawn(pump_lines_core(
                 pipe,
                 self.stderr_encoding,
                 self.stderr_handler.clone(),
+                self.stderr_tee.clone(),
                 stderr_sink.clone(),
             ))
         });
@@ -714,8 +723,10 @@ impl RunningProcess {
         if stderr_sink.overflowed() {
             return Err(crate::Error::OutputTooLarge {
                 program: self.program.clone(),
-                limit: self.buffer.max_lines.unwrap_or(0),
+                line_limit: self.buffer.max_lines,
+                byte_limit: self.buffer.max_bytes,
                 total_lines: stderr_sink.count(),
+                total_bytes: stderr_sink.seen_bytes(),
             });
         }
 
@@ -1020,8 +1031,10 @@ impl RunningProcess {
                 if sink.overflowed() {
                     return Err(crate::Error::OutputTooLarge {
                         program: self.program.clone(),
-                        limit: self.buffer.max_lines.unwrap_or(0),
+                        line_limit: self.buffer.max_lines,
+                        byte_limit: self.buffer.max_bytes,
                         total_lines: sink.count(),
+                        total_bytes: sink.seen_bytes(),
                     });
                 }
             }
@@ -1044,18 +1057,20 @@ impl RunningProcess {
     /// verb propagates an error before `join_pumps` runs (L3 fix).
     fn spawn_line_pumps(&mut self, stdout_sink: &Arc<SharedLines>, stderr_sink: &Arc<SharedLines>) {
         if let Some(pipe) = self.backend.take_stdout_reader() {
-            self.stdout_pump = Some(tokio::spawn(pump_lines(
+            self.stdout_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,
                 self.stdout_encoding,
                 self.stdout_handler.clone(),
+                self.stdout_tee.clone(),
                 stdout_sink.clone(),
             )));
         }
         if let Some(pipe) = self.backend.take_stderr_reader() {
-            self.stderr_pump = Some(tokio::spawn(pump_lines(
+            self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,
                 self.stderr_encoding,
                 self.stderr_handler.clone(),
+                self.stderr_tee.clone(),
                 stderr_sink.clone(),
             )));
         }

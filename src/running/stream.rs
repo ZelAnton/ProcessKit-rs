@@ -11,7 +11,7 @@ use tokio_stream::Stream;
 
 use crate::error::Result;
 use crate::group::ProcessGroup;
-use crate::pump::{Popped, SharedLines, pump_lines};
+use crate::pump::{Popped, SharedLines, pump_lines_core};
 use crate::result::Outcome;
 
 use super::RunningProcess;
@@ -89,10 +89,11 @@ impl RunningProcess {
         if self.stderr_sink.is_none() {
             let stderr_sink = SharedLines::new(&self.buffer);
             if let Some(pipe) = self.backend.take_stderr_reader() {
-                self.stderr_pump = Some(tokio::spawn(pump_lines(
+                self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                     pipe,
                     self.stderr_encoding,
                     self.stderr_handler.clone(),
+                    self.stderr_tee.clone(),
                     stderr_sink.clone(),
                 )));
             }
@@ -106,10 +107,11 @@ impl RunningProcess {
                 // joins it before the fail-loud overflow check and `Drop` aborts
                 // it on a shared-group handle — a discarded handle would leave
                 // both as no-ops for the stdout stream.
-                self.stdout_pump = Some(tokio::spawn(pump_lines(
+                self.stdout_pump = Some(tokio::spawn(pump_lines_core(
                     pipe,
                     self.stdout_encoding,
                     self.stdout_handler.clone(),
+                    self.stdout_tee.clone(),
                     stdout_sink.clone(),
                 )));
             }
@@ -212,10 +214,11 @@ impl RunningProcess {
         // joins it and Drop aborts it on an early-error exit.
         if let Some(pipe) = self.backend.take_stdout_reader() {
             let sink = crate::pump::SharedLines::new(&self.buffer);
-            self.stdout_pump = Some(tokio::spawn(crate::pump::pump_lines(
+            self.stdout_pump = Some(tokio::spawn(crate::pump::pump_lines_core(
                 pipe,
                 self.stdout_encoding,
                 self.stdout_handler.clone(),
+                self.stdout_tee.clone(),
                 sink.clone(),
             )));
             self.stdout_sink = Some(sink);
@@ -226,10 +229,11 @@ impl RunningProcess {
             && let Some(pipe) = self.backend.take_stderr_reader()
         {
             let sink = SharedLines::new(&self.buffer);
-            self.stderr_pump = Some(tokio::spawn(pump_lines(
+            self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,
                 self.stderr_encoding,
                 self.stderr_handler.clone(),
+                self.stderr_tee.clone(),
                 sink.clone(),
             )));
             self.stderr_sink = Some(sink);
@@ -257,8 +261,10 @@ impl RunningProcess {
             if sink.overflowed() {
                 return Err(crate::Error::OutputTooLarge {
                     program: self.program.clone(),
-                    limit: self.buffer.max_lines.unwrap_or(0),
+                    line_limit: self.buffer.max_lines,
+                    byte_limit: self.buffer.max_bytes,
                     total_lines: sink.count(),
+                    total_bytes: sink.seen_bytes(),
                 });
             }
         }
@@ -311,10 +317,11 @@ impl RunningProcess {
         let stdout_sink = SharedLines::new(&self.buffer);
         match self.backend.take_stdout_reader() {
             Some(pipe) => {
-                self.stdout_pump = Some(tokio::spawn(pump_lines(
+                self.stdout_pump = Some(tokio::spawn(pump_lines_core(
                     pipe,
                     self.stdout_encoding,
                     self.stdout_handler.clone(),
+                    self.stdout_tee.clone(),
                     stdout_sink.clone(),
                 )));
             }
@@ -334,10 +341,11 @@ impl RunningProcess {
         let stderr_sink = if self.stderr_sink.is_none() {
             let sink = SharedLines::new(&self.buffer);
             if let Some(pipe) = self.backend.take_stderr_reader() {
-                self.stderr_pump = Some(tokio::spawn(pump_lines(
+                self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                     pipe,
                     self.stderr_encoding,
                     self.stderr_handler.clone(),
+                    self.stderr_tee.clone(),
                     sink.clone(),
                 )));
             } else {
@@ -422,10 +430,11 @@ impl RunningProcess {
         // The handle is stored in self.stdout_pump and joined below.
         if let Some(pipe) = self.backend.take_stdout_reader() {
             let sink = crate::pump::SharedLines::new(&self.buffer);
-            self.stdout_pump = Some(tokio::spawn(crate::pump::pump_lines(
+            self.stdout_pump = Some(tokio::spawn(crate::pump::pump_lines_core(
                 pipe,
                 self.stdout_encoding,
                 self.stdout_handler.clone(),
+                self.stdout_tee.clone(),
                 sink.clone(),
             )));
             self.stdout_sink = Some(sink);
@@ -434,10 +443,11 @@ impl RunningProcess {
             && let Some(pipe) = self.backend.take_stderr_reader()
         {
             let sink = SharedLines::new(&self.buffer);
-            self.stderr_pump = Some(tokio::spawn(pump_lines(
+            self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,
                 self.stderr_encoding,
                 self.stderr_handler.clone(),
+                self.stderr_tee.clone(),
                 sink.clone(),
             )));
             self.stderr_sink = Some(sink);
@@ -466,8 +476,10 @@ impl RunningProcess {
             if sink.overflowed() {
                 return Err(crate::Error::OutputTooLarge {
                     program: self.program.clone(),
-                    limit: self.buffer.max_lines.unwrap_or(0),
+                    line_limit: self.buffer.max_lines,
+                    byte_limit: self.buffer.max_bytes,
                     total_lines: sink.count(),
+                    total_bytes: sink.seen_bytes(),
                 });
             }
         }

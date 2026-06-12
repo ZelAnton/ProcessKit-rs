@@ -101,21 +101,33 @@ pub enum Error {
     },
 
     /// The captured output exceeded the
-    /// [`OutputBufferPolicy::fail_loud`](crate::OutputBufferPolicy::fail_loud)
-    /// ceiling — the child produced more lines than allowed. The run itself
-    /// may have succeeded; this error is raised by the consuming path after
-    /// the run completes.
+    /// [`OverflowMode::Error`](crate::OverflowMode::Error) fail-loud ceiling —
+    /// a line cap ([`max_lines`](crate::OutputBufferPolicy::max_lines)), a byte
+    /// cap ([`max_bytes`](crate::OutputBufferPolicy::max_bytes)), or both. The
+    /// run itself may have succeeded; this error is raised by the consuming
+    /// path after the run completes.
     ///
-    /// The pipe is still fully drained (the child never blocks); excess lines
-    /// are counted (in the total) but not retained.
-    #[error("`{program}` output exceeded {limit}-line limit ({total_lines} lines total)")]
+    /// The pipe is still fully drained (the child never blocks); output past
+    /// the ceiling is counted (in the totals) but not retained.
+    #[error(
+        "`{program}` output exceeded its capture ceiling ({total_lines} lines, {total_bytes} bytes total)"
+    )]
     OutputTooLarge {
-        /// The program whose output exceeded the limit.
+        /// The program whose output exceeded the ceiling.
         program: String,
-        /// The configured cap (`OutputBufferPolicy::max_lines`).
-        limit: usize,
+        /// The configured line ceiling, if any
+        /// (`OutputBufferPolicy::max_lines`).
+        line_limit: Option<usize>,
+        /// The configured byte ceiling, if any
+        /// (`OutputBufferPolicy::max_bytes`).
+        byte_limit: Option<usize>,
         /// Total lines that arrived (retained + dropped).
         total_lines: usize,
+        /// Total bytes of decoded line text seen (retained + dropped) — the
+        /// same unit [`max_bytes`](crate::OutputBufferPolicy::max_bytes) caps:
+        /// the sum of line lengths with the trailing newline (and one `\r`)
+        /// stripped, not the raw stream size.
+        total_bytes: usize,
     },
 
     /// A readiness probe ([`RunningProcess::wait_for_line`],
@@ -364,13 +376,17 @@ impl fmt::Debug for Error {
                 .finish(),
             Error::OutputTooLarge {
                 program,
-                limit,
+                line_limit,
+                byte_limit,
                 total_lines,
+                total_bytes,
             } => f
                 .debug_struct("OutputTooLarge")
                 .field("program", program)
-                .field("limit", limit)
+                .field("line_limit", line_limit)
+                .field("byte_limit", byte_limit)
                 .field("total_lines", total_lines)
+                .field("total_bytes", total_bytes)
                 .finish(),
             Error::NotReady { program, timeout } => f
                 .debug_struct("NotReady")

@@ -160,15 +160,30 @@ async fn stdout_null_makes_capture_verbs_error_but_discard_verbs_run() {
 #[tokio::test]
 #[ignore = "spawns a real subprocess"]
 async fn stdout_tee_writes_to_the_sink_while_capturing() {
+    // An in-memory `tokio::io::AsyncWrite` sink shared with the test, so it can
+    // read back what the tee received without depending on file flush/close.
     #[derive(Clone)]
     struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for SharedSink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    impl tokio::io::AsyncWrite for SharedSink {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
             self.0.lock().expect("sink mutex").extend_from_slice(buf);
-            Ok(buf.len())
+            std::task::Poll::Ready(Ok(buf.len()))
         }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
         }
     }
 
@@ -185,7 +200,7 @@ async fn stdout_tee_writes_to_the_sink_while_capturing() {
         "capture must still see both lines: {:?}",
         result.stdout()
     );
-    // The tee received the same lines (writeln! per decoded line).
+    // The tee received the same lines (each decoded line + '\n').
     let teed = String::from_utf8(sink.0.lock().expect("sink mutex").clone()).expect("tee is utf-8");
     assert!(
         teed.contains("first") && teed.contains("second"),
@@ -574,9 +589,15 @@ async fn fail_loud_buffer_surfaces_output_too_large() {
         .expect_err("5 lines over a 2-line fail-loud cap must error");
     match err {
         processkit::Error::OutputTooLarge {
-            limit, total_lines, ..
+            line_limit,
+            total_lines,
+            ..
         } => {
-            assert_eq!(limit, 2, "the configured cap is reported: {err:?}");
+            assert_eq!(
+                line_limit,
+                Some(2),
+                "the configured line cap is reported: {err:?}"
+            );
             assert!(total_lines >= 5, "every line is counted: {total_lines}");
         }
         other => panic!("expected Error::OutputTooLarge, got {other:?}"),
