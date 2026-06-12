@@ -266,6 +266,11 @@ where
 /// An empty `processes` slice is an error ([`Error::Io`] with
 /// [`InvalidInput`](std::io::ErrorKind::InvalidInput)) rather than a future
 /// that never resolves.
+///
+/// The first finisher's result carries the same errors as a bulk verb:
+/// [`Error::Cancelled`] for a cancelled run, or [`Error::Stdin`] when its stdin
+/// source failed (non-broken-pipe) on an otherwise-successful exit. A non-zero
+/// exit or signal is *not* an error here — it is returned as its [`Outcome`].
 pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, Outcome)> {
     use std::future::Future;
 
@@ -324,7 +329,10 @@ pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, O
 /// zero outcomes is well-defined, where racing none is not.
 ///
 /// If a contender fails to reap (an OS I/O error), that `Err` is returned and
-/// the remaining processes stay waitable (cancel-safe).
+/// the remaining processes stay waitable (cancel-safe). A contender's
+/// [`Error::Cancelled`] (cancelled run) or [`Error::Stdin`] (a non-broken-pipe
+/// stdin-source failure on its otherwise-successful exit) likewise short-circuits
+/// the join — like the bulk verbs, these surface as an `Err`, not an `Outcome`.
 pub async fn wait_all(processes: &mut [&mut RunningProcess]) -> Result<Vec<Outcome>> {
     use std::future::Future;
     use std::task::Poll;
@@ -420,6 +428,80 @@ mod tests {
             result,
             Outcome::Exited(0),
             "natural exit must not be converted to Err(Cancelled)"
+        );
+    }
+
+    // Б2 regression: the same snapshot hazard via a *second* wait_any (not a
+    // bulk verb). The existing test above covers wait_exit -> wait() (the guarded
+    // drive_to_exit path); this covers wait_exit -> wait_exit, the documented
+    // "race them, keep watching the rest" pattern, where wait_exit re-snapshotted
+    // cancel_at_exit unconditionally and flipped a natural exit to Err(Cancelled).
+    #[cfg(feature = "cancellation")]
+    #[tokio::test]
+    async fn wait_any_winner_preserved_after_late_cancel_and_second_wait_any() {
+        use crate::doubles::{Reply, ScriptedRunner};
+        use crate::runner::ProcessRunner;
+
+        let token = crate::CancellationToken::new();
+        let runner = ScriptedRunner::new().fallback(Reply::ok(""));
+        let mut process = runner
+            .start(&crate::Command::new("test-prog").cancel_on(token.clone()))
+            .await
+            .expect("start scripted process");
+
+        let (idx, outcome) = super::wait_any(&mut [&mut process])
+            .await
+            .expect("first wait_any");
+        assert_eq!(idx, 0);
+        assert_eq!(outcome, Outcome::Exited(0));
+
+        token.cancel();
+
+        let (idx2, outcome2) = super::wait_any(&mut [&mut process])
+            .await
+            .expect("second wait_any must not error after a late cancel");
+        assert_eq!(idx2, 0);
+        assert_eq!(
+            outcome2,
+            Outcome::Exited(0),
+            "repeat wait_any must preserve the natural exit, not reclassify as Cancelled"
+        );
+    }
+
+    // Б2 regression for wait_all: a late cancel followed by a re-join must not
+    // make the whole batch error out (wait_all short-circuits on the first Err,
+    // so a spurious Cancelled would discard every other contender's outcome too).
+    #[cfg(feature = "cancellation")]
+    #[tokio::test]
+    async fn wait_all_winners_preserved_after_late_cancel_and_re_wait() {
+        use crate::doubles::{Reply, ScriptedRunner};
+        use crate::runner::ProcessRunner;
+
+        let token = crate::CancellationToken::new();
+        let runner = ScriptedRunner::new().fallback(Reply::ok(""));
+        let mut a = runner
+            .start(&crate::Command::new("a").cancel_on(token.clone()))
+            .await
+            .expect("start a");
+        let mut b = runner
+            .start(&crate::Command::new("b").cancel_on(token.clone()))
+            .await
+            .expect("start b");
+
+        let outcomes = super::wait_all(&mut [&mut a, &mut b])
+            .await
+            .expect("first wait_all");
+        assert_eq!(outcomes, vec![Outcome::Exited(0), Outcome::Exited(0)]);
+
+        token.cancel();
+
+        let outcomes2 = super::wait_all(&mut [&mut a, &mut b])
+            .await
+            .expect("re-join after a late cancel must not error");
+        assert_eq!(
+            outcomes2,
+            vec![Outcome::Exited(0), Outcome::Exited(0)],
+            "repeat wait_all must preserve natural exits, not reclassify as Cancelled"
         );
     }
 
@@ -533,6 +615,40 @@ mod tests {
         assert!(
             matches!(err, crate::Error::Cancelled { .. }),
             "expected Error::Cancelled, got {err:?}"
+        );
+    }
+
+    // Б2 symmetry: the snapshot-preserving guard must keep a genuine
+    // cancellation *sticky* across a re-wait, not just preserve a clean exit.
+    // A second wait_any after a genuinely cancelled run must STILL be
+    // Err(Cancelled) (the guard preserves Some(true) exactly as it preserves
+    // Some(false)) — the fix must not make cancellation non-sticky on re-wait.
+    #[cfg(feature = "cancellation")]
+    #[tokio::test]
+    async fn wait_any_genuine_cancel_stays_cancelled_on_re_wait() {
+        use crate::doubles::{Reply, ScriptedRunner};
+        use crate::runner::ProcessRunner;
+
+        let token = crate::CancellationToken::new();
+        let runner = ScriptedRunner::new().fallback(Reply::ok(""));
+        let mut process = runner
+            .start(&crate::Command::new("prog").cancel_on(token.clone()))
+            .await
+            .expect("start");
+
+        token.cancel(); // genuine cancel before the race -> snapshot Some(true)
+
+        let err = super::wait_any(&mut [&mut process])
+            .await
+            .expect_err("first wait_any: cancelled run errors");
+        assert!(matches!(err, crate::Error::Cancelled { .. }), "got {err:?}");
+
+        let err2 = super::wait_any(&mut [&mut process])
+            .await
+            .expect_err("re-wait must stay cancelled, not flip to Ok");
+        assert!(
+            matches!(err2, crate::Error::Cancelled { .. }),
+            "repeat wait_any must preserve the cancellation, got {err2:?}"
         );
     }
 

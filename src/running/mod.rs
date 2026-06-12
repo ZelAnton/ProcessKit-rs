@@ -703,6 +703,13 @@ impl RunningProcess {
     ///
     /// Aborts watchdog tasks after reap to prevent late-firing deadline/cancel
     /// tasks from sending signals to a recycled pid (B1/B2 fix).
+    ///
+    /// Surfaces the same errors as the bulk verbs' post-exit checkpoint: a
+    /// cancelled run is [`Error::Cancelled`], and a stdin source that failed for
+    /// a non-broken-pipe reason on an otherwise-successful run is
+    /// [`Error::Stdin`] (Э8). On a repeat call after the first reap the original
+    /// cancel snapshot is preserved (Б2) and the one-shot stdin error has already
+    /// been consumed, so the cached [`Outcome`] is returned unchanged.
     pub(crate) async fn wait_exit(&mut self) -> Result<Outcome> {
         // L5: close a `keep_stdin_open` pipe nobody took, so a stdin-reading
         // child sees EOF instead of blocking forever — `wait_exit` (the
@@ -713,11 +720,24 @@ impl RunningProcess {
         if let Backend::Real(real) = &mut self.backend {
             drop(real.stdin_pipe.take());
         }
+        // Б2: preserve a cancel snapshot taken by an earlier reap observation
+        // (a prior `wait_exit` / `has_exited_now` / `drive_to_exit`). Re-running
+        // the reap bookkeeping would re-query the live token, and a token
+        // cancelled *after* this child's natural exit would then misclassify the
+        // Tokio-cached exit as `Err(Cancelled)` on a second `wait_any`/`wait_all`
+        // (the documented "race them, keep watching the rest" pattern — and for
+        // `wait_all` that spurious error discards every other contender's outcome
+        // too). Mirrors `drive_to_exit`'s `cancel_at_exit.is_some()` guard.
+        #[cfg(feature = "cancellation")]
+        if self.cancel_at_exit.is_some() {
+            let outcome = self.backend_wait().await?;
+            return self.checked_outcome(outcome);
+        }
         let outcome = self.backend_wait().await?;
-        // Reap happened: abort watchdogs and clear pid before returning.
-        // This mirrors the `abort_watchdogs` call in `drive_to_exit` and
-        // prevents a streaming deadline/cancel task from waking up minutes
-        // later and killing an unrelated process that recycled this pid.
+        // First reap: abort watchdogs and clear pid before returning. This
+        // mirrors the `abort_watchdogs` call in `drive_to_exit` and prevents a
+        // streaming deadline/cancel task from waking up minutes later and
+        // killing an unrelated process that recycled this pid.
         self.abort_watchdogs();
         // Snapshot the cancel state at the true reap point (before any pump
         // teardown or caller code runs). A consuming verb called on the winner
@@ -729,6 +749,11 @@ impl RunningProcess {
             self.cancel_at_exit =
                 Some(self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()));
         }
+        // Э8: observe a finished stdin writer that failed for a non-broken-pipe
+        // reason, so a genuine `Error::Stdin` surfaces on the `wait_any`/
+        // `wait_all` path too (parity with `finish_lines`' B3 contract;
+        // previously this path never observed the writer, silently losing it).
+        self.observe_stdin_task().await;
         self.checked_outcome(outcome)
     }
 
@@ -1325,9 +1350,11 @@ impl RunningProcess {
             self.abort_watchdogs();
             // Same snapshot logic as `wait_exit`: a consuming verb called after
             // a probe that observed the exit must not be misclassified as Cancelled
-            // by a token that fires in the interim.
+            // by a token that fires in the interim. Б2: only on the FIRST reap
+            // observation — a repeat probe after a late cancel must not overwrite
+            // an existing snapshot and reclassify a natural exit as Cancelled.
             #[cfg(feature = "cancellation")]
-            {
+            if self.cancel_at_exit.is_none() {
                 self.cancel_at_exit =
                     Some(self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()));
             }

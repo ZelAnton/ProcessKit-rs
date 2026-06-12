@@ -120,3 +120,55 @@ async fn output_all_collects_a_failing_command_as_data() {
     );
     assert!(results[2].as_ref().expect("ok").is_success());
 }
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess fed a failing stdin source, observed via wait_all"]
+async fn failing_stdin_source_surfaces_as_error_stdin_via_wait_all() {
+    use processkit::{Error, Stdin};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    // Э8: the wait_any/wait_all path (wait_exit) must observe a finished stdin
+    // writer that failed for a non-broken-pipe reason and surface it as
+    // Error::Stdin on an otherwise-successful run, matching the bulk verbs' B3
+    // contract — previously this path never called observe_stdin_task, so the
+    // failure was silently lost and the join reported a clean Outcome.
+    //
+    // Determinism: observe_stdin_task only stashes a *finished* writer. The
+    // child cannot see EOF (and so cannot exit) until the writer's final action
+    // — drop(sink) — has run, and FailingReader fails on its first poll with no
+    // await afterward, so the writer task completes before the child exits. On
+    // the default single-threaded `#[tokio::test]` runtime the writer is thus
+    // always finished before wait_exit reaps the child; there is no cross-thread
+    // race window. (A multi_thread flavor could in principle starve the writer's
+    // completion past the reap — keep this on the default current-thread runtime.)
+
+    /// A stdin source whose read fails immediately with a non-broken-pipe error.
+    struct FailingReader;
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::other("stdin source failed")))
+        }
+    }
+
+    // `sort` (Windows) / `cat` (Unix): both read stdin and exit 0 on EOF.
+    let reads_stdin = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "sort"])
+    } else {
+        Command::new("cat")
+    };
+    let mut child = reads_stdin
+        .stdin(Stdin::from_reader(FailingReader))
+        .start()
+        .await
+        .expect("start");
+    let err = tokio::time::timeout(Duration::from_secs(15), wait_all(&mut [&mut child]))
+        .await
+        .expect("wait_all must not hang")
+        .expect_err("a failed stdin writer on a successful run must surface as Error::Stdin");
+    assert!(matches!(err, Error::Stdin { .. }), "got: {err:?}");
+}
