@@ -25,6 +25,13 @@ pub(crate) struct SharedLines {
     inner: Mutex<Inner>,
     notify: Notify,
     count: AtomicUsize,
+    /// Lines discarded by the buffer *policy* (DropOldest/DropNewest/Error) —
+    /// NOT lines a streaming consumer popped via [`try_pop`](Self::try_pop).
+    /// This is the truncation signal (`dropped() > 0`): unlike
+    /// `count() > retained`, it stays `0` when a stream merely consumed lines
+    /// under an unbounded policy, so `output_string` after partial streaming is
+    /// not falsely reported as truncated (Б4).
+    dropped: AtomicUsize,
 }
 
 struct Inner {
@@ -59,6 +66,7 @@ impl SharedLines {
             }),
             notify: Notify::new(),
             count: AtomicUsize::new(0),
+            dropped: AtomicUsize::new(0),
         })
     }
 
@@ -67,6 +75,10 @@ impl SharedLines {
     pub(crate) fn push(&self, line: String) {
         // Count every line, even one we are about to drop.
         self.count.fetch_add(1, Ordering::Relaxed);
+        // Whether *this* line (or a displaced older one) was discarded by the
+        // policy — distinct from a streaming consumer's pop. Tallied into
+        // `dropped` so the truncation signal ignores consumed-by-stream lines.
+        let mut policy_dropped = false;
         {
             let mut inner = self.inner.lock().expect("SharedLines poisoned");
             match inner.max {
@@ -75,6 +87,7 @@ impl SharedLines {
                 // "tolerate no output; error on the first line.") DropOldest /
                 // DropNewest just discard silently as before.
                 Some(0) => {
+                    policy_dropped = true;
                     if matches!(inner.mode, OverflowMode::Error) {
                         inner.overflowed = true;
                     }
@@ -83,12 +96,14 @@ impl SharedLines {
                     OverflowMode::DropOldest => {
                         inner.lines.pop_front();
                         inner.lines.push_back(line);
+                        policy_dropped = true; // an older line was discarded
                     }
-                    OverflowMode::DropNewest => {} // drop the incoming line
+                    OverflowMode::DropNewest => policy_dropped = true, // drop the incoming line
                     OverflowMode::Error => {
                         // Mark overflow and drop the incoming line; the pipe
                         // is still drained so the child never blocks.
                         inner.overflowed = true;
+                        policy_dropped = true;
                     }
                 },
                 // D9c: `Error` overflow with NO cap (`unbounded().with_overflow(Error)`)
@@ -99,9 +114,13 @@ impl SharedLines {
                 // `fail_loud(n)` for a real cap.
                 None if matches!(inner.mode, OverflowMode::Error) => {
                     inner.overflowed = true;
+                    policy_dropped = true;
                 }
                 _ => inner.lines.push_back(line),
             }
+        }
+        if policy_dropped {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
         // `notify_one` stores a permit if no consumer is waiting yet, so a
         // streaming consumer that registers just after this can't miss it.
@@ -129,6 +148,13 @@ impl SharedLines {
     /// Total lines seen by the pump (including dropped ones).
     pub(crate) fn count(&self) -> usize {
         self.count.load(Ordering::Relaxed)
+    }
+
+    /// Lines discarded by the buffer policy (DropOldest/DropNewest/Error), not
+    /// counting lines a streaming consumer popped. `> 0` iff output was actually
+    /// truncated by the policy (Б4).
+    pub(crate) fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Whether the `OverflowMode::Error` ceiling was hit during pumping.
@@ -335,6 +361,55 @@ mod tests {
         pump_lines(&b"a\nb\nc\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
         assert!(!sink.overflowed());
         assert_eq!(sink.drain(), ["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn dropped_counts_policy_drops_not_consumer_pops() {
+        // Б4: the truncation signal must reflect lines the *policy* discarded,
+        // not lines a streaming consumer popped. Under the default unbounded
+        // policy, popping lines must leave dropped() == 0 (nothing truncated).
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(&b"a\nb\nc\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(sink.count(), 3);
+        assert_eq!(sink.dropped(), 0, "unbounded policy discards nothing");
+        assert!(matches!(sink.try_pop(), Popped::Line(_)));
+        assert!(matches!(sink.try_pop(), Popped::Line(_)));
+        assert_eq!(
+            sink.dropped(),
+            0,
+            "a streaming consumer's pops are not truncation"
+        );
+
+        // A bounded policy that genuinely discards lines reports them.
+        let bounded = SharedLines::new(&OutputBufferPolicy::bounded(2));
+        pump_lines(
+            &b"a\nb\nc\nd\n"[..],
+            encoding_rs::UTF_8,
+            None,
+            bounded.clone(),
+        )
+        .await;
+        assert_eq!(
+            bounded.dropped(),
+            2,
+            "DropOldest discarded the two oldest lines"
+        );
+        // DropNewest and fail-loud likewise tally each discard.
+        let newest = SharedLines::new(
+            &OutputBufferPolicy::bounded(2).with_overflow(OverflowMode::DropNewest),
+        );
+        pump_lines(
+            &b"a\nb\nc\nd\n"[..],
+            encoding_rs::UTF_8,
+            None,
+            newest.clone(),
+        )
+        .await;
+        assert_eq!(
+            newest.dropped(),
+            2,
+            "DropNewest discarded the two newest lines"
+        );
     }
 
     #[tokio::test]

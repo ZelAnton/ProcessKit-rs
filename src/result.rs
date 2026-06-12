@@ -205,10 +205,13 @@ impl<T> ProcessResult<T> {
         self.duration
     }
 
-    /// Whether a bounded [`OutputBufferPolicy`](crate::OutputBufferPolicy) dropped
-    /// captured output lines (the line counter exceeded what the buffer retained).
-    /// Always `false` under the default unbounded policy, and for the raw stdout
-    /// of [`output_bytes`](crate::Command::output_bytes) (not line-buffered).
+    /// Whether a bounded [`OutputBufferPolicy`](crate::OutputBufferPolicy)
+    /// discarded captured output lines (one or more lines were dropped by the
+    /// buffer policy). Lines a streaming consumer popped are *not* truncation, so
+    /// this stays `false` under the default unbounded policy even after a partial
+    /// [`stdout_lines`](crate::RunningProcess::stdout_lines) stream, and for the
+    /// raw stdout of [`output_bytes`](crate::Command::output_bytes) (not
+    /// line-buffered).
     pub fn truncated(&self) -> bool {
         self.truncated
     }

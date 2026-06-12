@@ -566,16 +566,14 @@ impl RunningProcess {
         let finished = self
             .finish_lines(CaptureMode::Lines, /* expose_counts */ true, || {})
             .await?;
-        // `count > retained` on either sink means a bounded buffer dropped lines
-        // (the counters tally every line; the sinks were exposed by finish_lines).
-        let truncated = self
-            .stdout_sink
-            .as_ref()
-            .is_some_and(|s| s.count() > finished.stdout_lines.len())
-            || self
-                .stderr_sink
-                .as_ref()
-                .is_some_and(|s| s.count() > finished.stderr_lines.len());
+        // Б4: truncation = lines the buffer *policy* discarded, reported by each
+        // sink's `dropped()`. The old `count() > retained` test conflated policy
+        // drops with lines a prior `stdout_lines` stream *consumed* via `try_pop`
+        // — so `output_string` after partial streaming under the default
+        // unbounded policy falsely reported `truncated()` even though nothing was
+        // dropped. `dropped()` counts only policy discards, staying `0` here.
+        let truncated = self.stdout_sink.as_ref().is_some_and(|s| s.dropped() > 0)
+            || self.stderr_sink.as_ref().is_some_and(|s| s.dropped() > 0);
         let duration = self.started.elapsed();
         Ok(ProcessResult::new(
             self.program.clone(),
@@ -594,10 +592,44 @@ impl RunningProcess {
     ///
     /// Deliberately NOT routed through `finish_lines`: stdout is a raw byte
     /// reader (no line pump), with its own bounded drain-then-abort teardown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] with [`InvalidInput`](std::io::ErrorKind::InvalidInput)
+    /// if stdout is not piped (`Command::stdout` set to `Inherit`/`Null` — there
+    /// is nothing to read), or if a streaming call ([`stdout_lines`](Self::stdout_lines)
+    /// / [`output_events`](Self::output_events)) already consumed stdout as decoded
+    /// lines: the raw bytes are gone and cannot be faithfully reconstructed, so
+    /// `output_bytes` fails loudly rather than returning empty (Б3). Collect the
+    /// streamed lines with [`output_string`](Self::output_string), or call
+    /// `output_bytes` without streaming first.
     pub async fn output_bytes(mut self) -> Result<ProcessResult<Vec<u8>>> {
         self.ensure_stdout_capturable()?; // D5
+        // Б3: `output_bytes` returns the EXACT raw stdout bytes, so it must own
+        // the raw stdout reader. A prior streaming call (`stdout_lines` /
+        // `output_events`) already took that reader and pumped it as decoded,
+        // line-normalized text — the raw bytes are gone and cannot be faithfully
+        // reconstructed. Fail loudly rather than silently returning empty output
+        // (and clobbering the streamed sinks), mirroring D5's "never silently
+        // empty" stance. `stdout_lines`/`output_events` set both sinks, so either
+        // being present means a streaming call already consumed this run's output.
+        if self.stdout_sink.is_some() || self.stderr_sink.is_some() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "`{}`: output_bytes cannot follow a streaming call (stdout was already \
+                     consumed as lines) — use output_string to collect the streamed lines, or \
+                     call output_bytes without streaming first",
+                    self.program
+                ),
+            )));
+        }
         let stderr_sink = SharedLines::new(&self.buffer);
-        let err_pump = self.backend.take_stderr_reader().map(|pipe| {
+        // L3 parity (Б3): store the stderr pump on `self.stderr_pump` so `Drop`
+        // aborts it if `drive_to_exit` errors and the `?` below propagates before
+        // we join — an orphaned pump on a shared-group handle would otherwise
+        // buffer unboundedly for the child's remaining lifetime.
+        self.stderr_pump = self.backend.take_stderr_reader().map(|pipe| {
             tokio::spawn(pump_lines(
                 pipe,
                 self.stderr_encoding,
@@ -609,10 +641,13 @@ impl RunningProcess {
 
         // Read stdout raw, concurrently, so it never blocks the child. The
         // bytes accumulate in a shared buffer (not the task's return value) so
-        // the bounded teardown below can salvage a partial read.
+        // the bounded teardown below can salvage a partial read. Б3: the task is
+        // stored on `self.stdout_pump` (not a frame-local) for the same reason as
+        // the stderr pump — a `drive_to_exit` error must abort it via `Drop`, not
+        // detach it to grow `out_buf` unboundedly on a shared-group handle.
         let mut stdout_pipe = self.backend.take_stdout_reader();
         let out_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let out_task = {
+        self.stdout_pump = Some({
             let out_buf = out_buf.clone();
             tokio::spawn(async move {
                 if let Some(pipe) = &mut stdout_pipe {
@@ -628,24 +663,27 @@ impl RunningProcess {
                     }
                 }
             })
-        };
+        });
 
         let outcome = self.drive_to_exit().await?;
         self.observe_stdin_task().await;
-        // Bound the drain by the same teardown grace as the line pumps: on a
-        // shared-group handle a surviving descendant can hold stdout open past
-        // the child's death, and an unbounded `read_to_end` here would park
-        // this call forever (`output_string`/`wait` are bounded via
-        // `join_pumps` — `output_bytes` must be too).
-        let abort = out_task.abort_handle();
-        if tokio::time::timeout(PUMP_TEARDOWN, out_task).await.is_err() {
-            // The reader is still parked on a held-open pipe: abort it (like
-            // `join_pumps` aborts stragglers) and keep whatever arrived —
-            // parity with the line pumps' partial capture.
-            abort.abort();
+        // Take the raw-stdout task back off `self` (so `Drop` won't double-abort
+        // it) and bound its drain by the same teardown grace as the line pumps:
+        // on a shared-group handle a surviving descendant can hold stdout open
+        // past the child's death, and an unbounded `read_to_end` here would park
+        // this call forever (`output_string`/`wait` are bounded via `join_pumps`
+        // — `output_bytes` must be too).
+        if let Some(out_task) = self.stdout_pump.take() {
+            let abort = out_task.abort_handle();
+            if tokio::time::timeout(PUMP_TEARDOWN, out_task).await.is_err() {
+                // The reader is still parked on a held-open pipe: abort it (like
+                // `join_pumps` aborts stragglers) and keep whatever arrived —
+                // parity with the line pumps' partial capture.
+                abort.abort();
+            }
         }
         let stdout = std::mem::take(&mut *out_buf.lock().expect("stdout buffer poisoned"));
-        join_pumps(err_pump.into_iter().collect()).await;
+        join_pumps(self.stderr_pump.take().into_iter().collect()).await;
         let outcome = self.checked_outcome(outcome)?;
 
         // Fail-loud ceiling check for the line-pumped stderr.
@@ -658,9 +696,9 @@ impl RunningProcess {
         }
 
         // stdout is raw bytes (not line-buffered), so only the line-pumped stderr
-        // can be truncated by the buffer policy here.
+        // can be truncated by the buffer policy here (Б4: policy drops, not pops).
         let stderr_lines = stderr_sink.drain();
-        let truncated = stderr_sink.count() > stderr_lines.len();
+        let truncated = stderr_sink.dropped() > 0;
         let duration = self.started.elapsed();
         Ok(ProcessResult::new(
             self.program.clone(),
@@ -1532,6 +1570,105 @@ mod tests {
             run.checked_outcome(Outcome::Exited(0)),
             Ok(Outcome::Exited(0))
         ));
+    }
+
+    /// Б4: `output_string` after a partial `stdout_lines` stream must NOT report
+    /// truncation under the default unbounded policy — the consumed lines were
+    /// popped by the stream, not discarded by the buffer. (The old `count() >
+    /// retained` test conflated the two and falsely flagged truncation.)
+    #[tokio::test]
+    async fn output_string_after_partial_stream_is_not_truncated() {
+        use tokio_stream::StreamExt;
+
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::lines(["a", "b", "c", "d"]))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+
+        // Consume the first two lines via the stream.
+        {
+            let mut lines = run.stdout_lines();
+            assert_eq!(lines.next().await.as_deref(), Some("a"));
+            assert_eq!(lines.next().await.as_deref(), Some("b"));
+        }
+
+        let result = run.output_string().await.expect("output_string");
+        assert!(
+            !result.truncated(),
+            "consumed lines are not truncation under unbounded policy: {result:?}"
+        );
+        assert_eq!(
+            result.stdout(),
+            "c\nd",
+            "output_string returns the unconsumed tail"
+        );
+    }
+
+    /// Б3: `output_bytes` after a streaming call must fail loudly. The raw stdout
+    /// bytes were already taken and pumped as decoded lines, so they cannot be
+    /// reconstructed; the old code silently returned empty output (and clobbered
+    /// the streamed stderr sink).
+    #[tokio::test]
+    async fn output_bytes_after_streaming_errors_instead_of_empty() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::lines(["a", "b"]))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+
+        // A streaming call consumes stdout as lines (sets both sinks).
+        drop(run.stdout_lines());
+
+        let err = run
+            .output_bytes()
+            .await
+            .expect_err("output_bytes after streaming must error, not return empty");
+        match err {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+            other => panic!("expected Io(InvalidInput), got {other:?}"),
+        }
+    }
+
+    /// Б4 (other direction): a bounded buffer that genuinely discards lines
+    /// during streaming must STILL report `truncated=true` — the fix must narrow
+    /// only the false positive (consumed-by-stream), never mask real truncation.
+    /// Filling `bounded(2)` with four un-consumed lines drops two deterministically.
+    #[tokio::test]
+    async fn output_string_after_stream_still_reports_real_truncation() {
+        let cmd = Command::new("tool").output_buffer(OutputBufferPolicy::bounded(2));
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::lines(["a", "b", "c", "d"]))
+            .start(&cmd)
+            .await
+            .expect("scripted start");
+
+        // Set up the stream but consume nothing, so the pump fills the bounded
+        // buffer and the policy drops the two oldest lines.
+        drop(run.stdout_lines());
+
+        let result = run.output_string().await.expect("output_string");
+        assert!(
+            result.truncated(),
+            "a bounded buffer that dropped lines during streaming must report truncation: {result:?}"
+        );
+    }
+
+    /// Б3 happy path (now hermetic): `output_bytes` with no prior streaming
+    /// returns the EXACT raw stdout bytes — a NUL byte and a missing trailing
+    /// newline prove it is not line-processed.
+    #[tokio::test]
+    async fn output_bytes_returns_exact_raw_stdout() {
+        let result = ScriptedRunner::new()
+            .fallback(Reply::ok("raw\u{0}bytes\nno trailing newline"))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start")
+            .output_bytes()
+            .await
+            .expect("output_bytes");
+        assert_eq!(result.stdout(), b"raw\x00bytes\nno trailing newline");
+        assert!(!result.truncated(), "no policy drop: {result:?}");
     }
 
     /// D10: a scripted double owns no private group, so it never kills a tree on
