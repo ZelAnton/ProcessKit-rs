@@ -29,6 +29,19 @@ use crate::stats::ProcessGroupStats;
 /// How often the graceful path re-checks whether the tree has drained.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// One tracked id (a group leader pid or a solo pid) plus its Б5 latch.
+struct Entry {
+    id: i32,
+    /// Б5: latched `true` once the group probe (`kill(-id, 0)`) has succeeded —
+    /// the child has called `setpgid` and the fork→exec window is closed. After
+    /// that, an `ESRCH` on the group probe means the group is *genuinely gone*,
+    /// so the L6 direct-pid fallback is disabled: a reaped-and-recycled pid is
+    /// pruned (and never signalled) instead of being kept alive forever, which
+    /// would let `Drop`/`kill_all` SIGKILL an unrelated process that recycled the
+    /// pid. Unused for solo (non-group) sets, whose probe is always a direct pid.
+    group_seen: bool,
+}
+
 /// One tracked id-set with its probe/signal primitives — either process
 /// **groups** (each id is a leader child's pid, probed and signalled
 /// negatively: `kill(-id, 0)` / `killpg`) or **solo** pids (adopted children
@@ -45,7 +58,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 ///   a few instructions wide;
 /// - prune on `ESRCH` and never re-add a pruned id — an empty group can never
 ///   regain members (new members only fork from existing ones), so the probe
-///   is terminal and a recyclable dead id is forgotten promptly;
+///   is terminal and a recyclable dead id is forgotten promptly (and, once the
+///   group has been seen alive, the [`group_seen`](Entry::group_seen) latch
+///   disables the L6 direct-pid fallback so a recycled pid is never revived);
 /// - treat `EPERM` as **exists**: the process/group is alive but may not be
 ///   signalled (e.g. after a third-party uid change) — pruning it would
 ///   silently orphan a live tree, so it is kept and signalled best-effort.
@@ -53,7 +68,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// A tracked id stays until its process is *reaped* — an unreaped zombie
 /// probes alive (relevant for adopted children, which the caller reaps).
 struct Tracked {
-    ids: Mutex<Vec<i32>>,
+    ids: Mutex<Vec<Entry>>,
     /// Probe/signal the whole process group (negative id) instead of one pid.
     group: bool,
 }
@@ -66,119 +81,138 @@ impl Tracked {
         }
     }
 
-    /// Whether `id` still exists (see the type doc for the `EPERM` rule).
-    fn exists(&self, id: i32) -> bool {
+    /// Core liveness probe for `id` given the entry's latch state `group_seen`.
+    /// Returns `(alive, group_seen_after)`. See [`Entry::group_seen`] and the
+    /// type doc for the L6 rule and why the latch disables it.
+    fn probe_raw(&self, id: i32, group_seen: bool) -> (bool, bool) {
         let probe = if self.group { -id } else { id };
         // SAFETY: signal 0 is a sound existence probe (a negative target
         // probes the process group).
         if unsafe { libc::kill(probe, 0) } == 0 {
-            return true;
+            // Alive. For a group, latch: the leader exists, so it has `setpgid`'d
+            // and the fork→exec window is closed.
+            return (true, group_seen || self.group);
         }
         let err = std::io::Error::last_os_error().raw_os_error();
         if err == Some(libc::EPERM) {
-            return true;
+            // Alive but unsignallable — keep it (pruning would orphan a live tree).
+            return (true, group_seen || self.group);
         }
         // L6 — group-mode ESRCH on the negative group-id does not prove the
-        // process is gone: a just-forked child may not have called setpgid(0,0)
-        // yet (the between-fork-and-exec window, reachable on the `setsid` spawn
-        // path). Fall back to a direct pid probe so we don't permanently prune a
-        // still-live entry. `signal_all` mirrors this with a direct-pid *signal*
-        // fallback, so an entry kept alive here is still delivered to and drains
-        // — without that companion it would be probed-by-pid but signalled-by-
-        // group (`killpg` → ESRCH), retained forever and stalling shutdown.
-        //
-        // TOCTOU note: the pid could be reaped and recycled between the two
-        // probes (the same sub-µs window documented in the `Tracked` type doc
-        // for all pid probes). The hazard is the same as the existing solo-pid
-        // tracking and is accepted there; this adds no new risk surface.
-        if self.group && err == Some(libc::ESRCH) {
+        // process is gone *while the group has never been seen alive*: a
+        // just-forked child may not have called setpgid(0,0) yet (the
+        // between-fork-and-exec window, reachable on the `setsid` spawn path).
+        // Fall back to a direct pid probe so we don't permanently prune a
+        // still-live entry. ONCE `group_seen` has latched, the child long since
+        // `setpgid`'d, so an ESRCH means the group genuinely drained — we do NOT
+        // fall back (a direct pid probe would keep a reaped-and-recycled pid
+        // alive forever; Б5). `signal_all` mirrors the same latch-gated fallback.
+        if self.group && !group_seen && err == Some(libc::ESRCH) {
             // SAFETY: probing pid directly; EPERM means alive-but-unsignallable.
             if unsafe { libc::kill(id, 0) } == 0 {
-                return true;
+                return (true, false);
             }
-            return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            let alive = std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            return (alive, false);
         }
-        false
+        (false, group_seen)
+    }
+
+    /// Probe a stored entry, updating its [`group_seen`](Entry::group_seen) latch.
+    fn probe_entry(&self, entry: &mut Entry) -> bool {
+        let (alive, group_seen) = self.probe_raw(entry.id, entry.group_seen);
+        entry.group_seen = group_seen;
+        alive
+    }
+
+    /// Whether `id` is currently tracked (cheap membership check — no probe/prune).
+    /// Only the `process-control`-gated `adopt` de-dup uses this (Б9).
+    #[cfg(feature = "process-control")]
+    fn contains(&self, id: i32) -> bool {
+        self.ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|e| e.id == id)
     }
 
     /// Track `id`, pruning drained entries and de-duplicating (re-adopting a
     /// child this set already tracks must not make `members()`/`stats()`
-    /// over-report).
-    fn track(&self, id: i32) {
-        if let Ok(mut ids) = self.ids.lock() {
-            ids.retain(|&id| self.exists(id));
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
+    /// over-report). `group_seen` seeds the Б5 latch: `true` when the group is
+    /// already known to exist (a non-`setsid` spawn — `setpgid` ran before exec —
+    /// or a successful `adopt` `setpgid`), `false` only on the `setsid` path where
+    /// the group is created after fork (so the L6 window is still open).
+    fn track(&self, id: i32, group_seen: bool) {
+        // Э22: recover a poisoned lock instead of silently dropping the child
+        // from tracking (which would void the kill-on-drop guarantee). Mirrors
+        // the Windows backend and `SharedLines::close`.
+        let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
+        ids.retain_mut(|e| self.probe_entry(e));
+        if !ids.iter().any(|e| e.id == id) {
+            ids.push(Entry { id, group_seen });
         }
     }
 
     /// Send `sig` to every still-existing entry, pruning the drained ones.
     fn signal_all(&self, sig: i32) {
-        if let Ok(mut ids) = self.ids.lock() {
-            ids.retain(|&id| {
-                if !self.exists(id) {
-                    return false; // ESRCH: gone — forget it.
-                }
-                // SAFETY: killpg/kill to a probed-existing id; an exit between
-                // the probe and here just yields ESRCH, and EPERM stays
-                // best-effort — either way the sweep continues.
-                unsafe {
-                    if self.group {
-                        // killpg reaches the leader and every descendant. But if
-                        // the group doesn't exist yet — a child kept alive by the
-                        // L6 direct-pid fallback in `exists` (forked but not yet
-                        // `setpgid`'d), or a recycled pid — killpg yields ESRCH
-                        // and reaches nothing. Fall back to a direct pid signal so
-                        // the entry actually drains; otherwise it stays alive to
-                        // `exists` (by pid) yet is never delivered to, pinning it
-                        // in the set and stalling `graceful_shutdown` to its full
-                        // timeout. The not-yet-`setpgid`'d child has no
-                        // descendants, so a pid signal fully contains it; the
-                        // recycled-pid case is the same sub-µs window the type doc
-                        // already accepts for every probe/signal here.
-                        if libc::killpg(id, sig) == -1
-                            && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-                        {
-                            libc::kill(id, sig);
-                        }
-                    } else {
+        let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner()); // Э22
+        ids.retain_mut(|e| {
+            if !self.probe_entry(e) {
+                return false; // gone — forget it.
+            }
+            let id = e.id;
+            // SAFETY: killpg/kill to a probed-existing id; an exit between the
+            // probe and here just yields ESRCH and the sweep continues.
+            unsafe {
+                if self.group {
+                    // killpg reaches the leader and every descendant. While the
+                    // group has never been seen alive (a forked-but-not-yet-
+                    // `setpgid`'d child), killpg yields ESRCH; fall back to a
+                    // direct pid signal so the entry drains. ONCE `group_seen`
+                    // latched (`probe_entry` set it above), an ESRCH means the
+                    // group is genuinely gone — do NOT direct-signal: that would
+                    // SIGKILL a process that recycled the pid (Б5).
+                    if libc::killpg(id, sig) == -1
+                        && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                        && !e.group_seen
+                    {
                         libc::kill(id, sig);
                     }
+                } else {
+                    libc::kill(id, sig);
                 }
-                true
-            });
-        }
+            }
+            true
+        });
     }
 
     /// Whether any tracked entry still exists.
     fn any_alive(&self) -> bool {
-        self.ids
-            .lock()
-            .map(|ids| ids.iter().any(|&id| self.exists(id)))
-            .unwrap_or(false)
+        let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner()); // Э22
+        ids.iter_mut().any(|e| self.probe_entry(e))
     }
 
     /// The still-existing entries, pruning the drained ones on the way.
     #[cfg(feature = "process-control")]
     fn live_snapshot(&self) -> Vec<i32> {
-        match self.ids.lock() {
-            Ok(mut ids) => {
-                ids.retain(|&id| self.exists(id));
-                ids.clone()
-            }
-            Err(_) => Vec::new(),
-        }
+        let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner()); // Э22
+        ids.retain_mut(|e| self.probe_entry(e));
+        ids.iter().map(|e| e.id).collect()
     }
 
     /// How many tracked entries still exist (probe-only; no pruning — stats
-    /// must not mutate tracking state).
+    /// must not mutate the *set* of tracked ids, though it may refresh the Б5
+    /// latch, which is a benign monotonic cache).
     #[cfg(feature = "stats")]
     fn count_alive(&self) -> usize {
-        self.ids
-            .lock()
-            .map(|ids| ids.iter().filter(|&&id| self.exists(id)).count())
-            .unwrap_or(0)
+        let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner()); // Э22
+        let mut alive = 0;
+        for e in ids.iter_mut() {
+            if self.probe_entry(e) {
+                alive += 1;
+            }
+        }
+        alive
     }
 }
 
@@ -227,7 +261,11 @@ impl ProcessGroup {
         }
         let child = cmd.spawn()?;
         if let Some(pid) = child.id() {
-            self.groups.track(pid as i32);
+            // Б5: a non-`setsid` spawn is already its own group leader (`setpgid`
+            // ran before exec), so seed the latch true (L6 not needed). On the
+            // `setsid` path the group is created after fork, so leave it false
+            // (the L6 window is open until setsid runs).
+            self.groups.track(pid as i32, !opts.setsid);
         }
         Ok(child)
     }
@@ -244,10 +282,9 @@ impl ProcessGroup {
         let rc = unsafe { libc::setpgid(pid, 0) };
         if rc == 0 {
             // It now leads group `pid` — track the group; future forks inherit
-            // it and are reaped with it. (`track` de-duplicates an adopt of a
-            // child this group itself spawned — setpgid is a no-op success
-            // for an existing leader.)
-            self.groups.track(pid);
+            // it and are reaped with it. The group exists (setpgid succeeded), so
+            // seed the Б5 latch true. `track` de-duplicates a re-adopt.
+            self.groups.track(pid, true);
             return Ok(());
         }
 
@@ -262,7 +299,14 @@ impl ProcessGroup {
             // no-op (no group `pid` exists); track it individually instead:
             // the child is contained, its future forks are not.
             code if code == libc::EACCES || code == libc::EPERM => {
-                self.solos.track(pid);
+                // Б9: a child THIS group already spawned is already tracked as a
+                // group leader; its `setpgid` fails EACCES because it has exec'd.
+                // Don't also solo-track it (that would double-count in
+                // `members()`/`stats()` and double-deliver every broadcast) —
+                // only solo-track a genuinely external child.
+                if !self.groups.contains(pid) {
+                    self.solos.track(pid, false);
+                }
                 Ok(())
             }
             _ => Err(err),
@@ -432,8 +476,9 @@ mod tests {
         }
         assert!(pid_ok, "spawned child must be alive");
 
-        // The fixed `exists()` must return true — the pid is alive as a process.
-        let exists = tracked.exists(pid);
+        // The probe (no latch → L6 applies) must return true — the pid is alive
+        // as a process even though it is not a group leader.
+        let exists = tracked.probe_raw(pid, false).0;
 
         let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
         let _ = child.wait().await;
@@ -441,7 +486,80 @@ mod tests {
         assert!(
             exists,
             "a process that exists as a pid but not as a group leader \
-             must be considered alive by exists()"
+             must be considered alive (L6 fallback, pre-latch)"
         );
+    }
+
+    /// Б5: once the group has been seen alive (the `group_seen` latch), the L6
+    /// direct-pid fallback is disabled — a not-a-group-leader pid (standing in
+    /// for a reaped-and-recycled pid) is treated as GONE, instead of being kept
+    /// alive (and later signalled) forever, which would SIGKILL an innocent
+    /// process that recycled the pid.
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn group_seen_latch_disables_l6_fallback() {
+        let tracked = Tracked::new(true);
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap() as i32;
+
+        // Same precondition guard as the L6 test: skip if the pid happens to be
+        // a group leader (then kill(-pid,0) would succeed and there is no L6 case).
+        if unsafe { libc::kill(-pid, 0) } == 0 {
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = child.wait().await;
+            return;
+        }
+
+        // Before the group was seen, L6 keeps a live-but-not-a-leader pid alive
+        // (the fork→exec window semantics).
+        assert!(
+            tracked.probe_raw(pid, false).0,
+            "pre-latch: L6 keeps a live pid"
+        );
+        // After the latch, the same pid is GONE: L6 is disabled, so a recycled pid
+        // is pruned rather than kept and signalled.
+        assert!(
+            !tracked.probe_raw(pid, true).0,
+            "post-latch: L6 disabled — a not-a-group-leader pid is treated as gone (Б5)"
+        );
+
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait().await;
+    }
+
+    /// Б9: adopting a child this group already spawned must not double-track it.
+    /// The child has exec'd, so its `setpgid` fails `EACCES`; without the dedup it
+    /// would land in `solos` while still in `groups`, double-counting in
+    /// `members()`/`stats()` and double-delivering every broadcast.
+    #[cfg(feature = "process-control")]
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn adopt_of_an_already_spawned_child_does_not_double_track() {
+        let pg = ProcessGroup::new();
+        let opts = crate::sys::SpawnOptions::default();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 60");
+        cmd.kill_on_drop(true);
+        let mut child = pg.spawn(&mut cmd, &opts).unwrap();
+        let pid = child.id().unwrap() as i32;
+
+        // Re-adopt the same child: its `setpgid` fails EACCES (it has exec'd).
+        pg.adopt(&child).unwrap();
+
+        let members = pg.members();
+        assert_eq!(
+            members.iter().filter(|&&m| m == pid).count(),
+            1,
+            "an already-spawned child must be tracked once, not double-tracked"
+        );
+
+        drop(pg);
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait().await;
     }
 }
