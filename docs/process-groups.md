@@ -77,9 +77,13 @@ group.adopt(&external)?;
 ```
 
 `adopt` moves only the named process: descendants it *already* has keep their
-old containment (future forks are captured — on Windows/cgroup). Two sharp
+old containment (future forks are captured — on Windows/cgroup). A few sharp
 edges worth knowing:
 
+- A child that already exited **but has not been reaped** (no `wait()` yet — a
+  zombie whose pid/handle is still valid) is a successful **no-op**: there is
+  nothing left to contain, so `adopt` returns `Ok` on the containment backends
+  (the no-containment stub is always `Ok`).
 - A child that already exited **and was reaped** (`wait()`ed) has no pid left —
   `adopt` returns an error rather than silently tracking nothing.
 - On the POSIX process-group mechanism, a child that has already `exec`'d
@@ -92,7 +96,7 @@ edges worth knowing:
 | Verb | What happens | When |
 |---|---|---|
 | `drop(group)` | Immediate **hard kill** of the whole tree (kill-on-close) | The safety net — always on |
-| `group.terminate_all()` | The same hard kill, group stays usable | Explicit teardown mid-flight; idempotent |
+| `group.terminate_all()` | The same hard kill, group stays usable (cgroup-`kill` / Job Object / process-group backends). On a **pre-5.14 Linux kernel** lacking `cgroup.kill`, the per-pid `SIGKILL` fallback returns `Err` if the tree doesn't drain (a fork bomb still out-spawning, or `D`-state zombies) | Explicit teardown mid-flight; idempotent |
 | `group.shutdown().await` | Unix: `SIGTERM` → wait `shutdown_timeout` → `SIGKILL` survivors (if `escalate_to_kill`); Windows: atomic job kill. Consumes the group | Graceful service stop |
 
 ```rust,no_run

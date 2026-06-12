@@ -176,6 +176,14 @@ mod stdin;
 mod supervisor;
 mod sys;
 
+/// Clamp ceiling for `Instant + Duration` deadline math (Э15): a timeout, grace,
+/// or `within` longer than this is treated as "effectively forever", so a
+/// `Duration::MAX`-ish input can't overflow `Instant + Duration` and panic.
+/// ~10 years — far beyond any real process deadline, with ample margin below
+/// `Instant`'s representable range on every platform.
+pub(crate) const MAX_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(10 * 365 * 24 * 60 * 60);
+
 pub use batch::output_all;
 pub use buffer::{OutputBufferPolicy, OverflowMode, StdioMode};
 #[cfg(feature = "record")]
@@ -393,6 +401,17 @@ pub use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 mod tests {
     use super::Outcome;
+
+    /// Э15: the deadline-clamp ceiling must be small enough that
+    /// `Instant + MAX_DEADLINE` cannot overflow, and a `Duration::MAX` input must
+    /// clamp down to it — so `Instant::now() + within.min(MAX_DEADLINE)` is
+    /// panic-free for any timeout/grace, however absurd.
+    #[test]
+    fn max_deadline_clamp_prevents_instant_overflow() {
+        use std::time::{Duration, Instant};
+        let _ = Instant::now() + super::MAX_DEADLINE; // must not panic
+        assert_eq!(Duration::MAX.min(super::MAX_DEADLINE), super::MAX_DEADLINE);
+    }
 
     // Regression: wait_exit (used by wait_any/wait_all) did not snapshot
     // cancel_at_exit, so a .wait()/.output_string()/etc. on the winner after

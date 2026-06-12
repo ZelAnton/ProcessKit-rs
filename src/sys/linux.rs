@@ -150,7 +150,14 @@ impl Job {
                 // Moving a pid into the cgroup is a single write to cgroup.procs;
                 // the kernel re-parents that process (its existing descendants are
                 // not retroactively pulled in — only future forks).
-                std::fs::write(cg.path.join("cgroup.procs"), pid.to_string().as_bytes())
+                match std::fs::write(cg.path.join("cgroup.procs"), pid.to_string().as_bytes()) {
+                    Ok(()) => Ok(()),
+                    // Э21: the child already exited (a zombie pid) — the write
+                    // fails ESRCH. There is nothing to contain, so return Ok,
+                    // matching the process-group backend (which maps ESRCH→Ok).
+                    Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+                    Err(e) => Err(e),
+                }
             }
             Backend::ProcessGroup(pg) => pg.adopt(child),
         }
@@ -212,7 +219,8 @@ impl Job {
             Backend::Cgroup(cg) => {
                 // Best-effort: the graceful tier proceeds to polling regardless.
                 let _ = cg.signal(signal);
-                let deadline = Instant::now() + timeout;
+                // Э15: clamp so a `Duration::MAX`-ish timeout can't overflow.
+                let deadline = Instant::now() + timeout.min(crate::MAX_DEADLINE);
                 while !cg.is_empty() {
                     if Instant::now() >= deadline {
                         break;

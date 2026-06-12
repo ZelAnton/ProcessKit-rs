@@ -508,7 +508,8 @@ pub(crate) async fn graceful_kill_pid(pid: Option<u32>, grace: std::time::Durati
         unsafe {
             libc::kill(pid, signal);
         }
-        let deadline = tokio::time::Instant::now() + grace;
+        // Э15: clamp so a `Duration::MAX`-ish grace can't overflow `Instant + Duration`.
+        let deadline = tokio::time::Instant::now() + grace.min(crate::MAX_DEADLINE);
         loop {
             let now = tokio::time::Instant::now();
             if now >= deadline {

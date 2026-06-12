@@ -298,6 +298,50 @@ async fn adopt_of_a_reaped_child_errors_instead_of_tracking_nothing() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a child, kills it UNREAPED, then adopts the zombie"]
+async fn adopt_of_an_exited_unreaped_child_is_ok() {
+    // Э21: a child that has EXITED but not yet been reaped (a zombie — its
+    // handle/pid is still valid while the process is dead, distinct from the
+    // reaped case above) has nothing to contain, so `adopt` returns Ok on every
+    // backend (cgroup/pgroup `ESRCH` → Ok, Windows `GetExitCodeProcess` → Ok),
+    // rather than surfacing the raw backend failure.
+    let group = ProcessGroup::new().expect("create group");
+    if matches!(group.mechanism(), Mechanism::None) {
+        eprintln!("skipping: no containment on this target");
+        return;
+    }
+
+    // A long-lived child we control: `start_kill` terminates it WITHOUT reaping,
+    // so it is *deterministically* a dead-but-unreaped zombie at adopt time — no
+    // reliance on natural-exit timing (a too-short sleep would adopt a still-live
+    // child, whose assign succeeds, and never exercise the exited path).
+    let mut cmd = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("ping");
+        c.args(["-n", "60", "127.0.0.1"]);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sleep");
+        c.arg("60");
+        c
+    };
+    let mut child = cmd.spawn().expect("spawn long-lived child");
+
+    child
+        .start_kill()
+        .expect("kill the child without reaping it");
+    // The kill is prompt (SIGKILL / TerminateProcess); give it a moment to become
+    // a zombie. We never `wait`, so it stays unreaped (handle/pid still valid).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    group
+        .adopt(&child)
+        .expect("adopting an exited-but-unreaped (zombie) child must be a no-op Ok");
+
+    let _ = child.wait().await;
+    drop(group);
+}
+
+#[tokio::test]
 #[ignore = "creates an OS job/cgroup"]
 async fn empty_group_accepts_lifecycle_calls() {
     let group = ProcessGroup::new().expect("create group");

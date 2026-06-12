@@ -202,7 +202,12 @@ impl Reply {
         } else {
             let per_line = self.line_delay.unwrap_or_default();
             let lines = self.stdout.split_inclusive('\n').count() as u32;
-            Some(per_line * lines)
+            // Э15: saturate the multiply and clamp to MAX_DEADLINE so a test that
+            // hands a `Duration::MAX`-ish `line_delay` can't overflow the multiply
+            // or the later `Instant + lifetime` deadline. (A single line — `lines
+            // == 1` — wouldn't overflow the multiply, so the clamp, not the
+            // multiply, is what guards the downstream `Instant` arithmetic.)
+            Some(per_line.saturating_mul(lines).min(crate::MAX_DEADLINE))
         };
         let code_for_scripted = if self.timed_out || self.signalled {
             None

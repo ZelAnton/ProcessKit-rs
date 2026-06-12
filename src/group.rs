@@ -228,6 +228,12 @@ impl ProcessGroup {
     /// an adopted child that exited but was never awaited probes as alive, so
     /// a graceful [`shutdown`](Self::shutdown) can wait out its full timeout
     /// on the zombie before escalating.
+    ///
+    /// On the containment backends, adopting a child that has already **exited
+    /// but not yet been reaped** is a successful no-op (`Ok`) — there is nothing
+    /// left to contain (Э21) — while an **already-reaped** child (one that was
+    /// `wait`ed, so its handle/pid is gone) errors, since there is no longer
+    /// anything to reference. (The no-containment target above is always `Ok`.)
     #[cfg(feature = "process-control")]
     pub fn adopt(&self, child: &Child) -> Result<()> {
         self.job.adopt(child)?;

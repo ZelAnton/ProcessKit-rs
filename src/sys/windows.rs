@@ -38,11 +38,11 @@ use windows_sys::Win32::System::JobObjects::{
 };
 #[cfg(feature = "stats")]
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-#[cfg(feature = "process-control")]
-use windows_sys::Win32::System::Threading::SuspendThread;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
 };
+#[cfg(feature = "process-control")]
+use windows_sys::Win32::System::Threading::{GetExitCodeProcess, SuspendThread};
 #[cfg(feature = "stats")]
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -215,7 +215,15 @@ impl Job {
         // SAFETY: the raw handle is valid while `child` is alive (borrowed here).
         let ok = unsafe { AssignProcessToJobObject(self.handle, handle as HANDLE) };
         if ok == 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            // Э21: the assign fails for an already-terminated process. If the
+            // child has in fact exited there is nothing to contain — return Ok
+            // (matching the pgroup/cgroup backends), regardless of the specific
+            // error code; a genuine failure on a still-LIVE process still propagates.
+            if process_has_exited(handle as HANDLE) {
+                return Ok(());
+            }
+            return Err(err);
         }
         Ok(())
     }
@@ -379,6 +387,21 @@ impl Job {
     pub(crate) fn mechanism(&self) -> Mechanism {
         Mechanism::JobObject
     }
+}
+
+/// Э21: whether the process behind `handle` has already exited —
+/// `GetExitCodeProcess` reports an exit code other than `STILL_ACTIVE` (259).
+/// A *live* process always reports `STILL_ACTIVE`, so this never false-positives
+/// a live child as exited. The only ambiguity is a child that genuinely exited
+/// with code 259: it reads as "still active", so `adopt` surfaces the assign
+/// error for it rather than the nothing-to-contain `Ok` — an acceptable rarity.
+#[cfg(feature = "process-control")]
+fn process_has_exited(handle: HANDLE) -> bool {
+    const STILL_ACTIVE: u32 = 259;
+    let mut code: u32 = 0;
+    // SAFETY: `handle` is a valid process handle borrowed from the live `Child`.
+    let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
+    ok != 0 && code != STILL_ACTIVE
 }
 
 /// Resume every thread of `pid`. A child spawned `CREATE_SUSPENDED` has exactly

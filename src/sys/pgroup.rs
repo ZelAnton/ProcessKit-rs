@@ -369,7 +369,9 @@ impl ProcessGroup {
         escalate: bool,
     ) -> io::Result<()> {
         self.broadcast(signal);
-        let deadline = Instant::now() + timeout;
+        // Э15: clamp so a `Duration::MAX`-ish timeout can't overflow `Instant +
+        // Duration` and panic mid-teardown.
+        let deadline = Instant::now() + timeout.min(crate::MAX_DEADLINE);
         while self.any_alive() {
             if Instant::now() >= deadline {
                 break;
