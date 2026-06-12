@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
-#[cfg(feature = "process-control")]
-use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
 #[cfg(feature = "stats")]
 use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+#[cfg(feature = "process-control")]
+use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_MORE_DATA};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
@@ -264,9 +264,10 @@ impl Job {
     /// Best-effort, not atomic: the member list and the thread snapshot are
     /// taken once, so threads or processes created mid-walk are missed, and
     /// `SuspendThread`/`ResumeThread` maintain per-thread suspend *counts*
-    /// (nested suspends need matching resumes). A per-thread failure (e.g. a
-    /// thread exiting mid-walk) does not abort the walk; the last failure is
-    /// reported after every member has been attempted.
+    /// (nested suspends need matching resumes). A thread that exits mid-walk is
+    /// vacuously handled (Б8 — not a failure); a genuine `SuspendThread`/
+    /// `ResumeThread` failure on a still-open thread does not abort the walk and
+    /// is reported after every member has been attempted.
     #[cfg(feature = "process-control")]
     fn for_each_member_thread(&self, suspend: bool) -> io::Result<()> {
         // Mutually exclusive with `spawn`'s assign → resume window (see the
@@ -429,12 +430,15 @@ fn resume_thread(tid: u32) -> io::Result<()> {
     }
     // SAFETY: valid thread handle; a `u32::MAX` return signals failure.
     let prev = unsafe { ResumeThread(thread) };
+    // Capture the failure BEFORE `CloseHandle`, which can overwrite the
+    // thread-local last-error.
+    let err = (prev == u32::MAX).then(io::Error::last_os_error);
     // SAFETY: handle came from OpenThread; closed exactly once.
     unsafe { CloseHandle(thread) };
-    if prev == u32::MAX {
-        return Err(io::Error::last_os_error());
+    match err {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Suspend (increment) or resume (decrement) a single thread's suspend count.
@@ -443,7 +447,18 @@ fn suspend_or_resume_thread(tid: u32, suspend: bool) -> io::Result<()> {
     // SAFETY: opens the thread by id; returns null on failure (e.g. exited).
     let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, tid) };
     if thread.is_null() {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        // Б8: a STALE tid — a thread that exited between the system-wide snapshot
+        // and this open — fails `ERROR_INVALID_PARAMETER`. Such a thread is
+        // *vacuously* suspended/resumed, so swallow it: one churning thread must
+        // not fail the whole job suspend/resume when every still-existing thread
+        // was handled. ANY OTHER open failure (e.g. `ERROR_ACCESS_DENIED` on a
+        // live but protected thread) is genuine and IS reported — so a live
+        // thread is never silently left suspended.
+        if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            return Ok(());
+        }
+        return Err(err);
     }
     // SAFETY: valid thread handle; both calls signal failure with `u32::MAX`.
     let prev = unsafe {
@@ -453,12 +468,15 @@ fn suspend_or_resume_thread(tid: u32, suspend: bool) -> io::Result<()> {
             ResumeThread(thread)
         }
     };
+    // Capture the failure BEFORE `CloseHandle`, which can overwrite the
+    // thread-local last-error.
+    let err = (prev == u32::MAX).then(io::Error::last_os_error);
     // SAFETY: handle came from OpenThread; closed exactly once.
     unsafe { CloseHandle(thread) };
-    if prev == u32::MAX {
-        return Err(io::Error::last_os_error());
+    match err {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Enumerate the pids currently assigned to the job.
@@ -584,10 +602,10 @@ impl Drop for Job {
             // B12: clear KILL_ON_JOB_CLOSE so closing the handle does not kill the
             // tree. `SetInformationJobObject` with `JobObjectExtendedLimitInformation`
             // *replaces* the entire extended-limit structure, so passing a zeroed
-            // struct sets `LimitFlags = 0`, which drops `KILL_ON_JOB_CLOSE` and all
-            // other resource caps. This is intentional — this path only runs when
-            // the caller chose `escalate=false`, so orphaning survivors is the
-            // desired outcome and the caps are no longer meaningful.
+            // struct sets `LimitFlags = 0`, which drops `KILL_ON_JOB_CLOSE` and the
+            // memory/active-process caps. This is intentional — this path only runs
+            // when the caller chose `escalate=false`, so orphaning survivors
+            // (uncapped) is the desired outcome and the caps are no longer meaningful.
             let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
             // Best-effort: if clearing fails the handle close will still kill —
             // a safe fallback (unexpected kill is better than orphaning ambiguity).
@@ -599,11 +617,47 @@ impl Drop for Job {
                     std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 )
             };
+            // Э17: the CPU hard cap lives in a SEPARATE info class (set under
+            // `limits` in `Job::new`), so zeroing the extended-limit struct above
+            // does NOT lift it. Clear it too (zeroed `ControlFlags` = disabled) or
+            // orphaned survivors stay CPU-throttled forever — inconsistent with the
+            // memory/process caps just dropped. Harmless when no CPU cap was set
+            // (disabling an already-inactive control is a no-op).
+            #[cfg(feature = "limits")]
+            {
+                let cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+                let _ = unsafe {
+                    SetInformationJobObject(
+                        self.handle,
+                        JobObjectCpuRateControlInformation,
+                        std::ptr::from_ref(&cpu).cast(),
+                        std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+                    )
+                };
+            }
         }
         // Closing the last handle triggers KILL_ON_JOB_CLOSE → the tree is reaped
         // (unless cleared above). SAFETY: handle came from CreateJobObjectW and is
         // closed exactly once.
         unsafe { CloseHandle(self.handle) };
+    }
+}
+
+#[cfg(all(test, feature = "process-control"))]
+mod thread_tests {
+    use super::suspend_or_resume_thread;
+
+    /// Б8: a stale/invalid tid — a thread that exited between the system-wide
+    /// snapshot and the `OpenThread` — fails `ERROR_INVALID_PARAMETER` and is
+    /// *vacuously* suspended/resumed, not a failure (a single churning thread must
+    /// not fail the whole job suspend). `tid = 1` is not a valid thread id (the
+    /// kernel allocates thread/process ids as multiples of 4, and 0 is reserved),
+    /// so `OpenThread` deterministically fails with `ERROR_INVALID_PARAMETER` and
+    /// the fix returns `Ok` — and it can never open or suspend a real thread.
+    #[test]
+    fn suspend_or_resume_a_stale_tid_is_ok() {
+        assert!(suspend_or_resume_thread(1, true).is_ok());
+        assert!(suspend_or_resume_thread(1, false).is_ok());
     }
 }
 
