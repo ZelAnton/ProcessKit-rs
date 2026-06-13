@@ -169,11 +169,16 @@ pub enum Error {
     /// The process succeeded but its output could not be parsed into the
     /// expected shape (e.g. malformed `--json`). Produced by the fallible-parse
     /// helpers on [`CliClient`](crate::CliClient).
-    #[error("failed to parse `{program}` output: {message}")]
+    ///
+    /// `message` is caller-built and routinely embeds the unparsed output in
+    /// full, so — like the [`Exit`](Error::Exit) streams — both `Display` and
+    /// `Debug` bound it to a 200-byte preview (B14); the complete text stays
+    /// reachable via the public field.
+    #[error("{}", display_parse(program, message))]
     Parse {
         /// The program whose output failed to parse.
         program: String,
-        /// What went wrong.
+        /// What went wrong. Carried in full; only `Display`/`Debug` are bounded.
         message: String,
     },
 
@@ -412,7 +417,8 @@ impl fmt::Debug for Error {
             Error::Parse { program, message } => f
                 .debug_struct("Parse")
                 .field("program", program)
-                .field("message", message)
+                // B14: caller-built, often the full unparsed output — bound it.
+                .field("message", &StreamPreview(message))
                 .finish(),
             #[cfg(feature = "limits")]
             Error::ResourceLimit(reason) => f.debug_tuple("ResourceLimit").field(reason).finish(),
@@ -476,6 +482,25 @@ impl fmt::Debug for SearchedRedaction<'_> {
         let n = self.0.split(SEP).filter(|s| !s.is_empty()).count();
         write!(f, "<{n} directories>")
     }
+}
+
+/// `Parse`'s one-line `Display`: `` failed to parse `{program}` output: {message} ``
+/// with the caller-built `message` bounded to a 200-byte char-boundary head (B14)
+/// — its start carries the actionable detail (`unexpected token at line 3`),
+/// unlike a captured stream whose *tail* is quoted — so an embedded multi-KiB
+/// unparsed dump can never poison a log line. The full text stays on the field.
+fn display_parse(program: &str, message: &str) -> String {
+    const CAP: usize = 200;
+    let head = if message.len() <= CAP {
+        message.to_string()
+    } else {
+        let mut cut = CAP;
+        while !message.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}…", &message[..cut])
+    };
+    format!("failed to parse `{program}` output: {head}")
 }
 
 /// `Signalled`'s one-line Display: `` `{program}` was terminated by signal {n} ``
@@ -704,6 +729,51 @@ mod tests {
             program: "long-job".into(),
         };
         assert_eq!(err.to_string(), "`long-job` was cancelled");
+    }
+
+    #[test]
+    fn parse_message_is_bounded_in_display_and_debug() {
+        // B14: the `Parse` message is caller-built and routinely embeds the full
+        // unparsed output — it must be bounded like the `Exit` streams, never
+        // dumped whole into a `{e}` log line or a `{e:?}` panic message.
+        let huge = "x".repeat(10_000);
+        let err = Error::Parse {
+            program: "jq".into(),
+            message: huge,
+        };
+        let display = err.to_string();
+        assert!(
+            display.len() < 300,
+            "Display must be bounded, got {} bytes",
+            display.len()
+        );
+        assert!(display.starts_with("failed to parse `jq` output: "));
+        assert!(
+            display.ends_with('…'),
+            "truncated Display ends with ellipsis"
+        );
+        let dbg = format!("{err:?}");
+        assert!(
+            dbg.len() < 400,
+            "Debug must be bounded, got {} bytes",
+            dbg.len()
+        );
+        assert!(
+            !dbg.contains(&"x".repeat(300)),
+            "must not dump the full message: {dbg}"
+        );
+        assert!(dbg.contains("bytes)"), "truncation note present: {dbg}");
+
+        // A short message is shown verbatim (no truncation, no ellipsis).
+        let small = Error::Parse {
+            program: "jq".into(),
+            message: "unexpected token at line 3".into(),
+        };
+        assert_eq!(
+            small.to_string(),
+            "failed to parse `jq` output: unexpected token at line 3"
+        );
+        assert!(!format!("{small:?}").contains("bytes)"));
     }
 
     #[test]

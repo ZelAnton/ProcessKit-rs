@@ -89,6 +89,10 @@ to a dated version section.
   leftover directory and silently downgrade to the process-group fallback.
 - Deadline computations are clamped so a `Duration::MAX`-ish timeout/grace can no longer
   overflow `Instant` arithmetic and panic.
+- `Error::Parse`'s `message` is now bounded to a 200-byte preview in both `Display` and
+  `Debug` (B14) — a caller-built message that embeds the full unparsed output can no longer
+  flood a log line or an `.unwrap()` panic message (the same protection the `Exit` streams
+  already had). The complete text stays reachable on the `message` field.
 - Test doubles now match the live runner on the contracts they exist to exercise: a
   panicking line handler is isolated on the bulk `ScriptedRunner::output` path (not only
   while streaming); a capture verb on a non-piped stdout errors instead of returning canned
