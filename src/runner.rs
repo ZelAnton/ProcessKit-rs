@@ -152,16 +152,20 @@ pub trait ProcessRunnerExt: ProcessRunner {
         F: Fn(&str) -> bool + Send,
     {
         use tokio_stream::StreamExt;
-        let process = self.start(command).await?;
+        let mut process = self.start(command).await?;
         let program = command.program_name();
         let timeout = command.configured_timeout();
+        // Close an untaken `keep_stdin_open` pipe (taking it here drops it → EOF)
+        // so a stdin-reading filter isn't left blocking — `first_line` gives no
+        // way to write to it. A no-op for the usual case.
+        let _ = process.standard_input();
+        // D2: `stdout_lines` is fallible — a non-piped stdout surfaces here as a
+        // clear error rather than a stream that yields nothing.
+        let mut lines = process.stdout_lines()?;
         let search = async move {
-            let mut process = process;
-            // Close an untaken `keep_stdin_open` pipe (taking it here drops it →
-            // EOF) so a stdin-reading filter isn't left blocking — `first_line`
-            // gives no way to write to it. A no-op for the usual case.
-            let _ = process.standard_input();
-            let mut lines = process.stdout_lines();
+            // Keep `process` alive for the search; dropping it on a timeout (the
+            // `tokio::time::timeout` below) tears the tree down.
+            let _process = process;
             while let Some(line) = lines.next().await {
                 if predicate(&line) {
                     return Some(line);

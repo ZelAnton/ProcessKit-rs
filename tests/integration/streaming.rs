@@ -1,10 +1,10 @@
-//! Line streaming and incremental output: stdout_lines, finish_streamed,
+//! Line streaming and incremental output: stdout_lines, finish,
 //! line handlers, bounded buffers, and interactive stdin.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use processkit::{Command, Outcome, OutputBufferPolicy, StreamedFinish};
+use processkit::{Command, Finished, Outcome, OutputBufferPolicy};
 
 use crate::common::*;
 
@@ -24,13 +24,13 @@ async fn streaming_honors_timeout() {
 
     let start = Instant::now();
     let mut run = cmd.start().await.expect("start");
-    let mut lines = run.stdout_lines();
+    let mut lines = run.stdout_lines().unwrap();
     let mut seen = Vec::new();
     while let Some(line) = lines.next().await {
         seen.push(line);
     }
     drop(lines);
-    let StreamedFinish { outcome, .. } = run.finish_streamed().await.expect("finish");
+    let Finished { outcome, .. } = run.finish().await.expect("finish");
 
     // Generous anti-hang bound (the sleeper runs ~30s if the deadline is
     // broken): under full-suite load cold spawns have been seen to push a
@@ -114,7 +114,7 @@ async fn stdout_lines_streams_incrementally() {
     use tokio_stream::StreamExt;
 
     let mut process = two_line_echo().start().await.expect("start echo");
-    let mut lines = process.stdout_lines();
+    let mut lines = process.stdout_lines().unwrap();
     let mut collected: Vec<String> = Vec::new();
     while let Some(line) = lines.next().await {
         collected.push(line);
@@ -131,7 +131,7 @@ async fn stdout_lines_streams_incrementally() {
 
 #[tokio::test]
 #[ignore = "spawns a real subprocess: stream stdout, then collect exit + stderr"]
-async fn finish_streamed_returns_code_and_stderr() {
+async fn finish_returns_code_and_stderr() {
     use tokio_stream::StreamExt;
 
     // Emit one stdout line and one stderr line, exit 0, per platform.
@@ -141,13 +141,13 @@ async fn finish_streamed_returns_code_and_stderr() {
         Command::new("sh").args(["-c", "echo out; echo err 1>&2"])
     };
     let mut process = cmd.start().await.expect("start");
-    let mut lines = process.stdout_lines();
+    let mut lines = process.stdout_lines().unwrap();
     let mut out = Vec::new();
     while let Some(line) = lines.next().await {
         out.push(line);
     }
     drop(lines);
-    let StreamedFinish { outcome, stderr } = process.finish_streamed().await.expect("finish");
+    let Finished { outcome, stderr } = process.finish().await.expect("finish");
     assert_eq!(outcome, Outcome::Exited(0));
     assert!(out.iter().any(|l| l.contains("out")), "stdout: {out:?}");
     assert!(stderr.contains("err"), "stderr: {stderr:?}");
@@ -155,11 +155,11 @@ async fn finish_streamed_returns_code_and_stderr() {
 
 #[tokio::test]
 #[ignore = "spawns a real subprocess"]
-async fn second_stdout_lines_call_ends_immediately() {
+async fn second_stdout_lines_call_is_a_loud_error() {
     use tokio_stream::StreamExt;
 
     let mut process = five_lines().start().await.expect("start");
-    let mut first = process.stdout_lines();
+    let mut first = process.stdout_lines().expect("first stdout_lines");
     let mut seen = 0;
     while tokio::time::timeout(Duration::from_secs(10), first.next())
         .await
@@ -170,26 +170,28 @@ async fn second_stdout_lines_call_ends_immediately() {
     }
     assert_eq!(seen, 5);
 
-    // Documented: "Call this once." A second call must hand back an
-    // immediately-finished stream, not hang or panic.
-    let mut second = process.stdout_lines();
-    let next = tokio::time::timeout(Duration::from_secs(5), second.next())
-        .await
-        .expect("the second stream must end immediately");
-    assert!(next.is_none(), "second stream yields nothing: {next:?}");
+    // D2: "Call this once." A second call is a LOUD error (stdout streams once),
+    // not a silently-empty stream.
+    let err = process
+        .stdout_lines()
+        .expect_err("a second stdout_lines must be a loud error");
+    assert!(
+        matches!(err, processkit::Error::Io(_)),
+        "expected Error::Io, got {err:?}"
+    );
 
-    let _ = process.finish_streamed().await;
+    let _ = process.finish().await;
 }
 
 #[tokio::test]
 #[ignore = "spawns a real subprocess"]
-async fn finish_streamed_without_streaming_first_drains_and_exits() {
-    // Skipping stdout_lines() leaves both pipes untaken — finish_streamed must
+async fn finish_without_streaming_first_drains_and_exits() {
+    // Skipping stdout_lines() leaves both pipes untaken — finish must
     // drain them itself or a chatty child would block forever.
     let process = two_line_echo().start().await.expect("start");
-    let finish = tokio::time::timeout(Duration::from_secs(15), process.finish_streamed())
+    let finish = tokio::time::timeout(Duration::from_secs(15), process.finish())
         .await
-        .expect("finish_streamed must not hang without a prior stdout_lines")
+        .expect("finish must not hang without a prior stdout_lines")
         .expect("finish");
     assert_eq!(finish.outcome, Outcome::Exited(0));
 }

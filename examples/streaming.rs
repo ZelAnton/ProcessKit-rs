@@ -4,18 +4,18 @@
 //!
 //! Run with: `cargo run --example streaming`
 
-use processkit::{Command, StreamExt, StreamedFinish};
+use processkit::{Command, Finished, StreamExt};
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {
     let mut run = Command::new("cargo").args(["--version"]).start().await?;
 
-    let mut lines = run.stdout_lines();
+    let mut lines = run.stdout_lines()?;
     while let Some(line) = lines.next().await {
         println!("stdout: {line}");
     }
 
-    let StreamedFinish { outcome, stderr } = run.finish_streamed().await?;
+    let Finished { outcome, stderr } = run.finish().await?;
     println!("exit={outcome:?}");
     if !stderr.is_empty() {
         eprintln!("stderr: {stderr}");

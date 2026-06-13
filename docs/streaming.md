@@ -27,7 +27,7 @@ run.elapsed();    // time since spawn
 // Consume the handle exactly one way:
 //   output_string() / output_bytes()  → capture everything (same as the one-shot verbs)
 //   wait()                            → just the Outcome; output is discarded
-//   finish_streamed()                 → after streaming stdout (below)
+//   finish()                 → after streaming stdout (below)
 //   profile(every)                    → capture + resource samples (stats feature)
 let outcome = run.wait().await?;   // Outcome: Exited(code) / Signalled(sig) / TimedOut
 ```
@@ -48,7 +48,7 @@ for exit, no full-output buffering. `StreamExt` (re-exported from
 `tokio-stream`) provides `.next()`:
 
 ```rust,no_run
-use processkit::{Command, Outcome, StreamExt, StreamedFinish};
+use processkit::{Command, Outcome, StreamExt, Finished};
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {
@@ -57,7 +57,7 @@ async fn main() -> processkit::Result<()> {
         .start()
         .await?;
 
-    let mut lines = run.stdout_lines();
+    let mut lines = run.stdout_lines()?;
     while let Some(line) = lines.next().await {
         println!("build: {line}");
     }
@@ -65,7 +65,7 @@ async fn main() -> processkit::Result<()> {
     // The stream ended (stdout closed). Collect the outcome and stderr —
     // stderr was drained in the background the whole time, so a noisy child
     // could never block on a full pipe.
-    let StreamedFinish { outcome, stderr } = run.finish_streamed().await?;
+    let Finished { outcome, stderr } = run.finish().await?;
     if outcome != Outcome::Exited(0) {
         eprintln!("build failed ({outcome:?}):\n{stderr}");
     }
@@ -75,13 +75,15 @@ async fn main() -> processkit::Result<()> {
 
 Things to know:
 
-- **Call `stdout_lines()` once.** A second call returns an
-  immediately-finished stream (the pipe is already being pumped).
+- **Call `stdout_lines()` once.** It is fallible: a second `stdout_lines` /
+  `output_events` call (stdout is consumed once), or a non-piped stdout
+  (`StdioMode::Inherit`/`Null`), returns `Err` rather than a silently-empty
+  stream.
 - **The command's `timeout` bounds the stream** on an own-group handle: at the
   deadline the tree is killed, the pipes close, and the stream ends — a
   streamed run can't hang past its deadline. A `cancel_on` token ends it the
   same way; the following
-  `finish_streamed` then reports `Error::Cancelled`. Details in
+  `finish` then reports `Error::Cancelled`. Details in
   [Timeouts & cancellation](timeouts-and-cancellation.md).
 - Line counters tick live: `run.stdout_line_count()` / `stderr_line_count()`
   are cheap progress gauges even while you stream.
@@ -91,7 +93,7 @@ Things to know:
 - The whole streaming surface is **hermetically testable**: a
   `ScriptedRunner`'s `start()` returns a handle whose canned lines flow
   through the same pump machinery — `stdout_lines`, the readiness probes, and
-  `finish_streamed` behave identically with no subprocess. See
+  `finish` behave identically with no subprocess. See
   [Testing → scripted streaming](testing.md#scripted-streaming).
 
 ## Interactive stdin
@@ -100,7 +102,7 @@ Conversational tools — write a request, read the response, repeat. Keep stdin
 open with `keep_stdin_open()`, take the writer with `standard_input()`:
 
 ```rust,no_run
-use processkit::{Command, Outcome, StreamExt, StreamedFinish};
+use processkit::{Command, Outcome, StreamExt, Finished};
 
 // `ProcessStdin`'s writer methods return `std::io::Result`; `Box<dyn Error>`
 // mixes them with the crate's `Result` (or `.map_err(processkit::Error::Io)?`).
@@ -109,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `bc` evaluates each stdin line and prints the result.
     let mut run = Command::new("bc").keep_stdin_open().start().await?;
     let mut stdin = run.standard_input().expect("stdin was kept open");
-    let mut answers = run.stdout_lines();
+    let mut answers = run.stdout_lines()?;
 
     stdin.write_line("2 + 2").await?;             // writes "2 + 2\n", flushed
     println!("= {}", answers.next().await.unwrap());
@@ -118,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("= {}", answers.next().await.unwrap());
 
     stdin.finish().await?;                        // send EOF — bc exits
-    let StreamedFinish { outcome, .. } = run.finish_streamed().await?;
+    let Finished { outcome, .. } = run.finish().await?;
     assert_eq!(outcome, Outcome::Exited(0));
     Ok(())
 }
@@ -171,7 +173,7 @@ Probe semantics, deliberately uniform:
 - A failed probe **never kills the child.** You decide: retry, log and
   continue, or tear down.
 - `wait_for_line` consumes stdout up to (and including) the match — continue
-  with `finish_streamed` or further streaming. `wait_for_port` / `wait_for`
+  with `finish` or further streaming. `wait_for_port` / `wait_for`
   don't touch the pipes at all.
 
 ## Racing children with `wait_any`

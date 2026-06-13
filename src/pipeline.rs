@@ -12,7 +12,7 @@ use crate::command::Command;
 use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::result::{Outcome, ProcessResult};
-use crate::running::StreamedFinish;
+use crate::running::Finished;
 
 /// A chain of [`Command`]s connected stdout→stdin — built with
 /// [`Command::pipe`], extended with [`pipe`](Self::pipe), driven with
@@ -147,7 +147,7 @@ impl Pipeline {
             let program = process.program_name().to_owned();
             let ok_codes = stage.ok_codes_vec();
             inner_tasks.push(tokio::spawn(async move {
-                let StreamedFinish { outcome, stderr } = process.finish_streamed().await?;
+                let Finished { outcome, stderr } = process.finish().await?;
                 Ok::<_, crate::Error>(StageOutcome {
                     program,
                     outcome,

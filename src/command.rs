@@ -446,7 +446,7 @@ impl Command {
 
     /// Tie this run to `token`: cancelling it kills the process tree and makes
     /// every consuming path (`run`/`output_string`/`output_bytes`/`wait`/
-    /// `exit_code`/`probe`/`profile`/`finish_streamed` and the streamed
+    /// `exit_code`/`probe`/`profile`/`finish` and the streamed
     /// finishers) resolve to [`Error::Cancelled`](crate::Error::Cancelled).
     /// In a [`Pipeline`](crate::Pipeline), a token on any stage cancels that
     /// stage and the cancellation errors the whole pipeline (the private
@@ -547,7 +547,7 @@ impl Command {
     /// **Ordering guarantees:** invocations are FIFO *within* a stream; there
     /// is no ordering between stdout and stderr handlers (two independent
     /// pumps). On the consuming verbs (`run`/`output_*`/`wait`/`profile`/
-    /// `finish_streamed`) all handler invocations happen-before the awaited
+    /// `finish`) all handler invocations happen-before the awaited
     /// future resolves — a progress bar can be finalized the moment the call
     /// returns. (One documented exception: when a leaked pipe is held open
     /// past the child's death, teardown aborts the pump after a bounded

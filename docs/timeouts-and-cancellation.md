@@ -52,7 +52,7 @@ Where each verb lands:
 | `output_string()` / `output_bytes()` | `Ok` result with `timed_out() == true`, `code() == None`, partial output kept |
 | `run()` / `exit_code()` / `probe()` / `checked()` | `Error::Timeout { program, timeout, stdout, stderr }` — the partial output captured before the kill is attached (`err.diagnostic()` surfaces a hung tool's last words) |
 | `first_line(pred)` | `Error::Timeout` (the line never arrived in time) |
-| `start()` + streaming | the stream **ends** at the deadline (tree killed, pipes closed); `finish_streamed` then reports the kill (`outcome == Outcome::TimedOut`) |
+| `start()` + streaming | the stream **ends** at the deadline (tree killed, pipes closed); `finish` then reports the kill (`outcome == Outcome::TimedOut`) |
 | `ensure_success()` on a captured result | `Error::Timeout`, checked *before* the exit code |
 | [`Pipeline`](pipelines.md#timeouts) | chain deadline → `timed_out` result; per-stage deadlines fold into pipefail |
 
@@ -164,7 +164,7 @@ The contract, path by path:
 | Situation | Behavior |
 |---|---|
 | Cancel during `run` / `output_string` / `output_bytes` / `wait` / `profile` / `exit_code` / `probe` | tree killed, `Error::Cancelled { program }` |
-| Cancel during streaming (`stdout_lines`) | the stream **ends**; the following `finish_streamed` reports `Error::Cancelled` |
+| Cancel during streaming (`stdout_lines`) | the stream **ends**; the following `finish` reports `Error::Cancelled` |
 | Token already cancelled before the run | short-circuits **before spawning** — no process is ever created |
 | Cancel on a shared-`ProcessGroup` handle | kills the child itself, leaves the group's siblings alone (same scope as a timeout) |
 | A `Pipeline` stage's token cancels | that stage dies; the cancellation errors the whole pipeline and the private group reaps the other stages |

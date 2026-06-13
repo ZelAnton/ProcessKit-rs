@@ -1,6 +1,6 @@
 //! Incremental stdout streaming: [`StdoutLines`], [`OutputEvents`], the
-//! watchdog tasks that bound a streamed run (deadline/cancel), and
-//! `finish_streamed` / `finish_events`.
+//! watchdog tasks that bound a streamed run (deadline/cancel), and the unified
+//! `finish`.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -20,9 +20,9 @@ use super::RunningProcess;
 /// [`stdout_lines`](RunningProcess::stdout_lines) or
 /// [`output_events`](RunningProcess::output_events): how the run ended plus
 /// the captured standard error. Returned by
-/// [`RunningProcess::finish_streamed`].
+/// [`RunningProcess::finish`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamedFinish {
+pub struct Finished {
     /// How the run ended.
     pub outcome: Outcome,
     /// Standard error captured in the background while stdout was streaming.
@@ -42,7 +42,7 @@ impl RunningProcess {
     /// stream**: at the deadline the real child's process tree is killed
     /// (gracefully if a [`timeout_grace`](crate::Command::timeout_grace) is set),
     /// so the pipes close and this stream ends — a streamed run can't hang past
-    /// its timeout. A following [`finish_streamed`](Self::finish_streamed) then
+    /// its timeout. A following [`finish`](Self::finish) then
     /// reports [`Outcome::TimedOut`](crate::Outcome::TimedOut) — deterministically,
     /// and even if the child caught the signal and exited cleanly within the grace
     /// — consistent with the bulk `output_string` path. With no timeout the stream
@@ -55,13 +55,16 @@ impl RunningProcess {
     /// canned feeders are hung up at the deadline — but, having no signal tier
     /// (like Windows), it ignores `timeout_grace` and ends at once.)
     ///
-    /// **D5:** if `stdout` was set to [`Inherit`](crate::StdioMode::Inherit) or
-    /// [`Null`](crate::StdioMode::Null) (not the default
-    /// [`Piped`](crate::StdioMode::Piped)), there is no pipe to read, so this
-    /// stream is **empty** (ends immediately). Unlike the bulk verbs
-    /// (`output_string`/`output_bytes`), which error loudly on a non-piped
-    /// stdout, a streaming verb returns no `Result` to carry that error — so the
-    /// empty stream is the signal. Use `Piped` to stream output.
+    /// **D2 — fallible, stream once.** Returns `Err` (an
+    /// [`Error::Io`](crate::Error::Io) with
+    /// [`InvalidInput`](std::io::ErrorKind::InvalidInput)) instead of a
+    /// silently-empty stream when **(a)** `stdout` was set to
+    /// [`Inherit`](crate::StdioMode::Inherit) / [`Null`](crate::StdioMode::Null)
+    /// (not the default [`Piped`](crate::StdioMode::Piped) — nothing to read), or
+    /// **(b)** a streaming verb (`stdout_lines` / `output_events`) was already
+    /// called on this handle (stdout is consumed exactly once). This mirrors the
+    /// bulk verbs' loudness — a non-piped or repeated call is a clear error, not
+    /// a stream that quietly yields nothing.
     ///
     /// # Example
     ///
@@ -69,26 +72,27 @@ impl RunningProcess {
     /// and stderr:
     ///
     /// ```no_run
-    /// use processkit::{Command, StreamExt, StreamedFinish};
+    /// use processkit::{Command, StreamExt, Finished};
     ///
     /// # async fn demo() -> processkit::Result<()> {
     /// let mut run = Command::new("git").args(["log", "--oneline", "-n", "20"]).start().await?;
     ///
-    /// let mut lines = run.stdout_lines();
+    /// let mut lines = run.stdout_lines()?;
     /// while let Some(line) = lines.next().await {
     ///     println!("commit: {line}");
     /// }
     ///
-    /// let StreamedFinish { outcome, stderr } = run.finish_streamed().await?;
+    /// let Finished { outcome, stderr } = run.finish().await?;
     /// # let _ = (outcome, stderr);
     /// # Ok(())
     /// # }
     /// ```
-    pub fn stdout_lines(&mut self) -> StdoutLines {
+    pub fn stdout_lines(&mut self) -> Result<StdoutLines> {
+        self.ensure_stdout_streamable()?;
         // Background-drain stderr (counter + handler still apply). The handle is
-        // kept so `finish_streamed` can await the last line before draining. Only
+        // kept so `finish` can await the last line before draining. Only
         // set up once: a second `stdout_lines` call must not overwrite the first
-        // call's sink/pump, or `finish_streamed` would return empty stderr.
+        // call's sink/pump, or `finish` would return empty stderr.
         if self.stderr_sink.is_none() {
             let stderr_sink = SharedLines::new(&self.buffer);
             if let Some(pipe) = self.backend.take_stderr_reader() {
@@ -106,7 +110,7 @@ impl RunningProcess {
         let stdout_sink = SharedLines::new(&self.buffer);
         match self.backend.take_stdout_reader() {
             Some(pipe) => {
-                // Store the handle (like `output_events`) so `finish_streamed`
+                // Store the handle (like `output_events`) so `finish`
                 // joins it before the fail-loud overflow check and `Drop` aborts
                 // it on a shared-group handle — a discarded handle would leave
                 // both as no-ops for the stdout stream.
@@ -118,7 +122,10 @@ impl RunningProcess {
                     stdout_sink.clone(),
                 )));
             }
-            // Called more than once: hand back an immediately-finished stream.
+            // Defensive: `ensure_stdout_streamable` (above) already rejects a
+            // non-piped or already-consumed stdout with an `Err` (D2), so this
+            // arm is effectively unreachable — close the sink so the stream ends
+            // at once rather than hanging if an internal caller ever reaches it.
             None => stdout_sink.close_now(),
         }
         // L1: only store on the first call — a repeat call's stdout_sink is a
@@ -173,7 +180,7 @@ impl RunningProcess {
                     // so it can't reap concurrently — a child that exits on the
                     // signal closes its pipes (ending the stream promptly), but this
                     // task still waits the full grace before its no-op SIGKILL. The
-                    // early-grace-exit reaping lives in the bulk `finish_streamed` /
+                    // early-grace-exit reaping lives in the bulk `finish` /
                     // `drive_to_exit` path (`teardown_on_timeout`), not here.
                     Some(grace) => match group.upgrade() {
                         Some(group) => {
@@ -199,13 +206,13 @@ impl RunningProcess {
         // re-arm it here. The stored `cancel_task` is already `Some` if a token
         // was configured; `abort_watchdogs` will abort it on reap or drop.
 
-        StdoutLines {
+        Ok(StdoutLines {
             sink: stdout_sink,
             wait: None,
-        }
+        })
     }
 
-    /// Finish a streamed run: wait for exit and return a [`StreamedFinish`]
+    /// Finish a streamed run: wait for exit and return a [`Finished`]
     /// carrying the [`Outcome`] and the stderr collected in the background by
     /// [`stdout_lines`](Self::stdout_lines).
     ///
@@ -216,7 +223,7 @@ impl RunningProcess {
     /// Designed to pair with `stdout_lines` (consume the stdout stream first),
     /// but safe to call on its own — any pipe the stream didn't take is drained
     /// here so the child can never block on a full pipe.
-    pub async fn finish_streamed(mut self) -> Result<StreamedFinish> {
+    pub async fn finish(mut self) -> Result<Finished> {
         // B5: drain an untaken stdout pipe through the policy-aware line pump
         // instead of read_to_end into an unbounded Vec.  This applies the
         // buffer policy (including fail_loud), counts lines, calls handlers,
@@ -283,12 +290,17 @@ impl RunningProcess {
             .as_ref()
             .map(|sink| sink.drain().join("\n"))
             .unwrap_or_default();
-        Ok(StreamedFinish { outcome, stderr })
+        Ok(Finished { outcome, stderr })
     }
 
     /// Stream both stdout and stderr as a single ordered sequence of
     /// [`OutputEvent`] items — each event tagged with its origin stream —
     /// as the child produces them. Call this **once**.
+    ///
+    /// **D2 — fallible, stream once.** Like [`stdout_lines`](Self::stdout_lines),
+    /// returns `Err` (an [`Error::Io`](crate::Error::Io)) rather than a
+    /// silently-empty stream when stdout was not piped, or when a streaming verb
+    /// already consumed stdout on this handle.
     ///
     /// Interleaving is best-effort (lines are ordered by when they arrive in
     /// the async runtime, not by a kernel timestamp). D9d: the two streams are
@@ -296,8 +308,9 @@ impl RunningProcess {
     /// continuously-ready stream can't starve the other (neither monopolizes
     /// while the peer loses lines or trips its
     /// [`fail_loud`](crate::OutputBufferPolicy::fail_loud) ceiling). Use
-    /// [`finish_events`](Self::finish_events) after draining to collect the
-    /// run's [`Outcome`](crate::Outcome).
+    /// [`finish`](Self::finish) after draining to collect the run's
+    /// [`Outcome`](crate::Outcome) (its `stderr` is empty — stderr was delivered
+    /// to you as events).
     ///
     /// # Example
     ///
@@ -307,7 +320,7 @@ impl RunningProcess {
     /// # async fn demo() -> processkit::Result<()> {
     /// let mut run = Command::new("make").arg("build").start().await?;
     ///
-    /// let mut events = run.output_events();
+    /// let mut events = run.output_events()?;
     /// while let Some(event) = events.next().await {
     ///     match event {
     ///         OutputEvent::Stdout(line) => println!("out: {line}"),
@@ -315,13 +328,14 @@ impl RunningProcess {
     ///     }
     /// }
     ///
-    /// let outcome = run.finish_events().await?;
+    /// let outcome = run.finish().await?.outcome;
     /// # let _ = outcome;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn output_events(&mut self) -> OutputEvents {
-        // Set up stdout sink + pump. The handle is stored so `finish_events`
+    pub fn output_events(&mut self) -> Result<OutputEvents> {
+        self.ensure_stdout_streamable()?;
+        // Set up stdout sink + pump. The handle is stored so `finish`
         // can join it before checking overflow (ensuring the pump's last write
         // is visible before `overflowed()` is queried).
         let stdout_sink = SharedLines::new(&self.buffer);
@@ -416,7 +430,7 @@ impl RunningProcess {
 
         // Cancel watchdog is now armed at spawn time — no re-arm needed here.
 
-        OutputEvents {
+        Ok(OutputEvents {
             stdout_sink,
             stderr_sink,
             stdout_wait: None,
@@ -424,80 +438,7 @@ impl RunningProcess {
             stdout_done: false,
             stderr_done: false,
             prefer_stdout: true,
-        }
-    }
-
-    /// Finish a run after its [`output_events`](Self::output_events) stream has
-    /// been drained: wait for the child to exit and return the [`Outcome`].
-    ///
-    /// A run killed by its [`timeout`](crate::Command::timeout) reports
-    /// [`Outcome::TimedOut`](crate::Outcome::TimedOut), even if the child caught
-    /// the signal and exited cleanly within the grace — matching the bulk verbs.
-    ///
-    /// Designed to pair with `output_events` (consume the events stream first),
-    /// but safe to call on its own — any untaken pipes are drained so the child
-    /// never blocks.
-    pub async fn finish_events(mut self) -> crate::error::Result<Outcome> {
-        // B5: drain any untaken pipes through the policy-aware line pump so
-        // that the buffer policy (including fail_loud) and handlers apply.
-        // The handle is stored in self.stdout_pump and joined below.
-        if let Some(pipe) = self.backend.take_stdout_reader() {
-            let sink = crate::pump::SharedLines::new(&self.buffer);
-            self.stdout_pump = Some(tokio::spawn(crate::pump::pump_lines_core(
-                pipe,
-                self.stdout_encoding,
-                self.stdout_handler.clone(),
-                self.stdout_tee.clone(),
-                sink.clone(),
-            )));
-            self.stdout_sink = Some(sink);
-        }
-        if self.stderr_pump.is_none()
-            && let Some(pipe) = self.backend.take_stderr_reader()
-        {
-            let sink = SharedLines::new(&self.buffer);
-            self.stderr_pump = Some(tokio::spawn(pump_lines_core(
-                pipe,
-                self.stderr_encoding,
-                self.stderr_handler.clone(),
-                self.stderr_tee.clone(),
-                sink.clone(),
-            )));
-            self.stderr_sink = Some(sink);
-        }
-
-        let raw_outcome = self.drive_to_exit().await?;
-        self.observe_stdin_task().await;
-        // Join both pumps so their final writes are visible before the overflow
-        // check. `join_pumps` bounds the wait by `PUMP_TEARDOWN` and aborts
-        // stragglers, so a surviving grandchild holding a pipe open past the
-        // child's death can't park this finisher forever (parity with the bulk
-        // verbs). The child's own pipes closed when it exited, so the common
-        // case completes immediately.
-        let pumps: Vec<_> = [self.stdout_pump.take(), self.stderr_pump.take()]
-            .into_iter()
-            .flatten()
-            .collect();
-        super::join_pumps(pumps).await;
-        let outcome = self.checked_outcome(raw_outcome)?;
-
-        // Fail-loud ceiling check for both sinks.
-        for sink in [self.stdout_sink.as_ref(), self.stderr_sink.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            if sink.overflowed() {
-                return Err(crate::Error::OutputTooLarge {
-                    program: self.program.clone(),
-                    line_limit: self.buffer.max_lines,
-                    byte_limit: self.buffer.max_bytes,
-                    total_lines: sink.count(),
-                    total_bytes: sink.seen_bytes(),
-                });
-            }
-        }
-
-        Ok(outcome)
+        })
     }
 }
 

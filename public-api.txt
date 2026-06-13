@@ -330,6 +330,24 @@ impl core::marker::Unpin for processkit::Command
 impl core::marker::UnsafeUnpin for processkit::Command
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Command
 impl !core::panic::unwind_safe::UnwindSafe for processkit::Command
+pub struct processkit::Finished
+pub processkit::Finished::outcome: processkit::Outcome
+pub processkit::Finished::stderr: alloc::string::String
+impl core::clone::Clone for processkit::Finished
+pub fn processkit::Finished::clone(&self) -> processkit::Finished
+impl core::cmp::Eq for processkit::Finished
+impl core::cmp::PartialEq for processkit::Finished
+pub fn processkit::Finished::eq(&self, &processkit::Finished) -> bool
+impl core::fmt::Debug for processkit::Finished
+pub fn processkit::Finished::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for processkit::Finished
+impl core::marker::Freeze for processkit::Finished
+impl core::marker::Send for processkit::Finished
+impl core::marker::Sync for processkit::Finished
+impl core::marker::Unpin for processkit::Finished
+impl core::marker::UnsafeUnpin for processkit::Finished
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::Finished
+impl core::panic::unwind_safe::UnwindSafe for processkit::Finished
 pub struct processkit::Invocation
 pub processkit::Invocation::args: alloc::vec::Vec<std::ffi::os_str::OsString>
 pub processkit::Invocation::cwd: core::option::Option<std::path::PathBuf>
@@ -695,10 +713,9 @@ pub fn processkit::RunningProcess::stderr_line_count(&self) -> usize
 pub fn processkit::RunningProcess::stdout_line_count(&self) -> usize
 pub async fn processkit::RunningProcess::wait(self) -> processkit::Result<processkit::Outcome>
 impl processkit::RunningProcess
-pub async fn processkit::RunningProcess::finish_events(self) -> processkit::Result<processkit::Outcome>
-pub async fn processkit::RunningProcess::finish_streamed(self) -> processkit::Result<processkit::StreamedFinish>
-pub fn processkit::RunningProcess::output_events(&mut self) -> processkit::OutputEvents
-pub fn processkit::RunningProcess::stdout_lines(&mut self) -> processkit::StdoutLines
+pub async fn processkit::RunningProcess::finish(self) -> processkit::Result<processkit::Finished>
+pub fn processkit::RunningProcess::output_events(&mut self) -> processkit::Result<processkit::OutputEvents>
+pub fn processkit::RunningProcess::stdout_lines(&mut self) -> processkit::Result<processkit::StdoutLines>
 impl processkit::RunningProcess
 pub async fn processkit::RunningProcess::wait_for<F, Fut>(&mut self, F, core::time::Duration) -> processkit::Result<()> where F: core::ops::function::FnMut() -> Fut, Fut: core::future::future::Future<Output = bool>
 pub async fn processkit::RunningProcess::wait_for_line(&mut self, impl core::ops::function::Fn(&str) -> bool, core::time::Duration) -> processkit::Result<alloc::string::String>
@@ -781,24 +798,6 @@ impl core::marker::Unpin for processkit::StdoutLines
 impl core::marker::UnsafeUnpin for processkit::StdoutLines
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::StdoutLines
 impl !core::panic::unwind_safe::UnwindSafe for processkit::StdoutLines
-pub struct processkit::StreamedFinish
-pub processkit::StreamedFinish::outcome: processkit::Outcome
-pub processkit::StreamedFinish::stderr: alloc::string::String
-impl core::clone::Clone for processkit::StreamedFinish
-pub fn processkit::StreamedFinish::clone(&self) -> processkit::StreamedFinish
-impl core::cmp::Eq for processkit::StreamedFinish
-impl core::cmp::PartialEq for processkit::StreamedFinish
-pub fn processkit::StreamedFinish::eq(&self, &processkit::StreamedFinish) -> bool
-impl core::fmt::Debug for processkit::StreamedFinish
-pub fn processkit::StreamedFinish::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for processkit::StreamedFinish
-impl core::marker::Freeze for processkit::StreamedFinish
-impl core::marker::Send for processkit::StreamedFinish
-impl core::marker::Sync for processkit::StreamedFinish
-impl core::marker::Unpin for processkit::StreamedFinish
-impl core::marker::UnsafeUnpin for processkit::StreamedFinish
-impl core::panic::unwind_safe::RefUnwindSafe for processkit::StreamedFinish
-impl core::panic::unwind_safe::UnwindSafe for processkit::StreamedFinish
 #[non_exhaustive] pub struct processkit::SupervisionOutcome
 pub processkit::SupervisionOutcome::final_result: processkit::ProcessResult<alloc::string::String>
 pub processkit::SupervisionOutcome::restarts: u32

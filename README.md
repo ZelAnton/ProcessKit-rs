@@ -430,7 +430,7 @@ A probe that doesn't pass within its deadline — or that can no longer pass
 `Error::NotReady` (distinct from `Error::Timeout`, which is the run's own
 `Command::timeout`) and **does not kill the child**: the caller decides what
 happens next. `wait_for_line` consumes stdout up to the match
-(continue with `finish_streamed`); `wait_for_port` / `wait_for` don't touch
+(continue with `finish`); `wait_for_port` / `wait_for` don't touch
 the pipes at all.
 
 *Deeper: [Streaming → readiness probes](docs/streaming.md).*
@@ -573,7 +573,7 @@ Process each line as it arrives — no waiting for the child to exit, no bufferi
 the full output. `StreamExt` (re-exported from `tokio-stream`) provides `.next()`:
 
 ```rust,no_run
-use processkit::{Command, Outcome, StreamExt, StreamedFinish};
+use processkit::{Command, Outcome, StreamExt, Finished};
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {
@@ -582,7 +582,7 @@ async fn main() -> processkit::Result<()> {
         .start()
         .await?;
 
-    let mut lines = run.stdout_lines();
+    let mut lines = run.stdout_lines()?;
     while let Some(line) = lines.next().await {
         println!("commit: {line}");
     }
@@ -590,7 +590,7 @@ async fn main() -> processkit::Result<()> {
     // After the stream ends, collect the outcome and whatever went to stderr
     // (drained in the background while you streamed stdout). The `Outcome`
     // distinguishes a clean exit, a signal kill, and a timeout.
-    let StreamedFinish { outcome, stderr } = run.finish_streamed().await?;
+    let Finished { outcome, stderr } = run.finish().await?;
     if outcome != Outcome::Exited(0) {
         eprintln!("git ended {outcome:?}: {stderr}");
     }
@@ -601,7 +601,7 @@ async fn main() -> processkit::Result<()> {
 > The command's [`timeout`] **bounds the stream**: at the deadline the tree is
 > killed, the pipes close, and the stream ends (on a handle that owns its group —
 > the `start()` path). A `cancel_on` token ends
-> the stream the same way, and the following `finish_streamed` reports
+> the stream the same way, and the following `finish` reports
 > `Error::Cancelled`. For an ad-hoc bound, wrapping the loop in
 > [`tokio::time::timeout`] and dropping the handle (which kills the tree) still
 > works.
@@ -627,7 +627,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     stdin.write_line("6 * 7").await?;
     stdin.finish().await?; // send EOF so bc finishes
 
-    let mut answers = run.stdout_lines();
+    let mut answers = run.stdout_lines()?;
     while let Some(answer) = answers.next().await {
         println!("bc says: {answer}");
     }

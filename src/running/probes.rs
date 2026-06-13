@@ -36,10 +36,11 @@ impl RunningProcess {
     ///
     /// - **Consumes stdout** up to and including the matching line (this is
     ///   the one-shot [`stdout_lines`](Self::stdout_lines) stream underneath —
-    ///   if it was already called, the probe sees a closed stream and reports
-    ///   `NotReady` immediately). Continue with
-    ///   [`finish_streamed`](Self::finish_streamed) for the outcome and
-    ///   stderr; the other probes don't touch stdout.
+    ///   if stdout was already consumed by an earlier `stdout_lines` /
+    ///   `output_events` / `wait_for_line`, or was not piped, this returns an
+    ///   `Err` (D2) rather than a stream that is forever `NotReady`). Continue
+    ///   with [`finish`](Self::finish) for the outcome and stderr; the other
+    ///   probes don't touch stdout.
     /// - A failed probe does **not** kill the child — unlike
     ///   [`Command::timeout`](crate::Command::timeout), whose deadline (if
     ///   configured) is armed by this call exactly as `stdout_lines` always
@@ -52,8 +53,11 @@ impl RunningProcess {
         use tokio_stream::StreamExt;
 
         // Bound the borrow: `StdoutLines` owns its sink (no borrow of self), so
-        // `self.program` stays readable after the search.
-        let mut lines = self.stdout_lines();
+        // `self.program` stays readable after the search. D2: `stdout_lines` is
+        // fallible — a non-piped stdout, or a *second* `wait_for_line` (stdout
+        // already consumed), surfaces as a clear `Err` here rather than a probe
+        // that is forever `NotReady`.
+        let mut lines = self.stdout_lines()?;
         let search = async {
             while let Some(line) = lines.next().await {
                 if predicate(&line) {

@@ -8,7 +8,7 @@
 mod probes;
 mod stream;
 
-pub use stream::{OutputEvent, OutputEvents, StdoutLines, StreamedFinish};
+pub use stream::{Finished, OutputEvent, OutputEvents, StdoutLines};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -43,7 +43,9 @@ const TS_EXITED: u8 = 1;
 const TS_TIMED_OUT: u8 = 2;
 
 /// What [`RunningProcess::finish_lines`] hands back to its thin public verbs.
-struct Finished {
+/// (Internal — distinct from the public [`Finished`](crate::Finished) returned
+/// by the streaming `finish()`.)
+struct FinishedLines {
     outcome: Outcome,
     stdout_lines: Vec<String>,
     stderr_lines: Vec<String>,
@@ -103,11 +105,12 @@ pub struct RunningProcess {
     // The Option fields below encode the handle's de-facto states (fresh /
     // streaming / consumed) implicitly. No runtime state enum on purpose:
     // every consuming verb takes `self` BY VALUE (double consumption is a
-    // compile error), and the two &mut entry points (`stdout_lines`,
-    // `standard_input`) have explicit, tested, non-panicking handling for
-    // repeat calls (`second_stdout_lines_call_ends_immediately`,
-    // `finish_streamed_without_streaming_first…`). A state enum would add
-    // panic paths to guard doors the borrow checker already locks.
+    // compile error), and the two &mut entry points handle a repeat call
+    // explicitly without panicking — `stdout_lines`/`output_events` return a
+    // loud `Err` on a second call (D2, tested by
+    // `second_stdout_lines_errors_and_first_overflow_is_preserved`), and
+    // `standard_input` returns `None`. A state enum would add panic paths to
+    // guard doors the borrow checker already locks.
     program: String,
     /// The I/O-bearing half: a real OS child, or a scripted double feeding the
     /// same pump machinery (see [`Backend`]).
@@ -127,11 +130,11 @@ pub struct RunningProcess {
     stdout_sink: Option<Arc<SharedLines>>,
     stderr_sink: Option<Arc<SharedLines>>,
     // The background stdout-pump task started by `output_events`, joined by
-    // `finish_events` before the overflow check (ensures the pump has written
+    // `finish` before the overflow check (ensures the pump has written
     // its last lines before `overflowed()` is queried).
     stdout_pump: Option<JoinHandle<()>>,
     // The background stderr-drain task started by `stdout_lines`/`output_events`,
-    // awaited by `finish_streamed`/`finish_events` so no trailing line is missed.
+    // awaited by `finish` so no trailing line is missed.
     stderr_pump: Option<JoinHandle<()>>,
     // B3: a non-broken-pipe stdin-writer failure stashed by `observe_stdin_task`,
     // surfaced as `Error::Stdin` by `checked_outcome` when the run otherwise
@@ -179,7 +182,7 @@ type OutputReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
 /// The I/O-bearing half of a [`RunningProcess`]: a real OS child, or a
 /// scripted double ([`ScriptedRunner::start`](crate::ScriptedRunner)) that
 /// feeds canned bytes through the same pumps/sinks — which is what makes
-/// streaming, probes, and `finish_streamed` hermetically testable. Platform
+/// streaming, probes, and `finish` hermetically testable. Platform
 /// code only ever constructs `Real`.
 enum Backend {
     // Boxed: both variants are large, and the enum lives in every handle.
@@ -516,7 +519,7 @@ impl RunningProcess {
 
     /// Take the raw stdout pipe — the [`Pipeline`](crate::Pipeline) plumbing
     /// that feeds it into the next stage's stdin. Afterwards this handle can
-    /// still report exit + stderr via [`finish_streamed`](Self::finish_streamed)
+    /// still report exit + stderr via [`finish`](Self::finish)
     /// (which tolerates a taken stdout), like after `stdout_lines`.
     /// `None` for a scripted backend — scripted doubles don't compose into a
     /// real pipeline (pipelines are a real-process concern).
@@ -610,7 +613,7 @@ impl RunningProcess {
     /// stdin.write_line("6 * 7").await?;
     /// stdin.finish().await?; // send EOF so bc finishes
     ///
-    /// let mut answers = run.stdout_lines();
+    /// let mut answers = run.stdout_lines().unwrap();
     /// while let Some(line) = answers.next().await {
     ///     println!("bc says: {line}");
     /// }
@@ -666,6 +669,30 @@ impl RunningProcess {
                 self.program
             ),
         )))
+    }
+
+    /// D2: the streaming verbs ([`stdout_lines`](Self::stdout_lines) /
+    /// [`output_events`](Self::output_events)) are fallible — they fail loud
+    /// instead of handing back a silently-empty stream when (a) stdout was not
+    /// piped (nothing to read), or (b) a streaming verb already consumed stdout
+    /// on this handle (it streams **once**; a second call would be empty). This
+    /// mirrors the bulk verbs' D5 loudness, closing the crate's least-predictable
+    /// corner (and making a second `wait_for_line` a clear error rather than a
+    /// stream that is forever `NotReady`).
+    fn ensure_stdout_streamable(&self) -> Result<()> {
+        self.ensure_stdout_capturable()?; // (a) non-piped stdout
+        if self.stdout_sink.is_some() {
+            // (b) a prior stdout_lines / output_events already took stdout.
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "`{}`: stdout was already consumed by an earlier stdout_lines/output_events \
+                     call — stream it once (a second call would yield an empty stream)",
+                    self.program
+                ),
+            )));
+        }
+        Ok(())
     }
 
     /// Drain both streams, wait for exit, and return the captured text output
@@ -1068,7 +1095,7 @@ impl RunningProcess {
     /// `output_string` does (today's behavior, preserved).
     ///
     /// `output_bytes` (raw stdout reader, its own bounded teardown) and
-    /// `finish_streamed` (already-streaming state, late stderr pump)
+    /// `finish` (already-streaming state, late stderr pump)
     /// deliberately do NOT route through this core — their spines differ by
     /// nature, not by copy-paste.
     async fn finish_lines(
@@ -1076,7 +1103,7 @@ impl RunningProcess {
         capture: CaptureMode,
         expose_counts: bool,
         on_exit: impl FnOnce(),
-    ) -> Result<Finished> {
+    ) -> Result<FinishedLines> {
         // D5: the capturing path needs a piped stdout; fail loudly rather than
         // returning empty. The discard path (wait/profile) reads nothing, so it
         // is exempt — a non-piped stream is fine there.
@@ -1154,7 +1181,7 @@ impl RunningProcess {
             CaptureMode::Lines => (stdout_sink.drain(), stderr_sink.drain()),
             CaptureMode::Discard => (Vec::new(), Vec::new()),
         };
-        Ok(Finished {
+        Ok(FinishedLines {
             outcome,
             stdout_lines,
             stderr_lines,
@@ -1777,7 +1804,7 @@ mod tests {
 
         // Consume the first two lines via the stream.
         {
-            let mut lines = run.stdout_lines();
+            let mut lines = run.stdout_lines().unwrap();
             assert_eq!(lines.next().await.as_deref(), Some("a"));
             assert_eq!(lines.next().await.as_deref(), Some("b"));
         }
@@ -1807,7 +1834,7 @@ mod tests {
             .expect("scripted start");
 
         // A streaming call consumes stdout as lines (sets both sinks).
-        drop(run.stdout_lines());
+        drop(run.stdout_lines().unwrap());
 
         let err = run
             .output_bytes()
@@ -1834,7 +1861,7 @@ mod tests {
 
         // Set up the stream but consume nothing, so the pump fills the bounded
         // buffer and the policy drops the two oldest lines.
-        drop(run.stdout_lines());
+        drop(run.stdout_lines().unwrap());
 
         let result = run.output_string().await.expect("output_string");
         assert!(
@@ -1898,7 +1925,7 @@ mod tests {
     /// B1 (wait path): a streamed run whose deadline fired must report
     /// `Outcome::TimedOut` through `wait_any`/`wait_all` too — `wait_exit` applies
     /// `classify_timed_out` just like `drive_to_exit`, so the streamed-then-raced
-    /// composition (`stdout_lines` → `wait_any`) is consistent with `finish_streamed`.
+    /// composition (`stdout_lines` → `wait_any`) is consistent with `finish`.
     #[tokio::test]
     async fn wait_any_classifies_a_timed_out_run() {
         let mut run = scripted_handle(&[0]).await; // Reply::ok -> Exited(0)

@@ -41,7 +41,7 @@ a double exercises your retry handling hermetically.
 The seam covers **streaming as well as bulk runs**: `ProcessRunner::start`
 returns a live `RunningProcess`, and a `ScriptedRunner`'s `start` hands back a
 scripted handle whose canned lines flow through the same pump machinery a real
-child uses — `stdout_lines`, `wait_for_line`, and `finish_streamed` behave
+child uses — `stdout_lines`, `wait_for_line`, and `finish` behave
 identically, with no subprocess (see
 [Scripted streaming](#scripted-streaming) below). An `output`-only custom
 runner keeps compiling: `start` is defaulted to `Error::Unsupported`.
@@ -117,10 +117,10 @@ The pieces:
 reply instead of an OS child. The canned stdout/stderr feed the **same pump
 machinery** a real child uses, so the whole streaming surface works
 hermetically — `stdout_lines` yields the lines, `wait_for_line` probes them,
-`finish_streamed` reports the canned outcome and stderr:
+`finish` reports the canned outcome and stderr:
 
 ```rust,no_run
-use processkit::{Command, Outcome, ProcessRunner, Reply, ScriptedRunner, StreamExt, StreamedFinish};
+use processkit::{Command, Outcome, ProcessRunner, Reply, ScriptedRunner, StreamExt, Finished};
 use std::time::Duration;
 
 #[tokio::test]
@@ -133,7 +133,7 @@ async fn server_becomes_ready() {
         .await
         .unwrap(); // satisfied by the canned banner — no subprocess
 
-    let StreamedFinish { outcome, .. } = run.finish_streamed().await.unwrap();
+    let Finished { outcome, .. } = run.finish().await.unwrap();
     assert_eq!(outcome, Outcome::Exited(0));
 }
 ```

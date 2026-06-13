@@ -108,6 +108,19 @@ to a dated version section.
   `Error::Io` (`InvalidInput`) once the source has been consumed (D10), instead of silently
   feeding the re-run empty stdin. Use a re-runnable source
   (`from_bytes`/`from_string`/`from_file`/`from_iter_lines`) to retry or re-run.
+- **Breaking:** the streaming verbs are now **fallible** (D2): `RunningProcess::stdout_lines`
+  and `output_events` return `Result<StdoutLines>` / `Result<OutputEvents>` instead of the
+  bare stream. They `Err` (an `Error::Io` `InvalidInput`) on a non-piped stdout
+  (`StdioMode::Inherit`/`Null`) or a second streaming call (stdout streams once) rather than
+  handing back a silently-empty stream — mirroring the bulk verbs' loudness and making a
+  second `wait_for_line` a clear error instead of a forever-`NotReady` probe. Add `?` /
+  `.expect(..)` at the call site.
+- **Breaking:** the streaming finishers are **unified** (D3): `finish_streamed()` and
+  `finish_events()` collapse into a single `RunningProcess::finish() -> Result<Finished>`,
+  and the `StreamedFinish` struct is renamed `Finished` (`{ outcome, stderr }`). After
+  `output_events`, `finish().stderr` is empty (stderr was delivered to you as events). `wait()`
+  (the discard finisher) is unchanged. Rename `finish_streamed`/`finish_events` → `finish` and
+  `StreamedFinish` → `Finished`.
 
 ### Fixed
 

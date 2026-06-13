@@ -24,7 +24,7 @@ async fn unix_signal_reaches_the_tree() {
         "trap 'echo got-hup' HUP; echo ready; while :; do sleep 0.1; done",
     ]);
     let mut process = group.start(&cmd).await.expect("start trap child");
-    let mut lines = process.stdout_lines();
+    let mut lines = process.stdout_lines().unwrap();
 
     let ready = tokio::time::timeout(Duration::from_secs(10), lines.next())
         .await
@@ -53,7 +53,7 @@ async fn unix_suspend_freezes_progress() {
         "i=0; while :; do i=$((i+1)); echo $i; sleep 0.05; done",
     ]);
     let mut process = group.start(&cmd).await.expect("start ticker");
-    let mut lines = process.stdout_lines();
+    let mut lines = process.stdout_lines().unwrap();
 
     // Prove it is producing output, then freeze.
     tokio::time::timeout(Duration::from_secs(10), lines.next())
@@ -144,7 +144,7 @@ async fn windows_suspend_resume_stalls_output() {
     // ping prints one line per second — a slow ticker.
     let cmd = Command::new("ping").args(["-n", "30", "127.0.0.1"]);
     let mut process = group.start(&cmd).await.expect("start ping");
-    let mut lines = process.stdout_lines();
+    let mut lines = process.stdout_lines().unwrap();
 
     tokio::time::timeout(Duration::from_secs(10), lines.next())
         .await
@@ -371,7 +371,7 @@ async fn windows_nested_suspend_needs_matching_resumes() {
         .start(&Command::new("ping").args(["-n", "31", "127.0.0.1"]))
         .await
         .expect("start ticker");
-    let mut lines = run.stdout_lines();
+    let mut lines = run.stdout_lines().unwrap();
     tokio::time::timeout(Duration::from_secs(15), lines.next())
         .await
         .expect("ticker prints")

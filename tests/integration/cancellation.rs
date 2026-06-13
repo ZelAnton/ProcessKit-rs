@@ -145,7 +145,7 @@ async fn pre_cancelled_token_short_circuits_before_spawning() {
 
 #[tokio::test]
 #[ignore = "spawns a real subprocess and cancels it mid-stream"]
-async fn cancel_ends_the_stream_and_finish_streamed_reports_it() {
+async fn cancel_ends_the_stream_and_finish_reports_it() {
     use tokio_stream::StreamExt;
 
     let token = CancellationToken::new();
@@ -169,7 +169,7 @@ async fn cancel_ends_the_stream_and_finish_streamed_reports_it() {
         .expect("start banner child");
 
     let pid = run.pid().expect("pid");
-    let mut lines = run.stdout_lines();
+    let mut lines = run.stdout_lines().unwrap();
     // Wait for the banner so the cancel provably lands mid-stream.
     let first = tokio::time::timeout(Duration::from_secs(15), lines.next())
         .await
@@ -203,7 +203,7 @@ async fn cancel_ends_the_stream_and_finish_streamed_reports_it() {
     );
 
     let err = run
-        .finish_streamed()
+        .finish()
         .await
         .expect_err("finishing a cancelled streamed run must error");
     assert!(

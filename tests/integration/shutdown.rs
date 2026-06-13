@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use processkit::{Command, Outcome, ProcessGroup, StreamedFinish};
+use processkit::{Command, Finished, Outcome, ProcessGroup};
 
 #[tokio::test]
 #[ignore = "spawns a real subprocess and shuts it down gracefully"]
@@ -165,7 +165,7 @@ async fn graceful_timeout_on_a_streamed_run_signals_and_ends_the_stream() {
         .expect("start");
 
     let start = Instant::now();
-    let mut lines = run.stdout_lines();
+    let mut lines = run.stdout_lines().unwrap();
     let first = tokio::time::timeout(Duration::from_secs(10), lines.next())
         .await
         .expect("the ready banner arrives before the deadline");
@@ -175,7 +175,7 @@ async fn graceful_timeout_on_a_streamed_run_signals_and_ends_the_stream() {
     // → the stream must end promptly (this is the primary signal: a wired graceful
     // branch ends it within the grace; an *unwired* one — the busy-loop never
     // signalled — would hang past this 5s bound and fail here). We drain the stream
-    // to completion FIRST so the child is already dead before `finish_streamed`.
+    // to completion FIRST so the child is already dead before `finish`.
     let ended = tokio::time::timeout(Duration::from_secs(5), async {
         while lines.next().await.is_some() {}
     })
@@ -186,12 +186,12 @@ async fn graceful_timeout_on_a_streamed_run_signals_and_ends_the_stream() {
     );
 
     // B1: the streamed run TIMED OUT — the deadline fired and triggered the
-    // teardown — so `finish_streamed` reports `Outcome::TimedOut`, matching the
+    // teardown — so `finish` reports `Outcome::TimedOut`, matching the
     // bulk `output_string` path (which reports `timed_out()` for this same
     // scenario), not the child's in-grace `exit 0`. This is deterministic now:
     // the streaming watchdog sets a shared `timed_out` flag when it fires, and
     // the finisher classifies from that flag rather than racing the reaped exit.
-    let StreamedFinish { outcome, stderr } = run.finish_streamed().await.expect("finish");
+    let Finished { outcome, stderr } = run.finish().await.expect("finish");
     assert_eq!(
         outcome,
         Outcome::TimedOut,
@@ -220,7 +220,7 @@ async fn graceful_timeout_on_an_events_run_reports_timed_out() {
     use tokio_stream::StreamExt;
 
     // B1 parity for the events path: `output_events` arms the same deadline
-    // watchdog as `stdout_lines`, and `finish_events` classifies via the same
+    // watchdog as `stdout_lines`, and `finish` classifies via the same
     // `timed_out` flag, so a graceful streamed timeout must report
     // `Outcome::TimedOut` here too — not the child's in-grace `exit 0`.
     let mut run = Command::new("sh")
@@ -232,7 +232,7 @@ async fn graceful_timeout_on_an_events_run_reports_timed_out() {
         .expect("start");
 
     let start = Instant::now();
-    let mut events = run.output_events();
+    let mut events = run.output_events().unwrap();
     let mut saw_ready = false;
     let drained = tokio::time::timeout(Duration::from_secs(8), async {
         while let Some(ev) = events.next().await {
@@ -251,11 +251,11 @@ async fn graceful_timeout_on_an_events_run_reports_timed_out() {
         "the ready banner must arrive before the deadline"
     );
 
-    let outcome = run.finish_events().await.expect("finish_events");
+    let outcome = run.finish().await.expect("finish");
     assert_eq!(
         outcome,
         Outcome::TimedOut,
-        "an events run whose deadline fired must report TimedOut (parity with finish_streamed)"
+        "an events run whose deadline fired must report TimedOut (parity with finish)"
     );
     assert!(
         start.elapsed() < Duration::from_secs(8),

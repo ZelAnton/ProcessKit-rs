@@ -198,7 +198,7 @@ pub use mechanism::Mechanism;
 pub use pipeline::Pipeline;
 pub use result::{Outcome, ProcessResult};
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
-pub use running::{OutputEvent, OutputEvents, RunningProcess, StdoutLines, StreamedFinish};
+pub use running::{Finished, OutputEvent, OutputEvents, RunningProcess, StdoutLines};
 #[cfg(feature = "process-control")]
 pub use signal::Signal;
 #[cfg(feature = "stats")]
@@ -693,11 +693,11 @@ mod tests {
 
     // ── Phase C: output-capture integrity ────────────────────────────────────
 
-    // B5: finish_streamed without a prior stdout_lines call must route the
+    // B5: finish without a prior stdout_lines call must route the
     // untaken stdout through the policy-aware pump, not read_to_end into an
     // unbounded Vec.  A fail_loud ceiling must be enforced.
     #[tokio::test]
-    async fn finish_streamed_on_untaken_stdout_respects_fail_loud() {
+    async fn finish_on_untaken_stdout_respects_fail_loud() {
         use crate::buffer::OutputBufferPolicy;
         use crate::doubles::{Reply, ScriptedRunner};
         use crate::runner::ProcessRunner;
@@ -707,29 +707,7 @@ mod tests {
             .await
             .expect("start");
         let err = run
-            .finish_streamed()
-            .await
-            .expect_err("fail_loud(2) with 3 lines must error");
-        assert!(
-            matches!(err, crate::Error::OutputTooLarge { .. }),
-            "expected OutputTooLarge, got {err:?}"
-        );
-    }
-
-    // B5 companion: finish_events without a prior output_events call must also
-    // route untaken stdout through the policy-aware pump.
-    #[tokio::test]
-    async fn finish_events_on_untaken_stdout_respects_fail_loud() {
-        use crate::buffer::OutputBufferPolicy;
-        use crate::doubles::{Reply, ScriptedRunner};
-        use crate::runner::ProcessRunner;
-        let runner = ScriptedRunner::new().fallback(Reply::lines(["a", "b", "c"]));
-        let run = runner
-            .start(&crate::Command::new("prog").output_buffer(OutputBufferPolicy::fail_loud(2)))
-            .await
-            .expect("start");
-        let err = run
-            .finish_events()
+            .finish()
             .await
             .expect_err("fail_loud(2) with 3 lines must error");
         assert!(
@@ -769,7 +747,7 @@ mod tests {
             .start(&crate::Command::new("prog"))
             .await
             .expect("start");
-        let _ = run.stdout_lines(); // take the pipe, start the streaming pump
+        let _ = run.stdout_lines().unwrap(); // take the pipe, start the streaming pump
         // output_string must join the streaming pump and drain its sink.
         let result = run.output_string().await.expect("output_string");
         assert!(
@@ -779,11 +757,11 @@ mod tests {
         );
     }
 
-    // L1: a second stdout_lines call must not overwrite self.stdout_sink with
-    // the new call's immediately-closed empty sink — the first pump's overflow
-    // flag and line count must still be visible to finish_streamed.
+    // D2: a second stdout_lines call is a LOUD error (stdout streams once), not a
+    // silently-empty stream — and the first pump's overflow is still observed by
+    // finish (the error doesn't disturb the first call's sink).
     #[tokio::test]
-    async fn repeat_stdout_lines_preserves_overflow_flag() {
+    async fn second_stdout_lines_errors_and_first_overflow_is_preserved() {
         use crate::StreamExt;
         use crate::buffer::OutputBufferPolicy;
         use crate::doubles::{Reply, ScriptedRunner};
@@ -792,14 +770,16 @@ mod tests {
         let cmd = crate::Command::new("prog").output_buffer(OutputBufferPolicy::fail_loud(2));
         let mut run = runner.start(&cmd).await.expect("start");
         // Drain the first stream to completion.
-        let mut first = run.stdout_lines();
+        let mut first = run.stdout_lines().expect("first stdout_lines");
         while first.next().await.is_some() {}
-        // Second call — pipe already gone; returns immediately-closed stream.
-        let _ = run.stdout_lines();
-        // finish_streamed must observe the first pump's overflow, not the
-        // second call's fresh empty closed sink.
+        // D2: a second call errors instead of returning an empty stream.
         let err = run
-            .finish_streamed()
+            .stdout_lines()
+            .expect_err("a second stdout_lines must be a loud error");
+        assert!(matches!(err, crate::Error::Io(_)), "got {err:?}");
+        // finish still observes the first pump's overflow.
+        let err = run
+            .finish()
             .await
             .expect_err("overflow from first pump must still be visible");
         assert!(
@@ -808,11 +788,9 @@ mod tests {
         );
     }
 
-    // L2: a second output_events call must get its own immediately-closed
-    // stderr sink, not share the first call's SharedLines where notify_one
-    // on close could leave one consumer parked forever.
+    // D2: a second output_events call is likewise a loud error.
     #[tokio::test]
-    async fn second_output_events_yields_no_events() {
+    async fn second_output_events_is_a_loud_error() {
         use crate::StreamExt;
         use crate::doubles::{Reply, ScriptedRunner};
         use crate::runner::ProcessRunner;
@@ -822,15 +800,13 @@ mod tests {
             .await
             .expect("start");
         // First call: drain both streams.
-        let mut first = run.output_events();
+        let mut first = run.output_events().expect("first output_events");
         while first.next().await.is_some() {}
-        // Second call: both sinks are immediately closed.
-        let mut second = run.output_events();
-        let mut events: usize = 0;
-        while second.next().await.is_some() {
-            events += 1;
-        }
-        assert_eq!(events, 0, "second output_events must yield no events");
-        let _ = run.finish_events().await;
+        // D2: a second call errors instead of yielding an empty stream.
+        let err = run
+            .output_events()
+            .expect_err("a second output_events must be a loud error");
+        assert!(matches!(err, crate::Error::Io(_)), "got {err:?}");
+        let _ = run.finish().await;
     }
 }

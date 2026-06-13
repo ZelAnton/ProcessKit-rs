@@ -40,9 +40,8 @@ pub enum OverflowMode {
     ///
     /// The ceiling applies to **line-pumped** output. It fires on the
     /// line-capturing verbs — [`output_string`](crate::Command::output_string)
-    /// (stdout *and* stderr),
-    /// [`finish_streamed`](crate::RunningProcess::finish_streamed), and
-    /// [`finish_events`](crate::RunningProcess::finish_events). On
+    /// (stdout *and* stderr) and the streaming
+    /// [`finish`](crate::RunningProcess::finish). On
     /// [`output_bytes`](crate::Command::output_bytes) stdout is captured **raw**
     /// (no line buffer), so the cap applies only to its line-pumped *stderr* —
     /// the raw stdout is never line-capped (bound a flooding child with a

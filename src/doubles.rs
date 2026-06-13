@@ -15,7 +15,7 @@
 //! test hermetically. A scripted [`start`](crate::ProcessRunner::start) hands
 //! back a live [`RunningProcess`](crate::RunningProcess) whose canned output
 //! flows through the **same pump machinery** as a real child: `stdout_lines`,
-//! `wait_for_line`/`wait_for`, and `finish_streamed` all behave identically
+//! `wait_for_line`/`wait_for`, and `finish` all behave identically
 //! (per-line pacing via [`Reply::with_line_delay`]). Scripted handles have no
 //! OS identity (`pid()` is `None`), don't compose into a real
 //! [`Pipeline`](crate::Pipeline), and don't model interactive stdin.
@@ -541,7 +541,7 @@ impl ProcessRunner for ScriptedRunner {
 
     /// Start a scripted live handle: the canned stdout/stderr flow through the
     /// command's **real** pump machinery (handlers, encodings, buffer policy),
-    /// so `stdout_lines` / `wait_for_line` / `finish_streamed` behave exactly
+    /// so `stdout_lines` / `wait_for_line` / `finish` behave exactly
     /// as on a real child — no subprocess involved.
     async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
         let program = command.program().to_string_lossy().into_owned();
@@ -779,14 +779,14 @@ mod tests {
         let mut run = runner.start(&cmd).await.expect("scripted start");
         assert_eq!(run.pid(), None, "a scripted child has no OS identity");
 
-        let mut lines = run.stdout_lines();
+        let mut lines = run.stdout_lines().unwrap();
         let mut seen = Vec::new();
         while let Some(line) = lines.next().await {
             seen.push(line);
         }
         assert_eq!(seen, ["first", "second", "third"]);
 
-        let finish = run.finish_streamed().await.expect("finish");
+        let finish = run.finish().await.expect("finish");
         assert_eq!(finish.outcome, Outcome::Exited(0));
         assert_eq!(finish.stderr, "");
     }
@@ -801,7 +801,7 @@ mod tests {
         run.wait_for_line(|l| l.contains("ready"), std::time::Duration::from_secs(5))
             .await
             .expect("the canned banner satisfies the probe");
-        let finish = run.finish_streamed().await.expect("finish");
+        let finish = run.finish().await.expect("finish");
         assert_eq!(finish.outcome, Outcome::Exited(7));
         assert_eq!(finish.stderr, "boom: detail");
     }
@@ -827,7 +827,7 @@ mod tests {
             .start(&Command::new("clock"))
             .await
             .expect("scripted start");
-        let mut lines = run.stdout_lines();
+        let mut lines = run.stdout_lines().unwrap();
 
         // Nothing arrives before the first delay elapses…
         assert!(
@@ -846,7 +846,7 @@ mod tests {
     /// `timeout`, exactly like a real child whose pipe closes when the deadline
     /// kills the tree. The script would pace two lines 10s apart (20s total),
     /// but the 3s timeout fires first: the stream ends having delivered nothing,
-    /// and `finish_streamed` classifies the run `TimedOut`.
+    /// and `finish` classifies the run `TimedOut`.
     #[tokio::test(start_paused = true)]
     async fn scripted_stream_is_bounded_by_command_timeout() {
         use tokio_stream::StreamExt;
@@ -856,7 +856,7 @@ mod tests {
         let cmd = Command::new("clock").timeout(std::time::Duration::from_secs(3));
         let mut run = runner.start(&cmd).await.expect("scripted start");
 
-        let mut lines = run.stdout_lines();
+        let mut lines = run.stdout_lines().unwrap();
         // The 3s deadline fires before the first line's 10s pace: the stream
         // ends at the deadline instead of running the full 20s of output.
         assert_eq!(
@@ -865,7 +865,7 @@ mod tests {
             "the scripted stream must end at the command's deadline, not run to completion"
         );
 
-        let finish = run.finish_streamed().await.expect("finish");
+        let finish = run.finish().await.expect("finish");
         assert_eq!(
             finish.outcome,
             Outcome::TimedOut,
@@ -888,7 +888,7 @@ mod tests {
         let cmd = Command::new("clock").timeout(std::time::Duration::from_millis(2500));
         let mut run = runner.start(&cmd).await.expect("scripted start");
 
-        let mut lines = run.stdout_lines();
+        let mut lines = run.stdout_lines().unwrap();
         let mut seen = Vec::new();
         while let Some(line) = lines.next().await {
             seen.push(line);
@@ -899,7 +899,7 @@ mod tests {
             "lines produced before the 2.5s deadline survive; later ones are cut off"
         );
 
-        let finish = run.finish_streamed().await.expect("finish");
+        let finish = run.finish().await.expect("finish");
         assert_eq!(finish.outcome, Outcome::TimedOut);
     }
 
@@ -915,14 +915,14 @@ mod tests {
         let cmd = Command::new("quick").timeout(std::time::Duration::from_secs(60));
         let mut run = runner.start(&cmd).await.expect("scripted start");
 
-        let mut lines = run.stdout_lines();
+        let mut lines = run.stdout_lines().unwrap();
         let mut seen = Vec::new();
         while let Some(line) = lines.next().await {
             seen.push(line);
         }
         assert_eq!(seen, ["a", "b"], "the whole short script is delivered");
 
-        let finish = run.finish_streamed().await.expect("finish");
+        let finish = run.finish().await.expect("finish");
         assert_eq!(
             finish.outcome,
             Outcome::Exited(0),
@@ -931,7 +931,7 @@ mod tests {
     }
 
     /// F2 parity for the merged `output_events` stream: the same deadline bound
-    /// applies, so the event stream ends at the timeout and `finish_events`
+    /// applies, so the event stream ends at the timeout and `finish`
     /// reports `TimedOut`.
     #[tokio::test(start_paused = true)]
     async fn scripted_output_events_is_bounded_by_command_timeout() {
@@ -942,18 +942,18 @@ mod tests {
         let cmd = Command::new("clock").timeout(std::time::Duration::from_secs(3));
         let mut run = runner.start(&cmd).await.expect("scripted start");
 
-        let mut events = run.output_events();
+        let mut events = run.output_events().unwrap();
         assert!(
             events.next().await.is_none(),
             "the merged event stream must end at the command's deadline"
         );
 
-        let outcome = run.finish_events().await.expect("finish");
+        let outcome = run.finish().await.expect("finish").outcome;
         assert_eq!(outcome, Outcome::TimedOut);
     }
 
     /// F2: a never-exiting `pending` reply with a timeout — the stream is empty
-    /// (no canned output), but `finish_streamed` must still resolve at the
+    /// (no canned output), but `finish` must still resolve at the
     /// deadline as `TimedOut` rather than hanging on the never-resolving wait.
     /// This is a **liveness** guard: with the scripted deadline armed,
     /// `backend_wait` parks on `signal.notified()` and the watchdog's `fire()`
@@ -967,10 +967,10 @@ mod tests {
         let cmd = Command::new("hang").timeout(std::time::Duration::from_secs(3));
         let mut run = runner.start(&cmd).await.expect("scripted start");
 
-        let mut lines = run.stdout_lines();
+        let mut lines = run.stdout_lines().unwrap();
         assert_eq!(lines.next().await, None, "a pending reply has no output");
 
-        let finish = run.finish_streamed().await.expect("finish");
+        let finish = run.finish().await.expect("finish");
         assert_eq!(finish.outcome, Outcome::TimedOut);
     }
 
