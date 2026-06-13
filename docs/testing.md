@@ -144,7 +144,10 @@ scripted run "exits" after the last line. The honest boundaries: a scripted
 handle has no OS identity (`pid()` is `None`, `profile` reports empty
 samples), does not compose into a real `Pipeline`, and does not model
 interactive stdin. `Reply::pending()` scripts a run that never exits on its
-own — cancel or time it out through the command's own knobs.
+own — cancel or time it out through the command's own knobs. A command
+`timeout` *does* bound a scripted stream (it ends at the deadline and reports
+`Outcome::TimedOut`, like a real child), but a scripted handle has no signal
+tier, so — like on Windows — it ignores `timeout_grace` and ends at once.
 
 ## Asserting invocations
 

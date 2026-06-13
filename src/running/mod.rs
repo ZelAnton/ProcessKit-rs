@@ -11,13 +11,14 @@ mod stream;
 pub use stream::{OutputEvent, OutputEvents, StdoutLines, StreamedFinish};
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use encoding_rs::Encoding;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
-use tokio::task::JoinHandle;
+use tokio::sync::Notify;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::buffer::OutputBufferPolicy;
 use crate::error::Error;
@@ -202,15 +203,48 @@ struct RealProc {
     stdin_task: Option<JoinHandle<std::io::Result<()>>>,
 }
 
+/// Shared kill state for a scripted child, clonable out of the [`ScriptedProc`]
+/// so a *detached* watchdog (the streaming `deadline_task`) can end the run
+/// without holding `&mut` the backend. `fire` is the scripted analogue of
+/// killing a real tree: it hangs up the feeders (each abort drops a writer,
+/// EOF-ing the matching reader so pumps and streams end), flags the child dead,
+/// and wakes a parked `backend_wait` via `signal`.
+#[derive(Clone)]
+struct ScriptedKill {
+    /// Set once the scripted child is killed (cancel/deadline/start_kill/drop).
+    killed: Arc<AtomicBool>,
+    /// Notifies a `backend_wait` that is parked on a not-yet-exited (or
+    /// never-exiting `pending`) script. `notify_one` stores a permit, so a kill
+    /// that fires before the wait parks is not missed.
+    signal: Arc<Notify>,
+    /// Abort handles for the writer tasks feeding the duplex streams. Aborting a
+    /// writer drops its end, EOF-ing the reader — exactly as a real tree's death
+    /// closes its pipes. `abort` is idempotent, so repeat fires are harmless.
+    feeders: Arc<Vec<AbortHandle>>,
+}
+
+impl ScriptedKill {
+    /// Kill the scripted child: flag dead, hang up the feeders, wake any parked
+    /// `backend_wait`. Idempotent and callable from a detached task.
+    fn fire(&self) {
+        self.killed.store(true, Ordering::Release);
+        for feeder in self.feeders.iter() {
+            feeder.abort();
+        }
+        self.signal.notify_one();
+    }
+}
+
 /// A scripted "child": canned output readers (fed by detached writer tasks so
 /// per-line delays work under a paused clock) plus a canned exit.
 pub(crate) struct ScriptedProc {
     /// Canned stdout/stderr, taken once like real pipes.
     stdout: Option<tokio::io::DuplexStream>,
     stderr: Option<tokio::io::DuplexStream>,
-    /// The writer tasks feeding the duplex streams; aborted on kill/drop
-    /// (dropping the writer EOFs the reader, ending pumps and streams).
-    feeders: Vec<JoinHandle<()>>,
+    /// Shared kill state (feeder abort handles + dead flag + wakeup), held so a
+    /// detached deadline watchdog can tear the run down. The feeder writer tasks
+    /// run detached; only these abort handles reach them.
+    kill: ScriptedKill,
     /// Canned exit: code + timed-out flag + optional signal number.
     code: Option<i32>,
     timed_out: bool,
@@ -219,8 +253,6 @@ pub(crate) struct ScriptedProc {
     /// (now = immediately), `None` never exits on its own (`Reply::pending` —
     /// cancel/timeout still end it).
     exit_at: Option<tokio::time::Instant>,
-    /// Set by `kill_tree`/`start_kill`: the scripted child is dead now.
-    killed: bool,
 }
 
 impl ScriptedProc {
@@ -244,7 +276,10 @@ impl ScriptedProc {
                 // Dropping the writer immediately EOFs the reader.
                 return rx;
             }
-            feeders.push(tokio::spawn(async move {
+            // The writer runs detached; its `AbortHandle` (kept in `feeders`) is
+            // the only way to hang it up early — a dropped `JoinHandle` would
+            // leave the task running to completion.
+            let task = tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
                 match line_delay {
                     None => {
@@ -260,7 +295,8 @@ impl ScriptedProc {
                     }
                 }
                 // tx drops here → EOF.
-            }));
+            });
+            feeders.push(task.abort_handle());
             rx
         };
         let stdout = feed(stdout_text);
@@ -268,23 +304,23 @@ impl ScriptedProc {
         Self {
             stdout: Some(stdout),
             stderr: Some(stderr),
-            feeders,
+            kill: ScriptedKill {
+                killed: Arc::new(AtomicBool::new(false)),
+                signal: Arc::new(Notify::new()),
+                feeders: Arc::new(feeders),
+            },
             code,
             timed_out,
             signal,
             exit_at: lifetime.map(|d| tokio::time::Instant::now() + d),
-            killed: false,
         }
     }
 
     /// The scripted kill: mark dead and hang up the feeders (aborting a
     /// writer drops its end, EOF-ing the matching reader — pumps and streams
     /// end exactly as when a real tree dies and its pipes close).
-    fn kill(&mut self) {
-        self.killed = true;
-        for task in self.feeders.drain(..) {
-            task.abort();
-        }
+    fn kill(&self) {
+        self.kill.fire();
     }
 }
 
@@ -294,6 +330,16 @@ impl Backend {
         match self {
             Backend::Real(real) => real.own_group.as_ref(),
             Backend::Scripted(_) => None,
+        }
+    }
+
+    /// A clone of the scripted kill state, for arming a detached streaming
+    /// deadline watchdog (the scripted analogue of `own_group`'s `Weak` for the
+    /// real path). `None` for a real child.
+    fn scripted_kill(&self) -> Option<ScriptedKill> {
+        match self {
+            Backend::Real(_) => None,
+            Backend::Scripted(s) => Some(s.kill.clone()),
         }
     }
 
@@ -435,6 +481,48 @@ impl RunningProcess {
                 stream::kill_direct_child(pid);
             }));
         }
+    }
+
+    /// Ф2: bound a *scripted* streamed run by its [`timeout`](crate::Command::timeout).
+    /// A scripted handle has no process group, so the real watchdog (which kills
+    /// the tree) never arms for it; this detached task instead hangs up the
+    /// feeders at the deadline — their EOF ends the pump and the stream, exactly
+    /// as a real tree's closing pipes do. Claims the timeout via the arbiter
+    /// (`PENDING` → `TIMED_OUT`) so the finisher classifies `TimedOut`; if the
+    /// script already exited the CAS fails and the kill is skipped. Armed once
+    /// (a second streaming call won't duplicate it) and only when a timeout is
+    /// set; no-op for a real backend. The handle lands in `self.deadline_task`,
+    /// which also disables the bulk deadline arm in `drive_to_exit_inner` (so the
+    /// teardown happens here, once) and is aborted by `Drop`/`abort_watchdogs`.
+    fn arm_scripted_deadline(&mut self) {
+        if self.deadline_task.is_some() {
+            return;
+        }
+        let (Some(limit), Some(kill)) = (self.timeout, self.backend.scripted_kill()) else {
+            return;
+        };
+        // Anchor to spawn time so a late stream call can't re-grant the full
+        // limit (B7 fix); `started` is std::time::Instant (Copy).
+        let started = self.started;
+        let timeout_state = self.timeout_state.clone();
+        self.deadline_task = Some(tokio::spawn(async move {
+            let remaining = limit
+                .checked_sub(started.elapsed())
+                .unwrap_or(Duration::ZERO);
+            tokio::time::sleep(remaining).await;
+            if timeout_state
+                .compare_exchange(
+                    TS_PENDING,
+                    TS_TIMED_OUT,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                return; // the script already exited on its own — no kill
+            }
+            kill.fire();
+        }));
     }
 
     /// Take the raw stdout pipe — the [`Pipeline`](crate::Pipeline) plumbing
@@ -1299,19 +1387,40 @@ impl RunningProcess {
                 // never-exiting `pending`) script that is killed is `Signalled`.
                 let already_exited =
                     matches!(s.exit_at, Some(at) if at <= tokio::time::Instant::now());
-                if s.killed && !already_exited {
+                let classify = |s: &ScriptedProc| match (s.code, s.timed_out) {
+                    (_, true) => Outcome::TimedOut,
+                    (Some(code), false) => Outcome::Exited(code),
+                    (None, false) => Outcome::Signalled(s.signal),
+                };
+                if s.kill.killed.load(Ordering::Acquire) && !already_exited {
+                    // Killed before its natural exit (cancel/deadline), or a
+                    // never-exiting `pending` script that was killed.
                     Outcome::Signalled(None)
+                } else if already_exited {
+                    // Already past its exit instant: the cached natural outcome,
+                    // even if a kill landed afterwards (Ф5). No kill race here —
+                    // a stored `signal` permit must not preempt the real outcome.
+                    classify(s)
                 } else {
                     match s.exit_at {
+                        // Ф2: race the natural exit against a kill so a streaming
+                        // `deadline_task` (which disables the bulk deadline arm in
+                        // `drive_to_exit_inner`) can still end this wait — a
+                        // not-yet-drained stream finished right after arming would
+                        // otherwise park here until the full scripted lifetime.
                         Some(at) => {
-                            tokio::time::sleep_until(at).await;
-                            match (s.code, s.timed_out) {
-                                (_, true) => Outcome::TimedOut,
-                                (Some(code), false) => Outcome::Exited(code),
-                                (None, false) => Outcome::Signalled(s.signal),
+                            tokio::select! {
+                                biased;
+                                () = s.kill.signal.notified() => Outcome::Signalled(None),
+                                () = tokio::time::sleep_until(at) => classify(s),
                             }
                         }
-                        None => std::future::pending().await,
+                        // Never exits on its own: park until a kill (cancel or a
+                        // streaming deadline watchdog) wakes us.
+                        None => {
+                            s.kill.signal.notified().await;
+                            Outcome::Signalled(None)
+                        }
                     }
                 }
             }
@@ -1517,7 +1626,7 @@ impl RunningProcess {
         let exited = match &mut self.backend {
             Backend::Real(real) => matches!(real.child.try_wait(), Ok(Some(_))),
             Backend::Scripted(s) => {
-                s.killed
+                s.kill.killed.load(Ordering::Acquire)
                     || s.exit_at
                         .is_some_and(|at| tokio::time::Instant::now() >= at)
             }

@@ -849,6 +849,140 @@ mod tests {
         assert_eq!(lines.next().await, None);
     }
 
+    /// Ф2: a scripted `stdout_lines` stream is bounded by the command's
+    /// `timeout`, exactly like a real child whose pipe closes when the deadline
+    /// kills the tree. The script would pace two lines 10s apart (20s total),
+    /// but the 3s timeout fires first: the stream ends having delivered nothing,
+    /// and `finish_streamed` classifies the run `TimedOut`.
+    #[tokio::test(start_paused = true)]
+    async fn scripted_stream_is_bounded_by_command_timeout() {
+        use tokio_stream::StreamExt;
+        let runner = ScriptedRunner::new().fallback(
+            Reply::lines(["tick", "tock"]).with_line_delay(std::time::Duration::from_secs(10)),
+        );
+        let cmd = Command::new("clock").timeout(std::time::Duration::from_secs(3));
+        let mut run = runner.start(&cmd).await.expect("scripted start");
+
+        let mut lines = run.stdout_lines();
+        // The 3s deadline fires before the first line's 10s pace: the stream
+        // ends at the deadline instead of running the full 20s of output.
+        assert_eq!(
+            lines.next().await,
+            None,
+            "the scripted stream must end at the command's deadline, not run to completion"
+        );
+
+        let finish = run.finish_streamed().await.expect("finish");
+        assert_eq!(
+            finish.outcome,
+            Outcome::TimedOut,
+            "a stream killed by its timeout reports TimedOut, like the bulk verbs"
+        );
+    }
+
+    /// Ф2: output produced *before* the deadline survives — a real child's
+    /// already-written pipe bytes are readable after its tree is killed, and the
+    /// scripted feeder's already-written bytes are likewise drainable after the
+    /// abort. Here lines pace 1s apart under a 2.5s timeout, so two lines arrive
+    /// before the deadline ends the stream; the run is still `TimedOut`.
+    #[tokio::test(start_paused = true)]
+    async fn scripted_stream_delivers_output_produced_before_the_deadline() {
+        use tokio_stream::StreamExt;
+        let runner = ScriptedRunner::new().fallback(
+            Reply::lines(["one", "two", "three", "four"])
+                .with_line_delay(std::time::Duration::from_secs(1)),
+        );
+        let cmd = Command::new("clock").timeout(std::time::Duration::from_millis(2500));
+        let mut run = runner.start(&cmd).await.expect("scripted start");
+
+        let mut lines = run.stdout_lines();
+        let mut seen = Vec::new();
+        while let Some(line) = lines.next().await {
+            seen.push(line);
+        }
+        assert_eq!(
+            seen,
+            ["one", "two"],
+            "lines produced before the 2.5s deadline survive; later ones are cut off"
+        );
+
+        let finish = run.finish_streamed().await.expect("finish");
+        assert_eq!(finish.outcome, Outcome::TimedOut);
+    }
+
+    /// Ф2: arming the scripted deadline must NOT spuriously time out a run that
+    /// finishes within its timeout — a short script under a long timeout still
+    /// reports its natural exit (the watchdog's `PENDING`→`TIMED_OUT` CAS loses
+    /// to the natural reap's `PENDING`→`EXITED`).
+    #[tokio::test(start_paused = true)]
+    async fn scripted_stream_under_a_generous_timeout_reports_natural_exit() {
+        use tokio_stream::StreamExt;
+        let runner = ScriptedRunner::new()
+            .fallback(Reply::lines(["a", "b"]).with_line_delay(std::time::Duration::from_secs(1)));
+        let cmd = Command::new("quick").timeout(std::time::Duration::from_secs(60));
+        let mut run = runner.start(&cmd).await.expect("scripted start");
+
+        let mut lines = run.stdout_lines();
+        let mut seen = Vec::new();
+        while let Some(line) = lines.next().await {
+            seen.push(line);
+        }
+        assert_eq!(seen, ["a", "b"], "the whole short script is delivered");
+
+        let finish = run.finish_streamed().await.expect("finish");
+        assert_eq!(
+            finish.outcome,
+            Outcome::Exited(0),
+            "a run that finishes within its timeout is not spuriously TimedOut"
+        );
+    }
+
+    /// Ф2 parity for the merged `output_events` stream: the same deadline bound
+    /// applies, so the event stream ends at the timeout and `finish_events`
+    /// reports `TimedOut`.
+    #[tokio::test(start_paused = true)]
+    async fn scripted_output_events_is_bounded_by_command_timeout() {
+        use tokio_stream::StreamExt;
+        let runner = ScriptedRunner::new().fallback(
+            Reply::lines(["tick", "tock"]).with_line_delay(std::time::Duration::from_secs(10)),
+        );
+        let cmd = Command::new("clock").timeout(std::time::Duration::from_secs(3));
+        let mut run = runner.start(&cmd).await.expect("scripted start");
+
+        let mut events = run.output_events();
+        assert!(
+            events.next().await.is_none(),
+            "the merged event stream must end at the command's deadline"
+        );
+
+        let outcome = run.finish_events().await.expect("finish");
+        assert_eq!(outcome, Outcome::TimedOut);
+    }
+
+    /// Ф2: a never-exiting `pending` reply with a timeout — the stream is empty
+    /// (no canned output), but `finish_streamed` must still resolve at the
+    /// deadline as `TimedOut` rather than hanging on the never-resolving wait.
+    /// This is a **liveness** guard: with the scripted deadline armed,
+    /// `backend_wait` parks on `signal.notified()` and the watchdog's `fire()`
+    /// wakes it; if that wake regressed, the bulk deadline arm in
+    /// `drive_to_exit_inner` still backstops the classification (so this asserts
+    /// "doesn't hang + reports TimedOut", not which of the two paths resolved it).
+    /// (`Reply::pending` is `cancellation`-gated.)
+    #[cfg(feature = "cancellation")]
+    #[tokio::test(start_paused = true)]
+    async fn scripted_pending_stream_finishes_at_the_deadline() {
+        use tokio_stream::StreamExt;
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let cmd = Command::new("hang").timeout(std::time::Duration::from_secs(3));
+        let mut run = runner.start(&cmd).await.expect("scripted start");
+
+        let mut lines = run.stdout_lines();
+        assert_eq!(lines.next().await, None, "a pending reply has no output");
+
+        let finish = run.finish_streamed().await.expect("finish");
+        assert_eq!(finish.outcome, Outcome::TimedOut);
+    }
+
     #[tokio::test]
     async fn scripted_timeout_reply_surfaces_through_start() {
         let runner = ScriptedRunner::new().fallback(Reply::timeout());

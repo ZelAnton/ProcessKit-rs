@@ -80,8 +80,11 @@ to a dated version section.
   output; an already-cancelled token short-circuits to `Cancelled` before serving a reply;
   `wait_any`/`wait_all` honor cancellation mid-wait (a pending scripted handle no longer
   hangs forever); a kill landing after a scripted child's natural exit keeps the cached
-  outcome (not `Signalled`); and the scripted run lifetime accounts for a stderr longer
-  than stdout (no truncation).
+  outcome (not `Signalled`); the scripted run lifetime accounts for a stderr longer
+  than stdout (no truncation); and a scripted `stdout_lines`/`output_events` stream is now
+  bounded by the command's `timeout` — the stream ends at the deadline and the run reports
+  `TimedOut`, like a real child whose pipes close when its tree is killed (a scripted
+  streamed run that previously ran to completion ignoring the timeout now ends early).
 - Cassette replay now invokes `on_stdout_line`/`on_stderr_line` (as record mode does), and
   keys on the **stdin content** (hashed, never persisted) so concurrent calls differing
   only in their stdin no longer collide on replay. (A pre-existing cassette recorded *with*

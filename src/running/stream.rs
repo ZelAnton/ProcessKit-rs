@@ -39,18 +39,21 @@ impl RunningProcess {
     /// dropping it tears the process down.
     ///
     /// The command's [`timeout`](crate::Command::timeout), if set, **bounds the
-    /// stream**: at the deadline the process tree is killed (gracefully if a
-    /// [`timeout_grace`](crate::Command::timeout_grace) is set), so the pipes
-    /// close and this stream ends — a streamed run can't hang past its timeout. A
-    /// following [`finish_streamed`](Self::finish_streamed) then reports
-    /// [`Outcome::TimedOut`](crate::Outcome::TimedOut) — deterministically, and
-    /// even if the child caught the signal and exited cleanly within the grace —
-    /// consistent with the bulk `output_string` path. With no timeout the stream
+    /// stream**: at the deadline the real child's process tree is killed
+    /// (gracefully if a [`timeout_grace`](crate::Command::timeout_grace) is set),
+    /// so the pipes close and this stream ends — a streamed run can't hang past
+    /// its timeout. A following [`finish_streamed`](Self::finish_streamed) then
+    /// reports [`Outcome::TimedOut`](crate::Outcome::TimedOut) — deterministically,
+    /// and even if the child caught the signal and exited cleanly within the grace
+    /// — consistent with the bulk `output_string` path. With no timeout the stream
     /// is unbounded as before.
-    /// (Bounding applies to a run that owns its group — the
+    /// (For a real child, bounding applies to a run that owns its group — the
     /// [`Command::start`](crate::Command::start) / [`JobRunner`](crate::JobRunner)
     /// path. A handle from [`ProcessGroup::start`](crate::ProcessGroup::start)
-    /// shares its group, so the caller bounds the stream.)
+    /// shares its group, so the caller bounds the stream. A
+    /// [`ScriptedRunner`](crate::ScriptedRunner) handle is bounded too — its
+    /// canned feeders are hung up at the deadline — but, having no signal tier
+    /// (like Windows), it ignores `timeout_grace` and ends at once.)
     ///
     /// **D5:** if `stdout` was set to [`Inherit`](crate::StdioMode::Inherit) or
     /// [`Null`](crate::StdioMode::Null) (not the default
@@ -183,6 +186,13 @@ impl RunningProcess {
                 }
             }));
         }
+
+        // Ф2: the scripted analogue — a scripted handle has no group to kill, so
+        // bound the stream by hanging up the feeders at the deadline (their EOF
+        // ends the pump and this stream, exactly as a real tree's closing pipes
+        // do). Claim the timeout via the arbiter first so the finisher classifies
+        // `TimedOut`; if the script already exited the CAS fails and we skip.
+        self.arm_scripted_deadline();
 
         // The cancel watchdog is armed at spawn time by `arm_cancel_watchdog`
         // (via `launch`/`attach_group`), so streaming consumers don't need to
@@ -400,6 +410,9 @@ impl RunningProcess {
                 }
             }));
         }
+
+        // Ф2: scripted analogue — see `stdout_lines`.
+        self.arm_scripted_deadline();
 
         // Cancel watchdog is now armed at spawn time — no re-arm needed here.
 
