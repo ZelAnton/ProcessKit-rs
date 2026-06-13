@@ -515,15 +515,11 @@ impl ProcessRunner for ScriptedRunner {
         {
             return Err(crate::error::Error::Cancelled { program });
         }
-        let timeout = command.configured_timeout();
-        let reply = self.matched_reply(command, &program)?;
-        if reply.pending {
-            return park_until_cancelled(command, program).await;
-        }
         // Ф3: honor the D5 non-piped-stdout contract that the live bulk path and
         // the scripted `start` path both enforce — a capture verb on
         // `stdout(Inherit/Null)` errors, it does not hand back canned output it
-        // could never have captured.
+        // could never have captured. Checked before `matched_reply` so this
+        // config error never advances an `on_sequence` rule's reply cursor.
         if !command.stdout_is_piped() {
             return Err(crate::error::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -532,6 +528,11 @@ impl ProcessRunner for ScriptedRunner {
                      so the capture verbs have nothing to read — use StdioMode::Piped to capture it"
                 ),
             )));
+        }
+        let timeout = command.configured_timeout();
+        let reply = self.matched_reply(command, &program)?;
+        if reply.pending {
+            return park_until_cancelled(command, program).await;
         }
         replay_line_handlers(command, &reply.stdout, &reply.stderr);
         Ok(reply
@@ -546,6 +547,16 @@ impl ProcessRunner for ScriptedRunner {
     /// as on a real child — no subprocess involved.
     async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
         let program = command.program().to_string_lossy().into_owned();
+        // Ф4: an already-cancelled token short-circuits with `Cancelled`, exactly
+        // as the live runner does pre-spawn — `output` AND `start` both route
+        // through `launch`'s pre-spawn check. Without it, `first_line` (which
+        // routes through `start`) would stream canned lines instead of cancelling.
+        #[cfg(feature = "cancellation")]
+        if let Some(token) = command.cancel_token()
+            && token.is_cancelled()
+        {
+            return Err(crate::error::Error::Cancelled { program });
+        }
         let reply = self.matched_reply(command, &program)?;
         Ok(reply.clone().into_running(command))
     }
@@ -934,6 +945,26 @@ mod tests {
             .output(&cmd)
             .await
             .expect_err("a pre-cancelled token short-circuits");
+        assert!(
+            matches!(err, crate::error::Error::Cancelled { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "cancellation")]
+    #[tokio::test]
+    async fn start_with_an_already_cancelled_token_short_circuits() {
+        // Ф4: `start` (the path `first_line` routes through) must short-circuit
+        // a pre-cancelled token too, exactly as `output` and the live runner do
+        // — not hand back a live scripted handle.
+        let token = crate::CancellationToken::new();
+        token.cancel();
+        let runner = ScriptedRunner::new().fallback(Reply::ok("must not start"));
+        let cmd = Command::new("x").cancel_on(token);
+        let err = runner
+            .start(&cmd)
+            .await
+            .expect_err("a pre-cancelled token short-circuits start");
         assert!(
             matches!(err, crate::error::Error::Cancelled { .. }),
             "got {err:?}"

@@ -161,7 +161,7 @@ impl Entry {
 /// same key and collide on replay (the first recorded one answers for both).
 /// Accepted: keying on raw bytes would defeat the human-diffable text fixture,
 /// and valid-UTF-8 invocations (the common case) never collide.
-type Key = (String, Vec<String>, Option<String>, Option<u64>);
+type Key = (String, Vec<String>, Option<String>, bool, Option<u64>);
 
 /// The stdin content digest (Ф12) keyed into a cassette match — `None` for an
 /// empty/absent stdin. The content is hashed, never persisted.
@@ -175,7 +175,10 @@ fn stdin_digest_of(command: &Command) -> Option<u64> {
 /// The key of a live invocation — must decode exactly like
 /// [`key_of_entry`] (both sides go through the same lossy conversion). The
 /// `stdin_digest` is computed from the command, not carried on the
-/// [`Invocation`] (which records only *whether* stdin was supplied).
+/// [`Invocation`] (which records only *whether* stdin was supplied). The
+/// `has_stdin` bool is keyed alongside the digest so a *pre-Ф12* entry (which
+/// loads `stdin_digest: None` regardless of its stored `has_stdin`) cannot match
+/// a no-stdin replay — only miss.
 fn key_of(invocation: &Invocation, stdin_digest: Option<u64>) -> Key {
     (
         invocation.program.to_string_lossy().into_owned(),
@@ -188,6 +191,7 @@ fn key_of(invocation: &Invocation, stdin_digest: Option<u64>) -> Key {
             .cwd
             .as_ref()
             .map(|c| c.to_string_lossy().into_owned()),
+        invocation.has_stdin,
         stdin_digest,
     )
 }
@@ -198,6 +202,7 @@ fn key_of_entry(entry: &Entry) -> Key {
         entry.program.clone(),
         entry.args.clone(),
         entry.cwd.clone(),
+        entry.has_stdin,
         entry.stdin_digest,
     )
 }
@@ -428,16 +433,24 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
             Mode::Replay { slots } => {
                 let invocation = Invocation::from_command(command);
                 let stdin_digest = stdin_digest_of(command);
-                let mut slots = slots.lock().expect("cassette mutex poisoned");
-                let Some(slot) = slots.get_mut(&key_of(&invocation, stdin_digest)) else {
-                    // Ф7: a stale/incomplete cassette is a distinct error, not a
-                    // missing-program `Spawn`/`NotFound` (so `is_not_found()` is
-                    // false and a wrapper can't mistake it for an absent tool).
-                    return Err(Error::CassetteMiss {
-                        program: command.program_name(),
-                    });
+                // Take an owned copy of the matched entry and release the lock
+                // BEFORE invoking user line handlers: a handler that re-enters
+                // this replayer (`replayer.output(...)`) would otherwise
+                // self-deadlock on the non-reentrant mutex. Record mode and
+                // `ScriptedRunner::output` hold no lock across handlers either.
+                let entry = {
+                    let mut slots = slots.lock().expect("cassette mutex poisoned");
+                    let Some(slot) = slots.get_mut(&key_of(&invocation, stdin_digest)) else {
+                        // Ф7: a stale/incomplete cassette is a distinct error, not
+                        // a missing-program `Spawn`/`NotFound` (so `is_not_found()`
+                        // is false and a wrapper can't mistake it for an absent
+                        // tool).
+                        return Err(Error::CassetteMiss {
+                            program: command.program_name(),
+                        });
+                    };
+                    slot.play().clone()
                 };
-                let entry = slot.play();
                 // Ф6: feed the replayed output through the command's
                 // `on_stdout_line`/`on_stderr_line` handlers, so a wrapper's
                 // progress path is exercised on replay exactly as it is in
@@ -451,9 +464,9 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 Ok(ProcessResult::new(
                     // Same value the live runner reports — the lossy program
                     // name — so a round trip is comparison-identical.
-                    entry.program.clone(),
-                    entry.stdout.clone(),
-                    entry.stderr.clone(),
+                    entry.program,
+                    entry.stdout,
+                    entry.stderr,
                     outcome,
                     command.configured_timeout(),
                 )
@@ -691,6 +704,29 @@ mod tests {
             "out-A\n",
             "stdin A must replay its own recording"
         );
+    }
+
+    #[tokio::test]
+    async fn no_stdin_replay_does_not_match_a_stdin_recorded_entry() {
+        // The key distinguishes a stdin-bearing invocation from a no-stdin one
+        // (via the digest, and via `has_stdin` for pre-Ф12 entries that load
+        // `stdin_digest: None`) — a no-stdin replay misses, never serving the
+        // stdin entry's output.
+        let (_dir, path) = temp_cassette();
+        let recorder =
+            RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("out\n")));
+        recorder
+            .output(&Command::new("tool").stdin(crate::Stdin::from_string("input")))
+            .await
+            .expect("record with stdin");
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load");
+        let err = replayer
+            .output(&Command::new("tool"))
+            .await
+            .expect_err("a no-stdin call must not match a stdin-recorded entry");
+        assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
     }
 
     #[tokio::test]
