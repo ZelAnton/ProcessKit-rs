@@ -57,6 +57,21 @@ pub enum Error {
         searched: String,
     },
 
+    /// A cassette replay found **no recording** matching the invocation — a
+    /// stale or incomplete cassette, not a missing program (Ф7). Kept distinct
+    /// from [`Spawn`](Error::Spawn) / [`NotFound`](Error::NotFound) so a wrapper
+    /// that treats "tool not installed" as an *optional* dependency does not
+    /// silently swallow a stale cassette as an absent tool.
+    ///
+    /// [`is_not_found`](Error::is_not_found) returns `false` for this variant.
+    #[error(
+        "`{program}`: no cassette entry matches this invocation (stale or incomplete cassette)"
+    )]
+    CassetteMiss {
+        /// The program whose invocation found no recording.
+        program: String,
+    },
+
     /// The process ran to completion but exited with a non-zero status.
     ///
     /// Produced by the `ensure_success` helpers; the raw exit code is otherwise
@@ -356,6 +371,10 @@ impl fmt::Debug for Error {
                 // `searched` is the `PATH` env value — never rendered (the
                 // crate's secret-safety rule). Summarize as a directory count.
                 .field("searched", &SearchedRedaction(searched))
+                .finish(),
+            Error::CassetteMiss { program } => f
+                .debug_struct("CassetteMiss")
+                .field("program", program)
                 .finish(),
             Error::Exit {
                 program,

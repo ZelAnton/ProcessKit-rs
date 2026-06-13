@@ -237,10 +237,10 @@ enum Mode<R> {
 ///   repeats forever — a recorded sequence (`git rev-parse HEAD` twice with
 ///   different heads) replays faithfully, while a retry loop that outlives the
 ///   sequence keeps getting the final answer.
-/// - **A miss is a strict error** ([`Error::Spawn`] with a not-found source,
-///   like a [`ScriptedRunner`](crate::ScriptedRunner) without a fallback):
-///   replay never spawns a surprise subprocess, and a stale cassette fails
-///   loudly.
+/// - **A miss is a strict error** ([`Error::CassetteMiss`], distinct from a
+///   missing-program error so `is_not_found()` is `false`): replay never spawns
+///   a surprise subprocess, and a stale or incomplete cassette fails loudly
+///   rather than being mistaken for an absent optional tool.
 /// - The replayed [`ProcessResult`] carries the *replaying* command's
 ///   [`timeout`](Command::timeout) configuration, exactly like the live
 ///   runner — so a recorded timed-out run surfaces as
@@ -404,15 +404,19 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 let invocation = Invocation::from_command(command);
                 let mut slots = slots.lock().expect("cassette mutex poisoned");
                 let Some(slot) = slots.get_mut(&key_of(&invocation)) else {
-                    return Err(Error::Spawn {
+                    // Ф7: a stale/incomplete cassette is a distinct error, not a
+                    // missing-program `Spawn`/`NotFound` (so `is_not_found()` is
+                    // false and a wrapper can't mistake it for an absent tool).
+                    return Err(Error::CassetteMiss {
                         program: command.program_name(),
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "RecordReplayRunner: no cassette entry matches this invocation",
-                        ),
                     });
                 };
                 let entry = slot.play();
+                // Ф6: feed the replayed output through the command's
+                // `on_stdout_line`/`on_stderr_line` handlers, so a wrapper's
+                // progress path is exercised on replay exactly as it is in
+                // record mode (real pumps) and on `ScriptedRunner::output`.
+                crate::doubles::replay_line_handlers(command, &entry.stdout, &entry.stderr);
                 let outcome = match (entry.code, entry.timed_out) {
                     (_, true) => Outcome::TimedOut,
                     (Some(code), false) => Outcome::Exited(code),
@@ -569,7 +573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_miss_is_a_strict_not_found_error() {
+    async fn replay_miss_is_a_distinct_cassette_miss_error() {
         let (_dir, path) = temp_cassette();
         let recorder = RecordReplayRunner::record(&path, scripted());
         recorder
@@ -583,13 +587,42 @@ mod tests {
             .output(&Command::new("tool").arg("--other"))
             .await
             .expect_err("an unrecorded invocation must not be served");
-        match err {
-            Error::Spawn { program, source } => {
-                assert_eq!(program, "tool");
-                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
-            }
-            other => panic!("expected Error::Spawn, got {other:?}"),
+        match &err {
+            Error::CassetteMiss { program } => assert_eq!(program, "tool"),
+            other => panic!("expected Error::CassetteMiss, got {other:?}"),
         }
+        // Ф7: a stale cassette is NOT mistaken for a missing program.
+        assert!(
+            !err.is_not_found(),
+            "a cassette miss must not read as not-found: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_invokes_line_handlers() {
+        // Ф6: replay feeds the recorded output through `on_stdout_line`, just
+        // like record mode (real pumps) and `ScriptedRunner::output` — a
+        // wrapper's progress path tests the same hermetically on replay.
+        let (_dir, path) = temp_cassette();
+        let recorder = RecordReplayRunner::record(&path, scripted());
+        recorder
+            .output(&Command::new("tool").arg("--version"))
+            .await
+            .expect("record");
+        recorder.save().expect("save");
+
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let replayer = RecordReplayRunner::replay(&path).expect("load");
+        let cmd = Command::new("tool").arg("--version").on_stdout_line({
+            let seen = seen.clone();
+            move |l| seen.lock().unwrap().push(l.to_owned())
+        });
+        replayer.output(&cmd).await.expect("replay");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["tool 1.2.3"],
+            "replay must invoke the command's line handler"
+        );
     }
 
     #[tokio::test]
@@ -747,12 +780,12 @@ mod tests {
             .output(&Command::new("tool").current_dir("dir-b"))
             .await
             .expect_err("a different cwd is a different invocation");
-        assert!(matches!(err, Error::Spawn { .. }), "got {err:?}");
+        assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
         let err = replayer
             .output(&Command::new("tool"))
             .await
             .expect_err("a missing cwd is a different invocation too");
-        assert!(matches!(err, Error::Spawn { .. }), "got {err:?}");
+        assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
         // The recorded cwd still replays.
         let out = replayer
             .run(&Command::new("tool").current_dir("dir-a"))

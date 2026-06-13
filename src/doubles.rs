@@ -468,17 +468,18 @@ impl ScriptedRunner {
     }
 }
 
-/// Replay the canned streams through the command's `on_stdout_line` /
-/// `on_stderr_line` handlers, so a wrapper's progress-reporting path is
-/// exercised hermetically on the bulk `output` verbs too (on a scripted
-/// `start`, the real pumps already invoke them).
-fn replay_line_handlers(command: &Command, reply: &Reply) {
+/// Replay `stdout`/`stderr` text through the command's `on_stdout_line` /
+/// `on_stderr_line` handlers (panic-isolated, Б6), so a wrapper's
+/// progress-reporting path is exercised hermetically on the bulk `output` verb
+/// — both for a [`ScriptedRunner`] reply and a cassette replay (Ф6). On a
+/// scripted/real `start`, the live pumps invoke the handlers instead.
+pub(crate) fn replay_line_handlers(command: &Command, stdout: &str, stderr: &str) {
     let mut stdout_handler = command.stdout_handler();
-    for line in reply.stdout.lines() {
+    for line in stdout.lines() {
         invoke_isolated(&mut stdout_handler, line);
     }
     let mut stderr_handler = command.stderr_handler();
-    for line in reply.stderr.lines() {
+    for line in stderr.lines() {
         invoke_isolated(&mut stderr_handler, line);
     }
 }
@@ -531,7 +532,7 @@ impl ProcessRunner for ScriptedRunner {
                 ),
             )));
         }
-        replay_line_handlers(command, reply);
+        replay_line_handlers(command, &reply.stdout, &reply.stderr);
         Ok(reply
             .clone()
             .into_result(program, timeout)
