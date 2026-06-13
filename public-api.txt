@@ -67,7 +67,6 @@ impl !core::panic::unwind_safe::UnwindSafe for processkit::Error
 #[non_exhaustive] pub enum processkit::Mechanism
 pub processkit::Mechanism::CgroupV2
 pub processkit::Mechanism::JobObject
-pub processkit::Mechanism::None
 pub processkit::Mechanism::ProcessGroup
 impl core::clone::Clone for processkit::Mechanism
 pub fn processkit::Mechanism::clone(&self) -> processkit::Mechanism

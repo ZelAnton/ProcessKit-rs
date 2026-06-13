@@ -19,7 +19,4 @@ pub enum Mechanism {
     /// macOS and the BSDs, and the Linux fallback when no cgroup is writable.
     /// Weaker than a cgroup/Job Object: a child that calls `setsid` escapes it.
     ProcessGroup,
-    /// No kernel containment: the child is spawned directly. Only on non-unix,
-    /// non-Windows targets (e.g. wasm) that have no process groups.
-    None,
 }

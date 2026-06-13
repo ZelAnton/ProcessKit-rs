@@ -11,8 +11,8 @@
 /// # Platform support
 ///
 /// Enforcement needs a real container — a **Windows Job Object** or a **Linux
-/// cgroup v2**. On macOS/the BSDs, the Linux process-group fallback, and the
-/// no-containment `other` target there is no whole-tree limit primitive, so
+/// cgroup v2**. On macOS/the BSDs and the Linux process-group fallback there is
+/// no whole-tree limit primitive, so
 /// requesting *any* limit there fails fast with
 /// [`Error::ResourceLimit`](crate::Error::ResourceLimit) rather than silently
 /// leaving the tree unbounded.

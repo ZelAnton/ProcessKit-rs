@@ -595,8 +595,6 @@ pub(super) fn kill_direct_child(pid: Option<u32>) {
             CloseHandle(handle);
         }
     }
-    #[cfg(not(any(unix, windows)))]
-    let _ = pid;
 }
 
 /// A `Stream` of the child's standard-output lines (see

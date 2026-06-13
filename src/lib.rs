@@ -16,8 +16,8 @@
 //!   child spawned into the group, and everything those children spawn, dies
 //!   with the group, so an exiting or panicking owner never leaks subprocesses.
 //!   Containment is a Windows [Job Object], a Linux [cgroup v2] (with a POSIX
-//!   process-group fallback), a POSIX process group on macOS/BSD, or nothing on
-//!   other targets — observable via [`Mechanism`]. The whole tree can be
+//!   process-group fallback), or a POSIX process group on macOS/BSD —
+//!   observable via [`Mechanism`]. The whole tree can be
 //!   signalled (`ProcessGroup::signal`, see `Signal`), paused/resumed
 //!   (`ProcessGroup::suspend` / `ProcessGroup::resume`), and inspected
 //!   (`ProcessGroup::members`); [`wait_any`] races several running processes

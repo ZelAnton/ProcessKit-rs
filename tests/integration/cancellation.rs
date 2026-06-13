@@ -14,11 +14,6 @@ fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     // SAFETY: signal 0 is a sound liveness probe.
     return unsafe { libc::kill(pid as i32, 0) == 0 };
-    #[cfg(not(any(windows, unix)))]
-    {
-        let _ = pid;
-        false
-    }
 }
 
 #[tokio::test]

@@ -4,7 +4,9 @@
 
 use std::time::{Duration, Instant};
 
-use processkit::{Command, Mechanism, ProcessGroup, Signal};
+#[cfg(target_os = "linux")]
+use processkit::Mechanism;
+use processkit::{Command, ProcessGroup, Signal};
 
 use crate::common::*;
 
@@ -202,10 +204,6 @@ async fn adopt_brings_an_external_child_under_containment() {
 #[ignore = "spawns real subprocesses and lists the group's members"]
 async fn members_lists_live_children() {
     let group = ProcessGroup::new().expect("create group");
-    if matches!(group.mechanism(), Mechanism::None) {
-        eprintln!("skipping: no containment on this target");
-        return;
-    }
     let _a = group.start(&sleeper()).await.expect("start first sleeper");
     let _b = group.start(&sleeper()).await.expect("start second sleeper");
 
@@ -220,10 +218,6 @@ async fn members_lists_live_children() {
 #[ignore = "spawns real subprocesses and watches the member list shrink"]
 async fn members_shrinks_when_a_child_dies() {
     let group = ProcessGroup::new().expect("create group");
-    if matches!(group.mechanism(), Mechanism::None) {
-        eprintln!("skipping: no containment on this target");
-        return;
-    }
     // Single-process sleepers, deliberately: the cmd-wrapped `sleeper()` is two
     // processes whose second member spawns asynchronously, so a `before`
     // snapshot can race it — and `start_kill` would hit only the wrapper,
@@ -267,10 +261,6 @@ async fn members_on_empty_group_is_empty() {
 #[ignore = "spawns a short subprocess and adopts it after reaping"]
 async fn adopt_of_a_reaped_child_errors_instead_of_tracking_nothing() {
     let group = ProcessGroup::new().expect("create group");
-    if matches!(group.mechanism(), Mechanism::None) {
-        eprintln!("skipping: no containment on this target");
-        return;
-    }
 
     let mut cmd = if cfg!(windows) {
         let mut c = tokio::process::Command::new("cmd");
@@ -306,10 +296,6 @@ async fn adopt_of_an_exited_unreaped_child_is_ok() {
     // backend (cgroup/pgroup `ESRCH` → Ok, Windows `GetExitCodeProcess` → Ok),
     // rather than surfacing the raw backend failure.
     let group = ProcessGroup::new().expect("create group");
-    if matches!(group.mechanism(), Mechanism::None) {
-        eprintln!("skipping: no containment on this target");
-        return;
-    }
 
     // A long-lived child we control: `start_kill` terminates it WITHOUT reaping,
     // so it is *deterministically* a dead-but-unreaped zombie at adopt time — no
@@ -345,10 +331,6 @@ async fn adopt_of_an_exited_unreaped_child_is_ok() {
 #[ignore = "creates an OS job/cgroup"]
 async fn empty_group_accepts_lifecycle_calls() {
     let group = ProcessGroup::new().expect("create group");
-    if matches!(group.mechanism(), Mechanism::None) {
-        eprintln!("skipping: no containment on this target");
-        return;
-    }
 
     // Signalling, freezing, and thawing nobody must succeed trivially…
     group.signal(Signal::Kill).expect("Kill on an empty group");

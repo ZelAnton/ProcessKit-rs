@@ -26,10 +26,10 @@ async fn limits_are_enforced_or_rejected_per_platform() {
             Err(other) => panic!("unexpected error: {other:?}"),
         }
     } else {
-        // macOS/BSD and the no-containment target have no whole-tree cap.
+        // macOS/BSD have no whole-tree cap.
         assert!(
             matches!(res, Err(Error::ResourceLimit(_))),
-            "a limit on a container-less target must be rejected, not silently dropped"
+            "a limit on a container-less mechanism must be rejected, not silently dropped"
         );
     }
 }

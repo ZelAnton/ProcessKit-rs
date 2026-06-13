@@ -200,8 +200,8 @@ async fn main() -> processkit::Result<()> {
 cores); on Windows it is converted against the host's CPU count and is approximate.
 
 Limits need a real container — a **Windows Job Object** or a **Linux cgroup v2**.
-There is no whole-tree limit on macOS/the BSDs, the Linux process-group fallback, or
-the no-containment target. A Linux cgroup limit additionally needs this process to run
+There is no whole-tree limit on macOS/the BSDs or the Linux process-group fallback.
+A Linux cgroup limit additionally needs this process to run
 at the **real cgroup-v2 root**: the crate creates the limit cgroup under this process's
 own cgroup and enables the controllers there, which cgroup v2's "no internal processes"
 rule allows only for the real hierarchy root — *not* a cgroup-namespace root (so an

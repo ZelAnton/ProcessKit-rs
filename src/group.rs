@@ -217,8 +217,7 @@ impl ProcessGroup {
     /// Attach an already-started [`Child`] to this group.
     ///
     /// Only the child itself is moved into the group; processes it has *already*
-    /// spawned keep their original containment (future forks are captured). On
-    /// targets without a job mechanism (non-unix, non-Windows) this is a no-op.
+    /// spawned keep their original containment (future forks are captured).
     ///
     /// On the POSIX process-group mechanism, a child that has already `exec`'d
     /// cannot be re-grouped (POSIX forbids it), so it is tracked
@@ -233,7 +232,7 @@ impl ProcessGroup {
     /// but not yet been reaped** is a successful no-op (`Ok`) — there is nothing
     /// left to contain (Э21) — while an **already-reaped** child (one that was
     /// `wait`ed, so its handle/pid is gone) errors, since there is no longer
-    /// anything to reference. (The no-containment target above is always `Ok`.)
+    /// anything to reference.
     #[cfg(feature = "process-control")]
     pub fn adopt(&self, child: &Child) -> Result<()> {
         self.job.adopt(child)?;
@@ -277,7 +276,6 @@ impl ProcessGroup {
     ///   delivered to every live member of the tree.
     /// - **Windows** — only [`Signal::Kill`]; any other signal — including
     ///   [`Signal::Other`] — returns [`Error::Unsupported`].
-    /// - **No-containment target** — always [`Error::Unsupported`].
     ///
     /// `SIGKILL` ([`Signal::Kill`], or `Other(libc::SIGKILL)`) is routed through
     /// the same whole-tree hard kill as [`terminate_all`](Self::terminate_all)
@@ -308,7 +306,6 @@ impl ProcessGroup {
     ///   per-thread suspend *counts*, so nested `suspend` calls stack — N suspends
     ///   need N [`resume`](Self::resume)s. On Unix suspend/resume are idempotent
     ///   (level-triggered).
-    /// - **No-containment target** — [`Error::Unsupported`].
     ///
     /// A suspended tree can still be hard-killed
     /// ([`terminate_all`](Self::terminate_all), or dropping the group) — SIGKILL,
@@ -365,10 +362,6 @@ impl ProcessGroup {
     ///   but not enumerated. An exited child still counts as a member until it
     ///   is reaped (awaited): the liveness probe sees the not-yet-collected
     ///   process.
-    /// - **No-containment target** — always empty: nothing is tracked.
-    ///   [`Mechanism::None`](crate::Mechanism::None) (via
-    ///   [`mechanism`](Self::mechanism)) is the cue that children are
-    ///   *unmanaged*, not absent.
     #[cfg(feature = "process-control")]
     pub fn members(&self) -> Result<Vec<u32>> {
         let pids = self.job.members()?;

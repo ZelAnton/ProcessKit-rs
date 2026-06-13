@@ -51,6 +51,13 @@ to a dated version section.
   key). Existing argument-only rules must prepend the program name.
 - **Breaking:** a cassette replay that finds no matching recording now returns
   `Error::CassetteMiss` instead of `Error::Spawn` with a not-found source.
+- **Breaking:** `processkit` now supports **only Unix and Windows targets**. A bare target
+  (e.g. `wasm32-unknown-unknown`) no longer compiles a containment-less fallback that
+  couldn't honor kill-on-close or a graceful timeout — it now fails at compile time, via a
+  `compile_error!` guard (or, since the crate needs `tokio::process`, earlier in tokio's own
+  dependencies, which don't support such targets). The `Mechanism::None` variant (only ever
+  produced on those targets) is removed; `Mechanism` stays `#[non_exhaustive]`, so a future
+  fallback can re-add it.
 
 ### Fixed
 

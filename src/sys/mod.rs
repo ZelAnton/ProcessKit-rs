@@ -8,8 +8,9 @@
 //!   process group when no writable cgroup is available.
 //! - **macOS / the BSDs** — a POSIX process group (`killpg` the tree on drop);
 //!   no cgroups or Job Objects exist there. See [`pgroup`].
-//! - **other** (non-unix, non-Windows — e.g. wasm) — a plain spawn with no
-//!   kernel containment.
+//!
+//! Only Unix and Windows are supported; other targets fail to compile (see the
+//! `compile_error!` below).
 //!
 //! [Job Object]: https://learn.microsoft.com/windows/win32/procthread/job-objects
 //! [cgroup v2]: https://docs.kernel.org/admin-guide/cgroup-v2.html
@@ -84,12 +85,21 @@ pub(crate) struct SpawnOptions {
     pub kill_on_parent_death: bool,
 }
 
+// processkit supports only Unix and Windows: it relies on `tokio::process` and
+// on OS job / process-group primitives (cgroups, setpgid, Job Objects) that have
+// no equivalent on bare targets like wasm. Fail with a clear message rather than
+// a cascade of missing-symbol errors from a containment-less fallback.
+#[cfg(not(any(unix, windows)))]
+compile_error!(
+    "processkit supports only Unix and Windows targets — it requires tokio::process \
+     and OS job/process-group primitives unavailable on this target."
+);
+
 // Exactly one platform module is compiled per target. Each defines an `imp::Job`
 // with the same inherent methods plus a kill-on-close `Drop`.
 #[cfg_attr(windows, path = "windows.rs")]
 #[cfg_attr(target_os = "linux", path = "linux.rs")]
 #[cfg_attr(all(unix, not(target_os = "linux")), path = "unix.rs")]
-#[cfg_attr(not(any(windows, unix)), path = "other.rs")]
 mod imp;
 
 /// A handle to an OS job owning a tree of child processes.
@@ -126,8 +136,7 @@ impl Job {
     /// Attach an already-started child to this job.
     ///
     /// Only the child itself is moved into the job; descendants it already
-    /// spawned keep their original containment. On targets without a job
-    /// mechanism (non-unix, non-Windows) this is a no-op.
+    /// spawned keep their original containment.
     #[cfg(feature = "process-control")]
     pub(crate) fn adopt(&self, child: &Child) -> io::Result<()> {
         self.0.adopt(child)
@@ -139,15 +148,14 @@ impl Job {
     }
 
     /// Broadcast `sig` to every process in the job. On Windows only
-    /// [`Signal::Kill`] is deliverable (job terminate); other signals — and any
-    /// signal on the no-containment target — yield `ErrorKind::Unsupported`.
+    /// [`Signal::Kill`] is deliverable (job terminate); other signals yield
+    /// `ErrorKind::Unsupported`.
     #[cfg(feature = "process-control")]
     pub(crate) fn signal(&self, sig: Signal) -> io::Result<()> {
         self.0.signal(sig)
     }
 
     /// Freeze the whole tree (cgroup.freeze / SIGSTOP / per-thread suspend).
-    /// `ErrorKind::Unsupported` on the no-containment target.
     #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {
         self.0.suspend()
@@ -160,7 +168,7 @@ impl Job {
     }
 
     /// Snapshot the live member pids (whole tree on Windows/cgroup; tracked
-    /// group leaders on the POSIX fallback; always empty with no containment).
+    /// group leaders on the POSIX fallback).
     #[cfg(feature = "process-control")]
     pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
         self.0.members()

@@ -25,19 +25,13 @@ async fn group_reports_the_platforms_mechanism() {
     );
     #[cfg(all(unix, not(target_os = "linux")))]
     assert_eq!(mechanism, Mechanism::ProcessGroup);
-    #[cfg(not(any(unix, windows)))]
-    assert_eq!(mechanism, Mechanism::None);
 }
 
 #[tokio::test]
 #[ignore = "spawns a long-lived subprocess and asserts kill-on-drop"]
 async fn dropping_group_kills_children() {
     // Kill-on-close exists on Windows (Job Object), Linux (cgroup/process group)
-    // and other unix (macOS/BSD process group). Only targets with no containment
-    // at all (non-unix, non-Windows — `Mechanism::None`) can't assert it.
-    if cfg!(not(any(windows, unix))) {
-        return;
-    }
+    // and other unix (macOS/BSD process group) — i.e. every supported target.
 
     // Start the sleeper into a *shared* group: the returned handle does not own
     // the group, so we can drop the group out from under it.

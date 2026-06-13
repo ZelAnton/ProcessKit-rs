@@ -986,10 +986,6 @@ mod tests {
             // A lone surrogate is valid UTF-16-ish for OsString but not Unicode.
             std::ffi::OsString::from_wide(&[0x61, 0xD800, 0x62])
         };
-        // No non-Unicode OsString can be built portably elsewhere; the lossy
-        // path is still exercised, just with a clean string.
-        #[cfg(not(any(unix, windows)))]
-        let bad = std::ffi::OsString::from("ab");
 
         let (_dir, path) = temp_cassette();
         let recorder =

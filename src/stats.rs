@@ -12,8 +12,7 @@ use crate::group::ProcessGroup;
 ///
 /// `total_cpu_time` and `peak_memory_bytes` are `None` when the platform can't
 /// report them — notably the POSIX process-group mechanism (no cgroup
-/// accounting), i.e. macOS/BSD and the Linux fallback, and the no-containment
-/// `other` target.
+/// accounting), i.e. macOS/BSD and the Linux fallback.
 ///
 /// Non-exhaustive: a read-only snapshot the crate produces — new metrics can
 /// be added without a breaking change.

@@ -182,7 +182,7 @@ pub enum Error {
     /// Produced by [`ProcessGroup::with_options`](crate::ProcessGroup::with_options)
     /// when a [`ResourceLimits`](crate::ResourceLimits) cap was set but the active
     /// mechanism can't honor it — either the platform has no whole-tree container
-    /// (macOS/BSD, the Linux process-group fallback, the no-containment target), or
+    /// (macOS/BSD, the Linux process-group fallback), or
     /// the OS rejected the request (on Linux, the cgroup controllers can't be
     /// enabled — see [`ResourceLimits`](crate::ResourceLimits) for the cgroup-v2
     /// "real root only" requirement). An unenforced limit is no protection, so this
@@ -195,9 +195,7 @@ pub enum Error {
     /// this platform.
     ///
     /// Raised by `ProcessGroup::signal` for any signal other than
-    /// `Signal::Kill` on Windows (Job Objects have no POSIX signals), and by
-    /// `signal`/`suspend`/`resume` on the no-containment target, which has no
-    /// process tree to act on.
+    /// `Signal::Kill` on Windows (Job Objects have no POSIX signals).
     #[error("operation `{operation}` is not supported on this platform")]
     Unsupported {
         /// A short description of the operation, e.g. `"signal(Hup)"` or

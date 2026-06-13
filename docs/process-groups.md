@@ -37,14 +37,12 @@ let group = ProcessGroup::with_options(
 )?;
 
 // Which kernel mechanism is actually containing the tree?
-println!("{:?}", group.mechanism()); // JobObject | CgroupV2 | ProcessGroup | None
+println!("{:?}", group.mechanism()); // JobObject | CgroupV2 | ProcessGroup
 ```
 
 `mechanism()` reports what you actually got: `CgroupV2` quietly falls back to
 `ProcessGroup` on Linux hosts without cgroup delegation (see
-[Platform support](platform-support.md)). `Mechanism::None` only appears on
-targets with no containment facility at all — the cue that children are
-*unmanaged*, not absent.
+[Platform support](platform-support.md)).
 
 You rarely create a group explicitly for one-shot runs: every
 `Command::run()`-style call makes a private group automatically. Reach for an
@@ -82,8 +80,7 @@ edges worth knowing:
 
 - A child that already exited **but has not been reaped** (no `wait()` yet — a
   zombie whose pid/handle is still valid) is a successful **no-op**: there is
-  nothing left to contain, so `adopt` returns `Ok` on the containment backends
-  (the no-containment stub is always `Ok`).
+  nothing left to contain, so `adopt` returns `Ok` on the containment backends.
 - A child that already exited **and was reaped** (`wait()`ed) has no pid left —
   `adopt` returns an error rather than silently tracking nothing.
 - On the POSIX process-group mechanism, a child that has already `exec`'d
@@ -143,7 +140,6 @@ group.signal(Signal::Other(34))?;  // raw signal number escape hatch
 |---|---|
 | Linux (cgroup or pgroup), macOS/BSD | Any — `Term`, `Kill`, `Int`, `Hup`, `Quit`, `Usr1`, `Usr2`, `Other(n)` |
 | Windows | `Kill` only (maps to the Job Object terminate); anything else → `Error::Unsupported` |
-| No-containment target | Always `Error::Unsupported` |
 
 `Signal::Kill` always takes the same *atomic* whole-tree kill path as
 `terminate_all` (`cgroup.kill` / `killpg` / job terminate), so it cannot miss

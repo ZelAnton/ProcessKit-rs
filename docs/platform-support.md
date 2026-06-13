@@ -2,10 +2,14 @@
 
 [‹ docs index](README.md)
 
-`processkit` treats platform support as first-class: every capability is
-either fully implemented, *honestly partial* (documented and typed), or
-refused with `Error::Unsupported` — never silently skipped. This page
-collects all the matrices and fine print in one place.
+`processkit` supports **Unix and Windows only** — it requires `tokio::process`
+and OS job / process-group primitives that have no equivalent on bare targets
+like wasm. Building for such a target fails at compile time (a `compile_error!`
+guard, or earlier in tokio's own dependencies). Within the supported set, it
+treats platform support as first-class: every capability is either fully
+implemented, *honestly partial* (documented and typed), or refused with
+`Error::Unsupported` — never silently skipped. This page collects all the
+matrices and fine print in one place.
 
 - [Containment mechanisms](#containment-mechanisms)
 - [Capability matrices](#capability-matrices)
@@ -20,7 +24,6 @@ collects all the matrices and fine print in one place.
 | `JobObject` | Windows | A Job Object with kill-on-close; children are created suspended, assigned to the job, then resumed — so even a grandchild forked in the first instant is contained |
 | `CgroupV2` | Linux (with delegation) | A private cgroup; children join in `pre_exec`, before `exec`, so descendants can never escape; teardown is `cgroup.kill` |
 | `ProcessGroup` | macOS, BSDs, Linux fallback | POSIX process groups (`setpgid`); teardown is `killpg`; tracked per started/adopted child |
-| `None` | anything else | No containment facility — children are *unmanaged*, not absent |
 
 On Linux the cgroup backend requires controller **delegation**, and resource
 limits specifically need this process to run at the **real cgroup-v2 root**. The
@@ -143,10 +146,6 @@ alive (keep `wait()`ing handles if you need prompt liveness, e.g. for
 `shutdown`'s early return); and pid-based signalling is inherently
 best-effort against pid reuse — the crate prunes dead entries on every probe
 to keep the window minimal.
-
-**No-containment targets.** `Mechanism::None` means signals, suspension, and
-membership are `Unsupported`/empty, and nothing outlives-protection exists —
-the runner layer still works (spawn, capture, timeout the direct child).
 
 ---
 

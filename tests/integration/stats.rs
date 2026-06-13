@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use processkit::{Mechanism, ProcessGroup};
+use processkit::ProcessGroup;
 
 use crate::common::*;
 
@@ -12,11 +12,6 @@ use crate::common::*;
 #[ignore = "creates an OS job/cgroup and reads accounting"]
 async fn group_stats_report_active_processes() {
     let group = ProcessGroup::new().expect("create group");
-    if matches!(group.mechanism(), Mechanism::None) {
-        // No containment → stats() honestly reports zero live processes.
-        eprintln!("skipping: no containment on this target");
-        return;
-    }
     let _process = group.start(&sleeper()).await.expect("spawn sleeper");
     let stats = group.stats().expect("stats");
     assert!(
@@ -51,10 +46,6 @@ async fn sample_stats_yields_a_live_series() {
     use tokio_stream::StreamExt;
 
     let group = ProcessGroup::new().expect("create group");
-    if matches!(group.mechanism(), Mechanism::None) {
-        eprintln!("skipping: no containment on this target");
-        return;
-    }
     let _child = group.start(&sleeper()).await.expect("start sleeper");
 
     let mut samples = group.sample_stats(Duration::from_millis(50));

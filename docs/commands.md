@@ -264,7 +264,7 @@ Command::new("helper").create_no_window().run().await?;
 Command::new("worker").kill_on_parent_death().start().await?;
 ```
 
-`uid` / `gid` / `groups` / `setsid` are POSIX-only — on other targets the run
+`uid` / `gid` / `groups` / `setsid` are POSIX-only — on Windows the run
 fails with `Error::Unsupported` rather than silently skipping a privilege drop.
 A correct drop sets all three of `uid`/`gid`/`groups`: dropping the uid alone
 leaves the child holding the parent's (often root's) supplementary groups.
