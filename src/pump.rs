@@ -30,7 +30,7 @@ pub(crate) struct SharedLines {
     /// This is the truncation signal (`dropped() > 0`): unlike
     /// `count() > retained`, it stays `0` when a stream merely consumed lines
     /// under an unbounded policy, so `output_string` after partial streaming is
-    /// not falsely reported as truncated (Б4).
+    /// not falsely reported as truncated (B4).
     dropped: AtomicUsize,
 }
 
@@ -38,14 +38,14 @@ struct Inner {
     lines: VecDeque<String>,
     /// Retained-line cap (`OutputBufferPolicy::max_lines`).
     max_lines: Option<usize>,
-    /// Retained-byte cap (`OutputBufferPolicy::max_bytes`, Д8).
+    /// Retained-byte cap (`OutputBufferPolicy::max_bytes`, D8).
     max_bytes: Option<usize>,
     /// Sum of the retained lines' byte lengths — kept in step with `lines` so
     /// the byte backlog can be bounded without re-summing.
     bytes: usize,
     /// Cumulative bytes the pump has seen (including dropped lines) — the byte
     /// analogue of `SharedLines::count`, used by the `Error` fail-loud ceiling
-    /// (Э4) which fires on the total seen, not the current backlog.
+    /// (E4) which fires on the total seen, not the current backlog.
     seen_bytes: usize,
     mode: OverflowMode,
     closed: bool,
@@ -111,7 +111,7 @@ impl SharedLines {
             inner.seen_bytes = inner.seen_bytes.saturating_add(line.len());
             match inner.mode {
                 // Fail-loud ceiling. It fires on the CUMULATIVE total — lines and
-                // bytes the pump has seen — not the current backlog (Э4): a
+                // bytes the pump has seen — not the current backlog (E4): a
                 // streaming consumer draining lines frees buffer space but must
                 // not reset the ceiling. With neither cap set (D9c:
                 // `unbounded().with_overflow(Error)`) it is a fail-loud ceiling
@@ -210,7 +210,7 @@ impl SharedLines {
 
     /// Lines discarded by the buffer policy (DropOldest/DropNewest/Error), not
     /// counting lines a streaming consumer popped. `> 0` iff output was actually
-    /// truncated by the policy (Б4).
+    /// truncated by the policy (B4).
     pub(crate) fn dropped(&self) -> usize {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -254,7 +254,7 @@ impl SharedLines {
     }
 }
 
-/// A per-stream async tee sink (Э6): each decoded line is written to it (plus a
+/// A per-stream async tee sink (E6): each decoded line is written to it (plus a
 /// `\n`) as it is produced — [`Command::stdout_tee`](crate::Command::stdout_tee)
 /// / [`stderr_tee`](crate::Command::stderr_tee). Behind an `Arc<Mutex>` so a
 /// cloned `Command` shares one writer. The write is **awaited on the pump
@@ -291,7 +291,7 @@ pub(crate) async fn pump_lines<R>(
 /// is not a re-exportable contract. A `tee` write error is isolated the same
 /// way: the tee is disabled (with a `tracing` warn) and pumping continues.
 ///
-/// **Decoding (Б7/Э3):** bytes are fed through a single persistent
+/// **Decoding (B7/E3):** bytes are fed through a single persistent
 /// `encoding_rs::Decoder` and the *decoded* text is split on the `\n`
 /// character — correct for every encoding, including non-ASCII-compatible ones
 /// (UTF-16LE/BE, whose code units contain `0x0A` bytes that are *not* line
@@ -301,9 +301,9 @@ pub(crate) async fn pump_lines<R>(
 /// stripped, never a foreign one — so a legacy line that happens to start with
 /// BOM-looking bytes is not silently re-decoded as UTF-16). Each line is
 /// stripped of its `\n` and, if present, exactly **one** preceding `\r`
-/// (Э1: a CRLF terminator — not every trailing CR). The final line is emitted
+/// (E1: a CRLF terminator — not every trailing CR). The final line is emitted
 /// even without a trailing newline, on both EOF and a mid-stream read error
-/// (Э2: the partial tail is flushed, not dropped).
+/// (E2: the partial tail is flushed, not dropped).
 pub(crate) async fn pump_lines_core<R>(
     mut reader: R,
     encoding: &'static Encoding,
@@ -521,7 +521,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_counts_policy_drops_not_consumer_pops() {
-        // Б4: the truncation signal must reflect lines the *policy* discarded,
+        // B4: the truncation signal must reflect lines the *policy* discarded,
         // not lines a streaming consumer popped. Under the default unbounded
         // policy, popping lines must leave dropped() == 0 (nothing truncated).
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
@@ -742,7 +742,7 @@ mod tests {
 
     #[tokio::test]
     async fn utf16le_lines_decode_and_split_correctly() {
-        // Б7: "AB\nCD\n" in UTF-16LE. Each `\n` is the byte pair `0A 00`; the
+        // B7: "AB\nCD\n" in UTF-16LE. Each `\n` is the byte pair `0A 00`; the
         // `0A` is a real newline but the trailing `00` is part of the code unit.
         // A byte-level split on `0A` would graft that `00` onto the next line —
         // the streaming decoder splits the *decoded* text instead.
@@ -757,7 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn utf16le_code_unit_split_across_reads_is_reassembled() {
-        // Б7: a 2-byte code unit straddles a read boundary. A per-read decode
+        // B7: a 2-byte code unit straddles a read boundary. A per-read decode
         // would mangle it; the persistent decoder holds the partial unit until
         // the next chunk. Chunks: [41 00 42] then [00 0A 00] → "AB".
         let reader = ChunkedReader::new([vec![0x41, 0x00, 0x42], vec![0x00, 0x0A, 0x00]]);
@@ -788,7 +788,7 @@ mod tests {
 
     #[tokio::test]
     async fn strips_exactly_one_trailing_cr_not_all() {
-        // Э1: in "data\r\r\n" only the CR forming the CRLF is a terminator; the
+        // E1: in "data\r\r\n" only the CR forming the CRLF is a terminator; the
         // earlier CR is content. Must yield "data\r", not "data".
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
         pump_lines(&b"data\r\r\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
@@ -806,7 +806,7 @@ mod tests {
 
     #[tokio::test]
     async fn mid_stream_read_error_flushes_the_partial_tail() {
-        // Э2: a complete line, then a partial line, then an IO error. The partial
+        // E2: a complete line, then a partial line, then an IO error. The partial
         // tail must still be emitted, not silently dropped (the EOF path already
         // flushed it; the error path must too).
         let reader = ChunkedReader::erroring([b"done\npart".to_vec()]);
@@ -818,7 +818,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_line_starting_with_bom_bytes_is_not_resniffed() {
-        // Э3: a Windows-1252 line legitimately starting with FF FE (ÿþ) must stay
+        // E3: a Windows-1252 line legitimately starting with FF FE (ÿþ) must stay
         // Windows-1252, not be silently re-decoded as UTF-16LE. The old per-line
         // `Encoding::decode` sniffed a BOM on every line; one persistent decoder
         // (with_bom_removal of *this* encoding only) does not.
@@ -830,7 +830,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_loud_trips_on_total_even_when_streamed_dry() {
-        // Э4: `fail_loud(2)` with a consumer draining each line as it arrives.
+        // E4: `fail_loud(2)` with a consumer draining each line as it arrives.
         // The live backlog never exceeds 2, but the *total* does — the ceiling
         // must still trip (it counts the total seen, not the live backlog). The
         // old backlog-based check missed this: pops freed space and it never
@@ -850,7 +850,7 @@ mod tests {
 
     #[tokio::test]
     async fn max_bytes_drop_oldest_evicts_to_fit_the_byte_cap() {
-        // Д8: byte-bounded ring buffer. Each line "aa" is 2 bytes; a 5-byte cap
+        // D8: byte-bounded ring buffer. Each line "aa" is 2 bytes; a 5-byte cap
         // holds at most two of them — the third evicts the oldest.
         let policy = OutputBufferPolicy::unbounded().with_max_bytes(5);
         let sink = SharedLines::new(&policy);
@@ -861,9 +861,9 @@ mod tests {
 
     #[tokio::test]
     async fn max_bytes_drops_a_single_oversized_line_whole() {
-        // Д8: a line larger than the entire byte cap cannot be retained under a
+        // D8: a line larger than the entire byte cap cannot be retained under a
         // drop mode — it is dropped whole (the line cap alone would have kept it
-        // and blown the memory bound, which is exactly the gap Д8 closes).
+        // and blown the memory bound, which is exactly the gap D8 closes).
         let policy = OutputBufferPolicy::unbounded().with_max_bytes(3);
         let sink = SharedLines::new(&policy);
         pump_lines(
@@ -880,7 +880,7 @@ mod tests {
 
     #[tokio::test]
     async fn max_bytes_fail_loud_trips_on_byte_total() {
-        // Д8 + Э4: a byte fail-loud ceiling errors once cumulative bytes exceed
+        // D8 + E4: a byte fail-loud ceiling errors once cumulative bytes exceed
         // the cap, independent of the line count.
         let policy = OutputBufferPolicy::unbounded()
             .with_overflow(OverflowMode::Error)
@@ -906,7 +906,7 @@ mod tests {
 
     #[tokio::test]
     async fn max_bytes_drop_newest_keeps_head_within_byte_cap() {
-        // Д8 under DropNewest: keep the earliest lines that fit the byte cap,
+        // D8 under DropNewest: keep the earliest lines that fit the byte cap,
         // drop later ones that would breach it.
         let policy = OutputBufferPolicy::unbounded()
             .with_overflow(OverflowMode::DropNewest)
@@ -948,7 +948,7 @@ mod tests {
 
     #[tokio::test]
     async fn tee_writes_each_decoded_line_plus_newline_to_the_async_sink() {
-        // Э6: the async tee receives every decoded line followed by '\n', while
+        // E6: the async tee receives every decoded line followed by '\n', while
         // capture still sees the same lines.
         let buf = Arc::new(Mutex::new(Vec::new()));
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded());

@@ -185,7 +185,7 @@ async fn graceful_timeout_on_a_streamed_run_signals_and_ends_the_stream() {
         "the graceful-timeout signal must end the stream well within the grace"
     );
 
-    // Б1: the streamed run TIMED OUT — the deadline fired and triggered the
+    // B1: the streamed run TIMED OUT — the deadline fired and triggered the
     // teardown — so `finish_streamed` reports `Outcome::TimedOut`, matching the
     // bulk `output_string` path (which reports `timed_out()` for this same
     // scenario), not the child's in-grace `exit 0`. This is deterministic now:
@@ -219,7 +219,7 @@ async fn graceful_timeout_on_an_events_run_reports_timed_out() {
     use processkit::OutputEvent;
     use tokio_stream::StreamExt;
 
-    // Б1 parity for the events path: `output_events` arms the same deadline
+    // B1 parity for the events path: `output_events` arms the same deadline
     // watchdog as `stdout_lines`, and `finish_events` classifies via the same
     // `timed_out` flag, so a graceful streamed timeout must report
     // `Outcome::TimedOut` here too — not the child's in-grace `exit 0`.

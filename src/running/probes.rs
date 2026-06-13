@@ -97,7 +97,7 @@ impl RunningProcess {
     /// dropped as soon as it succeeds. Doesn't touch the child's pipes; a
     /// failed probe does not kill the child.
     pub async fn wait_for_port(&mut self, addr: SocketAddr, within: Duration) -> Result<()> {
-        // Э15: clamp so a `Duration::MAX`-ish `within` can't overflow.
+        // E15: clamp so a `Duration::MAX`-ish `within` can't overflow.
         let deadline = Instant::now() + within.min(crate::MAX_DEADLINE);
         self.poll_until(
             move || {
@@ -126,7 +126,7 @@ impl RunningProcess {
         F: FnMut() -> Fut,
         Fut: Future<Output = bool>,
     {
-        // Э15: clamp so a `Duration::MAX`-ish `within` can't overflow.
+        // E15: clamp so a `Duration::MAX`-ish `within` can't overflow.
         let deadline = Instant::now() + within.min(crate::MAX_DEADLINE);
         loop {
             if check().await {

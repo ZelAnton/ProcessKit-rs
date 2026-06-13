@@ -32,7 +32,7 @@ use crate::stdin::ProcessStdin;
 /// surviving grandchild holding a pipe can't hang the run.
 const PUMP_TEARDOWN: Duration = Duration::from_secs(5);
 
-// Timeout-arbitration states for `RunningProcess::timeout_state` (Б1/F1).
+// Timeout-arbitration states for `RunningProcess::timeout_state` (B1).
 // `PENDING` until the run resolves; whichever of the natural reap (claims
 // `EXITED` in `backend_wait`) or a fired deadline (the streaming watchdog / the
 // bulk deadline arm claim `TIMED_OUT`) first `compare_exchange`s from `PENDING`
@@ -145,7 +145,7 @@ pub struct RunningProcess {
     // A timer started by `stdout_lines` when a timeout is set: kills the tree at
     // the deadline so a streamed run can't hang forever. Aborted on drop.
     deadline_task: Option<JoinHandle<()>>,
-    // Б1/F1: timeout arbitration (`TS_PENDING`/`TS_EXITED`/`TS_TIMED_OUT`).
+    // B1: timeout arbitration (`TS_PENDING`/`TS_EXITED`/`TS_TIMED_OUT`).
     // Whichever of the natural reap (`backend_wait` claims `EXITED`) or a fired
     // deadline (the streaming `deadline_task` watchdog / the bulk
     // `drive_to_exit_inner` deadline arm claim `TIMED_OUT`) first
@@ -472,7 +472,7 @@ impl RunningProcess {
         }
     }
 
-    /// Ф2: bound a *scripted* streamed run by its [`timeout`](crate::Command::timeout).
+    /// F2: bound a *scripted* streamed run by its [`timeout`](crate::Command::timeout).
     /// A scripted handle has no process group, so the real watchdog (which kills
     /// the tree) never arms for it; this detached task instead hangs up the
     /// feeders at the deadline — their EOF ends the pump and the stream, exactly
@@ -675,7 +675,7 @@ impl RunningProcess {
         let finished = self
             .finish_lines(CaptureMode::Lines, /* expose_counts */ true, || {})
             .await?;
-        // Б4: truncation = lines the buffer *policy* discarded, reported by each
+        // B4: truncation = lines the buffer *policy* discarded, reported by each
         // sink's `dropped()`. The old `count() > retained` test conflated policy
         // drops with lines a prior `stdout_lines` stream *consumed* via `try_pop`
         // — so `output_string` after partial streaming under the default
@@ -709,12 +709,12 @@ impl RunningProcess {
     /// is nothing to read), or if a streaming call ([`stdout_lines`](Self::stdout_lines)
     /// / [`output_events`](Self::output_events)) already consumed stdout as decoded
     /// lines: the raw bytes are gone and cannot be faithfully reconstructed, so
-    /// `output_bytes` fails loudly rather than returning empty (Б3). Collect the
+    /// `output_bytes` fails loudly rather than returning empty (B3). Collect the
     /// streamed lines with [`output_string`](Self::output_string), or call
     /// `output_bytes` without streaming first.
     pub async fn output_bytes(mut self) -> Result<ProcessResult<Vec<u8>>> {
         self.ensure_stdout_capturable()?; // D5
-        // Б3: `output_bytes` returns the EXACT raw stdout bytes, so it must own
+        // B3: `output_bytes` returns the EXACT raw stdout bytes, so it must own
         // the raw stdout reader. A prior streaming call (`stdout_lines` /
         // `output_events`) already took that reader and pumped it as decoded,
         // line-normalized text — the raw bytes are gone and cannot be faithfully
@@ -734,7 +734,7 @@ impl RunningProcess {
             )));
         }
         let stderr_sink = SharedLines::new(&self.buffer);
-        // L3 parity (Б3): store the stderr pump on `self.stderr_pump` so `Drop`
+        // L3 parity (B3): store the stderr pump on `self.stderr_pump` so `Drop`
         // aborts it if `drive_to_exit` errors and the `?` below propagates before
         // we join — an orphaned pump on a shared-group handle would otherwise
         // buffer unboundedly for the child's remaining lifetime.
@@ -751,7 +751,7 @@ impl RunningProcess {
 
         // Read stdout raw, concurrently, so it never blocks the child. The
         // bytes accumulate in a shared buffer (not the task's return value) so
-        // the bounded teardown below can salvage a partial read. Б3: the task is
+        // the bounded teardown below can salvage a partial read. B3: the task is
         // stored on `self.stdout_pump` (not a frame-local) for the same reason as
         // the stderr pump — a `drive_to_exit` error must abort it via `Drop`, not
         // detach it to grow `out_buf` unboundedly on a shared-group handle.
@@ -808,7 +808,7 @@ impl RunningProcess {
         }
 
         // stdout is raw bytes (not line-buffered), so only the line-pumped stderr
-        // can be truncated by the buffer policy here (Б4: policy drops, not pops).
+        // can be truncated by the buffer policy here (B4: policy drops, not pops).
         let stderr_lines = stderr_sink.drain();
         let truncated = stderr_sink.dropped() > 0;
         let duration = self.started.elapsed();
@@ -857,8 +857,8 @@ impl RunningProcess {
     /// Surfaces the same errors as the bulk verbs' post-exit checkpoint: a
     /// cancelled run is [`Error::Cancelled`], and a stdin source that failed for
     /// a non-broken-pipe reason on an otherwise-successful run is
-    /// [`Error::Stdin`] (Э8). On a repeat call after the first reap the original
-    /// cancel snapshot is preserved (Б2) and the one-shot stdin error has already
+    /// [`Error::Stdin`] (E8). On a repeat call after the first reap the original
+    /// cancel snapshot is preserved (B2) and the one-shot stdin error has already
     /// been consumed, so the cached [`Outcome`] is returned unchanged.
     pub(crate) async fn wait_exit(&mut self) -> Result<Outcome> {
         // L5: close a `keep_stdin_open` pipe nobody took, so a stdin-reading
@@ -870,7 +870,7 @@ impl RunningProcess {
         if let Backend::Real(real) = &mut self.backend {
             drop(real.stdin_pipe.take());
         }
-        // Б2: preserve a cancel snapshot taken by an earlier reap observation
+        // B2: preserve a cancel snapshot taken by an earlier reap observation
         // (a prior `wait_exit` / `has_exited_now` / `drive_to_exit`). Re-running
         // the reap bookkeeping would re-query the live token, and a token
         // cancelled *after* this child's natural exit would then misclassify the
@@ -880,19 +880,19 @@ impl RunningProcess {
         // too). Mirrors `drive_to_exit`'s `cancel_at_exit.is_some()` guard.
         if self.cancel_at_exit.is_some() {
             let outcome = self.backend_wait().await?;
-            // Э8/F2: observe the stdin writer here too. If the first observation
+            // E8: observe the stdin writer here too. If the first observation
             // was a readiness probe (`has_exited_now`, which snapshots
             // `cancel_at_exit` but does not observe stdin), this repeat path is
             // where a genuine `Error::Stdin` surfaces. Idempotent: once the task
             // was taken (a prior `wait_exit`/consuming verb), this is a no-op.
             self.observe_stdin_task().await;
-            // Б1: classify a streamed timeout (the watchdog claimed `TimedOut`) as
+            // B1: classify a streamed timeout (the watchdog claimed `TimedOut`) as
             // TimedOut here too — `wait_any`/`wait_all` must match `drive_to_exit`
             // (classify before checked_outcome so cancellation still wins).
             let outcome = self.classify_timed_out(outcome);
             return self.checked_outcome(outcome);
         }
-        // Ф1: honor cancellation DURING the wait so `wait_any`/`wait_all` don't
+        // F1: honor cancellation DURING the wait so `wait_any`/`wait_all` don't
         // hang on a never-exiting handle (e.g. a scripted `Reply::pending`, whose
         // `backend_wait` parks forever) when the token fires. Mirrors
         // `drive_to_exit_inner`'s cancel arm — kill the tree and resolve as
@@ -930,12 +930,12 @@ impl RunningProcess {
             self.cancel_at_exit =
                 Some(self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()));
         }
-        // Э8: observe a finished stdin writer that failed for a non-broken-pipe
+        // E8: observe a finished stdin writer that failed for a non-broken-pipe
         // reason, so a genuine `Error::Stdin` surfaces on the `wait_any`/
         // `wait_all` path too (parity with `finish_lines`' B3 contract;
         // previously this path never observed the writer, silently losing it).
         self.observe_stdin_task().await;
-        // Б1: a streamed run whose deadline fired (the watchdog set `timed_out`)
+        // B1: a streamed run whose deadline fired (the watchdog set `timed_out`)
         // must report `Outcome::TimedOut` through `wait_any`/`wait_all` too —
         // matching `drive_to_exit`. Classify before `checked_outcome` so
         // cancellation still takes precedence.
@@ -1322,7 +1322,7 @@ impl RunningProcess {
         Ok(outcome)
     }
 
-    /// Б1: a run whose deadline fired (set by the streaming `deadline_task`
+    /// B1: a run whose deadline fired (set by the streaming `deadline_task`
     /// watchdog or the bulk deadline arm) is `Outcome::TimedOut` regardless of
     /// what `backend_wait` observed — a child that catches the signal and exits
     /// cleanly within the grace still timed out. Deterministic and consistent
@@ -1330,7 +1330,7 @@ impl RunningProcess {
     /// classified later in `checked_outcome` (which runs after this).
     fn classify_timed_out(&self, outcome: Outcome) -> Outcome {
         // Acquire pairs with the arbiter's AcqRel `compare_exchange`s. The run is
-        // TimedOut iff a deadline won the CAS race against the natural reap (F1).
+        // TimedOut iff a deadline won the CAS race against the natural reap (B1).
         if self.timeout_state.load(Ordering::Acquire) == TS_TIMED_OUT {
             Outcome::TimedOut
         } else {
@@ -1361,7 +1361,7 @@ impl RunningProcess {
                 }
             }
             Backend::Scripted(s) => {
-                // Ф5: a kill AFTER the scripted child already exited naturally
+                // F5: a kill AFTER the scripted child already exited naturally
                 // must still report the cached natural outcome — a real child's
                 // exit status survives a post-exit kill. Only an un-exited (or
                 // never-exiting `pending`) script that is killed is `Signalled`.
@@ -1378,12 +1378,12 @@ impl RunningProcess {
                     Outcome::Signalled(None)
                 } else if already_exited {
                     // Already past its exit instant: the cached natural outcome,
-                    // even if a kill landed afterwards (Ф5). No kill race here —
+                    // even if a kill landed afterwards (F5). No kill race here —
                     // a stored `signal` permit must not preempt the real outcome.
                     classify(s)
                 } else {
                     match s.exit_at {
-                        // Ф2: race the natural exit against a kill so a streaming
+                        // F2: race the natural exit against a kill so a streaming
                         // `deadline_task` (which disables the bulk deadline arm in
                         // `drive_to_exit_inner`) can still end this wait — a
                         // not-yet-drained stream finished right after arming would
@@ -1405,7 +1405,7 @@ impl RunningProcess {
                 }
             }
         };
-        // F1: claim the natural reap (PENDING -> EXITED). If a streaming deadline
+        // B1: claim the natural reap (PENDING -> EXITED). If a streaming deadline
         // watchdog whose timer fired in the same instant already won the race
         // (PENDING -> TIMED_OUT), this CAS fails and the run stays TimedOut — so a
         // child that exits on its own near the deadline is never misclassified.
@@ -1433,7 +1433,7 @@ impl RunningProcess {
         let limit = self.timeout;
         let token = self.cancel_token.clone();
         let started = self.started;
-        // Э10: when a streaming `deadline_task` watchdog already owns the
+        // E10: when a streaming `deadline_task` watchdog already owns the
         // deadline, disable this select's deadline arm — otherwise the graceful
         // signal is delivered twice (watchdog + here). The watchdog kills at the
         // deadline and sets `timed_out`, which `drive_to_exit` reads to classify.
@@ -1567,7 +1567,7 @@ impl RunningProcess {
             self.abort_watchdogs();
             // Same snapshot logic as `wait_exit`: a consuming verb called after
             // a probe that observed the exit must not be misclassified as Cancelled
-            // by a token that fires in the interim. Б2: only on the FIRST reap
+            // by a token that fires in the interim. B2: only on the FIRST reap
             // observation — a repeat probe after a late cancel must not overwrite
             // an existing snapshot and reclassify a natural exit as Cancelled.
             if self.cancel_at_exit.is_none() {
@@ -1749,7 +1749,7 @@ mod tests {
         ));
     }
 
-    /// Б4: `output_string` after a partial `stdout_lines` stream must NOT report
+    /// B4: `output_string` after a partial `stdout_lines` stream must NOT report
     /// truncation under the default unbounded policy — the consumed lines were
     /// popped by the stream, not discarded by the buffer. (The old `count() >
     /// retained` test conflated the two and falsely flagged truncation.)
@@ -1782,7 +1782,7 @@ mod tests {
         );
     }
 
-    /// Б3: `output_bytes` after a streaming call must fail loudly. The raw stdout
+    /// B3: `output_bytes` after a streaming call must fail loudly. The raw stdout
     /// bytes were already taken and pumped as decoded lines, so they cannot be
     /// reconstructed; the old code silently returned empty output (and clobbered
     /// the streamed stderr sink).
@@ -1807,7 +1807,7 @@ mod tests {
         }
     }
 
-    /// Б4 (other direction): a bounded buffer that genuinely discards lines
+    /// B4 (other direction): a bounded buffer that genuinely discards lines
     /// during streaming must STILL report `truncated=true` — the fix must narrow
     /// only the false positive (consumed-by-stream), never mask real truncation.
     /// Filling `bounded(2)` with four un-consumed lines drops two deterministically.
@@ -1831,7 +1831,7 @@ mod tests {
         );
     }
 
-    /// Б3 happy path (now hermetic): `output_bytes` with no prior streaming
+    /// B3 happy path (now hermetic): `output_bytes` with no prior streaming
     /// returns the EXACT raw stdout bytes — a NUL byte and a missing trailing
     /// newline prove it is not line-processed.
     #[tokio::test]
@@ -1848,7 +1848,7 @@ mod tests {
         assert!(!result.truncated(), "no policy drop: {result:?}");
     }
 
-    /// Б1 (core): once the `timed_out` flag is set (as the streaming deadline
+    /// B1 (core): once the `timed_out` flag is set (as the streaming deadline
     /// watchdog does when it fires), a consuming verb classifies the run as
     /// `Outcome::TimedOut` even though `backend_wait` observed a clean exit 0 —
     /// the same deterministic contract the bulk `output_string` path already had.
@@ -1883,7 +1883,7 @@ mod tests {
         }
     }
 
-    /// Б1 (wait path): a streamed run whose deadline fired must report
+    /// B1 (wait path): a streamed run whose deadline fired must report
     /// `Outcome::TimedOut` through `wait_any`/`wait_all` too — `wait_exit` applies
     /// `classify_timed_out` just like `drive_to_exit`, so the streamed-then-raced
     /// composition (`stdout_lines` → `wait_any`) is consistent with `finish_streamed`.
@@ -1900,7 +1900,7 @@ mod tests {
         );
     }
 
-    /// F1: the timeout arbiter is race-free. Once the natural reap claims
+    /// B1: the timeout arbiter is race-free. Once the natural reap claims
     /// `EXITED`, a watchdog whose timer fires late cannot flip the run to
     /// `TimedOut` (its CAS from `PENDING` fails), so a child that exits on its own
     /// within a scheduler quantum of the deadline keeps its real outcome. (The

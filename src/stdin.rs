@@ -98,7 +98,7 @@ impl Stdin {
         matches!(self.0, Source::Empty)
     }
 
-    /// A **stable** digest of the stdin *content* for cassette keying (Ф12) —
+    /// A **stable** digest of the stdin *content* for cassette keying (F12) —
     /// the content itself is never persisted (preserving the no-payload posture),
     /// only this hash, so two otherwise-identical invocations that differ only in
     /// their stdin no longer collide on replay. FNV-1a (not `DefaultHasher`,

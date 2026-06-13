@@ -40,7 +40,7 @@ async fn streaming_honors_timeout() {
         "stream did not end at the deadline (took {:?})",
         start.elapsed()
     );
-    // Б1: a timed-out streamed run reports `Outcome::TimedOut` deterministically
+    // B1: a timed-out streamed run reports `Outcome::TimedOut` deterministically
     // on every platform — the watchdog sets the shared `timed_out` flag before
     // killing the tree, even on this no-grace path — so we assert it exactly
     // rather than just "not a clean success".

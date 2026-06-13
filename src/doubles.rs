@@ -201,7 +201,7 @@ impl Reply {
             None
         } else {
             let per_line = self.line_delay.unwrap_or_default();
-            // Ф8: both streams are fed concurrently at `line_delay`, so the
+            // F8: both streams are fed concurrently at `line_delay`, so the
             // scripted "process" only finishes once the LONGER stream has
             // drained — count the max of stdout/stderr lines. Counting stdout
             // alone truncates a lagging stderr when `join_pumps` stops at the
@@ -209,7 +209,7 @@ impl Reply {
             let stdout_lines = self.stdout.split_inclusive('\n').count() as u32;
             let stderr_lines = self.stderr.split_inclusive('\n').count() as u32;
             let lines = stdout_lines.max(stderr_lines);
-            // Э15: saturate the multiply and clamp to MAX_DEADLINE so a test that
+            // E15: saturate the multiply and clamp to MAX_DEADLINE so a test that
             // hands a `Duration::MAX`-ish `line_delay` can't overflow the multiply
             // or the later `Instant + lifetime` deadline. (A single line — `lines
             // == 1` — wouldn't overflow the multiply, so the clamp, not the
@@ -256,7 +256,7 @@ type Predicate = Box<dyn Fn(&Command) -> bool + Send + Sync>;
 
 enum Rule {
     /// Match when the command's **program name followed by its arguments**
-    /// starts with this prefix (Ф9). The first element is the program; the rest
+    /// starts with this prefix (F9). The first element is the program; the rest
     /// is an argument prefix. An empty prefix is a catch-all.
     Prefix(Vec<OsString>),
     /// Match when the predicate accepts the command.
@@ -266,7 +266,7 @@ enum Rule {
 impl Rule {
     fn matches(&self, command: &Command) -> bool {
         match self {
-            // Ф9: match the program *and* the argument prefix, so
+            // F9: match the program *and* the argument prefix, so
             // `.on(["git", "status"])` answers for `git status …` but not for
             // `rm status` — aligning with the program-aware cassette key. The
             // first prefix element is the program name; an empty prefix matches
@@ -299,7 +299,7 @@ where
 struct RuleEntry {
     rule: Rule,
     /// One reply (served on every match) or an ordered sequence (each served
-    /// once in turn, then the last repeats) — the cassette replay model (Ф11).
+    /// once in turn, then the last repeats) — the cassette replay model (F11).
     /// Never empty.
     replies: Vec<Reply>,
     /// How many times this rule has matched — indexes into `replies` (clamped
@@ -360,7 +360,7 @@ impl ScriptedRunner {
     }
 
     /// Reply with `reply` when the command's **program name + arguments** start
-    /// with `prefix` (Ф9: the first element is the program). For example
+    /// with `prefix` (F9: the first element is the program). For example
     /// `.on(["git", "status"])` answers for `git status …`, not `rm status`.
     pub fn on<I, S>(mut self, prefix: I, reply: Reply) -> Self
     where
@@ -374,7 +374,7 @@ impl ScriptedRunner {
 
     /// Reply with each of `replies` in turn — the first match gets the first
     /// reply, the second the second, and so on; once exhausted, the **last**
-    /// reply repeats forever (Ф11). The declarative form for retry scenarios
+    /// reply repeats forever (F11). The declarative form for retry scenarios
     /// (fail once, then succeed), matching a cassette's "replay in order, then
     /// repeat the last" model. Matches like [`on`](Self::on) (program + arg
     /// prefix).
@@ -412,10 +412,10 @@ impl ScriptedRunner {
         self
     }
 
-    /// Register a rule, warning (Ф10) if it is unreachable because an earlier
+    /// Register a rule, warning (F10) if it is unreachable because an earlier
     /// prefix rule already matches everything it would.
     fn push_rule(&mut self, rule: Rule, replies: Vec<Reply>) {
-        // Ф10: a new prefix rule is unreachable if an *earlier* prefix rule is a
+        // F10: a new prefix rule is unreachable if an *earlier* prefix rule is a
         // prefix of it (a broader rule registered first — e.g. an empty
         // catch-all — wins by first-match). Predicate rules are opaque, so only
         // prefix-vs-prefix shadowing is detected. Diagnostic only (requires the
@@ -446,7 +446,7 @@ impl ScriptedRunner {
 
     /// The reply matching `command` (rules in registration order, then the
     /// fallback), or the loud not-found spawn error. A matched rule advances
-    /// through its reply sequence (Ф11).
+    /// through its reply sequence (F11).
     fn matched_reply(&self, command: &Command, program: &str) -> Result<&Reply> {
         for entry in &self.rules {
             if entry.rule.matches(command) {
@@ -469,9 +469,9 @@ impl ScriptedRunner {
 }
 
 /// Replay `stdout`/`stderr` text through the command's `on_stdout_line` /
-/// `on_stderr_line` handlers (panic-isolated, Б6), so a wrapper's
+/// `on_stderr_line` handlers (panic-isolated, B6), so a wrapper's
 /// progress-reporting path is exercised hermetically on the bulk `output` verb
-/// — both for a [`ScriptedRunner`] reply and a cassette replay (Ф6). On a
+/// — both for a [`ScriptedRunner`] reply and a cassette replay (F6). On a
 /// scripted/real `start`, the live pumps invoke the handlers instead.
 pub(crate) fn replay_line_handlers(command: &Command, stdout: &str, stderr: &str) {
     let mut stdout_handler = command.stdout_handler();
@@ -485,7 +485,7 @@ pub(crate) fn replay_line_handlers(command: &Command, stdout: &str, stderr: &str
 }
 
 /// Invoke a line handler with the same panic-isolation contract as the live
-/// pump (Б6): a panicking handler is caught, disabled for the rest of the run,
+/// pump (B6): a panicking handler is caught, disabled for the rest of the run,
 /// and replay continues. The scripted bulk path must not diverge from the live
 /// path on the very contract the doubles exist to exercise.
 fn invoke_isolated(handler: &mut Option<crate::pump::LineHandler>, line: &str) {
@@ -506,14 +506,14 @@ fn invoke_isolated(handler: &mut Option<crate::pump::LineHandler>, line: &str) {
 impl ProcessRunner for ScriptedRunner {
     async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
         let program = command.program().to_string_lossy().into_owned();
-        // Ф4: a token already cancelled short-circuits with `Cancelled`, exactly
+        // F4: a token already cancelled short-circuits with `Cancelled`, exactly
         // as the live runner does pre-spawn — not a canned reply.
         if let Some(token) = command.cancel_token()
             && token.is_cancelled()
         {
             return Err(crate::error::Error::Cancelled { program });
         }
-        // Ф3: honor the D5 non-piped-stdout contract that the live bulk path and
+        // F3: honor the D5 non-piped-stdout contract that the live bulk path and
         // the scripted `start` path both enforce — a capture verb on
         // `stdout(Inherit/Null)` errors, it does not hand back canned output it
         // could never have captured. Checked before `matched_reply` so this
@@ -545,7 +545,7 @@ impl ProcessRunner for ScriptedRunner {
     /// as on a real child — no subprocess involved.
     async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
         let program = command.program().to_string_lossy().into_owned();
-        // Ф4: an already-cancelled token short-circuits with `Cancelled`, exactly
+        // F4: an already-cancelled token short-circuits with `Cancelled`, exactly
         // as the live runner does pre-spawn — `output` AND `start` both route
         // through `launch`'s pre-spawn check. Without it, `first_line` (which
         // routes through `start`) would stream canned lines instead of cancelling.
@@ -842,7 +842,7 @@ mod tests {
         assert_eq!(lines.next().await, None);
     }
 
-    /// Ф2: a scripted `stdout_lines` stream is bounded by the command's
+    /// F2: a scripted `stdout_lines` stream is bounded by the command's
     /// `timeout`, exactly like a real child whose pipe closes when the deadline
     /// kills the tree. The script would pace two lines 10s apart (20s total),
     /// but the 3s timeout fires first: the stream ends having delivered nothing,
@@ -873,7 +873,7 @@ mod tests {
         );
     }
 
-    /// Ф2: output produced *before* the deadline survives — a real child's
+    /// F2: output produced *before* the deadline survives — a real child's
     /// already-written pipe bytes are readable after its tree is killed, and the
     /// scripted feeder's already-written bytes are likewise drainable after the
     /// abort. Here lines pace 1s apart under a 2.5s timeout, so two lines arrive
@@ -903,7 +903,7 @@ mod tests {
         assert_eq!(finish.outcome, Outcome::TimedOut);
     }
 
-    /// Ф2: arming the scripted deadline must NOT spuriously time out a run that
+    /// F2: arming the scripted deadline must NOT spuriously time out a run that
     /// finishes within its timeout — a short script under a long timeout still
     /// reports its natural exit (the watchdog's `PENDING`→`TIMED_OUT` CAS loses
     /// to the natural reap's `PENDING`→`EXITED`).
@@ -930,7 +930,7 @@ mod tests {
         );
     }
 
-    /// Ф2 parity for the merged `output_events` stream: the same deadline bound
+    /// F2 parity for the merged `output_events` stream: the same deadline bound
     /// applies, so the event stream ends at the timeout and `finish_events`
     /// reports `TimedOut`.
     #[tokio::test(start_paused = true)]
@@ -952,7 +952,7 @@ mod tests {
         assert_eq!(outcome, Outcome::TimedOut);
     }
 
-    /// Ф2: a never-exiting `pending` reply with a timeout — the stream is empty
+    /// F2: a never-exiting `pending` reply with a timeout — the stream is empty
     /// (no canned output), but `finish_streamed` must still resolve at the
     /// deadline as `TimedOut` rather than hanging on the never-resolving wait.
     /// This is a **liveness** guard: with the scripted deadline armed,
@@ -1011,7 +1011,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_isolates_a_panicking_line_handler() {
-        // Б6: a panicking handler on the bulk `output` path is caught and
+        // B6: a panicking handler on the bulk `output` path is caught and
         // disabled, and the run still completes — matching the live pump's
         // panic-isolation contract (the doubles must not diverge on it).
         use std::sync::Arc;
@@ -1040,7 +1040,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_on_non_piped_stdout_errors_like_the_live_path() {
-        // Ф3: a capture verb on `stdout(Null)` must error (Io(InvalidInput)), not
+        // F3: a capture verb on `stdout(Null)` must error (Io(InvalidInput)), not
         // hand back canned output — matching the live bulk path and the scripted
         // `start` path (which both enforce the D5 contract).
         let runner = ScriptedRunner::new().fallback(Reply::ok("canned"));
@@ -1059,7 +1059,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_with_an_already_cancelled_token_short_circuits() {
-        // Ф4: a token cancelled before the call returns `Cancelled`, exactly as
+        // F4: a token cancelled before the call returns `Cancelled`, exactly as
         // the live runner does pre-spawn — not a canned reply.
         let token = crate::CancellationToken::new();
         token.cancel();
@@ -1077,7 +1077,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_with_an_already_cancelled_token_short_circuits() {
-        // Ф4: `start` (the path `first_line` routes through) must short-circuit
+        // F4: `start` (the path `first_line` routes through) must short-circuit
         // a pre-cancelled token too, exactly as `output` and the live runner do
         // — not hand back a live scripted handle.
         let token = crate::CancellationToken::new();
@@ -1096,7 +1096,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn scripted_line_delay_does_not_truncate_a_longer_stderr() {
-        // Ф8: stderr is fed concurrently at the same `line_delay`, so the
+        // F8: stderr is fed concurrently at the same `line_delay`, so the
         // scripted lifetime must cover the LONGER stream. With only 1 stdout
         // line, a stderr that drains well past the (short) stdout-derived
         // lifetime + the pump-teardown grace would be cut off — count the max.
@@ -1179,7 +1179,7 @@ mod tests {
 
     #[tokio::test]
     async fn scripted_kill_after_natural_exit_keeps_the_cached_outcome() {
-        // Ф5: a kill that lands AFTER the scripted child already exited must not
+        // F5: a kill that lands AFTER the scripted child already exited must not
         // overwrite the cached exit with `Signalled` — a real child's status
         // survives a post-exit kill, and the double must match.
         let runner = ScriptedRunner::new().fallback(Reply::fail(5, "boom"));
@@ -1197,7 +1197,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn wait_any_on_a_pending_scripted_handle_is_cancellable() {
-        // Ф1: a never-exiting (pending) scripted handle raced in `wait_any` must
+        // F1: a never-exiting (pending) scripted handle raced in `wait_any` must
         // resolve to `Cancelled` when the token fires — previously it hung
         // forever because `wait_exit` never selected on the token.
         let token = crate::CancellationToken::new();
@@ -1295,7 +1295,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_matches_the_program_not_just_the_args() {
-        // Ф9: the prefix now includes the program, so `.on(["git", "status"])`
+        // F9: the prefix now includes the program, so `.on(["git", "status"])`
         // answers for `git status` but not `rm status` (the old arg-only match
         // would have answered for both).
         let runner = ScriptedRunner::new()
@@ -1319,7 +1319,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_sequence_yields_each_reply_then_repeats_the_last() {
-        // Ф11: a fail-then-succeed retry scenario, scripted declaratively. Each
+        // F11: a fail-then-succeed retry scenario, scripted declaratively. Each
         // reply is served once in order, then the last repeats.
         let runner = ScriptedRunner::new().on_sequence(
             ["git", "push"],

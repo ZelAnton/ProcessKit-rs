@@ -216,7 +216,7 @@ impl Job {
         let ok = unsafe { AssignProcessToJobObject(self.handle, handle as HANDLE) };
         if ok == 0 {
             let err = io::Error::last_os_error();
-            // Э21: the assign fails for an already-terminated process. If the
+            // E21: the assign fails for an already-terminated process. If the
             // child has in fact exited there is nothing to contain — return Ok
             // (matching the pgroup/cgroup backends), regardless of the specific
             // error code; a genuine failure on a still-LIVE process still propagates.
@@ -273,7 +273,7 @@ impl Job {
     /// taken once, so threads or processes created mid-walk are missed, and
     /// `SuspendThread`/`ResumeThread` maintain per-thread suspend *counts*
     /// (nested suspends need matching resumes). A thread that exits mid-walk is
-    /// vacuously handled (Б8 — not a failure); a genuine `SuspendThread`/
+    /// vacuously handled (B8 — not a failure); a genuine `SuspendThread`/
     /// `ResumeThread` failure on a still-open thread does not abort the walk and
     /// is reported after every member has been attempted.
     #[cfg(feature = "process-control")]
@@ -389,7 +389,7 @@ impl Job {
     }
 }
 
-/// Э21: whether the process behind `handle` has already exited —
+/// E21: whether the process behind `handle` has already exited —
 /// `GetExitCodeProcess` reports an exit code other than `STILL_ACTIVE` (259).
 /// A *live* process always reports `STILL_ACTIVE`, so this never false-positives
 /// a live child as exited. The only ambiguity is a child that genuinely exited
@@ -471,7 +471,7 @@ fn suspend_or_resume_thread(tid: u32, suspend: bool) -> io::Result<()> {
     let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, tid) };
     if thread.is_null() {
         let err = io::Error::last_os_error();
-        // Б8: a STALE tid — a thread that exited between the system-wide snapshot
+        // B8: a STALE tid — a thread that exited between the system-wide snapshot
         // and this open — fails `ERROR_INVALID_PARAMETER`. Such a thread is
         // *vacuously* suspended/resumed, so swallow it: one churning thread must
         // not fail the whole job suspend/resume when every still-existing thread
@@ -640,7 +640,7 @@ impl Drop for Job {
                     std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 )
             };
-            // Э17: the CPU hard cap lives in a SEPARATE info class (set under
+            // E17: the CPU hard cap lives in a SEPARATE info class (set under
             // `limits` in `Job::new`), so zeroing the extended-limit struct above
             // does NOT lift it. Clear it too (zeroed `ControlFlags` = disabled) or
             // orphaned survivors stay CPU-throttled forever — inconsistent with the
@@ -670,7 +670,7 @@ impl Drop for Job {
 mod thread_tests {
     use super::suspend_or_resume_thread;
 
-    /// Б8: a stale/invalid tid — a thread that exited between the system-wide
+    /// B8: a stale/invalid tid — a thread that exited between the system-wide
     /// snapshot and the `OpenThread` — fails `ERROR_INVALID_PARAMETER` and is
     /// *vacuously* suspended/resumed, not a failure (a single churning thread must
     /// not fail the whole job suspend). `tid = 1` is not a valid thread id (the

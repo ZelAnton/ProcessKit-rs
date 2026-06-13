@@ -54,7 +54,7 @@ pub enum OverflowMode {
     /// untrusted tool flooding its stdout through the line verbs is a
     /// denial-of-service, not a policy choice.
     ///
-    /// **Memory, not wall-time (Э5).** The ceiling bounds how much output is
+    /// **Memory, not wall-time (E5).** The ceiling bounds how much output is
     /// *retained*, and the error is surfaced when the consuming verb finishes —
     /// it does **not** tear the child down the instant it trips. A flooding
     /// child with no [`timeout`](crate::Command::timeout) keeps running (its
@@ -73,7 +73,7 @@ pub enum OverflowMode {
     /// (Previously it was an inert no-op.) Use `fail_loud(n)` when you want a
     /// real cap.
     ///
-    /// **Counts the total, not the backlog (Э4).** The ceiling fires on the
+    /// **Counts the total, not the backlog (E4).** The ceiling fires on the
     /// *cumulative* output the pump has seen — total lines and total bytes — not
     /// on how much is currently buffered. A streaming consumer
     /// ([`stdout_lines`](crate::RunningProcess::stdout_lines)) draining lines as
@@ -97,7 +97,7 @@ pub enum OverflowMode {
 /// set; the buffer stays within whichever are present. The line cap alone does
 /// not bound memory: a line is held whole until its newline arrives, so one
 /// enormous newline-free "line" (e.g. `base64 -w0` output) occupies memory in
-/// full under a `max_lines`-only policy (Д8). Add
+/// full under a `max_lines`-only policy (D8). Add
 /// [`with_max_bytes`](Self::with_max_bytes) to bound the actual retained memory,
 /// or use [`output_bytes`](crate::Command::output_bytes) (raw, no line
 /// splitting) when the output is not line-structured.
@@ -109,7 +109,7 @@ pub struct OutputBufferPolicy {
     pub max_lines: Option<usize>,
     /// Maximum retained bytes (sum of the retained lines' UTF-8 lengths): `None`
     /// is unbounded; `Some(n)` keeps the retained backlog at or under `n` bytes
-    /// (Д8). A single line longer than `n` cannot fit and is dropped whole under
+    /// (D8). A single line longer than `n` cannot fit and is dropped whole under
     /// the drop modes (which sets the truncation signal,
     /// [`ProcessResult::truncated`](crate::ProcessResult::truncated)); under
     /// [`OverflowMode::Error`] it trips the fail-loud ceiling.
@@ -150,7 +150,7 @@ impl OutputBufferPolicy {
         }
     }
 
-    /// Set the retained-byte ceiling (Д8), composable with any policy.
+    /// Set the retained-byte ceiling (D8), composable with any policy.
     ///
     /// Bounds the actual memory the buffer holds — the sum of the retained
     /// lines' UTF-8 byte lengths — independently of [`max_lines`](Self::max_lines).

@@ -10,12 +10,12 @@ A development sweep classifies every candidate into one of four homes:
 
 | Bucket | Meaning | Lives in |
 |---|---|---|
-| **Today** (сегодня) | Committed; will do | [`../ROADMAP.md`](../ROADMAP.md) |
-| **Next** (завтра) | Open; reconsider **first** when the roadmap drains | `ideas/next-*.md` |
-| **Later** (потом) | Open; further out, lower urgency | `ideas/later-*.md` |
+| **Today** | Committed; will do | [`../ROADMAP.md`](../ROADMAP.md) |
+| **Next** | Open; reconsider **first** when the roadmap drains | `ideas/next-*.md` |
+| **Later** | Open; further out, lower urgency | `ideas/later-*.md` |
 | **Won't do** | Settled against (or won't change) | [`../decisions/`](../decisions/) |
 
-"Завтра / потом" are hyperbole for ordering, not calendar dates — **next-** items
+"Next / Later" are hyperbole for ordering, not calendar dates — **next-** items
 are simply the first re-examined once committed work is done.
 
 ## Filename marker

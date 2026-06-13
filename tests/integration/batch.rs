@@ -128,7 +128,7 @@ async fn failing_stdin_source_surfaces_as_error_stdin_via_wait_all() {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    // Э8: the wait_any/wait_all path (wait_exit) must observe a finished stdin
+    // E8: the wait_any/wait_all path (wait_exit) must observe a finished stdin
     // writer that failed for a non-broken-pipe reason and surface it as
     // Error::Stdin on an otherwise-successful run, matching the bulk verbs' B3
     // contract — previously this path never called observe_stdin_task, so the

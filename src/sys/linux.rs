@@ -32,7 +32,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Process-wide counter so concurrent jobs get distinct cgroup names.
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Э20: a per-process salt mixed into the cgroup dir name so a pid recycled long
+/// E20: a per-process salt mixed into the cgroup dir name so a pid recycled long
 /// after a *crashed* ProcessKit process (whose `Drop` never cleaned up its
 /// `processkit-<pid>-…` dirs) does not collide with those leftovers and silently
 /// downgrade to the process-group fallback. Derived from the wall-clock time of
@@ -152,7 +152,7 @@ impl Job {
                 // not retroactively pulled in — only future forks).
                 match std::fs::write(cg.path.join("cgroup.procs"), pid.to_string().as_bytes()) {
                     Ok(()) => Ok(()),
-                    // Э21: the child already exited (a zombie pid) — the write
+                    // E21: the child already exited (a zombie pid) — the write
                     // fails ESRCH. There is nothing to contain, so return Ok,
                     // matching the process-group backend (which maps ESRCH→Ok).
                     Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
@@ -219,7 +219,7 @@ impl Job {
             Backend::Cgroup(cg) => {
                 // Best-effort: the graceful tier proceeds to polling regardless.
                 let _ = cg.signal(signal);
-                // Э15: clamp so a `Duration::MAX`-ish timeout can't overflow.
+                // E15: clamp so a `Duration::MAX`-ish timeout can't overflow.
                 let deadline = Instant::now() + timeout.min(crate::MAX_DEADLINE);
                 while !cg.is_empty() {
                     if Instant::now() >= deadline {
@@ -397,7 +397,7 @@ impl Cgroup {
         // permission gate that triggers the process-group fallback when delegation
         // is absent.
         //
-        // Э20: retry with a fresh counter when the dir already exists — a leftover
+        // E20: retry with a fresh counter when the dir already exists — a leftover
         // from a crashed run whose pid was recycled, or two crate versions sharing
         // the namespace — rather than letting `EEXIST` masquerade as a delegation
         // failure and silently downgrade. The salt makes a real collision
@@ -615,7 +615,7 @@ impl Cgroup {
         // (This unconditionally clears any freeze a prior `suspend()` set; a kill
         // verb resurrecting-then-killing a deliberately-suspended group is benign.)
         let _ = std::fs::write(self.path.join("cgroup.freeze"), b"0");
-        // Э18: report a real drain failure instead of a false success, so the
+        // E18: report a real drain failure instead of a false success, so the
         // caller (`kill_all`/`signal`/`terminate_all`/`shutdown`) knows the tree
         // may still be alive — a fork bomb still out-spawning, or un-reapable
         // zombies (a D-state task ignores SIGKILL until it unblocks).

@@ -49,9 +49,9 @@ struct Entry {
     args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
-    /// FNV-1a digest of the stdin content (Ф12) — keyed so two invocations
+    /// FNV-1a digest of the stdin content (F12) — keyed so two invocations
     /// differing only in stdin don't collide on replay. `None` for empty/absent
-    /// stdin. A pre-Ф12 cassette recorded *with* stdin loads this as `None` and
+    /// stdin. A pre-F12 cassette recorded *with* stdin loads this as `None` and
     /// must be re-recorded to match a stdin invocation again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stdin_digest: Option<u64>,
@@ -153,7 +153,7 @@ impl Entry {
 }
 
 /// What an invocation is matched on: program + args + cwd + the stdin content
-/// digest (Ф12). Env overrides are excluded so an irrelevant env difference
+/// digest (F12). Env overrides are excluded so an irrelevant env difference
 /// between the record and replay environments can't cause a spurious miss.
 ///
 /// L23: the string components are *lossy* UTF-8 decodes, so two distinct
@@ -163,7 +163,7 @@ impl Entry {
 /// and valid-UTF-8 invocations (the common case) never collide.
 type Key = (String, Vec<String>, Option<String>, bool, Option<u64>);
 
-/// The stdin content digest (Ф12) keyed into a cassette match — `None` for an
+/// The stdin content digest (F12) keyed into a cassette match — `None` for an
 /// empty/absent stdin. The content is hashed, never persisted.
 fn stdin_digest_of(command: &Command) -> Option<u64> {
     command
@@ -176,7 +176,7 @@ fn stdin_digest_of(command: &Command) -> Option<u64> {
 /// [`key_of_entry`] (both sides go through the same lossy conversion). The
 /// `stdin_digest` is computed from the command, not carried on the
 /// [`Invocation`] (which records only *whether* stdin was supplied). The
-/// `has_stdin` bool is keyed alongside the digest so a *pre-Ф12* entry (which
+/// `has_stdin` bool is keyed alongside the digest so a *pre-F12* entry (which
 /// loads `stdin_digest: None` regardless of its stored `has_stdin`) cannot match
 /// a no-stdin replay — only miss.
 fn key_of(invocation: &Invocation, stdin_digest: Option<u64>) -> Key {
@@ -441,7 +441,7 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 let entry = {
                     let mut slots = slots.lock().expect("cassette mutex poisoned");
                     let Some(slot) = slots.get_mut(&key_of(&invocation, stdin_digest)) else {
-                        // Ф7: a stale/incomplete cassette is a distinct error, not
+                        // F7: a stale/incomplete cassette is a distinct error, not
                         // a missing-program `Spawn`/`NotFound` (so `is_not_found()`
                         // is false and a wrapper can't mistake it for an absent
                         // tool).
@@ -451,7 +451,7 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                     };
                     slot.play().clone()
                 };
-                // Ф6: feed the replayed output through the command's
+                // F6: feed the replayed output through the command's
                 // `on_stdout_line`/`on_stderr_line` handlers, so a wrapper's
                 // progress path is exercised on replay exactly as it is in
                 // record mode (real pumps) and on `ScriptedRunner::output`.
@@ -630,7 +630,7 @@ mod tests {
             Error::CassetteMiss { program } => assert_eq!(program, "tool"),
             other => panic!("expected Error::CassetteMiss, got {other:?}"),
         }
-        // Ф7: a stale cassette is NOT mistaken for a missing program.
+        // F7: a stale cassette is NOT mistaken for a missing program.
         assert!(
             !err.is_not_found(),
             "a cassette miss must not read as not-found: {err:?}"
@@ -639,7 +639,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_invokes_line_handlers() {
-        // Ф6: replay feeds the recorded output through `on_stdout_line`, just
+        // F6: replay feeds the recorded output through `on_stdout_line`, just
         // like record mode (real pumps) and `ScriptedRunner::output` — a
         // wrapper's progress path tests the same hermetically on replay.
         let (_dir, path) = temp_cassette();
@@ -666,7 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn stdin_content_is_part_of_the_match_key() {
-        // Ф12: two invocations identical except for their stdin must record and
+        // F12: two invocations identical except for their stdin must record and
         // replay as *distinct* keys, not collide on `has_stdin` alone. The inner
         // sequence yields out-A then out-B in record order.
         let (_dir, path) = temp_cassette();
@@ -709,7 +709,7 @@ mod tests {
     #[tokio::test]
     async fn no_stdin_replay_does_not_match_a_stdin_recorded_entry() {
         // The key distinguishes a stdin-bearing invocation from a no-stdin one
-        // (via the digest, and via `has_stdin` for pre-Ф12 entries that load
+        // (via the digest, and via `has_stdin` for pre-F12 entries that load
         // `stdin_digest: None`) — a no-stdin replay misses, never serving the
         // stdin entry's output.
         let (_dir, path) = temp_cassette();

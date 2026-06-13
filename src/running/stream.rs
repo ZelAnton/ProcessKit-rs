@@ -144,7 +144,7 @@ impl RunningProcess {
             // Anchor to spawn time so a late stream call can't re-grant the
             // full limit (B7 fix). `started` is std::time::Instant (Copy).
             let started = self.started;
-            // Б1/F1: claim the timeout via the shared arbiter so the finisher
+            // B1: claim the timeout via the shared arbiter so the finisher
             // classifies the run as `TimedOut` even if the child then exits
             // cleanly within the grace. Only kill if we WON the race against the
             // natural reap (which claims `EXITED` in `backend_wait`): if the child
@@ -187,7 +187,7 @@ impl RunningProcess {
             }));
         }
 
-        // Ф2: the scripted analogue — a scripted handle has no group to kill, so
+        // F2: the scripted analogue — a scripted handle has no group to kill, so
         // bound the stream by hanging up the feeders at the deadline (their EOF
         // ends the pump and this stream, exactly as a real tree's closing pipes
         // do). Claim the timeout via the arbiter first so the finisher classifies
@@ -380,7 +380,7 @@ impl RunningProcess {
             let grace = self.timeout_grace;
             let signal = self.timeout_signal;
             let started = self.started;
-            // Б1/F1: see `stdout_lines` — claim the timeout via the arbiter and
+            // B1: see `stdout_lines` — claim the timeout via the arbiter and
             // kill only if we won the race against the natural reap.
             let timeout_state = self.timeout_state.clone();
             self.deadline_task = Some(tokio::spawn(async move {
@@ -411,7 +411,7 @@ impl RunningProcess {
             }));
         }
 
-        // Ф2: scripted analogue — see `stdout_lines`.
+        // F2: scripted analogue — see `stdout_lines`.
         self.arm_scripted_deadline();
 
         // Cancel watchdog is now armed at spawn time — no re-arm needed here.
@@ -533,7 +533,7 @@ pub(crate) async fn graceful_kill_pid(pid: Option<u32>, grace: std::time::Durati
         unsafe {
             libc::kill(pid, signal);
         }
-        // Э15: clamp so a `Duration::MAX`-ish grace can't overflow `Instant + Duration`.
+        // E15: clamp so a `Duration::MAX`-ish grace can't overflow `Instant + Duration`.
         let deadline = tokio::time::Instant::now() + grace.min(crate::MAX_DEADLINE);
         loop {
             let now = tokio::time::Instant::now();

@@ -58,7 +58,7 @@ pub enum Error {
     },
 
     /// A cassette replay found **no recording** matching the invocation — a
-    /// stale or incomplete cassette, not a missing program (Ф7). Kept distinct
+    /// stale or incomplete cassette, not a missing program (F7). Kept distinct
     /// from [`Spawn`](Error::Spawn) / [`NotFound`](Error::NotFound) so a wrapper
     /// that treats "tool not installed" as an *optional* dependency does not
     /// silently swallow a stale cassette as an absent tool.

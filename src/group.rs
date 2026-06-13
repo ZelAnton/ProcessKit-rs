@@ -230,7 +230,7 @@ impl ProcessGroup {
     ///
     /// On the containment backends, adopting a child that has already **exited
     /// but not yet been reaped** is a successful no-op (`Ok`) — there is nothing
-    /// left to contain (Э21) — while an **already-reaped** child (one that was
+    /// left to contain (E21) — while an **already-reaped** child (one that was
     /// `wait`ed, so its handle/pid is gone) errors, since there is no longer
     /// anything to reference.
     #[cfg(feature = "process-control")]

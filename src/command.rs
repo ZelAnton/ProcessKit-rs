@@ -49,7 +49,7 @@ pub struct Command {
     ok_codes: Option<Vec<i32>>,
     stdout_handler: Option<LineHandler>,
     stderr_handler: Option<LineHandler>,
-    /// Async tee sinks (Э6): each decoded line is also written here. Independent
+    /// Async tee sinks (E6): each decoded line is also written here. Independent
     /// of the line handlers above — both run.
     stdout_tee: Option<crate::pump::TeeSink>,
     stderr_tee: Option<crate::pump::TeeSink>,
@@ -615,7 +615,7 @@ impl Command {
     /// is written to it followed by `\n`. The write is **awaited on the capture
     /// pump**, so a slow sink applies backpressure (the pump slows, the OS pipe
     /// fills, the child blocks on its next write) rather than blocking the
-    /// runtime (Э6). The sink must make forward progress, though: a destination
+    /// runtime (E6). The sink must make forward progress, though: a destination
     /// that blocks *forever* (not merely slow) stalls the pump — no further
     /// lines are buffered and a live `stdout_lines`/`output_events` consumer
     /// parks — until the run's teardown grace aborts the pump. A write error

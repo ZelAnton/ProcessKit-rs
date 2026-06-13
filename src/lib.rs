@@ -174,7 +174,7 @@ mod stdin;
 mod supervisor;
 mod sys;
 
-/// Clamp ceiling for `Instant + Duration` deadline math (Э15): a timeout, grace,
+/// Clamp ceiling for `Instant + Duration` deadline math (E15): a timeout, grace,
 /// or `within` longer than this is treated as "effectively forever", so a
 /// `Duration::MAX`-ish input can't overflow `Instant + Duration` and panic.
 /// ~10 years — far beyond any real process deadline, with ample margin below
@@ -398,7 +398,7 @@ pub use tokio_util::sync::CancellationToken;
 mod tests {
     use super::Outcome;
 
-    /// Э15: the deadline-clamp ceiling must be small enough that
+    /// E15: the deadline-clamp ceiling must be small enough that
     /// `Instant + MAX_DEADLINE` cannot overflow, and a `Duration::MAX` input must
     /// clamp down to it — so `Instant::now() + within.min(MAX_DEADLINE)` is
     /// panic-free for any timeout/grace, however absurd.
@@ -445,7 +445,7 @@ mod tests {
         );
     }
 
-    // Б2 regression: the same snapshot hazard via a *second* wait_any (not a
+    // B2 regression: the same snapshot hazard via a *second* wait_any (not a
     // bulk verb). The existing test above covers wait_exit -> wait() (the guarded
     // drive_to_exit path); this covers wait_exit -> wait_exit, the documented
     // "race them, keep watching the rest" pattern, where wait_exit re-snapshotted
@@ -481,7 +481,7 @@ mod tests {
         );
     }
 
-    // Б2 regression for wait_all: a late cancel followed by a re-join must not
+    // B2 regression for wait_all: a late cancel followed by a re-join must not
     // make the whole batch error out (wait_all short-circuits on the first Err,
     // so a spurious Cancelled would discard every other contender's outcome too).
     #[tokio::test]
@@ -629,7 +629,7 @@ mod tests {
         );
     }
 
-    // Б2 symmetry: the snapshot-preserving guard must keep a genuine
+    // B2 symmetry: the snapshot-preserving guard must keep a genuine
     // cancellation *sticky* across a re-wait, not just preserve a clean exit.
     // A second wait_any after a genuinely cancelled run must STILL be
     // Err(Cancelled) (the guard preserves Some(true) exactly as it preserves

@@ -290,7 +290,7 @@ async fn adopt_of_a_reaped_child_errors_instead_of_tracking_nothing() {
 #[tokio::test]
 #[ignore = "spawns a child, kills it UNREAPED, then adopts the zombie"]
 async fn adopt_of_an_exited_unreaped_child_is_ok() {
-    // Э21: a child that has EXITED but not yet been reaped (a zombie — its
+    // E21: a child that has EXITED but not yet been reaped (a zombie — its
     // handle/pid is still valid while the process is dead, distinct from the
     // reaped case above) has nothing to contain, so `adopt` returns Ok on every
     // backend (cgroup/pgroup `ESRCH` → Ok, Windows `GetExitCodeProcess` → Ok),
