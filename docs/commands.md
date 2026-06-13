@@ -358,14 +358,14 @@ The error enum is structured and `#[non_exhaustive]`:
 
 | Variant | Meaning |
 |---|---|
-| `Error::Spawn { program, source }` | The OS couldn't start the program (permissions, …) |
-| `Error::NotFound { program, searched }` | A bare program name was not found; `searched` names the `PATH` directories looked at |
+| `Error::Spawn { program, source }` | The program was located but the OS couldn't start it (permissions, a bad working directory, a Windows `.cmd`/`.bat` needing `cmd.exe`, …) — **not** `is_not_found()` |
+| `Error::NotFound { program, searched }` | The program couldn't be located (the single "not found" representation — `is_not_found()` is true); `searched` is `Some(dirs)` for a bare-name `PATH` lookup, `None` otherwise |
 | `Error::Exit { program, code, stdout, stderr }` | Non-zero exit, both streams attached in full (the `Display` message is bounded, but the fields carry the complete captured text for classification) |
 | `Error::Signalled { program, signal }` | The process was killed by a signal (no exit code); `signal` carries the number on Unix, `None` elsewhere |
 | `Error::OutputTooLarge { program, line_limit, byte_limit, total_lines, total_bytes }` | A `fail_loud` buffer's line or byte ceiling was exceeded |
 | `Error::Timeout { program, timeout }` | The run's own deadline killed it |
 | `Error::NotReady { program, timeout }` | A [readiness probe](streaming.md#readiness-probes) gave up |
-| `Error::Parse { program, message }` | A `CliClient::try_parse` parser rejected the output |
+| `Error::Parse { program, message }` | A `CliClient::try_parse` parser rejected the output (the `Display`/`Debug` of `message` is bounded to a 200-byte preview; the field carries the full text) |
 | `Error::Unsupported { operation }` | The platform can't do what was asked (and silently skipping would be wrong) |
 | `Error::Cancelled { program }` | the run's token was cancelled |
 | `Error::ResourceLimit(reason)` | (`limits` feature) a requested cap couldn't be enforced |

@@ -10,16 +10,21 @@ use crate::common::*;
 #[tokio::test]
 #[ignore = "exercises the real spawn path (creates a process group)"]
 async fn missing_working_directory_errors_clearly() {
-    // A cwd that doesn't exist must surface as a clear, not-found error that
-    // names the working directory — not the opaque ENOENT that looks like the
-    // program is missing. The check fires before any child is spawned.
+    // A cwd that doesn't exist must surface as a clear error that names the
+    // working directory — not the opaque ENOENT that looks like the program is
+    // missing. The check fires before any child is spawned. D11: a bad cwd is
+    // NOT a missing program, so `is_not_found()` must be false — the
+    // "not installed?" hint would mislead.
     let err = Command::new("echo")
         .arg("hi")
         .current_dir("does-not-exist-processkit-xyz")
         .output_string()
         .await
         .expect_err("a missing cwd must error");
-    assert!(err.is_not_found(), "got {err:?}");
+    assert!(
+        !err.is_not_found(),
+        "a missing cwd is not a missing program: {err:?}"
+    );
     assert!(
         format!("{err}").contains("working directory does not exist"),
         "message should name the cwd: {err}"

@@ -350,11 +350,9 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         creation_flags: command.extra_creation_flags(),
         kill_on_parent_death: command.wants_kill_on_parent_death(),
     };
-    // Enrich the OS's opaque "not found" for a *bare* program name into a rich
-    // Error::NotFound naming the searched directories — the bare ENOENT is
-    // otherwise indistinguishable from a missing cwd or other filesystem error.
-    // (Absolute/relative paths skip this: the caller already located the file,
-    // and `find_in_path` only knows PATH.)
+    // Funnel the OS's opaque "not found" into the single `Error::NotFound`
+    // representation (D11) — the bare ENOENT is otherwise indistinguishable from
+    // a missing cwd or other filesystem error.
     //
     // Done *after* the spawn attempt rather than as a pre-check so the OS stays
     // the source of truth — a program the OS can launch by a path we don't model
@@ -364,30 +362,46 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     // pre-check would have rejected it. The cwd was already validated above, so a
     // NotFound here is genuinely the program, not the directory.
     //
-    // Skip the enrichment when the command customizes PATH (explicit PATH
-    // override/removal, env_clear, inherit_env): `find_in_path` reads the
-    // *process* PATH, so its "searched" list would name the wrong directories.
-    // The plain Error::Spawn (NotFound kind) still reports is_not_found() == true.
+    // For a bare name on the process PATH, `NotFound` names the searched
+    // directories (`searched: Some`). A path-form program, or one whose PATH is
+    // customized (explicit PATH override/removal, env_clear, inherit_env), gets
+    // `searched: None` — `find_in_path` reads the *process* PATH, so its list
+    // would be wrong or irrelevant — but it is still `Error::NotFound` (so
+    // `is_not_found()` holds), just without directories to name.
     let mut child = match group.spawn_with_options(&mut tokio_cmd, &opts) {
         Ok(child) => child,
         Err(crate::Error::Spawn { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound
-                && is_bare_name(command.program())
-                && !command.customizes_path() =>
+            if source.kind() == std::io::ErrorKind::NotFound =>
         {
-            let (found, searched) = find_in_path(command.program());
-            if found.is_some() {
-                // B8: program is on PATH but the OS can't exec it directly
-                // (e.g. a .cmd/.bat on Windows needs cmd.exe). Return the
-                // original spawn error — NotFound is misleading here.
-                return Err(crate::Error::Spawn {
+            // The cwd was validated above, so a NotFound from the spawn is the
+            // *program*, not the directory — funnel it into the single
+            // `Error::NotFound` representation (D11), regardless of how the
+            // program was named or the platform.
+            if is_bare_name(command.program()) && !command.customizes_path() {
+                let (found, searched) = find_in_path(command.program());
+                if found.is_some() {
+                    // B8: program is on PATH but the OS can't exec it directly
+                    // (e.g. a .cmd/.bat on Windows needs cmd.exe). Keep the
+                    // spawn error — the file *is* found, so `NotFound` (and
+                    // `is_not_found()`) would mislead.
+                    return Err(crate::Error::Spawn {
+                        program: command.program_name(),
+                        source,
+                    });
+                }
+                // A bare name absent from the process PATH: name the searched
+                // directories.
+                return Err(crate::Error::NotFound {
                     program: command.program_name(),
-                    source,
+                    searched: Some(searched),
                 });
             }
+            // A path-form program, or one whose PATH was customized: no PATH
+            // search applied (`find_in_path` reads the *process* PATH, so its
+            // list would be wrong), so there are no directories to report.
             return Err(crate::Error::NotFound {
                 program: command.program_name(),
-                searched,
+                searched: None,
             });
         }
         Err(other) => return Err(other),

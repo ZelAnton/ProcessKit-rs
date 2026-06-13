@@ -51,6 +51,18 @@ to a dated version section.
   key). Existing argument-only rules must prepend the program name.
 - **Breaking:** a cassette replay that finds no matching recording now returns
   `Error::CassetteMiss` instead of `Error::Spawn` with a not-found source.
+- **Breaking:** "program not found" now has a **single representation** (D11). Every
+  launch failure where the program can't be located — a bare name absent from `PATH`, a
+  path that doesn't resolve, a customized `PATH` — surfaces as `Error::NotFound`, and
+  `Error::NotFound::searched` changed from `String` to `Option<String>` (`Some(dirs)` when a
+  bare name was searched against `PATH`, `None` when no `PATH` search applied). As a result
+  **`is_not_found()` is now true *only* for `Error::NotFound`**: a missing or invalid working
+  directory (a `Spawn` carrying a `NotFound` io kind), a program that is installed but
+  not directly executable (a Windows `.cmd`/`.bat`, surfaced as `Spawn`), and a missing
+  cassette *file* (an `Io` not-found) are no longer reported as "not found", so the
+  "command not installed?" hint can't misfire. `Error::NotFound`'s `Display` now says
+  "not found on PATH" only when a `PATH` search happened (`searched` is `Some`); a path-form
+  or customized-`PATH` program reads simply "not found".
 - **Breaking:** run cancellation is now a **core feature, not opt-in** — the `cancellation`
   Cargo feature is removed. `Command::cancel_on`, `CliClient::default_cancel_on`,
   `Error::Cancelled`, `Reply::pending`, and the re-exported `CancellationToken` are always

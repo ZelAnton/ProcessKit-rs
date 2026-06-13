@@ -32,29 +32,38 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    /// A bare program name (no path separators) was not found — it is not
-    /// installed or the directory holding it is not on `PATH`. Enriched from the
-    /// OS's opaque not-found error so the message names the searched directories,
-    /// rather than pre-checking `PATH` (which would falsely reject a program the
-    /// OS resolves by another route — e.g. the application directory on Windows).
+    /// The program could not be located, so no child was ever started — it is
+    /// not installed, not on `PATH`, or the given path does not resolve to an
+    /// executable. The **single** representation of "program not found": the
+    /// launch path routes every such failure here regardless of how the program
+    /// was named (bare name vs path) or platform (D11), so a caller matches one
+    /// variant and [`is_not_found`](Error::is_not_found) classifies it.
     ///
     /// Distinct from [`Spawn`](Error::Spawn), which covers OS-level failures
-    /// once the executable location is known (permission denied, busy, etc.).
+    /// once the program *is* located (permission denied, busy, a bad working
+    /// directory, a `.cmd`/`.bat` on Windows that needs `cmd.exe`, etc.) —
+    /// those are **not** `is_not_found`.
     ///
-    /// [`is_not_found`](Error::is_not_found) returns `true` for this variant.
+    /// The `searched` cause is structured: `Some(dirs)` when a bare name was
+    /// looked up against `PATH` (the directories searched), `None` when the
+    /// program was given as a path or `PATH` was customized (no `PATH` search
+    /// applied, so there are no directories to name).
     ///
     /// The `Display` message intentionally omits `searched` — `PATH` is an
     /// environment value and must never appear in logs per the crate's
-    /// security policy. Access `searched` directly for a diagnostic.
-    #[error("`{program}` not found on PATH")]
+    /// security policy. Access `searched` directly for a diagnostic. The message
+    /// says "on PATH" only when a `PATH` search actually happened (`searched` is
+    /// `Some`); a path-form or customized-PATH program reads simply "not found".
+    #[error("{}", display_not_found(program, searched))]
     NotFound {
         /// The program name that was looked up.
         program: String,
-        /// The `PATH` directories that were searched, joined by the
-        /// platform separator (`:` on Unix, `;` on Windows). Empty when
-        /// `PATH` is not set. Not included in `Display` — use this field
-        /// directly when building a user-facing diagnostic.
-        searched: String,
+        /// The `PATH` directories searched, joined by the platform separator
+        /// (`:` on Unix, `;` on Windows) — `Some` for a bare-name PATH lookup
+        /// (empty string when `PATH` is unset), `None` when no PATH search
+        /// applied (a path-form program, or a customized PATH). Not included in
+        /// `Display`; use it directly when building a user-facing diagnostic.
+        searched: Option<String>,
     },
 
     /// A cassette replay found **no recording** matching the invocation — a
@@ -292,27 +301,20 @@ impl Error {
         }
     }
 
-    /// Whether this is a **"not found"** failure — the program doesn't exist
-    /// on `PATH` or a needed path is missing. True for:
+    /// Whether the **program could not be located** — it is not installed, not
+    /// on `PATH`, or the given path does not resolve to an executable. True for
+    /// [`NotFound`](Error::NotFound) and **only** that variant (D11): the launch
+    /// path funnels every program-not-found failure into `NotFound`, so this is
+    /// the one check a caller needs to surface a "command not installed?" hint.
     ///
-    /// - [`NotFound`](Error::NotFound) (bare name absent from `PATH`),
-    /// - [`Spawn`](Error::Spawn) / [`Io`](Error::Io) carrying
-    ///   [`NotFound`](std::io::ErrorKind::NotFound) (e.g. missing `cwd`).
-    ///
-    /// `false` for every other variant. Lets a caller surface a "command not
-    /// installed?" hint without matching on the underlying IO error.
-    ///
-    /// **Note:** On Windows, a bare program name (e.g. `git`) that resolves
-    /// only to a `.cmd`/`.bat` file on PATH cannot be executed directly — the
-    /// OS itself returns a `NotFound` error at the exec layer. In that case
-    /// this method returns `true` via the `Spawn(NotFound)` branch even though
-    /// the file was found on PATH. The program is installed; it just needs to
-    /// be invoked through `cmd.exe`.
+    /// `false` for every other variant — notably it does **not** fire for a
+    /// missing or invalid working directory (a [`Spawn`](Error::Spawn) carrying
+    /// [`NotFound`](std::io::ErrorKind::NotFound)/`NotADirectory`): a bad `cwd`
+    /// is not a missing program, so the hint would mislead. It is also `false`
+    /// for a program that *is* installed but can't be executed directly (e.g. a
+    /// Windows `.cmd`/`.bat` that needs `cmd.exe` — surfaced as `Spawn`).
     pub fn is_not_found(&self) -> bool {
         matches!(self, Error::NotFound { .. })
-            || self
-                .io_source()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
     }
 
     /// Whether this is a spawn/IO **permission denial** (`EACCES`/`EPERM`): the
@@ -371,8 +373,9 @@ impl fmt::Debug for Error {
                 .debug_struct("NotFound")
                 .field("program", program)
                 // `searched` is the `PATH` env value — never rendered (the
-                // crate's secret-safety rule). Summarize as a directory count.
-                .field("searched", &SearchedRedaction(searched))
+                // crate's secret-safety rule). Summarize as a directory count;
+                // `None` (no PATH search applied) renders as `None`.
+                .field("searched", &searched.as_deref().map(SearchedRedaction))
                 .finish(),
             Error::CassetteMiss { program } => f
                 .debug_struct("CassetteMiss")
@@ -481,6 +484,18 @@ impl fmt::Debug for SearchedRedaction<'_> {
         // inflate the redacted count.
         let n = self.0.split(SEP).filter(|s| !s.is_empty()).count();
         write!(f, "<{n} directories>")
+    }
+}
+
+/// `NotFound`'s one-line `Display`. Says "not found on PATH" only when a `PATH`
+/// search actually happened (`searched.is_some()` — a bare name looked up against
+/// the process `PATH`); a path-form program or a customized `PATH` (`None`) reads
+/// `` `{program}` not found ``, since no `PATH` lookup occurred. Never includes
+/// the `searched` value itself (the `PATH` env value — the crate's secret rule).
+fn display_not_found(program: &str, searched: &Option<String>) -> String {
+    match searched {
+        Some(_) => format!("`{program}` not found on PATH"),
+        None => format!("`{program}` not found"),
     }
 }
 
@@ -627,7 +642,7 @@ mod tests {
         // appear in Debug (which feeds `{e:?}` logs and `.unwrap()` panics).
         let err = Error::NotFound {
             program: "tool".into(),
-            searched: "/secret/bin:/another/private/dir".into(),
+            searched: Some("/secret/bin:/another/private/dir".into()),
         };
         let dbg = format!("{err:?}");
         assert!(
@@ -829,7 +844,7 @@ mod tests {
     fn not_found_display_and_classifier() {
         let err = Error::NotFound {
             program: "my-tool".into(),
-            searched: "/usr/bin:/usr/local/bin".into(),
+            searched: Some("/usr/bin:/usr/local/bin".into()),
         };
         // L21: Display must NOT include the raw PATH value (env values are
         // never logged per the security policy); searched is still accessible.
@@ -845,6 +860,25 @@ mod tests {
         assert_eq!(err.diagnostic(), None);
     }
 
+    #[test]
+    fn not_found_without_path_search_omits_on_path() {
+        // D11: a path-form program (or a customized PATH) is `NotFound` with
+        // `searched: None` — no PATH lookup happened, so the message must not
+        // claim "on PATH". Still `is_not_found()`.
+        let err = Error::NotFound {
+            program: "/no/such/tool".into(),
+            searched: None,
+        };
+        assert_eq!(err.to_string(), "`/no/such/tool` not found");
+        assert!(err.is_not_found());
+        // The bare-name case (a real PATH search) still says "on PATH".
+        let bare = Error::NotFound {
+            program: "tool".into(),
+            searched: Some("/usr/bin".into()),
+        };
+        assert_eq!(bare.to_string(), "`tool` not found on PATH");
+    }
+
     fn spawn(kind: std::io::ErrorKind) -> Error {
         Error::Spawn {
             program: "x".into(),
@@ -855,8 +889,20 @@ mod tests {
     #[test]
     fn not_found_and_permission_denied_are_classified_on_spawn_and_io() {
         use std::io::ErrorKind::{NotFound, PermissionDenied};
-        assert!(spawn(NotFound).is_not_found());
-        assert!(Error::Io(std::io::Error::from(NotFound)).is_not_found());
+        // D11: `is_not_found()` is true ONLY for the `NotFound` variant — a
+        // `Spawn`/`Io` carrying a `NotFound` io kind (e.g. a bad cwd) is no
+        // longer classified as a missing program, so the "not installed?" hint
+        // can't misfire. The launch path routes a genuine missing program into
+        // the `NotFound` variant itself.
+        assert!(
+            Error::NotFound {
+                program: "x".into(),
+                searched: None,
+            }
+            .is_not_found()
+        );
+        assert!(!spawn(NotFound).is_not_found());
+        assert!(!Error::Io(std::io::Error::from(NotFound)).is_not_found());
         assert!(!spawn(NotFound).is_permission_denied());
 
         assert!(spawn(PermissionDenied).is_permission_denied());

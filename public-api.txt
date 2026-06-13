@@ -16,7 +16,7 @@ pub processkit::Error::Exit::stdout: alloc::string::String
 pub processkit::Error::Io(std::io::error::Error)
 pub processkit::Error::NotFound
 pub processkit::Error::NotFound::program: alloc::string::String
-pub processkit::Error::NotFound::searched: alloc::string::String
+pub processkit::Error::NotFound::searched: core::option::Option<alloc::string::String>
 pub processkit::Error::NotReady
 pub processkit::Error::NotReady::program: alloc::string::String
 pub processkit::Error::NotReady::timeout: core::time::Duration

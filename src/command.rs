@@ -743,12 +743,12 @@ impl Command {
     /// Whether the command customizes the environment in a way that could move
     /// `PATH` away from the process `PATH` — an explicit `PATH` override/removal,
     /// [`env_clear`](Self::env_clear), or [`inherit_env`](Self::inherit_env)
-    /// (which clears the inherited set). When true, the rich
-    /// [`Error::NotFound`](crate::Error::NotFound) enrichment is skipped: it
-    /// names the directories `find_in_path` searched, but `find_in_path` reads
-    /// the *process* `PATH`, so against a custom child `PATH` that list would be
-    /// wrong. The runner lets the plain OS spawn error surface instead (still
-    /// [`is_not_found`](crate::Error::is_not_found) when the program is missing).
+    /// (which clears the inherited set). When true, the `PATH`-directory naming
+    /// in [`Error::NotFound`](crate::Error::NotFound) is skipped: `find_in_path`
+    /// reads the *process* `PATH`, so against a custom child `PATH` that list
+    /// would be wrong. A missing program still surfaces as `Error::NotFound`
+    /// (so [`is_not_found`](crate::Error::is_not_found) holds), just with
+    /// `searched: None` — no directories to name.
     pub(crate) fn customizes_path(&self) -> bool {
         self.env_clear
             || self.inherit_env.is_some()
