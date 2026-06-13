@@ -98,6 +98,36 @@ impl Stdin {
         matches!(self.0, Source::Empty)
     }
 
+    /// A **stable** digest of the stdin *content* for cassette keying (Ф12) —
+    /// the content itself is never persisted (preserving the no-payload posture),
+    /// only this hash, so two otherwise-identical invocations that differ only in
+    /// their stdin no longer collide on replay. FNV-1a (not `DefaultHasher`,
+    /// whose value can change between Rust releases) so a digest recorded today
+    /// matches one computed tomorrow. Byte content is hashed verbatim; a file
+    /// source hashes its *path* (the file is not read at key time); the one-shot
+    /// streaming sources have no fixed content, so they hash a discriminant only
+    /// (they cannot be faithfully recorded/replayed regardless).
+    #[cfg(feature = "record")]
+    pub(crate) fn content_digest(&self) -> u64 {
+        // FNV-1a, 64-bit.
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        fn mix(mut h: u64, bytes: &[u8]) -> u64 {
+            for &b in bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(PRIME);
+            }
+            h
+        }
+        let (tag, payload): (u8, &[u8]) = match &self.0 {
+            Source::Empty => (0, &[]),
+            Source::Bytes(b) => (1, b),
+            Source::File(p) => (2, p.as_os_str().as_encoded_bytes()),
+            Source::Reader(_) | Source::Lines(_) => (3, b"<stream>"),
+        };
+        mix(mix(OFFSET, &[tag]), payload)
+    }
+
     /// The [`Stdio`] to configure on the spawn: `null` for [`Self::empty`] (EOF
     /// at start), `piped` otherwise (we write, then drop to send EOF).
     pub(crate) fn stdio(&self) -> Stdio {

@@ -49,9 +49,16 @@ struct Entry {
     args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
+    /// FNV-1a digest of the stdin content (Ф12) — keyed so two invocations
+    /// differing only in stdin don't collide on replay. `None` for empty/absent
+    /// stdin. A pre-Ф12 cassette recorded *with* stdin loads this as `None` and
+    /// must be re-recorded to match a stdin invocation again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdin_digest: Option<u64>,
+    // --- stored for visibility, not matched on ---
+    /// Whether stdin was supplied (human-readable; matching uses `stdin_digest`).
     #[serde(default, skip_serializing_if = "is_false")]
     has_stdin: bool,
-    // --- stored for visibility, not matched on ---
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     env_names: Vec<String>,
     // --- the captured output ---
@@ -105,7 +112,11 @@ fn write_cassette(path: &Path, json: &str) -> std::io::Result<()> {
 
 impl Entry {
     /// Capture one record-mode call. Lossy UTF-8 throughout — see the type doc.
-    fn from_parts(invocation: &Invocation, result: &ProcessResult<String>) -> Self {
+    fn from_parts(
+        invocation: &Invocation,
+        result: &ProcessResult<String>,
+        stdin_digest: Option<u64>,
+    ) -> Self {
         let mut env_names: Vec<String> = invocation
             .envs
             .iter()
@@ -126,6 +137,7 @@ impl Entry {
                 .cwd
                 .as_ref()
                 .map(|c| c.to_string_lossy().into_owned()),
+            stdin_digest,
             has_stdin: invocation.has_stdin,
             env_names,
             stdout: result.stdout().clone(),
@@ -149,11 +161,22 @@ impl Entry {
 /// same key and collide on replay (the first recorded one answers for both).
 /// Accepted: keying on raw bytes would defeat the human-diffable text fixture,
 /// and valid-UTF-8 invocations (the common case) never collide.
-type Key = (String, Vec<String>, Option<String>, bool);
+type Key = (String, Vec<String>, Option<String>, Option<u64>);
+
+/// The stdin content digest (Ф12) keyed into a cassette match — `None` for an
+/// empty/absent stdin. The content is hashed, never persisted.
+fn stdin_digest_of(command: &Command) -> Option<u64> {
+    command
+        .stdin_source()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.content_digest())
+}
 
 /// The key of a live invocation — must decode exactly like
-/// [`key_of_entry`] (both sides go through the same lossy conversion).
-fn key_of(invocation: &Invocation) -> Key {
+/// [`key_of_entry`] (both sides go through the same lossy conversion). The
+/// `stdin_digest` is computed from the command, not carried on the
+/// [`Invocation`] (which records only *whether* stdin was supplied).
+fn key_of(invocation: &Invocation, stdin_digest: Option<u64>) -> Key {
     (
         invocation.program.to_string_lossy().into_owned(),
         invocation
@@ -165,7 +188,7 @@ fn key_of(invocation: &Invocation) -> Key {
             .cwd
             .as_ref()
             .map(|c| c.to_string_lossy().into_owned()),
-        invocation.has_stdin,
+        stdin_digest,
     )
 }
 
@@ -175,7 +198,7 @@ fn key_of_entry(entry: &Entry) -> Key {
         entry.program.clone(),
         entry.args.clone(),
         entry.cwd.clone(),
-        entry.has_stdin,
+        entry.stdin_digest,
     )
 }
 
@@ -393,8 +416,9 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
             } => {
                 let result = inner.output(command).await?;
                 let invocation = Invocation::from_command(command);
+                let stdin_digest = stdin_digest_of(command);
                 let mut entries = recorded.lock().expect("cassette mutex poisoned");
-                entries.push(Entry::from_parts(&invocation, &result));
+                entries.push(Entry::from_parts(&invocation, &result, stdin_digest));
                 // Under the same lock `save` holds while clearing the flag, so
                 // this entry is either in the file or marked unwritten.
                 dirty.store(true, Ordering::SeqCst);
@@ -402,8 +426,9 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
             }
             Mode::Replay { slots } => {
                 let invocation = Invocation::from_command(command);
+                let stdin_digest = stdin_digest_of(command);
                 let mut slots = slots.lock().expect("cassette mutex poisoned");
-                let Some(slot) = slots.get_mut(&key_of(&invocation)) else {
+                let Some(slot) = slots.get_mut(&key_of(&invocation, stdin_digest)) else {
                     // Ф7: a stale/incomplete cassette is a distinct error, not a
                     // missing-program `Spawn`/`NotFound` (so `is_not_found()` is
                     // false and a wrapper can't mistake it for an absent tool).
@@ -622,6 +647,48 @@ mod tests {
             *seen.lock().unwrap(),
             ["tool 1.2.3"],
             "replay must invoke the command's line handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdin_content_is_part_of_the_match_key() {
+        // Ф12: two invocations identical except for their stdin must record and
+        // replay as *distinct* keys, not collide on `has_stdin` alone. The inner
+        // sequence yields out-A then out-B in record order.
+        let (_dir, path) = temp_cassette();
+        let inner = ScriptedRunner::new()
+            .on_sequence(["tool"], [Reply::ok("out-A\n"), Reply::ok("out-B\n")]);
+        let recorder = RecordReplayRunner::record(&path, inner);
+        recorder
+            .output(&Command::new("tool").stdin(crate::Stdin::from_string("A")))
+            .await
+            .expect("record A");
+        recorder
+            .output(&Command::new("tool").stdin(crate::Stdin::from_string("B")))
+            .await
+            .expect("record B");
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load");
+        // Replay B FIRST: with stdin in the key it gets out-B. Keying on
+        // `has_stdin` alone would collide and return out-A (the first entry).
+        let b = replayer
+            .output(&Command::new("tool").stdin(crate::Stdin::from_string("B")))
+            .await
+            .expect("replay B");
+        assert_eq!(
+            b.stdout(),
+            "out-B\n",
+            "stdin B must replay its own recording"
+        );
+        let a = replayer
+            .output(&Command::new("tool").stdin(crate::Stdin::from_string("A")))
+            .await
+            .expect("replay A");
+        assert_eq!(
+            a.stdout(),
+            "out-A\n",
+            "stdin A must replay its own recording"
         );
     }
 
