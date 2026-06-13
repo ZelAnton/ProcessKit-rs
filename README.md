@@ -614,8 +614,11 @@ Keep stdin open with `keep_stdin_open()`, take the writer with
 ```rust,no_run
 use processkit::{Command, StreamExt};
 
+// `ProcessStdin`'s writer methods return `std::io::Result` (idiomatic for a
+// writer), so this example uses `Box<dyn std::error::Error>` to mix them with the
+// crate's `Result`; in a `processkit::Result` function, `.map_err(processkit::Error::Io)?`.
 #[tokio::main]
-async fn main() -> processkit::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `bc` evaluates each stdin line and prints the result on stdout.
     let mut run = Command::new("bc").keep_stdin_open().start().await?;
 

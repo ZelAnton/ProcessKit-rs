@@ -53,8 +53,6 @@ pub fn processkit::Error::diagnostic(&self) -> core::option::Option<&str>
 pub fn processkit::Error::is_not_found(&self) -> bool
 pub fn processkit::Error::is_permission_denied(&self) -> bool
 pub fn processkit::Error::is_transient(&self) -> bool
-impl core::convert::From<std::io::error::Error> for processkit::Error
-pub fn processkit::Error::from(std::io::error::Error) -> Self
 impl core::error::Error for processkit::Error
 pub fn processkit::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Debug for processkit::Error

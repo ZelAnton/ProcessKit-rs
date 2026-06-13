@@ -196,7 +196,10 @@ while let Some(answer) = answers.next().await {
 ```
 
 `keep_stdin_open()` hands you an async writer instead of closing stdin at
-spawn; interleave writes with reads for request/response tools.
+spawn; interleave writes with reads for request/response tools. Its writer
+methods return `std::io::Result` (idiomatic for a writer) — convert with
+`.map_err(processkit::Error::Io)?` in a `processkit::Result` function, or use
+`Box<dyn std::error::Error>`.
 
 *Fine print: [Streaming & interactive I/O → interactive stdin](streaming.md).*
 

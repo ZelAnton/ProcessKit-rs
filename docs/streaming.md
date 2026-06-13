@@ -102,8 +102,10 @@ open with `keep_stdin_open()`, take the writer with `standard_input()`:
 ```rust,no_run
 use processkit::{Command, Outcome, StreamExt, StreamedFinish};
 
+// `ProcessStdin`'s writer methods return `std::io::Result`; `Box<dyn Error>`
+// mixes them with the crate's `Result` (or `.map_err(processkit::Error::Io)?`).
 #[tokio::main]
-async fn main() -> processkit::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `bc` evaluates each stdin line and prints the result.
     let mut run = Command::new("bc").keep_stdin_open().start().await?;
     let mut stdin = run.standard_input().expect("stdin was kept open");

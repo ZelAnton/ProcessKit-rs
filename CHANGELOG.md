@@ -87,6 +87,15 @@ to a dated version section.
   lock held by pid 4123 ``). `Error::Cancelled` deliberately carries no streams —
   cancellation is a caller-initiated immediate stop; any output captured before the kill
   is intentionally discarded.
+- **Breaking:** the blanket `impl From<std::io::Error> for Error` is removed (D13). An
+  arbitrary `io::Error` no longer converts into `Error::Io` implicitly through `?`, so a
+  caller's unrelated IO error can't silently fall into the crate's taxonomy (where
+  `is_transient` / `is_permission_denied` would classify it). `Error::Io` is now produced
+  only at the crate's own deliberate IO sites (driving a child, controlling a group,
+  cassette files). Code that relied on `?`-converting an `io::Error` into `processkit::Error`
+  should map explicitly (`.map_err(processkit::Error::Io)`) or use `Box<dyn Error>` /
+  `anyhow`. `ProcessStdin`'s writer methods already returned `std::io::Result` and are
+  unchanged.
 
 ### Fixed
 

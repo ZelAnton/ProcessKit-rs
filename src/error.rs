@@ -320,10 +320,21 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    /// An IO error occurred while driving the process (reading a pipe, writing
-    /// stdin, waiting for exit).
+    /// A low-level IO error from the crate's own machinery — driving a child
+    /// (waiting for exit, issuing a kill), controlling a process group
+    /// (signalling, reaping, sampling stats), or reading/writing a cassette
+    /// file. It is **not** a spawn/launch condition (those are
+    /// [`Spawn`](Error::Spawn) / [`NotFound`](Error::NotFound)).
+    ///
+    /// There is **deliberately no blanket `From<std::io::Error>`** (D13): the
+    /// crate never lets an arbitrary foreign `io::Error` fall into this variant
+    /// via `?`. Every `Io` is constructed explicitly at a known site, so the
+    /// io-level classifiers ([`is_transient`](Error::is_transient),
+    /// [`is_permission_denied`](Error::is_permission_denied)) only ever see an
+    /// IO error the crate itself produced — never an unrelated one a caller's
+    /// `?` happened to route through here.
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
 }
 
 impl Error {

@@ -364,7 +364,7 @@ impl<R: ProcessRunner> RecordReplayRunner<R> {
         };
         let json = serde_json::to_string_pretty(&cassette)
             .map_err(|e| Error::Io(std::io::Error::from(e)))?;
-        write_cassette(path, &json)?;
+        write_cassette(path, &json).map_err(Error::Io)?;
         dirty.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -377,7 +377,7 @@ impl RecordReplayRunner<JobRunner> {
     /// Errors are [`Error::Io`]: a missing file keeps its `NotFound` kind; a
     /// corrupt file or an unknown format `version` is `InvalidData`.
     pub fn replay(path: impl AsRef<Path>) -> Result<Self> {
-        let text = std::fs::read_to_string(path)?;
+        let text = std::fs::read_to_string(path).map_err(Error::Io)?;
         // serde_json's From<serde_json::Error> for io::Error keeps the right
         // kind (syntax/data errors become InvalidData).
         let cassette: Cassette =

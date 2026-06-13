@@ -594,10 +594,14 @@ impl RunningProcess {
     /// Drive a process interactively — write requests on stdin, read answers
     /// from stdout:
     ///
+    /// `ProcessStdin`'s writer methods return [`std::io::Result`] (idiomatic for
+    /// a writer); mix them with the crate's `Result` via `Box<dyn Error>` here,
+    /// or `.map_err(processkit::Error::Io)?` in a `processkit::Result` function.
+    ///
     /// ```no_run
     /// use processkit::{Command, StreamExt};
     ///
-    /// # async fn demo() -> processkit::Result<()> {
+    /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
     /// // `bc` evaluates each stdin line and prints the result on stdout.
     /// let mut run = Command::new("bc").keep_stdin_open().start().await?;
     ///
@@ -1346,7 +1350,7 @@ impl RunningProcess {
     async fn backend_wait(&mut self) -> Result<Outcome> {
         let outcome = match &mut self.backend {
             Backend::Real(real) => {
-                let status = real.child.wait().await?;
+                let status = real.child.wait().await.map_err(Error::Io)?;
                 match status.code() {
                     Some(code) => Outcome::Exited(code),
                     None => {
@@ -1590,7 +1594,7 @@ impl RunningProcess {
     pub fn start_kill(&mut self) -> Result<()> {
         match &mut self.backend {
             Backend::Real(real) => {
-                real.child.start_kill()?;
+                real.child.start_kill().map_err(Error::Io)?;
             }
             Backend::Scripted(s) => s.kill(),
         }

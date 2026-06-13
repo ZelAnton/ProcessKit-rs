@@ -163,7 +163,7 @@ impl ProcessGroup {
             })?
         };
         #[cfg(not(feature = "limits"))]
-        let job = Job::new()?;
+        let job = Job::new().map_err(Error::Io)?;
         Ok(Self { job, options })
     }
 
@@ -235,7 +235,7 @@ impl ProcessGroup {
     /// anything to reference.
     #[cfg(feature = "process-control")]
     pub fn adopt(&self, child: &Child) -> Result<()> {
-        self.job.adopt(child)?;
+        self.job.adopt(child).map_err(Error::Io)?;
         #[cfg(feature = "tracing")]
         tracing::trace!(
             target: "processkit",
@@ -261,7 +261,7 @@ impl ProcessGroup {
             mechanism = ?self.mechanism(),
             "terminating every process in the group"
         );
-        self.job.kill_all()?;
+        self.job.kill_all().map_err(Error::Io)?;
         Ok(())
     }
 
@@ -364,7 +364,7 @@ impl ProcessGroup {
     ///   process.
     #[cfg(feature = "process-control")]
     pub fn members(&self) -> Result<Vec<u32>> {
-        let pids = self.job.members()?;
+        let pids = self.job.members().map_err(Error::Io)?;
         Ok(pids)
     }
 
@@ -406,7 +406,8 @@ impl ProcessGroup {
                 self.options.shutdown_timeout,
                 self.options.escalate_to_kill,
             )
-            .await?;
+            .await
+            .map_err(Error::Io)?;
         // `self` drops here; the job's Drop hard-kills any straggler (a no-op
         // after a successful graceful shutdown) and frees the OS handle/cgroup.
         Ok(())
@@ -420,7 +421,8 @@ impl ProcessGroup {
     pub(crate) async fn graceful_terminate(&self, grace: Duration, signal: i32) -> Result<()> {
         self.job
             .graceful_shutdown(signal, grace, /* escalate */ true)
-            .await?;
+            .await
+            .map_err(Error::Io)?;
         Ok(())
     }
 
@@ -429,7 +431,7 @@ impl ProcessGroup {
     /// [`ProcessGroupStats`].
     #[cfg(feature = "stats")]
     pub fn stats(&self) -> Result<ProcessGroupStats> {
-        let stats = self.job.stats()?;
+        let stats = self.job.stats().map_err(Error::Io)?;
         Ok(stats)
     }
 
