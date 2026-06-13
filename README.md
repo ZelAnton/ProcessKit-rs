@@ -708,8 +708,11 @@ async fn main() -> processkit::Result<()> {
 
 Entries are matched by program + args + cwd + stdin **content** (hashed, never
 persisted). Environment override **values never reach the file** — only the
-sorted variable names, so a committed fixture can't leak secrets (and env
-differences can't cause spurious misses). When one invocation was recorded
+sorted variable names, so env values can't leak through a committed fixture (and
+env differences can't cause spurious misses). **Note:** argv, cwd, stdout, and
+stderr *are* stored **verbatim** and can carry secrets (a `--password=…` flag, a
+token echoed to output) — review a fixture before committing it; on Unix the
+file is written `0600`. When one invocation was recorded
 several times, replay serves the entries in capture order and then repeats the
 last one — a recorded sequence of changing outputs replays faithfully, while
 retry/probe loops keep getting a stable final answer. An invocation absent from
