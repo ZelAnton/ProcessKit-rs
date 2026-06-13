@@ -212,7 +212,6 @@ pub enum Error {
     /// whereas a cancellation is **always** raised on every consuming path.
     /// When a run both times out and is cancelled, cancellation wins (it is
     /// checked first).
-    #[cfg(feature = "cancellation")]
     #[error("`{program}` was cancelled")]
     Cancelled {
         /// The program that was cancelled.
@@ -421,7 +420,6 @@ impl fmt::Debug for Error {
                 .debug_struct("Unsupported")
                 .field("operation", operation)
                 .finish(),
-            #[cfg(feature = "cancellation")]
             Error::Cancelled { program } => f
                 .debug_struct("Cancelled")
                 .field("program", program)
@@ -687,7 +685,6 @@ mod tests {
             timeout: Duration::from_secs(10),
         };
         assert_eq!(not_ready.diagnostic(), None);
-        #[cfg(feature = "cancellation")]
         {
             let cancelled = Error::Cancelled {
                 program: "job".into(),
@@ -701,7 +698,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cancellation")]
     #[test]
     fn cancelled_display_names_the_program() {
         let err = Error::Cancelled {

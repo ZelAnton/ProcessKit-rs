@@ -199,7 +199,6 @@ where
                 // A cancelled run is terminal regardless of the classifier: the
                 // token stays cancelled forever, so every retry would just hit
                 // the pre-spawn short-circuit again (mirrors the Supervisor).
-                #[cfg(feature = "cancellation")]
                 if matches!(err, crate::Error::Cancelled { .. }) {
                     return Err(err);
                 }
@@ -313,7 +312,6 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     // A token already cancelled before launch: short-circuit without spawning —
     // cheaper and cleaner than spawn-then-kill. (A cancel landing between this
     // check and the first wait poll is caught by drive_to_exit's cancel branch.)
-    #[cfg(feature = "cancellation")]
     if let Some(token) = command.cancel_token()
         && token.is_cancelled()
     {
@@ -451,7 +449,6 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         buffer: command.output_buffer_policy(),
         ok_codes: command.ok_codes_vec(),
         stdout_piped: command.stdout_is_piped(),
-        #[cfg(feature = "cancellation")]
         cancel_token: command.cancel_token(),
     });
     // Arm the spawn-time cancel watchdog with a pid-only kill. For own-group
@@ -572,10 +569,8 @@ mod tests {
 
     /// A runner whose every attempt fails with `Cancelled` — the token never
     /// un-cancels, so this is exactly what real retries would see.
-    #[cfg(feature = "cancellation")]
     struct AlwaysCancelled(AtomicU32);
 
-    #[cfg(feature = "cancellation")]
     #[async_trait::async_trait]
     impl ProcessRunner for AlwaysCancelled {
         async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
@@ -586,7 +581,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cancellation")]
     #[tokio::test]
     async fn cancelled_is_terminal_even_when_the_classifier_accepts() {
         let runner = AlwaysCancelled(AtomicU32::new(0));

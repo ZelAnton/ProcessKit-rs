@@ -367,7 +367,7 @@ The error enum is structured and `#[non_exhaustive]`:
 | `Error::NotReady { program, timeout }` | A [readiness probe](streaming.md#readiness-probes) gave up |
 | `Error::Parse { program, message }` | A `CliClient::try_parse` parser rejected the output |
 | `Error::Unsupported { operation }` | The platform can't do what was asked (and silently skipping would be wrong) |
-| `Error::Cancelled { program }` | (`cancellation` feature) the run's token was cancelled |
+| `Error::Cancelled { program }` | the run's token was cancelled |
 | `Error::ResourceLimit(reason)` | (`limits` feature) a requested cap couldn't be enforced |
 | `Error::Io(source)` | Everything else from the OS (no exit code, no timeout) |
 

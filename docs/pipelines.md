@@ -163,7 +163,7 @@ let out = Command::new("producer")
   deadline surfaces as that stage's signal-kill `Error::Signalled`, while the
   *last* stage's own deadline (or the chain deadline) is a proper `Error::Timeout`.
 
-With the `cancellation` feature, a `cancel_on` token on **any** stage cancels
+A `cancel_on` token on **any** stage cancels
 that stage; the cancellation errors the whole pipeline and the private group
 tears the other stages down — see
 [Timeouts & cancellation](timeouts-and-cancellation.md).

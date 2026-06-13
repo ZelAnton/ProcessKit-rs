@@ -360,8 +360,8 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// ([`with_runner(&group)`](Self::with_runner)) the incarnation stays
     /// alive in the caller's group until the group tears it down.
     ///
-    /// An incarnation cancelled via its token (`Command::cancel_on`, with the
-    /// `cancellation` feature) is **terminal**: supervision returns that
+    /// An incarnation cancelled via its token ([`Command::cancel_on`](crate::Command::cancel_on))
+    /// is **terminal**: supervision returns that
     /// `Error::Cancelled` immediately, regardless of policy or budget — the
     /// token stays cancelled, so a restart would only be cancelled again.
     pub async fn run(self) -> Result<SupervisionOutcome> {
@@ -424,7 +424,6 @@ impl<R: ProcessRunner> Supervisor<R> {
                     // A cancelled incarnation is terminal: the token stays
                     // cancelled, so restarting would spin a futile loop of
                     // instantly-cancelled runs. Ends supervision like `Never`.
-                    #[cfg(feature = "cancellation")]
                     if matches!(err, crate::Error::Cancelled { .. }) {
                         return Err(err);
                     }
@@ -858,7 +857,6 @@ mod tests {
         assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
     }
 
-    #[cfg(feature = "cancellation")]
     #[tokio::test]
     async fn cancelled_incarnation_is_terminal_under_always() {
         // Always would restart any failure; Cancelled must end supervision at
@@ -1117,7 +1115,6 @@ mod tests {
         assert_eq!(outcome.storm_pauses, 0);
     }
 
-    #[cfg(feature = "cancellation")]
     #[tokio::test(start_paused = true)]
     async fn cancellation_is_terminal_before_any_storm_pause() {
         let start = tokio::time::Instant::now();

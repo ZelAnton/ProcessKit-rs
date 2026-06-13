@@ -93,7 +93,7 @@ The pieces:
   **`.with_stdout(text)`** — attach stdout to any of them (e.g. the
   `CONFLICT …` text git prints on a failing merge).
   **`.with_line_delay(d)`** — pace a scripted stream's lines.
-- **`Reply::pending()`** (`cancellation` feature) — parks the call until the
+- **`Reply::pending()`** — parks the call until the
   command's cancellation token (per-command `cancel_on` or the client-level
   [`default_cancel_on`](timeouts-and-cancellation.md#client-level-default))
   fires, then resolves with `Error::Cancelled` — so a test can prove an

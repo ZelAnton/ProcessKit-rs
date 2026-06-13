@@ -1,5 +1,4 @@
-//! Cancellation: `Command::cancel_on` — `cancellation`-gated via the `mod`
-//! declaration in `main.rs`.
+//! Cancellation: `Command::cancel_on` and token-driven teardown.
 
 use std::time::{Duration, Instant};
 

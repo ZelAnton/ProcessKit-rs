@@ -79,8 +79,8 @@ Things to know:
   immediately-finished stream (the pipe is already being pumped).
 - **The command's `timeout` bounds the stream** on an own-group handle: at the
   deadline the tree is killed, the pipes close, and the stream ends — a
-  streamed run can't hang past its deadline. A `cancel_on` token (with the
-  `cancellation` feature) ends it the same way; the following
+  streamed run can't hang past its deadline. A `cancel_on` token ends it the
+  same way; the following
   `finish_streamed` then reports `Error::Cancelled`. Details in
   [Timeouts & cancellation](timeouts-and-cancellation.md).
 - Line counters tick live: `run.stdout_line_count()` / `stderr_line_count()`

@@ -9,7 +9,7 @@ Three ways a run ends early, with three different philosophies:
   turn it into an error);
 - a **retry** is a *policy* — the success-checking verbs replay the run while
   your classifier says the failure is transient;
-- a **cancellation** (`cancellation` feature) is an *abandonment* — the caller
+- a **cancellation** is an *abandonment* — the caller
   changed its mind, so every path reports an error; there is no result worth
   inspecting.
 
@@ -127,12 +127,6 @@ For "keep it alive" (restart a *service* whenever it exits) rather than
 backoff shape, different loop condition.
 
 ## Cancellation
-
-Off by default — enable the **`cancellation`** feature (pulls `tokio-util`):
-
-```toml
-processkit = { version = "…", features = ["cancellation"] }
-```
 
 Hand any command a `CancellationToken` (re-exported at the crate root);
 cancelling the token kills the run's tree and makes every consuming path

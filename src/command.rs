@@ -78,7 +78,6 @@ pub struct Command {
     /// resolves to `Error::Cancelled`. Cheap to clone (internally `Arc`'d), so
     /// a `Command` clone — including each `Pipeline` stage and each
     /// `Supervisor` incarnation — shares the same cancel state.
-    #[cfg(feature = "cancellation")]
     cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
@@ -125,7 +124,6 @@ impl Command {
             setsid: false,
             kill_on_parent_death: false,
             creation_flags_extra: 0,
-            #[cfg(feature = "cancellation")]
             cancel_token: None,
         }
     }
@@ -475,7 +473,6 @@ impl Command {
     /// [`Supervisor`](crate::Supervisor) restarts both treat
     /// `Error::Cancelled` as terminal — the token stays cancelled forever, so
     /// another attempt could only fail the same way.
-    #[cfg(feature = "cancellation")]
     pub fn cancel_on(mut self, token: tokio_util::sync::CancellationToken) -> Self {
         self.cancel_token = Some(token);
         self
@@ -773,7 +770,6 @@ impl Command {
     }
 
     /// The cancellation token, if any (an `Arc`-cheap clone).
-    #[cfg(feature = "cancellation")]
     pub(crate) fn cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
         self.cancel_token.clone()
     }
@@ -1119,7 +1115,6 @@ impl fmt::Debug for Command {
             .field("setsid", &self.setsid)
             .field("kill_on_parent_death", &self.kill_on_parent_death)
             .field("creation_flags_extra", &self.creation_flags_extra);
-        #[cfg(feature = "cancellation")]
         d.field("has_cancel_token", &self.cancel_token.is_some());
         d.finish()
     }
@@ -1420,7 +1415,6 @@ mod tests {
         assert_eq!(Command::new("x").extra_creation_flags(), 0);
     }
 
-    #[cfg(feature = "cancellation")]
     #[test]
     fn cancel_on_records_the_token() {
         let token = tokio_util::sync::CancellationToken::new();
@@ -1432,7 +1426,6 @@ mod tests {
         assert!(Command::new("x").cancel_token().is_none());
     }
 
-    #[cfg(feature = "cancellation")]
     #[test]
     fn debug_reports_token_presence_not_contents() {
         let with = Command::new("x").cancel_on(tokio_util::sync::CancellationToken::new());

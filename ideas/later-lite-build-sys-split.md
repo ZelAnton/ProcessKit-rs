@@ -30,8 +30,8 @@ the kill-on-drop-the-whole-tree guarantee is unconditional in every configuratio
 - `--no-default-features` drops `stats` (`ProcessGroup::stats`, per-process
   `cpu_time`/`peak_memory_bytes`, and on Windows the ProcessStatus FFI) and
   `process-control` (`Signal` + `signal`/`suspend`/`resume`/`members`/`adopt`).
-- The remaining optional surfaces (`limits`, `mock`, `tracing`, `cancellation`,
-  `record`) are off unless asked for.
+- The remaining optional surfaces (`limits`, `mock`, `tracing`, `record`) are
+  off unless asked for.
 
 So "lite" in the sense of *compile out what you don't use* is shipped today.
 

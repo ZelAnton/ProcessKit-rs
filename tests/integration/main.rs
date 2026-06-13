@@ -18,7 +18,6 @@
 mod common;
 
 mod batch;
-#[cfg(feature = "cancellation")]
 mod cancellation;
 mod capture;
 mod env_privileges;

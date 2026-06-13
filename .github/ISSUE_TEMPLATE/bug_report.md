@@ -24,7 +24,7 @@ A minimal snippet or steps. The smaller, the faster it gets fixed.
 - OS + version: <!-- Windows / Linux (distro + cgroup v1/v2) / macOS / BSD -->
 - Rust version (`rustc --version`):
 - Containment mechanism, if known (from `Mechanism` / `ProcessGroup`): <!-- Job Object / cgroup v2 / process group / none -->
-- Relevant feature flags: <!-- stats, process-control, limits, cancellation, … -->
+- Relevant feature flags: <!-- stats, process-control, limits, record, … -->
 
 **Additional context**
 Logs (the `tracing` feature, if enabled — but **never paste secrets/argv/env**),

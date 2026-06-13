@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # `--all-features` so the cancellation-storm scenario is compiled and run.
+      # `--all-features` so every feature-gated stress scenario is compiled and run.
       # `--test-threads=1` serializes the scenarios: each spawns 50–100 real
       # processes (and a 100k-line flood), so running them in parallel would
       # oversubscribe a 2–4 vCPU hosted runner and blow the per-scenario

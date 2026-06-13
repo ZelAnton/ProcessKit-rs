@@ -369,7 +369,7 @@ success — for keeping a process *alive*, use a `Supervisor` (previous recipe).
 ## Cancel runs on shutdown
 
 ```rust,no_run
-use processkit::CancellationToken; // `cancellation` feature
+use processkit::CancellationToken;
 
 let token = CancellationToken::new();
 

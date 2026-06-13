@@ -34,7 +34,9 @@
 //!   [`wait_for`](RunningProcess::wait_for)) wait until a started child is
 //!   actually *ready* instead of sleeping. A [`Pipeline`]
 //!   ([`Command::pipe`]) chains commands stdout→stdin without a shell — one
-//!   shared group, pipefail outcome. Spawn-time sandboxing knobs:
+//!   shared group, pipefail outcome. [`Command::cancel_on`] ties a run to a
+//!   [`CancellationToken`]: cancelling it kills the tree and every consuming
+//!   path resolves to [`Error::Cancelled`]. Spawn-time sandboxing knobs:
 //!   [`Command::inherit_env`] (env allow-list), [`Command::uid`] /
 //!   [`Command::gid`] (Unix privilege drop), [`Command::setsid`],
 //!   [`Command::create_no_window`].
@@ -139,10 +141,6 @@
 //!   terminate/shutdown, retry attempts, supervisor restarts and storm
 //!   pauses, and teardown anomalies (stdin-writer failures, pump overruns).
 //!   Never logs argv or environment values.
-//! - **`cancellation`** — first-class run cancellation:
-//!   `Command::cancel_on` ties a run to a `CancellationToken`; cancelling it
-//!   kills the tree and every consuming path resolves to `Error::Cancelled`.
-//!   Re-exports `CancellationToken` (from `tokio-util`).
 //! - **`record`** — record/replay cassettes over the [`ProcessRunner`] seam:
 //!   `RecordReplayRunner` records real `Invocation → ProcessResult` pairs to a
 //!   JSON fixture once, then replays them hermetically — no subprocess in CI.
@@ -392,10 +390,8 @@ pub async fn wait_all(processes: &mut [&mut RunningProcess]) -> Result<Vec<Outco
 #[cfg(feature = "mock")]
 pub use runner::MockProcessRunner as MockRunner;
 
-/// Re-exported (under the `cancellation` feature) so callers can
-/// `use processkit::CancellationToken;` without a direct `tokio-util`
-/// dependency. See [`Command::cancel_on`].
-#[cfg(feature = "cancellation")]
+/// Re-exported so callers can `use processkit::CancellationToken;` without a
+/// direct `tokio-util` dependency. See [`Command::cancel_on`].
 pub use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
@@ -418,7 +414,6 @@ mod tests {
     // wait_any returned — with the token now cancelled — would re-run
     // drive_to_exit_inner whose biased cancel arm fires (token already cancelled),
     // converting a natural exit to Err(Cancelled).
-    #[cfg(feature = "cancellation")]
     #[tokio::test]
     async fn wait_any_winner_natural_exit_preserved_after_late_cancel() {
         use crate::doubles::{Reply, ScriptedRunner};
@@ -455,7 +450,6 @@ mod tests {
     // drive_to_exit path); this covers wait_exit -> wait_exit, the documented
     // "race them, keep watching the rest" pattern, where wait_exit re-snapshotted
     // cancel_at_exit unconditionally and flipped a natural exit to Err(Cancelled).
-    #[cfg(feature = "cancellation")]
     #[tokio::test]
     async fn wait_any_winner_preserved_after_late_cancel_and_second_wait_any() {
         use crate::doubles::{Reply, ScriptedRunner};
@@ -490,7 +484,6 @@ mod tests {
     // Б2 regression for wait_all: a late cancel followed by a re-join must not
     // make the whole batch error out (wait_all short-circuits on the first Err,
     // so a spurious Cancelled would discard every other contender's outcome too).
-    #[cfg(feature = "cancellation")]
     #[tokio::test]
     async fn wait_all_winners_preserved_after_late_cancel_and_re_wait() {
         use crate::doubles::{Reply, ScriptedRunner};
@@ -610,7 +603,6 @@ mod tests {
     // Regression: wait_exit now calls checked_outcome, so a run whose
     // cancel token was fired before exit snapshots cancel_at_exit=Some(true)
     // and wait_any correctly raises Err(Cancelled) instead of Ok(Signalled(None)).
-    #[cfg(feature = "cancellation")]
     #[tokio::test]
     async fn wait_any_cancelled_run_surfaces_as_err_cancelled() {
         use crate::doubles::{Reply, ScriptedRunner};
@@ -642,7 +634,6 @@ mod tests {
     // A second wait_any after a genuinely cancelled run must STILL be
     // Err(Cancelled) (the guard preserves Some(true) exactly as it preserves
     // Some(false)) — the fix must not make cancellation non-sticky on re-wait.
-    #[cfg(feature = "cancellation")]
     #[tokio::test]
     async fn wait_any_genuine_cancel_stays_cancelled_on_re_wait() {
         use crate::doubles::{Reply, ScriptedRunner};

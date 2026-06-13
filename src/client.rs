@@ -35,7 +35,6 @@ pub struct CliClient<R: ProcessRunner = JobRunner> {
     envs: Vec<(OsString, Option<OsString>)>,
     /// A cancellation token applied to every built command (see
     /// [`default_cancel_on`](Self::default_cancel_on)).
-    #[cfg(feature = "cancellation")]
     cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
@@ -48,7 +47,6 @@ impl<R: ProcessRunner> std::fmt::Debug for CliClient<R> {
         d.field("program", &self.program)
             .field("timeout", &self.timeout)
             .field("env_names", &crate::command::redacted_env_names(&self.envs));
-        #[cfg(feature = "cancellation")]
         d.field("has_default_cancel", &self.cancel.is_some());
         d.finish_non_exhaustive()
     }
@@ -62,7 +60,6 @@ impl CliClient<JobRunner> {
             runner: JobRunner,
             timeout: None,
             envs: Vec::new(),
-            #[cfg(feature = "cancellation")]
             cancel: None,
         }
     }
@@ -76,7 +73,6 @@ impl<R: ProcessRunner> CliClient<R> {
             runner,
             timeout: None,
             envs: Vec::new(),
-            #[cfg(feature = "cancellation")]
             cancel: None,
         }
     }
@@ -125,7 +121,6 @@ impl<R: ProcessRunner> CliClient<R> {
     ///
     /// Scope cancellation by client, not by call: clients are cheap — build
     /// one per cancellable scope and hand each its own token.
-    #[cfg(feature = "cancellation")]
     #[must_use]
     pub fn default_cancel_on(mut self, token: tokio_util::sync::CancellationToken) -> Self {
         self.cancel = Some(token);
@@ -178,7 +173,6 @@ impl<R: ProcessRunner> CliClient<R> {
         }
         // Applied at build time, so a later per-command `cancel_on` chained on
         // the returned command replaces it — the documented override precedence.
-        #[cfg(feature = "cancellation")]
         if let Some(token) = &self.cancel {
             command = command.cancel_on(token.clone());
         }
@@ -318,20 +312,6 @@ macro_rules! cli_client {
             }
         }
 
-        $crate::__cli_client_cancellation!($name);
-    };
-}
-
-/// Internal helper for [`cli_client!`]: emits the `default_cancel_on` builder
-/// when **processkit** was built with the `cancellation` feature. A plain
-/// `#[cfg]` inside the macro body would be evaluated against the *downstream*
-/// crate's features (which may not even declare `cancellation`), so the gate
-/// must live here, on which definition processkit exports.
-#[cfg(feature = "cancellation")]
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __cli_client_cancellation {
-    ($name:ident) => {
         impl<R: $crate::ProcessRunner> $name<R> {
             /// Cancel every command this client builds when `token` fires (a
             /// per-command `cancel_on` replaces the default — see
@@ -342,15 +322,6 @@ macro_rules! __cli_client_cancellation {
             }
         }
     };
-}
-
-/// Counterpart of the gated definition above: without the `cancellation`
-/// feature the helper expands to nothing.
-#[cfg(not(feature = "cancellation"))]
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __cli_client_cancellation {
-    ($name:ident) => {};
 }
 
 #[cfg(test)]
@@ -565,7 +536,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cancellation")]
     #[tokio::test]
     async fn default_cancel_on_is_applied_to_every_command() {
         let token = crate::CancellationToken::new();
@@ -582,7 +552,6 @@ mod tests {
         assert!(format!("{client:?}").contains("has_default_cancel: true"));
     }
 
-    #[cfg(feature = "cancellation")]
     #[tokio::test(start_paused = true)]
     async fn per_command_cancel_on_overrides_the_default() {
         use crate::CancellationToken;
@@ -614,7 +583,6 @@ mod tests {
         assert!(matches!(err, Error::Cancelled { .. }), "got {err:?}");
     }
 
-    #[cfg(feature = "cancellation")]
     #[tokio::test(start_paused = true)]
     async fn acceptance_pending_reply_with_client_default_cancel() {
         use crate::CancellationToken;
@@ -647,7 +615,6 @@ mod tests {
         assert_eq!(rec.only_call().args_str(), ["run", "watch", "123"]);
     }
 
-    #[cfg(feature = "cancellation")]
     #[test]
     fn macro_emits_default_cancel_on() {
         let _client = Demo::with_runner(ScriptedRunner::new())

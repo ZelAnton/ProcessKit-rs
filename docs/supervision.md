@@ -187,8 +187,8 @@ A run that produces no result at all (spawn/IO failure) can't be judged by
 unless the policy is `Never` or the budget is exhausted — then the error
 itself surfaces as `run()`'s `Err`.
 
-With the [`cancellation` feature](timeouts-and-cancellation.md#cancellation),
-a cancelled incarnation is **terminal**: `run()` returns
+A [cancelled](timeouts-and-cancellation.md#cancellation) incarnation is
+**terminal**: `run()` returns
 `Err(Error::Cancelled)` immediately. The token never un-cancels, so a restart
 could only produce another instantly-cancelled run — the supervisor refuses
 the futile loop.

@@ -21,8 +21,8 @@ informational mode around 1.0, enforcing after.
 *Cost: trivial · Value: now*
 
 CI tests three *fixed* feature configs (`--no-default-features`, default,
-`--all-features`). With 7 features, combinations like `limits` without `stats`, or
-`cancellation` + `record` alone, can break compilation undetected. `cargo hack
+`--all-features`). With 6 features, combinations like `limits` without `stats`, or
+`record` alone, can break compilation undetected. `cargo hack
 --feature-powerset --depth 2` catches feature-gate mistakes the fixed configs miss.
 **Added as the `hack` CI job** — all 34 ≤2-feature combinations check clean today.
 

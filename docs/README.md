@@ -40,7 +40,7 @@ every per-OS caveat in one place.
 | [Process groups](process-groups.md) | Kill-on-drop containment: creating groups, spawning/adopting, teardown verbs, whole-tree signals, suspend/resume, member listing, resource limits, stats sampling |
 | [Streaming & interactive I/O](streaming.md) | `start()` and the live `RunningProcess`: line streaming, interactive stdin, readiness probes (`wait_for_line` / `wait_for_port` / `wait_for`), racing children with `wait_any`, per-run profiling |
 | [Pipelines](pipelines.md) | `a \| b \| c` without a shell (the `\|` operator works too): wiring, pipefail attribution, `unchecked()` stages for the `\| head` pattern, timeouts, stdin/stdout at the ends, re-running chains |
-| [Timeouts, retries & cancellation](timeouts-and-cancellation.md) | How a deadline is *captured* vs when it errors, retry policies and their classifier, and the `cancellation` feature: per-command tokens and the client-level `default_cancel_on` |
+| [Timeouts, retries & cancellation](timeouts-and-cancellation.md) | How a deadline is *captured* vs when it errors, retry policies and their classifier, and cancellation: per-command tokens and the client-level `default_cancel_on` |
 | [Supervision](supervision.md) | Keeping a child alive: restart policies, backoff & jitter math, the failure-storm guard, stop conditions, outcomes, supervising inside a shared group |
 | [Testing your code](testing.md) | The `ProcessRunner` seam — bulk **and** streaming: `ScriptedRunner` (incl. scripted `start()` with canned, paced lines), `RecordingRunner`, `MockRunner`, record/replay cassettes, and building hermetically-testable CLI wrappers with `CliClient` |
 | [Platform support](platform-support.md) | The containment mechanisms, every per-feature support matrix in one place, and the platform caveats worth knowing before you ship |
@@ -57,12 +57,11 @@ guarantee is unconditional in every configuration.
 | `limits` | off | Whole-tree resource caps on `ProcessGroupOptions` (`memory_max` / `max_processes` / `cpu_quota`), `Error::ResourceLimit`; implies `stats` | — |
 | `mock` | off | A `mockall`-generated `MockRunner` for expectation-style tests | `mockall` |
 | `tracing` | off | Events on the `processkit` target: spawn/exit, timeout & cancel firing, group teardown, retries, supervisor storms, teardown anomalies (never argv/env) | `tracing` |
-| `cancellation` | off | `Command::cancel_on`, `Error::Cancelled`, re-exported `CancellationToken` | `tokio-util` |
 | `record` | off | `RecordReplayRunner` JSON cassettes over the runner seam | `serde`, `serde_json` |
 
 ```toml
 [dependencies]
-processkit = { version = "…", features = ["limits", "cancellation"] }
+processkit = { version = "…", features = ["limits"] }
 ```
 
 ## The 60-second tour

@@ -23,7 +23,7 @@
 //! Instant replies never observe a `cancel_on` token (they resolve before any
 //! cancellation could race them). To exercise cancellation **behaviour** — a
 //! call that genuinely blocks until its token fires — script
-//! [`Reply::pending`] (`cancellation` feature): it parks the call (or never
+//! [`Reply::pending`]: it parks the call (or never
 //! "exits", on `start`) until the command's token — per-command or
 //! [`CliClient::default_cancel_on`](crate::CliClient::default_cancel_on) —
 //! cancels, then resolves with `Err(Error::Cancelled { .. })`, mirroring the
@@ -135,7 +135,6 @@ impl Reply {
     /// A pending reply for a command **without** a token parks forever, like a
     /// hung child nobody can cancel — deliberate; pair it with a token (or a
     /// test timeout) by design.
-    #[cfg(feature = "cancellation")]
     pub fn pending() -> Self {
         Self {
             stdout: String::new(),
@@ -509,7 +508,6 @@ impl ProcessRunner for ScriptedRunner {
         let program = command.program().to_string_lossy().into_owned();
         // Ф4: a token already cancelled short-circuits with `Cancelled`, exactly
         // as the live runner does pre-spawn — not a canned reply.
-        #[cfg(feature = "cancellation")]
         if let Some(token) = command.cancel_token()
             && token.is_cancelled()
         {
@@ -551,7 +549,6 @@ impl ProcessRunner for ScriptedRunner {
         // as the live runner does pre-spawn — `output` AND `start` both route
         // through `launch`'s pre-spawn check. Without it, `first_line` (which
         // routes through `start`) would stream canned lines instead of cancelling.
-        #[cfg(feature = "cancellation")]
         if let Some(token) = command.cancel_token()
             && token.is_cancelled()
         {
@@ -564,16 +561,12 @@ impl ProcessRunner for ScriptedRunner {
 
 /// Drive a [`Reply::pending`] match: wait for the command's cancellation token
 /// and resolve as the live runner would — `Err(Error::Cancelled)`. With no
-/// token (or without the `cancellation` feature, where `pending` replies can't
-/// even be constructed) the call parks forever, like a hung child.
+/// token the call parks forever, like a hung child.
 async fn park_until_cancelled(command: &Command, program: String) -> Result<ProcessResult<String>> {
-    #[cfg(feature = "cancellation")]
     if let Some(token) = command.cancel_token() {
         token.cancelled().await;
         return Err(crate::error::Error::Cancelled { program });
     }
-    #[cfg(not(feature = "cancellation"))]
-    let _ = (command, program);
     std::future::pending().await
 }
 
@@ -967,8 +960,6 @@ mod tests {
     /// wakes it; if that wake regressed, the bulk deadline arm in
     /// `drive_to_exit_inner` still backstops the classification (so this asserts
     /// "doesn't hang + reports TimedOut", not which of the two paths resolved it).
-    /// (`Reply::pending` is `cancellation`-gated.)
-    #[cfg(feature = "cancellation")]
     #[tokio::test(start_paused = true)]
     async fn scripted_pending_stream_finishes_at_the_deadline() {
         use tokio_stream::StreamExt;
@@ -1066,7 +1057,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cancellation")]
     #[tokio::test]
     async fn output_with_an_already_cancelled_token_short_circuits() {
         // Ф4: a token cancelled before the call returns `Cancelled`, exactly as
@@ -1085,7 +1075,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cancellation")]
     #[tokio::test]
     async fn start_with_an_already_cancelled_token_short_circuits() {
         // Ф4: `start` (the path `first_line` routes through) must short-circuit
@@ -1163,7 +1152,6 @@ mod tests {
         assert_eq!(rec.only_call().args_str(), ["run", "watch"]);
     }
 
-    #[cfg(feature = "cancellation")]
     #[tokio::test(start_paused = true)]
     async fn scripted_pending_start_is_cancellable() {
         let token = crate::CancellationToken::new();
@@ -1207,7 +1195,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cancellation")]
     #[tokio::test(start_paused = true)]
     async fn wait_any_on_a_pending_scripted_handle_is_cancellable() {
         // Ф1: a never-exiting (pending) scripted handle raced in `wait_any` must
@@ -1414,7 +1401,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "cancellation")]
     #[tokio::test(start_paused = true)]
     async fn pending_parks_until_the_token_fires_then_cancels() {
         use crate::error::Error;
@@ -1439,7 +1425,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cancellation")]
     #[tokio::test(start_paused = true)]
     async fn pending_without_a_token_parks_forever() {
         // Documented: a pending reply for a command with no token behaves like

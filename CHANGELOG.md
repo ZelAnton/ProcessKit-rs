@@ -51,6 +51,14 @@ to a dated version section.
   key). Existing argument-only rules must prepend the program name.
 - **Breaking:** a cassette replay that finds no matching recording now returns
   `Error::CassetteMiss` instead of `Error::Spawn` with a not-found source.
+- **Breaking:** run cancellation is now a **core feature, not opt-in** — the `cancellation`
+  Cargo feature is removed. `Command::cancel_on`, `CliClient::default_cancel_on`,
+  `Error::Cancelled`, `Reply::pending`, and the re-exported `CancellationToken` are always
+  available, and `tokio-util` is now an unconditional dependency. Remove `"cancellation"`
+  from your `features` list (a build that named it will fail with "unknown feature"); no code
+  change is otherwise needed. Cancellation is core semantics, not an option — the feature gate
+  bought little (`tokio-util`'s `sync` module is tiny and usually already in the graph) at the
+  cost of the crate's largest `#[cfg]` surface.
 - **Breaking:** `processkit` now supports **only Unix and Windows targets**. A bare target
   (e.g. `wasm32-unknown-unknown`) no longer compiles a containment-less fallback that
   couldn't honor kill-on-close or a graceful timeout — it now fails at compile time, via a

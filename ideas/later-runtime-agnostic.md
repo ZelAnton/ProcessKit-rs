@@ -113,9 +113,8 @@ decision under any agnostic scheme:
 
 - `Command::to_tokio_command() -> tokio::process::Command` (`src/command.rs:624`) —
   an explicit escape hatch that names the runtime in its return type.
-- `pub use tokio_util::sync::CancellationToken;` (`src/lib.rs:373`, behind the
-  `cancellation` feature) — re-exports a tokio-util type as the crate's
-  cancellation currency.
+- `pub use tokio_util::sync::CancellationToken;` (in `src/lib.rs`) — re-exports a
+  tokio-util type as the crate's cancellation currency.
 - `Stdin::from_reader<R: AsyncRead>` (`src/stdin.rs:76`) — a public generic bound
   on `tokio::io::AsyncRead`.
 

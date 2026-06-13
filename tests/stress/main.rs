@@ -214,7 +214,6 @@ async fn concurrent_kill_reaps_every_handle() {
 
 /// 6. A cancellation storm: fire many tokens at once and assert every in-flight
 ///    run resolves to `Error::Cancelled` (and its tree is torn down).
-#[cfg(feature = "cancellation")]
 #[tokio::test]
 async fn cancellation_storm_resolves_every_call() {
     use processkit::{CancellationToken, Error};

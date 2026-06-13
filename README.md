@@ -163,7 +163,6 @@ guarantee is unconditional in every configuration.
 | `stats` | ✅ | group/per-run resource measurement, `sample_stats`, `profile` |
 | `process-control` | ✅ | `Signal`, `ProcessGroup::{signal, suspend, resume, members, adopt}` |
 | `limits` | — | whole-tree resource caps (implies `stats`) |
-| `cancellation` | — | `CancellationToken` integration (pulls `tokio-util`) |
 | `record` | — | record/replay cassettes (pulls `serde`) |
 | `mock` | — | `mockall`-generated `MockRunner` |
 | `tracing` | — | lifecycle events: spawn/exit, timeout/cancel, teardown, retries, storms (never argv/env) |
@@ -521,7 +520,7 @@ macOS/BSD have no equivalent (documented no-op).
 
 ## Cancelling a run
 
-Requires the **`cancellation`** feature (off by default). Hand a command a
+Hand a command a
 [`CancellationToken`] (re-exported from `tokio-util`); cancelling the token
 kills the process tree, and every consuming path reports `Error::Cancelled`:
 
@@ -601,7 +600,7 @@ async fn main() -> processkit::Result<()> {
 
 > The command's [`timeout`] **bounds the stream**: at the deadline the tree is
 > killed, the pipes close, and the stream ends (on a handle that owns its group —
-> the `start()` path). A `cancel_on` token (with the `cancellation` feature) ends
+> the `start()` path). A `cancel_on` token ends
 > the stream the same way, and the following `finish_streamed` reports
 > `Error::Cancelled`. For an ad-hoc bound, wrapping the loop in
 > [`tokio::time::timeout`] and dropping the handle (which kills the tree) still
