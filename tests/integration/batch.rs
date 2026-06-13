@@ -55,12 +55,14 @@ async fn kill_on_drop_provenance_distinguishes_private_and_shared_groups() {
 
 #[tokio::test]
 #[ignore = "spawns a stdin-reading subprocess joined via wait_all"]
-async fn wait_all_closes_an_untaken_keep_stdin_open_pipe() {
-    // L5: a `keep_stdin_open` child whose stdin pipe was never taken must see
-    // EOF when joined via `wait_all` (which goes through `wait_exit` and applies
-    // no timeout) — otherwise a stdin-reading child (`cat`/`sort`) blocks
-    // forever and hangs the join. The race path must close the untaken pipe just
-    // as the bulk verbs do.
+async fn wait_all_does_not_close_an_untaken_keep_stdin_open_pipe() {
+    // B15: the borrowing wait path (`wait_exit`) must NOT close an untaken
+    // `keep_stdin_open` pipe — that would break the "losers remain usable"
+    // guarantee. The cost (symmetric with the documented "no output pumping"
+    // non-feature) is that a `keep_stdin_open` child blocked reading stdin never
+    // reaches EOF, so it never exits and `wait_all` must be externally bounded.
+    // Here the child wedges, the bounding timeout elapses, and — crucially — its
+    // stdin pipe is still available (it was not mutated by the join).
     let group = ProcessGroup::new().expect("create group");
     let reads_stdin = if cfg!(windows) {
         Command::new("cmd").args(["/c", "sort"]).keep_stdin_open()
@@ -68,16 +70,20 @@ async fn wait_all_closes_an_untaken_keep_stdin_open_pipe() {
         Command::new("cat").keep_stdin_open()
     };
     let mut child = group.start(&reads_stdin).await.expect("start");
-    let outcomes = tokio::time::timeout(Duration::from_secs(15), wait_all(&mut [&mut child]))
-        .await
-        .expect("wait_all must not hang on an untaken keep_stdin_open pipe")
-        .expect("wait_all ok");
-    assert_eq!(outcomes.len(), 1);
+    let joined = tokio::time::timeout(Duration::from_secs(2), wait_all(&mut [&mut child])).await;
     assert!(
-        matches!(outcomes[0], Outcome::Exited(_)),
-        "the stdin-reading child must see EOF and exit, got: {:?}",
-        outcomes[0]
+        joined.is_err(),
+        "B15: wait_all must NOT auto-close the untaken keep_stdin_open pipe; the \
+         stdin-blocked child wedges until externally bounded, got {joined:?}"
     );
+    // The pipe is still the caller's to use — the loser was not mutated.
+    assert!(
+        child.standard_input().is_some(),
+        "B15: the untaken keep_stdin_open pipe must remain available after the join"
+    );
+    // Clean up the wedged child.
+    child.start_kill().expect("kill the wedged child");
+    let _ = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
 }
 
 #[tokio::test]

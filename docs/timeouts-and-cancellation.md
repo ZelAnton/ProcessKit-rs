@@ -117,8 +117,9 @@ Ground rules:
 - The classifier sees the typed error — match on variants, codes, even the
   captured stderr.
 - Each attempt re-runs the *same* `Command`: a one-shot stdin source
-  ([table](commands.md#standard-input)) is already consumed, so attempt #2
-  feeds empty stdin. Use reusable sources for retried commands.
+  ([table](commands.md#standard-input)) is consumed by attempt #1, so attempt #2
+  **fails loud** with an `Error::Io` (`InvalidInput`) at launch (D10) rather than
+  silently feeding empty stdin. Use reusable sources for retried commands.
 - A `Cancelled` error is **never retried**, classifier or not — the token
   stays cancelled forever, so another attempt could only fail the same way.
 

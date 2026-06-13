@@ -154,8 +154,8 @@ let from_chan = Stdin::from_lines(tokio_stream::iter(vec!["one".to_owned()]));
 ```
 
 One-shot sources (`from_reader`/`from_lines`) feed a single run; re-running the
-same `Command` afterwards sees empty stdin. For a conversation, see the next
-recipe but one.
+same `Command` afterwards **fails loud** (an `Error::Io` at launch, D10) instead
+of silently seeing empty stdin. For a conversation, see the next recipe but one.
 
 *Fine print: [Running commands → standard input](commands.md).*
 

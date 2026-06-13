@@ -96,9 +96,30 @@ to a dated version section.
   should map explicitly (`.map_err(processkit::Error::Io)`) or use `Box<dyn Error>` /
   `anyhow`. `ProcessStdin`'s writer methods already returned `std::io::Result` and are
   unchanged.
+- **Breaking (behavior):** the checking verbs that hand back stdout — `run`, `parse`,
+  `try_parse` (on `Command`, `ProcessRunnerExt`, and `CliClient`) — now **fail loud** with
+  `Error::OutputTooLarge` when a bounded `OutputBufferPolicy` silently dropped captured
+  lines (B12), instead of returning a truncated tail as if complete (a parser would have
+  parsed half a document). The lenient capture verbs (`output_string`/`output_bytes`) are
+  unchanged — they still return the result with `truncated()` set for the caller to inspect.
+  Only triggers under a non-default bounded *drop* policy.
+- **Breaking (behavior):** re-running or retrying a command whose stdin is a **one-shot**
+  streaming source (`Stdin::from_reader`/`from_lines`) now fails loud at launch with an
+  `Error::Io` (`InvalidInput`) once the source has been consumed (D10), instead of silently
+  feeding the re-run empty stdin. Use a re-runnable source
+  (`from_bytes`/`from_string`/`from_file`/`from_iter_lines`) to retry or re-run.
 
 ### Fixed
 
+- A `wait_any` / `wait_all` **loser** with `keep_stdin_open` now keeps its stdin usable
+  (B15): the race no longer closes an untaken stdin pipe out from under the caller (which
+  left `standard_input()` returning `None` and the child wedged on a premature EOF),
+  honoring the documented "losers remain fully usable" guarantee. A `keep_stdin_open` child
+  blocked reading stdin is the caller's responsibility, like the existing "no output
+  pumping" non-feature — take its writer (or don't keep stdin open) before racing it.
+- `output_all`'s cancel-on-drop documentation is corrected (B16): dropping the batch future
+  tears down in-flight children only with an **own-group** runner (`JobRunner`); with a
+  shared `&ProcessGroup` runner the children live until the caller tears the group down.
 - **Non-ASCII-compatible encodings no longer corrupt output.** Bytes are fed through one
   persistent decoder and the *decoded* text is split on newlines, so UTF-16LE/BE (whose
   code units contain `0x0A` bytes that are not line breaks) and stateful encodings decode

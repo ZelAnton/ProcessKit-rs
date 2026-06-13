@@ -172,8 +172,9 @@ tears the other stages down — see
 
 A `Pipeline` is `Clone` and re-runnable — stages are re-cloned per run. The
 one caveat is inherited from `Command`: a **one-shot** stdin source on the
-first stage (`Stdin::from_reader` / `from_lines`) is consumed by the first run
-and feeds empty stdin afterwards. Use the reusable sources
+first stage (`Stdin::from_reader` / `from_lines`) is consumed by the first run;
+re-running then **fails loud** (an `Error::Io` at launch, D10) rather than
+silently feeding empty stdin. Use the reusable sources
 (`from_string` / `from_bytes` / `from_iter_lines` / `from_file`) when a chain
 runs more than once.
 

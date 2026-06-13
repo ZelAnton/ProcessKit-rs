@@ -106,8 +106,10 @@ assert_eq!(sorted, "apple\nbanana\ncherry");
 The payload is written on a background task (so a large input can't deadlock
 against the child's output) and the pipe is dropped afterwards to signal EOF.
 The two *one-shot* sources are consumed by their first run: a retried or
-cloned command reusing them feeds an **empty** stdin the second time — prefer
-the reusable sources when a command may run more than once.
+cloned command reusing them **fails loud** the second time — re-running a
+consumed `from_reader`/`from_lines` source is an `Error::Io` (`InvalidInput`)
+at launch (D10), not a silent empty stdin. Prefer the reusable sources when
+a command may run more than once.
 
 For conversational, request/response stdin — write a line, read the answer,
 repeat — use `keep_stdin_open()` and the streaming API instead: see
@@ -175,6 +177,13 @@ let strict = OutputBufferPolicy::fail_loud(10_000).with_max_bytes(8 << 20); // e
 `Error::OutputTooLarge` once the cumulative output (lines *or* bytes) crosses the
 cap — even when a streaming consumer is draining lines as they arrive. It bounds
 memory, not wall-time, so pair it with `timeout` against a flooding child.
+
+Even under a *drop* policy (`DropOldest`/`DropNewest`), the checking verbs that
+hand back stdout as if complete — `run`, `parse`, `try_parse` — **refuse**
+silently-truncated output (B12): if the policy dropped lines they fail with
+`Error::OutputTooLarge` rather than feed a parser a truncated tail. The lenient
+capture verbs (`output_string` / `output_bytes`) are unaffected — they return
+the partial result with `truncated()` set for you to inspect.
 
 ### Line handlers — tee output as it arrives
 

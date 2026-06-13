@@ -687,6 +687,12 @@ impl RunningProcess {
         // dropped. `dropped()` counts only policy discards, staying `0` here.
         let truncated = self.stdout_sink.as_ref().is_some_and(|s| s.dropped() > 0)
             || self.stderr_sink.as_ref().is_some_and(|s| s.dropped() > 0);
+        // B12: carry the total lines/bytes seen (retained + dropped) so a
+        // checking verb can report a faithful `OutputTooLarge` on truncation.
+        let total_lines = self.stdout_sink.as_ref().map_or(0, |s| s.count())
+            + self.stderr_sink.as_ref().map_or(0, |s| s.count());
+        let total_bytes = self.stdout_sink.as_ref().map_or(0, |s| s.seen_bytes())
+            + self.stderr_sink.as_ref().map_or(0, |s| s.seen_bytes());
         let duration = self.started.elapsed();
         Ok(ProcessResult::new(
             self.program.clone(),
@@ -697,6 +703,7 @@ impl RunningProcess {
         )
         .with_duration(duration)
         .with_truncated(truncated)
+        .with_overflow_totals(total_lines, total_bytes)
         .with_ok_codes(self.ok_codes.clone()))
     }
 
@@ -865,15 +872,16 @@ impl RunningProcess {
     /// cancel snapshot is preserved (B2) and the one-shot stdin error has already
     /// been consumed, so the cached [`Outcome`] is returned unchanged.
     pub(crate) async fn wait_exit(&mut self) -> Result<Outcome> {
-        // L5: close a `keep_stdin_open` pipe nobody took, so a stdin-reading
-        // child sees EOF instead of blocking forever — `wait_exit` (the
-        // `wait_any`/`wait_all` path) applies no timeout, so a held-open stdin
-        // would hang the race. A writer the caller took via `standard_input()`
-        // moved the pipe out of `self`, making this a no-op. Mirrors
-        // `drive_to_exit`'s close.
-        if let Backend::Real(real) = &mut self.backend {
-            drop(real.stdin_pipe.take());
-        }
+        // B15: `wait_exit` must NOT close an untaken `keep_stdin_open` pipe.
+        // `wait_any`/`wait_all` only *borrow* each contender and promise the
+        // losers "remain fully usable" — closing their stdin here would give a
+        // loser a premature EOF and leave `standard_input()` returning `None`
+        // afterward. Like the documented "no output pumping" non-feature, a
+        // `keep_stdin_open` child blocked on stdin is the caller's
+        // responsibility: take its writer (or don't keep stdin open) before
+        // racing it, otherwise it never reaches EOF and never exits. The
+        // consuming `drive_to_exit` (`wait()`) *does* close the pipe — it
+        // consumes the handle, so there is no loser to keep usable.
         // B2: preserve a cancel snapshot taken by an earlier reap observation
         // (a prior `wait_exit` / `has_exited_now` / `drive_to_exit`). Re-running
         // the reap bookkeeping would re-query the live token, and a token

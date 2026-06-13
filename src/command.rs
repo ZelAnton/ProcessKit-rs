@@ -498,8 +498,11 @@ impl Command {
     ///
     /// Because the command is replayed from scratch, a **one-shot** stdin source
     /// ([`Stdin::from_reader`](crate::Stdin::from_reader) /
-    /// [`from_lines`](crate::Stdin::from_lines)) won't survive a retry — the second
-    /// attempt sees empty stdin. Use a reusable source
+    /// [`from_lines`](crate::Stdin::from_lines)) won't survive a retry: its
+    /// payload is consumed by the first attempt. Rather than silently feed the
+    /// retry empty stdin, the second attempt **fails loud** with an
+    /// [`Error::Io`](crate::Error::Io) (`InvalidInput`) naming the consumed
+    /// source (D10). Use a reusable source
     /// (`from_string`/`from_bytes`/`from_file`/`from_iter_lines`) when retrying.
     ///
     /// [`Error::Timeout`]: crate::Error::Timeout

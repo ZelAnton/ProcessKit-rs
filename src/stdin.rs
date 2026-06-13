@@ -21,8 +21,12 @@ type SharedLines = Arc<AsyncMutex<Option<Pin<Box<dyn Stream<Item = String> + Sen
 /// When a command has no `Stdin` (or
 /// [`Stdin::empty`]), stdin is closed at start so the child reads EOF
 /// immediately. The streaming sources ([`from_reader`](Self::from_reader),
-/// [`from_lines`](Self::from_lines)) are one-shot: a cloned
-/// [`Command`](crate::Command) reusing them sees an empty stdin on the second run.
+/// [`from_lines`](Self::from_lines)) are one-shot — their payload is consumed by
+/// the first run. Re-running or retrying a [`Command`](crate::Command) that
+/// reuses a consumed one-shot source **fails loud** (an
+/// [`Error::Io`](crate::Error::Io) at launch, D10) rather than silently feeding
+/// the next run empty stdin; use a reusable source
+/// (`from_string`/`from_bytes`/`from_file`/`from_iter_lines`) to re-run.
 #[derive(Clone)]
 pub struct Stdin(Source);
 
@@ -96,6 +100,26 @@ impl Stdin {
     /// Whether this source closes stdin without writing anything.
     pub(crate) fn is_empty(&self) -> bool {
         matches!(self.0, Source::Empty)
+    }
+
+    /// D10: whether this is a one-shot streaming source
+    /// ([`from_reader`](Self::from_reader) / [`from_lines`](Self::from_lines))
+    /// whose payload was **already consumed** by a previous run — so re-running
+    /// (a retry, or a manual second run) would silently feed empty stdin. The
+    /// launch path checks this and fails loud instead. A `try_lock` that is
+    /// momentarily held means a *concurrent* run holds the lock for the instant
+    /// of its `take()` — treated as live here. Note the source is `take()`n
+    /// before its copy runs (B17), so a concurrent second Command run started
+    /// *after* the first has taken the payload observes it consumed and trips
+    /// this loud launch error (rather than B17's prompt-empty-EOF, which is the
+    /// `write_to` primitive's behavior); failing loud on concurrent reuse of a
+    /// one-shot source is the intended D10 contract.
+    pub(crate) fn is_consumed_one_shot(&self) -> bool {
+        match &self.0 {
+            Source::Reader(r) => r.try_lock().is_ok_and(|g| g.is_none()),
+            Source::Lines(l) => l.try_lock().is_ok_and(|g| g.is_none()),
+            Source::Empty | Source::Bytes(_) | Source::File(_) => false,
+        }
     }
 
     /// A **stable** digest of the stdin *content* for cassette keying (F12) —
@@ -259,8 +283,30 @@ mod tests {
         assert_eq!(written(&stdin).await, b"payload");
         assert!(
             written(&stdin).await.is_empty(),
-            "a second run must see empty stdin — the reader was consumed"
+            "the write_to primitive yields empty on a second drain — the reader was \
+             consumed (at the Command layer a re-run instead fails loud, D10)"
         );
+    }
+
+    #[tokio::test]
+    async fn is_consumed_one_shot_flips_after_the_payload_is_drained() {
+        // D10: a fresh one-shot source is not yet consumed; after its single use
+        // it reports consumed, so the launch path can fail a re-run loudly
+        // instead of feeding empty stdin.
+        let reader = Stdin::from_reader(&b"payload"[..]);
+        assert!(!reader.is_consumed_one_shot(), "fresh reader is live");
+        let _ = written(&reader).await;
+        assert!(reader.is_consumed_one_shot(), "drained reader is consumed");
+
+        let lines = Stdin::from_lines(tokio_stream::iter(vec!["x".to_owned()]));
+        assert!(!lines.is_consumed_one_shot(), "fresh stream is live");
+        let _ = written(&lines).await;
+        assert!(lines.is_consumed_one_shot(), "drained stream is consumed");
+
+        // Re-runnable sources are never "consumed".
+        assert!(!Stdin::from_bytes(b"abc".to_vec()).is_consumed_one_shot());
+        assert!(!Stdin::from_iter_lines(["a", "b"]).is_consumed_one_shot());
+        assert!(!Stdin::empty().is_consumed_one_shot());
     }
 
     #[tokio::test]

@@ -55,8 +55,9 @@ use crate::running::StreamedFinish;
 ///   bounds the whole chain.
 /// - A `Pipeline` can be re-run (stages are re-cloned per run), but a one-shot
 ///   [`Stdin`](crate::Stdin) source on the *first* stage
-///   (`from_reader`/`from_lines`) is consumed by the first run and feeds
-///   empty stdin afterwards — the same semantics as re-running a
+///   (`from_reader`/`from_lines`) is consumed by the first run; re-running then
+///   **fails loud** (an [`Error::Io`](crate::Error::Io) at launch, D10) rather
+///   than silently feeding empty stdin — the same semantics as re-running a
 ///   [`Command`].
 #[must_use = "a Pipeline does nothing until it is run"]
 #[derive(Clone)]

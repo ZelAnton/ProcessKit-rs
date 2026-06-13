@@ -617,6 +617,43 @@ async fn fail_loud_buffer_surfaces_output_too_large() {
     assert!(ok.is_success());
 }
 
+#[tokio::test]
+#[ignore = "spawns a real subprocess whose output a bounded drop-policy truncates"]
+async fn checking_verbs_reject_truncated_output_e2e() {
+    // B12: a bounded *drop* policy silently discards lines. The lenient capture
+    // verb (`output_string`) returns the partial result with `truncated()` set;
+    // the checking verbs that hand back stdout as if complete (`run`/`parse`)
+    // must instead fail loud with `OutputTooLarge` rather than feed a caller a
+    // truncated tail. `five_lines` prints 5 lines; the cap keeps 2.
+    use processkit::OutputBufferPolicy;
+
+    // Lenient: output_string keeps the (partial) result and flags truncation.
+    let lenient = five_lines()
+        .output_buffer(OutputBufferPolicy::bounded(2))
+        .output_string()
+        .await
+        .expect("output_string stays lenient under a bounded drop policy");
+    assert!(lenient.is_success());
+    assert!(lenient.truncated(), "the bounded policy dropped lines");
+
+    // Strict: run() refuses the silently-truncated stdout.
+    let err = five_lines()
+        .output_buffer(OutputBufferPolicy::bounded(2))
+        .run()
+        .await
+        .expect_err("run must reject truncated stdout (B12)");
+    assert!(
+        matches!(
+            err,
+            processkit::Error::OutputTooLarge {
+                line_limit: Some(2),
+                ..
+            }
+        ),
+        "expected OutputTooLarge with the configured cap, got {err:?}"
+    );
+}
+
 #[cfg(windows)]
 #[tokio::test]
 #[ignore = "Windows has no signal tier: timeout_grace must degrade to a prompt atomic kill"]

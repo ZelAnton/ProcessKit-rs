@@ -62,6 +62,44 @@ async fn wait_any_losers_still_waitable() {
 }
 
 #[tokio::test]
+#[ignore = "spawns real subprocesses; proves a keep_stdin_open loser keeps its stdin (B15)"]
+async fn wait_any_loser_keeps_its_stdin() {
+    let group = ProcessGroup::new().expect("create group");
+    // Loser: reads a line from stdin (blocks until a line + EOF, so it never
+    // exits on its own) with stdin kept open and NOT taken — the race must not
+    // close its stdin pipe out from under the caller.
+    let mut waiter = group
+        .start(&first_line_consumer().keep_stdin_open())
+        .await
+        .expect("start waiter");
+    let mut fast = group.start(&sleep_secs(1)).await.expect("start fast");
+
+    let (idx, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        wait_any(&mut [&mut waiter, &mut fast]),
+    )
+    .await
+    .expect("race finished in time")
+    .expect("race");
+    assert_eq!(idx, 1, "the fast sleeper wins the race");
+
+    // B15: the loser was only borrowed — its untaken keep_stdin_open pipe must
+    // still be present (the race must not have closed it, which would leave
+    // standard_input() returning None and the child wedged on a premature EOF).
+    let mut stdin = waiter
+        .standard_input()
+        .expect("B15: a wait_any loser's stdin must remain usable");
+    // It works end to end: feed the line it's blocked on, then watch it exit.
+    let _ = stdin.write_line("hello").await;
+    let _ = stdin.finish().await;
+    let outcome = tokio::time::timeout(Duration::from_secs(10), waiter.wait())
+        .await
+        .expect("loser reaped in time")
+        .expect("wait");
+    assert!(matches!(outcome, Outcome::Exited(0)), "got {outcome:?}");
+}
+
+#[tokio::test]
 #[ignore = "spawns a long-lived subprocess and kills it early"]
 async fn start_kill_terminates_a_running_process() {
     let mut process = sleeper().start().await.expect("start sleeper");

@@ -59,9 +59,18 @@ type OutputFut<'a> = Pin<Box<dyn Future<Output = Result<ProcessResult<String>>> 
 /// This is the one primitive: bounded fan-out that collects every outcome.
 ///
 /// Unlike [`wait_all`](crate::wait_all) / [`wait_any`](crate::wait_any), this is
-/// **not** cancel-safe: it consumes the `Command`s and owns the children it
-/// spawns, so dropping the returned future mid-batch tears down the
-/// still-running commands' trees (results already collected are unaffected).
+/// **not** cancel-safe: it consumes the `Command`s and owns the handles it
+/// spawns, so dropping the returned future mid-batch drops those handles
+/// (results already collected are unaffected).
+///
+/// Whether dropping a handle *kills* its tree depends on the `runner` (B16):
+/// with an **own-group** runner ([`JobRunner`](crate::JobRunner) — the common
+/// case) each handle owns its group, so its `Drop` tears the tree down. With a
+/// **shared-group** runner (`&ProcessGroup`), the handles share the caller's
+/// group and their `Drop` deliberately does *not* kill — the still-running
+/// children live until the caller tears the group down (its `Drop` or
+/// [`shutdown`](crate::ProcessGroup::shutdown)). Use an own-group runner if
+/// dropping the batch future must reap in-flight children.
 pub async fn output_all<R, I>(
     commands: I,
     concurrency: usize,

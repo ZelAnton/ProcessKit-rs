@@ -72,12 +72,13 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// `0` by default, widened by [`Command::ok_codes`](crate::Command::ok_codes);
     /// any other code is [`Error::Exit`](crate::Error::Exit).
     async fn run(&self, command: &Command) -> Result<String> {
-        Ok(self
-            .checked(command)
-            .await?
-            .into_stdout()
-            .trim_end()
-            .to_owned())
+        let result = self.checked(command).await?;
+        // B12: `run` returns stdout as if complete — a bounded buffer that
+        // silently dropped lines would hand the caller a truncated tail. Fail
+        // loud instead (use `output_string` + `truncated()` for lenient capture).
+        let policy = command.output_buffer_policy();
+        result.reject_if_truncated(policy.max_lines, policy.max_bytes)?;
+        Ok(result.into_stdout().trim_end().to_owned())
     }
 
     /// Run for the side effect: require an **accepted** exit (`0`, or any code in
@@ -346,6 +347,29 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
                 format!("working directory {what}: {}", cwd.display()),
             ),
         });
+    }
+
+    // D10: a one-shot streaming stdin (`from_reader`/`from_lines`) feeds a
+    // *single* run. If it was already consumed — by a prior `retry` attempt or a
+    // manual re-run — this run would silently get empty stdin (a footgun on a
+    // command whose behavior depends on its input). Fail loud instead. (Skipped
+    // for `keep_stdin_open`, which hands the pipe to the caller and never
+    // consumes the source.) `from_bytes`/`from_string`/`from_file` are
+    // re-runnable, so they never trip this.
+    if !command.keeps_stdin_open()
+        && let Some(source) = command.stdin_source()
+        && source.is_consumed_one_shot()
+    {
+        return Err(crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "`{}`: its one-shot streaming stdin (from_reader/from_lines) was already \
+                 consumed by a previous run — such a source feeds a single run and cannot be \
+                 retried or re-run; use Stdin::from_bytes/from_string (re-runnable), or rebuild \
+                 the command with a fresh source",
+                command.program_name()
+            ),
+        )));
     }
 
     let mut tokio_cmd = command.build_tokio();

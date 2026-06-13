@@ -48,6 +48,14 @@ pub struct ProcessResult<T> {
     /// Whether a bounded [`OutputBufferPolicy`](crate::OutputBufferPolicy)
     /// dropped captured output lines.
     truncated: bool,
+    /// Total lines seen across the captured streams (retained + dropped) — used
+    /// to build a faithful [`Error::OutputTooLarge`] when a checking verb
+    /// (`run`/`parse`/`try_parse`) refuses silently-truncated output (B12). `0`
+    /// for synthetic results; meaningful only when `truncated` is `true`.
+    total_lines: usize,
+    /// Total bytes of decoded line text seen across the captured streams
+    /// (retained + dropped) — the companion to `total_lines` for B12.
+    total_bytes: usize,
     /// Exit codes treated as success by [`is_success`](Self::is_success) /
     /// [`ensure_success`](Self::ensure_success). Default `[0]`; widened via
     /// [`Command::ok_codes`](crate::Command::ok_codes).
@@ -91,6 +99,8 @@ impl<T> ProcessResult<T> {
             // defaults keep synthetic results (doubles, pipeline, tests) correct.
             duration: Duration::ZERO,
             truncated: false,
+            total_lines: 0,
+            total_bytes: 0,
             ok_codes: vec![0],
         }
     }
@@ -237,6 +247,39 @@ impl<T> ProcessResult<T> {
     pub(crate) fn with_truncated(mut self, truncated: bool) -> Self {
         self.truncated = truncated;
         self
+    }
+
+    /// Record the total lines/bytes the streams produced (retained + dropped),
+    /// so a checking verb can build a faithful [`Error::OutputTooLarge`] when it
+    /// refuses truncated output (B12). Producer-only.
+    pub(crate) fn with_overflow_totals(mut self, total_lines: usize, total_bytes: usize) -> Self {
+        self.total_lines = total_lines;
+        self.total_bytes = total_bytes;
+        self
+    }
+
+    /// B12: refuse silently-truncated output. The checking verbs that hand back
+    /// stdout *as if complete* (`run`/`parse`/`try_parse`) call this so a bounded
+    /// drop-policy that discarded lines surfaces as [`Error::OutputTooLarge`]
+    /// rather than feeding a parser a truncated tail. The lenient capture verbs
+    /// (`output_string`/`output_bytes`/`checked`) do **not** call it — they
+    /// return the result with [`truncated`](Self::truncated) set so the caller
+    /// decides. `line_limit`/`byte_limit` are the command's configured ceilings.
+    pub(crate) fn reject_if_truncated(
+        &self,
+        line_limit: Option<usize>,
+        byte_limit: Option<usize>,
+    ) -> Result<(), Error> {
+        if self.truncated {
+            return Err(Error::OutputTooLarge {
+                program: self.program.clone(),
+                line_limit,
+                byte_limit,
+                total_lines: self.total_lines,
+                total_bytes: self.total_bytes,
+            });
+        }
+        Ok(())
     }
 
     /// Set the exit codes treated as success (producer-only). An empty set is
@@ -673,6 +716,48 @@ mod tests {
         assert_eq!(stamped.duration(), Duration::from_millis(5));
         assert!(stamped.truncated());
         assert!(stamped.is_success());
+    }
+
+    #[test]
+    fn checking_verbs_reject_truncated_output() {
+        // B12: a checking verb that hands back stdout (run/parse/try_parse) must
+        // refuse silently-truncated output, surfacing OutputTooLarge with the
+        // configured limits and the totals seen — not feed a parser a tail.
+        let truncated = ProcessResult::new(
+            "p".into(),
+            "tail".to_owned(),
+            String::new(),
+            Outcome::Exited(0),
+            None,
+        )
+        .with_truncated(true)
+        .with_overflow_totals(5000, 1_000_000);
+        match truncated.reject_if_truncated(Some(100), None) {
+            Err(Error::OutputTooLarge {
+                program,
+                line_limit,
+                byte_limit,
+                total_lines,
+                total_bytes,
+            }) => {
+                assert_eq!(program, "p");
+                assert_eq!(line_limit, Some(100));
+                assert_eq!(byte_limit, None);
+                assert_eq!(total_lines, 5000);
+                assert_eq!(total_bytes, 1_000_000);
+            }
+            other => panic!("expected OutputTooLarge, got {other:?}"),
+        }
+
+        // A complete (untruncated) result passes — the common case.
+        let complete = ProcessResult::new(
+            "p".into(),
+            "full".to_owned(),
+            String::new(),
+            Outcome::Exited(0),
+            None,
+        );
+        assert!(complete.reject_if_truncated(Some(100), None).is_ok());
     }
 
     #[test]

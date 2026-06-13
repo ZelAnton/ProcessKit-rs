@@ -186,13 +186,11 @@ impl<R: ProcessRunner> CliClient<R> {
     /// `trim_end`: the trailing newline is noise, but leading whitespace can be
     /// significant.
     pub async fn run(&self, command: Command) -> Result<String> {
-        Ok(self
-            .runner
-            .checked(&command)
-            .await?
-            .into_stdout()
-            .trim_end()
-            .to_owned())
+        let result = self.runner.checked(&command).await?;
+        // B12: refuse silently-truncated stdout (see `ProcessRunnerExt::run`).
+        let policy = command.output_buffer_policy();
+        result.reject_if_truncated(policy.max_lines, policy.max_bytes)?;
+        Ok(result.into_stdout().trim_end().to_owned())
     }
 
     /// Run `command`, capturing the full result without erroring on a non-zero
@@ -228,6 +226,9 @@ impl<R: ProcessRunner> CliClient<R> {
     /// infallible `parse` — the shape of git/jj struct-returning commands.
     pub async fn parse<T>(&self, command: Command, parse: impl FnOnce(&str) -> T) -> Result<T> {
         let out = self.runner.checked(&command).await?;
+        // B12: a parser must not silently see a truncated tail.
+        let policy = command.output_buffer_policy();
+        out.reject_if_truncated(policy.max_lines, policy.max_bytes)?;
         Ok(parse(out.stdout()))
     }
 
@@ -240,6 +241,9 @@ impl<R: ProcessRunner> CliClient<R> {
         parse: impl FnOnce(&str) -> Result<T>,
     ) -> Result<T> {
         let out = self.runner.checked(&command).await?;
+        // B12: a parser must not silently see a truncated tail.
+        let policy = command.output_buffer_policy();
+        out.reject_if_truncated(policy.max_lines, policy.max_bytes)?;
         parse(out.stdout())
     }
 }

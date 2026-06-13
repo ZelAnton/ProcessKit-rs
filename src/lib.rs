@@ -268,6 +268,12 @@ where
 ///   Note the interplay: a [`tokio::time::timeout`] bounding the race fires,
 ///   but leaves such pipe-blocked contenders alive and still wedged — kill or
 ///   drain them afterwards; the timeout alone is not the mitigation.
+/// - **No stdin management** — symmetrically, a contender started with
+///   [`keep_stdin_open`](Command::keep_stdin_open) and blocked reading stdin
+///   never reaches EOF, so it never exits. The race does **not** close its
+///   stdin for it (that would break the "losers remain usable" guarantee, B15):
+///   take its writer via [`standard_input`](RunningProcess::standard_input)
+///   (or don't keep stdin open) before racing it.
 ///
 /// An empty `processes` slice is an error ([`Error::Io`] with
 /// [`InvalidInput`](std::io::ErrorKind::InvalidInput)) rather than a future
