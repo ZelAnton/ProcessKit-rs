@@ -3,12 +3,17 @@
 [‹ docs index](README.md)
 
 Code that shells out is miserable to test — unless the subprocess is behind a
-seam. In `processkit` that seam is one trait with one method:
+seam. In `processkit` that seam is one small trait. Only `output` is required;
+`output_bytes` (raw-byte stdout) and `start` (a live handle for streaming/probes)
+are **defaulted**, so a minimal double implements just `output`:
 
 ```rust,ignore
 #[async_trait]
 pub trait ProcessRunner: Send + Sync {
     async fn output(&self, command: &Command) -> Result<ProcessResult<String>>;
+    // Defaulted (route through `start`); override for byte/streaming support:
+    async fn output_bytes(&self, command: &Command) -> Result<ProcessResult<Vec<u8>>>;
+    async fn start(&self, command: &Command) -> Result<RunningProcess>;
 }
 ```
 

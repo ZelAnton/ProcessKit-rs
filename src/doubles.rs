@@ -1375,6 +1375,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scripted_output_bytes_serves_canned_stdout_through_the_seam() {
+        // D5: `output_bytes` is on the `ProcessRunner` seam (default impl via
+        // `start`), so a byte-producing tool is testable through a scripted
+        // runner exactly like a text one — no real subprocess.
+        let runner = ScriptedRunner::new().fallback(Reply::ok("raw\u{0}bytes"));
+        let result = runner
+            .output_bytes(&Command::new("git").args(["cat-file", "blob", "HEAD"]))
+            .await
+            .expect("scripted output_bytes");
+        assert_eq!(result.stdout(), b"raw\x00bytes");
+        assert!(result.is_success());
+    }
+
+    #[tokio::test]
     async fn signalled_reply_carries_signal_number() {
         use crate::error::Error;
         let runner = ScriptedRunner::new().fallback(Reply::signalled(Some(9)));

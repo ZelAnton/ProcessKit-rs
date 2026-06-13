@@ -12,10 +12,11 @@ use crate::group::ProcessGroup;
 use crate::result::ProcessResult;
 use crate::running::{RunningProcess, Spawned};
 
-/// Runs a [`Command`] — to a captured result ([`output`](Self::output)) or a
-/// live handle ([`start`](Self::start)).
+/// Runs a [`Command`] — to a captured result ([`output`](Self::output) /
+/// [`output_bytes`](Self::output_bytes)) or a live handle ([`start`](Self::start)).
 ///
-/// This two-method seam is the mock point: production code takes
+/// This seam is the mock point — only [`output`](Self::output) is required
+/// (`output_bytes`/`start` are defaulted): production code takes
 /// `&dyn ProcessRunner`; tests pass a
 /// [`ScriptedRunner`](crate::ScriptedRunner) /
 /// [`RecordingRunner`](crate::RecordingRunner) (or, behind the `mock` feature,
@@ -26,6 +27,24 @@ pub trait ProcessRunner: Send + Sync {
     /// Run `command` to completion, capturing stdout/stderr and the exit code.
     /// A non-zero exit is reported in the result, not raised.
     async fn output(&self, command: &Command) -> Result<ProcessResult<String>>;
+
+    /// Run `command` to completion, capturing stdout as **raw bytes** (`output`
+    /// captures it as lossy-UTF-8 text); stderr is still text. For binary tools
+    /// — `git cat-file`, `tar -c`, an image transcoder — whose stdout is not
+    /// UTF-8.
+    ///
+    /// D5: part of the seam (not just `Command`), so byte-producing tools are
+    /// testable through a [`ScriptedRunner`](crate::ScriptedRunner) /
+    /// `&ProcessGroup` / [`JobRunner`] like text ones. Defaulted in terms of
+    /// [`start`](Self::start) — so a runner that overrides `start` gets byte
+    /// capture for free, and an `output`-only runner (one that does **not**
+    /// override `start`) surfaces [`Error::Unsupported`](crate::Error::Unsupported),
+    /// matching `start`. A text fixture (a `record`-feature cassette stores
+    /// lossy-UTF-8) cannot reproduce exact bytes; capture bytes from a real or
+    /// scripted runner.
+    async fn output_bytes(&self, command: &Command) -> Result<ProcessResult<Vec<u8>>> {
+        self.start(command).await?.output_bytes().await
+    }
 
     /// Start `command` and return a live [`RunningProcess`] for streaming,
     /// readiness probes, or incremental consumption.
@@ -57,6 +76,12 @@ pub trait ProcessRunner: Send + Sync {
 impl<R: ProcessRunner + ?Sized> ProcessRunner for &R {
     async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
         (**self).output(command).await
+    }
+
+    async fn output_bytes(&self, command: &Command) -> Result<ProcessResult<Vec<u8>>> {
+        // Forward (don't fall through to the default) so a runner that overrides
+        // `output_bytes` is honored through a `&R`.
+        (**self).output_bytes(command).await
     }
 
     async fn start(&self, command: &Command) -> Result<RunningProcess> {

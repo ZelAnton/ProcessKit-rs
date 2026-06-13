@@ -199,6 +199,14 @@ impl<R: ProcessRunner> CliClient<R> {
         self.runner.output(&command).await
     }
 
+    /// Run `command`, capturing stdout as **raw bytes** (stderr as text), without
+    /// erroring on a non-zero exit — the same verb as
+    /// [`ProcessRunner::output_bytes`] (D5). For binary tools whose stdout is not
+    /// UTF-8.
+    pub async fn output_bytes(&self, command: Command) -> Result<ProcessResult<Vec<u8>>> {
+        self.runner.output_bytes(&command).await
+    }
+
     /// Run `command` for its side effect, discarding stdout (errors on a
     /// non-zero exit) — the same verb as
     /// [`ProcessRunnerExt::run_unit`](crate::ProcessRunnerExt::run_unit).

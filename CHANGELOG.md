@@ -23,6 +23,13 @@ to a dated version section.
 - `Error::CassetteMiss { program }` — a cassette replay with no matching recording (a
   stale or incomplete cassette), kept distinct from a missing-program error so
   `is_not_found()` is `false` and a wrapper can't mistake it for an absent optional tool.
+- `ProcessRunner::output_bytes` (with a default impl) and `CliClient::output_bytes` (D5) —
+  raw-byte stdout capture is now part of the runner **seam**, not just `Command`, so a
+  byte-producing tool (`git cat-file`, `tar -c`, an image transcoder) is testable through a
+  `ScriptedRunner` / `&ProcessGroup` / `JobRunner` exactly like a text one. The default
+  routes through `start`, so a runner that overrides `start` gets it for free; an
+  `output`-only runner surfaces `Error::Unsupported`, matching `start`. (Adding a defaulted
+  trait method is source-compatible — existing `impl ProcessRunner` blocks keep compiling.)
 
 ### Changed
 
