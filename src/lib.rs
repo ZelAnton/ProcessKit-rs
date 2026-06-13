@@ -579,9 +579,9 @@ mod tests {
         // Three distinct terminal states must each surface as their own Outcome,
         // in input order — not collapse to a single shape.
         let runner = ScriptedRunner::new()
-            .on(["clean"], Reply::ok(""))
-            .on(["fail"], Reply::fail(3, "boom"))
-            .on(["killed"], Reply::signalled(Some(9)));
+            .on(["p", "clean"], Reply::ok(""))
+            .on(["p", "fail"], Reply::fail(3, "boom"))
+            .on(["p", "killed"], Reply::signalled(Some(9)));
         let mut a = runner
             .start(&crate::Command::new("p").arg("clean"))
             .await

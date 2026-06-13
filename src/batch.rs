@@ -142,9 +142,9 @@ mod tests {
     #[tokio::test]
     async fn output_all_preserves_input_order() {
         let runner = ScriptedRunner::new()
-            .on(["0"], Reply::ok("zero"))
-            .on(["1"], Reply::ok("one"))
-            .on(["2"], Reply::ok("two"));
+            .on(["step", "0"], Reply::ok("zero"))
+            .on(["step", "1"], Reply::ok("one"))
+            .on(["step", "2"], Reply::ok("two"));
         let cmds = vec![
             Command::new("step").arg("0"),
             Command::new("step").arg("1"),
@@ -163,9 +163,9 @@ mod tests {
         // The middle command exits non-zero — that's an `Ok(ProcessResult)`
         // with a non-zero code, not an `Err`, and must not stop the others.
         let runner = ScriptedRunner::new()
-            .on(["0"], Reply::ok("ok-0"))
-            .on(["1"], Reply::fail(7, "boom"))
-            .on(["2"], Reply::ok("ok-2"));
+            .on(["step", "0"], Reply::ok("ok-0"))
+            .on(["step", "1"], Reply::fail(7, "boom"))
+            .on(["step", "2"], Reply::ok("ok-2"));
         let cmds = vec![
             Command::new("step").arg("0"),
             Command::new("step").arg("1"),
@@ -190,7 +190,7 @@ mod tests {
         // 10 commands, cap 2: every one must still run and land in order.
         let mut runner = ScriptedRunner::new();
         for i in 0..10 {
-            runner = runner.on([i.to_string()], Reply::ok(format!("n{i}")));
+            runner = runner.on(["x".to_string(), i.to_string()], Reply::ok(format!("n{i}")));
         }
         let cmds: Vec<Command> = (0..10)
             .map(|i| Command::new("x").arg(i.to_string()))

@@ -540,7 +540,7 @@ mod tests {
         // 2 would make `ensure_success` return `Ok` and panic the `expect_err` —
         // probe must keep its strict 0/1 contract regardless of `ok_codes`.
         use crate::{Reply, ScriptedRunner};
-        let runner = ScriptedRunner::new().on(["x"], Reply::fail(2, "boom"));
+        let runner = ScriptedRunner::new().on(["tool", "x"], Reply::fail(2, "boom"));
         let cmd = Command::new("tool").args(["x"]).ok_codes([0, 1, 2]);
         assert!(matches!(
             runner.probe(&cmd).await,

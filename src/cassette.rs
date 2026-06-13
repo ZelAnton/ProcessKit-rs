@@ -495,8 +495,8 @@ mod tests {
     /// A scripted inner runner standing in for the real tool.
     fn scripted() -> ScriptedRunner {
         ScriptedRunner::new()
-            .on(["--version"], Reply::ok("tool 1.2.3\n"))
-            .on(["fail"], Reply::fail(7, "boom"))
+            .on(["tool", "--version"], Reply::ok("tool 1.2.3\n"))
+            .on(["tool", "fail"], Reply::fail(7, "boom"))
     }
 
     fn temp_cassette() -> (tempfile::TempDir, PathBuf) {
@@ -595,8 +595,10 @@ mod tests {
     #[tokio::test]
     async fn replayed_timeout_carries_the_commands_deadline() {
         let (_dir, path) = temp_cassette();
-        let recorder =
-            RecordReplayRunner::record(&path, ScriptedRunner::new().on(["slow"], Reply::timeout()));
+        let recorder = RecordReplayRunner::record(
+            &path,
+            ScriptedRunner::new().on(["tool", "slow"], Reply::timeout()),
+        );
         recorder
             .output(&Command::new("tool").arg("slow"))
             .await

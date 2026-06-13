@@ -255,7 +255,9 @@ impl Reply {
 type Predicate = Box<dyn Fn(&Command) -> bool + Send + Sync>;
 
 enum Rule {
-    /// Match when the command's arguments start with this prefix.
+    /// Match when the command's **program name followed by its arguments**
+    /// starts with this prefix (Ф9). The first element is the program; the rest
+    /// is an argument prefix. An empty prefix is a catch-all.
     Prefix(Vec<OsString>),
     /// Match when the predicate accepts the command.
     Predicate(Predicate),
@@ -264,10 +266,45 @@ enum Rule {
 impl Rule {
     fn matches(&self, command: &Command) -> bool {
         match self {
-            Rule::Prefix(prefix) => command.arguments().starts_with(prefix),
+            // Ф9: match the program *and* the argument prefix, so
+            // `.on(["git", "status"])` answers for `git status …` but not for
+            // `rm status` — aligning with the program-aware cassette key. The
+            // first prefix element is the program name; an empty prefix matches
+            // any command (a catch-all).
+            Rule::Prefix(prefix) => match prefix.split_first() {
+                Some((program, args)) => {
+                    command.program() == program.as_os_str()
+                        && command.arguments().starts_with(args)
+                }
+                None => true,
+            },
             Rule::Predicate(pred) => pred(command),
         }
     }
+}
+
+/// Collect a program-and-args prefix (`["git", "status"]`) into owned `OsString`s.
+fn collect_prefix<I, S>(prefix: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    prefix
+        .into_iter()
+        .map(|s| s.as_ref().to_os_string())
+        .collect()
+}
+
+/// A registered rule and the reply (or ordered sequence of replies) it serves.
+struct RuleEntry {
+    rule: Rule,
+    /// One reply (served on every match) or an ordered sequence (each served
+    /// once in turn, then the last repeats) — the cassette replay model (Ф11).
+    /// Never empty.
+    replies: Vec<Reply>,
+    /// How many times this rule has matched — indexes into `replies` (clamped
+    /// to the last). Interior-mutable: matching takes `&self`.
+    next: std::sync::atomic::AtomicUsize,
 }
 
 /// A [`ProcessRunner`] that returns canned [`Reply`]s for matched commands.
@@ -289,7 +326,7 @@ impl Rule {
 ///     .unwrap();
 /// rt.block_on(async {
 ///     let runner = ScriptedRunner::new()
-///         .on(["--version"], Reply::ok("tool 1.2.3"))
+///         .on(["tool", "--version"], Reply::ok("tool 1.2.3"))
 ///         .fallback(Reply::fail(1, "unexpected command"));
 ///
 ///     let out = runner
@@ -302,7 +339,7 @@ impl Rule {
 /// ```
 #[derive(Default)]
 pub struct ScriptedRunner {
-    rules: Vec<(Rule, Reply)>,
+    rules: Vec<RuleEntry>,
     fallback: Option<Reply>,
 }
 
@@ -322,17 +359,41 @@ impl ScriptedRunner {
         Self::default()
     }
 
-    /// Reply with `reply` when the command's arguments start with `prefix`.
+    /// Reply with `reply` when the command's **program name + arguments** start
+    /// with `prefix` (Ф9: the first element is the program). For example
+    /// `.on(["git", "status"])` answers for `git status …`, not `rm status`.
     pub fn on<I, S>(mut self, prefix: I, reply: Reply) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let prefix = prefix
-            .into_iter()
-            .map(|s| s.as_ref().to_os_string())
-            .collect();
-        self.rules.push((Rule::Prefix(prefix), reply));
+        let prefix = collect_prefix(prefix);
+        self.push_rule(Rule::Prefix(prefix), vec![reply]);
+        self
+    }
+
+    /// Reply with each of `replies` in turn — the first match gets the first
+    /// reply, the second the second, and so on; once exhausted, the **last**
+    /// reply repeats forever (Ф11). The declarative form for retry scenarios
+    /// (fail once, then succeed), matching a cassette's "replay in order, then
+    /// repeat the last" model. Matches like [`on`](Self::on) (program + arg
+    /// prefix).
+    ///
+    /// # Panics
+    /// If `replies` is empty.
+    pub fn on_sequence<I, S, R>(mut self, prefix: I, replies: R) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+        R: IntoIterator<Item = Reply>,
+    {
+        let prefix = collect_prefix(prefix);
+        let replies: Vec<Reply> = replies.into_iter().collect();
+        assert!(
+            !replies.is_empty(),
+            "ScriptedRunner::on_sequence needs at least one reply"
+        );
+        self.push_rule(Rule::Prefix(prefix), replies);
         self
     }
 
@@ -341,8 +402,7 @@ impl ScriptedRunner {
     where
         F: Fn(&Command) -> bool + Send + Sync + 'static,
     {
-        self.rules
-            .push((Rule::Predicate(Box::new(predicate)), reply));
+        self.push_rule(Rule::Predicate(Box::new(predicate)), vec![reply]);
         self
     }
 
@@ -352,12 +412,48 @@ impl ScriptedRunner {
         self
     }
 
-    /// The first reply matching `command` (rules in registration order, then
-    /// the fallback), or the loud not-found spawn error.
+    /// Register a rule, warning (Ф10) if it is unreachable because an earlier
+    /// prefix rule already matches everything it would.
+    fn push_rule(&mut self, rule: Rule, replies: Vec<Reply>) {
+        // Ф10: a new prefix rule is unreachable if an *earlier* prefix rule is a
+        // prefix of it (a broader rule registered first — e.g. an empty
+        // catch-all — wins by first-match). Predicate rules are opaque, so only
+        // prefix-vs-prefix shadowing is detected. Diagnostic only (requires the
+        // `tracing` feature); register more-specific rules first to silence it.
+        #[cfg(feature = "tracing")]
+        if let Rule::Prefix(new) = &rule {
+            for (i, existing) in self.rules.iter().enumerate() {
+                if let Rule::Prefix(earlier) = &existing.rule
+                    && new.starts_with(earlier)
+                {
+                    tracing::warn!(
+                        target: "processkit",
+                        "ScriptedRunner: rule #{} is unreachable — shadowed by the broader \
+                         earlier rule #{}; register more-specific rules first",
+                        self.rules.len(),
+                        i,
+                    );
+                    break;
+                }
+            }
+        }
+        self.rules.push(RuleEntry {
+            rule,
+            replies,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        });
+    }
+
+    /// The reply matching `command` (rules in registration order, then the
+    /// fallback), or the loud not-found spawn error. A matched rule advances
+    /// through its reply sequence (Ф11).
     fn matched_reply(&self, command: &Command, program: &str) -> Result<&Reply> {
-        for (rule, reply) in &self.rules {
-            if rule.matches(command) {
-                return Ok(reply);
+        for entry in &self.rules {
+            if entry.rule.matches(command) {
+                let i = entry
+                    .next
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(&entry.replies[i.min(entry.replies.len() - 1)]);
             }
         }
         self.fallback
@@ -651,8 +747,10 @@ mod tests {
         // D6: `ProcessRunnerExt::first_line` routes through `start`, so it runs
         // hermetically on a `ScriptedRunner` — no real subprocess.
         use crate::runner::ProcessRunnerExt;
-        let runner =
-            ScriptedRunner::new().on(["log"], Reply::lines(["alpha", "beta ready", "gamma"]));
+        let runner = ScriptedRunner::new().on(
+            ["git", "log"],
+            Reply::lines(["alpha", "beta ready", "gamma"]),
+        );
         let found = runner
             .first_line(&Command::new("git").arg("log"), |l| l.contains("ready"))
             .await
@@ -669,7 +767,8 @@ mod tests {
     #[tokio::test]
     async fn scripted_start_streams_canned_lines_through_real_pumps() {
         use tokio_stream::StreamExt;
-        let runner = ScriptedRunner::new().on(["log"], Reply::lines(["first", "second", "third"]));
+        let runner =
+            ScriptedRunner::new().on(["git", "log"], Reply::lines(["first", "second", "third"]));
         let cmd = Command::new("git").arg("log");
         let mut run = runner.start(&cmd).await.expect("scripted start");
         assert_eq!(run.pid(), None, "a scripted child has no OS identity");
@@ -754,7 +853,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
         let seen = Arc::new(Mutex::new(Vec::new()));
         let errs = Arc::new(Mutex::new(Vec::new()));
-        let runner = ScriptedRunner::new().on(["fetch"], Reply::ok("a\nb\n").with_stdout("a\nb\n"));
+        let runner =
+            ScriptedRunner::new().on(["git", "fetch"], Reply::ok("a\nb\n").with_stdout("a\nb\n"));
         let cmd = Command::new("git")
             .arg("fetch")
             .on_stdout_line({
@@ -972,7 +1072,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefix_rule_matches_and_replies() {
-        let runner = ScriptedRunner::new().on(["status"], Reply::ok("clean"));
+        let runner = ScriptedRunner::new().on(["git", "status"], Reply::ok("clean"));
         let out = runner
             .output(&Command::new("git").arg("status"))
             .await
@@ -1005,7 +1105,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_match_without_fallback_is_a_not_found_spawn_error() {
-        let runner = ScriptedRunner::new().on(["status"], Reply::ok("clean"));
+        let runner = ScriptedRunner::new().on(["git", "status"], Reply::ok("clean"));
         let err = runner
             .output(&Command::new("git").arg("log"))
             .await
@@ -1021,8 +1121,8 @@ mod tests {
 
     #[tokio::test]
     async fn prefix_matches_whole_elements_not_substrings() {
-        let runner = ScriptedRunner::new().on(["foo"], Reply::ok("hit"));
-        // ["foo", anything…] matches — element-wise prefix.
+        let runner = ScriptedRunner::new().on(["tool", "foo"], Reply::ok("hit"));
+        // ["tool", "foo", anything…] matches — element-wise prefix.
         assert!(
             runner
                 .output(&Command::new("tool").args(["foo", "bar"]))
@@ -1037,6 +1137,60 @@ mod tests {
                 .is_err(),
             "substring of an element is not a prefix match"
         );
+    }
+
+    #[tokio::test]
+    async fn on_matches_the_program_not_just_the_args() {
+        // Ф9: the prefix now includes the program, so `.on(["git", "status"])`
+        // answers for `git status` but not `rm status` (the old arg-only match
+        // would have answered for both).
+        let runner = ScriptedRunner::new()
+            .on(["git", "status"], Reply::ok("on branch main"))
+            .fallback(Reply::fail(1, "unmatched"));
+        let hit = runner
+            .output(&Command::new("git").arg("status"))
+            .await
+            .unwrap();
+        assert_eq!(hit.stdout(), "on branch main");
+        let miss = runner
+            .output(&Command::new("rm").arg("status"))
+            .await
+            .unwrap();
+        assert_eq!(
+            miss.code(),
+            Some(1),
+            "a different program with the same args must NOT match the rule"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_sequence_yields_each_reply_then_repeats_the_last() {
+        // Ф11: a fail-then-succeed retry scenario, scripted declaratively. Each
+        // reply is served once in order, then the last repeats.
+        let runner = ScriptedRunner::new().on_sequence(
+            ["git", "push"],
+            [Reply::fail(1, "rejected"), Reply::ok("pushed")],
+        );
+        assert_eq!(
+            runner
+                .output(&Command::new("git").arg("push"))
+                .await
+                .unwrap()
+                .code(),
+            Some(1),
+            "1st call: the first reply (fail)"
+        );
+        for nth in ["2nd", "3rd"] {
+            assert_eq!(
+                runner
+                    .output(&Command::new("git").arg("push"))
+                    .await
+                    .unwrap()
+                    .stdout(),
+                "pushed",
+                "{nth} call: the last reply repeats"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1098,7 +1252,7 @@ mod tests {
     async fn pending_parks_until_the_token_fires_then_cancels() {
         use crate::error::Error;
         let token = crate::CancellationToken::new();
-        let runner = ScriptedRunner::new().on(["run", "watch"], Reply::pending());
+        let runner = ScriptedRunner::new().on(["gh", "run", "watch"], Reply::pending());
         let cmd = Command::new("gh")
             .args(["run", "watch"])
             .cancel_on(token.clone());
@@ -1138,9 +1292,9 @@ mod tests {
     async fn probe_reads_exit_code_as_bool() {
         use crate::error::Error;
         let runner = ScriptedRunner::new()
-            .on(["yes"], Reply::ok(""))
-            .on(["no"], Reply::fail(1, ""))
-            .on(["boom"], Reply::fail(2, "bad"))
+            .on(["t", "yes"], Reply::ok(""))
+            .on(["t", "no"], Reply::fail(1, ""))
+            .on(["t", "boom"], Reply::fail(2, "bad"))
             .fallback(Reply::timeout());
         // 0 -> true, 1 -> false.
         assert!(runner.probe(&Command::new("t").arg("yes")).await.unwrap());

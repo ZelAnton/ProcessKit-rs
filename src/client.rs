@@ -408,21 +408,23 @@ mod tests {
     async fn run_trims_trailing_whitespace_only() {
         // `run` trims with `trim_end`: the trailing newline is dropped, but
         // leading whitespace is significant and preserved.
-        let demo =
-            Demo::with_runner(ScriptedRunner::new().on(["rev-parse"], Reply::ok("  abc123 \n")));
+        let demo = Demo::with_runner(
+            ScriptedRunner::new().on(["git", "rev-parse"], Reply::ok("  abc123 \n")),
+        );
         assert_eq!(demo.head(Path::new(".")).await.unwrap(), "  abc123");
     }
 
     #[tokio::test]
     async fn exit_code_maps_exit_status() {
-        let demo = Demo::with_runner(ScriptedRunner::new().on(["diff"], Reply::fail(1, "")));
+        let demo = Demo::with_runner(ScriptedRunner::new().on(["git", "diff"], Reply::fail(1, "")));
         assert!(!demo.is_clean(Path::new(".")).await.unwrap());
     }
 
     #[tokio::test]
     async fn parse_builds_a_typed_value() {
-        let demo =
-            Demo::with_runner(ScriptedRunner::new().on(["branch"], Reply::ok("main\nfeature\n")));
+        let demo = Demo::with_runner(
+            ScriptedRunner::new().on(["git", "branch"], Reply::ok("main\nfeature\n")),
+        );
         assert_eq!(
             demo.branches(Path::new(".")).await.unwrap(),
             vec!["main", "feature"]
@@ -515,7 +517,7 @@ mod tests {
         let client = CliClient::with_runner(
             "git",
             ScriptedRunner::new()
-                .on(["diff"], Reply::fail(1, ""))
+                .on(["git", "diff"], Reply::fail(1, ""))
                 .fallback(Reply::ok("")),
         );
         // `git diff --quiet` exits 1 (dirty) -> false; anything else (0) -> true.
@@ -620,8 +622,9 @@ mod tests {
         // `default_cancel_on` — the call parks until the token fires, then
         // yields Cancelled naming the program, and the invocation is recorded.
         let token = CancellationToken::new();
-        let rec =
-            RecordingRunner::new(ScriptedRunner::new().on(["run", "watch"], Reply::pending()));
+        let rec = RecordingRunner::new(
+            ScriptedRunner::new().on(["gh", "run", "watch"], Reply::pending()),
+        );
         let client = CliClient::with_runner("gh", &rec).default_cancel_on(token.clone());
 
         let call = client.output(client.command(["run", "watch", "123"]));
