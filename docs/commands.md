@@ -361,9 +361,9 @@ The error enum is structured and `#[non_exhaustive]`:
 | `Error::Spawn { program, source }` | The program was located but the OS couldn't start it (permissions, a bad working directory, a Windows `.cmd`/`.bat` needing `cmd.exe`, …) — **not** `is_not_found()` |
 | `Error::NotFound { program, searched }` | The program couldn't be located (the single "not found" representation — `is_not_found()` is true); `searched` is `Some(dirs)` for a bare-name `PATH` lookup, `None` otherwise |
 | `Error::Exit { program, code, stdout, stderr }` | Non-zero exit, both streams attached in full (the `Display` message is bounded, but the fields carry the complete captured text for classification) |
-| `Error::Signalled { program, signal }` | The process was killed by a signal (no exit code); `signal` carries the number on Unix, `None` elsewhere |
+| `Error::Signalled { program, signal, stdout, stderr }` | The process was killed by a signal (no exit code); `signal` carries the number on Unix, `None` elsewhere; the partial streams captured before the kill are attached (reach them via `diagnostic()`) |
 | `Error::OutputTooLarge { program, line_limit, byte_limit, total_lines, total_bytes }` | A `fail_loud` buffer's line or byte ceiling was exceeded |
-| `Error::Timeout { program, timeout }` | The run's own deadline killed it |
+| `Error::Timeout { program, timeout, stdout, stderr }` | The run's own deadline killed it; whatever the run captured before the kill is attached — a hung tool's last stderr line tails the `Display` and is reachable via `diagnostic()` |
 | `Error::NotReady { program, timeout }` | A [readiness probe](streaming.md#readiness-probes) gave up |
 | `Error::Parse { program, message }` | A `CliClient::try_parse` parser rejected the output (the `Display`/`Debug` of `message` is bounded to a 200-byte preview; the field carries the full text) |
 | `Error::Unsupported { operation }` | The platform can't do what was asked (and silently skipping would be wrong) |

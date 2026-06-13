@@ -671,7 +671,9 @@ mod tests {
         assert!(!result.timed_out(), "a stage kill is not a chain timeout");
         // Signalled outcome surfaces as Error::Signalled naming the attributed stage.
         match result.ensure_success() {
-            Err(crate::Error::Signalled { program, signal }) => {
+            Err(crate::Error::Signalled {
+                program, signal, ..
+            }) => {
                 assert_eq!(program, "a");
                 assert_eq!(signal, None);
             }

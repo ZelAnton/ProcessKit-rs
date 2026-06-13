@@ -78,6 +78,15 @@ to a dated version section.
   dependencies, which don't support such targets). The `Mechanism::None` variant (only ever
   produced on those targets) is removed; `Mechanism` stays `#[non_exhaustive]`, so a future
   fallback can re-add it.
+- **Breaking:** `Error::Timeout` and `Error::Signalled` now carry `stdout` and `stderr`
+  fields (D12) — whatever the run captured before the deadline or signal killed it. A
+  hung-then-killed tool's partial stderr is frequently the explanation, and it was
+  previously unreachable from `run()` / `checked()`: `diagnostic()` returned `None`. Now
+  `Error::diagnostic()` covers both variants, and their one-line `Display` appends the same
+  bounded last-line tail as `Error::Exit` (`` `db-migrate` timed out after 30s: waiting for
+  lock held by pid 4123 ``). `Error::Cancelled` deliberately carries no streams —
+  cancellation is a caller-initiated immediate stop; any output captured before the kill
+  is intentionally discarded.
 
 ### Fixed
 

@@ -166,10 +166,14 @@ impl<T> ProcessResult<T> {
             Outcome::TimedOut => Err(Error::Timeout {
                 program: self.program.clone(),
                 timeout: self.timeout.unwrap_or_default(),
+                stdout: self.stdout.as_text(),
+                stderr: self.stderr.clone(),
             }),
             Outcome::Signalled(signal) => Err(Error::Signalled {
                 program: self.program.clone(),
                 signal,
+                stdout: self.stdout.as_text(),
+                stderr: self.stderr.clone(),
             }),
             Outcome::Exited(code) => Err(Error::Exit {
                 program: self.program.clone(),
@@ -184,16 +188,23 @@ impl<T> ProcessResult<T> {
     /// (`Command::exit_code`, `ProcessRunnerExt::exit_code`, `CliClient::exit_code`):
     /// a timeout surfaces as [`Error::Timeout`], a signal-kill (no code) as
     /// [`Error::Signalled`], otherwise the code.
-    pub(crate) fn require_code(&self) -> Result<i32, Error> {
+    pub(crate) fn require_code(&self) -> Result<i32, Error>
+    where
+        T: StdoutText,
+    {
         match self.outcome {
             Outcome::Exited(code) => Ok(code),
             Outcome::TimedOut => Err(Error::Timeout {
                 program: self.program.clone(),
                 timeout: self.timeout.unwrap_or_default(),
+                stdout: self.stdout.as_text(),
+                stderr: self.stderr.clone(),
             }),
             Outcome::Signalled(signal) => Err(Error::Signalled {
                 program: self.program.clone(),
                 signal,
+                stdout: self.stdout.as_text(),
+                stderr: self.stderr.clone(),
             }),
         }
     }
@@ -343,9 +354,16 @@ mod tests {
         assert!(!killed.is_success());
         assert_eq!(killed.outcome(), Outcome::Signalled(Some(9)));
         match killed.ensure_success().unwrap_err() {
-            Error::Signalled { program, signal } => {
+            // D12: the captured stdout flows into the error.
+            Error::Signalled {
+                program,
+                signal,
+                stdout,
+                ..
+            } => {
                 assert_eq!(program, "git");
                 assert_eq!(signal, Some(9));
+                assert_eq!(stdout, "out");
             }
             other => panic!("expected Signalled, got {other:?}"),
         }
@@ -485,9 +503,16 @@ mod tests {
         assert!(timed.timed_out());
         assert_eq!(timed.code(), None);
         match timed.ensure_success().unwrap_err() {
-            Error::Timeout { program, timeout } => {
+            Error::Timeout {
+                program,
+                timeout,
+                stdout,
+                ..
+            } => {
                 assert_eq!(program, "git");
                 assert_eq!(timeout, Duration::from_millis(500));
+                // D12: partial stdout captured before the kill is carried.
+                assert_eq!(stdout, "out");
             }
             other => panic!("expected Timeout, got {other:?}"),
         }
@@ -513,7 +538,9 @@ mod tests {
             Error::Signalled { .. }
         ));
         match killed.ensure_success().unwrap_err() {
-            Error::Signalled { program, signal } => {
+            Error::Signalled {
+                program, signal, ..
+            } => {
                 assert_eq!(program, "git");
                 assert_eq!(signal, None);
             }

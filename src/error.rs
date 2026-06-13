@@ -116,12 +116,34 @@ pub enum Error {
     },
 
     /// The process exceeded its configured timeout and was killed.
-    #[error("`{program}` timed out after {timeout:?}")]
+    ///
+    /// Carries whatever the run captured **before** the deadline killed it
+    /// (D12): a hung tool's partial stderr is frequently the explanation
+    /// (`waiting for lock held by pid 4123`, `connecting to db…`), so it is
+    /// reachable via [`diagnostic`](Self::diagnostic) and the public fields
+    /// rather than lost. Empty when the producing path captured nothing (a
+    /// streaming probe such as `first_line`, which never buffers).
+    ///
+    /// The one-line `Display` message appends the **last non-empty line** of
+    /// [`diagnostic`](Self::diagnostic), capped at 200 bytes — just like
+    /// [`Exit`](Error::Exit) — so a log line stays actionable without dumping
+    /// the captured streams.
+    #[error("{}", display_timeout(program, *timeout, stdout, stderr))]
     Timeout {
         /// The program that timed out.
         program: String,
         /// The deadline that elapsed.
         timeout: Duration,
+        /// Standard output captured before the kill, in full. Not shown in the
+        /// `Display` message (only its bounded diagnostic tail is). Empty when
+        /// the path captured nothing. For the raw-bytes helper this is a lossy
+        /// UTF-8 decode; the exact bytes remain on the originating
+        /// `ProcessResult`.
+        stdout: String,
+        /// Standard error captured before the kill, in full — often the
+        /// explanation of *why* the tool hung. Only its last non-empty line
+        /// (bounded) reaches the `Display` message.
+        stderr: String,
     },
 
     /// The captured output exceeded the
@@ -226,6 +248,14 @@ pub enum Error {
     /// whereas a cancellation is **always** raised on every consuming path.
     /// When a run both times out and is cancelled, cancellation wins (it is
     /// checked first).
+    ///
+    /// Unlike [`Timeout`](Error::Timeout) / [`Signalled`](Error::Signalled),
+    /// this carries **no captured streams** (D12): cancellation is a deliberate
+    /// caller action that stops the run *immediately*. On the pre-spawn path (the
+    /// token was already cancelled) nothing was captured at all; on the consuming
+    /// verbs, any output captured before the kill is **intentionally discarded** —
+    /// the caller initiated the stop and knows why, so a partial diagnostic would
+    /// be noise. [`diagnostic`](Self::diagnostic) returns `None`.
     #[error("`{program}` was cancelled")]
     Cancelled {
         /// The program that was cancelled.
@@ -241,12 +271,24 @@ pub enum Error {
     /// [`ensure_success`](crate::ProcessResult::ensure_success) and the
     /// `require_code` path when the outcome is
     /// [`Outcome::Signalled`](crate::Outcome::Signalled).
-    #[error("{}", display_signalled(program, *signal))]
+    ///
+    /// Carries whatever the run captured before the signal killed it (D12) — a
+    /// crashing tool's partial stderr is often the diagnostic — reachable via
+    /// [`diagnostic`](Self::diagnostic) and the public fields. The one-line
+    /// `Display` appends the bounded diagnostic tail, like [`Exit`](Error::Exit).
+    #[error("{}", display_signalled(program, *signal, stdout, stderr))]
     Signalled {
         /// The program that was killed by a signal.
         program: String,
         /// The signal number, when reported by the platform.
         signal: Option<i32>,
+        /// Standard output captured before the kill, in full. Not shown in the
+        /// `Display` message (only its bounded diagnostic tail is). For the
+        /// raw-bytes helper this is a lossy UTF-8 decode of stdout.
+        stdout: String,
+        /// Standard error captured before the kill, in full. Only its last
+        /// non-empty line (bounded) reaches the `Display` message.
+        stderr: String,
     },
 
     /// The child ran but feeding its standard input failed for a reason other
@@ -288,15 +330,20 @@ impl Error {
     /// The best human-facing message for a failed run, trimmed of surrounding
     /// whitespace: captured standard error if it carries text, otherwise the
     /// captured standard output (where `git` puts `CONFLICT …` and `git commit`
-    /// puts `nothing to commit`). Returns `None` when there is no captured output
-    /// to show — a silent [`Exit`](Error::Exit) (both streams blank) or any
-    /// non-`Exit` variant ([`Spawn`](Error::Spawn), [`Timeout`](Error::Timeout),
+    /// puts `nothing to commit`). Covers the variants that capture streams — a
+    /// non-zero [`Exit`](Error::Exit), a [`Timeout`](Error::Timeout) (the partial
+    /// output of a hung-then-killed tool, D12), and a [`Signalled`](Error::Signalled)
+    /// crash. Returns `None` when there is no captured output to show — a silent
+    /// run (both streams blank) or a variant that carries none
+    /// ([`Spawn`](Error::Spawn), [`Cancelled`](Error::Cancelled),
     /// [`Parse`](Error::Parse), [`Io`](Error::Io)) — so a caller can fall back to
     /// the [`Display`](std::fmt::Display) message. For the raw, untrimmed stream
-    /// match on [`Exit`](Error::Exit)'s fields directly.
+    /// match on the variant's fields directly.
     pub fn diagnostic(&self) -> Option<&str> {
         match self {
-            Error::Exit { stdout, stderr, .. } => exit_diagnostic(stdout, stderr),
+            Error::Exit { stdout, stderr, .. }
+            | Error::Timeout { stdout, stderr, .. }
+            | Error::Signalled { stdout, stderr, .. } => exit_diagnostic(stdout, stderr),
             _ => None,
         }
     }
@@ -393,10 +440,17 @@ impl fmt::Debug for Error {
                 .field("stdout", &StreamPreview(stdout))
                 .field("stderr", &StreamPreview(stderr))
                 .finish(),
-            Error::Timeout { program, timeout } => f
+            Error::Timeout {
+                program,
+                timeout,
+                stdout,
+                stderr,
+            } => f
                 .debug_struct("Timeout")
                 .field("program", program)
                 .field("timeout", timeout)
+                .field("stdout", &StreamPreview(stdout))
+                .field("stderr", &StreamPreview(stderr))
                 .finish(),
             Error::OutputTooLarge {
                 program,
@@ -433,10 +487,17 @@ impl fmt::Debug for Error {
                 .debug_struct("Cancelled")
                 .field("program", program)
                 .finish(),
-            Error::Signalled { program, signal } => f
+            Error::Signalled {
+                program,
+                signal,
+                stdout,
+                stderr,
+            } => f
                 .debug_struct("Signalled")
                 .field("program", program)
                 .field("signal", signal)
+                .field("stdout", &StreamPreview(stdout))
+                .field("stderr", &StreamPreview(stderr))
                 .finish(),
             Error::Stdin { program, source } => f
                 .debug_struct("Stdin")
@@ -519,12 +580,26 @@ fn display_parse(program: &str, message: &str) -> String {
 }
 
 /// `Signalled`'s one-line Display: `` `{program}` was terminated by signal {n} ``
-/// when a number is known, `` `{program}` was terminated by a signal `` otherwise.
-fn display_signalled(program: &str, signal: Option<i32>) -> String {
-    match signal {
+/// when a number is known, `` `{program}` was terminated by a signal `` otherwise,
+/// plus the bounded diagnostic tail of the captured streams (D12), like
+/// [`display_exit`].
+fn display_signalled(program: &str, signal: Option<i32>, stdout: &str, stderr: &str) -> String {
+    let mut message = match signal {
         Some(n) => format!("`{program}` was terminated by signal {n}"),
         None => format!("`{program}` was terminated by a signal"),
-    }
+    };
+    append_diagnostic_tail(&mut message, stdout, stderr);
+    message
+}
+
+/// `Timeout`'s one-line Display: `` `{program}` timed out after {timeout:?} `` plus
+/// the bounded diagnostic tail of whatever the run captured before the kill (D12)
+/// — a hung tool's last stderr line is often the explanation. Same tail cap as
+/// [`display_exit`].
+fn display_timeout(program: &str, timeout: Duration, stdout: &str, stderr: &str) -> String {
+    let mut message = format!("`{program}` timed out after {timeout:?}");
+    append_diagnostic_tail(&mut message, stdout, stderr);
+    message
 }
 
 /// io-level "retry as-is" conditions: transient kernel/filesystem states a bare
@@ -571,8 +646,19 @@ fn exit_diagnostic<'a>(stdout: &'a str, stderr: &'a str) -> Option<&'a str> {
 /// a char boundary so a binary-garbage or one-enormous-line stream can never
 /// poison a log line.
 fn display_exit(program: &str, code: i32, stdout: &str, stderr: &str) -> String {
-    const TAIL_CAP: usize = 200;
     let mut message = format!("`{program}` exited with code {code}");
+    append_diagnostic_tail(&mut message, stdout, stderr);
+    message
+}
+
+/// Append `: <last non-empty diagnostic line>` to a one-line error `Display`,
+/// capped at 200 bytes on a char boundary with an ellipsis. Shared by
+/// [`display_exit`], [`display_timeout`], and [`display_signalled`] (D12) so a
+/// captured-stream error stays one actionable line and a binary-garbage or
+/// one-enormous-line stream can never poison a log line. A no-op when both
+/// streams are blank.
+fn append_diagnostic_tail(message: &mut String, stdout: &str, stderr: &str) {
+    const TAIL_CAP: usize = 200;
     let tail = exit_diagnostic(stdout, stderr)
         .and_then(|text| text.lines().rev().map(str::trim).find(|l| !l.is_empty()));
     if let Some(tail) = tail {
@@ -588,7 +674,6 @@ fn display_exit(program: &str, code: i32, stdout: &str, stderr: &str) -> String 
             message.push('…');
         }
     }
-    message
 }
 
 /// Crate result alias.
@@ -711,9 +796,13 @@ mod tests {
 
     #[test]
     fn diagnostic_is_none_for_non_exit_variants() {
+        // A timeout that captured nothing has no diagnostic (the streams-bearing
+        // case is covered in `timeout_and_signalled_carry_diagnostic_streams`).
         let timeout = Error::Timeout {
             program: "git".into(),
             timeout: Duration::from_secs(1),
+            stdout: String::new(),
+            stderr: String::new(),
         };
         assert_eq!(timeout.diagnostic(), None);
         let unsupported = Error::Unsupported {
@@ -744,6 +833,68 @@ mod tests {
             program: "long-job".into(),
         };
         assert_eq!(err.to_string(), "`long-job` was cancelled");
+        // D12: a cancellation deliberately carries no streams, so diagnostic is None.
+        assert_eq!(err.diagnostic(), None);
+    }
+
+    #[test]
+    fn timeout_and_signalled_carry_diagnostic_streams() {
+        // D12: a hung-then-killed tool's partial stderr is the explanation —
+        // reachable via diagnostic(), and its last line tails the Display.
+        let timeout = Error::Timeout {
+            program: "db-migrate".into(),
+            timeout: Duration::from_secs(30),
+            stdout: String::new(),
+            stderr: "connecting…\nwaiting for lock held by pid 4123\n".into(),
+        };
+        assert_eq!(
+            timeout.diagnostic(),
+            Some("connecting…\nwaiting for lock held by pid 4123")
+        );
+        assert_eq!(
+            timeout.to_string(),
+            "`db-migrate` timed out after 30s: waiting for lock held by pid 4123"
+        );
+
+        // stderr blank → the stdout-borne message is used (mirrors Exit).
+        let signalled = Error::Signalled {
+            program: "worker".into(),
+            signal: Some(11),
+            stdout: "processing batch 7\n".into(),
+            stderr: String::new(),
+        };
+        assert_eq!(signalled.diagnostic(), Some("processing batch 7"));
+        assert_eq!(
+            signalled.to_string(),
+            "`worker` was terminated by signal 11: processing batch 7"
+        );
+    }
+
+    #[test]
+    fn timeout_and_signalled_debug_bounds_their_streams() {
+        // D12 + L22: the new captured streams must be bounded in Debug, exactly
+        // like Exit — a multi-MiB partial capture must never flood `{e:?}`.
+        let huge = "x".repeat(10_000);
+        let timeout = Error::Timeout {
+            program: "t".into(),
+            timeout: Duration::from_secs(1),
+            stdout: huge.clone(),
+            stderr: huge.clone(),
+        };
+        let dbg = format!("{timeout:?}");
+        assert!(dbg.len() < 800, "Debug must be bounded, got {}", dbg.len());
+        assert!(!dbg.contains(&"x".repeat(300)), "must not dump the stream");
+        assert!(dbg.contains("(+9800 bytes)"), "got: {dbg}");
+
+        let signalled = Error::Signalled {
+            program: "s".into(),
+            signal: None,
+            stdout: huge.clone(),
+            stderr: huge,
+        };
+        let dbg = format!("{signalled:?}");
+        assert!(dbg.len() < 800, "Debug must be bounded, got {}", dbg.len());
+        assert!(!dbg.contains(&"x".repeat(300)), "must not dump the stream");
     }
 
     #[test]
@@ -826,6 +977,8 @@ mod tests {
         let with_signal = Error::Signalled {
             program: "git".into(),
             signal: Some(9),
+            stdout: String::new(),
+            stderr: String::new(),
         };
         assert_eq!(with_signal.to_string(), "`git` was terminated by signal 9");
         assert_eq!(with_signal.diagnostic(), None);
@@ -836,6 +989,8 @@ mod tests {
         let no_signal = Error::Signalled {
             program: "git".into(),
             signal: None,
+            stdout: String::new(),
+            stderr: String::new(),
         };
         assert_eq!(no_signal.to_string(), "`git` was terminated by a signal");
     }
@@ -970,6 +1125,8 @@ mod tests {
         let timeout = Error::Timeout {
             program: "x".into(),
             timeout: Duration::from_secs(1),
+            stdout: String::new(),
+            stderr: String::new(),
         };
         assert!(
             !timeout.is_transient(),

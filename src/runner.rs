@@ -174,6 +174,10 @@ pub trait ProcessRunnerExt: ProcessRunner {
                 Err(_elapsed) => Err(crate::Error::Timeout {
                     program,
                     timeout: limit,
+                    // `first_line` is a streaming line probe — it buffers nothing,
+                    // so there are no captured streams to carry (D12).
+                    stdout: String::new(),
+                    stderr: String::new(),
                 }),
             },
             None => Ok(search.await),

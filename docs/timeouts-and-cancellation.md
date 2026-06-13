@@ -50,7 +50,7 @@ Where each verb lands:
 | Verb | Deadline expiry becomes |
 |---|---|
 | `output_string()` / `output_bytes()` | `Ok` result with `timed_out() == true`, `code() == None`, partial output kept |
-| `run()` / `exit_code()` / `probe()` / `checked()` | `Error::Timeout { program, timeout }` |
+| `run()` / `exit_code()` / `probe()` / `checked()` | `Error::Timeout { program, timeout, stdout, stderr }` — the partial output captured before the kill is attached (`err.diagnostic()` surfaces a hung tool's last words) |
 | `first_line(pred)` | `Error::Timeout` (the line never arrived in time) |
 | `start()` + streaming | the stream **ends** at the deadline (tree killed, pipes closed); `finish_streamed` then reports the kill (`outcome == Outcome::TimedOut`) |
 | `ensure_success()` on a captured result | `Error::Timeout`, checked *before* the exit code |

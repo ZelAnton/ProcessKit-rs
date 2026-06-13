@@ -33,6 +33,8 @@ pub processkit::Error::ResourceLimit(alloc::string::String)
 pub processkit::Error::Signalled
 pub processkit::Error::Signalled::program: alloc::string::String
 pub processkit::Error::Signalled::signal: core::option::Option<i32>
+pub processkit::Error::Signalled::stderr: alloc::string::String
+pub processkit::Error::Signalled::stdout: alloc::string::String
 pub processkit::Error::Spawn
 pub processkit::Error::Spawn::program: alloc::string::String
 pub processkit::Error::Spawn::source: std::io::error::Error
@@ -41,6 +43,8 @@ pub processkit::Error::Stdin::program: alloc::string::String
 pub processkit::Error::Stdin::source: std::io::error::Error
 pub processkit::Error::Timeout
 pub processkit::Error::Timeout::program: alloc::string::String
+pub processkit::Error::Timeout::stderr: alloc::string::String
+pub processkit::Error::Timeout::stdout: alloc::string::String
 pub processkit::Error::Timeout::timeout: core::time::Duration
 pub processkit::Error::Unsupported
 pub processkit::Error::Unsupported::operation: alloc::string::String
