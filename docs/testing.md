@@ -68,8 +68,9 @@ use processkit::{Command, ProcessRunnerExt, Reply, ScriptedRunner};
 #[tokio::test]
 async fn detects_the_branch() {
     let runner = ScriptedRunner::new()
-        // Match by argument PREFIX (element-wise, in registration order):
-        .on(["branch", "--show-current"], Reply::ok("main\n"))
+        // Match by program + argument PREFIX (element-wise; first element is
+        // the program name, in registration order):
+        .on(["git", "branch", "--show-current"], Reply::ok("main\n"))
         // …or by any predicate over the full Command:
         .when(
             |cmd| cmd.working_dir().is_some(),
@@ -99,8 +100,11 @@ The pieces:
   orchestration *actually cancels* a blocked call, not just that it formats a
   canned error. With no token it parks forever, like a hung child.
 - Rules are tried in **registration order**; first match wins. Prefix
-  matching is element-wise — `on(["foo"])` matches args `["foo", "bar"]` but
-  not `["foobar"]`.
+  matching is element-wise over the **program name then the arguments** (the
+  first element is the program) — `on(["git", "foo"])` matches `git foo bar`
+  but not `git foobar` (and not `rm foo`). Use
+  [`on_sequence`](https://docs.rs/processkit) to serve an ordered sequence of
+  replies (each once, then the last repeats) for a fail-then-succeed scenario.
 - **No match and no fallback is a loud error** (`Error::Spawn`, not-found) —
   an unexpected invocation can't slip through a test silently.
 - Bulk runs also **replay the canned lines through the command's
@@ -122,7 +126,7 @@ use std::time::Duration;
 #[tokio::test]
 async fn server_becomes_ready() {
     let runner = ScriptedRunner::new()
-        .on(["serve"], Reply::lines(["booting", "listening on 8080"]));
+        .on(["server", "serve"], Reply::lines(["booting", "listening on 8080"]));
 
     let mut run = runner.start(&Command::new("server").arg("serve")).await.unwrap();
     run.wait_for_line(|l| l.contains("listening"), Duration::from_secs(5))
@@ -217,10 +221,10 @@ Semantics worth knowing before you commit a cassette:
 
 | Aspect | Behavior |
 |---|---|
-| Match key | program + args + cwd + has-stdin (lossy UTF-8 on both sides) |
+| Match key | program + args + cwd + stdin **content** (hashed, never persisted; absent ≡ empty) — lossy UTF-8 on the text parts |
 | Environment | **values never reach the file** — only sorted variable names (a committed fixture can't leak secrets); env is *not* matched, so env differences can't cause spurious misses |
 | Duplicates of one key | replay in capture order, then the **last entry repeats** — a recorded sequence (`git rev-parse HEAD` before/after a commit) replays faithfully, while retry/probe loops keep getting a stable final answer |
-| Miss | strict `Error::Spawn` (not-found) — replay never spawns a surprise subprocess; a stale cassette fails loudly |
+| Miss | strict `Error::CassetteMiss` (distinct from a missing program — `is_not_found()` is `false`) — replay never spawns a surprise subprocess; a stale cassette fails loudly |
 | Timeouts | a recorded timed-out run replays as one, surfacing `Error::Timeout` with the *replaying* command's deadline |
 | Format | pretty-printed JSON with a `version` field; unknown versions / corrupt files are `Error::Io(InvalidData)`, a missing file keeps `NotFound` |
 | Err results | not recorded — only completed runs (non-zero exits and captured timeouts *are* results and are recorded) |
@@ -297,7 +301,7 @@ And the payoff — the wrapper tests hermetically with any double:
 #[tokio::test]
 async fn head_is_trimmed() {
     let git = Git::with_runner(
-        ScriptedRunner::new().on(["rev-parse", "HEAD"], Reply::ok("abc123\n")),
+        ScriptedRunner::new().on(["git", "rev-parse", "HEAD"], Reply::ok("abc123\n")),
     );
     assert_eq!(git.head(Path::new("/repo")).await.unwrap(), "abc123");
 }

@@ -152,9 +152,9 @@ impl Entry {
     }
 }
 
-/// What an invocation is matched on: program + args + cwd + has_stdin. Env
-/// overrides are excluded so an irrelevant env difference between the record
-/// and replay environments can't cause a spurious miss.
+/// What an invocation is matched on: program + args + cwd + the stdin content
+/// digest (Ф12). Env overrides are excluded so an irrelevant env difference
+/// between the record and replay environments can't cause a spurious miss.
 ///
 /// L23: the string components are *lossy* UTF-8 decodes, so two distinct
 /// non-UTF-8 invocations that differ only in their invalid bytes produce the
@@ -250,9 +250,10 @@ enum Mode<R> {
 /// **Replay** mode loads the cassette and serves results without spawning
 /// anything:
 ///
-/// - **Matching** is by program + args + cwd + has-stdin. Env overrides are
-///   *not* matched, and their **values** are never written — only the sorted
-///   variable *names*. Everything else (argv, cwd, stdout, stderr) is stored
+/// - **Matching** is by program + args + cwd + stdin **content** (hashed, never
+///   persisted). Env overrides are *not* matched, and their **values** are
+///   never written — only the sorted variable *names*. Everything else (argv,
+///   cwd, stdout, stderr) is stored
 ///   **verbatim**, so a cassette can still carry secrets in those fields:
 ///   review fixtures before committing. The file is written owner-only
 ///   (`0600`) on Unix.

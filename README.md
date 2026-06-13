@@ -707,15 +707,17 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-Entries are matched by program + args + cwd + has-stdin. Environment override
-**values never reach the file** — only the sorted variable names, so a
-committed fixture can't leak secrets (and env differences can't cause spurious
-misses). When one invocation was recorded several times, replay serves the
-entries in capture order and then repeats the last one — a recorded sequence
-of changing outputs replays faithfully, while retry/probe loops keep getting a
-stable final answer. An invocation absent from the cassette is a strict error
-(replay never spawns a surprise subprocess), and the file carries a format
-`version` so future readers fail loudly instead of misreading old fixtures.
+Entries are matched by program + args + cwd + stdin **content** (hashed, never
+persisted). Environment override **values never reach the file** — only the
+sorted variable names, so a committed fixture can't leak secrets (and env
+differences can't cause spurious misses). When one invocation was recorded
+several times, replay serves the entries in capture order and then repeats the
+last one — a recorded sequence of changing outputs replays faithfully, while
+retry/probe loops keep getting a stable final answer. An invocation absent from
+the cassette is a strict `Error::CassetteMiss` (distinct from a missing program,
+so `is_not_found()` is `false`; replay never spawns a surprise subprocess), and
+the file carries a format `version` so future readers fail loudly instead of
+misreading old fixtures.
 
 *Deeper: [Testing your code → record/replay](docs/testing.md).*
 

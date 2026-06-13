@@ -443,11 +443,11 @@ spells out exactly what each mechanism can promise.
 use processkit::{Reply, ScriptedRunner};
 
 // Your code takes any `R: ProcessRunner`; in tests, hand it a script.
-// Rules match on a prefix of the *arguments* (the program name is not part
-// of the argument list):
+// Rules match on a prefix of the *program name followed by its arguments*
+// (the first element is the program):
 let runner = ScriptedRunner::new()
-    .on(["rev-parse"], Reply::ok("abc123\n"))
-    .on(["push"], Reply::fail(128, "remote: permission denied"))
+    .on(["git", "rev-parse"], Reply::ok("abc123\n"))
+    .on(["git", "push"], Reply::fail(128, "remote: permission denied"))
     .fallback(Reply::ok(""));
 
 // my_deploy(&runner).await? — no subprocess, fully deterministic.
@@ -467,7 +467,7 @@ use processkit::{Command, Outcome, ProcessRunner, Reply, ScriptedRunner, Streame
 use std::time::Duration;
 
 let runner = ScriptedRunner::new()
-    .on(["run", "watch"], Reply::lines(["queued", "in_progress", "completed"])
+    .on(["gh", "run", "watch"], Reply::lines(["queued", "in_progress", "completed"])
         .with_line_delay(Duration::from_millis(50))); // paced delivery
 
 let mut run = runner.start(&Command::new("gh").args(["run", "watch", "123"])).await?;

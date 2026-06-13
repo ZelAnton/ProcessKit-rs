@@ -17,6 +17,12 @@ to a dated version section.
   ceiling, independent of `max_lines`, so one enormous newline-free line can no longer
   evade the line cap and exhaust memory. Composes with `bounded`/`fail_loud`/`unbounded`;
   under `OverflowMode::Error` it is a fail-loud byte ceiling.
+- `ScriptedRunner::on_sequence(prefix, replies)` — serve an ordered sequence of replies
+  (each once in turn, then the last repeats forever), matching the cassette replay model
+  so a fail-then-succeed retry scenario is scriptable declaratively.
+- `Error::CassetteMiss { program }` — a cassette replay with no matching recording (a
+  stale or incomplete cassette), kept distinct from a missing-program error so
+  `is_not_found()` is `false` and a wrapper can't mistake it for an absent optional tool.
 
 ### Changed
 
@@ -39,6 +45,12 @@ to a dated version section.
 - `ProcessGroup::adopt` of a child that has exited but is **not yet reaped** is now a
   successful no-op (`Ok`) on the containment backends, instead of surfacing the backend's
   raw assign/write error. (An already-*reaped* child still errors — no pid/handle left.)
+- **Breaking:** `ScriptedRunner::on(prefix, …)` now matches the **program name** as well
+  as the arguments — the first prefix element is the program, so `.on(["git", "status"])`
+  answers for `git status` but not `rm status` (aligning with the program-aware cassette
+  key). Existing argument-only rules must prepend the program name.
+- **Breaking:** a cassette replay that finds no matching recording now returns
+  `Error::CassetteMiss` instead of `Error::Spawn` with a not-found source.
 
 ### Fixed
 
@@ -62,6 +74,20 @@ to a dated version section.
   leftover directory and silently downgrade to the process-group fallback.
 - Deadline computations are clamped so a `Duration::MAX`-ish timeout/grace can no longer
   overflow `Instant` arithmetic and panic.
+- Test doubles now match the live runner on the contracts they exist to exercise: a
+  panicking line handler is isolated on the bulk `ScriptedRunner::output` path (not only
+  while streaming); a capture verb on a non-piped stdout errors instead of returning canned
+  output; an already-cancelled token short-circuits to `Cancelled` before serving a reply;
+  `wait_any`/`wait_all` honor cancellation mid-wait (a pending scripted handle no longer
+  hangs forever); a kill landing after a scripted child's natural exit keeps the cached
+  outcome (not `Signalled`); and the scripted run lifetime accounts for a stderr longer
+  than stdout (no truncation).
+- Cassette replay now invokes `on_stdout_line`/`on_stderr_line` (as record mode does), and
+  keys on the **stdin content** (hashed, never persisted) so concurrent calls differing
+  only in their stdin no longer collide on replay. (A pre-existing cassette recorded *with*
+  stdin must be re-recorded to match a stdin invocation again.)
+- `ScriptedRunner` warns (under the `tracing` feature) when a rule is unreachable because an
+  earlier, broader prefix rule shadows it.
 
 ## [0.9.2] - 2026-06-11
 

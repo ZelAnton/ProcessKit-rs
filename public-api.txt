@@ -6,6 +6,8 @@ pub macro processkit::cli_client!
 #[non_exhaustive] pub enum processkit::Error
 pub processkit::Error::Cancelled
 pub processkit::Error::Cancelled::program: alloc::string::String
+pub processkit::Error::CassetteMiss
+pub processkit::Error::CassetteMiss::program: alloc::string::String
 pub processkit::Error::Exit
 pub processkit::Error::Exit::code: i32
 pub processkit::Error::Exit::program: alloc::string::String
@@ -716,6 +718,7 @@ impl processkit::ScriptedRunner
 pub fn processkit::ScriptedRunner::fallback(self, processkit::Reply) -> Self
 pub fn processkit::ScriptedRunner::new() -> Self
 pub fn processkit::ScriptedRunner::on<I, S>(self, I, processkit::Reply) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
+pub fn processkit::ScriptedRunner::on_sequence<I, S, R>(self, I, R) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>, R: core::iter::traits::collect::IntoIterator<Item = processkit::Reply>
 pub fn processkit::ScriptedRunner::when<F>(self, F, processkit::Reply) -> Self where F: core::ops::function::Fn(&processkit::Command) -> bool + core::marker::Send + core::marker::Sync + 'static
 impl core::default::Default for processkit::ScriptedRunner
 pub fn processkit::ScriptedRunner::default() -> processkit::ScriptedRunner

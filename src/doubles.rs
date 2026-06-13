@@ -1,7 +1,8 @@
 //! Test doubles for the [`ProcessRunner`] seam — no real subprocess required.
 //!
-//! - [`ScriptedRunner`] returns canned output for commands matched by argument
-//!   prefix or a predicate.
+//! - [`ScriptedRunner`] returns canned output for commands matched by a
+//!   program-and-argument prefix (the first element is the program) or a
+//!   predicate.
 //! - [`RecordingRunner`] wraps another runner and records every [`Invocation`]
 //!   so tests can assert exactly what was run.
 //!
