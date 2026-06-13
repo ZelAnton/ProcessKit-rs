@@ -276,7 +276,7 @@ where
 /// that never resolves.
 ///
 /// The first finisher's result carries the same errors as a bulk verb:
-/// [`Error::Cancelled`] for a cancelled run, or [`Error::Stdin`] when its stdin
+/// `Error::Cancelled` for a cancelled run, or [`Error::Stdin`] when its stdin
 /// source failed (non-broken-pipe) on an otherwise-successful exit. A non-zero
 /// exit or signal is *not* an error here — it is returned as its [`Outcome`].
 pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, Outcome)> {
@@ -338,7 +338,7 @@ pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, O
 ///
 /// If a contender fails to reap (an OS I/O error), that `Err` is returned and
 /// the remaining processes stay waitable (cancel-safe). A contender's
-/// [`Error::Cancelled`] (cancelled run) or [`Error::Stdin`] (a non-broken-pipe
+/// `Error::Cancelled` (cancelled run) or [`Error::Stdin`] (a non-broken-pipe
 /// stdin-source failure on its otherwise-successful exit) likewise short-circuits
 /// the join — like the bulk verbs, these surface as an `Err`, not an `Outcome`.
 pub async fn wait_all(processes: &mut [&mut RunningProcess]) -> Result<Vec<Outcome>> {
