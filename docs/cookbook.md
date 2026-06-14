@@ -497,10 +497,12 @@ cli_client!(pub struct Git => "git");
 
 impl<R: ProcessRunner> Git<R> {
     pub async fn current_branch(&self) -> Result<String> {
-        self.core.run(self.core.command(["branch", "--show-current"])).await
+        // A verb takes the args directly (D7); pass a built `command(..)` only
+        // when you need to customize it (per-call timeout, stdin, …).
+        self.core.run(["branch", "--show-current"]).await
     }
     pub async fn is_clean(&self) -> Result<bool> {
-        self.core.probe(self.core.command(["diff", "--quiet"])).await
+        self.core.probe(["diff", "--quiet"]).await
     }
 }
 ```

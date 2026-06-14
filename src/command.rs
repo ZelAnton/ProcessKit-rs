@@ -505,6 +505,18 @@ impl Command {
     /// source (D10). Use a reusable source
     /// (`from_string`/`from_bytes`/`from_file`/`from_iter_lines`) when retrying.
     ///
+    /// **Inert outside the success-checking verbs (D16).** A `retry` policy is
+    /// honored only by the verbs listed above. It is **ignored** by:
+    /// - [`Supervisor`](crate::Supervisor) — supervision is keep-alive
+    ///   *restarting* with its own [`RestartPolicy`](crate::RestartPolicy) /
+    ///   backoff / storm handling, a different concern from replay-to-success;
+    ///   configure restarts there, not via `retry`.
+    /// - [`output_all`](crate::output_all) — a bounded fan-out that collects
+    ///   every outcome as data (no per-command retry); wrap each command's verb
+    ///   yourself if a batch element must retry.
+    /// - the raw [`Pipeline`](crate::Pipeline) verbs — a stage's `retry` does not
+    ///   re-run that stage within the chain.
+    ///
     /// [`Error::Timeout`]: crate::Error::Timeout
     pub fn retry(
         mut self,

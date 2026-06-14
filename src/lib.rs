@@ -114,7 +114,7 @@
 //! // Set an env var once for every command (typed CLI wrapper):
 //! use processkit::CliClient;
 //! let git = CliClient::new("git").default_env("GIT_TERMINAL_PROMPT", "0");
-//! let _ = git.run(git.command(["status", "--porcelain"])).await?;
+//! let _ = git.run(["status", "--porcelain"]).await?;
 //! # let _ = (clean, fetched);
 //! # Ok(())
 //! # }
@@ -186,7 +186,7 @@ pub use batch::output_all;
 pub use buffer::{OutputBufferPolicy, OverflowMode, StdioMode};
 #[cfg(feature = "record")]
 pub use cassette::RecordReplayRunner;
-pub use client::CliClient;
+pub use client::{CliClient, IntoCommand};
 pub use command::Command;
 pub use doubles::{Invocation, RecordingRunner, Reply, ScriptedRunner};
 pub use encoding_rs::Encoding;

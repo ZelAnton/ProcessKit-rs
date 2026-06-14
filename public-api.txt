@@ -237,22 +237,24 @@ pub struct processkit::CliClient<R: processkit::ProcessRunner>
 impl processkit::CliClient<processkit::JobRunner>
 pub fn processkit::CliClient<processkit::JobRunner>::new(impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
 impl<R: processkit::ProcessRunner> processkit::CliClient<R>
+pub async fn processkit::CliClient<R>::checked(&self, impl processkit::IntoCommand<R>) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
 pub fn processkit::CliClient<R>::command<I, S>(&self, I) -> processkit::Command where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub fn processkit::CliClient<R>::command_in<I, S>(&self, &std::path::Path, I) -> processkit::Command where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub fn processkit::CliClient<R>::default_cancel_on(self, tokio_util::sync::cancellation_token::CancellationToken) -> Self
 pub fn processkit::CliClient<R>::default_env(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
 pub fn processkit::CliClient<R>::default_env_remove(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
 pub fn processkit::CliClient<R>::default_timeout(self, core::time::Duration) -> Self
-pub async fn processkit::CliClient<R>::exit_code(&self, processkit::Command) -> processkit::Result<i32>
-pub async fn processkit::CliClient<R>::output(&self, processkit::Command) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
-pub async fn processkit::CliClient<R>::output_bytes(&self, processkit::Command) -> processkit::Result<processkit::ProcessResult<alloc::vec::Vec<u8>>>
-pub async fn processkit::CliClient<R>::parse<T>(&self, processkit::Command, impl core::ops::function::FnOnce(&str) -> T) -> processkit::Result<T>
-pub async fn processkit::CliClient<R>::probe(&self, processkit::Command) -> processkit::Result<bool>
-pub async fn processkit::CliClient<R>::run(&self, processkit::Command) -> processkit::Result<alloc::string::String>
-pub async fn processkit::CliClient<R>::run_unit(&self, processkit::Command) -> processkit::Result<()>
+pub async fn processkit::CliClient<R>::exit_code(&self, impl processkit::IntoCommand<R>) -> processkit::Result<i32>
+pub async fn processkit::CliClient<R>::first_line<F>(&self, impl processkit::IntoCommand<R>, F) -> processkit::Result<core::option::Option<alloc::string::String>> where F: core::ops::function::Fn(&str) -> bool + core::marker::Send
+pub async fn processkit::CliClient<R>::output(&self, impl processkit::IntoCommand<R>) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
+pub async fn processkit::CliClient<R>::output_bytes(&self, impl processkit::IntoCommand<R>) -> processkit::Result<processkit::ProcessResult<alloc::vec::Vec<u8>>>
+pub async fn processkit::CliClient<R>::parse<T>(&self, impl processkit::IntoCommand<R>, impl core::ops::function::FnOnce(&str) -> T) -> processkit::Result<T>
+pub async fn processkit::CliClient<R>::probe(&self, impl processkit::IntoCommand<R>) -> processkit::Result<bool>
+pub async fn processkit::CliClient<R>::run(&self, impl processkit::IntoCommand<R>) -> processkit::Result<alloc::string::String>
+pub async fn processkit::CliClient<R>::run_unit(&self, impl processkit::IntoCommand<R>) -> processkit::Result<()>
 pub fn processkit::CliClient<R>::runner(&self) -> &R
 pub fn processkit::CliClient<R>::timeout(&self) -> core::option::Option<core::time::Duration>
-pub async fn processkit::CliClient<R>::try_parse<T>(&self, processkit::Command, impl core::ops::function::FnOnce(&str) -> processkit::Result<T>) -> processkit::Result<T>
+pub async fn processkit::CliClient<R>::try_parse<T>(&self, impl processkit::IntoCommand<R>, impl core::ops::function::FnOnce(&str) -> processkit::Result<T>) -> processkit::Result<T>
 pub fn processkit::CliClient<R>::with_runner(impl core::convert::AsRef<std::ffi::os_str::OsStr>, R) -> Self
 impl<R: processkit::ProcessRunner> core::fmt::Debug for processkit::CliClient<R>
 pub fn processkit::CliClient<R>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -324,6 +326,7 @@ pub fn processkit::Command::bitor(self, processkit::Command) -> processkit::Pipe
 impl core::ops::bit::BitOr<processkit::Command> for processkit::Pipeline
 pub type processkit::Pipeline::Output = processkit::Pipeline
 pub fn processkit::Pipeline::bitor(self, processkit::Command) -> processkit::Pipeline
+impl<R: processkit::ProcessRunner> processkit::IntoCommand<R> for processkit::Command
 impl core::marker::Freeze for processkit::Command
 impl core::marker::Send for processkit::Command
 impl core::marker::Sync for processkit::Command
@@ -845,6 +848,11 @@ impl<R> core::marker::Unpin for processkit::Supervisor<R> where R: core::marker:
 impl<R> core::marker::UnsafeUnpin for processkit::Supervisor<R> where R: core::marker::UnsafeUnpin
 impl<R> !core::panic::unwind_safe::RefUnwindSafe for processkit::Supervisor<R>
 impl<R> !core::panic::unwind_safe::UnwindSafe for processkit::Supervisor<R>
+pub trait processkit::IntoCommand<R: processkit::ProcessRunner>: processkit::client::sealed::Sealed
+impl<R: processkit::ProcessRunner, S: core::convert::AsRef<std::ffi::os_str::OsStr>, const N: usize> processkit::IntoCommand<R> for [S; N]
+impl<R: processkit::ProcessRunner, S: core::convert::AsRef<std::ffi::os_str::OsStr>> processkit::IntoCommand<R> for &[S]
+impl<R: processkit::ProcessRunner, S: core::convert::AsRef<std::ffi::os_str::OsStr>> processkit::IntoCommand<R> for alloc::vec::Vec<S>
+impl<R: processkit::ProcessRunner> processkit::IntoCommand<R> for processkit::Command
 pub trait processkit::ProcessRunner: core::marker::Send + core::marker::Sync
 pub fn processkit::ProcessRunner::output<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn processkit::ProcessRunner::output_bytes<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::vec::Vec<u8>>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait

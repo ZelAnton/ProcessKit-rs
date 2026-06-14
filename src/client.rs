@@ -20,6 +20,54 @@ use crate::error::Result;
 use crate::result::ProcessResult;
 use crate::runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
 
+mod sealed {
+    use std::ffi::OsStr;
+    pub trait Sealed {}
+    impl Sealed for crate::Command {}
+    impl<S: AsRef<OsStr>, const N: usize> Sealed for [S; N] {}
+    impl<S: AsRef<OsStr>> Sealed for Vec<S> {}
+    impl<S: AsRef<OsStr>> Sealed for &[S] {}
+}
+
+/// What a [`CliClient`] verb accepts (D7): either an **argument list** — built
+/// into a [`Command`] for the client's program with its defaults (timeout, env,
+/// cancellation) applied — or a ready-made `Command`, run as-is.
+///
+/// This lets one verb serve both the common `git.run(["status"])` and the
+/// customized `git.run(git.command(["push"]).timeout(d))`, removing the
+/// double-mention of the older `git.run(git.command([…]))` form. Implemented for
+/// argument containers (`[S; N]`, `Vec<S>`, `&[S]` where `S: AsRef<OsStr>`) and
+/// for [`Command`]; **sealed** (not implementable downstream).
+pub trait IntoCommand<R: ProcessRunner>: sealed::Sealed {
+    /// Build the [`Command`] to run for `client` — used by the verbs.
+    #[doc(hidden)]
+    fn into_command(self, client: &CliClient<R>) -> Command;
+}
+
+impl<R: ProcessRunner> IntoCommand<R> for Command {
+    fn into_command(self, _client: &CliClient<R>) -> Command {
+        self
+    }
+}
+
+impl<R: ProcessRunner, S: AsRef<OsStr>, const N: usize> IntoCommand<R> for [S; N] {
+    fn into_command(self, client: &CliClient<R>) -> Command {
+        client.command(self)
+    }
+}
+
+impl<R: ProcessRunner, S: AsRef<OsStr>> IntoCommand<R> for Vec<S> {
+    fn into_command(self, client: &CliClient<R>) -> Command {
+        client.command(self)
+    }
+}
+
+impl<R: ProcessRunner, S: AsRef<OsStr>> IntoCommand<R> for &[S] {
+    fn into_command(self, client: &CliClient<R>) -> Command {
+        client.command(self)
+    }
+}
+
 /// Owns a CLI tool's program name, [`ProcessRunner`], and default timeout, and
 /// builds + runs [`Command`]s against them.
 ///
@@ -179,13 +227,18 @@ impl<R: ProcessRunner> CliClient<R> {
         command
     }
 
-    /// Run `command`, returning stdout (trailing whitespace trimmed) on success
-    /// (errors on a non-zero exit) — the same verb, with the same semantics, as
+    /// Run, returning stdout (trailing whitespace trimmed) on success (errors on
+    /// a non-zero exit) — the same verb, with the same semantics, as
     /// [`Command::run`](crate::Command::run) and
     /// [`ProcessRunnerExt::run`](crate::ProcessRunnerExt::run). Trims with
     /// `trim_end`: the trailing newline is noise, but leading whitespace can be
     /// significant.
-    pub async fn run(&self, command: Command) -> Result<String> {
+    ///
+    /// Accepts an argument list (`git.run(["status"])`) or a customized
+    /// [`Command`] (`git.run(git.command(["push"]).timeout(d))`) — see
+    /// [`IntoCommand`] (D7).
+    pub async fn run(&self, call: impl IntoCommand<R>) -> Result<String> {
+        let command = call.into_command(self);
         let result = self.runner.checked(&command).await?;
         // B12: refuse silently-truncated stdout (see `ProcessRunnerExt::run`).
         let policy = command.output_buffer_policy();
@@ -193,46 +246,75 @@ impl<R: ProcessRunner> CliClient<R> {
         Ok(result.into_stdout().trim_end().to_owned())
     }
 
-    /// Run `command`, capturing the full result without erroring on a non-zero
-    /// exit — the same verb as [`ProcessRunner::output`].
-    pub async fn output(&self, command: Command) -> Result<ProcessResult<String>> {
-        self.runner.output(&command).await
+    /// Run, requiring an accepted exit, and return the full
+    /// [`ProcessResult`] (untrimmed) — the [`CliClient`] analogue of
+    /// [`ProcessRunnerExt::checked`](crate::ProcessRunnerExt::checked) (D7); the
+    /// building block when you need the whole result after success-checking.
+    pub async fn checked(&self, call: impl IntoCommand<R>) -> Result<ProcessResult<String>> {
+        self.runner.checked(&call.into_command(self)).await
     }
 
-    /// Run `command`, capturing stdout as **raw bytes** (stderr as text), without
-    /// erroring on a non-zero exit — the same verb as
-    /// [`ProcessRunner::output_bytes`] (D5). For binary tools whose stdout is not
-    /// UTF-8.
-    pub async fn output_bytes(&self, command: Command) -> Result<ProcessResult<Vec<u8>>> {
-        self.runner.output_bytes(&command).await
+    /// Run, capturing the full result without erroring on a non-zero exit — the
+    /// same verb as [`ProcessRunner::output`].
+    pub async fn output(&self, call: impl IntoCommand<R>) -> Result<ProcessResult<String>> {
+        self.runner.output(&call.into_command(self)).await
     }
 
-    /// Run `command` for its side effect, discarding stdout (errors on a
-    /// non-zero exit) — the same verb as
+    /// Run, capturing stdout as **raw bytes** (stderr as text), without erroring
+    /// on a non-zero exit — the same verb as [`ProcessRunner::output_bytes`]
+    /// (D5). For binary tools whose stdout is not UTF-8.
+    pub async fn output_bytes(&self, call: impl IntoCommand<R>) -> Result<ProcessResult<Vec<u8>>> {
+        self.runner.output_bytes(&call.into_command(self)).await
+    }
+
+    /// Run for the side effect, discarding stdout (errors on a non-zero exit) —
+    /// the same verb as
     /// [`ProcessRunnerExt::run_unit`](crate::ProcessRunnerExt::run_unit).
-    pub async fn run_unit(&self, command: Command) -> Result<()> {
-        self.runner.run_unit(&command).await
+    pub async fn run_unit(&self, call: impl IntoCommand<R>) -> Result<()> {
+        self.runner.run_unit(&call.into_command(self)).await
     }
 
-    /// Run `command` and return its exit code (e.g. `git diff --quiet`,
-    /// `gh auth status`) — never errors on a non-zero exit. The same verb as
+    /// Run and return the exit code (e.g. `git diff --quiet`, `gh auth status`)
+    /// — never errors on a non-zero exit. The same verb as
     /// [`Command::exit_code`](crate::Command::exit_code).
-    pub async fn exit_code(&self, command: Command) -> Result<i32> {
-        self.runner.exit_code(&command).await
+    pub async fn exit_code(&self, call: impl IntoCommand<R>) -> Result<i32> {
+        self.runner.exit_code(&call.into_command(self)).await
     }
 
-    /// Run a predicate `command` and read its exit code as a boolean: exit `0` →
+    /// Run a predicate and read its exit code as a boolean: exit `0` →
     /// `Ok(true)`, exit `1` → `Ok(false)`, anything else → `Err`. Collapses the
     /// `match code { 0 => …, 1 => …, _ => Err }` idiom for commands whose exit
     /// code is the answer (`git diff --quiet`, `git show-ref --verify --quiet`,
     /// `grep -q`, …); other codes / timeout / signal-kill all error.
-    pub async fn probe(&self, command: Command) -> Result<bool> {
-        self.runner.probe(&command).await
+    pub async fn probe(&self, call: impl IntoCommand<R>) -> Result<bool> {
+        self.runner.probe(&call.into_command(self)).await
     }
 
-    /// Run `command` (errors on a non-zero exit) and feed its stdout to an
-    /// infallible `parse` — the shape of git/jj struct-returning commands.
-    pub async fn parse<T>(&self, command: Command, parse: impl FnOnce(&str) -> T) -> Result<T> {
+    /// Stream stdout and return the first line matching `predicate` (`None` if
+    /// the stream ends first) — the [`CliClient`] analogue of
+    /// [`ProcessRunnerExt::first_line`](crate::ProcessRunnerExt::first_line)
+    /// (D7), bounded by the command's [`timeout`](crate::Command::timeout).
+    pub async fn first_line<F>(
+        &self,
+        call: impl IntoCommand<R>,
+        predicate: F,
+    ) -> Result<Option<String>>
+    where
+        F: Fn(&str) -> bool + Send,
+    {
+        self.runner
+            .first_line(&call.into_command(self), predicate)
+            .await
+    }
+
+    /// Run (errors on a non-zero exit) and feed stdout to an infallible
+    /// `parse` — the shape of git/jj struct-returning commands.
+    pub async fn parse<T>(
+        &self,
+        call: impl IntoCommand<R>,
+        parse: impl FnOnce(&str) -> T,
+    ) -> Result<T> {
+        let command = call.into_command(self);
         let out = self.runner.checked(&command).await?;
         // B12: a parser must not silently see a truncated tail.
         let policy = command.output_buffer_policy();
@@ -240,14 +322,15 @@ impl<R: ProcessRunner> CliClient<R> {
         Ok(parse(out.stdout()))
     }
 
-    /// Run `command` (errors on a non-zero exit) and feed its stdout to a
-    /// *fallible* `parse` — the shape of JSON deserialization, where a parse
-    /// failure becomes [`Error::Parse`](crate::Error::Parse).
+    /// Run (errors on a non-zero exit) and feed stdout to a *fallible* `parse` —
+    /// the shape of JSON deserialization, where a parse failure becomes
+    /// [`Error::Parse`](crate::Error::Parse).
     pub async fn try_parse<T>(
         &self,
-        command: Command,
+        call: impl IntoCommand<R>,
         parse: impl FnOnce(&str) -> Result<T>,
     ) -> Result<T> {
+        let command = call.into_command(self);
         let out = self.runner.checked(&command).await?;
         // B12: a parser must not silently see a truncated tail.
         let policy = command.output_buffer_policy();
@@ -430,6 +513,43 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn verbs_accept_args_directly_or_a_customized_command() {
+        // D7: a verb takes an argument list (no double `client.command(..)`
+        // mention) AND still accepts a customized Command via the same verb.
+        use std::time::Duration;
+        let runner = ScriptedRunner::new().on(["git", "status"], Reply::ok("clean"));
+        let client = CliClient::with_runner("git", runner);
+
+        // Argument list — the program comes from the client, defaults applied.
+        assert_eq!(client.run(["status"]).await.unwrap(), "clean");
+        // A Vec of owned args works too.
+        assert_eq!(client.run(vec!["status"]).await.unwrap(), "clean");
+        // A customized Command still runs through the same verb (pass-through).
+        let custom = client.command(["status"]).timeout(Duration::from_secs(3));
+        assert_eq!(custom.configured_timeout(), Some(Duration::from_secs(3)));
+        assert_eq!(client.run(custom).await.unwrap(), "clean");
+        // A borrowed slice works too (the `&[S]` impl).
+        let args = ["status"];
+        assert_eq!(client.run(&args[..]).await.unwrap(), "clean");
+        // The new `checked` verb (D7) returns the full result.
+        let result = client.checked(["status"]).await.unwrap();
+        assert_eq!(result.stdout(), "clean");
+    }
+
+    #[tokio::test]
+    async fn first_line_verb_streams_and_matches() {
+        // D7: CliClient gained `first_line`, delegating to the streaming seam.
+        let runner =
+            ScriptedRunner::new().on(["git", "log"], Reply::lines(["one", "two", "three"]));
+        let client = CliClient::with_runner("git", runner);
+        let found = client
+            .first_line(["log"], |line| line.starts_with('t'))
+            .await
+            .unwrap();
+        assert_eq!(found.as_deref(), Some("two"));
     }
 
     #[tokio::test]

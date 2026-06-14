@@ -23,6 +23,13 @@ to a dated version section.
 - `Error::CassetteMiss { program }` — a cassette replay with no matching recording (a
   stale or incomplete cassette), kept distinct from a missing-program error so
   `is_not_found()` is `false` and a wrapper can't mistake it for an absent optional tool.
+- `CliClient` verbs now take an **argument list directly** (D7): `git.run(["status"])`
+  instead of the double-mention `git.run(git.command(["status"]))`. A new sealed
+  `IntoCommand` trait lets every verb (`run`/`output`/`output_bytes`/`run_unit`/`exit_code`/
+  `probe`/`parse`/`try_parse`) accept either an argument list (built for the client's program
+  with its defaults) **or** a ready-made `Command` (for per-call customization) — so existing
+  `git.run(git.command(…))` call sites keep compiling. Two missing verbs were added to
+  `CliClient`: `checked` and `first_line`.
 - `ProcessRunner::output_bytes` (with a default impl) and `CliClient::output_bytes` (D5) —
   raw-byte stdout capture is now part of the runner **seam**, not just `Command`, so a
   byte-producing tool (`git cat-file`, `tar -c`, an image transcoder) is testable through a
