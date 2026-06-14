@@ -1,10 +1,19 @@
 //! [`Pipeline`] — `a | b | c` without a shell.
 //!
-//! Each stage's stdout feeds the next stage's stdin through a native pipe — no
-//! shell string, so no quoting or injection surface. Every stage spawns into
-//! one shared kill-on-drop [`ProcessGroup`](crate::ProcessGroup), so the whole
-//! chain dies as a unit, and the outcome is **pipefail**: the first stage
-//! without a clean exit decides the reported code/diagnostics.
+//! Each stage's stdout feeds the next stage's stdin — **no shell string**, so no
+//! quoting or injection surface, and no `sh -c`. The connection is a small
+//! in-process relay (a `tokio::io::copy` task per boundary copies stage N's
+//! stdout into stage N+1's stdin), not a kernel pipe spliced fd-to-fd; this is an
+//! implementation detail with two consequences: a producer whose consumer exits
+//! early stops on a [broken pipe](crate::Error) when the relay's next write fails
+//! (rather than instantly via SIGPIPE), and the relay's own I/O is plumbing — a
+//! closed sibling reads as EOF / writes as a broken pipe, neither of which is
+//! reported as a stage's stdin failure. (A future optimization could splice the
+//! child handles directly via `Stdio`; the relay is kept for now as the simpler,
+//! already-correct construction.) Every stage spawns into one shared kill-on-drop
+//! [`ProcessGroup`](crate::ProcessGroup), so the whole chain dies as a unit, and
+//! the outcome is **pipefail**: the first stage without a clean exit decides the
+//! reported code/diagnostics.
 
 use std::time::Duration;
 

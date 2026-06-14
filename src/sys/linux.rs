@@ -548,14 +548,26 @@ impl Cgroup {
     /// public signal broadcast). Best-effort: an empty cgroup is trivially
     /// signalled, and a member that exits mid-loop just yields `ESRCH`.
     fn signal(&self, sig: i32) -> io::Result<()> {
+        let mut last_err = None;
         for pid in self.members() {
-            // SAFETY: a plain signal to a pid read from cgroup.procs; a race
-            // where the pid already exited just yields ESRCH.
-            unsafe {
-                libc::kill(pid, sig);
+            // SAFETY: a plain signal to a pid read from cgroup.procs.
+            let rc = unsafe { libc::kill(pid, sig) };
+            if rc != 0 {
+                let err = io::Error::last_os_error();
+                // A race where the pid already exited (ESRCH) is benign — the
+                // member is gone, the intended end state. Any other failure
+                // (notably EPERM — a member that changed uid, or a seccomp /
+                // container restriction) is a real delivery failure and must not
+                // read as success (L2): surface the last one.
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    last_err = Some(err);
+                }
             }
         }
-        Ok(())
+        match last_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// Freeze (`true`) or thaw (`false`) the whole subtree.

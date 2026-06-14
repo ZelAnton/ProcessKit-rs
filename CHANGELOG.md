@@ -13,6 +13,16 @@ to a dated version section.
 
 ### Fixed
 
+- `ProcessGroup::signal` — and the `process-control` `suspend`/`resume` verbs on
+  their per-member fallback path (older kernels without `cgroup.freeze`) — on the
+  Linux **cgroup** backend now surface a
+  real per-member delivery failure instead of always reporting success: a non-`ESRCH`
+  `kill(2)` error (notably `EPERM` — a member that changed uid, or a seccomp/container
+  restriction) is returned rather than silently swallowed. `ESRCH` (the member already
+  exited) is still treated as success, and `signal(Signal::Kill)` still takes the
+  atomic whole-tree `cgroup.kill` path. The graceful-shutdown SIGTERM tier is unchanged
+  (it is best-effort and already ignores the per-member result before escalating to
+  SIGKILL).
 - `RunningProcess::first_line` now surfaces `Error::Cancelled` when its command's
   cancellation token has fired, instead of returning `Ok(None)`. A cancelled run's
   stdout stream simply ends, which was indistinguishable from "the predicate never
