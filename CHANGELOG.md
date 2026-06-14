@@ -11,14 +11,22 @@ to a dated version section.
 
 ## [Unreleased]
 
-### Added
--
-
-### Changed
--
-
 ### Fixed
--
+
+- A retained-byte cap ([`OutputBufferPolicy::with_max_bytes`]) now bounds the pump's
+  **in-flight** line-assembly buffer, not just the retained backlog. Previously a
+  newline-free flood (`base64 -w0`, a multi-gigabyte single "line") accumulated in full
+  in the decode buffer before the cap was ever consulted — defeating the very memory
+  bound the byte cap exists to provide. A line whose own length exceeds the cap is now
+  dropped as it arrives (it can never be retained whole): under the drop modes it sets
+  the truncation signal, under [`OverflowMode::Error`] it trips the fail-loud ceiling.
+  Consequence: an over-cap line, never assembled, is also not delivered to a per-line
+  handler or `stdout_tee` (set no byte cap if a tee must see arbitrarily long lines).
+- A child stream interrupted by a **read error** mid-multibyte-character no longer
+  fabricates a phantom replacement-character (`U+FFFD`) line. The decoder's end-of-stream
+  flush — which turns a dangling incomplete sequence into `U+FFFD` — is now performed only
+  on a *clean* EOF; a read error means the stream was truncated, so the incomplete trailing
+  bytes are dropped rather than invented into output.
 
 ## [0.10.1] - 2026-06-14
 

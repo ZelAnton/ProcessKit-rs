@@ -100,6 +100,17 @@ pub enum OverflowMode {
 /// [`with_max_bytes`](Self::with_max_bytes) to bound the actual retained memory,
 /// or use [`output_bytes`](crate::Command::output_bytes) (raw, no line
 /// splitting) when the output is not line-structured.
+///
+/// A byte cap bounds both the retained backlog **and** the in-flight line the
+/// pump is still assembling (H1): a line whose own length exceeds the cap can
+/// never be retained whole, so the pump drops it as it arrives — a newline-free
+/// flood cannot exhaust memory even before its (never-arriving) terminator. The
+/// ceiling measures the **retained text** — the sum of the decoded lines' UTF-8
+/// byte lengths, *excluding* the stripped `\n`/`\r` terminators — not the raw
+/// bytes on the pipe. One consequence: an over-cap line, since it is never
+/// assembled, is also **not** delivered to a per-line handler or
+/// [`stdout_tee`](crate::Command::stdout_tee) (set no byte cap if a tee must see
+/// arbitrarily long lines verbatim).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OutputBufferPolicy {
@@ -152,9 +163,11 @@ impl OutputBufferPolicy {
     /// Set the retained-byte ceiling (D8), composable with any policy.
     ///
     /// Bounds the actual memory the buffer holds — the sum of the retained
-    /// lines' UTF-8 byte lengths — independently of [`max_lines`](Self::max_lines).
-    /// Use it to cap a stream whose line *count* is modest but whose lines can be
-    /// huge (one `base64 -w0` line evades a line cap but not a byte cap):
+    /// lines' UTF-8 byte lengths — independently of [`max_lines`](Self::max_lines),
+    /// and bounds the pump's in-flight assembly buffer too, so even a single
+    /// never-terminated line cannot exhaust memory (H1). Use it to cap a stream
+    /// whose line *count* is modest but whose lines can be huge (one `base64 -w0`
+    /// line evades a line cap but not a byte cap):
     /// `unbounded().with_max_bytes(1 << 20)` is a 1 MiB byte-bounded ring buffer;
     /// `fail_loud(100).with_max_bytes(1 << 20)` errors on whichever ceiling — 100
     /// lines or 1 MiB — is reached first. Under the drop modes a single line

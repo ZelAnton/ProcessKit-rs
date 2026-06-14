@@ -175,6 +175,31 @@ impl SharedLines {
         self.notify.notify_one();
     }
 
+    /// The retained-byte ceiling (`OutputBufferPolicy::max_bytes`), read by the
+    /// pump once at start to bound the in-flight decode buffer (H1).
+    pub(crate) fn byte_cap(&self) -> Option<usize> {
+        self.inner.lock().expect("SharedLines poisoned").max_bytes
+    }
+
+    /// Record a line whose own byte length exceeds `max_bytes` (H1): it is
+    /// counted and added to the seen-byte total, but never retained (it cannot
+    /// fit the cap). Under [`OverflowMode::Error`] it trips the fail-loud
+    /// ceiling; under the drop modes it sets the truncation signal. Mirrors the
+    /// "cannot fit" accounting in [`push`](Self::push) for a line the pump never
+    /// buffered (so it is also not delivered to the per-line handler or tee).
+    pub(crate) fn record_oversized_line(&self, byte_len: usize) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut inner = self.inner.lock().expect("SharedLines poisoned");
+            inner.seen_bytes = inner.seen_bytes.saturating_add(byte_len);
+            if matches!(inner.mode, OverflowMode::Error) {
+                inner.overflowed = true;
+            }
+        }
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        self.notify.notify_one();
+    }
+
     fn close(&self) {
         // Recover a poisoned lock instead of panicking: `close` runs from a
         // `Drop` guard on the pump task's unwind path (see `pump_lines`), where a
@@ -369,18 +394,43 @@ pub(crate) async fn pump_lines_core<R>(
         sink.push(line);
     }
 
+    // Byte length of the line content ending at the `\n` at index `nl`, excluding
+    // a CRLF `\r` — matching the retained-content definition used by `push`, so
+    // the over-cap decision judges a CRLF line exactly like its LF twin (a line
+    // whose content is exactly `max_bytes` is retained either way).
+    fn content_len(pending: &str, nl: usize) -> usize {
+        if nl > 0 && pending.as_bytes()[nl - 1] == b'\r' {
+            nl - 1
+        } else {
+            nl
+        }
+    }
+
+    // The retained-byte ceiling (immutable), read once. When set, it bounds not
+    // just the retained backlog but the *in-flight* decode buffer too (H1): a
+    // line whose own length exceeds the cap can never be retained whole, so once
+    // `pending` passes the cap we stop buffering it and skip to its terminating
+    // newline — a newline-free flood (`base64 -w0`) can no longer OOM the parent.
+    let cap = sink.0.byte_cap();
     let mut decoder = encoding.new_decoder_with_bom_removal();
     let mut pending = String::new(); // decoded text not yet split into a line
     let mut chunk = [0u8; 8192];
+    // `Some(bytes_so_far)` while skipping an over-cap line: its bytes are
+    // discarded as decoded, only its length is tracked (for the seen-byte total).
+    let mut oversized: Option<usize> = None;
     loop {
-        // Treat a read error like EOF: flush what we have and stop (the child is
-        // reaped by its group). `last` triggers the decoder's end-of-stream
-        // flush (a trailing incomplete sequence becomes one replacement char).
-        let (n, last) = match reader.read(&mut chunk).await {
-            Ok(0) => (0, true),
-            Ok(n) => (n, false),
-            Err(_) => (0, true),
+        // Distinguish a clean EOF (`Ok(0)`) from a read error: both stop the
+        // pump (the child is reaped by its group), but only a clean EOF signals
+        // the decoder's end-of-stream flush. On an error we pass `last = false`
+        // so a trailing *incomplete* multibyte sequence is dropped (it was
+        // truncated by the error) rather than fabricated into a phantom
+        // replacement char / phantom final line (L12).
+        let (n, eof, errored) = match reader.read(&mut chunk).await {
+            Ok(0) => (0, true, false),
+            Ok(n) => (n, false, false),
+            Err(_) => (0, true, true),
         };
+        let last = eof && !errored;
         // Reserve the decoder's worst-case output up front so `decode_to_string`
         // (which uses the `String`'s spare capacity as its output limit, never
         // reallocating) consumes the whole chunk in one call.
@@ -389,18 +439,65 @@ pub(crate) async fn pump_lines_core<R>(
         }
         let _ = decoder.decode_to_string(&chunk[..n], &mut pending, last);
 
-        // Split out every complete line decoded so far.
-        while let Some(nl) = pending.find('\n') {
-            let mut line: String = pending.drain(..=nl).collect();
-            line.pop(); // drop the '\n'
-            if line.ends_with('\r') {
-                line.pop(); // drop exactly one preceding '\r' (CRLF)
+        // Split out every complete line decoded so far, bounding memory by `cap`.
+        loop {
+            if let Some(skipped) = oversized {
+                // Skipping an over-cap line: discard up to (and including) its
+                // terminating newline, keeping only its length for accounting.
+                match pending.find('\n') {
+                    Some(nl) => {
+                        let line_len = skipped.saturating_add(content_len(&pending, nl));
+                        pending.drain(..=nl);
+                        oversized = None;
+                        sink.0.record_oversized_line(line_len);
+                    }
+                    None => {
+                        oversized = Some(skipped.saturating_add(pending.len()));
+                        pending.clear();
+                        break;
+                    }
+                }
+            } else {
+                match pending.find('\n') {
+                    Some(nl) => {
+                        // Compare the *content* length (excluding a CRLF `\r`) to
+                        // the cap, so a CRLF line is judged exactly like its LF twin.
+                        let len = content_len(&pending, nl);
+                        if cap.is_none_or(|c| len <= c) {
+                            // Fits the byte cap: emit it normally.
+                            let mut line: String = pending.drain(..=nl).collect();
+                            line.pop(); // drop the '\n'
+                            if line.ends_with('\r') {
+                                line.pop(); // drop exactly one preceding '\r' (CRLF)
+                            }
+                            emit(&mut handler, &mut tee, &sink.0, line).await;
+                        } else {
+                            // Over-cap line whose newline is already here: drop it
+                            // whole (it can never be retained), counting its length.
+                            pending.drain(..=nl);
+                            sink.0.record_oversized_line(len);
+                        }
+                    }
+                    // No newline yet and already over the cap → over-cap line in
+                    // progress: discard what we have and skip to the newline.
+                    None if cap.is_some_and(|c| pending.len() > c) => {
+                        oversized = Some(pending.len());
+                        pending.clear();
+                        break;
+                    }
+                    None => break,
+                }
             }
-            emit(&mut handler, &mut tee, &sink.0, line).await;
         }
-        if last {
-            // Flush a final line that ended at EOF/error without a newline.
-            if !pending.is_empty() {
+
+        if eof {
+            // Finalize a final line (or an un-terminated over-cap tail) at end.
+            if let Some(skipped) = oversized.take() {
+                // An un-terminated tail has no '\n', so a trailing '\r' is content.
+                let line_len = skipped.saturating_add(pending.len());
+                pending.clear();
+                sink.0.record_oversized_line(line_len);
+            } else if !pending.is_empty() {
                 emit(
                     &mut handler,
                     &mut tee,
@@ -914,6 +1011,102 @@ mod tests {
         let sink = SharedLines::new(&policy);
         pump_lines(&b"ab\ncd\nef\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
         assert_eq!(sink.drain(), vec!["ab", "cd"]);
+    }
+
+    #[tokio::test]
+    async fn max_bytes_skips_an_over_cap_line_streamed_across_reads_without_buffering_it() {
+        // H1: an over-cap line arriving as a newline-free flood across many reads
+        // (`base64 -w0`-style) must be dropped whole WITHOUT the pump ever
+        // buffering it in full — the byte cap bounds the *in-flight* decode
+        // buffer, not just the retained backlog. We can't measure memory here,
+        // but the pump resyncing at the newline (the small trailing line is
+        // retained, the flood is a truncation) proves it skipped rather than
+        // accumulated the 50 KB line under an 8-byte cap.
+        let reader = ChunkedReader::new([vec![b'X'; 50_000], b"\n".to_vec(), b"tail\n".to_vec()]);
+        let policy = OutputBufferPolicy::unbounded().with_max_bytes(8);
+        let sink = SharedLines::new(&policy);
+        pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(
+            sink.drain(),
+            vec!["tail"],
+            "the over-cap flood is dropped; the small line is kept"
+        );
+        assert_eq!(sink.count(), 2, "both lines are counted");
+        assert!(sink.dropped() >= 1, "the over-cap line is a truncation");
+    }
+
+    #[tokio::test]
+    async fn error_mode_byte_cap_drains_a_post_trip_flood_without_retaining() {
+        // H1 + Error mode: after the byte ceiling trips, a large newline-free
+        // flood is still bounded (its in-flight bytes are skipped, not buffered)
+        // and drained to EOF so the child never blocks, while nothing is retained.
+        let policy = OutputBufferPolicy::unbounded()
+            .with_overflow(OverflowMode::Error)
+            .with_max_bytes(3);
+        let sink = SharedLines::new(&policy);
+        // "abcd" (4 bytes) trips the 3-byte ceiling; a flood and a line follow.
+        let reader =
+            ChunkedReader::new([b"abcd\n".to_vec(), vec![b'Z'; 20_000], b"\nmore\n".to_vec()]);
+        pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
+        assert!(
+            sink.overflowed(),
+            "the over-cap first line trips the ceiling"
+        );
+        assert!(
+            sink.drain().is_empty(),
+            "nothing is retained under the fail-loud ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn byte_cap_judges_a_crlf_line_like_its_lf_twin_at_the_boundary() {
+        // F1: the over-cap decision must measure line *content* (excluding the
+        // stripped CRLF '\r'), so a CRLF line whose content is exactly `max_bytes`
+        // is retained — identically to the same content with a bare LF — not
+        // wrongly dropped (and, under Error mode, not wrongly tripped).
+        let lf = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(2));
+        pump_lines(&b"ab\n"[..], encoding_rs::UTF_8, None, lf.clone()).await;
+        assert_eq!(
+            lf.drain(),
+            vec!["ab"],
+            "LF: 2-byte content fits a 2-byte cap"
+        );
+
+        let crlf = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(2));
+        pump_lines(&b"ab\r\n"[..], encoding_rs::UTF_8, None, crlf.clone()).await;
+        assert_eq!(
+            crlf.drain(),
+            vec!["ab"],
+            "CRLF: the same 2-byte content must also fit (the '\\r' is a terminator)"
+        );
+        assert_eq!(crlf.dropped(), 0, "nothing was over-cap");
+
+        // One byte over (3-byte content) is genuinely over-cap under both endings.
+        let over = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(2));
+        pump_lines(&b"abc\r\n"[..], encoding_rs::UTF_8, None, over.clone()).await;
+        assert!(
+            over.drain().is_empty(),
+            "3-byte content exceeds the 2-byte cap"
+        );
+        assert!(over.dropped() >= 1);
+    }
+
+    #[tokio::test]
+    async fn read_error_after_incomplete_multibyte_does_not_fabricate_a_phantom_char() {
+        // L12: a complete line, then a lone UTF-8 lead byte (0xC3, an incomplete
+        // 2-byte sequence), then a read ERROR. A clean EOF would legitimately
+        // flush the decoder and turn the dangling byte into U+FFFD — but an error
+        // means the stream was truncated mid-character, so the incomplete byte is
+        // dropped, never fabricated into a phantom replacement-char line.
+        let reader = ChunkedReader::erroring([b"ok\n\xC3".to_vec()]);
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(
+            sink.drain(),
+            vec!["ok"],
+            "the truncated lead byte produces no phantom line"
+        );
+        assert_eq!(sink.count(), 1);
     }
 
     /// An in-memory `AsyncWrite` collecting every byte written.
