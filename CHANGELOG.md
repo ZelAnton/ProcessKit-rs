@@ -11,14 +11,19 @@ to a dated version section.
 
 ## [Unreleased]
 
-### Added
--
-
 ### Changed
--
 
-### Fixed
--
+- **Packaging/metadata only — no code or API changes.** Sharpened the crates.io
+  discovery surface so the crate is easier to find: rewrote `description` to lead
+  with the kill-on-drop no-orphan guarantee; replaced the mis-applied
+  `command-line-utilities` category (that slug is for CLI *binaries*, not a
+  library) with `asynchronous`, `os`, `os::unix-apis`, `os::windows-apis`, and
+  `concurrency`; refreshed `keywords` to high-volume search terms
+  (`process`, `subprocess`, `tokio`, `async`, `process-group`); and excluded the
+  3.5 MB `cover.png` banner from the published archive (it renders from its
+  absolute URL), shrinking the package from ~4.7 MiB to ~1.3 MiB. Also tightened
+  the README and crate-doc intros. Cut as `0.10.1` so crates.io picks the new
+  metadata up — the live `0.10.0` shipped the old/mis-categorized values.
 
 ## [0.10.0] - 2026-06-14
 
