@@ -11,6 +11,17 @@ to a dated version section.
 
 ## [Unreleased]
 
+### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [0.11.0] - 2026-06-14
+
 ### Changed
 
 - **Breaking:** the `stats` feature is now **opt-in** — it is no longer in the
@@ -1289,7 +1300,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.10.2...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.9.2...v0.10.0
