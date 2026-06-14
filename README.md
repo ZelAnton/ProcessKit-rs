@@ -167,8 +167,8 @@ guarantee is unconditional in every configuration.
 
 | Feature | Default | Adds |
 |---|---|---|
-| `stats` | ✅ | group/per-run resource measurement, `sample_stats`, `profile` |
 | `process-control` | ✅ | `Signal`, `ProcessGroup::{signal, suspend, resume, members, adopt}` |
+| `stats` | — | group/per-run resource measurement, `sample_stats`, `profile` (opt-in: the one feature with an extra dependency) |
 | `limits` | — | whole-tree resource caps (implies `stats`) |
 | `record` | — | record/replay cassettes (pulls `serde`) |
 | `mock` | — | `mockall`-generated `MockRunner` (test-only; its surface is semver-exempt — prefer `ScriptedRunner`/`RecordingRunner`) |
