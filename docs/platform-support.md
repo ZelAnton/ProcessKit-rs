@@ -90,6 +90,18 @@ behaves identically everywhere.
 
 The honest fine print, mostly consequences of OS semantics:
 
+**Windows: termination is an exit code, never `Signalled` (D18).** Windows has
+no signal abstraction, so a killed process reports
+[`Outcome::Exited`](https://docs.rs/processkit/latest/processkit/enum.Outcome.html),
+not `Outcome::Signalled`. `TerminateProcess` / `TerminateJobObject(_, 1)` is
+`Exited(1)` — indistinguishable from a voluntary `exit(1)` — and `Ctrl-C`
+surfaces as `Exited(-1073741510)` (`STATUS_CONTROL_C_EXIT` as a signed `i32`).
+The crate reports the platform truth rather than fabricating a `Signalled` from
+an NTSTATUS code (that mapping would be a lossy guess). When you need to *know*
+the run was killed, use a `ProcessGroup` deadline or a cancellation token (which
+surface as `TimedOut` / `Error::Cancelled` on every platform). `Outcome::Signalled`
+is therefore Unix-only.
+
 **Linux cgroup delegation.** Creating the per-group cgroup needs write access
 to the cgroup v2 hierarchy. Dev boxes typically lack it → the pgroup fallback.
 CI inside containers usually has it. Check `mechanism()` when behavior must

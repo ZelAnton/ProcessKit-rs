@@ -161,6 +161,17 @@ to a dated version section.
 
 ### Fixed
 
+- `RunningProcess::start_kill` is **documented and guaranteed idempotent** (D20): killing a
+  child that has already exited and been reaped (e.g. by a prior readiness probe or `wait_any`
+  observation) is a successful no-op — like `kill` on a Unix zombie. (Current tokio/std
+  already return `Ok` here; the crate also defensively treats a stray `InvalidInput` from a
+  reaped handle as the no-op success it is, and a regression test pins the contract.)
+- **Documented (D18):** `Outcome::Signalled` is **Unix-only**. On Windows a killed process
+  reports `Outcome::Exited` with a platform code (no signal abstraction) —
+  `TerminateJobObject(_, 1)` is `Exited(1)` (indistinguishable from `exit(1)`), `Ctrl-C` is
+  `Exited(-1073741510)`. The crate reports the platform truth rather than guessing a
+  `Signalled` from an NTSTATUS code; use a deadline or cancellation token when you must *know*
+  a run was killed. (See `Outcome` docs and `docs/platform-support.md`.)
 - **Pipeline status semantics are unified (D14).** The last stage is now evaluated by the
   same pipefail rule as the inner stages — one `is_clean`, one attribution — fixing two
   inconsistencies:

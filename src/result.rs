@@ -15,10 +15,24 @@ use crate::error::Error;
 #[non_exhaustive]
 pub enum Outcome {
     /// The process exited on its own with this code.
+    ///
+    /// On **Windows** this also covers a *killed* process: the OS has no signal
+    /// abstraction, so termination yields an exit code, not a
+    /// [`Signalled`](Self::Signalled) (D18). A `TerminateProcess`/
+    /// `TerminateJobObject(_, 1)` is reported as `Exited(1)` — indistinguishable
+    /// from a voluntary `exit(1)` — and `Ctrl-C` surfaces as
+    /// `Exited(-1073741510)` (`STATUS_CONTROL_C_EXIT` as a signed `i32`). This is
+    /// the platform truth; the crate does not fabricate a `Signalled` from an
+    /// NTSTATUS code (the mapping would be a lossy guess). Use a
+    /// [`ProcessGroup`](crate::ProcessGroup) deadline / cancellation token when
+    /// you need to *know* you killed it.
     Exited(i32),
-    /// Terminated by a signal (Unix) — no exit code exists.
-    /// The inner value is the signal number when the platform reports one;
-    /// `None` on Windows or when the kernel does not expose the signal.
+    /// Terminated by a signal **(Unix only)** — no exit code exists. The inner
+    /// value is the signal number when the platform reports one (`None` when the
+    /// kernel does not expose it). **Never produced on Windows**, where a killed
+    /// process reports [`Exited`](Self::Exited) with a platform code instead
+    /// (D18). A [`ScriptedRunner`](crate::testing::ScriptedRunner) reports
+    /// `Signalled(None)` for a killed scripted run, matching Unix.
     Signalled(Option<i32>),
     /// Killed because it exceeded its configured timeout.
     TimedOut,

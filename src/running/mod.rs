@@ -1670,14 +1670,30 @@ impl RunningProcess {
     /// The [`Outcome`] reported afterwards (by [`wait`](Self::wait) /
     /// [`wait_any`](crate::wait_any)) for a killed child is platform-dependent
     /// — `Outcome::Signalled` on a Unix signal kill, `Outcome::Exited` with a
-    /// platform code on Windows `TerminateProcess`; a
+    /// platform code on Windows `TerminateProcess` (D18: Windows has no signal
+    /// abstraction, see [`Outcome::Signalled`](crate::Outcome::Signalled)); a
     /// [`ScriptedRunner`](crate::testing::ScriptedRunner) handle reports
     /// `Outcome::Signalled(None)` (matching Unix).
+    ///
+    /// **Idempotent (D20):** killing a child that has already exited (and been
+    /// reaped — e.g. by a prior [`wait_for_line`](Self::wait_for_line) probe or a
+    /// [`wait_any`](crate::wait_any) observation) is a successful no-op, like
+    /// `kill` on a Unix zombie — not an error.
     pub fn start_kill(&mut self) -> Result<()> {
         match &mut self.backend {
-            Backend::Real(real) => {
-                real.child.start_kill().map_err(Error::Io)?;
-            }
+            Backend::Real(real) => match real.child.start_kill() {
+                Ok(()) => {}
+                // Defensive (D20): current tokio/std already return `Ok` for a
+                // reaped/exited child (the handle is fused to "done"), so this
+                // arm is normally unreachable. Should any tokio/std version
+                // instead surface `InvalidInput` ("can't kill an exited
+                // process"), treat it as the benign no-op it is rather than
+                // leaking it as a spurious error. A real failure on a *live*
+                // child surfaces as the OS error (e.g. permission denied), never
+                // `InvalidInput`, so this can't mask one.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+                Err(e) => return Err(Error::Io(e)),
+            },
             Backend::Scripted(s) => s.kill(),
         }
         Ok(())

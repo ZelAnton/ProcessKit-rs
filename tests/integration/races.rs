@@ -119,3 +119,29 @@ async fn start_kill_terminates_a_running_process() {
         start.elapsed()
     );
 }
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess; D20 start_kill is idempotent after reap"]
+async fn start_kill_is_idempotent_after_the_child_is_reaped() {
+    // Pins the D20 contract: start_kill is idempotent. A child that exits on its
+    // own, reaped via a wait_any observation (the handle is only borrowed, not
+    // consumed); a subsequent start_kill — twice — must be a no-op success, like
+    // `kill` on a Unix zombie. Guards the contract against a future tokio/std or
+    // crate change that might surface a reaped-child kill as an error.
+    let group = ProcessGroup::new().expect("create group");
+    let mut quick = group
+        .start(&two_line_echo())
+        .await
+        .expect("start quick child");
+    let (idx, _) = tokio::time::timeout(Duration::from_secs(10), wait_any(&mut [&mut quick]))
+        .await
+        .expect("child reaped in time")
+        .expect("wait_any");
+    assert_eq!(idx, 0);
+    // The child is reaped; killing it again is a benign no-op.
+    quick
+        .start_kill()
+        .expect("start_kill on a reaped child must be an idempotent Ok (D20)");
+    // …and still idempotent on repeat.
+    quick.start_kill().expect("a second start_kill is also Ok");
+}
