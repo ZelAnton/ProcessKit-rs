@@ -251,7 +251,7 @@ async fn graceful_timeout_on_an_events_run_reports_timed_out() {
         "the ready banner must arrive before the deadline"
     );
 
-    let outcome = run.finish().await.expect("finish");
+    let outcome = run.finish().await.expect("finish").outcome;
     assert_eq!(
         outcome,
         Outcome::TimedOut,
