@@ -21,6 +21,16 @@ use crate::running::{RunningProcess, Spawned};
 /// [`ScriptedRunner`](crate::testing::ScriptedRunner) /
 /// [`RecordingRunner`](crate::testing::RecordingRunner) (or, behind the `mock` feature,
 /// a generated `MockRunner`) instead of spawning real processes.
+///
+/// The defaulting note above applies to **hand-written** runners. The
+/// `mock`-feature `MockRunner` is different: `mockall::automock` replaces *every*
+/// method — including the defaulted `output_bytes`/`start` — with an expectation,
+/// so a `MockRunner` does **not** inherit the `Unsupported` default (L8). Set the
+/// expectations you exercise (`expect_output()`, and `expect_start()` /
+/// `expect_output_bytes()` if a verb routes through them) or an unset call panics.
+/// `ScriptedRunner` is the recommended double — it provides the defaults and the
+/// streaming seam out of the box. (The `mock` feature / `MockRunner` are
+/// semver-exempt — see the crate-level docs.)
 #[cfg_attr(feature = "mock", mockall::automock)]
 #[async_trait::async_trait]
 pub trait ProcessRunner: Send + Sync {
@@ -155,6 +165,16 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// stdout). The building block for the `parse`/`try_parse` helpers — use it
     /// when you need the whole `ProcessResult` after success-checking, rather
     /// than just trimmed stdout (`run`) or the raw result (`output`).
+    ///
+    /// Unlike [`run`](Self::run) (and the
+    /// [`CliClient::parse`](crate::CliClient::parse)/[`try_parse`](crate::CliClient::try_parse)
+    /// verbs built over it), `checked` does **not** fail loud on a bounded-buffer
+    /// truncation (L4): it
+    /// hands back the (possibly truncated) `ProcessResult` so the caller can decide
+    /// — inspect [`truncated()`](crate::ProcessResult::truncated) before relying on
+    /// the stdout. This is deliberate: `checked` is the lenient building block;
+    /// the trimming / parsing verbs add the loud-on-truncation guard because they
+    /// present stdout as if complete.
     async fn checked(&self, command: &Command) -> Result<ProcessResult<String>> {
         retrying(command, || async {
             self.output(command).await?.ensure_success()
@@ -172,6 +192,13 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// [`ScriptedRunner`](crate::testing::ScriptedRunner) in tests), unlike the
     /// real-runner-only [`Command::first_line`](crate::Command::first_line),
     /// which now delegates here.
+    ///
+    /// Because it is generic over the predicate `F`, `first_line` is **not
+    /// object-safe** and so is unavailable on a `&dyn ProcessRunner` (S3): call it
+    /// on a concrete runner ([`JobRunner`], `&ProcessGroup`, a
+    /// [`ScriptedRunner`](crate::testing::ScriptedRunner)), or via the
+    /// [`Command::first_line`] / [`CliClient::first_line`](crate::CliClient::first_line)
+    /// wrappers. All other [`ProcessRunnerExt`] verbs work through `&dyn`.
     async fn first_line<F>(&self, command: &Command, predicate: F) -> Result<Option<String>>
     where
         F: Fn(&str) -> bool + Send,
@@ -305,6 +332,10 @@ impl JobRunner {
     }
 }
 
+// The inherent [`JobRunner::start`] above is the **canonical** implementation
+// (so `JobRunner::new().start(cmd)` works without the trait in scope); the trait
+// methods here, and `Command`'s direct verbs, all route through it. Keep new
+// start-time behavior in the inherent method so no path can bypass it (S2).
 #[async_trait::async_trait]
 impl ProcessRunner for JobRunner {
     async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {

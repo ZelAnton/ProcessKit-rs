@@ -11,6 +11,18 @@ to a dated version section.
 
 ## [Unreleased]
 
+### Changed
+
+- A ready-made [`Command`] passed straight to a [`CliClient`] verb (e.g.
+  `git.run(some_command)`, the per-call-customization form) now receives the
+  client's defaults — `default_timeout`, `default_env`, `default_cancel_on` —
+  **filled into the gaps it left**, instead of being run with none of them (M7).
+  The command's own explicit settings still win; only unset ones are filled, and
+  the fill is idempotent (a verb running `client.command(..)`, already defaulted,
+  is unaffected). This closes a silent footgun where a client-wide cancellation
+  token (wired for shutdown) would not reach a per-call-customized command. An
+  argument-list call is unchanged.
+
 ### Fixed
 
 - `ProcessGroup::signal` — and the `process-control` `suspend`/`resume` verbs on

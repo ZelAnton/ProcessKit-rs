@@ -789,6 +789,21 @@ impl Command {
         self.cancel_token.clone()
     }
 
+    /// Fill in a [`CliClient`](crate::CliClient)'s default env ops (M7) — but only
+    /// for keys this command has **not** already set, so a per-command `env` /
+    /// `env_remove` wins over a client default for the same key. Idempotent:
+    /// applying the same defaults twice (a verb running `client.command(..)`,
+    /// which already applied them) adds nothing the second time. The "already set?"
+    /// check is case-insensitive on Windows (where env names are), so a client
+    /// `default_env("Path", …)` does not clobber a per-command `env("PATH", …)`.
+    pub(crate) fn fill_default_envs(&mut self, defaults: &[(OsString, Option<OsString>)]) {
+        for (key, value) in defaults {
+            if !self.envs.iter().any(|(k, _)| env_key_eq(k, key)) {
+                self.envs.push((key.clone(), value.clone()));
+            }
+        }
+    }
+
     /// Extra Windows creation flags (read by the spawn seam on every target).
     pub(crate) fn extra_creation_flags(&self) -> u32 {
         self.creation_flags_extra
@@ -1151,6 +1166,24 @@ pub(crate) fn redacted_env_names(
     names.sort();
     names.dedup();
     names
+}
+
+/// Compare two environment-variable names with the platform's case rules:
+/// case-insensitive on Windows (where env names are), case-sensitive elsewhere.
+/// Used to decide whether a command already sets a key before filling a client
+/// default for it (M7). A non-UTF-8 name on Windows falls back to exact bytes.
+fn env_key_eq(a: &OsStr, b: &OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        match (a.to_str(), b.to_str()) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => a == b,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
 }
 
 /// Render one argument shell-quoted for **display** (POSIX single-quote rules).

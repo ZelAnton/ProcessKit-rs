@@ -38,6 +38,13 @@ mod sealed {
 /// double-mention of the older `git.run(git.command([…]))` form. Implemented for
 /// argument containers (`[S; N]`, `Vec<S>`, `&[S]` where `S: AsRef<OsStr>`) and
 /// for [`Command`]; **sealed** (not implementable downstream).
+///
+/// Either form receives the client's defaults (timeout / env /
+/// [`default_cancel_on`](CliClient::default_cancel_on)): an argument list builds a
+/// fresh command with them, and a ready-made [`Command`] has them **filled into
+/// the gaps it left** — its own explicit settings win, but a client-wide cancel
+/// token / timeout / env still reaches a per-call-customized command rather than
+/// being silently dropped (M7).
 pub trait IntoCommand<R: ProcessRunner>: sealed::Sealed {
     /// Build the [`Command`] to run for `client` — used by the verbs.
     #[doc(hidden)]
@@ -45,8 +52,11 @@ pub trait IntoCommand<R: ProcessRunner>: sealed::Sealed {
 }
 
 impl<R: ProcessRunner> IntoCommand<R> for Command {
-    fn into_command(self, _client: &CliClient<R>) -> Command {
-        self
+    fn into_command(self, client: &CliClient<R>) -> Command {
+        // Fill the client's defaults into the caller-supplied command's gaps
+        // (M7) — its explicit settings win, but the client-wide token/timeout/env
+        // is not silently dropped. Idempotent if `command()` already applied them.
+        client.apply_defaults(self)
     }
 }
 
@@ -206,24 +216,29 @@ impl<R: ProcessRunner> CliClient<R> {
         self.apply_defaults(Command::new(&self.program).current_dir(dir).args(args))
     }
 
-    /// Apply this client's defaults (timeout, env overrides, cancellation
-    /// token) to a freshly built command.
-    fn apply_defaults(&self, command: Command) -> Command {
-        let mut command = match self.timeout {
-            Some(timeout) => command.timeout(timeout),
-            None => command,
-        };
-        for (key, value) in &self.envs {
-            command = match value {
-                Some(value) => command.env(key, value),
-                None => command.env_remove(key),
-            };
+    /// Fill the client's defaults into `command`, but only where the command has
+    /// not set them itself — so a fresh [`command()`](Self::command) (no settings)
+    /// gets every default, while a caller-supplied [`Command`] passed straight to
+    /// a verb keeps its own explicit timeout/cancel/env and only fills the gaps
+    /// (M7: a client-wide cancel token / timeout / env is no longer silently
+    /// dropped when you customize a single call). Idempotent — running it twice
+    /// (a verb applies it to a command that `command()` already defaulted) is a
+    /// no-op the second time.
+    fn apply_defaults(&self, mut command: Command) -> Command {
+        if command.configured_timeout().is_none()
+            && let Some(timeout) = self.timeout
+        {
+            command = command.timeout(timeout);
         }
-        // Applied at build time, so a later per-command `cancel_on` chained on
-        // the returned command replaces it — the documented override precedence.
-        if let Some(token) = &self.cancel {
+        // The command's own `cancel_on` wins; a client default only fills the gap.
+        // (Chaining `cancel_on` on a `command()` still replaces the just-filled
+        // default — the single token field — so that precedence is unchanged.)
+        if command.cancel_token().is_none()
+            && let Some(token) = &self.cancel
+        {
             command = command.cancel_on(token.clone());
         }
+        command.fill_default_envs(&self.envs);
         command
     }
 
@@ -667,6 +682,98 @@ mod tests {
             "env override did not reach the runner: {:?}",
             call.envs
         );
+    }
+
+    #[tokio::test]
+    async fn a_prebuilt_command_passed_to_a_verb_still_gets_client_defaults() {
+        // M7: a ready-made `Command` passed straight to a verb (per-call
+        // customization) must still receive the client's default timeout / env /
+        // cancel token in the gaps it left — not have them silently dropped.
+        let token = crate::CancellationToken::new();
+        let client = CliClient::new("git")
+            .default_timeout(Duration::from_secs(9))
+            .default_env("GIT_TERMINAL_PROMPT", "0")
+            .default_cancel_on(token);
+
+        // Built WITHOUT the client (no defaults applied yet).
+        let raw = Command::new("git").args(["push"]);
+        let filled = raw.into_command(&client);
+        assert_eq!(
+            filled.configured_timeout(),
+            Some(Duration::from_secs(9)),
+            "the client default timeout fills the gap"
+        );
+        assert!(
+            filled.cancel_token().is_some(),
+            "the client cancel token reaches it"
+        );
+        assert!(
+            filled
+                .env_overrides()
+                .iter()
+                .any(|(k, _)| k == "GIT_TERMINAL_PROMPT"),
+            "the client default env reaches it"
+        );
+
+        // A command's OWN explicit settings win over the defaults (gap-fill only).
+        let explicit = Command::new("git")
+            .args(["push"])
+            .timeout(Duration::from_secs(2))
+            .env("GIT_TERMINAL_PROMPT", "1");
+        let filled = explicit.into_command(&client);
+        assert_eq!(
+            filled.configured_timeout(),
+            Some(Duration::from_secs(2)),
+            "an explicit per-command timeout wins"
+        );
+        let prompt: Vec<_> = filled
+            .env_overrides()
+            .iter()
+            .filter(|(k, _)| k == "GIT_TERMINAL_PROMPT")
+            .collect();
+        assert_eq!(prompt.len(), 1, "no duplicate env op for the same key");
+        assert_eq!(
+            prompt[0].1.as_deref(),
+            Some(std::ffi::OsStr::new("1")),
+            "the per-command env value wins over the client default"
+        );
+    }
+
+    #[tokio::test]
+    async fn prebuilt_command_env_wins_over_a_case_differing_client_default() {
+        // M7/F1: env names are case-insensitive on Windows, so a client
+        // `default_env("Path", …)` must not override a per-command `env("PATH", …)`
+        // (which would invert the documented "explicit wins"). On Unix the two are
+        // distinct variables and both are kept.
+        let client = CliClient::new("git").default_env("Path", "from-client");
+        let cmd = Command::new("git").env("PATH", "from-command");
+        let filled = cmd.into_command(&client);
+        let path_ops: Vec<_> = filled
+            .env_overrides()
+            .iter()
+            .filter(|(k, _)| k.to_str().is_some_and(|k| k.eq_ignore_ascii_case("PATH")))
+            .collect();
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                path_ops.len(),
+                1,
+                "the case-differing client default for the same var is skipped"
+            );
+            assert_eq!(
+                path_ops[0].1.as_deref(),
+                Some(std::ffi::OsStr::new("from-command")),
+                "the explicit per-command value wins"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                path_ops.len(),
+                2,
+                "on Unix PATH and Path are distinct variables — both kept"
+            );
+        }
     }
 
     #[tokio::test]
