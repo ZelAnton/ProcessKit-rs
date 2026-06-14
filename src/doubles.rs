@@ -97,6 +97,14 @@ impl Reply {
 
     /// A timed-out reply — drives the timeout path so a test can assert that a
     /// command which exceeds its deadline surfaces as [`Error::Timeout`](crate::Error::Timeout).
+    ///
+    /// On the bulk verbs (`output` and friends) this synthesizes a timed-out
+    /// result directly. On a scripted [`start`](crate::ProcessRunner::start),
+    /// though, it resolves **immediately** as timed-out rather than parking until
+    /// a deadline — it does not exercise the real deadline-watchdog race (L10). To
+    /// model "hangs until the command's `timeout` fires," script
+    /// [`pending`](Self::pending) and set a [`Command::timeout`](crate::Command::timeout):
+    /// the watchdog then drives the timeout exactly as it would for a live child.
     pub fn timeout() -> Self {
         Self {
             stdout: String::new(),

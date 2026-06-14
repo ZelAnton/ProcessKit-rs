@@ -83,8 +83,15 @@ fn is_false(b: &bool) -> bool {
 /// B18: a cassette redacts env *values* (it stores names only), but argv, cwd,
 /// stdout, and stderr are stored **verbatim** — any of which can carry a secret.
 /// So the file is created owner-only rather than inheriting a world-readable
-/// umask. On Windows it inherits the directory ACL (the unit of access control
-/// there); restrict the containing directory if the fixture is sensitive.
+/// umask.
+///
+/// M9 (security): on Unix the open also refuses to follow a symlink at `path`
+/// (`O_NOFOLLOW`) — a planted `cassette.json` symlink can no longer redirect the
+/// secret-bearing write (and the `0600`) onto a victim file the link points at.
+/// A cassette path that *is* a symlink fails loud (`ELOOP`) rather than writing
+/// through it. On Windows the file inherits the directory ACL (the unit of access
+/// control there); **restrict the containing directory** (or use a per-user temp
+/// dir, not a world-writable shared one) if the fixture can carry secrets.
 fn write_cassette(path: &Path, json: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -94,11 +101,13 @@ fn write_cassette(path: &Path, json: &str) -> std::io::Result<()> {
         // window. For a pre-existing (possibly world-readable) cassette being
         // rewritten, `open` truncates it but keeps its old perms — so tighten
         // the fd *before* writing the content, never holding it at loose perms.
+        // `O_NOFOLLOW` (M9): never write through a symlink planted at `path`.
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         file.write_all(json.as_bytes())?;
@@ -547,6 +556,32 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("cassette.json");
         (dir, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_cassette_refuses_to_follow_a_symlink() {
+        // M9: a planted symlink at the cassette path must not redirect the
+        // secret-bearing write (and its 0600) onto the link's target — O_NOFOLLOW
+        // makes the write fail loud, and the target is left untouched.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("victim.txt");
+        std::fs::write(&target, "original").expect("seed victim");
+        let link = dir.path().join("cassette.json");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        let err = write_cassette(&link, "{\"secret\":true}")
+            .expect_err("writing through a symlink must fail (O_NOFOLLOW)");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "O_NOFOLLOW on a symlink yields ELOOP, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read victim"),
+            "original",
+            "the victim file must be untouched"
+        );
     }
 
     #[tokio::test]

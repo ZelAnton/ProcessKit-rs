@@ -351,11 +351,26 @@ impl Error {
     /// the [`Display`](std::fmt::Display) message. For the raw, untrimmed stream
     /// match on the variant's fields directly.
     pub fn diagnostic(&self) -> Option<&str> {
+        // Exhaustive on purpose (L7): a future stream-carrying variant must add
+        // itself here rather than silently falling through a `_ => None` and being
+        // invisible to `diagnostic()`. `Error` is `#[non_exhaustive]` only for
+        // *downstream* matches; in-crate this list must stay complete.
         match self {
             Error::Exit { stdout, stderr, .. }
             | Error::Timeout { stdout, stderr, .. }
             | Error::Signalled { stdout, stderr, .. } => exit_diagnostic(stdout, stderr),
-            _ => None,
+            Error::Spawn { .. }
+            | Error::NotFound { .. }
+            | Error::CassetteMiss { .. }
+            | Error::OutputTooLarge { .. }
+            | Error::NotReady { .. }
+            | Error::Parse { .. }
+            | Error::Unsupported { .. }
+            | Error::Cancelled { .. }
+            | Error::Stdin { .. }
+            | Error::Io(_) => None,
+            #[cfg(feature = "limits")]
+            Error::ResourceLimit(_) => None,
         }
     }
 
@@ -407,10 +422,25 @@ impl Error {
     /// ([`Spawn`](Error::Spawn), [`Io`](Error::Io)) — the basis for the io-level
     /// classifiers above.
     fn io_source(&self) -> Option<&std::io::Error> {
+        // Exhaustive on purpose (L7): a future variant carrying an `io::Error`
+        // must add itself here so the io-level classifiers (`is_transient`,
+        // `is_permission_denied`) see it, rather than slipping through a wildcard.
         match self {
             Error::Spawn { source, .. } => Some(source),
             Error::Io(source) => Some(source),
-            _ => None,
+            Error::NotFound { .. }
+            | Error::CassetteMiss { .. }
+            | Error::Exit { .. }
+            | Error::Timeout { .. }
+            | Error::OutputTooLarge { .. }
+            | Error::NotReady { .. }
+            | Error::Parse { .. }
+            | Error::Unsupported { .. }
+            | Error::Cancelled { .. }
+            | Error::Signalled { .. }
+            | Error::Stdin { .. } => None,
+            #[cfg(feature = "limits")]
+            Error::ResourceLimit(_) => None,
         }
     }
 }
@@ -674,21 +704,27 @@ fn display_exit(program: &str, code: i32, stdout: &str, stderr: &str) -> String 
 /// captured-stream error stays one actionable line and a binary-garbage or
 /// one-enormous-line stream can never poison a log line. A no-op when both
 /// streams are blank.
+///
+/// L6 (security): control characters in the tail are replaced with `U+FFFD`, so a
+/// hostile child's stderr cannot inject terminal escape sequences (ANSI, `BEL`,
+/// `NUL`, cursor moves) into an operator's log or terminal through a `{err}`
+/// format. (The line was already split on `\n`; this also neutralizes any stray
+/// embedded `\r`/`ESC`.)
 fn append_diagnostic_tail(message: &mut String, stdout: &str, stderr: &str) {
     const TAIL_CAP: usize = 200;
     let tail = exit_diagnostic(stdout, stderr)
         .and_then(|text| text.lines().rev().map(str::trim).find(|l| !l.is_empty()));
     if let Some(tail) = tail {
         message.push_str(": ");
-        if tail.len() <= TAIL_CAP {
-            message.push_str(tail);
-        } else {
-            let mut cut = TAIL_CAP;
-            while !tail.is_char_boundary(cut) {
-                cut -= 1;
+        let mut written = 0usize;
+        for ch in tail.chars() {
+            let ch = if ch.is_control() { '\u{FFFD}' } else { ch };
+            if written + ch.len_utf8() > TAIL_CAP {
+                message.push('…');
+                break;
             }
-            message.push_str(&tail[..cut]);
-            message.push('…');
+            message.push(ch);
+            written += ch.len_utf8();
         }
     }
 }
@@ -699,6 +735,25 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_tail_sanitizes_control_chars_against_terminal_injection() {
+        // L6: a hostile child's stderr last line carrying ANSI/BEL/NUL must not
+        // reach a `{err}` log/terminal verbatim — control bytes become U+FFFD,
+        // while printable text survives.
+        let err = Error::Exit {
+            program: "tool".into(),
+            code: 1,
+            stdout: String::new(),
+            stderr: "boom\x1b[31m\x07\x00danger".into(),
+        };
+        let msg = err.to_string();
+        assert!(!msg.contains('\x1b'), "ESC must be sanitized: {msg:?}");
+        assert!(!msg.contains('\x07'), "BEL must be sanitized: {msg:?}");
+        assert!(!msg.contains('\x00'), "NUL must be sanitized: {msg:?}");
+        assert!(msg.contains("boom"), "printable text is kept: {msg:?}");
+        assert!(msg.contains("danger"), "printable text is kept: {msg:?}");
+    }
 
     #[test]
     fn debug_bounds_exit_streams_so_unwrap_cannot_dump_them() {

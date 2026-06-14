@@ -11,6 +11,20 @@ to a dated version section.
 
 ## [Unreleased]
 
+### Security
+
+- `record`-feature cassette writes no longer follow a symlink at the cassette path
+  on Unix (`O_NOFOLLOW`): a planted `cassette.json` symlink can no longer redirect
+  the secret-bearing write (and its `0600`) onto a victim file the link targets —
+  the write fails loud (`ELOOP`) instead. (On Windows the cassette still inherits
+  the directory ACL; restrict the containing directory, or use a per-user temp
+  dir, for sensitive fixtures — now documented on the writer.)
+- The one-line `Error` `Display` (the `: <last diagnostic line>` tail on
+  `Exit`/`Timeout`/`Signalled`) now replaces control characters with `U+FFFD`, so a
+  hostile child's stderr cannot inject terminal escape sequences (ANSI, `BEL`,
+  `NUL`, cursor moves) into an operator's log or terminal through a `{err}` format.
+  Printable text and the 200-byte cap are unchanged.
+
 ### Changed
 
 - A ready-made [`Command`] passed straight to a [`CliClient`] verb (e.g.
