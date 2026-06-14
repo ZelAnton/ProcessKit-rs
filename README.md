@@ -444,8 +444,9 @@ the pipes at all.
 
 ## Pipelines without a shell
 
-`a | b | c` without a shell string — native pipes, so no quoting or injection
-surface, and every stage lives in one shared kill-on-drop group:
+`a | b | c` without a shell string — stages connected in-process (a relay, not a
+shell), so no quoting or injection surface, and every stage lives in one shared
+kill-on-drop group:
 
 ```rust,no_run
 use processkit::Command;
@@ -468,8 +469,9 @@ The outcome is **pipefail**: `stdout` is the last stage's output, while the
 exit code, stderr, and reported program come from the first stage that didn't
 exit cleanly (or the last stage when all succeed). For a consumer that
 legitimately stops reading early — the `producer | head -1` shape, where the
-producer's `SIGPIPE` death is expected — mark that stage
-`.unchecked_in_pipe()` and pipefail skips it (a *checked* failure still always wins).
+producer's broken-pipe death (its next write fails once the downstream closes)
+is expected — mark that stage `.unchecked_in_pipe()` and pipefail skips it (a
+*checked* failure still always wins).
 The first stage's `stdin` source is honored; inner stages read from the pipe.
 `.timeout(d)` bounds the whole chain (killing every stage at the deadline),
 and `run()` requires every stage to succeed, returning the trimmed final
@@ -641,6 +643,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+> Writing the whole input *before* reading is fine for a small payload like this.
+> For a **large** interactive stdin, drain stdout concurrently (write from one
+> task, read `stdout_lines` from another) — otherwise the child can block writing
+> stdout while you block writing stdin, a full-duplex deadlock. See the note in
+> [`docs/streaming.md`](docs/streaming.md#interactive-stdin). (The non-interactive
+> `Stdin::from_*` sources are written on a background task and never deadlock.)
 
 ### Feed stdin from an async stream, react to stdout as it's read
 

@@ -131,6 +131,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 `RunningProcess` — closes stdin too; `finish()` just makes the EOF explicit
 and awaitable.
 
+**Avoid the full-duplex deadlock.** A child's stdout pipe has a finite OS
+buffer; once it fills, the child blocks *writing* stdout until something reads
+it. If you push a large interactive stdin while nothing drains the child's
+stdout, the child stops reading stdin (blocked on stdout), your `write` parks
+waiting for stdin buffer space, and neither side progresses. The `bc` example
+above is safe because it interleaves one write with one read; when you both feed
+a sizable stdin **and** the child produces output, drain `stdout_lines` from one
+task while writing stdin from another. (The non-interactive `Stdin::from_*`
+sources are safe — the crate writes them on a background task that runs
+concurrently with the output pumps.)
+
 For *one-directional* streamed input (a channel, a file tail) you don't need
 interactivity — give the command `Stdin::from_lines(stream)` /
 `Stdin::from_reader(reader)` and let the background writer feed it; see the

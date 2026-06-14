@@ -95,7 +95,9 @@ The pieces:
   with stderr. **`Reply::lines(["a", "b"])`** — exit 0 with the lines joined
   (and streamed one by one on a scripted [`start`](#scripted-streaming)).
   **`Reply::timeout()`** — a timed-out run (the checking helpers raise
-  `Error::Timeout` from it, carrying the command's own configured deadline).
+  `Error::Timeout` from it, carrying the command's own configured deadline). On a
+  scripted [`start`](#scripted-streaming) it resolves *immediately* as timed-out;
+  to exercise a real deadline race, use `Reply::pending()` + a `Command::timeout`.
   **`.with_stdout(text)`** — attach stdout to any of them (e.g. the
   `CONFLICT …` text git prints on a failing merge).
   **`.with_line_delay(d)`** — pace a scripted stream's lines.
@@ -210,6 +212,13 @@ mock.expect_output()
     .returning(|_cmd| /* build a Result<ProcessResult<String>> */ …);
 ```
 
+> **`MockRunner` does not inherit the defaults.** Unlike a hand-written runner
+> (where `output_bytes`/`start` are defaulted), `mockall::automock` replaces
+> **every** method with an expectation — so a verb that routes through `start` or
+> `output_bytes` needs its own `expect_start()` / `expect_output_bytes()`, or the
+> unset call panics ("no expectation"). `ScriptedRunner` provides the defaults and
+> the streaming seam out of the box.
+
 For most tests `ScriptedRunner`/`RecordingRunner` read better; reach for the
 mock when you need `mockall`'s matching machinery.
 
@@ -248,8 +257,12 @@ Semantics worth knowing before you commit a cassette:
 
 Only env **values** are redacted. `program`, `args`, `cwd`, `stdout`, and
 `stderr` are stored **verbatim** and can carry secrets (a `--password=…` flag, a
-token echoed to output), so review a fixture before committing it — on Unix the
-file is written `0600`.
+token echoed to output), so review a fixture before committing it. On Unix the
+file is written `0600` and the write **refuses to follow a symlink** at the
+cassette path (`O_NOFOLLOW`, so a planted link can't redirect the secret-bearing
+write — it fails loud instead). On Windows the file inherits the containing
+directory's ACL, so restrict that directory (or use a per-user temp dir, not a
+world-writable shared one) for secret-bearing fixtures.
 
 A neat trick: in tests, record against a `ScriptedRunner` instead of
 `JobRunner` — the whole record→save→replay round trip is then itself

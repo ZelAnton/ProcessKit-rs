@@ -86,6 +86,13 @@ let result = Command::new("slow-tool")
 `SIGKILL`ed after the grace — the deadline is what fired. **Windows** has no signal
 tier: `timeout_grace` is accepted but the deadline kills the job atomically.
 
+The explicit [`RunningProcess::shutdown(grace)`](streaming.md) verb (stop a started
+handle on demand) composes with a `Command::timeout`: its own SIGTERM → grace →
+SIGKILL is the **single** teardown (it does not also fire the run's timeout
+teardown), and if the deadline has **already elapsed** when you call `shutdown`,
+the outcome is reported as `Outcome::TimedOut` — the `grace` you pass governs the
+teardown timing.
+
 ## Retries
 
 `retry(max_attempts, backoff, classifier)` replays a failed run — up to
@@ -170,7 +177,8 @@ The contract, path by path:
 | A `Pipeline` stage's token cancels | that stage dies; the cancellation errors the whole pipeline and the private group reaps the other stages |
 | Under `retry` | terminal — never retried, whatever the classifier says |
 | Under a [`Supervisor`](supervision.md) | terminal — supervision returns `Err(Cancelled)` instead of restarting into a still-cancelled token |
-| `wait_any` / `first_line` mid-run | the raw primitives don't synthesize the error — the stream just ends (a *pre-cancelled* token still hits the pre-spawn short-circuit) |
+| `wait_any` mid-run | the raw primitive doesn't synthesize the error — the race just resolves (a *pre-cancelled* token still hits the pre-spawn short-circuit) |
+| `first_line` mid-run | surfaces `Error::Cancelled` once the token fires — a cancelled stream that closes without a match is reported as cancellation, not `Ok(None)` |
 
 ### Client-level default
 

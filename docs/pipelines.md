@@ -2,11 +2,14 @@
 
 [‹ docs index](README.md)
 
-`a | b | c` without a shell. Each stage's stdout feeds the next stage's stdin
-through a **native pipe** — there is no shell string anywhere, so no quoting
-rules, no word splitting, no injection surface. All stages spawn into one
-shared kill-on-drop [process group](process-groups.md), so the chain lives and
-dies as a unit.
+`a | b | c` **without a shell**. Each stage's stdout feeds the next stage's
+stdin through an in-process relay (a `tokio::io::copy` task per boundary) — there
+is no shell string anywhere, so no quoting rules, no word splitting, no injection
+surface. All stages spawn into one shared kill-on-drop
+[process group](process-groups.md), so the chain lives and dies as a unit. (The
+relay is an implementation detail, not a kernel splice: a producer whose consumer
+exits early stops on a *broken pipe* when the relay's next write fails, rather
+than instantly via `SIGPIPE`.)
 
 - [Building and running](#building-and-running)
 - [Semantics: pipefail and the ends](#semantics-pipefail-and-the-ends)
@@ -109,14 +112,15 @@ assert_eq!(unique_count.trim(), "3");
 
 Strict pipefail has one classic false positive: a consumer that legitimately
 stops reading early. In `producer | head -1` the consumer exits `0` after one
-line and closes the pipe; the producer dies of `SIGPIPE` (a broken-pipe write
-error on Windows) — a perfectly normal death that strict pipefail would blame
-the chain for. Mark that stage [`unchecked_in_pipe()`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.unchecked_in_pipe):
+line and closes the pipe; the producer then stops on a **broken pipe** — its
+next write fails once the relay's downstream is gone (a broken-pipe write error,
+or `SIGPIPE` where the OS delivers it) — a perfectly normal death that strict
+pipefail would blame the chain for. Mark that stage [`unchecked_in_pipe()`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.unchecked_in_pipe):
 
 ```rust,no_run
 use processkit::Command;
 
-// seq 1 1000000 | head -1 — the producer's SIGPIPE death is expected.
+// seq 1 1000000 | head -1 — the producer's broken-pipe death is expected.
 let first = (Command::new("seq").args(["1", "1000000"]).unchecked_in_pipe()
     | Command::new("head").args(["-n", "1"]))
     .run()
@@ -127,9 +131,10 @@ assert_eq!(first.trim(), "1");
 The rules (a design borrowed from `duct`'s `unchecked()` — the idea, not the
 code):
 
-- An unchecked stage's unclean exit — non-zero, signal kill (`SIGPIPE`
-  included), or its own per-stage timeout kill — is **skipped** when the
-  chain decides what to report.
+- An unchecked stage's unclean exit — a non-zero code, a broken-pipe write
+  failure (or `SIGPIPE` where the OS delivers it) from a consumer that closed
+  early, or its own per-stage timeout kill — is **skipped** when the chain
+  decides what to report.
 - A **checked** failure always trumps an unchecked one, regardless of
   position: `unchecked` never shields another stage's real failure.
 - A chain whose only failures are unchecked reports **success** (the last

@@ -145,7 +145,11 @@ group.signal(Signal::Other(34))?;  // raw signal number escape hatch
 `terminate_all` (`cgroup.kill` / `killpg` / job terminate), so it cannot miss
 a process forked mid-broadcast. Other signals are a per-member broadcast —
 best-effort against a tree that is forking at that exact moment. An empty
-group accepts any deliverable signal trivially.
+group accepts any deliverable signal trivially. On the **cgroup** mechanism a
+real per-member delivery failure (e.g. `EPERM` from a member that changed uid, or
+a seccomp/container restriction) is surfaced as an `Err` rather than swallowed —
+an `ESRCH` race (the member already exited) is still success; the pgroup
+(macOS/BSD, Linux-without-cgroup) backend remains purely best-effort.
 
 ## Suspending and resuming
 

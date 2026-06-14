@@ -33,7 +33,7 @@ let out = Command::new("git")
 Arguments are passed as an array — there is **no shell** between you and the
 child, so there is no quoting, no word-splitting, and no injection surface.
 (When you actually want `a | b | c`, use a [pipeline](pipelines.md), which
-wires native pipes instead of invoking a shell.)
+connects the stages in-process instead of invoking a shell.)
 
 The program name reaches the OS **verbatim** — two deliberate non-goals
 (conveniences some libraries layer on, e.g. `duct`): a bare name is resolved
@@ -160,12 +160,16 @@ let head_policy = OutputBufferPolicy::bounded(1_000).with_overflow(OverflowMode:
 
 `DropOldest` (the default) keeps a rolling tail; `DropNewest` freezes the
 head. `bounded(0)` retains nothing — useful when a line handler (below) is the
-real consumer. Dropped or not, **every** line still feeds the handlers and the
-line counters.
+real consumer. Under a *line* cap, dropped or not, **every** line still feeds
+the handlers and the line counters.
 
 The line cap alone does not bound memory — one enormous newline-free "line"
 (`base64 -w0`) is held whole. Add `with_max_bytes` to cap the *retained bytes*
-too (either ceiling, or both):
+too (either ceiling, or both); the byte cap also bounds the pump's in-flight
+assembly buffer, so a never-terminated flood can't exhaust memory. One
+consequence: a line whose own length exceeds the byte cap can't be assembled, so
+it is dropped **whole** — counted, but **not** delivered to a per-line handler or
+`stdout_tee` (don't set a byte cap if a tee must see arbitrarily long lines):
 
 ```rust,no_run
 # use processkit::{Command, OutputBufferPolicy};
@@ -323,7 +327,10 @@ let first_match = Command::new("git")
 
 `first_line` returns `Ok(None)` when stdout closes without a match, and kills
 the (private-group) child once it has its answer — you never wait out a long
-log for one line.
+log for one line. If the command's [`cancel_on`](timeouts-and-cancellation.md)
+token has fired, it returns `Error::Cancelled` instead of `Ok(None)`, so a
+readiness probe with a shutdown token can't misread cancellation as "the line
+never appeared".
 
 ## Results and errors
 

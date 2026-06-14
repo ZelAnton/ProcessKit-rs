@@ -55,6 +55,12 @@ instead (`Error::ResourceLimit`), because an unapplied cap is no protection.
 | Arbitrary signal (`Hup`, `Usr1`, `Other(n)`, …) | ❌ `Kill` only | ✅ | ✅ | ✅ |
 | `suspend` / `resume` | 🟡 per-thread counts | ✅ `cgroup.freeze` | ✅ `SIGSTOP`/`CONT` | ✅ `SIGSTOP`/`CONT` |
 
+On the cgroup mechanism, a non-`Kill` `signal` (and the `SIGSTOP`/`SIGCONT`
+fallback used for `suspend`/`resume` on pre-5.2 kernels without `cgroup.freeze`)
+surfaces a real per-member delivery failure (e.g. `EPERM`) as an `Err` rather
+than swallowing it — consistent with the "never silently skipped" philosophy; an
+`ESRCH` race (the member already exited) is still success.
+
 **Inspection & accounting** (`stats` feature)
 
 | Capability | Windows | Linux cgroup | Linux pgroup | macOS/BSD |
