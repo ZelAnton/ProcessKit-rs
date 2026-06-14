@@ -325,6 +325,7 @@ impl RunningProcess {
     ///     match event {
     ///         OutputEvent::Stdout(line) => println!("out: {line}"),
     ///         OutputEvent::Stderr(line) => eprintln!("err: {line}"),
+    ///         _ => {} // `OutputEvent` is non-exhaustive
     ///     }
     /// }
     ///
@@ -587,7 +588,12 @@ impl Stream for StdoutLines {
 ///
 /// Yielded by [`RunningProcess::output_events`], which merges both streams into
 /// a single, ordered sequence.
+///
+/// Non-exhaustive: a future release may add a third kind of event (e.g. a
+/// lifecycle marker) without a breaking change, so a `match` on `OutputEvent`
+/// needs a `_` arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OutputEvent {
     /// A line from the child's standard output.
     Stdout(String),

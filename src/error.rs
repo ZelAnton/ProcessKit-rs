@@ -489,7 +489,13 @@ impl fmt::Debug for Error {
                 .field("message", &StreamPreview(message))
                 .finish(),
             #[cfg(feature = "limits")]
-            Error::ResourceLimit(reason) => f.debug_tuple("ResourceLimit").field(reason).finish(),
+            Error::ResourceLimit(reason) => f
+                .debug_tuple("ResourceLimit")
+                // Bounded like every other text-bearing variant — `reason` is a
+                // short crate/OS-built string today, but keep the "no unbounded
+                // text in Debug" invariant uniform.
+                .field(&StreamPreview(reason))
+                .finish(),
             Error::Unsupported { operation } => f
                 .debug_struct("Unsupported")
                 .field("operation", operation)

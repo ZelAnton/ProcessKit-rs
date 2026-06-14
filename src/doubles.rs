@@ -7,7 +7,8 @@
 //!   so tests can assert exactly what was run.
 //!
 //! Behind the `mock` feature, [`mockall`] additionally generates a `MockRunner`
-//! (re-exported from the crate root) for expectation-style mocking.
+//! for expectation-style mocking. All of these live under
+//! [`processkit::testing`](crate::testing) (D6), not the crate root.
 //!
 //! The seam covers **both shapes of a run**. The bulk verbs (`output` and the
 //! helpers over it) replay canned results — and feed the command's
@@ -18,7 +19,12 @@
 //! `wait_for_line`/`wait_for`, and `finish` all behave identically
 //! (per-line pacing via [`Reply::with_line_delay`]). Scripted handles have no
 //! OS identity (`pid()` is `None`), don't compose into a real
-//! [`Pipeline`](crate::Pipeline), and don't model interactive stdin.
+//! [`Pipeline`](crate::Pipeline), and don't model interactive stdin. The bulk
+//! `output` replay also does not model a bounded-buffer **truncation** policy
+//! (a canned reply is returned whole, `truncated() == false`), so the
+//! checking-verb truncation error (B12) won't fire against a bulk double — to
+//! exercise that, drive output through a scripted [`start`] handle (whose canned
+//! lines flow through the real buffer policy).
 //!
 //! Instant replies never observe a `cancel_on` token (they resolve before any
 //! cancellation could race them). To exercise cancellation **behaviour** — a

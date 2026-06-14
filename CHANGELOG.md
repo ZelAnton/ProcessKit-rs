@@ -153,6 +153,12 @@ to a dated version section.
   the deadline lexicon `Error::Timeout` / `Outcome::TimedOut` / `timed_out` / `Error::NotReady`
   were reviewed and **kept** — already clear and well-differentiated (`NotReady` is intentionally
   distinct from `Timeout`), so a rename would be churn on a soon-frozen surface.)
+- **Breaking:** `OutputEvent` (yielded by `output_events`) is now `#[non_exhaustive]` — a future
+  release may add a third event kind (e.g. a lifecycle marker) without a breaking change, so a
+  `match` on it now needs a `_` arm.
+- The `mock` feature's `MockRunner` is documented as **semver-exempt**: its `mockall`-generated
+  `expect_*` surface (and the opaque expectation types) tracks the `mockall` dependency, not this
+  crate's frozen API. `ScriptedRunner` / `RecordingRunner` are the stable, recommended doubles.
 - **Breaking:** the test doubles moved from the crate root into a `processkit::testing` module
   (D6): `ScriptedRunner`, `Reply`, `Invocation`, `RecordingRunner`, and (feature-gated)
   `RecordReplayRunner` / `MockRunner` are now `processkit::testing::*`. This keeps the production
@@ -161,6 +167,10 @@ to a dated version section.
 
 ### Fixed
 
+- `Supervisor` no longer panics when a backoff/storm delay approaches `Duration::MAX` with
+  jitter enabled (the default): the jittered delay is clamped to the crate's `MAX_DEADLINE`
+  ceiling instead of overflowing `Duration::mul_f64`. Reachable via `max_backoff(Duration::MAX)`
+  or `storm_pause(Duration::MAX)`.
 - `RunningProcess::start_kill` is **documented and guaranteed idempotent** (D20): killing a
   child that has already exited and been reaped (e.g. by a prior readiness probe or `wait_any`
   observation) is a successful no-op — like `kill` on a Unix zombie. (Current tokio/std

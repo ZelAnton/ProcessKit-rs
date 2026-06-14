@@ -164,7 +164,7 @@ guarantee is unconditional in every configuration.
 | `process-control` | ✅ | `Signal`, `ProcessGroup::{signal, suspend, resume, members, adopt}` |
 | `limits` | — | whole-tree resource caps (implies `stats`) |
 | `record` | — | record/replay cassettes (pulls `serde`) |
-| `mock` | — | `mockall`-generated `MockRunner` |
+| `mock` | — | `mockall`-generated `MockRunner` (test-only; its surface is semver-exempt — prefer `ScriptedRunner`/`RecordingRunner`) |
 | `tracing` | — | lifecycle events: spawn/exit, timeout/cancel, teardown, retries, storms (never argv/env) |
 
 ## Capping a group's resources

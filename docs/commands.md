@@ -375,17 +375,20 @@ The error enum is structured and `#[non_exhaustive]`:
 | `Error::Timeout { program, timeout, stdout, stderr }` | The run's own deadline killed it; whatever the run captured before the kill is attached — a hung tool's last stderr line tails the `Display` and is reachable via `diagnostic()` |
 | `Error::NotReady { program, timeout }` | A [readiness probe](streaming.md#readiness-probes) gave up |
 | `Error::Parse { program, message }` | A `CliClient::try_parse` parser rejected the output (the `Display`/`Debug` of `message` is bounded to a 200-byte preview; the field carries the full text) |
+| `Error::Stdin { program, source }` | Feeding the child's stdin failed for a non-broken-pipe reason on an *otherwise-successful* run (a louder failure — exit/signal/timeout — wins instead); a routine broken pipe never surfaces |
+| `Error::CassetteMiss { program }` | (`record` feature) a cassette replay found no matching recording (stale/incomplete cassette) — kept distinct from a missing program, so `is_not_found()` is `false` |
 | `Error::Unsupported { operation }` | The platform can't do what was asked (and silently skipping would be wrong) |
 | `Error::Cancelled { program }` | the run's token was cancelled |
 | `Error::ResourceLimit(reason)` | (`limits` feature) a requested cap couldn't be enforced |
-| `Error::Io(source)` | Everything else from the OS (no exit code, no timeout) |
+| `Error::Io(source)` | A low-level IO error from the crate's own machinery (driving a child, group control, cassette files) — never an arbitrary foreign `io::Error` (no blanket `From`, D13) |
 
-`Error::diagnostic()` mirrors `ProcessResult::diagnostic()` for the `Exit`
-variant — one method to get the most useful human-facing line out of a
-failure. `Error::Exit`'s one-line `Display` already appends a bounded excerpt
-of that diagnostic (the last non-empty line, capped at 200 bytes), so a bare
-`eprintln!("{e}")` reads `` `git` exited with code 2: fatal: boom `` —
-actionable in a log line without dumping multi-KiB streams into it.
+`Error::diagnostic()` returns the most useful human-facing line out of a
+failure that captured output — `Exit`, and (D12) `Timeout` / `Signalled` (the
+partial streams of a hung-then-killed or crashed tool). Each of those variants'
+one-line `Display` also appends a bounded excerpt of that diagnostic (the last
+non-empty line, capped at 200 bytes), so a bare `eprintln!("{e}")` reads
+`` `git` exited with code 2: fatal: boom `` — actionable in a log line without
+dumping multi-KiB streams into it.
 
 ---
 

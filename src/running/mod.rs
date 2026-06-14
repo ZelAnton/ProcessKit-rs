@@ -906,6 +906,12 @@ impl RunningProcess {
     /// the whole group via
     /// [`ProcessGroup::shutdown`](crate::ProcessGroup::shutdown) instead, or kill
     /// just this child with [`start_kill`](Self::start_kill).
+    ///
+    /// A configured [`Command::timeout`](crate::Command::timeout) still applies
+    /// while shutting down: if its deadline has already elapsed (or is shorter
+    /// than `grace`), this reports [`Outcome::TimedOut`](crate::Outcome::TimedOut)
+    /// rather than the graceful exit — the run's own deadline is a hard ceiling
+    /// on the grace.
     pub async fn shutdown(self, grace: std::time::Duration) -> Result<Outcome> {
         let Some(group) = self.backend.own_group().cloned() else {
             return Err(Error::Unsupported {

@@ -238,7 +238,7 @@ impl core::marker::Unpin for processkit::Outcome
 impl core::marker::UnsafeUnpin for processkit::Outcome
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::Outcome
 impl core::panic::unwind_safe::UnwindSafe for processkit::Outcome
-pub enum processkit::OutputEvent
+#[non_exhaustive] pub enum processkit::OutputEvent
 pub processkit::OutputEvent::Stderr(alloc::string::String)
 pub processkit::OutputEvent::Stdout(alloc::string::String)
 impl core::clone::Clone for processkit::OutputEvent

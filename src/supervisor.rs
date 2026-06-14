@@ -564,7 +564,15 @@ fn apply_jitter(delay: Duration, enabled: bool) -> Duration {
     if !enabled || delay.is_zero() {
         return delay;
     }
-    delay.mul_f64(jitter_factor())
+    // Clamp the jittered delay to `MAX_DEADLINE`: `Duration::mul_f64` *panics* on
+    // overflow, and the up-to-1.5× factor can push a near-`Duration::MAX` delay
+    // (reachable via `max_backoff(Duration::MAX)` or `storm_pause(Duration::MAX)`,
+    // jitter on by default) past `Duration`'s range. Mirrors the crate-wide
+    // `MAX_DEADLINE` clamp used on every other timing path (E15).
+    let scaled = delay.as_secs_f64() * jitter_factor();
+    Duration::try_from_secs_f64(scaled)
+        .unwrap_or(crate::MAX_DEADLINE)
+        .min(crate::MAX_DEADLINE)
 }
 
 /// A pseudo-random factor in `[0.5, 1.5)` with no extra dependency: every
@@ -1140,5 +1148,20 @@ mod tests {
         // Saturation: an astronomic exponent clamps to the cap, no panic.
         assert_eq!(backoff_delay(base, 2.0, 1_000, cap), cap);
         assert_eq!(backoff_delay(Duration::ZERO, 2.0, 5, cap), Duration::ZERO);
+    }
+
+    #[test]
+    fn apply_jitter_clamps_instead_of_overflowing() {
+        // Regression: the up-to-1.5x jitter factor on a near-`Duration::MAX`
+        // delay (reachable via `max_backoff(Duration::MAX)` / `storm_pause`) must
+        // NOT panic in `Duration::mul_f64` — it clamps to `MAX_DEADLINE`.
+        let jittered = apply_jitter(Duration::MAX, true);
+        assert!(jittered <= crate::MAX_DEADLINE, "clamped, got {jittered:?}");
+        // Jitter disabled or zero delay passes through untouched (no clamp).
+        assert_eq!(apply_jitter(Duration::MAX, false), Duration::MAX);
+        assert_eq!(apply_jitter(Duration::ZERO, true), Duration::ZERO);
+        // A normal delay still gets a factor in [0.5, 1.5).
+        let normal = apply_jitter(Duration::from_secs(10), true);
+        assert!(normal >= Duration::from_secs(5) && normal < Duration::from_secs(15));
     }
 }
