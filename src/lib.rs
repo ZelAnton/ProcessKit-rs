@@ -272,7 +272,7 @@ where
 ///   [`keep_stdin_open`](Command::keep_stdin_open) and blocked reading stdin
 ///   never reaches EOF, so it never exits. The race does **not** close its
 ///   stdin for it (that would break the "losers remain usable" guarantee, B15):
-///   take its writer via [`standard_input`](RunningProcess::standard_input)
+///   take its writer via [`take_stdin`](RunningProcess::take_stdin)
 ///   (or don't keep stdin open) before racing it.
 ///
 /// An empty `processes` slice is an error ([`Error::Io`] with

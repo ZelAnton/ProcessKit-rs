@@ -35,7 +35,7 @@ pub struct Command {
     env_clear: bool,
     stdin: Option<Stdin>,
     keep_stdin_open: bool,
-    /// Exempt this stage from pipefail attribution (see [`Self::unchecked`]).
+    /// Exempt this stage from pipefail attribution (see [`Self::unchecked_in_pipe`]).
     unchecked: bool,
     timeout: Option<Duration>,
     /// Grace window after the deadline before `SIGKILL`; its presence makes the
@@ -368,7 +368,7 @@ impl Command {
     /// [`ensure_success`](crate::ProcessResult::ensure_success) stays opt-in
     /// — `unchecked` does not relax it, nor a whole-chain
     /// [`Pipeline::timeout`](crate::Pipeline::timeout).
-    pub fn unchecked(mut self) -> Self {
+    pub fn unchecked_in_pipe(mut self) -> Self {
         self.unchecked = true;
         self
     }
@@ -533,11 +533,11 @@ impl Command {
     }
 
     /// Leave stdin open after start so the child can be driven interactively via
-    /// [`RunningProcess::standard_input`](crate::RunningProcess::standard_input).
+    /// [`RunningProcess::take_stdin`](crate::RunningProcess::take_stdin).
     /// Takes precedence over a [`stdin`](Self::stdin) source — when set, that
     /// source is ignored and the pipe is handed to the caller instead.
     ///
-    /// The open pipe lives until the caller takes it (`standard_input`) or a
+    /// The open pipe lives until the caller takes it (`take_stdin`) or a
     /// consuming verb runs: at consume time an **untaken** pipe is closed
     /// (nothing could ever write to it again), so a stdin-reading child sees
     /// EOF instead of blocking — combining `keep_stdin_open` with a bulk

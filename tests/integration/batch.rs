@@ -78,7 +78,7 @@ async fn wait_all_does_not_close_an_untaken_keep_stdin_open_pipe() {
     );
     // The pipe is still the caller's to use — the loser was not mutated.
     assert!(
-        child.standard_input().is_some(),
+        child.take_stdin().is_some(),
         "B15: the untaken keep_stdin_open pipe must remain available after the join"
     );
     // Clean up the wedged child.

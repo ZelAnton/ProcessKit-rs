@@ -91,7 +91,7 @@ async fn interactive_stdin_round_trips() {
         Command::new("sort")
     };
     let mut process = program.keep_stdin_open().start().await.expect("start sort");
-    let mut stdin = process.standard_input().expect("stdin kept open");
+    let mut stdin = process.take_stdin().expect("stdin kept open");
     stdin.write_line("banana").await.expect("write");
     stdin.write_line("apple").await.expect("write");
     stdin.finish().await.expect("eof");

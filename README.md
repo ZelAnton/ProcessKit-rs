@@ -462,7 +462,7 @@ exit code, stderr, and reported program come from the first stage that didn't
 exit cleanly (or the last stage when all succeed). For a consumer that
 legitimately stops reading early — the `producer | head -1` shape, where the
 producer's `SIGPIPE` death is expected — mark that stage
-`.unchecked()` and pipefail skips it (a *checked* failure still always wins).
+`.unchecked_in_pipe()` and pipefail skips it (a *checked* failure still always wins).
 The first stage's `stdin` source is honored; inner stages read from the pipe.
 `.timeout(d)` bounds the whole chain (killing every stage at the deadline),
 and `run()` requires every stage to succeed, returning the trimmed final
@@ -609,7 +609,7 @@ async fn main() -> processkit::Result<()> {
 ### Interactive stdin — write requests, read responses
 
 Keep stdin open with `keep_stdin_open()`, take the writer with
-`standard_input()`, then interleave async writes and reads:
+`take_stdin()`, then interleave async writes and reads:
 
 ```rust,no_run
 use processkit::{Command, StreamExt};
@@ -622,7 +622,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `bc` evaluates each stdin line and prints the result on stdout.
     let mut run = Command::new("bc").keep_stdin_open().start().await?;
 
-    let mut stdin = run.standard_input().expect("stdin was kept open");
+    let mut stdin = run.take_stdin().expect("stdin was kept open");
     stdin.write_line("2 + 2").await?;
     stdin.write_line("6 * 7").await?;
     stdin.finish().await?; // send EOF so bc finishes

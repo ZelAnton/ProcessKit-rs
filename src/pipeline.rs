@@ -41,7 +41,7 @@ use crate::running::Finished;
 ///   `stderr`, and the reported program come from the **first** stage that
 ///   didn't exit cleanly (non-zero, signal-killed, or timed out), or from the
 ///   last stage when every stage succeeded. Stages marked
-///   [`unchecked`](Command::unchecked) are exempt: their unclean exits are
+///   [`unchecked_in_pipe`](Command::unchecked_in_pipe) are exempt: their unclean exits are
 ///   skipped during attribution (checked failures always trump unchecked
 ///   ones; a chain whose only failures are unchecked reports success) — the
 ///   `producer | head -1` escape hatch.
@@ -83,7 +83,7 @@ struct StageOutcome {
     program: String,
     outcome: Outcome,
     stderr: String,
-    /// The stage opted out of pipefail attribution ([`Command::unchecked`]).
+    /// The stage opted out of pipefail attribution ([`Command::unchecked_in_pipe`]).
     unchecked: bool,
     /// Exit codes the stage treats as success ([`Command::ok_codes`]).
     ok_codes: Vec<i32>,
@@ -200,7 +200,7 @@ impl Pipeline {
     /// Run the chain, require **every** stage to exit cleanly, and return the
     /// last stage's trimmed stdout. A failure surfaces as the first failing
     /// stage's [`Error::Exit`](crate::Error::Exit) (pipefail attribution;
-    /// [`unchecked`](Command::unchecked) stages are exempt, so a chain whose
+    /// [`unchecked_in_pipe`](Command::unchecked_in_pipe) stages are exempt, so a chain whose
     /// only failures are unchecked returns `Ok`).
     /// [`Error::Timeout`](crate::Error::Timeout) is produced by the
     /// whole-chain [`timeout`](Self::timeout) or the *last* stage's own
@@ -306,7 +306,7 @@ fn pipefail(
     // or not. A pipeline's success is pure pipefail (every stage exits 0), so a
     // stage's `ok_codes` does not widen it — reset to the default, consistent with
     // the rebuild paths above. (`ok_codes` is a single-run feature; for an
-    // expected SIGPIPE / non-zero last stage use `unchecked()`.)
+    // expected SIGPIPE / non-zero last stage use `unchecked_in_pipe()`.)
     last.with_ok_codes(vec![0])
 }
 

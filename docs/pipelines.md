@@ -111,13 +111,13 @@ Strict pipefail has one classic false positive: a consumer that legitimately
 stops reading early. In `producer | head -1` the consumer exits `0` after one
 line and closes the pipe; the producer dies of `SIGPIPE` (a broken-pipe write
 error on Windows) — a perfectly normal death that strict pipefail would blame
-the chain for. Mark that stage [`unchecked()`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.unchecked):
+the chain for. Mark that stage [`unchecked_in_pipe()`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.unchecked_in_pipe):
 
 ```rust,no_run
 use processkit::Command;
 
 // seq 1 1000000 | head -1 — the producer's SIGPIPE death is expected.
-let first = (Command::new("seq").args(["1", "1000000"]).unchecked()
+let first = (Command::new("seq").args(["1", "1000000"]).unchecked_in_pipe()
     | Command::new("head").args(["-n", "1"]))
     .run()
     .await?;

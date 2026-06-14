@@ -135,12 +135,24 @@ to a dated version section.
   `output_events`, `finish().stderr` is empty (stderr was delivered to you as events). `wait()`
   (the discard finisher) is unchanged. Rename `finish_streamed`/`finish_events` → `finish` and
   `StreamedFinish` → `Finished`.
+- **Breaking:** `RunningProcess::standard_input()` is renamed `take_stdin()` (D17) — the new
+  name signals that it *takes* (consumes) the stdin writer on the first call (returning `None`
+  after), and aligns the stdin family's spelling (`stdin` / `keep_stdin_open` / `take_stdin`).
+- **Breaking:** `Command::unchecked()` is renamed `unchecked_in_pipe()` (D9/D17) — the name now
+  makes the **pipeline-only** scope explicit. It was always a no-op outside a `Pipeline` (a
+  single run's status is already data in its `ProcessResult`); the clearer name removes that
+  footgun. The `producer.unchecked_in_pipe().pipe(consumer)` shape (suppress a producer's
+  `SIGPIPE` under pipefail) is otherwise unchanged.
+- (Naming sweep, D17: `OutputBufferPolicy::fail_loud`, `RunningProcess::kills_tree_on_drop`, and
+  the deadline lexicon `Error::Timeout` / `Outcome::TimedOut` / `timed_out` / `Error::NotReady`
+  were reviewed and **kept** — already clear and well-differentiated (`NotReady` is intentionally
+  distinct from `Timeout`), so a rename would be churn on a soon-frozen surface.)
 
 ### Fixed
 
 - A `wait_any` / `wait_all` **loser** with `keep_stdin_open` now keeps its stdin usable
   (B15): the race no longer closes an untaken stdin pipe out from under the caller (which
-  left `standard_input()` returning `None` and the child wedged on a premature EOF),
+  left `take_stdin()` returning `None` and the child wedged on a premature EOF),
   honoring the documented "losers remain fully usable" guarantee. A `keep_stdin_open` child
   blocked reading stdin is the caller's responsibility, like the existing "no output
   pumping" non-feature — take its writer (or don't keep stdin open) before racing it.

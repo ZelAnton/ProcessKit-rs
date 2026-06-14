@@ -98,7 +98,7 @@ pub(crate) struct Spawned {
 /// / [`wait`](Self::wait), or stream stdout incrementally with
 /// [`stdout_lines`](Self::stdout_lines). When the command set
 /// [`keep_stdin_open`](crate::Command::keep_stdin_open), drive stdin via
-/// [`standard_input`](Self::standard_input).
+/// [`take_stdin`](Self::take_stdin).
 pub struct RunningProcess {
     // (Debug: manual impl below — pipes/tasks/handlers are opaque.)
     //
@@ -109,7 +109,7 @@ pub struct RunningProcess {
     // explicitly without panicking — `stdout_lines`/`output_events` return a
     // loud `Err` on a second call (D2, tested by
     // `second_stdout_lines_errors_and_first_overflow_is_preserved`), and
-    // `standard_input` returns `None`. A state enum would add panic paths to
+    // `take_stdin` returns `None`. A state enum would add panic paths to
     // guard doors the borrow checker already locks.
     program: String,
     /// The I/O-bearing half: a real OS child, or a scripted double feeding the
@@ -608,7 +608,7 @@ impl RunningProcess {
     /// // `bc` evaluates each stdin line and prints the result on stdout.
     /// let mut run = Command::new("bc").keep_stdin_open().start().await?;
     ///
-    /// let mut stdin = run.standard_input().expect("stdin was kept open");
+    /// let mut stdin = run.take_stdin().expect("stdin was kept open");
     /// stdin.write_line("2 + 2").await?;
     /// stdin.write_line("6 * 7").await?;
     /// stdin.finish().await?; // send EOF so bc finishes
@@ -620,7 +620,7 @@ impl RunningProcess {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn standard_input(&mut self) -> Option<ProcessStdin> {
+    pub fn take_stdin(&mut self) -> Option<ProcessStdin> {
         match &mut self.backend {
             Backend::Real(real) => real.stdin_pipe.take().map(ProcessStdin::new),
             // Scripted doubles don't model interactive stdin (yet): the
@@ -902,7 +902,7 @@ impl RunningProcess {
         // B15: `wait_exit` must NOT close an untaken `keep_stdin_open` pipe.
         // `wait_any`/`wait_all` only *borrow* each contender and promise the
         // losers "remain fully usable" — closing their stdin here would give a
-        // loser a premature EOF and leave `standard_input()` returning `None`
+        // loser a premature EOF and leave `take_stdin()` returning `None`
         // afterward. Like the documented "no output pumping" non-feature, a
         // `keep_stdin_open` child blocked on stdin is the caller's
         // responsibility: take its writer (or don't keep stdin open) before
@@ -1314,7 +1314,7 @@ impl RunningProcess {
         // A `keep_stdin_open` pipe nobody took can never be taken once a
         // consuming verb is driving (the verbs own `self`): close it NOW so a
         // stdin-reading child sees EOF instead of blocking to its timeout. A
-        // writer the caller did take via `standard_input()` is unaffected —
+        // writer the caller did take via `take_stdin()` is unaffected —
         // the pipe moved out of `self` then.
         if let Backend::Real(real) = &mut self.backend {
             drop(real.stdin_pipe.take());

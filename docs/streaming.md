@@ -99,7 +99,7 @@ Things to know:
 ## Interactive stdin
 
 Conversational tools — write a request, read the response, repeat. Keep stdin
-open with `keep_stdin_open()`, take the writer with `standard_input()`:
+open with `keep_stdin_open()`, take the writer with `take_stdin()`:
 
 ```rust,no_run
 use processkit::{Command, Outcome, StreamExt, Finished};
@@ -110,7 +110,7 @@ use processkit::{Command, Outcome, StreamExt, Finished};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `bc` evaluates each stdin line and prints the result.
     let mut run = Command::new("bc").keep_stdin_open().start().await?;
-    let mut stdin = run.standard_input().expect("stdin was kept open");
+    let mut stdin = run.take_stdin().expect("stdin was kept open");
     let mut answers = run.stdout_lines()?;
 
     stdin.write_line("2 + 2").await?;             // writes "2 + 2\n", flushed

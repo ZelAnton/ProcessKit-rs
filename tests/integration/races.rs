@@ -85,9 +85,9 @@ async fn wait_any_loser_keeps_its_stdin() {
 
     // B15: the loser was only borrowed — its untaken keep_stdin_open pipe must
     // still be present (the race must not have closed it, which would leave
-    // standard_input() returning None and the child wedged on a premature EOF).
+    // take_stdin() returning None and the child wedged on a premature EOF).
     let mut stdin = waiter
-        .standard_input()
+        .take_stdin()
         .expect("B15: a wait_any loser's stdin must remain usable");
     // It works end to end: feed the line it's blocked on, then watch it exit.
     let _ = stdin.write_line("hello").await;

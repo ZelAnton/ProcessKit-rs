@@ -185,7 +185,7 @@ while any capture verb drives the run.
 use processkit::StreamExt;
 
 let mut run = Command::new("bc").keep_stdin_open().start().await?;
-let mut stdin = run.standard_input().expect("stdin was kept open");
+let mut stdin = run.take_stdin().expect("stdin was kept open");
 stdin.write_line("2 + 2").await?;
 stdin.finish().await?; // EOF — bc exits
 
@@ -221,10 +221,10 @@ group. The `|` operator is equivalent sugar:
 
 For a consumer that legitimately stops reading early — the `| head -1` shape,
 where the producer's `SIGPIPE` death is expected — mark the producer
-`unchecked()` so that death doesn't fail the chain:
+`unchecked_in_pipe()` so that death doesn't fail the chain:
 
 ```rust,no_run
-let first = (Command::new("seq").args(["1", "1000000"]).unchecked()
+let first = (Command::new("seq").args(["1", "1000000"]).unchecked_in_pipe()
     | Command::new("head").args(["-n", "1"]))
     .run()
     .await?;

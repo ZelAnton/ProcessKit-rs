@@ -36,7 +36,7 @@ async fn process_diagnostics_are_available() {
             "peak memory should be readable on this platform"
         );
     }
-    let _ = process.standard_input(); // no-op (stdin not kept open)
+    let _ = process.take_stdin(); // no-op (stdin not kept open)
     drop(process);
 }
 

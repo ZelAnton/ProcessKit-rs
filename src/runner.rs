@@ -183,7 +183,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
         // Close an untaken `keep_stdin_open` pipe (taking it here drops it → EOF)
         // so a stdin-reading filter isn't left blocking — `first_line` gives no
         // way to write to it. A no-op for the usual case.
-        let _ = process.standard_input();
+        let _ = process.take_stdin();
         // D2: `stdout_lines` is fallible — a non-piped stdout surfaces here as a
         // clear error rather than a stream that yields nothing.
         let mut lines = process.stdout_lines()?;
@@ -474,7 +474,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     );
 
     let (stdin_pipe, stdin_task) = if command.keeps_stdin_open() {
-        // Interactive: hand the pipe to the caller via `standard_input`.
+        // Interactive: hand the pipe to the caller via `take_stdin`.
         (child.stdin.take(), None)
     } else {
         match command.stdin_source() {

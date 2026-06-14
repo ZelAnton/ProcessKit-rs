@@ -222,7 +222,7 @@ impl fmt::Debug for Stdin {
 
 /// An interactive writer to a child's standard input.
 ///
-/// Available from [`RunningProcess::standard_input`](crate::RunningProcess::standard_input)
+/// Available from [`RunningProcess::take_stdin`](crate::RunningProcess::take_stdin)
 /// when the command was built with
 /// [`Command::keep_stdin_open`](crate::Command::keep_stdin_open). Write
 /// incrementally, then call [`finish`](Self::finish) to send EOF — dropping the
