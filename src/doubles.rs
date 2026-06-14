@@ -778,6 +778,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_line_reports_cancellation_not_a_missing_line() {
+        // M6: when the command's cancel token has fired, a `first_line` whose
+        // predicate never matched must surface `Error::Cancelled` — not `Ok(None)`,
+        // which a readiness probe would misread as "the line never appeared".
+        use crate::runner::ProcessRunnerExt;
+        use tokio_util::sync::CancellationToken;
+        let runner =
+            ScriptedRunner::new().on(["svc", "run"], Reply::lines(["warming up", "still busy"]));
+        let token = CancellationToken::new();
+        token.cancel(); // e.g. a shutdown signal arrived
+        let cmd = Command::new("svc")
+            .arg("run")
+            .cancel_on(token.child_token());
+        let result = runner.first_line(&cmd, |l| l.contains("ready")).await;
+        assert!(
+            matches!(result, Err(crate::Error::Cancelled { .. })),
+            "a cancelled probe must report Cancelled, got {result:?}"
+        );
+
+        // Control: without cancellation, a never-matching predicate is still Ok(None).
+        let cmd = Command::new("svc").arg("run");
+        let none = runner
+            .first_line(&cmd, |l| l.contains("ready"))
+            .await
+            .expect("first_line");
+        assert_eq!(
+            none, None,
+            "no cancellation → a missing line is still Ok(None)"
+        );
+    }
+
+    #[tokio::test]
     async fn scripted_start_streams_canned_lines_through_real_pumps() {
         use tokio_stream::StreamExt;
         let runner =

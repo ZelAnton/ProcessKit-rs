@@ -463,8 +463,21 @@ impl RunningProcess {
             };
             let group_weak = self.backend.own_group().map(Arc::downgrade);
             let pid = self.pid;
+            let timeout_state = self.timeout_state.clone();
             self.cancel_task = Some(tokio::spawn(async move {
                 token.cancelled().await;
+                // M1: don't signal if the child has already been reaped — its pid
+                // may be recycled by an unrelated process. The arbiter leaves
+                // `TS_PENDING` only once a natural reap (`TS_EXITED`) or a deadline
+                // (`TS_TIMED_OUT`) has claimed the run, mirroring the deadline
+                // watchdog's CAS guard. `abort_watchdogs` also aborts this task on
+                // reap; this check closes the residual window where a cancel fires
+                // between the reap and the abort landing. (A reap in the same
+                // scheduler quantum as this load is the same documented residual as
+                // `graceful_kill_pid`/`abort_watchdogs`.)
+                if timeout_state.load(Ordering::Acquire) != TS_PENDING {
+                    return;
+                }
                 // Full tree kill when we own the group; direct child kill as
                 // backstop for shared-group runs or after the group is gone.
                 if let Some(g) = group_weak.and_then(|w| w.upgrade()) {
@@ -907,12 +920,13 @@ impl RunningProcess {
     /// [`ProcessGroup::shutdown`](crate::ProcessGroup::shutdown) instead, or kill
     /// just this child with [`start_kill`](Self::start_kill).
     ///
-    /// A configured [`Command::timeout`](crate::Command::timeout) still applies
-    /// while shutting down: if its deadline has already elapsed (or is shorter
-    /// than `grace`), this reports [`Outcome::TimedOut`](crate::Outcome::TimedOut)
-    /// rather than the graceful exit — the run's own deadline is a hard ceiling
-    /// on the grace.
-    pub async fn shutdown(self, grace: std::time::Duration) -> Result<Outcome> {
+    /// If a [`Command::timeout`](crate::Command::timeout) deadline has **already
+    /// elapsed** when `shutdown` is called, the run is reported as
+    /// [`Outcome::TimedOut`](crate::Outcome::TimedOut) rather than the graceful
+    /// exit. The `grace` window governs the teardown timing itself — `shutdown`'s
+    /// own SIGTERM→grace→SIGKILL is the single teardown (M2: it does not also fire
+    /// the run's timeout teardown, which would signal the tree twice).
+    pub async fn shutdown(mut self, grace: std::time::Duration) -> Result<Outcome> {
         let Some(group) = self.backend.own_group().cloned() else {
             return Err(Error::Unsupported {
                 operation: "shutdown (a shared-group handle does not own its group — \
@@ -920,6 +934,25 @@ impl RunningProcess {
                     .into(),
             });
         };
+        // M2: `shutdown`'s graceful_terminate IS the teardown. Suppress the
+        // concurrent `wait()`'s own deadline tier so the tree is not torn down by
+        // two overlapping graceful ladders (the run's `Command::timeout` teardown
+        // + this one). A timeout that has already elapsed still classifies the
+        // outcome as TimedOut (claim the arbiter); the `grace` governs the timing.
+        if let Some(limit) = self.timeout
+            && self.started.elapsed() >= limit
+        {
+            let _ = self.timeout_state.compare_exchange(
+                TS_PENDING,
+                TS_TIMED_OUT,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
+        self.timeout = None; // disable the bulk deadline arm in drive_to_exit_inner
+        if let Some(task) = self.deadline_task.take() {
+            task.abort(); // disable a streaming deadline watchdog too
+        }
         // SIGTERM → wait `grace` → SIGKILL survivors (atomic kill on Windows).
         // Reap the child *concurrently* with the graceful teardown: on the
         // process-group backend (macOS/BSD, Linux without cgroup) the grace loop
@@ -972,6 +1005,11 @@ impl RunningProcess {
         // too). Mirrors `drive_to_exit`'s `cancel_at_exit.is_some()` guard.
         if self.cancel_at_exit.is_some() {
             let outcome = self.backend_wait().await?;
+            // S4: abort watchdogs on every reap path, not just the first observer.
+            // Idempotent (the first observer already aborted), but making it
+            // structural here means a future path that sets `cancel_at_exit`
+            // without aborting can't leave a live deadline/cancel task past reap.
+            self.abort_watchdogs();
             // E8: observe the stdin writer here too. If the first observation
             // was a readiness probe (`has_exited_now`, which snapshots
             // `cancel_at_exit` but does not observe stdin), this repeat path is
@@ -1105,10 +1143,14 @@ impl RunningProcess {
         }
         let _sampler_guard = sampler.as_ref().map(|h| AbortOnDrop(h.abort_handle()));
 
-        // The `on_exit` hook stops the sampler the moment the child is reaped:
-        // its pid is free for reuse from that point (Linux), and the pump
-        // drain can idle out PUMP_TEARDOWN on a leaked pipe — long enough for
-        // a recycled pid to masquerade as the child and corrupt the readings.
+        // The `on_exit` hook aborts the sampler when the child is reaped: its pid
+        // is free for reuse from that point (Linux), and the pump drain can idle
+        // out PUMP_TEARDOWN on a leaked pipe — long enough for a recycled pid to
+        // masquerade as the child and corrupt the readings (L11). The abort is
+        // asynchronous, so a sample already in flight at reap may still complete
+        // against the (possibly just-recycled) pid — a one-tick residual window,
+        // the same scheduler-quantum tradeoff as the kill watchdogs; the abort
+        // bounds it to at most one further reading rather than the whole drain.
         let outcome = self
             .finish_lines(CaptureMode::Discard, /* expose_counts */ false, || {
                 if let Some(task) = &sampler {
@@ -1396,6 +1438,9 @@ impl RunningProcess {
         // already-reaped child — safe and cheap.
         if self.cancel_at_exit.is_some() {
             let outcome = self.backend_wait().await?;
+            // S4: abort watchdogs on this reap path too (idempotent) — keep the
+            // "no live watchdog past reap" invariant structural, not by-luck.
+            self.abort_watchdogs();
             return Ok(self.classify_timed_out(outcome));
         }
         let outcome = self.drive_to_exit_inner().await?;

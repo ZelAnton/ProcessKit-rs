@@ -13,6 +13,26 @@ to a dated version section.
 
 ### Fixed
 
+- `RunningProcess::first_line` now surfaces `Error::Cancelled` when its command's
+  cancellation token has fired, instead of returning `Ok(None)`. A cancelled run's
+  stdout stream simply ends, which was indistinguishable from "the predicate never
+  matched" — a readiness probe with a shutdown token could misread cancellation as
+  "the line never appeared / startup failed".
+- The background cancellation watchdog no longer signals a process whose pid may
+  have already been reaped (and recycled by an unrelated process): it now checks the
+  same run-state arbiter the deadline watchdog uses and skips the kill once the run
+  has been reaped, closing the residual window between the reap and the watchdog's
+  abort.
+- `RunningProcess::shutdown(grace)` no longer tears the tree down twice when the
+  command also has a `Command::timeout`: its own graceful SIGTERM→grace→SIGKILL is
+  the single teardown (the run's timeout teardown is suppressed). An already-elapsed
+  deadline still classifies the outcome as `Outcome::TimedOut`; the `grace` governs
+  the teardown timing.
+- Hardened the "no watchdog task outlives the reap" invariant: the watchdog abort
+  now runs on every reap path (including the short-circuit repeat-reap branches),
+  not only the first observer, so a future code path cannot leave a deadline/cancel
+  task live past the child's exit.
+
 - Concurrent runs of the same cloned **one-shot** stdin source
   ([`Stdin::from_reader`]/[`from_lines`]) can no longer race so that one silently
   feeds the child empty stdin. The payload is now taken **atomically** at launch

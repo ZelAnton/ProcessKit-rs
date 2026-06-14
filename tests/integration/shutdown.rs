@@ -356,6 +356,48 @@ async fn shutdown_gracefully_stops_a_term_handling_child() {
     );
 }
 
+// M2: a `Command::timeout` that has already elapsed when `shutdown` is called
+// classifies the run as `TimedOut`, and `shutdown`'s own graceful teardown is the
+// SINGLE teardown — it ends as soon as the child exits on SIGTERM rather than the
+// run's timeout firing a second, overlapping graceful ladder.
+#[tokio::test]
+#[ignore = "spawns a real subprocess; M2 shutdown with an already-elapsed timeout"]
+async fn shutdown_reports_timed_out_when_the_deadline_already_elapsed() {
+    let mut run = Command::new("sh")
+        .args([
+            "-c",
+            "trap 'exit 0' TERM; echo ready; while :; do sleep 1; done",
+        ])
+        .timeout(Duration::from_millis(100))
+        .start()
+        .await
+        .expect("start");
+    run.wait_for_line(|l| l == "ready", Duration::from_secs(10))
+        .await
+        .expect("trap installed");
+    // Let the command's deadline elapse in wall-clock — nothing is driving it yet,
+    // so it is not enforced until `shutdown` reaps.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let start = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        run.shutdown(Duration::from_secs(5)),
+    )
+    .await
+    .expect("shutdown finished in time")
+    .expect("shutdown ok");
+    assert_eq!(
+        outcome,
+        Outcome::TimedOut,
+        "an already-elapsed deadline classifies the shutdown as TimedOut"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "a single teardown ends as soon as the child exits on TERM, not the full grace (took {:?})",
+        start.elapsed()
+    );
+}
+
 // D4: a shared-group handle (ProcessGroup::start) does not own its group, so
 // `shutdown` refuses with Error::Unsupported — the caller tears the group down
 // via ProcessGroup::shutdown instead.

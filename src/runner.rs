@@ -180,6 +180,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
         let mut process = self.start(command).await?;
         let program = command.program_name();
         let timeout = command.configured_timeout();
+        let cancel = command.cancel_token();
         // Close an untaken `keep_stdin_open` pipe (taking it here drops it → EOF)
         // so a stdin-reading filter isn't left blocking — `first_line` gives no
         // way to write to it. A no-op for the usual case.
@@ -198,20 +199,31 @@ pub trait ProcessRunnerExt: ProcessRunner {
             }
             None
         };
-        match timeout {
+        let found = match timeout {
             Some(limit) => match tokio::time::timeout(limit, search).await {
-                Ok(found) => Ok(found),
-                Err(_elapsed) => Err(crate::Error::Timeout {
-                    program,
-                    timeout: limit,
-                    // `first_line` is a streaming line probe — it buffers nothing,
-                    // so there are no captured streams to carry (D12).
-                    stdout: String::new(),
-                    stderr: String::new(),
-                }),
+                Ok(found) => found,
+                Err(_elapsed) => {
+                    return Err(crate::Error::Timeout {
+                        program,
+                        timeout: limit,
+                        // `first_line` is a streaming line probe — it buffers
+                        // nothing, so there are no captured streams to carry (D12).
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    });
+                }
             },
-            None => Ok(search.await),
+            None => search.await,
+        };
+        // M6: a cancelled run's stdout stream simply ends, so `search` yields
+        // `None` — indistinguishable from "the predicate never matched". Surface
+        // the cancellation instead, so a readiness probe (`first_line` with a
+        // shutdown `cancel_on` token) doesn't misread cancellation as "the line
+        // never appeared / startup failed".
+        if found.is_none() && cancel.is_some_and(|t| t.is_cancelled()) {
+            return Err(crate::Error::Cancelled { program });
         }
+        Ok(found)
     }
 }
 
