@@ -33,3 +33,8 @@ constraint) can reopen one by moving its substance back into `ideas/`.
 - **`readme-crate-doc-sourcing.md`** — why the README and the `lib.rs` crate doc stay
   separate (not `#![doc = include_str!]`): `include_str!` is lossy on docs.rs (relative
   links, cover image) and the two serve different audiences. Drift managed by review.
+- **`runtime-tokio-only.md`** — why the crate stays tokio-only: no sync variant and no
+  runtime abstraction (smol/async-std), and why async-as-a-feature wouldn't be one flag
+  but a second public API. The reliability core is inherently concurrent and tokio is
+  woven through it; revisit only on a concrete non-tokio consumer (reopening condition
+  inside).
