@@ -13,6 +13,28 @@ to a dated version section.
 
 ### Fixed
 
+- Concurrent runs of the same cloned **one-shot** stdin source
+  ([`Stdin::from_reader`]/[`from_lines`]) can no longer race so that one silently
+  feeds the child empty stdin. The payload is now taken **atomically** at launch
+  (a single step, under the source's async lock), so a second concurrent run
+  observes it consumed and fails loud, closing the check-then-take TOCTOU.
+- A command with a one-shot streaming stdin source is **no longer retried**: such
+  a source feeds a single run and cannot be replayed, so a retryable failure no
+  longer spins the retry loop re-hitting the consumed-stdin launch error
+  `max_attempts` times with backoff between — it runs exactly once regardless of
+  the retry policy. (Re-runnable sources — `from_bytes`/`from_string`/`from_file`/
+  `from_iter_lines` — still retry normally.)
+- A **panicking** stdin-writer task is now surfaced as `Error::Stdin` on an
+  otherwise-successful run instead of being silently swallowed into a clean
+  success (the writer task's `JoinError` was previously dropped).
+
+### Changed
+
+- `ProcessStdin` (the interactive `keep_stdin_open` writer) documents the
+  full-duplex deadlock hazard: feeding a large stdin while nothing drains the
+  child's stdout can wedge both sides — drain stdout concurrently. (No behavior
+  change; the non-interactive `Stdin` sources are already safe.)
+
 - A retained-byte cap ([`OutputBufferPolicy::with_max_bytes`]) now bounds the pump's
   **in-flight** line-assembly buffer, not just the retained backlog. Previously a
   newline-free flood (`base64 -w0`, a multi-gigabyte single "line") accumulated in full

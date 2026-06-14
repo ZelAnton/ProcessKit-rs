@@ -103,23 +103,13 @@ impl Stdin {
     }
 
     /// D10: whether this is a one-shot streaming source
-    /// ([`from_reader`](Self::from_reader) / [`from_lines`](Self::from_lines))
-    /// whose payload was **already consumed** by a previous run — so re-running
-    /// (a retry, or a manual second run) would silently feed empty stdin. The
-    /// launch path checks this and fails loud instead. A `try_lock` that is
-    /// momentarily held means a *concurrent* run holds the lock for the instant
-    /// of its `take()` — treated as live here. Note the source is `take()`n
-    /// before its copy runs (B17), so a concurrent second Command run started
-    /// *after* the first has taken the payload observes it consumed and trips
-    /// this loud launch error (rather than B17's prompt-empty-EOF, which is the
-    /// `write_to` primitive's behavior); failing loud on concurrent reuse of a
-    /// one-shot source is the intended D10 contract.
-    pub(crate) fn is_consumed_one_shot(&self) -> bool {
-        match &self.0 {
-            Source::Reader(r) => r.try_lock().is_ok_and(|g| g.is_none()),
-            Source::Lines(l) => l.try_lock().is_ok_and(|g| g.is_none()),
-            Source::Empty | Source::Bytes(_) | Source::File(_) => false,
-        }
+    /// ([`from_reader`](Self::from_reader) / [`from_lines`](Self::from_lines)) —
+    /// its payload feeds a *single* run and cannot be replayed. The retry path
+    /// uses this to refuse retrying such a command (a retry could not re-feed the
+    /// input), and the launch path takes the payload atomically (see
+    /// [`take_for_run`](Self::take_for_run)).
+    pub(crate) fn is_one_shot(&self) -> bool {
+        matches!(self.0, Source::Reader(_) | Source::Lines(_))
     }
 
     /// A **stable** digest of the stdin *content* for cassette keying (F12) —
@@ -162,46 +152,78 @@ impl Stdin {
         }
     }
 
-    /// Write this source to the child's stdin pipe, then return so the caller
-    /// can drop the sink to signal EOF. (Generic over the sink so the one-shot
-    /// semantics are unit-testable against an in-memory writer.)
-    pub(crate) async fn write_to<W>(&self, sink: &mut W) -> std::io::Result<()>
+    /// Take this source's payload for a single run (D10/M4), or report a one-shot
+    /// source already consumed by a previous run.
+    ///
+    /// One-shot sources ([`from_reader`](Self::from_reader)/
+    /// [`from_lines`](Self::from_lines)) are removed from their shared cell here —
+    /// **atomically**, under the async lock — so the take and the "already
+    /// consumed?" decision are a single step. This closes the TOCTOU where two
+    /// concurrent runs of the same cloned source could each pass a separate
+    /// `is_consumed`-style check and then have one silently feed the child empty
+    /// stdin: a concurrent second run now observes the source taken and fails
+    /// loud at launch. Re-runnable sources (bytes/file/empty) clone their
+    /// replayable payload. Call once per run, at launch.
+    pub(crate) async fn take_for_run(&self) -> Result<TakenStdin, OneShotConsumed> {
+        Ok(match &self.0 {
+            Source::Empty => TakenStdin::Empty,
+            Source::Bytes(bytes) => TakenStdin::Bytes(bytes.clone()),
+            Source::File(path) => TakenStdin::File(path.clone()),
+            Source::Reader(reader) => match reader.lock().await.take() {
+                Some(r) => TakenStdin::Reader(r),
+                None => return Err(OneShotConsumed),
+            },
+            Source::Lines(lines) => match lines.lock().await.take() {
+                Some(s) => TakenStdin::Lines(s),
+                None => return Err(OneShotConsumed),
+            },
+        })
+    }
+}
+
+/// A one-shot streaming stdin source ([`Stdin::from_reader`]/
+/// [`Stdin::from_lines`]) whose payload was already consumed by a previous run —
+/// returned by [`Stdin::take_for_run`] so the launch path can fail loud (D10).
+#[derive(Debug)]
+pub(crate) struct OneShotConsumed;
+
+/// A stdin payload taken for one run by [`Stdin::take_for_run`]. It owns its
+/// content (a one-shot source has been removed from its shared cell), so writing
+/// it is a plain move — there is no second take and so no empty-stdin footgun.
+pub(crate) enum TakenStdin {
+    Empty,
+    Bytes(Vec<u8>),
+    File(PathBuf),
+    Reader(Pin<Box<dyn AsyncRead + Send>>),
+    Lines(Pin<Box<dyn Stream<Item = String> + Send>>),
+}
+
+impl TakenStdin {
+    /// Whether this payload writes nothing (stdin is closed at start → EOF).
+    pub(crate) fn is_empty(&self) -> bool {
+        matches!(self, TakenStdin::Empty)
+    }
+
+    /// Write the payload to the child's stdin pipe, then return so the caller can
+    /// drop the sink to signal EOF.
+    pub(crate) async fn write_to<W>(self, sink: &mut W) -> std::io::Result<()>
     where
         W: tokio::io::AsyncWrite + Unpin,
     {
-        match &self.0 {
-            Source::Empty => Ok(()),
-            Source::Bytes(bytes) => sink.write_all(bytes).await,
-            Source::File(path) => {
-                let mut file = tokio::fs::File::open(path).await?;
+        match self {
+            TakenStdin::Empty => Ok(()),
+            TakenStdin::Bytes(bytes) => sink.write_all(&bytes).await,
+            TakenStdin::File(path) => {
+                let mut file = tokio::fs::File::open(&path).await?;
                 tokio::io::copy(&mut file, sink).await.map(|_| ())
             }
-            Source::Reader(reader) => {
-                // B17: take the reader out and release the lock *before* the
-                // copy — the guard temporary drops at the end of this statement.
-                // A concurrent second run then sees `None` (consumed) and gets
-                // prompt EOF instead of blocking for the whole copy.
-                let taken = reader.lock().await.take();
-                match taken {
-                    Some(mut r) => tokio::io::copy(&mut r, sink).await.map(|_| ()),
-                    None => Ok(()), // already consumed by an earlier run
+            TakenStdin::Reader(mut r) => tokio::io::copy(&mut r, sink).await.map(|_| ()),
+            TakenStdin::Lines(mut stream) => {
+                while let Some(line) = stream.next().await {
+                    sink.write_all(line.as_bytes()).await?;
+                    sink.write_all(b"\n").await?;
                 }
-            }
-            Source::Lines(lines) => {
-                // B17: release the lock before draining the stream (same as
-                // `Reader` above) so a concurrent run isn't held for the whole
-                // stream lifetime.
-                let taken = lines.lock().await.take();
-                match taken {
-                    Some(mut stream) => {
-                        while let Some(line) = stream.next().await {
-                            sink.write_all(line.as_bytes()).await?;
-                            sink.write_all(b"\n").await?;
-                        }
-                        Ok(())
-                    }
-                    None => Ok(()),
-                }
+                Ok(())
             }
         }
     }
@@ -227,6 +249,19 @@ impl fmt::Debug for Stdin {
 /// [`Command::keep_stdin_open`](crate::Command::keep_stdin_open). Write
 /// incrementally, then call [`finish`](Self::finish) to send EOF — dropping the
 /// writer (or the process handle) without finishing closes stdin too.
+///
+/// **Avoid the full-duplex deadlock.** A child's stdout pipe has a finite OS
+/// buffer; once it fills, the child blocks on *writing* stdout until something
+/// reads it. If you feed a large interactive stdin while nothing is draining the
+/// child's stdout, the child stops reading stdin (it is blocked writing stdout),
+/// your [`write`](Self::write) parks waiting for stdin buffer space, and neither
+/// side makes progress. When you both write a sizable stdin **and** the child
+/// produces output, drain its stdout concurrently — e.g. stream
+/// [`stdout_lines`](crate::RunningProcess::stdout_lines) from one task while
+/// writing stdin from another. (The non-interactive sources —
+/// [`Stdin::from_bytes`]/[`Stdin::from_string`]/[`Stdin::from_file`]/
+/// [`Stdin::from_reader`] — are safe: the crate writes them on a background task
+/// that runs concurrently with the output pumps.)
 pub struct ProcessStdin {
     sink: tokio::process::ChildStdin,
 }
@@ -270,43 +305,42 @@ impl fmt::Debug for ProcessStdin {
 mod tests {
     use super::*;
 
-    /// Drive `write_to` into an in-memory sink and return what was written.
+    /// Take the source for one run and drive its payload into an in-memory sink,
+    /// returning what was written (panics if the one-shot source was consumed).
     async fn written(stdin: &Stdin) -> Vec<u8> {
         let mut sink = Vec::new();
-        stdin.write_to(&mut sink).await.expect("write_to");
+        stdin
+            .take_for_run()
+            .await
+            .unwrap_or_else(|_| panic!("source already consumed"))
+            .write_to(&mut sink)
+            .await
+            .expect("write_to");
         sink
     }
 
     #[tokio::test]
     async fn reader_source_is_one_shot() {
+        // D10/M4: the first `take_for_run` yields the payload; a second take of
+        // the same (cloned) source reports it consumed (the launch path turns
+        // that into a loud error) rather than silently feeding empty stdin.
         let stdin = Stdin::from_reader(&b"payload"[..]);
         assert_eq!(written(&stdin).await, b"payload");
         assert!(
-            written(&stdin).await.is_empty(),
-            "the write_to primitive yields empty on a second drain — the reader was \
-             consumed (at the Command layer a re-run instead fails loud, D10)"
+            stdin.take_for_run().await.is_err(),
+            "a consumed one-shot reader reports OneShotConsumed, not empty"
         );
     }
 
     #[tokio::test]
-    async fn is_consumed_one_shot_flips_after_the_payload_is_drained() {
-        // D10: a fresh one-shot source is not yet consumed; after its single use
-        // it reports consumed, so the launch path can fail a re-run loudly
-        // instead of feeding empty stdin.
-        let reader = Stdin::from_reader(&b"payload"[..]);
-        assert!(!reader.is_consumed_one_shot(), "fresh reader is live");
-        let _ = written(&reader).await;
-        assert!(reader.is_consumed_one_shot(), "drained reader is consumed");
-
-        let lines = Stdin::from_lines(tokio_stream::iter(vec!["x".to_owned()]));
-        assert!(!lines.is_consumed_one_shot(), "fresh stream is live");
-        let _ = written(&lines).await;
-        assert!(lines.is_consumed_one_shot(), "drained stream is consumed");
-
-        // Re-runnable sources are never "consumed".
-        assert!(!Stdin::from_bytes(b"abc".to_vec()).is_consumed_one_shot());
-        assert!(!Stdin::from_iter_lines(["a", "b"]).is_consumed_one_shot());
-        assert!(!Stdin::empty().is_consumed_one_shot());
+    async fn is_one_shot_classifies_streaming_sources() {
+        assert!(Stdin::from_reader(&b"x"[..]).is_one_shot());
+        assert!(Stdin::from_lines(tokio_stream::iter(vec!["x".to_owned()])).is_one_shot());
+        // Re-runnable sources are not one-shot.
+        assert!(!Stdin::from_bytes(b"abc".to_vec()).is_one_shot());
+        assert!(!Stdin::from_iter_lines(["a", "b"]).is_one_shot());
+        assert!(!Stdin::from_string("x").is_one_shot());
+        assert!(!Stdin::empty().is_one_shot());
     }
 
     #[tokio::test]
@@ -317,7 +351,7 @@ mod tests {
         ]));
         assert_eq!(written(&stdin).await, b"first\nsecond\n");
         assert!(
-            written(&stdin).await.is_empty(),
+            stdin.take_for_run().await.is_err(),
             "the stream was consumed by the first run"
         );
     }
@@ -338,6 +372,9 @@ mod tests {
         let stdin = Stdin::from_file("processkit-definitely-missing-424242.txt");
         let mut sink = Vec::new();
         let err = stdin
+            .take_for_run()
+            .await
+            .unwrap_or_else(|_| panic!("file source is re-runnable"))
             .write_to(&mut sink)
             .await
             .expect_err("a missing stdin file must error, not feed silence");
@@ -350,37 +387,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_run_is_not_blocked_by_a_slow_first_run() {
-        // B17: while one run is parked mid-copy on a slow reader, a concurrent
-        // second run on the same (cloned) source must see it already taken and
-        // return promptly — not block on the source mutex for the whole copy.
-        // Before the fix, the guard was held across the copy and this would hang.
+    async fn concurrent_reuse_of_a_one_shot_source_fails_the_loser_atomically() {
+        // M4: the take is atomic — when two runs of the same (cloned) one-shot
+        // source race, exactly one wins the payload and the other observes it
+        // consumed. There is no window where both pass a check and one then
+        // silently feeds empty stdin. (The slow copy no longer holds the source
+        // lock, so the loser also returns promptly — superseding the old B17
+        // "not blocked by a slow first run" guarantee.)
         use std::time::Duration;
 
-        // A reader whose data never arrives and never EOFs: the writer parks.
         let (_tx, rx) = tokio::io::duplex(64);
         let stdin = Stdin::from_reader(rx);
         let stdin2 = stdin.clone();
 
-        // Run 1 takes the reader and parks in the copy (no data, no EOF).
+        // Run 1 wins the take and parks in the copy (no data, no EOF).
         let run1 = tokio::spawn(async move {
+            let taken = stdin.take_for_run().await.expect("run 1 wins the take");
             let mut sink = Vec::new();
-            let _ = stdin.write_to(&mut sink).await;
+            let _ = taken.write_to(&mut sink).await;
         });
-        // Let run 1 win the take.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Run 2 must observe the consumed source and finish quickly.
-        let mut sink2 = Vec::new();
-        let second =
-            tokio::time::timeout(Duration::from_secs(2), stdin2.write_to(&mut sink2)).await;
+        // Run 2 must observe the consumed source and finish quickly with an error.
+        let second = tokio::time::timeout(Duration::from_secs(2), stdin2.take_for_run()).await;
+        let second = second.expect("the loser must not block on the slow winner's copy");
         assert!(
-            second.is_ok(),
-            "the second run must not block on the source mutex held by the slow first run"
-        );
-        assert!(
-            sink2.is_empty(),
-            "the second run sees the already-consumed source"
+            second.is_err(),
+            "the losing concurrent run sees the one-shot source already taken"
         );
 
         run1.abort();

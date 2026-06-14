@@ -6,7 +6,7 @@
 //! both — its `start` hands back a scripted handle that feeds canned lines
 //! through the same pump machinery a real child uses.
 
-use crate::command::{Command, RetryPolicy, find_in_path, is_bare_name};
+use crate::command::{Command, find_in_path, is_bare_name};
 use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::result::ProcessResult;
@@ -118,7 +118,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// synthetic sentinel, mirroring
     /// [`ensure_success`](crate::ProcessResult::ensure_success).
     async fn exit_code(&self, command: &Command) -> Result<i32> {
-        retrying(command.retry_policy(), || async {
+        retrying(command, || async {
             self.output(command).await?.require_code()
         })
         .await
@@ -131,7 +131,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// [`Error::Signalled`](crate::Error::Signalled)). For
     /// commands whose exit code *is* the answer — `git diff --quiet`, `grep -q`, …
     async fn probe(&self, command: &Command) -> Result<bool> {
-        retrying(command.retry_policy(), || async {
+        retrying(command, || async {
             let result = self.output(command).await?;
             match result.code() {
                 Some(0) => Ok(true),
@@ -156,7 +156,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// when you need the whole `ProcessResult` after success-checking, rather
     /// than just trimmed stdout (`run`) or the raw result (`output`).
     async fn checked(&self, command: &Command) -> Result<ProcessResult<String>> {
-        retrying(command.retry_policy(), || async {
+        retrying(command, || async {
             self.output(command).await?.ensure_success()
         })
         .await
@@ -215,15 +215,25 @@ pub trait ProcessRunnerExt: ProcessRunner {
     }
 }
 
-/// Run `attempt` once, or — when the command carries a [`RetryPolicy`] — up to
+/// Run `attempt` once, or — when `command` carries a [`RetryPolicy`] — up to
 /// `max_attempts` times, retrying while the error is classified retryable and
 /// sleeping `backoff` between tries. The building block under the success-checking
 /// `ProcessRunnerExt` helpers; the non-erroring `output` path never retries.
-async fn retrying<T, Fut, F>(policy: Option<RetryPolicy>, mut attempt: F) -> Result<T>
+async fn retrying<T, Fut, F>(command: &Command, mut attempt: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: core::future::Future<Output = Result<T>>,
 {
+    let policy = command.retry_policy();
+    // M5: a one-shot streaming stdin (`from_reader`/`from_lines`) feeds a single
+    // run and cannot be replayed — the first attempt consumes it, so any retry
+    // would fail loud at launch (D10). Don't retry such a command: it runs once
+    // regardless of the policy (rather than re-hitting the consumed-stdin error
+    // `max_attempts` times with backoff between).
+    let one_shot_stdin = !command.keeps_stdin_open()
+        && command
+            .stdin_source()
+            .is_some_and(crate::Stdin::is_one_shot);
     let mut tries = 0u32;
     loop {
         tries += 1;
@@ -234,6 +244,9 @@ where
                 // token stays cancelled forever, so every retry would just hit
                 // the pre-spawn short-circuit again (mirrors the Supervisor).
                 if matches!(err, crate::Error::Cancelled { .. }) {
+                    return Err(err);
+                }
+                if one_shot_stdin {
                     return Err(err);
                 }
                 match &policy {
@@ -378,28 +391,39 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         });
     }
 
-    // D10: a one-shot streaming stdin (`from_reader`/`from_lines`) feeds a
-    // *single* run. If it was already consumed — by a prior `retry` attempt or a
-    // manual re-run — this run would silently get empty stdin (a footgun on a
-    // command whose behavior depends on its input). Fail loud instead. (Skipped
-    // for `keep_stdin_open`, which hands the pipe to the caller and never
-    // consumes the source.) `from_bytes`/`from_string`/`from_file` are
-    // re-runnable, so they never trip this.
-    if !command.keeps_stdin_open()
-        && let Some(source) = command.stdin_source()
-        && source.is_consumed_one_shot()
-    {
-        return Err(crate::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "`{}`: its one-shot streaming stdin (from_reader/from_lines) was already \
-                 consumed by a previous run — such a source feeds a single run and cannot be \
-                 retried or re-run; use Stdin::from_bytes/from_string (re-runnable), or rebuild \
-                 the command with a fresh source",
-                command.program_name()
-            ),
-        )));
-    }
+    // D10/M4: take the stdin payload up front, **atomically**. A one-shot
+    // streaming source (`from_reader`/`from_lines`) feeds a single run; taking it
+    // here — rather than checking "already consumed?" now and taking later in the
+    // writer task — means the take and the decision are one step, so a concurrent
+    // second run of the same cloned source observes it consumed and fails loud
+    // instead of racing the check against the take and silently getting empty
+    // stdin (a footgun on a command whose behavior depends on its input). A
+    // re-run / retry of an already-consumed source likewise fails loud here.
+    // (Skipped for `keep_stdin_open`, which hands the pipe to the caller.)
+    // `from_bytes`/`from_string`/`from_file` are re-runnable, so they never trip
+    // this. Taken before the spawn so a failed spawn never leaves a child to feed.
+    let taken_stdin = if command.keeps_stdin_open() {
+        None
+    } else {
+        match command.stdin_source() {
+            Some(source) => match source.take_for_run().await {
+                Ok(taken) => Some(taken),
+                Err(crate::stdin::OneShotConsumed) => {
+                    return Err(crate::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "`{}`: its one-shot streaming stdin (from_reader/from_lines) was \
+                             already consumed by a previous run — such a source feeds a single \
+                             run and cannot be retried or re-run; use Stdin::from_bytes/from_string \
+                             (re-runnable), or rebuild the command with a fresh source",
+                            command.program_name()
+                        ),
+                    )));
+                }
+            },
+            None => None,
+        }
+    };
 
     let mut tokio_cmd = command.build_tokio();
     let opts = crate::sys::SpawnOptions {
@@ -477,15 +501,14 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         // Interactive: hand the pipe to the caller via `take_stdin`.
         (child.stdin.take(), None)
     } else {
-        match command.stdin_source() {
-            // Write buffered/file/stream stdin on a background task so a large
-            // payload can't deadlock against the child's stdout; dropping the
-            // sink sends EOF.
-            Some(source) if !source.is_empty() => {
+        match taken_stdin {
+            // Write the (already-taken) buffered/file/stream stdin on a background
+            // task so a large payload can't deadlock against the child's stdout;
+            // dropping the sink sends EOF.
+            Some(payload) if !payload.is_empty() => {
                 let task = child.stdin.take().map(|mut sink| {
-                    let source = source.clone();
                     tokio::spawn(async move {
-                        let result = source.write_to(&mut sink).await;
+                        let result = payload.write_to(&mut sink).await;
                         drop(sink);
                         result
                     })
@@ -599,6 +622,37 @@ mod tests {
         let runner = flaky(10);
         assert!(runner.run(&Command::new("x")).await.is_err());
         assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn one_shot_stdin_command_is_not_retried() {
+        // M5: a command whose stdin is a one-shot streaming source cannot be
+        // replayed — the first run consumes it. A retryable failure must NOT spin
+        // the retry loop (which, against a real runner, would re-hit the
+        // consumed-stdin launch error `max_attempts` times with backoff between).
+        // It runs exactly once regardless of the policy.
+        let runner = flaky(10);
+        let cmd = Command::new("x")
+            .stdin(crate::Stdin::from_reader(&b"once"[..]))
+            .retry(5, Duration::from_millis(0), |_| true);
+        assert!(runner.run(&cmd).await.is_err());
+        assert_eq!(
+            runner.calls.load(Ordering::SeqCst),
+            1,
+            "a one-shot stdin command is attempted once, not retried"
+        );
+
+        // A re-runnable stdin source (eagerly buffered) still retries normally.
+        let runner = flaky(10);
+        let cmd = Command::new("x")
+            .stdin(crate::Stdin::from_bytes(b"again".to_vec()))
+            .retry(3, Duration::from_millis(0), |_| true);
+        assert!(runner.run(&cmd).await.is_err());
+        assert_eq!(
+            runner.calls.load(Ordering::SeqCst),
+            3,
+            "a re-runnable stdin source retries up to the cap"
+        );
     }
 
     #[tokio::test]

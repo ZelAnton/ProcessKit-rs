@@ -324,6 +324,41 @@ async fn failing_stdin_source_surfaces_as_error_stdin_on_a_successful_run() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real subprocess fed a panicking stdin source"]
+async fn panicking_stdin_source_surfaces_as_error_stdin_not_silent_success() {
+    use processkit::Error;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A stdin source whose read PANICS — a bug in a user-supplied reader.
+    struct PanickingReader;
+    impl tokio::io::AsyncRead for PanickingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            panic!("stdin source panicked");
+        }
+    }
+
+    let reads_stdin = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "sort"])
+    } else {
+        Command::new("cat")
+    };
+    // L1: the writer task panics; its `JoinError` must be surfaced as
+    // `Error::Stdin` on an otherwise-successful run, not swallowed into a clean
+    // success (a panicking source is a real failure the caller must see).
+    let err = reads_stdin
+        .stdin(processkit::Stdin::from_reader(PanickingReader))
+        .output_string()
+        .await
+        .expect_err("a panicking stdin writer on a successful run must surface as Error::Stdin");
+    assert!(matches!(err, Error::Stdin { .. }), "got: {err:?}");
+}
+
+#[tokio::test]
 #[ignore = "spawns a real subprocess that exits non-zero while its stdin source fails"]
 async fn nonzero_exit_wins_over_a_failing_stdin_source() {
     use std::pin::Pin;

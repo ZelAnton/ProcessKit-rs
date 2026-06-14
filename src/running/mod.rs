@@ -1327,9 +1327,24 @@ impl RunningProcess {
             return;
         }
         // The task is finished, so this await is immediate.
-        if let Ok(Err(e)) = task.await
-            && !is_broken_pipe(&e)
-        {
+        let observed = match task.await {
+            Ok(Ok(())) => None,
+            // A routine EPIPE (the child closed stdin / exited early) is expected,
+            // not a failure — don't stash it.
+            Ok(Err(e)) if is_broken_pipe(&e) => None,
+            Ok(Err(e)) => Some(e),
+            // L1: the writer task did not complete normally — surface it rather
+            // than swallowing it (a panicking stdin source must not read as a
+            // clean success). It is awaited only once `is_finished()`, and the
+            // only abort site (`Drop`) takes the handle first, so in practice this
+            // is a panic; word it precisely either way.
+            Err(join_err) => Some(std::io::Error::other(if join_err.is_panic() {
+                format!("stdin writer task panicked: {join_err}")
+            } else {
+                format!("stdin writer task did not complete: {join_err}")
+            })),
+        };
+        if let Some(e) = observed {
             #[cfg(feature = "tracing")]
             tracing::warn!(
                 target: "processkit",
