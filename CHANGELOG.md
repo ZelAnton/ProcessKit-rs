@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [0.10.0] - 2026-06-14
+
+### Added
 
 - `OutputBufferPolicy::with_max_bytes(n)` (and a `max_bytes` field) — a retained-byte
   ceiling, independent of `max_lines`, so one enormous newline-free line can no longer
@@ -1133,7 +1144,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.9.2...v0.10.0
 [0.9.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.8.2...v0.9.0
