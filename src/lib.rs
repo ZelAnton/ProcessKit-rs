@@ -8,7 +8,11 @@
 // tests are exempt); CI's `-D warnings` promotes it to a hard error.
 #![warn(missing_docs)]
 
-//! `processkit` — child-process management for Rust.
+//! `processkit` — async child-process management for Rust + [tokio]: whole-tree
+//! kill-on-drop (no orphaned subprocesses), run-and-capture, streaming,
+//! shell-free pipelines, timeouts & cancellation, and supervision.
+//!
+//! [tokio]: https://tokio.rs/
 //!
 //! Two layers:
 //!

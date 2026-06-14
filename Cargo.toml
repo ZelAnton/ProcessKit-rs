@@ -2,14 +2,26 @@
 name = "processkit"
 version = "0.10.0"
 edition = "2024"
-description = "Child-process management: kill-on-drop process trees and async run-and-capture"
+description = "Async child-process management for tokio: whole-tree kill-on-drop (no orphans), plus streaming, pipelines, timeouts, and supervision"
 license = "MIT"
 repository = "https://github.com/ZelAnton/ProcessKit-rs"
 documentation = "https://docs.rs/processkit"
 homepage = "https://github.com/ZelAnton/ProcessKit-rs"
 readme = "README.md"
-keywords = ["process", "subprocess", "job-object", "cgroup", "tokio"]
-categories = ["os", "asynchronous", "command-line-utilities"]
+# Up to 5 keywords (≤20 chars each): high-volume terms people actually search,
+# not niche mechanism names (job-object/cgroup live in the description instead).
+keywords = ["process", "subprocess", "tokio", "async", "process-group"]
+# Up to 5 *valid* crates.io category slugs (https://crates.io/category_slugs).
+# Was mis-tagged `command-line-utilities` — that slug is for CLI *binaries*, not
+# a library; replaced with the OS-API subcategories matching the cgroup /
+# Job Object / process-group machinery, plus `concurrency`.
+categories = [
+  "asynchronous",
+  "os",
+  "os::unix-apis",
+  "os::windows-apis",
+  "concurrency",
+]
 # Keep the published crate lean: ship code, docs, and license — not the
 # dev/CI/agent tooling that only matters in the repo.
 exclude = [
@@ -24,6 +36,9 @@ exclude = [
   "cliff.toml",
   "deny.toml",
   "rust-toolchain.toml",
+  # 3.5 MB README banner — rendered from its absolute raw.githubusercontent URL,
+  # so it never needs to ship inside the published crate.
+  "cover.png",
 ]
 # Minimum Supported Rust Version. 1.88 is required for `let`-chains
 # (`if let … && let …`), used in the unix process-group/cgroup code. The `msrv`
