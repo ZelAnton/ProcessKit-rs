@@ -21,13 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
-use tokio::time::{Instant, sleep};
 
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
-
-/// How often the graceful path re-checks whether the tree has drained.
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// One tracked id (a group leader pid or a solo pid) plus its B5 latch.
 struct Entry {
@@ -368,25 +364,7 @@ impl ProcessGroup {
         timeout: Duration,
         escalate: bool,
     ) -> io::Result<()> {
-        self.broadcast(signal);
-        // E15: clamp so a `Duration::MAX`-ish timeout can't overflow `Instant +
-        // Duration` and panic mid-teardown.
-        let deadline = Instant::now() + timeout.min(crate::MAX_DEADLINE);
-        while self.any_alive() {
-            if Instant::now() >= deadline {
-                break;
-            }
-            sleep(POLL_INTERVAL).await;
-        }
-        if escalate && self.any_alive() {
-            self.broadcast(libc::SIGKILL);
-        } else if !escalate {
-            // B12: tell Drop not to hard-kill the survivors the caller chose
-            // to leave alive. Relaxed is sufficient: this store happens-before
-            // Drop runs via the single-threaded call boundary.
-            self.skip_drop_kill.store(true, Ordering::Relaxed);
-        }
-        Ok(())
+        super::graceful::run(self, &self.skip_drop_kill, signal, timeout, escalate).await
     }
 
     #[cfg(feature = "stats")]
@@ -399,6 +377,23 @@ impl ProcessGroup {
             total_cpu_time: None,
             peak_memory_bytes: None,
         })
+    }
+}
+
+impl super::graceful::GracefulTarget for ProcessGroup {
+    fn signal_all(&self, signal: i32) {
+        self.broadcast(signal);
+    }
+
+    fn is_drained(&self) -> bool {
+        !self.any_alive()
+    }
+
+    fn hard_kill(&self) -> io::Result<()> {
+        // `killpg` is infallible-by-contract here (best-effort against a tree
+        // that may be exiting); there is no error to surface.
+        self.broadcast(libc::SIGKILL);
+        Ok(())
     }
 }
 

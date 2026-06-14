@@ -57,6 +57,12 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
 #[cfg(unix)]
 pub(crate) mod pgroup;
 
+// The shared graceful-shutdown escalation driver, used by both unix backends
+// (the Linux cgroup and the process-group fallback). Windows' atomic Job kill
+// has no graceful tier, so it is unix-only.
+#[cfg(unix)]
+mod graceful;
+
 /// Per-spawn knobs that must reach the platform backend (the
 /// `tokio::process::Command` can't carry them: creation flags have no getter,
 /// and the pgroup backend must know about `setsid` *before* it sets a process

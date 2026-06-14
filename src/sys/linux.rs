@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
-use tokio::time::{Instant, sleep};
 
 use crate::Mechanism;
 #[cfg(feature = "process-control")]
@@ -25,9 +24,6 @@ use crate::stats::ProcessGroupStats;
 #[cfg(feature = "stats")]
 use crate::sys::ProcMetrics;
 use crate::sys::pgroup::ProcessGroup;
-
-/// How often the graceful path re-checks whether the tree has drained.
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Process-wide counter so concurrent jobs get distinct cgroup names.
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -216,26 +212,10 @@ impl Job {
         escalate: bool,
     ) -> io::Result<()> {
         match &self.backend {
+            // The cgroup signals/observes/kills the tree through the cgroup file
+            // API; the shared driver owns the poll-and-escalate algorithm.
             Backend::Cgroup(cg) => {
-                // Best-effort: the graceful tier proceeds to polling regardless.
-                let _ = cg.signal(signal);
-                // E15: clamp so a `Duration::MAX`-ish timeout can't overflow.
-                let deadline = Instant::now() + timeout.min(crate::MAX_DEADLINE);
-                while !cg.is_empty() {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    sleep(POLL_INTERVAL).await;
-                }
-                if escalate && !cg.is_empty() {
-                    cg.kill()?;
-                } else if !escalate {
-                    // B12: tell Drop not to cgroup.kill the survivors.
-                    // Relaxed is sufficient: store happens-before Drop via the
-                    // single-threaded call boundary.
-                    self.skip_drop_kill.store(true, Ordering::Relaxed);
-                }
-                Ok(())
+                super::graceful::run(cg, &self.skip_drop_kill, signal, timeout, escalate).await
             }
             // The ProcessGroup backend carries its own `skip_drop_kill` flag;
             // `pg.graceful_shutdown` sets it when `escalate=false`. `Job::drop`
@@ -638,6 +618,22 @@ impl Cgroup {
                 "cgroup did not drain after the bounded SIGKILL sweep (kernel < 5.14 fallback)",
             ))
         }
+    }
+}
+
+impl super::graceful::GracefulTarget for Cgroup {
+    fn signal_all(&self, signal: i32) {
+        // Best-effort: a delivery failure (a member that exited, EPERM) doesn't
+        // stop the graceful tier from proceeding to poll.
+        let _ = self.signal(signal);
+    }
+
+    fn is_drained(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn hard_kill(&self) -> io::Result<()> {
+        self.kill()
     }
 }
 
