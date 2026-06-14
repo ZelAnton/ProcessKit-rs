@@ -129,11 +129,12 @@
 //! Every flag is *additive* and gates visibility only — the kill-on-drop tree
 //! guarantee is unconditional in every configuration.
 //!
-//! - **`stats`** *(default)* — resource measurement: `ProcessGroupStats`,
+//! - **`stats`** — resource measurement: `ProcessGroupStats`,
 //!   `ProcessGroup::stats` (plus the `sample_stats` time-series sampler), the
 //!   per-process `RunningProcess::cpu_time`/`peak_memory_bytes` diagnostics,
-//!   and the `RunningProcess::profile` run summary. Disable
-//!   (`default-features = false`) to compile the accounting code out.
+//!   and the `RunningProcess::profile` run summary. **Opt-in** — the one feature
+//!   with an extra dependency (the Windows `ProcessStatus` FFI) and a specialized
+//!   purpose; enable with `features = ["stats"]`, or `limits`, which implies it.
 //! - **`process-control`** *(default)* — tree control beyond contain+kill:
 //!   `Signal` and `ProcessGroup::{signal, suspend, resume, members, adopt}`.
 //! - **`limits`** — whole-tree resource caps: `ResourceLimits`, the

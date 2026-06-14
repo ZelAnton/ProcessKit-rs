@@ -12,7 +12,7 @@
 
 | Aspect | Verdict | Rationale |
 |---|---|---|
-| **Feature-trimmed lite** | **Already shipped** | `--no-default-features` drops `stats` + `process-control` and their FFI. Features are additive *visibility* gates — kill-on-drop is unconditional in every config. The "turn off what you don't need" lite already exists. |
+| **Feature-trimmed lite** | **Already shipped** | The default is already lean (`process-control` only); `stats` is opt-in (its Windows FFI is off by default), and `--no-default-features` drops `process-control` too. Features are additive *visibility* gates — kill-on-drop is unconditional in every config. The "turn off what you don't need" lite already exists. |
 | **Does trimming lower the floor?** | **No** | `tokio` (8 features), `encoding_rs`, `tokio-stream`, `async-trait`, `thiserror` stay mandatory. "Lower requirements" really means **dropping tokio** — a different class of change than a feature toggle. |
 | **A truly low-requirement lite = a sync, no-tokio core** | **Feasible** (unlike the agnostic idea) | Containment is sync at heart: `ProcessGroup::spawn`/`Job::spawn`/Drop have no `.await`. A sync core reaps with blocking `std::process::Child::wait` — **no reactor**, so it sidesteps the async-reaping problem that sank runtime-agnosticism, and `std` preserves the Windows containment seam. |
 | **Ship it as a forked "lite" crate** | **Reject** | A duplicate-and-trim copy of `sys/` would drift. The correct shape is layering. |

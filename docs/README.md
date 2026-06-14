@@ -52,7 +52,7 @@ guarantee is unconditional in every configuration.
 
 | Feature | Default | Adds | Extra dependency |
 |---|---|---|---|
-| `stats` | **on** | `ProcessGroup::stats` / `sample_stats`, `RunningProcess::cpu_time` / `peak_memory_bytes` / `profile` | — |
+| `stats` | off | `ProcessGroup::stats` / `sample_stats`, `RunningProcess::cpu_time` / `peak_memory_bytes` / `profile` | `windows-sys/ProcessStatus` (Windows) |
 | `process-control` | **on** | `Signal`, `ProcessGroup::{signal, suspend, resume, members, adopt}` | — |
 | `limits` | off | Whole-tree resource caps on `ProcessGroupOptions` (`memory_max` / `max_processes` / `cpu_quota`), `Error::ResourceLimit`; implies `stats` | — |
 | `mock` | off | A `mockall`-generated `MockRunner` for expectation-style tests (test-only; its `expect_*` surface is **semver-exempt**, tracking `mockall` — prefer `ScriptedRunner`/`RecordingRunner` for a stable double) | `mockall` |

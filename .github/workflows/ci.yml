@@ -42,7 +42,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       # All three feature configurations must stay warning-clean: minimal
-      # (no stats/limits compiled), default (stats only), and everything.
+      # (no features), default (process-control only — stats/limits opt-in), and
+      # everything.
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --all-features -- -D warnings
@@ -83,9 +84,9 @@ jobs:
       # `--include-ignored` runs the real-subprocess tests too, so kill-on-drop is
       # actually exercised on each OS — including the macOS process-group teardown.
       - run: cargo test --all-features -- --include-ignored
-      # Also exercise the default configuration (stats on, limits off) at runtime:
-      # it takes the `limits`-free `Job::new()` path — the one every default
-      # consumer runs — which `--all-features` alone never executes.
+      # Also exercise the default configuration (process-control only — stats and
+      # limits off) at runtime: it takes the `limits`-free `Job::new()` path — the
+      # one every default consumer runs — which `--all-features` alone never executes.
       - run: cargo test -- --include-ignored
       # And the bare core (no default features): clippy/doc only compile this
       # configuration — running its tests guards the lean runtime path (and the

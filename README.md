@@ -321,7 +321,7 @@ per-process timeout, no output pumping).
 ## Sampling stats over time
 
 A point-in-time `stats()` becomes a series with `sample_stats`, and a single run
-can be profiled end-to-end (requires the default-on `stats` feature):
+can be profiled end-to-end (requires the opt-in `stats` feature):
 
 ```rust,no_run
 use processkit::{Command, ProcessGroup, StreamExt};

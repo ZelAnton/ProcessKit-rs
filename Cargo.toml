@@ -110,17 +110,24 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 
 [features]
-# Both default features are *visibility* gates: additive, hiding API without
-# changing the core's semantics — the kill-on-drop tree guarantee is
-# unconditional in every configuration. (A broader visibility split was tried
-# and deliberately rolled back — decision recorded in
-# decisions/architecture-audit-2026-06.md; full analysis in git history,
-# ideas/three-layer-resource-split.md.)
-default = ["stats", "process-control"]
-# Resource measurement: `ProcessGroupStats`, `ProcessGroup::stats`, and the
-# per-process `RunningProcess::cpu_time`/`peak_memory_bytes` diagnostics.
-# Compile it out (`--no-default-features`) to drop the accounting code and, on
-# Windows, the ProcessStatus FFI used only for the peak-memory readout.
+# Feature flags are *visibility* gates: additive, hiding API without changing the
+# core's semantics — the kill-on-drop tree guarantee is unconditional in every
+# configuration. (A broader visibility split was tried and deliberately rolled
+# back — decision recorded in decisions/architecture-audit-2026-06.md; full
+# analysis in git history, ideas/three-layer-resource-split.md.)
+#
+# The default is lean: `process-control` (pure code, no extra deps) is the one
+# capability most process-management callers reach for. `stats` is *opt-in* — it
+# is the one feature with a real build cost (a Windows FFI dependency) and a
+# specialized purpose (metrics), and the crate's core (spawn / contain / capture /
+# stream / pipeline) never needs it. Enable it with `features = ["stats"]` (or
+# `limits`, which implies it).
+default = ["process-control"]
+# Resource measurement: `ProcessGroupStats`, `ProcessGroup::stats`, the per-process
+# `RunningProcess::cpu_time`/`peak_memory_bytes` diagnostics, and `RunProfile` /
+# `RunningProcess::profile`. Opt-in: it is the only feature pulling an extra
+# dependency (on Windows, the ProcessStatus FFI used solely for the peak-memory
+# readout), and metrics are a specialized add-on most callers don't need.
 stats = ["windows-sys/Win32_System_ProcessStatus"]
 # Whole-tree resource caps: `ResourceLimits`, the `memory_max`/`max_processes`/
 # `cpu_quota` builders on `ProcessGroupOptions`, and `Error::ResourceLimit`.

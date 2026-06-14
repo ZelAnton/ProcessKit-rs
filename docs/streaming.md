@@ -214,7 +214,7 @@ chatty children first or give them bounded
 
 ## Per-run telemetry
 
-With the default-on **`stats`** feature, a running child reports its own
+With the opt-in **`stats`** feature, a running child reports its own
 resource usage, and `profile()` turns a whole run into a summary:
 
 ```rust,no_run

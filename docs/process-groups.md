@@ -249,7 +249,7 @@ interaction lives under its [Caveats](platform-support.md#caveats).
 
 ## Stats and sampling
 
-Requires the default-on **`stats`** feature.
+Requires the opt-in **`stats`** feature (`features = ["stats"]`, or `limits`).
 
 ```rust,no_run
 use processkit::{Command, ProcessGroup, StreamExt};

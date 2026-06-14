@@ -11,14 +11,19 @@ to a dated version section.
 
 ## [Unreleased]
 
-### Added
--
-
 ### Changed
--
 
-### Fixed
--
+- **Breaking:** the `stats` feature is now **opt-in** — it is no longer in the
+  default feature set (`default = ["process-control"]`). The metrics surface it
+  gates — `ProcessGroup::stats` / `ProcessGroupStats`, `RunningProcess::cpu_time` /
+  `peak_memory_bytes`, and `RunProfile` / `RunningProcess::profile` — is hidden by
+  default; enable it with `features = ["stats"]` (or `limits`, which still implies
+  it). The motivation: `stats` is the only feature carrying an extra dependency (on
+  Windows, the `ProcessStatus` FFI used solely for the peak-memory readout) and is a
+  specialized add-on the crate's core (spawn / contain / capture / stream / pipeline)
+  never needs — so it shouldn't be in every default build. The kill-on-drop tree
+  guarantee and all non-metrics behavior are unchanged. Migration: add `stats` (or
+  `limits`) to your `processkit` features if you use any of the metrics APIs.
 
 ## [0.10.2] - 2026-06-14
 
