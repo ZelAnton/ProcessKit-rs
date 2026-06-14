@@ -25,6 +25,17 @@ to a dated version section.
   guarantee and all non-metrics behavior are unchanged. Migration: add `stats` (or
   `limits`) to your `processkit` features if you use any of the metrics APIs.
 
+### Fixed
+
+- Closed the documented cancel-precedence race ("Issue 7"): a run reaped on its own
+  is no longer at risk of being misreported as `Err(Cancelled)` by a token that
+  fires in the window between the reap and the disposition check. The reap paths now
+  carry *which wait arm won* (`backend_wait` vs the cancel arm) out of the `select!`
+  and record the cancel disposition from that, instead of a post-hoc
+  `is_cancelled()` read that another thread could flip. Internal refactor (the reap
+  bookkeeping — cancel snapshot, watchdog abort, timeout classification — is now a
+  single `on_reaped` step shared by every wait path); no public API change.
+
 ## [0.10.2] - 2026-06-14
 
 ### Added

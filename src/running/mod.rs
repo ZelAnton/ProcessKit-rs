@@ -42,6 +42,19 @@ const TS_PENDING: u8 = 0;
 const TS_EXITED: u8 = 1;
 const TS_TIMED_OUT: u8 = 2;
 
+/// Why a reap-via-wait ended — carried out of the cancel/deadline `select!` so
+/// the cancel disposition is decided by *which arm won*, not re-derived from a
+/// post-hoc `is_cancelled()` read (A3, closes Issue-7). Consumed by
+/// [`RunningProcess::on_reaped`].
+enum ExitCause {
+    /// The child was reaped on its own (or the deadline arm fired, yielding
+    /// `Outcome::TimedOut`) — cancellation did not end this run.
+    Exited(Outcome),
+    /// The cancel arm of the wait fired: the token cancelled and we killed the
+    /// tree. Becomes `Err(Cancelled)` via the `cancel_at_exit` snapshot.
+    Cancelled,
+}
+
 /// What [`RunningProcess::finish_lines`] hands back to its thin public verbs.
 /// (Internal — distinct from the public [`Finished`](crate::Finished) returned
 /// by the streaming `finish()`.)
@@ -995,41 +1008,25 @@ impl RunningProcess {
         // racing it, otherwise it never reaches EOF and never exits. The
         // consuming `drive_to_exit` (`wait()`) *does* close the pipe — it
         // consumes the handle, so there is no loser to keep usable.
-        // B2: preserve a cancel snapshot taken by an earlier reap observation
-        // (a prior `wait_exit` / `has_exited_now` / `drive_to_exit`). Re-running
-        // the reap bookkeeping would re-query the live token, and a token
-        // cancelled *after* this child's natural exit would then misclassify the
-        // Tokio-cached exit as `Err(Cancelled)` on a second `wait_any`/`wait_all`
-        // (the documented "race them, keep watching the rest" pattern — and for
-        // `wait_all` that spurious error discards every other contender's outcome
-        // too). Mirrors `drive_to_exit`'s `cancel_at_exit.is_some()` guard.
-        if self.cancel_at_exit.is_some() {
-            let outcome = self.backend_wait().await?;
-            // S4: abort watchdogs on every reap path, not just the first observer.
-            // Idempotent (the first observer already aborted), but making it
-            // structural here means a future path that sets `cancel_at_exit`
-            // without aborting can't leave a live deadline/cancel task past reap.
-            self.abort_watchdogs();
-            // E8: observe the stdin writer here too. If the first observation
-            // was a readiness probe (`has_exited_now`, which snapshots
-            // `cancel_at_exit` but does not observe stdin), this repeat path is
-            // where a genuine `Error::Stdin` surfaces. Idempotent: once the task
-            // was taken (a prior `wait_exit`/consuming verb), this is a no-op.
-            self.observe_stdin_task().await;
-            // B1: classify a streamed timeout (the watchdog claimed `TimedOut`) as
-            // TimedOut here too — `wait_any`/`wait_all` must match `drive_to_exit`
-            // (classify before checked_outcome so cancellation still wins).
-            let outcome = self.classify_timed_out(outcome);
-            return self.checked_outcome(outcome);
-        }
-        // F1: honor cancellation DURING the wait so `wait_any`/`wait_all` don't
-        // hang on a never-exiting handle (e.g. a scripted `Reply::pending`, whose
-        // `backend_wait` parks forever) when the token fires. Mirrors
-        // `drive_to_exit_inner`'s cancel arm — kill the tree and resolve as
-        // `Signalled(None)`, which the `cancel_at_exit` snapshot below turns into
-        // `Err(Cancelled)`. No deadline arm: this path applies no timeout by
-        // contract (a streamed run's deadline is owned by its watchdog).
-        let outcome = {
+        // B2: short-circuit when a prior reap observation (a `has_exited_now`
+        // probe, or an earlier `wait_exit`/`drive_to_exit`) already snapshotted
+        // `cancel_at_exit`. `on_reaped` preserves that snapshot
+        // (first-observation-wins) rather than re-deriving from the live token —
+        // a token cancelled *after* this child's natural exit must not misclassify
+        // the Tokio-cached exit as `Err(Cancelled)` on a second `wait_any`/
+        // `wait_all` (and for `wait_all` that spurious error would discard every
+        // other contender's outcome too). Pass the cached `backend_wait` outcome.
+        let cause = if self.cancel_at_exit.is_some() {
+            ExitCause::Exited(self.backend_wait().await?)
+        } else {
+            // F1: honor cancellation DURING the wait so `wait_any`/`wait_all`
+            // don't hang on a never-exiting handle (e.g. a scripted
+            // `Reply::pending`, whose `backend_wait` parks forever) when the
+            // token fires. Mirrors `drive_to_exit_inner`'s cancel arm. No
+            // deadline arm: a streamed run's deadline is owned by its watchdog.
+            // The cancel disposition is carried out as `ExitCause` (A3): no
+            // post-hoc `is_cancelled()` read, so a cancel firing right after a
+            // natural exit can't flip a success to `Err(Cancelled)`.
             let token = self.cancel_token.clone();
             let cancelled = async {
                 match &token {
@@ -1041,35 +1038,18 @@ impl RunningProcess {
                 biased; // cancel arm first: a cancel that fires mid-wait wins
                 () = cancelled => {
                     self.kill_tree().await;
-                    Ok(Outcome::Signalled(None))
+                    ExitCause::Cancelled
                 }
-                outcome = self.backend_wait() => outcome,
-            }?
+                outcome = self.backend_wait() => ExitCause::Exited(outcome?),
+            }
         };
-        // First reap: abort watchdogs and clear pid before returning. This
-        // mirrors the `abort_watchdogs` call in `drive_to_exit` and prevents a
-        // streaming deadline/cancel task from waking up minutes later and
-        // killing an unrelated process that recycled this pid.
-        self.abort_watchdogs();
-        // Snapshot the cancel state at the true reap point (before any pump
-        // teardown or caller code runs). A consuming verb called on the winner
-        // after `wait_any` must see this snapshot — not re-query the live
-        // token — so a cancel that fires after natural exit doesn't convert
-        // success to `Err(Cancelled)` (Issue 1 / L14 companion fix).
-        {
-            self.cancel_at_exit =
-                Some(self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()));
-        }
+        let outcome = self.on_reaped(cause);
         // E8: observe a finished stdin writer that failed for a non-broken-pipe
         // reason, so a genuine `Error::Stdin` surfaces on the `wait_any`/
-        // `wait_all` path too (parity with `finish_lines`' B3 contract;
-        // previously this path never observed the writer, silently losing it).
+        // `wait_all` path too (parity with `finish_lines`' B3 contract). On the
+        // short-circuit path this catches a writer error a prior readiness-probe
+        // observation (`has_exited_now`) didn't.
         self.observe_stdin_task().await;
-        // B1: a streamed run whose deadline fired (the watchdog set `timed_out`)
-        // must report `Outcome::TimedOut` through `wait_any`/`wait_all` too —
-        // matching `drive_to_exit`. Classify before `checked_outcome` so
-        // cancellation still takes precedence.
-        let outcome = self.classify_timed_out(outcome);
         self.checked_outcome(outcome)
     }
 
@@ -1418,6 +1398,39 @@ impl RunningProcess {
         }
     }
 
+    /// The post-reap bookkeeping shared by every reap-via-wait path, run in one
+    /// fixed order so the invariants are **structural**, not maintained by
+    /// copy-paste discipline (A3):
+    ///
+    /// 1. **Snapshot the cancel disposition from `cause`** (which `select!` arm
+    ///    won), first-observation wins (B2). This closes the documented Issue-7
+    ///    race: the disposition is *what the race decided*, not a post-hoc
+    ///    `is_cancelled()` read that another thread could flip in the window
+    ///    between the reap and the read. A run whose child exited on its own
+    ///    (`backend_wait` won the biased select) is **not** cancelled even if the
+    ///    token fires microseconds later; only the cancel arm firing makes it so.
+    /// 2. **Abort the watchdogs** — no deadline/cancel task outlives the reap (S4).
+    /// 3. **Classify a fired deadline as `TimedOut`** via the arbiter (B1).
+    ///
+    /// The `cancel_at_exit.is_some()` short-circuit paths (a prior reap already
+    /// snapshotted) pass the cached `backend_wait` outcome as `ExitCause::Exited`;
+    /// step 1 then preserves the existing snapshot. `checked_outcome` later turns
+    /// a `true` snapshot into `Err(Cancelled)`.
+    fn on_reaped(&mut self, cause: ExitCause) -> Outcome {
+        if self.cancel_at_exit.is_none() {
+            self.cancel_at_exit = Some(matches!(cause, ExitCause::Cancelled));
+        }
+        self.abort_watchdogs();
+        let outcome = match cause {
+            ExitCause::Exited(outcome) => outcome,
+            // The tree was killed by us (SIGKILL) because the token cancelled;
+            // the value is moot — `checked_outcome` maps the snapshot to
+            // `Err(Cancelled)` before any caller sees it.
+            ExitCause::Cancelled => Outcome::Signalled(None),
+        };
+        self.classify_timed_out(outcome)
+    }
+
     /// Wait for the child to exit, applying the timeout (killing the tree on
     /// elapse). Returns the [`Outcome`] of the run.
     async fn drive_to_exit(&mut self) -> Result<Outcome> {
@@ -1429,40 +1442,23 @@ impl RunningProcess {
         if let Backend::Real(real) = &mut self.backend {
             drop(real.stdin_pipe.take());
         }
-        // Short-circuit when the child was already reaped by `wait_exit` or
-        // a probe (`has_exited_now`): those paths snapshot `cancel_at_exit` at
-        // the true reap point. Re-running the cancel/deadline select here would
-        // fire the cancel arm immediately (token already cancelled), overwriting
-        // the correct snapshot and converting a natural exit to `Err(Cancelled)`.
-        // `backend_wait` returns the Tokio-cached exit status instantly for an
-        // already-reaped child — safe and cheap.
-        if self.cancel_at_exit.is_some() {
-            let outcome = self.backend_wait().await?;
-            // S4: abort watchdogs on this reap path too (idempotent) — keep the
-            // "no live watchdog past reap" invariant structural, not by-luck.
-            self.abort_watchdogs();
-            return Ok(self.classify_timed_out(outcome));
-        }
-        let outcome = self.drive_to_exit_inner().await?;
-        // The child is reaped (or being reaped) — the watchdogs' job is done.
-        self.abort_watchdogs();
-        // Snapshot cancel state NOW (before the ≤5 s pump teardown in the
-        // caller): a token that fires during `join_pumps` must not convert a
-        // real success into `Err(Cancelled)` (L14 fix). If the token already
-        // fired during the run, the select! cancel arm already ran kill_tree,
-        // so this snapshot will be `true` and the error is correct.
-        //
-        // Narrow known race (Issue 7, documented): on the `multi_thread`
-        // runtime, another thread could cancel the token in the synchronous
-        // window between `abort_watchdogs` returning and the `is_cancelled()`
-        // read below. Fully closing it requires the cancel arm of
-        // `drive_to_exit_inner` to carry an "exit was due to cancel" flag
-        // through the return type, which Phase B (result-shape reshape) enables.
-        {
-            self.cancel_at_exit =
-                Some(self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()));
-        }
-        let outcome = self.classify_timed_out(outcome);
+        // Short-circuit when the child was already reaped (`wait_exit` / a probe
+        // `has_exited_now` snapshotted `cancel_at_exit` at the true reap point):
+        // re-running the cancel/deadline select would fire the cancel arm
+        // immediately for an already-cancelled token and overwrite that snapshot.
+        // `backend_wait` returns the Tokio-cached status instantly; `on_reaped`
+        // preserves the snapshot (its first-observation-wins step) and aborts
+        // watchdogs.
+        let cause = if self.cancel_at_exit.is_some() {
+            ExitCause::Exited(self.backend_wait().await?)
+        } else {
+            // The cancel disposition is whatever the select decided (A3): no
+            // post-hoc `is_cancelled()` read, closing the Issue-7 race. The
+            // snapshot is taken inside `on_reaped` BEFORE the caller's ≤5 s pump
+            // teardown, so a token firing during `join_pumps` can't flip it.
+            self.drive_to_exit_inner().await?
+        };
+        let outcome = self.on_reaped(cause);
         #[cfg(feature = "tracing")]
         tracing::debug!(
             target: "processkit",
@@ -1579,7 +1575,7 @@ impl RunningProcess {
     /// ready deadline (L4: prevents routing through the graceful teardown tier
     /// when both fire on the same poll, which would delay the promised
     /// immediate hard kill by up to `timeout_grace`).
-    async fn drive_to_exit_inner(&mut self) -> Result<Outcome> {
+    async fn drive_to_exit_inner(&mut self) -> Result<ExitCause> {
         // Own the knobs so the helper futures borrow nothing from `self` —
         // only `self.backend_wait()` does, keeping the select! borrows disjoint.
         let limit = self.timeout;
@@ -1619,14 +1615,12 @@ impl RunningProcess {
                     "cancellation fired; killing the tree"
                 );
                 self.kill_tree().await;
-                // Outcome is Signalled(None): the tree was killed by us (SIGKILL).
-                // The caller snapshots `cancel_at_exit` from `is_cancelled()` after
-                // this returns; because the token IS cancelled (it fired the arm),
-                // the snapshot is always `Some(true)` and `checked_outcome` converts
-                // this to `Err(Cancelled)` before the caller ever sees the outcome.
-                Ok(Outcome::Signalled(None))
+                // The cancel arm won: carry that fact out as `ExitCause::Cancelled`
+                // so `on_reaped` records the disposition from the race result, not
+                // a post-hoc `is_cancelled()` read (A3, closes Issue-7).
+                Ok(ExitCause::Cancelled)
             }
-            outcome = self.backend_wait() => outcome,
+            outcome = self.backend_wait() => outcome.map(ExitCause::Exited),
             () = deadline => {
                 #[cfg(feature = "tracing")]
                 tracing::warn!(
@@ -1642,7 +1636,7 @@ impl RunningProcess {
                     Ordering::Relaxed,
                 );
                 self.teardown_on_timeout().await;
-                Ok(Outcome::TimedOut)
+                Ok(ExitCause::Exited(Outcome::TimedOut))
             }
         }
     }
@@ -2049,6 +2043,31 @@ mod tests {
             Err(Error::Cancelled { .. }) => {}
             other => panic!("expected Err(Cancelled), got {other:?}"),
         }
+    }
+
+    /// A3 (Issue-7): the cancel disposition is decided by which `select!` arm won
+    /// (`ExitCause`), not a post-hoc `is_cancelled()` read. A child reaped on its
+    /// own via `wait_any` — the `backend_wait` arm wins the biased select while
+    /// the token is still live — is recorded NOT-cancelled at the reap point, so a
+    /// token cancelled *afterward* cannot flip the cached natural exit to
+    /// `Err(Cancelled)` on a follow-up consuming verb.
+    #[tokio::test]
+    async fn a_natural_wait_any_exit_is_not_flipped_by_a_late_cancel() {
+        let token = crate::CancellationToken::new();
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok("done\n"))
+            .start(&Command::new("tool").cancel_on(token.clone()))
+            .await
+            .expect("scripted start");
+        let (idx, outcome) = crate::wait_any(&mut [&mut run]).await.expect("wait_any");
+        assert_eq!((idx, outcome), (0, Outcome::Exited(0)));
+        // Cancel AFTER the natural reap was observed by wait_any.
+        token.cancel();
+        let outcome = run
+            .wait()
+            .await
+            .expect("a late cancel must not flip a natural exit");
+        assert_eq!(outcome, Outcome::Exited(0));
     }
 
     /// B1 (wait path): a streamed run whose deadline fired must report
