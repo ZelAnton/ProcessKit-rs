@@ -24,6 +24,14 @@ to a dated version section.
   never needs — so it shouldn't be in every default build. The kill-on-drop tree
   guarantee and all non-metrics behavior are unchanged. Migration: add `stats` (or
   `limits`) to your `processkit` features if you use any of the metrics APIs.
+- **Breaking:** `OutputEvent` (yielded by `RunningProcess::output_events`) now
+  carries an `OutputLine` per stream instead of a bare `String`:
+  `OutputEvent::Stdout(OutputLine)` / `Stderr(OutputLine)`, where `OutputLine` is a
+  `#[non_exhaustive]` struct with a `text` field. This reserves room to attach
+  per-line metadata (e.g. a timestamp or a monotonic line index) in a future
+  release without another breaking change. A new `OutputEvent::text() -> Option<&str>`
+  reads the line text regardless of stream. Migration: replace `OutputEvent::Stdout(s)`
+  with `OutputEvent::Stdout(line)` and use `line.text` (or `event.text()`).
 
 ### Fixed
 

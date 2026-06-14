@@ -237,7 +237,7 @@ async fn graceful_timeout_on_an_events_run_reports_timed_out() {
     let drained = tokio::time::timeout(Duration::from_secs(8), async {
         while let Some(ev) = events.next().await {
             if let OutputEvent::Stdout(l) = ev {
-                saw_ready |= l.contains("ready");
+                saw_ready |= l.text.contains("ready");
             }
         }
     })

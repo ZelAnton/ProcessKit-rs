@@ -323,8 +323,8 @@ impl RunningProcess {
     /// let mut events = run.output_events()?;
     /// while let Some(event) = events.next().await {
     ///     match event {
-    ///         OutputEvent::Stdout(line) => println!("out: {line}"),
-    ///         OutputEvent::Stderr(line) => eprintln!("err: {line}"),
+    ///         OutputEvent::Stdout(line) => println!("out: {}", line.text),
+    ///         OutputEvent::Stderr(line) => eprintln!("err: {}", line.text),
     ///         _ => {} // `OutputEvent` is non-exhaustive
     ///     }
     /// }
@@ -591,14 +591,41 @@ impl Stream for StdoutLines {
 ///
 /// Non-exhaustive: a future release may add a third kind of event (e.g. a
 /// lifecycle marker) without a breaking change, so a `match` on `OutputEvent`
-/// needs a `_` arm.
+/// needs a `_` arm. Each per-stream line is an [`OutputLine`] (rather than a bare
+/// `String`) so per-line metadata can be attached there without a breaking change
+/// either.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OutputEvent {
     /// A line from the child's standard output.
-    Stdout(String),
+    Stdout(OutputLine),
     /// A line from the child's standard error.
-    Stderr(String),
+    Stderr(OutputLine),
+}
+
+impl OutputEvent {
+    /// The decoded text of this event's line, if it carries one. `Some` for
+    /// [`Stdout`](OutputEvent::Stdout)/[`Stderr`](OutputEvent::Stderr); `None` for
+    /// a future non-line event kind. Convenience for consumers that don't care
+    /// which stream a line came from.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            OutputEvent::Stdout(line) | OutputEvent::Stderr(line) => Some(&line.text),
+        }
+    }
+}
+
+/// One decoded line carried by an [`OutputEvent`].
+///
+/// `#[non_exhaustive]`: a future release may attach per-line metadata (e.g. a
+/// timestamp or a monotonic line index) without a breaking change — read the
+/// public fields rather than destructuring it exhaustively.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OutputLine {
+    /// The decoded line, with its trailing `\n` (and one CRLF `\r`) stripped —
+    /// the same line shape [`StdoutLines`] yields.
+    pub text: String,
 }
 
 /// A merged `Stream` of both stdout and stderr lines (see
@@ -639,7 +666,9 @@ impl Stream for OutputEvents {
                         Popped::Line(line) => {
                             this.stdout_wait = None;
                             this.prefer_stdout = false; // stderr gets the next first look
-                            return Poll::Ready(Some(OutputEvent::Stdout(line)));
+                            return Poll::Ready(Some(OutputEvent::Stdout(OutputLine {
+                                text: line,
+                            })));
                         }
                         Popped::Closed => {
                             this.stdout_done = true;
@@ -652,7 +681,9 @@ impl Stream for OutputEvents {
                         Popped::Line(line) => {
                             this.stderr_wait = None;
                             this.prefer_stdout = true;
-                            return Poll::Ready(Some(OutputEvent::Stderr(line)));
+                            return Poll::Ready(Some(OutputEvent::Stderr(OutputLine {
+                                text: line,
+                            })));
                         }
                         Popped::Closed => {
                             this.stderr_done = true;
@@ -751,8 +782,8 @@ mod tests {
         let mut seq = Vec::new();
         while let Some(ev) = events.next().await {
             seq.push(match ev {
-                OutputEvent::Stdout(l) => format!("O:{l}"),
-                OutputEvent::Stderr(l) => format!("E:{l}"),
+                OutputEvent::Stdout(l) => format!("O:{}", l.text),
+                OutputEvent::Stderr(l) => format!("E:{}", l.text),
             });
         }
         assert_eq!(
@@ -760,5 +791,36 @@ mod tests {
             ["O:o1", "E:e1", "O:o2", "E:e2", "O:o3", "E:e3"],
             "merged stream must interleave, not drain stdout first"
         );
+    }
+
+    #[tokio::test]
+    async fn output_event_carries_an_output_line_with_a_text_accessor() {
+        // B1: each event's payload is an `OutputLine` (the per-line metadata hook),
+        // and `OutputEvent::text()` reads its text regardless of stream.
+        let policy = OutputBufferPolicy::unbounded();
+        let stdout_sink = SharedLines::new(&policy);
+        let stderr_sink = SharedLines::new(&policy);
+        stdout_sink.push("out".to_owned());
+        stderr_sink.push("err".to_owned());
+        stdout_sink.close_now();
+        stderr_sink.close_now();
+        let mut events = OutputEvents {
+            stdout_sink,
+            stderr_sink,
+            stdout_wait: None,
+            stderr_wait: None,
+            stdout_done: false,
+            stderr_done: false,
+            prefer_stdout: true,
+        };
+        let first = events.next().await.expect("a stdout event");
+        assert!(
+            matches!(&first, OutputEvent::Stdout(line) if line.text == "out"),
+            "stdout event carries an OutputLine: {first:?}"
+        );
+        assert_eq!(first.text(), Some("out"), "text() reads the line");
+        let second = events.next().await.expect("a stderr event");
+        assert!(matches!(&second, OutputEvent::Stderr(line) if line.text == "err"));
+        assert_eq!(second.text(), Some("err"));
     }
 }

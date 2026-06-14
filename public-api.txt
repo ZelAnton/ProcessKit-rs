@@ -239,8 +239,10 @@ impl core::marker::UnsafeUnpin for processkit::Outcome
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::Outcome
 impl core::panic::unwind_safe::UnwindSafe for processkit::Outcome
 #[non_exhaustive] pub enum processkit::OutputEvent
-pub processkit::OutputEvent::Stderr(alloc::string::String)
-pub processkit::OutputEvent::Stdout(alloc::string::String)
+pub processkit::OutputEvent::Stderr(processkit::OutputLine)
+pub processkit::OutputEvent::Stdout(processkit::OutputLine)
+impl processkit::OutputEvent
+pub fn processkit::OutputEvent::text(&self) -> core::option::Option<&str>
 impl core::clone::Clone for processkit::OutputEvent
 pub fn processkit::OutputEvent::clone(&self) -> processkit::OutputEvent
 impl core::cmp::Eq for processkit::OutputEvent
@@ -548,6 +550,23 @@ impl core::marker::Unpin for processkit::OutputEvents
 impl core::marker::UnsafeUnpin for processkit::OutputEvents
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::OutputEvents
 impl !core::panic::unwind_safe::UnwindSafe for processkit::OutputEvents
+#[non_exhaustive] pub struct processkit::OutputLine
+pub processkit::OutputLine::text: alloc::string::String
+impl core::clone::Clone for processkit::OutputLine
+pub fn processkit::OutputLine::clone(&self) -> processkit::OutputLine
+impl core::cmp::Eq for processkit::OutputLine
+impl core::cmp::PartialEq for processkit::OutputLine
+pub fn processkit::OutputLine::eq(&self, &processkit::OutputLine) -> bool
+impl core::fmt::Debug for processkit::OutputLine
+pub fn processkit::OutputLine::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for processkit::OutputLine
+impl core::marker::Freeze for processkit::OutputLine
+impl core::marker::Send for processkit::OutputLine
+impl core::marker::Sync for processkit::OutputLine
+impl core::marker::Unpin for processkit::OutputLine
+impl core::marker::UnsafeUnpin for processkit::OutputLine
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::OutputLine
+impl core::panic::unwind_safe::UnwindSafe for processkit::OutputLine
 pub struct processkit::Pipeline
 impl processkit::Pipeline
 pub async fn processkit::Pipeline::output_string(&self) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>

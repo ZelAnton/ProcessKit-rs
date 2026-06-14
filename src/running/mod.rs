@@ -8,7 +8,7 @@
 mod probes;
 mod stream;
 
-pub use stream::{Finished, OutputEvent, OutputEvents, StdoutLines};
+pub use stream::{Finished, OutputEvent, OutputEvents, OutputLine, StdoutLines};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};

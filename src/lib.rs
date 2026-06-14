@@ -208,7 +208,7 @@ pub use mechanism::Mechanism;
 pub use pipeline::Pipeline;
 pub use result::{Outcome, ProcessResult};
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
-pub use running::{Finished, OutputEvent, OutputEvents, RunningProcess, StdoutLines};
+pub use running::{Finished, OutputEvent, OutputEvents, OutputLine, RunningProcess, StdoutLines};
 #[cfg(feature = "process-control")]
 pub use signal::Signal;
 #[cfg(feature = "stats")]
