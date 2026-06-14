@@ -117,15 +117,22 @@ async fn windows_grandchild_is_contained() {
 
     // Wait for the grandchild to publish its PID.
     let mut grandchild_pid = None;
-    for _ in 0..50 {
-        if let Ok(text) = std::fs::read_to_string(&pidfile)
-            && let Ok(pid) = text.trim().parse::<u32>()
-        {
-            grandchild_pid = Some(pid);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    poll_until(
+        Duration::from_secs(5),
+        Duration::from_millis(100),
+        "grandchild never recorded its PID",
+        || {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                grandchild_pid = Some(pid);
+                true
+            } else {
+                false
+            }
+        },
+    )
+    .await;
     let pid = grandchild_pid.expect("grandchild never recorded its PID");
     assert!(
         windows_pid_alive(pid),

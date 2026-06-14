@@ -44,21 +44,18 @@ async fn cancel_mid_run_errors_and_kills_only_the_cancelled_child() {
         }
     });
 
-    let start = Instant::now();
-    let err = run
-        .output_string()
-        .await
-        .expect_err("a cancelled run must error, not produce a result");
+    // Promptness bound: the sleeper runs ~30s if cancellation is broken.
+    // Generous headroom for full-suite load (cf. the widened timeout bounds).
+    let err = completes_within(
+        Duration::from_secs(10),
+        "cancelled run",
+        run.output_string(),
+    )
+    .await
+    .expect_err("a cancelled run must error, not produce a result");
     assert!(
         matches!(err, processkit::Error::Cancelled { .. }),
         "expected Error::Cancelled, got {err:?}"
-    );
-    // Promptness: the sleeper runs ~30s if cancellation is broken. Generous
-    // headroom for full-suite load (cf. the widened timeout-test bounds).
-    assert!(
-        start.elapsed() < Duration::from_secs(10),
-        "cancel was not prompt (took {:?})",
-        start.elapsed()
     );
     canceller.await.expect("canceller task");
     // The cancelled child is dead AND reaped by the time `output_string`
@@ -98,19 +95,16 @@ async fn client_default_cancel_on_cancels_a_real_run() {
         }
     });
 
-    let start = Instant::now();
-    let err = client
-        .output(cmd)
-        .await
-        .expect_err("a cancelled run must error, not produce a result");
+    let err = completes_within(
+        Duration::from_secs(10),
+        "client-default cancel",
+        client.output(cmd),
+    )
+    .await
+    .expect_err("a cancelled run must error, not produce a result");
     assert!(
         matches!(err, processkit::Error::Cancelled { .. }),
         "expected Error::Cancelled, got {err:?}"
-    );
-    assert!(
-        start.elapsed() < Duration::from_secs(10),
-        "client-default cancel was not prompt (took {:?})",
-        start.elapsed()
     );
     canceller.await.expect("canceller task");
     // Death proof: the prompt Cancelled return (the cancel arm kills the tree
@@ -123,23 +117,21 @@ async fn pre_cancelled_token_short_circuits_before_spawning() {
     let token = CancellationToken::new();
     token.cancel();
 
-    let start = Instant::now();
     // A program that doesn't exist: reaching the OS spawn would fail with
     // an Io error, so getting Cancelled proves the short-circuit fired
-    // before any spawn was attempted.
-    let err = Command::new("processkit-no-such-program-424242")
-        .cancel_on(token)
-        .run()
-        .await
-        .expect_err("a pre-cancelled run must not start");
+    // before any spawn was attempted — and immediately (a 2s bound).
+    let err = completes_within(
+        Duration::from_secs(2),
+        "pre-cancelled short-circuit",
+        Command::new("processkit-no-such-program-424242")
+            .cancel_on(token)
+            .run(),
+    )
+    .await
+    .expect_err("a pre-cancelled run must not start");
     assert!(
         matches!(err, processkit::Error::Cancelled { .. }),
         "expected Error::Cancelled, got {err:?}"
-    );
-    assert!(
-        start.elapsed() < Duration::from_secs(2),
-        "short-circuit was not immediate (took {:?})",
-        start.elapsed()
     );
 }
 

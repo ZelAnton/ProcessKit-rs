@@ -2,7 +2,7 @@
 //! everything behind the `process-control` feature (the `mod` declaration in
 //! `main.rs` carries the gate).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 use processkit::Mechanism;
@@ -122,16 +122,9 @@ async fn windows_signal_kill_kills_tree() {
     // The ~30s sleeper waiting out promptly proves the whole tree was killed
     // (pid liveness can't be probed here: our own RunningProcess still holds the
     // child handle, which keeps the terminated process object around).
-    let start = Instant::now();
-    let _ = tokio::time::timeout(Duration::from_secs(10), process.wait())
+    completes_within(Duration::from_secs(5), "Signal::Kill reap", process.wait())
         .await
-        .expect("killed tree should be reaped promptly")
         .expect("wait");
-    assert!(
-        start.elapsed() < Duration::from_secs(5),
-        "Signal::Kill was not prompt (took {:?})",
-        start.elapsed()
-    );
 }
 
 #[cfg(windows)]
@@ -189,15 +182,7 @@ async fn adopt_brings_an_external_child_under_containment() {
     group.terminate_all().expect("terminate the adopted tree");
 
     // The adopted child must die promptly — well under its ~30s natural run.
-    let start = Instant::now();
-    let _ = tokio::time::timeout(Duration::from_secs(10), child.wait())
-        .await
-        .expect("adopted child reaped in time");
-    assert!(
-        start.elapsed() < Duration::from_secs(5),
-        "adopted child was not contained (took {:?})",
-        start.elapsed()
-    );
+    let _ = completes_within(Duration::from_secs(5), "adopted child reap", child.wait()).await;
 }
 
 #[tokio::test]
@@ -231,22 +216,15 @@ async fn members_shrinks_when_a_child_dies() {
     dying.start_kill().expect("kill victim");
     // Reap it (wait consumes the handle) so the kill is visible everywhere —
     // an unreaped zombie still probes as alive on the pgroup backends.
-    let _ = tokio::time::timeout(Duration::from_secs(10), dying.wait())
-        .await
-        .expect("victim reaped in time");
+    let _ = completes_within(Duration::from_secs(10), "victim reap", dying.wait()).await;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let now = group.members().expect("members").len();
-        if now < before {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "member count never dropped below {before}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    poll_until(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        &format!("member count never dropped below {before}"),
+        || group.members().expect("members").len() < before,
+    )
+    .await;
 }
 
 #[tokio::test]

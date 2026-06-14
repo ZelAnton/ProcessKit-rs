@@ -1,6 +1,54 @@
-//! Shared per-platform helpers: canned child commands and liveness probes.
+//! Shared per-platform helpers: canned child commands, liveness probes, and
+//! timing/poll utilities for the real-subprocess tests.
+
+use std::future::Future;
+use std::time::{Duration, Instant};
 
 use processkit::Command;
+
+/// Awaits `fut`, panicking if it does not finish within `max`; returns its
+/// output. Prefer this over a bare `Instant::now()` / `elapsed()` pair for
+/// promptness checks: it expresses the deadline in one place *and* bounds a
+/// hang, so a regression fails the one test instead of stalling the suite.
+pub(crate) async fn completes_within<T>(
+    max: Duration,
+    what: &str,
+    fut: impl Future<Output = T>,
+) -> T {
+    match tokio::time::timeout(max, fut).await {
+        Ok(out) => out,
+        Err(_) => panic!("{what} did not finish within {max:?}"),
+    }
+}
+
+/// Polls `cond` every `interval` until it returns `true`, panicking if `max`
+/// elapses first. Replaces hand-rolled `loop { … deadline … sleep }` and
+/// `for _ in 0..N { … sleep }` waits, centralising the deadline arithmetic that
+/// is easy to get subtly wrong (off-by-one iteration counts, a missing final
+/// check after the loop). `cond` is `FnMut`, so it may capture a value found on
+/// the satisfying poll. Don't use it where cleanup must run on timeout — the
+/// panic skips any teardown after the call site.
+// All current callers sit behind a feature/platform gate, so a minimal feature
+// set can legitimately compile this in with no user.
+#[allow(dead_code)]
+pub(crate) async fn poll_until(
+    max: Duration,
+    interval: Duration,
+    what: &str,
+    mut cond: impl FnMut() -> bool,
+) {
+    let deadline = Instant::now() + max;
+    loop {
+        if cond() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what} did not happen within {max:?}"
+        );
+        tokio::time::sleep(interval).await;
+    }
+}
 
 /// A command that prints five numbered lines and exits 0, per platform.
 pub(crate) fn five_lines() -> Command {
