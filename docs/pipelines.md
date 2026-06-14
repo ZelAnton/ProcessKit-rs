@@ -158,10 +158,10 @@ let out = Command::new("producer")
 - **`Pipeline::timeout`** bounds the whole chain: at the deadline the shared
   group is torn down and the result reports `timed_out` (no partial stdout —
   unlike a single command's captured timeout).
-- A **per-stage `Command::timeout`** kills just that stage. The stage shows up
-  in the pipefail fold as its unclean exit; on `run()` an *inner* stage's
-  deadline surfaces as that stage's signal-kill `Error::Signalled`, while the
-  *last* stage's own deadline (or the chain deadline) is a proper `Error::Timeout`.
+- A **per-stage `Command::timeout`** kills just that stage. Every stage is
+  evaluated by the same pipefail rule (D14): a stage that hit its own deadline —
+  inner *or* last — surfaces on `run()` as that stage's `Error::Timeout`,
+  reporting **that stage's own deadline** (not the chain's, and never `0ns`).
 
 A `cancel_on` token on **any** stage cancels
 that stage; the cancellation errors the whole pipeline and the private group

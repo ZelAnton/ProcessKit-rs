@@ -161,6 +161,17 @@ to a dated version section.
 
 ### Fixed
 
+- **Pipeline status semantics are unified (D14).** The last stage is now evaluated by the
+  same pipefail rule as the inner stages — one `is_clean`, one attribution — fixing two
+  inconsistencies:
+  - An inner stage that hit its **own** `Command::timeout` now reports **that stage's**
+    deadline in the resulting `Error::Timeout`, instead of the chain's timeout or a
+    misleading `timed out after 0ns` (B10).
+  - The **last** stage's `ok_codes` are now honored (E24e): a last stage with
+    `ok_codes([0, 1])` exiting `1` is a clean, successful chain — previously the last
+    stage's `ok_codes` were reset to `[0]` while inner stages honored theirs.
+  `unchecked_in_pipe` still forgives an exit (preserving the real code) but not a last-stage
+  timeout/signal (the chain's output is then broken).
 - A `wait_any` / `wait_all` **loser** with `keep_stdin_open` now keeps its stdin usable
   (B15): the race no longer closes an untaken stdin pipe out from under the caller (which
   left `take_stdin()` returning `None` and the child wedged on a premature EOF),
