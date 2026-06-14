@@ -153,6 +153,7 @@ first — it maps "I want to …" tasks to working snippets — then read
 | [Supervision](docs/supervision.md) | Restart policies, backoff & jitter, stop conditions, outcomes |
 | [Testing your code](docs/testing.md) | The `ProcessRunner` seam, scripted/recording/mock doubles, cassettes, `CliClient` |
 | [Platform support](docs/platform-support.md) | Mechanisms, all capability matrices, every caveat |
+| [Upgrading](docs/upgrading.md) | Per-version consumer upgrade notes — what breaks on each minor bump and how to migrate |
 
 API reference: [docs.rs/processkit](https://docs.rs/processkit).
 
