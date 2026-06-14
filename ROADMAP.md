@@ -101,8 +101,8 @@ check + Windows PATHEXT expansion). Verified fmt/clippy/doc/test/cross-compile.
 The "now" subset of [`ideas/next-ci-and-quality-hardening.md`](ideas/next-ci-and-quality-hardening.md),
 plus one new tool:
 - **`cargo-hack --feature-powerset --depth 2`** — the standout: CI tests three fixed
-  feature configs, but 7 features have combinations (`limits` w/o `stats`, `cancellation`+`record`)
-  that can break compilation undetected. Cheapest real correctness gain.
+  feature configs, but the optional features have combinations (`limits` w/o `stats`,
+  `record`+`tracing`) that can break compilation undetected. Cheapest real correctness gain.
 - **`-Z minimal-versions`** check and **`cargo llvm-cov` coverage + badge** (run
   `--include-ignored` — much of the suite is `#[ignore]`d real-subprocess tests).
 - **`cargo-public-api` snapshot** committed and diffed in CI — turns "did this PR move the

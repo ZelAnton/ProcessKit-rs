@@ -728,6 +728,16 @@ fn write_self_pid(path: &CStr) -> io::Result<()> {
         if written < 0 {
             return Err(werr);
         }
+        // A short write would leave the child only partially joined to the cgroup
+        // — degrading containment silently. Writing a small pid to `cgroup.procs`
+        // is atomic in practice, but treat anything less than the full write as a
+        // failure (the spawn then surfaces it) rather than a half-join. Use the
+        // allocation-free `ErrorKind` form: this runs in the fork→exec window
+        // where `io::Error::new(_, msg)` (which boxes `msg`) would not be
+        // async-signal-safe.
+        if (written as usize) != bytes.len() {
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
+        }
         Ok(())
     }
 }

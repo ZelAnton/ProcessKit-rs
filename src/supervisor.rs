@@ -418,7 +418,7 @@ impl<R: ProcessRunner> Supervisor<R> {
                         self.storm_gate(&mut storm).await;
                     }
                     self.sleep_backoff(restarts, factor).await;
-                    restarts += 1;
+                    restarts = restarts.saturating_add(1);
                 }
                 Err(err) => {
                     // A cancelled incarnation is terminal: the token stays
@@ -435,7 +435,7 @@ impl<R: ProcessRunner> Supervisor<R> {
                     }
                     self.storm_gate(&mut storm).await;
                     self.sleep_backoff(restarts, factor).await;
-                    restarts += 1;
+                    restarts = restarts.saturating_add(1);
                 }
             }
         }
@@ -489,7 +489,7 @@ impl<R: ProcessRunner> Supervisor<R> {
         }
         storm.score = 0.0;
         storm.last_failure_at = None;
-        storm.pauses += 1;
+        storm.pauses = storm.pauses.saturating_add(1);
     }
 
     /// Sleep out the delay before the `restarts`-th (0-based) restart.

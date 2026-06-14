@@ -220,7 +220,8 @@ group. The `|` operator is equivalent sugar:
 `(a | b | c).output_string()`.
 
 For a consumer that legitimately stops reading early — the `| head -1` shape,
-where the producer's `SIGPIPE` death is expected — mark the producer
+where the producer's broken-pipe death (its next write fails once the downstream
+closes, or `SIGPIPE` where the OS delivers it) is expected — mark the producer
 `unchecked_in_pipe()` so that death doesn't fail the chain:
 
 ```rust,no_run

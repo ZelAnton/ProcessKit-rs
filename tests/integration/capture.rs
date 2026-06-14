@@ -124,6 +124,29 @@ async fn output_string_captures_stdout() {
     );
 }
 
+#[tokio::test]
+#[ignore = "spawns a real subprocess"]
+async fn command_checked_and_run_unit_verbs() {
+    // Command-level `checked()` returns the full success-checked result (untrimmed
+    // stdout); `run_unit()` requires an accepted exit and discards the output —
+    // the same verbs the runner/client families carry (holistic API consistency).
+    let result = two_line_echo()
+        .checked()
+        .await
+        .expect("checked on a zero exit");
+    assert!(result.is_success(), "exit was {:?}", result.code());
+    assert!(
+        result.stdout().contains("first"),
+        "stdout: {:?}",
+        result.stdout()
+    );
+
+    two_line_echo()
+        .run_unit()
+        .await
+        .expect("run_unit ok on a zero exit");
+}
+
 // StdioMode::Null on stdout: D5 makes the bulk capture verbs ERROR (there is no
 // pipe to read, so returning silently-empty output was a footgun). To run a
 // command with a suppressed stdout, use a discard verb (`wait`), which captures

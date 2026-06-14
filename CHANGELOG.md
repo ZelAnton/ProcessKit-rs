@@ -11,6 +11,15 @@ to a dated version section.
 
 ## [Unreleased]
 
+### Added
+
+- `Command::checked` and `Command::run_unit` — the success-checking verbs that the
+  `ProcessRunnerExt` and `CliClient` families already carry, now also on `Command`
+  itself (`cmd.checked()` returns the whole success-checked `ProcessResult`;
+  `cmd.run_unit()` requires an accepted exit and discards the output). Closes a
+  verb-family inconsistency: `Command` already had `run`/`probe`/`exit_code`/
+  `first_line` but not these two.
+
 ### Security
 
 - `record`-feature cassette writes no longer follow a symlink at the cassette path
@@ -36,9 +45,31 @@ to a dated version section.
   is unaffected). This closes a silent footgun where a client-wide cancellation
   token (wired for shutdown) would not reach a per-call-customized command. An
   argument-list call is unchanged.
+- `ProcessStdin` (the interactive `keep_stdin_open` writer) documents the
+  full-duplex deadlock hazard: feeding a large stdin while nothing drains the
+  child's stdout can wedge both sides — drain stdout concurrently. (No behavior
+  change; the non-interactive `Stdin` sources are already safe.)
 
 ### Fixed
 
+- A retained-byte cap ([`OutputBufferPolicy::with_max_bytes`]) now bounds the pump's
+  **in-flight** line-assembly buffer, not just the retained backlog. Previously a
+  newline-free flood (`base64 -w0`, a multi-gigabyte single "line") accumulated in full
+  in the decode buffer before the cap was ever consulted — defeating the very memory
+  bound the byte cap exists to provide. A line whose own length exceeds the cap is now
+  dropped as it arrives (it can never be retained whole): under the drop modes it sets
+  the truncation signal, under [`OverflowMode::Error`] it trips the fail-loud ceiling.
+  Consequence: an over-cap line, never assembled, is also not delivered to a per-line
+  handler or `stdout_tee` (set no byte cap if a tee must see arbitrarily long lines).
+- A child stream interrupted by a **read error** mid-multibyte-character no longer
+  fabricates a phantom replacement-character (`U+FFFD`) line. The decoder's end-of-stream
+  flush — which turns a dangling incomplete sequence into `U+FFFD` — is now performed only
+  on a *clean* EOF; a read error means the stream was truncated, so the incomplete trailing
+  bytes are dropped rather than invented into output.
+- Linux cgroup join (`write_self_pid`) now treats a **short write** to
+  `cgroup.procs` as an error instead of a success, so a child can't end up only
+  partially joined to its cgroup (silent containment degradation). The check is
+  allocation-free, preserving the async-signal-safety of the fork→exec hook.
 - `ProcessGroup::signal` — and the `process-control` `suspend`/`resume` verbs on
   their per-member fallback path (older kernels without `cgroup.freeze`) — on the
   Linux **cgroup** backend now surface a
@@ -68,7 +99,6 @@ to a dated version section.
   now runs on every reap path (including the short-circuit repeat-reap branches),
   not only the first observer, so a future code path cannot leave a deadline/cancel
   task live past the child's exit.
-
 - Concurrent runs of the same cloned **one-shot** stdin source
   ([`Stdin::from_reader`]/[`from_lines`]) can no longer race so that one silently
   feeds the child empty stdin. The payload is now taken **atomically** at launch
@@ -83,28 +113,6 @@ to a dated version section.
 - A **panicking** stdin-writer task is now surfaced as `Error::Stdin` on an
   otherwise-successful run instead of being silently swallowed into a clean
   success (the writer task's `JoinError` was previously dropped).
-
-### Changed
-
-- `ProcessStdin` (the interactive `keep_stdin_open` writer) documents the
-  full-duplex deadlock hazard: feeding a large stdin while nothing drains the
-  child's stdout can wedge both sides — drain stdout concurrently. (No behavior
-  change; the non-interactive `Stdin` sources are already safe.)
-
-- A retained-byte cap ([`OutputBufferPolicy::with_max_bytes`]) now bounds the pump's
-  **in-flight** line-assembly buffer, not just the retained backlog. Previously a
-  newline-free flood (`base64 -w0`, a multi-gigabyte single "line") accumulated in full
-  in the decode buffer before the cap was ever consulted — defeating the very memory
-  bound the byte cap exists to provide. A line whose own length exceeds the cap is now
-  dropped as it arrives (it can never be retained whole): under the drop modes it sets
-  the truncation signal, under [`OverflowMode::Error`] it trips the fail-loud ceiling.
-  Consequence: an over-cap line, never assembled, is also not delivered to a per-line
-  handler or `stdout_tee` (set no byte cap if a tee must see arbitrarily long lines).
-- A child stream interrupted by a **read error** mid-multibyte-character no longer
-  fabricates a phantom replacement-character (`U+FFFD`) line. The decoder's end-of-stream
-  flush — which turns a dangling incomplete sequence into `U+FFFD` — is now performed only
-  on a *clean* EOF; a read error means the stream was truncated, so the incomplete trailing
-  bytes are dropped rather than invented into output.
 
 ## [0.10.1] - 2026-06-14
 

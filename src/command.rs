@@ -1091,6 +1091,24 @@ impl Command {
         JobRunner::new().run(self).await
     }
 
+    /// Run to completion, require an **accepted** exit, and return the full
+    /// captured [`ProcessResult`] (untrimmed stdout) — the building block when you
+    /// need the whole result after success-checking rather than trimmed stdout
+    /// ([`run`](Self::run)) or the raw result ([`output_string`](Self::output_string)).
+    /// Consistent with [`ProcessRunnerExt::checked`](crate::ProcessRunnerExt::checked)
+    /// and [`CliClient::checked`](crate::CliClient::checked).
+    pub async fn checked(&self) -> Result<ProcessResult<String>> {
+        JobRunner::new().checked(self).await
+    }
+
+    /// Run for the side effect: require an **accepted** exit (`0`, or any code in
+    /// [`ok_codes`](Self::ok_codes)) and discard the output. Consistent with
+    /// [`ProcessRunnerExt::run_unit`](crate::ProcessRunnerExt::run_unit) and
+    /// [`CliClient::run_unit`](crate::CliClient::run_unit).
+    pub async fn run_unit(&self) -> Result<()> {
+        JobRunner::new().run_unit(self).await
+    }
+
     /// Run a predicate command and read its exit code as a boolean: exit `0` →
     /// `Ok(true)`, exit `1` → `Ok(false)`, anything else → `Err` (any other code
     /// as [`Error::Exit`], a timeout as [`Error::Timeout`](crate::Error::Timeout),

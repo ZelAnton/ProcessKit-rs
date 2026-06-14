@@ -161,10 +161,12 @@ pub trait ProcessRunnerExt: ProcessRunner {
         .await
     }
 
-    /// Run, require a zero exit, and return the full captured result (untrimmed
-    /// stdout). The building block for the `parse`/`try_parse` helpers — use it
-    /// when you need the whole `ProcessResult` after success-checking, rather
-    /// than just trimmed stdout (`run`) or the raw result (`output`).
+    /// Run, require an **accepted** exit (`0` by default, widened by
+    /// [`Command::ok_codes`](crate::Command::ok_codes)), and return the full
+    /// captured result (untrimmed stdout). The building block for the
+    /// `parse`/`try_parse` helpers — use it when you need the whole
+    /// `ProcessResult` after success-checking, rather than just trimmed stdout
+    /// (`run`) or the raw result (`output`).
     ///
     /// Unlike [`run`](Self::run) (and the
     /// [`CliClient::parse`](crate::CliClient::parse)/[`try_parse`](crate::CliClient::try_parse)
