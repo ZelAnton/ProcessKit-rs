@@ -26,7 +26,7 @@
 //!   [`Command`], then drive it to completion ([`Command::output_string`],
 //!   [`Command::run`], …) or [`start`](Command::start) it for streaming and
 //!   interactive I/O. The [`ProcessRunner`] trait runs commands to completion
-//!   and is the mock seam (see [`ScriptedRunner`]). A
+//!   and is the mock seam (see [`ScriptedRunner`](testing::ScriptedRunner)). A
 //!   [`Supervisor`] keeps a command *alive* — restarting it per policy with
 //!   backoff — where [`Command::retry`] merely replays one run to success.
 //!   Readiness probes ([`RunningProcess::wait_for_line`] /
@@ -184,11 +184,8 @@ pub(crate) const MAX_DEADLINE: std::time::Duration =
 
 pub use batch::output_all;
 pub use buffer::{OutputBufferPolicy, OverflowMode, StdioMode};
-#[cfg(feature = "record")]
-pub use cassette::RecordReplayRunner;
 pub use client::{CliClient, IntoCommand};
 pub use command::Command;
-pub use doubles::{Invocation, RecordingRunner, Reply, ScriptedRunner};
 pub use encoding_rs::Encoding;
 pub use error::{Error, Result};
 pub use group::{ProcessGroup, ProcessGroupOptions};
@@ -391,10 +388,38 @@ pub async fn wait_all(processes: &mut [&mut RunningProcess]) -> Result<Vec<Outco
     .await
 }
 
-/// The `mockall`-generated mock of [`ProcessRunner`] (enabled by the `mock`
-/// feature), re-exported under a friendlier name.
-#[cfg(feature = "mock")]
-pub use runner::MockProcessRunner as MockRunner;
+/// Test doubles for the [`ProcessRunner`] seam (D6).
+///
+/// Grouped under `testing` rather than the crate root so the production surface
+/// stays focused: these types exist to **replace real subprocesses in tests** —
+/// a [`ScriptedRunner`](testing::ScriptedRunner) that serves canned replies, a
+/// [`RecordingRunner`](testing::RecordingRunner) that asserts on invocations,
+/// the [`Invocation`](testing::Invocation) it captures, and (behind features)
+/// record/replay cassettes and a `mockall` mock.
+///
+/// ```no_run
+/// use processkit::Command;
+/// use processkit::testing::{Reply, ScriptedRunner};
+/// use processkit::ProcessRunnerExt; // for `run`
+///
+/// # async fn demo() -> processkit::Result<()> {
+/// let runner = ScriptedRunner::new().on(["git", "status"], Reply::ok("clean"));
+/// assert_eq!(runner.run(&Command::new("git").arg("status")).await?, "clean");
+/// # Ok(())
+/// # }
+/// ```
+pub mod testing {
+    pub use crate::doubles::{Invocation, RecordingRunner, Reply, ScriptedRunner};
+
+    /// Record/replay cassette runner (enabled by the `record` feature).
+    #[cfg(feature = "record")]
+    pub use crate::cassette::RecordReplayRunner;
+
+    /// The `mockall`-generated mock of [`ProcessRunner`](crate::ProcessRunner)
+    /// (enabled by the `mock` feature), re-exported under a friendlier name.
+    #[cfg(feature = "mock")]
+    pub use crate::runner::MockProcessRunner as MockRunner;
+}
 
 /// Re-exported so callers can `use processkit::CancellationToken;` without a
 /// direct `tokio-util` dependency. See [`Command::cancel_on`].

@@ -180,7 +180,7 @@ pub struct RunningProcess {
 type OutputReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
 
 /// The I/O-bearing half of a [`RunningProcess`]: a real OS child, or a
-/// scripted double ([`ScriptedRunner::start`](crate::ScriptedRunner)) that
+/// scripted double ([`ScriptedRunner::start`](crate::testing::ScriptedRunner)) that
 /// feeds canned bytes through the same pumps/sinks — which is what makes
 /// streaming, probes, and `finish` hermetically testable. Platform
 /// code only ever constructs `Real`.
@@ -881,6 +881,53 @@ impl RunningProcess {
             .finish_lines(CaptureMode::Discard, /* expose_counts */ false, || {})
             .await?
             .outcome)
+    }
+
+    /// Gracefully stop the process tree and report how it ended (D4): send
+    /// `SIGTERM`, wait up to `grace` for the tree to exit on its own, then
+    /// `SIGKILL` any survivor. On Windows there is no signal tier, so the kill is
+    /// atomic and `grace` is not awaited. The returned [`Outcome`] reflects how
+    /// the child actually ended — `Exited(0)` if it handled `SIGTERM` and shut
+    /// down cleanly within the grace, or [`Signalled`](crate::Outcome::Signalled)
+    /// / a platform kill code otherwise.
+    ///
+    /// This is the "started a dev server, exercised it, now stop it cleanly"
+    /// verb — the graceful counterpart to dropping the handle (an immediate hard
+    /// kill) or [`start_kill`](Self::start_kill) (kill now, `wait` for the code
+    /// yourself).
+    ///
+    /// Only an **own-group** handle (from
+    /// [`Command::start`](crate::Command::start) / the
+    /// [`JobRunner`](crate::JobRunner)) can be gracefully shut down here — it owns
+    /// its process group. A **shared-group** handle (from
+    /// [`ProcessGroup::start`](crate::ProcessGroup::start)) does not own its
+    /// group; shutting it down would tear down the caller's *other* children too,
+    /// so this returns [`Error::Unsupported`](crate::Error::Unsupported) — stop
+    /// the whole group via
+    /// [`ProcessGroup::shutdown`](crate::ProcessGroup::shutdown) instead, or kill
+    /// just this child with [`start_kill`](Self::start_kill).
+    pub async fn shutdown(self, grace: std::time::Duration) -> Result<Outcome> {
+        let Some(group) = self.backend.own_group().cloned() else {
+            return Err(Error::Unsupported {
+                operation: "shutdown (a shared-group handle does not own its group — \
+                            use ProcessGroup::shutdown, or start_kill for just this child)"
+                    .into(),
+            });
+        };
+        // SIGTERM → wait `grace` → SIGKILL survivors (atomic kill on Windows).
+        // Reap the child *concurrently* with the graceful teardown: on the
+        // process-group backend (macOS/BSD, Linux without cgroup) the grace loop
+        // polls liveness via `kill(pgid, 0)`, and an unreaped zombie still
+        // answers that probe — so without a concurrent reap a child that exits
+        // immediately on `SIGTERM` would be seen as alive for the *whole* grace
+        // and eat a pointless `SIGKILL`. Reaping alongside lets the loop end as
+        // soon as the child is gone (the same pattern as `teardown_on_timeout`).
+        let (term_result, outcome) = tokio::join!(
+            group.graceful_terminate(grace, crate::sys::SIGTERM_RAW),
+            self.wait(),
+        );
+        term_result?;
+        outcome
     }
 
     /// Minimal non-consuming exit wait — the [`wait_any`](crate::wait_any) race
@@ -1624,7 +1671,7 @@ impl RunningProcess {
     /// [`wait_any`](crate::wait_any)) for a killed child is platform-dependent
     /// — `Outcome::Signalled` on a Unix signal kill, `Outcome::Exited` with a
     /// platform code on Windows `TerminateProcess`; a
-    /// [`ScriptedRunner`](crate::ScriptedRunner) handle reports
+    /// [`ScriptedRunner`](crate::testing::ScriptedRunner) handle reports
     /// `Outcome::Signalled(None)` (matching Unix).
     pub fn start_kill(&mut self) -> Result<()> {
         match &mut self.backend {

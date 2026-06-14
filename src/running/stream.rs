@@ -51,7 +51,7 @@ impl RunningProcess {
     /// [`Command::start`](crate::Command::start) / [`JobRunner`](crate::JobRunner)
     /// path. A handle from [`ProcessGroup::start`](crate::ProcessGroup::start)
     /// shares its group, so the caller bounds the stream. A
-    /// [`ScriptedRunner`](crate::ScriptedRunner) handle is bounded too — its
+    /// [`ScriptedRunner`](crate::testing::ScriptedRunner) handle is bounded too — its
     /// canned feeders are hung up at the deadline — but, having no signal tier
     /// (like Windows), it ignores `timeout_grace` and ends at once.)
     ///

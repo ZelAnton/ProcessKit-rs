@@ -121,7 +121,7 @@ pub struct SupervisionOutcome {
 /// incarnation in its own private kill-on-drop group). Inject another with
 /// [`with_runner`](Self::with_runner): a `&ProcessGroup` supervises every
 /// incarnation inside one shared group, and a
-/// [`ScriptedRunner`](crate::ScriptedRunner) makes supervision logic fully
+/// [`ScriptedRunner`](crate::testing::ScriptedRunner) makes supervision logic fully
 /// hermetic in tests.
 pub struct Supervisor<R: ProcessRunner = JobRunner> {
     command: Command,

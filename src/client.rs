@@ -6,7 +6,7 @@
 //! run/parse helpers a wrapper otherwise repeats. A wrapper then reduces to a
 //! typed facade over its parsers, with no process plumbing — and is mockable by
 //! construction, since the runner is injectable (pass a
-//! [`ScriptedRunner`](crate::ScriptedRunner) in tests).
+//! [`ScriptedRunner`](crate::testing::ScriptedRunner) in tests).
 //!
 //! The [`cli_client!`](crate::cli_client) macro scaffolds the wrapper struct and
 //! its constructors.
@@ -425,7 +425,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::{Error, RecordingRunner, Reply, ScriptedRunner};
+    use crate::Error;
+    use crate::testing::{RecordingRunner, Reply, ScriptedRunner};
 
     #[test]
     fn debug_redacts_default_env_values_keeping_names() {

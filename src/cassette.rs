@@ -1,8 +1,8 @@
 //! Record/replay cassettes over the [`ProcessRunner`] seam (`record` feature).
 //!
 //! [`RecordReplayRunner`] closes the gap between the hand-written
-//! [`ScriptedRunner`](crate::ScriptedRunner) and the input-asserting
-//! [`RecordingRunner`](crate::RecordingRunner): run the real tool **once** with
+//! [`ScriptedRunner`](crate::testing::ScriptedRunner) and the input-asserting
+//! [`RecordingRunner`](crate::testing::RecordingRunner): run the real tool **once** with
 //! the runner in *record* mode and every `Invocation → ProcessResult` pair is
 //! captured to a human-diffable JSON cassette; switch to *replay* mode and the
 //! cassette serves results that compare equal to the recorded ones — fast,
@@ -278,7 +278,7 @@ enum Mode<R> {
 ///   ([`start`](crate::ProcessRunner::start)) inherits the default and returns
 ///   [`Error::Unsupported`](crate::Error::Unsupported) — recording line timing
 ///   and stream shape is future work; use
-///   [`ScriptedRunner`](crate::ScriptedRunner) for hermetic streaming tests.
+///   [`ScriptedRunner`](crate::testing::ScriptedRunner) for hermetic streaming tests.
 ///
 /// Cassettes are pretty-printed JSON with a `version` field; loading an
 /// unknown version (or a corrupt file) is an [`Error::Io`] with
@@ -300,7 +300,8 @@ enum Mode<R> {
 /// persists a surprise file (it may carry secrets in argv/stdout).
 ///
 /// ```no_run
-/// use processkit::{Command, JobRunner, ProcessRunnerExt, RecordReplayRunner};
+/// use processkit::{Command, JobRunner, ProcessRunnerExt};
+/// use processkit::testing::RecordReplayRunner;
 ///
 /// # async fn demo() -> processkit::Result<()> {
 /// // Record once against the real tool (e.g. an opt-in `--record` test run):

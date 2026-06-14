@@ -2,7 +2,7 @@
 //!
 //! The seam covers both shapes of a run: [`ProcessRunner::output`] (a finished
 //! [`ProcessResult`]) and [`ProcessRunner::start`] (a live [`RunningProcess`]
-//! for streaming/probes). A [`ScriptedRunner`](crate::ScriptedRunner) fakes
+//! for streaming/probes). A [`ScriptedRunner`](crate::testing::ScriptedRunner) fakes
 //! both — its `start` hands back a scripted handle that feeds canned lines
 //! through the same pump machinery a real child uses.
 
@@ -18,8 +18,8 @@ use crate::running::{RunningProcess, Spawned};
 /// This seam is the mock point — only [`output`](Self::output) is required
 /// (`output_bytes`/`start` are defaulted): production code takes
 /// `&dyn ProcessRunner`; tests pass a
-/// [`ScriptedRunner`](crate::ScriptedRunner) /
-/// [`RecordingRunner`](crate::RecordingRunner) (or, behind the `mock` feature,
+/// [`ScriptedRunner`](crate::testing::ScriptedRunner) /
+/// [`RecordingRunner`](crate::testing::RecordingRunner) (or, behind the `mock` feature,
 /// a generated `MockRunner`) instead of spawning real processes.
 #[cfg_attr(feature = "mock", mockall::automock)]
 #[async_trait::async_trait]
@@ -34,7 +34,7 @@ pub trait ProcessRunner: Send + Sync {
     /// UTF-8.
     ///
     /// D5: part of the seam (not just `Command`), so byte-producing tools are
-    /// testable through a [`ScriptedRunner`](crate::ScriptedRunner) /
+    /// testable through a [`ScriptedRunner`](crate::testing::ScriptedRunner) /
     /// `&ProcessGroup` / [`JobRunner`] like text ones. Defaulted in terms of
     /// [`start`](Self::start) — so a runner that overrides `start` gets byte
     /// capture for free, and an `output`-only runner (one that does **not**
@@ -52,7 +52,7 @@ pub trait ProcessRunner: Send + Sync {
     /// Defaulted to [`Error::Unsupported`](crate::Error::Unsupported) so an
     /// `output`-only runner (a hand-rolled double, a cassette runner) keeps
     /// compiling; the real runners ([`JobRunner`], `&ProcessGroup`) and
-    /// [`ScriptedRunner`](crate::ScriptedRunner) override it.
+    /// [`ScriptedRunner`](crate::testing::ScriptedRunner) override it.
     ///
     /// D4: this is deliberately a **runtime** capability (a default that errors)
     /// rather than a compile-time split (e.g. a separate `ProcessStarter:
@@ -70,7 +70,7 @@ pub trait ProcessRunner: Send + Sync {
 }
 
 /// A shared reference to a runner is itself a runner, so a borrowed
-/// [`RecordingRunner`](crate::RecordingRunner) (or any `&R`) can be injected
+/// [`RecordingRunner`](crate::testing::RecordingRunner) (or any `&R`) can be injected
 /// where a `ProcessRunner` is expected.
 #[async_trait::async_trait]
 impl<R: ProcessRunner + ?Sized> ProcessRunner for &R {
@@ -169,7 +169,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
     ///
     /// D6: routes through [`start`](ProcessRunner::start) — the streaming seam —
     /// so it is exercisable with **any** runner (a
-    /// [`ScriptedRunner`](crate::ScriptedRunner) in tests), unlike the
+    /// [`ScriptedRunner`](crate::testing::ScriptedRunner) in tests), unlike the
     /// real-runner-only [`Command::first_line`](crate::Command::first_line),
     /// which now delegates here.
     async fn first_line<F>(&self, command: &Command, predicate: F) -> Result<Option<String>>
@@ -607,7 +607,7 @@ mod tests {
         // non-{0,1} exit. With `ok_codes` widening success, an accepted code like
         // 2 would make `ensure_success` return `Ok` and panic the `expect_err` —
         // probe must keep its strict 0/1 contract regardless of `ok_codes`.
-        use crate::{Reply, ScriptedRunner};
+        use crate::testing::{Reply, ScriptedRunner};
         let runner = ScriptedRunner::new().on(["tool", "x"], Reply::fail(2, "boom"));
         let cmd = Command::new("tool").args(["x"]).ok_codes([0, 1, 2]);
         assert!(matches!(

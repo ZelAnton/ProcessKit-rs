@@ -693,7 +693,8 @@ real runs into a JSON cassette once, then replays them deterministically —
 fast, hermetic, no subprocess in CI:
 
 ```rust,no_run
-use processkit::{Command, JobRunner, ProcessRunnerExt, RecordReplayRunner};
+use processkit::{Command, JobRunner, ProcessRunnerExt};
+use processkit::testing::RecordReplayRunner;
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {

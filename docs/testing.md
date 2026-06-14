@@ -68,7 +68,8 @@ async fn current_branch(runner: &impl ProcessRunner) -> Result<String> {
 work-horse double:
 
 ```rust,no_run
-use processkit::{Command, ProcessRunnerExt, Reply, ScriptedRunner};
+use processkit::{Command, ProcessRunnerExt};
+use processkit::testing::{Reply, ScriptedRunner};
 
 #[tokio::test]
 async fn detects_the_branch() {
@@ -125,7 +126,8 @@ hermetically — `stdout_lines` yields the lines, `wait_for_line` probes them,
 `finish` reports the canned outcome and stderr:
 
 ```rust,no_run
-use processkit::{Command, Outcome, ProcessRunner, Reply, ScriptedRunner, StreamExt, Finished};
+use processkit::{Command, Outcome, ProcessRunner, StreamExt, Finished};
+use processkit::testing::{Reply, ScriptedRunner};
 use std::time::Duration;
 
 #[tokio::test]
@@ -160,7 +162,8 @@ tier, so — like on Windows — it ignores `timeout_grace` and ends at once.
 was *asked* — so a test asserts inputs, not just outputs:
 
 ```rust,no_run
-use processkit::{Command, ProcessRunnerExt, RecordingRunner, Reply, ScriptedRunner};
+use processkit::{Command, ProcessRunnerExt};
+use processkit::testing::{RecordingRunner, Reply, ScriptedRunner};
 
 #[tokio::test]
 async fn passes_the_right_flags() {
@@ -194,7 +197,7 @@ expectation-style tests (call counts, argument matchers, ordered
 expectations) — the right tool when the *interaction* is the contract:
 
 ```rust,ignore
-use processkit::MockRunner;
+use processkit::testing::MockRunner;
 
 let mut mock = MockRunner::new();
 mock.expect_output()
@@ -212,7 +215,8 @@ real runs to a JSON *cassette* once, then replay them deterministically —
 fast, hermetic, byte-stable, no subprocess in CI:
 
 ```rust,no_run
-use processkit::{Command, JobRunner, ProcessRunnerExt, RecordReplayRunner};
+use processkit::{Command, JobRunner, ProcessRunnerExt};
+use processkit::testing::RecordReplayRunner;
 
 // Record once against the real tool (an opt-in `--record` test run, say):
 let runner = RecordReplayRunner::record("fixtures/git.json", JobRunner::new());

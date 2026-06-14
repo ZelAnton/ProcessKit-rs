@@ -443,7 +443,7 @@ spells out exactly what each mechanism can promise.
 ## Test code that runs processes — without processes
 
 ```rust,no_run
-use processkit::{Reply, ScriptedRunner};
+use processkit::testing::{Reply, ScriptedRunner};
 
 // Your code takes any `R: ProcessRunner`; in tests, hand it a script.
 // Rules match on a prefix of the *program name followed by its arguments*
@@ -466,7 +466,8 @@ cassette once and replays them hermetically in CI.
 ## Test streaming code — without processes
 
 ```rust,no_run
-use processkit::{Command, Outcome, ProcessRunner, Reply, ScriptedRunner, Finished};
+use processkit::{Command, Outcome, ProcessRunner, Finished};
+use processkit::testing::{Reply, ScriptedRunner};
 use std::time::Duration;
 
 let runner = ScriptedRunner::new()

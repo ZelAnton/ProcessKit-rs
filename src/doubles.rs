@@ -318,7 +318,8 @@ struct RuleEntry {
 /// this example actually runs in `cargo test` on every OS:
 ///
 /// ```
-/// use processkit::{Command, ProcessRunner, Reply, ScriptedRunner};
+/// use processkit::{Command, ProcessRunner};
+/// use processkit::testing::{Reply, ScriptedRunner};
 ///
 /// let rt = tokio::runtime::Builder::new_current_thread()
 ///     .enable_all()

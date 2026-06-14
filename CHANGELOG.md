@@ -23,6 +23,12 @@ to a dated version section.
 - `Error::CassetteMiss { program }` — a cassette replay with no matching recording (a
   stale or incomplete cassette), kept distinct from a missing-program error so
   `is_not_found()` is `false` and a wrapper can't mistake it for an absent optional tool.
+- `RunningProcess::shutdown(grace)` (D4) — gracefully stop a started handle's process tree:
+  `SIGTERM`, wait up to `grace`, then `SIGKILL` survivors (atomic on Windows), returning the
+  resulting `Outcome`. The "started a dev server, exercised it, now stop it cleanly" verb — the
+  graceful counterpart to dropping the handle (hard kill) or `start_kill`. Own-group handles
+  (`Command::start`/`JobRunner`) only; a shared-group handle (`ProcessGroup::start`) returns
+  `Error::Unsupported` (use `ProcessGroup::shutdown`).
 - `CliClient` verbs now take an **argument list directly** (D7): `git.run(["status"])`
   instead of the double-mention `git.run(git.command(["status"]))`. A new sealed
   `IntoCommand` trait lets every verb (`run`/`output`/`output_bytes`/`run_unit`/`exit_code`/
@@ -147,6 +153,11 @@ to a dated version section.
   the deadline lexicon `Error::Timeout` / `Outcome::TimedOut` / `timed_out` / `Error::NotReady`
   were reviewed and **kept** — already clear and well-differentiated (`NotReady` is intentionally
   distinct from `Timeout`), so a rename would be churn on a soon-frozen surface.)
+- **Breaking:** the test doubles moved from the crate root into a `processkit::testing` module
+  (D6): `ScriptedRunner`, `Reply`, `Invocation`, `RecordingRunner`, and (feature-gated)
+  `RecordReplayRunner` / `MockRunner` are now `processkit::testing::*`. This keeps the production
+  surface focused (they exist only to replace subprocesses in tests). Update imports:
+  `use processkit::testing::{ScriptedRunner, Reply};`.
 
 ### Fixed
 

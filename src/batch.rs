@@ -142,7 +142,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Reply, ScriptedRunner};
+    use crate::testing::{Reply, ScriptedRunner};
 
     // A scripted runner answers each `output` with a canned reply keyed on the
     // command's args — no subprocess, so these exercise the batch driver itself

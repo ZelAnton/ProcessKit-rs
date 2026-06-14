@@ -316,3 +316,65 @@ async fn graceful_timeout_uses_the_configured_signal() {
         start.elapsed()
     );
 }
+
+// D4: `RunningProcess::shutdown(grace)` gracefully stops an own-group handle
+// (Command::start): SIGTERM, wait the grace, SIGKILL survivors. A TERM-handling
+// child exits cleanly within the grace, so the reported Outcome is Exited(0).
+#[tokio::test]
+#[ignore = "spawns a real subprocess; D4 graceful shutdown of an own-group handle"]
+async fn shutdown_gracefully_stops_a_term_handling_child() {
+    let mut run = Command::new("sh")
+        .args(["-c", "trap 'exit 0' TERM; echo ready; while :; do :; done"])
+        .start()
+        .await
+        .expect("start");
+    // Confirm the trap is installed before shutting down (avoids racing SIGTERM
+    // in before the handler is set).
+    run.wait_for_line(|l| l == "ready", Duration::from_secs(10))
+        .await
+        .expect("trap installed");
+    let start = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        run.shutdown(Duration::from_secs(5)),
+    )
+    .await
+    .expect("shutdown finished in time")
+    .expect("shutdown ok");
+    assert_eq!(
+        outcome,
+        Outcome::Exited(0),
+        "the child caught SIGTERM and exited cleanly within the grace"
+    );
+    // The grace must end *early* (the child exited on TERM): shutdown reaps
+    // concurrently, so a pgroup backend's liveness probe sees the child gone
+    // rather than riding out the full 5s grace (M1).
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "graceful shutdown must end as soon as the child exits, not ride the grace (took {:?})",
+        start.elapsed()
+    );
+}
+
+// D4: a shared-group handle (ProcessGroup::start) does not own its group, so
+// `shutdown` refuses with Error::Unsupported — the caller tears the group down
+// via ProcessGroup::shutdown instead.
+#[tokio::test]
+#[ignore = "spawns a real subprocess; D4 shutdown is unsupported on a shared-group handle"]
+async fn shutdown_is_unsupported_on_a_shared_group_handle() {
+    let group = ProcessGroup::new().expect("group");
+    let run = group
+        .start(&Command::new("sh").args(["-c", "sleep 30"]))
+        .await
+        .expect("start");
+    let err = run
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect_err("a shared-group handle cannot be gracefully shut down");
+    assert!(
+        matches!(err, processkit::Error::Unsupported { .. }),
+        "expected Unsupported, got {err:?}"
+    );
+    // The child survived (shared-group Drop doesn't kill); tear it down here.
+    group.shutdown().await.expect("teardown the group");
+}
