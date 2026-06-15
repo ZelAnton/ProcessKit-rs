@@ -406,6 +406,27 @@ pub(crate) async fn pump_lines_core<R>(
         }
     }
 
+    // Discard the buffered prefix of an over-cap line we are skipping, returning
+    // its content-byte count and emptying `pending` — EXCEPT a single trailing
+    // `\r`, which is held back rather than counted: it may be the CR of a CRLF
+    // whose `\n` lands in the next chunk, where it is a terminator (not content)
+    // and `content_len` would have excluded it. Deferring keeps the recorded
+    // length identical no matter where the read boundary falls. A `\r` that
+    // turns out to be mid-line content (any non-`\n` byte follows, or EOF) is
+    // counted later — by a subsequent split, a further `skip_over_cap` pass, or
+    // the EOF finalizer, all of which see it carried forward in `pending`.
+    fn skip_over_cap(pending: &mut String) -> usize {
+        if pending.ends_with('\r') {
+            let counted = pending.len() - 1;
+            pending.drain(..counted); // keep only the trailing '\r'
+            counted
+        } else {
+            let counted = pending.len();
+            pending.clear();
+            counted
+        }
+    }
+
     // The retained-byte ceiling (immutable), read once. When set, it bounds not
     // just the retained backlog but the *in-flight* decode buffer too (H1): a
     // line whose own length exceeds the cap can never be retained whole, so once
@@ -452,8 +473,7 @@ pub(crate) async fn pump_lines_core<R>(
                         sink.0.record_oversized_line(line_len);
                     }
                     None => {
-                        oversized = Some(skipped.saturating_add(pending.len()));
-                        pending.clear();
+                        oversized = Some(skipped.saturating_add(skip_over_cap(&mut pending)));
                         break;
                     }
                 }
@@ -481,8 +501,7 @@ pub(crate) async fn pump_lines_core<R>(
                     // No newline yet and already over the cap → over-cap line in
                     // progress: discard what we have and skip to the newline.
                     None if cap.is_some_and(|c| pending.len() > c) => {
-                        oversized = Some(pending.len());
-                        pending.clear();
+                        oversized = Some(skip_over_cap(&mut pending));
                         break;
                     }
                     None => break,
@@ -1033,6 +1052,67 @@ mod tests {
         );
         assert_eq!(sink.count(), 2, "both lines are counted");
         assert!(sink.dropped() >= 1, "the over-cap line is a truncation");
+    }
+
+    #[tokio::test]
+    async fn over_cap_crlf_line_byte_count_is_stable_across_a_read_boundary() {
+        // P1-6: an over-cap line ending in CRLF must record the same content-byte
+        // length whether its `\r` and `\n` arrive together or are split across a
+        // read boundary. The terminator's `\r` is never content; counting it only
+        // when it lands at a chunk end (and stripping it via `content_len` when it
+        // does not) made `seen_bytes` — which drives the Error byte ceiling and
+        // the truncation total — depend on chunking. 10 X's + "\r\n" over a 4-byte
+        // cap, then a "tail\n" line (4 bytes, retained): the over-cap line counts
+        // 10, so both runs see 14 total.
+        let content = vec![b'X'; 10];
+
+        // Single chunk: "XXXXXXXXXX\r\ntail\n".
+        let mut one = content.clone();
+        one.extend_from_slice(b"\r\ntail\n");
+        let single = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(4));
+        pump_lines(&one[..], encoding_rs::UTF_8, None, single.clone()).await;
+
+        // Split so the CRLF straddles a read: ["XXXXXXXXXX\r", "\ntail\n"].
+        let mut first = content.clone();
+        first.push(b'\r');
+        let reader = ChunkedReader::new([first, b"\ntail\n".to_vec()]);
+        let split = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(4));
+        pump_lines(reader, encoding_rs::UTF_8, None, split.clone()).await;
+
+        assert_eq!(
+            split.seen_bytes(),
+            single.seen_bytes(),
+            "the CRLF terminator must not be counted only when it lands at a chunk end"
+        );
+        assert_eq!(
+            single.seen_bytes(),
+            14,
+            "over-cap content (10) excluding the CRLF, plus the retained 'tail' (4)"
+        );
+        assert_eq!(split.drain(), vec!["tail"], "the over-cap line is dropped");
+        assert_eq!(single.drain(), vec!["tail"]);
+    }
+
+    #[tokio::test]
+    async fn over_cap_skip_keeps_a_lone_cr_as_content_across_reads() {
+        // The deferral must not lose a `\r` that is real content: when the byte
+        // after a held-back `\r` is NOT `\n` (a lone CR mid-line), it counts. An
+        // over-cap line "XXXXXXXXXX\rYYYYY\n" split right after the `\r` records
+        // all 16 content bytes (no terminator CR exists here — the `\r` is data).
+        let mut first = vec![b'X'; 10];
+        first.push(b'\r');
+        let reader = ChunkedReader::new([first, b"YYYYY\n".to_vec()]);
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(4));
+        pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(
+            sink.seen_bytes(),
+            16,
+            "a lone CR before non-newline content is counted, not dropped"
+        );
+        assert!(
+            sink.drain().is_empty(),
+            "the over-cap line is dropped whole"
+        );
     }
 
     #[tokio::test]
