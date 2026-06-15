@@ -323,6 +323,18 @@ impl Drop for Job {
                     // reaped — so this drains within milliseconds and doesn't depend on
                     // the async reaper). Wait, bounded, so we don't leak the dir; sleep
                     // rather than busy-spin.
+                    //
+                    // This `sleep` is blocking and `Drop` cannot await, so it runs
+                    // synchronously wherever the `Job` is dropped — for this async
+                    // crate, frequently a tokio worker thread — and stalls that
+                    // thread's executor for the wait (the whole runtime on a
+                    // current-thread flavor). The stall is bounded: ~100ms here, and
+                    // the pre-5.14 `cg.kill()` fallback above can add ~100ms more for
+                    // its own SIGKILL sweep. On a modern kernel `cgroup.kill` is
+                    // atomic and the subtree drains within a few ms, so the loop
+                    // usually exits on the first check. Accepted as the cost of a
+                    // synchronous leak-safe teardown; revisit only if the worker
+                    // stall is ever measured to matter.
                     for _ in 0..50 {
                         if cg.is_empty() {
                             break;
