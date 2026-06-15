@@ -195,7 +195,7 @@ mod sys;
 pub(crate) const MAX_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
-pub use batch::output_all;
+pub use batch::{output_all, output_all_bytes};
 pub use buffer::{OutputBufferPolicy, OverflowMode, StdioMode};
 pub use client::{CliClient, IntoCommand};
 pub use command::Command;

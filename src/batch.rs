@@ -1,8 +1,9 @@
 //! Bounded-concurrency batch execution.
 //!
-//! [`output_all`] runs a whole slice of commands while capping how many live at
-//! once — the back-pressure the one-shot verbs lack when you fan out hundreds of
-//! commands. For awaiting handles you already hold, see [`wait_all`](crate::wait_all).
+//! [`output_all`] (text) and [`output_all_bytes`] (raw bytes) run a whole slice
+//! of commands while capping how many live at once — the back-pressure the
+//! one-shot verbs lack when you fan out hundreds of commands. For awaiting
+//! handles you already hold, see [`wait_all`](crate::wait_all).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -10,9 +11,11 @@ use std::task::Poll;
 
 use crate::{Command, ProcessResult, ProcessRunner, Result};
 
-/// The boxed future a [`ProcessRunner::output`] call returns (via `async-trait`):
-/// already pinned, boxed, and `Send`, so the batch driver stores it as-is.
-type OutputFut<'a> = Pin<Box<dyn Future<Output = Result<ProcessResult<String>>> + Send + 'a>>;
+/// The boxed future a [`ProcessRunner::output`] / [`ProcessRunner::output_bytes`]
+/// call returns (via `async-trait`): already pinned, boxed, and `Send`, so the
+/// batch driver stores it as-is. Generic over the captured payload `T` (`String`
+/// for [`output_all`], `Vec<u8>` for [`output_all_bytes`]).
+type OutputFut<'a, T> = Pin<Box<dyn Future<Output = Result<ProcessResult<T>>> + Send + 'a>>;
 
 /// Run every command in `commands`, keeping at most `concurrency` of them live
 /// at once, and collect **all** their results in input order.
@@ -56,7 +59,9 @@ type OutputFut<'a> = Pin<Box<dyn Future<Output = Result<ProcessResult<String>>> 
 /// ```
 ///
 /// Deliberately *not* a process pool, scheduler, or retrier — those are policy.
-/// This is the one primitive: bounded fan-out that collects every outcome.
+/// This is the one primitive — bounded fan-out that collects every outcome — in
+/// two capture flavors: text here, raw bytes via [`output_all_bytes`] (the same
+/// `output` vs `output_bytes` split `Command`/`Pipeline` already have).
 ///
 /// Unlike [`wait_all`](crate::wait_all) / [`wait_any`](crate::wait_any), this is
 /// **not** cancel-safe: it consumes the `Command`s and owns the handles it
@@ -80,6 +85,65 @@ where
     R: ProcessRunner + ?Sized,
     I: IntoIterator<Item = Command>,
 {
+    run_all(commands, concurrency, runner, |r, c| r.output(c)).await
+}
+
+/// The raw-bytes companion to [`output_all`]: the same bounded fan-out, but each
+/// command's stdout is captured as [`Vec<u8>`] (via
+/// [`ProcessRunner::output_bytes`]) instead of decoded text — for batching
+/// binary-producing commands (image conversions, `curl`-into-bytes, …). Every
+/// other property is identical: partial failure is per-element data, results are
+/// in input order, at most `concurrency` (clamped to ≥ 1) run at once, and
+/// dropping the future tears in-flight children down per the `runner`'s grouping
+/// (own-group reaps, shared-group defers — see [`output_all`]). Like
+/// [`output_all`], it is **not** cancel-safe: it owns the handles it spawns, so
+/// dropping the returned future mid-batch drops them (already-collected results
+/// are unaffected).
+///
+/// ```no_run
+/// # async fn demo() -> processkit::Result<()> {
+/// use processkit::{Command, JobRunner, output_all_bytes};
+///
+/// let cmds = vec![
+///     Command::new("gzip").args(["-c", "a.txt"]),
+///     Command::new("gzip").args(["-c", "b.txt"]),
+/// ];
+/// let results = output_all_bytes(cmds, 2, &JobRunner).await;
+/// for r in &results {
+///     if let Ok(out) = r {
+///         println!("{} compressed bytes", out.stdout().len());
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub async fn output_all_bytes<R, I>(
+    commands: I,
+    concurrency: usize,
+    runner: &R,
+) -> Vec<Result<ProcessResult<Vec<u8>>>>
+where
+    R: ProcessRunner + ?Sized,
+    I: IntoIterator<Item = Command>,
+{
+    run_all(commands, concurrency, runner, |r, c| r.output_bytes(c)).await
+}
+
+/// The shared bounded-fan-out driver behind [`output_all`] /
+/// [`output_all_bytes`]. `launch` selects the per-command capture verb (text vs
+/// raw bytes); everything else — the `concurrency`-capped active set, the
+/// poll-and-harvest loop, and input-order assembly — is identical for both.
+async fn run_all<R, I, T, L>(
+    commands: I,
+    concurrency: usize,
+    runner: &R,
+    launch: L,
+) -> Vec<Result<ProcessResult<T>>>
+where
+    R: ProcessRunner + ?Sized,
+    I: IntoIterator<Item = Command>,
+    L: for<'a> Fn(&'a R, &'a Command) -> OutputFut<'a, T>,
+{
     let commands: Vec<Command> = commands.into_iter().collect();
     let n = commands.len();
     let limit = concurrency.max(1);
@@ -89,10 +153,10 @@ where
     // capture its `waits` without borrowing itself).
     let commands = &commands;
 
-    let mut results: Vec<Option<Result<ProcessResult<String>>>> = (0..n).map(|_| None).collect();
+    let mut results: Vec<Option<Result<ProcessResult<T>>>> = (0..n).map(|_| None).collect();
     let mut next = 0usize;
-    // Active set: (result slot, in-flight `output` future). Capped at `limit`.
-    let mut active: Vec<(usize, OutputFut<'_>)> = Vec::new();
+    // Active set: (result slot, in-flight capture future). Capped at `limit`.
+    let mut active: Vec<(usize, OutputFut<'_, T>)> = Vec::new();
 
     std::future::poll_fn(move |cx| {
         loop {
@@ -100,7 +164,7 @@ where
             while active.len() < limit && next < n {
                 let idx = next;
                 next += 1;
-                active.push((idx, runner.output(&commands[idx])));
+                active.push((idx, launch(runner, &commands[idx])));
             }
 
             // Poll every active future once; harvest the finishers in place.
@@ -243,6 +307,61 @@ mod tests {
             probe.active.load(Ordering::SeqCst),
             0,
             "all futures finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_all_bytes_captures_raw_stdout_in_input_order() {
+        // S-7: the bytes companion runs the same bounded fan-out but captures
+        // each command's stdout as raw bytes (via `output_bytes`). A runner that
+        // echoes the command's first arg as bytes lets us assert order + payload
+        // hermetically.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct BytesEcho {
+            peak: Arc<AtomicUsize>,
+            active: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl ProcessRunner for BytesEcho {
+            async fn output(&self, _command: &Command) -> Result<ProcessResult<String>> {
+                unreachable!("output_all_bytes must use output_bytes, not output")
+            }
+            async fn output_bytes(&self, command: &Command) -> Result<ProcessResult<Vec<u8>>> {
+                let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                let arg = command.arguments()[0].to_string_lossy().into_owned();
+                Ok(ProcessResult::new(
+                    command.program().to_string_lossy().into_owned(),
+                    arg.into_bytes(),
+                    String::new(),
+                    crate::result::Outcome::Exited(0),
+                    None,
+                ))
+            }
+        }
+
+        let runner = BytesEcho {
+            peak: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+        };
+        let cmds: Vec<Command> = (0..6)
+            .map(|i| Command::new("echo").arg(i.to_string()))
+            .collect();
+        let results = output_all_bytes(cmds, 2, &runner).await;
+        let bytes: Vec<Vec<u8>> = results
+            .iter()
+            .map(|r| r.as_ref().expect("ok").stdout().clone())
+            .collect();
+        let expected: Vec<Vec<u8>> = (0..6).map(|i| i.to_string().into_bytes()).collect();
+        assert_eq!(bytes, expected, "raw bytes preserved in input order");
+        assert!(
+            runner.peak.load(Ordering::SeqCst) <= 2,
+            "concurrency cap honored for the bytes batch too"
         );
     }
 

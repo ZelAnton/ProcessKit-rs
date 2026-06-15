@@ -13,6 +13,12 @@ to a dated version section.
 
 ### Added
 
+- `output_all_bytes` — the raw-bytes companion to `output_all`: the same
+  bounded-concurrency fan-out, but each command's stdout is captured as
+  `Vec<u8>` (for batching binary-producing commands). Same ordering, partial-
+  failure, and teardown semantics (S-7). The `concurrency` argument stays a
+  plain `usize` clamped to ≥ 1 (not `NonZeroUsize`) — the documented clamp keeps
+  the common call ergonomic.
 - `Pipeline` gained verb parity with a single `Command`: `output_bytes` (binary
   capture), `run_unit`, `exit_code`, `checked`, `probe`, and `parse` / `try_parse`
   — each operating on the pipefail outcome — plus a chain-level `cancel_on(token)`
