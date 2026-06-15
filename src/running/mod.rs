@@ -828,11 +828,21 @@ impl RunningProcess {
                     let mut chunk = [0u8; 8 * 1024];
                     loop {
                         match pipe.read(&mut chunk).await {
-                            Ok(0) | Err(_) => break,
+                            Ok(0) => break,
                             Ok(n) => out_buf
                                 .lock()
                                 .expect("stdout buffer poisoned")
                                 .extend_from_slice(&chunk[..n]),
+                            Err(_e) => {
+                                // A mid-stream read error ends byte capture with
+                                // whatever already arrived (parity with the line
+                                // pumps' partial capture), not a failed run — but
+                                // surface it under `tracing` instead of silently
+                                // treating it as a clean EOF (R2-8).
+                                #[cfg(feature = "tracing")]
+                                tracing::warn!(target: "processkit", error = %_e, "stdout read error; ending byte capture early");
+                                break;
+                            }
                         }
                     }
                 }
@@ -885,6 +895,10 @@ impl RunningProcess {
         )
         .with_duration(duration)
         .with_truncated(truncated)
+        // Only stderr is line-pumped here (stdout is raw bytes), so its counters
+        // are the overflow totals — populate them for parity with `output_string`
+        // so `truncated()`'s companion totals aren't left zeroed (R2-7).
+        .with_overflow_totals(stderr_sink.count(), stderr_sink.seen_bytes())
         .with_ok_codes(self.ok_codes.clone()))
     }
 
