@@ -33,6 +33,10 @@ pub(crate) trait GracefulTarget {
     fn signal_all(&self, signal: i32);
 
     /// Whether the tree has fully drained (no tracked process remains alive).
+    /// May refresh a backend's internal liveness cache (e.g. the pgroup
+    /// `group_seen` latch), but must NOT prune the tracked set: [`run`] polls
+    /// this repeatedly, and forgetting a survivor would corrupt a later
+    /// `members()`/`stats()` under `escalate = false`.
     fn is_drained(&self) -> bool;
 
     /// Forcibly kill any survivors. Called only when escalation is requested
@@ -71,9 +75,12 @@ pub(crate) async fn run(
         target.hard_kill()?;
     } else if !escalate {
         // B12: tell Drop not to hard-kill the survivors the caller chose to
-        // leave alive. Relaxed is sufficient: this store happens-before Drop
-        // via the single-threaded call boundary.
-        skip_drop_kill.store(true, Ordering::Relaxed);
+        // leave alive. `Release` here pairs with the `Acquire` load in each
+        // backend's `Drop`, so the store is visible whichever thread runs Drop:
+        // a tokio task can migrate across the `.await`s between this call and the
+        // owner dropping the backend, so a "single-threaded boundary" can't be
+        // assumed (P2-2).
+        skip_drop_kill.store(true, Ordering::Release);
     }
     Ok(())
 }

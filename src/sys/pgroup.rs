@@ -399,7 +399,8 @@ impl super::graceful::GracefulTarget for ProcessGroup {
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        if !self.skip_drop_kill.load(Ordering::Relaxed) {
+        // Acquire pairs with the Release store in `graceful::run` (P2-2).
+        if !self.skip_drop_kill.load(Ordering::Acquire) {
             self.broadcast(libc::SIGKILL);
         }
     }

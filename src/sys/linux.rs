@@ -314,7 +314,8 @@ impl Drop for Job {
     fn drop(&mut self) {
         match &self.backend {
             Backend::Cgroup(cg) => {
-                if !self.skip_drop_kill.load(Ordering::Relaxed) {
+                // Acquire pairs with the Release store in `graceful::run` (P2-2).
+                if !self.skip_drop_kill.load(Ordering::Acquire) {
                     // B12: only hard-kill when the caller didn't choose escalate=false.
                     let _ = cg.kill();
                     // `cgroup.kill` is asynchronous: the kernel SIGKILLs the subtree,
@@ -526,7 +527,12 @@ impl Cgroup {
         match std::fs::read_to_string(self.path.join("cgroup.procs")) {
             Ok(procs) => procs
                 .lines()
+                // Keep only real pids: a `0`/negative line (never emitted by the
+                // kernel, but cheap to guard) would otherwise reach `kill(pid, …)`
+                // as "the caller's whole process group" (0) or "a process group"
+                // (negative) — never a single tracked member (P2-11).
                 .filter_map(|l| l.trim().parse::<i32>().ok())
+                .filter(|&pid| pid > 0)
                 .collect(),
             Err(_) => Vec::new(),
         }
@@ -539,6 +545,15 @@ impl Cgroup {
     /// Send `sig` to every current member (the graceful SIGTERM tier and the
     /// public signal broadcast). Best-effort: an empty cgroup is trivially
     /// signalled, and a member that exits mid-loop just yields `ESRCH`.
+    ///
+    /// This per-pid path is inherently best-effort against pid recycling: in the
+    /// window between reading `cgroup.procs` and `kill(pid, sig)`, a member can
+    /// exit and its pid be reused by an unrelated process, which would then
+    /// receive `sig`. The window is tiny, but the kernel offers no atomic
+    /// per-pid-within-cgroup signal — only `cgroup.kill` (whole-subtree SIGKILL,
+    /// used by [`kill`](Self::kill)) and `cgroup.freeze` (whole-subtree
+    /// suspend/resume, preferred by [`freeze`](Self::freeze)) are race-free.
+    /// SIGKILL teardown therefore goes through `cgroup.kill`, not this path.
     fn signal(&self, sig: i32) -> io::Result<()> {
         let mut last_err = None;
         for pid in self.members() {
@@ -572,8 +587,15 @@ impl Cgroup {
     #[cfg(feature = "process-control")]
     fn freeze(&self, frozen: bool) -> io::Result<()> {
         let val: &[u8] = if frozen { b"1" } else { b"0" };
-        if std::fs::write(self.path.join("cgroup.freeze"), val).is_ok() {
-            return Ok(());
+        match std::fs::write(self.path.join("cgroup.freeze"), val) {
+            Ok(()) => return Ok(()),
+            // Only the file being ABSENT means "kernel < 5.2" → fall back to the
+            // per-pid SIGSTOP/SIGCONT path. Any other error (EACCES/EBUSY on a
+            // restricted delegated cgroup, EIO, …) is a real failure on a file
+            // that *exists*: surface it rather than silently degrading to the
+            // racy per-pid path on a modern kernel (R2-3).
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            Err(_) => {} // NotFound → no cgroup.freeze; use the fallback below.
         }
         let sig = if frozen { libc::SIGSTOP } else { libc::SIGCONT };
         self.signal(sig)

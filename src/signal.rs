@@ -35,7 +35,11 @@ pub enum Signal {
     Usr1,
     /// `SIGUSR2` — user-defined.
     Usr2,
-    /// A raw signal number, passed through verbatim (Unix only).
+    /// A raw signal number, passed through verbatim (Unix only). It must be a
+    /// valid signal (`1..=SIGRTMAX`); it lands in the *signal* argument of
+    /// `kill(pid, sig)` (never the pid/target), so an out-of-range or non-positive
+    /// value simply fails the send with `EINVAL` — it cannot retarget the signal
+    /// at a process group.
     Other(i32),
 }
 
