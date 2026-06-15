@@ -222,6 +222,10 @@ impl core::panic::unwind_safe::UnwindSafe for processkit::Mechanism
 pub processkit::Outcome::Exited(i32)
 pub processkit::Outcome::Signalled(core::option::Option<i32>)
 pub processkit::Outcome::TimedOut
+impl processkit::Outcome
+pub fn processkit::Outcome::code(&self) -> core::option::Option<i32>
+pub fn processkit::Outcome::signal(&self) -> core::option::Option<i32>
+pub fn processkit::Outcome::timed_out(&self) -> bool
 impl core::clone::Clone for processkit::Outcome
 pub fn processkit::Outcome::clone(&self) -> processkit::Outcome
 impl core::cmp::Eq for processkit::Outcome
@@ -683,6 +687,7 @@ pub fn processkit::ProcessResult<T>::into_stdout(self) -> T
 pub fn processkit::ProcessResult<T>::is_success(&self) -> bool
 pub fn processkit::ProcessResult<T>::outcome(&self) -> processkit::Outcome
 pub fn processkit::ProcessResult<T>::program(&self) -> &str
+pub fn processkit::ProcessResult<T>::signal(&self) -> core::option::Option<i32>
 pub fn processkit::ProcessResult<T>::stderr(&self) -> &str
 pub fn processkit::ProcessResult<T>::stdout(&self) -> &T
 pub fn processkit::ProcessResult<T>::timed_out(&self) -> bool

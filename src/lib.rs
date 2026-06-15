@@ -228,6 +228,12 @@ use std::ffi::OsStr;
 /// Run `program` with `args` inside a private job and return trimmed stdout, or
 /// an [`Error`] on a non-zero exit / spawn failure / timeout. A thin shim over
 /// [`Command`]; use the builder for a working directory, env, stdin, or timeout.
+///
+/// The crate root exposes only the two most common one-liners — `run` and
+/// [`output_string`] (plus the batch [`output_all`] / [`output_all_bytes`]). The
+/// full verb vocabulary (`output_bytes`, `run_unit`, `exit_code`, `checked`,
+/// `probe`, `parse`/`try_parse`, `start`) lives on [`Command`]; reach for the
+/// builder for anything beyond a bare run/capture.
 pub async fn run<I, S>(program: impl AsRef<OsStr>, args: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,

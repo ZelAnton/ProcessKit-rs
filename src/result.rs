@@ -7,10 +7,16 @@ use crate::error::Error;
 /// How a run ended — the explicit form of the `code()`/`timed_out()` pair.
 ///
 /// Non-exhaustive: a future disposition (e.g. a richer platform-specific
-/// termination) can be added without a breaking change. The convenience
-/// accessors [`ProcessResult::code`] / [`ProcessResult::timed_out`] /
-/// [`ProcessResult::is_success`] derive from this and remain the everyday
-/// surface; match on `Outcome` when the three-way distinction matters.
+/// termination) can be added without a breaking change — so prefer the
+/// accessors [`code`](Self::code) / [`signal`](Self::signal) /
+/// [`timed_out`](Self::timed_out) over a `match` with a wildcard when you hold a
+/// bare `Outcome` (e.g. from [`RunningProcess::wait`](crate::RunningProcess::wait)).
+///
+/// There is deliberately **no** `Outcome::is_success`: success depends on the
+/// accepted exit codes ([`Command::ok_codes`](crate::Command::ok_codes)), which a
+/// bare `Outcome` does not carry — use
+/// [`ProcessResult::is_success`](crate::ProcessResult::is_success) (which honors
+/// `ok_codes`) rather than assuming `Exited(0)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Outcome {
@@ -36,6 +42,40 @@ pub enum Outcome {
     Signalled(Option<i32>),
     /// Killed because it exceeded its configured timeout.
     TimedOut,
+}
+
+impl Outcome {
+    /// The exit code if the process [`Exited`](Self::Exited), else `None`
+    /// (a signal kill or timeout has no exit code — never a `-1` sentinel).
+    ///
+    /// The accessor for a bare `Outcome` (e.g. from
+    /// [`RunningProcess::wait`](crate::RunningProcess::wait) or
+    /// [`Finished::outcome`](crate::Finished)); mirrors
+    /// [`ProcessResult::code`](crate::ProcessResult::code). Because `Outcome` is
+    /// `#[non_exhaustive]`, prefer these accessors over a `match` with a wildcard.
+    pub fn code(&self) -> Option<i32> {
+        match self {
+            Outcome::Exited(code) => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// The signal number if the process was [`Signalled`](Self::Signalled) with a
+    /// known number, else `None` (a clean exit, a timeout, or a signal the kernel
+    /// did not expose). **Unix only** — a killed process reports
+    /// [`Exited`](Self::Exited) on Windows (D18).
+    pub fn signal(&self) -> Option<i32> {
+        match self {
+            Outcome::Signalled(signal) => *signal,
+            _ => None,
+        }
+    }
+
+    /// Whether the run was killed because it exceeded its timeout. Mirrors
+    /// [`ProcessResult::timed_out`](crate::ProcessResult::timed_out).
+    pub fn timed_out(&self) -> bool {
+        matches!(self, Outcome::TimedOut)
+    }
 }
 
 /// The captured result of running a process to completion.
@@ -174,6 +214,14 @@ impl<T> ProcessResult<T> {
     /// from [`outcome`](Self::outcome).
     pub fn timed_out(&self) -> bool {
         matches!(self.outcome, Outcome::TimedOut)
+    }
+
+    /// The signal number if the process was terminated by a signal with a known
+    /// number (**Unix only**; `None` otherwise — a clean exit, a timeout, or a
+    /// signal the kernel did not expose). Derived from [`outcome`](Self::outcome);
+    /// the `Outcome`-level twin is [`Outcome::signal`].
+    pub fn signal(&self) -> Option<i32> {
+        self.outcome.signal()
     }
 
     /// Whether the process exited with an **accepted** code — `0` by default, or
@@ -388,6 +436,47 @@ impl StdoutText for Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outcome_accessors_match_each_variant() {
+        // R5-3: the bare-`Outcome` accessors (so callers needn't `match` a
+        // non_exhaustive enum with a wildcard).
+        assert_eq!(Outcome::Exited(7).code(), Some(7));
+        assert_eq!(Outcome::Exited(7).signal(), None);
+        assert!(!Outcome::Exited(7).timed_out());
+
+        assert_eq!(Outcome::Signalled(Some(9)).signal(), Some(9));
+        assert_eq!(Outcome::Signalled(Some(9)).code(), None);
+        assert_eq!(Outcome::Signalled(None).signal(), None);
+        assert!(!Outcome::Signalled(None).timed_out());
+
+        assert!(Outcome::TimedOut.timed_out());
+        assert_eq!(Outcome::TimedOut.code(), None);
+        assert_eq!(Outcome::TimedOut.signal(), None);
+
+        // The accessors agree with the ProcessResult-level ones derived from the
+        // same outcome (parity vocabulary across the two types).
+        let exited = ProcessResult::new(
+            "x".into(),
+            String::new(),
+            String::new(),
+            Outcome::Exited(2),
+            None,
+        );
+        assert_eq!(exited.outcome().code(), exited.code());
+        assert_eq!(exited.outcome().signal(), exited.signal());
+        assert_eq!(exited.outcome().timed_out(), exited.timed_out());
+
+        let killed = ProcessResult::new(
+            "x".into(),
+            String::new(),
+            String::new(),
+            Outcome::Signalled(Some(9)),
+            None,
+        );
+        assert_eq!(killed.signal(), Some(9));
+        assert_eq!(killed.code(), None);
+    }
 
     #[test]
     fn outcome_reflects_the_three_terminal_states() {

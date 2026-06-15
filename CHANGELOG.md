@@ -12,7 +12,14 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+
+- `Outcome` gained accessor methods — `code() -> Option<i32>`,
+  `signal() -> Option<i32>`, `timed_out() -> bool` — so code holding a bare
+  `Outcome` (e.g. from `RunningProcess::wait` or `Finished::outcome`) needn't
+  `match` a `#[non_exhaustive]` enum with a wildcard. (No `is_success`: success is
+  `ok_codes`-aware and lives on `ProcessResult::is_success`.) `ProcessResult`
+  gained `signal() -> Option<i32>` for the same vocabulary parity (it already had
+  `code`/`timed_out`). (R5-3)
 
 ### Changed
 
