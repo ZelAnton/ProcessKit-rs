@@ -388,9 +388,13 @@ impl<R: ProcessRunner> Supervisor<R> {
                     {
                         return Ok(self.outcome(result, restarts, &storm, StopReason::Predicate));
                     }
-                    // A crash is any run without a clean exit: non-zero code,
-                    // timeout, or signal kill (both of the latter have no code).
-                    let crashed = result.code() != Some(0);
+                    // A crash is any run that is not a success: an exit code
+                    // outside the accepted set (`ok_codes`, default `{0}`), a
+                    // timeout, or a signal kill (both of the latter have no
+                    // code). `is_success` honors `ok_codes` so the supervisor
+                    // agrees with the rest of the crate — a command exiting an
+                    // accepted non-zero code is clean, not a crash.
+                    let crashed = !result.is_success();
                     let wants_restart = match self.policy {
                         RestartPolicy::Always => true,
                         RestartPolicy::OnCrash => crashed,
@@ -842,6 +846,52 @@ mod tests {
             .await
             .expect("supervision");
         assert_eq!(outcome.restarts, 1);
+        assert!(outcome.final_result.is_success());
+    }
+
+    #[tokio::test]
+    async fn an_accepted_nonzero_exit_is_not_a_crash() {
+        // P1-3: a supervised command with `ok_codes([0, 2])` that exits 2 is a
+        // success everywhere else in the crate (`is_success() == true`), so
+        // OnCrash must NOT restart it. The real runner stamps the command's
+        // `ok_codes` onto the result, so model that here. Only one reply is
+        // scripted: a spurious restart would deplete the SeqRunner and panic.
+        let accepted = Ok(ProcessResult::new(
+            "fake".into(),
+            "out".into(),
+            String::new(),
+            Outcome::Exited(2),
+            None,
+        )
+        .with_ok_codes(vec![0, 2]));
+        let outcome = supervise(SeqRunner::new(vec![accepted]))
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.restarts, 0, "an accepted exit code is not a crash");
+        assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
+        assert!(outcome.final_result.is_success());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_zero_exit_is_a_crash() {
+        // Inverse of the above: `ok_codes([1])` makes 0 a failure. OnCrash must
+        // restart it rather than reading raw code 0 as clean. The follow-up
+        // clean run (default ok_codes {0}, exit 0) satisfies the policy.
+        let rejected_zero = Ok(ProcessResult::new(
+            "fake".into(),
+            String::new(),
+            String::new(),
+            Outcome::Exited(0),
+            None,
+        )
+        .with_ok_codes(vec![1]));
+        let outcome = supervise(SeqRunner::new(vec![rejected_zero, ok()]))
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.restarts, 1, "a rejected exit code is a crash");
+        assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
         assert!(outcome.final_result.is_success());
     }
 
