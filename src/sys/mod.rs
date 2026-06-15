@@ -188,6 +188,12 @@ impl Job {
     /// `escalate` is still honored: `true` kills the tree immediately (equivalent
     /// to [`kill_all`](Self::kill_all)), while `false` leaves survivors alive
     /// (`Drop` then closes the handle without `KILL_ON_JOB_CLOSE`).
+    ///
+    /// `escalate = false` survivor-sparing is **best-effort on Windows**: `Drop`
+    /// clears `KILL_ON_JOB_CLOSE` before closing the handle, but if that
+    /// `SetInformationJobObject` call fails the handle close still kills the tree
+    /// (a deliberate fail-safe — an unexpected kill is preferred over ambiguous
+    /// orphaning). On Unix the spare is unconditional once the flag is set.
     pub(crate) async fn graceful_shutdown(
         &self,
         signal: i32,

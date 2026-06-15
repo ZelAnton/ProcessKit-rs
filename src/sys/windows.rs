@@ -199,6 +199,14 @@ impl Job {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // SAFETY: the raw handle is valid until the child is dropped; `guard`
         // owns the child for the rest of this scope, well past this call.
+        //
+        // Nested jobs (Win-H1): if THIS process is itself already inside a Job
+        // Object that forbids breakaway, the assign can fail with
+        // `ERROR_ACCESS_DENIED`. On Windows 8+ jobs nest (the child joins our job
+        // *and* the outer one), so the common case works; we do not set a
+        // breakaway flag (that would let children escape our containment). When
+        // the assign does fail, the suspended child is reaped (the guard) and the
+        // error is surfaced — we never leak an uncontained child.
         let ok = unsafe { AssignProcessToJobObject(self.handle, handle as HANDLE) };
         if ok == 0 {
             // The reaper kills the still-suspended child as `guard` drops.
@@ -340,8 +348,11 @@ impl Job {
         if escalate {
             self.kill_all()
         } else {
-            // B12: mark Drop to preserve survivors.
-            self.skip_drop_kill.store(true, Ordering::Relaxed);
+            // B12: mark Drop to preserve survivors. Release pairs with the
+            // Acquire load in `Drop` so the flag is visible whichever thread
+            // drops the `Job` (it may differ from the one that ran graceful
+            // shutdown, e.g. after a tokio task migrates across an `.await`) (P2-2).
+            self.skip_drop_kill.store(true, Ordering::Release);
             Ok(())
         }
     }
@@ -490,11 +501,24 @@ fn resume_thread(tid: u32) -> io::Result<()> {
     if thread.is_null() {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: valid thread handle; a `u32::MAX` return signals failure.
-    let prev = unsafe { ResumeThread(thread) };
-    // Capture the failure BEFORE `CloseHandle`, which can overwrite the
-    // thread-local last-error.
-    let err = (prev == u32::MAX).then(io::Error::last_os_error);
+    // Resume until the suspend count reaches 0. A `CREATE_SUSPENDED` child's
+    // primary thread is normally at count 1 (one decrement runs it), but a
+    // member-walk suspend racing the spawn — bounded by `suspend_lock`, yet
+    // possible — could nest it higher; a single decrement would then leave it
+    // stuck suspended forever (R2-5). `ResumeThread` returns the PREVIOUS count
+    // and decrements by one each call, so loop until it reports `<= 1` (now 0);
+    // this is bounded by the suspend depth. The failure is captured BEFORE
+    // `CloseHandle`, which can overwrite the thread-local last-error.
+    let err = loop {
+        // SAFETY: valid thread handle; a `u32::MAX` return signals failure.
+        let prev = unsafe { ResumeThread(thread) };
+        if prev == u32::MAX {
+            break Some(io::Error::last_os_error());
+        }
+        if prev <= 1 {
+            break None; // prev == 1 → now 0 (running); prev == 0 → already running
+        }
+    };
     // SAFETY: handle came from OpenThread; closed exactly once.
     unsafe { CloseHandle(thread) };
     match err {
@@ -639,7 +663,7 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
     let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
     if ok != 0 {
         metrics.cpu_time = Some(Duration::from_nanos(
-            filetime_nanos(kernel) + filetime_nanos(user),
+            filetime_nanos(kernel).saturating_add(filetime_nanos(user)),
         ));
     }
 
@@ -658,9 +682,9 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
 
 impl Drop for Job {
     fn drop(&mut self) {
-        // Relaxed is sufficient: `graceful_shutdown` returns before `Drop` runs,
-        // so the store happens-before the load via the single-threaded call boundary.
-        if self.skip_drop_kill.load(Ordering::Relaxed) {
+        // Acquire pairs with the Release store in `graceful_shutdown` so the flag
+        // is visible no matter which thread drops the `Job` (P2-2).
+        if self.skip_drop_kill.load(Ordering::Acquire) {
             // B12: clear KILL_ON_JOB_CLOSE so closing the handle does not kill the
             // tree. `SetInformationJobObject` with `JobObjectExtendedLimitInformation`
             // *replaces* the entire extended-limit structure, so passing a zeroed

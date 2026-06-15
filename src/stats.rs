@@ -41,7 +41,16 @@ pub struct ProcessGroupStats {
     /// - **POSIX process-group / macOS** — always `None`; no kernel accumulator
     ///   is available without a cgroup or Job Object.
     pub total_cpu_time: Option<Duration>,
-    /// Peak memory used by the group in bytes, if available.
+    /// Peak memory used by the group in bytes, if available. This is the OS's
+    /// own group-wide measure; its exact meaning differs by platform and it is
+    /// **not directly comparable across platforms**, nor equal to the sum of the
+    /// per-process [`RunningProcess::peak_memory_bytes`](crate::RunningProcess::peak_memory_bytes)
+    /// (which is a resident-set peak):
+    /// - **Windows** — the Job Object's `PeakJobMemoryUsed`: peak *committed*
+    ///   memory (commit charge) charged to the job, not a working-set figure.
+    /// - **Linux cgroup v2** — the sum of currently-live members' peak resident
+    ///   sets (`VmHWM`); members that already exited are not counted.
+    /// - **POSIX process-group / macOS** — always `None`; no kernel accumulator.
     pub peak_memory_bytes: Option<u64>,
 }
 
