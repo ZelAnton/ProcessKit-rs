@@ -34,17 +34,20 @@ impl RunningProcess {
     ///
     /// # Caveats
     ///
-    /// - **Consumes stdout** up to and including the matching line (this is
-    ///   the one-shot [`stdout_lines`](Self::stdout_lines) stream underneath —
-    ///   if stdout was already consumed by an earlier `stdout_lines` /
+    /// - **Consumes stdout** up to and including the matching line (the same
+    ///   one-shot stdout drain [`stdout_lines`](Self::stdout_lines) uses — if
+    ///   stdout was already consumed by an earlier `stdout_lines` /
     ///   `output_events` / `wait_for_line`, or was not piped, this returns an
     ///   `Err` (D2) rather than a stream that is forever `NotReady`). Continue
     ///   with [`finish`](Self::finish) for the outcome and stderr; the other
     ///   probes don't touch stdout.
-    /// - A failed probe does **not** kill the child — unlike
-    ///   [`Command::timeout`](crate::Command::timeout), whose deadline (if
-    ///   configured) is armed by this call exactly as `stdout_lines` always
-    ///   arms it, and still tears the tree down independently of the probe.
+    /// - A failed probe does **not** kill the child, and — unlike
+    ///   [`stdout_lines`](Self::stdout_lines) — it does **not** arm the
+    ///   [`Command::timeout`](crate::Command::timeout) watchdog: this probe is
+    ///   bounded only by its own `within`, and the command's timeout is enforced
+    ///   later by the consuming verb ([`finish`](Self::finish)). So a probe can
+    ///   never tear the tree down or flip the run's outcome to `TimedOut`,
+    ///   matching [`wait_for`](Self::wait_for) / [`wait_for_port`](Self::wait_for_port).
     pub async fn wait_for_line(
         &mut self,
         predicate: impl Fn(&str) -> bool,
@@ -53,11 +56,14 @@ impl RunningProcess {
         use tokio_stream::StreamExt;
 
         // Bound the borrow: `StdoutLines` owns its sink (no borrow of self), so
-        // `self.program` stays readable after the search. D2: `stdout_lines` is
-        // fallible — a non-piped stdout, or a *second* `wait_for_line` (stdout
-        // already consumed), surfaces as a clear `Err` here rather than a probe
-        // that is forever `NotReady`.
-        let mut lines = self.stdout_lines()?;
+        // `self.program` stays readable after the search. `drain_stdout_lines`
+        // (not `stdout_lines`) sets up the same stdout drain but does NOT arm the
+        // `Command::timeout` watchdog, so this readiness probe never kills the
+        // tree or flips the outcome to `TimedOut` — it is bounded only by
+        // `within`. D2: it is fallible — a non-piped stdout, or a *second*
+        // `wait_for_line` (stdout already consumed), surfaces as a clear `Err`
+        // here rather than a probe that is forever `NotReady`.
+        let mut lines = self.drain_stdout_lines()?;
         let search = async {
             while let Some(line) = lines.next().await {
                 if predicate(&line) {

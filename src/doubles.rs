@@ -1021,6 +1021,65 @@ mod tests {
         assert_eq!(finish.outcome, Outcome::TimedOut);
     }
 
+    /// P1-4: a readiness probe must NOT arm the `Command::timeout` watchdog, so
+    /// it can never kill the tree or flip the outcome to `TimedOut`. With a probe
+    /// `within` (10s) LONGER than the command timeout (3s) and a child that never
+    /// produces the wanted line, the fixed `wait_for_line` waits the full
+    /// `within`; the old version (which armed the deadline) was cut short at ~3s
+    /// when the watchdog tore the tree down.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_line_does_not_arm_the_command_timeout() {
+        // A child whose stdout stays OPEN past the probe (lines paced 30s apart,
+        // none matching "ready") — so the probe is bounded by `within`, not by
+        // stdout closing. Old behavior cut it off at the 3s command deadline.
+        let runner = ScriptedRunner::new().fallback(
+            Reply::lines(["working", "working"])
+                .with_line_delay(std::time::Duration::from_secs(30)),
+        );
+        let cmd = Command::new("server").timeout(std::time::Duration::from_secs(3));
+        let mut run = runner.start(&cmd).await.expect("scripted start");
+
+        let start = tokio::time::Instant::now();
+        let err = run
+            .wait_for_line(|l| l.contains("ready"), std::time::Duration::from_secs(10))
+            .await
+            .expect_err("the line never arrives, so the probe is NotReady");
+        let waited = start.elapsed();
+
+        assert!(matches!(err, crate::Error::NotReady { .. }), "got {err:?}");
+        assert!(
+            waited >= std::time::Duration::from_secs(9),
+            "the probe must wait its full `within` (10s), not be cut short by the \
+             3s command timeout — armed-deadline regression: waited {waited:?}"
+        );
+    }
+
+    /// P1-4: the command timeout isn't lost, just deferred — a short probe
+    /// returns `NotReady` without arming anything, and a subsequent `finish`
+    /// still enforces the timeout, reporting `TimedOut` at the command deadline.
+    #[tokio::test(start_paused = true)]
+    async fn finish_after_wait_for_line_still_times_out_at_the_command_deadline() {
+        let runner = ScriptedRunner::new().fallback(
+            Reply::lines(["working", "working"])
+                .with_line_delay(std::time::Duration::from_secs(30)),
+        );
+        let cmd = Command::new("hang").timeout(std::time::Duration::from_secs(3));
+        let mut run = runner.start(&cmd).await.expect("scripted start");
+
+        let err = run
+            .wait_for_line(|_| false, std::time::Duration::from_secs(1))
+            .await
+            .expect_err("nothing matches within 1s");
+        assert!(matches!(err, crate::Error::NotReady { .. }), "got {err:?}");
+
+        let finish = run.finish().await.expect("finish");
+        assert_eq!(
+            finish.outcome,
+            Outcome::TimedOut,
+            "the command timeout is still enforced by finish after a probe"
+        );
+    }
+
     #[tokio::test]
     async fn scripted_timeout_reply_surfaces_through_start() {
         let runner = ScriptedRunner::new().fallback(Reply::timeout());

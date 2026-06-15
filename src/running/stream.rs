@@ -88,6 +88,22 @@ impl RunningProcess {
     /// # }
     /// ```
     pub fn stdout_lines(&mut self) -> Result<StdoutLines> {
+        // A full streaming verb: drain stdout AND arm the watchdog that bounds
+        // the live stream by `Command::timeout`. The `wait_for_line` readiness
+        // probe calls `drain_stdout_lines` directly, WITHOUT the watchdog, so a
+        // probe never kills the tree (matching `wait_for`/`wait_for_port`).
+        let lines = self.drain_stdout_lines()?;
+        self.arm_stream_deadline();
+        Ok(lines)
+    }
+
+    /// Set up the stdout line drain (and the background stderr drain) and return
+    /// the stream, **without** arming the [`Command::timeout`](crate::Command::timeout)
+    /// watchdog. Shared by [`stdout_lines`](Self::stdout_lines) (which arms the
+    /// watchdog on top) and `wait_for_line` (which does not, so a failed
+    /// readiness probe leaves the child running and lets the consuming verb
+    /// enforce the timeout).
+    pub(super) fn drain_stdout_lines(&mut self) -> Result<StdoutLines> {
         self.ensure_stdout_streamable()?;
         // Background-drain stderr (counter + handler still apply). The handle is
         // kept so `finish` can await the last line before draining. Only
@@ -135,6 +151,20 @@ impl RunningProcess {
             self.stdout_sink = Some(stdout_sink.clone());
         }
 
+        Ok(StdoutLines {
+            sink: stdout_sink,
+            wait: None,
+        })
+    }
+
+    /// Arm the watchdog that bounds a live stdout/event stream by
+    /// [`Command::timeout`](crate::Command::timeout): at the deadline, claim the
+    /// timeout via the shared arbiter and tear the tree down so the pipes close
+    /// and the stream ends. Armed once — a second streaming call won't duplicate
+    /// it. Shared by [`stdout_lines`](Self::stdout_lines) and
+    /// [`output_events`](Self::output_events); deliberately NOT called by
+    /// `wait_for_line`, so a readiness probe never kills the child.
+    fn arm_stream_deadline(&mut self) {
         // Bound the stream by the command's timeout: kill the tree at the deadline
         // so the pipes close and this stream ends. A `Weak` to the group means a
         // hard-kill timer never delays kill-on-close when the handle is dropped
@@ -200,16 +230,6 @@ impl RunningProcess {
         // do). Claim the timeout via the arbiter first so the finisher classifies
         // `TimedOut`; if the script already exited the CAS fails and we skip.
         self.arm_scripted_deadline();
-
-        // The cancel watchdog is armed at spawn time by `arm_cancel_watchdog`
-        // (via `launch`/`attach_group`), so streaming consumers don't need to
-        // re-arm it here. The stored `cancel_task` is already `Some` if a token
-        // was configured; `abort_watchdogs` will abort it on reap or drop.
-
-        Ok(StdoutLines {
-            sink: stdout_sink,
-            wait: None,
-        })
     }
 
     /// Finish a streamed run: wait for exit and return a [`Finished`]
@@ -386,50 +406,9 @@ impl RunningProcess {
             closed
         };
 
-        // Arm the deadline watchdog (same as stdout_lines — bounds the stream).
-        if self.deadline_task.is_none()
-            && let (Some(limit), Some(group)) = (self.timeout, self.backend.own_group())
-        {
-            let group = Arc::downgrade(group);
-            let pid = self.pid;
-            let grace = self.timeout_grace;
-            let signal = self.timeout_signal;
-            let started = self.started;
-            // B1: see `stdout_lines` — claim the timeout via the arbiter and
-            // kill only if we won the race against the natural reap.
-            let timeout_state = self.timeout_state.clone();
-            self.deadline_task = Some(tokio::spawn(async move {
-                let remaining = limit
-                    .checked_sub(started.elapsed())
-                    .unwrap_or(std::time::Duration::ZERO);
-                tokio::time::sleep(remaining).await;
-                if timeout_state
-                    .compare_exchange(
-                        super::TS_PENDING,
-                        super::TS_TIMED_OUT,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_err()
-                {
-                    return; // the child already exited on its own — no kill
-                }
-                match grace {
-                    Some(grace) => match group.upgrade() {
-                        Some(group) => {
-                            let _ = group.graceful_terminate(grace, signal).await;
-                        }
-                        None => kill_direct_child(pid),
-                    },
-                    None => kill_via_weak(&group, pid),
-                }
-            }));
-        }
-
-        // F2: scripted analogue — see `stdout_lines`.
-        self.arm_scripted_deadline();
-
-        // Cancel watchdog is now armed at spawn time — no re-arm needed here.
+        // Bound the live stream by `Command::timeout` (shared with stdout_lines).
+        // The cancel watchdog is already armed at spawn time — no re-arm here.
+        self.arm_stream_deadline();
 
         Ok(OutputEvents {
             stdout_sink,
