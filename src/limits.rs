@@ -36,6 +36,10 @@
 /// work elsewhere (the create-leaf→migrate-self→enable dance); do that externally
 /// if you need them. (When the controllers are already enabled — at the root — no
 /// `subtree_control` write is attempted.)
+///
+/// Derives `PartialEq` but **not** `Eq` (unlike the sibling config/stats types):
+/// [`cpu_quota`](Self::cpu_quota) is an `Option<f64>`, and `f64` is not `Eq`. So
+/// `ResourceLimits` compares with `==` but can't be a `HashMap`/`BTreeSet` key.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 #[non_exhaustive]
 pub struct ResourceLimits {

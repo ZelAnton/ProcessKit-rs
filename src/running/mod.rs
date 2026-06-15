@@ -766,6 +766,12 @@ impl RunningProcess {
     /// Deliberately NOT routed through `finish_lines`: stdout is a raw byte
     /// reader (no line pump), with its own bounded drain-then-abort teardown.
     ///
+    /// On a **timeout/cancellation teardown** the raw reader is aborted and the
+    /// bytes captured so far are returned (best-effort, like the line pumps): a
+    /// chunk read in the instant the abort lands can be dropped, so the captured
+    /// bytes for a killed run are a prefix, not guaranteed to be every byte the
+    /// child wrote before the kill.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Io`] with [`InvalidInput`](std::io::ErrorKind::InvalidInput)

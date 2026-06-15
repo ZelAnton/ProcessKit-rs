@@ -92,6 +92,10 @@ impl Drop for AbortTasksOnDrop {
 /// - Per-stage [`Command::timeout`]s still apply to their own stage; a staged
 ///   timeout surfaces as that stage's failure. [`timeout`](Self::timeout)
 ///   bounds the whole chain.
+/// - A per-stage [`Command::retry`] is **not** applied: stages run through the
+///   streaming `start` path (which never retries), so a `retry(..)` set on a
+///   stage has no effect inside a pipeline. Retry a whole chain by wrapping the
+///   `Pipeline` call yourself.
 /// - A `Pipeline` can be re-run (stages are re-cloned per run), but a one-shot
 ///   [`Stdin`](crate::Stdin) source on the *first* stage
 ///   (`from_reader`/`from_lines`) is consumed by the first run; re-running then

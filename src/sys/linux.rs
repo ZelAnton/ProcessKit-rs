@@ -245,6 +245,14 @@ impl Job {
                 // without the "no internal processes" rule), so cpu/memory aren't
                 // available from the cgroup itself — sum per-process /proc
                 // counters of the live members instead.
+                //
+                // Note: `cgroup.procs` retains an unreaped zombie's pid until its
+                // parent reaps it, and `/proc/<pid>/stat` still reports the
+                // zombie's final counters — so a tree with unreaped zombies can
+                // momentarily over-report `active_process_count` and fold dead
+                // members' CPU/memory. (The pgroup backend over-reports the count
+                // the same way; it reports no CPU/memory at all, so only the count
+                // is affected there.)
                 let pids = cg.members();
                 let active = pids.len();
                 let mut cpu = Duration::ZERO;
