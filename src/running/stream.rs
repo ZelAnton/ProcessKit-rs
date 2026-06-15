@@ -802,4 +802,92 @@ mod tests {
         assert!(matches!(&second, OutputEvent::Stderr(line) if line.text == "err"));
         assert_eq!(second.text(), Some("err"));
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdout_lines_loses_no_line_under_a_parking_consumer() {
+        // P3-1: stress the park/wake/notify path. A producer pushes many lines —
+        // yielding so the consumer genuinely parks between them — then closes; the
+        // consumer must receive EVERY line in push order and the stream must
+        // terminate. A lost wakeup would hang (caught by the timeout) or drop a
+        // line. The multi-thread runtime makes push/notify truly race
+        // try_pop/register.
+        const N: usize = 5_000;
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        let producer = {
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                for i in 0..N {
+                    sink.push(i.to_string());
+                    if i % 7 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                sink.close_now();
+            })
+        };
+        let mut lines = StdoutLines { sink, wait: None };
+        let consume = async {
+            let mut seen = 0usize;
+            while let Some(line) = lines.next().await {
+                assert_eq!(line, seen.to_string(), "lines must arrive in push order");
+                seen += 1;
+            }
+            seen
+        };
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(30), consume)
+            .await
+            .expect("consumer hung — possible lost wakeup");
+        producer.await.expect("producer task");
+        assert_eq!(seen, N, "every pushed line must be received");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn output_events_lose_no_line_under_two_racing_producers() {
+        // P3-1: the merged stream parks on TWO sinks; stress both wakeups. Two
+        // producers feed stdout and stderr concurrently, then close; the consumer
+        // must receive all 2N events and terminate. A lost wakeup on either sink
+        // would hang or drop events.
+        const N: usize = 3_000;
+        let stdout_sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        let stderr_sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        let feed = |sink: Arc<SharedLines>| {
+            tokio::spawn(async move {
+                for i in 0..N {
+                    sink.push(i.to_string());
+                    if i % 5 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                sink.close_now();
+            })
+        };
+        let p_out = feed(stdout_sink.clone());
+        let p_err = feed(stderr_sink.clone());
+        let mut events = OutputEvents {
+            stdout_sink,
+            stderr_sink,
+            stdout_wait: None,
+            stderr_wait: None,
+            stdout_done: false,
+            stderr_done: false,
+            prefer_stdout: true,
+        };
+        let consume = async {
+            let (mut out, mut err) = (0usize, 0usize);
+            while let Some(ev) = events.next().await {
+                match ev {
+                    OutputEvent::Stdout(_) => out += 1,
+                    OutputEvent::Stderr(_) => err += 1,
+                }
+            }
+            (out, err)
+        };
+        let (out, err) = tokio::time::timeout(std::time::Duration::from_secs(30), consume)
+            .await
+            .expect("consumer hung — possible lost wakeup");
+        p_out.await.expect("stdout producer");
+        p_err.await.expect("stderr producer");
+        assert_eq!(out, N, "every stdout line received");
+        assert_eq!(err, N, "every stderr line received");
+    }
 }

@@ -1097,16 +1097,36 @@ impl RunningProcess {
         let every = every.max(Duration::from_millis(1));
         let started = self.started;
         let acc = Arc::new(Mutex::new(Acc::default()));
+        // P2-10: set by the `on_exit` hook once the child is reaped, so the
+        // sampler stops folding readings taken against a pid the OS may have freed
+        // for reuse (which would corrupt the peak/CPU numbers). Checked both
+        // before the read and before the fold. This *narrows* — does not fully
+        // close — the recycled-pid window: the actual reap (`waitpid`) happens
+        // inside `backend_wait`, a few frames before this flag is set, so a read
+        // that both starts and finishes in that brief gap can still be folded. It
+        // is the same scheduler-quantum residual the kill watchdogs accept, now
+        // bounded to at most one stale sample instead of the whole drain.
+        let reaped = Arc::new(AtomicBool::new(false));
         // Sampling needs only the pid (process_metrics is a free query), so the
         // task never borrows `self` and the consuming wait below stays intact.
         let sampler = self.pid.map(|pid| {
             let acc = Arc::clone(&acc);
+            let reaped = Arc::clone(&reaped);
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(every);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     ticker.tick().await;
+                    // Reaped before this tick → the pid may already be recycled.
+                    if reaped.load(Ordering::Acquire) {
+                        break;
+                    }
                     let metrics = crate::sys::process_metrics(pid);
+                    // Reaped while this read was in flight → discard it (it may
+                    // have hit a recycled process) and stop.
+                    if reaped.load(Ordering::Acquire) {
+                        break;
+                    }
                     if let Ok(mut acc) = acc.lock() {
                         acc.samples += 1;
                         // Cumulative CPU only grows while the process lives;
@@ -1137,16 +1157,17 @@ impl RunningProcess {
         }
         let _sampler_guard = sampler.as_ref().map(|h| AbortOnDrop(h.abort_handle()));
 
-        // The `on_exit` hook aborts the sampler when the child is reaped: its pid
-        // is free for reuse from that point (Linux), and the pump drain can idle
-        // out PUMP_TEARDOWN on a leaked pipe — long enough for a recycled pid to
-        // masquerade as the child and corrupt the readings (L11). The abort is
-        // asynchronous, so a sample already in flight at reap may still complete
-        // against the (possibly just-recycled) pid — a one-tick residual window,
-        // the same scheduler-quantum tradeoff as the kill watchdogs; the abort
-        // bounds it to at most one further reading rather than the whole drain.
+        // The `on_exit` hook signals + aborts the sampler when the child is
+        // reaped: its pid is free for reuse from that point (Linux), and the pump
+        // drain can idle out PUMP_TEARDOWN on a leaked pipe — long enough for a
+        // recycled pid to masquerade as the child and corrupt the readings (L11).
+        // `abort` is asynchronous, so the `reaped` flag (set here, before the
+        // abort) does the real work: the sampler checks it before folding, so a
+        // reading taken once the pid may be recycled is discarded rather than
+        // folded — narrowing the window to the brief reap→store gap (P2-10).
         let outcome = self
             .finish_lines(CaptureMode::Discard, /* expose_counts */ false, || {
+                reaped.store(true, Ordering::Release);
                 if let Some(task) = &sampler {
                     task.abort();
                 }

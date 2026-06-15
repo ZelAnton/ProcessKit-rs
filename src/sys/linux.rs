@@ -35,6 +35,18 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 /// its first use (effectively a per-process value, computed once via `OnceLock`);
 /// concurrent jobs / two crate versions in one process share the salt but differ
 /// by the monotonic counter.
+///
+/// P3-13: those leftover dirs from a *hard-killed* ProcessKit process accumulate
+/// (its `Drop` never ran). A `SIGKILL` of the host is the one case the kill-on-
+/// drop guarantee cannot cover — cleanup code can't run — and a cgroup, unlike a
+/// Windows Job Object, is **not** torn down by the kernel when its creator dies,
+/// so such a leftover dir may still contain a live, orphaned tree (only the
+/// opt-in `kill_on_parent_death` / `PR_SET_PDEATHSIG` propagates host death, and
+/// only to the direct child). The salt above keeps these leftovers from ever
+/// affecting a *future* run. A startup sweep is deliberately NOT done: it would
+/// have to scan the delegated hierarchy and could race another live ProcessKit
+/// instance's dirs. Operators who churn through many crashes can reclaim stale
+/// `processkit-*` dirs (and any surviving trees) out of band.
 fn cgroup_name_salt() -> u64 {
     static SALT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *SALT.get_or_init(|| {
