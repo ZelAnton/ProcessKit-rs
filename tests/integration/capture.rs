@@ -741,7 +741,7 @@ async fn top_level_run_and_output() {
         .expect("run cargo --version");
     assert!(v.to_lowercase().contains("cargo"), "unexpected: {v}");
 
-    let result = processkit::output("cargo", ["--version"])
+    let result = processkit::output_string("cargo", ["--version"])
         .await
         .expect("output cargo --version");
     assert!(result.is_success());

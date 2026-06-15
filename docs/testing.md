@@ -3,14 +3,14 @@
 [‹ docs index](README.md)
 
 Code that shells out is miserable to test — unless the subprocess is behind a
-seam. In `processkit` that seam is one small trait. Only `output` is required;
+seam. In `processkit` that seam is one small trait. Only `output_string` is required;
 `output_bytes` (raw-byte stdout) and `start` (a live handle for streaming/probes)
-are **defaulted**, so a minimal double implements just `output`:
+are **defaulted**, so a minimal double implements just `output_string`:
 
 ```rust,ignore
 #[async_trait]
 pub trait ProcessRunner: Send + Sync {
-    async fn output(&self, command: &Command) -> Result<ProcessResult<String>>;
+    async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>>;
     // Defaulted (route through `start`); override for byte/streaming support:
     async fn output_bytes(&self, command: &Command) -> Result<ProcessResult<Vec<u8>>>;
     async fn start(&self, command: &Command) -> Result<RunningProcess>;
@@ -50,7 +50,7 @@ returns a live `RunningProcess`, and a `ScriptedRunner`'s `start` hands back a
 scripted handle whose canned lines flow through the same pump machinery a real
 child uses — `stdout_lines`, `wait_for_line`, and `finish` behave
 identically, with no subprocess (see
-[Scripted streaming](#scripted-streaming) below). An `output`-only custom
+[Scripted streaming](#scripted-streaming) below). An `output_string`-only custom
 runner keeps compiling: `start` is defaulted to `Error::Unsupported`.
 
 ```rust,no_run
@@ -209,7 +209,7 @@ expectations) — the right tool when the *interaction* is the contract.
 use processkit::testing::MockRunner;
 
 let mut mock = MockRunner::new();
-mock.expect_output()
+mock.expect_output_string()
     .times(1)
     .returning(|_cmd| /* build a Result<ProcessResult<String>> */ …);
 ```
@@ -328,7 +328,7 @@ let head = git.head(Path::new(".")).await?;
 The generated type is `Git<R: ProcessRunner = JobRunner>` with `Git::new()`,
 `Git::with_runner(runner)`, `default_timeout` / `default_env` /
 `default_env_remove` builders, and a public `core: CliClient<R>` whose helpers
-speak the crate-wide verb vocabulary: `run` (trimmed stdout), `output` (full
+speak the crate-wide verb vocabulary: `run` (trimmed stdout), `output_string` (full
 result), `run_unit` (success only), `exit_code`, `probe`, plus `parse`
 (infallible) and `try_parse` (fallible → `Error::Parse`).
 

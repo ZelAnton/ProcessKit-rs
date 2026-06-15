@@ -11,7 +11,7 @@ use std::task::Poll;
 
 use crate::{Command, ProcessResult, ProcessRunner, Result};
 
-/// The boxed future a [`ProcessRunner::output`] / [`ProcessRunner::output_bytes`]
+/// The boxed future a [`ProcessRunner::output_string`] / [`ProcessRunner::output_bytes`]
 /// call returns (via `async-trait`): already pinned, boxed, and `Send`, so the
 /// batch driver stores it as-is. Generic over the captured payload `T` (`String`
 /// for [`output_all`], `Vec<u8>` for [`output_all_bytes`]).
@@ -85,7 +85,7 @@ where
     R: ProcessRunner + ?Sized,
     I: IntoIterator<Item = Command>,
 {
-    run_all(commands, concurrency, runner, |r, c| r.output(c)).await
+    run_all(commands, concurrency, runner, |r, c| r.output_string(c)).await
 }
 
 /// The raw-bytes companion to [`output_all`]: the same bounded fan-out, but each
@@ -208,7 +208,7 @@ mod tests {
     use super::*;
     use crate::testing::{Reply, ScriptedRunner};
 
-    // A scripted runner answers each `output` with a canned reply keyed on the
+    // A scripted runner answers each `output_string` with a canned reply keyed on the
     // command's args — no subprocess, so these exercise the batch driver itself
     // hermetically. Each batch command carries a distinct arg to route it.
 
@@ -253,7 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_all_never_exceeds_and_actually_reaches_the_concurrency_cap() {
-        // A probe runner whose `output` future stays `Pending` across several
+        // A probe runner whose `output_string` future stays `Pending` across several
         // polls (via `yield_now`), so the batch driver tops the active set up to
         // the cap *before* any future completes — letting us observe the true peak
         // concurrency. The synchronous-`Ready` `ScriptedRunner` can't exercise the
@@ -269,7 +269,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl ProcessRunner for ConcurrencyProbe {
-            async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+            async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
                 let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.peak.fetch_max(now, Ordering::SeqCst);
                 for _ in 0..4 {
@@ -326,8 +326,8 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl ProcessRunner for BytesEcho {
-            async fn output(&self, _command: &Command) -> Result<ProcessResult<String>> {
-                unreachable!("output_all_bytes must use output_bytes, not output")
+            async fn output_string(&self, _command: &Command) -> Result<ProcessResult<String>> {
+                unreachable!("output_all_bytes must use output_bytes, not output_string")
             }
             async fn output_bytes(&self, command: &Command) -> Result<ProcessResult<Vec<u8>>> {
                 let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;

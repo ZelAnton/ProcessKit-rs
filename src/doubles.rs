@@ -10,7 +10,7 @@
 //! for expectation-style mocking. All of these live under
 //! [`processkit::testing`](crate::testing) (D6), not the crate root.
 //!
-//! The seam covers **both shapes of a run**. The bulk verbs (`output` and the
+//! The seam covers **both shapes of a run**. The bulk verbs (`output_string` and the
 //! helpers over it) replay canned results — and feed the command's
 //! `on_stdout_line`/`on_stderr_line` handlers, so progress-reporting paths
 //! test hermetically. A scripted [`start`](crate::ProcessRunner::start) hands
@@ -20,7 +20,7 @@
 //! (per-line pacing via [`Reply::with_line_delay`]). Scripted handles have no
 //! OS identity (`pid()` is `None`), don't compose into a real
 //! [`Pipeline`](crate::Pipeline), and don't model interactive stdin. The bulk
-//! `output` replay also does not model a bounded-buffer **truncation** policy
+//! `output_string` replay also does not model a bounded-buffer **truncation** policy
 //! (a canned reply is returned whole, `truncated() == false`), so the
 //! checking-verb truncation error (B12) won't fire against a bulk double — to
 //! exercise that, drive output through a scripted [`start`] handle (whose canned
@@ -62,7 +62,7 @@ pub struct Reply {
     /// [`pending`](Self::pending)); the other fields are unused then.
     pending: bool,
     /// On a scripted `start`, sleep this long before each stdout line (see
-    /// [`with_line_delay`](Self::with_line_delay)). Bulk `output` ignores it.
+    /// [`with_line_delay`](Self::with_line_delay)). Bulk `output_string` ignores it.
     line_delay: Option<std::time::Duration>,
 }
 
@@ -98,7 +98,7 @@ impl Reply {
     /// A timed-out reply — drives the timeout path so a test can assert that a
     /// command which exceeds its deadline surfaces as [`Error::Timeout`](crate::Error::Timeout).
     ///
-    /// On the bulk verbs (`output` and friends) this synthesizes a timed-out
+    /// On the bulk verbs (`output_string` and friends) this synthesizes a timed-out
     /// result directly. On a scripted [`start`](crate::ProcessRunner::start),
     /// though, it resolves **immediately** as timed-out rather than parking until
     /// a deadline — it does not exercise the real deadline-watchdog race (L10). To
@@ -185,7 +185,7 @@ impl Reply {
     /// On a scripted `start`, sleep `delay` before each stdout line — so a
     /// hermetic streaming test can observe genuinely incremental delivery
     /// (deterministic under `#[tokio::test(start_paused = true)]`). The
-    /// scripted run "exits" after the last line. Ignored by the bulk `output`
+    /// scripted run "exits" after the last line. Ignored by the bulk `output_string`
     /// path.
     pub fn with_line_delay(mut self, delay: std::time::Duration) -> Self {
         self.line_delay = Some(delay);
@@ -352,7 +352,7 @@ struct RuleEntry {
 ///         .fallback(Reply::fail(1, "unexpected command"));
 ///
 ///     let out = runner
-///         .output(&Command::new("tool").arg("--version"))
+///         .output_string(&Command::new("tool").arg("--version"))
 ///         .await
 ///         .expect("scripted reply");
 ///     assert!(out.is_success());
@@ -506,7 +506,7 @@ impl ScriptedRunner {
 
 /// Replay `stdout`/`stderr` text through the command's `on_stdout_line` /
 /// `on_stderr_line` handlers (panic-isolated, B6), so a wrapper's
-/// progress-reporting path is exercised hermetically on the bulk `output` verb
+/// progress-reporting path is exercised hermetically on the bulk `output_string` verb
 /// — both for a [`ScriptedRunner`] reply and a cassette replay (F6). On a
 /// scripted/real `start`, the live pumps invoke the handlers instead.
 pub(crate) fn replay_line_handlers(command: &Command, stdout: &str, stderr: &str) {
@@ -540,7 +540,7 @@ fn invoke_isolated(handler: &mut Option<crate::pump::LineHandler>, line: &str) {
 
 #[async_trait::async_trait]
 impl ProcessRunner for ScriptedRunner {
-    async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+    async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
         let program = command.program().to_string_lossy().into_owned();
         // F4: a token already cancelled short-circuits with `Cancelled`, exactly
         // as the live runner does pre-spawn — not a canned reply.
@@ -582,7 +582,7 @@ impl ProcessRunner for ScriptedRunner {
     async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
         let program = command.program().to_string_lossy().into_owned();
         // F4: an already-cancelled token short-circuits with `Cancelled`, exactly
-        // as the live runner does pre-spawn — `output` AND `start` both route
+        // as the live runner does pre-spawn — `output_string` AND `start` both route
         // through `launch`'s pre-spawn check. Without it, `first_line` (which
         // routes through `start`) would stream canned lines instead of cancelling.
         if let Some(token) = command.cancel_token()
@@ -730,16 +730,16 @@ impl<R: ProcessRunner> RecordingRunner<R> {
 
 #[async_trait::async_trait]
 impl<R: ProcessRunner> ProcessRunner for RecordingRunner<R> {
-    async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+    async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
         self.calls
             .lock()
             .expect("recorder lock poisoned")
             .push(Invocation::from_command(command));
-        self.inner.output(command).await
+        self.inner.output_string(command).await
     }
 
     async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
-        // Recorded BEFORE delegating (like `output`), so a streamed run is
+        // Recorded BEFORE delegating (like `output_string`), so a streamed run is
         // captured even if its stream is never consumed.
         self.calls
             .lock()
@@ -1130,7 +1130,7 @@ mod tests {
                 let errs = errs.clone();
                 move |l| errs.lock().unwrap().push(l.to_owned())
             });
-        let result = runner.output(&cmd).await.expect("scripted run");
+        let result = runner.output_string(&cmd).await.expect("scripted run");
         assert!(result.is_success());
         assert_eq!(*seen.lock().unwrap(), ["a", "b"]);
         assert!(errs.lock().unwrap().is_empty());
@@ -1138,7 +1138,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_isolates_a_panicking_line_handler() {
-        // B6: a panicking handler on the bulk `output` path is caught and
+        // B6: a panicking handler on the bulk `output_string` path is caught and
         // disabled, and the run still completes — matching the live pump's
         // panic-isolation contract (the doubles must not diverge on it).
         use std::sync::Arc;
@@ -1154,7 +1154,7 @@ mod tests {
             }
         });
         let result = runner
-            .output(&cmd)
+            .output_string(&cmd)
             .await
             .expect("a handler panic must not fail the scripted run");
         assert!(result.is_success());
@@ -1173,7 +1173,7 @@ mod tests {
         let runner = ScriptedRunner::new().fallback(Reply::ok("canned"));
         let cmd = Command::new("x").stdout(crate::StdioMode::Null);
         let err = runner
-            .output(&cmd)
+            .output_string(&cmd)
             .await
             .expect_err("a non-piped stdout must error on a capture verb");
         match err {
@@ -1193,7 +1193,7 @@ mod tests {
         let runner = ScriptedRunner::new().fallback(Reply::ok("must not be returned"));
         let cmd = Command::new("x").cancel_on(token);
         let err = runner
-            .output(&cmd)
+            .output_string(&cmd)
             .await
             .expect_err("a pre-cancelled token short-circuits");
         assert!(
@@ -1205,7 +1205,7 @@ mod tests {
     #[tokio::test]
     async fn start_with_an_already_cancelled_token_short_circuits() {
         // F4: `start` (the path `first_line` routes through) must short-circuit
-        // a pre-cancelled token too, exactly as `output` and the live runner do
+        // a pre-cancelled token too, exactly as `output_string` and the live runner do
         // — not hand back a live scripted handle.
         let token = crate::CancellationToken::new();
         token.cancel();
@@ -1355,7 +1355,7 @@ mod tests {
     async fn prefix_rule_matches_and_replies() {
         let runner = ScriptedRunner::new().on(["git", "status"], Reply::ok("clean"));
         let out = runner
-            .output(&Command::new("git").arg("status"))
+            .output_string(&Command::new("git").arg("status"))
             .await
             .unwrap();
         assert_eq!(out.stdout(), "clean");
@@ -1373,13 +1373,16 @@ mod tests {
 
         assert_eq!(
             runner
-                .output(&Command::new("tool").arg("--version"))
+                .output_string(&Command::new("tool").arg("--version"))
                 .await
                 .unwrap()
                 .stdout(),
             "v1"
         );
-        let miss = runner.output(&Command::new("tool").arg("x")).await.unwrap();
+        let miss = runner
+            .output_string(&Command::new("tool").arg("x"))
+            .await
+            .unwrap();
         assert_eq!(miss.code(), Some(1));
         assert!(!miss.is_success());
     }
@@ -1388,7 +1391,7 @@ mod tests {
     async fn no_match_without_fallback_is_a_not_found_spawn_error() {
         let runner = ScriptedRunner::new().on(["git", "status"], Reply::ok("clean"));
         let err = runner
-            .output(&Command::new("git").arg("log"))
+            .output_string(&Command::new("git").arg("log"))
             .await
             .expect_err("an unmatched command with no fallback must error");
         match err {
@@ -1406,14 +1409,14 @@ mod tests {
         // ["tool", "foo", anything…] matches — element-wise prefix.
         assert!(
             runner
-                .output(&Command::new("tool").args(["foo", "bar"]))
+                .output_string(&Command::new("tool").args(["foo", "bar"]))
                 .await
                 .is_ok()
         );
         // ["foobar"] must NOT: "foo" is a substring, not an args prefix.
         assert!(
             runner
-                .output(&Command::new("tool").arg("foobar"))
+                .output_string(&Command::new("tool").arg("foobar"))
                 .await
                 .is_err(),
             "substring of an element is not a prefix match"
@@ -1429,12 +1432,12 @@ mod tests {
             .on(["git", "status"], Reply::ok("on branch main"))
             .fallback(Reply::fail(1, "unmatched"));
         let hit = runner
-            .output(&Command::new("git").arg("status"))
+            .output_string(&Command::new("git").arg("status"))
             .await
             .unwrap();
         assert_eq!(hit.stdout(), "on branch main");
         let miss = runner
-            .output(&Command::new("rm").arg("status"))
+            .output_string(&Command::new("rm").arg("status"))
             .await
             .unwrap();
         assert_eq!(
@@ -1454,7 +1457,7 @@ mod tests {
         );
         assert_eq!(
             runner
-                .output(&Command::new("git").arg("push"))
+                .output_string(&Command::new("git").arg("push"))
                 .await
                 .unwrap()
                 .code(),
@@ -1464,7 +1467,7 @@ mod tests {
         for nth in ["2nd", "3rd"] {
             assert_eq!(
                 runner
-                    .output(&Command::new("git").arg("push"))
+                    .output_string(&Command::new("git").arg("push"))
                     .await
                     .unwrap()
                     .stdout(),
@@ -1479,7 +1482,7 @@ mod tests {
         use crate::error::Error;
         let runner = ScriptedRunner::new().fallback(Reply::timeout());
         // capture/output exposes the flag without erroring …
-        let out = runner.output(&Command::new("git")).await.unwrap();
+        let out = runner.output_string(&Command::new("git")).await.unwrap();
         assert!(out.timed_out());
         // … but the success-checking helpers raise a distinct Timeout.
         assert!(matches!(
@@ -1519,7 +1522,7 @@ mod tests {
     async fn signalled_reply_carries_signal_number() {
         use crate::error::Error;
         let runner = ScriptedRunner::new().fallback(Reply::signalled(Some(9)));
-        let result = runner.output(&Command::new("tool")).await.unwrap();
+        let result = runner.output_string(&Command::new("tool")).await.unwrap();
         assert_eq!(result.outcome(), crate::Outcome::Signalled(Some(9)));
         assert!(matches!(
             runner.run(&Command::new("tool")).await.unwrap_err(),
@@ -1534,7 +1537,7 @@ mod tests {
     async fn signalled_reply_without_a_number_is_signalled_none() {
         use crate::error::Error;
         let runner = ScriptedRunner::new().fallback(Reply::signalled(None));
-        let result = runner.output(&Command::new("tool")).await.unwrap();
+        let result = runner.output_string(&Command::new("tool")).await.unwrap();
         assert_eq!(result.outcome(), crate::Outcome::Signalled(None));
         assert!(matches!(
             runner.run(&Command::new("tool")).await.unwrap_err(),
@@ -1551,7 +1554,7 @@ mod tests {
             .args(["run", "watch"])
             .cancel_on(token.clone());
 
-        let call = runner.output(&cmd);
+        let call = runner.output_string(&cmd);
         tokio::pin!(call);
         assert!(
             tokio::time::timeout(std::time::Duration::from_secs(3600), &mut call)
@@ -1572,7 +1575,7 @@ mod tests {
         // a hung child nobody can cancel.
         let runner = ScriptedRunner::new().fallback(Reply::pending());
         let cmd = Command::new("gh");
-        let call = runner.output(&cmd);
+        let call = runner.output_string(&cmd);
         tokio::pin!(call);
         assert!(
             tokio::time::timeout(std::time::Duration::from_secs(3600), &mut call)
@@ -1620,7 +1623,7 @@ mod tests {
     async fn recording_captures_args_cwd_and_absence() {
         let recorder = RecordingRunner::replying(Reply::ok("ok"));
         let _ = recorder
-            .output(
+            .output_string(
                 &Command::new("gh")
                     .current_dir("/repo")
                     .args(["pr", "create", "--title", "T"]),

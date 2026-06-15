@@ -98,7 +98,7 @@ async fn client_default_cancel_on_cancels_a_real_run() {
     let err = completes_within(
         Duration::from_secs(10),
         "client-default cancel",
-        client.output(cmd),
+        client.output_string(cmd),
     )
     .await
     .expect_err("a cancelled run must error, not produce a result");

@@ -99,7 +99,7 @@ you get back:
 | a live handle — streaming, stdin, probes | `.start()` | [`RunningProcess`] |
 
 The same vocabulary repeats on every layer (`ProcessRunner`, `CliClient`), and
-`processkit::run("git", ["status"])` / `processkit::output(…)` skip the builder
+`processkit::run("git", ["status"])` / `processkit::output_string(…)` skip the builder
 for one-liners.
 
 ## Quick start

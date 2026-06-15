@@ -67,7 +67,7 @@ pub struct ProcessResult<T> {
     /// success-checking helpers can build a faithful [`Error::Timeout`].
     timeout: Option<Duration>,
     /// Wall-clock duration of the run; `Duration::ZERO` for synthetic results
-    /// (a scripted/replayed bulk `output` that didn't time a real process).
+    /// (a scripted/replayed bulk `output_string` that didn't time a real process).
     duration: Duration,
     /// Whether a bounded [`OutputBufferPolicy`](crate::OutputBufferPolicy)
     /// dropped captured output lines.
@@ -245,7 +245,7 @@ impl<T> ProcessResult<T> {
 
     /// The wall-clock duration of the run — spawn to exit (or kill). It is
     /// `Duration::ZERO` for synthetic results that didn't time a real process
-    /// (a scripted/replayed bulk `output`).
+    /// (a scripted/replayed bulk `output_string`).
     pub fn duration(&self) -> Duration {
         self.duration
     }

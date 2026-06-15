@@ -63,9 +63,11 @@
 //!   whitespace trimmed (`trim_end`: the final newline is noise, but leading
 //!   whitespace can be significant). **`run_unit`** — the same, discarding the
 //!   output.
-//! - **`output`** — return the full [`ProcessResult`]; a non-zero exit is
-//!   *not* an error here. (`Command` splits the verb by payload:
-//!   `output_string` / `output_bytes`.)
+//! - **`output_string`** / **`output_bytes`** — return the full
+//!   [`ProcessResult`] (stdout as text / raw bytes); a non-zero exit is *not* an
+//!   error here. (`output_string`, not a bare `output`, since
+//!   `std::process::Command::output` yields *bytes* — the explicit name avoids
+//!   that footgun and is spelled the same on every layer.)
 //! - **`exit_code`** — the exit code, with a missing code surfaced as an
 //!   error. (On a [`ProcessResult`], [`code`](ProcessResult::code) is the
 //!   plain `Option<i32>` accessor — `None` for a timeout/signal kill, never a
@@ -236,7 +238,10 @@ where
 
 /// Run `program` with `args` inside a private job and capture the result
 /// without erroring on a non-zero exit — for commands whose exit code is meaningful.
-pub async fn output<I, S>(program: impl AsRef<OsStr>, args: I) -> Result<ProcessResult<String>>
+pub async fn output_string<I, S>(
+    program: impl AsRef<OsStr>,
+    args: I,
+) -> Result<ProcessResult<String>>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,

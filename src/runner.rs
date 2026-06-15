@@ -1,6 +1,6 @@
 //! The [`ProcessRunner`] seam and its real implementations.
 //!
-//! The seam covers both shapes of a run: [`ProcessRunner::output`] (a finished
+//! The seam covers both shapes of a run: [`ProcessRunner::output_string`] (a finished
 //! [`ProcessResult`]) and [`ProcessRunner::start`] (a live [`RunningProcess`]
 //! for streaming/probes). A [`ScriptedRunner`](crate::testing::ScriptedRunner) fakes
 //! both — its `start` hands back a scripted handle that feeds canned lines
@@ -12,10 +12,10 @@ use crate::group::ProcessGroup;
 use crate::result::ProcessResult;
 use crate::running::{RunningProcess, Spawned};
 
-/// Runs a [`Command`] — to a captured result ([`output`](Self::output) /
+/// Runs a [`Command`] — to a captured result ([`output_string`](Self::output_string) /
 /// [`output_bytes`](Self::output_bytes)) or a live handle ([`start`](Self::start)).
 ///
-/// This seam is the mock point — only [`output`](Self::output) is required
+/// This seam is the mock point — only [`output_string`](Self::output_string) is required
 /// (`output_bytes`/`start` are defaulted): production code takes
 /// `&dyn ProcessRunner`; tests pass a
 /// [`ScriptedRunner`](crate::testing::ScriptedRunner) /
@@ -26,7 +26,7 @@ use crate::running::{RunningProcess, Spawned};
 /// `mock`-feature `MockRunner` is different: `mockall::automock` replaces *every*
 /// method — including the defaulted `output_bytes`/`start` — with an expectation,
 /// so a `MockRunner` does **not** inherit the `Unsupported` default (L8). Set the
-/// expectations you exercise (`expect_output()`, and `expect_start()` /
+/// expectations you exercise (`expect_output_string()`, and `expect_start()` /
 /// `expect_output_bytes()` if a verb routes through them) or an unset call panics.
 /// `ScriptedRunner` is the recommended double — it provides the defaults and the
 /// streaming seam out of the box. (The `mock` feature / `MockRunner` are
@@ -36,9 +36,9 @@ use crate::running::{RunningProcess, Spawned};
 pub trait ProcessRunner: Send + Sync {
     /// Run `command` to completion, capturing stdout/stderr and the exit code.
     /// A non-zero exit is reported in the result, not raised.
-    async fn output(&self, command: &Command) -> Result<ProcessResult<String>>;
+    async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>>;
 
-    /// Run `command` to completion, capturing stdout as **raw bytes** (`output`
+    /// Run `command` to completion, capturing stdout as **raw bytes** (`output_string`
     /// captures it as lossy-UTF-8 text); stderr is still text. For binary tools
     /// — `git cat-file`, `tar -c`, an image transcoder — whose stdout is not
     /// UTF-8.
@@ -47,7 +47,7 @@ pub trait ProcessRunner: Send + Sync {
     /// testable through a [`ScriptedRunner`](crate::testing::ScriptedRunner) /
     /// `&ProcessGroup` / [`JobRunner`] like text ones. Defaulted in terms of
     /// [`start`](Self::start) — so a runner that overrides `start` gets byte
-    /// capture for free, and an `output`-only runner (one that does **not**
+    /// capture for free, and an `output_string`-only runner (one that does **not**
     /// override `start`) surfaces [`Error::Unsupported`](crate::Error::Unsupported),
     /// matching `start`. A text fixture (a `record`-feature cassette stores
     /// lossy-UTF-8) cannot reproduce exact bytes; capture bytes from a real or
@@ -60,7 +60,7 @@ pub trait ProcessRunner: Send + Sync {
     /// readiness probes, or incremental consumption.
     ///
     /// Defaulted to [`Error::Unsupported`](crate::Error::Unsupported) so an
-    /// `output`-only runner (a hand-rolled double, a cassette runner) keeps
+    /// `output_string`-only runner (a hand-rolled double, a cassette runner) keeps
     /// compiling; the real runners ([`JobRunner`], `&ProcessGroup`) and
     /// [`ScriptedRunner`](crate::testing::ScriptedRunner) override it.
     ///
@@ -84,8 +84,8 @@ pub trait ProcessRunner: Send + Sync {
 /// where a `ProcessRunner` is expected.
 #[async_trait::async_trait]
 impl<R: ProcessRunner + ?Sized> ProcessRunner for &R {
-    async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
-        (**self).output(command).await
+    async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+        (**self).output_string(command).await
     }
 
     async fn output_bytes(&self, command: &Command) -> Result<ProcessResult<Vec<u8>>> {
@@ -100,7 +100,7 @@ impl<R: ProcessRunner + ?Sized> ProcessRunner for &R {
 }
 
 /// Convenience methods available on every [`ProcessRunner`] (including
-/// `&dyn ProcessRunner`), layered over [`output`](ProcessRunner::output).
+/// `&dyn ProcessRunner`), layered over [`output_string`](ProcessRunner::output_string).
 #[async_trait::async_trait]
 pub trait ProcessRunnerExt: ProcessRunner {
     /// Run, require an **accepted** exit, and return trimmed stdout. Accepted is
@@ -129,7 +129,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// [`ensure_success`](crate::ProcessResult::ensure_success).
     async fn exit_code(&self, command: &Command) -> Result<i32> {
         retrying(command, || async {
-            self.output(command).await?.require_code()
+            self.output_string(command).await?.require_code()
         })
         .await
     }
@@ -142,7 +142,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// commands whose exit code *is* the answer — `git diff --quiet`, `grep -q`, …
     async fn probe(&self, command: &Command) -> Result<bool> {
         retrying(command, || async {
-            let result = self.output(command).await?;
+            let result = self.output_string(command).await?;
             match result.code() {
                 Some(0) => Ok(true),
                 Some(1) => Ok(false),
@@ -166,7 +166,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// captured result (untrimmed stdout). The building block for the
     /// `parse`/`try_parse` helpers — use it when you need the whole
     /// `ProcessResult` after success-checking, rather than just trimmed stdout
-    /// (`run`) or the raw result (`output`).
+    /// (`run`) or the raw result (`output_string`).
     ///
     /// Unlike [`run`](Self::run) (and the
     /// [`CliClient::parse`](crate::CliClient::parse)/[`try_parse`](crate::CliClient::try_parse)
@@ -179,7 +179,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// present stdout as if complete.
     async fn checked(&self, command: &Command) -> Result<ProcessResult<String>> {
         retrying(command, || async {
-            self.output(command).await?.ensure_success()
+            self.output_string(command).await?.ensure_success()
         })
         .await
     }
@@ -304,7 +304,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
 /// Run `attempt` once, or — when `command` carries a [`RetryPolicy`] — up to
 /// `max_attempts` times, retrying while the error is classified retryable and
 /// sleeping `backoff` between tries. The building block under the success-checking
-/// `ProcessRunnerExt` helpers; the non-erroring `output` path never retries.
+/// `ProcessRunnerExt` helpers; the non-erroring `output_string` path never retries.
 async fn retrying<T, Fut, F>(command: &Command, mut attempt: F) -> Result<T>
 where
     F: FnMut() -> Fut,
@@ -385,7 +385,7 @@ impl JobRunner {
 // start-time behavior in the inherent method so no path can bypass it (S2).
 #[async_trait::async_trait]
 impl ProcessRunner for JobRunner {
-    async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+    async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
         JobRunner::start(self, command).await?.output_string().await
     }
 
@@ -405,7 +405,7 @@ impl ProcessGroup {
 
 #[async_trait::async_trait]
 impl ProcessRunner for ProcessGroup {
-    async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+    async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
         ProcessGroup::start(self, command)
             .await?
             .output_string()
@@ -661,7 +661,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ProcessRunner for Flaky {
-        async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+        async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             let code = if n < self.fail_times { 1 } else { 0 };
             Ok(ProcessResult::new(
@@ -811,7 +811,7 @@ mod tests {
         struct TruncatedRunner;
         #[async_trait::async_trait]
         impl ProcessRunner for TruncatedRunner {
-            async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+            async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
                 Ok(ProcessResult::new(
                     command.program().to_string_lossy().into_owned(),
                     "clipped".to_owned(),
@@ -860,7 +860,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ProcessRunner for AlwaysCancelled {
-        async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+        async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Err(Error::Cancelled {
                 program: command.program().to_string_lossy().into_owned(),

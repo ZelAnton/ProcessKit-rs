@@ -493,7 +493,7 @@ impl Command {
     /// helpers — i.e. the ones that surface failure as an [`Error`] the classifier
     /// can inspect (e.g. a transient network failure in `stderr`, or
     /// [`Error::Timeout`](crate::Error::Timeout)). The non-erroring
-    /// `output_string`/`output_bytes`/`output` paths don't retry.
+    /// `output_string`/`output_bytes` paths don't retry.
     ///
     /// Each attempt **re-executes the whole command** — a fresh process. Only
     /// retry operations that are safe to repeat: a side effect that already landed
@@ -918,7 +918,7 @@ impl Command {
     /// D8: `#[doc(hidden)]` — this is a raw-tokio escape hatch, not part of the
     /// advertised 1.0 surface. It stays public and callable for power users
     /// bridging to `ProcessGroup::spawn`, but the recommended path is the
-    /// `start`/`output`/run verbs.
+    /// `start`/`output_string`/run verbs.
     #[doc(hidden)]
     pub fn to_tokio_command(&self) -> tokio::process::Command {
         self.build_tokio()

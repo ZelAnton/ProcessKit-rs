@@ -316,7 +316,7 @@ enum Mode<R> {
 ///   [`timeout`](Command::timeout) configuration, exactly like the live
 ///   runner — so a recorded timed-out run surfaces as
 ///   [`Error::Timeout`](crate::Error::Timeout) with the real deadline.
-/// - Covers the **`output`** shape only. The streaming half of the seam
+/// - Covers the **`output_string`** shape only. The streaming half of the seam
 ///   ([`start`](crate::ProcessRunner::start)) inherits the default and returns
 ///   [`Error::Unsupported`](crate::Error::Unsupported) — recording line timing
 ///   and stream shape is future work; use
@@ -498,7 +498,7 @@ impl RecordReplayRunner<JobRunner> {
 
 #[async_trait::async_trait]
 impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
-    async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+    async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
         // L-1: a one-shot streaming stdin cannot be faithfully keyed (its bytes
         // aren't captured), so refuse it in both modes before doing any work —
         // in record mode this also avoids consuming the source on the inner run.
@@ -510,7 +510,7 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 dirty,
                 ..
             } => {
-                let result = inner.output(command).await?;
+                let result = inner.output_string(command).await?;
                 let invocation = Invocation::from_command(command);
                 let stdin_digest = stdin_digest_of(command);
                 let mut entries = recorded.lock().expect("cassette mutex poisoned");
@@ -525,9 +525,9 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 let stdin_digest = stdin_digest_of(command);
                 // Take an owned copy of the matched entry and release the lock
                 // BEFORE invoking user line handlers: a handler that re-enters
-                // this replayer (`replayer.output(...)`) would otherwise
+                // this replayer (`replayer.output_string(...)`) would otherwise
                 // self-deadlock on the non-reentrant mutex. Record mode and
-                // `ScriptedRunner::output` hold no lock across handlers either.
+                // `ScriptedRunner::output_string` hold no lock across handlers either.
                 let entry = {
                     let mut slots = slots.lock().expect("cassette mutex poisoned");
                     let Some(slot) = slots.get_mut(&key_of(&invocation, stdin_digest)) else {
@@ -544,7 +544,7 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 // F6: feed the replayed output through the command's
                 // `on_stdout_line`/`on_stderr_line` handlers, so a wrapper's
                 // progress path is exercised on replay exactly as it is in
-                // record mode (real pumps) and on `ScriptedRunner::output`.
+                // record mode (real pumps) and on `ScriptedRunner::output_string`.
                 crate::doubles::replay_line_handlers(command, &entry.stdout, &entry.stderr);
                 let outcome = match (entry.code, entry.timed_out) {
                     (_, true) => Outcome::TimedOut,
@@ -670,22 +670,22 @@ mod tests {
 
         let recorder = RecordReplayRunner::record(&path, scripted());
         let ok = recorder
-            .output(&Command::new("tool").arg("--version"))
+            .output_string(&Command::new("tool").arg("--version"))
             .await
             .expect("record ok run");
         let fail = recorder
-            .output(&Command::new("tool").arg("fail"))
+            .output_string(&Command::new("tool").arg("fail"))
             .await
             .expect("record failing run (non-zero exit is a result, not Err)");
         recorder.save().expect("save cassette");
 
         let replayer = RecordReplayRunner::replay(&path).expect("load cassette");
         let ok2 = replayer
-            .output(&Command::new("tool").arg("--version"))
+            .output_string(&Command::new("tool").arg("--version"))
             .await
             .expect("replay ok run");
         let fail2 = replayer
-            .output(&Command::new("tool").arg("fail"))
+            .output_string(&Command::new("tool").arg("fail"))
             .await
             .expect("replay failing run");
         assert_eq!(ok, ok2, "replay must be identical to the recording");
@@ -752,14 +752,14 @@ mod tests {
         let (_dir, path) = temp_cassette();
         let recorder = RecordReplayRunner::record(&path, scripted());
         let _ = recorder
-            .output(&Command::new("tool").arg("--version"))
+            .output_string(&Command::new("tool").arg("--version"))
             .await
             .expect("record");
         recorder.save().expect("save");
 
         let replayer = RecordReplayRunner::replay(&path).expect("load");
         let err = replayer
-            .output(&Command::new("tool").arg("--other"))
+            .output_string(&Command::new("tool").arg("--other"))
             .await
             .expect_err("an unrecorded invocation must not be served");
         match &err {
@@ -776,12 +776,12 @@ mod tests {
     #[tokio::test]
     async fn replay_invokes_line_handlers() {
         // F6: replay feeds the recorded output through `on_stdout_line`, just
-        // like record mode (real pumps) and `ScriptedRunner::output` — a
+        // like record mode (real pumps) and `ScriptedRunner::output_string` — a
         // wrapper's progress path tests the same hermetically on replay.
         let (_dir, path) = temp_cassette();
         let recorder = RecordReplayRunner::record(&path, scripted());
         let _ = recorder
-            .output(&Command::new("tool").arg("--version"))
+            .output_string(&Command::new("tool").arg("--version"))
             .await
             .expect("record");
         recorder.save().expect("save");
@@ -792,7 +792,7 @@ mod tests {
             let seen = seen.clone();
             move |l| seen.lock().unwrap().push(l.to_owned())
         });
-        let _ = replayer.output(&cmd).await.expect("replay");
+        let _ = replayer.output_string(&cmd).await.expect("replay");
         assert_eq!(
             *seen.lock().unwrap(),
             ["tool 1.2.3"],
@@ -810,11 +810,11 @@ mod tests {
             .on_sequence(["tool"], [Reply::ok("out-A\n"), Reply::ok("out-B\n")]);
         let recorder = RecordReplayRunner::record(&path, inner);
         let _ = recorder
-            .output(&Command::new("tool").stdin(crate::Stdin::from_string("A")))
+            .output_string(&Command::new("tool").stdin(crate::Stdin::from_string("A")))
             .await
             .expect("record A");
         let _ = recorder
-            .output(&Command::new("tool").stdin(crate::Stdin::from_string("B")))
+            .output_string(&Command::new("tool").stdin(crate::Stdin::from_string("B")))
             .await
             .expect("record B");
         recorder.save().expect("save");
@@ -823,7 +823,7 @@ mod tests {
         // Replay B FIRST: with stdin in the key it gets out-B. Keying on
         // `has_stdin` alone would collide and return out-A (the first entry).
         let b = replayer
-            .output(&Command::new("tool").stdin(crate::Stdin::from_string("B")))
+            .output_string(&Command::new("tool").stdin(crate::Stdin::from_string("B")))
             .await
             .expect("replay B");
         assert_eq!(
@@ -832,7 +832,7 @@ mod tests {
             "stdin B must replay its own recording"
         );
         let a = replayer
-            .output(&Command::new("tool").stdin(crate::Stdin::from_string("A")))
+            .output_string(&Command::new("tool").stdin(crate::Stdin::from_string("A")))
             .await
             .expect("replay A");
         assert_eq!(
@@ -852,7 +852,7 @@ mod tests {
         let inner = ScriptedRunner::new().fallback(Reply::ok("out\n"));
         let recorder = RecordReplayRunner::record(&path, inner);
         let err = recorder
-            .output(&Command::new("tool").stdin(crate::Stdin::from_reader(&b"payload"[..])))
+            .output_string(&Command::new("tool").stdin(crate::Stdin::from_reader(&b"payload"[..])))
             .await
             .expect_err("record must reject a one-shot streaming stdin");
         assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
@@ -860,13 +860,13 @@ mod tests {
         // Record a plain entry so the cassette loads, then prove replay rejects
         // a streaming stdin too.
         let _ = recorder
-            .output(&Command::new("tool"))
+            .output_string(&Command::new("tool"))
             .await
             .expect("record a replayable entry");
         recorder.save().expect("save");
         let replayer = RecordReplayRunner::replay(&path).expect("load");
         let err = replayer
-            .output(&Command::new("tool").stdin(crate::Stdin::from_reader(&b"payload"[..])))
+            .output_string(&Command::new("tool").stdin(crate::Stdin::from_reader(&b"payload"[..])))
             .await
             .expect_err("replay must reject a one-shot streaming stdin");
         assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
@@ -882,14 +882,14 @@ mod tests {
         let recorder =
             RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("out\n")));
         let _ = recorder
-            .output(&Command::new("tool").stdin(crate::Stdin::from_string("input")))
+            .output_string(&Command::new("tool").stdin(crate::Stdin::from_string("input")))
             .await
             .expect("record with stdin");
         recorder.save().expect("save");
 
         let replayer = RecordReplayRunner::replay(&path).expect("load");
         let err = replayer
-            .output(&Command::new("tool"))
+            .output_string(&Command::new("tool"))
             .await
             .expect_err("a no-stdin call must not match a stdin-recorded entry");
         assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
@@ -903,7 +903,7 @@ mod tests {
             ScriptedRunner::new().on(["tool", "slow"], Reply::timeout()),
         );
         let _ = recorder
-            .output(&Command::new("tool").arg("slow"))
+            .output_string(&Command::new("tool").arg("slow"))
             .await
             .expect("a captured timeout is a result, not an Err");
         recorder.save().expect("save");
@@ -929,7 +929,7 @@ mod tests {
         let recorder =
             RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("done")));
         let _ = recorder
-            .output(
+            .output_string(
                 &Command::new("tool")
                     .env("API_TOKEN", "hunter2-very-secret")
                     .env("MODE", "fast"),
@@ -965,7 +965,7 @@ mod tests {
 
         let replayer = RecordReplayRunner::replay(&path).expect("load cassette");
         let result = replayer
-            .output(&Command::new("tool"))
+            .output_string(&Command::new("tool"))
             .await
             .expect("replay");
         assert_eq!(result.outcome(), Outcome::Signalled(Some(9)));
@@ -981,7 +981,7 @@ mod tests {
 
         let replayer = RecordReplayRunner::replay(&path).expect("load cassette");
         let result = replayer
-            .output(&Command::new("tool"))
+            .output_string(&Command::new("tool"))
             .await
             .expect("replay");
         assert_eq!(result.outcome(), Outcome::Signalled(None));
@@ -1020,7 +1020,7 @@ mod tests {
         {
             let recorder = RecordReplayRunner::record(&path, scripted());
             let _ = recorder
-                .output(&Command::new("tool").arg("--version"))
+                .output_string(&Command::new("tool").arg("--version"))
                 .await
                 .expect("record");
             // No save() — the Drop flush must persist the cassette.
@@ -1039,7 +1039,7 @@ mod tests {
         let recorder =
             RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("from-a")));
         let _ = recorder
-            .output(&Command::new("tool").current_dir("dir-a"))
+            .output_string(&Command::new("tool").current_dir("dir-a"))
             .await
             .expect("record in dir-a");
         recorder.save().expect("save");
@@ -1047,12 +1047,12 @@ mod tests {
         let replayer = RecordReplayRunner::replay(&path).expect("load");
         // Same program+args but a different (or no) cwd must not match.
         let err = replayer
-            .output(&Command::new("tool").current_dir("dir-b"))
+            .output_string(&Command::new("tool").current_dir("dir-b"))
             .await
             .expect_err("a different cwd is a different invocation");
         assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
         let err = replayer
-            .output(&Command::new("tool"))
+            .output_string(&Command::new("tool"))
             .await
             .expect_err("a missing cwd is a different invocation too");
         assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
@@ -1073,7 +1073,7 @@ mod tests {
         let (_dir, path) = temp_cassette();
         let recorder = RecordReplayRunner::record(&path, scripted());
         let _ = recorder
-            .output(&Command::new("tool").arg("--version"))
+            .output_string(&Command::new("tool").arg("--version"))
             .await
             .expect("record");
         recorder.save().expect("save");
@@ -1097,7 +1097,7 @@ mod tests {
         let (_dir, path) = temp_cassette();
         let recorder = RecordReplayRunner::record(&path, scripted());
         let _ = recorder
-            .output(&Command::new("tool").arg("--version"))
+            .output_string(&Command::new("tool").arg("--version"))
             .await
             .expect("record (now dirty, unsaved)");
 
@@ -1120,19 +1120,19 @@ mod tests {
         {
             let recorder = RecordReplayRunner::record(&path, scripted());
             let _ = recorder
-                .output(&Command::new("tool").arg("--version"))
+                .output_string(&Command::new("tool").arg("--version"))
                 .await
                 .expect("record first");
             recorder.save().expect("first save");
             // A run recorded *after* the save must not be lost on drop.
             let _ = recorder
-                .output(&Command::new("tool").arg("fail"))
+                .output_string(&Command::new("tool").arg("fail"))
                 .await
                 .expect("record second");
         }
         let replayer = RecordReplayRunner::replay(&path).expect("load");
         let result = replayer
-            .output(&Command::new("tool").arg("fail"))
+            .output_string(&Command::new("tool").arg("fail"))
             .await
             .expect("the post-save run was flushed by drop");
         assert_eq!(result.code(), Some(7));
@@ -1157,7 +1157,7 @@ mod tests {
         let recorder =
             RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("ok")));
         let cmd = Command::new("tool").arg(&bad);
-        let _ = recorder.output(&cmd).await.expect("record lossily");
+        let _ = recorder.output_string(&cmd).await.expect("record lossily");
         recorder.save().expect("save");
 
         // Both sides apply the same lossy conversion, so the entry matches.

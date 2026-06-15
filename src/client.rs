@@ -270,9 +270,9 @@ impl<R: ProcessRunner> CliClient<R> {
     }
 
     /// Run, capturing the full result without erroring on a non-zero exit — the
-    /// same verb as [`ProcessRunner::output`].
-    pub async fn output(&self, call: impl IntoCommand<R>) -> Result<ProcessResult<String>> {
-        self.runner.output(&call.into_command(self)).await
+    /// same verb as [`ProcessRunner::output_string`].
+    pub async fn output_string(&self, call: impl IntoCommand<R>) -> Result<ProcessResult<String>> {
+        self.runner.output_string(&call.into_command(self)).await
     }
 
     /// Run, capturing stdout as **raw bytes** (stderr as text), without erroring
@@ -798,7 +798,7 @@ mod tests {
             .default_cancel_on(default_token.clone());
         let cmd = client.command(["run", "watch"]).cancel_on(explicit.clone());
 
-        let call = client.output(cmd);
+        let call = client.output_string(cmd);
         tokio::pin!(call);
         default_token.cancel();
         assert!(
@@ -829,7 +829,7 @@ mod tests {
         );
         let client = CliClient::with_runner("gh", &rec).default_cancel_on(token.clone());
 
-        let call = client.output(client.command(["run", "watch", "123"]));
+        let call = client.output_string(client.command(["run", "watch", "123"]));
         tokio::pin!(call);
         assert!(
             tokio::time::timeout(Duration::from_secs(3600), &mut call)

@@ -47,7 +47,7 @@ For quick one-liners the free functions skip the builder:
 
 ```rust,no_run
 let version = processkit::run("cargo", ["--version"]).await?;       // trimmed stdout, success required
-let result  = processkit::output("git", ["status", "-s"]).await?;   // full ProcessResult
+let result  = processkit::output_string("git", ["status", "-s"]).await?;   // full ProcessResult
 ```
 
 ## Environment

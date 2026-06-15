@@ -15,7 +15,19 @@ to a dated version section.
 -
 
 ### Changed
--
+
+- **Breaking (pre-1.0):** the text-capture verb is now spelled **`output_string`
+  everywhere** — `ProcessRunner::output_string` (the trait seam, was `output`),
+  `CliClient::output_string` (was `output`), and the free fn
+  `processkit::output_string` (was `processkit::output`). `Command`, `Pipeline`,
+  and `RunningProcess` already used `output_string`, so the surface is now uniform
+  (`output_string` / `output_bytes` on every layer). Two reasons: cross-type
+  consistency (the same operation no longer has two names), and disambiguation
+  from `std::process::Command::output`, which returns **bytes** — a bare `output`
+  returning text was a footgun. Migration: rename `.output(` calls to
+  `.output_string(`, `processkit::output(` to `processkit::output_string(`, and —
+  for custom `ProcessRunner` impls — the required method and any `mockall`
+  `expect_output` to `expect_output_string` (M-1).
 
 ### Fixed
 

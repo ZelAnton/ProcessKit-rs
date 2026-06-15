@@ -386,7 +386,7 @@ impl<R: ProcessRunner> Supervisor<R> {
         let mut restarts: u32 = 0;
         let mut storm = StormState::new();
         loop {
-            match self.runner.output(&command).await {
+            match self.runner.output_string(&command).await {
                 Ok(result) => {
                     if let Some(predicate) = &self.stop_when
                         && predicate(&result)
@@ -624,7 +624,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ProcessRunner for SeqRunner {
-        async fn output(&self, _command: &Command) -> Result<ProcessResult<String>> {
+        async fn output_string(&self, _command: &Command) -> Result<ProcessResult<String>> {
             self.replies
                 .lock()
                 .expect("replies lock")
@@ -725,7 +725,7 @@ mod tests {
         struct CapturingRunner(Arc<Mutex<Option<OutputBufferPolicy>>>);
         #[async_trait::async_trait]
         impl ProcessRunner for CapturingRunner {
-            async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+            async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
                 *self.0.lock().expect("seen lock") = Some(command.output_buffer_policy());
                 ok()
             }
