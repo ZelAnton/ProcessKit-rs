@@ -13,7 +13,6 @@
 //! not use this module.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 // `tokio::time::Instant` (not `std::time::Instant`): the deadline must share the
@@ -56,7 +55,7 @@ pub(crate) trait GracefulTarget {
 ///   `Drop` won't kill them either (B12).
 pub(crate) async fn run(
     target: &impl GracefulTarget,
-    skip_drop_kill: &AtomicBool,
+    skip_drop_kill: &super::SkipDropKill,
     signal: i32,
     timeout: Duration,
     escalate: bool,
@@ -75,12 +74,9 @@ pub(crate) async fn run(
         target.hard_kill()?;
     } else if !escalate {
         // B12: tell Drop not to hard-kill the survivors the caller chose to
-        // leave alive. `Release` here pairs with the `Acquire` load in each
-        // backend's `Drop`, so the store is visible whichever thread runs Drop:
-        // a tokio task can migrate across the `.await`s between this call and the
-        // owner dropping the backend, so a "single-threaded boundary" can't be
-        // assumed (P2-2).
-        skip_drop_kill.store(true, Ordering::Release);
+        // leave alive. The latch's Release/Acquire pairing (see `SkipDropKill`)
+        // makes the decision visible whichever thread runs Drop (P2-2).
+        skip_drop_kill.request();
     }
     Ok(())
 }
@@ -88,7 +84,7 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A scriptable `GracefulTarget` that counts the driver's calls and reports
     /// "alive" for the first `alive_polls` drain checks, then "drained".
@@ -140,7 +136,7 @@ mod tests {
     #[tokio::test]
     async fn drained_before_deadline_does_not_escalate() {
         let target = FakeTarget::new(0); // drained on first check
-        let skip = AtomicBool::new(false);
+        let skip = crate::sys::SkipDropKill::new();
         run(&target, &skip, 15, Duration::from_secs(10), true)
             .await
             .expect("graceful run");
@@ -150,10 +146,7 @@ mod tests {
             0,
             "no escalation"
         );
-        assert!(
-            !skip.load(Ordering::Relaxed),
-            "escalate path leaves skip clear"
-        );
+        assert!(!skip.is_set(), "escalate path leaves skip clear");
     }
 
     #[tokio::test(start_paused = true)]
@@ -161,7 +154,7 @@ mod tests {
         // Alive for three drain checks, then drained — the loop polls, sleeps
         // (auto-advanced under start_paused), and exits before the deadline.
         let target = FakeTarget::new(3);
-        let skip = AtomicBool::new(false);
+        let skip = crate::sys::SkipDropKill::new();
         run(&target, &skip, 15, Duration::from_secs(10), true)
             .await
             .expect("graceful run");
@@ -170,7 +163,7 @@ mod tests {
             0,
             "drained in time"
         );
-        assert!(!skip.load(Ordering::Relaxed));
+        assert!(!skip.is_set());
     }
 
     #[tokio::test(start_paused = true)]
@@ -180,7 +173,7 @@ mod tests {
         // terminates because the deadline shares tokio's virtual clock with the
         // sleeps — a regression to `std::time::Instant` would hang here.
         let target = FakeTarget::new(usize::MAX);
-        let skip = AtomicBool::new(false);
+        let skip = crate::sys::SkipDropKill::new();
         run(&target, &skip, 15, Duration::from_millis(50), true)
             .await
             .expect("graceful run");
@@ -189,7 +182,7 @@ mod tests {
             1,
             "escalated after the deadline elapsed"
         );
-        assert!(!skip.load(Ordering::Relaxed));
+        assert!(!skip.is_set());
     }
 
     #[tokio::test]
@@ -197,7 +190,7 @@ mod tests {
         // Never drains within the test; a zero timeout makes the deadline pass
         // on the first check, so the loop breaks without sleeping.
         let target = FakeTarget::new(usize::MAX);
-        let skip = AtomicBool::new(false);
+        let skip = crate::sys::SkipDropKill::new();
         run(&target, &skip, 15, Duration::ZERO, true)
             .await
             .expect("graceful run");
@@ -206,43 +199,37 @@ mod tests {
             1,
             "escalated once"
         );
-        assert!(
-            !skip.load(Ordering::Relaxed),
-            "escalation does not set skip"
-        );
+        assert!(!skip.is_set(), "escalation does not set skip");
     }
 
     #[tokio::test]
     async fn not_drained_without_escalation_sets_skip_and_spares_survivors() {
         let target = FakeTarget::new(usize::MAX);
-        let skip = AtomicBool::new(false);
+        let skip = crate::sys::SkipDropKill::new();
         run(&target, &skip, 15, Duration::ZERO, false)
             .await
             .expect("graceful run");
         assert_eq!(target.hard_kills.load(Ordering::Relaxed), 0, "no hard kill");
-        assert!(
-            skip.load(Ordering::Relaxed),
-            "skip set so Drop spares survivors"
-        );
+        assert!(skip.is_set(), "skip set so Drop spares survivors");
     }
 
     #[tokio::test]
     async fn hard_kill_error_propagates() {
         let mut target = FakeTarget::new(usize::MAX);
         target.fail_hard_kill = true;
-        let skip = AtomicBool::new(false);
+        let skip = crate::sys::SkipDropKill::new();
         let err = run(&target, &skip, 15, Duration::ZERO, true)
             .await
             .expect_err("hard_kill failure surfaces");
         assert_eq!(err.kind(), io::ErrorKind::Other);
-        assert!(!skip.load(Ordering::Relaxed));
+        assert!(!skip.is_set());
     }
 
     #[tokio::test]
     async fn saturating_timeout_does_not_panic() {
         // E15: Duration::MAX must be clamped before the `Instant + Duration`.
         let target = FakeTarget::new(0); // drained immediately so we don't wait
-        let skip = AtomicBool::new(false);
+        let skip = crate::sys::SkipDropKill::new();
         run(&target, &skip, 15, Duration::MAX, true)
             .await
             .expect("graceful run with saturating timeout");

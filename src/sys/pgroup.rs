@@ -17,7 +17,6 @@
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -228,7 +227,7 @@ pub(crate) struct ProcessGroup {
     solos: Tracked,
     /// B12: set by `graceful_shutdown(escalate=false)` to tell `Drop` not to
     /// hard-kill survivors (the caller deliberately chose not to escalate).
-    skip_drop_kill: AtomicBool,
+    skip_drop_kill: super::SkipDropKill,
 }
 
 impl ProcessGroup {
@@ -236,7 +235,7 @@ impl ProcessGroup {
         ProcessGroup {
             groups: Tracked::new(true),
             solos: Tracked::new(false),
-            skip_drop_kill: AtomicBool::new(false),
+            skip_drop_kill: super::SkipDropKill::new(),
         }
     }
 
@@ -399,8 +398,8 @@ impl super::graceful::GracefulTarget for ProcessGroup {
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        // Acquire pairs with the Release store in `graceful::run` (P2-2).
-        if !self.skip_drop_kill.load(Ordering::Acquire) {
+        // The latch's Release/Acquire pairing (see `SkipDropKill`) (P2-2).
+        if !self.skip_drop_kill.is_set() {
             self.broadcast(libc::SIGKILL);
         }
     }

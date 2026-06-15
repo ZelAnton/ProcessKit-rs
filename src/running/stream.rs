@@ -26,6 +26,16 @@ use super::RunningProcess;
 /// (e.g. a duration or a truncation flag, mirroring [`ProcessResult`](crate::ProcessResult))
 /// without a breaking change — read the public fields rather than destructuring
 /// it exhaustively.
+///
+/// **Why this is not a [`ProcessResult`](crate::ProcessResult) (S-8):** `Finished`
+/// is the tail of a run whose **stdout the caller already consumed** line by line,
+/// so it deliberately carries *no* `stdout` field — there is nothing left to hand
+/// back. `ProcessResult` is the *captured* shape (the bulk verbs buffer stdout and
+/// return it as `T`). The two are intentionally distinct: a streaming finisher
+/// that re-bundled stdout would either double-buffer what the consumer already saw
+/// or hand back an empty string pretending to be the output. The overlapping
+/// fields (`outcome`, `stderr`) are kept name-compatible so the mental model
+/// carries over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Finished {

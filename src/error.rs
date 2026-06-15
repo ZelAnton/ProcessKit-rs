@@ -564,7 +564,7 @@ struct StreamPreview<'a>(&'a str);
 
 impl fmt::Debug for StreamPreview<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        const CAP: usize = 200;
+        const CAP: usize = DIAG_CAP;
         let s = self.0;
         if s.len() <= CAP {
             return fmt::Debug::fmt(s, f);
@@ -618,27 +618,9 @@ fn display_not_found(program: &str, searched: &Option<String>) -> String {
 /// replaced with `U+FFFD` if dangerous — the same control-/bidi-injection defense
 /// the captured-stream tails get, which a bare truncation would have skipped.
 fn display_parse(program: &str, message: &str) -> String {
-    const CAP: usize = 200;
-    let mut head = String::new();
-    let mut written = 0usize;
-    let mut truncated = false;
-    for ch in message.chars() {
-        let ch = if is_display_unsafe(ch) {
-            '\u{FFFD}'
-        } else {
-            ch
-        };
-        if written + ch.len_utf8() > CAP {
-            truncated = true;
-            break;
-        }
-        head.push(ch);
-        written += ch.len_utf8();
-    }
-    if truncated {
-        head.push('…');
-    }
-    format!("failed to parse `{program}` output: {head}")
+    let mut out = format!("failed to parse `{program}` output: ");
+    push_sanitized_capped(&mut out, message, DIAG_CAP);
+    out
 }
 
 /// `Signalled`'s one-line Display: `` `{program}` was terminated by signal {n} ``
@@ -713,6 +695,36 @@ fn display_exit(program: &str, code: i32, stdout: &str, stderr: &str) -> String 
     message
 }
 
+/// The byte budget every one-line `Display`/`Debug` excerpt of caller- or
+/// child-influenced text is capped to, so a multi-KiB stream or unparsed dump can
+/// never poison a log line (B14). Shared by [`push_sanitized_capped`], the
+/// [`StreamPreview`] `Debug`, and the diagnostic-tail/`Parse` displays.
+const DIAG_CAP: usize = 200;
+
+/// Append `text` to `out`, replacing any [display-unsafe](is_display_unsafe) char
+/// with `U+FFFD` and stopping at `cap` bytes (an `…` marks truncation). The byte
+/// budget counts only `text`, never what `out` already holds. The single
+/// sanitize-and-cap loop shared by the `Display` paths that embed
+/// attacker-influenced text — the diagnostic tail ([`append_diagnostic_tail`])
+/// and the [`Parse`](Error::Parse) message head ([`display_parse`]) — so the
+/// control-/bidi-injection defense (L6/P2-6) and the cap can't drift apart.
+fn push_sanitized_capped(out: &mut String, text: &str, cap: usize) {
+    let mut written = 0usize;
+    for ch in text.chars() {
+        let ch = if is_display_unsafe(ch) {
+            '\u{FFFD}'
+        } else {
+            ch
+        };
+        if written + ch.len_utf8() > cap {
+            out.push('…');
+            return;
+        }
+        out.push(ch);
+        written += ch.len_utf8();
+    }
+}
+
 /// Whether `ch` is unsafe to emit verbatim into a one-line log/terminal from
 /// attacker-influenced text (L6 / P2-6): a control character (ANSI `ESC`, `BEL`,
 /// `NUL`, `CR`, cursor moves, …) **or** a Unicode bidirectional-formatting
@@ -742,25 +754,11 @@ fn is_display_unsafe(ch: char) -> bool {
 /// line was already split on `\n`; this also neutralizes any stray embedded
 /// `\r`/`ESC`.)
 fn append_diagnostic_tail(message: &mut String, stdout: &str, stderr: &str) {
-    const TAIL_CAP: usize = 200;
     let tail = exit_diagnostic(stdout, stderr)
         .and_then(|text| text.lines().rev().map(str::trim).find(|l| !l.is_empty()));
     if let Some(tail) = tail {
         message.push_str(": ");
-        let mut written = 0usize;
-        for ch in tail.chars() {
-            let ch = if is_display_unsafe(ch) {
-                '\u{FFFD}'
-            } else {
-                ch
-            };
-            if written + ch.len_utf8() > TAIL_CAP {
-                message.push('…');
-                break;
-            }
-            message.push(ch);
-            written += ch.len_utf8();
-        }
+        push_sanitized_capped(message, tail, DIAG_CAP);
     }
 }
 

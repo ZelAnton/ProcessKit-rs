@@ -35,6 +35,10 @@ to a dated version section.
 
 ### Changed
 
+- Internal: the per-backend "spare survivors on drop" flag is now a shared
+  `SkipDropKill` latch (one place owns the load-bearing memory ordering), and the
+  two display sanitize-and-cap loops in `error.rs` are factored into one helper
+  with a single `DIAG_CAP` constant. No behavior change.
 - **Breaking (minor):** `CliClient::parse` / `try_parse` gained an explicit
   closure type parameter and `T: Send` / `F: Send` bounds (they now delegate to
   the new `ProcessRunnerExt` verbs). Turbofish call sites that named only the

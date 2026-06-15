@@ -3,7 +3,6 @@
 //! [Job Object]: https://learn.microsoft.com/windows/win32/procthread/job-objects
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -74,7 +73,7 @@ pub(crate) struct Job {
     suspend_lock: std::sync::Mutex<()>,
     /// B12: set by `graceful_shutdown(escalate=false)` so `Drop` clears
     /// `KILL_ON_JOB_CLOSE` before closing the handle, leaving survivors alive.
-    skip_drop_kill: AtomicBool,
+    skip_drop_kill: super::SkipDropKill,
 }
 
 // The handle is owned solely by this struct and every Win32 job API used here is
@@ -92,7 +91,7 @@ impl Job {
         let job = Job {
             handle,
             suspend_lock: std::sync::Mutex::new(()),
-            skip_drop_kill: AtomicBool::new(false),
+            skip_drop_kill: super::SkipDropKill::new(),
         };
 
         // Kill every process in the job once the last handle closes — i.e. when
@@ -352,11 +351,11 @@ impl Job {
         if escalate {
             self.kill_all()
         } else {
-            // B12: mark Drop to preserve survivors. Release pairs with the
-            // Acquire load in `Drop` so the flag is visible whichever thread
-            // drops the `Job` (it may differ from the one that ran graceful
-            // shutdown, e.g. after a tokio task migrates across an `.await`) (P2-2).
-            self.skip_drop_kill.store(true, Ordering::Release);
+            // B12: mark Drop to preserve survivors. The latch's Release/Acquire
+            // pairing (see `SkipDropKill`) makes the flag visible whichever thread
+            // drops the `Job` — it may differ from the one that ran graceful
+            // shutdown, e.g. after a tokio task migrates across an `.await` (P2-2).
+            self.skip_drop_kill.request();
             Ok(())
         }
     }
@@ -694,9 +693,9 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
 
 impl Drop for Job {
     fn drop(&mut self) {
-        // Acquire pairs with the Release store in `graceful_shutdown` so the flag
-        // is visible no matter which thread drops the `Job` (P2-2).
-        if self.skip_drop_kill.load(Ordering::Acquire) {
+        // The latch's Release/Acquire pairing (see `SkipDropKill`) makes the flag
+        // visible no matter which thread drops the `Job` (P2-2).
+        if self.skip_drop_kill.is_set() {
             // B12: clear KILL_ON_JOB_CLOSE so closing the handle does not kill the
             // tree. `SetInformationJobObject` with `JobObjectExtendedLimitInformation`
             // *replaces* the entire extended-limit structure, so passing a zeroed

@@ -9,7 +9,7 @@ use std::io;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -61,7 +61,7 @@ pub(crate) struct Job {
     backend: Backend,
     /// B12: set by `graceful_shutdown(escalate=false)` so `Drop` skips the
     /// hard kill when the caller chose not to escalate.
-    skip_drop_kill: AtomicBool,
+    skip_drop_kill: super::SkipDropKill,
 }
 
 enum Backend {
@@ -97,7 +97,7 @@ impl Job {
         };
         Ok(Job {
             backend,
-            skip_drop_kill: AtomicBool::new(false),
+            skip_drop_kill: super::SkipDropKill::new(),
         })
     }
 
@@ -329,8 +329,8 @@ impl Drop for Job {
     fn drop(&mut self) {
         match &self.backend {
             Backend::Cgroup(cg) => {
-                // Acquire pairs with the Release store in `graceful::run` (P2-2).
-                if !self.skip_drop_kill.load(Ordering::Acquire) {
+                // The latch's Release/Acquire pairing (see `SkipDropKill`) (P2-2).
+                if !self.skip_drop_kill.is_set() {
                     // B12: only hard-kill when the caller didn't choose escalate=false.
                     let _ = cg.kill();
                     // `cgroup.kill` is asynchronous: the kernel SIGKILLs the subtree,

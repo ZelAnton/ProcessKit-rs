@@ -180,3 +180,26 @@ in test-only or unreachable paths. The durable value of this pass is the
 worth making deliberately rather than by omission.
 
 Per the request: **no code was changed.** This is the fix-list only.
+
+---
+
+## Execution status (resolved 2026-06-15)
+
+The list was subsequently executed in staged changes, each gated and reviewed:
+
+- **Done:** N-1, N-2, L-1 (bug/correctness); L-2, L-3, L-4, L-5 (result/stats
+  ergonomics); S-2 (`parse`/`try_parse` on `ProcessRunnerExt` + `Command`); S-1
+  (`Pipeline` verb-parity: `output_bytes`/`run_unit`/`exit_code`/`checked`/`probe`/
+  `parse`/`try_parse`/`cancel_on`); S-5 (factored the sanitize-and-cap loop +
+  `DIAG_CAP`); S-4 (`SkipDropKill` wrapper shared by all backends); S-8 (documented
+  why `Finished` ≠ `ProcessResult`).
+- **Declined — S-6 (`is_drained` rename):** stale. Round-2 R2-4 already removed the
+  pruning; `any_alive`/`probe_entry` now only refresh the idempotent `group_seen`
+  latch cache (documented on the trait), so `is_drained` is a legitimate query name.
+  A rename to `poll_drained` would *imply* state advancement it no longer does.
+- **Deferred — S-3 (split `running/mod.rs`):** the module is the most
+  concurrency-sensitive code in the crate (timeout arbiter, teardown, profile
+  sampler, raw reader) and is heavily reviewed. A split is pure internal churn with
+  no effect on the (about-to-freeze) public surface, so it carries regression risk
+  for zero user-facing or freeze-related benefit. It can be done safely *after* the
+  freeze; doing it now trades stability for cosmetics.

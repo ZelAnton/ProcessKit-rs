@@ -37,6 +37,38 @@ pub(crate) const SIGTERM_RAW: i32 = libc::SIGTERM;
 #[cfg(not(unix))]
 pub(crate) const SIGTERM_RAW: i32 = 15;
 
+/// A one-shot "don't kill on Drop" latch shared by every backend (S-4).
+///
+/// `graceful_shutdown(escalate = false)` sets it to spare the survivors the
+/// caller chose to leave running; each backend's `Drop` reads it and skips the
+/// hard kill when set. Centralizing the flag (instead of an open-coded
+/// `AtomicBool` in each backend) makes the load-bearing memory ordering correct
+/// by construction in one place: the `Release` store pairs with the `Acquire`
+/// load so the decision is visible to whichever thread runs `Drop` — a tokio
+/// task can migrate across the `.await`s between the set and the owner dropping
+/// the backend, so a single-threaded boundary cannot be assumed (P2-2).
+#[derive(Debug, Default)]
+pub(crate) struct SkipDropKill(std::sync::atomic::AtomicBool);
+
+impl SkipDropKill {
+    /// A fresh latch — Drop will hard-kill until [`request`](Self::request).
+    pub(crate) fn new() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// Mark that `Drop` must **not** hard-kill the survivors. `Release` pairs
+    /// with the `Acquire` in [`is_set`](Self::is_set) (P2-2).
+    pub(crate) fn request(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether `Drop` should skip the kill. `Acquire` pairs with the `Release`
+    /// in [`request`](Self::request).
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// Per-process resource metrics sampled from the OS.
 #[cfg(feature = "stats")]
 #[derive(Debug, Clone, Copy, Default)]
