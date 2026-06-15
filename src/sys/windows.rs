@@ -723,10 +723,10 @@ mod thread_tests {
     }
 }
 
-#[cfg(all(test, feature = "limits"))]
-mod tests {
-    use super::cpu_hard_cap_rate;
-
+// Un-gated (the guard is a core, non-feature-gated type) so a default
+// `cargo test -- --ignored` exercises it, not only `--features limits`.
+#[cfg(test)]
+mod guard_tests {
     /// Whether `pid` is a live process. Self-contained FFI (independent of the
     /// crate's feature-gated helpers) so the test compiles in any config.
     fn pid_alive(pid: u32) -> bool {
@@ -748,22 +748,31 @@ mod tests {
         ok != 0 && code == STILL_ACTIVE
     }
 
-    /// A long-lived child to guard, via `ping` (no extra binaries needed).
-    fn spawn_sleeper() -> tokio::process::Child {
+    /// A child created `CREATE_SUSPENDED` and never resumed — the exact state
+    /// [`Job::spawn`](super::Job) guards: spawned but not yet assigned to the
+    /// job. It runs no user code (a suspended process is still "alive" — its
+    /// exit code reads `STILL_ACTIVE`); the guard's reap, or the test cleanup,
+    /// terminates it via `TerminateProcess`.
+    fn spawn_suspended() -> tokio::process::Child {
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
         tokio::process::Command::new("cmd")
             .args(["/C", "ping -n 30 127.0.0.1 > NUL"])
+            .creation_flags(CREATE_SUSPENDED)
             .spawn()
-            .expect("spawn the sleeper child")
+            .expect("spawn the suspended child")
     }
 
     #[tokio::test]
     #[ignore = "spawns a real subprocess"]
     async fn uncontained_guard_reaps_the_child_on_an_armed_drop() {
         // P1-1: an armed guard dropped without disarm must terminate the
-        // not-yet-contained child (the spawn→assign unwind path).
-        let child = spawn_sleeper();
+        // suspended, not-yet-contained child (the spawn→assign unwind path).
+        let child = spawn_suspended();
         let pid = child.id().expect("the child has a pid");
-        assert!(pid_alive(pid), "the child is alive right after spawn");
+        assert!(
+            pid_alive(pid),
+            "the suspended child is alive right after spawn"
+        );
         drop(super::UncontainedChildGuard::arm(child)); // armed → reaps on drop
         let mut dead = false;
         for _ in 0..200 {
@@ -781,14 +790,19 @@ mod tests {
     async fn uncontained_guard_disarm_hands_back_a_live_child() {
         // The success path: disarm returns the same child, still running, for the
         // job to own — the guard must not kill a contained child.
-        let child = spawn_sleeper();
+        let child = spawn_suspended();
         let pid = child.id().expect("the child has a pid");
         let mut kept = super::UncontainedChildGuard::arm(child).disarm();
         assert!(pid_alive(pid), "disarm must leave the child running");
-        // Clean up the sleeper.
+        // Clean up the suspended child.
         let _ = kept.start_kill();
         let _ = kept.wait().await;
     }
+}
+
+#[cfg(all(test, feature = "limits"))]
+mod tests {
+    use super::cpu_hard_cap_rate;
 
     #[test]
     fn cpu_rate_maps_per_core_fraction_to_total_system_percent() {

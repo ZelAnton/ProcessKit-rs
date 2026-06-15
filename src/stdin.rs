@@ -112,10 +112,10 @@ impl Stdin {
         matches!(self.0, Source::Reader(_) | Source::Lines(_))
     }
 
-    /// A **stable** digest of the stdin *content* for cassette keying (F12) —
-    /// the content itself is never persisted (preserving the no-payload posture),
-    /// only this hash, so two otherwise-identical invocations that differ only in
-    /// their stdin no longer collide on replay. FNV-1a (not `DefaultHasher`,
+    /// A **stable** digest of the stdin *source identity* for cassette keying
+    /// (F12) — the payload itself is never persisted (preserving the no-payload
+    /// posture), only this hash, so two otherwise-identical invocations that
+    /// differ only in their stdin no longer collide on replay. FNV-1a (not `DefaultHasher`,
     /// whose value can change between Rust releases) so a digest recorded today
     /// matches one computed tomorrow. Byte content is hashed verbatim; a file
     /// source hashes its *path* (the file is not read at key time); the one-shot
