@@ -172,39 +172,42 @@ impl Job {
         cmd.as_std_mut()
             .creation_flags(CREATE_SUSPENDED | opts.creation_flags);
 
-        let mut child = cmd.spawn()?;
+        let child = cmd.spawn()?;
         let pid = child.id().ok_or_else(|| {
             io::Error::other("child exited before it could be assigned to the job")
         })?;
         let handle = child.raw_handle().ok_or_else(|| {
             io::Error::other("child exited before it could be assigned to the job")
         })?;
+        // Arm a reaper for the window between spawn and containment: the child is
+        // suspended and not yet in the job, so until `AssignProcessToJobObject`
+        // succeeds neither the job's kill-on-close nor anything else would reap
+        // it — an early return OR a panic here would leak a suspended orphan. The
+        // guard is disarmed once contained, restoring the normal "the job owns
+        // teardown" semantics. (A permanent `kill_on_drop` on the returned child
+        // would instead fight `graceful_shutdown(escalate=false)` survivor-sparing,
+        // and tokio can't toggle it off after spawn.)
+        let guard = UncontainedChildGuard::arm(child);
         // Hold the suspend lock across assign → resume: once assigned, the pid
         // is visible to a concurrent suspend()/resume() member walk, which
         // would otherwise skew the still-suspended primary thread's count
         // (suspend counts nest) and strand or prematurely release the child.
         // Poisoning is impossible to act on here — recover the guard.
-        let _guard = self
+        let _suspend_guard = self
             .suspend_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // SAFETY: the raw handle is valid until `child` is dropped, well after
-        // this call returns.
+        // SAFETY: the raw handle is valid until the child is dropped; `guard`
+        // owns the child for the rest of this scope, well past this call.
         let ok = unsafe { AssignProcessToJobObject(self.handle, handle as HANDLE) };
         if ok == 0 {
-            let err = io::Error::last_os_error();
-            // Don't leak a child we failed to contain (still suspended).
-            let _ = child.start_kill();
-            return Err(err);
+            // The reaper kills the still-suspended child as `guard` drops.
+            return Err(io::Error::last_os_error());
         }
-
         // Contained — release the primary thread. A failure here would strand a
-        // suspended-but-contained process, so kill it rather than leak it.
-        if let Err(err) = resume_process_threads(pid) {
-            let _ = child.start_kill();
-            return Err(err);
-        }
-        Ok(child)
+        // suspended-but-contained process; the reaper kills it as `guard` drops.
+        resume_process_threads(pid)?;
+        Ok(guard.disarm())
     }
 
     #[cfg(feature = "process-control")]
@@ -402,6 +405,42 @@ fn process_has_exited(handle: HANDLE) -> bool {
     // SAFETY: `handle` is a valid process handle borrowed from the live `Child`.
     let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
     ok != 0 && code != STILL_ACTIVE
+}
+
+/// Reaps a freshly-spawned, not-yet-contained child if [`Job::spawn`] unwinds
+/// (an early `Err` or a panic) before the child is assigned to the job. Until
+/// containment succeeds the child — created `CREATE_SUSPENDED` — is reachable by
+/// nothing that would reap it, so dropping it un-disarmed would leak a suspended
+/// orphan. [`disarm`](Self::disarm) hands the child back once it is contained,
+/// after which the job's kill-on-close owns teardown.
+struct UncontainedChildGuard {
+    // `None` only after `disarm` has taken the child.
+    child: Option<Child>,
+}
+
+impl UncontainedChildGuard {
+    fn arm(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// Containment succeeded: stop guarding and return the child unharmed.
+    fn disarm(mut self) -> Child {
+        self.child
+            .take()
+            .expect("the guarded child is taken exactly once")
+    }
+}
+
+impl Drop for UncontainedChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            // Best-effort: `start_kill` issues `TerminateProcess` on the
+            // suspended child; dropping the `Child` then closes its handle. This
+            // is the same kill the explicit error paths used to do inline, now
+            // also covering an unwind.
+            let _ = child.start_kill();
+        }
+    }
 }
 
 /// Resume every thread of `pid`. A child spawned `CREATE_SUSPENDED` has exactly
@@ -687,6 +726,69 @@ mod thread_tests {
 #[cfg(all(test, feature = "limits"))]
 mod tests {
     use super::cpu_hard_cap_rate;
+
+    /// Whether `pid` is a live process. Self-contained FFI (independent of the
+    /// crate's feature-gated helpers) so the test compiles in any config.
+    fn pid_alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        const STILL_ACTIVE: u32 = 259;
+        // SAFETY: a plain query open; the handle is closed exactly once below.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false; // gone (or no longer openable) — dead for our purposes
+        }
+        let mut code: u32 = 0;
+        // SAFETY: `handle` is a valid process handle from OpenProcess.
+        let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
+        // SAFETY: closing the handle obtained above, exactly once.
+        unsafe { CloseHandle(handle) };
+        ok != 0 && code == STILL_ACTIVE
+    }
+
+    /// A long-lived child to guard, via `ping` (no extra binaries needed).
+    fn spawn_sleeper() -> tokio::process::Child {
+        tokio::process::Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 > NUL"])
+            .spawn()
+            .expect("spawn the sleeper child")
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn uncontained_guard_reaps_the_child_on_an_armed_drop() {
+        // P1-1: an armed guard dropped without disarm must terminate the
+        // not-yet-contained child (the spawn→assign unwind path).
+        let child = spawn_sleeper();
+        let pid = child.id().expect("the child has a pid");
+        assert!(pid_alive(pid), "the child is alive right after spawn");
+        drop(super::UncontainedChildGuard::arm(child)); // armed → reaps on drop
+        let mut dead = false;
+        for _ in 0..200 {
+            if !pid_alive(pid) {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(dead, "an armed guard drop must terminate the child");
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn uncontained_guard_disarm_hands_back_a_live_child() {
+        // The success path: disarm returns the same child, still running, for the
+        // job to own — the guard must not kill a contained child.
+        let child = spawn_sleeper();
+        let pid = child.id().expect("the child has a pid");
+        let mut kept = super::UncontainedChildGuard::arm(child).disarm();
+        assert!(pid_alive(pid), "disarm must leave the child running");
+        // Clean up the sleeper.
+        let _ = kept.start_kill();
+        let _ = kept.wait().await;
+    }
 
     #[test]
     fn cpu_rate_maps_per_core_fraction_to_total_system_percent() {
