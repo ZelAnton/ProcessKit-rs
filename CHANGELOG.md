@@ -15,10 +15,28 @@ to a dated version section.
 -
 
 ### Changed
--
+
+- `RunningProcess::wait_for_line` no longer arms the `Command::timeout`
+  watchdog: a readiness probe is now bounded only by its own `within` and can
+  never kill the process tree or
+  flip the run's outcome to `TimedOut` — matching `wait_for` / `wait_for_port`.
+  The command timeout is still enforced, by the consuming verb (`finish`) after
+  the probe. (Behavior fix; the probe's signature is unchanged.)
+- The supervisor now classifies a "crash" with `ProcessResult::is_success` (which
+  honors `Command::ok_codes`) instead of raw `code() == Some(0)`. A supervised
+  command with custom accepted codes (e.g. `ok_codes([0, 2])` exiting `2`) is no
+  longer treated as a crash — `RestartPolicy::OnCrash` agrees with the rest of
+  the crate and stops feeding the failure-storm score on accepted exits.
 
 ### Fixed
--
+
+- The output line pump's byte accounting for an over-cap (dropped) line is now
+  stable across read boundaries: a CRLF terminator's `\r` is no longer counted as
+  content when it lands at the end of a chunk, so the `OverflowMode::Error` byte
+  ceiling and the seen-byte total are independent of how the OS chunked the read.
+- Windows: a child is reaped if `spawn` unwinds in the window between process
+  creation (`CREATE_SUSPENDED`) and Job-Object assignment, so a panic there can
+  no longer leak a suspended, uncontained process.
 
 ## [0.11.0] - 2026-06-14
 
