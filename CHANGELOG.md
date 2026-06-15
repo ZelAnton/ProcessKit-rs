@@ -31,6 +31,14 @@ to a dated version section.
 
 ### Fixed
 
+- `Pipeline::run` now fails loud (`Error::OutputTooLarge`) when the last stage's
+  capture was truncated by a bounded `output_buffer`, instead of silently
+  returning the clipped tail as if complete — matching `ProcessRunnerExt::run`,
+  `CliClient::run`, and the pipeline's own `parse`/`try_parse` (R5-2).
+- A readiness probe (`wait_for` / `wait_for_port`) that reaps a cleanly-exited
+  child now claims the timeout arbiter, like every other reap path. This closes a
+  multi-threaded race where a streaming deadline watchdog firing on another thread
+  at the same instant could misclassify the clean exit as `TimedOut` (R5-1).
 - Linux per-process sampling (`stats()` / `RunningProcess::cpu_time` /
   `peak_memory_bytes`) now uses saturating arithmetic throughout: the CPU
   user+system tick counts combine with `saturating_add` and the nanosecond cast

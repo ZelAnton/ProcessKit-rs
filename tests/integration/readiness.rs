@@ -134,6 +134,15 @@ async fn wait_for_passes_once_the_check_turns_true() {
     );
 }
 
+// Note: R5-1 (a probe reaping a cleanly-exited child must claim the timeout
+// arbiter so a concurrent streaming-deadline watchdog can't misclassify it as
+// TimedOut) is a multi-threaded atomic race between the deadline task and the
+// probe's reap. It is not deterministically reproducible from a single-threaded
+// test (when the probe reaps first it also aborts the watchdog → clean either
+// way; when the deadline fires first the arbiter is already TimedOut), so the fix
+// is verified by construction — `has_exited_now` now claims the arbiter exactly
+// like every other reap path (`backend_wait`). See src/running/mod.rs.
+
 #[tokio::test]
 #[ignore = "spawns a short subprocess; the probe must fail fast once it exits"]
 async fn wait_for_fails_fast_when_child_exits() {

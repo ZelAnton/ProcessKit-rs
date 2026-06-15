@@ -1761,6 +1761,23 @@ impl RunningProcess {
             }
         };
         if exited {
+            // B1: claim the natural reap (PENDING -> EXITED) here too. A probe
+            // (`wait_for`/`wait_for_port`) is a reap path like `backend_wait`, and
+            // it was the only reaper that did not claim the arbiter. On a
+            // multi-threaded runtime this opens a genuine race: a streaming
+            // deadline watchdog firing on another thread at the same instant this
+            // probe reaps a cleanly-exited child could win `PENDING -> TIMED_OUT`
+            // before `abort_watchdogs()` (below) stops it, misclassifying the clean
+            // exit as `TimedOut`. Claiming `EXITED` here closes that window
+            // (defense-in-depth: every reaper claims the arbiter). A genuinely
+            // timed-out child (deadline already `TS_TIMED_OUT`) makes this CAS
+            // fail, so the `TimedOut` verdict is preserved (R5-1).
+            let _ = self.timeout_state.compare_exchange(
+                TS_PENDING,
+                TS_EXITED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
             self.abort_watchdogs();
             // Same snapshot logic as `wait_exit`: a consuming verb called after
             // a probe that observed the exit must not be misclassified as Cancelled

@@ -367,13 +367,13 @@ impl Pipeline {
     /// [`Command::timeout`] — the attributed stage's *own* deadline is reported,
     /// not the chain's (D14/B10).
     pub async fn run(&self) -> Result<String> {
-        Ok(self
-            .output_string()
-            .await?
-            .ensure_success()?
-            .into_stdout()
-            .trim_end()
-            .to_owned())
+        // B12: `run` presents stdout as if complete, so it must fail loud on a
+        // truncated last-stage capture rather than return a clipped tail — the
+        // same guard `ProcessRunnerExt::run` / `CliClient::run` and the pipeline's
+        // own `parse`/`try_parse` apply (R5-2).
+        let out = self.checked().await?;
+        self.reject_if_last_truncated(&out)?;
+        Ok(out.into_stdout().trim_end().to_owned())
     }
 
     /// Run the chain, require **every** stage to exit cleanly (pipefail), and

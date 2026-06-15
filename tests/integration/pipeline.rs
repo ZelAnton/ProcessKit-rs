@@ -382,6 +382,29 @@ async fn pipeline_parse_fails_loud_on_a_truncated_last_stage() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a pipeline whose last stage truncates its capture"]
+async fn pipeline_run_fails_loud_on_a_truncated_last_stage() {
+    // R5-2/B12: `run` presents stdout as if complete, so a clipped last-stage
+    // capture must fail loud (OutputTooLarge), not return a partial tail — the
+    // same guard `parse`/`try_parse` and the single-command verbs apply.
+    use processkit::OutputBufferPolicy;
+    let producer = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo a& echo b& echo c& echo d"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'a\\nb\\nc\\nd\\n'"])
+    };
+    let err = producer
+        .pipe(sort_stage().output_buffer(OutputBufferPolicy::bounded(2)))
+        .run()
+        .await
+        .expect_err("a truncated last stage must fail loud on run()");
+    assert!(
+        matches!(err, processkit::Error::OutputTooLarge { .. }),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a real long-running pipeline and cancels it"]
 async fn pipeline_cancel_on_tears_the_whole_chain_down() {
     // S-1: a token fired mid-run cancels every stage; the run resolves to
