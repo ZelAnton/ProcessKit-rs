@@ -254,11 +254,14 @@ impl Job {
                 for pid in pids {
                     let m = process_metrics(pid as u32);
                     if let Some(c) = m.cpu_time {
-                        cpu += c;
+                        // Saturating: summing many members' CPU time could in
+                        // principle overflow `Duration`; clamp rather than panic
+                        // (N-2, parity with the Windows `saturating_add` fold).
+                        cpu = cpu.saturating_add(c);
                         have_cpu = true;
                     }
                     if let Some(p) = m.peak_memory_bytes {
-                        mem += p;
+                        mem = mem.saturating_add(p);
                         have_mem = true;
                     }
                 }

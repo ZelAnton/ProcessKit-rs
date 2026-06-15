@@ -53,7 +53,9 @@ struct Entry {
     /// invocations differing only in stdin don't collide on replay. In-memory
     /// bytes hash their content; a `from_file` source hashes its **path** (the
     /// file is not read at key time, so changing the file's bytes does not
-    /// change the key); the one-shot streaming sources hash a discriminant only.
+    /// change the key). One-shot streaming sources (`from_reader`/`from_lines`)
+    /// are rejected by record/replay (L-1) — their bytes can't be keyed — so
+    /// this digest only ever describes a replayable source.
     /// `None` for empty/absent stdin. A pre-F12 cassette recorded *with* stdin
     /// loads this as `None` and must be re-recorded to match a stdin invocation
     /// again. See `Stdin::content_digest` for the per-source hashing.
@@ -185,6 +187,26 @@ fn stdin_digest_of(command: &Command) -> Option<u64> {
         .stdin_source()
         .filter(|s| !s.is_empty())
         .map(|s| s.content_digest())
+}
+
+/// Reject a one-shot streaming stdin source (`from_reader`/`from_lines`) in
+/// record/replay (L-1). Such a source's bytes are consumed lazily and never
+/// captured into the match key — `content_digest` can only hash a constant
+/// discriminant for them — so two invocations differing *only* in streamed
+/// stdin would collide on one cassette key and silently replay each other's
+/// recording. Failing loud (consistent with the streaming `start` half already
+/// returning [`Error::Unsupported`]) is safer than a silent wrong answer; use a
+/// replayable source (`from_bytes`/`from_string`/`from_file`) for a recordable
+/// invocation.
+fn reject_unrecordable_stdin(command: &Command) -> Result<()> {
+    if command.stdin_source().is_some_and(|s| s.is_one_shot()) {
+        return Err(Error::Unsupported {
+            operation: "cassette record/replay with one-shot streaming stdin \
+                        (from_reader/from_lines); use from_bytes/from_string/from_file"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// The key of a live invocation — must decode exactly like
@@ -477,6 +499,10 @@ impl RecordReplayRunner<JobRunner> {
 #[async_trait::async_trait]
 impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
     async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+        // L-1: a one-shot streaming stdin cannot be faithfully keyed (its bytes
+        // aren't captured), so refuse it in both modes before doing any work —
+        // in record mode this also avoids consuming the source on the inner run.
+        reject_unrecordable_stdin(command)?;
         match &self.mode {
             Mode::Record {
                 inner,
@@ -814,6 +840,36 @@ mod tests {
             "out-A\n",
             "stdin A must replay its own recording"
         );
+    }
+
+    #[tokio::test]
+    async fn one_shot_streaming_stdin_is_rejected_in_both_modes() {
+        // L-1: a one-shot streaming source can't be keyed (its bytes aren't
+        // captured), so record/replay must fail loud rather than collide on the
+        // constant `<stream>` discriminant. Record mode also must not consume the
+        // inner run before rejecting.
+        let (_dir, path) = temp_cassette();
+        let inner = ScriptedRunner::new().fallback(Reply::ok("out\n"));
+        let recorder = RecordReplayRunner::record(&path, inner);
+        let err = recorder
+            .output(&Command::new("tool").stdin(crate::Stdin::from_reader(&b"payload"[..])))
+            .await
+            .expect_err("record must reject a one-shot streaming stdin");
+        assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
+
+        // Record a plain entry so the cassette loads, then prove replay rejects
+        // a streaming stdin too.
+        recorder
+            .output(&Command::new("tool"))
+            .await
+            .expect("record a replayable entry");
+        recorder.save().expect("save");
+        let replayer = RecordReplayRunner::replay(&path).expect("load");
+        let err = replayer
+            .output(&Command::new("tool").stdin(crate::Stdin::from_reader(&b"payload"[..])))
+            .await
+            .expect_err("replay must reject a one-shot streaming stdin");
+        assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
     }
 
     #[tokio::test]

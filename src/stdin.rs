@@ -118,9 +118,10 @@ impl Stdin {
     /// differ only in their stdin no longer collide on replay. FNV-1a (not `DefaultHasher`,
     /// whose value can change between Rust releases) so a digest recorded today
     /// matches one computed tomorrow. Byte content is hashed verbatim; a file
-    /// source hashes its *path* (the file is not read at key time); the one-shot
+    /// source hashes its *path* (the file is not read at key time). The one-shot
     /// streaming sources have no fixed content, so they hash a discriminant only
-    /// (they cannot be faithfully recorded/replayed regardless).
+    /// — but the cassette runner rejects them outright (L-1) before this is
+    /// keyed, since that discriminant would collide distinct payloads.
     #[cfg(feature = "record")]
     pub(crate) fn content_digest(&self) -> u64 {
         // FNV-1a, 64-bit.

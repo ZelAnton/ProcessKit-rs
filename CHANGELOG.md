@@ -55,7 +55,18 @@ to a dated version section.
   child's pid may have been recycled.
 - Windows: a child is reaped if `spawn` unwinds in the window between process
   creation (`CREATE_SUSPENDED`) and Job-Object assignment, so a panic there can
-  no longer leak a suspended, uncontained process.
+  no longer leak a suspended, uncontained process. The reaper guard is now armed
+  *before* the fallible `id()`/`raw_handle()` reads as well, closing the matching
+  early-return leak window (N-1).
+- Linux: `ProcessGroupStats` now sums per-process CPU time and memory with
+  `saturating_add`, so an implausibly large aggregate clamps instead of panicking
+  on overflow (N-2, parity with the Windows fold).
+- Record/replay (`record` feature): a command whose stdin is a one-shot streaming
+  source (`Stdin::from_reader`/`from_lines`) is now rejected with
+  `Error::Unsupported` in both record and replay modes, instead of silently keying
+  all such invocations alike (their bytes can't be captured into the match key).
+  Use a replayable source (`from_bytes`/`from_string`/`from_file`) to record a
+  stdin-bearing invocation (L-1).
 
 ### Security
 

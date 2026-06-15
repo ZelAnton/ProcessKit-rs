@@ -172,13 +172,6 @@ impl Job {
         cmd.as_std_mut()
             .creation_flags(CREATE_SUSPENDED | opts.creation_flags);
 
-        let child = cmd.spawn()?;
-        let pid = child.id().ok_or_else(|| {
-            io::Error::other("child exited before it could be assigned to the job")
-        })?;
-        let handle = child.raw_handle().ok_or_else(|| {
-            io::Error::other("child exited before it could be assigned to the job")
-        })?;
         // Arm a reaper for the window between spawn and containment: the child is
         // suspended and not yet in the job, so until `AssignProcessToJobObject`
         // succeeds neither the job's kill-on-close nor anything else would reap
@@ -187,7 +180,18 @@ impl Job {
         // teardown" semantics. (A permanent `kill_on_drop` on the returned child
         // would instead fight `graceful_shutdown(escalate=false)` survivor-sparing,
         // and tokio can't toggle it off after spawn.)
-        let guard = UncontainedChildGuard::arm(child);
+        //
+        // Arm it *before* reading `id()`/`raw_handle()` (N-1): both are fallible,
+        // and a child that dropped on their `?` early-return would otherwise leak
+        // un-reaped (a suspended child can't exit on its own, so this is a
+        // narrow window, but the guard makes "every early return reaps" total).
+        let guard = UncontainedChildGuard::arm(cmd.spawn()?);
+        let pid = guard.child().id().ok_or_else(|| {
+            io::Error::other("child exited before it could be assigned to the job")
+        })?;
+        let handle = guard.child().raw_handle().ok_or_else(|| {
+            io::Error::other("child exited before it could be assigned to the job")
+        })?;
         // Hold the suspend lock across assign → resume: once assigned, the pid
         // is visible to a concurrent suspend()/resume() member walk, which
         // would otherwise skew the still-suspended primary thread's count
@@ -432,6 +436,14 @@ struct UncontainedChildGuard {
 impl UncontainedChildGuard {
     fn arm(child: Child) -> Self {
         Self { child: Some(child) }
+    }
+
+    /// Borrow the guarded child (present from `arm` until `disarm`). Used to read
+    /// the child's `id()`/`raw_handle()` while the reaper is armed (N-1).
+    fn child(&self) -> &Child {
+        self.child
+            .as_ref()
+            .expect("the guarded child is present until disarm")
     }
 
     /// Containment succeeded: stop guarding and return the child unharmed.
