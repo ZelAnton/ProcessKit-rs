@@ -612,17 +612,32 @@ fn display_not_found(program: &str, searched: &Option<String>) -> String {
 /// — its start carries the actionable detail (`unexpected token at line 3`),
 /// unlike a captured stream whose *tail* is quoted — so an embedded multi-KiB
 /// unparsed dump can never poison a log line. The full text stays on the field.
+///
+/// L6/P2-6 (security): `Parse` messages routinely embed attacker-influenced
+/// unparsed output, so each char is passed through [`is_display_unsafe`] and
+/// replaced with `U+FFFD` if dangerous — the same control-/bidi-injection defense
+/// the captured-stream tails get, which a bare truncation would have skipped.
 fn display_parse(program: &str, message: &str) -> String {
     const CAP: usize = 200;
-    let head = if message.len() <= CAP {
-        message.to_string()
-    } else {
-        let mut cut = CAP;
-        while !message.is_char_boundary(cut) {
-            cut -= 1;
+    let mut head = String::new();
+    let mut written = 0usize;
+    let mut truncated = false;
+    for ch in message.chars() {
+        let ch = if is_display_unsafe(ch) {
+            '\u{FFFD}'
+        } else {
+            ch
+        };
+        if written + ch.len_utf8() > CAP {
+            truncated = true;
+            break;
         }
-        format!("{}…", &message[..cut])
-    };
+        head.push(ch);
+        written += ch.len_utf8();
+    }
+    if truncated {
+        head.push('…');
+    }
     format!("failed to parse `{program}` output: {head}")
 }
 
@@ -698,6 +713,21 @@ fn display_exit(program: &str, code: i32, stdout: &str, stderr: &str) -> String 
     message
 }
 
+/// Whether `ch` is unsafe to emit verbatim into a one-line log/terminal from
+/// attacker-influenced text (L6 / P2-6): a control character (ANSI `ESC`, `BEL`,
+/// `NUL`, `CR`, cursor moves, …) **or** a Unicode bidirectional-formatting
+/// control — the "Trojan Source" class (CVE-2021-42574) that can visually
+/// reorder the surrounding text in a terminal or editor.
+fn is_display_unsafe(ch: char) -> bool {
+    ch.is_control()
+        || matches!(ch,
+            '\u{202A}'..='\u{202E}'   // LRE RLE PDF LRO RLO (embeddings/overrides)
+            | '\u{2066}'..='\u{2069}' // LRI RLI FSI PDI (isolates)
+            | '\u{200E}' | '\u{200F}' // LRM RLM (implicit marks)
+            | '\u{061C}'              // ALM (Arabic letter mark)
+        )
+}
+
 /// Append `: <last non-empty diagnostic line>` to a one-line error `Display`,
 /// capped at 200 bytes on a char boundary with an ellipsis. Shared by
 /// [`display_exit`], [`display_timeout`], and [`display_signalled`] (D12) so a
@@ -705,11 +735,12 @@ fn display_exit(program: &str, code: i32, stdout: &str, stderr: &str) -> String 
 /// one-enormous-line stream can never poison a log line. A no-op when both
 /// streams are blank.
 ///
-/// L6 (security): control characters in the tail are replaced with `U+FFFD`, so a
-/// hostile child's stderr cannot inject terminal escape sequences (ANSI, `BEL`,
-/// `NUL`, cursor moves) into an operator's log or terminal through a `{err}`
-/// format. (The line was already split on `\n`; this also neutralizes any stray
-/// embedded `\r`/`ESC`.)
+/// L6/P2-6 (security): each char is passed through [`is_display_unsafe`] and
+/// replaced with `U+FFFD` if dangerous, so a hostile child's stderr cannot inject
+/// terminal escape sequences (ANSI, `BEL`, `NUL`, cursor moves) or bidi-reordering
+/// controls into an operator's log or terminal through a `{err}` format. (The
+/// line was already split on `\n`; this also neutralizes any stray embedded
+/// `\r`/`ESC`.)
 fn append_diagnostic_tail(message: &mut String, stdout: &str, stderr: &str) {
     const TAIL_CAP: usize = 200;
     let tail = exit_diagnostic(stdout, stderr)
@@ -718,7 +749,11 @@ fn append_diagnostic_tail(message: &mut String, stdout: &str, stderr: &str) {
         message.push_str(": ");
         let mut written = 0usize;
         for ch in tail.chars() {
-            let ch = if ch.is_control() { '\u{FFFD}' } else { ch };
+            let ch = if is_display_unsafe(ch) {
+                '\u{FFFD}'
+            } else {
+                ch
+            };
             if written + ch.len_utf8() > TAIL_CAP {
                 message.push('…');
                 break;
@@ -753,6 +788,41 @@ mod tests {
         assert!(!msg.contains('\x00'), "NUL must be sanitized: {msg:?}");
         assert!(msg.contains("boom"), "printable text is kept: {msg:?}");
         assert!(msg.contains("danger"), "printable text is kept: {msg:?}");
+    }
+
+    #[test]
+    fn display_tail_strips_bidi_controls_against_trojan_source() {
+        // P2-6: a hostile stderr last line carrying bidi-override controls
+        // (CVE-2021-42574) must not reach a `{err}` line and visually reorder it.
+        let err = Error::Exit {
+            program: "tool".into(),
+            code: 1,
+            stdout: String::new(),
+            stderr: "safe\u{202E}reversed\u{202C}\u{2066}iso".into(),
+        };
+        let msg = err.to_string();
+        assert!(!msg.contains('\u{202E}'), "RLO must be sanitized: {msg:?}");
+        assert!(!msg.contains('\u{202C}'), "PDF must be sanitized: {msg:?}");
+        assert!(!msg.contains('\u{2066}'), "LRI must be sanitized: {msg:?}");
+        assert!(msg.contains("safe"), "printable text is kept: {msg:?}");
+    }
+
+    #[test]
+    fn parse_display_sanitizes_control_and_bidi_injection() {
+        // P2-6: `Parse` messages routinely embed attacker-influenced unparsed
+        // output; the one-line Display must neutralize control AND bidi controls,
+        // not just truncate (the gap this fix closed).
+        let err = Error::Parse {
+            program: "jq".into(),
+            message: "bad\x1b[31m\x07token\u{202E}flip\u{2069}".into(),
+        };
+        let msg = err.to_string();
+        assert!(!msg.contains('\x1b'), "ESC must be sanitized: {msg:?}");
+        assert!(!msg.contains('\x07'), "BEL must be sanitized: {msg:?}");
+        assert!(!msg.contains('\u{202E}'), "RLO must be sanitized: {msg:?}");
+        assert!(!msg.contains('\u{2069}'), "PDI must be sanitized: {msg:?}");
+        assert!(msg.contains("bad"), "printable text is kept: {msg:?}");
+        assert!(msg.contains("token"), "printable text is kept: {msg:?}");
     }
 
     #[test]
