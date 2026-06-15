@@ -241,6 +241,35 @@ async fn pipeline_output_bytes_captures_the_last_stage_stdout() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real pipeline with a failing inner stage, captured as bytes"]
+async fn pipeline_output_bytes_uses_pipefail_attribution() {
+    // S-1: output_bytes shares the pipefail fold with output_string — a failing
+    // inner stage's code is attributed even though stdout is captured as bytes.
+    let producer = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "exit", "0"])
+    } else {
+        Command::new("sh").args(["-c", "exit 0"])
+    };
+    let failing = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "exit", "5"])
+    } else {
+        Command::new("sh").args(["-c", "exit 5"])
+    };
+    let result = producer
+        .pipe(failing)
+        .pipe(sort_stage())
+        .output_bytes()
+        .await
+        .expect("pipeline completes with a result");
+    assert_eq!(
+        result.code(),
+        Some(5),
+        "pipefail code on the bytes path: {result:?}"
+    );
+    assert!(!result.is_success());
+}
+
+#[tokio::test]
 #[ignore = "spawns real pipelines exercising the parity verbs"]
 async fn pipeline_run_verbs_mirror_the_command_vocabulary() {
     // S-1: run_unit / exit_code / checked on a clean two-stage chain.

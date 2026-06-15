@@ -94,6 +94,7 @@ you get back:
 | the full outcome, exit code as data | `.output_string()` / `.output_bytes()` | [`ProcessResult`] — code, stdout, stderr, `timed_out`; never errors on non-zero |
 | just the exit code | `.exit_code()` | `i32` (a timed-out / killed run errors instead of inventing `-1`) |
 | a yes/no answer | `.probe()` | `bool` — exit 0 → `true`, 1 → `false`, anything else errors |
+| a typed value from stdout | `.parse(\|s\| …)` / `.try_parse(\|s\| …)` | `T` — success required; fails loud on a truncated capture |
 | the first matching output line | `.first_line(\|l\| …)` | `Option<String>` — `None` when stdout closes without a match |
 | a live handle — streaming, stdin, probes | `.start()` | [`RunningProcess`] |
 

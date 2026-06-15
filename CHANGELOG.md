@@ -22,9 +22,15 @@ to a dated version section.
 - `Pipeline` gained verb parity with a single `Command`: `output_bytes` (binary
   capture), `run_unit`, `exit_code`, `checked`, `probe`, and `parse` / `try_parse`
   — each operating on the pipefail outcome — plus a chain-level `cancel_on(token)`
-  that tears the whole chain down to `Error::Cancelled` (applied to every stage).
-  The streaming `first_line` is intentionally omitted (a chain consumes its last
-  stage in full; add a `| head -n1` stage instead) (S-1).
+  that tears the whole chain down to `Error::Cancelled`. `cancel_on` **gap-fills**
+  (it leaves an explicit per-stage `Command::cancel_on` intact), matching
+  `CliClient::default_cancel_on` rather than `Command::cancel_on`'s last-write-wins
+  override. `Pipeline::parse` / `try_parse` deliberately carry **no** `Send` bound
+  on the closure (unlike the `Command`/`ProcessRunnerExt`/`CliClient` versions),
+  since the pipeline runs the parser inline rather than across a task boundary — so
+  they accept strictly more closures. The streaming `first_line` is intentionally
+  omitted (a chain consumes its last stage in full; add a `| head -n1` stage
+  instead) (S-1).
 - `parse` / `try_parse` are now first-class verbs on `ProcessRunnerExt` (so every
   runner — `JobRunner`, `&ProcessGroup`, a `ScriptedRunner` — has them) and on
   `Command` (`cmd.parse(|s| …)` / `cmd.try_parse(|s| …)`), not just `CliClient`.
@@ -32,10 +38,10 @@ to a dated version section.
   parser never sees a clipped tail), and feeds stdout to the closure. Like
   `first_line`, they are generic over the closure and therefore unavailable on a
   `&dyn ProcessRunner` (call them on a concrete runner or via the wrappers) (S-2).
-- `ProcessResult` is now `#[must_use]`: dropping a result unread (its exit
-  status is the only failure signal) triggers an `unused_must_use` warning.
-  Inspect `is_success()`/`code()`/`ensure_success()` or bind to `let _` to
-  discard on purpose (L-4).
+- `ProcessResult` and `Finished` are now `#[must_use]`: dropping one unread (its
+  exit status / outcome is the only signal of how the run ended) triggers an
+  `unused_must_use` warning. Inspect `is_success()`/`code()`/`ensure_success()`
+  (or `Finished::outcome`), or bind to `let _` to discard on purpose (L-4).
 - `RunProfile` now derives `Eq` (it already derived `PartialEq`; all fields are
   integer/`Duration`), so profiles can be compared exactly and used as keys (L-5).
 

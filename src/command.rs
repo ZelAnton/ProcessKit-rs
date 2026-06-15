@@ -473,6 +473,12 @@ impl Command {
     /// [`Supervisor`](crate::Supervisor) restarts both treat
     /// `Error::Cancelled` as terminal — the token stays cancelled forever, so
     /// another attempt could only fail the same way.
+    ///
+    /// On a `Command` this **replaces** any previously set token (last write
+    /// wins) — contrast the *gap-fill* containers
+    /// [`Pipeline::cancel_on`](crate::Pipeline::cancel_on) and
+    /// [`CliClient::default_cancel_on`](crate::CliClient::default_cancel_on),
+    /// which leave an explicit per-element token intact.
     pub fn cancel_on(mut self, token: tokio_util::sync::CancellationToken) -> Self {
         self.cancel_token = Some(token);
         self
@@ -1130,12 +1136,12 @@ impl Command {
     /// ```no_run
     /// # async fn demo() -> processkit::Result<()> {
     /// use processkit::Command;
-    /// // `wc -l` prints a count; turn it straight into a number.
-    /// let lines: usize = Command::new("wc")
-    ///     .args(["-l", "src/lib.rs"])
+    /// // `date +%Y` prints just the year; turn it straight into a number.
+    /// let year: u32 = Command::new("date")
+    ///     .arg("+%Y")
     ///     .parse(|s| s.trim().parse().unwrap_or(0))
     ///     .await?;
-    /// # let _ = lines;
+    /// # let _ = year;
     /// # Ok(())
     /// # }
     /// ```

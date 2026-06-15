@@ -36,6 +36,12 @@ use super::RunningProcess;
 /// or hand back an empty string pretending to be the output. The overlapping
 /// fields (`outcome`, `stderr`) are kept name-compatible so the mental model
 /// carries over.
+///
+/// `#[must_use]`: like [`ProcessResult`](crate::ProcessResult), its
+/// [`outcome`](Self::outcome) is the only signal of *how* the run ended —
+/// dropping a `Finished` unread discards whether the process succeeded, timed
+/// out, or was signal-killed.
+#[must_use = "a Finished carries the run's outcome; inspect `outcome` or it is silently discarded"]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Finished {

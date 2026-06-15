@@ -61,7 +61,7 @@ type OutputFut<'a, T> = Pin<Box<dyn Future<Output = Result<ProcessResult<T>>> + 
 /// Deliberately *not* a process pool, scheduler, or retrier — those are policy.
 /// This is the one primitive — bounded fan-out that collects every outcome — in
 /// two capture flavors: text here, raw bytes via [`output_all_bytes`] (the same
-/// `output` vs `output_bytes` split `Command`/`Pipeline` already have).
+/// `output_string` vs `output_bytes` split `Command`/`Pipeline` already have).
 ///
 /// Unlike [`wait_all`](crate::wait_all) / [`wait_any`](crate::wait_any), this is
 /// **not** cancel-safe: it consumes the `Command`s and owns the handles it
@@ -332,7 +332,12 @@ mod tests {
             async fn output_bytes(&self, command: &Command) -> Result<ProcessResult<Vec<u8>>> {
                 let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.peak.fetch_max(now, Ordering::SeqCst);
-                tokio::task::yield_now().await;
+                // Stay Pending across several polls so the driver tops the active
+                // set up to the cap before any future completes — letting us
+                // observe the true peak (mirrors the text-path cap test).
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
                 self.active.fetch_sub(1, Ordering::SeqCst);
                 let arg = command.arguments()[0].to_string_lossy().into_owned();
                 Ok(ProcessResult::new(
@@ -359,9 +364,14 @@ mod tests {
             .collect();
         let expected: Vec<Vec<u8>> = (0..6).map(|i| i.to_string().into_bytes()).collect();
         assert_eq!(bytes, expected, "raw bytes preserved in input order");
+        let peak = runner.peak.load(Ordering::SeqCst);
         assert!(
-            runner.peak.load(Ordering::SeqCst) <= 2,
-            "concurrency cap honored for the bytes batch too"
+            peak <= 2,
+            "concurrency cap exceeded for the bytes batch: {peak}"
+        );
+        assert_eq!(
+            peak, 2,
+            "the cap must actually be reached (genuine overlap), got {peak}"
         );
     }
 

@@ -51,8 +51,8 @@ pub(crate) trait GracefulTarget {
 ///   (E15) so a `Duration::MAX`-ish value can't overflow `Instant + Duration`
 ///   and panic mid-teardown.
 /// - `escalate`: on `true`, hard-kill any survivors once the deadline passes; on
-///   `false`, leave them running and set `skip_drop_kill` so the backend's
-///   `Drop` won't kill them either (B12).
+///   `false`, leave them running and `request()` the `skip_drop_kill` latch so the
+///   backend's `Drop` won't kill them either (B12).
 pub(crate) async fn run(
     target: &impl GracefulTarget,
     skip_drop_kill: &super::SkipDropKill,
