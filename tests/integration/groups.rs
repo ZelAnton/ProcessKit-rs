@@ -171,10 +171,27 @@ async fn terminate_all_is_idempotent() {
         .expect("second terminate must be a no-op success, not an error");
 
     // The group stays usable after teardown: a fresh spawn still lands in it.
-    let again = group
-        .start(&sleep_secs(1))
-        .await
-        .expect("group usable after terminate");
+    // On Windows, `CreateProcess` of a binary just killed via `TerminateJobObject`
+    // can transiently fail with `ERROR_ACCESS_DENIED` — the dying image stays
+    // briefly locked (the exiting process, or Defender re-scanning it), so
+    // re-spawning the *same* binary right away occasionally "Access is denied."s.
+    // That is orthogonal to the job-reusability this asserts, and the crate
+    // (rightly) treats `PermissionDenied` as permanent for a real launch, so we
+    // retry the transient here rather than in the library.
+    let mut again = None;
+    for attempt in 0..20u32 {
+        match group.start(&sleep_secs(1)).await {
+            Ok(run) => {
+                again = Some(run);
+                break;
+            }
+            Err(e) if e.is_permission_denied() && attempt < 19 => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("group usable after terminate: {e:?}"),
+        }
+    }
+    let again = again.expect("group usable after terminate (after transient retries)");
     drop(again);
     let _ = tokio::time::timeout(Duration::from_secs(10), child.wait())
         .await
