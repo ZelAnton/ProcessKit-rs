@@ -22,6 +22,21 @@ use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::result::{Outcome, ProcessResult};
 use crate::running::Finished;
+use tokio::task::AbortHandle;
+
+/// Aborts a set of in-flight stage drain tasks when the chain exits early — a
+/// whole-chain timeout or a stage error — instead of detaching them to linger
+/// until the killed children close their pipes (P3-2). On the success path the
+/// tasks have already completed, so the abort is a harmless no-op.
+struct AbortTasksOnDrop(Vec<AbortHandle>);
+
+impl Drop for AbortTasksOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
 
 /// A chain of [`Command`]s connected stdout→stdin — built with
 /// [`Command::pipe`], extended with [`pipe`](Self::pipe), driven with
@@ -183,6 +198,19 @@ impl Pipeline {
         }
         let last_task = tokio::spawn(async move { last.output_string().await });
 
+        // P3-2: abort any still-running stage drain tasks on an early exit (a
+        // whole-chain timeout, or a stage that errored before its siblings were
+        // awaited) rather than detaching them. The children are killed via the
+        // group regardless; this stops the now-useless drain tasks promptly
+        // instead of leaving them parked until the killed pipes close.
+        let _abort_guard = AbortTasksOnDrop(
+            inner_tasks
+                .iter()
+                .map(|t| t.abort_handle())
+                .chain(std::iter::once(last_task.abort_handle()))
+                .collect(),
+        );
+
         let collect = async {
             let mut outcomes = Vec::with_capacity(inner_tasks.len() + 1);
             for task in inner_tasks {
@@ -197,10 +225,11 @@ impl Pipeline {
             Some(limit) => match tokio::time::timeout(limit, collect).await {
                 Ok(collected) => collected?,
                 Err(_elapsed) => {
-                    // Whole-chain deadline: kill the chain. The stages exit
-                    // promptly, so the moved-out drain tasks finish on their own;
-                    // report the timeout in the result like `Command::timeout`
-                    // does. Best-effort kill: the group's Drop backstops a failure.
+                    // Whole-chain deadline: kill the chain and report the timeout
+                    // in the result like `Command::timeout` does. Best-effort
+                    // kill: the group's Drop backstops a failure. The drain tasks
+                    // are aborted by `_abort_guard` as this returns, rather than
+                    // detached to linger until the killed pipes close (P3-2).
                     let _ = group.terminate_all();
                     return Ok(ProcessResult::new(
                         self.pipeline_name(),
