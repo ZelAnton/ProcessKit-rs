@@ -30,13 +30,37 @@ to a dated version section.
 
 ### Fixed
 
-- The output line pump's byte accounting for an over-cap (dropped) line is now
-  stable across read boundaries: a CRLF terminator's `\r` is no longer counted as
-  content when it lands at the end of a chunk, so the `OverflowMode::Error` byte
-  ceiling and the seen-byte total are independent of how the OS chunked the read.
+- The output line pump's handling of an over-cap line is now independent of how
+  the OS chunked the read: (a) its byte accounting no longer counts a CRLF
+  terminator's `\r` as content when it lands at the end of a chunk, and (b) a line
+  whose content is exactly `max_bytes` and ends in CRLF is retained whether the
+  CRLF arrives whole or split across a read (previously it was dropped when split).
+  An over-cap *unterminated* final line is dropped — never delivered to a line
+  handler or tee — upholding the "an over-cap line is never retained or delivered"
+  contract. This stabilizes the `OverflowMode::Error` byte ceiling and the
+  seen-byte total.
+- Record/replay (`record` feature): `RecordReplayRunner::replay` now rejects, as
+  `Error::Io(InvalidData)` at load, a cassette entry with a contradictory outcome
+  (more than one of an exit code, a timeout, or a signal set) and a cassette file
+  over 64 MiB — a malformed or stray fixture fails loud instead of replaying a
+  silently-wrong outcome or buffering an unbounded file.
+- The supervisor's crash classification, the `output_bytes` truncation totals, the
+  pipeline's whole-chain-timeout task teardown, and the cgroup/Job-Object
+  graceful-shutdown survivor flag were tightened (no behavior change for the common
+  path); the `profile` sampler no longer folds a metrics reading taken once the
+  child's pid may have been recycled.
 - Windows: a child is reaped if `spawn` unwinds in the window between process
   creation (`CREATE_SUSPENDED`) and Job-Object assignment, so a panic there can
   no longer leak a suspended, uncontained process.
+
+### Security
+
+- `Error`'s one-line `Display` now neutralizes Unicode **bidirectional-formatting
+  controls** (the "Trojan Source" class, CVE-2021-42574) in addition to the ASCII
+  / C1 control characters it already replaced, and the `Parse` variant's `Display`
+  is sanitized too (it previously only truncated). A hostile child's output can no
+  longer inject terminal-reordering or escape sequences into an operator's log or
+  terminal through an error's `{}`.
 
 ## [0.11.0] - 2026-06-14
 

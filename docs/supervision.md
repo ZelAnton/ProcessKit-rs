@@ -51,8 +51,11 @@ onward).
 
 ## Policies: what counts as a crash
 
-A **crash** is any run without a clean exit: a non-zero code, a timeout, a
-signal-kill, or a spawn failure.
+A **crash** is any run that is not a *success* (`ProcessResult::is_success`,
+which honors the command's `ok_codes`): an exit code outside the accepted set
+(default `{0}`), a timeout, a signal-kill, or a spawn failure. A command with
+`ok_codes([0, 2])` that exits `2` is a success, so `OnCrash` treats it as clean,
+not a crash.
 
 | `RestartPolicy` | Restarts after… |
 |---|---|

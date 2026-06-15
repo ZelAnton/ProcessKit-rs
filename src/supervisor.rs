@@ -49,8 +49,13 @@ fn default_supervision_capture(command: &Command) -> OutputBufferPolicy {
 pub enum RestartPolicy {
     /// Restart after every completed run, clean or not.
     Always,
-    /// Restart only after a *crash* — a non-zero exit, a timeout, a signal
-    /// kill, or a failure to spawn. A clean exit (code `0`) ends supervision.
+    /// Restart only after a *crash* — a run that is **not a success**
+    /// ([`ProcessResult::is_success`](crate::ProcessResult::is_success)): an exit
+    /// code outside the accepted set (the command's
+    /// [`ok_codes`](crate::Command::ok_codes), default `{0}`), a timeout, a signal
+    /// kill, or a failure to spawn. A successful run (an accepted exit code) ends
+    /// supervision — so a command with `ok_codes([0, 2])` exiting `2` is treated
+    /// as clean, not a crash.
     OnCrash,
     /// Never restart: run the child once and report its outcome.
     Never,

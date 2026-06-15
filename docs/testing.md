@@ -252,7 +252,7 @@ Semantics worth knowing before you commit a cassette:
 | Duplicates of one key | replay in capture order, then the **last entry repeats** — a recorded sequence (`git rev-parse HEAD` before/after a commit) replays faithfully, while retry/probe loops keep getting a stable final answer |
 | Miss | strict `Error::CassetteMiss` (distinct from a missing program — `is_not_found()` is `false`) — replay never spawns a surprise subprocess; a stale cassette fails loudly |
 | Timeouts | a recorded timed-out run replays as one, surfacing `Error::Timeout` with the *replaying* command's deadline |
-| Format | pretty-printed JSON with a `version` field; unknown versions / corrupt files are `Error::Io(InvalidData)`, a missing file keeps `NotFound` |
+| Format | pretty-printed JSON with a `version` field; unknown versions / corrupt files / an entry with a contradictory outcome / a file over 64 MiB are `Error::Io(InvalidData)`, a missing file keeps `NotFound` |
 | Err results | not recorded — only completed runs (non-zero exits and captured timeouts *are* results and are recorded) |
 
 Only env **values** are redacted. `program`, `args`, `cwd`, `stdout`, and
