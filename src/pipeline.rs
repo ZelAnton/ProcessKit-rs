@@ -39,8 +39,23 @@ impl Drop for AbortTasksOnDrop {
 }
 
 /// A chain of [`Command`]s connected stdout→stdin — built with
-/// [`Command::pipe`], extended with [`pipe`](Self::pipe), driven with
-/// [`output_string`](Self::output_string) / [`run`](Self::run).
+/// [`Command::pipe`], extended with [`pipe`](Self::pipe), driven with the same
+/// verb vocabulary as a single [`Command`]:
+/// [`output_string`](Self::output_string) / [`output_bytes`](Self::output_bytes)
+/// for capture, [`run`](Self::run) / [`run_unit`](Self::run_unit) /
+/// [`checked`](Self::checked) for success-checked runs,
+/// [`exit_code`](Self::exit_code) / [`probe`](Self::probe) for the code, and
+/// [`parse`](Self::parse) / [`try_parse`](Self::try_parse) for typed output —
+/// each operating on the **pipefail** outcome. Bound the whole chain with
+/// [`timeout`](Self::timeout) / [`cancel_on`](Self::cancel_on).
+///
+/// The streaming [`first_line`](Command::first_line) probe is intentionally
+/// **not** on `Pipeline`: a chain consumes its last stage in full to fold the
+/// pipefail outcome. To *capture* a finished chain's first matching line, add a
+/// `| head -n1` (or `findstr`/`grep -m1`) stage and capture. A streaming
+/// readiness probe over a chain that must **keep running** (wait for a banner
+/// line, then leave the chain alive) is not supported — use a single
+/// [`Command`] with `first_line`, since `| head` would tear the chain down.
 ///
 /// ```no_run
 /// # async fn demo() -> processkit::Result<()> {
@@ -88,6 +103,9 @@ impl Drop for AbortTasksOnDrop {
 pub struct Pipeline {
     stages: Vec<Command>,
     timeout: Option<Duration>,
+    /// Applied to every stage at launch ([`cancel_on`](Self::cancel_on)) so the
+    /// whole chain shares one cancel state and a cancellation errors the run.
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 // Manual: `Command` has a manual Debug; keep the surface small.
@@ -122,6 +140,7 @@ impl Pipeline {
         Pipeline {
             stages: vec![first, second],
             timeout: None,
+            cancel_token: None,
         }
     }
 
@@ -141,11 +160,57 @@ impl Pipeline {
         self
     }
 
-    /// Run the chain to completion and capture the outcome. A failing stage is
-    /// **not** an `Err` here — it is reported in the result (pipefail
-    /// attribution, see the type docs); `Err` means a stage could not be
-    /// started or driven at all.
+    /// Cancel the **whole chain** when `token` fires: the shared kill-on-drop
+    /// group tears every stage down and the run resolves to
+    /// [`Error::Cancelled`](crate::Error::Cancelled).
+    ///
+    /// The token **gap-fills** — at launch it is applied to every stage that does
+    /// not already carry its own [`Command::cancel_on`], leaving an explicit
+    /// per-stage token intact (which still cancels the chain, since cancelling one
+    /// stage errors the run and the group tears the rest down). This matches
+    /// [`CliClient::default_cancel_on`](crate::CliClient::default_cancel_on)
+    /// rather than silently overriding a per-stage choice. To have a stage
+    /// cancelled by **both** its own token and the chain token, pass a child of
+    /// this token as the stage's token (`token.child_token()`).
+    ///
+    /// Like [`Command::cancel_on`], a cancelled run is terminal: it is not
+    /// retried, and the chain cannot be re-run through a token that stays
+    /// cancelled.
+    pub fn cancel_on(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel_token = Some(token);
+        self
+    }
+
+    /// Run the chain to completion and capture the outcome (stdout as text). A
+    /// failing stage is **not** an `Err` here — it is reported in the result
+    /// (pipefail attribution, see the type docs); `Err` means a stage could not
+    /// be started or driven at all.
     pub async fn output_string(&self) -> Result<ProcessResult<String>> {
+        self.capture(|last| async move { last.output_string().await })
+            .await
+    }
+
+    /// Run the chain to completion and capture the last stage's stdout as **raw
+    /// bytes** (the binary-pipe analogue of [`output_string`](Self::output_string)
+    /// — e.g. `curl … | gunzip`). Pipefail attribution is identical; only the
+    /// last stage's stdout is captured raw. Stderr (every stage, including the
+    /// last) stays decoded text — it is diagnostics, never the binary payload.
+    pub async fn output_bytes(&self) -> Result<ProcessResult<Vec<u8>>> {
+        self.capture(|last| async move { last.output_bytes().await })
+            .await
+    }
+
+    /// The shared driver behind [`output_string`](Self::output_string) /
+    /// [`output_bytes`](Self::output_bytes): start and chain every stage, drain
+    /// them concurrently, and fold the pipefail outcome. `capture_last` decides
+    /// how the **last** stage's stdout is captured (text vs raw bytes); inner
+    /// stages are always line-drained for their stderr/exit.
+    async fn capture<T, C, F>(&self, capture_last: C) -> Result<ProcessResult<T>>
+    where
+        T: Default + Send + 'static,
+        C: FnOnce(crate::running::RunningProcess) -> F,
+        F: std::future::Future<Output = Result<ProcessResult<T>>> + Send + 'static,
+    {
         let group = ProcessGroup::new()?;
 
         // Start every stage, chaining stage N's stdout into stage N+1's stdin.
@@ -155,6 +220,20 @@ impl Pipeline {
         let mut upstream = None;
         for (index, stage) in self.stages.iter().enumerate() {
             let mut command = stage.clone();
+            // A pipeline-level cancel token *gap-fills* — it is applied to every
+            // stage that doesn't already carry its own `Command::cancel_on`,
+            // leaving an explicit per-stage token intact (which still cancels the
+            // chain, since one stage's `Error::Cancelled` errors the run and the
+            // shared group tears the rest down). This mirrors
+            // `CliClient::default_cancel_on`'s gap-fill precedent rather than
+            // silently overriding a setting the caller chose. To have a stage
+            // cancelled by *both*, pass a child of this token as the stage's own
+            // token (`token.child_token()`).
+            if let Some(token) = &self.cancel_token
+                && command.cancel_token().is_none()
+            {
+                command = command.cancel_on(token.clone());
+            }
             if let Some(reader) = upstream.take() {
                 command.set_pipe_stdin(reader);
             }
@@ -196,7 +275,7 @@ impl Pipeline {
                 })
             }));
         }
-        let last_task = tokio::spawn(async move { last.output_string().await });
+        let last_task = tokio::spawn(capture_last(last));
 
         // P3-2: abort any still-running stage drain tasks on an early exit (a
         // whole-chain timeout, or a stage that errored before its siblings were
@@ -233,7 +312,9 @@ impl Pipeline {
                     let _ = group.terminate_all();
                     return Ok(ProcessResult::new(
                         self.pipeline_name(),
-                        String::new(),
+                        // Empty payload of the captured type (`""` / `[]`): a
+                        // timed-out chain reports no partial stdout.
+                        T::default(),
                         String::new(),
                         Outcome::TimedOut,
                         Some(limit),
@@ -252,10 +333,24 @@ impl Pipeline {
             ok_codes: last_ok_codes,
             timeout: last_timeout,
         };
+        // Carry the last stage's truncation state: the chain's stdout *is* the
+        // last stage's, so if its bounded buffer dropped lines the folded result
+        // must report `truncated()` too — `pipefail` rebuilds the result via
+        // `ProcessResult::new` (which defaults `truncated=false`), so re-stamp it
+        // here. This is what makes the `parse`/`try_parse` truncation guard real.
+        let last_truncated = last_result.truncated();
+        let (last_total_lines, last_total_bytes) =
+            (last_result.total_lines(), last_result.total_bytes());
         let last_stdout = last_result.into_stdout();
         stages.push(last_outcome);
 
-        Ok(pipefail(stages, last_stdout))
+        let mut result = pipefail(stages, last_stdout);
+        if last_truncated {
+            result = result
+                .with_truncated(true)
+                .with_overflow_totals(last_total_lines, last_total_bytes);
+        }
+        Ok(result)
     }
 
     /// Run the chain, require **every** stage to exit cleanly, and return the
@@ -275,6 +370,102 @@ impl Pipeline {
             .into_stdout()
             .trim_end()
             .to_owned())
+    }
+
+    /// Run the chain, require **every** stage to exit cleanly (pipefail), and
+    /// return the full captured [`ProcessResult`] (untrimmed stdout) — the
+    /// building block when you need the whole result after success-checking,
+    /// rather than trimmed stdout ([`run`](Self::run)). Mirrors
+    /// [`Command::checked`](crate::Command::checked).
+    pub async fn checked(&self) -> Result<ProcessResult<String>> {
+        self.output_string().await?.ensure_success()
+    }
+
+    /// Run the chain for its side effect: require a clean pipefail outcome and
+    /// discard the output. Mirrors [`Command::run_unit`](crate::Command::run_unit).
+    pub async fn run_unit(&self) -> Result<()> {
+        self.output_string().await?.ensure_success().map(drop)
+    }
+
+    /// Run the chain and return the pipefail-attributed exit code. A chain that
+    /// produced no code surfaces as an error — a whole-chain or stage timeout as
+    /// [`Error::Timeout`](crate::Error::Timeout), a signal-kill as
+    /// [`Error::Signalled`](crate::Error::Signalled) — mirroring
+    /// [`Command::exit_code`](crate::Command::exit_code).
+    pub async fn exit_code(&self) -> Result<i32> {
+        self.output_string().await?.require_code()
+    }
+
+    /// Read the chain's pipefail-attributed exit code as a boolean: `0` →
+    /// `Ok(true)`, `1` → `Ok(false)`, anything else → `Err` (other code as
+    /// [`Error::Exit`](crate::Error::Exit), a timeout as
+    /// [`Error::Timeout`](crate::Error::Timeout), a signal-kill as
+    /// [`Error::Signalled`](crate::Error::Signalled)). For a chain whose final
+    /// answer is a yes/no exit — `producer | grep -q pattern`. Mirrors
+    /// [`Command::probe`](crate::Command::probe) and keeps its strict 0/1
+    /// contract regardless of any stage's `ok_codes`.
+    ///
+    /// The code is the **pipefail** code, so an *inner* stage exiting `1` reads as
+    /// `false` even when the predicate is the last stage. If only the final
+    /// stage's verdict should decide the boolean, mark the earlier stages
+    /// [`unchecked_in_pipe`](Command::unchecked_in_pipe) so they never speak for
+    /// the chain.
+    pub async fn probe(&self) -> Result<bool> {
+        let result = self.output_string().await?;
+        match result.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            // Reset to the default `{0}` so an accepted non-{0,1} code still
+            // errors (probe's contract is strict), reusing ensure_success to
+            // build the faithful error — see `ProcessRunnerExt::probe`.
+            _ => Err(result
+                .with_ok_codes(vec![0])
+                .ensure_success()
+                .expect_err("a non-{0,1} exit code is never success")),
+        }
+    }
+
+    /// Run the chain (requiring a clean pipefail outcome) and feed the last
+    /// stage's stdout to an **infallible** `parse` closure. Fails loud on a
+    /// bounded-buffer truncation of the last stage so the parser never sees a
+    /// clipped tail. Mirrors [`Command::parse`](crate::Command::parse) — except
+    /// the closure runs *inline* on the awaiting task (not across a `tokio::spawn`
+    /// boundary), so it needs no `Send` bound, accepting strictly more closures
+    /// than `Command::parse`.
+    pub async fn parse<T, F>(&self, parse: F) -> Result<T>
+    where
+        F: FnOnce(&str) -> T,
+    {
+        let out = self.checked().await?;
+        self.reject_if_last_truncated(&out)?;
+        Ok(parse(out.stdout()))
+    }
+
+    /// Run the chain (requiring a clean pipefail outcome) and feed the last
+    /// stage's stdout to a *fallible* `parse` closure (the JSON-deserialization
+    /// shape; a failure becomes [`Error::Parse`](crate::Error::Parse) or whatever
+    /// the closure returns). Fails loud on truncation. Mirrors
+    /// [`Command::try_parse`](crate::Command::try_parse).
+    pub async fn try_parse<T, F>(&self, parse: F) -> Result<T>
+    where
+        F: FnOnce(&str) -> Result<T>,
+    {
+        let out = self.checked().await?;
+        self.reject_if_last_truncated(&out)?;
+        parse(out.stdout())
+    }
+
+    /// Fail loud if the last stage's capture was truncated by its bounded buffer
+    /// (B12) — the parsing verbs must not hand a clipped tail to the closure. The
+    /// ceiling is the **last** stage's [`Command::output_buffer`] policy, since its
+    /// stdout is the chain's output.
+    fn reject_if_last_truncated(&self, out: &ProcessResult<String>) -> Result<()> {
+        let policy = self
+            .stages
+            .last()
+            .expect("a pipeline has at least two stages")
+            .output_buffer_policy();
+        out.reject_if_truncated(policy.max_lines, policy.max_bytes)
     }
 
     /// `"a | b | c"` — the chain's display name for timeout attribution.
@@ -318,7 +509,7 @@ fn is_sigpipe(outcome: &Outcome) -> bool {
 ///   (L19), else the leftmost.
 /// - The attributed failure carries its **own** deadline, so a stage that timed
 ///   out reports its real `timeout`, never the chain's or `0ns` (B10).
-fn pipefail(stages: Vec<StageOutcome>, last_stdout: String) -> ProcessResult<String> {
+fn pipefail<T>(stages: Vec<StageOutcome>, last_stdout: T) -> ProcessResult<T> {
     let is_clean = |stage: &StageOutcome| match stage.outcome {
         Outcome::Exited(code) => stage.ok_codes.contains(&code),
         _ => false, // signal kill or timeout → unclean regardless

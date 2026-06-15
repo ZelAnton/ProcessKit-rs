@@ -217,6 +217,174 @@ async fn pipeline_timeout_kills_the_whole_chain() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real pipeline and captures raw bytes"]
+async fn pipeline_output_bytes_captures_the_last_stage_stdout() {
+    // S-1: the binary-capture analogue of output_string. A simple echo|sort
+    // chain whose last stage's stdout is captured as raw bytes.
+    let producer = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo beta& echo alpha"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'beta\\nalpha\\n'"])
+    };
+    let result = producer
+        .pipe(sort_stage())
+        .output_bytes()
+        .await
+        .expect("run pipeline");
+    assert!(result.is_success(), "pipeline result: {result:?}");
+    let bytes = result.stdout();
+    let text = String::from_utf8_lossy(bytes);
+    assert!(
+        text.contains("alpha") && text.contains("beta"),
+        "raw bytes carry both lines: {text:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns real pipelines exercising the parity verbs"]
+async fn pipeline_run_verbs_mirror_the_command_vocabulary() {
+    // S-1: run_unit / exit_code / checked on a clean two-stage chain.
+    let clean = || {
+        let producer = if cfg!(windows) {
+            Command::new("cmd").args(["/c", "echo hi"])
+        } else {
+            Command::new("sh").args(["-c", "printf 'hi\\n'"])
+        };
+        producer.pipe(sort_stage())
+    };
+    clean().run_unit().await.expect("run_unit on a clean chain");
+    assert_eq!(clean().exit_code().await.expect("exit_code"), 0);
+    let checked = clean().checked().await.expect("checked");
+    assert!(checked.stdout().contains("hi"), "checked: {checked:?}");
+
+    // exit_code surfaces a failing inner stage's attributed code.
+    let code = failing_exit(0)
+        .pipe(failing_exit(4))
+        .pipe(sort_stage())
+        .exit_code()
+        .await
+        .expect("exit_code reports a result");
+    assert_eq!(code, 4, "pipefail-attributed exit code");
+}
+
+#[tokio::test]
+#[ignore = "spawns a real grep -q pipeline for probe"]
+async fn pipeline_probe_reads_the_chain_exit_as_a_bool() {
+    // S-1: a `producer | grep -q pattern` chain — exit 0 (match) → true,
+    // exit 1 (no match) → false.
+    let grep_q = |pattern: &str| {
+        if cfg!(windows) {
+            // findstr has no quiet flag, but pipefail reads its exit code (0 hit
+            // / 1 miss) the same way; `/c:<pattern>` must be a single token.
+            Command::new("findstr").arg(format!("/c:{pattern}"))
+        } else {
+            Command::new("grep").args(["-q", pattern])
+        }
+    };
+    let producer = || {
+        if cfg!(windows) {
+            Command::new("cmd").args(["/c", "echo hello world"])
+        } else {
+            Command::new("sh").args(["-c", "printf 'hello world\\n'"])
+        }
+    };
+    assert!(
+        producer()
+            .pipe(grep_q("hello"))
+            .probe()
+            .await
+            .expect("probe match"),
+        "grep -q finds the pattern → true"
+    );
+    assert!(
+        !producer()
+            .pipe(grep_q("absent"))
+            .probe()
+            .await
+            .expect("probe miss"),
+        "grep -q misses → false (exit 1)"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real pipeline and parses its output"]
+async fn pipeline_parse_turns_chain_stdout_into_a_value() {
+    // S-1: parse the line count of a sorted producer.
+    let producer = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo b& echo a& echo a"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'b\\na\\na\\n'"])
+    };
+    let dedup = if cfg!(windows) {
+        // `sort` on Windows has no -u; pipe through to keep it simple: count lines.
+        Command::new("findstr").arg("a")
+    } else {
+        Command::new("grep").arg("a")
+    };
+    let n: usize = producer
+        .pipe(dedup)
+        .parse(|s| s.lines().count())
+        .await
+        .expect("parse the count");
+    assert_eq!(n, 2, "two 'a' lines");
+}
+
+#[tokio::test]
+#[ignore = "spawns a pipeline whose last stage truncates its capture"]
+async fn pipeline_parse_fails_loud_on_a_truncated_last_stage() {
+    // S-1/B12: parse must reject a clipped tail rather than hand the closure a
+    // partial capture. The last stage's bounded buffer drops lines; the folded
+    // result must carry `truncated()` so parse errors with OutputTooLarge.
+    use processkit::OutputBufferPolicy;
+    let producer = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo a& echo b& echo c& echo d"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'a\\nb\\nc\\nd\\n'"])
+    };
+    let err = producer
+        .pipe(sort_stage().output_buffer(OutputBufferPolicy::bounded(2)))
+        .parse(|s| s.to_owned())
+        .await
+        .expect_err("a truncated last stage must fail loud");
+    assert!(
+        matches!(err, processkit::Error::OutputTooLarge { .. }),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real long-running pipeline and cancels it"]
+async fn pipeline_cancel_on_tears_the_whole_chain_down() {
+    // S-1: a token fired mid-run cancels every stage; the run resolves to
+    // Error::Cancelled rather than hanging on the endless producer.
+    use tokio_util::sync::CancellationToken;
+    let token = CancellationToken::new();
+    let chain = endless_yes()
+        .unchecked_in_pipe()
+        .pipe(sleep_secs(30))
+        .cancel_on(token.clone());
+    let fired = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        fired.cancel();
+    });
+    let start = Instant::now();
+    let err = chain
+        .output_string()
+        .await
+        .expect_err("a cancelled chain errors");
+    assert!(
+        matches!(err, processkit::Error::Cancelled { .. }),
+        "expected Cancelled, got {err:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(15),
+        "cancellation must be prompt, took {:?}",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a real pipeline fed from a string stdin"]
 async fn pipeline_honors_first_stage_stdin() {
     let result = sort_stage()

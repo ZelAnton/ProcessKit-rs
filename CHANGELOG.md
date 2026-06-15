@@ -13,6 +13,12 @@ to a dated version section.
 
 ### Added
 
+- `Pipeline` gained verb parity with a single `Command`: `output_bytes` (binary
+  capture), `run_unit`, `exit_code`, `checked`, `probe`, and `parse` / `try_parse`
+  — each operating on the pipefail outcome — plus a chain-level `cancel_on(token)`
+  that tears the whole chain down to `Error::Cancelled` (applied to every stage).
+  The streaming `first_line` is intentionally omitted (a chain consumes its last
+  stage in full; add a `| head -n1` stage instead) (S-1).
 - `parse` / `try_parse` are now first-class verbs on `ProcessRunnerExt` (so every
   runner — `JobRunner`, `&ProcessGroup`, a `ScriptedRunner` — has them) and on
   `Command` (`cmd.parse(|s| …)` / `cmd.try_parse(|s| …)`), not just `CliClient`.

@@ -571,10 +571,18 @@ impl core::panic::unwind_safe::RefUnwindSafe for processkit::OutputLine
 impl core::panic::unwind_safe::UnwindSafe for processkit::OutputLine
 pub struct processkit::Pipeline
 impl processkit::Pipeline
+pub fn processkit::Pipeline::cancel_on(self, tokio_util::sync::cancellation_token::CancellationToken) -> Self
+pub async fn processkit::Pipeline::checked(&self) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
+pub async fn processkit::Pipeline::exit_code(&self) -> processkit::Result<i32>
+pub async fn processkit::Pipeline::output_bytes(&self) -> processkit::Result<processkit::ProcessResult<alloc::vec::Vec<u8>>>
 pub async fn processkit::Pipeline::output_string(&self) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
+pub async fn processkit::Pipeline::parse<T, F>(&self, F) -> processkit::Result<T> where F: core::ops::function::FnOnce(&str) -> T
 pub fn processkit::Pipeline::pipe(self, processkit::Command) -> Self
+pub async fn processkit::Pipeline::probe(&self) -> processkit::Result<bool>
 pub async fn processkit::Pipeline::run(&self) -> processkit::Result<alloc::string::String>
+pub async fn processkit::Pipeline::run_unit(&self) -> processkit::Result<()>
 pub fn processkit::Pipeline::timeout(self, core::time::Duration) -> Self
+pub async fn processkit::Pipeline::try_parse<T, F>(&self, F) -> processkit::Result<T> where F: core::ops::function::FnOnce(&str) -> processkit::Result<T>
 impl core::clone::Clone for processkit::Pipeline
 pub fn processkit::Pipeline::clone(&self) -> processkit::Pipeline
 impl core::fmt::Debug for processkit::Pipeline

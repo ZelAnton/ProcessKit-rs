@@ -38,15 +38,29 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-The two verbs mirror `Command`'s:
+The verbs mirror `Command`'s, each operating on the pipefail outcome:
 
 | Verb | Returns | A failing stage is… |
 |---|---|---|
 | `output_string()` | `ProcessResult<String>` | …reported in the result (code/stderr/program of the first unclean stage) |
+| `output_bytes()` | `ProcessResult<Vec<u8>>` | …same, with the last stage's stdout captured raw (binary pipes) |
 | `run()` | trimmed final stdout | …raised as that stage's `Error::Exit` |
+| `checked()` | full `ProcessResult<String>` | …raised as `Error::Exit` (untrimmed stdout) |
+| `run_unit()` | `()` | …raised as `Error::Exit` (output discarded) |
+| `exit_code()` | `i32` | …its attributed code (no code → `Error::Timeout`/`Signalled`) |
+| `probe()` | `bool` | `0` → `true`, `1` → `false`, else `Err` |
+| `parse(\|s\| …)` / `try_parse(\|s\| …)` | `T` | …raised as `Error::Exit`; fails loud on a truncated capture |
 
 `Err` from `output_string` itself means a stage couldn't be *started or
 driven* at all (spawn failure, broken plumbing) — never a mere non-zero exit.
+
+The streaming `first_line` probe is deliberately not a pipeline verb: a chain
+consumes its last stage in full to fold the pipefail outcome. To *capture* the
+first matching line of a finished chain, add a `| head -n1` (Unix) / `grep -m1`
+/ `findstr` stage and capture. This does **not** cover a streaming readiness
+probe over a chain that must keep running (e.g. wait for a banner line, then
+leave the chain alive) — `| head` would tear it down; use a single `Command`
+with `first_line` for that.
 
 The `|` operator is sugar for the same thing — `a | b | c` ≡
 `a.pipe(b).pipe(c)`. Parenthesize the chain before a terminal verb, since
@@ -168,9 +182,11 @@ let out = Command::new("producer")
   inner *or* last — surfaces on `run()` as that stage's `Error::Timeout`,
   reporting **that stage's own deadline** (not the chain's, and never `0ns`).
 
-A `cancel_on` token on **any** stage cancels
-that stage; the cancellation errors the whole pipeline and the private group
-tears the other stages down — see
+Cancellation has two forms. **`Pipeline::cancel_on(token)`** is the chain-level
+control: the token is applied to every stage, so firing it tears the whole chain
+down and the run resolves to `Error::Cancelled`. (A `cancel_on` token on an
+individual stage `Command` also cancels that stage and errors the pipeline, but
+the pipeline-level builder is the clearer authority.) See
 [Timeouts & cancellation](timeouts-and-cancellation.md).
 
 ## Re-running a pipeline

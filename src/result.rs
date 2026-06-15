@@ -282,6 +282,18 @@ impl<T> ProcessResult<T> {
         self
     }
 
+    /// Total lines seen across the captured streams (retained + dropped) —
+    /// companion to [`truncated`](Self::truncated) for re-stamping a folded
+    /// result (e.g. the pipeline pipefail fold). Producer-only.
+    pub(crate) fn total_lines(&self) -> usize {
+        self.total_lines
+    }
+
+    /// Total bytes seen across the captured streams (retained + dropped).
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
     /// B12: refuse silently-truncated output. The checking verbs that hand back
     /// stdout *as if complete* (`run`/`parse`/`try_parse`) call this so a bounded
     /// drop-policy that discarded lines surfaces as [`Error::OutputTooLarge`]
