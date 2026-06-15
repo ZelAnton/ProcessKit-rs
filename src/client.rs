@@ -323,34 +323,28 @@ impl<R: ProcessRunner> CliClient<R> {
     }
 
     /// Run (errors on a non-zero exit) and feed stdout to an infallible
-    /// `parse` — the shape of git/jj struct-returning commands.
-    pub async fn parse<T>(
-        &self,
-        call: impl IntoCommand<R>,
-        parse: impl FnOnce(&str) -> T,
-    ) -> Result<T> {
-        let command = call.into_command(self);
-        let out = self.runner.checked(&command).await?;
-        // B12: a parser must not silently see a truncated tail.
-        let policy = command.output_buffer_policy();
-        out.reject_if_truncated(policy.max_lines, policy.max_bytes)?;
-        Ok(parse(out.stdout()))
+    /// `parse` — the shape of git/jj struct-returning commands. Fails loud on a
+    /// bounded-buffer truncation. Delegates to
+    /// [`ProcessRunnerExt::parse`](crate::ProcessRunnerExt::parse).
+    pub async fn parse<T, F>(&self, call: impl IntoCommand<R>, parse: F) -> Result<T>
+    where
+        T: Send,
+        F: FnOnce(&str) -> T + Send,
+    {
+        self.runner.parse(&call.into_command(self), parse).await
     }
 
     /// Run (errors on a non-zero exit) and feed stdout to a *fallible* `parse` —
     /// the shape of JSON deserialization, where a parse failure becomes
-    /// [`Error::Parse`](crate::Error::Parse).
-    pub async fn try_parse<T>(
-        &self,
-        call: impl IntoCommand<R>,
-        parse: impl FnOnce(&str) -> Result<T>,
-    ) -> Result<T> {
-        let command = call.into_command(self);
-        let out = self.runner.checked(&command).await?;
-        // B12: a parser must not silently see a truncated tail.
-        let policy = command.output_buffer_policy();
-        out.reject_if_truncated(policy.max_lines, policy.max_bytes)?;
-        parse(out.stdout())
+    /// [`Error::Parse`](crate::Error::Parse). Fails loud on a bounded-buffer
+    /// truncation. Delegates to
+    /// [`ProcessRunnerExt::try_parse`](crate::ProcessRunnerExt::try_parse).
+    pub async fn try_parse<T, F>(&self, call: impl IntoCommand<R>, parse: F) -> Result<T>
+    where
+        T: Send,
+        F: FnOnce(&str) -> Result<T> + Send,
+    {
+        self.runner.try_parse(&call.into_command(self), parse).await
     }
 }
 
@@ -520,7 +514,7 @@ mod tests {
             ScriptedRunner::new().fallback(Reply::ok("not a number")),
         );
         let err = client
-            .try_parse::<u32>(client.command(["x"]), |s| {
+            .try_parse::<u32, _>(client.command(["x"]), |s| {
                 s.trim().parse::<u32>().map_err(|e| Error::Parse {
                     program: "gh".into(),
                     message: e.to_string(),

@@ -13,6 +13,13 @@ to a dated version section.
 
 ### Added
 
+- `parse` / `try_parse` are now first-class verbs on `ProcessRunnerExt` (so every
+  runner — `JobRunner`, `&ProcessGroup`, a `ScriptedRunner` — has them) and on
+  `Command` (`cmd.parse(|s| …)` / `cmd.try_parse(|s| …)`), not just `CliClient`.
+  Each runs success-checked, fails loud on a bounded-buffer truncation (so a
+  parser never sees a clipped tail), and feeds stdout to the closure. Like
+  `first_line`, they are generic over the closure and therefore unavailable on a
+  `&dyn ProcessRunner` (call them on a concrete runner or via the wrappers) (S-2).
 - `ProcessResult` is now `#[must_use]`: dropping a result unread (its exit
   status is the only failure signal) triggers an `unused_must_use` warning.
   Inspect `is_success()`/`code()`/`ensure_success()` or bind to `let _` to
@@ -22,6 +29,14 @@ to a dated version section.
 
 ### Changed
 
+- **Breaking (minor):** `CliClient::parse` / `try_parse` gained an explicit
+  closure type parameter and `T: Send` / `F: Send` bounds (they now delegate to
+  the new `ProcessRunnerExt` verbs). Turbofish call sites that named only the
+  output type (`try_parse::<u32>(…)`) become `try_parse::<u32, _>(…)`; the common
+  inferred-generics form is unaffected. The `Send` bounds (required because the
+  verbs return a boxed `Send` future) also narrow what compiles: a parser that
+  returns a non-`Send` value, or a closure that captures a non-`Send` value, is
+  no longer accepted — extract the parse into a `Send`-returning step first.
 - **Breaking (pre-1.0 hardening):** `Finished` (returned by `RunningProcess::finish`)
   is now `#[non_exhaustive]` — read its `outcome` / `stderr` fields or destructure
   with a trailing `..`, so a future field (e.g. a duration) can be added without

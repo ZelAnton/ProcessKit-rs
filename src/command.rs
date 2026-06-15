@@ -1121,6 +1121,64 @@ impl Command {
         JobRunner::new().probe(self).await
     }
 
+    /// Run (requiring an **accepted** exit) and feed stdout to an **infallible**
+    /// `parse` closure, returning the parsed value. Fails loud on a bounded-buffer
+    /// truncation so the parser never sees a clipped tail. Consistent with
+    /// [`ProcessRunnerExt::parse`](crate::ProcessRunnerExt::parse) and
+    /// [`CliClient::parse`](crate::CliClient::parse).
+    ///
+    /// ```no_run
+    /// # async fn demo() -> processkit::Result<()> {
+    /// use processkit::Command;
+    /// // `wc -l` prints a count; turn it straight into a number.
+    /// let lines: usize = Command::new("wc")
+    ///     .args(["-l", "src/lib.rs"])
+    ///     .parse(|s| s.trim().parse().unwrap_or(0))
+    ///     .await?;
+    /// # let _ = lines;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn parse<T, F>(&self, parse: F) -> Result<T>
+    where
+        T: Send,
+        F: FnOnce(&str) -> T + Send,
+    {
+        JobRunner::new().parse(self, parse).await
+    }
+
+    /// Run (requiring an **accepted** exit) and feed stdout to a *fallible*
+    /// `parse` closure (the JSON-deserialization shape; a failure becomes
+    /// [`Error::Parse`](crate::Error::Parse) or whatever the closure returns).
+    /// Fails loud on truncation. Consistent with
+    /// [`ProcessRunnerExt::try_parse`](crate::ProcessRunnerExt::try_parse) and
+    /// [`CliClient::try_parse`](crate::CliClient::try_parse).
+    ///
+    /// ```no_run
+    /// # async fn demo() -> processkit::Result<()> {
+    /// use processkit::{Command, Error};
+    /// // A fallible parse: map the failure into a typed `Error::Parse`.
+    /// let count: u32 = Command::new("git")
+    ///     .args(["rev-list", "--count", "HEAD"])
+    ///     .try_parse(|s| {
+    ///         s.trim().parse().map_err(|e: std::num::ParseIntError| Error::Parse {
+    ///             program: "git".into(),
+    ///             message: e.to_string(),
+    ///         })
+    ///     })
+    ///     .await?;
+    /// # let _ = count;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn try_parse<T, F>(&self, parse: F) -> Result<T>
+    where
+        T: Send,
+        F: FnOnce(&str) -> Result<T> + Send,
+    {
+        JobRunner::new().try_parse(self, parse).await
+    }
+
     /// Return the first stdout line matching `predicate` (or the first line when
     /// the predicate is trivial), then tear the process down.
     pub async fn first_line<F>(&self, predicate: F) -> Result<Option<String>>

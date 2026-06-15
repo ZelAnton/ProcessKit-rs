@@ -184,6 +184,51 @@ pub trait ProcessRunnerExt: ProcessRunner {
         .await
     }
 
+    /// Run (requiring an **accepted** exit) and feed the captured stdout to an
+    /// **infallible** `parse` closure — the shape of struct-returning CLI
+    /// commands (git/jj `--format` output). Built on [`checked`](Self::checked),
+    /// but unlike it, fails loud on a bounded-buffer truncation (B12) so the
+    /// parser never silently sees a clipped tail; returns the parsed value.
+    ///
+    /// Because it is generic over the parser `F`, `parse` — like
+    /// [`first_line`](Self::first_line) — is **not object-safe** and so is
+    /// unavailable on a `&dyn ProcessRunner`: call it on a concrete runner
+    /// ([`JobRunner`], `&ProcessGroup`, a
+    /// [`ScriptedRunner`](crate::testing::ScriptedRunner)), or via the
+    /// [`Command::parse`](crate::Command::parse) /
+    /// [`CliClient::parse`](crate::CliClient::parse) wrappers.
+    async fn parse<T, F>(&self, command: &Command, parse: F) -> Result<T>
+    where
+        T: Send,
+        F: FnOnce(&str) -> T + Send,
+    {
+        let out = self.checked(command).await?;
+        // B12: a parser must not silently see a truncated tail.
+        let policy = command.output_buffer_policy();
+        out.reject_if_truncated(policy.max_lines, policy.max_bytes)?;
+        Ok(parse(out.stdout()))
+    }
+
+    /// Run (requiring an **accepted** exit) and feed the captured stdout to a
+    /// *fallible* `parse` closure — the shape of JSON deserialization, where a
+    /// parse failure becomes [`Error::Parse`](crate::Error::Parse) (or whatever
+    /// error the closure returns). Like [`parse`](Self::parse) it is built on
+    /// [`checked`](Self::checked), fails loud on truncation (B12), and — being
+    /// generic over `F` — is unavailable on a `&dyn ProcessRunner`; use a
+    /// concrete runner or the [`Command::try_parse`](crate::Command::try_parse) /
+    /// [`CliClient::try_parse`](crate::CliClient::try_parse) wrappers.
+    async fn try_parse<T, F>(&self, command: &Command, parse: F) -> Result<T>
+    where
+        T: Send,
+        F: FnOnce(&str) -> Result<T> + Send,
+    {
+        let out = self.checked(command).await?;
+        // B12: a parser must not silently see a truncated tail.
+        let policy = command.output_buffer_policy();
+        out.reject_if_truncated(policy.max_lines, policy.max_bytes)?;
+        parse(out.stdout())
+    }
+
     /// Stream `command`'s stdout and return the first line matching `predicate`
     /// (`None` if the stream ends first), bounded by the command's
     /// [`timeout`](crate::Command::timeout) (a `Some` deadline surfaces as
@@ -713,6 +758,78 @@ mod tests {
             runner.probe(&cmd).await,
             Err(Error::Exit { code: 2, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn parse_feeds_checked_stdout_to_the_parser() {
+        // S-2: `parse` runs (success-checked) and hands stdout to an infallible
+        // closure, returning the typed value — the building block the Command /
+        // CliClient wrappers delegate to.
+        use crate::testing::{Reply, ScriptedRunner};
+        let runner = ScriptedRunner::new().on(["wc", "-l"], Reply::ok("  42\n"));
+        let cmd = Command::new("wc").arg("-l");
+        let n: u32 = runner
+            .parse(&cmd, |s| s.trim().parse().unwrap_or(0))
+            .await
+            .expect("parse");
+        assert_eq!(n, 42);
+    }
+
+    #[tokio::test]
+    async fn try_parse_surfaces_a_parser_error_and_a_nonzero_exit() {
+        use crate::testing::{Reply, ScriptedRunner};
+        // A fallible parser's error propagates.
+        let ok_runner = ScriptedRunner::new().on(["tool"], Reply::ok("nope"));
+        let err = ok_runner
+            .try_parse::<u32, _>(&Command::new("tool"), |s| {
+                s.trim().parse::<u32>().map_err(|e| Error::Parse {
+                    program: "tool".into(),
+                    message: e.to_string(),
+                })
+            })
+            .await
+            .expect_err("a parser failure is an error");
+        assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+
+        // A non-zero exit short-circuits before the parser ever runs.
+        let fail_runner = ScriptedRunner::new().on(["tool"], Reply::fail(3, "boom"));
+        let err = fail_runner
+            .try_parse::<u32, _>(&Command::new("tool"), |_| {
+                panic!("parser must not run on a failed exit")
+            })
+            .await
+            .expect_err("a non-zero exit is an error");
+        assert!(matches!(err, Error::Exit { code: 3, .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn parse_fails_loud_on_a_truncated_capture() {
+        // B12: unlike `checked`, `parse`/`try_parse` must not hand the closure a
+        // tail clipped by a bounded buffer — they reject_if_truncated first. A
+        // runner that reports a truncated success must make `parse` error rather
+        // than feed the parser the clipped stdout.
+        struct TruncatedRunner;
+        #[async_trait::async_trait]
+        impl ProcessRunner for TruncatedRunner {
+            async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+                Ok(ProcessResult::new(
+                    command.program().to_string_lossy().into_owned(),
+                    "clipped".to_owned(),
+                    String::new(),
+                    crate::result::Outcome::Exited(0),
+                    None,
+                )
+                .with_truncated(true)
+                .with_overflow_totals(100, 9999))
+            }
+        }
+        let err = TruncatedRunner
+            .parse(&Command::new("tool"), |_| {
+                panic!("parser must not run on a truncated capture")
+            })
+            .await
+            .expect_err("a truncated capture must fail loud, not parse a clipped tail");
+        assert!(matches!(err, Error::OutputTooLarge { .. }), "got {err:?}");
     }
 
     #[tokio::test(start_paused = true)]
