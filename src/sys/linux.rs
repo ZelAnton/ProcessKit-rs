@@ -300,8 +300,13 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
             // SAFETY: sysconf is a pure query with no preconditions.
             let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
             if hz > 0 {
-                let nanos = (utime + stime) as u128 * 1_000_000_000u128 / hz as u128;
-                metrics.cpu_time = Some(Duration::from_nanos(nanos as u64));
+                // Saturating throughout (A1, parity with the `stats()` fold and
+                // the Windows FILETIME combine): the add and the final `u64` cast
+                // clamp rather than debug-panic / silently wrap on an implausibly
+                // large tick count.
+                let ticks = utime.saturating_add(stime);
+                let nanos = ticks as u128 * 1_000_000_000u128 / hz as u128;
+                metrics.cpu_time = Some(Duration::from_nanos(nanos.min(u64::MAX as u128) as u64));
             }
         }
     }
@@ -315,7 +320,9 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
                     .next()
                     .and_then(|s| s.parse::<u64>().ok())
                 {
-                    metrics.peak_memory_bytes = Some(kb * 1024);
+                    // Saturating (A1): kB→bytes can't wrap on an implausible
+                    // VmHWM, matching the CPU branch above and the `stats()` fold.
+                    metrics.peak_memory_bytes = Some(kb.saturating_mul(1024));
                 }
                 break;
             }

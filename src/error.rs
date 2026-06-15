@@ -730,13 +730,16 @@ fn push_sanitized_capped(out: &mut String, text: &str, cap: usize) {
 
 /// Whether `ch` is unsafe to emit verbatim into a one-line log/terminal from
 /// attacker-influenced text (L6 / P2-6): a control character (ANSI `ESC`, `BEL`,
-/// `NUL`, `CR`, cursor moves, …) **or** a Unicode bidirectional-formatting
-/// control — the "Trojan Source" class (CVE-2021-42574) that can visually
-/// reorder the surrounding text in a terminal or editor.
+/// `NUL`, `CR`, cursor moves, …), a Unicode **line/paragraph separator** that a
+/// terminal or log viewer renders as a newline (breaking the "one actionable
+/// line" intent), **or** a Unicode bidirectional-formatting control — the
+/// "Trojan Source" class (CVE-2021-42574) that can visually reorder the
+/// surrounding text in a terminal or editor.
 fn is_display_unsafe(ch: char) -> bool {
     ch.is_control()
         || matches!(ch,
-            '\u{202A}'..='\u{202E}'   // LRE RLE PDF LRO RLO (embeddings/overrides)
+            '\u{2028}' | '\u{2029}'   // LS PS (line/paragraph separators — `is_control` misses these)
+            | '\u{202A}'..='\u{202E}' // LRE RLE PDF LRO RLO (embeddings/overrides)
             | '\u{2066}'..='\u{2069}' // LRI RLI FSI PDI (isolates)
             | '\u{200E}' | '\u{200F}' // LRM RLM (implicit marks)
             | '\u{061C}'              // ALM (Arabic letter mark)
@@ -809,19 +812,38 @@ mod tests {
     }
 
     #[test]
+    fn display_tail_strips_unicode_line_separators() {
+        // N4-1: U+2028 / U+2029 are NOT `char::is_control()`, yet terminals and
+        // log viewers render them as a newline — a hostile last line carrying them
+        // must not inject a break into the one-line `{err}` render.
+        let err = Error::Exit {
+            program: "tool".into(),
+            code: 1,
+            stdout: String::new(),
+            stderr: "before\u{2028}after\u{2029}end".into(),
+        };
+        let msg = err.to_string();
+        assert!(!msg.contains('\u{2028}'), "LS must be sanitized: {msg:?}");
+        assert!(!msg.contains('\u{2029}'), "PS must be sanitized: {msg:?}");
+        assert!(msg.contains("before"), "printable text is kept: {msg:?}");
+        assert!(msg.contains("after"), "printable text is kept: {msg:?}");
+    }
+
+    #[test]
     fn parse_display_sanitizes_control_and_bidi_injection() {
         // P2-6: `Parse` messages routinely embed attacker-influenced unparsed
         // output; the one-line Display must neutralize control AND bidi controls,
         // not just truncate (the gap this fix closed).
         let err = Error::Parse {
             program: "jq".into(),
-            message: "bad\x1b[31m\x07token\u{202E}flip\u{2069}".into(),
+            message: "bad\x1b[31m\x07token\u{202E}flip\u{2069}sep\u{2028}end".into(),
         };
         let msg = err.to_string();
         assert!(!msg.contains('\x1b'), "ESC must be sanitized: {msg:?}");
         assert!(!msg.contains('\x07'), "BEL must be sanitized: {msg:?}");
         assert!(!msg.contains('\u{202E}'), "RLO must be sanitized: {msg:?}");
         assert!(!msg.contains('\u{2069}'), "PDI must be sanitized: {msg:?}");
+        assert!(!msg.contains('\u{2028}'), "LS must be sanitized: {msg:?}");
         assert!(msg.contains("bad"), "printable text is kept: {msg:?}");
         assert!(msg.contains("token"), "printable text is kept: {msg:?}");
     }

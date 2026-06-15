@@ -18,7 +18,21 @@ to a dated version section.
 -
 
 ### Fixed
--
+
+- Linux per-process sampling (`stats()` / `RunningProcess::cpu_time` /
+  `peak_memory_bytes`) now uses saturating arithmetic throughout: the CPU
+  user+system tick counts combine with `saturating_add` and the nanosecond cast
+  is clamped, and the VmHWM kB→bytes conversion uses `saturating_mul` — so an
+  implausibly large tick or memory figure clamps instead of debug-panicking or
+  silently wrapping (parity with the `stats()` fold and the Windows combine) (A1).
+
+### Security
+
+- Error `Display` now sanitizes the Unicode line/paragraph separators U+2028 and
+  U+2029 (replaced with `U+FFFD`), alongside the existing control- and
+  bidi-control neutralization. `char::is_control()` does not cover these two, so a
+  hostile child's stderr/`Parse` text carrying them could previously inject a line
+  break into a one-line `{err}` log/terminal render (N4-1).
 
 ## [0.11.1] - 2026-06-15
 
