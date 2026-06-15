@@ -12,7 +12,13 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+
+- `ProcessResult` is now `#[must_use]`: dropping a result unread (its exit
+  status is the only failure signal) triggers an `unused_must_use` warning.
+  Inspect `is_success()`/`code()`/`ensure_success()` or bind to `let _` to
+  discard on purpose (L-4).
+- `RunProfile` now derives `Eq` (it already derived `PartialEq`; all fields are
+  integer/`Duration`), so profiles can be compared exactly and used as keys (L-5).
 
 ### Changed
 

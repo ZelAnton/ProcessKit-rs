@@ -737,6 +737,7 @@ impl processkit::RunProfile
 pub fn processkit::RunProfile::avg_cpu(&self) -> core::option::Option<f64>
 impl core::clone::Clone for processkit::RunProfile
 pub fn processkit::RunProfile::clone(&self) -> processkit::RunProfile
+impl core::cmp::Eq for processkit::RunProfile
 impl core::cmp::PartialEq for processkit::RunProfile
 pub fn processkit::RunProfile::eq(&self, &processkit::RunProfile) -> bool
 impl core::fmt::Debug for processkit::RunProfile

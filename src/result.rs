@@ -45,6 +45,16 @@ pub enum Outcome {
 /// Standard error is always captured as text. A non-zero exit code is **not**
 /// treated as an error on its own — inspect [`code`](Self::code) or call
 /// [`ensure_success`](Self::ensure_success).
+///
+/// `#[must_use]`: the result *is* the exit status — dropping it unread discards
+/// the only signal that the command failed. Call
+/// [`is_success`](Self::is_success) / [`code`](Self::code) /
+/// [`ensure_success`](Self::ensure_success). If you only need the side effect,
+/// prefer a verb that never produces a result to discard —
+/// [`run_unit`](crate::Command::run_unit) (error-or-`()`) or
+/// [`exit_code`](crate::Command::exit_code) — rather than capturing and binding
+/// to `let _`.
+#[must_use = "a ProcessResult carries the exit status; inspect is_success()/code()/ensure_success() or it is silently discarded"]
 #[derive(Debug, Clone)]
 pub struct ProcessResult<T> {
     program: String,

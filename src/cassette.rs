@@ -751,7 +751,7 @@ mod tests {
     async fn replay_miss_is_a_distinct_cassette_miss_error() {
         let (_dir, path) = temp_cassette();
         let recorder = RecordReplayRunner::record(&path, scripted());
-        recorder
+        let _ = recorder
             .output(&Command::new("tool").arg("--version"))
             .await
             .expect("record");
@@ -780,7 +780,7 @@ mod tests {
         // wrapper's progress path tests the same hermetically on replay.
         let (_dir, path) = temp_cassette();
         let recorder = RecordReplayRunner::record(&path, scripted());
-        recorder
+        let _ = recorder
             .output(&Command::new("tool").arg("--version"))
             .await
             .expect("record");
@@ -792,7 +792,7 @@ mod tests {
             let seen = seen.clone();
             move |l| seen.lock().unwrap().push(l.to_owned())
         });
-        replayer.output(&cmd).await.expect("replay");
+        let _ = replayer.output(&cmd).await.expect("replay");
         assert_eq!(
             *seen.lock().unwrap(),
             ["tool 1.2.3"],
@@ -809,11 +809,11 @@ mod tests {
         let inner = ScriptedRunner::new()
             .on_sequence(["tool"], [Reply::ok("out-A\n"), Reply::ok("out-B\n")]);
         let recorder = RecordReplayRunner::record(&path, inner);
-        recorder
+        let _ = recorder
             .output(&Command::new("tool").stdin(crate::Stdin::from_string("A")))
             .await
             .expect("record A");
-        recorder
+        let _ = recorder
             .output(&Command::new("tool").stdin(crate::Stdin::from_string("B")))
             .await
             .expect("record B");
@@ -859,7 +859,7 @@ mod tests {
 
         // Record a plain entry so the cassette loads, then prove replay rejects
         // a streaming stdin too.
-        recorder
+        let _ = recorder
             .output(&Command::new("tool"))
             .await
             .expect("record a replayable entry");
@@ -881,7 +881,7 @@ mod tests {
         let (_dir, path) = temp_cassette();
         let recorder =
             RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("out\n")));
-        recorder
+        let _ = recorder
             .output(&Command::new("tool").stdin(crate::Stdin::from_string("input")))
             .await
             .expect("record with stdin");
@@ -902,7 +902,7 @@ mod tests {
             &path,
             ScriptedRunner::new().on(["tool", "slow"], Reply::timeout()),
         );
-        recorder
+        let _ = recorder
             .output(&Command::new("tool").arg("slow"))
             .await
             .expect("a captured timeout is a result, not an Err");
@@ -928,7 +928,7 @@ mod tests {
         let (_dir, path) = temp_cassette();
         let recorder =
             RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("done")));
-        recorder
+        let _ = recorder
             .output(
                 &Command::new("tool")
                     .env("API_TOKEN", "hunter2-very-secret")
@@ -1019,7 +1019,7 @@ mod tests {
         let (_dir, path) = temp_cassette();
         {
             let recorder = RecordReplayRunner::record(&path, scripted());
-            recorder
+            let _ = recorder
                 .output(&Command::new("tool").arg("--version"))
                 .await
                 .expect("record");
@@ -1038,7 +1038,7 @@ mod tests {
         let (_dir, path) = temp_cassette();
         let recorder =
             RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("from-a")));
-        recorder
+        let _ = recorder
             .output(&Command::new("tool").current_dir("dir-a"))
             .await
             .expect("record in dir-a");
@@ -1072,7 +1072,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (_dir, path) = temp_cassette();
         let recorder = RecordReplayRunner::record(&path, scripted());
-        recorder
+        let _ = recorder
             .output(&Command::new("tool").arg("--version"))
             .await
             .expect("record");
@@ -1096,7 +1096,7 @@ mod tests {
         // (it may carry secrets in argv/stdout). The Drop guard skips on unwind.
         let (_dir, path) = temp_cassette();
         let recorder = RecordReplayRunner::record(&path, scripted());
-        recorder
+        let _ = recorder
             .output(&Command::new("tool").arg("--version"))
             .await
             .expect("record (now dirty, unsaved)");
@@ -1119,13 +1119,13 @@ mod tests {
         let (_dir, path) = temp_cassette();
         {
             let recorder = RecordReplayRunner::record(&path, scripted());
-            recorder
+            let _ = recorder
                 .output(&Command::new("tool").arg("--version"))
                 .await
                 .expect("record first");
             recorder.save().expect("first save");
             // A run recorded *after* the save must not be lost on drop.
-            recorder
+            let _ = recorder
                 .output(&Command::new("tool").arg("fail"))
                 .await
                 .expect("record second");
@@ -1157,7 +1157,7 @@ mod tests {
         let recorder =
             RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("ok")));
         let cmd = Command::new("tool").arg(&bad);
-        recorder.output(&cmd).await.expect("record lossily");
+        let _ = recorder.output(&cmd).await.expect("record lossily");
         recorder.save().expect("save");
 
         // Both sides apply the same lossy conversion, so the entry matches.

@@ -63,6 +63,13 @@ impl Stdin {
     /// Write each item (as a UTF-8 line, `\n`-terminated) to the child's stdin.
     /// Eagerly collected, so the resulting [`Stdin`] is fully reusable. (The
     /// async-stream analogue is [`from_lines`](Self::from_lines).)
+    ///
+    /// **Newline contract:** exactly one `\n` is appended after *every* item,
+    /// including the last — so `["a", "b"]` sends `"a\nb\n"` (a trailing
+    /// newline). Each item is written verbatim and is **not** re-split, so an
+    /// item that already contains `\n` (or ends in one) is passed through as-is
+    /// and yields a blank line. To send bytes without this per-item framing, use
+    /// [`from_bytes`](Self::from_bytes) / [`from_string`](Self::from_string).
     pub fn from_iter_lines<I, S>(lines: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -365,6 +372,21 @@ mod tests {
             written(&stdin).await,
             b"a\nb\n",
             "eagerly-collected lines replay on every run"
+        );
+    }
+
+    #[tokio::test]
+    async fn iter_lines_appends_one_newline_per_item_verbatim() {
+        // L-3: the contract is "exactly one `\n` after every item, verbatim, no
+        // re-splitting." An item that already ends in `\n` yields a blank line;
+        // an empty iterator yields no bytes (not a lone newline).
+        assert_eq!(
+            written(&Stdin::from_iter_lines(["a\n", "b"])).await,
+            b"a\n\nb\n"
+        );
+        assert_eq!(
+            written(&Stdin::from_iter_lines(Vec::<&str>::new())).await,
+            b""
         );
     }
 

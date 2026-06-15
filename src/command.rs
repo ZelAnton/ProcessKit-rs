@@ -849,7 +849,9 @@ impl Command {
     /// error messages, a dry-run echo. Quoting is per-platform (POSIX
     /// single-quote / Windows double-quote) and is for readability, **not
     /// execution**: the crate never invokes a shell, and the rendering is not
-    /// guaranteed to round-trip through one.
+    /// guaranteed to round-trip through one. Do **not** feed the output back to a
+    /// shell to re-run the command — the escaping targets human legibility, not
+    /// any specific shell's parsing rules.
     ///
     /// The line includes the arguments, which may carry secrets (a `--token=…`
     /// flag). Unlike the `tracing` feature — which never logs argv — this is

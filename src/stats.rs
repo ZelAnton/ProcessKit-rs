@@ -132,7 +132,7 @@ impl tokio_stream::Stream for StatsSampler<'_> {
 /// Non-exhaustive: a read-only summary the crate produces — new metrics can
 /// be added without a breaking change.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunProfile {
     /// The exit code; `None` for a run killed by its timeout or a signal
     /// (matching [`RunningProcess::wait`](crate::RunningProcess::wait)).

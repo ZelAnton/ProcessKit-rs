@@ -1619,7 +1619,7 @@ mod tests {
     #[tokio::test]
     async fn recording_captures_args_cwd_and_absence() {
         let recorder = RecordingRunner::replying(Reply::ok("ok"));
-        recorder
+        let _ = recorder
             .output(
                 &Command::new("gh")
                     .current_dir("/repo")
