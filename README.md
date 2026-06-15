@@ -316,8 +316,9 @@ async fn main() -> processkit::Result<()> {
 `Result`, so a non-zero exit (an `Ok` with a non-zero code) never short-circuits
 the batch — the caller folds the outcomes. Pass `&group` instead of `&JobRunner`
 to keep every child in one shared kill-on-drop group. It is deliberately not a
-pool, scheduler, or retrier. `wait_all` shares `wait_any`'s two non-features (no
-per-process timeout, no output pumping).
+pool, scheduler, or retrier. For batches whose stdout is binary, `output_all_bytes`
+is the identical fan-out with each result captured as `Vec<u8>`. `wait_all` shares
+`wait_any`'s two non-features (no per-process timeout, no output pumping).
 
 ## Sampling stats over time
 

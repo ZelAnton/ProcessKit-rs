@@ -381,7 +381,7 @@ The error enum is structured and `#[non_exhaustive]`:
 | `Error::OutputTooLarge { program, line_limit, byte_limit, total_lines, total_bytes }` | A `fail_loud` buffer's line or byte ceiling was exceeded |
 | `Error::Timeout { program, timeout, stdout, stderr }` | The run's own deadline killed it; whatever the run captured before the kill is attached — a hung tool's last stderr line tails the `Display` and is reachable via `diagnostic()` |
 | `Error::NotReady { program, timeout }` | A [readiness probe](streaming.md#readiness-probes) gave up |
-| `Error::Parse { program, message }` | A `CliClient::try_parse` parser rejected the output (the `Display`/`Debug` of `message` is bounded to a 200-byte preview; the field carries the full text) |
+| `Error::Parse { program, message }` | A `try_parse` parser (on `Command`, `ProcessRunnerExt`, `CliClient`, or `Pipeline`) rejected the output (the `Display`/`Debug` of `message` is bounded to a 200-byte preview; the field carries the full text) |
 | `Error::Stdin { program, source }` | Feeding the child's stdin failed for a non-broken-pipe reason on an *otherwise-successful* run (a louder failure — exit/signal/timeout — wins instead); a routine broken pipe never surfaces |
 | `Error::CassetteMiss { program }` | (`record` feature) a cassette replay found no matching recording (stale/incomplete cassette) — kept distinct from a missing program, so `is_not_found()` is `false` |
 | `Error::Unsupported { operation }` | The platform can't do what was asked (and silently skipping would be wrong) |

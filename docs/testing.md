@@ -39,7 +39,9 @@ giving ownership away.
 Every runner — real or double — gets the convenience helpers of
 `ProcessRunnerExt` for free: `run` (trimmed stdout, success required),
 `run_unit`, `exit_code`, `probe` (exit code as a boolean), `checked`
-(success-checked full result). [Retry
+(success-checked full result), and `parse`/`try_parse` (feed stdout to a
+closure; like `first_line`, generic over the closure so unavailable on a
+`&dyn ProcessRunner`). [Retry
 policies](timeouts-and-cancellation.md#retries) work through the seam too, so
 a double exercises your retry handling hermetically.
 

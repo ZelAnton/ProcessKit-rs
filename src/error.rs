@@ -199,7 +199,10 @@ pub enum Error {
 
     /// The process succeeded but its output could not be parsed into the
     /// expected shape (e.g. malformed `--json`). Produced by the fallible-parse
-    /// helpers on [`CliClient`](crate::CliClient).
+    /// helpers `try_parse` on [`Command`](crate::Command),
+    /// [`ProcessRunnerExt`](crate::ProcessRunnerExt),
+    /// [`CliClient`](crate::CliClient), and [`Pipeline`](crate::Pipeline) (or any
+    /// parser the caller maps into this variant).
     ///
     /// `message` is caller-built and routinely embeds the unparsed output in
     /// full, so — like the [`Exit`](Error::Exit) streams — both `Display` and
