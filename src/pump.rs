@@ -427,15 +427,19 @@ pub(crate) async fn pump_lines_core<R>(
         }
     }
 
-    // The retained-byte ceiling (immutable), read once. When set, it bounds not
-    // just the retained backlog but the *in-flight* decode buffer too (H1): a
-    // line whose own length exceeds the cap can never be retained whole, so once
+    // The OS read size.
+    const CHUNK: usize = 8192;
+    // The retained-byte ceiling (immutable), read once. When set, it bounds the
+    // *in-flight* decode buffer too (H1), not just the retained backlog: a line
+    // whose own length exceeds the cap can never be retained whole, so once
     // `pending` passes the cap we stop buffering it and skip to its terminating
     // newline — a newline-free flood (`base64 -w0`) can no longer OOM the parent.
+    // The bound is `cap + CHUNK` (the cap is rechecked once per read, after a
+    // whole chunk is decoded in), not exactly `cap` (P2-8).
     let cap = sink.0.byte_cap();
     let mut decoder = encoding.new_decoder_with_bom_removal();
     let mut pending = String::new(); // decoded text not yet split into a line
-    let mut chunk = [0u8; 8192];
+    let mut chunk = [0u8; CHUNK];
     // `Some(bytes_so_far)` while skipping an over-cap line: its bytes are
     // discarded as decoded, only its length is tracked (for the seen-byte total).
     let mut oversized: Option<usize> = None;
@@ -500,7 +504,16 @@ pub(crate) async fn pump_lines_core<R>(
                     }
                     // No newline yet and already over the cap → over-cap line in
                     // progress: discard what we have and skip to the newline.
-                    None if cap.is_some_and(|c| pending.len() > c) => {
+                    // A lone *trailing* `\r` may be a CRLF terminator (not
+                    // content), so it alone must not push the line over the cap
+                    // (R2-1) — otherwise a content-exactly-at-cap CRLF line is
+                    // dropped when its `\r`/`\n` straddle a read but retained in
+                    // one chunk. Exclude that one byte; the next read re-decides
+                    // (the `\r` is then a terminator → fits, or content → counts).
+                    None if cap.is_some_and(|c| {
+                        pending.len() - usize::from(pending.ends_with('\r')) > c
+                    }) =>
+                    {
                         oversized = Some(skip_over_cap(&mut pending));
                         break;
                     }
@@ -517,13 +530,19 @@ pub(crate) async fn pump_lines_core<R>(
                 pending.clear();
                 sink.0.record_oversized_line(line_len);
             } else if !pending.is_empty() {
-                emit(
-                    &mut handler,
-                    &mut tee,
-                    &sink.0,
-                    std::mem::take(&mut pending),
-                )
-                .await;
+                // An un-terminated final line: no '\n', so a trailing '\r' is
+                // content, not a CRLF terminator. Re-apply the byte cap here
+                // (R2-1): the in-flight enter-skip deferred a lone trailing '\r'
+                // in case a '\n' followed, but at EOF none does — so a tail whose
+                // content exceeds the cap must be dropped (counted, never handed
+                // to the handler/tee), upholding the "over-cap line is never
+                // retained or delivered" invariant rather than emitting it.
+                let line = std::mem::take(&mut pending);
+                if cap.is_some_and(|c| line.len() > c) {
+                    sink.0.record_oversized_line(line.len());
+                } else {
+                    emit(&mut handler, &mut tee, &sink.0, line).await;
+                }
             }
             // Flush the tee once at stream end (best-effort).
             if let Some(t) = &tee {
@@ -1112,6 +1131,68 @@ mod tests {
         assert!(
             sink.drain().is_empty(),
             "the over-cap line is dropped whole"
+        );
+    }
+
+    #[tokio::test]
+    async fn crlf_line_at_exactly_the_cap_is_retained_regardless_of_read_boundary() {
+        // R2-1: a line whose *content* is exactly `max_bytes` fits the cap, so it
+        // must be retained whether its CRLF arrives in one chunk or split across a
+        // read. The old enter-skip check counted the trailing `\r` toward the cap,
+        // so it dropped the split case while keeping the one-chunk case — a
+        // chunk-boundary-dependent verdict. (One line only: a second retained line
+        // would push the *backlog* past the same 2-byte cap and evict this one,
+        // which is the unrelated DropOldest path — keep them separate here.)
+        let single = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(2));
+        pump_lines(&b"ab\r\n"[..], encoding_rs::UTF_8, None, single.clone()).await;
+
+        // Split so the CRLF straddles a read: ["ab\r", "\n"].
+        let reader = ChunkedReader::new([b"ab\r".to_vec(), b"\n".to_vec()]);
+        let split = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(2));
+        pump_lines(reader, encoding_rs::UTF_8, None, split.clone()).await;
+
+        assert_eq!(
+            single.drain(),
+            vec!["ab"],
+            "one-chunk: an at-cap CRLF line is retained"
+        );
+        assert_eq!(
+            split.drain(),
+            vec!["ab"],
+            "split CRLF must retain the at-cap line identically — not drop it"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_cap_unterminated_tail_at_eof_is_dropped_not_delivered() {
+        // R2-1/S2: an unterminated final line whose content exceeds the cap must
+        // be dropped (and NOT handed to the per-line handler/tee), even though the
+        // in-flight enter-skip deferred its lone trailing `\r`. "ab\r" at EOF is 3
+        // content bytes (no `\n` follows, so the `\r` is content) over a 2-byte
+        // cap. Regression guard: without the EOF cap re-check it would be emitted.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let handler: LineHandler =
+            Arc::new(move |line: &str| captured.lock().unwrap().push(line.to_owned()));
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(2));
+        pump_lines(
+            &b"ab\r"[..],
+            encoding_rs::UTF_8,
+            Some(handler),
+            sink.clone(),
+        )
+        .await;
+        assert!(
+            sink.drain().is_empty(),
+            "an over-cap unterminated tail is not retained"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "an over-cap line is never delivered to the handler"
+        );
+        assert!(
+            sink.dropped() >= 1,
+            "the over-cap tail counts as a truncation"
         );
     }
 

@@ -104,7 +104,9 @@ pub enum OverflowMode {
 /// A byte cap bounds both the retained backlog **and** the in-flight line the
 /// pump is still assembling (H1): a line whose own length exceeds the cap can
 /// never be retained whole, so the pump drops it as it arrives — a newline-free
-/// flood cannot exhaust memory even before its (never-arriving) terminator. The
+/// flood is held to about `max_bytes` plus one read buffer (the cap is rechecked
+/// once per read), never the whole flood, so memory cannot be exhausted even
+/// before the (never-arriving) terminator. The
 /// ceiling measures the **retained text** — the sum of the decoded lines' UTF-8
 /// byte lengths, *excluding* the stripped `\n`/`\r` terminators — not the raw
 /// bytes on the pipe. One consequence: an over-cap line, since it is never
