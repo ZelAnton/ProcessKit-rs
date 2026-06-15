@@ -147,7 +147,9 @@ async fn finish_returns_code_and_stderr() {
         out.push(line);
     }
     drop(lines);
-    let Finished { outcome, stderr } = process.finish().await.expect("finish");
+    let Finished {
+        outcome, stderr, ..
+    } = process.finish().await.expect("finish");
     assert_eq!(outcome, Outcome::Exited(0));
     assert!(out.iter().any(|l| l.contains("out")), "stdout: {out:?}");
     assert!(stderr.contains("err"), "stderr: {stderr:?}");

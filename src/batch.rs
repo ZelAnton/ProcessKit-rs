@@ -188,6 +188,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn output_all_never_exceeds_and_actually_reaches_the_concurrency_cap() {
+        // A probe runner whose `output` future stays `Pending` across several
+        // polls (via `yield_now`), so the batch driver tops the active set up to
+        // the cap *before* any future completes — letting us observe the true peak
+        // concurrency. The synchronous-`Ready` `ScriptedRunner` can't exercise the
+        // `active.len() < limit` ceiling at all (every reply completes on the first
+        // poll), so a regression removing the cap would pass against it.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct ConcurrencyProbe {
+            active: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl ProcessRunner for ConcurrencyProbe {
+            async fn output(&self, command: &Command) -> Result<ProcessResult<String>> {
+                let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(ProcessResult::new(
+                    command.program().to_string_lossy().into_owned(),
+                    String::new(),
+                    String::new(),
+                    crate::result::Outcome::Exited(0),
+                    None,
+                ))
+            }
+        }
+
+        let probe = ConcurrencyProbe {
+            active: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+        };
+        let cmds: Vec<Command> = (0..10)
+            .map(|i| Command::new("x").arg(i.to_string()))
+            .collect();
+        let results = output_all(cmds, 3, &probe).await;
+
+        assert_eq!(results.len(), 10);
+        assert!(results.iter().all(|r| r.as_ref().unwrap().is_success()));
+        let peak = probe.peak.load(Ordering::SeqCst);
+        assert!(peak <= 3, "concurrency cap exceeded: peak {peak} > 3");
+        assert_eq!(
+            peak, 3,
+            "the cap must actually be reached (genuine overlap), got peak {peak}"
+        );
+        assert_eq!(
+            probe.active.load(Ordering::SeqCst),
+            0,
+            "all futures finished"
+        );
+    }
+
+    #[tokio::test]
     async fn output_all_on_an_empty_batch_is_an_empty_vec() {
         let runner = ScriptedRunner::new().fallback(Reply::ok(""));
         let results = output_all(Vec::new(), 4, &runner).await;

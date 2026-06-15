@@ -191,7 +191,9 @@ async fn graceful_timeout_on_a_streamed_run_signals_and_ends_the_stream() {
     // scenario), not the child's in-grace `exit 0`. This is deterministic now:
     // the streaming watchdog sets a shared `timed_out` flag when it fires, and
     // the finisher classifies from that flag rather than racing the reaped exit.
-    let Finished { outcome, stderr } = run.finish().await.expect("finish");
+    let Finished {
+        outcome, stderr, ..
+    } = run.finish().await.expect("finish");
     assert_eq!(
         outcome,
         Outcome::TimedOut,

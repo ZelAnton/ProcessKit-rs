@@ -470,7 +470,7 @@ impl core::marker::Unpin for processkit::Command
 impl core::marker::UnsafeUnpin for processkit::Command
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Command
 impl !core::panic::unwind_safe::UnwindSafe for processkit::Command
-pub struct processkit::Finished
+#[non_exhaustive] pub struct processkit::Finished
 pub processkit::Finished::outcome: processkit::Outcome
 pub processkit::Finished::stderr: alloc::string::String
 impl core::clone::Clone for processkit::Finished

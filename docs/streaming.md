@@ -65,7 +65,7 @@ async fn main() -> processkit::Result<()> {
     // The stream ended (stdout closed). Collect the outcome and stderr —
     // stderr was drained in the background the whole time, so a noisy child
     // could never block on a full pipe.
-    let Finished { outcome, stderr } = run.finish().await?;
+    let Finished { outcome, stderr, .. } = run.finish().await?;
     if outcome != Outcome::Exited(0) {
         eprintln!("build failed ({outcome:?}):\n{stderr}");
     }

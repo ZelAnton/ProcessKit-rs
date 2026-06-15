@@ -63,6 +63,15 @@ isolation gain (the dependency is already transitive and load-bearing). The
 [`../ideas/later-lite-build-sys-split.md`](../ideas/later-lite-build-sys-split.md));
 if that crate split ever happens, revisit then, not now.
 
+A fourth, narrower leak is also **accepted**: `ProcessGroup::spawn` /
+`ProcessGroup::adopt` take/return `tokio::process::{Command, Child}` (and the
+`#[doc(hidden)]` `Command::to_tokio_command`). These are the deliberate low-level
+bridge for power users who hold their own tokio `Child` and want it contained; the
+crate is tokio-only by design (see [`runtime-tokio-only.md`](runtime-tokio-only.md)),
+so tying this *one* power-user seam to `tokio::process`'s shape costs nothing the
+runtime choice hasn't already spent. The high-level verbs never expose these types.
+Listed here so a future reviewer treats it as intentional, not a slip.
+
 ## 4. Verb surface — confirmed sound
 
 The consuming verbs across the three layers are consistent and intentionally

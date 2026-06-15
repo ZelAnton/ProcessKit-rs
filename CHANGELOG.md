@@ -16,6 +16,10 @@ to a dated version section.
 
 ### Changed
 
+- **Breaking (pre-1.0 hardening):** `Finished` (returned by `RunningProcess::finish`)
+  is now `#[non_exhaustive]` — read its `outcome` / `stderr` fields or destructure
+  with a trailing `..`, so a future field (e.g. a duration) can be added without
+  another break. Brings it in line with every other crate-produced result struct.
 - `RunningProcess::wait_for_line` no longer arms the `Command::timeout`
   watchdog: a readiness probe is now bounded only by its own `within` and can
   never kill the process tree or

@@ -616,6 +616,16 @@ impl Cgroup {
     fn kill(&self) -> io::Result<()> {
         // `cgroup.kill` (kernel ≥ 5.14): write "1" to SIGKILL the whole subtree
         // atomically.
+        //
+        // Unlike `freeze` (which surfaces a non-`NotFound` write error rather than
+        // silently degrading a *suspend* to the racy per-pid path, R2-3), `kill`
+        // falls back on *any* failure here on purpose: the fallback below is a
+        // *complete* alternative teardown (freeze + per-pid SIGKILL sweep) that
+        // ends in the E18 drain check and surfaces a genuine failure itself. So on
+        // a non-version write error (e.g. EACCES on a restricted delegated cgroup)
+        // attempting the sweep maximizes the chance of actually killing the tree,
+        // and a truly un-killable tree is still reported by the drain check — there
+        // is no silent degrade to document away.
         if std::fs::write(self.path.join("cgroup.kill"), b"1").is_ok() {
             return Ok(());
         }

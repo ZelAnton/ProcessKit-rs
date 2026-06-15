@@ -1688,8 +1688,13 @@ impl RunningProcess {
                     let _ = group.terminate_all();
                 }
                 // Reap after the kill; a wait error here cannot change the
-                // outcome the caller is about to report.
-                let _ = real.child.wait().await;
+                // outcome the caller is about to report. Bound it: a direct child
+                // wedged in uninterruptible (`D`-state) sleep can ignore the
+                // delivered `SIGKILL` until its I/O unblocks, and an unbounded wait
+                // would hang the cancel path on a shared-group handle (no group to
+                // reap the tree). The kill was already sent, so time out and move
+                // on — parity with the pump-drain teardown bound.
+                let _ = tokio::time::timeout(PUMP_TEARDOWN, real.child.wait()).await;
             }
             Backend::Scripted(s) => s.kill(),
         }
@@ -1726,7 +1731,12 @@ impl RunningProcess {
                 };
                 // Reap concurrently so the liveness probe sees a signal-handling
                 // child leave, ending the grace early (see ProcessGroup::shutdown).
-                let _ = tokio::join!(teardown, real.child.wait());
+                // Bound the reap by the grace plus a teardown margin: a `D`-state
+                // child can ignore the final `SIGKILL`, and an unbounded wait would
+                // hang past the grace window even after `teardown` finishes.
+                let reap =
+                    tokio::time::timeout(grace.saturating_add(PUMP_TEARDOWN), real.child.wait());
+                let _ = tokio::join!(teardown, reap);
             }
             Backend::Scripted(s) => s.kill(),
         }

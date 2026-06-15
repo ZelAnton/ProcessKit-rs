@@ -600,7 +600,7 @@ async fn main() -> processkit::Result<()> {
     // After the stream ends, collect the outcome and whatever went to stderr
     // (drained in the background while you streamed stdout). The `Outcome`
     // distinguishes a clean exit, a signal kill, and a timeout.
-    let Finished { outcome, stderr } = run.finish().await?;
+    let Finished { outcome, stderr, .. } = run.finish().await?;
     if outcome != Outcome::Exited(0) {
         eprintln!("git ended {outcome:?}: {stderr}");
     }

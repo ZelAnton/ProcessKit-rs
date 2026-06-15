@@ -15,7 +15,9 @@ async fn main() -> processkit::Result<()> {
         println!("stdout: {line}");
     }
 
-    let Finished { outcome, stderr } = run.finish().await?;
+    let Finished {
+        outcome, stderr, ..
+    } = run.finish().await?;
     println!("exit={outcome:?}");
     if !stderr.is_empty() {
         eprintln!("stderr: {stderr}");

@@ -169,7 +169,7 @@ let mut lines = run.stdout_lines()?;
 while let Some(line) = lines.next().await {
     println!("build: {line}");
 }
-let Finished { outcome, stderr } = run.finish().await?; // outcome + buffered stderr
+let Finished { outcome, stderr, .. } = run.finish().await?; // outcome + buffered stderr
 ```
 
 No waiting for exit, no full-output buffering; stderr is drained in the

@@ -21,7 +21,13 @@ use super::RunningProcess;
 /// [`output_events`](RunningProcess::output_events): how the run ended plus
 /// the captured standard error. Returned by
 /// [`RunningProcess::finish`].
+///
+/// `#[non_exhaustive]`: a future release may attach more about the finished run
+/// (e.g. a duration or a truncation flag, mirroring [`ProcessResult`](crate::ProcessResult))
+/// without a breaking change — read the public fields rather than destructuring
+/// it exhaustively.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Finished {
     /// How the run ended.
     pub outcome: Outcome,
@@ -82,7 +88,7 @@ impl RunningProcess {
     ///     println!("commit: {line}");
     /// }
     ///
-    /// let Finished { outcome, stderr } = run.finish().await?;
+    /// let Finished { outcome, stderr, .. } = run.finish().await?;
     /// # let _ = (outcome, stderr);
     /// # Ok(())
     /// # }
@@ -168,9 +174,12 @@ impl RunningProcess {
         // Bound the stream by the command's timeout: kill the tree at the deadline
         // so the pipes close and this stream ends. A `Weak` to the group means a
         // hard-kill timer never delays kill-on-close when the handle is dropped
-        // early (the graceful branch below holds the upgraded `Arc` only until its
-        // next poll await, so a dropped handle delays the Drop by at most one poll
-        // interval). Armed once (a second `stdout_lines` call won't duplicate it).
+        // early: the non-graceful branch only upgrades the `Weak` momentarily to
+        // kill. The graceful branch DOES hold the upgraded `Arc` across its
+        // `graceful_terminate(grace, …).await`, so a handle dropped mid-grace has
+        // its group-Drop deferred until that teardown finishes (up to the grace) —
+        // benign, since that same task is already tearing the tree down. Armed once
+        // (a second `stdout_lines` call won't duplicate it).
         if self.deadline_task.is_none()
             && let (Some(limit), Some(group)) = (self.timeout, self.backend.own_group())
         {
