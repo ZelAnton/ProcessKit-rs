@@ -49,10 +49,14 @@ struct Entry {
     args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
-    /// FNV-1a digest of the stdin content (F12) — keyed so two invocations
-    /// differing only in stdin don't collide on replay. `None` for empty/absent
-    /// stdin. A pre-F12 cassette recorded *with* stdin loads this as `None` and
-    /// must be re-recorded to match a stdin invocation again.
+    /// FNV-1a digest of the stdin *source identity* (F12) — keyed so two
+    /// invocations differing only in stdin don't collide on replay. In-memory
+    /// bytes hash their content; a `from_file` source hashes its **path** (the
+    /// file is not read at key time, so changing the file's bytes does not
+    /// change the key); the one-shot streaming sources hash a discriminant only.
+    /// `None` for empty/absent stdin. A pre-F12 cassette recorded *with* stdin
+    /// loads this as `None` and must be re-recorded to match a stdin invocation
+    /// again. See `Stdin::content_digest` for the per-source hashing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stdin_digest: Option<u64>,
     // --- stored for visibility, not matched on ---
@@ -161,9 +165,10 @@ impl Entry {
     }
 }
 
-/// What an invocation is matched on: program + args + cwd + the stdin content
-/// digest (F12). Env overrides are excluded so an irrelevant env difference
-/// between the record and replay environments can't cause a spurious miss.
+/// What an invocation is matched on: program + args + cwd + the stdin source
+/// digest (F12 — content for in-memory bytes, path for a `from_file` source).
+/// Env overrides are excluded so an irrelevant env difference between the
+/// record and replay environments can't cause a spurious miss.
 ///
 /// L23: the string components are *lossy* UTF-8 decodes, so two distinct
 /// non-UTF-8 invocations that differ only in their invalid bytes produce the
@@ -172,8 +177,9 @@ impl Entry {
 /// and valid-UTF-8 invocations (the common case) never collide.
 type Key = (String, Vec<String>, Option<String>, bool, Option<u64>);
 
-/// The stdin content digest (F12) keyed into a cassette match — `None` for an
-/// empty/absent stdin. The content is hashed, never persisted.
+/// The stdin source digest (F12) keyed into a cassette match — `None` for an
+/// empty/absent stdin. The digest never persists the stdin payload: in-memory
+/// bytes hash their content, a `from_file` source hashes its path.
 fn stdin_digest_of(command: &Command) -> Option<u64> {
     command
         .stdin_source()
@@ -264,8 +270,9 @@ enum Mode<R> {
 /// **Replay** mode loads the cassette and serves results without spawning
 /// anything:
 ///
-/// - **Matching** is by program + args + cwd + stdin **content** (hashed, never
-///   persisted). Env overrides are *not* matched, and their **values** are
+/// - **Matching** is by program + args + cwd + a stdin **source digest**
+///   (hashed, never persisted: in-memory bytes hash their content, a `from_file`
+///   source hashes its path). Env overrides are *not* matched, and their **values** are
 ///   never written — only the sorted variable *names*. Everything else (argv,
 ///   cwd, stdout, stderr) is stored
 ///   **verbatim**, so a cassette can still carry secrets in those fields:
