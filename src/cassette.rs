@@ -265,7 +265,11 @@ enum Mode<R> {
 /// writes the cassette on [`save`](Self::save) (or best-effort on drop). Only
 /// *completed* runs are captured — a call that returns `Err` (spawn failure,
 /// timeout error from a checking helper, …) records nothing; non-zero exits
-/// and captured timeouts are results and **are** recorded.
+/// and captured timeouts are results and **are** recorded. The inner runner is
+/// invoked before the entry is appended, so for same-key calls the recorded
+/// order matches *execution* order only under **sequential** recording;
+/// recording is a one-shot capture step and is not designed for concurrent
+/// same-key invocation of a stateful inner runner.
 ///
 /// **Replay** mode loads the cassette and serves results without spawning
 /// anything:
@@ -387,6 +391,31 @@ impl<R: ProcessRunner> RecordReplayRunner<R> {
     }
 }
 
+/// Reject a cassette entry whose outcome fields *contradict* each other (R2-9).
+/// The decode model is: `timed_out` → `TimedOut`; else `code` present →
+/// `Exited`; else → `Signalled(signal)` (with `signal` optionally absent, i.e.
+/// "killed, signal unknown"). So at most one of `code` / `timed_out` / `signal`
+/// may be set — an entry that sets two or more (e.g. both `code` and `signal`)
+/// is malformed: the decoder would silently pick one and drop the rest. Fail
+/// loud on load, like an unknown `version` does. (An entry that sets *none* is
+/// the legitimate `Signalled(None)` and is allowed.)
+fn validate_entry_outcome(entry: &Entry) -> Result<()> {
+    let indicators = usize::from(entry.code.is_some())
+        + usize::from(entry.timed_out)
+        + usize::from(entry.signal.is_some());
+    if indicators > 1 {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "cassette entry for `{}` has a contradictory outcome: at most one of \
+                 `code` (exited), `timed_out`, or `signal` (signalled) may be set — found {indicators}",
+                entry.program
+            ),
+        )));
+    }
+    Ok(())
+}
+
 impl RecordReplayRunner<JobRunner> {
     /// Load the cassette at `path` and serve its entries hermetically — no
     /// subprocess is ever spawned in replay mode.
@@ -394,6 +423,23 @@ impl RecordReplayRunner<JobRunner> {
     /// Errors are [`Error::Io`]: a missing file keeps its `NotFound` kind; a
     /// corrupt file or an unknown format `version` is `InvalidData`.
     pub fn replay(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        // P3-14: bound the read so a stray/huge file can't be buffered into
+        // memory twice (text + parsed). Cassettes are committed test fixtures, so
+        // the limit is generous; anything past it is far more likely a mistake
+        // (a wrong path, a log file) than a real cassette.
+        const MAX_CASSETTE_BYTES: u64 = 64 << 20; // 64 MiB
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.len() > MAX_CASSETTE_BYTES
+        {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "cassette is {} bytes, over the {MAX_CASSETTE_BYTES}-byte limit",
+                    meta.len()
+                ),
+            )));
+        }
         let text = std::fs::read_to_string(path).map_err(Error::Io)?;
         // serde_json's From<serde_json::Error> for io::Error keeps the right
         // kind (syntax/data errors become InvalidData).
@@ -410,6 +456,7 @@ impl RecordReplayRunner<JobRunner> {
         }
         let mut slots: HashMap<Key, ReplaySlot> = HashMap::new();
         for entry in cassette.entries {
+            validate_entry_outcome(&entry)?;
             slots
                 .entry(key_of_entry(&entry))
                 .or_insert_with(|| ReplaySlot {
@@ -652,6 +699,26 @@ mod tests {
         assert_eq!(first, "aaa");
         assert_eq!(second, "bbb");
         assert_eq!(third, "bbb", "exhausted key must repeat the last entry");
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_an_entry_with_contradictory_outcome() {
+        // R2-9: an entry that sets both an exit `code` and a `signal` is
+        // contradictory; reject it rather than silently picking `Exited`.
+        let (_dir, path) = temp_cassette();
+        let json = serde_json::json!({
+            "version": 1,
+            "entries": [
+                { "program": "x", "args": [], "stdout": "", "stderr": "", "code": 0, "signal": 9 }
+            ]
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        let err = RecordReplayRunner::replay(&path)
+            .expect_err("a contradictory outcome must be rejected");
+        assert!(
+            matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidData),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

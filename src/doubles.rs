@@ -220,8 +220,15 @@ impl Reply {
             // drained — count the max of stdout/stderr lines. Counting stdout
             // alone truncates a lagging stderr when `join_pumps` stops at the
             // (shorter) stdout-derived lifetime, which a real child never does.
-            let stdout_lines = self.stdout.split_inclusive('\n').count() as u32;
-            let stderr_lines = self.stderr.split_inclusive('\n').count() as u32;
+            // Count lines with `str::lines` to match `replay_line_handlers` (and
+            // the per-line count the pumps deliver), so the lifetime budget
+            // matches the number of lines actually fed (P3-8). The previous
+            // `split_inclusive('\n').count()` yields the identical count for every
+            // input — each counts the `\n`-delimited segments, with a trailing
+            // newline adding no empty line — but using one method removes the
+            // apparent divergence.
+            let stdout_lines = self.stdout.lines().count() as u32;
+            let stderr_lines = self.stderr.lines().count() as u32;
             let lines = stdout_lines.max(stderr_lines);
             // E15: saturate the multiply and clamp to MAX_DEADLINE so a test that
             // hands a `Duration::MAX`-ish `line_delay` can't overflow the multiply
@@ -394,6 +401,12 @@ impl ScriptedRunner {
     /// repeat the last" model. Matches like [`on`](Self::on) (program + arg
     /// prefix).
     ///
+    /// The sequence advances once per matching call via a relaxed atomic counter,
+    /// so the "first call gets reply 0, second gets reply 1, …" ordering is
+    /// well-defined only for **sequential** calls. Concurrent calls to the same
+    /// rule still each get a distinct, in-bounds reply, but which call sees which
+    /// reply is unspecified — don't rely on the order across overlapping tasks.
+    ///
     /// # Panics
     /// If `replies` is empty.
     pub fn on_sequence<I, S, R>(mut self, prefix: I, replies: R) -> Self
@@ -430,6 +443,14 @@ impl ScriptedRunner {
     /// Register a rule, warning (F10) if it is unreachable because an earlier
     /// prefix rule already matches everything it would.
     fn push_rule(&mut self, rule: Rule, replies: Vec<Reply>) {
+        // `matched_reply` indexes `replies[i.min(len - 1)]`, which underflows on
+        // an empty vec. Every caller passes a non-empty one (`on`/`when` a
+        // singleton, `on_sequence` asserts it) — codify that invariant at the one
+        // choke point so a future caller can't silently break it (P3-10).
+        debug_assert!(
+            !replies.is_empty(),
+            "a ScriptedRunner rule needs at least one reply"
+        );
         // F10: a new prefix rule is unreachable if an *earlier* prefix rule is a
         // prefix of it (a broader rule registered first — e.g. an empty
         // catch-all — wins by first-match). Predicate rules are opaque, so only
