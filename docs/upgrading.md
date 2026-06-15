@@ -9,6 +9,37 @@ the full record; this page is the "I depend on it, what do I do" view.
 > changes. Pin to a minor range — `processkit = "0.11"` allows `0.11.*` but not
 > `0.12` — and skim the relevant section here before each minor bump.
 
+## Unreleased (from 0.11.x)
+
+One breaking change, **caught by the compiler** — if it builds after the bump,
+you're done.
+
+### The text-capture verb is renamed `output` → `output_string`
+
+The verb that runs to completion and returns the full `ProcessResult<String>`
+is now spelled **`output_string`** on every layer, matching `output_bytes` (and
+the spelling `Command`/`Pipeline`/`RunningProcess` already used). Two reasons:
+the same operation no longer has two names depending on the type, and a bare
+`output` clashed with `std::process::Command::output`, which returns **bytes** —
+the explicit name removes that footgun.
+
+**Affected if you call** `ProcessRunner::output`, `CliClient::output`, the free
+fn `processkit::output`, or implement a custom `ProcessRunner` / use `MockRunner`.
+The symptom is a build error like *"no method named `output`"* /
+*"cannot find function `output` in crate `processkit`"*.
+
+**Fix** — rename the calls (mechanical):
+
+| Before | After |
+|---|---|
+| `runner.output(&cmd)` / `client.output(args)` | `runner.output_string(&cmd)` / `client.output_string(args)` |
+| `processkit::output(prog, args)` | `processkit::output_string(prog, args)` |
+| `impl ProcessRunner { async fn output(..) }` | `async fn output_string(..)` (the required method) |
+| `mock.expect_output()` | `mock.expect_output_string()` |
+
+`output_bytes` is unchanged, and `Command`/`Pipeline`/`RunningProcess` callers
+need no change (those already used `output_string`).
+
 ## 0.11.0 (from 0.10.x)
 
 Two breaking changes, both small and **caught by the compiler** — if it builds

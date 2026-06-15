@@ -67,4 +67,5 @@
   window is a POSIX limit, not a fixable bug; kernel-handle mechanisms
   (Job/cgroup) are the real fix and already preferred where available.
 - `ProcessRunner` as the seam, now covering both run shapes (`output` +
-  `start`).
+  `start`). *(The capture method was later renamed `output` → `output_string`;
+  see the round-4 fix plan.)*
