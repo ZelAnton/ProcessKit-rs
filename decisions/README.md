@@ -30,6 +30,12 @@ constraint) can reopen one by moving its substance back into `ideas/`.
 - **`pre-1.0-api-review.md`** — the pre-1.0 public-API sweep: the `#[non_exhaustive]`
   additions (shipped 0.9.1) and the deliberate re-export-leak decisions
   (`CancellationToken`/`encoding_rs::Encoding` kept).
+- **`interface-freeze-2026-06.md`** — the pre-release interface-freeze keep-as-is
+  calls: conversions deliberately *not* added (no `From<&str> for Command` — the
+  shell-free footgun, etc.), signature/type shapes kept (`usize` batch concurrency,
+  looser `Pipeline::parse` bounds, `Copy` retained, no `must_use` on `Outcome`),
+  and the sealing/leak posture re-confirmed. Recorded so the frozen surface isn't
+  reversed or re-litigated post-1.0.
 - **`readme-crate-doc-sourcing.md`** — why the README and the `lib.rs` crate doc stay
   separate (not `#![doc = include_str!]`): `include_str!` is lossy on docs.rs (relative
   links, cover image) and the two serve different audiences. Drift managed by review.
