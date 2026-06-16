@@ -13,6 +13,13 @@ AGENTS.md
 CLAUDE.md
 .claude/
 
+# Local-only working directories — not pushed to remote
+ideas/
+reviews/
+decisions/
+ROADMAP.md
+None
+
 # Rust
 **/*.rs.bk
 *.pdb
