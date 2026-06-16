@@ -24,7 +24,7 @@ type SharedLines = Arc<AsyncMutex<Option<Pin<Box<dyn Stream<Item = String> + Sen
 /// [`from_lines`](Self::from_lines)) are one-shot — their payload is consumed by
 /// the first run. Re-running or retrying a [`Command`](crate::Command) that
 /// reuses a consumed one-shot source **fails loud** (an
-/// [`Error::Io`](crate::Error::Io) at launch, D10) rather than silently feeding
+/// [`Error::Io`](crate::Error::Io) at launch) rather than silently feeding
 /// the next run empty stdin; use a reusable source
 /// (`from_string`/`from_bytes`/`from_file`/`from_iter_lines`) to re-run.
 #[derive(Clone)]
@@ -109,7 +109,7 @@ impl Stdin {
         matches!(self.0, Source::Empty)
     }
 
-    /// D10: whether this is a one-shot streaming source
+    /// Whether this is a one-shot streaming source
     /// ([`from_reader`](Self::from_reader) / [`from_lines`](Self::from_lines)) —
     /// its payload feeds a *single* run and cannot be replayed. The retry path
     /// uses this to refuse retrying such a command (a retry could not re-feed the
@@ -119,19 +119,18 @@ impl Stdin {
         matches!(self.0, Source::Reader(_) | Source::Lines(_))
     }
 
-    /// A **stable** digest of the stdin *source identity* for cassette keying
-    /// (F12) — the payload itself is never persisted (preserving the no-payload
-    /// posture), only this hash, so two otherwise-identical invocations that
-    /// differ only in their stdin no longer collide on replay. FNV-1a (not `DefaultHasher`,
-    /// whose value can change between Rust releases) so a digest recorded today
-    /// matches one computed tomorrow. Byte content is hashed verbatim; a file
-    /// source hashes its *path* (the file is not read at key time). The one-shot
+    /// A **stable** digest of the stdin *source identity* for cassette keying —
+    /// the payload itself is never persisted (preserving the no-payload posture),
+    /// only this hash, so two otherwise-identical invocations that differ only in
+    /// their stdin no longer collide on replay. FNV-1a (not `DefaultHasher`, whose
+    /// value can change between Rust releases) so a digest recorded today matches
+    /// one computed tomorrow. Byte content is hashed verbatim; a file source
+    /// hashes its *path* (the file is not read at key time). The one-shot
     /// streaming sources have no fixed content, so they hash a discriminant only
-    /// — but the cassette runner rejects them outright (L-1) before this is
-    /// keyed, since that discriminant would collide distinct payloads.
+    /// — but the cassette runner rejects them outright before this is keyed, since
+    /// that discriminant would collide distinct payloads.
     #[cfg(feature = "record")]
     pub(crate) fn content_digest(&self) -> u64 {
-        // FNV-1a, 64-bit.
         const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
         const PRIME: u64 = 0x0000_0100_0000_01b3;
         fn mix(mut h: u64, bytes: &[u8]) -> u64 {
@@ -160,7 +159,7 @@ impl Stdin {
         }
     }
 
-    /// Take this source's payload for a single run (D10/M4), or report a one-shot
+    /// Take this source's payload for a single run, or report a one-shot
     /// source already consumed by a previous run.
     ///
     /// One-shot sources ([`from_reader`](Self::from_reader)/
@@ -191,7 +190,7 @@ impl Stdin {
 
 /// A one-shot streaming stdin source ([`Stdin::from_reader`]/
 /// [`Stdin::from_lines`]) whose payload was already consumed by a previous run —
-/// returned by [`Stdin::take_for_run`] so the launch path can fail loud (D10).
+/// returned by [`Stdin::take_for_run`] so the launch path can fail loud.
 #[derive(Debug)]
 pub(crate) struct OneShotConsumed;
 
@@ -329,9 +328,8 @@ mod tests {
 
     #[tokio::test]
     async fn reader_source_is_one_shot() {
-        // D10/M4: the first `take_for_run` yields the payload; a second take of
-        // the same (cloned) source reports it consumed (the launch path turns
-        // that into a loud error) rather than silently feeding empty stdin.
+        // A second take of the same (cloned) source reports it consumed rather
+        // than silently feeding empty stdin.
         let stdin = Stdin::from_reader(&b"payload"[..]);
         assert_eq!(written(&stdin).await, b"payload");
         assert!(
@@ -377,9 +375,9 @@ mod tests {
 
     #[tokio::test]
     async fn iter_lines_appends_one_newline_per_item_verbatim() {
-        // L-3: the contract is "exactly one `\n` after every item, verbatim, no
-        // re-splitting." An item that already ends in `\n` yields a blank line;
-        // an empty iterator yields no bytes (not a lone newline).
+        // Contract: exactly one `\n` after every item, verbatim, no re-splitting.
+        // An item ending in `\n` yields a blank line; an empty iterator yields
+        // no bytes (not a lone newline).
         assert_eq!(
             written(&Stdin::from_iter_lines(["a\n", "b"])).await,
             b"a\n\nb\n"
@@ -411,12 +409,10 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_reuse_of_a_one_shot_source_fails_the_loser_atomically() {
-        // M4: the take is atomic — when two runs of the same (cloned) one-shot
-        // source race, exactly one wins the payload and the other observes it
-        // consumed. There is no window where both pass a check and one then
-        // silently feeds empty stdin. (The slow copy no longer holds the source
-        // lock, so the loser also returns promptly — superseding the old B17
-        // "not blocked by a slow first run" guarantee.)
+        // The take is atomic: when two runs of the same (cloned) one-shot source
+        // race, exactly one wins the payload and the other observes it consumed —
+        // no window where both pass a check and one then feeds empty stdin. The
+        // slow copy no longer holds the source lock, so the loser returns promptly.
         use std::time::Duration;
 
         let (_tx, rx) = tokio::io::duplex(64);

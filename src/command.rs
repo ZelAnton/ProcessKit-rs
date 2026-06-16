@@ -49,8 +49,8 @@ pub struct Command {
     ok_codes: Option<Vec<i32>>,
     stdout_handler: Option<LineHandler>,
     stderr_handler: Option<LineHandler>,
-    /// Async tee sinks (E6): each decoded line is also written here. Independent
-    /// of the line handlers above — both run.
+    /// Async tee sinks: each decoded line is also written here. Independent of
+    /// the line handlers above — both run.
     stdout_tee: Option<crate::pump::TeeSink>,
     stderr_tee: Option<crate::pump::TeeSink>,
     stdout_mode: StdioMode,
@@ -330,8 +330,7 @@ impl Command {
     /// [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) escape hatch still
     /// overwrites creation flags (see its docs).
     pub fn create_no_window(mut self) -> Self {
-        // CREATE_NO_WINDOW = 0x0800_0000; spelled as a literal so the field
-        // exists (and tests compile) on every platform.
+        // CREATE_NO_WINDOW, as a literal so the field exists on every platform.
         self.creation_flags_extra |= 0x0800_0000;
         self
     }
@@ -416,12 +415,11 @@ impl Command {
     /// [`Signal::Term`](crate::Signal::Term)). Unix-only in effect; ignored on
     /// Windows (no signal tier).
     ///
-    /// D9b: this builder lives behind the `process-control` feature because the
-    /// [`Signal`](crate::Signal) type does — the divergence is **accepted, not an
-    /// oversight**. Without `process-control` the graceful timeout always uses
-    /// `SIGTERM` (the default); the feature is only needed to *choose a different*
-    /// teardown signal. Promoting `Signal` into the base API would be the
-    /// alternative, but it enlarges the always-on 1.0 surface for a niche knob.
+    /// This builder lives behind the `process-control` feature because the
+    /// [`Signal`](crate::Signal) type does. Without `process-control` the
+    /// graceful timeout always uses `SIGTERM` (the default); the feature is only
+    /// needed to *choose a different* teardown signal — promoting `Signal` into
+    /// the base API would enlarge the always-on surface for a niche knob.
     #[cfg(feature = "process-control")]
     pub fn timeout_signal(mut self, signal: crate::Signal) -> Self {
         self.timeout_signal = Some(signal);
@@ -508,10 +506,10 @@ impl Command {
     /// payload is consumed by the first attempt. Rather than silently feed the
     /// retry empty stdin, the second attempt **fails loud** with an
     /// [`Error::Io`](crate::Error::Io) (`InvalidInput`) naming the consumed
-    /// source (D10). Use a reusable source
+    /// source. Use a reusable source
     /// (`from_string`/`from_bytes`/`from_file`/`from_iter_lines`) when retrying.
     ///
-    /// **Inert outside the success-checking verbs (D16).** A `retry` policy is
+    /// **Inert outside the success-checking verbs.** A `retry` policy is
     /// honored only by the verbs listed above. It is **ignored** by:
     /// - [`Supervisor`](crate::Supervisor) — supervision is keep-alive
     ///   *restarting* with its own [`RestartPolicy`](crate::RestartPolicy) /
@@ -609,7 +607,7 @@ impl Command {
     ///   in the terminal/log but is not captured.
     /// - **`Null`** — suppressed entirely (redirected to `/dev/null`).
     ///
-    /// With `Inherit`/`Null` there is no pipe to read, so (D5) the bulk capture
+    /// With `Inherit`/`Null` there is no pipe to read, so the bulk capture
     /// verbs (`output_string`/`output_bytes`) **error** rather than return
     /// silently-empty output, and the streaming verbs (`stdout_lines`/
     /// `output_events`) yield an empty stream. Use a discard verb (`wait`) to run
@@ -636,7 +634,7 @@ impl Command {
     /// is written to it followed by `\n`. The write is **awaited on the capture
     /// pump**, so a slow sink applies backpressure (the pump slows, the OS pipe
     /// fills, the child blocks on its next write) rather than blocking the
-    /// runtime (E6). The sink must make forward progress, though: a destination
+    /// runtime. The sink must make forward progress, though: a destination
     /// that blocks *forever* (not merely slow) stalls the pump — no further
     /// lines are buffered and a live `stdout_lines`/`output_events` consumer
     /// parks — until the run's teardown grace aborts the pump. A write error
@@ -750,7 +748,7 @@ impl Command {
         self.stderr_encoding
     }
 
-    /// D5: whether stdout is captured into a pipe (vs `Inherit`/`Null`). The bulk
+    /// Whether stdout is captured into a pipe (vs `Inherit`/`Null`). The bulk
     /// capture verbs use this to fail loudly instead of returning silently-empty
     /// output when stdout wasn't piped.
     pub(crate) fn stdout_is_piped(&self) -> bool {
@@ -795,7 +793,7 @@ impl Command {
         self.cancel_token.clone()
     }
 
-    /// Fill in a [`CliClient`](crate::CliClient)'s default env ops (M7) — but only
+    /// Fill in a [`CliClient`](crate::CliClient)'s default env ops — but only
     /// for keys this command has **not** already set, so a per-command `env` /
     /// `env_remove` wins over a client default for the same key. Idempotent:
     /// applying the same defaults twice (a verb running `client.command(..)`,
@@ -836,10 +834,9 @@ impl Command {
     }
 
     // ----- Public accessors -----------------------------------------------
-    // Exposed so external `ScriptedRunner::when(|cmd| …)` predicates and other
-    // inspection can read what a command will run. Named to avoid clashing with
-    // the same-named builder methods (`program` has no builder; `arguments` vs
-    // `args`, `working_dir` vs `current_dir`, etc.).
+    // Let `ScriptedRunner::when(|cmd| …)` predicates and other inspection read
+    // what a command will run. Named to avoid clashing with the builder methods
+    // (`arguments` vs `args`, `working_dir` vs `current_dir`, …).
 
     /// The program to launch.
     pub fn program(&self) -> &OsStr {
@@ -915,8 +912,8 @@ impl Command {
     /// the low-level [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) escape
     /// hatch directly (which returns a raw [`tokio::process::Child`]).
     ///
-    /// D8: `#[doc(hidden)]` — this is a raw-tokio escape hatch, not part of the
-    /// advertised 1.0 surface. It stays public and callable for power users
+    /// `#[doc(hidden)]` — this is a raw-tokio escape hatch, not part of the
+    /// advertised surface. It stays public and callable for power users
     /// bridging to `ProcessGroup::spawn`, but the recommended path is the
     /// `start`/`output_string`/run verbs.
     #[doc(hidden)]
@@ -937,8 +934,7 @@ impl Command {
             cmd.env_clear();
         }
         if let Some(names) = &self.inherit_env {
-            // Copy the allow-listed vars from the parent env at spawn time;
-            // vars the parent lacks are skipped. Explicit overrides below win.
+            // Vars the parent lacks are skipped; explicit overrides below win.
             for name in names {
                 if let Some(value) = std::env::var_os(name) {
                     cmd.env(name, value);
@@ -959,13 +955,10 @@ impl Command {
         {
             use std::os::unix::process::CommandExt;
             match &self.groups {
-                // Supplementary groups requested: do the *whole* privilege drop
-                // (setgroups → setgid → setuid) in one async-signal-safe
-                // pre_exec. std applies its own setgid/setuid BEFORE any user
-                // pre_exec hook, so a separate setgroups hook would run after the
-                // uid already dropped and fail EPERM — setgroups must precede
-                // setuid while still privileged. (`CommandExt::groups` is still
-                // unstable, so it can't carry this for us.)
+                // Do the *whole* drop (setgroups → setgid → setuid) in one
+                // pre_exec: std runs its own setgid/setuid before any user hook,
+                // so a separate setgroups hook would run post-uid-drop and fail
+                // EPERM. (`CommandExt::groups` is unstable, so unusable here.)
                 Some(groups) => {
                     let groups = groups.clone();
                     let gid = self.gid;
@@ -993,9 +986,8 @@ impl Command {
                         });
                     }
                 }
-                // No supplementary groups: keep std's path — it applies gid
-                // before uid (once the uid drops, changing gid is no longer
-                // permitted), before any user pre_exec hook. Unchanged.
+                // Keep std's path: it applies gid before uid (changing gid is
+                // barred once the uid drops), before any user pre_exec hook.
                 None => {
                     if let Some(gid) = self.gid {
                         cmd.as_std_mut().gid(gid);
@@ -1006,11 +998,9 @@ impl Command {
                 }
             }
             if self.setsid {
-                // Registered before any backend hook (e.g. the Linux cgroup
-                // join), so the new session exists first. The pgroup backend
-                // skips its setpgid when setsid is requested — std applies
-                // setpgid before pre_exec hooks, and setsid fails EPERM for a
-                // process that is already a group leader.
+                // Registered before any backend hook (e.g. the cgroup join) so
+                // the session exists first. The pgroup backend skips its setpgid
+                // under setsid: setsid fails EPERM on an existing group leader.
                 // SAFETY: the closure calls only setsid() and reads errno —
                 // both async-signal-safe.
                 unsafe {
@@ -1027,8 +1017,8 @@ impl Command {
         #[cfg(windows)]
         if self.creation_flags_extra != 0 {
             use std::os::windows::process::CommandExt;
-            // Covers non-group launch paths; the group spawn on Windows
-            // overwrites flags with CREATE_SUSPENDED | these extras.
+            // Non-group launch paths only; the group spawn overwrites flags with
+            // CREATE_SUSPENDED | these extras.
             cmd.as_std_mut().creation_flags(self.creation_flags_extra);
         }
         cmd.stdout(match self.stdout_mode {
@@ -1049,7 +1039,7 @@ impl Command {
                 Some(src) => {
                     cmd.stdin(src.stdio());
                 }
-                // No source given: close stdin so the child reads EOF at start.
+                // No source: close stdin so the child reads EOF at start.
                 None => {
                     cmd.stdin(Stdio::null());
                 }
@@ -1191,20 +1181,17 @@ impl Command {
     where
         F: Fn(&str) -> bool + Send,
     {
-        // D6: delegate to the `ProcessRunnerExt` seam (real `JobRunner` here) so
-        // the streaming-search logic lives in one place and is exercisable with
-        // any runner — see `ProcessRunnerExt::first_line`. The deadline is read
-        // from `self` there via `configured_timeout()`.
+        // Delegate to the `ProcessRunnerExt` seam so the streaming-search logic
+        // lives in one place and stays exercisable with any runner.
         JobRunner::new().first_line(self, predicate).await
     }
 }
 
 impl fmt::Debug for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // B4 (Decision 3): never render argv or env *values* in Debug — they may
-        // carry secrets (the crate-wide rule, see `lib.rs`). Surface the argument
-        // *count* and the env variable *names* (sorted); `command_line()` is the
-        // documented, explicitly-secret-bearing escape hatch for the real argv.
+        // Never render argv or env *values* in Debug — they may carry secrets
+        // (the crate-wide rule). Surface the argument *count* and env *names*;
+        // `command_line()` is the explicit secret-bearing escape hatch for argv.
         let mut d = f.debug_struct("Command");
         d.field("program", &self.program)
             .field("args", &self.args.len())
@@ -1235,11 +1222,11 @@ impl fmt::Debug for Command {
 }
 
 /// Render env *names* (sorted, deduped) for a redacted `Debug` — the env
-/// *values* are never shown (the crate-wide secret-safety rule; see `lib.rs`).
-/// Shared by the [`Command`], `CliClient`, and `Invocation` `Debug` impls so the
-/// redaction lives in exactly one audited place. A repeated override of one
-/// variable collapses to a single name (its repetition is a `command_line()`
-/// concern, not a Debug one).
+/// *values* are never shown (the crate-wide secret-safety rule). Shared by the
+/// [`Command`], `CliClient`, and `Invocation` `Debug` impls so the redaction
+/// lives in exactly one audited place. A repeated override of one variable
+/// collapses to a single name (its repetition is a `command_line()` concern,
+/// not a Debug one).
 pub(crate) fn redacted_env_names(
     envs: &[(OsString, Option<OsString>)],
 ) -> Vec<std::borrow::Cow<'_, str>> {
@@ -1255,7 +1242,7 @@ pub(crate) fn redacted_env_names(
 /// Compare two environment-variable names with the platform's case rules:
 /// case-insensitive on Windows (where env names are), case-sensitive elsewhere.
 /// Used to decide whether a command already sets a key before filling a client
-/// default for it (M7). A non-UTF-8 name on Windows falls back to exact bytes.
+/// default for it. A non-UTF-8 name on Windows falls back to exact bytes.
 fn env_key_eq(a: &OsStr, b: &OsStr) -> bool {
     #[cfg(windows)]
     {
@@ -1275,8 +1262,7 @@ fn env_key_eq(a: &OsStr, b: &OsStr) -> bool {
 /// `command_line()` echo readable and unambiguous.
 #[cfg(unix)]
 fn quote_arg(arg: &str) -> String {
-    // Bare when entirely shell-safe; otherwise single-quote, rewriting an
-    // embedded `'` as the classic `'\''`.
+    // Bare when entirely shell-safe; else single-quote, rewriting `'` as `'\''`.
     let safe = !arg.is_empty()
         && arg.bytes().all(|b| {
             b.is_ascii_alphanumeric()
@@ -1323,8 +1309,7 @@ fn quote_arg(arg: &str) -> String {
             out.push(ch);
         }
     }
-    // L13: double any trailing backslashes before the closing quote so they
-    // don't escape it (e.g. `C:\tools\` → `"C:\tools\\"` not `"C:\tools\"`).
+    // Double any trailing backslashes so they don't escape the closing quote.
     let trailing = out.chars().rev().take_while(|&c| c == '\\').count();
     for _ in 0..trailing {
         out.push('\\');
@@ -1346,8 +1331,8 @@ fn quote_arg(arg: &str) -> String {
 /// the location.
 pub(crate) fn is_bare_name(program: &OsStr) -> bool {
     use std::path::{Component, Path};
-    // Path::components() normalizes trailing separators away ("git/" → Normal("git")),
-    // so check the raw bytes first: any separator makes it path-ish.
+    // components() normalizes trailing separators away ("git/" → Normal("git")),
+    // so check raw bytes first: any separator makes it path-ish.
     let bytes = program.as_encoded_bytes();
     if bytes.contains(&b'/') || bytes.contains(&b'\\') {
         return false;
@@ -1389,12 +1374,12 @@ fn probe_dir(dir: &std::path::Path, program: &OsStr) -> Option<std::path::PathBu
 /// Check whether `program` (with PATHEXT expansion) exists in `dir`.
 #[cfg(not(unix))]
 fn probe_dir(dir: &std::path::Path, program: &OsStr) -> Option<std::path::PathBuf> {
-    // Try the name exactly as given first (handles `git.exe` already having an ext).
+    // Exact name first (handles `git.exe` already carrying an ext).
     let candidate = dir.join(program);
     if candidate.is_file() {
         return Some(candidate);
     }
-    // Then try each PATHEXT extension (.EXE, .CMD, .BAT, …).
+    // Then each PATHEXT extension.
     let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
     for ext in pathext.split(';') {
         if ext.is_empty() {
@@ -1417,8 +1402,8 @@ mod tests {
 
     #[test]
     fn debug_redacts_argv_and_env_values_keeping_names_and_count() {
-        // B4 (Decision 3): the manual Debug must never expose argv or env
-        // *values* — only the arg count and the sorted env *names*.
+        // The manual Debug must never expose argv or env *values* — only the
+        // arg count and the sorted env *names*.
         let cmd = Command::new("git")
             .arg("--password=hunter2")
             .arg("secret-positional")
@@ -1494,8 +1479,8 @@ mod tests {
             .env("PATH", "overridden")
             .env("EXTRA", "1");
         let envs = built_envs(&cmd);
-        // The std Command keeps one entry per key, last write winning — so the
-        // explicit override (applied after the inherited copy) is what remains.
+        // std keeps one entry per key, last write winning — the explicit
+        // override (applied after the inherited copy) is what remains.
         assert!(
             envs.contains(&("PATH".to_string(), Some("overridden".to_string()))),
             "explicit env must override the inherited value: {envs:?}"
@@ -1579,7 +1564,7 @@ mod tests {
         assert!(!is_bare_name(OsStr::new("subdir/tool")));
         #[cfg(windows)]
         assert!(!is_bare_name(OsStr::new("C:\\git.exe")));
-        // L20: a trailing separator is path-ish (Path normalizes it away).
+        // A trailing separator is path-ish (Path normalizes it away).
         assert!(!is_bare_name(OsStr::new("git/")));
         assert!(!is_bare_name(OsStr::new("git\\")));
     }

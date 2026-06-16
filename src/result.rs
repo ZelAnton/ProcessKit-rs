@@ -24,7 +24,7 @@ pub enum Outcome {
     ///
     /// On **Windows** this also covers a *killed* process: the OS has no signal
     /// abstraction, so termination yields an exit code, not a
-    /// [`Signalled`](Self::Signalled) (D18). A `TerminateProcess`/
+    /// [`Signalled`](Self::Signalled). A `TerminateProcess`/
     /// `TerminateJobObject(_, 1)` is reported as `Exited(1)` — indistinguishable
     /// from a voluntary `exit(1)` — and `Ctrl-C` surfaces as
     /// `Exited(-1073741510)` (`STATUS_CONTROL_C_EXIT` as a signed `i32`). This is
@@ -36,8 +36,8 @@ pub enum Outcome {
     /// Terminated by a signal **(Unix only)** — no exit code exists. The inner
     /// value is the signal number when the platform reports one (`None` when the
     /// kernel does not expose it). **Never produced on Windows**, where a killed
-    /// process reports [`Exited`](Self::Exited) with a platform code instead
-    /// (D18). A [`ScriptedRunner`](crate::testing::ScriptedRunner) reports
+    /// process reports [`Exited`](Self::Exited) with a platform code instead.
+    /// A [`ScriptedRunner`](crate::testing::ScriptedRunner) reports
     /// `Signalled(None)` for a killed scripted run, matching Unix.
     Signalled(Option<i32>),
     /// Killed because it exceeded its configured timeout.
@@ -63,7 +63,7 @@ impl Outcome {
     /// The signal number if the process was [`Signalled`](Self::Signalled) with a
     /// known number, else `None` (a clean exit, a timeout, or a signal the kernel
     /// did not expose). **Unix only** — a killed process reports
-    /// [`Exited`](Self::Exited) on Windows (D18).
+    /// [`Exited`](Self::Exited) on Windows.
     pub fn signal(&self) -> Option<i32> {
         match self {
             Outcome::Signalled(signal) => *signal,
@@ -100,25 +100,17 @@ pub struct ProcessResult<T> {
     program: String,
     stdout: T,
     stderr: String,
-    /// How the run ended (see [`Outcome`]); `code()`/`signal()`/`timed_out()`
-    /// derive from it.
     outcome: Outcome,
-    /// The deadline that elapsed, when timed out — carried so the
-    /// success-checking helpers can build a faithful [`Error::Timeout`].
+    /// Carried so the success-checking helpers can build a faithful [`Error::Timeout`].
     timeout: Option<Duration>,
-    /// Wall-clock duration of the run; `Duration::ZERO` for synthetic results
-    /// (a scripted/replayed bulk `output_string` that didn't time a real process).
+    /// `Duration::ZERO` for synthetic results that didn't time a real process.
     duration: Duration,
     /// Whether a bounded [`OutputBufferPolicy`](crate::OutputBufferPolicy)
     /// dropped captured output lines.
     truncated: bool,
-    /// Total lines seen across the captured streams (retained + dropped) — used
-    /// to build a faithful [`Error::OutputTooLarge`] when a checking verb
-    /// (`run`/`parse`/`try_parse`) refuses silently-truncated output (B12). `0`
-    /// for synthetic results; meaningful only when `truncated` is `true`.
+    /// Retained + dropped, so a checking verb can build a faithful
+    /// [`Error::OutputTooLarge`]; meaningful only when `truncated`.
     total_lines: usize,
-    /// Total bytes of decoded line text seen across the captured streams
-    /// (retained + dropped) — the companion to `total_lines` for B12.
     total_bytes: usize,
     /// Exit codes treated as success by [`is_success`](Self::is_success) /
     /// [`ensure_success`](Self::ensure_success). Default `[0]`; widened via
@@ -126,11 +118,9 @@ pub struct ProcessResult<T> {
     ok_codes: Vec<i32>,
 }
 
-// Equality is over the *logical* outcome, not incidental measurement: `duration`
-// (wall-clock timing) and `truncated` (buffer state) are deliberately excluded.
-// This keeps the cassette's round-trip contract — a result and its replay compare
-// equal — true even when the recording ran on a real runner (non-zero duration)
-// while replay rebuilds it as `Duration::ZERO`. See `cassette.rs`.
+// Equality is over the *logical* outcome: `duration` and `truncated` are excluded
+// so a recorded result compares equal to its replay (which rebuilds duration as
+// `Duration::ZERO`), keeping the cassette round-trip contract intact.
 impl<T: PartialEq> PartialEq for ProcessResult<T> {
     fn eq(&self, other: &Self) -> bool {
         self.program == other.program
@@ -159,8 +149,8 @@ impl<T> ProcessResult<T> {
             stderr,
             outcome,
             timeout,
-            // Producer-only setters fill these on the real run paths; the
-            // defaults keep synthetic results (doubles, pipeline, tests) correct.
+            // Producer-only setters fill these on real runs; defaults keep
+            // synthetic results correct.
             duration: Duration::ZERO,
             truncated: false,
             total_lines: 0,
@@ -320,7 +310,7 @@ impl<T> ProcessResult<T> {
 
     /// Record the total lines/bytes the streams produced (retained + dropped),
     /// so a checking verb can build a faithful [`Error::OutputTooLarge`] when it
-    /// refuses truncated output (B12). Producer-only.
+    /// refuses truncated output. Producer-only.
     pub(crate) fn with_overflow_totals(mut self, total_lines: usize, total_bytes: usize) -> Self {
         self.total_lines = total_lines;
         self.total_bytes = total_bytes;
@@ -339,7 +329,7 @@ impl<T> ProcessResult<T> {
         self.total_bytes
     }
 
-    /// B12: refuse silently-truncated output. The checking verbs that hand back
+    /// Refuse silently-truncated output. The checking verbs that hand back
     /// stdout *as if complete* (`run`/`parse`/`try_parse`) call this so a bounded
     /// drop-policy that discarded lines surfaces as [`Error::OutputTooLarge`]
     /// rather than feeding a parser a truncated tail. The lenient capture verbs
@@ -436,8 +426,8 @@ mod tests {
 
     #[test]
     fn outcome_accessors_match_each_variant() {
-        // R5-3: the bare-`Outcome` accessors (so callers needn't `match` a
-        // non_exhaustive enum with a wildcard).
+        // The bare-`Outcome` accessors, so callers needn't `match` a
+        // non_exhaustive enum with a wildcard.
         assert_eq!(Outcome::Exited(7).code(), Some(7));
         assert_eq!(Outcome::Exited(7).signal(), None);
         assert!(!Outcome::Exited(7).timed_out());
@@ -452,7 +442,7 @@ mod tests {
         assert_eq!(Outcome::TimedOut.signal(), None);
 
         // The accessors agree with the ProcessResult-level ones derived from the
-        // same outcome (parity vocabulary across the two types).
+        // same outcome.
         let exited = ProcessResult::new(
             "x".into(),
             String::new(),
@@ -519,7 +509,7 @@ mod tests {
         assert!(!killed.is_success());
         assert_eq!(killed.outcome(), Outcome::Signalled(Some(9)));
         match killed.ensure_success().unwrap_err() {
-            // D12: the captured stdout flows into the error.
+            // The captured stdout flows into the error.
             Error::Signalled {
                 program,
                 signal,
@@ -607,7 +597,6 @@ mod tests {
 
     #[test]
     fn diagnostic_prefers_stderr_then_falls_back_to_stdout() {
-        // stderr present → stderr wins, trimmed of surrounding whitespace.
         let with_stderr = ProcessResult::new(
             "git".into(),
             "on stdout".into(),
@@ -633,7 +622,6 @@ mod tests {
             conflict.diagnostic(),
             "CONFLICT (content): merge conflict in a.rs"
         );
-        // The erroring path exposes the same rule via Error::diagnostic.
         let Error::Exit { .. } = conflict.clone().ensure_success().unwrap_err() else {
             panic!("expected Exit");
         };
@@ -643,7 +631,7 @@ mod tests {
         );
 
         // Both streams blank → no captured message; the caller falls back to the
-        // Display text rather than getting an empty string.
+        // Display text rather than an empty string.
         let silent = ProcessResult::new(
             "git".into(),
             String::new(),
@@ -656,8 +644,7 @@ mod tests {
 
     #[test]
     fn timed_out_takes_precedence_over_exit_code() {
-        // A timed-out run has no code (None), and ensure_success must report it
-        // as a distinct Timeout, not a non-zero Exit.
+        // A timed-out run must report as a distinct Timeout, not a non-zero Exit.
         let timed = ProcessResult::new(
             "git".into(),
             "out".to_owned(),
@@ -676,7 +663,7 @@ mod tests {
             } => {
                 assert_eq!(program, "git");
                 assert_eq!(timeout, Duration::from_millis(500));
-                // D12: partial stdout captured before the kill is carried.
+                // Partial stdout captured before the kill is carried.
                 assert_eq!(stdout, "out");
             }
             other => panic!("expected Timeout, got {other:?}"),
@@ -685,10 +672,9 @@ mod tests {
 
     #[test]
     fn signal_kill_surfaces_as_signalled_error() {
-        // A signal-terminated run (no code, not a timeout) reports `None` code.
-        // Both `require_code` and `ensure_success` must surface `Error::Signalled`
-        // — never a synthetic `Error::Exit { code: -1 }`, which would resurrect
-        // the sentinel, and no longer `Error::Io` (which was the old stand-in).
+        // A signal-terminated run (no code, not a timeout) must surface
+        // `Error::Signalled` from both `require_code` and `ensure_success`,
+        // never a synthetic `Error::Exit { code: -1 }` sentinel.
         let killed = ProcessResult::new(
             "git".into(),
             "out".to_owned(),
@@ -722,8 +708,8 @@ mod tests {
             Outcome::Exited(0),
             None,
         );
-        // L16: when stdout doesn't end with \n, a newline separator is inserted
-        // so the last stdout line is not glued to the first stderr line.
+        // A newline separator is inserted so the last stdout line is not glued
+        // to the first stderr line.
         assert_eq!(r.combined(), "out\nerr");
     }
 
@@ -764,9 +750,8 @@ mod tests {
     #[test]
     fn error_exit_carries_full_streams() {
         // The error fields must carry the complete captured streams — consumers
-        // classify on them (grep for a marker, parse a code), and truncating
-        // before classification destroyed data. The `Display` impl bounds what
-        // it *prints*; the fields stay whole.
+        // classify on them (grep for a marker, parse a code). The `Display` impl
+        // bounds what it *prints*; the fields stay whole.
         let big = "x".repeat(10_000);
         let bad = ProcessResult::new(
             "p".into(),
@@ -842,9 +827,9 @@ mod tests {
 
     #[test]
     fn checking_verbs_reject_truncated_output() {
-        // B12: a checking verb that hands back stdout (run/parse/try_parse) must
-        // refuse silently-truncated output, surfacing OutputTooLarge with the
-        // configured limits and the totals seen — not feed a parser a tail.
+        // A checking verb that hands back stdout (run/parse/try_parse) must refuse
+        // silently-truncated output, surfacing OutputTooLarge with the configured
+        // limits and the totals seen — not feed a parser a tail.
         let truncated = ProcessResult::new(
             "p".into(),
             "tail".to_owned(),
@@ -871,7 +856,7 @@ mod tests {
             other => panic!("expected OutputTooLarge, got {other:?}"),
         }
 
-        // A complete (untruncated) result passes — the common case.
+        // A complete (untruncated) result passes.
         let complete = ProcessResult::new(
             "p".into(),
             "full".to_owned(),
@@ -900,8 +885,8 @@ mod tests {
 
     #[test]
     fn equality_ignores_duration_and_truncation() {
-        // The cassette round-trip relies on this: a recorded result (real,
-        // non-zero duration) must compare equal to its replay (Duration::ZERO).
+        // The cassette round-trip relies on this: a recorded result (non-zero
+        // duration) must compare equal to its replay (Duration::ZERO).
         let base = ProcessResult::new(
             "p".into(),
             "out".to_owned(),

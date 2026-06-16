@@ -66,7 +66,6 @@ pub struct ProcessGroupStats {
 /// The sampler *borrows* the group, so it can neither outlive it nor keep it
 /// (and its kill-on-drop guarantee) alive.
 pub struct StatsSampler<'a> {
-    // (Debug: manual impl below.)
     group: &'a ProcessGroup,
     interval: tokio::time::Interval,
     /// Latched once a snapshot fails: the series has ended for good, and
@@ -77,12 +76,11 @@ pub struct StatsSampler<'a> {
 
 impl<'a> StatsSampler<'a> {
     pub(crate) fn new(group: &'a ProcessGroup, every: Duration) -> Self {
-        // tokio panics on a zero interval period; clamp instead of imposing a
-        // Result on an otherwise-infallible constructor.
+        // tokio panics on a zero period; clamp rather than make the constructor fallible.
         let every = every.max(Duration::from_millis(1));
         let mut interval = tokio::time::interval(every);
-        // Sampling wants the *current* state on each tick; replaying a backlog
-        // of missed ticks would fabricate identical samples.
+        // Each tick wants the *current* state; replaying missed ticks would
+        // fabricate identical samples.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         StatsSampler {
             group,

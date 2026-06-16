@@ -8,7 +8,7 @@
 //!
 //! Behind the `mock` feature, [`mockall`] additionally generates a `MockRunner`
 //! for expectation-style mocking. All of these live under
-//! [`processkit::testing`](crate::testing) (D6), not the crate root.
+//! [`processkit::testing`](crate::testing), not the crate root.
 //!
 //! The seam covers **both shapes of a run**. The bulk verbs (`output_string` and the
 //! helpers over it) replay canned results — and feed the command's
@@ -22,7 +22,7 @@
 //! [`Pipeline`](crate::Pipeline), and don't model interactive stdin. The bulk
 //! `output_string` replay also does not model a bounded-buffer **truncation** policy
 //! (a canned reply is returned whole, `truncated() == false`), so the
-//! checking-verb truncation error (B12) won't fire against a bulk double — to
+//! checking-verb truncation error won't fire against a bulk double — to
 //! exercise that, drive output through a scripted [`start`] handle (whose canned
 //! lines flow through the real buffer policy).
 //!
@@ -101,7 +101,7 @@ impl Reply {
     /// On the bulk verbs (`output_string` and friends) this synthesizes a timed-out
     /// result directly. On a scripted [`start`](crate::ProcessRunner::start),
     /// though, it resolves **immediately** as timed-out rather than parking until
-    /// a deadline — it does not exercise the real deadline-watchdog race (L10). To
+    /// a deadline — it does not exercise the real deadline-watchdog race. To
     /// model "hangs until the command's `timeout` fires," script
     /// [`pending`](Self::pending) and set a [`Command::timeout`](crate::Command::timeout):
     /// the watchdog then drives the timeout exactly as it would for a live child.
@@ -109,8 +109,7 @@ impl Reply {
         Self {
             stdout: String::new(),
             stderr: String::new(),
-            // Unused — a timed-out result carries no code; `timed_out` is what
-            // the helpers key on.
+            // Unused: a timed-out result carries no code.
             code: 0,
             timed_out: true,
             signalled: false,
@@ -215,26 +214,16 @@ impl Reply {
             None
         } else {
             let per_line = self.line_delay.unwrap_or_default();
-            // F8: both streams are fed concurrently at `line_delay`, so the
-            // scripted "process" only finishes once the LONGER stream has
-            // drained — count the max of stdout/stderr lines. Counting stdout
-            // alone truncates a lagging stderr when `join_pumps` stops at the
-            // (shorter) stdout-derived lifetime, which a real child never does.
-            // Count lines with `str::lines` to match `replay_line_handlers` (and
-            // the per-line count the pumps deliver), so the lifetime budget
-            // matches the number of lines actually fed (P3-8). The previous
-            // `split_inclusive('\n').count()` yields the identical count for every
-            // input — each counts the `\n`-delimited segments, with a trailing
-            // newline adding no empty line — but using one method removes the
-            // apparent divergence.
+            // Both streams feed concurrently at `line_delay`, so the scripted
+            // "process" only finishes once the LONGER stream has drained — count
+            // the max, or a lagging stderr gets truncated at the shorter
+            // stdout-derived lifetime (which a real child never does). `str::lines`
+            // matches the count the pumps actually deliver.
             let stdout_lines = self.stdout.lines().count() as u32;
             let stderr_lines = self.stderr.lines().count() as u32;
             let lines = stdout_lines.max(stderr_lines);
-            // E15: saturate the multiply and clamp to MAX_DEADLINE so a test that
-            // hands a `Duration::MAX`-ish `line_delay` can't overflow the multiply
-            // or the later `Instant + lifetime` deadline. (A single line — `lines
-            // == 1` — wouldn't overflow the multiply, so the clamp, not the
-            // multiply, is what guards the downstream `Instant` arithmetic.)
+            // Saturate and clamp so a `Duration::MAX`-ish `line_delay` can't
+            // overflow the multiply or the later `Instant + lifetime` deadline.
             Some(per_line.saturating_mul(lines).min(crate::MAX_DEADLINE))
         };
         let code_for_scripted = if self.timed_out || self.signalled {
@@ -260,8 +249,7 @@ impl Reply {
         timeout: Option<std::time::Duration>,
     ) -> ProcessResult<String> {
         // Carry the command's configured timeout so a timed-out reply surfaces as
-        // `Error::Timeout` with the *real* deadline (matching the live runner),
-        // not a zero duration.
+        // `Error::Timeout` with the real deadline, not a zero duration.
         let outcome = if self.timed_out {
             Outcome::TimedOut
         } else if self.signalled {
@@ -277,7 +265,7 @@ type Predicate = Box<dyn Fn(&Command) -> bool + Send + Sync>;
 
 enum Rule {
     /// Match when the command's **program name followed by its arguments**
-    /// starts with this prefix (F9). The first element is the program; the rest
+    /// starts with this prefix. The first element is the program; the rest
     /// is an argument prefix. An empty prefix is a catch-all.
     Prefix(Vec<OsString>),
     /// Match when the predicate accepts the command.
@@ -287,11 +275,9 @@ enum Rule {
 impl Rule {
     fn matches(&self, command: &Command) -> bool {
         match self {
-            // F9: match the program *and* the argument prefix, so
-            // `.on(["git", "status"])` answers for `git status …` but not for
-            // `rm status` — aligning with the program-aware cassette key. The
-            // first prefix element is the program name; an empty prefix matches
-            // any command (a catch-all).
+            // Match the program *and* the argument prefix, so `.on(["git",
+            // "status"])` answers for `git status …` but not `rm status`. An empty
+            // prefix matches any command.
             Rule::Prefix(prefix) => match prefix.split_first() {
                 Some((program, args)) => {
                     command.program() == program.as_os_str()
@@ -320,7 +306,7 @@ where
 struct RuleEntry {
     rule: Rule,
     /// One reply (served on every match) or an ordered sequence (each served
-    /// once in turn, then the last repeats) — the cassette replay model (F11).
+    /// once in turn, then the last repeats) — the cassette replay model.
     /// Never empty.
     replies: Vec<Reply>,
     /// How many times this rule has matched — indexes into `replies` (clamped
@@ -382,7 +368,7 @@ impl ScriptedRunner {
     }
 
     /// Reply with `reply` when the command's **program name + arguments** start
-    /// with `prefix` (F9: the first element is the program). For example
+    /// with `prefix` (the first element is the program). For example
     /// `.on(["git", "status"])` answers for `git status …`, not `rm status`.
     pub fn on<I, S>(mut self, prefix: I, reply: Reply) -> Self
     where
@@ -396,7 +382,7 @@ impl ScriptedRunner {
 
     /// Reply with each of `replies` in turn — the first match gets the first
     /// reply, the second the second, and so on; once exhausted, the **last**
-    /// reply repeats forever (F11). The declarative form for retry scenarios
+    /// reply repeats forever. The declarative form for retry scenarios
     /// (fail once, then succeed), matching a cassette's "replay in order, then
     /// repeat the last" model. Matches like [`on`](Self::on) (program + arg
     /// prefix).
@@ -440,22 +426,19 @@ impl ScriptedRunner {
         self
     }
 
-    /// Register a rule, warning (F10) if it is unreachable because an earlier
+    /// Register a rule, warning if it is unreachable because an earlier
     /// prefix rule already matches everything it would.
     fn push_rule(&mut self, rule: Rule, replies: Vec<Reply>) {
         // `matched_reply` indexes `replies[i.min(len - 1)]`, which underflows on
-        // an empty vec. Every caller passes a non-empty one (`on`/`when` a
-        // singleton, `on_sequence` asserts it) — codify that invariant at the one
-        // choke point so a future caller can't silently break it (P3-10).
+        // an empty vec — codify the non-empty invariant at this one choke point.
         debug_assert!(
             !replies.is_empty(),
             "a ScriptedRunner rule needs at least one reply"
         );
-        // F10: a new prefix rule is unreachable if an *earlier* prefix rule is a
-        // prefix of it (a broader rule registered first — e.g. an empty
-        // catch-all — wins by first-match). Predicate rules are opaque, so only
-        // prefix-vs-prefix shadowing is detected. Diagnostic only (requires the
-        // `tracing` feature); register more-specific rules first to silence it.
+        // A new prefix rule is unreachable if an *earlier* prefix rule is a
+        // prefix of it (the broader, first-registered rule wins by first-match).
+        // Predicate rules are opaque, so only prefix-vs-prefix shadowing is
+        // detected. Diagnostic only; register more-specific rules first to silence.
         #[cfg(feature = "tracing")]
         if let Rule::Prefix(new) = &rule {
             for (i, existing) in self.rules.iter().enumerate() {
@@ -482,7 +465,7 @@ impl ScriptedRunner {
 
     /// The reply matching `command` (rules in registration order, then the
     /// fallback), or the loud not-found spawn error. A matched rule advances
-    /// through its reply sequence (F11).
+    /// through its reply sequence.
     fn matched_reply(&self, command: &Command, program: &str) -> Result<&Reply> {
         for entry in &self.rules {
             if entry.rule.matches(command) {
@@ -505,9 +488,9 @@ impl ScriptedRunner {
 }
 
 /// Replay `stdout`/`stderr` text through the command's `on_stdout_line` /
-/// `on_stderr_line` handlers (panic-isolated, B6), so a wrapper's
+/// `on_stderr_line` handlers (panic-isolated), so a wrapper's
 /// progress-reporting path is exercised hermetically on the bulk `output_string` verb
-/// — both for a [`ScriptedRunner`] reply and a cassette replay (F6). On a
+/// — both for a [`ScriptedRunner`] reply and a cassette replay. On a
 /// scripted/real `start`, the live pumps invoke the handlers instead.
 pub(crate) fn replay_line_handlers(command: &Command, stdout: &str, stderr: &str) {
     let mut stdout_handler = command.stdout_handler();
@@ -521,7 +504,7 @@ pub(crate) fn replay_line_handlers(command: &Command, stdout: &str, stderr: &str
 }
 
 /// Invoke a line handler with the same panic-isolation contract as the live
-/// pump (B6): a panicking handler is caught, disabled for the rest of the run,
+/// pump: a panicking handler is caught, disabled for the rest of the run,
 /// and replay continues. The scripted bulk path must not diverge from the live
 /// path on the very contract the doubles exist to exercise.
 fn invoke_isolated(handler: &mut Option<crate::pump::LineHandler>, line: &str) {
@@ -542,18 +525,17 @@ fn invoke_isolated(handler: &mut Option<crate::pump::LineHandler>, line: &str) {
 impl ProcessRunner for ScriptedRunner {
     async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
         let program = command.program().to_string_lossy().into_owned();
-        // F4: a token already cancelled short-circuits with `Cancelled`, exactly
-        // as the live runner does pre-spawn — not a canned reply.
+        // An already-cancelled token short-circuits with `Cancelled`, exactly as
+        // the live runner does pre-spawn — not a canned reply.
         if let Some(token) = command.cancel_token()
             && token.is_cancelled()
         {
             return Err(crate::error::Error::Cancelled { program });
         }
-        // F3: honor the D5 non-piped-stdout contract that the live bulk path and
-        // the scripted `start` path both enforce — a capture verb on
-        // `stdout(Inherit/Null)` errors, it does not hand back canned output it
-        // could never have captured. Checked before `matched_reply` so this
-        // config error never advances an `on_sequence` rule's reply cursor.
+        // Honor the non-piped-stdout contract: a capture verb on
+        // `stdout(Inherit/Null)` errors rather than handing back output it could
+        // never have captured. Checked before `matched_reply` so this config error
+        // never advances an `on_sequence` rule's reply cursor.
         if !command.stdout_is_piped() {
             return Err(crate::error::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -581,10 +563,10 @@ impl ProcessRunner for ScriptedRunner {
     /// as on a real child — no subprocess involved.
     async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
         let program = command.program().to_string_lossy().into_owned();
-        // F4: an already-cancelled token short-circuits with `Cancelled`, exactly
-        // as the live runner does pre-spawn — `output_string` AND `start` both route
-        // through `launch`'s pre-spawn check. Without it, `first_line` (which
-        // routes through `start`) would stream canned lines instead of cancelling.
+        // Both `output_string` and `start` short-circuit an already-cancelled
+        // token, as the live runner does pre-spawn. Without it, `first_line`
+        // (which routes through `start`) would stream canned lines instead of
+        // cancelling.
         if let Some(token) = command.cancel_token()
             && token.is_cancelled()
         {
@@ -613,7 +595,7 @@ async fn park_until_cancelled(command: &Command, program: String) -> Result<Proc
 /// policy, line handlers, `keep_stdin_open`, retry). Tests that need to assert
 /// those inspect the built [`Command`] itself.
 ///
-/// `Debug` is **manual, not derived** (B4): it surfaces the argument *count* and
+/// `Debug` is **manual, not derived**: it surfaces the argument *count* and
 /// the env variable *names* (sorted), never the argv or env *values* — a
 /// `{inv:?}` log line or an `assert_eq!` failure must not leak a secret. The
 /// public fields stay available for tests that assert on exact values.
@@ -631,8 +613,8 @@ pub struct Invocation {
     pub has_stdin: bool,
 }
 
-// B4 (Decision 3): never render argv or env *values* — only the arg count and
-// the sorted env names. Mirrors the `Command`/`CliClient` redaction.
+// Never render argv or env *values* — only the arg count and the sorted env
+// names. Mirrors the `Command`/`CliClient` redaction.
 impl std::fmt::Debug for Invocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Invocation")
@@ -646,9 +628,9 @@ impl std::fmt::Debug for Invocation {
 }
 
 impl Invocation {
-    // pub(crate): the `record` feature's cassette runner captures inputs
-    // through this same single path, so recordings and `RecordingRunner`
-    // assertions can never disagree on what an invocation is.
+    // pub(crate): the cassette runner captures inputs through this same path, so
+    // recordings and `RecordingRunner` assertions can never disagree on what an
+    // invocation is.
     pub(crate) fn from_command(command: &Command) -> Self {
         Self {
             program: command.program().to_os_string(),
@@ -739,8 +721,8 @@ impl<R: ProcessRunner> ProcessRunner for RecordingRunner<R> {
     }
 
     async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
-        // Recorded BEFORE delegating (like `output_string`), so a streamed run is
-        // captured even if its stream is never consumed.
+        // Recorded before delegating, so a streamed run is captured even if its
+        // stream is never consumed.
         self.calls
             .lock()
             .expect("recorder lock poisoned")
@@ -756,8 +738,8 @@ mod tests {
 
     #[test]
     fn invocation_debug_redacts_argv_and_env_values() {
-        // B4 (Decision 3): a `{inv:?}` log line or an `assert_eq!` failure must
-        // not leak argv or env values — only the arg count and env names.
+        // A `{inv:?}` log line or an `assert_eq!` failure must not leak argv or
+        // env values — only the arg count and env names.
         let inv = Invocation {
             program: "git".into(),
             args: vec!["--token=secret123".into(), "another-secret".into()],
@@ -786,7 +768,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_line_is_reachable_through_the_scripted_seam() {
-        // D6: `ProcessRunnerExt::first_line` routes through `start`, so it runs
+        // `ProcessRunnerExt::first_line` routes through `start`, so it runs
         // hermetically on a `ScriptedRunner` — no real subprocess.
         use crate::runner::ProcessRunnerExt;
         let runner = ScriptedRunner::new().on(
@@ -808,7 +790,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_line_reports_cancellation_not_a_missing_line() {
-        // M6: when the command's cancel token has fired, a `first_line` whose
+        // When the command's cancel token has fired, a `first_line` whose
         // predicate never matched must surface `Error::Cancelled` — not `Ok(None)`,
         // which a readiness probe would misread as "the line never appeared".
         use crate::runner::ProcessRunnerExt;
@@ -910,7 +892,7 @@ mod tests {
         assert_eq!(lines.next().await, None);
     }
 
-    /// F2: a scripted `stdout_lines` stream is bounded by the command's
+    /// A scripted `stdout_lines` stream is bounded by the command's
     /// `timeout`, exactly like a real child whose pipe closes when the deadline
     /// kills the tree. The script would pace two lines 10s apart (20s total),
     /// but the 3s timeout fires first: the stream ends having delivered nothing,
@@ -941,7 +923,7 @@ mod tests {
         );
     }
 
-    /// F2: output produced *before* the deadline survives — a real child's
+    /// Output produced *before* the deadline survives — a real child's
     /// already-written pipe bytes are readable after its tree is killed, and the
     /// scripted feeder's already-written bytes are likewise drainable after the
     /// abort. Here lines pace 1s apart under a 2.5s timeout, so two lines arrive
@@ -971,7 +953,7 @@ mod tests {
         assert_eq!(finish.outcome, Outcome::TimedOut);
     }
 
-    /// F2: arming the scripted deadline must NOT spuriously time out a run that
+    /// Arming the scripted deadline must NOT spuriously time out a run that
     /// finishes within its timeout — a short script under a long timeout still
     /// reports its natural exit (the watchdog's `PENDING`→`TIMED_OUT` CAS loses
     /// to the natural reap's `PENDING`→`EXITED`).
@@ -998,7 +980,7 @@ mod tests {
         );
     }
 
-    /// F2 parity for the merged `output_events` stream: the same deadline bound
+    /// Parity for the merged `output_events` stream: the same deadline bound
     /// applies, so the event stream ends at the timeout and `finish`
     /// reports `TimedOut`.
     #[tokio::test(start_paused = true)]
@@ -1020,7 +1002,7 @@ mod tests {
         assert_eq!(outcome, Outcome::TimedOut);
     }
 
-    /// F2: a never-exiting `pending` reply with a timeout — the stream is empty
+    /// A never-exiting `pending` reply with a timeout — the stream is empty
     /// (no canned output), but `finish` must still resolve at the
     /// deadline as `TimedOut` rather than hanging on the never-resolving wait.
     /// This is a **liveness** guard: with the scripted deadline armed,
@@ -1042,17 +1024,16 @@ mod tests {
         assert_eq!(finish.outcome, Outcome::TimedOut);
     }
 
-    /// P1-4: a readiness probe must NOT arm the `Command::timeout` watchdog, so
+    /// A readiness probe must NOT arm the `Command::timeout` watchdog, so
     /// it can never kill the tree or flip the outcome to `TimedOut`. With a probe
     /// `within` (10s) LONGER than the command timeout (3s) and a child that never
-    /// produces the wanted line, the fixed `wait_for_line` waits the full
-    /// `within`; the old version (which armed the deadline) was cut short at ~3s
-    /// when the watchdog tore the tree down.
+    /// produces the wanted line, `wait_for_line` waits the full `within` rather
+    /// than being cut short at ~3s.
     #[tokio::test(start_paused = true)]
     async fn wait_for_line_does_not_arm_the_command_timeout() {
         // A child whose stdout stays OPEN past the probe (lines paced 30s apart,
         // none matching "ready") — so the probe is bounded by `within`, not by
-        // stdout closing. Old behavior cut it off at the 3s command deadline.
+        // stdout closing.
         let runner = ScriptedRunner::new().fallback(
             Reply::lines(["working", "working"])
                 .with_line_delay(std::time::Duration::from_secs(30)),
@@ -1071,11 +1052,11 @@ mod tests {
         assert!(
             waited >= std::time::Duration::from_secs(9),
             "the probe must wait its full `within` (10s), not be cut short by the \
-             3s command timeout — armed-deadline regression: waited {waited:?}"
+             3s command timeout: waited {waited:?}"
         );
     }
 
-    /// P1-4: the command timeout isn't lost, just deferred — a short probe
+    /// The command timeout isn't lost, just deferred — a short probe
     /// returns `NotReady` without arming anything, and a subsequent `finish`
     /// still enforces the timeout, reporting `TimedOut` at the command deadline.
     #[tokio::test(start_paused = true)]
@@ -1138,7 +1119,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_isolates_a_panicking_line_handler() {
-        // B6: a panicking handler on the bulk `output_string` path is caught and
+        // A panicking handler on the bulk `output_string` path is caught and
         // disabled, and the run still completes — matching the live pump's
         // panic-isolation contract (the doubles must not diverge on it).
         use std::sync::Arc;
@@ -1167,9 +1148,9 @@ mod tests {
 
     #[tokio::test]
     async fn output_on_non_piped_stdout_errors_like_the_live_path() {
-        // F3: a capture verb on `stdout(Null)` must error (Io(InvalidInput)), not
+        // A capture verb on `stdout(Null)` must error (Io(InvalidInput)), not
         // hand back canned output — matching the live bulk path and the scripted
-        // `start` path (which both enforce the D5 contract).
+        // `start` path.
         let runner = ScriptedRunner::new().fallback(Reply::ok("canned"));
         let cmd = Command::new("x").stdout(crate::StdioMode::Null);
         let err = runner
@@ -1186,7 +1167,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_with_an_already_cancelled_token_short_circuits() {
-        // F4: a token cancelled before the call returns `Cancelled`, exactly as
+        // A token cancelled before the call returns `Cancelled`, exactly as
         // the live runner does pre-spawn — not a canned reply.
         let token = crate::CancellationToken::new();
         token.cancel();
@@ -1204,7 +1185,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_with_an_already_cancelled_token_short_circuits() {
-        // F4: `start` (the path `first_line` routes through) must short-circuit
+        // `start` (the path `first_line` routes through) must short-circuit
         // a pre-cancelled token too, exactly as `output_string` and the live runner do
         // — not hand back a live scripted handle.
         let token = crate::CancellationToken::new();
@@ -1223,10 +1204,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn scripted_line_delay_does_not_truncate_a_longer_stderr() {
-        // F8: stderr is fed concurrently at the same `line_delay`, so the
-        // scripted lifetime must cover the LONGER stream. With only 1 stdout
-        // line, a stderr that drains well past the (short) stdout-derived
-        // lifetime + the pump-teardown grace would be cut off — count the max.
+        // stderr is fed concurrently at the same `line_delay`, so the scripted
+        // lifetime must cover the LONGER stream. With only 1 stdout line, a
+        // stderr that drains past the (short) stdout-derived lifetime would be
+        // cut off — count the max.
         let stderr_text = (1..=10)
             .map(|n| format!("e{n}"))
             .collect::<Vec<_>>()
@@ -1306,7 +1287,7 @@ mod tests {
 
     #[tokio::test]
     async fn scripted_kill_after_natural_exit_keeps_the_cached_outcome() {
-        // F5: a kill that lands AFTER the scripted child already exited must not
+        // A kill that lands AFTER the scripted child already exited must not
         // overwrite the cached exit with `Signalled` — a real child's status
         // survives a post-exit kill, and the double must match.
         let runner = ScriptedRunner::new().fallback(Reply::fail(5, "boom"));
@@ -1324,9 +1305,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn wait_any_on_a_pending_scripted_handle_is_cancellable() {
-        // F1: a never-exiting (pending) scripted handle raced in `wait_any` must
-        // resolve to `Cancelled` when the token fires — previously it hung
-        // forever because `wait_exit` never selected on the token.
+        // A never-exiting (pending) scripted handle raced in `wait_any` must
+        // resolve to `Cancelled` when the token fires.
         let token = crate::CancellationToken::new();
         let runner = ScriptedRunner::new().fallback(Reply::pending());
         let cmd = Command::new("watch").cancel_on(token.clone());
@@ -1425,9 +1405,8 @@ mod tests {
 
     #[tokio::test]
     async fn on_matches_the_program_not_just_the_args() {
-        // F9: the prefix now includes the program, so `.on(["git", "status"])`
-        // answers for `git status` but not `rm status` (the old arg-only match
-        // would have answered for both).
+        // The prefix includes the program, so `.on(["git", "status"])` answers
+        // for `git status` but not `rm status`.
         let runner = ScriptedRunner::new()
             .on(["git", "status"], Reply::ok("on branch main"))
             .fallback(Reply::fail(1, "unmatched"));
@@ -1449,7 +1428,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_sequence_yields_each_reply_then_repeats_the_last() {
-        // F11: a fail-then-succeed retry scenario, scripted declaratively. Each
+        // A fail-then-succeed retry scenario, scripted declaratively. Each
         // reply is served once in order, then the last repeats.
         let runner = ScriptedRunner::new().on_sequence(
             ["git", "push"],
@@ -1506,7 +1485,7 @@ mod tests {
 
     #[tokio::test]
     async fn scripted_output_bytes_serves_canned_stdout_through_the_seam() {
-        // D5: `output_bytes` is on the `ProcessRunner` seam (default impl via
+        // `output_bytes` is on the `ProcessRunner` seam (default impl via
         // `start`), so a byte-producing tool is testable through a scripted
         // runner exactly like a text one — no real subprocess.
         let runner = ScriptedRunner::new().fallback(Reply::ok("raw\u{0}bytes"));

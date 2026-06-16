@@ -53,7 +53,7 @@ pub enum OverflowMode {
     /// untrusted tool flooding its stdout through the line verbs is a
     /// denial-of-service, not a policy choice.
     ///
-    /// **Memory, not wall-time (E5).** The ceiling bounds how much output is
+    /// **Memory, not wall-time.** The ceiling bounds how much output is
     /// *retained*, and the error is surfaced when the consuming verb finishes —
     /// it does **not** tear the child down the instant it trips. A flooding
     /// child with no [`timeout`](crate::Command::timeout) keeps running (its
@@ -64,15 +64,14 @@ pub enum OverflowMode {
     /// [`with_max_bytes`](OutputBufferPolicy::with_max_bytes) byte cap) it fires
     /// when the ceiling is reached — reach for it via
     /// [`fail_loud`](OutputBufferPolicy::fail_loud) (which sets the cap for you)
-    /// or [`with_overflow`](OutputBufferPolicy::with_overflow). **D9c:** on an
+    /// or [`with_overflow`](OutputBufferPolicy::with_overflow). On an
     /// *unbounded* buffer (no `max_lines` and no `max_bytes`) this mode is a
     /// misconfiguration — a fail-loud ceiling with no ceiling — so it is treated
     /// as **zero-tolerance**: the run errors on *any* line-pumped output
-    /// (`Error::OutputTooLarge`), rather than silently retaining everything.
-    /// (Previously it was an inert no-op.) Use `fail_loud(n)` when you want a
-    /// real cap.
+    /// (`Error::OutputTooLarge`), rather than silently retaining everything. Use
+    /// `fail_loud(n)` when you want a real cap.
     ///
-    /// **Counts the total, not the backlog (E4).** The ceiling fires on the
+    /// **Counts the total, not the backlog.** The ceiling fires on the
     /// *cumulative* output the pump has seen — total lines and total bytes — not
     /// on how much is currently buffered. A streaming consumer
     /// ([`stdout_lines`](crate::RunningProcess::stdout_lines)) draining lines as
@@ -96,13 +95,13 @@ pub enum OverflowMode {
 /// set; the buffer stays within whichever are present. The line cap alone does
 /// not bound memory: a line is held whole until its newline arrives, so one
 /// enormous newline-free "line" (e.g. `base64 -w0` output) occupies memory in
-/// full under a `max_lines`-only policy (D8). Add
+/// full under a `max_lines`-only policy. Add
 /// [`with_max_bytes`](Self::with_max_bytes) to bound the actual retained memory,
 /// or use [`output_bytes`](crate::Command::output_bytes) (raw, no line
 /// splitting) when the output is not line-structured.
 ///
 /// A byte cap bounds both the retained backlog **and** the in-flight line the
-/// pump is still assembling (H1): a line whose own length exceeds the cap can
+/// pump is still assembling: a line whose own length exceeds the cap can
 /// never be retained whole, so the pump drops it as it arrives — a newline-free
 /// flood is held to about `max_bytes` plus one read buffer (the cap is rechecked
 /// once per read), never the whole flood, so memory cannot be exhausted even
@@ -120,8 +119,8 @@ pub struct OutputBufferPolicy {
     /// `Some(n)` keeps at most `n`.
     pub max_lines: Option<usize>,
     /// Maximum retained bytes (sum of the retained lines' UTF-8 lengths): `None`
-    /// is unbounded; `Some(n)` keeps the retained backlog at or under `n` bytes
-    /// (D8). A single line longer than `n` cannot fit and is dropped whole under
+    /// is unbounded; `Some(n)` keeps the retained backlog at or under `n` bytes.
+    /// A single line longer than `n` cannot fit and is dropped whole under
     /// the drop modes (which sets the truncation signal,
     /// [`ProcessResult::truncated`](crate::ProcessResult::truncated)); under
     /// [`OverflowMode::Error`] it trips the fail-loud ceiling.
@@ -162,12 +161,12 @@ impl OutputBufferPolicy {
         }
     }
 
-    /// Set the retained-byte ceiling (D8), composable with any policy.
+    /// Set the retained-byte ceiling, composable with any policy.
     ///
     /// Bounds the actual memory the buffer holds — the sum of the retained
     /// lines' UTF-8 byte lengths — independently of [`max_lines`](Self::max_lines),
     /// and bounds the pump's in-flight assembly buffer too, so even a single
-    /// never-terminated line cannot exhaust memory (H1). Use it to cap a stream
+    /// never-terminated line cannot exhaust memory. Use it to cap a stream
     /// whose line *count* is modest but whose lines can be huge (one `base64 -w0`
     /// line evades a line cap but not a byte cap):
     /// `unbounded().with_max_bytes(1 << 20)` is a 1 MiB byte-bounded ring buffer;
@@ -184,7 +183,7 @@ impl OutputBufferPolicy {
     /// Set the overflow behavior.
     ///
     /// With a `bounded` cap, [`OverflowMode::Error`] fires when the buffer fills.
-    /// On an *unbounded* buffer (`max_lines: None`) — D9c — `with_overflow(Error)`
+    /// On an *unbounded* buffer (`max_lines: None`) `with_overflow(Error)`
     /// is treated as **zero-tolerance**: the run errors on any line-pumped output
     /// (it is a fail-loud ceiling with no ceiling, i.e. a misconfiguration; see
     /// [`OverflowMode::Error`] for which streams the ceiling covers). For a real

@@ -152,7 +152,7 @@ impl ProcessGroup {
         let job = {
             validate_limits(&options.limits)?;
             Job::new(&options.limits).map_err(|source| {
-                // A failure while limits were requested means we could not enforce
+                // A failure while limits were requested means we couldn't enforce
                 // them — surface that distinctly so the caller never assumes a cap
                 // is live.
                 if options.limits.any() {
@@ -192,9 +192,9 @@ impl ProcessGroup {
     ///
     /// These mutations make `cmd` **single-use**: the spawn appends a `pre_exec`
     /// hook (Unix) and re-sets the creation flags (Windows), which would stack if
-    /// the same command were spawned twice. **D8: `spawn` takes `cmd` by value**
-    /// so that reuse is a compile error rather than a silent hook-stacking
-    /// footgun — build a fresh `Command` per spawn. (The crate's own run helpers
+    /// the same command were spawned twice. **`spawn` takes `cmd` by value** so
+    /// that reuse is a compile error rather than a silent hook-stacking footgun —
+    /// build a fresh `Command` per spawn. (The crate's own run helpers
     /// already rebuild the OS command per run, so this only ever concerned direct
     /// `spawn` callers.)
     pub fn spawn(&self, mut cmd: Command) -> Result<Child> {
@@ -232,7 +232,7 @@ impl ProcessGroup {
     ///
     /// On the containment backends, adopting a child that has already **exited
     /// but not yet been reaped** is a successful no-op (`Ok`) — there is nothing
-    /// left to contain (E21) — while an **already-reaped** child (one that was
+    /// left to contain — while an **already-reaped** child (one that was
     /// `wait`ed, so its handle/pid is gone) errors, since there is no longer
     /// anything to reference.
     #[cfg(feature = "process-control")]
@@ -377,7 +377,7 @@ impl ProcessGroup {
     /// Dropping the group instead (without calling this) performs only the hard
     /// kill.
     ///
-    /// **B16 — reap your children, or the grace is wasted (POSIX process-group
+    /// **Reap your children, or the grace is wasted (POSIX process-group
     /// mechanism only).** On the [`Mechanism::ProcessGroup`](crate::Mechanism)
     /// fallback (macOS/the BSDs, and Linux without a usable cgroup), liveness is
     /// probed by signalling the group id, and an **unreaped zombie still answers**

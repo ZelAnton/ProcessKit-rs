@@ -38,7 +38,7 @@ impl RunningProcess {
     ///   one-shot stdout drain [`stdout_lines`](Self::stdout_lines) uses — if
     ///   stdout was already consumed by an earlier `stdout_lines` /
     ///   `output_events` / `wait_for_line`, or was not piped, this returns an
-    ///   `Err` (D2) rather than a stream that is forever `NotReady`). Continue
+    ///   `Err` rather than a stream that is forever `NotReady`). Continue
     ///   with [`finish`](Self::finish) for the outcome and stderr; the other
     ///   probes don't touch stdout.
     /// - A failed probe does **not** kill the child, and — unlike
@@ -55,14 +55,11 @@ impl RunningProcess {
     ) -> Result<String> {
         use tokio_stream::StreamExt;
 
-        // Bound the borrow: `StdoutLines` owns its sink (no borrow of self), so
-        // `self.program` stays readable after the search. `drain_stdout_lines`
-        // (not `stdout_lines`) sets up the same stdout drain but does NOT arm the
-        // `Command::timeout` watchdog, so this readiness probe never kills the
-        // tree or flips the outcome to `TimedOut` — it is bounded only by
-        // `within`. D2: it is fallible — a non-piped stdout, or a *second*
-        // `wait_for_line` (stdout already consumed), surfaces as a clear `Err`
-        // here rather than a probe that is forever `NotReady`.
+        // `drain_stdout_lines` (not `stdout_lines`) drains stdout WITHOUT arming
+        // the `Command::timeout` watchdog, so a readiness probe can never kill the
+        // tree or flip the outcome to `TimedOut`. It owns its sink, leaving `self`
+        // borrowable after the search, and is fallible (non-piped or
+        // already-consumed stdout) rather than forever `NotReady`.
         let mut lines = self.drain_stdout_lines()?;
         let search = async {
             while let Some(line) = lines.next().await {
@@ -107,7 +104,7 @@ impl RunningProcess {
     /// dropped as soon as it succeeds. Doesn't touch the child's pipes; a
     /// failed probe does not kill the child.
     pub async fn wait_for_port(&mut self, addr: SocketAddr, within: Duration) -> Result<()> {
-        // E15: clamp so a `Duration::MAX`-ish `within` can't overflow.
+        // Clamp so a `Duration::MAX`-ish `within` can't overflow the deadline.
         let deadline = Instant::now() + within.min(crate::MAX_DEADLINE);
         self.poll_until(
             move || {
@@ -136,7 +133,7 @@ impl RunningProcess {
         F: FnMut() -> Fut,
         Fut: Future<Output = bool>,
     {
-        // E15: clamp so a `Duration::MAX`-ish `within` can't overflow.
+        // Clamp so a `Duration::MAX`-ish `within` can't overflow the deadline.
         let deadline = Instant::now() + within.min(crate::MAX_DEADLINE);
         loop {
             if check().await {

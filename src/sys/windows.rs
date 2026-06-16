@@ -71,7 +71,7 @@ pub(crate) struct Job {
     /// double-suspends the new child's primary thread (per-thread suspend
     /// *counts*), and `spawn`'s single resume leaves it suspended forever.
     suspend_lock: std::sync::Mutex<()>,
-    /// B12: set by `graceful_shutdown(escalate=false)` so `Drop` clears
+    /// Set by `graceful_shutdown(escalate=false)` so `Drop` clears
     /// `KILL_ON_JOB_CLOSE` before closing the handle, leaving survivors alive.
     skip_drop_kill: super::SkipDropKill,
 }
@@ -173,17 +173,12 @@ impl Job {
 
         // Arm a reaper for the window between spawn and containment: the child is
         // suspended and not yet in the job, so until `AssignProcessToJobObject`
-        // succeeds neither the job's kill-on-close nor anything else would reap
-        // it — an early return OR a panic here would leak a suspended orphan. The
-        // guard is disarmed once contained, restoring the normal "the job owns
-        // teardown" semantics. (A permanent `kill_on_drop` on the returned child
-        // would instead fight `graceful_shutdown(escalate=false)` survivor-sparing,
-        // and tokio can't toggle it off after spawn.)
-        //
-        // Arm it *before* reading `id()`/`raw_handle()` (N-1): both are fallible,
-        // and a child that dropped on their `?` early-return would otherwise leak
-        // un-reaped (a suspended child can't exit on its own, so this is a
-        // narrow window, but the guard makes "every early return reaps" total).
+        // succeeds nothing would reap it — an early return or panic here would
+        // leak a suspended orphan. Disarmed once contained, restoring the normal
+        // "the job owns teardown" semantics. (A permanent `kill_on_drop` would
+        // instead fight `graceful_shutdown(escalate=false)` survivor-sparing, and
+        // tokio can't toggle it off after spawn.) Arm it *before* reading the
+        // fallible `id()`/`raw_handle()` so even their `?` early-returns reap.
         let guard = UncontainedChildGuard::arm(cmd.spawn()?);
         let pid = guard.child().id().ok_or_else(|| {
             io::Error::other("child exited before it could be assigned to the job")
@@ -203,13 +198,12 @@ impl Job {
         // SAFETY: the raw handle is valid until the child is dropped; `guard`
         // owns the child for the rest of this scope, well past this call.
         //
-        // Nested jobs (Win-H1): if THIS process is itself already inside a Job
-        // Object that forbids breakaway, the assign can fail with
-        // `ERROR_ACCESS_DENIED`. On Windows 8+ jobs nest (the child joins our job
-        // *and* the outer one), so the common case works; we do not set a
-        // breakaway flag (that would let children escape our containment). When
-        // the assign does fail, the suspended child is reaped (the guard) and the
-        // error is surfaced — we never leak an uncontained child.
+        // Nested jobs: if THIS process is itself inside a Job Object that forbids
+        // breakaway, the assign can fail with `ERROR_ACCESS_DENIED`. On Windows 8+
+        // jobs nest (the child joins our job *and* the outer one), so the common
+        // case works; we do not set a breakaway flag (that would let children
+        // escape our containment). On failure the suspended child is reaped (the
+        // guard) and the error surfaced — we never leak an uncontained child.
         let ok = unsafe { AssignProcessToJobObject(self.handle, handle as HANDLE) };
         if ok == 0 {
             // The reaper kills the still-suspended child as `guard` drops.
@@ -230,10 +224,10 @@ impl Job {
         let ok = unsafe { AssignProcessToJobObject(self.handle, handle as HANDLE) };
         if ok == 0 {
             let err = io::Error::last_os_error();
-            // E21: the assign fails for an already-terminated process. If the
-            // child has in fact exited there is nothing to contain — return Ok
-            // (matching the pgroup/cgroup backends), regardless of the specific
-            // error code; a genuine failure on a still-LIVE process still propagates.
+            // The assign fails for an already-terminated process. If the child has
+            // in fact exited there is nothing to contain — return Ok (matching the
+            // pgroup/cgroup backends); a genuine failure on a still-LIVE process
+            // still propagates.
             if process_has_exited(handle as HANDLE) {
                 return Ok(());
             }
@@ -287,7 +281,7 @@ impl Job {
     /// taken once, so threads or processes created mid-walk are missed, and
     /// `SuspendThread`/`ResumeThread` maintain per-thread suspend *counts*
     /// (nested suspends need matching resumes). A thread that exits mid-walk is
-    /// vacuously handled (B8 — not a failure); a genuine `SuspendThread`/
+    /// vacuously handled (not a failure); a genuine `SuspendThread`/
     /// `ResumeThread` failure on a still-open thread does not abort the walk and
     /// is reported after every member has been attempted.
     #[cfg(feature = "process-control")]
@@ -351,10 +345,9 @@ impl Job {
         if escalate {
             self.kill_all()
         } else {
-            // B12: mark Drop to preserve survivors. The latch's Release/Acquire
-            // pairing (see `SkipDropKill`) makes the flag visible whichever thread
-            // drops the `Job` — it may differ from the one that ran graceful
-            // shutdown, e.g. after a tokio task migrates across an `.await` (P2-2).
+            // Mark Drop to preserve survivors; the latch makes the flag visible
+            // whichever thread drops the `Job` (it may differ from the one that
+            // ran graceful shutdown, e.g. after a task migrates across `.await`).
             self.skip_drop_kill.request();
             Ok(())
         }
@@ -406,7 +399,7 @@ impl Job {
     }
 }
 
-/// E21: whether the process behind `handle` has already exited —
+/// Whether the process behind `handle` has already exited —
 /// `GetExitCodeProcess` reports an exit code other than `STILL_ACTIVE` (259).
 /// A *live* process always reports `STILL_ACTIVE`, so this never false-positives
 /// a live child as exited. The only ambiguity is a child that genuinely exited
@@ -438,7 +431,7 @@ impl UncontainedChildGuard {
     }
 
     /// Borrow the guarded child (present from `arm` until `disarm`). Used to read
-    /// the child's `id()`/`raw_handle()` while the reaper is armed (N-1).
+    /// the child's `id()`/`raw_handle()` while the reaper is armed.
     fn child(&self) -> &Child {
         self.child
             .as_ref()
@@ -513,13 +506,12 @@ fn resume_thread(tid: u32) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     // Resume until the suspend count reaches 0. A `CREATE_SUSPENDED` child's
-    // primary thread is normally at count 1 (one decrement runs it), but a
-    // member-walk suspend racing the spawn — bounded by `suspend_lock`, yet
-    // possible — could nest it higher; a single decrement would then leave it
-    // stuck suspended forever (R2-5). `ResumeThread` returns the PREVIOUS count
-    // and decrements by one each call, so loop until it reports `<= 1` (now 0);
-    // this is bounded by the suspend depth. The failure is captured BEFORE
-    // `CloseHandle`, which can overwrite the thread-local last-error.
+    // primary thread is normally at count 1, but a member-walk suspend racing the
+    // spawn (bounded by `suspend_lock`, yet possible) could nest it higher, and a
+    // single decrement would leave it stuck suspended forever. `ResumeThread`
+    // returns the PREVIOUS count and decrements by one each call, so loop until it
+    // reports `<= 1` (now 0); bounded by the suspend depth. The failure is
+    // captured BEFORE `CloseHandle`, which can overwrite the last-error.
     let err = loop {
         // SAFETY: valid thread handle; a `u32::MAX` return signals failure.
         let prev = unsafe { ResumeThread(thread) };
@@ -545,13 +537,12 @@ fn suspend_or_resume_thread(tid: u32, suspend: bool) -> io::Result<()> {
     let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, tid) };
     if thread.is_null() {
         let err = io::Error::last_os_error();
-        // B8: a STALE tid — a thread that exited between the system-wide snapshot
-        // and this open — fails `ERROR_INVALID_PARAMETER`. Such a thread is
-        // *vacuously* suspended/resumed, so swallow it: one churning thread must
-        // not fail the whole job suspend/resume when every still-existing thread
-        // was handled. ANY OTHER open failure (e.g. `ERROR_ACCESS_DENIED` on a
-        // live but protected thread) is genuine and IS reported — so a live
-        // thread is never silently left suspended.
+        // A STALE tid — a thread that exited between the system-wide snapshot and
+        // this open — fails `ERROR_INVALID_PARAMETER` and is *vacuously*
+        // suspended/resumed, so swallow it: one churning thread must not fail the
+        // whole job suspend/resume. ANY OTHER open failure (e.g.
+        // `ERROR_ACCESS_DENIED` on a live but protected thread) is genuine and IS
+        // reported — a live thread is never silently left suspended.
         if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
             return Ok(());
         }
@@ -693,16 +684,14 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
 
 impl Drop for Job {
     fn drop(&mut self) {
-        // The latch's Release/Acquire pairing (see `SkipDropKill`) makes the flag
-        // visible no matter which thread drops the `Job` (P2-2).
         if self.skip_drop_kill.is_set() {
-            // B12: clear KILL_ON_JOB_CLOSE so closing the handle does not kill the
-            // tree. `SetInformationJobObject` with `JobObjectExtendedLimitInformation`
-            // *replaces* the entire extended-limit structure, so passing a zeroed
-            // struct sets `LimitFlags = 0`, which drops `KILL_ON_JOB_CLOSE` and the
-            // memory/active-process caps. This is intentional — this path only runs
-            // when the caller chose `escalate=false`, so orphaning survivors
-            // (uncapped) is the desired outcome and the caps are no longer meaningful.
+            // Clear KILL_ON_JOB_CLOSE so closing the handle does not kill the tree.
+            // `SetInformationJobObject` with `JobObjectExtendedLimitInformation`
+            // *replaces* the entire extended-limit structure, so a zeroed struct
+            // sets `LimitFlags = 0`, dropping `KILL_ON_JOB_CLOSE` and the
+            // memory/active-process caps. Intentional — this path only runs under
+            // `escalate=false`, so orphaning survivors uncapped is the desired
+            // outcome and the caps are no longer meaningful.
             let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
             // Best-effort: if clearing fails the handle close will still kill —
             // a safe fallback (unexpected kill is better than orphaning ambiguity).
@@ -714,12 +703,11 @@ impl Drop for Job {
                     std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 )
             };
-            // E17: the CPU hard cap lives in a SEPARATE info class (set under
-            // `limits` in `Job::new`), so zeroing the extended-limit struct above
-            // does NOT lift it. Clear it too (zeroed `ControlFlags` = disabled) or
-            // orphaned survivors stay CPU-throttled forever — inconsistent with the
-            // memory/process caps just dropped. Harmless when no CPU cap was set
-            // (disabling an already-inactive control is a no-op).
+            // The CPU hard cap lives in a SEPARATE info class, so zeroing the
+            // extended-limit struct above does NOT lift it. Clear it too (zeroed
+            // `ControlFlags` = disabled) or orphaned survivors stay CPU-throttled
+            // forever, inconsistent with the memory/process caps just dropped.
+            // Harmless when no CPU cap was set.
             #[cfg(feature = "limits")]
             {
                 let cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
@@ -744,7 +732,7 @@ impl Drop for Job {
 mod thread_tests {
     use super::suspend_or_resume_thread;
 
-    /// B8: a stale/invalid tid — a thread that exited between the system-wide
+    /// A stale/invalid tid — a thread that exited between the system-wide
     /// snapshot and the `OpenThread` — fails `ERROR_INVALID_PARAMETER` and is
     /// *vacuously* suspended/resumed, not a failure (a single churning thread must
     /// not fail the whole job suspend). `tid = 1` is not a valid thread id (the
@@ -800,8 +788,8 @@ mod guard_tests {
     #[tokio::test]
     #[ignore = "spawns a real subprocess"]
     async fn uncontained_guard_reaps_the_child_on_an_armed_drop() {
-        // P1-1: an armed guard dropped without disarm must terminate the
-        // suspended, not-yet-contained child (the spawn→assign unwind path).
+        // An armed guard dropped without disarm must terminate the suspended,
+        // not-yet-contained child (the spawn→assign unwind path).
         let child = spawn_suspended();
         let pid = child.id().expect("the child has a pid");
         assert!(

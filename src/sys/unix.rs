@@ -29,8 +29,8 @@ pub(crate) struct Job {
 
 impl Job {
     pub(crate) fn new(#[cfg(feature = "limits")] limits: &ResourceLimits) -> io::Result<Self> {
-        // A POSIX process group has no resource accounting — there is no whole-tree
-        // memory/pids/cpu primitive here, so a requested limit can't be honored.
+        // A POSIX process group has no resource accounting, so a requested limit
+        // can't be honored — fail rather than hand back an unbounded tree.
         #[cfg(feature = "limits")]
         if limits.any() {
             return Err(io::Error::new(

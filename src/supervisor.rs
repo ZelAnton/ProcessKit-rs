@@ -20,7 +20,7 @@ use crate::error::Result;
 use crate::result::ProcessResult;
 use crate::runner::{JobRunner, ProcessRunner};
 
-/// D3: default per-incarnation capture tail for a supervised command whose own
+/// Default per-incarnation capture tail for a supervised command whose own
 /// policy is unbounded. A supervised process can be long-lived and chatty, so
 /// capturing its *entire* output risks unbounded heap — keep a bounded tail (the
 /// most recent lines, the ones that matter for a crash) by default instead.
@@ -28,9 +28,8 @@ const DEFAULT_SUPERVISION_TAIL: usize = 1000;
 
 /// The capture policy to apply to each incarnation: respect an explicit
 /// bounded/fail-loud command policy, but bound an unbounded line count to a
-/// tail (D3). Only the line cap is filled in — the overflow *mode* and any
-/// byte cap ([`with_max_bytes`](OutputBufferPolicy::with_max_bytes), D8) the
-/// command set are preserved, so an unbounded `Error` ("fail loud") command
+/// tail. Only the line cap is filled in — the overflow *mode* and any byte cap
+/// the command set are preserved, so an unbounded `Error` ("fail loud") command
 /// stays fail-loud rather than silently switching to `DropOldest`, and a
 /// byte-capped command keeps its memory bound.
 fn default_supervision_capture(command: &Command) -> OutputBufferPolicy {
@@ -142,13 +141,13 @@ pub struct Supervisor<R: ProcessRunner = JobRunner> {
     storm_pause: Option<Duration>,
     #[allow(clippy::type_complexity)]
     stop_when: Option<Box<dyn Fn(&ProcessResult<String>) -> bool + Send + Sync>>,
-    /// D3: the output-capture policy applied to every incarnation. Defaults to a
+    /// The output-capture policy applied to every incarnation. Defaults to a
     /// bounded tail (see [`default_supervision_capture`]); override with
     /// [`capture`](Self::capture).
     capture: OutputBufferPolicy,
 }
 
-// Manual: the runner type parameter and the boxed predicate are opaque.
+// The runner type parameter and the boxed predicate are opaque, so Debug is manual.
 impl<R: ProcessRunner> std::fmt::Debug for Supervisor<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Supervisor")
@@ -219,7 +218,7 @@ impl<R: ProcessRunner> Supervisor<R> {
         }
     }
 
-    /// Bound (or widen) the output captured from each incarnation (D3).
+    /// Bound (or widen) the output captured from each incarnation.
     ///
     /// A supervised process is often long-lived and chatty, so the default is a
     /// **bounded tail** ([`OutputBufferPolicy::bounded`] of the most recent lines)
@@ -236,7 +235,7 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// incarnation's output (to evaluate [`stop_when`](Self::stop_when) and the
     /// final result), so the command's `stdout` must stay
     /// [`Piped`](crate::StdioMode::Piped) (the default). A command with a
-    /// non-piped `stdout` (`Inherit`/`Null`) errors every incarnation (D5) and
+    /// non-piped `stdout` (`Inherit`/`Null`) errors every incarnation and
     /// would just spin the restart loop.
     #[must_use]
     pub fn capture(mut self, policy: OutputBufferPolicy) -> Self {
@@ -370,17 +369,15 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// `Error::Cancelled` immediately, regardless of policy or budget — the
     /// token stays cancelled, so a restart would only be cancelled again.
     pub async fn run(self) -> Result<SupervisionOutcome> {
-        // Documented tolerance: a sub-1.0 or non-finite factor never shrinks
-        // the delay or panics the Duration math — it decays to 1.0.
+        // A sub-1.0 or non-finite factor decays to 1.0 rather than shrinking the
+        // delay or panicking the Duration math.
         let factor = if self.backoff_factor.is_finite() {
             self.backoff_factor.max(1.0)
         } else {
             1.0
         };
 
-        // D3: apply the supervisor's capture policy (a bounded tail by default)
-        // to the command once, so a long-lived chatty incarnation can't grow
-        // unbounded heap. Cloned, so `self` (and `self.outcome`) stay intact.
+        // Apply the capture policy once; clone so `self` stays intact.
         let command = self.command.clone().output_buffer(self.capture);
 
         let mut restarts: u32 = 0;
@@ -393,12 +390,9 @@ impl<R: ProcessRunner> Supervisor<R> {
                     {
                         return Ok(self.outcome(result, restarts, &storm, StopReason::Predicate));
                     }
-                    // A crash is any run that is not a success: an exit code
-                    // outside the accepted set (`ok_codes`, default `{0}`), a
-                    // timeout, or a signal kill (both of the latter have no
-                    // code). `is_success` honors `ok_codes` so the supervisor
-                    // agrees with the rest of the crate — a command exiting an
-                    // accepted non-zero code is clean, not a crash.
+                    // A crash is any non-success run. `is_success` honors
+                    // `ok_codes`, so an accepted non-zero exit is clean, not a
+                    // crash — keeping the supervisor consistent with the crate.
                     let crashed = !result.is_success();
                     let wants_restart = match self.policy {
                         RestartPolicy::Always => true,
@@ -421,8 +415,8 @@ impl<R: ProcessRunner> Supervisor<R> {
                             StopReason::RestartsExhausted,
                         ));
                     }
-                    // Only failures feed the storm score: a clean exit
-                    // restarted under `Always` is churn, not a failure.
+                    // Only failures feed the storm score; a clean exit restarted
+                    // under `Always` is churn, not a failure.
                     if crashed {
                         self.storm_gate(&mut storm).await;
                     }
@@ -431,13 +425,12 @@ impl<R: ProcessRunner> Supervisor<R> {
                 }
                 Err(err) => {
                     // A cancelled incarnation is terminal: the token stays
-                    // cancelled, so restarting would spin a futile loop of
-                    // instantly-cancelled runs. Ends supervision like `Never`.
+                    // cancelled, so restarting would spin instantly-cancelled runs.
                     if matches!(err, crate::Error::Cancelled { .. }) {
                         return Err(err);
                     }
-                    // The child never produced a result (spawn/IO failure). The
-                    // predicate can't judge it; the policy treats it as a crash.
+                    // No result produced (spawn/IO failure): the predicate can't
+                    // judge it, so the policy treats it as a crash.
                     let wants_restart = !matches!(self.policy, RestartPolicy::Never);
                     if !wants_restart || self.max_restarts.is_some_and(|max| restarts >= max) {
                         return Err(err);
@@ -573,11 +566,9 @@ fn apply_jitter(delay: Duration, enabled: bool) -> Duration {
     if !enabled || delay.is_zero() {
         return delay;
     }
-    // Clamp the jittered delay to `MAX_DEADLINE`: `Duration::mul_f64` *panics* on
-    // overflow, and the up-to-1.5× factor can push a near-`Duration::MAX` delay
-    // (reachable via `max_backoff(Duration::MAX)` or `storm_pause(Duration::MAX)`,
-    // jitter on by default) past `Duration`'s range. Mirrors the crate-wide
-    // `MAX_DEADLINE` clamp used on every other timing path (E15).
+    // Clamp to `MAX_DEADLINE`: the up-to-1.5x factor can push a near-`Duration::MAX`
+    // delay past `Duration`'s range, and `mul_f64` *panics* on overflow. Mirrors the
+    // crate-wide clamp on every other timing path.
     let scaled = delay.as_secs_f64() * jitter_factor();
     Duration::try_from_secs_f64(scaled)
         .unwrap_or(crate::MAX_DEADLINE)
@@ -594,7 +585,7 @@ fn jitter_factor() -> f64 {
     let mut hasher = RandomState::new().build_hasher();
     hasher.write_u64(0x9E37_79B9_7F4A_7C15);
     let bits = hasher.finish();
-    // Take the top 53 bits → uniform in [0, 1) at f64 precision.
+    // Top 53 bits → uniform in [0, 1) at f64 precision.
     let unit = (bits >> 11) as f64 / (1u64 << 53) as f64;
     0.5 + unit
 }
@@ -671,15 +662,14 @@ mod tests {
     }
 
     fn supervise(runner: SeqRunner) -> Supervisor<SeqRunner> {
-        // Zero backoff keeps the hermetic tests instant; timing-sensitive
-        // cases use the paused clock below instead.
+        // Zero backoff keeps these instant; timing cases use the paused clock.
         Supervisor::new(Command::new("fake"))
             .with_runner(runner)
             .backoff(Duration::ZERO, 1.0)
             .jitter(false)
     }
 
-    /// D3: the capture default — an unbounded command is bounded to a tail
+    /// The capture default — an unbounded command is bounded to a tail
     /// (preserving its overflow mode); an explicit bounded/fail-loud policy is
     /// respected.
     #[test]
@@ -715,7 +705,7 @@ mod tests {
         assert_eq!(policy.overflow, crate::OverflowMode::Error);
     }
 
-    /// D3: `run` actually applies the capture policy to the incarnation — by
+    /// `run` actually applies the capture policy to the incarnation — by
     /// default a bounded tail, overridable via `capture()`.
     #[tokio::test]
     async fn run_applies_the_capture_policy_to_each_incarnation() {
@@ -769,10 +759,8 @@ mod tests {
 
     #[tokio::test]
     async fn zero_max_restarts_means_a_single_run() {
-        // `max_restarts(0)` = a zero restart budget: one run, reported as
-        // exhausted when the policy wanted more. A restart slipping through
-        // would consume the second (clean) reply and report PolicySatisfied
-        // with restarts=1 — the assertions below rule that out.
+        // Zero budget: one run, reported exhausted. A restart slipping through
+        // would consume the second (clean) reply — the assertions rule that out.
         let outcome = supervise(SeqRunner::new(vec![fail(1), ok()]))
             .max_restarts(0)
             .run()
@@ -856,11 +844,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_accepted_nonzero_exit_is_not_a_crash() {
-        // P1-3: a supervised command with `ok_codes([0, 2])` that exits 2 is a
-        // success everywhere else in the crate (`is_success() == true`), so
-        // OnCrash must NOT restart it. The real runner stamps the command's
-        // `ok_codes` onto the result, so model that here. Only one reply is
-        // scripted: a spurious restart would deplete the SeqRunner and panic.
+        // A command with `ok_codes([0, 2])` exiting 2 is a success everywhere
+        // else, so OnCrash must NOT restart it. The real runner stamps `ok_codes`
+        // onto the result, modeled here. Only one reply: a spurious restart would
+        // deplete the SeqRunner and panic.
         let accepted = Ok(ProcessResult::new(
             "fake".into(),
             "out".into(),
@@ -880,9 +867,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_zero_exit_is_a_crash() {
-        // Inverse of the above: `ok_codes([1])` makes 0 a failure. OnCrash must
-        // restart it rather than reading raw code 0 as clean. The follow-up
-        // clean run (default ok_codes {0}, exit 0) satisfies the policy.
+        // Inverse: `ok_codes([1])` makes 0 a failure, so OnCrash must restart
+        // rather than read raw code 0 as clean.
         let rejected_zero = Ok(ProcessResult::new(
             "fake".into(),
             String::new(),
@@ -923,8 +909,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_incarnation_is_terminal_under_always() {
         // Always would restart any failure; Cancelled must end supervision at
-        // once — the second scripted reply is never consumed (SeqRunner would
-        // panic on depletion if a restart happened past it).
+        // once — the second reply is never consumed (SeqRunner panics if so).
         let err = supervise(SeqRunner::new(vec![
             Err(crate::Error::Cancelled {
                 program: "fake".into(),
@@ -991,9 +976,8 @@ mod tests {
             .expect("supervision");
         assert_eq!(outcome.restarts, 1);
         let waited = start.elapsed();
-        // `<=` upper bound: the factor is in [0.5, 1.5), but `mul_f64` rounds
-        // to the nearest nanosecond — a factor just under 1.5 can round the
-        // delay up to exactly 1.5× (observed as a rare flake).
+        // `<=` upper bound: ns-rounding can push a factor just under 1.5 to
+        // exactly 1.5× (a rare flake otherwise).
         assert!(
             waited >= Duration::from_millis(500) && waited <= Duration::from_millis(1500),
             "jittered delay out of [0.5, 1.5] band: {waited:?}"

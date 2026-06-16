@@ -1,11 +1,6 @@
-// On docs.rs (which builds with `--cfg docsrs`, see `[package.metadata.docs.rs]`)
-// derive the "Available on crate feature `X`" badges from the existing `#[cfg]`
-// gates. `doc_cfg` (which absorbed `doc_auto_cfg` in 1.92) is nightly-only, so
-// it is gated behind `docsrs` — stable/CI `cargo doc` ignores it.
+// `doc_cfg` (nightly-only) auto-derives the "Available on crate feature" badges
+// from `#[cfg]` gates; gated behind `docsrs` so stable/CI `cargo doc` ignores it.
 #![cfg_attr(docsrs, feature(doc_cfg))]
-// Enforce that every public item carries docs — the crate's public surface is
-// fully documented today, and this keeps it that way. Lib-scoped (examples and
-// tests are exempt); CI's `-D warnings` promotes it to a hard error.
 #![warn(missing_docs)]
 
 //! `processkit` — async child-process management for Rust + [tokio]: whole-tree
@@ -196,7 +191,7 @@ mod stdin;
 mod supervisor;
 mod sys;
 
-/// Clamp ceiling for `Instant + Duration` deadline math (E15): a timeout, grace,
+/// Clamp ceiling for `Instant + Duration` deadline math: a timeout, grace,
 /// or `within` longer than this is treated as "effectively forever", so a
 /// `Duration::MAX`-ish input can't overflow `Instant + Duration` and panic.
 /// ~10 years — far beyond any real process deadline, with ample margin below
@@ -224,11 +219,9 @@ pub use signal::Signal;
 pub use stats::{ProcessGroupStats, RunProfile, StatsSampler};
 pub use stdin::{ProcessStdin, Stdin};
 pub use supervisor::{RestartPolicy, StopReason, SupervisionOutcome, Supervisor};
-// Re-exported so callers can `use processkit::StreamExt;` to consume
-// [`RunningProcess::stdout_lines`]'s [`StdoutLines`] stream (`.next().await`,
-// combinators) without depending on `tokio-stream` directly.
+// Re-exported so callers consume the stdout/event streams without a direct
+// `tokio-stream` dependency.
 pub use tokio_stream::StreamExt;
-// `cli_client!` is exported at the crate root via `#[macro_export]`.
 
 use std::ffi::OsStr;
 
@@ -299,7 +292,7 @@ where
 /// - **No stdin management** — symmetrically, a contender started with
 ///   [`keep_stdin_open`](Command::keep_stdin_open) and blocked reading stdin
 ///   never reaches EOF, so it never exits. The race does **not** close its
-///   stdin for it (that would break the "losers remain usable" guarantee, B15):
+///   stdin for it (that would break the "losers remain usable" guarantee):
 ///   take its writer via [`take_stdin`](RunningProcess::take_stdin)
 ///   (or don't keep stdin open) before racing it.
 ///
@@ -320,14 +313,12 @@ pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, O
             "wait_any requires at least one process",
         )));
     }
-    // One future per contender; `iter_mut` hands out disjoint `&mut` borrows.
     let mut waits: Vec<_> = processes
         .iter_mut()
         .map(|process| Box::pin(process.wait_exit()))
         .collect();
-    // Hand-rolled race (no `futures` dependency): poll every contender; the
-    // first `Ready` wins, the rest are dropped — cancel-safe, so they stay
-    // waitable by the caller.
+    // Hand-rolled race (avoids a `futures` dependency): first `Ready` wins, the
+    // rest are dropped cancel-safe so the caller can still wait on them.
     std::future::poll_fn(move |cx| {
         for (idx, wait) in waits.iter_mut().enumerate() {
             if let std::task::Poll::Ready(result) = wait.as_mut().poll(cx) {
@@ -377,21 +368,18 @@ pub async fn wait_all(processes: &mut [&mut RunningProcess]) -> Result<Vec<Outco
     use std::future::Future;
     use std::task::Poll;
 
-    // One future per contender; `iter_mut` hands out disjoint `&mut` borrows.
-    // A slot goes `None` once it has resolved, so finishers aren't re-polled.
+    // A slot goes `None` once resolved so finishers aren't re-polled.
     let mut waits: Vec<_> = processes
         .iter_mut()
         .map(|process| Some(Box::pin(process.wait_exit())))
         .collect();
-    // `None` is the "not yet resolved" sentinel; replaced by `Some(Outcome)` on
-    // completion. All slots are `Some` when `remaining == 0`, so the final
-    // `unwrap` below is always safe.
+    // `None` outcome slot = not yet resolved; all are `Some` when `remaining ==
+    // 0`, so the final `expect` cannot fire.
     let mut outcomes: Vec<Option<Outcome>> = vec![None; waits.len()];
     let mut remaining = waits.len();
 
-    // Hand-rolled join (no `futures` dependency): poll every unfinished
-    // contender each wake, store its outcome at the input-order index, and
-    // resolve once all have exited. Cancel-safe, mirroring `wait_any`.
+    // Hand-rolled join (avoids a `futures` dependency): store each outcome at its
+    // input-order index, resolve once all have exited. Cancel-safe like wait_any.
     std::future::poll_fn(move |cx| {
         for (idx, slot) in waits.iter_mut().enumerate() {
             if let Some(wait) = slot.as_mut()
@@ -419,7 +407,7 @@ pub async fn wait_all(processes: &mut [&mut RunningProcess]) -> Result<Vec<Outco
     .await
 }
 
-/// Test doubles for the [`ProcessRunner`] seam (D6).
+/// Test doubles for the [`ProcessRunner`] seam.
 ///
 /// Grouped under `testing` rather than the crate root so the production surface
 /// stays focused: these types exist to **replace real subprocesses in tests** —
@@ -467,7 +455,7 @@ pub use tokio_util::sync::CancellationToken;
 mod tests {
     use super::Outcome;
 
-    /// E15: the deadline-clamp ceiling must be small enough that
+    /// The deadline-clamp ceiling must be small enough that
     /// `Instant + MAX_DEADLINE` cannot overflow, and a `Duration::MAX` input must
     /// clamp down to it — so `Instant::now() + within.min(MAX_DEADLINE)` is
     /// panic-free for any timeout/grace, however absurd.
@@ -478,11 +466,9 @@ mod tests {
         assert_eq!(Duration::MAX.min(super::MAX_DEADLINE), super::MAX_DEADLINE);
     }
 
-    // Regression: wait_exit (used by wait_any/wait_all) did not snapshot
-    // cancel_at_exit, so a .wait()/.output_string()/etc. on the winner after
-    // wait_any returned — with the token now cancelled — would re-run
-    // drive_to_exit_inner whose biased cancel arm fires (token already cancelled),
-    // converting a natural exit to Err(Cancelled).
+    // Regression: a bulk verb on the winner after a late cancel must not
+    // reclassify its natural exit as Err(Cancelled) (wait_exit must snapshot
+    // cancel_at_exit rather than re-evaluate the now-cancelled token).
     #[tokio::test]
     async fn wait_any_winner_natural_exit_preserved_after_late_cancel() {
         use crate::doubles::{Reply, ScriptedRunner};
@@ -495,17 +481,13 @@ mod tests {
             .await
             .expect("start scripted process");
 
-        // Race the single process — scripted Reply::ok exits immediately (code 0).
         let (idx, outcome) = super::wait_any(&mut [&mut process])
             .await
             .expect("wait_any");
         assert_eq!(idx, 0);
         assert_eq!(outcome, Outcome::Exited(0), "process exited naturally");
 
-        // Cancel the token AFTER the natural exit.
-        token.cancel();
-
-        // A bulk verb on the winner must return the natural exit, not Err(Cancelled).
+        token.cancel(); // after the natural exit
         let result = process.wait().await.expect("wait after wait_any");
         assert_eq!(
             result,
@@ -514,11 +496,8 @@ mod tests {
         );
     }
 
-    // B2 regression: the same snapshot hazard via a *second* wait_any (not a
-    // bulk verb). The existing test above covers wait_exit -> wait() (the guarded
-    // drive_to_exit path); this covers wait_exit -> wait_exit, the documented
-    // "race them, keep watching the rest" pattern, where wait_exit re-snapshotted
-    // cancel_at_exit unconditionally and flipped a natural exit to Err(Cancelled).
+    // Regression: the same snapshot hazard via a *second* wait_any (the
+    // "race them, keep watching the rest" pattern) rather than a bulk verb.
     #[tokio::test]
     async fn wait_any_winner_preserved_after_late_cancel_and_second_wait_any() {
         use crate::doubles::{Reply, ScriptedRunner};
@@ -550,9 +529,8 @@ mod tests {
         );
     }
 
-    // B2 regression for wait_all: a late cancel followed by a re-join must not
-    // make the whole batch error out (wait_all short-circuits on the first Err,
-    // so a spurious Cancelled would discard every other contender's outcome too).
+    // Regression for wait_all: a late cancel then a re-join must not error the
+    // whole batch (it short-circuits on first Err, discarding every outcome).
     #[tokio::test]
     async fn wait_all_winners_preserved_after_late_cancel_and_re_wait() {
         use crate::doubles::{Reply, ScriptedRunner};
@@ -638,8 +616,7 @@ mod tests {
     async fn wait_all_collects_a_mix_of_outcomes_in_order() {
         use crate::doubles::{Reply, ScriptedRunner};
         use crate::runner::ProcessRunner;
-        // Three distinct terminal states must each surface as their own Outcome,
-        // in input order — not collapse to a single shape.
+        // Distinct terminal states must each surface as their own Outcome, in order.
         let runner = ScriptedRunner::new()
             .on(["p", "clean"], Reply::ok(""))
             .on(["p", "fail"], Reply::fail(3, "boom"))
@@ -669,26 +646,21 @@ mod tests {
         );
     }
 
-    // Regression: wait_exit now calls checked_outcome, so a run whose
-    // cancel token was fired before exit snapshots cancel_at_exit=Some(true)
-    // and wait_any correctly raises Err(Cancelled) instead of Ok(Signalled(None)).
+    // Regression: a run cancelled before exit must surface as Err(Cancelled)
+    // from wait_any, not Ok(Signalled(None)).
     #[tokio::test]
     async fn wait_any_cancelled_run_surfaces_as_err_cancelled() {
         use crate::doubles::{Reply, ScriptedRunner};
         use crate::runner::ProcessRunner;
 
         let token = crate::CancellationToken::new();
-        // Reply::ok exits immediately so backend_wait() returns right away and
-        // the cancel_at_exit snapshot captures the already-cancelled token.
         let runner = ScriptedRunner::new().fallback(Reply::ok(""));
         let mut process = runner
             .start(&crate::Command::new("prog").cancel_on(token.clone()))
             .await
             .expect("start");
 
-        // Cancel before wait_any so the snapshot sees is_cancelled()=true.
-        token.cancel();
-
+        token.cancel(); // before wait_any
         let err = super::wait_any(&mut [&mut process])
             .await
             .expect_err("cancelled run must error");
@@ -698,11 +670,8 @@ mod tests {
         );
     }
 
-    // B2 symmetry: the snapshot-preserving guard must keep a genuine
-    // cancellation *sticky* across a re-wait, not just preserve a clean exit.
-    // A second wait_any after a genuinely cancelled run must STILL be
-    // Err(Cancelled) (the guard preserves Some(true) exactly as it preserves
-    // Some(false)) — the fix must not make cancellation non-sticky on re-wait.
+    // Symmetry: a genuine cancellation must stay sticky across a re-wait, not
+    // just a clean exit — the guard must not make cancellation non-sticky.
     #[tokio::test]
     async fn wait_any_genuine_cancel_stays_cancelled_on_re_wait() {
         use crate::doubles::{Reply, ScriptedRunner};
@@ -715,7 +684,7 @@ mod tests {
             .await
             .expect("start");
 
-        token.cancel(); // genuine cancel before the race -> snapshot Some(true)
+        token.cancel(); // genuine cancel before the race
 
         let err = super::wait_any(&mut [&mut process])
             .await
@@ -754,11 +723,10 @@ mod tests {
         assert!(outcomes.is_empty());
     }
 
-    // ── Phase C: output-capture integrity ────────────────────────────────────
+    // ── output-capture integrity ─────────────────────────────────────────────
 
-    // B5: finish without a prior stdout_lines call must route the
-    // untaken stdout through the policy-aware pump, not read_to_end into an
-    // unbounded Vec.  A fail_loud ceiling must be enforced.
+    // finish without a prior stdout_lines must route untaken stdout through the
+    // policy-aware pump (enforcing fail_loud), not read_to_end into a Vec.
     #[tokio::test]
     async fn finish_on_untaken_stdout_respects_fail_loud() {
         use crate::buffer::OutputBufferPolicy;
@@ -779,8 +747,7 @@ mod tests {
         );
     }
 
-    // B9: wait must not accumulate lines or fire fail_loud — the discard path
-    // uses a retain-nothing sink that never trips the overflow ceiling.
+    // wait discards output, so it must never fire fail_loud (retain-nothing sink).
     #[tokio::test]
     async fn wait_does_not_error_on_fail_loud() {
         use crate::buffer::OutputBufferPolicy;
@@ -791,7 +758,6 @@ mod tests {
             .start(&crate::Command::new("prog").output_buffer(OutputBufferPolicy::fail_loud(2)))
             .await
             .expect("start");
-        // wait discards output — fail_loud must not fire.
         let outcome = run
             .wait()
             .await
@@ -799,8 +765,8 @@ mod tests {
         assert_eq!(outcome, Outcome::Exited(0));
     }
 
-    // B10: output_string called after stdout_lines must see the lines the
-    // streaming pump wrote rather than silently returning empty output.
+    // output_string after stdout_lines must see the lines the streaming pump
+    // wrote, not silently return empty output.
     #[tokio::test]
     async fn output_string_after_stdout_lines_captures_buffered_output() {
         use crate::doubles::{Reply, ScriptedRunner};
@@ -811,7 +777,6 @@ mod tests {
             .await
             .expect("start");
         let _ = run.stdout_lines().unwrap(); // take the pipe, start the streaming pump
-        // output_string must join the streaming pump and drain its sink.
         let result = run.output_string().await.expect("output_string");
         assert!(
             !result.stdout().is_empty(),
@@ -820,9 +785,8 @@ mod tests {
         );
     }
 
-    // D2: a second stdout_lines call is a LOUD error (stdout streams once), not a
-    // silently-empty stream — and the first pump's overflow is still observed by
-    // finish (the error doesn't disturb the first call's sink).
+    // A second stdout_lines call is a loud error (stdout streams once), not a
+    // silent empty stream — and the first pump's overflow is still seen by finish.
     #[tokio::test]
     async fn second_stdout_lines_errors_and_first_overflow_is_preserved() {
         use crate::StreamExt;
@@ -832,15 +796,12 @@ mod tests {
         let runner = ScriptedRunner::new().fallback(Reply::lines(["a", "b", "c"]));
         let cmd = crate::Command::new("prog").output_buffer(OutputBufferPolicy::fail_loud(2));
         let mut run = runner.start(&cmd).await.expect("start");
-        // Drain the first stream to completion.
         let mut first = run.stdout_lines().expect("first stdout_lines");
         while first.next().await.is_some() {}
-        // D2: a second call errors instead of returning an empty stream.
         let err = run
             .stdout_lines()
             .expect_err("a second stdout_lines must be a loud error");
         assert!(matches!(err, crate::Error::Io(_)), "got {err:?}");
-        // finish still observes the first pump's overflow.
         let err = run
             .finish()
             .await
@@ -851,7 +812,7 @@ mod tests {
         );
     }
 
-    // D2: a second output_events call is likewise a loud error.
+    // A second output_events call is likewise a loud error.
     #[tokio::test]
     async fn second_output_events_is_a_loud_error() {
         use crate::StreamExt;
@@ -862,10 +823,8 @@ mod tests {
             .start(&crate::Command::new("prog"))
             .await
             .expect("start");
-        // First call: drain both streams.
         let mut first = run.output_events().expect("first output_events");
         while first.next().await.is_some() {}
-        // D2: a second call errors instead of yielding an empty stream.
         let err = run
             .output_events()
             .expect_err("a second output_events must be a loud error");

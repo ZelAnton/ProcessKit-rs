@@ -28,25 +28,24 @@ use crate::sys::pgroup::ProcessGroup;
 /// Process-wide counter so concurrent jobs get distinct cgroup names.
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
-/// E20: a per-process salt mixed into the cgroup dir name so a pid recycled long
-/// after a *crashed* ProcessKit process (whose `Drop` never cleaned up its
+/// A per-process salt mixed into the cgroup dir name so a pid recycled long after
+/// a *crashed* ProcessKit process (whose `Drop` never cleaned up its
 /// `processkit-<pid>-…` dirs) does not collide with those leftovers and silently
 /// downgrade to the process-group fallback. Derived from the wall-clock time of
-/// its first use (effectively a per-process value, computed once via `OnceLock`);
+/// its first use (effectively per-process, computed once via `OnceLock`);
 /// concurrent jobs / two crate versions in one process share the salt but differ
 /// by the monotonic counter.
 ///
-/// P3-13: those leftover dirs from a *hard-killed* ProcessKit process accumulate
-/// (its `Drop` never ran). A `SIGKILL` of the host is the one case the kill-on-
-/// drop guarantee cannot cover — cleanup code can't run — and a cgroup, unlike a
-/// Windows Job Object, is **not** torn down by the kernel when its creator dies,
-/// so such a leftover dir may still contain a live, orphaned tree (only the
-/// opt-in `kill_on_parent_death` / `PR_SET_PDEATHSIG` propagates host death, and
-/// only to the direct child). The salt above keeps these leftovers from ever
-/// affecting a *future* run. A startup sweep is deliberately NOT done: it would
-/// have to scan the delegated hierarchy and could race another live ProcessKit
-/// instance's dirs. Operators who churn through many crashes can reclaim stale
-/// `processkit-*` dirs (and any surviving trees) out of band.
+/// Leftover dirs from a *hard-killed* ProcessKit process accumulate (its `Drop`
+/// never ran). A `SIGKILL` of the host is the one case the kill-on-drop guarantee
+/// cannot cover, and a cgroup — unlike a Windows Job Object — is **not** torn down
+/// by the kernel when its creator dies, so such a leftover dir may still contain a
+/// live, orphaned tree (only the opt-in `kill_on_parent_death` /
+/// `PR_SET_PDEATHSIG` propagates host death, and only to the direct child). The
+/// salt keeps these leftovers from ever affecting a *future* run. A startup sweep
+/// is deliberately NOT done: it would have to scan the delegated hierarchy and
+/// could race another live ProcessKit instance's dirs. Operators who churn through
+/// many crashes can reclaim stale `processkit-*` dirs out of band.
 fn cgroup_name_salt() -> u64 {
     static SALT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *SALT.get_or_init(|| {
@@ -59,8 +58,8 @@ fn cgroup_name_salt() -> u64 {
 
 pub(crate) struct Job {
     backend: Backend,
-    /// B12: set by `graceful_shutdown(escalate=false)` so `Drop` skips the
-    /// hard kill when the caller chose not to escalate.
+    /// Set by `graceful_shutdown(escalate=false)` so `Drop` skips the hard kill
+    /// when the caller chose not to escalate.
     skip_drop_kill: super::SkipDropKill,
 }
 
@@ -160,9 +159,9 @@ impl Job {
                 // not retroactively pulled in — only future forks).
                 match std::fs::write(cg.path.join("cgroup.procs"), pid.to_string().as_bytes()) {
                     Ok(()) => Ok(()),
-                    // E21: the child already exited (a zombie pid) — the write
-                    // fails ESRCH. There is nothing to contain, so return Ok,
-                    // matching the process-group backend (which maps ESRCH→Ok).
+                    // The child already exited (a zombie pid) — the write fails
+                    // ESRCH. Nothing to contain, so return Ok, matching the
+                    // process-group backend (which maps ESRCH→Ok).
                     Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
                     Err(e) => Err(e),
                 }
@@ -263,8 +262,7 @@ impl Job {
                     let m = process_metrics(pid as u32);
                     if let Some(c) = m.cpu_time {
                         // Saturating: summing many members' CPU time could in
-                        // principle overflow `Duration`; clamp rather than panic
-                        // (N-2, parity with the Windows `saturating_add` fold).
+                        // principle overflow `Duration`; clamp rather than panic.
                         cpu = cpu.saturating_add(c);
                         have_cpu = true;
                     }
@@ -308,10 +306,9 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
             // SAFETY: sysconf is a pure query with no preconditions.
             let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
             if hz > 0 {
-                // Saturating throughout (A1, parity with the `stats()` fold and
-                // the Windows FILETIME combine): the add and the final `u64` cast
-                // clamp rather than debug-panic / silently wrap on an implausibly
-                // large tick count.
+                // Saturating throughout: the add and the final `u64` cast clamp
+                // rather than debug-panic / silently wrap on an implausibly large
+                // tick count.
                 let ticks = utime.saturating_add(stime);
                 let nanos = ticks as u128 * 1_000_000_000u128 / hz as u128;
                 metrics.cpu_time = Some(Duration::from_nanos(nanos.min(u64::MAX as u128) as u64));
@@ -328,8 +325,7 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
                     .next()
                     .and_then(|s| s.parse::<u64>().ok())
                 {
-                    // Saturating (A1): kB→bytes can't wrap on an implausible
-                    // VmHWM, matching the CPU branch above and the `stats()` fold.
+                    // Saturating: kB→bytes can't wrap on an implausible VmHWM.
                     metrics.peak_memory_bytes = Some(kb.saturating_mul(1024));
                 }
                 break;
@@ -344,28 +340,22 @@ impl Drop for Job {
     fn drop(&mut self) {
         match &self.backend {
             Backend::Cgroup(cg) => {
-                // The latch's Release/Acquire pairing (see `SkipDropKill`) (P2-2).
                 if !self.skip_drop_kill.is_set() {
-                    // B12: only hard-kill when the caller didn't choose escalate=false.
+                    // Only hard-kill when the caller didn't choose escalate=false.
                     let _ = cg.kill();
                     // `cgroup.kill` is asynchronous: the kernel SIGKILLs the subtree,
                     // but `rmdir` returns `EBUSY` until the members have actually left
                     // (a process leaves `cgroup.procs` when it *exits*, before it is
-                    // reaped — so this drains within milliseconds and doesn't depend on
-                    // the async reaper). Wait, bounded, so we don't leak the dir; sleep
-                    // rather than busy-spin.
+                    // reaped — so this drains within milliseconds, independent of the
+                    // async reaper). Wait bounded so we don't leak the dir.
                     //
-                    // This `sleep` is blocking and `Drop` cannot await, so it runs
-                    // synchronously wherever the `Job` is dropped — for this async
-                    // crate, frequently a tokio worker thread — and stalls that
-                    // thread's executor for the wait (the whole runtime on a
-                    // current-thread flavor). The stall is bounded: ~100ms here, and
-                    // the pre-5.14 `cg.kill()` fallback above can add ~100ms more for
-                    // its own SIGKILL sweep. On a modern kernel `cgroup.kill` is
-                    // atomic and the subtree drains within a few ms, so the loop
-                    // usually exits on the first check. Accepted as the cost of a
-                    // synchronous leak-safe teardown; revisit only if the worker
-                    // stall is ever measured to matter.
+                    // `Drop` can't await, so this blocking sleep runs synchronously
+                    // wherever the `Job` is dropped — often a tokio worker thread —
+                    // stalling that thread's executor for the wait. Bounded: ~100ms
+                    // here plus ~100ms from the pre-5.14 `cg.kill()` SIGKILL-sweep
+                    // fallback; on a modern kernel `cgroup.kill` is atomic and the
+                    // loop usually exits on the first check. Accepted cost of a
+                    // synchronous leak-safe teardown.
                     for _ in 0..50 {
                         if cg.is_empty() {
                             break;
@@ -420,9 +410,9 @@ impl Cgroup {
         // permission gate that triggers the process-group fallback when delegation
         // is absent.
         //
-        // E20: retry with a fresh counter when the dir already exists — a leftover
-        // from a crashed run whose pid was recycled, or two crate versions sharing
-        // the namespace — rather than letting `EEXIST` masquerade as a delegation
+        // Retry with a fresh counter when the dir already exists — a leftover from
+        // a crashed run whose pid was recycled, or two crate versions sharing the
+        // namespace — rather than letting `EEXIST` masquerade as a delegation
         // failure and silently downgrade. The salt makes a real collision
         // astronomically unlikely; the bounded retry is the backstop. A genuine
         // permission failure (`EACCES`/`EPERM`) is NOT retried — it propagates and
@@ -495,7 +485,7 @@ impl Cgroup {
             needed.push("cpu");
         }
 
-        // B13: enable only the controllers not ALREADY in the parent's
+        // Enable only the controllers not ALREADY in the parent's
         // `subtree_control`. When they are present (the parent is the *real*
         // cgroup-v2 hierarchy root — the one cgroup that may carry controllers
         // despite holding this process), the write is skipped, and that is also
@@ -560,7 +550,7 @@ impl Cgroup {
                 // Keep only real pids: a `0`/negative line (never emitted by the
                 // kernel, but cheap to guard) would otherwise reach `kill(pid, …)`
                 // as "the caller's whole process group" (0) or "a process group"
-                // (negative) — never a single tracked member (P2-11).
+                // (negative) — never a single tracked member.
                 .filter_map(|l| l.trim().parse::<i32>().ok())
                 .filter(|&pid| pid > 0)
                 .collect(),
@@ -595,7 +585,7 @@ impl Cgroup {
                 // member is gone, the intended end state. Any other failure
                 // (notably EPERM — a member that changed uid, or a seccomp /
                 // container restriction) is a real delivery failure and must not
-                // read as success (L2): surface the last one.
+                // read as success: surface the last one.
                 if err.raw_os_error() != Some(libc::ESRCH) {
                     last_err = Some(err);
                 }
@@ -623,7 +613,7 @@ impl Cgroup {
             // per-pid SIGSTOP/SIGCONT path. Any other error (EACCES/EBUSY on a
             // restricted delegated cgroup, EIO, …) is a real failure on a file
             // that *exists*: surface it rather than silently degrading to the
-            // racy per-pid path on a modern kernel (R2-3).
+            // racy per-pid path on a modern kernel.
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
             Err(_) => {} // NotFound → no cgroup.freeze; use the fallback below.
         }
@@ -636,10 +626,10 @@ impl Cgroup {
         // atomically.
         //
         // Unlike `freeze` (which surfaces a non-`NotFound` write error rather than
-        // silently degrading a *suspend* to the racy per-pid path, R2-3), `kill`
-        // falls back on *any* failure here on purpose: the fallback below is a
-        // *complete* alternative teardown (freeze + per-pid SIGKILL sweep) that
-        // ends in the E18 drain check and surfaces a genuine failure itself. So on
+        // silently degrading a *suspend* to the racy per-pid path), `kill` falls
+        // back on *any* failure here on purpose: the fallback below is a *complete*
+        // alternative teardown (freeze + per-pid SIGKILL sweep) that ends in the
+        // drain check and surfaces a genuine failure itself. So on
         // a non-version write error (e.g. EACCES on a restricted delegated cgroup)
         // attempting the sweep maximizes the chance of actually killing the tree,
         // and a truly un-killable tree is still reported by the drain check — there
@@ -656,7 +646,7 @@ impl Cgroup {
         // takes the fatal signal, and leaves `cgroup.procs` even while the subtree
         // is still frozen (the sweep below therefore drains and breaks normally).
         // This is the deliberate v2 redesign: the v1 freezer blocked SIGKILL until
-        // thaw (the root of runc#2105) — that hazard does NOT apply to `cgroup.freeze`.
+        // thaw — that hazard does NOT apply to `cgroup.freeze`.
         // Sleep between sweeps rather than busy-spin while the kernel reaps, and
         // bound it so teardown (incl. Drop) can never hang on un-reaped zombies.
         let _ = std::fs::write(self.path.join("cgroup.freeze"), b"1");
@@ -681,10 +671,9 @@ impl Cgroup {
         // (This unconditionally clears any freeze a prior `suspend()` set; a kill
         // verb resurrecting-then-killing a deliberately-suspended group is benign.)
         let _ = std::fs::write(self.path.join("cgroup.freeze"), b"0");
-        // E18: report a real drain failure instead of a false success, so the
-        // caller (`kill_all`/`signal`/`terminate_all`/`shutdown`) knows the tree
-        // may still be alive — a fork bomb still out-spawning, or un-reapable
-        // zombies (a D-state task ignores SIGKILL until it unblocks).
+        // Report a real drain failure instead of a false success, so the caller
+        // knows the tree may still be alive — a fork bomb still out-spawning, or
+        // un-reapable zombies (a D-state task ignores SIGKILL until it unblocks).
         if self.members().is_empty() {
             Ok(())
         } else {
@@ -711,7 +700,7 @@ impl super::graceful::GracefulTarget for Cgroup {
     }
 }
 
-/// B13: which of the `needed` cgroup controllers are not already present in a
+/// Which of the `needed` cgroup controllers are not already present in a
 /// `cgroup.subtree_control` value (a space-separated list of enabled controller
 /// names). Returns the ones that still need enabling — so the caller writes
 /// `subtree_control` only when something is missing, never redundantly (a
@@ -827,7 +816,7 @@ mod tests {
 
     #[test]
     fn controllers_to_enable_skips_already_enabled_ones() {
-        // B13: nothing missing → empty (skip the redundant subtree_control write,
+        // Nothing missing → empty (skip the redundant subtree_control write,
         // which is what makes limits work in an already-delegated environment).
         assert!(controllers_to_enable(&["memory", "pids"], "cpu memory pids").is_empty());
         // Only the genuinely-missing controllers are returned, order preserved.

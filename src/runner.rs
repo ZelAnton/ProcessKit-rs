@@ -25,7 +25,7 @@ use crate::running::{RunningProcess, Spawned};
 /// The defaulting note above applies to **hand-written** runners. The
 /// `mock`-feature `MockRunner` is different: `mockall::automock` replaces *every*
 /// method — including the defaulted `output_bytes`/`start` — with an expectation,
-/// so a `MockRunner` does **not** inherit the `Unsupported` default (L8). Set the
+/// so a `MockRunner` does **not** inherit the `Unsupported` default. Set the
 /// expectations you exercise (`expect_output_string()`, and `expect_start()` /
 /// `expect_output_bytes()` if a verb routes through them) or an unset call panics.
 /// `ScriptedRunner` is the recommended double — it provides the defaults and the
@@ -43,7 +43,7 @@ pub trait ProcessRunner: Send + Sync {
     /// — `git cat-file`, `tar -c`, an image transcoder — whose stdout is not
     /// UTF-8.
     ///
-    /// D5: part of the seam (not just `Command`), so byte-producing tools are
+    /// Part of the seam (not just `Command`), so byte-producing tools are
     /// testable through a [`ScriptedRunner`](crate::testing::ScriptedRunner) /
     /// `&ProcessGroup` / [`JobRunner`] like text ones. Defaulted in terms of
     /// [`start`](Self::start) — so a runner that overrides `start` gets byte
@@ -64,7 +64,7 @@ pub trait ProcessRunner: Send + Sync {
     /// compiling; the real runners ([`JobRunner`], `&ProcessGroup`) and
     /// [`ScriptedRunner`](crate::testing::ScriptedRunner) override it.
     ///
-    /// D4: this is deliberately a **runtime** capability (a default that errors)
+    /// This is deliberately a **runtime** capability (a default that errors)
     /// rather than a compile-time split (e.g. a separate `ProcessStarter:
     /// ProcessRunner` supertrait). The trade-off is intentional: an output-only
     /// runner stays a one-method `impl`, at the cost that calling a streaming
@@ -108,9 +108,8 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// any other code is [`Error::Exit`](crate::Error::Exit).
     async fn run(&self, command: &Command) -> Result<String> {
         let result = self.checked(command).await?;
-        // B12: `run` returns stdout as if complete — a bounded buffer that
-        // silently dropped lines would hand the caller a truncated tail. Fail
-        // loud instead (use `output_string` + `truncated()` for lenient capture).
+        // `run` presents stdout as if complete, so fail loud on a bounded-buffer
+        // truncation rather than hand back a silently clipped tail.
         let policy = command.output_buffer_policy();
         result.reject_if_truncated(policy.max_lines, policy.max_bytes)?;
         Ok(result.into_stdout().trim_end().to_owned())
@@ -171,7 +170,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// Unlike [`run`](Self::run) (and the
     /// [`CliClient::parse`](crate::CliClient::parse)/[`try_parse`](crate::CliClient::try_parse)
     /// verbs built over it), `checked` does **not** fail loud on a bounded-buffer
-    /// truncation (L4): it
+    /// truncation: it
     /// hands back the (possibly truncated) `ProcessResult` so the caller can decide
     /// — inspect [`truncated()`](crate::ProcessResult::truncated) before relying on
     /// the stdout. This is deliberate: `checked` is the lenient building block;
@@ -187,7 +186,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// Run (requiring an **accepted** exit) and feed the captured stdout to an
     /// **infallible** `parse` closure — the shape of struct-returning CLI
     /// commands (git/jj `--format` output). Built on [`checked`](Self::checked),
-    /// but unlike it, fails loud on a bounded-buffer truncation (B12) so the
+    /// but unlike it, fails loud on a bounded-buffer truncation so the
     /// parser never silently sees a clipped tail; returns the parsed value.
     ///
     /// Because it is generic over the parser `F`, `parse` — like
@@ -203,7 +202,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
         F: FnOnce(&str) -> T + Send,
     {
         let out = self.checked(command).await?;
-        // B12: a parser must not silently see a truncated tail.
+        // A parser must not silently see a truncated tail.
         let policy = command.output_buffer_policy();
         out.reject_if_truncated(policy.max_lines, policy.max_bytes)?;
         Ok(parse(out.stdout()))
@@ -213,7 +212,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// *fallible* `parse` closure — the shape of JSON deserialization, where a
     /// parse failure becomes [`Error::Parse`](crate::Error::Parse) (or whatever
     /// error the closure returns). Like [`parse`](Self::parse) it is built on
-    /// [`checked`](Self::checked), fails loud on truncation (B12), and — being
+    /// [`checked`](Self::checked), fails loud on truncation, and — being
     /// generic over `F` — is unavailable on a `&dyn ProcessRunner`; use a
     /// concrete runner or the [`Command::try_parse`](crate::Command::try_parse) /
     /// [`CliClient::try_parse`](crate::CliClient::try_parse) wrappers.
@@ -223,7 +222,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
         F: FnOnce(&str) -> Result<T> + Send,
     {
         let out = self.checked(command).await?;
-        // B12: a parser must not silently see a truncated tail.
+        // A parser must not silently see a truncated tail.
         let policy = command.output_buffer_policy();
         out.reject_if_truncated(policy.max_lines, policy.max_bytes)?;
         parse(out.stdout())
@@ -234,14 +233,14 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// [`timeout`](crate::Command::timeout) (a `Some` deadline surfaces as
     /// [`Error::Timeout`](crate::Error::Timeout) and tears the tree down).
     ///
-    /// D6: routes through [`start`](ProcessRunner::start) — the streaming seam —
+    /// Routes through [`start`](ProcessRunner::start) — the streaming seam —
     /// so it is exercisable with **any** runner (a
     /// [`ScriptedRunner`](crate::testing::ScriptedRunner) in tests), unlike the
     /// real-runner-only [`Command::first_line`](crate::Command::first_line),
     /// which now delegates here.
     ///
     /// Because it is generic over the predicate `F`, `first_line` is **not
-    /// object-safe** and so is unavailable on a `&dyn ProcessRunner` (S3): call it
+    /// object-safe** and so is unavailable on a `&dyn ProcessRunner`: call it
     /// on a concrete runner ([`JobRunner`], `&ProcessGroup`, a
     /// [`ScriptedRunner`](crate::testing::ScriptedRunner)), or via the
     /// [`Command::first_line`] / [`CliClient::first_line`](crate::CliClient::first_line)
@@ -255,16 +254,15 @@ pub trait ProcessRunnerExt: ProcessRunner {
         let program = command.program_name();
         let timeout = command.configured_timeout();
         let cancel = command.cancel_token();
-        // Close an untaken `keep_stdin_open` pipe (taking it here drops it → EOF)
-        // so a stdin-reading filter isn't left blocking — `first_line` gives no
-        // way to write to it. A no-op for the usual case.
+        // Close an untaken `keep_stdin_open` pipe (taking it drops it → EOF) so a
+        // stdin-reading filter isn't left blocking — `first_line` can't write to it.
         let _ = process.take_stdin();
-        // D2: `stdout_lines` is fallible — a non-piped stdout surfaces here as a
-        // clear error rather than a stream that yields nothing.
+        // Fallible: a non-piped stdout surfaces as a clear error rather than a
+        // stream that silently yields nothing.
         let mut lines = process.stdout_lines()?;
         let search = async move {
-            // Keep `process` alive for the search; dropping it on a timeout (the
-            // `tokio::time::timeout` below) tears the tree down.
+            // Keep `process` alive for the search; dropping it on timeout tears
+            // the tree down.
             let _process = process;
             while let Some(line) = lines.next().await {
                 if predicate(&line) {
@@ -280,8 +278,8 @@ pub trait ProcessRunnerExt: ProcessRunner {
                     return Err(crate::Error::Timeout {
                         program,
                         timeout: limit,
-                        // `first_line` is a streaming line probe — it buffers
-                        // nothing, so there are no captured streams to carry (D12).
+                        // A streaming line probe buffers nothing, so there are no
+                        // captured streams to carry.
                         stdout: String::new(),
                         stderr: String::new(),
                     });
@@ -289,11 +287,10 @@ pub trait ProcessRunnerExt: ProcessRunner {
             },
             None => search.await,
         };
-        // M6: a cancelled run's stdout stream simply ends, so `search` yields
-        // `None` — indistinguishable from "the predicate never matched". Surface
-        // the cancellation instead, so a readiness probe (`first_line` with a
-        // shutdown `cancel_on` token) doesn't misread cancellation as "the line
-        // never appeared / startup failed".
+        // A cancelled run's stdout stream just ends, so `search` yields `None` —
+        // indistinguishable from "predicate never matched". Surface the
+        // cancellation so a readiness probe doesn't misread it as "line never
+        // appeared".
         if found.is_none() && cancel.is_some_and(|t| t.is_cancelled()) {
             return Err(crate::Error::Cancelled { program });
         }
@@ -311,11 +308,9 @@ where
     Fut: core::future::Future<Output = Result<T>>,
 {
     let policy = command.retry_policy();
-    // M5: a one-shot streaming stdin (`from_reader`/`from_lines`) feeds a single
-    // run and cannot be replayed — the first attempt consumes it, so any retry
-    // would fail loud at launch (D10). Don't retry such a command: it runs once
-    // regardless of the policy (rather than re-hitting the consumed-stdin error
-    // `max_attempts` times with backoff between).
+    // A one-shot streaming stdin (`from_reader`/`from_lines`) is consumed by the
+    // first attempt, so any retry would just fail loud at launch. Don't retry such
+    // a command: run it once regardless of the policy.
     let one_shot_stdin = !command.keeps_stdin_open()
         && command
             .stdin_source()
@@ -327,8 +322,8 @@ where
             Ok(value) => return Ok(value),
             Err(err) => {
                 // A cancelled run is terminal regardless of the classifier: the
-                // token stays cancelled forever, so every retry would just hit
-                // the pre-spawn short-circuit again (mirrors the Supervisor).
+                // token stays cancelled, so every retry would just hit the
+                // pre-spawn short-circuit again.
                 if matches!(err, crate::Error::Cancelled { .. }) {
                     return Err(err);
                 }
@@ -379,10 +374,9 @@ impl JobRunner {
     }
 }
 
-// The inherent [`JobRunner::start`] above is the **canonical** implementation
-// (so `JobRunner::new().start(cmd)` works without the trait in scope); the trait
-// methods here, and `Command`'s direct verbs, all route through it. Keep new
-// start-time behavior in the inherent method so no path can bypass it (S2).
+// The inherent `JobRunner::start` above is canonical (usable without the trait in
+// scope); the trait methods and `Command`'s direct verbs all route through it.
+// Keep new start-time behavior there so no path can bypass it.
 #[async_trait::async_trait]
 impl ProcessRunner for JobRunner {
     async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
@@ -446,9 +440,8 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         }
     }
 
-    // A token already cancelled before launch: short-circuit without spawning —
-    // cheaper and cleaner than spawn-then-kill. (A cancel landing between this
-    // check and the first wait poll is caught by drive_to_exit's cancel branch.)
+    // Already cancelled before launch: short-circuit without spawning. A cancel
+    // landing after this check is caught later by drive_to_exit's cancel branch.
     if let Some(token) = command.cancel_token()
         && token.is_cancelled()
     {
@@ -457,16 +450,14 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         });
     }
 
-    // A working directory that doesn't exist (or isn't a directory) makes the OS
-    // spawn fail with a bare ENOENT — indistinguishable from "program not found".
-    // Check it up front so the error names the real cause. Best-effort: a TOCTOU
-    // race where it vanishes after this check just falls back to the OS error.
+    // A missing/non-directory cwd makes the OS spawn fail with a bare ENOENT,
+    // indistinguishable from "program not found"; check up front so the error
+    // names the real cause. Best-effort: a TOCTOU race falls back to the OS error.
     if let Some(cwd) = command.working_dir()
         && !cwd.is_dir()
     {
-        // Distinguish "missing" from "exists but isn't a directory" so the
-        // message is accurate and `is_not_found()` stays honest (a file at the
-        // path is found, just not usable as a cwd).
+        // Distinguish "missing" from "exists but isn't a directory" so the message
+        // is accurate and `is_not_found()` stays honest.
         let (kind, what) = if cwd.exists() {
             (std::io::ErrorKind::NotADirectory, "is not a directory")
         } else {
@@ -481,17 +472,13 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         });
     }
 
-    // D10/M4: take the stdin payload up front, **atomically**. A one-shot
-    // streaming source (`from_reader`/`from_lines`) feeds a single run; taking it
-    // here — rather than checking "already consumed?" now and taking later in the
-    // writer task — means the take and the decision are one step, so a concurrent
-    // second run of the same cloned source observes it consumed and fails loud
-    // instead of racing the check against the take and silently getting empty
-    // stdin (a footgun on a command whose behavior depends on its input). A
-    // re-run / retry of an already-consumed source likewise fails loud here.
-    // (Skipped for `keep_stdin_open`, which hands the pipe to the caller.)
-    // `from_bytes`/`from_string`/`from_file` are re-runnable, so they never trip
-    // this. Taken before the spawn so a failed spawn never leaves a child to feed.
+    // Take the stdin payload up front and **atomically**, so the take and the
+    // "already consumed?" decision are one step: a concurrent second run of a
+    // cloned one-shot source (`from_reader`/`from_lines`) sees it consumed and
+    // fails loud instead of racing into silently-empty stdin. Re-runnable sources
+    // (`from_bytes`/`from_string`/`from_file`) never trip this; `keep_stdin_open`
+    // is skipped (the pipe goes to the caller). Taken before the spawn so a failed
+    // spawn never leaves a child to feed.
     let taken_stdin = if command.keeps_stdin_open() {
         None
     } else {
@@ -522,54 +509,40 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         kill_on_parent_death: command.wants_kill_on_parent_death(),
     };
     // Funnel the OS's opaque "not found" into the single `Error::NotFound`
-    // representation (D11) — the bare ENOENT is otherwise indistinguishable from
-    // a missing cwd or other filesystem error.
+    // representation, done *after* the spawn attempt (not as a pre-check) so the
+    // OS stays the source of truth — a program it can launch by a path we don't
+    // model is never falsely reported missing. Matters on Windows, where std also
+    // searches the application directory, not just PATH. The cwd was validated
+    // above, so a NotFound here is genuinely the program.
     //
-    // Done *after* the spawn attempt rather than as a pre-check so the OS stays
-    // the source of truth — a program the OS can launch by a path we don't model
-    // is never falsely reported missing. This matters on Windows, where std also
-    // searches the *application directory* (the running exe's dir), not just
-    // PATH: a helper shipped beside the binary spawns fine, and a PATH-only
-    // pre-check would have rejected it. The cwd was already validated above, so a
-    // NotFound here is genuinely the program, not the directory.
-    //
-    // For a bare name on the process PATH, `NotFound` names the searched
-    // directories (`searched: Some`). A path-form program, or one whose PATH is
-    // customized (explicit PATH override/removal, env_clear, inherit_env), gets
-    // `searched: None` — `find_in_path` reads the *process* PATH, so its list
-    // would be wrong or irrelevant — but it is still `Error::NotFound` (so
-    // `is_not_found()` holds), just without directories to name.
+    // A bare name on the process PATH names the searched directories
+    // (`searched: Some`); a path-form program or a customized PATH gets
+    // `searched: None` (find_in_path reads the *process* PATH, so its list would
+    // be wrong) but is still `Error::NotFound`.
     let mut child = match group.spawn_with_options(&mut tokio_cmd, &opts) {
         Ok(child) => child,
         Err(crate::Error::Spawn { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
-            // The cwd was validated above, so a NotFound from the spawn is the
-            // *program*, not the directory — funnel it into the single
-            // `Error::NotFound` representation (D11), regardless of how the
-            // program was named or the platform.
             if is_bare_name(command.program()) && !command.customizes_path() {
                 let (found, searched) = find_in_path(command.program());
                 if found.is_some() {
-                    // B8: program is on PATH but the OS can't exec it directly
-                    // (e.g. a .cmd/.bat on Windows needs cmd.exe). Keep the
-                    // spawn error — the file *is* found, so `NotFound` (and
-                    // `is_not_found()`) would mislead.
+                    // On PATH but not directly executable by the OS (e.g. a
+                    // .cmd/.bat on Windows needs cmd.exe). Keep the spawn error —
+                    // the file *is* found, so `NotFound` would mislead.
                     return Err(crate::Error::Spawn {
                         program: command.program_name(),
                         source,
                     });
                 }
-                // A bare name absent from the process PATH: name the searched
-                // directories.
+                // A bare name absent from the process PATH: name the directories.
                 return Err(crate::Error::NotFound {
                     program: command.program_name(),
                     searched: Some(searched),
                 });
             }
-            // A path-form program, or one whose PATH was customized: no PATH
-            // search applied (`find_in_path` reads the *process* PATH, so its
-            // list would be wrong), so there are no directories to report.
+            // Path-form or customized PATH: no PATH search applied, so no
+            // directories to report.
             return Err(crate::Error::NotFound {
                 program: command.program_name(),
                 searched: None,
@@ -592,9 +565,8 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         (child.stdin.take(), None)
     } else {
         match taken_stdin {
-            // Write the (already-taken) buffered/file/stream stdin on a background
-            // task so a large payload can't deadlock against the child's stdout;
-            // dropping the sink sends EOF.
+            // Write the payload on a background task so a large one can't deadlock
+            // against the child's stdout; dropping the sink sends EOF.
             Some(payload) if !payload.is_empty() => {
                 let task = child.stdin.take().map(|mut sink| {
                     tokio::spawn(async move {
@@ -635,11 +607,10 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         stdout_piped: command.stdout_is_piped(),
         cancel_token: command.cancel_token(),
     });
-    // Arm the spawn-time cancel watchdog with a pid-only kill. For own-group
-    // runs, `attach_group` (called immediately after `launch` in `JobRunner`)
-    // will re-arm with the full group+pid kill. For shared-group runs, this
-    // pid-only kill is the permanent watchdog — ensuring the cancel token kills
-    // the child even when no consuming verb has been called (B2 fix).
+    // Arm the spawn-time cancel watchdog with a pid-only kill. Own-group runs
+    // re-arm with the full group+pid kill via `attach_group`; for shared-group
+    // runs this pid-only kill is the permanent watchdog, so the cancel token kills
+    // the child even when no consuming verb is ever called.
     process.arm_cancel_watchdog();
     Ok(process)
 }
@@ -716,11 +687,8 @@ mod tests {
 
     #[tokio::test]
     async fn one_shot_stdin_command_is_not_retried() {
-        // M5: a command whose stdin is a one-shot streaming source cannot be
-        // replayed — the first run consumes it. A retryable failure must NOT spin
-        // the retry loop (which, against a real runner, would re-hit the
-        // consumed-stdin launch error `max_attempts` times with backoff between).
-        // It runs exactly once regardless of the policy.
+        // A one-shot streaming stdin source is consumed by the first run, so a
+        // retryable failure must not spin the retry loop: it runs exactly once.
         let runner = flaky(10);
         let cmd = Command::new("x")
             .stdin(crate::Stdin::from_reader(&b"once"[..]))
@@ -747,10 +715,9 @@ mod tests {
 
     #[tokio::test]
     async fn probe_with_ok_codes_does_not_panic_on_a_non_binary_exit() {
-        // Regression: `probe` reuses `ensure_success` to build its error for a
-        // non-{0,1} exit. With `ok_codes` widening success, an accepted code like
-        // 2 would make `ensure_success` return `Ok` and panic the `expect_err` —
-        // probe must keep its strict 0/1 contract regardless of `ok_codes`.
+        // `probe` reuses `ensure_success` to build its error for a non-{0,1} exit.
+        // An `ok_codes`-accepted code like 2 would make `ensure_success` return
+        // `Ok` and panic the `expect_err`; probe must keep its strict 0/1 contract.
         use crate::testing::{Reply, ScriptedRunner};
         let runner = ScriptedRunner::new().on(["tool", "x"], Reply::fail(2, "boom"));
         let cmd = Command::new("tool").args(["x"]).ok_codes([0, 1, 2]);
@@ -762,9 +729,8 @@ mod tests {
 
     #[tokio::test]
     async fn parse_feeds_checked_stdout_to_the_parser() {
-        // S-2: `parse` runs (success-checked) and hands stdout to an infallible
-        // closure, returning the typed value — the building block the Command /
-        // CliClient wrappers delegate to.
+        // `parse` runs success-checked and hands stdout to an infallible closure,
+        // returning the typed value — what the Command / CliClient wrappers delegate to.
         use crate::testing::{Reply, ScriptedRunner};
         let runner = ScriptedRunner::new().on(["wc", "-l"], Reply::ok("  42\n"));
         let cmd = Command::new("wc").arg("-l");
@@ -804,10 +770,9 @@ mod tests {
 
     #[tokio::test]
     async fn parse_fails_loud_on_a_truncated_capture() {
-        // B12: unlike `checked`, `parse`/`try_parse` must not hand the closure a
-        // tail clipped by a bounded buffer — they reject_if_truncated first. A
-        // runner that reports a truncated success must make `parse` error rather
-        // than feed the parser the clipped stdout.
+        // Unlike `checked`, `parse`/`try_parse` reject_if_truncated first, so a
+        // runner reporting a truncated success makes `parse` error rather than
+        // feed the parser a clipped tail.
         struct TruncatedRunner;
         #[async_trait::async_trait]
         impl ProcessRunner for TruncatedRunner {

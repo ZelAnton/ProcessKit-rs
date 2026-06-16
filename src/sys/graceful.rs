@@ -4,7 +4,7 @@
 //! process-group fallback — escalate teardown the same way: send a graceful
 //! signal to the whole tree, poll until it drains or a deadline passes, then
 //! either hard-kill the survivors (`escalate`) or leave them running and tell
-//! `Drop` to keep its hands off (`!escalate`, B12). Only the mechanics differ
+//! `Drop` to keep its hands off (`!escalate`). Only the mechanics differ
 //! (a cgroup signals and kills through the cgroup file API; a process group via
 //! `killpg`), so each backend supplies those primitives through
 //! [`GracefulTarget`] and they share the escalation algorithm in [`run`].
@@ -16,9 +16,8 @@ use std::io;
 use std::time::Duration;
 
 // `tokio::time::Instant` (not `std::time::Instant`): the deadline must share the
-// same clock as the `sleep` below, so it tracks tokio's virtual time under a
-// paused runtime — both for the hermetic tests here and to match the inline
-// loops this driver replaced byte-for-byte.
+// same clock as the `sleep` below so it tracks tokio's virtual time under a
+// paused runtime, which the hermetic tests here rely on.
 use tokio::time::{Instant, sleep};
 
 /// How often the graceful tier re-checks whether the tree has drained.
@@ -33,9 +32,9 @@ pub(crate) trait GracefulTarget {
 
     /// Whether the tree has fully drained (no tracked process remains alive).
     /// May refresh a backend's internal liveness cache (e.g. the pgroup
-    /// `group_seen` latch), but must NOT prune the tracked set: [`run`] polls
-    /// this repeatedly, and forgetting a survivor would corrupt a later
-    /// `members()`/`stats()` under `escalate = false`.
+    /// `group_seen` latch), but must NOT prune the tracked set: forgetting a
+    /// survivor would corrupt a later `members()`/`stats()` under
+    /// `escalate = false`.
     fn is_drained(&self) -> bool;
 
     /// Forcibly kill any survivors. Called only when escalation is requested
@@ -48,11 +47,11 @@ pub(crate) trait GracefulTarget {
 ///
 /// - `signal` is the graceful signal (usually `SIGTERM`).
 /// - `timeout` bounds the polling wait; it is clamped to [`crate::MAX_DEADLINE`]
-///   (E15) so a `Duration::MAX`-ish value can't overflow `Instant + Duration`
-///   and panic mid-teardown.
+///   so a `Duration::MAX`-ish value can't overflow `Instant + Duration` and
+///   panic mid-teardown.
 /// - `escalate`: on `true`, hard-kill any survivors once the deadline passes; on
 ///   `false`, leave them running and `request()` the `skip_drop_kill` latch so the
-///   backend's `Drop` won't kill them either (B12).
+///   backend's `Drop` won't kill them either.
 pub(crate) async fn run(
     target: &impl GracefulTarget,
     skip_drop_kill: &super::SkipDropKill,
@@ -62,7 +61,7 @@ pub(crate) async fn run(
 ) -> io::Result<()> {
     // Best-effort: the graceful tier proceeds to polling regardless.
     target.signal_all(signal);
-    // E15: clamp so a `Duration::MAX`-ish timeout can't overflow.
+    // Clamp so a `Duration::MAX`-ish timeout can't overflow the `Instant` add.
     let deadline = Instant::now() + timeout.min(crate::MAX_DEADLINE);
     while !target.is_drained() {
         if Instant::now() >= deadline {
@@ -73,9 +72,8 @@ pub(crate) async fn run(
     if escalate && !target.is_drained() {
         target.hard_kill()?;
     } else if !escalate {
-        // B12: tell Drop not to hard-kill the survivors the caller chose to
-        // leave alive. The latch's Release/Acquire pairing (see `SkipDropKill`)
-        // makes the decision visible whichever thread runs Drop (P2-2).
+        // Tell Drop not to hard-kill the survivors the caller chose to leave
+        // alive; the latch makes the decision visible whichever thread runs Drop.
         skip_drop_kill.request();
     }
     Ok(())
@@ -114,7 +112,6 @@ mod tests {
         }
 
         fn is_drained(&self) -> bool {
-            // Single-threaded in tests; a plain load/store decrement is fine.
             let remaining = self.alive_polls.load(Ordering::Relaxed);
             if remaining == 0 {
                 return true;
@@ -168,10 +165,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn deadline_elapses_after_polling_then_escalates() {
-        // Stays alive past the timeout: the loop polls and sleeps (virtual time
-        // auto-advances) until `now >= deadline`, then escalates. This only
-        // terminates because the deadline shares tokio's virtual clock with the
-        // sleeps — a regression to `std::time::Instant` would hang here.
+        // Stays alive past the timeout: only terminates because the deadline
+        // shares tokio's virtual clock with the sleeps — a regression to
+        // `std::time::Instant` would hang here.
         let target = FakeTarget::new(usize::MAX);
         let skip = crate::sys::SkipDropKill::new();
         run(&target, &skip, 15, Duration::from_millis(50), true)
@@ -227,7 +223,7 @@ mod tests {
 
     #[tokio::test]
     async fn saturating_timeout_does_not_panic() {
-        // E15: Duration::MAX must be clamped before the `Instant + Duration`.
+        // Duration::MAX must be clamped before the `Instant + Duration`.
         let target = FakeTarget::new(0); // drained immediately so we don't wait
         let skip = crate::sys::SkipDropKill::new();
         run(&target, &skip, 15, Duration::MAX, true)

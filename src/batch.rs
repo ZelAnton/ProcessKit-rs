@@ -68,7 +68,7 @@ type OutputFut<'a, T> = Pin<Box<dyn Future<Output = Result<ProcessResult<T>>> + 
 /// spawns, so dropping the returned future mid-batch drops those handles
 /// (results already collected are unaffected).
 ///
-/// Whether dropping a handle *kills* its tree depends on the `runner` (B16):
+/// Whether dropping a handle *kills* its tree depends on the `runner`:
 /// with an **own-group** runner ([`JobRunner`](crate::JobRunner) — the common
 /// case) each handle owns its group, so its `Drop` tears the tree down. With a
 /// **shared-group** runner (`&ProcessGroup`), the handles share the caller's
@@ -147,10 +147,9 @@ where
     let commands: Vec<Command> = commands.into_iter().collect();
     let n = commands.len();
     let limit = concurrency.max(1);
-    // Borrow the owned Vec: the in-flight futures reference `commands` here in
-    // the async-fn frame, not a field of the `move` closure — so the closure's
-    // `active` set isn't self-referential (the same shape that lets `wait_any`
-    // capture its `waits` without borrowing itself).
+    // Borrow the owned Vec so the in-flight futures reference `commands` in the
+    // async-fn frame, not a field of the `move` closure — keeping the closure's
+    // `active` set from being self-referential.
     let commands = &commands;
 
     let mut results: Vec<Option<Result<ProcessResult<T>>>> = (0..n).map(|_| None).collect();
@@ -160,14 +159,12 @@ where
 
     std::future::poll_fn(move |cx| {
         loop {
-            // Top the active set up from the remaining commands.
             while active.len() < limit && next < n {
                 let idx = next;
                 next += 1;
                 active.push((idx, launch(runner, &commands[idx])));
             }
 
-            // Poll every active future once; harvest the finishers in place.
             let mut completed = false;
             let mut i = 0;
             while i < active.len() {
@@ -183,7 +180,6 @@ where
             }
 
             if active.is_empty() && next >= n {
-                // Every command has run; assemble the results in input order.
                 return Poll::Ready(
                     results
                         .iter_mut()
@@ -192,8 +188,8 @@ where
                 );
             }
             if !completed {
-                // All active futures are `Pending` and have just registered
-                // their wakers; nothing new can start until one completes.
+                // All active futures are `Pending` with wakers registered;
+                // nothing new can start until one completes.
                 return Poll::Pending;
             }
             // A completion freed a slot: loop to top up and poll the freshly
@@ -208,7 +204,7 @@ mod tests {
     use super::*;
     use crate::testing::{Reply, ScriptedRunner};
 
-    // A scripted runner answers each `output_string` with a canned reply keyed on the
+    // ScriptedRunner answers each `output_string` with a canned reply keyed on the
     // command's args — no subprocess, so these exercise the batch driver itself
     // hermetically. Each batch command carries a distinct arg to route it.
 
@@ -312,8 +308,8 @@ mod tests {
 
     #[tokio::test]
     async fn output_all_bytes_captures_raw_stdout_in_input_order() {
-        // S-7: the bytes companion runs the same bounded fan-out but captures
-        // each command's stdout as raw bytes (via `output_bytes`). A runner that
+        // The bytes companion runs the same bounded fan-out but captures each
+        // command's stdout as raw bytes (via `output_bytes`). A runner that
         // echoes the command's first arg as bytes lets us assert order + payload
         // hermetically.
         use std::sync::Arc;

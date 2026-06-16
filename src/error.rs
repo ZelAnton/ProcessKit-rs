@@ -9,7 +9,7 @@ use std::time::Duration;
 /// errors fold into one structured enum, so callers can pattern-match on the
 /// failure mode instead of parsing strings.
 ///
-/// `Debug` is **manual, not derived** (L22): the [`Exit`](Error::Exit) variant
+/// `Debug` is **manual, not derived**: the [`Exit`](Error::Exit) variant
 /// carries both captured streams in full, and a derived `Debug` would dump them
 /// — potentially multi-MiB — into a `{e:?}` log line or an `.unwrap()` panic
 /// message. The manual impl bounds each stream to a 200-byte preview (mirroring
@@ -36,7 +36,7 @@ pub enum Error {
     /// not installed, not on `PATH`, or the given path does not resolve to an
     /// executable. The **single** representation of "program not found": the
     /// launch path routes every such failure here regardless of how the program
-    /// was named (bare name vs path) or platform (D11), so a caller matches one
+    /// was named (bare name vs path) or platform, so a caller matches one
     /// variant and [`is_not_found`](Error::is_not_found) classifies it.
     ///
     /// Distinct from [`Spawn`](Error::Spawn), which covers OS-level failures
@@ -67,7 +67,7 @@ pub enum Error {
     },
 
     /// A cassette replay found **no recording** matching the invocation — a
-    /// stale or incomplete cassette, not a missing program (F7). Kept distinct
+    /// stale or incomplete cassette, not a missing program. Kept distinct
     /// from [`Spawn`](Error::Spawn) / [`NotFound`](Error::NotFound) so a wrapper
     /// that treats "tool not installed" as an *optional* dependency does not
     /// silently swallow a stale cassette as an absent tool.
@@ -117,8 +117,8 @@ pub enum Error {
 
     /// The process exceeded its configured timeout and was killed.
     ///
-    /// Carries whatever the run captured **before** the deadline killed it
-    /// (D12): a hung tool's partial stderr is frequently the explanation
+    /// Carries whatever the run captured **before** the deadline killed it:
+    /// a hung tool's partial stderr is frequently the explanation
     /// (`waiting for lock held by pid 4123`, `connecting to db…`), so it is
     /// reachable via [`diagnostic`](Self::diagnostic) and the public fields
     /// rather than lost. Empty when the producing path captured nothing (a
@@ -206,7 +206,7 @@ pub enum Error {
     ///
     /// `message` is caller-built and routinely embeds the unparsed output in
     /// full, so — like the [`Exit`](Error::Exit) streams — both `Display` and
-    /// `Debug` bound it to a 200-byte preview (B14); the complete text stays
+    /// `Debug` bound it to a 200-byte preview; the complete text stays
     /// reachable via the public field.
     #[error("{}", display_parse(program, message))]
     Parse {
@@ -256,7 +256,7 @@ pub enum Error {
     /// checked first).
     ///
     /// Unlike [`Timeout`](Error::Timeout) / [`Signalled`](Error::Signalled),
-    /// this carries **no captured streams** (D12): cancellation is a deliberate
+    /// this carries **no captured streams**: cancellation is a deliberate
     /// caller action that stops the run *immediately*. On the pre-spawn path (the
     /// token was already cancelled) nothing was captured at all; on the consuming
     /// verbs, any output captured before the kill is **intentionally discarded** —
@@ -278,7 +278,7 @@ pub enum Error {
     /// `require_code` path when the outcome is
     /// [`Outcome::Signalled`](crate::Outcome::Signalled).
     ///
-    /// Carries whatever the run captured before the signal killed it (D12) — a
+    /// Carries whatever the run captured before the signal killed it — a
     /// crashing tool's partial stderr is often the diagnostic — reachable via
     /// [`diagnostic`](Self::diagnostic) and the public fields. The one-line
     /// `Display` appends the bounded diagnostic tail, like [`Exit`](Error::Exit).
@@ -300,15 +300,14 @@ pub enum Error {
     /// The child ran but feeding its standard input failed for a reason other
     /// than the routine broken pipe.
     ///
-    /// Per [Decision 2], this is raised by the consuming paths **only when the
+    /// This is raised by the consuming paths **only when the
     /// run otherwise succeeded** — a non-zero [`Exit`](Error::Exit), a
     /// [`Signalled`](Error::Signalled), or a [`Timeout`](Error::Timeout) is the
     /// "realer" failure and wins (the stdin error is then dropped). A broken
     /// pipe (`EPIPE` / `ERROR_BROKEN_PIPE` — the child closing stdin before
     /// reading all of it) is routine and **never** surfaces. Diagnoses a
     /// silently-truncated input the otherwise-successful child may have acted on.
-    ///
-    /// [Decision 2]: the stdin source ([`Command::stdin`](crate::Command::stdin))
+    /// The stdin source ([`Command::stdin`](crate::Command::stdin))
     /// is written on a background task; this carries that task's failure.
     ///
     /// The io-level classifiers ([`is_transient`](Error::is_transient),
@@ -332,7 +331,7 @@ pub enum Error {
     /// file. It is **not** a spawn/launch condition (those are
     /// [`Spawn`](Error::Spawn) / [`NotFound`](Error::NotFound)).
     ///
-    /// There is **deliberately no blanket `From<std::io::Error>`** (D13): the
+    /// There is **deliberately no blanket `From<std::io::Error>`**: the
     /// crate never lets an arbitrary foreign `io::Error` fall into this variant
     /// via `?`. Every `Io` is constructed explicitly at a known site, so the
     /// io-level classifiers ([`is_transient`](Error::is_transient),
@@ -349,7 +348,7 @@ impl Error {
     /// captured standard output (where `git` puts `CONFLICT …` and `git commit`
     /// puts `nothing to commit`). Covers the variants that capture streams — a
     /// non-zero [`Exit`](Error::Exit), a [`Timeout`](Error::Timeout) (the partial
-    /// output of a hung-then-killed tool, D12), and a [`Signalled`](Error::Signalled)
+    /// output of a hung-then-killed tool), and a [`Signalled`](Error::Signalled)
     /// crash. Returns `None` when there is no captured output to show — a silent
     /// run (both streams blank) or a variant that carries none
     /// ([`Spawn`](Error::Spawn), [`Cancelled`](Error::Cancelled),
@@ -357,10 +356,9 @@ impl Error {
     /// the [`Display`](std::fmt::Display) message. For the raw, untrimmed stream
     /// match on the variant's fields directly.
     pub fn diagnostic(&self) -> Option<&str> {
-        // Exhaustive on purpose (L7): a future stream-carrying variant must add
-        // itself here rather than silently falling through a `_ => None` and being
-        // invisible to `diagnostic()`. `Error` is `#[non_exhaustive]` only for
-        // *downstream* matches; in-crate this list must stay complete.
+        // Exhaustive on purpose: a future stream-carrying variant must add itself
+        // here rather than fall through a `_ => None` and be invisible to
+        // `diagnostic()`. `#[non_exhaustive]` only constrains downstream matches.
         match self {
             Error::Exit { stdout, stderr, .. }
             | Error::Timeout { stdout, stderr, .. }
@@ -382,7 +380,7 @@ impl Error {
 
     /// Whether the **program could not be located** — it is not installed, not
     /// on `PATH`, or the given path does not resolve to an executable. True for
-    /// [`NotFound`](Error::NotFound) and **only** that variant (D11): the launch
+    /// [`NotFound`](Error::NotFound) and **only** that variant: the launch
     /// path funnels every program-not-found failure into `NotFound`, so this is
     /// the one check a caller needs to surface a "command not installed?" hint.
     ///
@@ -428,8 +426,8 @@ impl Error {
     /// ([`Spawn`](Error::Spawn), [`Io`](Error::Io)) — the basis for the io-level
     /// classifiers above.
     fn io_source(&self) -> Option<&std::io::Error> {
-        // Exhaustive on purpose (L7): a future variant carrying an `io::Error`
-        // must add itself here so the io-level classifiers (`is_transient`,
+        // Exhaustive on purpose: a future variant carrying an `io::Error` must
+        // add itself here so the io-level classifiers (`is_transient`,
         // `is_permission_denied`) see it, rather than slipping through a wildcard.
         match self {
             Error::Spawn { source, .. } => Some(source),
@@ -451,7 +449,7 @@ impl Error {
     }
 }
 
-/// Manual `Debug` (L22): bounds the [`Exit`](Error::Exit) streams and redacts
+/// Manual `Debug`: bounds the [`Exit`](Error::Exit) streams and redacts
 /// the `PATH` value, so `{e:?}` / `.unwrap()` neither dumps a multi-MiB stream
 /// nor logs an environment value. Every other variant mirrors what the derive
 /// would print.
@@ -466,9 +464,8 @@ impl fmt::Debug for Error {
             Error::NotFound { program, searched } => f
                 .debug_struct("NotFound")
                 .field("program", program)
-                // `searched` is the `PATH` env value — never rendered (the
-                // crate's secret-safety rule). Summarize as a directory count;
-                // `None` (no PATH search applied) renders as `None`.
+                // `searched` is the `PATH` env value — never rendered; summarize
+                // as a directory count (`None` renders as `None`).
                 .field("searched", &searched.as_deref().map(SearchedRedaction))
                 .finish(),
             Error::CassetteMiss { program } => f
@@ -521,15 +518,15 @@ impl fmt::Debug for Error {
             Error::Parse { program, message } => f
                 .debug_struct("Parse")
                 .field("program", program)
-                // B14: caller-built, often the full unparsed output — bound it.
+                // Caller-built, often the full unparsed output — bound it.
                 .field("message", &StreamPreview(message))
                 .finish(),
             #[cfg(feature = "limits")]
             Error::ResourceLimit { message } => f
                 .debug_struct("ResourceLimit")
-                // Bounded like every other text-bearing variant — `message` is a
-                // short crate/OS-built string today, but keep the "no unbounded
-                // text in Debug" invariant uniform.
+                // Bounded like every text-bearing variant to keep the "no
+                // unbounded text in Debug" invariant uniform, though `message`
+                // is short today.
                 .field("message", &StreamPreview(message))
                 .finish(),
             Error::Unsupported { operation } => f
@@ -590,12 +587,9 @@ struct SearchedRedaction<'a>(&'a str);
 
 impl fmt::Debug for SearchedRedaction<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The platform `PATH` list separator (`:` on Unix, `;` on Windows) — the
-        // same join `searched` is built with.
         const SEP: char = if cfg!(windows) { ';' } else { ':' };
-        // Count non-empty segments only: empty PATH → 0, and a trailing or
-        // doubled separator (which `std::env::split_paths` skips) must not
-        // inflate the redacted count.
+        // Count non-empty segments only, so a trailing or doubled separator does
+        // not inflate the redacted count.
         let n = self.0.split(SEP).filter(|s| !s.is_empty()).count();
         write!(f, "<{n} directories>")
     }
@@ -614,15 +608,15 @@ fn display_not_found(program: &str, searched: &Option<String>) -> String {
 }
 
 /// `Parse`'s one-line `Display`: `` failed to parse `{program}` output: {message} ``
-/// with the caller-built `message` bounded to a 200-byte char-boundary head (B14)
+/// with the caller-built `message` bounded to a 200-byte char-boundary head
 /// — its start carries the actionable detail (`unexpected token at line 3`),
 /// unlike a captured stream whose *tail* is quoted — so an embedded multi-KiB
 /// unparsed dump can never poison a log line. The full text stays on the field.
 ///
-/// L6/P2-6 (security): `Parse` messages routinely embed attacker-influenced
-/// unparsed output, so each char is passed through [`is_display_unsafe`] and
-/// replaced with `U+FFFD` if dangerous — the same control-/bidi-injection defense
-/// the captured-stream tails get, which a bare truncation would have skipped.
+/// `Parse` messages routinely embed attacker-influenced unparsed output, so each
+/// char is passed through [`is_display_unsafe`] and replaced with `U+FFFD` if
+/// dangerous — the same control-/bidi-injection defense the captured-stream tails
+/// get, which a bare truncation would have skipped.
 fn display_parse(program: &str, message: &str) -> String {
     let mut out = format!("failed to parse `{program}` output: ");
     push_sanitized_capped(&mut out, message, DIAG_CAP);
@@ -631,7 +625,7 @@ fn display_parse(program: &str, message: &str) -> String {
 
 /// `Signalled`'s one-line Display: `` `{program}` was terminated by signal {n} ``
 /// when a number is known, `` `{program}` was terminated by a signal `` otherwise,
-/// plus the bounded diagnostic tail of the captured streams (D12), like
+/// plus the bounded diagnostic tail of the captured streams, like
 /// [`display_exit`].
 fn display_signalled(program: &str, signal: Option<i32>, stdout: &str, stderr: &str) -> String {
     let mut message = match signal {
@@ -643,7 +637,7 @@ fn display_signalled(program: &str, signal: Option<i32>, stdout: &str, stderr: &
 }
 
 /// `Timeout`'s one-line Display: `` `{program}` timed out after {timeout:?} `` plus
-/// the bounded diagnostic tail of whatever the run captured before the kill (D12)
+/// the bounded diagnostic tail of whatever the run captured before the kill
 /// — a hung tool's last stderr line is often the explanation. Same tail cap as
 /// [`display_exit`].
 fn display_timeout(program: &str, timeout: Duration, stdout: &str, stderr: &str) -> String {
@@ -657,8 +651,8 @@ fn display_timeout(program: &str, timeout: Duration, stdout: &str, stderr: &str)
 /// Kept deliberately narrow.
 fn is_transient_io(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
-    // `ExecutableFileBusy` is std's stable mapping of `ETXTBSY` — the executable
-    // is being written; the launch clears once the writer closes it.
+    // `ExecutableFileBusy` (std's `ETXTBSY` mapping) clears once the writer
+    // closes the executable.
     if matches!(
         e.kind(),
         ErrorKind::Interrupted
@@ -668,9 +662,8 @@ fn is_transient_io(e: &std::io::Error) -> bool {
     ) {
         return true;
     }
-    // Windows sharing/lock violations std leaves `Uncategorized`, so match the
-    // raw codes: ERROR_SHARING_VIOLATION (32) / ERROR_LOCK_VIOLATION (33) — a
-    // file the launch needs is briefly locked by another process.
+    // std leaves Windows sharing/lock violations `Uncategorized`, so match the
+    // raw codes: ERROR_SHARING_VIOLATION (32) / ERROR_LOCK_VIOLATION (33).
     #[cfg(windows)]
     {
         matches!(e.raw_os_error(), Some(32 | 33))
@@ -703,7 +696,7 @@ fn display_exit(program: &str, code: i32, stdout: &str, stderr: &str) -> String 
 
 /// The byte budget every one-line `Display`/`Debug` excerpt of caller- or
 /// child-influenced text is capped to, so a multi-KiB stream or unparsed dump can
-/// never poison a log line (B14). Shared by [`push_sanitized_capped`], the
+/// never poison a log line. Shared by [`push_sanitized_capped`], the
 /// [`StreamPreview`] `Debug`, and the diagnostic-tail/`Parse` displays.
 const DIAG_CAP: usize = 200;
 
@@ -713,7 +706,7 @@ const DIAG_CAP: usize = 200;
 /// sanitize-and-cap loop shared by the `Display` paths that embed
 /// attacker-influenced text — the diagnostic tail ([`append_diagnostic_tail`])
 /// and the [`Parse`](Error::Parse) message head ([`display_parse`]) — so the
-/// control-/bidi-injection defense (L6/P2-6) and the cap can't drift apart.
+/// control-/bidi-injection defense and the cap can't drift apart.
 fn push_sanitized_capped(out: &mut String, text: &str, cap: usize) {
     let mut written = 0usize;
     for ch in text.chars() {
@@ -732,7 +725,7 @@ fn push_sanitized_capped(out: &mut String, text: &str, cap: usize) {
 }
 
 /// Whether `ch` is unsafe to emit verbatim into a one-line log/terminal from
-/// attacker-influenced text (L6 / P2-6): a control character (ANSI `ESC`, `BEL`,
+/// attacker-influenced text: a control character (ANSI `ESC`, `BEL`,
 /// `NUL`, `CR`, cursor moves, …), a Unicode **line/paragraph separator** that a
 /// terminal or log viewer renders as a newline (breaking the "one actionable
 /// line" intent), **or** a Unicode bidirectional-formatting control — the
@@ -751,12 +744,12 @@ fn is_display_unsafe(ch: char) -> bool {
 
 /// Append `: <last non-empty diagnostic line>` to a one-line error `Display`,
 /// capped at 200 bytes on a char boundary with an ellipsis. Shared by
-/// [`display_exit`], [`display_timeout`], and [`display_signalled`] (D12) so a
+/// [`display_exit`], [`display_timeout`], and [`display_signalled`] so a
 /// captured-stream error stays one actionable line and a binary-garbage or
 /// one-enormous-line stream can never poison a log line. A no-op when both
 /// streams are blank.
 ///
-/// L6/P2-6 (security): each char is passed through [`is_display_unsafe`] and
+/// Each char is passed through [`is_display_unsafe`] and
 /// replaced with `U+FFFD` if dangerous, so a hostile child's stderr cannot inject
 /// terminal escape sequences (ANSI, `BEL`, `NUL`, cursor moves) or bidi-reordering
 /// controls into an operator's log or terminal through a `{err}` format. (The
@@ -780,9 +773,9 @@ mod tests {
 
     #[test]
     fn display_tail_sanitizes_control_chars_against_terminal_injection() {
-        // L6: a hostile child's stderr last line carrying ANSI/BEL/NUL must not
-        // reach a `{err}` log/terminal verbatim — control bytes become U+FFFD,
-        // while printable text survives.
+        // A hostile child's stderr last line carrying ANSI/BEL/NUL must not reach
+        // a `{err}` log/terminal verbatim — control bytes become U+FFFD, while
+        // printable text survives.
         let err = Error::Exit {
             program: "tool".into(),
             code: 1,
@@ -799,7 +792,7 @@ mod tests {
 
     #[test]
     fn display_tail_strips_bidi_controls_against_trojan_source() {
-        // P2-6: a hostile stderr last line carrying bidi-override controls
+        // A hostile stderr last line carrying bidi-override controls
         // (CVE-2021-42574) must not reach a `{err}` line and visually reorder it.
         let err = Error::Exit {
             program: "tool".into(),
@@ -816,8 +809,8 @@ mod tests {
 
     #[test]
     fn display_tail_strips_unicode_line_separators() {
-        // N4-1: U+2028 / U+2029 are NOT `char::is_control()`, yet terminals and
-        // log viewers render them as a newline — a hostile last line carrying them
+        // U+2028 / U+2029 are NOT `char::is_control()`, yet terminals and log
+        // viewers render them as a newline — a hostile last line carrying them
         // must not inject a break into the one-line `{err}` render.
         let err = Error::Exit {
             program: "tool".into(),
@@ -834,9 +827,9 @@ mod tests {
 
     #[test]
     fn parse_display_sanitizes_control_and_bidi_injection() {
-        // P2-6: `Parse` messages routinely embed attacker-influenced unparsed
-        // output; the one-line Display must neutralize control AND bidi controls,
-        // not just truncate (the gap this fix closed).
+        // `Parse` messages routinely embed attacker-influenced unparsed output;
+        // the one-line Display must neutralize control AND bidi controls, not
+        // just truncate.
         let err = Error::Parse {
             program: "jq".into(),
             message: "bad\x1b[31m\x07token\u{202E}flip\u{2069}sep\u{2028}end".into(),
@@ -853,7 +846,7 @@ mod tests {
 
     #[test]
     fn debug_bounds_exit_streams_so_unwrap_cannot_dump_them() {
-        // L22: a derived Debug would dump both full streams into `{e:?}` /
+        // A derived Debug would dump both full streams into `{e:?}` /
         // `.unwrap()`. The manual Debug bounds each to a 200-byte preview.
         let huge = "x".repeat(10_000);
         let err = Error::Exit {
@@ -891,8 +884,8 @@ mod tests {
 
     #[test]
     fn debug_redacts_the_path_value_in_not_found() {
-        // L22 + security policy: `searched` is the PATH env value and must never
-        // appear in Debug (which feeds `{e:?}` logs and `.unwrap()` panics).
+        // `searched` is the PATH env value and must never appear in Debug
+        // (which feeds `{e:?}` logs and `.unwrap()` panics).
         let err = Error::NotFound {
             program: "tool".into(),
             searched: Some("/secret/bin:/another/private/dir".into()),
@@ -910,8 +903,7 @@ mod tests {
 
     #[test]
     fn exit_display_appends_a_bounded_diagnostic_tail() {
-        // The policy guard (deliberately rewritten when the tail was added):
-        // the Display stays one actionable line — program + code + the LAST
+        // The Display stays one actionable line — program + code + the LAST
         // non-empty diagnostic line — never the full captured streams.
         let err = Error::Exit {
             program: "git".into(),
@@ -949,7 +941,7 @@ mod tests {
     fn exit_display_tail_is_capped_and_never_leaks_the_stream() {
         // A multi-KiB single-line stderr must not poison the log line: the
         // tail is cut at 200 bytes on a char boundary, with an ellipsis.
-        let huge = "é".repeat(3000); // 2 bytes per char — exercises the boundary
+        let huge = "é".repeat(3000); // 2 bytes/char exercises the boundary
         let err = Error::Exit {
             program: "x".into(),
             code: 1,
@@ -964,8 +956,8 @@ mod tests {
 
     #[test]
     fn diagnostic_is_none_for_non_exit_variants() {
-        // A timeout that captured nothing has no diagnostic (the streams-bearing
-        // case is covered in `timeout_and_signalled_carry_diagnostic_streams`).
+        // A timeout that captured nothing has no diagnostic (streams-bearing
+        // case covered in `timeout_and_signalled_carry_diagnostic_streams`).
         let timeout = Error::Timeout {
             program: "git".into(),
             timeout: Duration::from_secs(1),
@@ -1003,13 +995,13 @@ mod tests {
             program: "long-job".into(),
         };
         assert_eq!(err.to_string(), "`long-job` was cancelled");
-        // D12: a cancellation deliberately carries no streams, so diagnostic is None.
+        // A cancellation deliberately carries no streams, so diagnostic is None.
         assert_eq!(err.diagnostic(), None);
     }
 
     #[test]
     fn timeout_and_signalled_carry_diagnostic_streams() {
-        // D12: a hung-then-killed tool's partial stderr is the explanation —
+        // A hung-then-killed tool's partial stderr is the explanation —
         // reachable via diagnostic(), and its last line tails the Display.
         let timeout = Error::Timeout {
             program: "db-migrate".into(),
@@ -1042,8 +1034,8 @@ mod tests {
 
     #[test]
     fn timeout_and_signalled_debug_bounds_their_streams() {
-        // D12 + L22: the new captured streams must be bounded in Debug, exactly
-        // like Exit — a multi-MiB partial capture must never flood `{e:?}`.
+        // Captured streams must be bounded in Debug, exactly like Exit — a
+        // multi-MiB partial capture must never flood `{e:?}`.
         let huge = "x".repeat(10_000);
         let timeout = Error::Timeout {
             program: "t".into(),
@@ -1069,7 +1061,7 @@ mod tests {
 
     #[test]
     fn parse_message_is_bounded_in_display_and_debug() {
-        // B14: the `Parse` message is caller-built and routinely embeds the full
+        // The `Parse` message is caller-built and routinely embeds the full
         // unparsed output — it must be bounded like the `Exit` streams, never
         // dumped whole into a `{e}` log line or a `{e:?}` panic message.
         let huge = "x".repeat(10_000);
@@ -1173,8 +1165,8 @@ mod tests {
             program: "my-tool".into(),
             searched: Some("/usr/bin:/usr/local/bin".into()),
         };
-        // L21: Display must NOT include the raw PATH value (env values are
-        // never logged per the security policy); searched is still accessible.
+        // Display must NOT include the raw PATH value (env values are never
+        // logged); searched is still accessible.
         let display = err.to_string();
         assert_eq!(display, "`my-tool` not found on PATH");
         assert!(
@@ -1189,7 +1181,7 @@ mod tests {
 
     #[test]
     fn not_found_without_path_search_omits_on_path() {
-        // D11: a path-form program (or a customized PATH) is `NotFound` with
+        // A path-form program (or a customized PATH) is `NotFound` with
         // `searched: None` — no PATH lookup happened, so the message must not
         // claim "on PATH". Still `is_not_found()`.
         let err = Error::NotFound {
@@ -1216,11 +1208,9 @@ mod tests {
     #[test]
     fn not_found_and_permission_denied_are_classified_on_spawn_and_io() {
         use std::io::ErrorKind::{NotFound, PermissionDenied};
-        // D11: `is_not_found()` is true ONLY for the `NotFound` variant — a
-        // `Spawn`/`Io` carrying a `NotFound` io kind (e.g. a bad cwd) is no
-        // longer classified as a missing program, so the "not installed?" hint
-        // can't misfire. The launch path routes a genuine missing program into
-        // the `NotFound` variant itself.
+        // `is_not_found()` is true ONLY for the `NotFound` variant — a
+        // `Spawn`/`Io` carrying a `NotFound` io kind (e.g. a bad cwd) is not a
+        // missing program, so the "not installed?" hint can't misfire.
         assert!(
             Error::NotFound {
                 program: "x".into(),
@@ -1241,8 +1231,8 @@ mod tests {
 
     #[test]
     fn transient_kinds_are_classified() {
-        // Includes ExecutableFileBusy built straight from the kind (no raw
-        // errno) — the classifier must recognize it by `ErrorKind` alone.
+        // ExecutableFileBusy is built straight from the kind (no raw errno) —
+        // the classifier must recognize it by `ErrorKind` alone.
         for kind in [
             std::io::ErrorKind::Interrupted,
             std::io::ErrorKind::WouldBlock,

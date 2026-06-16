@@ -29,7 +29,7 @@ mod sealed {
     impl<S: AsRef<OsStr>> Sealed for &[S] {}
 }
 
-/// What a [`CliClient`] verb accepts (D7): either an **argument list** — built
+/// What a [`CliClient`] verb accepts: either an **argument list** — built
 /// into a [`Command`] for the client's program with its defaults (timeout, env,
 /// cancellation) applied — or a ready-made `Command`, run as-is.
 ///
@@ -44,7 +44,7 @@ mod sealed {
 /// fresh command with them, and a ready-made [`Command`] has them **filled into
 /// the gaps it left** — its own explicit settings win, but a client-wide cancel
 /// token / timeout / env still reaches a per-call-customized command rather than
-/// being silently dropped (M7).
+/// being silently dropped.
 pub trait IntoCommand<R: ProcessRunner>: sealed::Sealed {
     /// Build the [`Command`] to run for `client` — used by the verbs.
     #[doc(hidden)]
@@ -53,9 +53,8 @@ pub trait IntoCommand<R: ProcessRunner>: sealed::Sealed {
 
 impl<R: ProcessRunner> IntoCommand<R> for Command {
     fn into_command(self, client: &CliClient<R>) -> Command {
-        // Fill the client's defaults into the caller-supplied command's gaps
-        // (M7) — its explicit settings win, but the client-wide token/timeout/env
-        // is not silently dropped. Idempotent if `command()` already applied them.
+        // Fill defaults into the caller-supplied command's gaps; its explicit
+        // settings win. Idempotent if `command()` already applied them.
         client.apply_defaults(self)
     }
 }
@@ -96,9 +95,9 @@ pub struct CliClient<R: ProcessRunner = JobRunner> {
     cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
-// Manual: the runner type parameter carries no `Debug` bound, and (B4) the env
-// *values* are never rendered — only the sorted variable names (the crate-wide
-// secret-safety rule; see `lib.rs`).
+// Manual Debug: the runner type parameter carries no `Debug` bound, and env
+// *values* are never rendered — only the sorted variable names, per the
+// crate-wide secret-safety rule.
 impl<R: ProcessRunner> std::fmt::Debug for CliClient<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("CliClient");
@@ -220,10 +219,10 @@ impl<R: ProcessRunner> CliClient<R> {
     /// not set them itself — so a fresh [`command()`](Self::command) (no settings)
     /// gets every default, while a caller-supplied [`Command`] passed straight to
     /// a verb keeps its own explicit timeout/cancel/env and only fills the gaps
-    /// (M7: a client-wide cancel token / timeout / env is no longer silently
-    /// dropped when you customize a single call). Idempotent — running it twice
-    /// (a verb applies it to a command that `command()` already defaulted) is a
-    /// no-op the second time.
+    /// (so a client-wide cancel token / timeout / env is not silently dropped
+    /// when you customize a single call). Idempotent — running it twice (a verb
+    /// applies it to a command that `command()` already defaulted) is a no-op
+    /// the second time.
     fn apply_defaults(&self, mut command: Command) -> Command {
         if command.configured_timeout().is_none()
             && let Some(timeout) = self.timeout
@@ -231,8 +230,6 @@ impl<R: ProcessRunner> CliClient<R> {
             command = command.timeout(timeout);
         }
         // The command's own `cancel_on` wins; a client default only fills the gap.
-        // (Chaining `cancel_on` on a `command()` still replaces the just-filled
-        // default — the single token field — so that precedence is unchanged.)
         if command.cancel_token().is_none()
             && let Some(token) = &self.cancel
         {
@@ -251,11 +248,11 @@ impl<R: ProcessRunner> CliClient<R> {
     ///
     /// Accepts an argument list (`git.run(["status"])`) or a customized
     /// [`Command`] (`git.run(git.command(["push"]).timeout(d))`) — see
-    /// [`IntoCommand`] (D7).
+    /// [`IntoCommand`].
     pub async fn run(&self, call: impl IntoCommand<R>) -> Result<String> {
         let command = call.into_command(self);
         let result = self.runner.checked(&command).await?;
-        // B12: refuse silently-truncated stdout (see `ProcessRunnerExt::run`).
+        // Refuse silently-truncated stdout (see `ProcessRunnerExt::run`).
         let policy = command.output_buffer_policy();
         result.reject_if_truncated(policy.max_lines, policy.max_bytes)?;
         Ok(result.into_stdout().trim_end().to_owned())
@@ -263,7 +260,7 @@ impl<R: ProcessRunner> CliClient<R> {
 
     /// Run, requiring an accepted exit, and return the full
     /// [`ProcessResult`] (untrimmed) — the [`CliClient`] analogue of
-    /// [`ProcessRunnerExt::checked`](crate::ProcessRunnerExt::checked) (D7); the
+    /// [`ProcessRunnerExt::checked`](crate::ProcessRunnerExt::checked); the
     /// building block when you need the whole result after success-checking.
     pub async fn checked(&self, call: impl IntoCommand<R>) -> Result<ProcessResult<String>> {
         self.runner.checked(&call.into_command(self)).await
@@ -276,8 +273,8 @@ impl<R: ProcessRunner> CliClient<R> {
     }
 
     /// Run, capturing stdout as **raw bytes** (stderr as text), without erroring
-    /// on a non-zero exit — the same verb as [`ProcessRunner::output_bytes`]
-    /// (D5). For binary tools whose stdout is not UTF-8.
+    /// on a non-zero exit — the same verb as [`ProcessRunner::output_bytes`].
+    /// For binary tools whose stdout is not UTF-8.
     pub async fn output_bytes(&self, call: impl IntoCommand<R>) -> Result<ProcessResult<Vec<u8>>> {
         self.runner.output_bytes(&call.into_command(self)).await
     }
@@ -307,8 +304,8 @@ impl<R: ProcessRunner> CliClient<R> {
 
     /// Stream stdout and return the first line matching `predicate` (`None` if
     /// the stream ends first) — the [`CliClient`] analogue of
-    /// [`ProcessRunnerExt::first_line`](crate::ProcessRunnerExt::first_line)
-    /// (D7), bounded by the command's [`timeout`](crate::Command::timeout).
+    /// [`ProcessRunnerExt::first_line`](crate::ProcessRunnerExt::first_line),
+    /// bounded by the command's [`timeout`](crate::Command::timeout).
     pub async fn first_line<F>(
         &self,
         call: impl IntoCommand<R>,
@@ -356,11 +353,10 @@ impl<R: ProcessRunner> CliClient<R> {
 /// `default_timeout(d)`. Implement the tool's typed methods on it, delegating to
 /// `self.core` — see the crate docs for an example.
 ///
-/// D7: this macro is **committed public API**. Because it is `#[macro_export]`,
-/// it lives at the crate root and is a stable part of the surface — kept (rather
-/// than removed in favor of the hand-rolled wrapper) as the supported scaffold
-/// for typed CLI wrappers. The hand-rolled equivalent (a struct wrapping
-/// [`CliClient`]) remains valid and interchangeable.
+/// This macro is **committed public API**. Because it is `#[macro_export]`,
+/// it lives at the crate root and is a stable part of the surface — the
+/// supported scaffold for typed CLI wrappers. The hand-rolled equivalent (a
+/// struct wrapping [`CliClient`]) remains valid and interchangeable.
 #[macro_export]
 macro_rules! cli_client {
     ($(#[$meta:meta])* $vis:vis struct $name:ident => $binary:expr) => {
@@ -439,7 +435,7 @@ mod tests {
 
     #[test]
     fn debug_redacts_default_env_values_keeping_names() {
-        // B4: CliClient Debug must surface default-env *names*, never values.
+        // Debug must surface default-env *names*, never values.
         let client = CliClient::new("git")
             .default_env("API_TOKEN", "topsecret-value")
             .default_env_remove("GIT_PAGER");
@@ -482,8 +478,6 @@ mod tests {
 
     #[tokio::test]
     async fn run_trims_trailing_whitespace_only() {
-        // `run` trims with `trim_end`: the trailing newline is dropped, but
-        // leading whitespace is significant and preserved.
         let demo = Demo::with_runner(
             ScriptedRunner::new().on(["git", "rev-parse"], Reply::ok("  abc123 \n")),
         );
@@ -527,31 +521,27 @@ mod tests {
 
     #[tokio::test]
     async fn verbs_accept_args_directly_or_a_customized_command() {
-        // D7: a verb takes an argument list (no double `client.command(..)`
-        // mention) AND still accepts a customized Command via the same verb.
+        // A verb takes an argument list (no double `client.command(..)` mention)
+        // AND still accepts a customized Command via the same verb.
         use std::time::Duration;
         let runner = ScriptedRunner::new().on(["git", "status"], Reply::ok("clean"));
         let client = CliClient::with_runner("git", runner);
 
         // Argument list — the program comes from the client, defaults applied.
         assert_eq!(client.run(["status"]).await.unwrap(), "clean");
-        // A Vec of owned args works too.
         assert_eq!(client.run(vec!["status"]).await.unwrap(), "clean");
-        // A customized Command still runs through the same verb (pass-through).
+        // A customized Command runs through the same verb (pass-through).
         let custom = client.command(["status"]).timeout(Duration::from_secs(3));
         assert_eq!(custom.configured_timeout(), Some(Duration::from_secs(3)));
         assert_eq!(client.run(custom).await.unwrap(), "clean");
-        // A borrowed slice works too (the `&[S]` impl).
         let args = ["status"];
         assert_eq!(client.run(&args[..]).await.unwrap(), "clean");
-        // The new `checked` verb (D7) returns the full result.
         let result = client.checked(["status"]).await.unwrap();
         assert_eq!(result.stdout(), "clean");
     }
 
     #[tokio::test]
     async fn first_line_verb_streams_and_matches() {
-        // D7: CliClient gained `first_line`, delegating to the streaming seam.
         let runner =
             ScriptedRunner::new().on(["git", "log"], Reply::lines(["one", "two", "three"]));
         let client = CliClient::with_runner("git", runner);
@@ -603,9 +593,8 @@ mod tests {
 
     #[tokio::test]
     async fn exit_code_errors_on_timeout() {
-        // A timed-out run has no meaningful exit code: `code` must raise
-        // Error::Timeout, not return the synthetic -1 (so a consumer like
-        // `gh auth status` can't misread a timeout as "exited non-zero").
+        // A timed-out run has no exit code: it must raise Error::Timeout, not the
+        // synthetic -1 (else a consumer misreads a timeout as "exited non-zero").
         let client = CliClient::with_runner("gh", ScriptedRunner::new().fallback(Reply::timeout()));
         assert!(matches!(
             client
@@ -647,8 +636,6 @@ mod tests {
     async fn default_env_is_applied_to_every_command() {
         use std::ffi::OsString;
         let client = CliClient::new("git").default_env("GIT_TERMINAL_PROMPT", "0");
-        // Set once on the client, present on each built command without a per-call
-        // `.env`.
         for cmd in [
             client.command(["status"]),
             client.command_in(Path::new("."), ["fetch"]),
@@ -680,9 +667,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_prebuilt_command_passed_to_a_verb_still_gets_client_defaults() {
-        // M7: a ready-made `Command` passed straight to a verb (per-call
-        // customization) must still receive the client's default timeout / env /
-        // cancel token in the gaps it left — not have them silently dropped.
+        // A ready-made `Command` passed straight to a verb must still receive the
+        // client's default timeout / env / cancel token in the gaps it left.
         let token = crate::CancellationToken::new();
         let client = CliClient::new("git")
             .default_timeout(Duration::from_secs(9))
@@ -735,10 +721,10 @@ mod tests {
 
     #[tokio::test]
     async fn prebuilt_command_env_wins_over_a_case_differing_client_default() {
-        // M7/F1: env names are case-insensitive on Windows, so a client
+        // Env names are case-insensitive on Windows, so a client
         // `default_env("Path", …)` must not override a per-command `env("PATH", …)`
-        // (which would invert the documented "explicit wins"). On Unix the two are
-        // distinct variables and both are kept.
+        // (which would invert "explicit wins"). On Unix they are distinct vars and
+        // both are kept.
         let client = CliClient::new("git").default_env("Path", "from-client");
         let cmd = Command::new("git").env("PATH", "from-command");
         let filled = cmd.into_command(&client);
@@ -789,9 +775,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn per_command_cancel_on_overrides_the_default() {
         use crate::CancellationToken;
-        // Pins the documented precedence: an explicit `cancel_on` on a built
-        // command REPLACES the client default — the default token firing must
-        // not resolve the call, the explicit one must.
+        // An explicit `cancel_on` REPLACES the client default: the default token
+        // firing must not resolve the call, the explicit one must.
         let default_token = CancellationToken::new();
         let explicit = CancellationToken::new();
         let client = CliClient::with_runner("gh", ScriptedRunner::new().fallback(Reply::pending()))
@@ -820,9 +805,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn acceptance_pending_reply_with_client_default_cancel() {
         use crate::CancellationToken;
-        // The vcs-toolkit spec's R2 acceptance, verbatim: a pending reply +
-        // `default_cancel_on` — the call parks until the token fires, then
-        // yields Cancelled naming the program, and the invocation is recorded.
+        // A pending reply + `default_cancel_on`: the call parks until the token
+        // fires, then yields Cancelled naming the program, with the call recorded.
         let token = CancellationToken::new();
         let rec = RecordingRunner::new(
             ScriptedRunner::new().on(["gh", "run", "watch"], Reply::pending()),

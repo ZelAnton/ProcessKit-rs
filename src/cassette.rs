@@ -49,16 +49,16 @@ struct Entry {
     args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
-    /// FNV-1a digest of the stdin *source identity* (F12) — keyed so two
-    /// invocations differing only in stdin don't collide on replay. In-memory
-    /// bytes hash their content; a `from_file` source hashes its **path** (the
-    /// file is not read at key time, so changing the file's bytes does not
-    /// change the key). One-shot streaming sources (`from_reader`/`from_lines`)
-    /// are rejected by record/replay (L-1) — their bytes can't be keyed — so
-    /// this digest only ever describes a replayable source.
-    /// `None` for empty/absent stdin. A pre-F12 cassette recorded *with* stdin
-    /// loads this as `None` and must be re-recorded to match a stdin invocation
-    /// again. See `Stdin::content_digest` for the per-source hashing.
+    /// FNV-1a digest of the stdin *source identity* — keyed so two invocations
+    /// differing only in stdin don't collide on replay. In-memory bytes hash
+    /// their content; a `from_file` source hashes its **path** (the file is not
+    /// read at key time, so changing the file's bytes does not change the key).
+    /// One-shot streaming sources (`from_reader`/`from_lines`) are rejected by
+    /// record/replay — their bytes can't be keyed — so this digest only ever
+    /// describes a replayable source.
+    /// `None` for empty/absent stdin. An older cassette recorded *with* stdin
+    /// but no digest loads this as `None` and must be re-recorded to match a
+    /// stdin invocation again. See `Stdin::content_digest` for the hashing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stdin_digest: Option<u64>,
     // --- stored for visibility, not matched on ---
@@ -86,28 +86,27 @@ fn is_false(b: &bool) -> bool {
 
 /// Write `json` to `path`, restricting the file to owner-only (`0600`) on Unix.
 ///
-/// B18: a cassette redacts env *values* (it stores names only), but argv, cwd,
+/// A cassette redacts env *values* (it stores names only), but argv, cwd,
 /// stdout, and stderr are stored **verbatim** — any of which can carry a secret.
 /// So the file is created owner-only rather than inheriting a world-readable
 /// umask.
 ///
-/// M9 (security): on Unix the open also refuses to follow a symlink at `path`
-/// (`O_NOFOLLOW`) — a planted `cassette.json` symlink can no longer redirect the
-/// secret-bearing write (and the `0600`) onto a victim file the link points at.
-/// A cassette path that *is* a symlink fails loud (`ELOOP`) rather than writing
-/// through it. On Windows the file inherits the directory ACL (the unit of access
-/// control there); **restrict the containing directory** (or use a per-user temp
-/// dir, not a world-writable shared one) if the fixture can carry secrets.
+/// On Unix the open also refuses to follow a symlink at `path` (`O_NOFOLLOW`),
+/// so a planted `cassette.json` symlink can't redirect the secret-bearing write
+/// (and the `0600`) onto the link's target — it fails loud (`ELOOP`) instead. On
+/// Windows the file inherits the directory ACL (the unit of access control
+/// there); **restrict the containing directory** (or use a per-user temp dir,
+/// not a world-writable shared one) if the fixture can carry secrets.
 fn write_cassette(path: &Path, json: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        // `mode(0o600)` applies only at *creation*, closing the create-time
-        // window. For a pre-existing (possibly world-readable) cassette being
-        // rewritten, `open` truncates it but keeps its old perms — so tighten
-        // the fd *before* writing the content, never holding it at loose perms.
-        // `O_NOFOLLOW` (M9): never write through a symlink planted at `path`.
+        // `mode(0o600)` applies only at *creation*. A pre-existing (possibly
+        // world-readable) cassette being rewritten keeps its old perms through
+        // the truncating `open`, so tighten the fd *before* writing the content,
+        // never holding it at loose perms. `O_NOFOLLOW`: never write through a
+        // symlink planted at `path`.
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -168,18 +167,18 @@ impl Entry {
 }
 
 /// What an invocation is matched on: program + args + cwd + the stdin source
-/// digest (F12 — content for in-memory bytes, path for a `from_file` source).
+/// digest (content for in-memory bytes, path for a `from_file` source).
 /// Env overrides are excluded so an irrelevant env difference between the
 /// record and replay environments can't cause a spurious miss.
 ///
-/// L23: the string components are *lossy* UTF-8 decodes, so two distinct
-/// non-UTF-8 invocations that differ only in their invalid bytes produce the
-/// same key and collide on replay (the first recorded one answers for both).
-/// Accepted: keying on raw bytes would defeat the human-diffable text fixture,
-/// and valid-UTF-8 invocations (the common case) never collide.
+/// The string components are *lossy* UTF-8 decodes, so two distinct non-UTF-8
+/// invocations that differ only in their invalid bytes produce the same key and
+/// collide on replay (the first recorded one answers for both). Accepted: keying
+/// on raw bytes would defeat the human-diffable text fixture, and valid-UTF-8
+/// invocations (the common case) never collide.
 type Key = (String, Vec<String>, Option<String>, bool, Option<u64>);
 
-/// The stdin source digest (F12) keyed into a cassette match — `None` for an
+/// The stdin source digest keyed into a cassette match — `None` for an
 /// empty/absent stdin. The digest never persists the stdin payload: in-memory
 /// bytes hash their content, a `from_file` source hashes its path.
 fn stdin_digest_of(command: &Command) -> Option<u64> {
@@ -190,14 +189,13 @@ fn stdin_digest_of(command: &Command) -> Option<u64> {
 }
 
 /// Reject a one-shot streaming stdin source (`from_reader`/`from_lines`) in
-/// record/replay (L-1). Such a source's bytes are consumed lazily and never
-/// captured into the match key — `content_digest` can only hash a constant
-/// discriminant for them — so two invocations differing *only* in streamed
-/// stdin would collide on one cassette key and silently replay each other's
-/// recording. Failing loud (consistent with the streaming `start` half already
-/// returning [`Error::Unsupported`]) is safer than a silent wrong answer; use a
-/// replayable source (`from_bytes`/`from_string`/`from_file`) for a recordable
-/// invocation.
+/// record/replay. Such a source's bytes are consumed lazily and never captured
+/// into the match key — `content_digest` can only hash a constant discriminant
+/// for them — so two invocations differing *only* in streamed stdin would
+/// collide on one cassette key and silently replay each other's recording.
+/// Failing loud (consistent with the streaming `start` half already returning
+/// [`Error::Unsupported`]) is safer than a silent wrong answer; use a replayable
+/// source (`from_bytes`/`from_string`/`from_file`) for a recordable invocation.
 fn reject_unrecordable_stdin(command: &Command) -> Result<()> {
     if command.stdin_source().is_some_and(|s| s.is_one_shot()) {
         return Err(Error::Unsupported {
@@ -213,9 +211,9 @@ fn reject_unrecordable_stdin(command: &Command) -> Result<()> {
 /// [`key_of_entry`] (both sides go through the same lossy conversion). The
 /// `stdin_digest` is computed from the command, not carried on the
 /// [`Invocation`] (which records only *whether* stdin was supplied). The
-/// `has_stdin` bool is keyed alongside the digest so a *pre-F12* entry (which
-/// loads `stdin_digest: None` regardless of its stored `has_stdin`) cannot match
-/// a no-stdin replay — only miss.
+/// `has_stdin` bool is keyed alongside the digest so an older entry that loads
+/// `stdin_digest: None` regardless of its stored `has_stdin` cannot match a
+/// no-stdin replay — only miss.
 fn key_of(invocation: &Invocation, stdin_digest: Option<u64>) -> Key {
     (
         invocation.program.to_string_lossy().into_owned(),
@@ -398,8 +396,7 @@ impl<R: ProcessRunner> RecordReplayRunner<R> {
         // concurrently with the save can't be marked clean without being in
         // the written file (it blocks, then lands as dirty again).
         // `expect`, not poison-recovery: no user code ever runs under the
-        // cassette locks, so poisoning is a logic bug worth failing loudly on
-        // (the crate-wide rule lives in AGENTS.md "Code style").
+        // cassette locks, so poisoning is a logic bug worth failing loudly on.
         let entries = recorded.lock().expect("cassette mutex poisoned");
         let cassette = Cassette {
             version: CASSETTE_VERSION,
@@ -413,7 +410,7 @@ impl<R: ProcessRunner> RecordReplayRunner<R> {
     }
 }
 
-/// Reject a cassette entry whose outcome fields *contradict* each other (R2-9).
+/// Reject a cassette entry whose outcome fields *contradict* each other.
 /// The decode model is: `timed_out` → `TimedOut`; else `code` present →
 /// `Exited`; else → `Signalled(signal)` (with `signal` optionally absent, i.e.
 /// "killed, signal unknown"). So at most one of `code` / `timed_out` / `signal`
@@ -446,10 +443,10 @@ impl RecordReplayRunner<JobRunner> {
     /// corrupt file or an unknown format `version` is `InvalidData`.
     pub fn replay(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        // P3-14: bound the read so a stray/huge file can't be buffered into
-        // memory twice (text + parsed). Cassettes are committed test fixtures, so
-        // the limit is generous; anything past it is far more likely a mistake
-        // (a wrong path, a log file) than a real cassette.
+        // Bound the read so a stray/huge file can't be buffered into memory twice
+        // (text + parsed). Cassettes are committed test fixtures, so the limit is
+        // generous; anything past it is far more likely a mistake (a wrong path,
+        // a log file) than a real cassette.
         const MAX_CASSETTE_BYTES: u64 = 64 << 20; // 64 MiB
         if let Ok(meta) = std::fs::metadata(path)
             && meta.len() > MAX_CASSETTE_BYTES
@@ -499,9 +496,9 @@ impl RecordReplayRunner<JobRunner> {
 #[async_trait::async_trait]
 impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
     async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
-        // L-1: a one-shot streaming stdin cannot be faithfully keyed (its bytes
-        // aren't captured), so refuse it in both modes before doing any work —
-        // in record mode this also avoids consuming the source on the inner run.
+        // A one-shot streaming stdin cannot be faithfully keyed (its bytes aren't
+        // captured), so refuse it in both modes before doing any work — in record
+        // mode this also avoids consuming the source on the inner run.
         reject_unrecordable_stdin(command)?;
         match &self.mode {
             Mode::Record {
@@ -531,17 +528,17 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 let entry = {
                     let mut slots = slots.lock().expect("cassette mutex poisoned");
                     let Some(slot) = slots.get_mut(&key_of(&invocation, stdin_digest)) else {
-                        // F7: a stale/incomplete cassette is a distinct error, not
-                        // a missing-program `Spawn`/`NotFound` (so `is_not_found()`
+                        // A stale/incomplete cassette is a distinct error, not a
+                        // missing-program `Spawn`/`NotFound` — so `is_not_found()`
                         // is false and a wrapper can't mistake it for an absent
-                        // tool).
+                        // tool.
                         return Err(Error::CassetteMiss {
                             program: command.program_name(),
                         });
                     };
                     slot.play().clone()
                 };
-                // F6: feed the replayed output through the command's
+                // Feed the replayed output through the command's
                 // `on_stdout_line`/`on_stderr_line` handlers, so a wrapper's
                 // progress path is exercised on replay exactly as it is in
                 // record mode (real pumps) and on `ScriptedRunner::output_string`.
@@ -603,11 +600,11 @@ impl<R: ProcessRunner> Drop for RecordReplayRunner<R> {
         // leaves a complete cassette behind; errors are deliberately swallowed
         // (a Drop can't surface them) — call `save()` to observe failures.
         //
-        // B18: skip the flush while *unwinding* (`thread::panicking()`). A test
-        // that panics mid-recording should not silently persist a surprise
-        // cassette — which stores argv/cwd/stdout/stderr verbatim and may carry
-        // secrets — as a side effect of the panic. Normal scope-exit still
-        // flushes; call `save()` for explicit control on the panic path.
+        // Skip the flush while *unwinding* (`thread::panicking()`). A test that
+        // panics mid-recording should not silently persist a surprise cassette —
+        // which stores argv/cwd/stdout/stderr verbatim and may carry secrets — as
+        // a side effect of the panic. Normal scope-exit still flushes; call
+        // `save()` for explicit control on the panic path.
         if let Mode::Record { dirty, .. } = &self.mode
             && dirty.load(Ordering::SeqCst)
             && !std::thread::panicking()
@@ -641,7 +638,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_cassette_refuses_to_follow_a_symlink() {
-        // M9: a planted symlink at the cassette path must not redirect the
+        // A planted symlink at the cassette path must not redirect the
         // secret-bearing write (and its 0600) onto the link's target — O_NOFOLLOW
         // makes the write fail loud, and the target is left untouched.
         let dir = tempfile::tempdir().expect("temp dir");
@@ -729,8 +726,8 @@ mod tests {
 
     #[tokio::test]
     async fn replay_rejects_an_entry_with_contradictory_outcome() {
-        // R2-9: an entry that sets both an exit `code` and a `signal` is
-        // contradictory; reject it rather than silently picking `Exited`.
+        // An entry that sets both an exit `code` and a `signal` is contradictory;
+        // reject it rather than silently picking `Exited`.
         let (_dir, path) = temp_cassette();
         let json = serde_json::json!({
             "version": 1,
@@ -766,7 +763,7 @@ mod tests {
             Error::CassetteMiss { program } => assert_eq!(program, "tool"),
             other => panic!("expected Error::CassetteMiss, got {other:?}"),
         }
-        // F7: a stale cassette is NOT mistaken for a missing program.
+        // A stale cassette is NOT mistaken for a missing program.
         assert!(
             !err.is_not_found(),
             "a cassette miss must not read as not-found: {err:?}"
@@ -775,8 +772,8 @@ mod tests {
 
     #[tokio::test]
     async fn replay_invokes_line_handlers() {
-        // F6: replay feeds the recorded output through `on_stdout_line`, just
-        // like record mode (real pumps) and `ScriptedRunner::output_string` — a
+        // Replay feeds the recorded output through `on_stdout_line`, just like
+        // record mode (real pumps) and `ScriptedRunner::output_string` — a
         // wrapper's progress path tests the same hermetically on replay.
         let (_dir, path) = temp_cassette();
         let recorder = RecordReplayRunner::record(&path, scripted());
@@ -802,8 +799,8 @@ mod tests {
 
     #[tokio::test]
     async fn stdin_content_is_part_of_the_match_key() {
-        // F12: two invocations identical except for their stdin must record and
-        // replay as *distinct* keys, not collide on `has_stdin` alone. The inner
+        // Two invocations identical except for their stdin must record and replay
+        // as *distinct* keys, not collide on `has_stdin` alone. The inner
         // sequence yields out-A then out-B in record order.
         let (_dir, path) = temp_cassette();
         let inner = ScriptedRunner::new()
@@ -844,10 +841,10 @@ mod tests {
 
     #[tokio::test]
     async fn one_shot_streaming_stdin_is_rejected_in_both_modes() {
-        // L-1: a one-shot streaming source can't be keyed (its bytes aren't
-        // captured), so record/replay must fail loud rather than collide on the
-        // constant `<stream>` discriminant. Record mode also must not consume the
-        // inner run before rejecting.
+        // A one-shot streaming source can't be keyed (its bytes aren't captured),
+        // so record/replay must fail loud rather than collide on the constant
+        // `<stream>` discriminant. Record mode also must not consume the inner run
+        // before rejecting.
         let (_dir, path) = temp_cassette();
         let inner = ScriptedRunner::new().fallback(Reply::ok("out\n"));
         let recorder = RecordReplayRunner::record(&path, inner);
@@ -875,7 +872,7 @@ mod tests {
     #[tokio::test]
     async fn no_stdin_replay_does_not_match_a_stdin_recorded_entry() {
         // The key distinguishes a stdin-bearing invocation from a no-stdin one
-        // (via the digest, and via `has_stdin` for pre-F12 entries that load
+        // (via the digest, and via `has_stdin` for older entries that load
         // `stdin_digest: None`) — a no-stdin replay misses, never serving the
         // stdin entry's output.
         let (_dir, path) = temp_cassette();
@@ -1067,7 +1064,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cassette_file_is_written_owner_only() {
-        // B18: a cassette stores argv/cwd/stdout/stderr verbatim, so it must not
+        // A cassette stores argv/cwd/stdout/stderr verbatim, so it must not
         // inherit a world-readable umask — it is created 0600 on Unix.
         use std::os::unix::fs::PermissionsExt;
         let (_dir, path) = temp_cassette();
@@ -1092,8 +1089,8 @@ mod tests {
 
     #[tokio::test]
     async fn drop_while_unwinding_does_not_persist_a_surprise_cassette() {
-        // B18: a panic mid-recording must not flush a cassette as a side effect
-        // (it may carry secrets in argv/stdout). The Drop guard skips on unwind.
+        // A panic mid-recording must not flush a cassette as a side effect (it
+        // may carry secrets in argv/stdout). The Drop guard skips on unwind.
         let (_dir, path) = temp_cassette();
         let recorder = RecordReplayRunner::record(&path, scripted());
         let _ = recorder

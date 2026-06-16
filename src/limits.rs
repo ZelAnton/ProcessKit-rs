@@ -49,7 +49,7 @@ pub struct ResourceLimits {
     /// Maximum number of live processes in the tree. `None` leaves the count
     /// unbounded.
     ///
-    /// **B14 — cross-platform enforcement differs for direct `spawn`s.** On
+    /// **Cross-platform enforcement differs for direct `spawn`s.** On
     /// **Windows** the Job Object's `ActiveProcessLimit` rejects the *(n+1)*th
     /// process assigned to the job, so `max_processes(n)` caps even repeated
     /// [`ProcessGroup::start`](crate::ProcessGroup::start) calls into one group.
