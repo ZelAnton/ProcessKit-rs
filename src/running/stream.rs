@@ -419,7 +419,7 @@ impl Stream for StdoutLines {
                     if this.wait.is_none() {
                         this.wait = Some(Box::pin(this.sink.clone().changed()));
                     }
-                                match this.wait.as_mut().expect("just set").as_mut().poll(cx) {
+                    match this.wait.as_mut().expect("just set").as_mut().poll(cx) {
                         Poll::Ready(()) => {
                             this.wait = None;
                             continue;
