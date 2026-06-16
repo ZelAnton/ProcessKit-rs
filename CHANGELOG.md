@@ -15,7 +15,7 @@ to a dated version section.
 -
 
 ### Changed
--
+- fixes in README.md
 
 ### Fixed
 -
