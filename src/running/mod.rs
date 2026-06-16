@@ -1180,10 +1180,7 @@ impl RunningProcess {
             })
             .await?
             .outcome;
-        let exit_code = match outcome {
-            Outcome::Exited(c) => Some(c),
-            _ => None,
-        };
+        let exit_code = outcome.code();
         let duration = started.elapsed();
         let (cpu_time, peak_memory_bytes, samples) = match acc.lock() {
             Ok(acc) => (acc.cpu_time, acc.peak_memory_bytes, acc.samples),

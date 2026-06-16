@@ -100,8 +100,8 @@ pub struct ProcessResult<T> {
     program: String,
     stdout: T,
     stderr: String,
-    /// How the run ended (see [`Outcome`]); `code()`/`timed_out()` derive
-    /// from it.
+    /// How the run ended (see [`Outcome`]); `code()`/`signal()`/`timed_out()`
+    /// derive from it.
     outcome: Outcome,
     /// The deadline that elapsed, when timed out — carried so the
     /// success-checking helpers can build a faithful [`Error::Timeout`].
@@ -204,16 +204,13 @@ impl<T> ProcessResult<T> {
     /// sentinel: a missing code is `None`, never `-1`. Derived from
     /// [`outcome`](Self::outcome).
     pub fn code(&self) -> Option<i32> {
-        match self.outcome {
-            Outcome::Exited(code) => Some(code),
-            _ => None,
-        }
+        self.outcome.code()
     }
 
     /// Whether the run was killed because it exceeded its timeout. Derived
     /// from [`outcome`](Self::outcome).
     pub fn timed_out(&self) -> bool {
-        matches!(self.outcome, Outcome::TimedOut)
+        self.outcome.timed_out()
     }
 
     /// The signal number if the process was terminated by a signal with a known

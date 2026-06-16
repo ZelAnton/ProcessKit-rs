@@ -342,9 +342,10 @@ use processkit::Command;
 let result = Command::new("git").args(["merge", "feature"]).output_string().await?;
 
 result.code();         // Option<i32> — None = killed (timeout/signal), no code
-result.is_success();   // code == Some(0)
+result.signal();       // Option<i32> — the signal number (Unix), else None
+result.is_success();   // code in ok_codes (default {0})
 result.timed_out();    // the run's own deadline expired
-result.outcome();      // the explicit three-way enum behind the two above
+result.outcome();      // the explicit three-way enum behind the accessors above
 result.stdout();       // &str (or &[u8] from output_bytes)
 result.stderr();       // &str
 result.combined();     // stdout + stderr concatenated
