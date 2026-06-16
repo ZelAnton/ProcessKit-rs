@@ -13,6 +13,9 @@ to a dated version section.
 
 ### Added
 
+- `SupervisionOutcome` now derives `Clone`, `PartialEq`, and `Eq` — consistent
+  with the other result types (`ProcessResult`, `Finished`, `Outcome`,
+  `RunProfile`), so a supervision report can be stored, compared, and logged.
 - `Outcome` gained accessor methods — `code() -> Option<i32>`,
   `signal() -> Option<i32>`, `timed_out() -> bool` — so code holding a bare
   `Outcome` (e.g. from `RunningProcess::wait` or `Finished::outcome`) needn't

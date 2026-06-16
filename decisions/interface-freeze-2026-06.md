@@ -46,6 +46,13 @@
   bound and accepts strictly more closures. Crucially this is the *freeze-safe*
   side: loosening a bound later is non-breaking, tightening is breaking — so the
   permissive state is the right one to lock.
+- **Keep the batch free-fn argument order `output_all(commands, concurrency,
+  runner)`** (and `output_all_bytes`). It reads "what to run, how many at once,
+  who runs them"; the three arguments are distinctly typed so a mis-order won't
+  compile, and the order has been stable across many releases. The runner trails a
+  scalar (unlike the receiver-style `runner.checked(..)`), but these are
+  free-function batch helpers with no receiver, so there is no convention to
+  violate. Frozen as-is.
 - **Keep `Copy` on the small scalar value types** (`Outcome`,
   `OutputBufferPolicy`, `ResourceLimits`, `ProcessGroupStats`, `RunProfile`, and
   the unit-ish enums). They are all-scalar; `Copy` is a real ergonomic and the
@@ -86,8 +93,14 @@
 - Features are additive; default set is `process-control` only; the `mock`
   expectation surface is semver-exempt and feature-gated. MSRV 1.88 / edition 2024.
 
+## Additive polish landed this round (not freeze-critical, done for day-one consistency)
+
+`SupervisionOutcome` now derives `Clone`/`PartialEq`/`Eq` (was `Debug`-only) — it
+was the lone result type without them. Additive, but shipped now so the result-type
+surface is uniform on release.
+
 ## Genuinely deferred (additive — safe to add after 1.0, not freeze-critical)
 
-`Clone`/`PartialEq` on `SupervisionOutcome`; builder methods on `ResourceLimits`;
-more crate-root free fns (`output_bytes` / `run_unit`); an `Outcome::signalled() ->
-bool` companion. All purely additive — no freeze pressure.
+Builder methods on `ResourceLimits`; more crate-root free fns (`output_bytes` /
+`run_unit`); an `Outcome::signalled() -> bool` companion. All purely additive — no
+freeze pressure.

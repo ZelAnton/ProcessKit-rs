@@ -856,8 +856,14 @@ pub processkit::SupervisionOutcome::final_result: processkit::ProcessResult<allo
 pub processkit::SupervisionOutcome::restarts: u32
 pub processkit::SupervisionOutcome::stopped: processkit::StopReason
 pub processkit::SupervisionOutcome::storm_pauses: u32
+impl core::clone::Clone for processkit::SupervisionOutcome
+pub fn processkit::SupervisionOutcome::clone(&self) -> processkit::SupervisionOutcome
+impl core::cmp::Eq for processkit::SupervisionOutcome
+impl core::cmp::PartialEq for processkit::SupervisionOutcome
+pub fn processkit::SupervisionOutcome::eq(&self, &processkit::SupervisionOutcome) -> bool
 impl core::fmt::Debug for processkit::SupervisionOutcome
 pub fn processkit::SupervisionOutcome::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for processkit::SupervisionOutcome
 impl core::marker::Freeze for processkit::SupervisionOutcome
 impl core::marker::Send for processkit::SupervisionOutcome
 impl core::marker::Sync for processkit::SupervisionOutcome

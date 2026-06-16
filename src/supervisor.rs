@@ -81,7 +81,7 @@ pub enum StopReason {
 ///
 /// Non-exhaustive: a read-only report the crate produces — new telemetry can
 /// be added without a breaking change.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SupervisionOutcome {
     /// The result of the final run (the one that ended supervision).
