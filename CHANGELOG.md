@@ -11,8 +11,6 @@ to a dated version section.
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-06-16
-
 **First stable release.** From 1.0.0 onward `processkit` follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the public API is
 **stable**, and any breaking change lands only in a new **major** version. Within
@@ -1479,8 +1477,7 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.11.1...v1.0.0
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.11.1...HEAD
 [0.11.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.10.1...v0.10.2
