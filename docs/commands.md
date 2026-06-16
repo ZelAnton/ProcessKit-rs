@@ -395,7 +395,7 @@ The error enum is structured and `#[non_exhaustive]`:
 | `Error::CassetteMiss { program }` | (`record` feature) a cassette replay found no matching recording (stale/incomplete cassette) — kept distinct from a missing program, so `is_not_found()` is `false` |
 | `Error::Unsupported { operation }` | The platform can't do what was asked (and silently skipping would be wrong) |
 | `Error::Cancelled { program }` | the run's token was cancelled |
-| `Error::ResourceLimit(reason)` | (`limits` feature) a requested cap couldn't be enforced |
+| `Error::ResourceLimit { message }` | (`limits` feature) a requested cap couldn't be enforced |
 | `Error::Io(source)` | A low-level IO error from the crate's own machinery (driving a child, group control, cassette files) — never an arbitrary foreign `io::Error` (no blanket `From`, D13) |
 
 `Error::diagnostic()` returns the most useful human-facing line out of a

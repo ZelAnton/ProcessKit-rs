@@ -23,6 +23,17 @@ to a dated version section.
 
 ### Changed
 
+- **Breaking (pre-1.0 freeze):** `OutputLine` (the per-line payload of
+  `RunningProcess::output_events`) no longer exposes its `text` as a public field —
+  read it via `OutputLine::text() -> &str` or `into_text() -> String`. This
+  accessor-fronting (matching `ProcessResult`/`Stdin`) frees the line
+  representation to evolve post-1.0 without a break. Migration: `line.text` →
+  `line.text()`.
+- **Breaking (pre-1.0 freeze):** `Error::ResourceLimit(String)` is now the struct
+  variant `Error::ResourceLimit { message: String }` (parity with the crate's
+  other rich error variants; room to add structured detail later without a break).
+  Only relevant with the `limits` feature. Migration: match
+  `Error::ResourceLimit(m)` → `Error::ResourceLimit { message: m }`.
 - **Breaking (pre-1.0):** the text-capture verb is now spelled **`output_string`
   everywhere** — `ProcessRunner::output_string` (the trait seam, was `output`),
   `CliClient::output_string` (was `output`), and the free fn

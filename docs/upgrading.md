@@ -11,8 +11,22 @@ the full record; this page is the "I depend on it, what do I do" view.
 
 ## Unreleased (from 0.11.x)
 
-One breaking change, **caught by the compiler** — if it builds after the bump,
-you're done.
+A few breaking changes, all **caught by the compiler** — if it builds after the
+bump, you're done.
+
+### `OutputLine.text` is now an accessor
+
+`OutputLine` (the per-line payload of `RunningProcess::output_events`) no longer
+exposes `text` as a public field — read it via `line.text() -> &str` (or
+`line.into_text() -> String` to take ownership). This frees the line
+representation to evolve. Fix: `line.text` → `line.text()`.
+
+### `Error::ResourceLimit` is now a struct variant
+
+`Error::ResourceLimit(String)` became `Error::ResourceLimit { message: String }`
+(parity with the other rich variants, room for structured detail later). Fix a
+match `Error::ResourceLimit(m)` → `Error::ResourceLimit { message: m }`.
+(Only relevant with the `limits` feature.)
 
 ### The text-capture verb is renamed `output` → `output_string`
 
@@ -90,7 +104,8 @@ while let Some(ev) = events.next().await {
 }
 ```
 
-After — read `line.text`:
+After — read `line.text` (in 0.12 this becomes `line.text()`; see the Unreleased
+section):
 
 ```rust
 match ev {

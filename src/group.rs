@@ -156,7 +156,9 @@ impl ProcessGroup {
                 // them — surface that distinctly so the caller never assumes a cap
                 // is live.
                 if options.limits.any() {
-                    Error::ResourceLimit(source.to_string())
+                    Error::ResourceLimit {
+                        message: source.to_string(),
+                    }
                 } else {
                     Error::Io(source)
                 }
@@ -495,21 +497,21 @@ fn map_unsupported(source: std::io::Error, operation: impl Into<String>) -> Erro
 #[cfg(feature = "limits")]
 fn validate_limits(limits: &ResourceLimits) -> Result<()> {
     if limits.memory_max == Some(0) {
-        return Err(Error::ResourceLimit(
-            "memory_max must be greater than 0".into(),
-        ));
+        return Err(Error::ResourceLimit {
+            message: "memory_max must be greater than 0".into(),
+        });
     }
     if limits.max_processes == Some(0) {
-        return Err(Error::ResourceLimit(
-            "max_processes must be greater than 0".into(),
-        ));
+        return Err(Error::ResourceLimit {
+            message: "max_processes must be greater than 0".into(),
+        });
     }
     if let Some(cores) = limits.cpu_quota
         && !(cores.is_finite() && cores > 0.0)
     {
-        return Err(Error::ResourceLimit(
-            "cpu_quota must be a finite value greater than 0".into(),
-        ));
+        return Err(Error::ResourceLimit {
+            message: "cpu_quota must be a finite value greater than 0".into(),
+        });
     }
     Ok(())
 }
@@ -548,12 +550,12 @@ mod tests {
         ] {
             assert!(matches!(
                 validate_limits(&opts.limits),
-                Err(Error::ResourceLimit(_))
+                Err(Error::ResourceLimit { .. })
             ));
             // The public entry point rejects them too, before any OS work.
             assert!(matches!(
                 ProcessGroup::with_options(opts),
-                Err(Error::ResourceLimit(_))
+                Err(Error::ResourceLimit { .. })
             ));
         }
     }

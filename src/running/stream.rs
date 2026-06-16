@@ -368,8 +368,8 @@ impl RunningProcess {
     /// let mut events = run.output_events()?;
     /// while let Some(event) = events.next().await {
     ///     match event {
-    ///         OutputEvent::Stdout(line) => println!("out: {}", line.text),
-    ///         OutputEvent::Stderr(line) => eprintln!("err: {}", line.text),
+    ///         OutputEvent::Stdout(line) => println!("out: {}", line.text()),
+    ///         OutputEvent::Stderr(line) => eprintln!("err: {}", line.text()),
     ///         _ => {} // `OutputEvent` is non-exhaustive
     ///     }
     /// }
@@ -614,7 +614,7 @@ impl OutputEvent {
     /// which stream a line came from.
     pub fn text(&self) -> Option<&str> {
         match self {
-            OutputEvent::Stdout(line) | OutputEvent::Stderr(line) => Some(&line.text),
+            OutputEvent::Stdout(line) | OutputEvent::Stderr(line) => Some(line.text()),
         }
     }
 }
@@ -622,14 +622,29 @@ impl OutputEvent {
 /// One decoded line carried by an [`OutputEvent`].
 ///
 /// `#[non_exhaustive]`: a future release may attach per-line metadata (e.g. a
-/// timestamp or a monotonic line index) without a breaking change — read the
-/// public fields rather than destructuring it exhaustively.
+/// timestamp or a monotonic line index) without a breaking change. The line text
+/// is reached through [`text`](Self::text) / [`into_text`](Self::into_text)
+/// (accessor-fronted, like [`ProcessResult`](crate::ProcessResult)), so the
+/// payload representation can evolve without breaking callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OutputLine {
     /// The decoded line, with its trailing `\n` (and one CRLF `\r`) stripped —
     /// the same line shape [`StdoutLines`] yields.
-    pub text: String,
+    text: String,
+}
+
+impl OutputLine {
+    /// The decoded line text (trailing `\n` / CRLF `\r` already stripped).
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Consume the line and take ownership of its decoded text.
+    #[must_use]
+    pub fn into_text(self) -> String {
+        self.text
+    }
 }
 
 /// A merged `Stream` of both stdout and stderr lines (see
@@ -786,8 +801,8 @@ mod tests {
         let mut seq = Vec::new();
         while let Some(ev) = events.next().await {
             seq.push(match ev {
-                OutputEvent::Stdout(l) => format!("O:{}", l.text),
-                OutputEvent::Stderr(l) => format!("E:{}", l.text),
+                OutputEvent::Stdout(l) => format!("O:{}", l.text()),
+                OutputEvent::Stderr(l) => format!("E:{}", l.text()),
             });
         }
         assert_eq!(
@@ -819,12 +834,12 @@ mod tests {
         };
         let first = events.next().await.expect("a stdout event");
         assert!(
-            matches!(&first, OutputEvent::Stdout(line) if line.text == "out"),
+            matches!(&first, OutputEvent::Stdout(line) if line.text() == "out"),
             "stdout event carries an OutputLine: {first:?}"
         );
         assert_eq!(first.text(), Some("out"), "text() reads the line");
         let second = events.next().await.expect("a stderr event");
-        assert!(matches!(&second, OutputEvent::Stderr(line) if line.text == "err"));
+        assert!(matches!(&second, OutputEvent::Stderr(line) if line.text() == "err"));
         assert_eq!(second.text(), Some("err"));
     }
 

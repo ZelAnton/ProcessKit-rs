@@ -161,7 +161,8 @@ pub processkit::Error::OutputTooLarge::total_lines: usize
 pub processkit::Error::Parse
 pub processkit::Error::Parse::message: alloc::string::String
 pub processkit::Error::Parse::program: alloc::string::String
-pub processkit::Error::ResourceLimit(alloc::string::String)
+pub processkit::Error::ResourceLimit
+pub processkit::Error::ResourceLimit::message: alloc::string::String
 pub processkit::Error::Signalled
 pub processkit::Error::Signalled::program: alloc::string::String
 pub processkit::Error::Signalled::signal: core::option::Option<i32>
@@ -557,7 +558,9 @@ impl core::marker::UnsafeUnpin for processkit::OutputEvents
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::OutputEvents
 impl !core::panic::unwind_safe::UnwindSafe for processkit::OutputEvents
 #[non_exhaustive] pub struct processkit::OutputLine
-pub processkit::OutputLine::text: alloc::string::String
+impl processkit::OutputLine
+pub fn processkit::OutputLine::into_text(self) -> alloc::string::String
+pub fn processkit::OutputLine::text(&self) -> &str
 impl core::clone::Clone for processkit::OutputLine
 pub fn processkit::OutputLine::clone(&self) -> processkit::OutputLine
 impl core::cmp::Eq for processkit::OutputLine

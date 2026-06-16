@@ -20,7 +20,7 @@ async fn limits_are_enforced_or_rejected_per_platform() {
         match res {
             Ok(group) => assert!(matches!(group.mechanism(), Mechanism::CgroupV2)),
             // Common on dev boxes / CI without cgroup delegation — the fail-fast path.
-            Err(Error::ResourceLimit(_)) => {
+            Err(Error::ResourceLimit { .. }) => {
                 eprintln!("skipping cgroup enforcement: controller delegation unavailable");
             }
             Err(other) => panic!("unexpected error: {other:?}"),
@@ -28,7 +28,7 @@ async fn limits_are_enforced_or_rejected_per_platform() {
     } else {
         // macOS/BSD have no whole-tree cap.
         assert!(
-            matches!(res, Err(Error::ResourceLimit(_))),
+            matches!(res, Err(Error::ResourceLimit { .. })),
             "a limit on a container-less mechanism must be rejected, not silently dropped"
         );
     }

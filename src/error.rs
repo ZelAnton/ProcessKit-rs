@@ -227,8 +227,11 @@ pub enum Error {
     /// "real root only" requirement). An unenforced limit is no protection, so this
     /// is raised rather than leaving the tree silently unbounded.
     #[cfg(feature = "limits")]
-    #[error("could not enforce resource limits: {0}")]
-    ResourceLimit(String),
+    #[error("could not enforce resource limits: {message}")]
+    ResourceLimit {
+        /// Human-readable detail of which limit could not be enforced and why.
+        message: String,
+    },
 
     /// An operation is not supported by the active containment mechanism on
     /// this platform.
@@ -373,7 +376,7 @@ impl Error {
             | Error::Stdin { .. }
             | Error::Io(_) => None,
             #[cfg(feature = "limits")]
-            Error::ResourceLimit(_) => None,
+            Error::ResourceLimit { .. } => None,
         }
     }
 
@@ -443,7 +446,7 @@ impl Error {
             | Error::Signalled { .. }
             | Error::Stdin { .. } => None,
             #[cfg(feature = "limits")]
-            Error::ResourceLimit(_) => None,
+            Error::ResourceLimit { .. } => None,
         }
     }
 }
@@ -522,12 +525,12 @@ impl fmt::Debug for Error {
                 .field("message", &StreamPreview(message))
                 .finish(),
             #[cfg(feature = "limits")]
-            Error::ResourceLimit(reason) => f
-                .debug_tuple("ResourceLimit")
-                // Bounded like every other text-bearing variant — `reason` is a
+            Error::ResourceLimit { message } => f
+                .debug_struct("ResourceLimit")
+                // Bounded like every other text-bearing variant — `message` is a
                 // short crate/OS-built string today, but keep the "no unbounded
                 // text in Debug" invariant uniform.
-                .field(&StreamPreview(reason))
+                .field("message", &StreamPreview(message))
                 .finish(),
             Error::Unsupported { operation } => f
                 .debug_struct("Unsupported")
@@ -987,7 +990,9 @@ mod tests {
         }
         #[cfg(feature = "limits")]
         {
-            let limit = Error::ResourceLimit("cgroup controller delegation unavailable".into());
+            let limit = Error::ResourceLimit {
+                message: "cgroup controller delegation unavailable".into(),
+            };
             assert_eq!(limit.diagnostic(), None);
         }
     }
@@ -1130,7 +1135,9 @@ mod tests {
     #[cfg(feature = "limits")]
     #[test]
     fn resource_limit_display_carries_reason() {
-        let err = Error::ResourceLimit("no cgroup or Job Object available".into());
+        let err = Error::ResourceLimit {
+            message: "no cgroup or Job Object available".into(),
+        };
         assert_eq!(
             err.to_string(),
             "could not enforce resource limits: no cgroup or Job Object available"
