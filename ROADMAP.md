@@ -68,7 +68,7 @@ no-trailing-newline unit test. Verified fmt/clippy/doc/test/cross-compile.
 **Shipped:** `StdioMode { Piped, Inherit, Null }` + `Command::stdout(mode)` /
 `Command::stderr(mode)` builders; `Command::stdout_tee<W>()` / `stderr_tee<W>()` tee;
 `OutputEvent { Stdout(OutputLine), Stderr(OutputLine) }` + `OutputEvents`
-merged stream + `RunningProcess::output_events()` / `finish_events()`; `OverflowMode::Error`
+merged stream + `RunningProcess::output_events()` / `finish()`; `OverflowMode::Error`
 + `OutputBufferPolicy::fail_loud(n)` + `Error::OutputTooLarge`.
 Verified fmt/clippy/doc/test/cross-compile.
 *(Revised by the 0.9.2 inspection sweep: the tee now takes a `tokio::io::AsyncWrite`
