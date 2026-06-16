@@ -25,6 +25,7 @@ just functional ones.
 
 ## Supported versions
 
-The crate is pre-1.0. Only the **latest published version** on
-[crates.io](https://crates.io/crates/processkit) receives security fixes; please
-reproduce on the latest release before reporting.
+Security fixes land on the **latest published version** on
+[crates.io](https://crates.io/crates/processkit); please reproduce on the latest
+release before reporting. Within the current `1.x` line, fixes ship as patch
+releases.

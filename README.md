@@ -70,8 +70,9 @@ The first column is the differentiator: a child's *descendants* are contained
 and reaped as a unit (Job Object / cgroup v2 / process group), not just the
 direct child.
 
-> **Status:** feature-complete — every capability below ships today; pre-1.0,
-> so the API can still move between minor versions. See
+> **Status:** stable — **1.0**, feature-complete. The public API follows
+> [Semantic Versioning](https://semver.org/): breaking changes land only in a new
+> major version, so `1.x` upgrades are backward-compatible. See
 > [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Install
@@ -154,7 +155,7 @@ first — it maps "I want to …" tasks to working snippets — then read
 | [Supervision](docs/supervision.md) | Restart policies, backoff & jitter, stop conditions, outcomes |
 | [Testing your code](docs/testing.md) | The `ProcessRunner` seam, scripted/recording/mock doubles, cassettes, `CliClient` |
 | [Platform support](docs/platform-support.md) | Mechanisms, all capability matrices, every caveat |
-| [Upgrading](docs/upgrading.md) | Per-version consumer upgrade notes — what breaks on each minor bump and how to migrate |
+| [Upgrading](docs/upgrading.md) | Per-version consumer upgrade notes — what changed on each release and how to migrate across a major bump |
 
 API reference: [docs.rs/processkit](https://docs.rs/processkit).
 

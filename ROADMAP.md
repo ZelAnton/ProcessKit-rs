@@ -6,9 +6,12 @@
 > "won't do / won't change" decisions live in [`decisions/`](decisions/). See
 > [`ideas/README.md`](ideas/README.md) for the taxonomy.
 >
-> **Pre-1.0 freedom.** The crate is in strong pre-release: structure, architecture,
-> and the public interface can change freely. Backward compatibility is **not** a
-> constraint on any item below — getting the shape right *before* 1.0 is the point.
+> **Stability since 1.0.** The crate has shipped **1.0** and follows
+> [Semantic Versioning](https://semver.org/): the public API is stable, and any
+> breaking change lands only in a new **major** version. Items below are scoped to
+> respect that — additive work targets the `1.x` line; anything that would reshape
+> the public interface is deferred to a future major. (The history above this point
+> describes the pre-1.0 development sweeps, when the shape could still move freely.)
 >
 > Items are roughly ordered by leverage, not strict sequence. Cost is a gut
 > estimate (trivial / moderate / major).

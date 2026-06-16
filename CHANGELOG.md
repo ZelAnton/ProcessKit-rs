@@ -11,6 +11,19 @@ to a dated version section.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-16
+
+**First stable release.** From 1.0.0 onward `processkit` follows
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html): the public API is
+**stable**, and any breaking change lands only in a new **major** version. Within
+the `1.x` line, upgrades are backward-compatible. (The `mock` feature's
+`mockall`-generated `expect_*` surface stays semver-exempt — it tracks the
+`mockall` version; prefer `ScriptedRunner` / `RecordingRunner` for a stable
+double.)
+
+The entries below are the final shape-fixes and additions made before the freeze,
+relative to `0.11.1`.
+
 ### Added
 
 - `SupervisionOutcome` now derives `Clone`, `PartialEq`, and `Eq` — consistent
@@ -26,18 +39,18 @@ to a dated version section.
 
 ### Changed
 
-- **Breaking (pre-1.0 freeze):** `OutputLine` (the per-line payload of
+- **Breaking:** `OutputLine` (the per-line payload of
   `RunningProcess::output_events`) no longer exposes its `text` as a public field —
   read it via `OutputLine::text() -> &str` or `into_text() -> String`. This
   accessor-fronting (matching `ProcessResult`/`Stdin`) frees the line
   representation to evolve post-1.0 without a break. Migration: `line.text` →
   `line.text()`.
-- **Breaking (pre-1.0 freeze):** `Error::ResourceLimit(String)` is now the struct
+- **Breaking:** `Error::ResourceLimit(String)` is now the struct
   variant `Error::ResourceLimit { message: String }` (parity with the crate's
   other rich error variants; room to add structured detail later without a break).
   Only relevant with the `limits` feature. Migration: match
   `Error::ResourceLimit(m)` → `Error::ResourceLimit { message: m }`.
-- **Breaking (pre-1.0):** the text-capture verb is now spelled **`output_string`
+- **Breaking:** the text-capture verb is now spelled **`output_string`
   everywhere** — `ProcessRunner::output_string` (the trait seam, was `output`),
   `CliClient::output_string` (was `output`), and the free fn
   `processkit::output_string` (was `processkit::output`). `Command`, `Pipeline`,
@@ -1466,7 +1479,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.11.1...v1.0.0
 [0.11.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.10.1...v0.10.2

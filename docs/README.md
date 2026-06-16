@@ -44,7 +44,7 @@ every per-OS caveat in one place.
 | [Supervision](supervision.md) | Keeping a child alive: restart policies, backoff & jitter math, the failure-storm guard, stop conditions, outcomes, supervising inside a shared group |
 | [Testing your code](testing.md) | The `ProcessRunner` seam — bulk **and** streaming: `ScriptedRunner` (incl. scripted `start()` with canned, paced lines), `RecordingRunner`, `MockRunner`, record/replay cassettes, and building hermetically-testable CLI wrappers with `CliClient` |
 | [Platform support](platform-support.md) | The containment mechanisms, every per-feature support matrix in one place, and the platform caveats worth knowing before you ship |
-| [Upgrading](upgrading.md) | Per-version consumer upgrade notes — what breaks on each minor bump and the exact change to make |
+| [Upgrading](upgrading.md) | Per-version consumer upgrade notes — what changed on each release and the exact change to make across a major bump |
 
 ## Feature flags
 

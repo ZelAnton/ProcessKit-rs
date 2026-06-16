@@ -4,12 +4,15 @@ Per-version notes for **consumers** moving their dependency forward: what breaks
 who it affects, and the exact change to make. The [CHANGELOG](../CHANGELOG.md) is
 the full record; this page is the "I depend on it, what do I do" view.
 
-> **Pre-1.0 versioning.** Under Cargo's semver rules a `0.x` crate treats the
-> *minor* as the breaking position, so a `0.10 → 0.11` bump can carry breaking
-> changes. Pin to a minor range — `processkit = "0.11"` allows `0.11.*` but not
-> `0.12` — and skim the relevant section here before each minor bump.
+> **Versioning.** From 1.0.0 onward `processkit` follows
+> [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the public API is
+> stable, and any breaking change lands only in a new **major** version, so `1.x`
+> upgrades are backward-compatible. The default Cargo requirement `processkit = "1"`
+> already does the right thing — it allows `1.*` but not `2.0`. Skim the relevant
+> section here before each major bump. (The `mock` feature's `mockall`-generated
+> `expect_*` surface stays semver-exempt — it tracks the `mockall` version.)
 
-## Unreleased (from 0.11.x)
+## 1.0.0 (from 0.11.x)
 
 A few breaking changes, all **caught by the compiler** — if it builds after the
 bump, you're done.
@@ -104,8 +107,8 @@ while let Some(ev) = events.next().await {
 }
 ```
 
-After — read `line.text` (in 0.12 this becomes `line.text()`; see the Unreleased
-section):
+After — read `line.text` (in 1.0 this becomes `line.text()`; see the
+[1.0.0 section](#100-from-011x) above):
 
 ```rust
 match ev {
