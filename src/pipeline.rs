@@ -21,10 +21,7 @@ use crate::result::{Outcome, ProcessResult};
 use crate::running::Finished;
 use tokio::task::AbortHandle;
 
-/// Aborts in-flight stage drain tasks when the chain exits early (whole-chain
-/// timeout or stage error) instead of detaching them to linger until the killed
-/// children close their pipes. On the success path the tasks have already
-/// completed, so the abort is a no-op.
+/// Abort in-flight drain tasks on early exit so they don't linger until killed children close their pipes.
 struct AbortTasksOnDrop(Vec<AbortHandle>);
 
 impl Drop for AbortTasksOnDrop {
@@ -46,66 +43,35 @@ impl Drop for AbortTasksOnDrop {
 /// each operating on the **pipefail** outcome. Bound the whole chain with
 /// [`timeout`](Self::timeout) / [`cancel_on`](Self::cancel_on).
 ///
-/// The streaming [`first_line`](Command::first_line) probe is intentionally
-/// **not** on `Pipeline`: a chain consumes its last stage in full to fold the
-/// pipefail outcome. To *capture* a finished chain's first matching line, add a
-/// `| head -n1` (or `findstr`/`grep -m1`) stage and capture. A streaming
-/// readiness probe over a chain that must **keep running** (wait for a banner
-/// line, then leave the chain alive) is not supported — use a single
-/// [`Command`] with `first_line`, since `| head` would tear the chain down.
-///
-/// ```no_run
-/// # async fn demo() -> processkit::Result<()> {
-/// use processkit::Command;
-///
-/// let out = Command::new("git").args(["log", "--format=%an"])
-///     .pipe(Command::new("sort"))
-///     .pipe(Command::new("uniq").arg("-c"))
-///     .output_string()
-///     .await?;
-/// println!("{}", out.stdout());
-/// # Ok(())
-/// # }
-/// ```
+/// [`first_line`](Command::first_line) is intentionally **not** on `Pipeline`:
+/// a chain consumes its last stage in full to fold the pipefail outcome. For a
+/// streaming readiness probe that leaves the chain alive, use a single
+/// [`Command`] with `first_line` instead.
 ///
 /// Semantics:
 ///
-/// - **One group, one fate** — all stages run inside a private
-///   kill-on-drop group; cancelling the future (or a
-///   [`timeout`](Self::timeout) elapsing) tears the whole chain down.
+/// - **One group, one fate** — cancelling the future or a
+///   [`timeout`](Self::timeout) elapsing tears the whole chain down.
 /// - **Pipefail** — `stdout` is always the *last* stage's output; `code`,
 ///   `stderr`, and the reported program come from the **first** stage that
-///   didn't exit cleanly (non-zero, signal-killed, or timed out), or from the
-///   last stage when every stage succeeded. Stages marked
-///   [`unchecked_in_pipe`](Command::unchecked_in_pipe) are exempt: their unclean exits are
-///   skipped during attribution (checked failures always trump unchecked
-///   ones; a chain whose only failures are unchecked reports success) — the
-///   `producer | head -1` escape hatch.
+///   didn't exit cleanly, or from the last stage when every stage succeeded.
+///   [`unchecked_in_pipe`](Command::unchecked_in_pipe) stages are exempt:
+///   checked failures always trump unchecked ones; a chain whose only failures
+///   are unchecked reports success.
 /// - **Stdin/stdout at the ends** — the *first* stage's configured
-///   [`stdin`](Command::stdin) source is honored; inner stages' stdin is the
-///   pipe (any configured source or `keep_stdin_open` on them is overridden).
-///   Inner stages' stdout goes to the next stage; their stderr is captured
+///   [`stdin`](Command::stdin) is honored; inner stages' stdin is the pipe
+///   (any configured source is overridden). Inner stages' stderr is captured
 ///   per-stage for pipefail diagnostics.
-/// - Per-stage [`Command::timeout`]s still apply to their own stage; a staged
-///   timeout surfaces as that stage's failure. [`timeout`](Self::timeout)
-///   bounds the whole chain.
-/// - A per-stage [`Command::retry`] is **not** applied: stages run through the
-///   streaming `start` path (which never retries), so a `retry(..)` set on a
-///   stage has no effect inside a pipeline. Retry a whole chain by wrapping the
-///   `Pipeline` call yourself.
-/// - A `Pipeline` can be re-run (stages are re-cloned per run), but a one-shot
-///   [`Stdin`](crate::Stdin) source on the *first* stage
-///   (`from_reader`/`from_lines`) is consumed by the first run; re-running then
-///   **fails loud** (an [`Error::Io`](crate::Error::Io) at launch) rather
-///   than silently feeding empty stdin — the same semantics as re-running a
-///   [`Command`].
+/// - A per-stage [`Command::retry`] is **not** applied inside a pipeline;
+///   wrap the `Pipeline` call to retry the whole chain.
+/// - A one-shot [`Stdin`](crate::Stdin) source on the *first* stage is
+///   consumed by the first run; re-running **fails loud** rather than silently
+///   feeding empty stdin.
 #[must_use = "a Pipeline does nothing until it is run"]
 #[derive(Clone)]
 pub struct Pipeline {
     stages: Vec<Command>,
     timeout: Option<Duration>,
-    /// Applied to every stage at launch ([`cancel_on`](Self::cancel_on)) so the
-    /// whole chain shares one cancel state and a cancellation errors the run.
     cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
@@ -118,19 +84,16 @@ impl std::fmt::Debug for Pipeline {
     }
 }
 
-/// What one finished stage reported — input to the pipefail fold. The **last**
-/// stage is folded in here too, so every stage is evaluated by the same
-/// `is_clean` rule and a failure carries the stage's *own* deadline.
+/// One finished stage's data — input to the pipefail fold.
 struct StageOutcome {
     program: String,
     outcome: Outcome,
     stderr: String,
-    /// The stage opted out of pipefail attribution ([`Command::unchecked_in_pipe`]).
+    /// Stage opted out of pipefail attribution.
     unchecked: bool,
-    /// Exit codes the stage treats as success ([`Command::ok_codes`]).
+    /// Exit codes the stage treats as success.
     ok_codes: Vec<i32>,
-    /// The stage's *own* configured [`Command::timeout`] — carried so a stage
-    /// that timed out reports its real deadline, not the chain's (or `0ns`).
+    /// Stage's own configured timeout — carried so a timed-out stage reports its real deadline.
     timeout: Option<Duration>,
 }
 
@@ -199,11 +162,8 @@ impl Pipeline {
             .await
     }
 
-    /// The shared driver behind [`output_string`](Self::output_string) /
-    /// [`output_bytes`](Self::output_bytes): start and chain every stage, drain
-    /// them concurrently, and fold the pipefail outcome. `capture_last` decides
-    /// how the **last** stage's stdout is captured (text vs raw bytes); inner
-    /// stages are always line-drained for their stderr/exit.
+    /// Start and chain every stage, drain concurrently, and fold the pipefail
+    /// outcome. `capture_last` decides how the last stage's stdout is captured.
     async fn capture<T, C, F>(&self, capture_last: C) -> Result<ProcessResult<T>>
     where
         T: Default + Send + 'static,
@@ -212,14 +172,11 @@ impl Pipeline {
     {
         let group = ProcessGroup::new()?;
 
-        // Start every stage, chaining stage N's stdout into stage N+1's stdin via
-        // the stdin copy task `launch` spawns per stage.
         let mut running = Vec::with_capacity(self.stages.len());
         let mut upstream = None;
         for (index, stage) in self.stages.iter().enumerate() {
             let mut command = stage.clone();
-            // The pipeline cancel token gap-fills: applied only where a stage has
-            // no token of its own, never overriding an explicit per-stage choice.
+            // Gap-fill: apply the pipeline cancel token only where a stage has no token of its own.
             if let Some(token) = &self.cancel_token
                 && command.cancel_token().is_none()
             {
@@ -232,16 +189,12 @@ impl Pipeline {
             if index + 1 < self.stages.len() {
                 upstream = process.take_stdout_pipe();
             }
-            // Carry the unchecked flag with the handle: the last stage is popped
-            // off below, so positional lookups would be fragile.
+            // Bundle the unchecked flag with the handle; the last stage is popped below.
             running.push((process, stage.is_unchecked()));
         }
 
-        // Drain every stage concurrently: a stderr-chatty inner stage must not
-        // block on a full pipe while we wait on its neighbours.
+        // Drain concurrently: a stderr-chatty inner stage must not block on a full pipe.
         let (last, last_unchecked) = running.pop().expect("a pipeline has at least two stages");
-        // The last stage is evaluated by the same pipefail rule as inner stages,
-        // so capture its `ok_codes` and own deadline for the fold below.
         let last_stage = self
             .stages
             .last()
@@ -267,8 +220,6 @@ impl Pipeline {
         }
         let last_task = tokio::spawn(capture_last(last));
 
-        // Abort still-running drain tasks on an early exit rather than leaving
-        // them parked until the group-killed pipes close.
         let _abort_guard = AbortTasksOnDrop(
             inner_tasks
                 .iter()
@@ -291,14 +242,10 @@ impl Pipeline {
             Some(limit) => match tokio::time::timeout(limit, collect).await {
                 Ok(collected) => collected?,
                 Err(_elapsed) => {
-                    // Whole-chain deadline: kill the chain (best-effort; the
-                    // group's Drop backstops) and report the timeout in the
-                    // result like `Command::timeout` does. `_abort_guard` reaps
-                    // the drain tasks as this returns.
+                    // Kill the chain; `_abort_guard` reaps the drain tasks as this returns.
                     let _ = group.terminate_all();
                     return Ok(ProcessResult::new(
                         self.pipeline_name(),
-                        // A timed-out chain reports no partial stdout.
                         T::default(),
                         String::new(),
                         Outcome::TimedOut,
@@ -308,8 +255,6 @@ impl Pipeline {
             },
         };
 
-        // Fold the last stage into the same `StageOutcome` evaluation; its stdout
-        // is the chain's stdout.
         let last_outcome = StageOutcome {
             program: last_result.program().to_owned(),
             outcome: last_result.outcome(),
@@ -318,10 +263,8 @@ impl Pipeline {
             ok_codes: last_ok_codes,
             timeout: last_timeout,
         };
-        // The chain's stdout *is* the last stage's, so its truncation state must
-        // survive the fold — `pipefail` rebuilds via `ProcessResult::new` (which
-        // defaults `truncated=false`), so re-stamp it below. This is what makes
-        // the `parse`/`try_parse` truncation guard real.
+        // `pipefail` rebuilds via `ProcessResult::new` (which defaults `truncated=false`);
+        // re-stamp truncation so the `parse`/`try_parse` guard fires correctly.
         let last_truncated = last_result.truncated();
         let (last_total_lines, last_total_bytes) =
             (last_result.total_lines(), last_result.total_bytes());
@@ -347,8 +290,6 @@ impl Pipeline {
     /// [`Command::timeout`] — the attributed stage's *own* deadline is reported,
     /// not the chain's.
     pub async fn run(&self) -> Result<String> {
-        // `run` presents stdout as if complete, so it must fail loud on a
-        // truncated last-stage capture rather than return a clipped tail.
         let out = self.checked().await?;
         self.reject_if_last_truncated(&out)?;
         Ok(out.into_stdout().trim_end().to_owned())
@@ -397,9 +338,8 @@ impl Pipeline {
         match result.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
-            // Reset to the default `{0}` so an accepted non-{0,1} code still
-            // errors (probe's contract is strict), reusing ensure_success to
-            // build the faithful error.
+            // Reset ok_codes to {0}: probe's contract is strict 0/1 regardless of
+            // any stage's ok_codes; ensure_success builds the faithful error.
             _ => Err(result
                 .with_ok_codes(vec![0])
                 .ensure_success()
@@ -437,10 +377,6 @@ impl Pipeline {
         parse(out.stdout())
     }
 
-    /// Fail loud if the last stage's capture was truncated by its bounded buffer
-    /// — the parsing verbs must not hand a clipped tail to the closure. The
-    /// ceiling is the **last** stage's [`Command::output_buffer`] policy, since its
-    /// stdout is the chain's output.
     fn reject_if_last_truncated(&self, out: &ProcessResult<String>) -> Result<()> {
         let policy = self
             .stages
@@ -450,7 +386,6 @@ impl Pipeline {
         out.reject_if_truncated(policy.max_lines, policy.max_bytes)
     }
 
-    /// `"a | b | c"` — the chain's display name for timeout attribution.
     fn pipeline_name(&self) -> String {
         self.stages
             .iter()
@@ -460,8 +395,7 @@ impl Pipeline {
     }
 }
 
-/// Whether an outcome is SIGPIPE (Unix signal 13) — the usual symptom of an
-/// upstream stage whose downstream consumer exited, not the actual culprit.
+/// True for SIGPIPE (Unix signal 13) — the usual victim symptom, not the culprit.
 fn is_sigpipe(outcome: &Outcome) -> bool {
     #[cfg(unix)]
     return matches!(outcome, Outcome::Signalled(Some(13)));
@@ -471,25 +405,14 @@ fn is_sigpipe(outcome: &Outcome) -> bool {
     false
 }
 
-/// Fold **all** stages (the last included) into one pipefail result: the chain's
-/// stdout is the last stage's `last_stdout`, with code/stderr/program attributed
-/// to the first **checked** unclean stage (or the last stage when none failed).
+/// Fold all stages (last included) into one pipefail result.
 ///
-/// One uniform rule for every stage:
-/// - A stage is *clean* iff it `Exited(code)` with `code` in its own `ok_codes`
-///   (honored for the **last** stage too — not reset to `[0]`).
-/// - An `unchecked` **inner** stage is exempt from attribution **regardless of
-///   how it ended** (non-zero exit, signal — including SIGPIPE — or its own
-///   per-stage timeout): it never speaks for the chain and never shields another
-///   stage. An `unchecked` **last** stage is the one carve-out: since its stdout
-///   *is* the chain's output, only its non-zero *exit* is forgiven (the real
-///   code is preserved, the chain succeeds) — a last-stage timeout or signal
-///   still surfaces (the chain output is then broken).
-/// - A checked failure always trumps an unchecked one (any position). Among
-///   checked failures, a non-SIGPIPE culprit is preferred over a SIGPIPE victim,
-///   else the leftmost.
-/// - The attributed failure carries its **own** deadline, so a stage that timed
-///   out reports its real `timeout`, never the chain's or `0ns`.
+/// Key invariants:
+/// - An `unchecked` inner stage is fully exempt from attribution regardless of
+///   how it ended. An `unchecked` last stage is the one carve-out: only its
+///   non-zero *exit* is forgiven; a last-stage timeout or signal still surfaces.
+/// - Among checked failures, a non-SIGPIPE culprit is preferred over a SIGPIPE
+///   victim; otherwise the leftmost wins.
 fn pipefail<T>(stages: Vec<StageOutcome>, last_stdout: T) -> ProcessResult<T> {
     let is_clean = |stage: &StageOutcome| match stage.outcome {
         Outcome::Exited(code) => stage.ok_codes.contains(&code),
@@ -503,12 +426,10 @@ fn pipefail<T>(stages: Vec<StageOutcome>, last_stdout: T) -> ProcessResult<T> {
 
     if let Some(stage) = checked_failures
         .iter()
-        .find(|s| !is_sigpipe(&s.outcome)) // prefer a non-SIGPIPE culprit over a SIGPIPE victim
-        .or_else(|| checked_failures.first()) // else the leftmost failure
+        .find(|s| !is_sigpipe(&s.outcome)) // prefer non-SIGPIPE culprit over SIGPIPE victim
+        .or_else(|| checked_failures.first()) // else leftmost
         .copied()
     {
-        // A checked stage failed — its diagnostics and its own deadline win; the
-        // chain's stdout is still the last stage's.
         return ProcessResult::new(
             stage.program.clone(),
             last_stdout,
@@ -518,10 +439,9 @@ fn pipefail<T>(stages: Vec<StageOutcome>, last_stdout: T) -> ProcessResult<T> {
         );
     }
 
-    // No checked failure: the last stage speaks for the chain. Honor its
-    // `ok_codes`; an `unchecked` last stage that exited non-clean is forgiven —
-    // preserve its real code so `is_success()` is true (not a fabricated `0`). A
-    // signal/timeout outcome stays non-success regardless.
+    // No checked failure: the last stage speaks. For an unchecked last stage that
+    // exited non-clean, widen ok_codes to include the real code so is_success() is
+    // true without fabricating 0. Signal/timeout outcomes stay non-success regardless.
     let last = stages.last().expect("a pipeline has at least two stages");
     let ok_codes = match last.outcome {
         Outcome::Exited(code) if last.unchecked && !last.ok_codes.contains(&code) => vec![code],
@@ -537,23 +457,8 @@ fn pipefail<T>(stages: Vec<StageOutcome>, last_stdout: T) -> ProcessResult<T> {
     .with_ok_codes(ok_codes)
 }
 
-/// `a | b` — sugar for [`Command::pipe`]: the same shell-free, one-group,
-/// pipefail pipeline. Parenthesize the chain before a terminal verb, since
-/// method calls bind tighter than `|`:
-///
-/// ```no_run
-/// # async fn demo() -> processkit::Result<()> {
-/// use processkit::Command;
-///
-/// let out = (Command::new("git").args(["log", "--format=%an"])
-///     | Command::new("sort")
-///     | Command::new("uniq").arg("-c"))
-///     .output_string()
-///     .await?;
-/// println!("{}", out.stdout());
-/// # Ok(())
-/// # }
-/// ```
+/// `a | b` — sugar for [`Command::pipe`]. Parenthesize the chain before a
+/// terminal verb, since method calls bind tighter than `|`.
 impl std::ops::BitOr<Command> for Command {
     type Output = Pipeline;
 
@@ -604,7 +509,6 @@ mod tests {
         }
     }
 
-    /// An unclean stage that opted out of attribution.
     fn unchecked_fail(program: &str, outcome: Outcome) -> StageOutcome {
         StageOutcome {
             unchecked: true,
@@ -612,8 +516,6 @@ mod tests {
         }
     }
 
-    /// The last stage as a `StageOutcome` (program `"last"`, stderr `"last-err"`)
-    /// — folded into the same evaluation as the inner stages.
     fn last(outcome: Outcome, unchecked: bool) -> StageOutcome {
         StageOutcome {
             program: "last".into(),
@@ -625,13 +527,11 @@ mod tests {
         }
     }
 
-    /// Run `pipefail` over the inner stages + the last stage + the chain stdout.
     fn pf(mut inner: Vec<StageOutcome>, last: StageOutcome, stdout: &str) -> ProcessResult<String> {
         inner.push(last);
         pipefail(inner, stdout.to_owned())
     }
 
-    /// The expected result when the last stage speaks unchanged.
     fn expect_last(outcome: Outcome, stdout: &str) -> ProcessResult<String> {
         ProcessResult::new(
             "last".into(),
@@ -644,7 +544,6 @@ mod tests {
 
     #[test]
     fn all_clean_inner_stages_let_the_last_stage_speak() {
-        // Success and failure of the last stage alike pass through untouched.
         let ok = pf(
             vec![clean("a"), clean("b")],
             last(Outcome::Exited(0), false),
@@ -672,7 +571,6 @@ mod tests {
             "stdout is what the chain produced — the last stage's"
         );
         assert!(!result.timed_out());
-        // The same attribution must survive the public error surface too.
         match result.ensure_success() {
             Err(crate::Error::Exit {
                 program,
@@ -770,8 +668,6 @@ mod tests {
 
     #[test]
     fn unchecked_last_stage_failure_is_forgiven() {
-        // An unchecked last stage that exited non-zero reports success,
-        // preserving the real exit code (not fabricating 0).
         let result = pf(
             vec![clean("a")],
             last(Outcome::Exited(141), true),
@@ -786,8 +682,6 @@ mod tests {
 
     #[test]
     fn last_stage_ok_codes_are_honoured() {
-        // The LAST stage's `ok_codes` are honored just like an inner stage's — a
-        // last stage with ok_codes([0,1]) exiting 1 is a clean, successful chain.
         let mut last_grep = last(Outcome::Exited(1), false);
         last_grep.program = "grep".into();
         last_grep.ok_codes = vec![0, 1];
@@ -802,8 +696,6 @@ mod tests {
 
     #[test]
     fn inner_stage_ok_codes_are_honoured_in_pipefail_cleanliness() {
-        // An inner stage with ok_codes([0,1]) that exits 1 must not trigger
-        // pipefail attribution — exit 1 is clean per its ok_codes.
         let mut with_ok = stage("grep", Outcome::Exited(1));
         with_ok.ok_codes = vec![0, 1];
         let result = pf(vec![with_ok], last(Outcome::Exited(0), false), "out");
@@ -816,8 +708,6 @@ mod tests {
 
     #[test]
     fn timed_out_stage_reports_its_own_deadline_not_the_chains() {
-        // An inner stage that hit its own `Command::timeout` reports that stage's
-        // OWN deadline, not the chain's (or `0ns`).
         let mut timed = unclean("slow", Outcome::TimedOut, "");
         timed.timeout = Some(Duration::from_millis(500));
         let result = pf(vec![timed], last(Outcome::Exited(0), false), "out");
@@ -841,8 +731,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sigpipe_victim_not_blamed_when_downstream_non_sigpipe_failure_exists() {
-        // The SIGPIPE-killed upstream stage is the victim, not the culprit; the
-        // downstream non-SIGPIPE failure should be attributed instead.
         let sigpipe_victim = unclean("producer", Outcome::Signalled(Some(13)), "pipe broken");
         let real_failure = unclean("consumer", Outcome::Exited(2), "consumer broke");
         let result = pf(
@@ -860,7 +748,7 @@ mod tests {
 
     #[test]
     fn checked_last_stage_failure_still_speaks_verbatim() {
-        // Regression guard: a checked last stage's unclean exit speaks as-is.
+        // Regression guard: a checked unclean last stage must not be discarded.
         let result = pf(vec![clean("a")], last(Outcome::Exited(3), false), "partial");
         assert_eq!(result, expect_last(Outcome::Exited(3), "partial"));
     }
@@ -876,8 +764,6 @@ mod tests {
 
     #[test]
     fn unchecked_never_forgives_a_signal_kill() {
-        // An unchecked LAST stage killed by a signal is not forgiven — a signal
-        // kill is not a voluntary exit with a code, just like a timeout.
         let result = pf(
             vec![clean("a")],
             last(Outcome::Signalled(Some(9)), true),
@@ -897,8 +783,6 @@ mod tests {
 
     #[test]
     fn signal_killed_inner_stage_counts_as_unclean() {
-        // A signal-kill (or per-stage timeout kill) reports Signalled — that is
-        // not a clean exit, so the stage must win the attribution.
         let result = pf(
             vec![unclean("a", Outcome::Signalled(None), "killed")],
             last(Outcome::Exited(0), false),
@@ -908,7 +792,6 @@ mod tests {
         assert_eq!(result.code(), None);
         assert_eq!(result.stderr(), "killed");
         assert!(!result.timed_out(), "a stage kill is not a chain timeout");
-        // Signalled outcome surfaces as Error::Signalled naming the attributed stage.
         match result.ensure_success() {
             Err(crate::Error::Signalled {
                 program, signal, ..

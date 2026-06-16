@@ -174,10 +174,8 @@ impl Command {
         self
     }
 
-    /// Set multiple environment variables at once.
-    ///
-    /// Equivalent to chaining [`env`](Self::env) calls; order is preserved and
-    /// later entries win on a duplicated key.
+    /// Set multiple environment variables at once. Order is preserved; later
+    /// entries win on a duplicated key.
     ///
     /// ```
     /// use processkit::Command;
@@ -265,14 +263,6 @@ impl Command {
     /// [`Error::Unsupported`](crate::Error::Unsupported) — never silently
     /// skipped. The Linux cgroup-v2 caveat from [`uid`](Self::uid) applies
     /// unchanged.
-    ///
-    /// ```no_run
-    /// # fn demo() -> processkit::Command {
-    /// use processkit::Command;
-    /// // Drop to uid/gid 1000 with exactly that user's groups.
-    /// Command::new("worker").uid(1000).gid(1000).groups([1000, 27])
-    /// # }
-    /// ```
     pub fn groups(mut self, gids: impl AsRef<[u32]>) -> Self {
         self.groups = Some(gids.as_ref().to_vec());
         self
@@ -793,13 +783,9 @@ impl Command {
         self.cancel_token.clone()
     }
 
-    /// Fill in a [`CliClient`](crate::CliClient)'s default env ops — but only
-    /// for keys this command has **not** already set, so a per-command `env` /
-    /// `env_remove` wins over a client default for the same key. Idempotent:
-    /// applying the same defaults twice (a verb running `client.command(..)`,
-    /// which already applied them) adds nothing the second time. The "already set?"
-    /// check is case-insensitive on Windows (where env names are), so a client
-    /// `default_env("Path", …)` does not clobber a per-command `env("PATH", …)`.
+    /// Fill in a [`CliClient`](crate::CliClient)'s default env ops for keys this
+    /// command has **not** already set. Per-command `env`/`env_remove` wins.
+    /// Case-insensitive key comparison on Windows.
     pub(crate) fn fill_default_envs(&mut self, defaults: &[(OsString, Option<OsString>)]) {
         for (key, value) in defaults {
             if !self.envs.iter().any(|(k, _)| env_key_eq(k, key)) {
@@ -907,15 +893,9 @@ impl Command {
         self.ok_codes.clone().unwrap_or_else(|| vec![0])
     }
 
-    /// Build a `tokio::process::Command` with this command's program, args,
-    /// working dir, and environment — stdio wired for capture. Use it to feed
-    /// the low-level [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) escape
-    /// hatch directly (which returns a raw [`tokio::process::Child`]).
-    ///
-    /// `#[doc(hidden)]` — this is a raw-tokio escape hatch, not part of the
-    /// advertised surface. It stays public and callable for power users
-    /// bridging to `ProcessGroup::spawn`, but the recommended path is the
-    /// `start`/`output_string`/run verbs.
+    /// Build a `tokio::process::Command` for the low-level
+    /// [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) escape hatch.
+    /// Not part of the advertised surface; prefer the `start`/`output_string`/`run` verbs.
     #[doc(hidden)]
     pub fn to_tokio_command(&self) -> tokio::process::Command {
         self.build_tokio()
@@ -929,12 +909,10 @@ impl Command {
         if let Some(cwd) = &self.cwd {
             cmd.current_dir(cwd);
         }
-        // An inherit_env allow-list implies a cleared environment.
         if self.env_clear || self.inherit_env.is_some() {
             cmd.env_clear();
         }
         if let Some(names) = &self.inherit_env {
-            // Vars the parent lacks are skipped; explicit overrides below win.
             for name in names {
                 if let Some(value) = std::env::var_os(name) {
                     cmd.env(name, value);
@@ -1032,14 +1010,12 @@ impl Command {
             StdioMode::Null => Stdio::null(),
         });
         if self.keep_stdin_open {
-            // Interactive: keep a pipe open for the caller to write to.
             cmd.stdin(Stdio::piped());
         } else {
             match &self.stdin {
                 Some(src) => {
                     cmd.stdin(src.stdio());
                 }
-                // No source: close stdin so the child reads EOF at start.
                 None => {
                     cmd.stdin(Stdio::null());
                 }
@@ -1122,19 +1098,6 @@ impl Command {
     /// truncation so the parser never sees a clipped tail. Consistent with
     /// [`ProcessRunnerExt::parse`](crate::ProcessRunnerExt::parse) and
     /// [`CliClient::parse`](crate::CliClient::parse).
-    ///
-    /// ```no_run
-    /// # async fn demo() -> processkit::Result<()> {
-    /// use processkit::Command;
-    /// // `date +%Y` prints just the year; turn it straight into a number.
-    /// let year: u32 = Command::new("date")
-    ///     .arg("+%Y")
-    ///     .parse(|s| s.trim().parse().unwrap_or(0))
-    ///     .await?;
-    /// # let _ = year;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn parse<T, F>(&self, parse: F) -> Result<T>
     where
         T: Send,
@@ -1149,24 +1112,6 @@ impl Command {
     /// Fails loud on truncation. Consistent with
     /// [`ProcessRunnerExt::try_parse`](crate::ProcessRunnerExt::try_parse) and
     /// [`CliClient::try_parse`](crate::CliClient::try_parse).
-    ///
-    /// ```no_run
-    /// # async fn demo() -> processkit::Result<()> {
-    /// use processkit::{Command, Error};
-    /// // A fallible parse: map the failure into a typed `Error::Parse`.
-    /// let count: u32 = Command::new("git")
-    ///     .args(["rev-list", "--count", "HEAD"])
-    ///     .try_parse(|s| {
-    ///         s.trim().parse().map_err(|e: std::num::ParseIntError| Error::Parse {
-    ///             program: "git".into(),
-    ///             message: e.to_string(),
-    ///         })
-    ///     })
-    ///     .await?;
-    /// # let _ = count;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn try_parse<T, F>(&self, parse: F) -> Result<T>
     where
         T: Send,
@@ -1221,12 +1166,9 @@ impl fmt::Debug for Command {
     }
 }
 
-/// Render env *names* (sorted, deduped) for a redacted `Debug` — the env
-/// *values* are never shown (the crate-wide secret-safety rule). Shared by the
-/// [`Command`], `CliClient`, and `Invocation` `Debug` impls so the redaction
-/// lives in exactly one audited place. A repeated override of one variable
-/// collapses to a single name (its repetition is a `command_line()` concern,
-/// not a Debug one).
+/// Render env *names* (sorted, deduped) for a redacted `Debug` — values are
+/// never shown. Shared by `Command`, `CliClient`, and `Invocation` so
+/// the redaction lives in one audited place.
 pub(crate) fn redacted_env_names(
     envs: &[(OsString, Option<OsString>)],
 ) -> Vec<std::borrow::Cow<'_, str>> {
@@ -1322,13 +1264,8 @@ fn quote_arg(arg: &str) -> String {
 // PATH resolution helpers (used to enrich a not-found spawn error in runner.rs)
 // ---------------------------------------------------------------------------
 
-/// Whether `program` is a bare name that should be looked up on `PATH`.
-///
-/// Returns `true` when `program` has exactly one path component and that
-/// component is a `Normal` segment (no `/`, `\`, `.`, or `..` prefix).
-/// Absolute paths (`/usr/bin/git`, `C:\git.exe`) and relative paths
-/// (`./tool`, `../bin/x`) return `false` — the caller already spelled out
-/// the location.
+/// Whether `program` is a bare name (exactly one `Normal` path component) that
+/// should be looked up on `PATH`. Absolute and relative paths return `false`.
 pub(crate) fn is_bare_name(program: &OsStr) -> bool {
     use std::path::{Component, Path};
     // components() normalizes trailing separators away ("git/" → Normal("git")),

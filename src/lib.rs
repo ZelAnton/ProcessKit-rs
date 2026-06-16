@@ -77,57 +77,6 @@
 //! - **`probe`** — run a predicate and read its exit code as a `bool`: `0` →
 //!   `true`, `1` → `false`, anything else is an error (`git diff --quiet`, …).
 //!
-//! ```no_run
-//! # async fn demo() -> processkit::Result<()> {
-//! use processkit::Command;
-//!
-//! // Capture output; a non-zero exit does not error on its own.
-//! let result = Command::new("git").args(["rev-parse", "HEAD"]).output_string().await?;
-//! println!("HEAD is {}", result.stdout().trim());
-//!
-//! // Or require success and get trimmed stdout directly.
-//! let version = Command::new("cargo").arg("--version").run().await?;
-//! # let _ = version;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Recipes
-//!
-//! ```no_run
-//! # use std::time::Duration;
-//! # async fn demo() -> processkit::Result<()> {
-//! use processkit::{Command, Error};
-//!
-//! // Exit code *is* the answer (0 = yes, 1 = no; anything else errors):
-//! let clean = Command::new("git").args(["diff", "--quiet"]).probe().await?;
-//!
-//! // Retry a transient failure (replays the command; classifier inspects the error):
-//! let fetched = Command::new("git")
-//!     .args(["fetch", "--quiet"])
-//!     .timeout(Duration::from_secs(10))
-//!     .retry(3, Duration::from_millis(200), |e| {
-//!         matches!(e, Error::Timeout { .. })
-//!             || e.diagnostic().is_some_and(|m| m.contains("Could not resolve host"))
-//!     })
-//!     .run()
-//!     .await;
-//!
-//! // A friendly failure message — stderr, falling back to stdout (git writes
-//! // `CONFLICT …` / `nothing to commit` there):
-//! if let Err(e) = Command::new("git").args(["merge", "topic"]).run().await {
-//!     eprintln!("merge failed: {}", e.diagnostic().unwrap_or("(no output)"));
-//! }
-//!
-//! // Set an env var once for every command (typed CLI wrapper):
-//! use processkit::CliClient;
-//! let git = CliClient::new("git").default_env("GIT_TERMINAL_PROMPT", "0");
-//! let _ = git.run(["status", "--porcelain"]).await?;
-//! # let _ = (clean, fetched);
-//! # Ok(())
-//! # }
-//! ```
-//!
 //! # Features
 //!
 //! Every flag is *additive* and gates visibility only — the kill-on-drop tree
@@ -227,13 +176,8 @@ use std::ffi::OsStr;
 
 /// Run `program` with `args` inside a private job and return trimmed stdout, or
 /// an [`Error`] on a non-zero exit / spawn failure / timeout. A thin shim over
-/// [`Command`]; use the builder for a working directory, env, stdin, or timeout.
-///
-/// The crate root exposes only the two most common one-liners — `run` and
-/// [`output_string`] (plus the batch [`output_all`] / [`output_all_bytes`]). The
-/// full verb vocabulary (`output_bytes`, `run_unit`, `exit_code`, `checked`,
-/// `probe`, `parse`/`try_parse`, `start`) lives on [`Command`]; reach for the
-/// builder for anything beyond a bare run/capture.
+/// [`Command`]; use the builder for a working directory, env, stdin, timeout, or
+/// the full verb vocabulary.
 pub async fn run<I, S>(program: impl AsRef<OsStr>, args: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,
@@ -261,22 +205,7 @@ where
 ///
 /// The processes are only *borrowed*: the race is cancel-safe, so the losers —
 /// and the winner, whose exit status tokio caches — remain fully usable
-/// afterwards ([`wait`](RunningProcess::wait), another `wait_any`, …). This is
-/// the natural primitive for supervising several long-lived children: race
-/// them, handle the one that finished, keep watching the rest.
-///
-/// ```no_run
-/// # async fn demo() -> processkit::Result<()> {
-/// use processkit::{Command, ProcessGroup, wait_any};
-///
-/// let group = ProcessGroup::new()?;
-/// let mut a = group.start(&Command::new("server-a")).await?;
-/// let mut b = group.start(&Command::new("server-b")).await?;
-/// let (idx, outcome) = wait_any(&mut [&mut a, &mut b]).await?;
-/// println!("contender #{idx} exited first with {outcome:?}");
-/// # Ok(())
-/// # }
-/// ```
+/// afterwards ([`wait`](RunningProcess::wait), another `wait_any`, …).
 ///
 /// Two deliberate non-features:
 ///
@@ -331,26 +260,9 @@ pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, O
 }
 
 /// Wait for **all** of several running processes to exit, returning their
-/// [`Outcome`]s in the same order as `processes`.
-///
-/// The companion to [`wait_any`]: where `wait_any` races and returns the first
-/// finisher, `wait_all` drives every contender to completion concurrently and
-/// collects them. The processes are only *borrowed* and stay usable afterwards
-/// (the exit status tokio caches remains re-readable). This is the natural
-/// primitive for fanning a fixed set of children out and joining on the lot.
-///
-/// ```no_run
-/// # async fn demo() -> processkit::Result<()> {
-/// use processkit::{Command, ProcessGroup, wait_all};
-///
-/// let group = ProcessGroup::new()?;
-/// let mut a = group.start(&Command::new("worker-a")).await?;
-/// let mut b = group.start(&Command::new("worker-b")).await?;
-/// let outcomes = wait_all(&mut [&mut a, &mut b]).await?;
-/// assert_eq!(outcomes.len(), 2); // one entry per process, in input order
-/// # Ok(())
-/// # }
-/// ```
+/// [`Outcome`]s in the same order as `processes`. The processes are only
+/// *borrowed* and stay usable afterwards (the exit status tokio caches remains
+/// re-readable).
 ///
 /// Same two non-features as [`wait_any`]: **no per-process
 /// [`timeout`](Command::timeout)** (bound the whole batch with
@@ -407,26 +319,11 @@ pub async fn wait_all(processes: &mut [&mut RunningProcess]) -> Result<Vec<Outco
     .await
 }
 
-/// Test doubles for the [`ProcessRunner`] seam.
-///
-/// Grouped under `testing` rather than the crate root so the production surface
-/// stays focused: these types exist to **replace real subprocesses in tests** —
-/// a [`ScriptedRunner`](testing::ScriptedRunner) that serves canned replies, a
+/// Test doubles for the [`ProcessRunner`] seam: a
+/// [`ScriptedRunner`](testing::ScriptedRunner) that serves canned replies, a
 /// [`RecordingRunner`](testing::RecordingRunner) that asserts on invocations,
 /// the [`Invocation`](testing::Invocation) it captures, and (behind features)
 /// record/replay cassettes and a `mockall` mock.
-///
-/// ```no_run
-/// use processkit::Command;
-/// use processkit::testing::{Reply, ScriptedRunner};
-/// use processkit::ProcessRunnerExt; // for `run`
-///
-/// # async fn demo() -> processkit::Result<()> {
-/// let runner = ScriptedRunner::new().on(["git", "status"], Reply::ok("clean"));
-/// assert_eq!(runner.run(&Command::new("git").arg("status")).await?, "clean");
-/// # Ok(())
-/// # }
-/// ```
 pub mod testing {
     pub use crate::doubles::{Invocation, RecordingRunner, Reply, ScriptedRunner};
 

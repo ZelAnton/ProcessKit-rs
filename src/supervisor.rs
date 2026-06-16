@@ -99,34 +99,14 @@ pub struct SupervisionOutcome {
 /// [`RestartPolicy`] and the [`stop_when`](Self::stop_when) predicate, and
 /// restarts it after an exponential-backoff delay until supervision ends.
 ///
-/// ```no_run
-/// # async fn demo() -> processkit::Result<()> {
-/// use processkit::{Command, RestartPolicy, Supervisor};
-/// use std::time::Duration;
-///
-/// let outcome = Supervisor::new(Command::new("my-server").args(["--port", "8080"]))
-///     .restart(RestartPolicy::OnCrash)
-///     .max_restarts(5)
-///     .backoff(Duration::from_millis(200), 2.0)
-///     .stop_when(|res| res.code() == Some(0))
-///     .run()
-///     .await?;
-/// println!("ended after {} restarts: {:?}", outcome.restarts, outcome.stopped);
-/// # Ok(())
-/// # }
-/// ```
-///
 /// Defaults: [`OnCrash`](RestartPolicy::OnCrash), unlimited restarts, backoff
 /// `200ms × 2.0` capped at 30 s, jitter on, failure-storm guard off (enable
-/// with [`storm_pause`](Self::storm_pause); once enabled, failure-score
-/// half-life 30 s and threshold 5.0).
+/// with [`storm_pause`](Self::storm_pause); failure-score half-life 30 s and
+/// threshold 5.0 once enabled).
 ///
-/// Runs go through a [`ProcessRunner`] — [`JobRunner`] by default (each
-/// incarnation in its own private kill-on-drop group). Inject another with
-/// [`with_runner`](Self::with_runner): a `&ProcessGroup` supervises every
-/// incarnation inside one shared group, and a
-/// [`ScriptedRunner`](crate::testing::ScriptedRunner) makes supervision logic fully
-/// hermetic in tests.
+/// Runs go through a [`ProcessRunner`] — [`JobRunner`] by default. Override
+/// with [`with_runner`](Self::with_runner) to share a [`ProcessGroup`](crate::ProcessGroup)
+/// or inject a test double.
 pub struct Supervisor<R: ProcessRunner = JobRunner> {
     command: Command,
     runner: R,
@@ -147,7 +127,7 @@ pub struct Supervisor<R: ProcessRunner = JobRunner> {
     capture: OutputBufferPolicy,
 }
 
-// The runner type parameter and the boxed predicate are opaque, so Debug is manual.
+// Manual: runner type parameter and boxed predicate are opaque.
 impl<R: ProcessRunner> std::fmt::Debug for Supervisor<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Supervisor")
@@ -369,8 +349,6 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// `Error::Cancelled` immediately, regardless of policy or budget — the
     /// token stays cancelled, so a restart would only be cancelled again.
     pub async fn run(self) -> Result<SupervisionOutcome> {
-        // A sub-1.0 or non-finite factor decays to 1.0 rather than shrinking the
-        // delay or panicking the Duration math.
         let factor = if self.backoff_factor.is_finite() {
             self.backoff_factor.max(1.0)
         } else {
@@ -390,9 +368,6 @@ impl<R: ProcessRunner> Supervisor<R> {
                     {
                         return Ok(self.outcome(result, restarts, &storm, StopReason::Predicate));
                     }
-                    // A crash is any non-success run. `is_success` honors
-                    // `ok_codes`, so an accepted non-zero exit is clean, not a
-                    // crash — keeping the supervisor consistent with the crate.
                     let crashed = !result.is_success();
                     let wants_restart = match self.policy {
                         RestartPolicy::Always => true,
@@ -415,8 +390,6 @@ impl<R: ProcessRunner> Supervisor<R> {
                             StopReason::RestartsExhausted,
                         ));
                     }
-                    // Only failures feed the storm score; a clean exit restarted
-                    // under `Always` is churn, not a failure.
                     if crashed {
                         self.storm_gate(&mut storm).await;
                     }
@@ -424,13 +397,9 @@ impl<R: ProcessRunner> Supervisor<R> {
                     restarts = restarts.saturating_add(1);
                 }
                 Err(err) => {
-                    // A cancelled incarnation is terminal: the token stays
-                    // cancelled, so restarting would spin instantly-cancelled runs.
                     if matches!(err, crate::Error::Cancelled { .. }) {
                         return Err(err);
                     }
-                    // No result produced (spawn/IO failure): the predicate can't
-                    // judge it, so the policy treats it as a crash.
                     let wants_restart = !matches!(self.policy, RestartPolicy::Never);
                     if !wants_restart || self.max_restarts.is_some_and(|max| restarts >= max) {
                         return Err(err);
@@ -474,7 +443,6 @@ impl<R: ProcessRunner> Supervisor<R> {
             .unwrap_or(Duration::ZERO);
         storm.last_failure_at = Some(now);
         storm.score = decayed_failure_score(storm.score, elapsed, self.failure_decay);
-        // A non-finite threshold never trips (NaN comparisons are false).
         let tripped = storm.score > self.failure_threshold;
         if !tripped {
             return;
@@ -511,13 +479,9 @@ impl<R: ProcessRunner> Supervisor<R> {
     }
 }
 
-/// The storm guard's running state — one per `run()` call.
 struct StormState {
-    /// The decaying failure score (see [`decayed_failure_score`]).
     score: f64,
-    /// When the previous failure was folded in (`None` = fresh window).
     last_failure_at: Option<tokio::time::Instant>,
-    /// How many storm pauses were taken (reported in the outcome).
     pauses: u32,
 }
 
@@ -548,8 +512,7 @@ fn decayed_failure_score(prev: f64, elapsed: Duration, half_life: Duration) -> f
     }
 }
 
-/// `base × factor^n`, capped — computed in `f64` and clamped into a domain
-/// where the `Duration` conversion cannot panic.
+/// `base × factor^n`, capped at `cap`.
 fn backoff_delay(base: Duration, factor: f64, n: u32, cap: Duration) -> Duration {
     if base.is_zero() {
         return Duration::ZERO;
@@ -561,23 +524,19 @@ fn backoff_delay(base: Duration, factor: f64, n: u32, cap: Duration) -> Duration
     Duration::from_secs_f64(scaled).min(cap)
 }
 
-/// Multiply `delay` by a uniform factor in `[0.5, 1.5)` when enabled.
+/// Multiply `delay` by a uniform random factor in `[0.5, 1.5)` when `enabled`.
 fn apply_jitter(delay: Duration, enabled: bool) -> Duration {
     if !enabled || delay.is_zero() {
         return delay;
     }
-    // Clamp to `MAX_DEADLINE`: the up-to-1.5x factor can push a near-`Duration::MAX`
-    // delay past `Duration`'s range, and `mul_f64` *panics* on overflow. Mirrors the
-    // crate-wide clamp on every other timing path.
     let scaled = delay.as_secs_f64() * jitter_factor();
     Duration::try_from_secs_f64(scaled)
         .unwrap_or(crate::MAX_DEADLINE)
         .min(crate::MAX_DEADLINE)
 }
 
-/// A pseudo-random factor in `[0.5, 1.5)` with no extra dependency: every
-/// `RandomState` is constructed with fresh random keys, so hashing a constant
-/// through it yields a fresh `u64` per call.
+/// A pseudo-random factor in `[0.5, 1.5)`: hash a constant through a fresh
+/// `RandomState` to get a fresh `u64` per call, no extra dependency.
 fn jitter_factor() -> f64 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
@@ -585,8 +544,7 @@ fn jitter_factor() -> f64 {
     let mut hasher = RandomState::new().build_hasher();
     hasher.write_u64(0x9E37_79B9_7F4A_7C15);
     let bits = hasher.finish();
-    // Top 53 bits → uniform in [0, 1) at f64 precision.
-    let unit = (bits >> 11) as f64 / (1u64 << 53) as f64;
+    let unit = (bits >> 11) as f64 / (1u64 << 53) as f64; // top 53 bits → [0, 1)
     0.5 + unit
 }
 
@@ -598,9 +556,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A scripted sequence of per-call outcomes — covers the `Err` cases the
-    /// reply-matching `ScriptedRunner` can't produce. Running out of replies
-    /// panics, so a supervisor looping more than scripted fails loudly.
+    /// Per-call outcome sequence; panics if exhausted, so an unexpected restart fails loudly.
     struct SeqRunner {
         replies: Mutex<VecDeque<Result<ProcessResult<String>>>>,
     }
@@ -662,19 +618,14 @@ mod tests {
     }
 
     fn supervise(runner: SeqRunner) -> Supervisor<SeqRunner> {
-        // Zero backoff keeps these instant; timing cases use the paused clock.
         Supervisor::new(Command::new("fake"))
             .with_runner(runner)
             .backoff(Duration::ZERO, 1.0)
             .jitter(false)
     }
 
-    /// The capture default — an unbounded command is bounded to a tail
-    /// (preserving its overflow mode); an explicit bounded/fail-loud policy is
-    /// respected.
     #[test]
     fn supervision_capture_default_bounds_an_unbounded_command() {
-        // Default unbounded (DropOldest) → bounded tail, DropOldest preserved.
         let unbounded = Command::new("server");
         let policy = default_supervision_capture(&unbounded);
         assert_eq!(
@@ -684,8 +635,6 @@ mod tests {
         );
         assert_eq!(policy.overflow, crate::OverflowMode::DropOldest);
 
-        // Unbounded + Error → bounded fail-loud (overflow mode preserved, not
-        // silently dropped to DropOldest).
         let unbounded_fail_loud = Command::new("server").output_buffer(
             crate::OutputBufferPolicy::unbounded().with_overflow(crate::OverflowMode::Error),
         );
@@ -697,7 +646,6 @@ mod tests {
             "an unbounded+Error command must become a bounded fail-loud"
         );
 
-        // An explicit bounded fail_loud policy is respected as-is.
         let explicit =
             Command::new("server").output_buffer(crate::OutputBufferPolicy::fail_loud(50));
         let policy = default_supervision_capture(&explicit);
@@ -705,8 +653,6 @@ mod tests {
         assert_eq!(policy.overflow, crate::OverflowMode::Error);
     }
 
-    /// `run` actually applies the capture policy to the incarnation — by
-    /// default a bounded tail, overridable via `capture()`.
     #[tokio::test]
     async fn run_applies_the_capture_policy_to_each_incarnation() {
         use std::sync::Arc;
@@ -721,7 +667,6 @@ mod tests {
             }
         }
 
-        // Default: an unbounded command is bounded to the tail.
         let seen = Arc::new(Mutex::new(None));
         Supervisor::new(Command::new("server"))
             .restart(RestartPolicy::Never)
@@ -734,7 +679,6 @@ mod tests {
             Some(DEFAULT_SUPERVISION_TAIL)
         );
 
-        // `capture()` overrides — here back to unbounded.
         let seen = Arc::new(Mutex::new(None));
         Supervisor::new(Command::new("server"))
             .restart(RestartPolicy::Never)
@@ -759,8 +703,6 @@ mod tests {
 
     #[tokio::test]
     async fn zero_max_restarts_means_a_single_run() {
-        // Zero budget: one run, reported exhausted. A restart slipping through
-        // would consume the second (clean) reply — the assertions rule that out.
         let outcome = supervise(SeqRunner::new(vec![fail(1), ok()]))
             .max_restarts(0)
             .run()
@@ -783,7 +725,6 @@ mod tests {
 
     #[tokio::test]
     async fn predicate_beats_policy() {
-        // Always would restart a clean run; the predicate ends it first.
         let outcome = supervise(SeqRunner::new(vec![ok()]))
             .restart(RestartPolicy::Always)
             .stop_when(|res| res.code() == Some(0))
@@ -844,10 +785,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_accepted_nonzero_exit_is_not_a_crash() {
-        // A command with `ok_codes([0, 2])` exiting 2 is a success everywhere
-        // else, so OnCrash must NOT restart it. The real runner stamps `ok_codes`
-        // onto the result, modeled here. Only one reply: a spurious restart would
-        // deplete the SeqRunner and panic.
         let accepted = Ok(ProcessResult::new(
             "fake".into(),
             "out".into(),
@@ -867,8 +804,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_zero_exit_is_a_crash() {
-        // Inverse: `ok_codes([1])` makes 0 a failure, so OnCrash must restart
-        // rather than read raw code 0 as clean.
         let rejected_zero = Ok(ProcessResult::new(
             "fake".into(),
             String::new(),
@@ -945,8 +880,7 @@ mod tests {
             .await
             .expect("supervision");
         assert_eq!(outcome.restarts, 2);
-        // 200ms before the first restart + 400ms before the second.
-        assert_eq!(start.elapsed(), Duration::from_millis(600));
+        assert_eq!(start.elapsed(), Duration::from_millis(600)); // 200 + 400
     }
 
     #[tokio::test(start_paused = true)]
@@ -961,8 +895,7 @@ mod tests {
             .await
             .expect("supervision");
         assert_eq!(outcome.restarts, 2);
-        // 200ms, then 400ms clamped to 300ms.
-        assert_eq!(start.elapsed(), Duration::from_millis(500));
+        assert_eq!(start.elapsed(), Duration::from_millis(500)); // 200 + 400→300
     }
 
     #[tokio::test(start_paused = true)]
@@ -976,8 +909,7 @@ mod tests {
             .expect("supervision");
         assert_eq!(outcome.restarts, 1);
         let waited = start.elapsed();
-        // `<=` upper bound: ns-rounding can push a factor just under 1.5 to
-        // exactly 1.5× (a rare flake otherwise).
+        // ns-rounding can push a factor just under 1.5 to exactly 1.5×.
         assert!(
             waited >= Duration::from_millis(500) && waited <= Duration::from_millis(1500),
             "jittered delay out of [0.5, 1.5] band: {waited:?}"
@@ -986,8 +918,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn nonsense_backoff_factor_decays_to_constant_delay() {
-        // factor 0.0 must not shrink the delay or panic — it is treated as
-        // 1.0, so both restarts wait the base delay.
         let start = tokio::time::Instant::now();
         let outcome = Supervisor::new(Command::new("fake"))
             .with_runner(SeqRunner::new(vec![fail(1), fail(1), ok()]))
@@ -1011,23 +941,17 @@ mod tests {
     #[test]
     fn decayed_failure_score_math() {
         let hl = Duration::from_secs(30);
-        // First failure on a fresh window.
         assert_eq!(decayed_failure_score(0.0, Duration::ZERO, hl), 1.0);
-        // Back-to-back failures accumulate undecayed.
         assert_eq!(decayed_failure_score(1.0, Duration::ZERO, hl), 2.0);
-        // Exactly one half-life: the previous score halves, then +1.
-        assert_eq!(decayed_failure_score(2.0, hl, hl), 2.0);
+        assert_eq!(decayed_failure_score(2.0, hl, hl), 2.0); // one half-life: 2×0.5+1
         assert_eq!(decayed_failure_score(4.0, hl, hl), 3.0);
-        // Many half-lives: history all but vanishes.
         let aged = decayed_failure_score(8.0, Duration::from_secs(3000), hl);
-        assert!((aged - 1.0).abs() < 1e-9, "got {aged}");
-        // Zero half-life keeps no history.
+        assert!((aged - 1.0).abs() < 1e-9, "got {aged}"); // many half-lives → ≈1
         assert_eq!(
             decayed_failure_score(100.0, Duration::ZERO, Duration::ZERO),
-            1.0
+            1.0 // zero half-life keeps no history
         );
-        // A poisoned previous score resets instead of propagating.
-        assert_eq!(decayed_failure_score(f64::NAN, Duration::ZERO, hl), 1.0);
+        assert_eq!(decayed_failure_score(f64::NAN, Duration::ZERO, hl), 1.0); // poisoned → reset
     }
 
     #[tokio::test(start_paused = true)]
@@ -1049,8 +973,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn storm_trips_past_the_threshold() {
-        // Zero backoff → zero decay time between failures: scores run 1, 2, 3;
-        // the third crosses 2.5 and takes exactly one 1 s pause.
+        // Zero backoff → zero decay: scores 1, 2, 3; third crosses 2.5 → one pause.
         let start = tokio::time::Instant::now();
         let outcome = supervise(SeqRunner::new(vec![fail(1), fail(1), fail(1), ok()]))
             .storm_pause(Duration::from_secs(1))
@@ -1066,9 +989,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn spaced_failures_decay_below_the_threshold() {
-        // The 10 s backoff between failures is 10 half-lives of decay — each
-        // failure scores ≈1, never reaching 2.5: same failure count as the
-        // tripping test above, zero pauses.
         let outcome = Supervisor::new(Command::new("fake"))
             .with_runner(SeqRunner::new(vec![fail(1), fail(1), fail(1), ok()]))
             .backoff(Duration::from_secs(10), 1.0)
@@ -1085,9 +1005,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn storm_pause_resets_the_score() {
-        // Threshold 1.5, no meaningful decay: failures score 1, 2(pause),
-        // 1, 2(pause) — the reset after each pause is what keeps the second
-        // failure from tripping immediately.
+        // Threshold 1.5: scores 1, 2(pause), 1, 2(pause) — reset after each pause.
         let outcome = supervise(SeqRunner::new(vec![
             fail(1),
             fail(1),
@@ -1107,8 +1025,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn exhausted_budget_wins_over_the_storm_gate() {
-        // The budget check runs first: the second failure terminates before
-        // its storm bookkeeping, so no pause is taken or reported.
         let start = tokio::time::Instant::now();
         let outcome = supervise(SeqRunner::new(vec![fail(1), fail(1)]))
             .max_restarts(1)
@@ -1136,8 +1052,6 @@ mod tests {
             .expect("supervision");
         assert_eq!(outcome.storm_pauses, 1);
         let waited = start.elapsed();
-        // `<=` upper bound: ns-rounding can land exactly on 1.5× (see
-        // jitter_stays_within_its_band).
         assert!(
             waited >= Duration::from_millis(500) && waited <= Duration::from_millis(1500),
             "jittered storm pause out of [0.5, 1.5] band: {waited:?}"
@@ -1146,8 +1060,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn clean_restarts_under_always_do_not_feed_the_storm_score() {
-        // Three clean exits restarted by Always would trip threshold 1.5 if
-        // they counted as failures; they must not.
         let seen = AtomicU32::new(0);
         let outcome = supervise(SeqRunner::new(vec![ok(), ok(), ok()]))
             .restart(RestartPolicy::Always)
@@ -1184,22 +1096,17 @@ mod tests {
         assert_eq!(backoff_delay(base, 2.0, 0, cap), base);
         assert_eq!(backoff_delay(base, 2.0, 1, cap), Duration::from_millis(200));
         assert_eq!(backoff_delay(base, 2.0, 3, cap), Duration::from_millis(800));
-        // Saturation: an astronomic exponent clamps to the cap, no panic.
-        assert_eq!(backoff_delay(base, 2.0, 1_000, cap), cap);
+        assert_eq!(backoff_delay(base, 2.0, 1_000, cap), cap); // astronomic → cap
         assert_eq!(backoff_delay(Duration::ZERO, 2.0, 5, cap), Duration::ZERO);
     }
 
     #[test]
     fn apply_jitter_clamps_instead_of_overflowing() {
-        // Regression: the up-to-1.5x jitter factor on a near-`Duration::MAX`
-        // delay (reachable via `max_backoff(Duration::MAX)` / `storm_pause`) must
-        // NOT panic in `Duration::mul_f64` — it clamps to `MAX_DEADLINE`.
+        // near-Duration::MAX × up-to-1.5x must clamp, not panic in mul_f64.
         let jittered = apply_jitter(Duration::MAX, true);
         assert!(jittered <= crate::MAX_DEADLINE, "clamped, got {jittered:?}");
-        // Jitter disabled or zero delay passes through untouched (no clamp).
         assert_eq!(apply_jitter(Duration::MAX, false), Duration::MAX);
         assert_eq!(apply_jitter(Duration::ZERO, true), Duration::ZERO);
-        // A normal delay still gets a factor in [0.5, 1.5).
         let normal = apply_jitter(Duration::from_secs(10), true);
         assert!(normal >= Duration::from_secs(5) && normal < Duration::from_secs(15));
     }

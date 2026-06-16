@@ -95,9 +95,7 @@ pub struct CliClient<R: ProcessRunner = JobRunner> {
     cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
-// Manual Debug: the runner type parameter carries no `Debug` bound, and env
-// *values* are never rendered — only the sorted variable names, per the
-// crate-wide secret-safety rule.
+// Manual Debug: no `Debug` bound on R; env values omitted per secret-safety rule.
 impl<R: ProcessRunner> std::fmt::Debug for CliClient<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("CliClient");
@@ -229,7 +227,6 @@ impl<R: ProcessRunner> CliClient<R> {
         {
             command = command.timeout(timeout);
         }
-        // The command's own `cancel_on` wins; a client default only fills the gap.
         if command.cancel_token().is_none()
             && let Some(token) = &self.cancel
         {
@@ -252,7 +249,6 @@ impl<R: ProcessRunner> CliClient<R> {
     pub async fn run(&self, call: impl IntoCommand<R>) -> Result<String> {
         let command = call.into_command(self);
         let result = self.runner.checked(&command).await?;
-        // Refuse silently-truncated stdout (see `ProcessRunnerExt::run`).
         let policy = command.output_buffer_policy();
         result.reject_if_truncated(policy.max_lines, policy.max_bytes)?;
         Ok(result.into_stdout().trim_end().to_owned())
@@ -435,7 +431,6 @@ mod tests {
 
     #[test]
     fn debug_redacts_default_env_values_keeping_names() {
-        // Debug must surface default-env *names*, never values.
         let client = CliClient::new("git")
             .default_env("API_TOKEN", "topsecret-value")
             .default_env_remove("GIT_PAGER");
@@ -450,8 +445,6 @@ mod tests {
         );
     }
 
-    // A `vcs-git`-shaped wrapper, expressed on ProcessKit-rs with zero process
-    // plumbing — the proof that the convenience layer fits a real consumer.
     crate::cli_client!(struct Demo => "git");
 
     impl<R: ProcessRunner> Demo<R> {
@@ -521,8 +514,6 @@ mod tests {
 
     #[tokio::test]
     async fn verbs_accept_args_directly_or_a_customized_command() {
-        // A verb takes an argument list (no double `client.command(..)` mention)
-        // AND still accepts a customized Command via the same verb.
         use std::time::Duration;
         let runner = ScriptedRunner::new().on(["git", "status"], Reply::ok("clean"));
         let client = CliClient::with_runner("git", runner);
@@ -593,8 +584,6 @@ mod tests {
 
     #[tokio::test]
     async fn exit_code_errors_on_timeout() {
-        // A timed-out run has no exit code: it must raise Error::Timeout, not the
-        // synthetic -1 (else a consumer misreads a timeout as "exited non-zero").
         let client = CliClient::with_runner("gh", ScriptedRunner::new().fallback(Reply::timeout()));
         assert!(matches!(
             client
@@ -667,8 +656,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_prebuilt_command_passed_to_a_verb_still_gets_client_defaults() {
-        // A ready-made `Command` passed straight to a verb must still receive the
-        // client's default timeout / env / cancel token in the gaps it left.
         let token = crate::CancellationToken::new();
         let client = CliClient::new("git")
             .default_timeout(Duration::from_secs(9))
@@ -695,7 +682,6 @@ mod tests {
             "the client default env reaches it"
         );
 
-        // A command's OWN explicit settings win over the defaults (gap-fill only).
         let explicit = Command::new("git")
             .args(["push"])
             .timeout(Duration::from_secs(2))
@@ -721,10 +707,6 @@ mod tests {
 
     #[tokio::test]
     async fn prebuilt_command_env_wins_over_a_case_differing_client_default() {
-        // Env names are case-insensitive on Windows, so a client
-        // `default_env("Path", …)` must not override a per-command `env("PATH", …)`
-        // (which would invert "explicit wins"). On Unix they are distinct vars and
-        // both are kept.
         let client = CliClient::new("git").default_env("Path", "from-client");
         let cmd = Command::new("git").env("PATH", "from-command");
         let filled = cmd.into_command(&client);
@@ -775,8 +757,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn per_command_cancel_on_overrides_the_default() {
         use crate::CancellationToken;
-        // An explicit `cancel_on` REPLACES the client default: the default token
-        // firing must not resolve the call, the explicit one must.
         let default_token = CancellationToken::new();
         let explicit = CancellationToken::new();
         let client = CliClient::with_runner("gh", ScriptedRunner::new().fallback(Reply::pending()))
@@ -793,8 +773,6 @@ mod tests {
             "the replaced default token must not cancel the call"
         );
         explicit.cancel();
-        // Guarded await: a compound regression (no token at all) would park
-        // forever — fail cleanly instead of hanging the suite.
         let err = tokio::time::timeout(Duration::from_secs(3600), call)
             .await
             .expect("the explicit token must resolve the call")
@@ -805,8 +783,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn acceptance_pending_reply_with_client_default_cancel() {
         use crate::CancellationToken;
-        // A pending reply + `default_cancel_on`: the call parks until the token
-        // fires, then yields Cancelled naming the program, with the call recorded.
         let token = CancellationToken::new();
         let rec = RecordingRunner::new(
             ScriptedRunner::new().on(["gh", "run", "watch"], Reply::pending()),
@@ -822,7 +798,6 @@ mod tests {
             "must not resolve before the token fires"
         );
         token.cancel();
-        // Guarded await: see per_command_cancel_on_overrides_the_default.
         match tokio::time::timeout(Duration::from_secs(3600), call)
             .await
             .expect("the cancelled token must resolve the call")
@@ -841,9 +816,6 @@ mod tests {
 
     #[test]
     fn macro_generates_all_constructors() {
-        // Exercises every method the `cli_client!` macro emits (these are public
-        // API for real consumers; touch them here so our own build sees no
-        // dead code). Construction only — no subprocess is spawned.
         let _real = Demo::new();
         let _default = Demo::default();
         let _fake = Demo::with_runner(ScriptedRunner::new())

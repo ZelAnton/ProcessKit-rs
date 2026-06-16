@@ -121,7 +121,7 @@ pub struct ProcessGroup {
     options: ProcessGroupOptions,
 }
 
-// Manual: the platform `Job` is an opaque OS handle.
+// Manual: `Job` is an opaque OS handle.
 impl std::fmt::Debug for ProcessGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProcessGroup")
@@ -152,9 +152,6 @@ impl ProcessGroup {
         let job = {
             validate_limits(&options.limits)?;
             Job::new(&options.limits).map_err(|source| {
-                // A failure while limits were requested means we couldn't enforce
-                // them — surface that distinctly so the caller never assumes a cap
-                // is live.
                 if options.limits.any() {
                     Error::ResourceLimit {
                         message: source.to_string(),
@@ -410,8 +407,6 @@ impl ProcessGroup {
             )
             .await
             .map_err(Error::Io)?;
-        // `self` drops here; the job's Drop hard-kills any straggler (a no-op
-        // after a successful graceful shutdown) and frees the OS handle/cgroup.
         Ok(())
     }
 
@@ -422,7 +417,7 @@ impl ProcessGroup {
     /// reaps the child and the group's `Drop` backstops any straggler.
     pub(crate) async fn graceful_terminate(&self, grace: Duration, signal: i32) -> Result<()> {
         self.job
-            .graceful_shutdown(signal, grace, /* escalate */ true)
+            .graceful_shutdown(signal, grace, true)
             .await
             .map_err(Error::Io)?;
         Ok(())
@@ -437,30 +432,10 @@ impl ProcessGroup {
         Ok(stats)
     }
 
-    /// Sample [`stats`](Self::stats) on an interval, as a
-    /// [`Stream`](tokio_stream::Stream) of snapshots — a time-series of the
-    /// group's CPU/memory/process-count for benchmarking and diagnostics.
-    ///
-    /// The first sample is taken immediately; the series ends on the first
-    /// snapshot the group fails to report. The sampler borrows the group, so it
-    /// never keeps the group (or its kill-on-drop guarantee) alive. What each
-    /// snapshot can report per platform is exactly [`stats`](Self::stats)'s
-    /// matrix. A zero `every` is clamped to 1 ms.
-    ///
-    /// ```no_run
-    /// # async fn demo() -> processkit::Result<()> {
-    /// use processkit::{Command, ProcessGroup, StreamExt};
-    /// use std::time::Duration;
-    ///
-    /// let group = ProcessGroup::new()?;
-    /// let _worker = group.start(&Command::new("worker")).await?;
-    /// let mut samples = group.sample_stats(Duration::from_millis(250));
-    /// while let Some(s) = samples.next().await {
-    ///     println!("procs={} rss={:?}", s.active_process_count, s.peak_memory_bytes);
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Sample [`stats`](Self::stats) on an interval as a
+    /// [`Stream`](tokio_stream::Stream) of snapshots. The first sample is taken
+    /// immediately; the series ends on the first failure. A zero `every` is
+    /// clamped to 1 ms.
     #[cfg(feature = "stats")]
     pub fn sample_stats(&self, every: Duration) -> crate::stats::StatsSampler<'_> {
         crate::stats::StatsSampler::new(self, every)
@@ -552,7 +527,6 @@ mod tests {
                 validate_limits(&opts.limits),
                 Err(Error::ResourceLimit { .. })
             ));
-            // The public entry point rejects them too, before any OS work.
             assert!(matches!(
                 ProcessGroup::with_options(opts),
                 Err(Error::ResourceLimit { .. })

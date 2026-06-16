@@ -280,84 +280,32 @@ enum Mode<R> {
 /// A [`ProcessRunner`] that records real runs to a JSON cassette, or replays a
 /// cassette hermetically (`record` feature).
 ///
-/// **Record** mode wraps a real inner runner (a [`JobRunner`] in production;
-/// any runner in tests), captures each call's invocation and result, and
-/// writes the cassette on [`save`](Self::save) (or best-effort on drop). Only
-/// *completed* runs are captured — a call that returns `Err` (spawn failure,
-/// timeout error from a checking helper, …) records nothing; non-zero exits
-/// and captured timeouts are results and **are** recorded. The inner runner is
-/// invoked before the entry is appended, so for same-key calls the recorded
-/// order matches *execution* order only under **sequential** recording;
-/// recording is a one-shot capture step and is not designed for concurrent
-/// same-key invocation of a stateful inner runner.
+/// **Record** mode wraps a real inner runner, captures each completed call's
+/// invocation and result, and writes the cassette on [`save`](Self::save) (or
+/// best-effort on drop). Errors (spawn failure, …) record nothing; non-zero
+/// exits and captured timeouts are results and are recorded.
 ///
-/// **Replay** mode loads the cassette and serves results without spawning
-/// anything:
+/// **Replay** mode loads the cassette and serves results without spawning:
 ///
-/// - **Matching** is by program + args + cwd + a stdin **source digest**
-///   (hashed, never persisted: in-memory bytes hash their content, a `from_file`
-///   source hashes its path). Env overrides are *not* matched, and their **values** are
-///   never written — only the sorted variable *names*. Everything else (argv,
-///   cwd, stdout, stderr) is stored
-///   **verbatim**, so a cassette can still carry secrets in those fields:
-///   review fixtures before committing. The file is written owner-only
-///   (`0600`) on Unix.
-/// - **Duplicates** of one key replay in capture order, then the last entry
-///   repeats forever — a recorded sequence (`git rev-parse HEAD` twice with
-///   different heads) replays faithfully, while a retry loop that outlives the
-///   sequence keeps getting the final answer.
-/// - **A miss is a strict error** ([`Error::CassetteMiss`], distinct from a
-///   missing-program error so `is_not_found()` is `false`): replay never spawns
-///   a surprise subprocess, and a stale or incomplete cassette fails loudly
-///   rather than being mistaken for an absent optional tool.
-/// - The replayed [`ProcessResult`] carries the *replaying* command's
-///   [`timeout`](Command::timeout) configuration, exactly like the live
-///   runner — so a recorded timed-out run surfaces as
+/// - **Matching**: program + args + cwd + stdin source digest. Env override
+///   *values* are never written — only sorted variable names. Everything else
+///   (argv, cwd, stdout, stderr) is stored verbatim, so review fixtures
+///   before committing. File is written owner-only (`0600`) on Unix.
+/// - **Duplicates** replay in capture order, then the last entry repeats.
+/// - **A miss is [`Error::CassetteMiss`]** (not `is_not_found()`): never a
+///   surprise subprocess.
+/// - The replayed result carries the *replaying* command's
+///   [`timeout`](Command::timeout), so a recorded timed-out run surfaces as
 ///   [`Error::Timeout`](crate::Error::Timeout) with the real deadline.
-/// - Covers the **`output_string`** shape only. The streaming half of the seam
-///   ([`start`](crate::ProcessRunner::start)) inherits the default and returns
-///   [`Error::Unsupported`](crate::Error::Unsupported) — recording line timing
-///   and stream shape is future work; use
-///   [`ScriptedRunner`](crate::testing::ScriptedRunner) for hermetic streaming tests.
+/// - Covers **`output_string`** only; `start` returns
+///   [`Error::Unsupported`](crate::Error::Unsupported).
 ///
-/// Cassettes are pretty-printed JSON with a `version` field; loading an
-/// unknown version (or a corrupt file) is an [`Error::Io`] with
-/// `InvalidData`. Non-UTF-8 programs/args/paths are stored *lossily* (the
-/// fixture is text); both record and replay apply the same conversion, so
-/// matching still works — the rare non-UTF-8 byte just round-trips as `�`.
+/// Non-UTF-8 programs/args/paths are stored lossily; both sides apply the same
+/// conversion, so matching still works. Two distinct non-UTF-8 invocations that
+/// differ only in invalid bytes share the same key and collide on replay.
 ///
-/// **Lossy-key limitation (exotic input):** because the match key is the
-/// lossy-decoded program/args/cwd, two *distinct* non-UTF-8 invocations that
-/// differ only in their invalid bytes decode to the same key and are
-/// indistinguishable on replay (the first recorded one answers for both). This
-/// affects only commands whose program/args/cwd contain invalid UTF-8; keying
-/// on raw bytes is intentionally avoided to keep the fixture human-diffable
-/// text, and valid-UTF-8 invocations never collide.
-///
-/// **Persistence:** [`save`](Self::save) is the explicit write; record mode also
-/// flushes best-effort on drop (so a forgotten `save()` still leaves a complete
-/// cassette) — **except while unwinding**, so a panic mid-recording never
-/// persists a surprise file (it may carry secrets in argv/stdout).
-///
-/// ```no_run
-/// use processkit::{Command, JobRunner, ProcessRunnerExt};
-/// use processkit::testing::RecordReplayRunner;
-///
-/// # async fn demo() -> processkit::Result<()> {
-/// // Record once against the real tool (e.g. an opt-in `--record` test run):
-/// let runner = RecordReplayRunner::record("fixtures/git.json", JobRunner::new());
-/// let version = runner.run(&Command::new("git").arg("--version")).await?;
-/// runner.save()?;
-///
-/// // Replay everywhere else — no subprocess, identical results:
-/// let runner = RecordReplayRunner::replay("fixtures/git.json")?;
-/// assert_eq!(
-///     runner.run(&Command::new("git").arg("--version")).await?,
-///     version,
-/// );
-/// # Ok(())
-/// # }
-/// ```
+/// [`save`](Self::save) is the explicit write; drop flushes best-effort except
+/// while unwinding (a panic never silently persists a cassette).
 pub struct RecordReplayRunner<R: ProcessRunner = JobRunner> {
     mode: Mode<R>,
 }
@@ -443,10 +391,6 @@ impl RecordReplayRunner<JobRunner> {
     /// corrupt file or an unknown format `version` is `InvalidData`.
     pub fn replay(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        // Bound the read so a stray/huge file can't be buffered into memory twice
-        // (text + parsed). Cassettes are committed test fixtures, so the limit is
-        // generous; anything past it is far more likely a mistake (a wrong path,
-        // a log file) than a real cassette.
         const MAX_CASSETTE_BYTES: u64 = 64 << 20; // 64 MiB
         if let Ok(meta) = std::fs::metadata(path)
             && meta.len() > MAX_CASSETTE_BYTES
@@ -460,8 +404,6 @@ impl RecordReplayRunner<JobRunner> {
             )));
         }
         let text = std::fs::read_to_string(path).map_err(Error::Io)?;
-        // serde_json's From<serde_json::Error> for io::Error keeps the right
-        // kind (syntax/data errors become InvalidData).
         let cassette: Cassette =
             serde_json::from_str(&text).map_err(|e| Error::Io(std::io::Error::from(e)))?;
         if cassette.version != CASSETTE_VERSION {
@@ -496,9 +438,6 @@ impl RecordReplayRunner<JobRunner> {
 #[async_trait::async_trait]
 impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
     async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
-        // A one-shot streaming stdin cannot be faithfully keyed (its bytes aren't
-        // captured), so refuse it in both modes before doing any work — in record
-        // mode this also avoids consuming the source on the inner run.
         reject_unrecordable_stdin(command)?;
         match &self.mode {
             Mode::Record {
@@ -512,36 +451,23 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 let stdin_digest = stdin_digest_of(command);
                 let mut entries = recorded.lock().expect("cassette mutex poisoned");
                 entries.push(Entry::from_parts(&invocation, &result, stdin_digest));
-                // Under the same lock `save` holds while clearing the flag, so
-                // this entry is either in the file or marked unwritten.
                 dirty.store(true, Ordering::SeqCst);
                 Ok(result)
             }
             Mode::Replay { slots } => {
                 let invocation = Invocation::from_command(command);
                 let stdin_digest = stdin_digest_of(command);
-                // Take an owned copy of the matched entry and release the lock
-                // BEFORE invoking user line handlers: a handler that re-enters
-                // this replayer (`replayer.output_string(...)`) would otherwise
-                // self-deadlock on the non-reentrant mutex. Record mode and
-                // `ScriptedRunner::output_string` hold no lock across handlers either.
+                // Release the lock before invoking line handlers — a handler that
+                // re-enters this replayer would otherwise deadlock.
                 let entry = {
                     let mut slots = slots.lock().expect("cassette mutex poisoned");
                     let Some(slot) = slots.get_mut(&key_of(&invocation, stdin_digest)) else {
-                        // A stale/incomplete cassette is a distinct error, not a
-                        // missing-program `Spawn`/`NotFound` — so `is_not_found()`
-                        // is false and a wrapper can't mistake it for an absent
-                        // tool.
                         return Err(Error::CassetteMiss {
                             program: command.program_name(),
                         });
                     };
                     slot.play().clone()
                 };
-                // Feed the replayed output through the command's
-                // `on_stdout_line`/`on_stderr_line` handlers, so a wrapper's
-                // progress path is exercised on replay exactly as it is in
-                // record mode (real pumps) and on `ScriptedRunner::output_string`.
                 crate::doubles::replay_line_handlers(command, &entry.stdout, &entry.stderr);
                 let outcome = match (entry.code, entry.timed_out) {
                     (_, true) => Outcome::TimedOut,
@@ -549,8 +475,6 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                     (None, false) => Outcome::Signalled(entry.signal),
                 };
                 Ok(ProcessResult::new(
-                    // Same value the live runner reports — the lossy program
-                    // name — so a round trip is comparison-identical.
                     entry.program,
                     entry.stdout,
                     entry.stderr,
@@ -563,8 +487,7 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
     }
 }
 
-// Manual: no `R: Debug` bound (mirrors `RecordingRunner`), and the recorded
-// entries/slots are summarized as counts rather than dumped.
+// Manual: no `R: Debug` bound; entries/slots are summarized as counts.
 impl<R: ProcessRunner> std::fmt::Debug for RecordReplayRunner<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.mode {
@@ -595,16 +518,8 @@ impl<R: ProcessRunner> std::fmt::Debug for RecordReplayRunner<R> {
 
 impl<R: ProcessRunner> Drop for RecordReplayRunner<R> {
     fn drop(&mut self) {
-        // Best-effort flush of anything recorded since the last save, so a
-        // record run that forgot `save()` (or recorded more after one) still
-        // leaves a complete cassette behind; errors are deliberately swallowed
-        // (a Drop can't surface them) — call `save()` to observe failures.
-        //
-        // Skip the flush while *unwinding* (`thread::panicking()`). A test that
-        // panics mid-recording should not silently persist a surprise cassette —
-        // which stores argv/cwd/stdout/stderr verbatim and may carry secrets — as
-        // a side effect of the panic. Normal scope-exit still flushes; call
-        // `save()` for explicit control on the panic path.
+        // Best-effort flush; skip while unwinding so a panic never silently
+        // persists a cassette that may carry secrets in argv/stdout.
         if let Mode::Record { dirty, .. } = &self.mode
             && dirty.load(Ordering::SeqCst)
             && !std::thread::panicking()
@@ -638,9 +553,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_cassette_refuses_to_follow_a_symlink() {
-        // A planted symlink at the cassette path must not redirect the
-        // secret-bearing write (and its 0600) onto the link's target — O_NOFOLLOW
-        // makes the write fail loud, and the target is left untouched.
         let dir = tempfile::tempdir().expect("temp dir");
         let target = dir.path().join("victim.txt");
         std::fs::write(&target, "original").expect("seed victim");
@@ -695,10 +607,6 @@ mod tests {
     async fn duplicate_key_plays_in_order_then_repeats_last() {
         let (_dir, path) = temp_cassette();
 
-        // The same invocation captured twice with different outputs (think
-        // `git rev-parse HEAD` before and after a commit). ScriptedRunner
-        // replies are stateless, so the sequence is hand-crafted exactly as a
-        // real recording of a changing command lays it out.
         let json = serde_json::json!({
             "version": 1,
             "entries": [
@@ -726,8 +634,6 @@ mod tests {
 
     #[tokio::test]
     async fn replay_rejects_an_entry_with_contradictory_outcome() {
-        // An entry that sets both an exit `code` and a `signal` is contradictory;
-        // reject it rather than silently picking `Exited`.
         let (_dir, path) = temp_cassette();
         let json = serde_json::json!({
             "version": 1,
@@ -772,9 +678,6 @@ mod tests {
 
     #[tokio::test]
     async fn replay_invokes_line_handlers() {
-        // Replay feeds the recorded output through `on_stdout_line`, just like
-        // record mode (real pumps) and `ScriptedRunner::output_string` — a
-        // wrapper's progress path tests the same hermetically on replay.
         let (_dir, path) = temp_cassette();
         let recorder = RecordReplayRunner::record(&path, scripted());
         let _ = recorder
@@ -799,9 +702,6 @@ mod tests {
 
     #[tokio::test]
     async fn stdin_content_is_part_of_the_match_key() {
-        // Two invocations identical except for their stdin must record and replay
-        // as *distinct* keys, not collide on `has_stdin` alone. The inner
-        // sequence yields out-A then out-B in record order.
         let (_dir, path) = temp_cassette();
         let inner = ScriptedRunner::new()
             .on_sequence(["tool"], [Reply::ok("out-A\n"), Reply::ok("out-B\n")]);
@@ -841,10 +741,6 @@ mod tests {
 
     #[tokio::test]
     async fn one_shot_streaming_stdin_is_rejected_in_both_modes() {
-        // A one-shot streaming source can't be keyed (its bytes aren't captured),
-        // so record/replay must fail loud rather than collide on the constant
-        // `<stream>` discriminant. Record mode also must not consume the inner run
-        // before rejecting.
         let (_dir, path) = temp_cassette();
         let inner = ScriptedRunner::new().fallback(Reply::ok("out\n"));
         let recorder = RecordReplayRunner::record(&path, inner);
@@ -871,10 +767,6 @@ mod tests {
 
     #[tokio::test]
     async fn no_stdin_replay_does_not_match_a_stdin_recorded_entry() {
-        // The key distinguishes a stdin-bearing invocation from a no-stdin one
-        // (via the digest, and via `has_stdin` for older entries that load
-        // `stdin_digest: None`) — a no-stdin replay misses, never serving the
-        // stdin entry's output.
         let (_dir, path) = temp_cassette();
         let recorder =
             RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("out\n")));
@@ -943,7 +835,6 @@ mod tests {
             "values must never be written: {json}"
         );
 
-        // And env differences don't affect matching: replay without any env.
         let replayer = RecordReplayRunner::replay(&path).expect("load");
         let out = replayer
             .run(&Command::new("tool"))
@@ -954,8 +845,6 @@ mod tests {
 
     #[tokio::test]
     async fn signal_number_survives_round_trip() {
-        // Write a cassette JSON that encodes a signal-killed run (signal 9).
-        // Then replay it and verify the outcome carries the signal number.
         let (_dir, path) = temp_cassette();
         let json = r#"{"version":1,"entries":[{"program":"tool","args":[],"stdout":"","stderr":"","code":null,"signal":9}]}"#;
         std::fs::write(&path, json).expect("write cassette");
@@ -970,8 +859,6 @@ mod tests {
 
     #[tokio::test]
     async fn cassette_without_signal_field_loads_as_signalled_none() {
-        // Old cassettes have no `signal` field; they should replay as
-        // Signalled(None) for a code:null entry, not fail to load.
         let (_dir, path) = temp_cassette();
         let json = r#"{"version":1,"entries":[{"program":"tool","args":[],"stdout":"","stderr":"","code":null}]}"#;
         std::fs::write(&path, json).expect("write cassette");
@@ -986,21 +873,18 @@ mod tests {
 
     #[tokio::test]
     async fn load_errors_are_typed_io() {
-        // Missing file keeps NotFound.
         let (_dir, path) = temp_cassette();
         match RecordReplayRunner::replay(&path) {
             Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
             other => panic!("expected Io(NotFound), got {other:?}"),
         }
 
-        // Corrupt JSON is InvalidData.
         std::fs::write(&path, "{ not json").unwrap();
         match RecordReplayRunner::replay(&path) {
             Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
             other => panic!("expected Io(InvalidData), got {other:?}"),
         }
 
-        // An unknown format version is InvalidData too.
         std::fs::write(&path, r#"{ "version": 99, "entries": [] }"#).unwrap();
         match RecordReplayRunner::replay(&path) {
             Err(Error::Io(e)) => {
@@ -1020,7 +904,6 @@ mod tests {
                 .output_string(&Command::new("tool").arg("--version"))
                 .await
                 .expect("record");
-            // No save() — the Drop flush must persist the cassette.
         }
         let replayer = RecordReplayRunner::replay(&path).expect("dropped recorder left a cassette");
         let out = replayer
@@ -1042,7 +925,6 @@ mod tests {
         recorder.save().expect("save");
 
         let replayer = RecordReplayRunner::replay(&path).expect("load");
-        // Same program+args but a different (or no) cwd must not match.
         let err = replayer
             .output_string(&Command::new("tool").current_dir("dir-b"))
             .await
@@ -1053,7 +935,6 @@ mod tests {
             .await
             .expect_err("a missing cwd is a different invocation too");
         assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
-        // The recorded cwd still replays.
         let out = replayer
             .run(&Command::new("tool").current_dir("dir-a"))
             .await
@@ -1064,8 +945,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cassette_file_is_written_owner_only() {
-        // A cassette stores argv/cwd/stdout/stderr verbatim, so it must not
-        // inherit a world-readable umask — it is created 0600 on Unix.
         use std::os::unix::fs::PermissionsExt;
         let (_dir, path) = temp_cassette();
         let recorder = RecordReplayRunner::record(&path, scripted());
@@ -1089,8 +968,6 @@ mod tests {
 
     #[tokio::test]
     async fn drop_while_unwinding_does_not_persist_a_surprise_cassette() {
-        // A panic mid-recording must not flush a cassette as a side effect (it
-        // may carry secrets in argv/stdout). The Drop guard skips on unwind.
         let (_dir, path) = temp_cassette();
         let recorder = RecordReplayRunner::record(&path, scripted());
         let _ = recorder
@@ -1098,8 +975,6 @@ mod tests {
             .await
             .expect("record (now dirty, unsaved)");
 
-        // Move the dirty recorder into a panicking scope; its Drop runs during
-        // unwind and must NOT write the file.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _hold = recorder;
             panic!("boom mid-recording");
@@ -1121,7 +996,6 @@ mod tests {
                 .await
                 .expect("record first");
             recorder.save().expect("first save");
-            // A run recorded *after* the save must not be lost on drop.
             let _ = recorder
                 .output_string(&Command::new("tool").arg("fail"))
                 .await
@@ -1157,7 +1031,6 @@ mod tests {
         let _ = recorder.output_string(&cmd).await.expect("record lossily");
         recorder.save().expect("save");
 
-        // Both sides apply the same lossy conversion, so the entry matches.
         let replayer = RecordReplayRunner::replay(&path).expect("load");
         let out = replayer.run(&cmd).await.expect("replay matches lossily");
         assert_eq!(out, "ok");

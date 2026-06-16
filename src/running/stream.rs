@@ -55,60 +55,15 @@ pub struct Finished {
 impl RunningProcess {
     /// Stream the child's standard output line by line. Call this **once**.
     ///
-    /// Standard error is drained in the background (so the child can't block on a
-    /// full stderr pipe) and discarded — use [`output_string`](Self::output_string)
-    /// when you need both. Keep this `RunningProcess` in scope while consuming;
-    /// dropping it tears the process down.
+    /// Standard error is drained in the background and discarded — use
+    /// [`output_string`](Self::output_string) when you need both. The command's
+    /// [`timeout`](crate::Command::timeout) bounds the stream: at the deadline the
+    /// process tree is killed, pipes close, and a following
+    /// [`finish`](Self::finish) reports [`Outcome::TimedOut`](crate::Outcome::TimedOut)
+    /// even if the child caught the signal and exited cleanly within the grace.
     ///
-    /// The command's [`timeout`](crate::Command::timeout), if set, **bounds the
-    /// stream**: at the deadline the real child's process tree is killed
-    /// (gracefully if a [`timeout_grace`](crate::Command::timeout_grace) is set),
-    /// so the pipes close and this stream ends — a streamed run can't hang past
-    /// its timeout. A following [`finish`](Self::finish) then
-    /// reports [`Outcome::TimedOut`](crate::Outcome::TimedOut) — deterministically,
-    /// and even if the child caught the signal and exited cleanly within the grace
-    /// — consistent with the bulk `output_string` path. With no timeout the stream
-    /// is unbounded as before.
-    /// (For a real child, bounding applies to a run that owns its group — the
-    /// [`Command::start`](crate::Command::start) / [`JobRunner`](crate::JobRunner)
-    /// path. A handle from [`ProcessGroup::start`](crate::ProcessGroup::start)
-    /// shares its group, so the caller bounds the stream. A
-    /// [`ScriptedRunner`](crate::testing::ScriptedRunner) handle is bounded too — its
-    /// canned feeders are hung up at the deadline — but, having no signal tier
-    /// (like Windows), it ignores `timeout_grace` and ends at once.)
-    ///
-    /// **Fallible, stream once.** Returns `Err` (an
-    /// [`Error::Io`](crate::Error::Io) with
-    /// [`InvalidInput`](std::io::ErrorKind::InvalidInput)) instead of a
-    /// silently-empty stream when **(a)** `stdout` was set to
-    /// [`Inherit`](crate::StdioMode::Inherit) / [`Null`](crate::StdioMode::Null)
-    /// (not the default [`Piped`](crate::StdioMode::Piped) — nothing to read), or
-    /// **(b)** a streaming verb (`stdout_lines` / `output_events`) was already
-    /// called on this handle (stdout is consumed exactly once). This mirrors the
-    /// bulk verbs' loudness — a non-piped or repeated call is a clear error, not
-    /// a stream that quietly yields nothing.
-    ///
-    /// # Example
-    ///
-    /// Stream stdout line by line as it is produced, then collect the outcome
-    /// and stderr:
-    ///
-    /// ```no_run
-    /// use processkit::{Command, StreamExt, Finished};
-    ///
-    /// # async fn demo() -> processkit::Result<()> {
-    /// let mut run = Command::new("git").args(["log", "--oneline", "-n", "20"]).start().await?;
-    ///
-    /// let mut lines = run.stdout_lines()?;
-    /// while let Some(line) = lines.next().await {
-    ///     println!("commit: {line}");
-    /// }
-    ///
-    /// let Finished { outcome, stderr, .. } = run.finish().await?;
-    /// # let _ = (outcome, stderr);
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Returns `Err` instead of a silently-empty stream when stdout was not piped
+    /// or a streaming verb was already called on this handle.
     pub fn stdout_lines(&mut self) -> Result<StdoutLines> {
         // Drain stdout AND arm the timeout watchdog. `wait_for_line` instead calls
         // `drain_stdout_lines` directly, so a readiness probe never kills the tree.
@@ -117,12 +72,10 @@ impl RunningProcess {
         Ok(lines)
     }
 
-    /// Set up the stdout line drain (and the background stderr drain) and return
-    /// the stream, **without** arming the [`Command::timeout`](crate::Command::timeout)
-    /// watchdog. Shared by [`stdout_lines`](Self::stdout_lines) (which arms the
-    /// watchdog on top) and `wait_for_line` (which does not, so a failed
-    /// readiness probe leaves the child running and lets the consuming verb
-    /// enforce the timeout).
+    /// Set up the stdout and background stderr drains without arming the timeout
+    /// watchdog. Shared by [`stdout_lines`](Self::stdout_lines) (which arms it)
+    /// and `wait_for_line` (which must not, so a failed probe leaves the child
+    /// running).
     pub(super) fn drain_stdout_lines(&mut self) -> Result<StdoutLines> {
         self.ensure_stdout_streamable()?;
         // Background-drain stderr; keep the handle so `finish` can await the last
@@ -145,8 +98,6 @@ impl RunningProcess {
         let stdout_sink = SharedLines::new(&self.buffer);
         match self.backend.take_stdout_reader() {
             Some(pipe) => {
-                // Store the handle so `finish` joins it before the overflow check
-                // and `Drop` aborts it on a shared-group handle.
                 self.stdout_pump = Some(tokio::spawn(pump_lines_core(
                     pipe,
                     self.stdout_encoding,
@@ -155,13 +106,12 @@ impl RunningProcess {
                     stdout_sink.clone(),
                 )));
             }
-            // `ensure_stdout_streamable` already rejected non-piped/consumed stdout,
-            // so this is effectively unreachable; close the sink to end the stream
-            // at once rather than hang if an internal caller reaches it.
+            // `ensure_stdout_streamable` already rejected non-piped/consumed stdout;
+            // close the sink rather than hang if an internal caller reaches here.
             None => stdout_sink.close_now(),
         }
-        // Store only on the first call — a repeat call's sink is fresh/closed/empty,
-        // and overwriting would discard the first pump's overflow flag and count.
+        // Store only on the first call — overwriting would discard the first pump's
+        // overflow flag and count.
         if self.stdout_sink.is_none() {
             self.stdout_sink = Some(stdout_sink.clone());
         }
@@ -172,20 +122,14 @@ impl RunningProcess {
         })
     }
 
-    /// Arm the watchdog that bounds a live stdout/event stream by
-    /// [`Command::timeout`](crate::Command::timeout): at the deadline, claim the
-    /// timeout via the shared arbiter and tear the tree down so the pipes close
-    /// and the stream ends. Armed once — a second streaming call won't duplicate
-    /// it. Shared by [`stdout_lines`](Self::stdout_lines) and
-    /// [`output_events`](Self::output_events); deliberately not called by
-    /// `wait_for_line`, so a readiness probe never kills the child.
+    /// Arm the deadline watchdog for a live stream. At the timeout, claim it via
+    /// the shared arbiter and tear the tree down so pipes close and the stream
+    /// ends. Armed once; not called by `wait_for_line` so a readiness probe never
+    /// kills the child.
     fn arm_stream_deadline(&mut self) {
-        // A `Weak` to the group means a hard-kill timer never delays kill-on-close
-        // when the handle is dropped early: the non-graceful branch only upgrades
-        // momentarily. The graceful branch holds the upgraded `Arc` across its
-        // `graceful_terminate().await`, so a handle dropped mid-grace defers its
-        // group-Drop until teardown finishes — benign, as that task is already
-        // tearing the tree down.
+        // `Weak` so a hard-kill timer never delays kill-on-close when the handle
+        // drops early. The graceful branch upgrades across `graceful_terminate`,
+        // deferring group-Drop until teardown finishes — benign.
         if self.deadline_task.is_none()
             && let (Some(limit), Some(group)) = (self.timeout, self.backend.own_group())
         {
@@ -215,27 +159,23 @@ impl RunningProcess {
                     )
                     .is_err()
                 {
-                    return; // the child already exited on its own — no kill
+                    return; // child already exited — no kill
                 }
                 match grace {
-                    // Signal the group, wait the grace, then kill. This detached
-                    // watchdog doesn't hold the `Child`, so it can't reap: a child
-                    // that exits on the signal closes its pipes (ending the stream),
-                    // but this task still waits the full grace before a no-op SIGKILL.
+                    // This watchdog can't reap the child, so a child that exits on
+                    // the signal still causes the task to wait the full grace before
+                    // a no-op SIGKILL.
                     Some(grace) => match group.upgrade() {
                         Some(group) => {
                             let _ = group.graceful_terminate(grace, signal).await;
                         }
-                        // Group already gone (handle dropped) → tree torn down.
-                        None => kill_direct_child(pid),
+                        None => kill_direct_child(pid), // group already gone
                     },
                     None => kill_via_weak(&group, pid),
                 }
             }));
         }
 
-        // Scripted analogue: no group to kill, so bound the stream by hanging up the
-        // feeders at the deadline (their EOF ends the pump and stream).
         self.arm_scripted_deadline();
     }
 
@@ -251,9 +191,6 @@ impl RunningProcess {
     /// but safe to call on its own — any pipe the stream didn't take is drained
     /// here so the child can never block on a full pipe.
     pub async fn finish(mut self) -> Result<Finished> {
-        // Drain an untaken stdout pipe through the policy-aware line pump (applies
-        // buffer policy, counts lines, calls handlers) rather than an unbounded
-        // read_to_end. Stored in stdout_pump so join_pumps joins it and Drop aborts.
         if let Some(pipe) = self.backend.take_stdout_reader() {
             let sink = crate::pump::SharedLines::new(&self.buffer);
             self.stdout_pump = Some(tokio::spawn(crate::pump::pump_lines_core(
@@ -265,8 +202,6 @@ impl RunningProcess {
             )));
             self.stdout_sink = Some(sink);
         }
-        // Likewise start a stderr pump if streaming never did (so its output is
-        // still captured and the pipe never fills).
         if self.stderr_pump.is_none()
             && let Some(pipe) = self.backend.take_stderr_reader()
         {
@@ -283,16 +218,12 @@ impl RunningProcess {
 
         let raw_outcome = self.drive_to_exit().await?;
         self.observe_stdin_task().await;
-        // Join both pumps before the overflow check so their final writes are
-        // visible. `join_pumps` bounds the wait and aborts stragglers, so a
-        // surviving grandchild holding a pipe open can't park this finisher forever.
         let pumps: Vec<_> = [self.stdout_pump.take(), self.stderr_pump.take()]
             .into_iter()
             .flatten()
             .collect();
         super::join_pumps(pumps).await;
         let outcome = self.checked_outcome(raw_outcome)?;
-        // Fail-loud ceiling check for both streams.
         for sink in [self.stdout_sink.as_ref(), self.stderr_sink.as_ref()]
             .into_iter()
             .flatten()
@@ -316,49 +247,15 @@ impl RunningProcess {
     }
 
     /// Stream both stdout and stderr as a single ordered sequence of
-    /// [`OutputEvent`] items — each event tagged with its origin stream —
-    /// as the child produces them. Call this **once**.
+    /// [`OutputEvent`] items. Call this **once**.
     ///
-    /// **Fallible, stream once.** Like [`stdout_lines`](Self::stdout_lines),
-    /// returns `Err` (an [`Error::Io`](crate::Error::Io)) rather than a
-    /// silently-empty stream when stdout was not piped, or when a streaming verb
-    /// already consumed stdout on this handle.
-    ///
-    /// Interleaving is best-effort (lines are ordered by when they arrive in
-    /// the async runtime, not by a kernel timestamp). The two streams are
-    /// polled **fairly** — the first-look alternates each poll, so a
-    /// continuously-ready stream can't starve the other (neither monopolizes
-    /// while the peer loses lines or trips its
-    /// [`fail_loud`](crate::OutputBufferPolicy::fail_loud) ceiling). Use
-    /// [`finish`](Self::finish) after draining to collect the run's
-    /// [`Outcome`](crate::Outcome) (its `stderr` is empty — stderr was delivered
-    /// to you as events).
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use processkit::{Command, OutputEvent, StreamExt};
-    ///
-    /// # async fn demo() -> processkit::Result<()> {
-    /// let mut run = Command::new("make").arg("build").start().await?;
-    ///
-    /// let mut events = run.output_events()?;
-    /// while let Some(event) = events.next().await {
-    ///     match event {
-    ///         OutputEvent::Stdout(line) => println!("out: {}", line.text()),
-    ///         OutputEvent::Stderr(line) => eprintln!("err: {}", line.text()),
-    ///         _ => {} // `OutputEvent` is non-exhaustive
-    ///     }
-    /// }
-    ///
-    /// let outcome = run.finish().await?.outcome;
-    /// # let _ = outcome;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Interleaving is best-effort; the two streams are polled **fairly** so a
+    /// continuously-ready stream can't starve the other. Returns `Err` instead of
+    /// a silently-empty stream when stdout was not piped or was already consumed.
+    /// Call [`finish`](Self::finish) after draining — its `stderr` will be empty
+    /// since stderr was delivered as events.
     pub fn output_events(&mut self) -> Result<OutputEvents> {
         self.ensure_stdout_streamable()?;
-        // Store the handle so `finish` joins it before checking overflow.
         let stdout_sink = SharedLines::new(&self.buffer);
         match self.backend.take_stdout_reader() {
             Some(pipe) => {
@@ -372,15 +269,14 @@ impl RunningProcess {
             }
             None => stdout_sink.close_now(),
         }
-        // Store only on the first call — overwriting with a repeat call's
-        // fresh/closed sink would discard the first pump's overflow flag and count.
+        // Store only on the first call — overwriting would discard the first pump's
+        // overflow flag and count.
         if self.stdout_sink.is_none() {
             self.stdout_sink = Some(stdout_sink.clone());
         }
 
         // Set up stderr on the first call only. A repeat call gets its own closed
-        // stderr so the two consumers don't share a SharedLines — a shared sink's
-        // notify_one on close wakes only one waiter, parking the other forever.
+        // sink — a shared sink's notify_one on close wakes only one waiter.
         let stderr_sink = if self.stderr_sink.is_none() {
             let sink = SharedLines::new(&self.buffer);
             if let Some(pipe) = self.backend.take_stderr_reader() {
@@ -397,8 +293,6 @@ impl RunningProcess {
             self.stderr_sink = Some(sink.clone());
             sink
         } else {
-            // Repeat call: a fresh closed sink so this stderr stream ends at once
-            // without racing the first sink.
             let closed = SharedLines::new(&self.buffer);
             closed.close_now();
             closed
@@ -418,10 +312,7 @@ impl RunningProcess {
     }
 }
 
-/// The shared kill step of the streaming watchdogs (deadline timer and cancel
-/// listener): tear down the group if it is still around, then best-effort kill
-/// the direct child. The `Weak` means a watchdog never delays the group's
-/// kill-on-close when the handle is dropped early.
+/// Tear down the group if still alive, then best-effort kill the direct child.
 pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, pid: Option<u32>) {
     if let Some(group) = group.upgrade() {
         let _ = group.terminate_all();
@@ -429,18 +320,14 @@ pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, pid: Option<u32>) {
     kill_direct_child(pid);
 }
 
-/// Gracefully terminate a single child by pid — the **shared-group** timeout
-/// case (no owned group to tear down). Send `signal`, poll liveness up to
-/// `grace`, then `SIGKILL`. The caller reaps the child concurrently, so a child
-/// that exits on the signal is collected and the poll ends early instead of
-/// seeing an unreaped zombie as still-alive. Windows has no signal tier — hard
-/// kill.
+/// Gracefully terminate a single child by pid (shared-group timeout path —
+/// no owned group). Sends `signal`, polls liveness up to `grace`, then
+/// `SIGKILL`. The caller reaps concurrently, so a child that exits on the
+/// signal is collected and the poll ends early. Windows has no signal tier —
+/// hard kill.
 ///
-/// Like any bare-pid signal (cf. `kill_direct_child`), this relies on the
-/// concurrent reap winning the race: a pid recycled between the reap and the
-/// next poll could in principle receive the final `SIGKILL`. The window is
-/// narrow and the alternative (no force-kill) is worse; kernel-handle
-/// mechanisms (Job/cgroup) take the own-group path instead.
+/// Relies on the concurrent reap winning the pid-recycle race; the window is
+/// narrow and the alternative (no force-kill) is worse.
 pub(crate) async fn graceful_kill_pid(pid: Option<u32>, grace: std::time::Duration, signal: i32) {
     #[cfg(unix)]
     {
@@ -457,12 +344,8 @@ pub(crate) async fn graceful_kill_pid(pid: Option<u32>, grace: std::time::Durati
             if now >= deadline {
                 break;
             }
-            // SAFETY: signal 0 only probes existence/permission.
-            // ESRCH (non-zero, non-EPERM) → gone: exit the grace early.
-            // EPERM → alive but can't be signalled (e.g. after a uid change) —
-            // treat as exists, matching `Tracked::exists`'s convention; the
-            // final SIGKILL is still sent best-effort. Any other non-zero (rare)
-            // is treated conservatively as "still alive".
+            // SAFETY: signal 0 probes existence. ESRCH → gone; EPERM → alive but
+            // unsignallable (treat as exists). Other non-zero treated as alive.
             let probe = unsafe { libc::kill(pid, 0) };
             if probe != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
                 return; // ESRCH: gone
@@ -470,37 +353,30 @@ pub(crate) async fn graceful_kill_pid(pid: Option<u32>, grace: std::time::Durati
             let poll = std::time::Duration::from_millis(20);
             tokio::time::sleep(poll.min(deadline - now)).await;
         }
-        // SAFETY: as above; force the survivor down (a no-op if already gone).
+        // SAFETY: force the survivor down (no-op if already gone).
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
     }
     #[cfg(not(unix))]
     {
-        // No signal tier off unix: hard kill (Windows TerminateProcess).
         let _ = (grace, signal);
         kill_direct_child(pid);
     }
 }
 
-/// Best-effort kill of the direct child by pid, used by the streaming
-/// deadline/cancel tasks after the group teardown — parity with
-/// `kill_tree`'s `start_kill` + `terminate_all` pairing (the tasks can't
-/// reach the `Child` handle, so they signal by pid). The group kill usually
-/// makes this a no-op; it exists so a group-kill miss (e.g. a pgroup
-/// broadcast racing the tree) still closes the pipes and ends the stream.
-/// Also called by the spawn-time cancel watchdog in `mod.rs`.
+/// Best-effort kill of the direct child by pid — called by deadline/cancel
+/// watchdogs after the group teardown. The group kill usually makes this a
+/// no-op; it closes pipes and ends the stream on a group-kill miss.
 pub(super) fn kill_direct_child(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     #[cfg(unix)]
-    // SAFETY: SIGKILL to a specific live-or-zombie pid; an exited/reaped pid
-    // yields ESRCH, which is ignored.
+    // SAFETY: SIGKILL to a pid; ESRCH (exited/reaped) is ignored.
     unsafe {
         libc::kill(pid as i32, libc::SIGKILL);
     }
     #[cfg(windows)]
-    // SAFETY: opens the process by id with the narrowest right; both calls
-    // tolerate an already-exited process (open fails, handle closed once).
+    // SAFETY: opens by pid with narrowest right; tolerates an already-exited process.
     unsafe {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
@@ -521,7 +397,6 @@ pub struct StdoutLines {
     wait: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
-// Manual: the sink and the pending-wait future are opaque.
 impl std::fmt::Debug for StdoutLines {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StdoutLines").finish_non_exhaustive()
@@ -544,9 +419,7 @@ impl Stream for StdoutLines {
                     if this.wait.is_none() {
                         this.wait = Some(Box::pin(this.sink.clone().changed()));
                     }
-                    // `notify_one` stores a permit, so a push racing this registration
-                    // is not missed.
-                    match this.wait.as_mut().expect("just set").as_mut().poll(cx) {
+                                match this.wait.as_mut().expect("just set").as_mut().poll(cx) {
                         Poll::Ready(()) => {
                             this.wait = None;
                             continue;
@@ -634,7 +507,6 @@ pub struct OutputEvents {
     prefer_stdout: bool,
 }
 
-// Manual: the sinks and pending-wait futures are opaque.
 impl std::fmt::Debug for OutputEvents {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OutputEvents").finish_non_exhaustive()
@@ -647,8 +519,6 @@ impl Stream for OutputEvents {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<OutputEvent>> {
         let this = self.get_mut();
         loop {
-            // Alternate the first look so a continuously-ready stream can't starve
-            // the other; `[pref, !pref]` visits both.
             for stdout_turn in [this.prefer_stdout, !this.prefer_stdout] {
                 if stdout_turn && !this.stdout_done {
                     match this.stdout_sink.try_pop() {
@@ -683,13 +553,12 @@ impl Stream for OutputEvents {
                 }
             }
 
-            // Both streams are closed and drained.
             if this.stdout_done && this.stderr_done {
                 return Poll::Ready(None);
             }
 
-            // At least one stream is open but empty: register a wait future for
-            // each open stream so a wakeup from either re-enters the loop.
+            // Register a wait future for each open stream so a wakeup from either
+            // re-enters the loop.
             let mut any_ready = false;
             if !this.stdout_done {
                 if this.stdout_wait.is_none() {
@@ -737,9 +606,6 @@ mod tests {
     use crate::buffer::OutputBufferPolicy;
     use tokio_stream::StreamExt;
 
-    /// When both streams are continuously ready, the merged event stream
-    /// alternates between them rather than draining all of stdout first — so a
-    /// chatty stdout can't starve stderr (or vice versa).
     #[tokio::test]
     async fn output_events_interleaves_fairly_between_two_ready_streams() {
         let policy = OutputBufferPolicy::unbounded();
@@ -751,7 +617,6 @@ mod tests {
         for line in ["e1", "e2", "e3"] {
             stderr_sink.push(line.to_owned());
         }
-        // Closed and pre-filled, so every poll finds both ready — deterministic.
         stdout_sink.close_now();
         stderr_sink.close_now();
 
@@ -780,8 +645,6 @@ mod tests {
 
     #[tokio::test]
     async fn output_event_carries_an_output_line_with_a_text_accessor() {
-        // Each event's payload is an `OutputLine`, and `text()` reads it regardless
-        // of stream.
         let policy = OutputBufferPolicy::unbounded();
         let stdout_sink = SharedLines::new(&policy);
         let stderr_sink = SharedLines::new(&policy);
@@ -811,10 +674,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stdout_lines_loses_no_line_under_a_parking_consumer() {
-        // Stress the park/wake/notify path: a producer yields so the consumer
-        // genuinely parks between lines, then closes. The consumer must receive
-        // every line in push order and terminate — a lost wakeup would hang or drop
-        // a line. The multi-thread runtime makes push/notify truly race register.
         const N: usize = 5_000;
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
         let producer = {
@@ -847,9 +706,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn output_events_lose_no_line_under_two_racing_producers() {
-        // The merged stream parks on two sinks; stress both wakeups. Two producers
-        // feed stdout and stderr concurrently, then close; the consumer must
-        // receive all 2N events and terminate.
         const N: usize = 3_000;
         let stdout_sink = SharedLines::new(&OutputBufferPolicy::unbounded());
         let stderr_sink = SharedLines::new(&OutputBufferPolicy::unbounded());

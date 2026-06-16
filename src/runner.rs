@@ -254,16 +254,11 @@ pub trait ProcessRunnerExt: ProcessRunner {
         let program = command.program_name();
         let timeout = command.configured_timeout();
         let cancel = command.cancel_token();
-        // Close an untaken `keep_stdin_open` pipe (taking it drops it → EOF) so a
-        // stdin-reading filter isn't left blocking — `first_line` can't write to it.
+        // Drop any open stdin pipe so a stdin-reading child isn't left blocking.
         let _ = process.take_stdin();
-        // Fallible: a non-piped stdout surfaces as a clear error rather than a
-        // stream that silently yields nothing.
         let mut lines = process.stdout_lines()?;
         let search = async move {
-            // Keep `process` alive for the search; dropping it on timeout tears
-            // the tree down.
-            let _process = process;
+            let _process = process; // keep alive; drop on timeout tears the tree down
             while let Some(line) = lines.next().await {
                 if predicate(&line) {
                     return Some(line);
@@ -278,19 +273,15 @@ pub trait ProcessRunnerExt: ProcessRunner {
                     return Err(crate::Error::Timeout {
                         program,
                         timeout: limit,
-                        // A streaming line probe buffers nothing, so there are no
-                        // captured streams to carry.
-                        stdout: String::new(),
+                        stdout: String::new(), // streaming probe buffers nothing
                         stderr: String::new(),
                     });
                 }
             },
             None => search.await,
         };
-        // A cancelled run's stdout stream just ends, so `search` yields `None` —
-        // indistinguishable from "predicate never matched". Surface the
-        // cancellation so a readiness probe doesn't misread it as "line never
-        // appeared".
+        // A cancelled run's stream just ends; surface the cancellation so a
+        // readiness probe doesn't misread `None` as "predicate never matched".
         if found.is_none() && cancel.is_some_and(|t| t.is_cancelled()) {
             return Err(crate::Error::Cancelled { program });
         }
@@ -298,19 +289,16 @@ pub trait ProcessRunnerExt: ProcessRunner {
     }
 }
 
-/// Run `attempt` once, or — when `command` carries a [`RetryPolicy`] — up to
-/// `max_attempts` times, retrying while the error is classified retryable and
-/// sleeping `backoff` between tries. The building block under the success-checking
-/// `ProcessRunnerExt` helpers; the non-erroring `output_string` path never retries.
+/// Run `attempt` once, or up to `max_attempts` times when the command carries a
+/// retry policy, sleeping `backoff` between retries while the error is classified
+/// retryable.
 async fn retrying<T, Fut, F>(command: &Command, mut attempt: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: core::future::Future<Output = Result<T>>,
 {
     let policy = command.retry_policy();
-    // A one-shot streaming stdin (`from_reader`/`from_lines`) is consumed by the
-    // first attempt, so any retry would just fail loud at launch. Don't retry such
-    // a command: run it once regardless of the policy.
+    // A one-shot streaming stdin is consumed by the first attempt; run once.
     let one_shot_stdin = !command.keeps_stdin_open()
         && command
             .stdin_source()
@@ -321,9 +309,8 @@ where
         match attempt().await {
             Ok(value) => return Ok(value),
             Err(err) => {
-                // A cancelled run is terminal regardless of the classifier: the
-                // token stays cancelled, so every retry would just hit the
-                // pre-spawn short-circuit again.
+                // Cancelled is terminal — token stays cancelled, every retry
+                // would hit the pre-spawn short-circuit again.
                 if matches!(err, crate::Error::Cancelled { .. }) {
                     return Err(err);
                 }
@@ -374,9 +361,6 @@ impl JobRunner {
     }
 }
 
-// The inherent `JobRunner::start` above is canonical (usable without the trait in
-// scope); the trait methods and `Command`'s direct verbs all route through it.
-// Keep new start-time behavior there so no path can bypass it.
 #[async_trait::async_trait]
 impl ProcessRunner for JobRunner {
     async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
@@ -440,8 +424,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         }
     }
 
-    // Already cancelled before launch: short-circuit without spawning. A cancel
-    // landing after this check is caught later by drive_to_exit's cancel branch.
+    // Already cancelled: short-circuit before spawning.
     if let Some(token) = command.cancel_token()
         && token.is_cancelled()
     {
@@ -450,14 +433,11 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         });
     }
 
-    // A missing/non-directory cwd makes the OS spawn fail with a bare ENOENT,
-    // indistinguishable from "program not found"; check up front so the error
-    // names the real cause. Best-effort: a TOCTOU race falls back to the OS error.
+    // A missing/non-directory cwd produces a bare ENOENT, indistinguishable from
+    // "program not found"; check up front so the error names the real cause.
     if let Some(cwd) = command.working_dir()
         && !cwd.is_dir()
     {
-        // Distinguish "missing" from "exists but isn't a directory" so the message
-        // is accurate and `is_not_found()` stays honest.
         let (kind, what) = if cwd.exists() {
             (std::io::ErrorKind::NotADirectory, "is not a directory")
         } else {
@@ -472,13 +452,9 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         });
     }
 
-    // Take the stdin payload up front and **atomically**, so the take and the
-    // "already consumed?" decision are one step: a concurrent second run of a
-    // cloned one-shot source (`from_reader`/`from_lines`) sees it consumed and
-    // fails loud instead of racing into silently-empty stdin. Re-runnable sources
-    // (`from_bytes`/`from_string`/`from_file`) never trip this; `keep_stdin_open`
-    // is skipped (the pipe goes to the caller). Taken before the spawn so a failed
-    // spawn never leaves a child to feed.
+    // Take stdin atomically so a concurrent second run of a one-shot source sees
+    // it consumed and fails loud. Taken before the spawn so a failed spawn never
+    // leaves a child to feed.
     let taken_stdin = if command.keeps_stdin_open() {
         None
     } else {
@@ -508,17 +484,10 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         creation_flags: command.extra_creation_flags(),
         kill_on_parent_death: command.wants_kill_on_parent_death(),
     };
-    // Funnel the OS's opaque "not found" into the single `Error::NotFound`
-    // representation, done *after* the spawn attempt (not as a pre-check) so the
-    // OS stays the source of truth — a program it can launch by a path we don't
-    // model is never falsely reported missing. Matters on Windows, where std also
-    // searches the application directory, not just PATH. The cwd was validated
-    // above, so a NotFound here is genuinely the program.
-    //
-    // A bare name on the process PATH names the searched directories
-    // (`searched: Some`); a path-form program or a customized PATH gets
-    // `searched: None` (find_in_path reads the *process* PATH, so its list would
-    // be wrong) but is still `Error::NotFound`.
+    // Translate the OS's opaque NotFound into `Error::NotFound` after the spawn
+    // attempt, so the OS stays the source of truth. The cwd was validated above,
+    // so NotFound here is genuinely the program. A bare name reports searched dirs;
+    // a path-form program or customized PATH gets `searched: None`.
     let mut child = match group.spawn_with_options(&mut tokio_cmd, &opts) {
         Ok(child) => child,
         Err(crate::Error::Spawn { source, .. })
@@ -527,22 +496,17 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
             if is_bare_name(command.program()) && !command.customizes_path() {
                 let (found, searched) = find_in_path(command.program());
                 if found.is_some() {
-                    // On PATH but not directly executable by the OS (e.g. a
-                    // .cmd/.bat on Windows needs cmd.exe). Keep the spawn error —
-                    // the file *is* found, so `NotFound` would mislead.
+                    // On PATH but not directly executable (e.g. .cmd/.bat on Windows).
                     return Err(crate::Error::Spawn {
                         program: command.program_name(),
                         source,
                     });
                 }
-                // A bare name absent from the process PATH: name the directories.
                 return Err(crate::Error::NotFound {
                     program: command.program_name(),
                     searched: Some(searched),
                 });
             }
-            // Path-form or customized PATH: no PATH search applied, so no
-            // directories to report.
             return Err(crate::Error::NotFound {
                 program: command.program_name(),
                 searched: None,
@@ -561,12 +525,11 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     );
 
     let (stdin_pipe, stdin_task) = if command.keeps_stdin_open() {
-        // Interactive: hand the pipe to the caller via `take_stdin`.
         (child.stdin.take(), None)
     } else {
         match taken_stdin {
-            // Write the payload on a background task so a large one can't deadlock
-            // against the child's stdout; dropping the sink sends EOF.
+            // Background write so a large payload can't deadlock against the child's
+            // stdout; dropping the sink sends EOF.
             Some(payload) if !payload.is_empty() => {
                 let task = child.stdin.take().map(|mut sink| {
                     tokio::spawn(async move {
@@ -607,10 +570,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         stdout_piped: command.stdout_is_piped(),
         cancel_token: command.cancel_token(),
     });
-    // Arm the spawn-time cancel watchdog with a pid-only kill. Own-group runs
-    // re-arm with the full group+pid kill via `attach_group`; for shared-group
-    // runs this pid-only kill is the permanent watchdog, so the cancel token kills
-    // the child even when no consuming verb is ever called.
+    // Pid-only watchdog; own-group runs re-arm with full group+pid via `attach_group`.
     process.arm_cancel_watchdog();
     Ok(process)
 }
@@ -687,8 +647,6 @@ mod tests {
 
     #[tokio::test]
     async fn one_shot_stdin_command_is_not_retried() {
-        // A one-shot streaming stdin source is consumed by the first run, so a
-        // retryable failure must not spin the retry loop: it runs exactly once.
         let runner = flaky(10);
         let cmd = Command::new("x")
             .stdin(crate::Stdin::from_reader(&b"once"[..]))
@@ -700,7 +658,6 @@ mod tests {
             "a one-shot stdin command is attempted once, not retried"
         );
 
-        // A re-runnable stdin source (eagerly buffered) still retries normally.
         let runner = flaky(10);
         let cmd = Command::new("x")
             .stdin(crate::Stdin::from_bytes(b"again".to_vec()))
@@ -715,9 +672,6 @@ mod tests {
 
     #[tokio::test]
     async fn probe_with_ok_codes_does_not_panic_on_a_non_binary_exit() {
-        // `probe` reuses `ensure_success` to build its error for a non-{0,1} exit.
-        // An `ok_codes`-accepted code like 2 would make `ensure_success` return
-        // `Ok` and panic the `expect_err`; probe must keep its strict 0/1 contract.
         use crate::testing::{Reply, ScriptedRunner};
         let runner = ScriptedRunner::new().on(["tool", "x"], Reply::fail(2, "boom"));
         let cmd = Command::new("tool").args(["x"]).ok_codes([0, 1, 2]);
@@ -729,8 +683,6 @@ mod tests {
 
     #[tokio::test]
     async fn parse_feeds_checked_stdout_to_the_parser() {
-        // `parse` runs success-checked and hands stdout to an infallible closure,
-        // returning the typed value — what the Command / CliClient wrappers delegate to.
         use crate::testing::{Reply, ScriptedRunner};
         let runner = ScriptedRunner::new().on(["wc", "-l"], Reply::ok("  42\n"));
         let cmd = Command::new("wc").arg("-l");
@@ -744,7 +696,6 @@ mod tests {
     #[tokio::test]
     async fn try_parse_surfaces_a_parser_error_and_a_nonzero_exit() {
         use crate::testing::{Reply, ScriptedRunner};
-        // A fallible parser's error propagates.
         let ok_runner = ScriptedRunner::new().on(["tool"], Reply::ok("nope"));
         let err = ok_runner
             .try_parse::<u32, _>(&Command::new("tool"), |s| {
@@ -757,7 +708,6 @@ mod tests {
             .expect_err("a parser failure is an error");
         assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 
-        // A non-zero exit short-circuits before the parser ever runs.
         let fail_runner = ScriptedRunner::new().on(["tool"], Reply::fail(3, "boom"));
         let err = fail_runner
             .try_parse::<u32, _>(&Command::new("tool"), |_| {
@@ -770,9 +720,6 @@ mod tests {
 
     #[tokio::test]
     async fn parse_fails_loud_on_a_truncated_capture() {
-        // Unlike `checked`, `parse`/`try_parse` reject_if_truncated first, so a
-        // runner reporting a truncated success makes `parse` error rather than
-        // feed the parser a clipped tail.
         struct TruncatedRunner;
         #[async_trait::async_trait]
         impl ProcessRunner for TruncatedRunner {
@@ -799,9 +746,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn retry_sleeps_the_backoff_between_attempts() {
-        // Two failures before success → exactly two backoff sleeps. The paused
-        // clock advances only through tokio sleeps, so elapsed virtual time
-        // proves the backoff is actually awaited (not silently skipped).
         let runner = flaky(2);
         let cmd = Command::new("x").retry(5, Duration::from_millis(100), |e| {
             matches!(e, Error::Exit { .. })
@@ -819,8 +763,6 @@ mod tests {
         );
     }
 
-    /// A runner whose every attempt fails with `Cancelled` — the token never
-    /// un-cancels, so this is exactly what real retries would see.
     struct AlwaysCancelled(AtomicU32);
 
     #[async_trait::async_trait]
