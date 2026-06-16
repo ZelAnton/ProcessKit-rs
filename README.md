@@ -1,14 +1,14 @@
 # processkit
 
-**Async child-process management for Rust + [tokio](https://tokio.rs/)** with a
-**kernel-backed no-orphan guarantee**: every process you start — and everything
-*it* spawns — lives in a kill-on-drop container (a Linux **cgroup v2**, a Windows
-**Job Object**, or a POSIX **process group**), so no descendant ever outlives
+Async child-process management for Rust + [tokio](https://tokio.rs/) with a
+kernel-backed no-orphan guarantee: every process you start — and everything
+*it* spawns — lives in a kill-on-drop container (a **Linux cgroup v2**, a **Windows
+Job Object**, or a POSIX process group), so no descendant ever outlives
 your program.
 
-Beyond spawning a subprocess: run-and-capture, line **streaming**, interactive
-stdin, shell-free **pipelines**, readiness probes, **timeouts** & cancellation,
-**supervision** with restart/backoff, and a mockable runner **seam** for
+Beyond spawning a subprocess: run-and-capture, line streaming, interactive
+stdin, shell-free pipelines, readiness probes, timeouts & cancellation,
+supervision with restart/backoff, and a mockable runner seam for
 subprocess-free tests.
 
 [![Crates.io](https://img.shields.io/crates/v/processkit.svg)](https://crates.io/crates/processkit)
