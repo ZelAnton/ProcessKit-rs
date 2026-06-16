@@ -44,7 +44,7 @@ The verbs mirror `Command`'s, each operating on the pipefail outcome:
 |---|---|---|
 | `output_string()` | `ProcessResult<String>` | …reported in the result (code/stderr/program of the first unclean stage) |
 | `output_bytes()` | `ProcessResult<Vec<u8>>` | …same, with the last stage's stdout captured raw (binary pipes) |
-| `run()` | trimmed final stdout | …raised as that stage's `Error::Exit` |
+| `run()` | trimmed final stdout | …raised as that stage's `Error::Exit`; fails loud on a truncated capture |
 | `checked()` | full `ProcessResult<String>` | …raised as `Error::Exit` (untrimmed stdout) |
 | `run_unit()` | `()` | …raised as `Error::Exit` (output discarded) |
 | `exit_code()` | `i32` | …its attributed code (no code → `Error::Timeout`/`Signalled`) |

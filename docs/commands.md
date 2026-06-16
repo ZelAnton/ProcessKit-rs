@@ -370,6 +370,14 @@ match result.outcome() {
 }
 ```
 
+For a single query you usually don't need the `match` (and its
+`#[non_exhaustive]` wildcard): `Outcome` carries the same `code()` /
+`signal()` / `timed_out()` accessors as `ProcessResult`, so a bare `Outcome`
+(from `RunningProcess::wait` or `Finished::outcome`) answers directly —
+`outcome.code()`, `outcome.signal()`, `outcome.timed_out()`. There is no
+`Outcome::is_success` (success is `ok_codes`-aware — use
+`ProcessResult::is_success`).
+
 The error enum is structured and `#[non_exhaustive]`:
 
 | Variant | Meaning |
