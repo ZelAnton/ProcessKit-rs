@@ -179,7 +179,7 @@ async fn adopt_brings_an_external_child_under_containment() {
 
     let group = ProcessGroup::new().expect("create group");
     group.adopt(&child).expect("adopt external child");
-    group.terminate_all().expect("terminate the adopted tree");
+    group.kill_all().expect("hard-kill the adopted tree");
 
     // The adopted child must die promptly — well under its ~30s natural run.
     let _ = completes_within(Duration::from_secs(5), "adopted child reap", child.wait()).await;

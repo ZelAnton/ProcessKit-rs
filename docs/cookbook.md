@@ -411,8 +411,8 @@ use std::time::Duration;
 
 // One run, summarized (requires the opt-in `stats` feature):
 let profile = Command::new("crunch").start().await?.profile(Duration::from_millis(100)).await?;
-println!("exit={:?} took={:?} peak_rss={:?} avg_cpu={:?}",
-    profile.exit_code, profile.duration, profile.peak_memory_bytes, profile.avg_cpu());
+println!("outcome={:?} took={:?} peak_rss={:?} avg_cpu_cores={:?}",
+    profile.outcome, profile.duration, profile.peak_memory_bytes, profile.avg_cpu_cores());
 ```
 
 For a live series over a whole group, `group.sample_stats(every)` yields a

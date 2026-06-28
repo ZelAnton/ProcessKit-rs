@@ -315,7 +315,7 @@ impl RunningProcess {
 /// Tear down the group if still alive, then best-effort kill the direct child.
 pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, pid: Option<u32>) {
     if let Some(group) = group.upgrade() {
-        let _ = group.terminate_all();
+        let _ = group.kill_all();
     }
     kill_direct_child(pid);
 }

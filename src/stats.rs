@@ -7,6 +7,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::group::ProcessGroup;
+use crate::result::Outcome;
 
 /// A snapshot of a process group's resource usage.
 ///
@@ -132,8 +133,18 @@ impl tokio_stream::Stream for StatsSampler<'_> {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunProfile {
-    /// The exit code; `None` for a run killed by its timeout or a signal
-    /// (matching [`RunningProcess::wait`](crate::RunningProcess::wait)).
+    /// How the run ended — the full [`Outcome`](crate::Outcome), so a profile can
+    /// distinguish a clean exit from a signal kill from a timeout (all three of
+    /// which leave [`exit_code`](Self::exit_code) `None`). Read it directly, or
+    /// via the [`signal`](Self::signal) / [`timed_out`](Self::timed_out)
+    /// convenience accessors. The profile is therefore a superset of
+    /// [`RunningProcess::wait`](crate::RunningProcess::wait): one call yields both
+    /// the resource telemetry and the run's actual outcome.
+    pub outcome: Outcome,
+    /// The exit code if the run [exited](crate::Outcome::Exited); `None` for a run
+    /// killed by its timeout or a signal. Equals
+    /// [`outcome.code()`](crate::Outcome::code) — a convenience for the common
+    /// case; consult [`outcome`](Self::outcome) to tell a timeout from a signal.
     pub exit_code: Option<i32>,
     /// Wall-clock time from process start until the run finished (exit reaped
     /// and output drained).
@@ -147,21 +158,49 @@ pub struct RunProfile {
 }
 
 impl RunProfile {
-    /// Average CPU utilisation over the run, in cores (`0.5` = half a core
+    /// Average CPU utilisation over the run, in **cores** (`0.5` = half a core
     /// busy on average; can exceed `1.0` for multi-threaded children).
     /// `None` when CPU time was never observed or the run had no duration.
-    pub fn avg_cpu(&self) -> Option<f64> {
+    pub fn avg_cpu_cores(&self) -> Option<f64> {
         let cpu = self.cpu_time?;
         if self.duration.is_zero() {
             return None;
         }
         Some(cpu.as_secs_f64() / self.duration.as_secs_f64())
     }
+
+    /// Renamed to [`avg_cpu_cores`](Self::avg_cpu_cores): the value is in CPU
+    /// **cores**, and the suffix makes the unit self-documenting. A thin
+    /// forwarding shim kept for one minor; **removed in 2.0**.
+    #[deprecated(
+        since = "1.1.0",
+        note = "renamed to `avg_cpu_cores` (the unit is cores); removed in 2.0"
+    )]
+    pub fn avg_cpu(&self) -> Option<f64> {
+        self.avg_cpu_cores()
+    }
+
+    /// The signal that killed the run, if it was
+    /// [signalled](crate::Outcome::Signalled) with a known number (`None` on a
+    /// clean exit, a timeout, or a signal kill the platform didn't number).
+    /// Shorthand for [`outcome.signal()`](crate::Outcome::signal).
+    pub fn signal(&self) -> Option<i32> {
+        self.outcome.signal()
+    }
+
+    /// Whether the run was killed by its
+    /// [timeout](crate::Outcome::TimedOut). Shorthand for
+    /// [`outcome.timed_out()`](crate::Outcome::timed_out) — distinguishes a
+    /// deadline kill from a signal kill, which [`exit_code`](Self::exit_code)
+    /// alone (both `None`) cannot.
+    pub fn timed_out(&self) -> bool {
+        self.outcome.timed_out()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RunProfile;
+    use super::{Outcome, RunProfile};
     use std::time::Duration;
 
     #[tokio::test]
@@ -172,35 +211,67 @@ mod tests {
     }
 
     #[test]
-    fn avg_cpu_is_cpu_time_over_duration() {
+    fn avg_cpu_cores_is_cpu_time_over_duration() {
         let profile = RunProfile {
+            outcome: Outcome::Exited(0),
             exit_code: Some(0),
             duration: Duration::from_secs(2),
             cpu_time: Some(Duration::from_secs(1)),
             peak_memory_bytes: None,
             samples: 8,
         };
-        assert_eq!(profile.avg_cpu(), Some(0.5));
+        assert_eq!(profile.avg_cpu_cores(), Some(0.5));
     }
 
     #[test]
-    fn avg_cpu_is_none_without_cpu_or_duration() {
+    fn avg_cpu_cores_is_none_without_cpu_or_duration() {
         let no_cpu = RunProfile {
+            outcome: Outcome::Exited(0),
             exit_code: Some(0),
             duration: Duration::from_secs(1),
             cpu_time: None,
             peak_memory_bytes: None,
             samples: 0,
         };
-        assert_eq!(no_cpu.avg_cpu(), None);
+        assert_eq!(no_cpu.avg_cpu_cores(), None);
 
         let no_duration = RunProfile {
+            outcome: Outcome::Exited(0),
             exit_code: Some(0),
             duration: Duration::ZERO,
             cpu_time: Some(Duration::from_secs(1)),
             peak_memory_bytes: None,
             samples: 1,
         };
-        assert_eq!(no_duration.avg_cpu(), None);
+        assert_eq!(no_duration.avg_cpu_cores(), None);
+    }
+
+    #[test]
+    fn outcome_distinguishes_timeout_from_signal_when_exit_code_is_none() {
+        // The whole point of carrying `outcome`: a timeout and a signal kill both
+        // leave `exit_code == None`, yet the profile must tell them apart.
+        let timed_out = RunProfile {
+            outcome: Outcome::TimedOut,
+            exit_code: None,
+            duration: Duration::from_secs(1),
+            cpu_time: None,
+            peak_memory_bytes: None,
+            samples: 0,
+        };
+        assert!(timed_out.timed_out());
+        assert_eq!(timed_out.signal(), None);
+
+        let signalled = RunProfile {
+            outcome: Outcome::Signalled(Some(9)),
+            exit_code: None,
+            duration: Duration::from_secs(1),
+            cpu_time: None,
+            peak_memory_bytes: None,
+            samples: 0,
+        };
+        assert!(!signalled.timed_out());
+        assert_eq!(signalled.signal(), Some(9));
+        // Both leave `exit_code` empty — only `outcome` separates them.
+        assert_eq!(timed_out.exit_code, signalled.exit_code);
     }
 }

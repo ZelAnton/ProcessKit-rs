@@ -248,20 +248,38 @@ impl ProcessGroup {
     /// Immediately hard-kill every process currently in the group. Idempotent;
     /// the group remains usable for further spawns afterwards.
     ///
+    /// This is an unconditional **hard** kill (`SIGKILL` / `cgroup.kill` /
+    /// `TerminateJobObject`), not a graceful `SIGTERM` — for a `SIGTERM` → grace →
+    /// `SIGKILL` teardown use [`shutdown`](Self::shutdown) /
+    /// [`shutdown_ref`](Self::shutdown_ref). The name mirrors the underlying
+    /// `Job::kill_all` it delegates to.
+    ///
     /// On the legacy per-pid kill fallback (a Linux kernel without `cgroup.kill`,
     /// pre-5.14), a tree that won't drain within the bounded sweep — a fork bomb
     /// still out-spawning, or un-reapable `D`-state zombies — surfaces as an `Err`
     /// rather than a false success; the atomic backends (`cgroup.kill`, Windows
     /// Job Object) and the process-group fallback do not report this.
-    pub fn terminate_all(&self) -> Result<()> {
+    pub fn kill_all(&self) -> Result<()> {
         #[cfg(feature = "tracing")]
         tracing::debug!(
             target: "processkit",
             mechanism = ?self.mechanism(),
-            "terminating every process in the group"
+            "hard-killing every process in the group"
         );
         self.job.kill_all().map_err(Error::Io)?;
         Ok(())
+    }
+
+    /// Renamed to [`kill_all`](Self::kill_all): the verb "terminate" reads as a
+    /// graceful `SIGTERM`, but this has always been an unconditional **hard**
+    /// kill, so the name fought the behaviour. A thin forwarding shim kept for
+    /// one minor; **removed in 2.0**.
+    #[deprecated(
+        since = "1.1.0",
+        note = "renamed to `kill_all` (it hard-kills, not a graceful SIGTERM); removed in 2.0"
+    )]
+    pub fn terminate_all(&self) -> Result<()> {
+        self.kill_all()
     }
 
     /// Broadcast `sig` to every process in the group.
@@ -277,7 +295,7 @@ impl ProcessGroup {
     ///   [`Signal::Other`] — returns [`Error::Unsupported`].
     ///
     /// `SIGKILL` ([`Signal::Kill`], or `Other(libc::SIGKILL)`) is routed through
-    /// the same whole-tree hard kill as [`terminate_all`](Self::terminate_all)
+    /// the same whole-tree hard kill as [`kill_all`](Self::kill_all)
     /// on every backend (`cgroup.kill` / `killpg` / Job Object terminate), so it
     /// cannot miss a process forked mid-broadcast. Other signals are a per-member
     /// broadcast.
@@ -307,7 +325,7 @@ impl ProcessGroup {
     ///   (level-triggered).
     ///
     /// A suspended tree can still be hard-killed
-    /// ([`terminate_all`](Self::terminate_all), or dropping the group) — SIGKILL,
+    /// ([`kill_all`](Self::kill_all), or dropping the group) — SIGKILL,
     /// `cgroup.kill`, and `TerminateJobObject` all act on frozen processes. The
     /// graceful [`shutdown`](Self::shutdown), however, starts with a `SIGTERM`
     /// that a frozen tree cannot act on until thawed, so it waits out
@@ -388,9 +406,33 @@ impl ProcessGroup {
     /// leaves `cgroup.procs` / the job on *exit*, before reaping).
     ///
     /// When `escalate_to_kill` is set, the final hard kill can surface the same
-    /// undrained-tree `Err` as [`terminate_all`](Self::terminate_all) on the
-    /// legacy pre-5.14 per-pid fallback.
+    /// undrained-tree `Err` as [`kill_all`](Self::kill_all) on the legacy pre-5.14
+    /// per-pid fallback.
+    ///
+    /// Holding the group behind a shared handle (an `Arc`, a long-lived
+    /// supervisor) that can't be moved out by value? Use the borrowing twin
+    /// [`shutdown_ref`](Self::shutdown_ref) — same teardown, `&self`.
     pub async fn shutdown(self) -> Result<()> {
+        self.shutdown_ref().await
+    }
+
+    /// Gracefully tear the group down **without consuming it** — the borrowing
+    /// twin of [`shutdown`](Self::shutdown), for a group held behind a shared
+    /// handle (an `Arc`, a supervisor) that cannot be moved out by value to call
+    /// the consuming form.
+    ///
+    /// Identical teardown to [`shutdown`](Self::shutdown): on Unix, `SIGTERM` the
+    /// tree, wait up to the configured
+    /// [`shutdown_timeout`](ProcessGroupOptions::shutdown_timeout), then `SIGKILL`
+    /// survivors when [`escalate_to_kill`](ProcessGroupOptions::escalate_to_kill)
+    /// is set; on Windows the kill is atomic and the timeout is ignored. The group
+    /// stays usable afterwards (a re-`shutdown_ref` on an already-drained tree is a
+    /// near no-op), and its `Drop` still backstops any straggler.
+    ///
+    /// The same reaping caveat as [`shutdown`](Self::shutdown) applies on the
+    /// POSIX process-group mechanism: await each child you started into the group,
+    /// or an unreaped zombie reads as alive for the whole grace.
+    pub async fn shutdown_ref(&self) -> Result<()> {
         #[cfg(feature = "tracing")]
         tracing::debug!(
             target: "processkit",

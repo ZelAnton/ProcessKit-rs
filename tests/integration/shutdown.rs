@@ -54,6 +54,58 @@ async fn shutdown_lets_a_term_handling_child_end_the_grace_early() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real subprocess and shuts it down gracefully via a shared handle"]
+async fn shutdown_ref_gracefully_tears_down_a_group_held_by_shared_reference() {
+    use std::sync::Arc;
+
+    // The borrowing twin's reason to exist: a group held behind a shared handle
+    // (here an `Arc`, as a long-lived supervisor or an FFI binding would) can't be
+    // moved out by value to call `shutdown(self)`, yet must still tear down
+    // gracefully rather than fall back to a hard kill.
+    let group = Arc::new(
+        ProcessGroup::with_options(
+            processkit::ProcessGroupOptions::default().shutdown_timeout(Duration::from_secs(10)),
+        )
+        .expect("create group"),
+    );
+
+    let mut run = group
+        .start(
+            &Command::new("sh")
+                .args(["-c", "trap 'exit 0' TERM; echo ready; read line"])
+                .keep_stdin_open(),
+        )
+        .await
+        .expect("start");
+    run.wait_for_line(|l| l.contains("ready"), Duration::from_secs(10))
+        .await
+        .expect("trap installed");
+    let waiter = tokio::spawn(run.wait());
+
+    // A second owner stays alive across the teardown, so `Arc::try_unwrap` would
+    // fail — exactly the case the by-value `shutdown` couldn't serve gracefully.
+    let _second_owner = Arc::clone(&group);
+
+    let start = Instant::now();
+    tokio::time::timeout(Duration::from_secs(20), group.shutdown_ref())
+        .await
+        .expect("shutdown_ref bounded")
+        .expect("shutdown_ref ok");
+    assert!(
+        start.elapsed() < Duration::from_secs(8),
+        "a TERM-handling child must end the 10s grace early (took {:?})",
+        start.elapsed()
+    );
+
+    let outcome = waiter.await.expect("join").expect("wait");
+    assert_eq!(
+        outcome,
+        Outcome::Exited(0),
+        "the shared-handle group still shut down gracefully (TERM trap), not hard-killed"
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a TERM-ignoring subprocess and escalates to SIGKILL"]
 async fn shutdown_escalates_to_kill_after_the_grace_window() {
     let group = ProcessGroup::with_options(

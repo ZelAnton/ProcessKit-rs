@@ -7,7 +7,7 @@
 /// The curated variants map to the POSIX signal of the same name on Unix. On
 /// Windows only [`Kill`](Signal::Kill) is deliverable (it maps to the Job
 /// Object terminate, the same hard kill as
-/// [`terminate_all`](crate::ProcessGroup::terminate_all)); every other variant
+/// [`kill_all`](crate::ProcessGroup::kill_all)); every other variant
 /// yields [`Error::Unsupported`](crate::Error::Unsupported).
 ///
 /// [`Other`](Signal::Other) is an escape hatch carrying a raw signal number on

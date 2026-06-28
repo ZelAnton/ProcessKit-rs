@@ -161,14 +161,14 @@ async fn windows_grandchild_is_contained() {
 
 #[tokio::test]
 #[ignore = "spawns a real subprocess and kills it twice"]
-async fn terminate_all_is_idempotent() {
+async fn kill_all_is_idempotent() {
     let group = ProcessGroup::new().expect("create group");
     let child = group.start(&sleep_secs(30)).await.expect("start sleeper");
 
-    group.terminate_all().expect("first terminate");
+    group.kill_all().expect("first kill");
     group
-        .terminate_all()
-        .expect("second terminate must be a no-op success, not an error");
+        .kill_all()
+        .expect("second kill must be a no-op success, not an error");
 
     // The group stays usable after teardown: a fresh spawn still lands in it.
     // On Windows, `CreateProcess` of a binary just killed via `TerminateJobObject`

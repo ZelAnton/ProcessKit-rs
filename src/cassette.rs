@@ -193,9 +193,9 @@ fn stdin_digest_of(command: &Command) -> Option<u64> {
 /// into the match key — `content_digest` can only hash a constant discriminant
 /// for them — so two invocations differing *only* in streamed stdin would
 /// collide on one cassette key and silently replay each other's recording.
-/// Failing loud (consistent with the streaming `start` half already returning
-/// [`Error::Unsupported`]) is safer than a silent wrong answer; use a replayable
-/// source (`from_bytes`/`from_string`/`from_file`) for a recordable invocation.
+/// Failing loud is safer than a silent wrong answer; use a replayable source
+/// (`from_bytes`/`from_string`/`from_file`) for a recordable invocation. Applies
+/// to both verbs, `output_string` and `start`.
 fn reject_unrecordable_stdin(command: &Command) -> Result<()> {
     if command.stdin_source().is_some_and(|s| s.is_one_shot()) {
         return Err(Error::Unsupported {
@@ -297,8 +297,26 @@ enum Mode<R> {
 /// - The replayed result carries the *replaying* command's
 ///   [`timeout`](Command::timeout), so a recorded timed-out run surfaces as
 ///   [`Error::Timeout`](crate::Error::Timeout) with the real deadline.
-/// - Covers **`output_string`** only; `start` returns
-///   [`Error::Unsupported`](crate::Error::Unsupported).
+/// - Covers the **text and streaming verbs**: `output_string` replays the
+///   captured result, and [`start`](crate::ProcessRunner::start) replays the
+///   recorded output through a scripted [`RunningProcess`](crate::RunningProcess)
+///   (its lines flow through the command's real pumps — `stdout_lines` /
+///   `wait_for_line` / `finish` — with no subprocess). A cassette is verb-agnostic:
+///   record through either, replay through either. **Record-side caveat:**
+///   recording a `start` captures the run *whole* — the recording call drives the
+///   child to completion (via the inner runner's `output_string`) before returning
+///   the handle, so an **interactive** streaming run that must be fed stdin
+///   mid-stream can't be recorded this way (it would block waiting for input that
+///   never comes; bound it with a [`Command::timeout`](crate::Command::timeout), or
+///   script it with a [`ScriptedRunner`](crate::testing::ScriptedRunner) instead).
+/// - **The runner's `output_bytes` verb is unsupported**
+///   ([`Error::Unsupported`](crate::Error::Unsupported)) in both modes: a cassette
+///   stores lossy-UTF-8 text and cannot reproduce the exact raw bytes that verb
+///   promises — capture bytes from a real or scripted runner. (This guards the
+///   convenient default route, which would otherwise re-encode the recorded text
+///   to bytes through `start`; a streaming handle you obtain from `start` will
+///   still re-encode on its own `output_bytes` — the same lossy bytes, not the
+///   original.)
 ///
 /// Non-UTF-8 programs/args/paths are stored lossily; both sides apply the same
 /// conversion, so matching still works. Two distinct non-UTF-8 invocations that
@@ -485,6 +503,87 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
             }
         }
     }
+
+    /// Unsupported on a cassette in **either** mode. A cassette is a lossy-UTF-8
+    /// text fixture (`stdout`/`stderr` are stored as `String`), so it can neither
+    /// record nor replay the *exact* bytes `output_bytes` promises — for a binary
+    /// tool the raw bytes were already mangled to `U+FFFD` at record time. Failing
+    /// loud here keeps that contract honest rather than handing back silently-lossy
+    /// bytes through the defaulted `start` path; capture bytes from a real or
+    /// scripted runner instead.
+    async fn output_bytes(&self, _command: &Command) -> Result<ProcessResult<Vec<u8>>> {
+        Err(Error::Unsupported {
+            operation: "output_bytes on a cassette (a lossy-UTF-8 text fixture cannot \
+                        reproduce exact bytes; capture them from a real or scripted runner)"
+                .to_string(),
+        })
+    }
+
+    async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
+        reject_unrecordable_stdin(command)?;
+        match &self.mode {
+            Mode::Record {
+                inner,
+                recorded,
+                dirty,
+                ..
+            } => {
+                // Record a streaming run by capturing it whole — the real child
+                // via the inner runner's `output_string` — then hand back a
+                // scripted handle that replays the captured output through the
+                // command's real pumps. The stored `Entry` is byte-identical to
+                // the one `output_string` records, so a cassette is verb-agnostic:
+                // record through either verb, replay through either.
+                //
+                // The capture-whole trade-off on *record*: the child runs to
+                // completion before this returns, so a run that must be fed stdin
+                // *mid-stream* (interactive streaming) cannot be recorded this way
+                // — script those with a [`ScriptedRunner`](crate::testing::ScriptedRunner)
+                // instead. *Replay* has no such limit (it never spawns).
+                let result = inner.output_string(command).await?;
+                let invocation = Invocation::from_command(command);
+                let stdin_digest = stdin_digest_of(command);
+                let entry = Entry::from_parts(&invocation, &result, stdin_digest);
+                {
+                    let mut entries = recorded.lock().expect("cassette mutex poisoned");
+                    entries.push(entry.clone());
+                    dirty.store(true, Ordering::SeqCst);
+                }
+                Ok(crate::doubles::scripted_running_from_parts(
+                    command,
+                    entry.stdout,
+                    entry.stderr,
+                    entry.code,
+                    entry.timed_out,
+                    entry.signal,
+                ))
+            }
+            Mode::Replay { slots } => {
+                let invocation = Invocation::from_command(command);
+                let stdin_digest = stdin_digest_of(command);
+                let entry = {
+                    let mut slots = slots.lock().expect("cassette mutex poisoned");
+                    let Some(slot) = slots.get_mut(&key_of(&invocation, stdin_digest)) else {
+                        return Err(Error::CassetteMiss {
+                            program: command.program_name(),
+                        });
+                    };
+                    slot.play().clone()
+                };
+                // The recorded output flows through the command's real pumps on a
+                // scripted handle: `stdout_lines` / `wait_for_line` / `finish`
+                // behave as on a live child, with no subprocess.
+                Ok(crate::doubles::scripted_running_from_parts(
+                    command,
+                    entry.stdout,
+                    entry.stderr,
+                    entry.code,
+                    entry.timed_out,
+                    entry.signal,
+                ))
+            }
+        }
+    }
 }
 
 // Manual: no `R: Debug` bound; entries/slots are summarized as counts.
@@ -601,6 +700,131 @@ mod tests {
         assert_eq!(fail, fail2);
         assert_eq!(fail2.code(), Some(7));
         assert_eq!(fail2.stderr(), "boom");
+    }
+
+    #[tokio::test]
+    async fn start_records_then_replays_a_streaming_run() {
+        // The streaming verb round-trips like the bulk one: record a `start` run
+        // (captured whole), then replay it through `start` — the recorded output
+        // flows through the command's real pumps on a scripted handle, with no
+        // subprocess. Closes the gap where `start` used to return `Unsupported`.
+        let (_dir, path) = temp_cassette();
+        let inner = ScriptedRunner::new().on(
+            ["server", "--watch"],
+            Reply::lines(["starting", "listening on :8080", "ready"]),
+        );
+
+        let recorder = RecordReplayRunner::record(&path, inner);
+        let mut run = recorder
+            .start(&Command::new("server").arg("--watch"))
+            .await
+            .expect("record start");
+        let line = run
+            .wait_for_line(|l| l.contains("listening"), Duration::from_secs(5))
+            .await
+            .expect("readiness line during record");
+        assert_eq!(line, "listening on :8080");
+        assert_eq!(run.wait().await.expect("record finish"), Outcome::Exited(0));
+        recorder.save().expect("save cassette");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load cassette");
+        let mut replayed = replayer
+            .start(&Command::new("server").arg("--watch"))
+            .await
+            .expect("replay start");
+        assert_eq!(replayed.pid(), None, "a replayed handle has no OS identity");
+        let line2 = replayed
+            .wait_for_line(|l| l.contains("listening"), Duration::from_secs(5))
+            .await
+            .expect("readiness line during replay");
+        assert_eq!(line2, "listening on :8080");
+        assert_eq!(
+            replayed.wait().await.expect("replay finish"),
+            Outcome::Exited(0),
+            "replay must reproduce the recorded outcome through the streaming path"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_replay_reproduces_signal_and_timeout_outcomes() {
+        // The whole point of `Reply::from_outcome` → `into_running`: the scripted
+        // `start` handle must reproduce every non-exit outcome (not just Exited),
+        // so a recorded signal kill / timeout replays as one through the streaming
+        // path, exactly as the bulk `output_string` path already does.
+        let (_dir, path) = temp_cassette();
+        let json = serde_json::json!({
+            "version": 1,
+            "entries": [
+                { "program": "killed", "args": [], "stdout": "", "stderr": "", "signal": 9 },
+                { "program": "crashed", "args": [], "stdout": "", "stderr": "" },
+                { "program": "slow", "args": [], "stdout": "", "stderr": "", "timed_out": true }
+            ]
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        let replayer = RecordReplayRunner::replay(&path).expect("load cassette");
+
+        let signalled = replayer
+            .start(&Command::new("killed"))
+            .await
+            .expect("replay a signalled run through start")
+            .wait()
+            .await
+            .expect("wait the signalled handle");
+        assert_eq!(signalled, Outcome::Signalled(Some(9)));
+
+        // An entry with no code/timed_out/signal is the legitimate "killed,
+        // signal unknown" — it must decode to `Signalled(None)`, not `Exited`.
+        let signalled_unknown = replayer
+            .start(&Command::new("crashed"))
+            .await
+            .expect("replay a signal-unknown run through start")
+            .wait()
+            .await
+            .expect("wait the signal-unknown handle");
+        assert_eq!(signalled_unknown, Outcome::Signalled(None));
+
+        let timed_out = replayer
+            .start(&Command::new("slow"))
+            .await
+            .expect("replay a timed-out run through start")
+            .wait()
+            .await
+            .expect("wait the timed-out handle");
+        assert_eq!(timed_out, Outcome::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn output_bytes_is_unsupported_in_both_modes() {
+        // A cassette stores lossy-UTF-8 text, so `output_bytes` (exact raw bytes)
+        // must be rejected loudly rather than served silently-lossy through the
+        // now-implemented `start` path.
+        let (_dir, path) = temp_cassette();
+
+        let recorder = RecordReplayRunner::record(&path, scripted());
+        let rec_err = recorder
+            .output_bytes(&Command::new("tool").arg("--version"))
+            .await
+            .expect_err("output_bytes must be unsupported in record mode");
+        assert!(
+            matches!(rec_err, Error::Unsupported { .. }),
+            "got {rec_err:?}"
+        );
+        // The rejected call recorded nothing; a real entry is still needed to load.
+        let _ = recorder
+            .output_string(&Command::new("tool").arg("--version"))
+            .await
+            .expect("record a real entry");
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load cassette");
+        let rep_err = replayer
+            .output_bytes(&Command::new("tool").arg("--version"))
+            .await
+            .expect_err("output_bytes must be unsupported in replay mode");
+        assert!(
+            matches!(rep_err, Error::Unsupported { .. }),
+            "got {rep_err:?}"
+        );
     }
 
     #[tokio::test]
