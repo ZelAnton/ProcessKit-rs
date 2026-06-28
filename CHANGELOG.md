@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [1.1.0] - 2026-06-28
+
+### Added
 - `ProcessGroup::shutdown_ref(&self)` — graceful `SIGTERM` → grace → `SIGKILL`
   teardown that **borrows** the group instead of consuming it, for a group held
   behind a shared handle (an `Arc`, a long-lived supervisor, an FFI binding) that
@@ -1536,7 +1547,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.11.1...v1.0.0
 [0.11.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.11.0...v0.11.1
