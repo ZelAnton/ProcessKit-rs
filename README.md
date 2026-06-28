@@ -245,7 +245,7 @@ async fn main() -> processkit::Result<()> {
 Signals are POSIX-only: on Windows just `Signal::Kill` is deliverable (it maps to
 the Job Object terminate) and anything else returns `Error::Unsupported`.
 `Signal::Kill` always takes the same whole-tree hard-kill path as
-`terminate_all()`. Suspend/resume work everywhere a container exists — one
+`kill_all()`. Suspend/resume work everywhere a container exists — one
 `cgroup.freeze` write covering the subtree on Linux, `SIGSTOP`/`SIGCONT` on
 macOS/BSD and the Linux process-group fallback (both idempotent), and
 per-thread suspension on Windows (best-effort; only there nested suspends
@@ -347,8 +347,8 @@ async fn main() -> processkit::Result<()> {
         .start().await?
         .profile(Duration::from_millis(100)).await?;
     println!(
-        "exit={:?} took={:?} peak_rss={:?} avg_cpu={:?}",
-        profile.exit_code, profile.duration, profile.peak_memory_bytes, profile.avg_cpu(),
+        "outcome={:?} took={:?} peak_rss={:?} avg_cpu_cores={:?}",
+        profile.outcome, profile.duration, profile.peak_memory_bytes, profile.avg_cpu_cores(),
     );
     Ok(())
 }

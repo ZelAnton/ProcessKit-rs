@@ -665,7 +665,7 @@ impl Cgroup {
         }
         // Thaw (best-effort): the freeze only halted forking DURING the sweep.
         // Restore the cgroup unfrozen so it stays reusable for further spawns
-        // (`terminate_all` keeps the group usable; a child spawned into a frozen
+        // (`kill_all` keeps the group usable; a child spawned into a frozen
         // cgroup would itself start frozen and the spawn could block) — and so a
         // SIGKILL'd-but-frozen straggler can run its pending fatal signal and exit.
         // (This unconditionally clears any freeze a prior `suspend()` set; a kill

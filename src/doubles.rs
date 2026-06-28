@@ -200,13 +200,39 @@ impl Reply {
         self
     }
 
+    /// A reply reconstructed from a recorded outcome — the decode model shared
+    /// with the cassette's `Entry`: `timed_out` → timed out; else a present
+    /// `code` → exited; else a signal kill (`signal` optionally absent). Lets the
+    /// record/replay runner rebuild a streaming handle ([`into_running`](Self::into_running))
+    /// from a stored entry without duplicating `Reply`'s private shape.
+    #[cfg(feature = "record")]
+    pub(crate) fn from_outcome(
+        stdout: String,
+        stderr: String,
+        code: Option<i32>,
+        timed_out: bool,
+        signal: Option<i32>,
+    ) -> Self {
+        Self {
+            stdout,
+            stderr,
+            code: code.unwrap_or_default(),
+            timed_out,
+            // Signalled iff it neither timed out nor carries an exit code.
+            signalled: !timed_out && code.is_none(),
+            signal,
+            pending: false,
+            line_delay: None,
+        }
+    }
+
     /// Build a scripted live handle for `command` from this reply — the
     /// `start` analogue of [`into_result`](Self::into_result). The canned
     /// stdout/stderr feed the command's real pump machinery (handlers,
     /// encodings, buffer policy all apply); the scripted "process" exits with
     /// the canned code after the last delayed line (immediately without
     /// delays), or never for a [`pending`](Self::pending) reply.
-    fn into_running(self, command: &Command) -> crate::RunningProcess {
+    pub(crate) fn into_running(self, command: &Command) -> crate::RunningProcess {
         // A pending reply never exits on its own; everything else exits after
         // its (possibly zero) total line-delay budget. A canned timeout exits
         // immediately as a timed-out outcome, mirroring `into_result`.
@@ -259,6 +285,24 @@ impl Reply {
         };
         ProcessResult::new(program, self.stdout, self.stderr, outcome, timeout)
     }
+}
+
+/// Build a scripted live [`RunningProcess`](crate::RunningProcess) for `command`
+/// from recorded outcome parts — the streaming-`start` counterpart of the bulk
+/// replay path. Shared by the `record`-feature cassette so a recorded run can be
+/// replayed through `start` (its canned output flowing through the command's real
+/// pumps), not only `output_string`. The decode model matches the cassette
+/// `Entry`'s (see [`Reply::from_outcome`]).
+#[cfg(feature = "record")]
+pub(crate) fn scripted_running_from_parts(
+    command: &Command,
+    stdout: String,
+    stderr: String,
+    code: Option<i32>,
+    timed_out: bool,
+    signal: Option<i32>,
+) -> crate::RunningProcess {
+    Reply::from_outcome(stdout, stderr, code, timed_out, signal).into_running(command)
 }
 
 type Predicate = Box<dyn Fn(&Command) -> bool + Send + Sync>;

@@ -12,10 +12,43 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- `ProcessGroup::shutdown_ref(&self)` — graceful `SIGTERM` → grace → `SIGKILL`
+  teardown that **borrows** the group instead of consuming it, for a group held
+  behind a shared handle (an `Arc`, a long-lived supervisor, an FFI binding) that
+  can't be moved out by value. `shutdown(self)` now delegates to it.
+- `ProcessGroup::kill_all` — the honest name for the immediate hard kill
+  (mirrors the underlying `Job::kill_all`); replaces the misleadingly-named
+  `terminate_all`, which read as a graceful `SIGTERM`.
+- `RunProfile::outcome` — the full `Outcome` of a profiled run, plus `signal()`
+  and `timed_out()` accessors, so a profile distinguishes a clean exit from a
+  signal kill from a timeout (all three leave `exit_code` `None`). `profile()` is
+  now a superset of `wait()`: one call yields both telemetry and the outcome.
+- `RunProfile::avg_cpu_cores` — unit-explicit rename of `avg_cpu` (the value is
+  in CPU cores).
+- `RecordReplayRunner` now covers the streaming `start` verb in both record and
+  replay: a recorded run replays through a scripted `RunningProcess` (its output
+  flowing through the command's real pumps), where `start` previously returned
+  `Error::Unsupported`. Recording a `start` captures the run whole, so an
+  interactive streaming run fed stdin mid-stream still can't be cassette-recorded.
+- `CliClient` now implements `Clone` (when its runner is `Clone`, as the default
+  `JobRunner` is), so the whole CLI-wrapper family — `Command`, `Pipeline`,
+  `CliClient` — clones uniformly. A clone shares the same default cancellation
+  token.
 
 ### Changed
--
+- The readiness probes `RunningProcess::wait_for_line` / `wait_for` now require
+  `Send` callbacks (matching `Command::first_line`), so the returned futures are
+  `Send` — they can cross a thread boundary on a multi-threaded runtime or be
+  bridged onto another async runtime, not only `.await`ed in place. This tightens
+  a bound on two pre-existing methods: a caller passing a non-`Send` readiness
+  closure (rare) would need to adjust. Real-world impact is negligible, so it
+  ships in the minor rather than waiting for 2.0.
+
+### Deprecated
+- `ProcessGroup::terminate_all` — renamed to `kill_all`; the forwarding alias is
+  removed in 2.0.
+- `RunProfile::avg_cpu` — renamed to `avg_cpu_cores`; the forwarding alias is
+  removed in 2.0.
 
 ### Fixed
 -

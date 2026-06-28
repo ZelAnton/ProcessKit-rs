@@ -82,6 +82,15 @@ impl<R: ProcessRunner, S: AsRef<OsStr>> IntoCommand<R> for &[S] {
 ///
 /// Generic over the runner so tests inject a fake; [`new`](Self::new) uses the
 /// real job-backed [`JobRunner`].
+///
+/// `Clone` when the runner is `Clone` — the default [`JobRunner`] is, as are
+/// [`Command`] and [`Pipeline`](crate::Pipeline), so the whole CLI-wrapper family
+/// clones uniformly (e.g. to hand an owned, `'static` value to a spawned task or
+/// an async-runtime bridge). A clone copies the program, timeout, and env
+/// defaults and **shares the same default cancellation token**
+/// ([`default_cancel_on`](Self::default_cancel_on)): cancelling via one clone
+/// cancels every command built from any of them, as a shared token should.
+#[derive(Clone)]
 pub struct CliClient<R: ProcessRunner = JobRunner> {
     program: OsString,
     runner: R,
@@ -443,6 +452,24 @@ mod tests {
             dbg.contains("API_TOKEN") && dbg.contains("GIT_PAGER"),
             "env names should appear: {dbg}"
         );
+    }
+
+    #[test]
+    fn client_is_clone_with_the_default_runner() {
+        // `Command`/`Pipeline` are `Clone`; so is the default-runner `CliClient`,
+        // so the whole CLI-wrapper family clones uniformly (e.g. to own a `'static`
+        // value for a spawned task or an async-runtime bridge).
+        fn assert_clone<T: Clone>() {}
+        assert_clone::<CliClient>();
+
+        let client = CliClient::new("git")
+            .default_timeout(Duration::from_secs(3))
+            .default_env("GIT_TERMINAL_PROMPT", "0")
+            .default_cancel_on(tokio_util::sync::CancellationToken::new());
+        let clone = client.clone();
+        // Every field (program, timeout, env defaults, and the presence of a
+        // shared cancel token) survives the clone verbatim.
+        assert_eq!(format!("{client:?}"), format!("{clone:?}"));
     }
 
     crate::cli_client!(struct Demo => "git");

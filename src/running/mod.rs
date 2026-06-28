@@ -407,7 +407,7 @@ impl RunningProcess {
                     return;
                 }
                 if let Some(g) = group_weak.and_then(|w| w.upgrade()) {
-                    let _ = g.terminate_all();
+                    let _ = g.kill_all();
                 }
                 stream::kill_direct_child(pid);
             }));
@@ -894,6 +894,7 @@ impl RunningProcess {
             Err(_) => (None, None, 0),
         };
         Ok(crate::stats::RunProfile {
+            outcome,
             exit_code,
             duration,
             cpu_time,
@@ -1279,7 +1280,7 @@ impl RunningProcess {
             Backend::Real(real) => {
                 let _ = real.child.start_kill();
                 if let Some(group) = &real.own_group {
-                    let _ = group.terminate_all();
+                    let _ = group.kill_all();
                 }
                 // Bound the reap: a D-state child can ignore SIGKILL until I/O
                 // unblocks, and an unbounded wait hangs shared-group handles.

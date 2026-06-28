@@ -50,7 +50,7 @@ impl RunningProcess {
     ///   matching [`wait_for`](Self::wait_for) / [`wait_for_port`](Self::wait_for_port).
     pub async fn wait_for_line(
         &mut self,
-        predicate: impl Fn(&str) -> bool,
+        predicate: impl Fn(&str) -> bool + Send,
         within: Duration,
     ) -> Result<String> {
         use tokio_stream::StreamExt;
@@ -87,10 +87,19 @@ impl RunningProcess {
     /// failed probe does not kill the child. The deadline bounds the polling
     /// loop, not an in-flight check: a slow `check` future can overrun
     /// `within` by its own duration.
+    ///
+    /// `check` and its future are `Send` (matching
+    /// [`wait_for_line`](Self::wait_for_line)'s predicate and
+    /// [`Command::first_line`](crate::Command::first_line)'s), so the returned
+    /// future is `Send` — it can cross a thread boundary on a multi-threaded
+    /// runtime or be bridged onto another async runtime (e.g. a non-Rust binding
+    /// that owns the handle), not only `.await`ed in place. The future still
+    /// borrows `&mut self`, so spawning it standalone means moving the owned
+    /// [`RunningProcess`] into the surrounding `async` block to make it `'static`.
     pub async fn wait_for<F, Fut>(&mut self, check: F, within: Duration) -> Result<()>
     where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = bool>,
+        F: FnMut() -> Fut + Send,
+        Fut: Future<Output = bool> + Send,
     {
         self.poll_until(check, within).await
     }
@@ -159,4 +168,20 @@ impl RunningProcess {
             timeout: within,
         }
     }
+}
+
+/// Compile-time proof that every readiness probe's future is `Send`. They must
+/// cross a `tokio::spawn` / non-Rust-runtime bridge (e.g. a Python async
+/// binding), which requires `Send + 'static` futures; a binding that re-derives
+/// readiness in its own language is duplicating semantics this crate already
+/// owns. Dropping a `+ Send` bound on a probe callback breaks the build *here*,
+/// at the crate, rather than silently in a downstream consumer.
+#[cfg(test)]
+#[allow(dead_code)]
+fn probe_futures_are_send(rp: &mut RunningProcess) {
+    fn assert_send<T: Send>(_: &T) {}
+    assert_send(&rp.wait_for_line(|line| line.is_empty(), Duration::ZERO));
+    assert_send(&rp.wait_for(|| async { true }, Duration::ZERO));
+    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+    assert_send(&rp.wait_for_port(addr, Duration::ZERO));
 }

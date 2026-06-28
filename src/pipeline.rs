@@ -243,7 +243,7 @@ impl Pipeline {
                 Ok(collected) => collected?,
                 Err(_elapsed) => {
                     // Kill the chain; `_abort_guard` reaps the drain tasks as this returns.
-                    let _ = group.terminate_all();
+                    let _ = group.kill_all();
                     return Ok(ProcessResult::new(
                         self.pipeline_name(),
                         T::default(),

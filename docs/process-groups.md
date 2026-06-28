@@ -93,8 +93,8 @@ edges worth knowing:
 | Verb | What happens | When |
 |---|---|---|
 | `drop(group)` | Immediate **hard kill** of the whole tree (kill-on-close) | The safety net — always on |
-| `group.terminate_all()` | The same hard kill, group stays usable (cgroup-`kill` / Job Object / process-group backends). On a **pre-5.14 Linux kernel** lacking `cgroup.kill`, the per-pid `SIGKILL` fallback returns `Err` if the tree doesn't drain (a fork bomb still out-spawning, or `D`-state zombies) | Explicit teardown mid-flight; idempotent |
-| `group.shutdown().await` | Unix: `SIGTERM` → wait `shutdown_timeout` → `SIGKILL` survivors (if `escalate_to_kill`); Windows: atomic job kill. Consumes the group | Graceful service stop |
+| `group.kill_all()` | The same hard kill, group stays usable (cgroup-`kill` / Job Object / process-group backends). On a **pre-5.14 Linux kernel** lacking `cgroup.kill`, the per-pid `SIGKILL` fallback returns `Err` if the tree doesn't drain (a fork bomb still out-spawning, or `D`-state zombies) | Explicit teardown mid-flight; idempotent |
+| `group.shutdown().await` | Unix: `SIGTERM` → wait `shutdown_timeout` → `SIGKILL` survivors (if `escalate_to_kill`); Windows: atomic job kill. Consumes the group (`shutdown_ref(&self)` is the same teardown, borrowing — for a group held behind an `Arc`/supervisor) | Graceful service stop |
 
 ```rust,no_run
 use processkit::{Command, ProcessGroup, ProcessGroupOptions};
@@ -142,7 +142,7 @@ group.signal(Signal::Other(34))?;  // raw signal number escape hatch
 | Windows | `Kill` only (maps to the Job Object terminate); anything else → `Error::Unsupported` |
 
 `Signal::Kill` always takes the same *atomic* whole-tree kill path as
-`terminate_all` (`cgroup.kill` / `killpg` / job terminate), so it cannot miss
+`kill_all` (`cgroup.kill` / `killpg` / job terminate), so it cannot miss
 a process forked mid-broadcast. Other signals are a per-member broadcast —
 best-effort against a tree that is forking at that exact moment. An empty
 group accepts any deliverable signal trivially. On the **cgroup** mechanism a
@@ -183,7 +183,7 @@ Two caveats that bite in practice:
   cgroup before `exec`, so it can freeze before completing the spawn
   handshake). Windows and the pgroup backends freeze only members present at
   the call. Rule of thumb: resume before starting new work.
-- A suspended tree can still be **hard-killed** (drop / `terminate_all` /
+- A suspended tree can still be **hard-killed** (drop / `kill_all` /
   `Signal::Kill` all act on frozen processes), but a graceful `shutdown`
   starts with a `SIGTERM` the frozen tree can't act on — it would wait out the
   whole grace. Resume first for a clean shutdown.

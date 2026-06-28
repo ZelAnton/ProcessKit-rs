@@ -232,12 +232,12 @@ let profile = Command::new("crunch")
     .await?;
 
 println!(
-    "exit={:?} wall={:?} cpu={:?} peak_rss={:?} avg_cpu={:?} ({} samples)",
-    profile.exit_code,
+    "outcome={:?} wall={:?} cpu={:?} peak_rss={:?} avg_cpu_cores={:?} ({} samples)",
+    profile.outcome,            // Exited(code) / Signalled(sig) / TimedOut
     profile.duration,
     profile.cpu_time,
     profile.peak_memory_bytes,
-    profile.avg_cpu(),          // cpu / wall — e.g. Some(1.7) ≈ 1.7 cores busy
+    profile.avg_cpu_cores(),    // cpu / wall — e.g. Some(1.7) ≈ 1.7 cores busy
     profile.samples,
 );
 ```

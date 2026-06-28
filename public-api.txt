@@ -395,6 +395,8 @@ pub fn processkit::CliClient<R>::runner(&self) -> &R
 pub fn processkit::CliClient<R>::timeout(&self) -> core::option::Option<core::time::Duration>
 pub async fn processkit::CliClient<R>::try_parse<T, F>(&self, impl processkit::IntoCommand<R>, F) -> processkit::Result<T> where T: core::marker::Send, F: core::ops::function::FnOnce(&str) -> processkit::Result<T> + core::marker::Send
 pub fn processkit::CliClient<R>::with_runner(impl core::convert::AsRef<std::ffi::os_str::OsStr>, R) -> Self
+impl<R: core::clone::Clone + processkit::ProcessRunner> core::clone::Clone for processkit::CliClient<R>
+pub fn processkit::CliClient<R>::clone(&self) -> processkit::CliClient<R>
 impl<R: processkit::ProcessRunner> core::fmt::Debug for processkit::CliClient<R>
 pub fn processkit::CliClient<R>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<R> core::marker::Freeze for processkit::CliClient<R> where R: core::marker::Freeze
@@ -607,12 +609,14 @@ impl !core::panic::unwind_safe::UnwindSafe for processkit::Pipeline
 pub struct processkit::ProcessGroup
 impl processkit::ProcessGroup
 pub fn processkit::ProcessGroup::adopt(&self, &tokio::process::Child) -> processkit::Result<()>
+pub fn processkit::ProcessGroup::kill_all(&self) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::mechanism(&self) -> processkit::Mechanism
 pub fn processkit::ProcessGroup::members(&self) -> processkit::Result<alloc::vec::Vec<u32>>
 pub fn processkit::ProcessGroup::new() -> processkit::Result<Self>
 pub fn processkit::ProcessGroup::resume(&self) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::sample_stats(&self, core::time::Duration) -> processkit::StatsSampler<'_>
 pub async fn processkit::ProcessGroup::shutdown(self) -> processkit::Result<()>
+pub async fn processkit::ProcessGroup::shutdown_ref(&self) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::signal(&self, processkit::Signal) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::spawn(&self, tokio::process::Command) -> processkit::Result<tokio::process::Child>
 pub fn processkit::ProcessGroup::stats(&self) -> processkit::Result<processkit::ProcessGroupStats>
@@ -749,10 +753,14 @@ impl core::panic::unwind_safe::UnwindSafe for processkit::ResourceLimits
 pub processkit::RunProfile::cpu_time: core::option::Option<core::time::Duration>
 pub processkit::RunProfile::duration: core::time::Duration
 pub processkit::RunProfile::exit_code: core::option::Option<i32>
+pub processkit::RunProfile::outcome: processkit::Outcome
 pub processkit::RunProfile::peak_memory_bytes: core::option::Option<u64>
 pub processkit::RunProfile::samples: usize
 impl processkit::RunProfile
 pub fn processkit::RunProfile::avg_cpu(&self) -> core::option::Option<f64>
+pub fn processkit::RunProfile::avg_cpu_cores(&self) -> core::option::Option<f64>
+pub fn processkit::RunProfile::signal(&self) -> core::option::Option<i32>
+pub fn processkit::RunProfile::timed_out(&self) -> bool
 impl core::clone::Clone for processkit::RunProfile
 pub fn processkit::RunProfile::clone(&self) -> processkit::RunProfile
 impl core::cmp::Eq for processkit::RunProfile
@@ -791,8 +799,8 @@ pub async fn processkit::RunningProcess::finish(self) -> processkit::Result<proc
 pub fn processkit::RunningProcess::output_events(&mut self) -> processkit::Result<processkit::OutputEvents>
 pub fn processkit::RunningProcess::stdout_lines(&mut self) -> processkit::Result<processkit::StdoutLines>
 impl processkit::RunningProcess
-pub async fn processkit::RunningProcess::wait_for<F, Fut>(&mut self, F, core::time::Duration) -> processkit::Result<()> where F: core::ops::function::FnMut() -> Fut, Fut: core::future::future::Future<Output = bool>
-pub async fn processkit::RunningProcess::wait_for_line(&mut self, impl core::ops::function::Fn(&str) -> bool, core::time::Duration) -> processkit::Result<alloc::string::String>
+pub async fn processkit::RunningProcess::wait_for<F, Fut>(&mut self, F, core::time::Duration) -> processkit::Result<()> where F: core::ops::function::FnMut() -> Fut + core::marker::Send, Fut: core::future::future::Future<Output = bool> + core::marker::Send
+pub async fn processkit::RunningProcess::wait_for_line(&mut self, impl core::ops::function::Fn(&str) -> bool + core::marker::Send, core::time::Duration) -> processkit::Result<alloc::string::String>
 pub async fn processkit::RunningProcess::wait_for_port(&mut self, core::net::socket_addr::SocketAddr, core::time::Duration) -> processkit::Result<()>
 impl core::fmt::Debug for processkit::RunningProcess
 pub fn processkit::RunningProcess::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
