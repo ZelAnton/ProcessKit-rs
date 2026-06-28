@@ -71,6 +71,17 @@ async fn profile_summarizes_a_run() {
         .expect("profile");
 
     assert_eq!(profile.exit_code, Some(0), "profile: {profile:?}");
+    // `outcome` is wired through a real run (not just hand-built structs): a clean
+    // exit reads as `Exited(0)` with no signal and not timed out, and the
+    // `code()`/`exit_code`/`outcome` projections agree.
+    assert_eq!(
+        profile.outcome,
+        processkit::Outcome::Exited(0),
+        "profile: {profile:?}"
+    );
+    assert_eq!(profile.code(), profile.exit_code);
+    assert_eq!(profile.signal(), None);
+    assert!(!profile.timed_out());
     assert!(
         profile.duration >= Duration::from_millis(500),
         "a ~1s child reported {:?}",

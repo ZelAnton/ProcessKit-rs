@@ -180,6 +180,16 @@ impl RunProfile {
         self.avg_cpu_cores()
     }
 
+    /// The exit code if the run [exited](crate::Outcome::Exited), else `None`
+    /// (a signal kill or a timeout). Equals the [`exit_code`](Self::exit_code)
+    /// field and [`outcome.code()`](crate::Outcome::code); the method form
+    /// completes the `code()` / [`signal()`](Self::signal) /
+    /// [`timed_out()`](Self::timed_out) accessor trio that mirrors
+    /// [`ProcessResult`](crate::ProcessResult) and [`Outcome`](crate::Outcome).
+    pub fn code(&self) -> Option<i32> {
+        self.outcome.code()
+    }
+
     /// The signal that killed the run, if it was
     /// [signalled](crate::Outcome::Signalled) with a known number (`None` on a
     /// clean exit, a timeout, or a signal kill the platform didn't number).
@@ -244,6 +254,23 @@ mod tests {
             samples: 1,
         };
         assert_eq!(no_duration.avg_cpu_cores(), None);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn avg_cpu_forwards_to_avg_cpu_cores() {
+        // The deprecated alias must keep returning exactly what its replacement does
+        // until it is removed in 2.0.
+        let profile = RunProfile {
+            outcome: Outcome::Exited(0),
+            exit_code: Some(0),
+            duration: Duration::from_secs(2),
+            cpu_time: Some(Duration::from_secs(1)),
+            peak_memory_bytes: None,
+            samples: 4,
+        };
+        assert_eq!(profile.avg_cpu(), profile.avg_cpu_cores());
+        assert_eq!(profile.avg_cpu(), Some(0.5));
     }
 
     #[test]

@@ -835,6 +835,38 @@ mod tests {
         assert_eq!(rec.only_call().args_str(), ["run", "watch", "123"]);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn clone_shares_the_default_cancel_token() {
+        // The load-bearing half of `CliClient: Clone`'s doc: a clone shares the
+        // SAME default cancel token, not a copy. A command built from the *clone*
+        // must therefore respond to the token the *original* was built with —
+        // parking until it fires, then resolving as `Cancelled`.
+        use crate::CancellationToken;
+        let token = CancellationToken::new();
+        let rec = RecordingRunner::new(
+            ScriptedRunner::new().on(["gh", "run", "watch"], Reply::pending()),
+        );
+        let original = CliClient::with_runner("gh", &rec).default_cancel_on(token.clone());
+        let clone = original.clone();
+
+        let call = clone.output_string(clone.command(["run", "watch", "123"]));
+        tokio::pin!(call);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3600), &mut call)
+                .await
+                .is_err(),
+            "the clone's command must park on the shared token, not resolve early"
+        );
+        token.cancel();
+        match tokio::time::timeout(Duration::from_secs(3600), call)
+            .await
+            .expect("cancelling the shared token must resolve the clone's call")
+        {
+            Err(Error::Cancelled { program }) => assert_eq!(program, "gh"),
+            other => panic!("expected Error::Cancelled, got {other:?}"),
+        }
+    }
+
     #[test]
     fn macro_emits_default_cancel_on() {
         let _client = Demo::with_runner(ScriptedRunner::new())

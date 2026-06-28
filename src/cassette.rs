@@ -540,7 +540,14 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 // *mid-stream* (interactive streaming) cannot be recorded this way
                 // — script those with a [`ScriptedRunner`](crate::testing::ScriptedRunner)
                 // instead. *Replay* has no such limit (it never spawns).
-                let result = inner.output_string(command).await?;
+                //
+                // Capture with the per-line handlers/tees stripped: the scripted
+                // handle returned below carries the caller's handlers and fires them
+                // once when consumed (as a live `start` would), so this capture pass
+                // must stay silent or every handler/tee would fire twice.
+                let result = inner
+                    .output_string(&command.without_line_side_effects())
+                    .await?;
                 let invocation = Invocation::from_command(command);
                 let stdin_digest = stdin_digest_of(command);
                 let entry = Entry::from_parts(&invocation, &result, stdin_digest);
@@ -742,6 +749,74 @@ mod tests {
             replayed.wait().await.expect("replay finish"),
             Outcome::Exited(0),
             "replay must reproduce the recorded outcome through the streaming path"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_record_fires_line_side_effects_exactly_once() {
+        // Record-mode `start` captures the run whole AND hands back a scripted
+        // handle. The caller's per-line side-effects — BOTH `on_stdout_line`
+        // handlers and `stdout_tee` sinks — must fire once (on consume), not twice
+        // (once for the internal capture, once for the scripted replay). The
+        // capture pass runs on a `without_line_side_effects` command for exactly
+        // this; this test covers both channels that method strips.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        // A shared in-memory `AsyncWrite` so the test reads back what the tee got
+        // (mirrors the `SharedSink` in tests/integration/capture.rs).
+        struct SharedSink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl tokio::io::AsyncWrite for SharedSink {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                self.0.lock().expect("sink mutex").extend_from_slice(buf);
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let (_dir, path) = temp_cassette();
+        let inner = ScriptedRunner::new().on(["tool"], Reply::lines(["a", "b", "c"]));
+        let recorder = RecordReplayRunner::record(&path, inner);
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let teed = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let cmd = Command::new("tool")
+            .on_stdout_line(move |_line| {
+                counter.fetch_add(1, AtomicOrdering::SeqCst);
+            })
+            .stdout_tee(SharedSink(Arc::clone(&teed)));
+
+        let run = recorder.start(&cmd).await.expect("record start");
+        let _ = run
+            .output_string()
+            .await
+            .expect("consume the scripted handle");
+
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            3,
+            "stdout handler must fire once per line, not twice (the capture pass must stay silent)"
+        );
+        assert_eq!(
+            teed.lock().expect("teed mutex").as_slice(),
+            b"a\nb\nc\n",
+            "stdout tee must receive each line once, not twice"
         );
     }
 

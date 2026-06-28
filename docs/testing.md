@@ -256,6 +256,8 @@ Semantics worth knowing before you commit a cassette:
 | Timeouts | a recorded timed-out run replays as one, surfacing `Error::Timeout` with the *replaying* command's deadline |
 | Format | pretty-printed JSON with a `version` field; unknown versions / corrupt files / an entry with a contradictory outcome / a file over 64 MiB are `Error::Io(InvalidData)`, a missing file keeps `NotFound` |
 | Err results | not recorded — only completed runs (non-zero exits and captured timeouts *are* results and are recorded) |
+| Verbs (`output_string` + `start`) | a cassette is **verb-agnostic**: record through either and replay through either. Replaying `start` hands back a scripted `RunningProcess` whose recorded lines flow through the command's real pumps (`stdout_lines` / `wait_for_line` / `finish`), no subprocess. *Recording* a `start` captures the run whole (the child runs to completion before the handle returns), so an **interactive** run fed stdin mid-stream can't be recorded that way — bound it with `Command::timeout` or script it with `ScriptedRunner` |
+| `output_bytes` | **unsupported** (`Error::Unsupported`) in both modes — a lossy-UTF-8 text fixture can't reproduce exact raw bytes; capture bytes from a real or scripted runner |
 
 Only env **values** are redacted. `program`, `args`, `cwd`, `stdout`, and
 `stderr` are stored **verbatim** and can carry secrets (a `--password=…` flag, a

@@ -759,6 +759,7 @@ pub processkit::RunProfile::samples: usize
 impl processkit::RunProfile
 pub fn processkit::RunProfile::avg_cpu(&self) -> core::option::Option<f64>
 pub fn processkit::RunProfile::avg_cpu_cores(&self) -> core::option::Option<f64>
+pub fn processkit::RunProfile::code(&self) -> core::option::Option<i32>
 pub fn processkit::RunProfile::signal(&self) -> core::option::Option<i32>
 pub fn processkit::RunProfile::timed_out(&self) -> bool
 impl core::clone::Clone for processkit::RunProfile

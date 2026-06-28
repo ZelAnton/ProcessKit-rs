@@ -706,6 +706,24 @@ impl Command {
         self.keep_stdin_open
     }
 
+    /// A clone with the per-line push side-effects — the
+    /// [`on_stdout_line`](Self::on_stdout_line)/[`on_stderr_line`](Self::on_stderr_line)
+    /// handlers and the [`stdout_tee`](Self::stdout_tee)/[`stderr_tee`](Self::stderr_tee)
+    /// sinks — removed. Used by the record/replay cassette's streaming `start`: its
+    /// internal whole-run capture pass (`inner.output_string`) must stay silent,
+    /// because the scripted handle it hands back fires the caller's handlers/tees
+    /// once when the caller consumes it — exactly as a live `start` would. Without
+    /// the strip they would fire twice (once for the capture, once for the replay).
+    #[cfg(feature = "record")]
+    pub(crate) fn without_line_side_effects(&self) -> Self {
+        let mut clone = self.clone();
+        clone.stdout_handler = None;
+        clone.stderr_handler = None;
+        clone.stdout_tee = None;
+        clone.stderr_tee = None;
+        clone
+    }
+
     pub(crate) fn stdout_handler(&self) -> Option<LineHandler> {
         self.stdout_handler.clone()
     }

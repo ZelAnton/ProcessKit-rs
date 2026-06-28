@@ -197,3 +197,15 @@ async fn kill_all_is_idempotent() {
         .await
         .expect("child reaped");
 }
+
+#[tokio::test]
+#[ignore = "creates an OS job/cgroup"]
+async fn terminate_all_forwards_to_kill_all() {
+    // The deprecated alias is a thin forward to `kill_all` — same result on the
+    // same (here empty) group. Kept covered until it is removed in 2.0.
+    let group = ProcessGroup::new().expect("create group");
+    #[allow(deprecated)]
+    let via_alias = group.terminate_all();
+    let via_new = group.kill_all();
+    assert_eq!(via_alias.is_ok(), via_new.is_ok());
+}

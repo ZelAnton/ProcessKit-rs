@@ -19,10 +19,11 @@ to a dated version section.
 - `ProcessGroup::kill_all` — the honest name for the immediate hard kill
   (mirrors the underlying `Job::kill_all`); replaces the misleadingly-named
   `terminate_all`, which read as a graceful `SIGTERM`.
-- `RunProfile::outcome` — the full `Outcome` of a profiled run, plus `signal()`
-  and `timed_out()` accessors, so a profile distinguishes a clean exit from a
-  signal kill from a timeout (all three leave `exit_code` `None`). `profile()` is
-  now a superset of `wait()`: one call yields both telemetry and the outcome.
+- `RunProfile::outcome` — the full `Outcome` of a profiled run, plus `code()`,
+  `signal()`, and `timed_out()` accessors (mirroring `ProcessResult`/`Outcome`),
+  so a profile distinguishes a clean exit from a signal kill from a timeout (all
+  three leave `exit_code` `None`). `profile()` is now a superset of `wait()`: one
+  call yields both telemetry and the outcome.
 - `RunProfile::avg_cpu_cores` — unit-explicit rename of `avg_cpu` (the value is
   in CPU cores).
 - `RecordReplayRunner` now covers the streaming `start` verb in both record and
@@ -30,6 +31,9 @@ to a dated version section.
   flowing through the command's real pumps), where `start` previously returned
   `Error::Unsupported`. Recording a `start` captures the run whole, so an
   interactive streaming run fed stdin mid-stream still can't be cassette-recorded.
+  The runner's `output_bytes` verb is now explicitly rejected with
+  `Error::Unsupported` in both modes (a lossy-UTF-8 text fixture can't reproduce
+  exact bytes) rather than silently re-encoding through the new `start` path.
 - `CliClient` now implements `Clone` (when its runner is `Clone`, as the default
   `JobRunner` is), so the whole CLI-wrapper family — `Command`, `Pipeline`,
   `CliClient` — clones uniformly. A clone shares the same default cancellation
