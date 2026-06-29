@@ -371,13 +371,22 @@ impl ProcessResult<String> {
     /// non-empty and does not already end with a newline, preventing the last
     /// stdout line from being glued to the first stderr line.
     pub fn combined(&self) -> String {
-        let out = self.stdout();
-        let err = self.stderr();
-        if !out.is_empty() && !err.is_empty() && !out.ends_with('\n') {
-            format!("{out}\n{err}")
-        } else {
-            format!("{out}{err}")
-        }
+        combine_streams(self.stdout(), self.stderr())
+    }
+
+    /// Whether **either** captured stream contains any of `needles`, matched
+    /// **case-insensitively** (ASCII). For the lenient "a specific non-zero exit
+    /// is benign when a known stderr/stdout marker is present" idiom — e.g. `gh`'s
+    /// `"no checks reported"` or `jj`'s `"no conflicts"` — without re-lowercasing a
+    /// stream by hand each time. **Allocation-free** (it never materializes a
+    /// lowercased copy of a possibly-large captured stream). The two streams are
+    /// searched independently, so a needle never matches across the stdout/stderr
+    /// boundary. An empty `needles` slice is `false`; an empty `""` needle follows
+    /// [`str::contains`] (always present).
+    pub fn output_contains_any(&self, needles: &[&str]) -> bool {
+        needles.iter().any(|needle| {
+            contains_ascii_ci(&self.stdout, needle) || contains_ascii_ci(&self.stderr, needle)
+        })
     }
 
     /// The best human-facing message from a captured run, trimmed of surrounding
@@ -394,6 +403,33 @@ impl ProcessResult<String> {
             self.stderr.trim()
         }
     }
+}
+
+/// Join captured stdout and stderr — stdout, then stderr, with a single `\n`
+/// inserted between only when both are non-empty and stdout doesn't already end
+/// in a newline (so a clean run's two streams read as consecutive lines, and an
+/// empty stream adds nothing). The one implementation shared by
+/// [`ProcessResult::combined`] and [`Error::combined`](crate::Error::combined),
+/// so the two `combined()` views can't drift.
+pub(crate) fn combine_streams(out: &str, err: &str) -> String {
+    if !out.is_empty() && !err.is_empty() && !out.ends_with('\n') {
+        format!("{out}\n{err}")
+    } else {
+        format!("{out}{err}")
+    }
+}
+
+/// ASCII-case-insensitive substring test, **allocation-free** — it never builds a
+/// lowercased copy of `haystack` (a captured stream the [`Error`] variants carry
+/// in full, potentially multi-MiB). An empty `needle` is always present, matching
+/// [`str::contains`]. Backs [`ProcessResult::output_contains_any`].
+fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    let (hay, needle) = (haystack.as_bytes(), needle.as_bytes());
+    // `<[u8]>::windows(0)` panics, so the empty needle is handled first.
+    needle.is_empty()
+        || hay
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// Render captured stdout as text for [`Error::Exit`], whatever the payload type:
@@ -711,6 +747,38 @@ mod tests {
         // A newline separator is inserted so the last stdout line is not glued
         // to the first stderr line.
         assert_eq!(r.combined(), "out\nerr");
+    }
+
+    #[test]
+    fn output_contains_any_is_case_insensitive_over_both_streams() {
+        let r = ProcessResult::new(
+            "gh".into(),
+            "No Checks Reported\n".to_owned(),
+            "warning: HTTP 401".to_owned(),
+            Outcome::Exited(1),
+            None,
+        );
+        // Case-insensitive; matches a marker on stdout OR stderr; any-of semantics.
+        assert!(r.output_contains_any(&["no checks reported"]));
+        assert!(r.output_contains_any(&["http 401"]));
+        assert!(r.output_contains_any(&["missing", "HTTP 401"]));
+        assert!(!r.output_contains_any(&["nothing to commit"]));
+        // An empty needle slice matches nothing; an empty `""` needle follows
+        // `str::contains` (always present).
+        assert!(!r.output_contains_any(&[]));
+        assert!(r.output_contains_any(&[""]));
+
+        // The streams are searched independently — a needle never matches across
+        // the stdout/stderr seam.
+        let seam = ProcessResult::new(
+            "p".into(),
+            "foo".to_owned(),
+            "bar".to_owned(),
+            Outcome::Exited(1),
+            None,
+        );
+        assert!(!seam.output_contains_any(&["foobar"]));
+        assert!(!seam.output_contains_any(&["foo\nbar"]));
     }
 
     #[test]

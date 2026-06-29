@@ -378,6 +378,61 @@ impl Error {
         }
     }
 
+    /// The captured standard output, for the variants that carry a stream — a
+    /// non-zero [`Exit`](Error::Exit), a [`Timeout`](Error::Timeout) (partial
+    /// output before the kill), or a [`Signalled`](Error::Signalled) crash —
+    /// `None` for every other variant. The raw stream in full (untrimmed); for
+    /// the best one-line message use [`diagnostic`](Self::diagnostic), for both
+    /// streams joined [`combined`](Self::combined). Reads the stream off the error
+    /// without destructuring a `#[non_exhaustive]` variant.
+    pub fn stdout(&self) -> Option<&str> {
+        self.streams().map(|(stdout, _)| stdout)
+    }
+
+    /// The captured standard error, for the stream-bearing variants (see
+    /// [`stdout`](Self::stdout)); `None` otherwise. The raw stream in full.
+    pub fn stderr(&self) -> Option<&str> {
+        self.streams().map(|(_, stderr)| stderr)
+    }
+
+    /// Standard output followed by standard error, joined — the [`Error`] twin of
+    /// [`ProcessResult::combined`](crate::ProcessResult::combined). `Some` for the
+    /// stream-bearing variants, `None` otherwise. A `\n` is inserted between the
+    /// streams only when both are non-empty and stdout doesn't already end in one.
+    /// Use when a tool interleaves diagnostics across both streams, so a single
+    /// [`diagnostic`](Self::diagnostic) stream (stderr *else* stdout) would miss a
+    /// marker on the other.
+    pub fn combined(&self) -> Option<String> {
+        self.streams()
+            .map(|(stdout, stderr)| crate::result::combine_streams(stdout, stderr))
+    }
+
+    /// The captured `(stdout, stderr)` for the stream-bearing variants
+    /// ([`Exit`](Error::Exit) / [`Timeout`](Error::Timeout) /
+    /// [`Signalled`](Error::Signalled)), `None` for the rest — the single
+    /// exhaustive match the public stream accessors above derive from.
+    fn streams(&self) -> Option<(&str, &str)> {
+        // Exhaustive on purpose (like `diagnostic`/`io_source`): a future
+        // stream-carrying variant must add itself here, not fall through a `_`.
+        match self {
+            Error::Exit { stdout, stderr, .. }
+            | Error::Timeout { stdout, stderr, .. }
+            | Error::Signalled { stdout, stderr, .. } => Some((stdout, stderr)),
+            Error::Spawn { .. }
+            | Error::NotFound { .. }
+            | Error::CassetteMiss { .. }
+            | Error::OutputTooLarge { .. }
+            | Error::NotReady { .. }
+            | Error::Parse { .. }
+            | Error::Unsupported { .. }
+            | Error::Cancelled { .. }
+            | Error::Stdin { .. }
+            | Error::Io(_) => None,
+            #[cfg(feature = "limits")]
+            Error::ResourceLimit { .. } => None,
+        }
+    }
+
     /// Whether the **program could not be located** — it is not installed, not
     /// on `PATH`, or the given path does not resolve to an executable. True for
     /// [`NotFound`](Error::NotFound) and **only** that variant: the launch
@@ -414,12 +469,33 @@ impl Error {
     /// [`Exit`](Error::Exit) is retryable is domain-specific (a `git` 128 is not
     /// generically transient) — that stays the caller's call. [`Timeout`](Error::Timeout)
     /// is also excluded by design; compose it if wanted:
-    /// `e.is_transient() || matches!(e, Error::Timeout { .. })`.
+    /// `e.is_transient() || e.is_timeout()`.
     ///
     /// Pairs with [`Command::retry`](crate::Command::retry):
     /// `cmd.retry(3, backoff, |e| e.is_transient())`.
     pub fn is_transient(&self) -> bool {
         self.io_source().is_some_and(is_transient_io)
+    }
+
+    /// The process exit code for a non-zero [`Exit`](Error::Exit); `None` for
+    /// every other variant (a timeout or a signal kill carries no exit code) —
+    /// the [`Error`] twin of [`ProcessResult::code`](crate::ProcessResult::code) /
+    /// [`Outcome::code`](crate::Outcome::code). Reads the code off the error
+    /// without destructuring the variant.
+    pub fn exit_code(&self) -> Option<i32> {
+        match self {
+            Error::Exit { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// Whether the run was killed because it exceeded its
+    /// [`Command::timeout`](crate::Command::timeout) — i.e. this is a
+    /// [`Timeout`](Error::Timeout). First-class here so the
+    /// [`is_transient`](Self::is_transient) retry-composition example can read
+    /// `e.is_transient() || e.is_timeout()` rather than matching the variant by hand.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Error::Timeout { .. })
     }
 
     /// The underlying [`std::io::Error`] for the variants that carry one
@@ -445,6 +521,59 @@ impl Error {
             | Error::Stdin { .. } => None,
             #[cfg(feature = "limits")]
             Error::ResourceLimit { .. } => None,
+        }
+    }
+
+    /// Construct an [`Exit`](Error::Exit) — a `#[doc(hidden)]` convenience for
+    /// custom [`ProcessRunner`](crate::ProcessRunner) doubles and error-classifier
+    /// tests, so they stop spelling out the struct literal (which a future
+    /// `#[non_exhaustive]` field addition would break) and go through one
+    /// insulated constructor instead. Off the documented surface, but `pub` so
+    /// downstream test code can call it; semver-covered like any public item.
+    #[doc(hidden)]
+    pub fn exit(
+        program: impl Into<String>,
+        code: i32,
+        stdout: impl Into<String>,
+        stderr: impl Into<String>,
+    ) -> Self {
+        Error::Exit {
+            program: program.into(),
+            code,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    /// Construct a [`Timeout`](Error::Timeout) — see [`exit`](Self::exit).
+    #[doc(hidden)]
+    pub fn timeout(
+        program: impl Into<String>,
+        timeout: Duration,
+        stdout: impl Into<String>,
+        stderr: impl Into<String>,
+    ) -> Self {
+        Error::Timeout {
+            program: program.into(),
+            timeout,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    /// Construct a [`Signalled`](Error::Signalled) — see [`exit`](Self::exit).
+    #[doc(hidden)]
+    pub fn signalled(
+        program: impl Into<String>,
+        signal: Option<i32>,
+        stdout: impl Into<String>,
+        stderr: impl Into<String>,
+    ) -> Self {
+        Error::Signalled {
+            program: program.into(),
+            signal,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
         }
     }
 }
@@ -770,6 +899,74 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_accessors_cover_the_stream_bearing_variants() {
+        // Exit/Timeout/Signalled expose stdout/stderr/combined; combined mirrors
+        // ProcessResult::combined (a `\n` between only when both are non-empty
+        // and stdout doesn't already end in one).
+        for err in [
+            Error::exit("git", 1, "out", "err"),
+            Error::timeout("git", Duration::from_secs(1), "out", "err"),
+            Error::signalled("git", Some(9), "out", "err"),
+        ] {
+            assert_eq!(err.stdout(), Some("out"));
+            assert_eq!(err.stderr(), Some("err"));
+            assert_eq!(err.combined().as_deref(), Some("out\nerr"));
+        }
+        // stdout already ending in `\n` is not double-separated.
+        let trailing = Error::exit("git", 1, "out\n", "err");
+        assert_eq!(trailing.combined().as_deref(), Some("out\nerr"));
+        // An empty stream contributes nothing to `combined`, but the raw
+        // accessors still report it as present (`Some("")`) — the contract that
+        // distinguishes them from `diagnostic()` (which trims to `None`).
+        let only_err = Error::exit("git", 1, "", "err");
+        assert_eq!(only_err.stdout(), Some(""));
+        assert_eq!(only_err.stderr(), Some("err"));
+        assert_eq!(only_err.combined().as_deref(), Some("err"));
+
+        // Non-stream variants carry no streams.
+        let not_ready = Error::NotReady {
+            program: "server".into(),
+            timeout: Duration::from_secs(1),
+        };
+        assert_eq!(not_ready.stdout(), None);
+        assert_eq!(not_ready.stderr(), None);
+        assert_eq!(not_ready.combined(), None);
+    }
+
+    #[test]
+    fn exit_code_and_is_timeout_accessors() {
+        let exit = Error::exit("git", 7, "", "");
+        assert_eq!(exit.exit_code(), Some(7));
+        assert!(!exit.is_timeout());
+
+        let timeout = Error::timeout("git", Duration::from_secs(1), "", "");
+        assert_eq!(timeout.exit_code(), None);
+        assert!(timeout.is_timeout());
+
+        let signalled = Error::signalled("git", Some(9), "", "");
+        assert_eq!(signalled.exit_code(), None);
+        assert!(!signalled.is_timeout());
+    }
+
+    #[test]
+    fn doc_hidden_constructors_build_the_expected_variants() {
+        // The constructors insulate doubles/tests from `#[non_exhaustive]` field
+        // additions; round-trip through the accessors confirms the variant.
+        assert!(matches!(
+            Error::exit("git", 2, "o", "e"),
+            Error::Exit { code: 2, .. }
+        ));
+        assert!(matches!(
+            Error::timeout("git", Duration::from_secs(3), "o", "e"),
+            Error::Timeout { .. }
+        ));
+        match Error::signalled("git", None, "o", "e") {
+            Error::Signalled { signal, .. } => assert_eq!(signal, None),
+            other => panic!("expected Signalled, got {other:?}"),
+        }
+    }
 
     #[test]
     fn display_tail_sanitizes_control_chars_against_terminal_injection() {
