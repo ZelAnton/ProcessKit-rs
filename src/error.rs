@@ -509,9 +509,9 @@ impl Error {
     /// every other variant (a timeout or a signal kill carries no exit code).
     /// The same `code()` the crate's other disposition types expose
     /// ([`ProcessResult::code`](crate::ProcessResult::code) /
-    /// [`Outcome::code`](crate::Outcome::code) /
-    /// [`RunProfile::code`](crate::RunProfile::code)), so a code is one name
-    /// everywhere. Reads the code off the error without destructuring the variant.
+    /// [`Outcome::code`](crate::Outcome::code), and `RunProfile::code` under the
+    /// `stats` feature), so a code is one name everywhere. Reads the code off the
+    /// error without destructuring the variant.
     pub fn code(&self) -> Option<i32> {
         match self {
             Error::Exit { code, .. } => Some(*code),
