@@ -152,6 +152,30 @@ impl Command {
     /// Set an environment variable for the child. To *remove* an inherited
     /// variable, use [`env_remove`](Self::env_remove) — `value` here is always a
     /// value, never `None`.
+    ///
+    /// **Secrets.** env is the right channel for a token or password: env *values*
+    /// are redacted from this command's `Debug` (only names appear) and are never
+    /// emitted via `tracing` or in cassette recordings, and the child receives the
+    /// value intact. Prefer it — or [`stdin`](Self::stdin), the strongest — over a
+    /// command-line [`arg`](Self::arg): argv is reduced to a count in `Debug` too,
+    /// but is world-readable through the OS process table (`/proc/<pid>/cmdline`,
+    /// `ps`) and is exposed verbatim by [`command_line`](Self::command_line) and
+    /// cassette recording. An env value is *not* world-readable, but is still
+    /// visible to the same user and root via `/proc/<pid>/environ` and is inherited
+    /// by every descendant process; `stdin` exposes the secret to neither.
+    ///
+    /// processkit deliberately ships **no** `Secret` wrapper type — pair `env` with
+    /// the [`secrecy`]/[`zeroize`] crates for a typed, memory-scrubbed secret at
+    /// your own call sites and pass the exposed value here. Scrubbing only covers
+    /// *your* copy: once passed, processkit holds a plain `OsString` for the
+    /// command's lifetime and the child receives cleartext (a core dump can expose
+    /// either). For a secret recomputed per *operation* — resolved when each command
+    /// is built and reused across that command's retries, **not** regenerated per
+    /// attempt — use
+    /// [`CliClient::default_env_fn`](crate::CliClient::default_env_fn).
+    ///
+    /// [`secrecy`]: https://crates.io/crates/secrecy
+    /// [`zeroize`]: https://crates.io/crates/zeroize
     pub fn env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
         self.envs.push((
             key.as_ref().to_os_string(),

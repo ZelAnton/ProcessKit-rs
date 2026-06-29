@@ -222,9 +222,11 @@ impl<R: ProcessRunner> CliClient<R> {
     /// it fall back. A panic propagates out of the build like any other; it does not
     /// corrupt the client. The resolved value lands in the command's env exactly
     /// like a static [`default_env`](Self::default_env) — and is never logged (env
-    /// values are redacted from `Debug`/tracing).
+    /// values are redacted from `Debug`/tracing). See [`Command::env`]'s **Secrets**
+    /// note for typing/zeroizing a secret value at the call site.
     ///
     /// [`default_retry`]: Self::default_retry
+    /// [`Command::env`]: crate::Command::env
     #[must_use]
     pub fn default_env_fn<V, F>(mut self, key: impl AsRef<OsStr>, resolver: F) -> Self
     where
