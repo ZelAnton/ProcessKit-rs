@@ -513,9 +513,25 @@ impl Error {
     /// `stats` feature), so a code is one name everywhere. Reads the code off the
     /// error without destructuring the variant.
     pub fn code(&self) -> Option<i32> {
+        // Exhaustive on purpose (like `streams`/`program`): a future exit-code-
+        // carrying variant must add itself here, not fall through a `_` and be
+        // silently invisible to `code()`.
         match self {
             Error::Exit { code, .. } => Some(*code),
-            _ => None,
+            Error::Spawn { .. }
+            | Error::NotFound { .. }
+            | Error::CassetteMiss { .. }
+            | Error::Timeout { .. }
+            | Error::OutputTooLarge { .. }
+            | Error::NotReady { .. }
+            | Error::Parse { .. }
+            | Error::Unsupported { .. }
+            | Error::Cancelled { .. }
+            | Error::Signalled { .. }
+            | Error::Stdin { .. }
+            | Error::Io(_) => None,
+            #[cfg(feature = "limits")]
+            Error::ResourceLimit { .. } => None,
         }
     }
 
@@ -526,9 +542,24 @@ impl Error {
     /// [`Outcome::signal`](crate::Outcome::signal). Reads the signal off the error
     /// without destructuring the variant.
     pub fn signal(&self) -> Option<i32> {
+        // Exhaustive on purpose (like `streams`/`program`): a future signal-
+        // carrying variant must add itself here, not fall through a `_`.
         match self {
             Error::Signalled { signal, .. } => *signal,
-            _ => None,
+            Error::Spawn { .. }
+            | Error::NotFound { .. }
+            | Error::CassetteMiss { .. }
+            | Error::Exit { .. }
+            | Error::Timeout { .. }
+            | Error::OutputTooLarge { .. }
+            | Error::NotReady { .. }
+            | Error::Parse { .. }
+            | Error::Unsupported { .. }
+            | Error::Cancelled { .. }
+            | Error::Stdin { .. }
+            | Error::Io(_) => None,
+            #[cfg(feature = "limits")]
+            Error::ResourceLimit { .. } => None,
         }
     }
 
@@ -537,6 +568,9 @@ impl Error {
     /// [`Timeout`](Error::Timeout). First-class here so the
     /// [`is_transient`](Self::is_transient) retry-composition example can read
     /// `e.is_transient() || e.is_timeout()` rather than matching the variant by hand.
+    /// The [`Error`] twin of the crate-wide deadline predicate
+    /// [`ProcessResult::timed_out`](crate::ProcessResult::timed_out) (named
+    /// `is_timeout` here to sit alongside the error's `is_*` predicate family).
     pub fn is_timeout(&self) -> bool {
         matches!(self, Error::Timeout { .. })
     }

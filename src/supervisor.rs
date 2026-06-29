@@ -1,11 +1,14 @@
 //! [`Supervisor`] — keep a child alive with policy-driven restarts and backoff.
 //!
-//! [`Command::retry`](crate::Command::retry) answers "run this once, replaying
-//! on failure". A supervisor answers the different question **"keep this
-//! alive"**: restart a child whenever it exits (unless its exit satisfies the
-//! policy or a predicate), with bounded restarts and exponential backoff plus
-//! jitter — a minimal `runit`/`systemd`-style keeper on top of the runner
-//! layer.
+//! [`Command::retry`](crate::Command::retry) / [`retry_with`](crate::Command::retry_with)
+//! (and the client-wide [`CliClient::default_retry`](crate::CliClient::default_retry))
+//! answer "run this once, replaying on failure" on a
+//! [`RetryPolicy`](crate::RetryPolicy). A supervisor answers the different
+//! question **"keep this alive"**: restart a child whenever it exits (unless its
+//! exit satisfies the policy or a predicate), with bounded restarts and
+//! exponential backoff plus jitter — a minimal `runit`/`systemd`-style keeper on
+//! top of the runner layer. Its [`RestartPolicy`](crate::RestartPolicy) is the
+//! keep-alive twin of that `RetryPolicy`.
 //!
 //! Built entirely on the [`ProcessRunner`] seam, so supervision logic is
 //! hermetically testable with the crate's doubles, and
@@ -241,6 +244,11 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// waits `base × factor^n`, capped by [`max_backoff`](Self::max_backoff).
     /// A `factor` below `1.0` (or non-finite) is treated as `1.0`.
     /// Default: `200ms × 2.0`.
+    ///
+    /// The keep-alive twin of [`RetryPolicy`](crate::RetryPolicy)'s replay-to-success
+    /// backoff, which spells these same two knobs `initial_backoff` (`base`) and
+    /// `multiplier` (`factor`); this one uses a `[0.5, 1.5)` multiplicative
+    /// [`jitter`](Self::jitter) rather than the policy's `[0, delay]` full jitter.
     #[must_use]
     pub fn backoff(mut self, base: Duration, factor: f64) -> Self {
         self.backoff_base = base;

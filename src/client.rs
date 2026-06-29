@@ -266,7 +266,9 @@ impl<R: ProcessRunner> CliClient<R> {
     /// cap + jitter) — the client-wide analogue of the per-call
     /// [`Command::retry`](crate::Command::retry), filled into each built command
     /// the same way [`default_timeout`](Self::default_timeout) is. A per-command
-    /// [`Command::retry`] **wins** (gap-fill, not override).
+    /// [`Command::retry`] / [`retry_with`](crate::Command::retry_with) **wins**
+    /// (gap-fill, not override); this takes the same [`RetryPolicy`] as
+    /// [`Command::retry_with`](crate::Command::retry_with), applied to every verb.
     ///
     /// Honored by the success-checking verbs — [`run`](Self::run) /
     /// [`run_unit`](Self::run_unit) / [`checked`](Self::checked) /

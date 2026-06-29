@@ -43,10 +43,13 @@ pub struct RetryPolicy {
     /// `max_attempts`.
     pub max_retries: u32,
     /// Backoff before the **first** retry (and the whole delay when `multiplier`
-    /// is `1.0`). Default 100 ms. `Duration::ZERO` retries immediately.
+    /// is `1.0`). Default 100 ms. `Duration::ZERO` retries immediately. (The
+    /// `base` of [`Supervisor::backoff`](crate::Supervisor::backoff), spelled in
+    /// full here.)
     pub initial_backoff: Duration,
     /// Exponential growth factor per retry. Default `2.0`; `1.0` is fixed backoff.
-    /// Values below `1.0` are treated as `1.0` (backoff never shrinks).
+    /// Values below `1.0` are treated as `1.0` (backoff never shrinks). (The
+    /// `factor` of [`Supervisor::backoff`](crate::Supervisor::backoff).)
     pub multiplier: f64,
     /// Upper bound on a single delay, so exponential growth can't run away.
     /// Default 30 s; set `Duration::MAX` to effectively disable the cap.

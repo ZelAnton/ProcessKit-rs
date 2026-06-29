@@ -509,6 +509,13 @@ impl Command {
     /// - the raw [`Pipeline`](crate::Pipeline) verbs — a stage's `retry` does not
     ///   re-run that stage within the chain.
     ///
+    /// **Counting:** `max_attempts` is the **total** number of runs (so
+    /// `retry(3, …)` runs at most three times: the first plus two more). For
+    /// exponential backoff + cap + jitter instead of a fixed delay, use
+    /// [`retry_with`](Self::retry_with), which takes a [`RetryPolicy`] — note that
+    /// a `RetryPolicy` counts `max_retries` (the runs *after* the first), so
+    /// `retry(3, …)` corresponds to `RetryPolicy::new().max_retries(2)`.
+    ///
     /// [`Error::Timeout`]: crate::Error::Timeout
     pub fn retry(
         mut self,
