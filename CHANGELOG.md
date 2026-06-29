@@ -31,9 +31,10 @@ to a dated version section.
   full jitter) — the client-wide analogue of the per-call `Command::retry`. A
   per-command `Command::retry` still wins (gap-fill, not override). The new public
   `RetryPolicy` (`#[non_exhaustive]`, builder + `Default`: 3 retries / 100 ms / ×2
-  growth / 30 s cap / jitter on) is also the schedule behind `Command::retry`,
-  whose released fixed-backoff form is unchanged. Jitter uses a small per-thread
-  PRNG seeded from system entropy — no new dependency.
+  growth / 30 s cap / jitter on) is also usable per-command via
+  `Command::retry_with(policy, retry_if)`, and is the schedule behind the released
+  `Command::retry`, whose fixed-backoff form is unchanged. Jitter uses a small
+  per-thread PRNG seeded from system entropy — no new dependency.
 - `testing::Invocation` env assertions — the env analogue of `has_flag`:
   `env(name) -> Option<Option<&OsStr>>` (full fidelity: untouched / set / removed,
   last override wins), `env_is(name, value) -> bool`, and `has_env(name) -> bool`

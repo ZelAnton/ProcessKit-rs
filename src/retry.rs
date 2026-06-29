@@ -26,13 +26,21 @@ use crate::error::Error;
 /// seeded from system entropy — no extra dependency, and no crypto-grade
 /// randomness is needed for backoff.
 ///
+/// Distinct from [`RestartPolicy`](crate::RestartPolicy): a `RetryPolicy` **replays
+/// a verb to success** (re-running on a classified [`Error`](crate::Error)), while a
+/// `RestartPolicy` is the [`Supervisor`](crate::Supervisor)'s **keep-alive restart**
+/// schedule for a long-lived process — different subsystems, different intent.
+///
 /// Non-exhaustive: construct via [`RetryPolicy::new`] / [`Default`] + the builder
 /// methods (new knobs can be added without a breaking change).
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct RetryPolicy {
     /// Retries **after** the first attempt — `0` never retries; `3` (the default)
-    /// means up to 4 total attempts.
+    /// means up to 4 total attempts. Counts retries (like
+    /// [`Supervisor::max_restarts`](crate::Supervisor::max_restarts)), **not** total
+    /// attempts — in contrast to [`Command::retry`](crate::Command::retry)'s
+    /// `max_attempts`.
     pub max_retries: u32,
     /// Backoff before the **first** retry (and the whole delay when `multiplier`
     /// is `1.0`). Default 100 ms. `Duration::ZERO` retries immediately.
@@ -41,9 +49,12 @@ pub struct RetryPolicy {
     /// Values below `1.0` are treated as `1.0` (backoff never shrinks).
     pub multiplier: f64,
     /// Upper bound on a single delay, so exponential growth can't run away.
-    /// Default 30 s.
+    /// Default 30 s; set `Duration::MAX` to effectively disable the cap.
     pub max_backoff: Duration,
-    /// Apply **full jitter** — spread the actual wait uniformly over `[0, delay]`.
+    /// Apply **full jitter** — spread the actual wait uniformly over `[0, delay]`,
+    /// so a retry may fire almost immediately (AWS-style; decorrelates a fleet all
+    /// backing off at once). This is *full* jitter, distinct from the multiplicative
+    /// band the supervisor's [`RestartPolicy`](crate::RestartPolicy) backoff uses.
     /// Default `true`.
     pub jitter: bool,
 }

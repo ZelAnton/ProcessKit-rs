@@ -643,6 +643,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_with_rich_policy_goes_through_the_retry_loop() {
+        use crate::RetryPolicy;
+        let runner = flaky(10);
+        // A per-command rich `RetryPolicy`: max_retries(2) → 3 total attempts.
+        let cmd = Command::new("x").retry_with(
+            RetryPolicy::new()
+                .max_retries(2)
+                .initial_backoff(Duration::ZERO),
+            |_| true,
+        );
+        assert!(runner.run(&cmd).await.is_err());
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 3); // 1 attempt + 2 retries
+    }
+
+    #[tokio::test]
     async fn no_policy_runs_once() {
         let runner = flaky(10);
         assert!(runner.run(&Command::new("x")).await.is_err());

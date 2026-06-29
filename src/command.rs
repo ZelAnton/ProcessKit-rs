@@ -13,7 +13,7 @@ use crate::buffer::{OutputBufferPolicy, StdioMode};
 use crate::error::{Error, Result};
 use crate::pump::LineHandler;
 use crate::result::ProcessResult;
-use crate::retry::RetryConfig;
+use crate::retry::{RetryConfig, RetryPolicy};
 use crate::runner::{JobRunner, ProcessRunnerExt};
 use crate::running::RunningProcess;
 use crate::stdin::Stdin;
@@ -465,7 +465,8 @@ impl Command {
     }
 
     /// Retry the run while `retry_if` accepts the error, up to `max_attempts`
-    /// total attempts, sleeping `backoff` between tries.
+    /// total attempts, sleeping a fixed `backoff` between tries. For exponential
+    /// backoff + cap + jitter, use [`retry_with`](Self::retry_with).
     ///
     /// Applies to the **success-checking** helpers — [`run`](Self::run),
     /// [`exit_code`](Self::exit_code), [`probe`](Self::probe), and the
@@ -481,6 +482,11 @@ impl Command {
     /// connection) will be replayed. Prefer to gate retries on a classifier that
     /// matches *pre-effect* failures (DNS/connection errors, [`Error::Timeout`]
     /// while still connecting) rather than any non-zero exit.
+    ///
+    /// A [`timeout`](Self::timeout) bounds **each attempt**, not the whole retried
+    /// operation — there is no total wall-clock ceiling across retries (worst case
+    /// ≈ `attempts × timeout` + the sum of the backoffs). Bound the total with
+    /// [`cancel_on`](Self::cancel_on) (a `Cancelled` is terminal — never retried).
     ///
     /// Because the command is replayed from scratch, a **one-shot** stdin source
     /// ([`Stdin::from_reader`](crate::Stdin::from_reader) /
@@ -511,6 +517,22 @@ impl Command {
         retry_if: impl Fn(&Error) -> bool + Send + Sync + 'static,
     ) -> Self {
         self.retry = Some(RetryConfig::fixed(max_attempts, backoff, retry_if));
+        self
+    }
+
+    /// Retry on a rich [`RetryPolicy`] — **exponential backoff + cap + jitter** —
+    /// instead of the fixed `(max_attempts, backoff)` of [`retry`](Self::retry).
+    /// The per-command analogue of
+    /// [`CliClient::default_retry`](crate::CliClient::default_retry), with the same
+    /// applicability and replay caveats as [`retry`](Self::retry). Note
+    /// `RetryPolicy` counts `max_retries` (after the first attempt), whereas
+    /// [`retry`](Self::retry) counts `max_attempts` (total).
+    pub fn retry_with(
+        mut self,
+        policy: RetryPolicy,
+        retry_if: impl Fn(&Error) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.retry = Some(RetryConfig::new(policy, retry_if));
         self
     }
 
