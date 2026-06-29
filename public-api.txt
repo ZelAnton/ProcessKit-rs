@@ -11,6 +11,9 @@ pub processkit::testing::Invocation::has_stdin: bool
 pub processkit::testing::Invocation::program: std::ffi::os_str::OsString
 impl processkit::testing::Invocation
 pub fn processkit::testing::Invocation::args_str(&self) -> alloc::vec::Vec<alloc::string::String>
+pub fn processkit::testing::Invocation::env(&self, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> core::option::Option<core::option::Option<&std::ffi::os_str::OsStr>>
+pub fn processkit::testing::Invocation::env_is(&self, impl core::convert::AsRef<std::ffi::os_str::OsStr>, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> bool
+pub fn processkit::testing::Invocation::has_env(&self, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> bool
 pub fn processkit::testing::Invocation::has_flag(&self, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> bool
 impl core::clone::Clone for processkit::testing::Invocation
 pub fn processkit::testing::Invocation::clone(&self) -> processkit::testing::Invocation

@@ -1202,8 +1202,10 @@ pub(crate) fn redacted_env_names(
 /// Compare two environment-variable names with the platform's case rules:
 /// case-insensitive on Windows (where env names are), case-sensitive elsewhere.
 /// Used to decide whether a command already sets a key before filling a client
-/// default for it. A non-UTF-8 name on Windows falls back to exact bytes.
-fn env_key_eq(a: &OsStr, b: &OsStr) -> bool {
+/// default for it, and by [`Invocation`](crate::testing::Invocation)'s env
+/// assertions so a test double reads the same effective key a spawn would. A
+/// non-UTF-8 name on Windows falls back to exact bytes.
+pub(crate) fn env_key_eq(a: &OsStr, b: &OsStr) -> bool {
     #[cfg(windows)]
     {
         match (a.to_str(), b.to_str()) {

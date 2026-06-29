@@ -26,6 +26,11 @@ to a dated version section.
 - `#[doc(hidden)]` constructors `Error::{exit, timeout, signalled}` for custom
   `ProcessRunner` doubles and error-classifier tests, so they stop spelling out
   struct literals that a future `#[non_exhaustive]` field addition would break.
+- `testing::Invocation` env assertions — the env analogue of `has_flag`:
+  `env(name) -> Option<Option<&OsStr>>` (full fidelity: untouched / set / removed,
+  last override wins), `env_is(name, value) -> bool`, and `has_env(name) -> bool`
+  — so tests stop hand-rolling `envs.iter().any(..)` closures to assert injected
+  variables.
 
 ### Changed
 -

@@ -693,6 +693,43 @@ impl Invocation {
         self.args.iter().any(|a| a == flag)
     }
 
+    /// The environment override the invocation set for `name`, if any — the env
+    /// analogue of [`has_flag`](Self::has_flag), full-fidelity. The **outer**
+    /// `Option` is `None` when the invocation didn't touch `name`; the **inner**
+    /// `Option` distinguishes a *set* (`Some(Some(value))`) from a *removal* via
+    /// [`Command::env_remove`](crate::Command::env_remove) (`Some(None)`). When a
+    /// key is overridden more than once the **last** (effective) override is
+    /// returned. Key matching follows the platform's environment rules —
+    /// **case-insensitive on Windows** (where env names are), case-sensitive
+    /// elsewhere — so the accessor reflects the override the spawned child would
+    /// actually see. For the common assertions prefer [`env_is`](Self::env_is) /
+    /// [`has_env`](Self::has_env).
+    pub fn env(&self, name: impl AsRef<OsStr>) -> Option<Option<&OsStr>> {
+        let name = name.as_ref();
+        self.envs
+            .iter()
+            .rev()
+            .find(|(key, _)| crate::command::env_key_eq(key.as_os_str(), name))
+            .map(|(_, value)| value.as_deref())
+    }
+
+    /// Whether the invocation **set** `name` to exactly `value` (its effective
+    /// override is a matching `Some`). `false` if `name` was untouched, removed,
+    /// or set to a different value. `name` is matched per [`env`](Self::env)'s
+    /// platform case rules; the `value` comparison is exact on every platform.
+    pub fn env_is(&self, name: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> bool {
+        self.env(name) == Some(Some(value.as_ref()))
+    }
+
+    /// Whether the invocation **set** `name` to some value — the env presence
+    /// check for the "we injected `LC_ALL=C` / `GIT_EDITOR=true`" assertion. A
+    /// *removal* ([`Command::env_remove`](crate::Command::env_remove)) is not
+    /// "having" the variable, so it returns `false`; query that case via
+    /// [`env`](Self::env) returning `Some(None)`.
+    pub fn has_env(&self, name: impl AsRef<OsStr>) -> bool {
+        matches!(self.env(name), Some(Some(_)))
+    }
+
     /// The arguments as lossy UTF-8 strings, for ergonomic assertions
     /// (e.g. `assert_eq!(call.args_str(), ["pr", "create"])`).
     pub fn args_str(&self) -> Vec<String> {
@@ -779,6 +816,67 @@ impl<R: ProcessRunner> ProcessRunner for RecordingRunner<R> {
 mod tests {
     use super::*;
     use crate::runner::ProcessRunnerExt;
+
+    #[test]
+    fn invocation_env_assertions() {
+        use crate::Command;
+        let cmd = Command::new("git")
+            .env("LC_ALL", "C")
+            .env("GIT_EDITOR", "true")
+            .env_remove("PAGER")
+            .env("LC_ALL", "en_US") // set then set: last wins
+            .env("TMPVAR", "x")
+            .env_remove("TMPVAR") // set then remove: removed wins
+            .env_remove("EDVAR")
+            .env("EDVAR", "vi") // remove then set: set wins
+            .env("EMPTY", ""); // empty value is a set, distinct from a removal
+        let inv = Invocation::from_command(&cmd);
+
+        // env(): full fidelity across set / removed / untouched and interleavings.
+        assert_eq!(inv.env("GIT_EDITOR"), Some(Some(OsStr::new("true"))));
+        assert_eq!(inv.env("LC_ALL"), Some(Some(OsStr::new("en_US"))));
+        assert_eq!(inv.env("PAGER"), Some(None));
+        assert_eq!(inv.env("TMPVAR"), Some(None));
+        assert_eq!(inv.env("EDVAR"), Some(Some(OsStr::new("vi"))));
+        assert_eq!(inv.env("EMPTY"), Some(Some(OsStr::new(""))));
+        assert_eq!(inv.env("HOME"), None);
+
+        // env_is(): exact effective set value.
+        assert!(inv.env_is("GIT_EDITOR", "true"));
+        assert!(inv.env_is("LC_ALL", "en_US"));
+        assert!(!inv.env_is("LC_ALL", "C")); // shadowed by the later set
+        assert!(inv.env_is("EMPTY", "")); // empty value matches
+        assert!(!inv.env_is("PAGER", "")); // removed, not set to ""
+        assert!(!inv.env_is("HOME", "x"));
+
+        // has_env(): a set (incl. empty value) is "having"; removal / untouched not.
+        assert!(inv.has_env("GIT_EDITOR"));
+        assert!(inv.has_env("EMPTY"));
+        assert!(inv.has_env("EDVAR"));
+        assert!(!inv.has_env("PAGER")); // removed
+        assert!(!inv.has_env("TMPVAR")); // set then removed
+        assert!(!inv.has_env("HOME")); // untouched
+    }
+
+    #[test]
+    fn invocation_env_lookup_respects_platform_case_rules() {
+        use crate::Command;
+        // Two case-differing keys: Windows env names are case-insensitive, so the
+        // spawn collapses them (last wins); elsewhere they are distinct keys.
+        let cmd = Command::new("git").env("Path", "a").env("PATH", "b");
+        let inv = Invocation::from_command(&cmd);
+        #[cfg(windows)]
+        {
+            assert_eq!(inv.env("path"), Some(Some(OsStr::new("b"))));
+            assert!(inv.env_is("PATH", "b") && inv.env_is("Path", "b"));
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(inv.env("Path"), Some(Some(OsStr::new("a"))));
+            assert_eq!(inv.env("PATH"), Some(Some(OsStr::new("b"))));
+            assert!(inv.env("path").is_none()); // distinct lowercase key is untouched
+        }
+    }
 
     #[test]
     fn invocation_debug_redacts_argv_and_env_values() {
