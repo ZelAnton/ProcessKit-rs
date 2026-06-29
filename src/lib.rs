@@ -130,6 +130,7 @@ mod mechanism;
 mod pipeline;
 mod pump;
 mod result;
+mod retry;
 mod runner;
 mod running;
 #[cfg(feature = "process-control")]
@@ -160,6 +161,7 @@ pub use limits::ResourceLimits;
 pub use mechanism::Mechanism;
 pub use pipeline::Pipeline;
 pub use result::{Outcome, ProcessResult};
+pub use retry::RetryPolicy;
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
 pub use running::{Finished, OutputEvent, OutputEvents, OutputLine, RunningProcess, StdoutLines};
 #[cfg(feature = "process-control")]

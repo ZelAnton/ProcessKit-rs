@@ -13,6 +13,7 @@ use crate::buffer::{OutputBufferPolicy, StdioMode};
 use crate::error::{Error, Result};
 use crate::pump::LineHandler;
 use crate::result::ProcessResult;
+use crate::retry::RetryConfig;
 use crate::runner::{JobRunner, ProcessRunnerExt};
 use crate::running::RunningProcess;
 use crate::stdin::Stdin;
@@ -58,7 +59,7 @@ pub struct Command {
     output_buffer: OutputBufferPolicy,
     stdout_encoding: &'static Encoding,
     stderr_encoding: &'static Encoding,
-    retry: Option<RetryPolicy>,
+    retry: Option<RetryConfig>,
     /// `Some` once `inherit_env` was called (even with an empty list): clear
     /// the inherited environment and copy only these parent vars.
     inherit_env: Option<Vec<OsString>>,
@@ -79,15 +80,6 @@ pub struct Command {
     /// a `Command` clone — including each `Pipeline` stage and each
     /// `Supervisor` incarnation — shares the same cancel state.
     cancel_token: Option<tokio_util::sync::CancellationToken>,
-}
-
-/// A retry policy attached to a [`Command`] via [`Command::retry`], honored by
-/// the success-checking run helpers. Cheap to clone (the classifier is `Arc`'d).
-#[derive(Clone)]
-pub(crate) struct RetryPolicy {
-    pub(crate) max_attempts: u32,
-    pub(crate) backoff: Duration,
-    pub(crate) classifier: Arc<dyn Fn(&Error) -> bool + Send + Sync>,
 }
 
 impl Command {
@@ -477,7 +469,7 @@ impl Command {
     ///
     /// Applies to the **success-checking** helpers — [`run`](Self::run),
     /// [`exit_code`](Self::exit_code), [`probe`](Self::probe), and the
-    /// [`CliClient`](crate::CliClient) `run`/`run_unit`/`exit_code`/`parse`/`try_parse`
+    /// [`CliClient`](crate::CliClient) `run`/`run_unit`/`checked`/`exit_code`/`probe`/`parse`/`try_parse`
     /// helpers — i.e. the ones that surface failure as an [`Error`] the classifier
     /// can inspect (e.g. a transient network failure in `stderr`, or
     /// [`Error::Timeout`](crate::Error::Timeout)). The non-erroring
@@ -518,11 +510,7 @@ impl Command {
         backoff: Duration,
         retry_if: impl Fn(&Error) -> bool + Send + Sync + 'static,
     ) -> Self {
-        self.retry = Some(RetryPolicy {
-            max_attempts,
-            backoff,
-            classifier: Arc::new(retry_if),
-        });
+        self.retry = Some(RetryConfig::fixed(max_attempts, backoff, retry_if));
         self
     }
 
@@ -744,7 +732,7 @@ impl Command {
         self.output_buffer
     }
 
-    pub(crate) fn retry_policy(&self) -> Option<RetryPolicy> {
+    pub(crate) fn retry_config(&self) -> Option<RetryConfig> {
         self.retry.clone()
     }
 
@@ -809,6 +797,15 @@ impl Command {
             if !self.envs.iter().any(|(k, _)| env_key_eq(k, key)) {
                 self.envs.push((key.clone(), value.clone()));
             }
+        }
+    }
+
+    /// Fill a client-wide retry config ([`CliClient::default_retry`](crate::CliClient::default_retry))
+    /// only when this command set no [`retry`](Self::retry) of its own — so a
+    /// per-command policy wins (gap-fill, not override).
+    pub(crate) fn fill_default_retry(&mut self, default: &Option<RetryConfig>) {
+        if self.retry.is_none() {
+            self.retry = default.clone();
         }
     }
 

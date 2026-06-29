@@ -16,8 +16,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::command::Command;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::result::ProcessResult;
+use crate::retry::{RetryConfig, RetryPolicy};
 use crate::runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
 
 mod sealed {
@@ -102,6 +103,9 @@ pub struct CliClient<R: ProcessRunner = JobRunner> {
     /// A cancellation token applied to every built command (see
     /// [`default_cancel_on`](Self::default_cancel_on)).
     cancel: Option<tokio_util::sync::CancellationToken>,
+    /// A retry policy + classifier applied to every built command (see
+    /// [`default_retry`](Self::default_retry)).
+    retry: Option<RetryConfig>,
 }
 
 // Manual Debug: no `Debug` bound on R; env values omitted per secret-safety rule.
@@ -112,6 +116,7 @@ impl<R: ProcessRunner> std::fmt::Debug for CliClient<R> {
             .field("timeout", &self.timeout)
             .field("env_names", &crate::command::redacted_env_names(&self.envs));
         d.field("has_default_cancel", &self.cancel.is_some());
+        d.field("has_default_retry", &self.retry.is_some());
         d.finish_non_exhaustive()
     }
 }
@@ -125,6 +130,7 @@ impl CliClient<JobRunner> {
             timeout: None,
             envs: Vec::new(),
             cancel: None,
+            retry: None,
         }
     }
 }
@@ -138,6 +144,7 @@ impl<R: ProcessRunner> CliClient<R> {
             timeout: None,
             envs: Vec::new(),
             cancel: None,
+            retry: None,
         }
     }
 
@@ -188,6 +195,35 @@ impl<R: ProcessRunner> CliClient<R> {
     #[must_use]
     pub fn default_cancel_on(mut self, token: tokio_util::sync::CancellationToken) -> Self {
         self.cancel = Some(token);
+        self
+    }
+
+    /// Retry **every** verb of this client whose failure surfaces as an [`Error`]
+    /// the classifier accepts, on a shared [`RetryPolicy`] (exponential backoff +
+    /// cap + jitter) — the client-wide analogue of the per-call
+    /// [`Command::retry`](crate::Command::retry), filled into each built command
+    /// the same way [`default_timeout`](Self::default_timeout) is. A per-command
+    /// [`Command::retry`] **wins** (gap-fill, not override).
+    ///
+    /// Honored by the success-checking verbs — [`run`](Self::run) /
+    /// [`run_unit`](Self::run_unit) / [`checked`](Self::checked) /
+    /// [`exit_code`](Self::exit_code) / [`probe`](Self::probe) /
+    /// [`parse`](Self::parse) / [`try_parse`](Self::try_parse) — the ones that
+    /// surface failure as an [`Error`] the classifier can inspect
+    /// (read it via [`is_transient`](crate::Error::is_transient) /
+    /// [`is_timeout`](crate::Error::is_timeout) / [`combined`](crate::Error::combined)).
+    /// The non-erroring `output_string`/`output_bytes` paths don't retry.
+    ///
+    /// **Each attempt re-executes the whole command** — a fresh process. Gate
+    /// retries on a classifier that matches *pre-effect* failures; see
+    /// [`Command::retry`]'s caveats on replayed side effects and one-shot stdin.
+    #[must_use]
+    pub fn default_retry(
+        mut self,
+        policy: RetryPolicy,
+        retry_if: impl Fn(&Error) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.retry = Some(RetryConfig::new(policy, retry_if));
         self
     }
 
@@ -242,6 +278,7 @@ impl<R: ProcessRunner> CliClient<R> {
             command = command.cancel_on(token.clone());
         }
         command.fill_default_envs(&self.envs);
+        command.fill_default_retry(&self.retry);
         command
     }
 
@@ -423,6 +460,20 @@ macro_rules! cli_client {
             /// `CliClient::default_cancel_on`).
             pub fn default_cancel_on(mut self, token: $crate::CancellationToken) -> Self {
                 self.core = self.core.default_cancel_on(token);
+                self
+            }
+
+            /// Retry every verb on a shared `RetryPolicy` + classifier
+            /// (see `CliClient::default_retry`).
+            pub fn default_retry(
+                mut self,
+                policy: $crate::RetryPolicy,
+                retry_if: impl Fn(&$crate::Error) -> bool
+                    + ::core::marker::Send
+                    + ::core::marker::Sync
+                    + 'static,
+            ) -> Self {
+                self.core = self.core.default_retry(policy, retry_if);
                 self
             }
         }
@@ -871,6 +922,40 @@ mod tests {
     fn macro_emits_default_cancel_on() {
         let _client = Demo::with_runner(ScriptedRunner::new())
             .default_cancel_on(crate::CancellationToken::new());
+    }
+
+    #[tokio::test]
+    async fn default_retry_retries_client_verbs() {
+        use crate::RetryPolicy;
+        // on_sequence: a retryable failure then success — the client-wide retry
+        // re-runs the verb. Exercises the macro-generated `default_retry`, the
+        // apply_defaults gap-fill, and the retry loop end-to-end.
+        let demo = Demo::with_runner(ScriptedRunner::new().on_sequence(
+            ["git", "rev-parse"],
+            [
+                Reply::fail(128, "could not read from remote"),
+                Reply::ok("abc123\n"),
+            ],
+        ))
+        .default_retry(RetryPolicy::new().initial_backoff(Duration::ZERO), |_e| {
+            true
+        });
+        // `head` runs `git rev-parse HEAD`: attempt 1 fails, the retry succeeds.
+        assert_eq!(demo.head(Path::new(".")).await.unwrap(), "abc123");
+    }
+
+    #[tokio::test]
+    async fn default_retry_classifier_can_decline() {
+        use crate::RetryPolicy;
+        // A classifier that rejects the error → no retry; the first failure surfaces.
+        let demo = Demo::with_runner(ScriptedRunner::new().on_sequence(
+            ["git", "rev-parse"],
+            [Reply::fail(128, "fatal"), Reply::ok("abc\n")],
+        ))
+        .default_retry(RetryPolicy::new().initial_backoff(Duration::ZERO), |_e| {
+            false
+        });
+        assert!(demo.head(Path::new(".")).await.is_err());
     }
 
     #[test]

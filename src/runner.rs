@@ -289,15 +289,16 @@ pub trait ProcessRunnerExt: ProcessRunner {
     }
 }
 
-/// Run `attempt` once, or up to `max_attempts` times when the command carries a
-/// retry policy, sleeping `backoff` between retries while the error is classified
-/// retryable.
+/// Run `attempt` once, or up to the policy's `max_attempts` when the command
+/// carries a retry config, sleeping the policy's per-retry delay (capped
+/// exponential backoff, optionally jittered) between retries while the error is
+/// classified retryable.
 async fn retrying<T, Fut, F>(command: &Command, mut attempt: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: core::future::Future<Output = Result<T>>,
 {
-    let policy = command.retry_policy();
+    let config = command.retry_config();
     // A one-shot streaming stdin is consumed by the first attempt; run once.
     let one_shot_stdin = !command.keeps_stdin_open()
         && command
@@ -317,18 +318,21 @@ where
                 if one_shot_stdin {
                     return Err(err);
                 }
-                match &policy {
-                    Some(p) if tries < p.max_attempts && (p.classifier)(&err) => {
+                match &config {
+                    Some(c) if tries < c.policy.max_attempts() && (c.classifier)(&err) => {
+                        // `tries` is the attempts-so-far count (1-based); the delay
+                        // before the next attempt uses the 0-based retry index.
+                        let delay = c.policy.delay_for(tries - 1);
                         #[cfg(feature = "tracing")]
                         tracing::debug!(
                             target: "processkit",
                             attempt = tries,
-                            max_attempts = p.max_attempts,
-                            backoff_ms = p.backoff.as_millis() as u64,
+                            max_attempts = c.policy.max_attempts(),
+                            backoff_ms = delay.as_millis() as u64,
                             error = %err,
                             "retrying after a retryable failure"
                         );
-                        tokio::time::sleep(p.backoff).await;
+                        tokio::time::sleep(delay).await;
                     }
                     _ => return Err(err),
                 }

@@ -26,6 +26,14 @@ to a dated version section.
 - `#[doc(hidden)]` constructors `Error::{exit, timeout, signalled}` for custom
   `ProcessRunner` doubles and error-classifier tests, so they stop spelling out
   struct literals that a future `#[non_exhaustive]` field addition would break.
+- Client-wide retry: `CliClient::default_retry(policy, retry_if)` retries **every**
+  verb on a shared `RetryPolicy` (exponential backoff + per-delay cap + AWS-style
+  full jitter) — the client-wide analogue of the per-call `Command::retry`. A
+  per-command `Command::retry` still wins (gap-fill, not override). The new public
+  `RetryPolicy` (`#[non_exhaustive]`, builder + `Default`: 3 retries / 100 ms / ×2
+  growth / 30 s cap / jitter on) is also the schedule behind `Command::retry`,
+  whose released fixed-backoff form is unchanged. Jitter uses a small per-thread
+  PRNG seeded from system entropy — no new dependency.
 - `testing::Invocation` env assertions — the env analogue of `has_flag`:
   `env(name) -> Option<Option<&OsStr>>` (full fidelity: untouched / set / removed,
   last override wins), `env_is(name, value) -> bool`, and `has_env(name) -> bool`

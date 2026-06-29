@@ -393,6 +393,7 @@ pub fn processkit::CliClient<R>::command_in<I, S>(&self, &std::path::Path, I) ->
 pub fn processkit::CliClient<R>::default_cancel_on(self, tokio_util::sync::cancellation_token::CancellationToken) -> Self
 pub fn processkit::CliClient<R>::default_env(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
 pub fn processkit::CliClient<R>::default_env_remove(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
+pub fn processkit::CliClient<R>::default_retry(self, processkit::RetryPolicy, impl core::ops::function::Fn(&processkit::Error) -> bool + core::marker::Send + core::marker::Sync + 'static) -> Self
 pub fn processkit::CliClient<R>::default_timeout(self, core::time::Duration) -> Self
 pub async fn processkit::CliClient<R>::exit_code(&self, impl processkit::IntoCommand<R>) -> processkit::Result<i32>
 pub async fn processkit::CliClient<R>::first_line<F>(&self, impl processkit::IntoCommand<R>, F) -> processkit::Result<core::option::Option<alloc::string::String>> where F: core::ops::function::Fn(&str) -> bool + core::marker::Send
@@ -415,8 +416,8 @@ impl<R> core::marker::Send for processkit::CliClient<R>
 impl<R> core::marker::Sync for processkit::CliClient<R>
 impl<R> core::marker::Unpin for processkit::CliClient<R> where R: core::marker::Unpin
 impl<R> core::marker::UnsafeUnpin for processkit::CliClient<R> where R: core::marker::UnsafeUnpin
-impl<R> core::panic::unwind_safe::RefUnwindSafe for processkit::CliClient<R> where R: core::panic::unwind_safe::RefUnwindSafe
-impl<R> core::panic::unwind_safe::UnwindSafe for processkit::CliClient<R> where R: core::panic::unwind_safe::UnwindSafe
+impl<R> !core::panic::unwind_safe::RefUnwindSafe for processkit::CliClient<R>
+impl<R> !core::panic::unwind_safe::UnwindSafe for processkit::CliClient<R>
 pub struct processkit::Command
 impl processkit::Command
 pub fn processkit::Command::arg(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
@@ -761,6 +762,36 @@ impl core::marker::Unpin for processkit::ResourceLimits
 impl core::marker::UnsafeUnpin for processkit::ResourceLimits
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::ResourceLimits
 impl core::panic::unwind_safe::UnwindSafe for processkit::ResourceLimits
+#[non_exhaustive] pub struct processkit::RetryPolicy
+pub processkit::RetryPolicy::initial_backoff: core::time::Duration
+pub processkit::RetryPolicy::jitter: bool
+pub processkit::RetryPolicy::max_backoff: core::time::Duration
+pub processkit::RetryPolicy::max_retries: u32
+pub processkit::RetryPolicy::multiplier: f64
+impl processkit::RetryPolicy
+pub fn processkit::RetryPolicy::initial_backoff(self, core::time::Duration) -> Self
+pub fn processkit::RetryPolicy::jitter(self, bool) -> Self
+pub fn processkit::RetryPolicy::max_backoff(self, core::time::Duration) -> Self
+pub fn processkit::RetryPolicy::max_retries(self, u32) -> Self
+pub fn processkit::RetryPolicy::multiplier(self, f64) -> Self
+pub fn processkit::RetryPolicy::new() -> Self
+impl core::clone::Clone for processkit::RetryPolicy
+pub fn processkit::RetryPolicy::clone(&self) -> processkit::RetryPolicy
+impl core::cmp::PartialEq for processkit::RetryPolicy
+pub fn processkit::RetryPolicy::eq(&self, &processkit::RetryPolicy) -> bool
+impl core::default::Default for processkit::RetryPolicy
+pub fn processkit::RetryPolicy::default() -> Self
+impl core::fmt::Debug for processkit::RetryPolicy
+pub fn processkit::RetryPolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for processkit::RetryPolicy
+impl core::marker::StructuralPartialEq for processkit::RetryPolicy
+impl core::marker::Freeze for processkit::RetryPolicy
+impl core::marker::Send for processkit::RetryPolicy
+impl core::marker::Sync for processkit::RetryPolicy
+impl core::marker::Unpin for processkit::RetryPolicy
+impl core::marker::UnsafeUnpin for processkit::RetryPolicy
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::RetryPolicy
+impl core::panic::unwind_safe::UnwindSafe for processkit::RetryPolicy
 #[non_exhaustive] pub struct processkit::RunProfile
 pub processkit::RunProfile::cpu_time: core::option::Option<core::time::Duration>
 pub processkit::RunProfile::duration: core::time::Duration
