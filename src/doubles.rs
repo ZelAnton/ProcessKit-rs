@@ -651,7 +651,11 @@ pub struct Invocation {
     pub args: Vec<OsString>,
     /// The working directory, if one was set.
     pub cwd: Option<PathBuf>,
-    /// Environment overrides (`None` value = removal), in order.
+    /// Environment overrides (`None` value = removal), in order — the raw list,
+    /// preserving order and duplicates for order/duplicate-sensitive checks. For
+    /// the **effective override** value (platform case rules, last write wins) use
+    /// the [`env`](Self::env) / [`env_is`](Self::env_is) / [`has_env`](Self::has_env)
+    /// accessors rather than scanning this by hand.
     pub envs: Vec<(OsString, Option<OsString>)>,
     /// Whether a (non-empty) stdin source was provided.
     pub has_stdin: bool,
@@ -701,9 +705,11 @@ impl Invocation {
     /// key is overridden more than once the **last** (effective) override is
     /// returned. Key matching follows the platform's environment rules —
     /// **case-insensitive on Windows** (where env names are), case-sensitive
-    /// elsewhere — so the accessor reflects the override the spawned child would
-    /// actually see. For the common assertions prefer [`env_is`](Self::env_is) /
-    /// [`has_env`](Self::has_env).
+    /// elsewhere — matching the key a spawn resolves. These accessors reflect the
+    /// invocation's explicit **per-variable** overrides (`env`/`env_remove`) only,
+    /// not whole-environment scoping (`env_clear`/`inherit_env`, which an
+    /// `Invocation` doesn't capture). For the common assertions prefer
+    /// [`env_is`](Self::env_is) / [`has_env`](Self::has_env).
     pub fn env(&self, name: impl AsRef<OsStr>) -> Option<Option<&OsStr>> {
         let name = name.as_ref();
         self.envs
