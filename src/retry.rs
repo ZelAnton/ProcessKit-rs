@@ -32,8 +32,11 @@ use crate::error::Error;
 /// schedule for a long-lived process — different subsystems, different intent.
 ///
 /// Non-exhaustive: construct via [`RetryPolicy::new`] / [`Default`] + the builder
-/// methods (new knobs can be added without a breaking change).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// methods (new knobs can be added without a breaking change). Intentionally
+/// **not** `Copy` — that would pin every future field to a `Copy` type (a boxed
+/// custom-backoff fn, a list of retryable codes), and shedding `Copy` later is the
+/// breaking change; `Clone` covers every real need (all reads are by-`&`).
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct RetryPolicy {
     /// Retries **after** the first attempt — `0` never retries; `3` (the default)
@@ -48,8 +51,8 @@ pub struct RetryPolicy {
     /// full here.)
     pub initial_backoff: Duration,
     /// Exponential growth factor per retry. Default `2.0`; `1.0` is fixed backoff.
-    /// Values below `1.0` are treated as `1.0` (backoff never shrinks). (The
-    /// `factor` of [`Supervisor::backoff`](crate::Supervisor::backoff).)
+    /// Values below `1.0` (or non-finite) are treated as `1.0` (backoff never
+    /// shrinks). (The `factor` of [`Supervisor::backoff`](crate::Supervisor::backoff).)
     pub multiplier: f64,
     /// Upper bound on a single delay, so exponential growth can't run away.
     /// Default 30 s; set `Duration::MAX` to effectively disable the cap.

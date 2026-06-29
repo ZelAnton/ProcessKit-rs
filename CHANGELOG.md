@@ -12,20 +12,22 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
-- `Error` accessors so consumers stop destructuring `#[non_exhaustive]` variants:
-  `program()`, `stdout()`, `stderr()` -> `Option<&str>`; `combined()` ->
-  `Option<String>` (streams for the `Exit`/`Timeout`/`Signalled` variants, `None`
-  elsewhere); `code()` / `signal()` -> `Option<i32>`; and the `is_timeout()` /
-  `is_cancelled()` predicates. `code` / `signal` / `program` reuse the crate-wide
-  `ProcessResult` / `Outcome` / `RunProfile` vocabulary, so a wrapper reads every
-  failure off `Error` through accessors — keeping a future 1.x field addition a
-  non-event for the whole re-exporting dependent tree.
+- `Error` accessors so consumers stop matching the `#[non_exhaustive]` `Error`
+  enum's variants by hand: `program()`, `stdout()`, `stderr()` -> `Option<&str>`;
+  `combined()` -> `Option<String>` (streams for the `Exit`/`Timeout`/`Signalled`
+  variants, `None` elsewhere); `code()` / `signal()` -> `Option<i32>`; and the
+  `is_timeout()` / `is_cancelled()` / `is_signalled()` predicates. `code` /
+  `signal` / `program` reuse the crate-wide `ProcessResult` / `Outcome` /
+  `RunProfile` vocabulary, so a wrapper reads every failure off `Error` through
+  accessors — making a future *variant* addition a non-event for the whole
+  re-exporting dependent tree (and, once the data-bearing variants become
+  `#[non_exhaustive]` in 2.0, field additions too).
 - `ProcessResult::output_contains_any(&[&str]) -> bool` — case-insensitive (ASCII)
   search across both captured streams, for the lenient "a specific non-zero exit
   is benign when a known stderr/stdout marker is present" idiom.
 - `#[doc(hidden)]` constructors `Error::{exit, timeout, signalled}` for custom
   `ProcessRunner` doubles and error-classifier tests, so they stop spelling out
-  struct literals that a future `#[non_exhaustive]` field addition would break.
+  struct literals that a future field addition (a 2.0 change) would break.
 - Client-wide retry: `CliClient::default_retry(policy, retry_if)` retries **every**
   verb on a shared `RetryPolicy` (exponential backoff + per-delay cap + AWS-style
   full jitter) — the client-wide analogue of the per-call `Command::retry`. A
@@ -43,8 +45,9 @@ to a dated version section.
 - `CliClient::default_env_fn(key, resolver)` — a client-wide env default whose
   value is **recomputed once each time a command is built** (per `command()` /
   verb call), for a value that must refresh per operation rather than freeze at
-  client construction (a rotating token, a fresh request id, the current trace
-  span) where the static `default_env` would pin a stale value. The resolver is
+  client construction (a fresh request id, the current trace span, a
+  periodically-rotated token) where the static `default_env` would pin a stale
+  value. The resolver is
   gap-filled: it runs only when the command doesn't already set that key at the
   moment the client's defaults are applied (so a per-command `Command::env` and a
   static `default_env` for the same key win, and the resolver is then skipped, not
@@ -57,6 +60,15 @@ to a dated version section.
 
 ### Fixed
 -
+
+### Documentation
+- `Command::env` documents how to pass secrets: env values are redacted from
+  `Debug`/tracing/cassettes (argv is not — prefer env or `stdin`), processkit ships
+  no `Secret` type (bring your own `secrecy`/`zeroize` and pass the exposed value),
+  and `default_env_fn` covers a per-operation rotating value. `Command::retry` ↔
+  `Command::retry_with`/`RetryPolicy` now cross-reference their attempt-vs-retry
+  counting, and `RetryPolicy` ↔ `Supervisor::backoff` cross-reference their shared
+  backoff schedule.
 
 ## [1.1.0] - 2026-06-28
 

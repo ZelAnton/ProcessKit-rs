@@ -191,6 +191,7 @@ pub fn processkit::Error::diagnostic(&self) -> core::option::Option<&str>
 pub fn processkit::Error::is_cancelled(&self) -> bool
 pub fn processkit::Error::is_not_found(&self) -> bool
 pub fn processkit::Error::is_permission_denied(&self) -> bool
+pub fn processkit::Error::is_signalled(&self) -> bool
 pub fn processkit::Error::is_timeout(&self) -> bool
 pub fn processkit::Error::is_transient(&self) -> bool
 pub fn processkit::Error::program(&self) -> core::option::Option<&str>
@@ -785,7 +786,6 @@ impl core::default::Default for processkit::RetryPolicy
 pub fn processkit::RetryPolicy::default() -> Self
 impl core::fmt::Debug for processkit::RetryPolicy
 pub fn processkit::RetryPolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Copy for processkit::RetryPolicy
 impl core::marker::StructuralPartialEq for processkit::RetryPolicy
 impl core::marker::Freeze for processkit::RetryPolicy
 impl core::marker::Send for processkit::RetryPolicy

@@ -585,6 +585,17 @@ impl Error {
         matches!(self, Error::Cancelled { .. })
     }
 
+    /// Whether the run was killed by a signal — i.e. this is a
+    /// [`Signalled`](Error::Signalled). Distinct from [`signal`](Self::signal):
+    /// this is `true` even when the kernel didn't expose a number (a Unix kill
+    /// where `signal()` is `None`, or any platform's signal disposition), so it is
+    /// the reliable "died by a signal?" check — the predicate twin of
+    /// [`is_timeout`](Self::is_timeout) / [`is_cancelled`](Self::is_cancelled),
+    /// without destructuring the variant.
+    pub fn is_signalled(&self) -> bool {
+        matches!(self, Error::Signalled { .. })
+    }
+
     /// The underlying [`std::io::Error`] for the variants that carry one
     /// ([`Spawn`](Error::Spawn), [`Io`](Error::Io)) — the basis for the io-level
     /// classifiers above.
@@ -613,10 +624,11 @@ impl Error {
 
     /// Construct an [`Exit`](Error::Exit) — a `#[doc(hidden)]` convenience for
     /// custom [`ProcessRunner`](crate::ProcessRunner) doubles and error-classifier
-    /// tests, so they stop spelling out the struct literal (which a future
-    /// `#[non_exhaustive]` field addition would break) and go through one
-    /// insulated constructor instead. Off the documented surface, but `pub` so
-    /// downstream test code can call it; semver-covered like any public item.
+    /// tests, so they stop spelling out the struct literal (which any future field
+    /// addition to the variant — a 2.0 change, see the variant-`#[non_exhaustive]`
+    /// plan — would break) and go through one insulated constructor instead. Off
+    /// the documented surface, but `pub` so downstream test code can call it;
+    /// semver-covered like any public item.
     #[doc(hidden)]
     pub fn exit(
         program: impl Into<String>,
@@ -1039,13 +1051,19 @@ mod tests {
         assert_eq!(signalled.code(), None);
         assert_eq!(signalled.signal(), Some(9));
         assert!(!signalled.is_timeout());
-        // A signal kill with no reported number reads as `None`, not a sentinel.
-        assert_eq!(Error::signalled("git", None, "", "").signal(), None);
+        assert!(signalled.is_signalled());
+        // A signal kill with no reported number reads as `None`, not a sentinel —
+        // but `is_signalled()` still detects it (the reason it exists).
+        let unknown_sig = Error::signalled("git", None, "", "");
+        assert_eq!(unknown_sig.signal(), None);
+        assert!(unknown_sig.is_signalled());
+        assert!(!exit.is_signalled() && !timeout.is_signalled());
 
         let cancelled = Error::Cancelled {
             program: "job".into(),
         };
         assert!(cancelled.is_cancelled());
+        assert!(!cancelled.is_signalled());
         assert!(!exit.is_cancelled() && !timeout.is_cancelled());
     }
 
@@ -1092,8 +1110,8 @@ mod tests {
 
     #[test]
     fn doc_hidden_constructors_build_the_expected_variants() {
-        // The constructors insulate doubles/tests from `#[non_exhaustive]` field
-        // additions; round-trip through the accessors confirms the variant.
+        // The constructors insulate doubles/tests from a future field addition to
+        // these variants; round-trip through the accessors confirms the variant.
         assert!(matches!(
             Error::exit("git", 2, "o", "e"),
             Error::Exit { code: 2, .. }

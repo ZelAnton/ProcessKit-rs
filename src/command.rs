@@ -492,12 +492,12 @@ impl Command {
     /// total attempts, sleeping a fixed `backoff` between tries. For exponential
     /// backoff + cap + jitter, use [`retry_with`](Self::retry_with).
     ///
-    /// Applies to the **success-checking** helpers — [`run`](Self::run),
-    /// [`exit_code`](Self::exit_code), [`probe`](Self::probe), and the
-    /// [`CliClient`](crate::CliClient) `run`/`run_unit`/`checked`/`exit_code`/`probe`/`parse`/`try_parse`
-    /// helpers — i.e. the ones that surface failure as an [`Error`] the classifier
-    /// can inspect (e.g. a transient network failure in `stderr`, or
-    /// [`Error::Timeout`](crate::Error::Timeout)). The non-erroring
+    /// Applies to the **success-checking** helpers —
+    /// `run`/`run_unit`/`checked`/`exit_code`/`probe`/`parse`/`try_parse` — on
+    /// [`Command`](Self::run), on [`ProcessRunnerExt`](crate::ProcessRunnerExt),
+    /// and on [`CliClient`](crate::CliClient): the ones that surface failure as an
+    /// [`Error`] the classifier can inspect (e.g. a transient network failure in
+    /// `stderr`, or [`Error::Timeout`](crate::Error::Timeout)). The non-erroring
     /// `output_string`/`output_bytes` paths don't retry.
     ///
     /// Each attempt **re-executes the whole command** — a fresh process. Only
