@@ -182,13 +182,16 @@ pub processkit::Error::Timeout::timeout: core::time::Duration
 pub processkit::Error::Unsupported
 pub processkit::Error::Unsupported::operation: alloc::string::String
 impl processkit::Error
+pub fn processkit::Error::code(&self) -> core::option::Option<i32>
 pub fn processkit::Error::combined(&self) -> core::option::Option<alloc::string::String>
 pub fn processkit::Error::diagnostic(&self) -> core::option::Option<&str>
-pub fn processkit::Error::exit_code(&self) -> core::option::Option<i32>
+pub fn processkit::Error::is_cancelled(&self) -> bool
 pub fn processkit::Error::is_not_found(&self) -> bool
 pub fn processkit::Error::is_permission_denied(&self) -> bool
 pub fn processkit::Error::is_timeout(&self) -> bool
 pub fn processkit::Error::is_transient(&self) -> bool
+pub fn processkit::Error::program(&self) -> core::option::Option<&str>
+pub fn processkit::Error::signal(&self) -> core::option::Option<i32>
 pub fn processkit::Error::stderr(&self) -> core::option::Option<&str>
 pub fn processkit::Error::stdout(&self) -> core::option::Option<&str>
 impl core::error::Error for processkit::Error

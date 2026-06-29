@@ -12,13 +12,14 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
-- `Error` output accessors so consumers stop destructuring `#[non_exhaustive]`
-  variants: `stdout()` / `stderr()` -> `Option<&str>` and `combined()` ->
-  `Option<String>` (the `Error` twin of `ProcessResult::combined`) for the
-  stream-bearing variants (`Exit`/`Timeout`/`Signalled`), `None` elsewhere; plus
-  `exit_code() -> Option<i32>` and `is_timeout() -> bool`. Reading everything off
-  `Error` through accessors keeps a future 1.x field addition a non-event for the
-  whole re-exporting dependent tree.
+- `Error` accessors so consumers stop destructuring `#[non_exhaustive]` variants:
+  `program()`, `stdout()`, `stderr()` -> `Option<&str>`; `combined()` ->
+  `Option<String>` (streams for the `Exit`/`Timeout`/`Signalled` variants, `None`
+  elsewhere); `code()` / `signal()` -> `Option<i32>`; and the `is_timeout()` /
+  `is_cancelled()` predicates. `code` / `signal` / `program` reuse the crate-wide
+  `ProcessResult` / `Outcome` / `RunProfile` vocabulary, so a wrapper reads every
+  failure off `Error` through accessors — keeping a future 1.x field addition a
+  non-event for the whole re-exporting dependent tree.
 - `ProcessResult::output_contains_any(&[&str]) -> bool` — case-insensitive (ASCII)
   search across both captured streams, for the lenient "a specific non-zero exit
   is benign when a known stderr/stdout marker is present" idiom.

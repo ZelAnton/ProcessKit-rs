@@ -433,6 +433,34 @@ impl Error {
         }
     }
 
+    /// The program (the CLI tool) this error is attributed to — `Some` for every
+    /// variant that names one (all except [`Unsupported`](Error::Unsupported),
+    /// [`Io`](Error::Io), and the `limits`-only `ResourceLimit`), `None` otherwise.
+    /// The [`Error`] twin of
+    /// [`ProcessResult::program`](crate::ProcessResult::program): the one
+    /// cross-cutting datum a wrapper routes or logs on, read without destructuring
+    /// a `#[non_exhaustive]` variant.
+    pub fn program(&self) -> Option<&str> {
+        // Exhaustive on purpose (like `diagnostic`/`streams`/`io_source`): a future
+        // program-naming variant must add itself here, not fall through a `_`.
+        match self {
+            Error::Spawn { program, .. }
+            | Error::NotFound { program, .. }
+            | Error::CassetteMiss { program }
+            | Error::Exit { program, .. }
+            | Error::Timeout { program, .. }
+            | Error::OutputTooLarge { program, .. }
+            | Error::NotReady { program, .. }
+            | Error::Parse { program, .. }
+            | Error::Cancelled { program }
+            | Error::Signalled { program, .. }
+            | Error::Stdin { program, .. } => Some(program),
+            Error::Unsupported { .. } | Error::Io(_) => None,
+            #[cfg(feature = "limits")]
+            Error::ResourceLimit { .. } => None,
+        }
+    }
+
     /// Whether the **program could not be located** — it is not installed, not
     /// on `PATH`, or the given path does not resolve to an executable. True for
     /// [`NotFound`](Error::NotFound) and **only** that variant: the launch
@@ -478,13 +506,28 @@ impl Error {
     }
 
     /// The process exit code for a non-zero [`Exit`](Error::Exit); `None` for
-    /// every other variant (a timeout or a signal kill carries no exit code) —
-    /// the [`Error`] twin of [`ProcessResult::code`](crate::ProcessResult::code) /
-    /// [`Outcome::code`](crate::Outcome::code). Reads the code off the error
-    /// without destructuring the variant.
-    pub fn exit_code(&self) -> Option<i32> {
+    /// every other variant (a timeout or a signal kill carries no exit code).
+    /// The same `code()` the crate's other disposition types expose
+    /// ([`ProcessResult::code`](crate::ProcessResult::code) /
+    /// [`Outcome::code`](crate::Outcome::code) /
+    /// [`RunProfile::code`](crate::RunProfile::code)), so a code is one name
+    /// everywhere. Reads the code off the error without destructuring the variant.
+    pub fn code(&self) -> Option<i32> {
         match self {
             Error::Exit { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// The signal number for a [`Signalled`](Error::Signalled) run terminated
+    /// with a **known** signal (**Unix only**); `None` for every other variant and
+    /// for a signal the kernel didn't expose — the [`Error`] twin of
+    /// [`ProcessResult::signal`](crate::ProcessResult::signal) /
+    /// [`Outcome::signal`](crate::Outcome::signal). Reads the signal off the error
+    /// without destructuring the variant.
+    pub fn signal(&self) -> Option<i32> {
+        match self {
+            Error::Signalled { signal, .. } => *signal,
             _ => None,
         }
     }
@@ -496,6 +539,16 @@ impl Error {
     /// `e.is_transient() || e.is_timeout()` rather than matching the variant by hand.
     pub fn is_timeout(&self) -> bool {
         matches!(self, Error::Timeout { .. })
+    }
+
+    /// Whether the run was deliberately cancelled via its
+    /// [`Command::cancel_on`](crate::Command::cancel_on) token — i.e. this is a
+    /// [`Cancelled`](Error::Cancelled). A caller that initiated the stop can
+    /// swallow it rather than log or retry it as a real failure (the same
+    /// disposition [`Supervisor`](crate::Supervisor) treats as terminal), without
+    /// destructuring the variant.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Error::Cancelled { .. })
     }
 
     /// The underlying [`std::io::Error`] for the variants that carry one
@@ -936,18 +989,71 @@ mod tests {
     }
 
     #[test]
-    fn exit_code_and_is_timeout_accessors() {
+    fn disposition_accessors_code_signal_timeout_cancelled() {
         let exit = Error::exit("git", 7, "", "");
-        assert_eq!(exit.exit_code(), Some(7));
+        assert_eq!(exit.code(), Some(7));
+        assert_eq!(exit.signal(), None);
         assert!(!exit.is_timeout());
+        assert!(!exit.is_cancelled());
 
         let timeout = Error::timeout("git", Duration::from_secs(1), "", "");
-        assert_eq!(timeout.exit_code(), None);
+        assert_eq!(timeout.code(), None);
+        assert_eq!(timeout.signal(), None);
         assert!(timeout.is_timeout());
 
         let signalled = Error::signalled("git", Some(9), "", "");
-        assert_eq!(signalled.exit_code(), None);
+        assert_eq!(signalled.code(), None);
+        assert_eq!(signalled.signal(), Some(9));
         assert!(!signalled.is_timeout());
+        // A signal kill with no reported number reads as `None`, not a sentinel.
+        assert_eq!(Error::signalled("git", None, "", "").signal(), None);
+
+        let cancelled = Error::Cancelled {
+            program: "job".into(),
+        };
+        assert!(cancelled.is_cancelled());
+        assert!(!exit.is_cancelled() && !timeout.is_cancelled());
+    }
+
+    #[test]
+    fn program_accessor_covers_named_variants_and_skips_the_rest() {
+        // Every variant that names a program returns it; the variants that don't
+        // (Unsupported, Io) return None.
+        assert_eq!(Error::exit("git", 1, "", "").program(), Some("git"));
+        assert_eq!(
+            Error::NotReady {
+                program: "server".into(),
+                timeout: Duration::from_secs(1),
+            }
+            .program(),
+            Some("server")
+        );
+        assert_eq!(
+            Error::Cancelled {
+                program: "job".into()
+            }
+            .program(),
+            Some("job")
+        );
+        assert_eq!(
+            Error::Unsupported {
+                operation: "suspend".into()
+            }
+            .program(),
+            None
+        );
+        assert_eq!(
+            Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)).program(),
+            None
+        );
+        #[cfg(feature = "limits")]
+        assert_eq!(
+            Error::ResourceLimit {
+                message: "no container".into()
+            }
+            .program(),
+            None
+        );
     }
 
     #[test]
