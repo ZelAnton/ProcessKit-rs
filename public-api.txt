@@ -392,6 +392,7 @@ pub fn processkit::CliClient<R>::command<I, S>(&self, I) -> processkit::Command 
 pub fn processkit::CliClient<R>::command_in<I, S>(&self, &std::path::Path, I) -> processkit::Command where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub fn processkit::CliClient<R>::default_cancel_on(self, tokio_util::sync::cancellation_token::CancellationToken) -> Self
 pub fn processkit::CliClient<R>::default_env(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
+pub fn processkit::CliClient<R>::default_env_fn<V, F>(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>, F) -> Self where V: core::convert::Into<std::ffi::os_str::OsString>, F: core::ops::function::Fn() -> V + core::marker::Send + core::marker::Sync + 'static
 pub fn processkit::CliClient<R>::default_env_remove(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
 pub fn processkit::CliClient<R>::default_retry(self, processkit::RetryPolicy, impl core::ops::function::Fn(&processkit::Error) -> bool + core::marker::Send + core::marker::Sync + 'static) -> Self
 pub fn processkit::CliClient<R>::default_timeout(self, core::time::Duration) -> Self

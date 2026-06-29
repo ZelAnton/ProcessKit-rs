@@ -816,10 +816,17 @@ impl Command {
     /// Case-insensitive key comparison on Windows.
     pub(crate) fn fill_default_envs(&mut self, defaults: &[(OsString, Option<OsString>)]) {
         for (key, value) in defaults {
-            if !self.envs.iter().any(|(k, _)| env_key_eq(k, key)) {
+            if !self.has_env_override(key) {
                 self.envs.push((key.clone(), value.clone()));
             }
         }
+    }
+
+    /// Whether this command already overrides `name` (set or removed), under the
+    /// platform's env case rules — used to gap-fill client defaults without
+    /// clobbering a per-command setting.
+    pub(crate) fn has_env_override(&self, name: &OsStr) -> bool {
+        self.envs.iter().any(|(key, _)| env_key_eq(key, name))
     }
 
     /// Fill a client-wide retry config ([`CliClient::default_retry`](crate::CliClient::default_retry))

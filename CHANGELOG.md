@@ -40,6 +40,17 @@ to a dated version section.
   last override wins), `env_is(name, value) -> bool`, and `has_env(name) -> bool`
   — so tests stop hand-rolling `envs.iter().any(..)` closures to assert injected
   variables.
+- `CliClient::default_env_fn(key, resolver)` — a client-wide env default whose
+  value is **recomputed once each time a command is built** (per `command()` /
+  verb call), for a value that must refresh per operation rather than freeze at
+  client construction (a rotating token, a fresh request id, the current trace
+  span) where the static `default_env` would pin a stale value. The resolver is
+  gap-filled: it runs only when the command doesn't already set that key at the
+  moment the client's defaults are applied (so a per-command `Command::env` and a
+  static `default_env` for the same key win, and the resolver is then skipped, not
+  merely overwritten). The value is baked into the built command — it is not
+  re-resolved per process spawn, so retries and re-runs of one command reuse it.
+  `Arc`-shared so `CliClient` stays `Clone`.
 
 ### Changed
 -

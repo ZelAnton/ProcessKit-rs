@@ -13,6 +13,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::command::Command;
@@ -106,7 +107,15 @@ pub struct CliClient<R: ProcessRunner = JobRunner> {
     /// A retry policy + classifier applied to every built command (see
     /// [`default_retry`](Self::default_retry)).
     retry: Option<RetryConfig>,
+    /// Per-build env resolvers — `(key, resolver)`, evaluated once when each
+    /// command is built and baked into it (see
+    /// [`default_env_fn`](Self::default_env_fn)).
+    env_fns: Vec<(OsString, EnvResolver)>,
 }
+
+/// A closure that computes an environment value when a command is built — backs
+/// [`CliClient::default_env_fn`]. `Arc`-shared so a `CliClient` stays `Clone`.
+type EnvResolver = Arc<dyn Fn() -> OsString + Send + Sync>;
 
 // Manual Debug: no `Debug` bound on R; env values omitted per secret-safety rule.
 impl<R: ProcessRunner> std::fmt::Debug for CliClient<R> {
@@ -117,6 +126,11 @@ impl<R: ProcessRunner> std::fmt::Debug for CliClient<R> {
             .field("env_names", &crate::command::redacted_env_names(&self.envs));
         d.field("has_default_cancel", &self.cancel.is_some());
         d.field("has_default_retry", &self.retry.is_some());
+        // Dynamic-env *keys* only (names aren't secret; the resolved values are).
+        if !self.env_fns.is_empty() {
+            let keys: Vec<&OsString> = self.env_fns.iter().map(|(key, _)| key).collect();
+            d.field("dynamic_env_keys", &keys);
+        }
         d.finish_non_exhaustive()
     }
 }
@@ -131,6 +145,7 @@ impl CliClient<JobRunner> {
             envs: Vec::new(),
             cancel: None,
             retry: None,
+            env_fns: Vec::new(),
         }
     }
 }
@@ -145,6 +160,7 @@ impl<R: ProcessRunner> CliClient<R> {
             envs: Vec::new(),
             cancel: None,
             retry: None,
+            env_fns: Vec::new(),
         }
     }
 
@@ -172,6 +188,53 @@ impl<R: ProcessRunner> CliClient<R> {
     #[must_use]
     pub fn default_env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
         self.envs.push((key.as_ref().to_os_string(), None));
+        self
+    }
+
+    /// Set an environment variable on every command this client builds to a value
+    /// **computed once per built command** by `resolver` — the dynamic companion to
+    /// [`default_env`](Self::default_env), for a value that must be refreshed for
+    /// each new operation rather than frozen at client construction (a rotating
+    /// token, a per-invocation request id, the current trace span). `resolver` runs
+    /// when each command is built — i.e. once per `command()` / verb call — and the
+    /// value is gap-filled like the other defaults: a per-command
+    /// [`env`](Command::env) / [`env_remove`](Command::env_remove) for the same key
+    /// wins, and an explicit static [`default_env`](Self::default_env) /
+    /// [`default_env_remove`](Self::default_env_remove) for the same key takes
+    /// precedence over the resolver (in which case the resolver is not run at all).
+    /// Lets a typed wrapper
+    /// drop the boilerplate of re-implementing every verb just to inject the value
+    /// first.
+    ///
+    /// **Scope of "fresh":** the value is resolved when the command is built and
+    /// then **baked into that command** — it is *not* re-resolved per process
+    /// spawn. A built command that is retried (via [`default_retry`] /
+    /// [`Command::retry`]) or run more than once reuses the value captured at build
+    /// time on every attempt. So this refreshes per *operation*, not per *attempt*:
+    /// suitable for a credential whose lifetime comfortably exceeds the retry
+    /// window, not for a strictly single-use token that must differ between two
+    /// attempts of the same command.
+    ///
+    /// `resolver` runs synchronously on the thread building the command (typically
+    /// an async runtime worker), once per build — keep it cheap and non-blocking;
+    /// cache or fall back inside it rather than blocking on I/O. It is infallible
+    /// (returns a value, not a `Result`): do any fallible resolution inside and have
+    /// it fall back. A panic propagates out of the build like any other; it does not
+    /// corrupt the client. The resolved value lands in the command's env exactly
+    /// like a static [`default_env`](Self::default_env) — and is never logged (env
+    /// values are redacted from `Debug`/tracing).
+    ///
+    /// [`default_retry`]: Self::default_retry
+    #[must_use]
+    pub fn default_env_fn<V, F>(mut self, key: impl AsRef<OsStr>, resolver: F) -> Self
+    where
+        V: Into<OsString>,
+        F: Fn() -> V + Send + Sync + 'static,
+    {
+        self.env_fns.push((
+            key.as_ref().to_os_string(),
+            Arc::new(move || resolver().into()),
+        ));
         self
     }
 
@@ -278,6 +341,15 @@ impl<R: ProcessRunner> CliClient<R> {
             command = command.cancel_on(token.clone());
         }
         command.fill_default_envs(&self.envs);
+        // Dynamic env defaults, applied after the static ones: resolve and set each
+        // only when the key is still absent — so a per-command `env` or an explicit
+        // `default_env` wins, AND a resolver (which may do real work — read a vault)
+        // never runs when the key is already set at the moment defaults are applied.
+        for (key, resolver) in &self.env_fns {
+            if !command.has_env_override(key) {
+                command = command.env(key, resolver());
+            }
+        }
         command.fill_default_retry(&self.retry);
         command
     }
@@ -450,6 +522,24 @@ macro_rules! cli_client {
                 key: impl ::core::convert::AsRef<::std::ffi::OsStr>,
             ) -> Self {
                 self.core = self.core.default_env_remove(key);
+                self
+            }
+
+            /// Set an env variable on every command to a value computed per built
+            /// command (see `CliClient::default_env_fn`).
+            pub fn default_env_fn<V, F>(
+                mut self,
+                key: impl ::core::convert::AsRef<::std::ffi::OsStr>,
+                resolver: F,
+            ) -> Self
+            where
+                V: ::core::convert::Into<::std::ffi::OsString>,
+                F: ::core::ops::Fn() -> V
+                    + ::core::marker::Send
+                    + ::core::marker::Sync
+                    + 'static,
+            {
+                self.core = self.core.default_env_fn(key, resolver);
                 self
             }
         }
@@ -922,6 +1012,119 @@ mod tests {
     fn macro_emits_default_cancel_on() {
         let _client = Demo::with_runner(ScriptedRunner::new())
             .default_cancel_on(crate::CancellationToken::new());
+    }
+
+    #[test]
+    fn macro_emits_default_env_fn() {
+        let _client = Demo::with_runner(ScriptedRunner::new()).default_env_fn("TOKEN", || "x");
+    }
+
+    #[test]
+    fn default_env_fn_resolves_per_build_and_respects_precedence() {
+        use crate::testing::Invocation;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&counter);
+        let client = CliClient::new("git").default_env_fn("TOKEN", move || {
+            format!("t{}", c.fetch_add(1, Ordering::SeqCst))
+        });
+
+        // Each built command resolves a FRESH value.
+        let inv1 = Invocation::from_command(&client.command(["status"]));
+        let inv2 = Invocation::from_command(&client.command(["status"]));
+        assert!(inv1.env_is("TOKEN", "t0"));
+        assert!(inv2.env_is("TOKEN", "t1"));
+
+        // A pre-built command that sets TOKEN keeps its own value, and the resolver
+        // is NOT invoked for it (the counter stays at the 2 resolves above).
+        let filled = client.apply_defaults(Command::new("git").env("TOKEN", "explicit"));
+        assert!(Invocation::from_command(&filled).env_is("TOKEN", "explicit"));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "the resolver must be skipped when the key is already set"
+        );
+    }
+
+    #[test]
+    fn default_env_fn_precedence_against_static_and_self() {
+        use crate::testing::Invocation;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // (a) A static `default_env` for the same key wins, and the resolver is
+        //     skipped entirely (the doc's stated precedence).
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&calls);
+        let client = CliClient::new("git")
+            .default_env("TOKEN", "static")
+            .default_env_fn("TOKEN", move || {
+                c.fetch_add(1, Ordering::SeqCst);
+                "dynamic"
+            });
+        let inv = Invocation::from_command(&client.command(["status"]));
+        assert!(inv.env_is("TOKEN", "static"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a static default_env must shadow the resolver, which then never runs"
+        );
+
+        // (b) A per-command `env_remove` for the key suppresses the resolver too —
+        //     an explicit unset beats the dynamic default, like the static one.
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&calls);
+        let client = CliClient::new("git").default_env_fn("TOKEN", move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            "dynamic"
+        });
+        let removed = client.apply_defaults(Command::new("git").env_remove("TOKEN"));
+        assert!(matches!(
+            Invocation::from_command(&removed).env("TOKEN"),
+            Some(None)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // (c) Two resolvers for the same key: the first registered wins (consistent
+        //     with the static `default_env` gap-fill), the second never runs.
+        let second_ran = Arc::new(AtomicU32::new(0));
+        let s = Arc::clone(&second_ran);
+        let client = CliClient::new("git")
+            .default_env_fn("TOKEN", || "first")
+            .default_env_fn("TOKEN", move || {
+                s.fetch_add(1, Ordering::SeqCst);
+                "second"
+            });
+        let inv = Invocation::from_command(&client.command(["status"]));
+        assert!(inv.env_is("TOKEN", "first"));
+        assert_eq!(second_ran.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn default_env_fn_value_is_baked_in_and_stable_across_clone_and_reuse() {
+        use crate::testing::Invocation;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&counter);
+        let client = CliClient::new("git").default_env_fn("TOKEN", move || {
+            format!("t{}", c.fetch_add(1, Ordering::SeqCst))
+        });
+
+        // A built command captures its value; re-running it (here: re-deriving the
+        // Invocation) does not re-resolve — the retry loop reuses this same value.
+        let built = client.command(["status"]);
+        assert!(Invocation::from_command(&built).env_is("TOKEN", "t0"));
+        assert!(Invocation::from_command(&built).env_is("TOKEN", "t0"));
+
+        // A clone shares the resolver's state (Arc), so it continues the sequence
+        // rather than restarting it — documents the shared-state semantics.
+        let clone = client.clone();
+        assert!(Invocation::from_command(&clone.command(["status"])).env_is("TOKEN", "t1"));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
