@@ -266,9 +266,31 @@ pub trait ProcessRunnerExt: ProcessRunner {
             }
             None
         };
+        // Race the search against cancellation. Once the search resolves — a
+        // match or a natural end-of-stream — we commit to that result and never
+        // re-inspect the token, so a run that ended with no match is reported as
+        // `Ok(None)` even if the shared token fires an instant later (the old
+        // post-hoc `is_cancelled()` re-check turned that natural `None` into a
+        // spurious `Cancelled`). A firing token only wins while the search is
+        // still pending; the tree teardown that closes the pipes is driven by the
+        // cancel watchdog independently.
+        let search_or_cancel = async move {
+            match cancel {
+                Some(token) => {
+                    tokio::pin!(search);
+                    tokio::select! {
+                        biased;
+                        found = &mut search => Ok(found),
+                        () = token.cancelled() => Err(()),
+                    }
+                }
+                None => Ok(search.await),
+            }
+        };
         let found = match timeout {
-            Some(limit) => match tokio::time::timeout(limit, search).await {
-                Ok(found) => found,
+            Some(limit) => match tokio::time::timeout(limit, search_or_cancel).await {
+                Ok(Ok(found)) => found,
+                Ok(Err(())) => return Err(crate::Error::Cancelled { program }),
                 Err(_elapsed) => {
                     return Err(crate::Error::Timeout {
                         program,
@@ -278,13 +300,11 @@ pub trait ProcessRunnerExt: ProcessRunner {
                     });
                 }
             },
-            None => search.await,
+            None => match search_or_cancel.await {
+                Ok(found) => found,
+                Err(()) => return Err(crate::Error::Cancelled { program }),
+            },
         };
-        // A cancelled run's stream just ends; surface the cancellation so a
-        // readiness probe doesn't misread `None` as "predicate never matched".
-        if found.is_none() && cancel.is_some_and(|t| t.is_cancelled()) {
-            return Err(crate::Error::Cancelled { program });
-        }
         Ok(found)
     }
 }
@@ -808,5 +828,36 @@ mod tests {
             1,
             "a cancelled run must not be retried"
         );
+    }
+
+    // The natural-end-of-stream-vs-late-token *race* the E7 change eliminates is
+    // a real-time window with no post-await gap in the new code, so it can't be
+    // reproduced deterministically here; these two lock in the invariant that
+    // matters day-to-day — merely *wiring* a (never-fired) cancel token must not
+    // perturb a normal `first_line` result. The end-to-end cancel path (a token
+    // that actually fires) is covered by the cancellation integration suite.
+    #[tokio::test]
+    async fn first_line_no_match_is_none_with_a_cancel_token_wired() {
+        use crate::testing::{Reply, ScriptedRunner};
+        let runner = ScriptedRunner::new().on(["tool"], Reply::lines(["alpha", "beta"]));
+        let cmd = Command::new("tool").cancel_on(crate::CancellationToken::new());
+        let found = runner
+            .first_line(&cmd, |l| l.contains("zzz"))
+            .await
+            .expect("a no-match run is Ok(None), not an error");
+        assert_eq!(found, None);
+    }
+
+    #[tokio::test]
+    async fn first_line_returns_the_match_with_a_cancel_token_wired() {
+        use crate::testing::{Reply, ScriptedRunner};
+        let runner =
+            ScriptedRunner::new().on(["tool"], Reply::lines(["alpha", "ready: yes", "beta"]));
+        let cmd = Command::new("tool").cancel_on(crate::CancellationToken::new());
+        let found = runner
+            .first_line(&cmd, |l| l.contains("ready"))
+            .await
+            .expect("first_line");
+        assert_eq!(found.as_deref(), Some("ready: yes"));
     }
 }

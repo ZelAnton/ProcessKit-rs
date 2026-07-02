@@ -676,6 +676,59 @@ async fn fail_loud_buffer_surfaces_output_too_large() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real subprocess whose raw stdout a byte cap bounds"]
+async fn output_bytes_honors_the_byte_cap() {
+    // `output_bytes` captures stdout raw, but a byte ceiling on the policy is a
+    // real memory bound there (not just for the line verbs): fail-loud errors,
+    // the drop modes bound the retained bytes. `two_line_echo` prints > 4 bytes.
+    use processkit::{OutputBufferPolicy, OverflowMode};
+
+    // Fail-loud: a raw-stdout flood past the byte cap errors with OutputTooLarge,
+    // reporting the byte ceiling (raw stdout has no lines).
+    let err = two_line_echo()
+        .output_buffer(
+            OutputBufferPolicy::unbounded()
+                .with_max_bytes(4)
+                .with_overflow(OverflowMode::Error),
+        )
+        .output_bytes()
+        .await
+        .expect_err("raw stdout over a 4-byte fail-loud cap must error");
+    assert!(
+        matches!(
+            err,
+            processkit::Error::OutputTooLarge {
+                byte_limit: Some(4),
+                line_limit: None,
+                ..
+            }
+        ),
+        "expected OutputTooLarge with the byte cap and no line cap, got {err:?}"
+    );
+
+    // Drop mode: the retained bytes are bounded and truncation is flagged.
+    let capped = two_line_echo()
+        .output_buffer(OutputBufferPolicy::unbounded().with_max_bytes(4))
+        .output_bytes()
+        .await
+        .expect("a drop-mode byte cap does not error");
+    assert!(
+        capped.stdout().len() <= 4,
+        "retained bytes are bounded to the cap, got {}",
+        capped.stdout().len()
+    );
+    assert!(capped.truncated(), "dropping raw bytes flags truncation");
+
+    // Control: no cap keeps the full output, no truncation.
+    let full = two_line_echo()
+        .output_bytes()
+        .await
+        .expect("uncapped output_bytes");
+    assert!(full.stdout().len() > 4, "the full output exceeds the cap");
+    assert!(!full.truncated());
+}
+
+#[tokio::test]
 #[ignore = "spawns a real subprocess whose output a bounded drop-policy truncates"]
 async fn checking_verbs_reject_truncated_output_e2e() {
     // B12: a bounded *drop* policy silently discards lines. The lenient capture

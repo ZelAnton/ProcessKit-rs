@@ -203,3 +203,44 @@ async fn cancel_ends_the_stream_and_finish_reports_it() {
         "expected Error::Cancelled, got {err:?}"
     );
 }
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess and cancels a streaming first_line probe"]
+async fn first_line_cancel_surfaces_cancelled_promptly() {
+    // first_line streams stdout for a match; if the shared token fires before a
+    // match appears, it must surface Err(Cancelled) — promptly, not after the
+    // child's long idle. (E7 rewrote first_line's cancel path from a post-stream
+    // token re-check to a select racing the token against the search; this is the
+    // end-to-end guard the scripted unit tests can't provide deterministically.)
+    let token = CancellationToken::new();
+    // Same fork-free child shape as the streaming test above (macOS pgroup): a
+    // banner then an idle that first_line's predicate never matches.
+    let child = if cfg!(windows) {
+        banner_then_idle()
+    } else {
+        Command::new("sh")
+            .args(["-c", "echo ready; read line"])
+            .keep_stdin_open()
+    };
+    let probe = child.cancel_on(token.clone());
+
+    let canceller = tokio::spawn({
+        let token = token.clone();
+        async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            token.cancel();
+        }
+    });
+
+    let result = completes_within(
+        Duration::from_secs(15),
+        "cancelled first_line probe",
+        probe.first_line(|l| l.contains("never-appears")),
+    )
+    .await;
+    canceller.await.expect("canceller task");
+    assert!(
+        matches!(result, Err(processkit::Error::Cancelled { .. })),
+        "a cancelled streaming probe must error Cancelled, got {result:?}"
+    );
+}

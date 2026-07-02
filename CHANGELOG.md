@@ -59,7 +59,28 @@ to a dated version section.
 -
 
 ### Fixed
--
+- Pipeline pipefail attribution now preserves the failing stage's `ok_codes`: a
+  stage whose `ok_codes` exclude `0` that nonetheless exited `0` (a rejected-zero
+  failure) was rebuilt with the default accepted set `[0]`, so the whole chain
+  reported `is_success()` / `Ok` even though the fold had deemed that stage
+  failed. `run`/`checked`/`run_unit`/`probe` on such a chain now correctly surface
+  the failure.
+- `RunningProcess::output_bytes` now honors the `OutputBufferPolicy` **byte**
+  ceiling (`max_bytes`) on its raw stdout capture — previously only the
+  line-pumped *stderr* was capped, so a caller that set `with_max_bytes(..)` /
+  `fail_loud(..).with_max_bytes(..)` expecting a memory bound could still be
+  OOM'd by a flooding child. `OverflowMode::Error` now errors with
+  `OutputTooLarge`; the drop modes bound the retained bytes (tail/head) and set
+  `truncated`. The line cap (`max_lines`) still does not apply to a non-line
+  stream, and the default (no byte cap) capture is byte-for-byte unchanged.
+- `wait` / `profile` no longer let a newline-free flood (e.g. `base64 -w0`) grow
+  the pump's in-flight line-assembly buffer without bound: their internal
+  retain-nothing discard sink now also carries a 1 MiB in-flight byte cap.
+- `ProcessRunnerExt::first_line` no longer misreports a run that ends naturally
+  with no match as `Error::Cancelled` when its `cancel_on` token fires an instant
+  after the stream closes; the search is now raced against the token (a firing
+  token wins only while the search is still pending), so a natural end still
+  reports `Ok(None)` and genuine cancellation is surfaced more promptly.
 
 ### Documentation
 - `Command::env` documents how to pass secrets: env values are redacted from

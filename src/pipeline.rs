@@ -430,13 +430,19 @@ fn pipefail<T>(stages: Vec<StageOutcome>, last_stdout: T) -> ProcessResult<T> {
         .or_else(|| checked_failures.first()) // else leftmost
         .copied()
     {
+        // Carry the stage's own `ok_codes` so the rebuilt result classifies
+        // success exactly as the stage did. Without this the default `[0]` would
+        // make a rejected-zero failure (a stage with `ok_codes` excluding `0`
+        // that exited `0`) — which `is_clean` deemed a *failure* above — report
+        // `is_success() == true`, so the whole chain would return `Ok`.
         return ProcessResult::new(
             stage.program.clone(),
             last_stdout,
             stage.stderr.clone(),
             stage.outcome,
             stage.timeout,
-        );
+        )
+        .with_ok_codes(stage.ok_codes.clone());
     }
 
     // No checked failure: the last stage speaks. For an unchecked last stage that
@@ -585,6 +591,31 @@ mod tests {
             }
             other => panic!("expected Error::Exit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejected_zero_stage_stays_a_failure_after_attribution() {
+        // A stage whose `ok_codes` exclude 0 that nonetheless exits 0 is a
+        // *failure* (`is_clean` says so) and wins attribution. The rebuilt result
+        // must carry that stage's own `ok_codes`, or the `ProcessResult::new`
+        // default `[0]` would make `is_success()` report true for a chain the
+        // fold deemed failed — so `run`/`checked`/`probe` would return `Ok`.
+        let culprit = StageOutcome {
+            ok_codes: vec![1],
+            ..unclean("check", Outcome::Exited(0), "rejected zero")
+        };
+        let result = pf(vec![culprit], last(Outcome::Exited(0), false), "final");
+        assert_eq!(result.program(), "check", "the rejected-zero stage wins");
+        assert_eq!(result.code(), Some(0));
+        assert_eq!(result.stderr(), "rejected zero");
+        assert!(
+            !result.is_success(),
+            "a rejected-zero failure must not report success just because it exited 0"
+        );
+        assert!(
+            result.ensure_success().is_err(),
+            "the chain must surface the failure, not swallow it as Ok"
+        );
     }
 
     #[test]

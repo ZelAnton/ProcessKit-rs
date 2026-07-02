@@ -327,10 +327,11 @@ let first_match = Command::new("git")
 
 `first_line` returns `Ok(None)` when stdout closes without a match, and kills
 the (private-group) child once it has its answer — you never wait out a long
-log for one line. If the command's [`cancel_on`](timeouts-and-cancellation.md)
-token has fired, it returns `Error::Cancelled` instead of `Ok(None)`, so a
-readiness probe with a shutdown token can't misread cancellation as "the line
-never appeared".
+log for one line. A [`cancel_on`](timeouts-and-cancellation.md) token that fires
+while the search is still running surfaces as `Error::Cancelled`, so a readiness
+probe with a shutdown token can't misread token-driven teardown as "the line
+never appeared" — while a run that genuinely ends with no match still reports
+`Ok(None)`, even if the token happens to fire an instant later.
 
 ## Results and errors
 

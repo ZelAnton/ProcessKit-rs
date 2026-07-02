@@ -11,7 +11,7 @@ mod stream;
 pub use stream::{Finished, OutputEvent, OutputEvents, OutputLine, StdoutLines};
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use encoding_rs::Encoding;
@@ -20,7 +20,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::Notify;
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::buffer::OutputBufferPolicy;
+use crate::buffer::{OutputBufferPolicy, OverflowMode};
 use crate::error::Error;
 use crate::error::Result;
 use crate::group::ProcessGroup;
@@ -31,6 +31,93 @@ use crate::stdin::ProcessStdin;
 /// How long teardown waits for output pumps to finish before aborting them, so a
 /// surviving grandchild holding a pipe can't hang the run.
 const PUMP_TEARDOWN: Duration = Duration::from_secs(5);
+
+/// In-flight byte cap for the discard sink used by `wait`/`profile`. These verbs
+/// retain no lines, but the pump still assembles each line in memory before
+/// discarding it; without a byte cap a newline-free flood (e.g. `base64 -w0`)
+/// would grow that in-flight buffer to O(total). The cap bounds it while staying
+/// generous enough that any realistically-sized line is still delivered whole to
+/// a per-line handler or [`stdout_tee`](crate::Command::stdout_tee). The tradeoff
+/// (vs the old unbounded discard sink): a single line whose content exceeds 1 MiB
+/// is treated as over-cap and is *not* delivered to that handler/tee during a
+/// `wait`/`profile` — the right call, since the alternative is an unbounded-memory
+/// OOM on a pathological flood, and 1 MiB clears every realistic line.
+const DISCARD_INFLIGHT_CAP: usize = 1 << 20;
+
+/// Append `chunk` to the raw-stdout capture buffer for `output_bytes` under the
+/// command's [`OutputBufferPolicy`] byte ceiling ([`max_bytes`]), updating the
+/// overflow and truncation signals. This mirrors the line pump's byte-cap
+/// semantics for a stream that has no lines: [`max_lines`] does not apply.
+///
+/// - No cap (`None`): retain everything (the default — byte-for-byte the old
+///   behavior).
+/// - [`OverflowMode::Error`]: flag overflow and stop retaining past the cap; the
+///   caller drains the pipe to EOF and then raises `Error::OutputTooLarge`.
+/// - [`OverflowMode::DropNewest`]: keep the first `cap` bytes (head), flag
+///   truncation.
+/// - [`OverflowMode::DropOldest`]: keep roughly the last `cap` bytes (tail). The
+///   tail is allowed to grow to `2 * cap` before a single compaction reclaims
+///   it, so a multi-GB stream costs O(total) memmoves rather than O(total×cap);
+///   [`clamp_dropoldest_tail`] trims the final buffer back to exactly `cap`.
+///
+/// [`max_bytes`]: crate::OutputBufferPolicy::max_bytes
+/// [`max_lines`]: crate::OutputBufferPolicy::max_lines
+fn push_capped_bytes(
+    buf: &mut Vec<u8>,
+    chunk: &[u8],
+    cap: Option<usize>,
+    mode: OverflowMode,
+    overflowed: &AtomicBool,
+    truncated: &AtomicBool,
+) {
+    let Some(cap) = cap else {
+        buf.extend_from_slice(chunk);
+        return;
+    };
+    match mode {
+        OverflowMode::Error => {
+            if buf.len() + chunk.len() > cap {
+                overflowed.store(true, Ordering::Relaxed);
+                let room = cap.saturating_sub(buf.len());
+                buf.extend_from_slice(&chunk[..room.min(chunk.len())]);
+            } else {
+                buf.extend_from_slice(chunk);
+            }
+        }
+        OverflowMode::DropNewest => {
+            let room = cap.saturating_sub(buf.len());
+            let take = room.min(chunk.len());
+            if take < chunk.len() {
+                truncated.store(true, Ordering::Relaxed);
+            }
+            buf.extend_from_slice(&chunk[..take]);
+        }
+        OverflowMode::DropOldest => {
+            buf.extend_from_slice(chunk);
+            if buf.len() > cap {
+                truncated.store(true, Ordering::Relaxed);
+                // Amortize: only compact once the tail has grown to ~2×cap, so
+                // the reclaimed prefix is large relative to the memmove cost.
+                if buf.len() > cap.saturating_mul(2) {
+                    let excess = buf.len() - cap;
+                    buf.drain(..excess);
+                }
+            }
+        }
+    }
+}
+
+/// Trim a [`OverflowMode::DropOldest`] `output_bytes` capture back to exactly the
+/// last `cap` bytes. [`push_capped_bytes`] lets the tail run up to `2 * cap`
+/// during streaming to amortize compaction; this clamps the retained result.
+fn clamp_dropoldest_tail(buf: &mut Vec<u8>, cap: Option<usize>, mode: OverflowMode) {
+    if let (OverflowMode::DropOldest, Some(cap)) = (mode, cap)
+        && buf.len() > cap
+    {
+        let excess = buf.len() - cap;
+        buf.drain(..excess);
+    }
+}
 
 // Timeout-arbitration states for `RunningProcess::timeout_state`. Whichever of
 // the natural reap (claims `EXITED`) or a fired deadline (claims `TIMED_OUT`)
@@ -608,8 +695,20 @@ impl RunningProcess {
     }
 
     /// Drain both streams, wait for exit, and return the exact raw stdout bytes
-    /// (stderr captured as text). On timeout/cancellation returns bytes read so
-    /// far — a killed run's bytes are a best-effort prefix.
+    /// (stderr captured as text). On **timeout** the bytes read before the
+    /// deadline are returned as a best-effort prefix (the outcome is
+    /// [`Outcome::TimedOut`]); a **cancelled** run instead errors with
+    /// [`Error::Cancelled`] and no bytes — cancellation via
+    /// [`Command::cancel_on`](crate::Command::cancel_on) is always terminal.
+    ///
+    /// A byte ceiling on the [`OutputBufferPolicy`] bounds the raw stdout capture
+    /// (its `max_lines` does not — raw bytes have no lines): with
+    /// [`OverflowMode::Error`](crate::OverflowMode) a flood past the cap errors
+    /// with [`Error::OutputTooLarge`], while the drop modes keep a bounded
+    /// head/tail and set [`ProcessResult::truncated`]. With no byte cap the
+    /// capture is unbounded — bound a flooding child with
+    /// [`with_max_bytes`](crate::OutputBufferPolicy::with_max_bytes) or a
+    /// [`timeout`](crate::Command::timeout).
     ///
     /// # Errors
     ///
@@ -648,18 +747,40 @@ impl RunningProcess {
         // of leaving it to grow `out_buf` unboundedly on a shared-group handle.
         let mut stdout_pipe = self.backend.take_stdout_reader();
         let out_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Honor the byte ceiling (`max_bytes`) on the raw stdout capture so a
+        // caller that set `with_max_bytes(..)` / `fail_loud(..).with_max_bytes(..)`
+        // is bounded rather than OOM'd by a flooding child; `max_lines` does not
+        // apply to a non-line stream. `None` cap keeps the exact old behavior.
+        // The signals are shared (not the task's return value) so the bounded
+        // teardown below can read them even if it has to abort the task.
+        let stdout_cap = self.buffer.max_bytes;
+        let stdout_mode = self.buffer.overflow;
+        let stdout_seen = Arc::new(AtomicUsize::new(0));
+        let stdout_overflowed = Arc::new(AtomicBool::new(false));
+        let stdout_truncated = Arc::new(AtomicBool::new(false));
         self.stdout_pump = Some({
             let out_buf = out_buf.clone();
+            let stdout_seen = stdout_seen.clone();
+            let stdout_overflowed = stdout_overflowed.clone();
+            let stdout_truncated = stdout_truncated.clone();
             tokio::spawn(async move {
                 if let Some(pipe) = &mut stdout_pipe {
                     let mut chunk = [0u8; 8 * 1024];
                     loop {
                         match pipe.read(&mut chunk).await {
                             Ok(0) => break,
-                            Ok(n) => out_buf
-                                .lock()
-                                .expect("stdout buffer poisoned")
-                                .extend_from_slice(&chunk[..n]),
+                            Ok(n) => {
+                                stdout_seen.fetch_add(n, Ordering::Relaxed);
+                                let mut guard = out_buf.lock().expect("stdout buffer poisoned");
+                                push_capped_bytes(
+                                    &mut guard,
+                                    &chunk[..n],
+                                    stdout_cap,
+                                    stdout_mode,
+                                    &stdout_overflowed,
+                                    &stdout_truncated,
+                                );
+                            }
                             Err(_e) => {
                                 // Read error: keep partial capture, surface via tracing.
                                 #[cfg(feature = "tracing")]
@@ -682,10 +803,30 @@ impl RunningProcess {
                 abort.abort();
             }
         }
-        let stdout = std::mem::take(&mut *out_buf.lock().expect("stdout buffer poisoned"));
+        // The `out_buf` bytes are consistent even on the abort path: the mutex
+        // orders every push, and a push never spans the task's only await
+        // (`pipe.read`), so the lock here sees whole writes. The overflow/seen
+        // atomics read below are likewise current when the task ran to EOF
+        // (the JoinHandle await orders them); on the abort path (a grandchild
+        // held the pipe past PUMP_TEARDOWN) they are best-effort, matching this
+        // verb's documented best-effort-prefix-on-teardown contract.
+        let mut stdout = std::mem::take(&mut *out_buf.lock().expect("stdout buffer poisoned"));
+        clamp_dropoldest_tail(&mut stdout, stdout_cap, stdout_mode);
         join_pumps(self.stderr_pump.take().into_iter().collect()).await;
         let outcome = self.checked_outcome(outcome)?;
 
+        // A raw-stdout fail-loud (Error mode) byte overflow surfaces first, like
+        // the stderr line ceiling below. Raw stdout has no lines, so report only
+        // the byte ceiling that actually fired.
+        if stdout_overflowed.load(Ordering::Relaxed) {
+            return Err(crate::Error::OutputTooLarge {
+                program: self.program.clone(),
+                line_limit: None,
+                byte_limit: self.buffer.max_bytes,
+                total_lines: 0,
+                total_bytes: stdout_seen.load(Ordering::Relaxed),
+            });
+        }
         if stderr_sink.overflowed() {
             return Err(crate::Error::OutputTooLarge {
                 program: self.program.clone(),
@@ -697,7 +838,7 @@ impl RunningProcess {
         }
 
         let stderr_lines = stderr_sink.drain();
-        let truncated = stderr_sink.dropped() > 0;
+        let truncated = stdout_truncated.load(Ordering::Relaxed) || stderr_sink.dropped() > 0;
         let duration = self.started.elapsed();
         Ok(ProcessResult::new(
             self.program.clone(),
@@ -708,7 +849,12 @@ impl RunningProcess {
         )
         .with_duration(duration)
         .with_truncated(truncated)
-        .with_overflow_totals(stderr_sink.count(), stderr_sink.seen_bytes())
+        .with_overflow_totals(
+            stderr_sink.count(),
+            stdout_seen
+                .load(Ordering::Relaxed)
+                .saturating_add(stderr_sink.seen_bytes()),
+        )
         .with_ok_codes(self.ok_codes.clone()))
     }
 
@@ -928,8 +1074,10 @@ impl RunningProcess {
         // output_string after stdout_lines/output_events sees those lines rather
         // than returning empty. For the discard path use a retain-nothing sink
         // (not the user's policy) so a chatty child never accumulates O(total)
-        // heap in wait/profile.
-        let discard_policy = OutputBufferPolicy::bounded(0);
+        // heap in wait/profile. The byte cap bounds the pump's in-flight line
+        // assembly too — `bounded(0)` alone retains no lines but would still let
+        // a newline-free flood grow the in-flight buffer without limit.
+        let discard_policy = OutputBufferPolicy::bounded(0).with_max_bytes(DISCARD_INFLIGHT_CAP);
         let sink_policy: &OutputBufferPolicy = match capture {
             CaptureMode::Discard => &discard_policy,
             CaptureMode::Lines => &self.buffer,
