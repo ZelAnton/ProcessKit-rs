@@ -213,16 +213,18 @@ async fn first_line_cancel_surfaces_cancelled_promptly() {
     // token re-check to a select racing the token against the search; this is the
     // end-to-end guard the scripted unit tests can't provide deterministically.)
     let token = CancellationToken::new();
-    // Same fork-free child shape as the streaming test above (macOS pgroup): a
-    // banner then an idle that first_line's predicate never matches.
-    let child = if cfg!(windows) {
-        banner_then_idle()
+    // A stdin-INDEPENDENT idle: first_line drops the child's stdin, so a
+    // `read`-blocked shell would see EOF and exit before the cancel lands. A
+    // plain sleeper idles regardless and is fork-free on Unix (single process,
+    // so the pgroup kill has nothing to escape); it produces no output, so the
+    // `|_| false` predicate never matches and the search stays pending until the
+    // cancel closes it.
+    let idle = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "ping -n 31 127.0.0.1 >nul"])
     } else {
-        Command::new("sh")
-            .args(["-c", "echo ready; read line"])
-            .keep_stdin_open()
+        Command::new("sleep").arg("30")
     };
-    let probe = child.cancel_on(token.clone());
+    let probe = idle.cancel_on(token.clone());
 
     let canceller = tokio::spawn({
         let token = token.clone();
@@ -235,7 +237,7 @@ async fn first_line_cancel_surfaces_cancelled_promptly() {
     let result = completes_within(
         Duration::from_secs(15),
         "cancelled first_line probe",
-        probe.first_line(|l| l.contains("never-appears")),
+        probe.first_line(|_| false),
     )
     .await;
     canceller.await.expect("canceller task");
