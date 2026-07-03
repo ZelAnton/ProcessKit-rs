@@ -245,6 +245,17 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// A `factor` below `1.0` (or non-finite) is treated as `1.0`.
     /// Default: `200ms × 2.0`.
     ///
+    /// The escalation **resets** after a healthy run — one that stayed up at least
+    /// as long as [`max_backoff`](Self::max_backoff) — so a long-lived service that
+    /// crashes occasionally isn't pinned at the ceiling by an old crash burst; a
+    /// tight loop whose incarnations are each shorter than the ceiling keeps
+    /// climbing (the exponent `n` counts restarts *since the last healthy run*, not
+    /// lifetime restarts). The floor is on uptime, not exit kind: under
+    /// [`Always`](RestartPolicy::Always) a worker that exits — cleanly or not — in
+    /// under `max_backoff` is treated as flapping and its restarts escalate, so
+    /// loop inside a long-lived process (or lower `max_backoff`) if you want prompt
+    /// clean-exit restarts.
+    ///
     /// The keep-alive twin of [`RetryPolicy`](crate::RetryPolicy)'s replay-to-success
     /// backoff, which spells these same two knobs `initial_backoff` (`base`) and
     /// `multiplier` (`factor`); this one uses a `[0.5, 1.5)` multiplicative
@@ -256,7 +267,11 @@ impl<R: ProcessRunner> Supervisor<R> {
         self
     }
 
-    /// Cap any single backoff delay (default: 30 s).
+    /// Cap any single backoff delay (default: 30 s). With [`jitter`](Self::jitter)
+    /// on (the default), this bounds the *pre-jitter* delay — the `[0.5, 1.5)`
+    /// jitter is applied afterward, so an individual restart delay can reach up to
+    /// `1.5 ×` this cap. (Contrast [`RetryPolicy`](crate::RetryPolicy)'s `[0, delay]`
+    /// full jitter, which never exceeds its own cap.)
     #[must_use]
     pub fn max_backoff(mut self, cap: Duration) -> Self {
         self.max_backoff = cap;
@@ -337,6 +352,20 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// Supervise until the policy, the predicate, or the restart budget ends
     /// it, and report the [`SupervisionOutcome`].
     ///
+    /// # Permanent failures
+    ///
+    /// The supervisor does **not** distinguish a transient crash from a permanent
+    /// one — a command that can never succeed (a missing binary, a config error
+    /// that crashes on startup, a port that is permanently taken) restarts
+    /// **forever** under the default unlimited [`OnCrash`](RestartPolicy::OnCrash)
+    /// policy, throttled only by the backoff: a fast-failing one climbs to
+    /// [`max_backoff`](Self::max_backoff) (each incarnation is shorter than the
+    /// ceiling, so never healthy), while one that takes `≥ max_backoff` to fail is
+    /// throttled by its own runtime instead. Either way it loops indefinitely —
+    /// bound it with [`max_restarts`](Self::max_restarts) and/or a
+    /// [`stop_when`](Self::stop_when) predicate that recognizes the unrecoverable
+    /// case, so supervision gives up.
+    ///
     /// # Errors
     ///
     /// Returns `Err` only when the **terminating** attempt failed to produce a
@@ -367,6 +396,11 @@ impl<R: ProcessRunner> Supervisor<R> {
         let command = self.command.clone().output_buffer(self.capture);
 
         let mut restarts: u32 = 0;
+        // The backoff *exponent* — separate from the lifetime `restarts` count so a
+        // run that stayed healthy resets the escalation (E3): otherwise a
+        // long-lived service that exits/crashes occasionally would climb to the
+        // `max_backoff` ceiling and restart at it forever.
+        let mut backoff_restarts: u32 = 0;
         let mut storm = StormState::new();
         loop {
             match self.runner.output_string(&command).await {
@@ -398,11 +432,27 @@ impl<R: ProcessRunner> Supervisor<R> {
                             StopReason::RestartsExhausted,
                         ));
                     }
-                    if crashed {
-                        self.storm_gate(&mut storm).await;
+                    // E3: a run is "healthy" only if it stayed up at least as long
+                    // as the backoff ceiling — a clear "it's stable now" signal —
+                    // whether it then exited cleanly or crashed. Resetting the
+                    // escalation there keeps a long-lived service off the ceiling,
+                    // while a tight loop (clean OR crashing, each incarnation shorter
+                    // than max_backoff) keeps climbing and self-throttles. A uniform
+                    // uptime floor — rather than "any clean exit resets" — avoids a
+                    // footgun: under Always, an instantly-exiting `exit 0` loop would
+                    // otherwise reset every iteration and spin at the base delay.
+                    let healthy = result.duration() >= self.max_backoff;
+                    if healthy {
+                        backoff_restarts = 0;
                     }
-                    self.sleep_backoff(restarts, factor).await;
+                    if crashed && self.storm_gate(&mut storm).await {
+                        return Err(self.cancelled_err(&command));
+                    }
+                    if self.sleep_backoff(backoff_restarts, factor).await {
+                        return Err(self.cancelled_err(&command));
+                    }
                     restarts = restarts.saturating_add(1);
+                    backoff_restarts = backoff_restarts.saturating_add(1);
                 }
                 Err(err) => {
                     if matches!(err, crate::Error::Cancelled { .. }) {
@@ -412,9 +462,16 @@ impl<R: ProcessRunner> Supervisor<R> {
                     if !wants_restart || self.max_restarts.is_some_and(|max| restarts >= max) {
                         return Err(err);
                     }
-                    self.storm_gate(&mut storm).await;
-                    self.sleep_backoff(restarts, factor).await;
+                    // A spawn-side failure carries no run duration, so it never
+                    // counts as healthy — the escalation keeps climbing.
+                    if self.storm_gate(&mut storm).await {
+                        return Err(self.cancelled_err(&command));
+                    }
+                    if self.sleep_backoff(backoff_restarts, factor).await {
+                        return Err(self.cancelled_err(&command));
+                    }
                     restarts = restarts.saturating_add(1);
+                    backoff_restarts = backoff_restarts.saturating_add(1);
                 }
             }
         }
@@ -435,14 +492,51 @@ impl<R: ProcessRunner> Supervisor<R> {
         }
     }
 
+    /// The terminal `Cancelled` error for supervision cut short by a cancel token
+    /// firing during a backoff or storm pause.
+    fn cancelled_err(&self, command: &Command) -> crate::Error {
+        crate::Error::Cancelled {
+            program: command.program_name(),
+        }
+    }
+
+    /// Sleep `delay`, waking early (returning `true`) if the supervised command's
+    /// [`cancel_on`](crate::Command::cancel_on) token fires — so a cancellation
+    /// during a backoff or storm pause ends supervision promptly with
+    /// `Error::Cancelled` instead of waiting out a (possibly long) delay. Without a
+    /// token, this just sleeps and returns `false`. A zero delay still observes an
+    /// already-cancelled token (returns `true`) so supervision ends promptly.
+    #[must_use = "the returned bool signals cancellation — supervision must end when true"]
+    async fn sleep_or_cancel(&self, delay: Duration) -> bool {
+        if delay.is_zero() {
+            return self
+                .command
+                .cancel_token()
+                .is_some_and(|t| t.is_cancelled());
+        }
+        match self.command.cancel_token() {
+            Some(token) => tokio::select! {
+                biased;
+                () = token.cancelled() => true,
+                () = tokio::time::sleep(delay) => false,
+            },
+            None => {
+                tokio::time::sleep(delay).await;
+                false
+            }
+        }
+    }
+
     /// The failure-storm gate, run before the backoff of every *failure*-
     /// driven restart: fold the failure into the decaying score and, past the
     /// threshold, sleep out one jittered [`storm_pause`](Self::storm_pause)
     /// and reset the score (a fresh window — the pause itself must not count
-    /// as elapsed decay time for the *next* failure).
-    async fn storm_gate(&self, storm: &mut StormState) {
+    /// as elapsed decay time for the *next* failure). Returns `true` if the
+    /// cancel token fired during the pause (supervision should end).
+    #[must_use = "the returned bool signals cancellation — supervision must end when true"]
+    async fn storm_gate(&self, storm: &mut StormState) -> bool {
         let Some(pause) = self.storm_pause else {
-            return;
+            return false;
         };
         let now = tokio::time::Instant::now();
         let elapsed = storm
@@ -453,7 +547,7 @@ impl<R: ProcessRunner> Supervisor<R> {
         storm.score = decayed_failure_score(storm.score, elapsed, self.failure_decay);
         let tripped = storm.score > self.failure_threshold;
         if !tripped {
-            return;
+            return false;
         }
         let pause = apply_jitter(pause, self.jitter);
         #[cfg(feature = "tracing")]
@@ -462,16 +556,19 @@ impl<R: ProcessRunner> Supervisor<R> {
             pause_ms = pause.as_millis() as u64,
             "supervisor failure storm — pausing restarts"
         );
-        if !pause.is_zero() {
-            tokio::time::sleep(pause).await;
+        if self.sleep_or_cancel(pause).await {
+            return true;
         }
         storm.score = 0.0;
         storm.last_failure_at = None;
         storm.pauses = storm.pauses.saturating_add(1);
+        false
     }
 
-    /// Sleep out the delay before the `restarts`-th (0-based) restart.
-    async fn sleep_backoff(&self, restarts: u32, factor: f64) {
+    /// Sleep out the delay before the `restarts`-th (0-based) restart. Returns
+    /// `true` if the cancel token fired during the backoff.
+    #[must_use = "the returned bool signals cancellation — supervision must end when true"]
+    async fn sleep_backoff(&self, restarts: u32, factor: f64) -> bool {
         let delay = backoff_delay(self.backoff_base, factor, restarts, self.max_backoff);
         let delay = apply_jitter(delay, self.jitter);
         #[cfg(feature = "tracing")]
@@ -481,9 +578,7 @@ impl<R: ProcessRunner> Supervisor<R> {
             delay_ms = delay.as_millis() as u64,
             "supervisor restarting child"
         );
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
+        self.sleep_or_cancel(delay).await
     }
 }
 
@@ -606,6 +701,19 @@ mod tests {
             Outcome::Exited(code),
             None,
         ))
+    }
+
+    /// A crash whose incarnation reports having stayed up for `uptime` (stamped
+    /// on the result the way a real run's wall-clock is), for the E3 uptime path.
+    fn fail_after(code: i32, uptime: Duration) -> Result<ProcessResult<String>> {
+        Ok(ProcessResult::new(
+            "fake".into(),
+            String::new(),
+            "boom".into(),
+            Outcome::Exited(code),
+            None,
+        )
+        .with_duration(uptime))
     }
 
     fn timeout() -> Result<ProcessResult<String>> {
@@ -1095,6 +1203,103 @@ mod tests {
         .expect_err("cancelled is terminal");
         assert!(matches!(err, crate::Error::Cancelled { .. }), "got {err:?}");
         assert_eq!(start.elapsed(), Duration::ZERO, "no storm pause was taken");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_outlived_the_backoff_ceiling_resets_the_escalation() {
+        // E3 (uptime path): a crash whose incarnation stayed up at least as long as
+        // max_backoff is "healthy" — the escalation resets to base, so a long-lived
+        // service that crashes occasionally isn't pinned at the ceiling. 5 such
+        // crashes at a 1s base × 2 factor, cap 30s: with the reset the total backoff
+        // is ≈5s (5 × base); without it the delays climb 1+2+4+8+16 = 31s. Each
+        // incarnation *reports* a 40s uptime (the fake returns instantly; only the
+        // stamped duration drives the reset), so this exercises the `duration() >=
+        // max_backoff` branch, not the fake's zero-duration path.
+        let long = Duration::from_secs(40); // ≥ max_backoff (30s)
+        let start = tokio::time::Instant::now();
+        let outcome = Supervisor::new(Command::new("fake"))
+            .with_runner(SeqRunner::new(vec![
+                fail_after(1, long),
+                fail_after(1, long),
+                fail_after(1, long),
+                fail_after(1, long),
+                fail_after(1, long),
+                fail_after(1, long),
+            ]))
+            .restart(RestartPolicy::OnCrash)
+            .max_restarts(5)
+            .backoff(Duration::from_secs(1), 2.0)
+            .max_backoff(Duration::from_secs(30))
+            .jitter(false)
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.restarts, 5);
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "an uptime ≥ max_backoff must reset the backoff (≈5s), not escalate (31s); took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_short_lived_crash_loop_keeps_escalating() {
+        // E3 footgun guard: a crash that did NOT stay up as long as max_backoff is
+        // not healthy, so a tight loop (here zero-uptime fakes) keeps climbing. 4
+        // restarts at a 1s base × 2 factor: delays 1+2+4+8 = 15s (escalating), not
+        // 4s (reset). Proves the uptime floor throttles instant loops (clean or
+        // crashing) — including `exit 0` spin under Always.
+        let start = tokio::time::Instant::now();
+        let outcome = Supervisor::new(Command::new("fake"))
+            .with_runner(SeqRunner::new(vec![
+                fail(1),
+                fail(1),
+                fail(1),
+                fail(1),
+                fail(1),
+            ]))
+            .restart(RestartPolicy::OnCrash)
+            .max_restarts(4)
+            .backoff(Duration::from_secs(1), 2.0)
+            .max_backoff(Duration::from_secs(30))
+            .jitter(false)
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.restarts, 4);
+        assert!(
+            start.elapsed() >= Duration::from_secs(15),
+            "a short-lived crash loop must escalate (1+2+4+8=15s), not reset; took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_is_cancellable() {
+        // E1: a cancel token firing during a backoff ends supervision promptly
+        // with Cancelled, not after the full (here 60s) delay.
+        let token = crate::CancellationToken::new();
+        let sv = Supervisor::new(Command::new("fake").cancel_on(token.clone()))
+            .with_runner(SeqRunner::new(vec![fail(1), fail(1)]))
+            .restart(RestartPolicy::Always)
+            .backoff(Duration::from_secs(60), 1.0)
+            .jitter(false);
+        let canceller = tokio::spawn({
+            let token = token.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                token.cancel();
+            }
+        });
+        let start = tokio::time::Instant::now();
+        let err = sv.run().await.expect_err("cancelled during backoff");
+        assert!(matches!(err, crate::Error::Cancelled { .. }), "got {err:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "backoff must be cancellable, took {:?}",
+            start.elapsed()
+        );
+        canceller.await.expect("canceller");
     }
 
     #[test]

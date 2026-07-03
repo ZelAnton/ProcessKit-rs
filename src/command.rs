@@ -516,12 +516,15 @@ impl Command {
     ///
     /// Because the command is replayed from scratch, a **one-shot** stdin source
     /// ([`Stdin::from_reader`](crate::Stdin::from_reader) /
-    /// [`from_lines`](crate::Stdin::from_lines)) won't survive a retry: its
-    /// payload is consumed by the first attempt. Rather than silently feed the
-    /// retry empty stdin, the second attempt **fails loud** with an
-    /// [`Error::Io`](crate::Error::Io) (`InvalidInput`) naming the consumed
-    /// source. Use a reusable source
+    /// [`from_lines`](crate::Stdin::from_lines)) can't survive a retry: its
+    /// payload is consumed by the first attempt and can't be re-fed. So such a
+    /// command is **not retried at all** — the first attempt's error is returned
+    /// as-is (retrying would either replay empty stdin or spuriously classify the
+    /// re-consume), and the retry policy is inert for it. Use a reusable source
     /// (`from_string`/`from_bytes`/`from_file`/`from_iter_lines`) when retrying.
+    /// (A one-shot source *re-run* outside this retry loop — a `Supervisor`
+    /// incarnation, a pipeline re-run — does fail loud with
+    /// [`Error::Io`](crate::Error::Io) `InvalidInput` at launch instead.)
     ///
     /// **Inert outside the success-checking verbs.** A `retry` policy is
     /// honored only by the verbs listed above. It is **ignored** by:

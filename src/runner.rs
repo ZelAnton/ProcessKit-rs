@@ -404,7 +404,30 @@ where
                             error = %err,
                             "retrying after a retryable failure"
                         );
-                        tokio::time::sleep(delay).await;
+                        // Race the backoff against the command's cancel token: a
+                        // cancellation mid-backoff resolves promptly with
+                        // `Cancelled` instead of waiting out a (possibly 30 s)
+                        // delay, honoring `cancel_on`'s "bound the total with
+                        // cancellation" advice. For the built-in runners this only
+                        // changes *when*, not *what* — the next attempt would hit
+                        // `launch`'s pre-spawn short-circuit and return `Cancelled`
+                        // anyway. (A custom runner that ignores the token would
+                        // otherwise have retried to exhaustion; surfacing the
+                        // cancellation here is the more faithful behavior.)
+                        match command.cancel_token() {
+                            Some(token) => {
+                                tokio::select! {
+                                    biased;
+                                    () = token.cancelled() => {
+                                        return Err(crate::Error::Cancelled {
+                                            program: command.program_name(),
+                                        });
+                                    }
+                                    () = tokio::time::sleep(delay) => {}
+                                }
+                            }
+                            None => tokio::time::sleep(delay).await,
+                        }
                     }
                     _ => return Err(err),
                 }
@@ -833,6 +856,36 @@ mod tests {
             .await
             .expect_err("a truncated capture must fail loud, not parse a clipped tail");
         assert!(matches!(err, Error::OutputTooLarge { .. }), "got {err:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_backoff_is_cancellable() {
+        // E1: a cancel token firing during the retry backoff resolves promptly
+        // with Cancelled instead of waiting out the (here 60s) delay.
+        let runner = flaky(5); // always fails within the retry budget
+        let token = crate::CancellationToken::new();
+        let cmd = Command::new("x")
+            .retry(5, Duration::from_secs(60), |_| true)
+            .cancel_on(token.clone());
+        let canceller = tokio::spawn({
+            let token = token.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                token.cancel();
+            }
+        });
+        let start = tokio::time::Instant::now();
+        let err = runner
+            .run(&cmd)
+            .await
+            .expect_err("a cancelled backoff errors");
+        assert!(matches!(err, Error::Cancelled { .. }), "got {err:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the backoff must be cancellable, took {:?}",
+            start.elapsed()
+        );
+        canceller.await.expect("canceller");
     }
 
     #[tokio::test(start_paused = true)]

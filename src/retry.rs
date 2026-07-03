@@ -135,10 +135,12 @@ impl RetryPolicy {
         if self.initial_backoff.is_zero() {
             return Duration::ZERO;
         }
-        // Treat a sub-unit, NaN, or non-positive multiplier as `1.0` (backoff never
-        // shrinks). The fixed case (and the first retry) is the byte-exact `initial`,
-        // capped — no f64 round-trip.
-        let multiplier = if self.multiplier > 1.0 {
+        // Treat a sub-unit, NaN, non-positive, OR non-finite (±∞) multiplier as
+        // `1.0` (backoff never shrinks or explodes to the cap on the second retry),
+        // matching the field doc and `Supervisor::backoff`, which likewise folds a
+        // non-finite factor to `1.0`. The fixed case (and the first retry) is the
+        // byte-exact `initial`, capped — no f64 round-trip.
+        let multiplier = if self.multiplier.is_finite() && self.multiplier > 1.0 {
             self.multiplier
         } else {
             1.0
@@ -342,22 +344,17 @@ mod tests {
     #[test]
     fn non_finite_or_nonpositive_multiplier_is_treated_as_fixed() {
         let cap = Duration::from_secs(5);
-        for bad in [f64::NAN, -1.0, 0.0, 0.5] {
+        // Non-finite (NaN, ±∞), non-positive, and sub-unit multipliers all fold to
+        // a fixed 1.0 backoff — matching the field doc and `Supervisor::backoff`.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0, 0.5] {
             let p = RetryPolicy::new()
                 .initial_backoff(Duration::from_millis(100))
                 .multiplier(bad)
                 .max_backoff(cap);
-            // Treated as 1.0 → fixed backoff, never shrinking, never NaN.
-            assert_eq!(p.backoff_at(0), Duration::from_millis(100));
-            assert_eq!(p.backoff_at(3), Duration::from_millis(100));
+            // Treated as 1.0 → fixed backoff, never shrinking, never exploding.
+            assert_eq!(p.backoff_at(0), Duration::from_millis(100), "bad = {bad}");
+            assert_eq!(p.backoff_at(3), Duration::from_millis(100), "bad = {bad}");
         }
-        // An infinite multiplier saturates to the cap past the first retry.
-        let p = RetryPolicy::new()
-            .initial_backoff(Duration::from_millis(100))
-            .multiplier(f64::INFINITY)
-            .max_backoff(cap);
-        assert_eq!(p.backoff_at(0), Duration::from_millis(100));
-        assert_eq!(p.backoff_at(1), cap);
     }
 
     #[test]

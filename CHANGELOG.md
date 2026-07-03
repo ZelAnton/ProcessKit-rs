@@ -122,8 +122,26 @@ to a dated version section.
   atomically renames it over the target, so an interrupted write can no longer
   truncate or destroy an existing good cassette (the symlink-refusal guard is
   preserved).
+- Retry and `Supervisor` backoffs are now **cancellable**: a `cancel_on` token
+  firing during a backoff (or a supervisor storm pause) resolves promptly with
+  `Error::Cancelled` instead of waiting out the full — possibly 30 s+ — delay.
+- `Supervisor` backoff escalation now **resets after a healthy run** — one that
+  stayed up at least as long as `max_backoff`. A long-lived service that crashes
+  occasionally no longer restarts at the `max_backoff` ceiling forever; a tight
+  loop whose incarnations are each shorter than the ceiling keeps climbing (the
+  floor is on uptime, not exit kind, so an instant `exit 0` loop under `Always`
+  escalates and self-throttles rather than spinning at the base delay).
+- `RetryPolicy` now folds a **non-finite `multiplier`** (`±∞`) to `1.0`, matching
+  its documented contract and `Supervisor::backoff` — previously `+∞` exploded the
+  backoff to the cap on the second retry while `Supervisor` treated it as constant.
 
 ### Documentation
+- `Supervisor`: documented that a permanently-failing command restarts forever
+  under the default unlimited `OnCrash` policy (bound it with `max_restarts` /
+  `stop_when`); that a single jittered backoff can reach `1.5 ×` `max_backoff`;
+  and the healthy-run backoff reset. Corrected `Command::retry`'s one-shot-stdin
+  note: such a command is **not retried** (the first error is returned as-is),
+  rather than "failing loud on the second attempt".
 - `Command::env` documents how to pass secrets: env values are redacted from
   `Debug`/tracing/cassettes (argv is not — prefer env or `stdin`), processkit ships
   no `Secret` type (bring your own `secrecy`/`zeroize` and pass the exposed value),
