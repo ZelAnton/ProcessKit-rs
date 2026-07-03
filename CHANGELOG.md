@@ -68,10 +68,13 @@ to a dated version section.
 
 ### Changed
 - `CliClient::default_env` / `default_env_remove` / `default_env_fn` now resolve a
-  **duplicate key last-registration-wins**, matching `Command::env`'s later-wins
-  (previously first-registered won, opposite of the builder intuition). A later
-  registration for a key supersedes — and drops — the earlier one (a superseded
-  `default_env_fn` resolver never runs).
+  duplicate key **last-registration-wins *within each channel*** (the static
+  `default_env`/`default_env_remove` list, and the dynamic `default_env_fn` list),
+  matching `Command::env`'s later-wins — previously first-registered won, opposite
+  of the builder intuition. A later registration for a key supersedes and drops the
+  earlier one in the same channel (a superseded `default_env_fn` resolver never
+  runs). The cross-channel rule is unchanged and orthogonal: a static `default_env`
+  for a key always beats a `default_env_fn` for it, regardless of order.
 
 ### Fixed
 - A client-wide `default_env`/`default_env_fn` no longer **pierces a command's env

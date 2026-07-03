@@ -183,10 +183,14 @@ impl<R: ProcessRunner> CliClient<R> {
     /// `GIT_TERMINAL_PROMPT=0` so a probe can never block on a credential
     /// prompt. Per-command [`Command::env`] still works and is layered after.
     ///
-    /// **Duplicate keys: last registration wins** (matching [`Command::env`]'s
-    /// later-wins): `default_env("K", "a").default_env("K", "b")` yields `K=b`. A
-    /// later [`default_env_remove`](Self::default_env_remove) of the same key
-    /// likewise supersedes an earlier set.
+    /// **Duplicate keys: last registration wins** among the *static* env ops
+    /// (`default_env`/[`default_env_remove`](Self::default_env_remove)), matching
+    /// [`Command::env`]'s later-wins: `default_env("K","a").default_env("K","b")`
+    /// yields `K=b`, and a later `default_env_remove("K")` supersedes an earlier
+    /// set. This is *within* the static channel only — a static `default_env`
+    /// always beats a [`default_env_fn`](Self::default_env_fn) for the same key
+    /// regardless of registration order (the resolver is a fallback, never run when
+    /// a static value is present).
     #[must_use]
     pub fn default_env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
         let key = key.as_ref().to_os_string();
@@ -880,6 +884,21 @@ mod tests {
             .collect();
         assert_eq!(k.len(), 1);
         assert_eq!(k[0].1, None, "the later remove wins");
+
+        // Cross-channel: last-wins is *within* a channel. A static `default_env`
+        // beats a `default_env_fn` for the same key EVEN when the fn is registered
+        // later — the resolver is a fallback, so static-beats-dynamic is orthogonal
+        // to registration order.
+        let static_wins = CliClient::new("tool")
+            .default_env("K", "static")
+            .default_env_fn("K", || "dynamic")
+            .command(["x"]);
+        assert!(
+            static_wins.env_overrides().iter().any(
+                |(k, v)| k == "K" && v.as_deref() == Some(OsString::from("static").as_os_str())
+            ),
+            "a static default_env beats a later-registered default_env_fn"
+        );
     }
 
     #[test]
