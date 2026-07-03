@@ -230,8 +230,14 @@ pub trait ProcessRunnerExt: ProcessRunner {
 
     /// Stream `command`'s stdout and return the first line matching `predicate`
     /// (`None` if the stream ends first), bounded by the command's
-    /// [`timeout`](crate::Command::timeout) (a `Some` deadline surfaces as
-    /// [`Error::Timeout`](crate::Error::Timeout) and tears the tree down).
+    /// [`timeout`](crate::Command::timeout): a `Some` deadline surfaces as
+    /// [`Error::Timeout`](crate::Error::Timeout) and tears the process down. On an
+    /// **own-group** runner ([`JobRunner`], the default) that teardown covers the
+    /// whole tree; on a **shared** [`ProcessGroup`](crate::ProcessGroup) it reaches
+    /// the run's direct child by pid — a forking child's grandchildren (and, on the
+    /// Linux cgroup mechanism, a direct child that catches the graceful signal and
+    /// closes stdout but keeps running) may outlive the probe until the group is
+    /// dropped. Bound such a run with a whole-chain owner instead.
     ///
     /// Routes through [`start`](ProcessRunner::start) — the streaming seam —
     /// so it is exercisable with **any** runner (a
@@ -253,12 +259,24 @@ pub trait ProcessRunnerExt: ProcessRunner {
         let mut process = self.start(command).await?;
         let program = command.program_name();
         let timeout = command.configured_timeout();
+        let grace = command
+            .configured_timeout_grace()
+            .unwrap_or(std::time::Duration::ZERO);
         let cancel = command.cancel_token();
+        // A race-free record of whether the deadline watchdog fired: it stores
+        // `TS_TIMED_OUT` *before* it kills, so reading it once the stream has
+        // closed distinguishes a deadline kill from a natural end.
+        let arbiter = process.deadline_arbiter();
         // Drop any open stdin pipe so a stdin-reading child isn't left blocking.
         let _ = process.take_stdin();
+        // `stdout_lines` arms the deadline watchdog, which enforces the timeout
+        // and tears the tree down — including on a shared-group handle, where it
+        // reaches the direct child by pid. `first_line` therefore runs no
+        // `tokio::time::timeout` of its own: dropping the search on a raised
+        // deadline would abort that watchdog before it fired and strand the child.
         let mut lines = process.stdout_lines()?;
         let search = async move {
-            let _process = process; // keep alive; drop on timeout tears the tree down
+            let _process = process; // keep alive so the watchdog can kill through it
             while let Some(line) = lines.next().await {
                 if predicate(&line) {
                     return Some(line);
@@ -266,57 +284,73 @@ pub trait ProcessRunnerExt: ProcessRunner {
             }
             None
         };
-        // Race the search against cancellation. On a match or a natural
-        // end-of-stream (the biased `&mut search` arm) we commit to that result
-        // and never re-inspect the token, so a run that ended with no match is
-        // reported as `Ok(None)` even if the shared token fires an instant later
-        // (the old post-hoc `is_cancelled()` re-check turned that natural `None`
-        // into a spurious `Cancelled`).
-        //
-        // On a firing token we DRAIN the search to its end before reporting
-        // `Cancelled`, rather than dropping it early. `search` owns the
-        // `RunningProcess`; dropping it runs `RunningProcess::Drop`, which aborts
-        // the cancel watchdog — and that watchdog is the *only* thing that kills a
-        // shared-group child on cancel (a shared-group handle's own `Drop` does
-        // not kill the tree). Draining keeps the process alive until the watchdog
-        // has torn the tree down and closed the pipes (which is what ends the
-        // stream), so the child is actually reaped instead of leaked. A
-        // private-group handle self-kills on drop either way; the drain is
-        // bounded by the watchdog's kill (and, when set, the outer deadline).
-        let search_or_cancel = async move {
+        // Race the search against cancellation. A match or a natural/deadline
+        // end-of-stream commits via the biased `&mut search` arm, so a token that
+        // fires an instant after a natural end can't reclassify `Ok(None)` as
+        // `Cancelled`. On a firing token we DRAIN the search to its end before
+        // reporting `Cancelled`, rather than dropping it early: `search` owns the
+        // `RunningProcess`, and dropping it aborts the cancel watchdog — the only
+        // thing that kills a shared-group child on cancel — so we keep the process
+        // alive until the watchdog has closed the pipes.
+        let raced = async move {
             tokio::pin!(search);
             match cancel {
-                Some(token) => {
-                    tokio::select! {
-                        biased;
-                        found = &mut search => Ok(found),
-                        () = token.cancelled() => {
-                            let _ = (&mut search).await;
-                            Err(())
-                        }
+                Some(token) => tokio::select! {
+                    biased;
+                    found = &mut search => Ok(found),
+                    () = token.cancelled() => {
+                        let _ = (&mut search).await;
+                        Err(())
                     }
-                }
+                },
                 None => Ok(search.await),
             }
         };
+        // The deadline is enforced by the watchdog (it kills → the stream closes →
+        // the search returns `None`). We bound the whole race only as a *backstop*
+        // for a forking shared-group child, whose grandchild can hold stdout open
+        // past the watchdog's pid-only kill so the stream never closes (the
+        // shared-group teardown gap). The backstop sits well past the deadline (+
+        // its grace + a teardown margin), so it never preempts a legitimate slow
+        // kill of a single-process child. (In that same forking gap a *cancel*
+        // whose drain can't complete also surfaces as `Timeout` via the backstop
+        // rather than `Cancelled` — acceptable: it is bounded, not hung, and only
+        // reachable when teardown itself can't finish.)
         let found = match timeout {
-            Some(limit) => match tokio::time::timeout(limit, search_or_cancel).await {
-                Ok(Ok(found)) => found,
-                Ok(Err(())) => return Err(crate::Error::Cancelled { program }),
-                Err(_elapsed) => {
-                    return Err(crate::Error::Timeout {
-                        program,
-                        timeout: limit,
-                        stdout: String::new(), // streaming probe buffers nothing
-                        stderr: String::new(),
-                    });
+            Some(limit) => {
+                let backstop = limit
+                    .saturating_add(grace)
+                    .saturating_add(std::time::Duration::from_secs(5));
+                match tokio::time::timeout(backstop, raced).await {
+                    Ok(Ok(found)) => found,
+                    Ok(Err(())) => return Err(crate::Error::Cancelled { program }),
+                    Err(_elapsed) => {
+                        return Err(crate::Error::Timeout {
+                            program,
+                            timeout: limit,
+                            stdout: String::new(), // streaming probe buffers nothing
+                            stderr: String::new(),
+                        });
+                    }
                 }
-            },
-            None => match search_or_cancel.await {
+            }
+            None => match raced.await {
                 Ok(found) => found,
                 Err(()) => return Err(crate::Error::Cancelled { program }),
             },
         };
+        // Distinguish a deadline kill (arbiter `TS_TIMED_OUT`, set before the kill,
+        // so the child is already dead when the stream closed) from a natural end.
+        if found.is_none()
+            && arbiter.load(std::sync::atomic::Ordering::Acquire) == crate::running::TS_TIMED_OUT
+        {
+            return Err(crate::Error::Timeout {
+                program,
+                timeout: timeout.unwrap_or_default(),
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
         Ok(found)
     }
 }

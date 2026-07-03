@@ -82,6 +82,21 @@ to a dated version section.
   watchdog-closed end before returning, so a `first_line` run on a **shared**
   process group (`ProcessGroup::first_line`) reliably tears its child down on
   cancel instead of racing the watchdog against handle teardown.
+- `Command::timeout` is now enforced while **streaming** on a shared-group handle
+  (`ProcessGroup::start(&cmd) → stdout_lines`). Previously the deadline watchdog
+  armed only for own-group handles, so a quiet, never-exiting child left the
+  stream pending forever and `finish` never reported `TimedOut`; the watchdog now
+  also arms on a shared-group handle, reaching the direct child by pid.
+- `first_line` on a shared-group handle now honors the command timeout — it
+  surfaces `Error::Timeout` **and** tears the direct child down, instead of
+  returning `Timeout` while stranding the process (its own deadline wrapper could
+  abort the watchdog before it fired). It now relies on the deadline watchdog for
+  teardown and classifies the timeout from the shared arbiter (set before the
+  kill); a backstop bounds the wait for the forking-child gap. On a shared group
+  the teardown reaches the direct child by pid — a forking child's grandchildren
+  (and, on the Linux cgroup mechanism, a direct child that catches the graceful
+  signal and closes stdout but keeps running) may outlive the probe until the
+  group is dropped, same as the other shared-group teardown edges.
 
 ### Documentation
 - `Command::env` documents how to pass secrets: env values are redacted from

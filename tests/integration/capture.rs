@@ -547,6 +547,57 @@ async fn first_line_honors_timeout_instead_of_hanging() {
     );
 }
 
+#[cfg(feature = "process-control")]
+#[tokio::test]
+#[ignore = "spawns a real subprocess in a shared group; first_line must time out and tear it down"]
+async fn shared_group_first_line_honors_timeout_and_tears_down() {
+    use processkit::{ProcessGroup, ProcessRunnerExt};
+
+    // A2: a first_line probe on a SHARED group must honor the command timeout —
+    // surface Error::Timeout AND tear the child down (the shared-group deadline
+    // watchdog now reaches the direct child by pid). A single-process idle emits
+    // no matching line and outlives the deadline.
+    let group = ProcessGroup::new().expect("group");
+    let silent = if cfg!(windows) {
+        Command::new("ping").args(["-n", "30", "127.0.0.1"])
+    } else {
+        Command::new("sleep").arg("30")
+    }
+    .timeout(Duration::from_millis(300));
+
+    let start = Instant::now();
+    let err = completes_within(
+        Duration::from_secs(15),
+        "shared-group first_line timeout",
+        group.first_line(&silent, |_| false),
+    )
+    .await
+    .expect_err("a stalled shared-group probe must time out, not hang or return Ok(None)");
+    assert!(
+        matches!(err, processkit::Error::Timeout { .. }),
+        "expected Error::Timeout, got {err:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(15),
+        "first_line did not honor the timeout (took {:?})",
+        start.elapsed()
+    );
+
+    // No leak: the deadline watchdog tore the child down.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let members = group.members().expect("members");
+        if members.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first_line timeout leaked a shared-group child: {members:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 #[ignore = "spawns a real stdin-reading subprocess via first_line"]
 async fn first_line_closes_an_untaken_keep_stdin_open_pipe() {

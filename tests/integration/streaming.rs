@@ -53,6 +53,56 @@ async fn streaming_honors_timeout() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real subprocess in a shared group that outlives its timeout"]
+async fn shared_group_streaming_honors_timeout() {
+    use processkit::ProcessGroup;
+    use tokio_stream::StreamExt;
+
+    // A1: `Command::timeout` must bound a stream on a SHARED-group handle too.
+    // Before the fix the deadline watchdog armed only for own-group handles, so a
+    // quiet never-exiting child left the stream pending forever. A single-process
+    // idle keeps the shared-group pid-only kill sufficient (a forking tree is the
+    // separate teardown gap).
+    let group = ProcessGroup::new().expect("group");
+    let cmd = if cfg!(windows) {
+        // ping is a single process that emits lines then idles.
+        Command::new("ping").args(["-n", "30", "127.0.0.1"])
+    } else {
+        // `exec` replaces the shell so the idle is one process (fork-free).
+        Command::new("sh").args(["-c", "echo one; exec sleep 30"])
+    }
+    .timeout(Duration::from_millis(500));
+
+    let start = Instant::now();
+    let mut run = group.start(&cmd).await.expect("start");
+    let mut lines = run.stdout_lines().unwrap();
+    // Bound the drain so a broken deadline fails loud instead of hanging forever.
+    let seen = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut seen = Vec::new();
+        while let Some(line) = lines.next().await {
+            seen.push(line);
+        }
+        seen
+    })
+    .await
+    .expect("the deadline must end the stream, not hang");
+    drop(lines);
+    let Finished { outcome, .. } = run.finish().await.expect("finish");
+
+    assert!(
+        start.elapsed() < Duration::from_secs(15),
+        "shared-group stream did not end at the deadline (took {:?})",
+        start.elapsed()
+    );
+    assert_eq!(
+        outcome,
+        Outcome::TimedOut,
+        "a timed-out shared-group streamed run must report TimedOut (got {outcome:?})"
+    );
+    assert!(!seen.is_empty(), "the stream should have seen some output first");
+}
+
+#[tokio::test]
 #[ignore = "spawns a real subprocess"]
 async fn stdout_line_handler_sees_every_line() {
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));

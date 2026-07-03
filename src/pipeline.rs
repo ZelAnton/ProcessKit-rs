@@ -117,6 +117,14 @@ impl Pipeline {
     /// down; the result reports `timed_out`). Unlike a single
     /// [`Command::timeout`] capture, no partial stdout is reported for a
     /// timed-out chain.
+    ///
+    /// Prefer this over a **per-stage** [`Command::timeout`] when a stage may
+    /// fork. Every stage shares one kill-on-drop group, so a per-stage deadline
+    /// reaches only that stage's *direct* child (by pid) — a grandchild it forked
+    /// can keep the stdout pipe open past the kill, stalling the downstream stage.
+    /// A whole-chain timeout tears the entire group down (grandchildren
+    /// included), so it always bounds the run; a per-stage timeout alone does not
+    /// for a forking stage. Single-process stages are bounded by either.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self

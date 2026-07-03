@@ -51,7 +51,11 @@ const DISCARD_INFLIGHT_CAP: usize = 64 << 20;
 // scheduler quantum of the deadline.
 const TS_PENDING: u8 = 0;
 const TS_EXITED: u8 = 1;
-const TS_TIMED_OUT: u8 = 2;
+// `pub(crate)` so `first_line` (in `crate::runner`) can classify a timed-out
+// streamed run: the deadline watchdog stores `TS_TIMED_OUT` *before* it kills, so
+// reading it after the stream closes distinguishes a deadline kill from a natural
+// end race-free.
+pub(crate) const TS_TIMED_OUT: u8 = 2;
 
 /// Why a reap-via-wait ended — the race result, not a post-hoc token read.
 enum ExitCause {
@@ -514,6 +518,15 @@ impl RunningProcess {
     pub fn peak_memory_bytes(&self) -> Option<u64> {
         self.pid
             .and_then(|pid| crate::sys::process_metrics(pid).peak_memory_bytes)
+    }
+
+    /// A clone of the timeout arbiter, so a consumer that has moved the handle
+    /// into a search future (e.g. `first_line`) can still learn — race-free —
+    /// whether the deadline watchdog fired. The watchdog stores `TS_TIMED_OUT`
+    /// *before* it kills, so a `TS_TIMED_OUT` read after the stream has closed
+    /// means the run was timed out, not a natural end.
+    pub(crate) fn deadline_arbiter(&self) -> Arc<AtomicU8> {
+        self.timeout_state.clone()
     }
 
     /// Lines read from stdout so far (counts every line, even ones dropped by an

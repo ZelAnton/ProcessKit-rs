@@ -131,49 +131,67 @@ impl RunningProcess {
         // drops early. The graceful branch upgrades across `graceful_terminate`,
         // deferring group-Drop until teardown finishes — benign.
         if self.deadline_task.is_none()
-            && let (Some(limit), Some(group)) = (self.timeout, self.backend.own_group())
+            && let Some(limit) = self.timeout
         {
-            let group = Arc::downgrade(group);
+            // Own-group handles tear down the whole tree; a shared-group handle
+            // (`own_group` is `None`) doesn't own the tree, so it reaches only its
+            // direct child by pid — the same scope as the cancel watchdog. A Real
+            // backend always has a pid; a scripted stream carries neither and is
+            // bounded by `arm_scripted_deadline` below instead. Without arming the
+            // shared-group case, `Command::timeout` was silently *unenforced*
+            // while streaming on a shared group: a quiet, never-exiting child left
+            // the stream pending forever (A1).
+            let own_group = self.backend.own_group().map(Arc::downgrade);
             let pid = self.pid;
-            let grace = self.timeout_grace;
-            let signal = self.timeout_signal;
-            // Anchor to spawn time so a late stream call can't re-grant the full limit.
-            let started = self.started;
-            // Claim the timeout via the shared arbiter so the finisher classifies
-            // `TimedOut` even if the child exits cleanly within the grace. Only kill
-            // if we won the race against the natural reap: if the child already
-            // exited, the CAS fails and we skip the kill, avoiding a signal to a
-            // recycled pid.
-            let timeout_state = self.timeout_state.clone();
-            self.deadline_task = Some(tokio::spawn(async move {
-                let remaining = limit
-                    .checked_sub(started.elapsed())
-                    .unwrap_or(std::time::Duration::ZERO);
-                tokio::time::sleep(remaining).await;
-                if timeout_state
-                    .compare_exchange(
-                        super::TS_PENDING,
-                        super::TS_TIMED_OUT,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_err()
-                {
-                    return; // child already exited — no kill
-                }
-                match grace {
+            if own_group.is_some() || pid.is_some() {
+                let grace = self.timeout_grace;
+                let signal = self.timeout_signal;
+                // Anchor to spawn time so a late stream call can't re-grant the full limit.
+                let started = self.started;
+                // Claim the timeout via the shared arbiter so the finisher
+                // classifies `TimedOut` even if the child exits cleanly within the
+                // grace. Only kill if we won the race against the natural reap: if
+                // the child already exited, the CAS fails and we skip the kill,
+                // avoiding a signal to a recycled pid.
+                let timeout_state = self.timeout_state.clone();
+                self.deadline_task = Some(tokio::spawn(async move {
+                    let remaining = limit
+                        .checked_sub(started.elapsed())
+                        .unwrap_or(std::time::Duration::ZERO);
+                    tokio::time::sleep(remaining).await;
+                    if timeout_state
+                        .compare_exchange(
+                            super::TS_PENDING,
+                            super::TS_TIMED_OUT,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_err()
+                    {
+                        return; // child already exited — no kill
+                    }
                     // This watchdog can't reap the child, so a child that exits on
-                    // the signal still causes the task to wait the full grace before
-                    // a no-op SIGKILL.
-                    Some(grace) => match group.upgrade() {
-                        Some(group) => {
-                            let _ = group.graceful_terminate(grace, signal).await;
-                        }
-                        None => kill_direct_child(pid), // group already gone
-                    },
-                    None => kill_via_weak(&group, pid),
-                }
-            }));
+                    // the signal still waits the full grace before a no-op SIGKILL.
+                    match own_group {
+                        Some(group) => match grace {
+                            Some(grace) => match group.upgrade() {
+                                Some(group) => {
+                                    let _ = group.graceful_terminate(grace, signal).await;
+                                }
+                                None => kill_direct_child(pid), // group already gone
+                            },
+                            None => kill_via_weak(&group, pid),
+                        },
+                        // Shared group: pid-only teardown (grandchildren of a
+                        // forking child are the shared-group teardown gap — pair a
+                        // per-stage timeout with a whole-chain one).
+                        None => match grace {
+                            Some(grace) => graceful_kill_pid(pid, grace, signal).await,
+                            None => kill_direct_child(pid),
+                        },
+                    }
+                }));
+            }
         }
 
         self.arm_scripted_deadline();
