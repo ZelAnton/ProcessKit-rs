@@ -233,9 +233,10 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// parser never silently sees a clipped tail; returns the parsed value.
     ///
     /// Because it is generic over the parser `F`, `parse` — like
-    /// [`first_line`](Self::first_line) — is **not object-safe** and so is
-    /// unavailable on a `&dyn ProcessRunner`: call it on a concrete runner
-    /// ([`JobRunner`], `&ProcessGroup`, a
+    /// [`first_line`](Self::first_line) — makes the ext trait **not object-safe**,
+    /// so it cannot be dispatched through a `dyn ProcessRunnerExt` object; it *is*
+    /// callable on a `&dyn ProcessRunner` (via the blanket ext impl). Reach for it
+    /// on a concrete runner ([`JobRunner`], `&ProcessGroup`, a
     /// [`ScriptedRunner`](crate::testing::ScriptedRunner)), or via the
     /// [`Command::parse`](crate::Command::parse) /
     /// [`CliClient::parse`](crate::CliClient::parse) wrappers.
@@ -255,10 +256,12 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// *fallible* `parse` closure — the shape of JSON deserialization, where a
     /// parse failure becomes [`Error::Parse`](crate::Error::Parse) (or whatever
     /// error the closure returns). Like [`parse`](Self::parse) it is built on
-    /// [`checked`](Self::checked), fails loud on truncation, and — being
-    /// generic over `F` — is unavailable on a `&dyn ProcessRunner`; use a
-    /// concrete runner or the [`Command::try_parse`](crate::Command::try_parse) /
-    /// [`CliClient::try_parse`](crate::CliClient::try_parse) wrappers.
+    /// [`checked`](Self::checked), fails loud on truncation, and — being generic
+    /// over `F` — cannot be dispatched through a `dyn ProcessRunnerExt` **object**
+    /// (the trait isn't object-safe), though it *is* callable on a
+    /// `&dyn ProcessRunner`. The [`Command::try_parse`](crate::Command::try_parse) /
+    /// [`CliClient::try_parse`](crate::CliClient::try_parse) wrappers are the
+    /// ergonomic path.
     async fn try_parse<T, F>(&self, command: &Command, parse: F) -> Result<T>
     where
         T: Send,
@@ -288,12 +291,12 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// real-runner-only [`Command::first_line`](crate::Command::first_line),
     /// which now delegates here.
     ///
-    /// Because it is generic over the predicate `F`, `first_line` is **not
-    /// object-safe** and so is unavailable on a `&dyn ProcessRunner`: call it
-    /// on a concrete runner ([`JobRunner`], `&ProcessGroup`, a
-    /// [`ScriptedRunner`](crate::testing::ScriptedRunner)), or via the
+    /// Because it is generic over the predicate `F`, `first_line` makes the ext
+    /// trait **not object-safe**, so it cannot be dispatched through a `dyn
+    /// ProcessRunnerExt` object; it *is* callable on a `&dyn ProcessRunner` (via
+    /// the blanket ext impl), like every other [`ProcessRunnerExt`] verb. The
     /// [`Command::first_line`] / [`CliClient::first_line`](crate::CliClient::first_line)
-    /// wrappers. All other [`ProcessRunnerExt`] verbs work through `&dyn`.
+    /// wrappers are the ergonomic path.
     async fn first_line<F>(&self, command: &Command, predicate: F) -> Result<Option<String>>
     where
         F: Fn(&str) -> bool + Send,

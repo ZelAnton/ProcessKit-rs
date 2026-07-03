@@ -94,7 +94,7 @@ edges worth knowing:
 |---|---|---|
 | `drop(group)` | Immediate **hard kill** of the whole tree (kill-on-close) | The safety net — always on |
 | `group.kill_all()` | The same hard kill, group stays usable (cgroup-`kill` / Job Object / process-group backends). On a **pre-5.14 Linux kernel** lacking `cgroup.kill`, the per-pid `SIGKILL` fallback returns `Err` if the tree doesn't drain (a fork bomb still out-spawning, or `D`-state zombies) | Explicit teardown mid-flight; idempotent |
-| `group.shutdown().await` | Unix: `SIGTERM` → wait `shutdown_timeout` → `SIGKILL` survivors (if `escalate_to_kill`); Windows: atomic job kill. Consumes the group (`shutdown_ref(&self)` is the same teardown, borrowing — for a group held behind an `Arc`/supervisor) | Graceful service stop |
+| `group.shutdown().await` | Unix: `SIGTERM` → wait `shutdown_timeout` → `SIGKILL` survivors (if `escalate_to_kill`); Windows: atomic job kill when `escalate_to_kill`, else the survivors are **spared** (handle closed without kill-on-close). Consumes the group (`shutdown_ref(&self)` is the same teardown, borrowing — for a group held behind an `Arc`/supervisor) | Graceful service stop |
 
 ```rust,no_run
 use processkit::{Command, ProcessGroup, ProcessGroupOptions};

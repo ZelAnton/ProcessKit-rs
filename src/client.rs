@@ -492,7 +492,8 @@ impl<R: ProcessRunner> CliClient<R> {
 /// `struct Git<R: ProcessRunner = JobRunner> { core: CliClient<R> }` with
 /// `new()` (real runner), a `Default` impl, `with_runner(runner)`, and
 /// `default_timeout(d)`. Implement the tool's typed methods on it, delegating to
-/// `self.core` — see the crate docs for an example.
+/// `self.core` — see the *Wrapping a CLI tool* section of the crate's
+/// `docs/testing.md` guide for a worked example.
 ///
 /// This macro is **committed public API**. Because it is `#[macro_export]`,
 /// it lives at the crate root and is a stable part of the surface — the

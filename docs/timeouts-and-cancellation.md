@@ -177,7 +177,7 @@ The contract, path by path:
 | A `Pipeline` stage's token cancels | that stage dies; the cancellation errors the whole pipeline and the private group reaps the other stages |
 | Under `retry` | terminal — never retried, whatever the classifier says |
 | Under a [`Supervisor`](supervision.md) | terminal — supervision returns `Err(Cancelled)` instead of restarting into a still-cancelled token |
-| `wait_any` mid-run | the raw primitive doesn't synthesize the error — the race just resolves (a *pre-cancelled* token still hits the pre-spawn short-circuit) |
+| `wait_any` mid-run | surfaces `Err(Cancelled)` — each racer's wait path resolves to `Cancelled` when its token fires, the same as a bulk verb (a *pre-cancelled* token still hits the pre-spawn short-circuit) |
 | `first_line` mid-run | surfaces `Error::Cancelled` once the token fires — a cancelled stream that closes without a match is reported as cancellation, not `Ok(None)` |
 
 ### Client-level default

@@ -82,9 +82,12 @@ The outcome is **pipefail**, like `set -o pipefail` in a shell:
 
 - `stdout` is always the **last** stage's output — that's what the chain
   produced.
-- `code`, `stderr`, and the reported program come from the **first** stage
-  that didn't exit cleanly (non-zero, signal-killed, or timed out) — or from
-  the last stage when every stage succeeded.
+- `code`, `stderr`, and the reported program come from the **culprit** stage:
+  the leftmost stage that didn't exit cleanly (non-zero, signal-killed, or timed
+  out), but **preferring a real failure over a downstream `SIGPIPE` victim** — a
+  stage killed only because a later stage closed the pipe early. If every failure
+  is such a broken-pipe victim, the leftmost one wins; when every stage succeeded,
+  the last stage speaks.
 
 ```rust,no_run
 use processkit::Command;
@@ -151,8 +154,11 @@ code):
   decides what to report.
 - A **checked** failure always trumps an unchecked one, regardless of
   position: `unchecked` never shields another stage's real failure.
-- A chain whose only failures are unchecked reports **success** (the last
-  stage's stdout, `code 0`).
+- A chain whose only failures are unchecked reports **success** with the last
+  stage's stdout and its **real** exit code preserved (not a fabricated `0` — the
+  accepted-code set is widened to include it). The carve-out is for an exit
+  *status* only: a last stage killed by a **signal** or its own **timeout** is not
+  a status to forgive and still surfaces as the failure.
 - `unchecked` forgives exit *status* only — never a whole-chain
   [`Pipeline::timeout`](#timeouts), and it has no effect on a `Command` run
   outside a pipeline (a single run's status is already plain data in its
@@ -183,9 +189,11 @@ let out = Command::new("producer")
   reporting **that stage's own deadline** (not the chain's, and never `0ns`).
 
 Cancellation has two forms. **`Pipeline::cancel_on(token)`** is the chain-level
-control: the token is applied to every stage, so firing it tears the whole chain
-down and the run resolves to `Error::Cancelled`. (A `cancel_on` token on an
-individual stage `Command` also cancels that stage and errors the pipeline, but
+control: the token **gap-fills** into every stage that doesn't already carry its
+own [`Command::cancel_on`] (an explicit per-stage token is left intact), so firing
+it tears the whole chain down and the run resolves to `Error::Cancelled`. (A
+`cancel_on` token on an individual stage `Command` also cancels that stage and
+errors the pipeline, but
 the pipeline-level builder is the clearer authority.) See
 [Timeouts & cancellation](timeouts-and-cancellation.md).
 

@@ -48,6 +48,11 @@ instead (`Error::ResourceLimit`), because an unapplied cap is no protection.
 | Graceful `shutdown` (TERM → grace → KILL) | 🟡 atomic kill only | ✅ | ✅ | ✅ |
 | `adopt` an external child | ✅ (future forks contained) | ✅ (future forks contained) | 🟡 exec'd child tracked individually | 🟡 same |
 
+Windows has no signal tier, so a graceful `shutdown` collapses to the atomic Job
+kill — but it still honors `escalate_to_kill`: `false` **spares** the survivors
+(closes the Job handle without `KILL_ON_JOB_CLOSE`) rather than killing them, so
+the Windows column is "atomic kill *when it kills*", not an unconditional kill.
+
 **Signals & freezing**
 
 | Capability | Windows | Linux cgroup | Linux pgroup | macOS/BSD |
@@ -61,13 +66,16 @@ surfaces a real per-member delivery failure (e.g. `EPERM`) as an `Err` rather
 than swallowing it — consistent with the "never silently skipped" philosophy; an
 `ESRCH` race (the member already exited) is still success.
 
-**Inspection & accounting** (`stats` feature)
+**Inspection & accounting**
 
 | Capability | Windows | Linux cgroup | Linux pgroup | macOS/BSD |
 |---|---|---|---|---|
 | `members()` | ✅ whole tree | ✅ whole tree | 🟡 leaders only | 🟡 leaders only |
 | Group CPU / peak memory | ✅ | ✅ | ❌ count only | ❌ count only |
 | Per-run `cpu_time` / `peak_memory_bytes` / `profile` | ✅ | ✅ | ✅ (`/proc`) | ❌ `None` |
+
+`members()` is gated on the **`process-control`** feature; the CPU / memory /
+`profile` rows are gated on the **`stats`** feature.
 
 **Resource limits** (`limits` feature)
 

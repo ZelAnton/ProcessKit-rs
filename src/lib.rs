@@ -13,10 +13,15 @@
 //!
 //! - **[`ProcessGroup`]** — a kill-on-drop container for a process *tree*. Every
 //!   child spawned into the group, and everything those children spawn, dies
-//!   with the group, so an exiting or panicking owner never leaks subprocesses.
+//!   with the group, so an exiting or panicking owner doesn't leak subprocesses.
 //!   Containment is a Windows [Job Object], a Linux [cgroup v2] (with a POSIX
 //!   process-group fallback), or a POSIX process group on macOS/BSD —
-//!   observable via [`Mechanism`]. The whole tree can be
+//!   observable via [`Mechanism`]. Two caveats the [`ProcessGroup`] /
+//!   [`Mechanism`] docs spell out: the guarantee rides on `Drop` running (a
+//!   `panic = "abort"` process, or a `SIGKILL`/power-loss of the *owner*, skips
+//!   it — the OS-owned Job Object / cgroup still reaps on handle close, the POSIX
+//!   process-group fallback does not), and on the process-group mechanism a child
+//!   that calls `setsid` escapes containment. The whole tree can be
 //!   signalled (`ProcessGroup::signal`, see `Signal`), paused/resumed
 //!   (`ProcessGroup::suspend` / `ProcessGroup::resume`), and inspected
 //!   (`ProcessGroup::members`); [`wait_any`] races several running processes
@@ -61,10 +66,10 @@
 //! **Run vocabulary** — one verb, one meaning, at every layer ([`Command`],
 //! [`ProcessRunner`]/[`ProcessRunnerExt`], [`CliClient`]):
 //!
-//! - **`run`** — require a zero exit and return stdout as a `String`, trailing
-//!   whitespace trimmed (`trim_end`: the final newline is noise, but leading
-//!   whitespace can be significant). **`run_unit`** — the same, discarding the
-//!   output.
+//! - **`run`** — require an **accepted** exit (`0` by default, widened by
+//!   [`Command::ok_codes`]) and return stdout as a `String`, trailing whitespace
+//!   trimmed (`trim_end`: the final newline is noise, but leading whitespace can
+//!   be significant). **`run_unit`** — the same, discarding the output.
 //! - **`output_string`** / **`output_bytes`** — return the full
 //!   [`ProcessResult`] (stdout as text / raw bytes); a non-zero exit is *not* an
 //!   error here. (`output_string`, not a bare `output`, since
@@ -85,9 +90,12 @@
 //! - **`stats`** — resource measurement: `ProcessGroupStats`,
 //!   `ProcessGroup::stats` (plus the `sample_stats` time-series sampler), the
 //!   per-process `RunningProcess::cpu_time`/`peak_memory_bytes` diagnostics,
-//!   and the `RunningProcess::profile` run summary. **Opt-in** — the one feature
-//!   with an extra dependency (the Windows `ProcessStatus` FFI) and a specialized
-//!   purpose; enable with `features = ["stats"]`, or `limits`, which implies it.
+//!   and the `RunningProcess::profile` run summary. **Opt-in** for its
+//!   specialized purpose (on Windows it calls the system `ProcessStatus`/PSAPI
+//!   API — a link to an OS library, *not* an added crate dependency); enable with
+//!   `features = ["stats"]`, or `limits`, which implies it. (The features that do
+//!   pull an extra crate are `mock` → `mockall`, `tracing` → `tracing`, and
+//!   `record` → `serde`/`serde_json`.)
 //! - **`process-control`** *(default)* — tree control beyond contain+kill:
 //!   `Signal` and `ProcessGroup::{signal, suspend, resume, members, adopt}`.
 //! - **`limits`** — whole-tree resource caps: `ResourceLimits`, the

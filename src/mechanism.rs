@@ -13,7 +13,9 @@
 pub enum Mechanism {
     /// Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
     JobObject,
-    /// Linux cgroup v2, torn down via `cgroup.kill`.
+    /// Linux cgroup v2, torn down via `cgroup.kill` where available (Linux ≥ 5.14);
+    /// on an older kernel without `cgroup.kill`, or if that write fails, it falls
+    /// back to sweeping `cgroup.procs` with per-pid `SIGKILL`.
     CgroupV2,
     /// POSIX process group, torn down via `killpg`. The primary mechanism on
     /// macOS and the BSDs, and the Linux fallback when no cgroup is writable.

@@ -189,6 +189,23 @@ to a dated version section.
   backoff to the cap on the second retry while `Supervisor` treated it as constant.
 
 ### Documentation
+- Guide/README/rustdoc sweep — corrected several inaccuracies verified against the
+  source: `wait_any` **does** surface `Err(Cancelled)` mid-run; the ext verbs
+  (`parse`/`try_parse`/`first_line`) are callable on `&dyn ProcessRunner` (they
+  just can't form a `dyn ProcessRunnerExt` object); pipefail prefers a real culprit
+  over a downstream `SIGPIPE` victim; an unchecked *last* stage preserves its real
+  exit code (not a fabricated `0`) but a signal/timeout still surfaces; the
+  `cli_client!` `core` field is module-private (not public); `profile` discards
+  output like `wait`; `members()` is `process-control`-gated (not `stats`);
+  Windows graceful shutdown honors `escalate_to_kill=false` (spares survivors);
+  the retry verb list is seven (`run`/`run_unit`/`exit_code`/`probe`/`checked`/
+  `parse`/`try_parse`); `run` requires an *accepted* exit (widened by `ok_codes`),
+  not strictly `0`; `stats` adds no crate dependency (only a `windows-sys`
+  sub-feature) while `mock`/`tracing`/`record` do; `Mechanism::CgroupV2` teardown
+  falls back to a per-pid `SIGKILL` sweep pre-5.14 / on write failure; the
+  crate-root "never leaks" guarantee is qualified (rides on `Drop`; `setsid`
+  escapes the process-group mechanism); and a cookbook snippet shows the explicit
+  `io::Error` → `Error::Io` map (no blanket `From<io::Error>`).
 - `Error::Exit`/`Timeout`/`Signalled` stdout docs: corrected the claim that a
   raw-bytes error's exact bytes "remain on the originating `ProcessResult`" — a
   consuming checking verb (`run`/`ensure_success`) drops the result, so the exact

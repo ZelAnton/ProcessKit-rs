@@ -40,8 +40,9 @@ Every runner — real or double — gets the convenience helpers of
 `ProcessRunnerExt` for free: `run` (trimmed stdout, success required),
 `run_unit`, `exit_code`, `probe` (exit code as a boolean), `checked`
 (success-checked full result), and `parse`/`try_parse` (feed stdout to a
-closure; like `first_line`, generic over the closure so unavailable on a
-`&dyn ProcessRunner`). [Retry
+closure). These are all callable on a `&dyn ProcessRunner`; being generic over
+the closure, `parse`/`try_parse`/`first_line` simply can't be dispatched through
+a `dyn ProcessRunnerExt` **object** (the ext trait isn't object-safe). [Retry
 policies](timeouts-and-cancellation.md#retries) work through the seam too, so
 a double exercises your retry handling hermetically.
 
@@ -329,7 +330,8 @@ let head = git.head(Path::new(".")).await?;
 
 The generated type is `Git<R: ProcessRunner = JobRunner>` with `Git::new()`,
 `Git::with_runner(runner)`, `default_timeout` / `default_env` /
-`default_env_remove` builders, and a public `core: CliClient<R>` whose helpers
+`default_env_remove` builders, and a **module-private** `core: CliClient<R>` (reach
+it as `self.core` from the wrapper's own methods) whose helpers
 speak the crate-wide verb vocabulary: `run` (trimmed stdout), `output_string` (full
 result), `run_unit` (success only), `exit_code`, `probe`, plus `parse`
 (infallible) and `try_parse` (fallible → `Error::Parse`).

@@ -250,9 +250,11 @@ let out = Command::new("flaky-network-tool")
   verbs the expiry is *captured* (`ProcessResult::timed_out`), on the
   success-checking verbs it *raises* `Error::Timeout` — the full decision
   table lives in [Timeouts, retries & cancellation](timeouts-and-cancellation.md).
-- **`retry`** applies to the success-checking verbs only (`run`, `exit_code`,
-  `probe`, and `ProcessRunnerExt::checked`); the classifier sees the typed
-  error and decides. The non-erroring `output_string` path never retries.
+- **`retry`** applies to the success-checking verbs only — `run`, `run_unit`,
+  `exit_code`, `probe`, `checked`, `parse`, and `try_parse` (seven in all; each
+  runs through the retry loop). The classifier sees the typed error and decides.
+  The non-erroring `output_string`/`output_bytes` paths never retry, and neither
+  does `first_line` (its stream search is single-attempt).
 
 ## Privileges and spawn flags
 

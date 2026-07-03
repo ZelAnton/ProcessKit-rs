@@ -28,7 +28,7 @@ run.elapsed();    // time since spawn
 //   output_string() / output_bytes()  → capture everything (same as the one-shot verbs)
 //   wait()                            → just the Outcome; output is discarded
 //   finish()                 → after streaming stdout (below)
-//   profile(every)                    → capture + resource samples (stats feature)
+//   profile(every)                    → resource samples; output discarded, like wait() (stats feature)
 let outcome = run.wait().await?;   // Outcome: Exited(code) / Signalled(sig) / TimedOut
 ```
 

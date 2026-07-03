@@ -425,9 +425,15 @@ cgroup); elsewhere you still get process counts.
 ## Contain a process you didn't spawn
 
 ```rust,no_run
-use processkit::ProcessGroup;
+use processkit::{Error, ProcessGroup};
 
-let child = tokio::process::Command::new("legacy-launcher").spawn()?;
+// `tokio`/`std` calls return `io::Error`, which the crate does NOT auto-convert
+// into `processkit::Error` (there is no blanket `From<io::Error>`, by design) —
+// map it explicitly, or use a `Box<dyn std::error::Error>` / `anyhow` return in
+// your own code so both error types `?` freely.
+let child = tokio::process::Command::new("legacy-launcher")
+    .spawn()
+    .map_err(Error::Io)?;
 
 let group = ProcessGroup::new()?; // `adopt` is part of `process-control` (default-on)
 group.adopt(&child)?;            // from now on the group's teardown covers it
