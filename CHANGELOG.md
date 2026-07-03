@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- `impl<R: ProcessRunner + ?Sized> ProcessRunner for Box<R>` and `Arc<R>` — a
+  runner chosen at **runtime** (the real `JobRunner` vs a `record`-feature
+  cassette, picked from config) can now be stored type-erased as
+  `Box<dyn ProcessRunner>` in `CliClient`/`Supervisor` state and shared across
+  tasks as `Arc<dyn ProcessRunner>`, not just borrowed as `&R`. Generic over
+  `?Sized`, so a boxed/shared *concrete* runner (`Arc<JobRunner>`) qualifies too.
+  Both forward every method (`output_string`/`output_bytes`/`start`).
+- `Command::no_timeout()` — mark a command **explicitly unbounded** so a client
+  `default_timeout` gap-fill leaves it alone (a `tail -f`, a watch loop). Distinct
+  from simply leaving the timeout unset (which the client *does* fill); the last
+  of `timeout`/`no_timeout` wins.
 - `Error` accessors so consumers stop matching the `#[non_exhaustive]` `Error`
   enum's variants by hand: `program()`, `stdout()`, `stderr()` -> `Option<&str>`;
   `combined()` -> `Option<String>` (streams for the `Exit`/`Timeout`/`Signalled`
@@ -56,9 +67,30 @@ to a dated version section.
   `Arc`-shared so `CliClient` stays `Clone`.
 
 ### Changed
--
+- `CliClient::default_env` / `default_env_remove` / `default_env_fn` now resolve a
+  **duplicate key last-registration-wins**, matching `Command::env`'s later-wins
+  (previously first-registered won, opposite of the builder intuition). A later
+  registration for a key supersedes — and drops — the earlier one (a superseded
+  `default_env_fn` resolver never runs).
 
 ### Fixed
+- A client-wide `default_env`/`default_env_fn` no longer **pierces a command's env
+  isolation**: `env_clear()` now opts the command out of the gap-fill for *every*
+  key (a clean slate the client must not pierce), and `inherit_env([...])` blocks a
+  client default only for its **allow-listed** keys (a client default must not
+  override a value the command chose to inherit from the parent). A client default
+  for a key an `inherit_env` command did not list still fills — so a client-wide
+  safety default (e.g. `GIT_TERMINAL_PROMPT=0`) keeps reaching such commands.
+- `Command::ok_codes([])` (an empty set) is now truly **ignored** — a no-op that
+  keeps the previously configured codes — rather than resetting the accepted set
+  to `[0]`, matching its doc.
+- Windows `command_line()` display now doubles a backslash that **precedes an
+  embedded quote** (`a\"b` → `"a\\\"b"`), so the rendered argument round-trips
+  through `CommandLineToArgvW` instead of re-parsing as `a\b`.
+- `Command`'s `Debug` no longer claims to be exhaustive (`finish()` →
+  `finish_non_exhaustive()`) and now includes the previously-omitted
+  `timeout_grace`/`timeout_signal`/`ok_codes`/tee-presence and the
+  security-relevant `groups` (a privilege-drop's supplementary group set).
 - Pipeline pipefail attribution now preserves the failing stage's `ok_codes`: a
   stage whose `ok_codes` exclude `0` that nonetheless exited `0` (a rejected-zero
   failure) was rebuilt with the default accepted set `[0]`, so the whole chain
@@ -136,6 +168,18 @@ to a dated version section.
   backoff to the cap on the second retry while `Supervisor` treated it as constant.
 
 ### Documentation
+- `Command::stdout_tee`/`stderr_tee`: documented that the sink is shared through
+  `Clone` (an `Arc<Mutex<…>>`), so concurrent `Pipeline` stages **interleave** and
+  sequential `retry`/`Supervisor` re-runs **append** (a retried command's sink
+  accumulates the failed attempt's output before the successful one's).
+- `IntoCommand`: documented the graft trap — passing a ready-made `Command` for a
+  *different* program to a client verb runs that program with the **client's**
+  env/timeout defaults grafted on (the program is not substituted).
+- Crate-root `Encoding`/`StreamExt` re-exports: documented the `0.x`-dependency
+  semver coupling and glob-import collision risk (a `prelude` move is tracked for
+  v2).
+- `Command::retry`: documented that `max_attempts` of `0` and `1` both mean a
+  single run (a command always runs at least once).
 - `Supervisor`: documented that a permanently-failing command restarts forever
   under the default unlimited `OnCrash` policy (bound it with `max_restarts` /
   `stop_when`); that a single jittered backoff can reach `1.5 ×` `max_backoff`;

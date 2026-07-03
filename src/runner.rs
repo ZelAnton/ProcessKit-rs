@@ -99,6 +99,49 @@ impl<R: ProcessRunner + ?Sized> ProcessRunner for &R {
     }
 }
 
+/// A boxed runner is a runner. Generic over `R: ?Sized` so it covers both a
+/// type-erased `Box<dyn ProcessRunner>` — a runner chosen at **runtime** (the real
+/// [`JobRunner`] vs a `record`-feature cassette, picked from config) and stored in
+/// `CliClient`/`Supervisor` state — and a boxed concrete `Box<JobRunner>`.
+/// Forwards every method (including `output_bytes`/`start`), so a boxed runner
+/// that overrides them is honored. (`dyn ProcessRunner` is `Send + Sync` via the
+/// trait's supertraits, so the box is too — store it as `Box<dyn ProcessRunner>`,
+/// no `+ Send + Sync` marker needed.)
+#[async_trait::async_trait]
+impl<R: ProcessRunner + ?Sized> ProcessRunner for Box<R> {
+    async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+        (**self).output_string(command).await
+    }
+
+    async fn output_bytes(&self, command: &Command) -> Result<ProcessResult<Vec<u8>>> {
+        (**self).output_bytes(command).await
+    }
+
+    async fn start(&self, command: &Command) -> Result<RunningProcess> {
+        (**self).start(command).await
+    }
+}
+
+/// A shared runner is a runner — the `Arc` twin of the `Box` impl above, for when
+/// one runner must be **shared** (cloned into several
+/// [`Supervisor`](crate::Supervisor)s or spawned tasks) rather than owned once.
+/// Generic over `R: ?Sized`, so both `Arc<dyn ProcessRunner>` (runtime-selected)
+/// and `Arc<JobRunner>` (a shared concrete runner) qualify.
+#[async_trait::async_trait]
+impl<R: ProcessRunner + ?Sized> ProcessRunner for std::sync::Arc<R> {
+    async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+        (**self).output_string(command).await
+    }
+
+    async fn output_bytes(&self, command: &Command) -> Result<ProcessResult<Vec<u8>>> {
+        (**self).output_bytes(command).await
+    }
+
+    async fn start(&self, command: &Command) -> Result<RunningProcess> {
+        (**self).start(command).await
+    }
+}
+
 /// Convenience methods available on every [`ProcessRunner`] (including
 /// `&dyn ProcessRunner`), layered over [`output_string`](ProcessRunner::output_string).
 #[async_trait::async_trait]
@@ -709,6 +752,57 @@ mod tests {
             calls: AtomicU32::new(0),
             fail_times,
         }
+    }
+
+    #[tokio::test]
+    async fn boxed_and_arc_runners_are_runners() {
+        // G1: a runner chosen at runtime (real vs cassette, from config) can be
+        // stored type-erased and still injected wherever a `ProcessRunner` is
+        // expected — including the `ProcessRunnerExt` verbs.
+        let boxed: Box<dyn ProcessRunner> = Box::new(flaky(0));
+        assert_eq!(
+            boxed.run(&Command::new("x")).await.expect("boxed runs"),
+            "out"
+        );
+        // `start` forwards to the inner runner (Flaky doesn't override it →
+        // Unsupported), proving the box doesn't shadow with its own default.
+        assert!(
+            boxed.start(&Command::new("x")).await.is_err(),
+            "start forwards to the inner runner's Unsupported default"
+        );
+
+        let shared: std::sync::Arc<dyn ProcessRunner> = std::sync::Arc::new(flaky(0));
+        let shared2 = std::sync::Arc::clone(&shared);
+        assert_eq!(
+            shared.run(&Command::new("x")).await.expect("arc runs"),
+            "out"
+        );
+        assert_eq!(
+            shared2
+                .run(&Command::new("x"))
+                .await
+                .expect("arc clone runs"),
+            "out"
+        );
+
+        // The impls are generic over `R: ?Sized`, so a *concrete* boxed/shared
+        // runner (not just the type-erased `dyn` form) is a runner too.
+        let boxed_concrete: Box<Flaky> = Box::new(flaky(0));
+        assert_eq!(
+            boxed_concrete
+                .run(&Command::new("x"))
+                .await
+                .expect("box<concrete>"),
+            "out"
+        );
+        let arc_concrete: std::sync::Arc<Flaky> = std::sync::Arc::new(flaky(0));
+        assert_eq!(
+            arc_concrete
+                .run(&Command::new("x"))
+                .await
+                .expect("arc<concrete>"),
+            "out"
+        );
     }
 
     #[tokio::test]

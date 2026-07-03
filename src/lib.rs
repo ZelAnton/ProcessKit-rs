@@ -153,6 +153,12 @@ pub use batch::{output_all, output_all_bytes};
 pub use buffer::{OutputBufferPolicy, OverflowMode, StdioMode};
 pub use client::{CliClient, IntoCommand};
 pub use command::Command;
+/// Re-exported from [`encoding_rs`] so a caller can name the type passed to
+/// [`Command::stdout_encoding`]/[`stderr_encoding`](Command::stderr_encoding)
+/// without a direct dependency. **Semver note:** this is a flat re-export of a
+/// `0.x` dependency's type, so a major bump of `encoding_rs` is a breaking change
+/// here, and `use processkit::*` pulls `Encoding` into scope (a glob-collision
+/// risk). A future major version may move it behind a dedicated module.
 pub use encoding_rs::Encoding;
 pub use error::{Error, Result};
 pub use group::{ProcessGroup, ProcessGroupOptions};
@@ -170,8 +176,13 @@ pub use signal::Signal;
 pub use stats::{ProcessGroupStats, RunProfile, StatsSampler};
 pub use stdin::{ProcessStdin, Stdin};
 pub use supervisor::{RestartPolicy, StopReason, SupervisionOutcome, Supervisor};
-// Re-exported so callers consume the stdout/event streams without a direct
-// `tokio-stream` dependency.
+/// Re-exported from [`tokio_stream`] so callers consume the stdout/event streams
+/// (e.g. [`StdoutLines`], [`OutputEvents`]) without a direct `tokio-stream`
+/// dependency. **Semver note:** a flat re-export of a `0.x` dependency's trait —
+/// a major bump of `tokio-stream` is breaking here, and `use processkit::*` pulls
+/// `StreamExt` into scope (it collides with `futures::StreamExt` /
+/// `tokio_stream::StreamExt` under a glob). Prefer importing it by path, or the
+/// upstream trait directly. A future major version may move it behind a module.
 pub use tokio_stream::StreamExt;
 
 use std::ffi::OsStr;

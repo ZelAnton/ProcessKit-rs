@@ -39,6 +39,10 @@ pub struct Command {
     /// Exempt this stage from pipefail attribution (see [`Self::unchecked_in_pipe`]).
     unchecked: bool,
     timeout: Option<Duration>,
+    /// Set by [`no_timeout`](Self::no_timeout): "explicitly unbounded" — distinct
+    /// from `timeout: None` ("unset"), so a client `default_timeout` gap-fill
+    /// leaves it alone instead of imposing a deadline.
+    no_timeout: bool,
     /// Grace window after the deadline before `SIGKILL`; its presence makes the
     /// timeout graceful (see [`Self::timeout_grace`]).
     timeout_grace: Option<Duration>,
@@ -95,6 +99,7 @@ impl Command {
             keep_stdin_open: false,
             unchecked: false,
             timeout: None,
+            no_timeout: false,
             timeout_grace: None,
             #[cfg(feature = "process-control")]
             timeout_signal: None,
@@ -211,6 +216,13 @@ impl Command {
     }
 
     /// Clear all inherited environment variables before applying any set here.
+    ///
+    /// **Opts out of client env defaults:** a command that clears its environment
+    /// is treated as having taken full control of it, so a
+    /// [`CliClient`](crate::CliClient)'s [`default_env`](crate::CliClient::default_env)/
+    /// [`default_env_fn`](crate::CliClient::default_env_fn) is **not** gap-filled
+    /// into it (a client default would otherwise pierce the clean slate). Set any
+    /// var you still want with an explicit [`env`](Self::env).
     pub fn env_clear(mut self) -> Self {
         self.env_clear = true;
         self
@@ -223,6 +235,14 @@ impl Command {
     /// (vars the parent lacks are skipped); explicit [`env`](Self::env) /
     /// [`env_remove`](Self::env_remove) overrides still apply afterwards.
     /// Repeated calls extend the allow-list. Works on every platform.
+    ///
+    /// A client [`default_env`](crate::CliClient::default_env) for an
+    /// **allow-listed** key is **not** applied — the command chose to inherit that
+    /// key from the parent, and a client default must not override it. A client
+    /// default for a key *not* in the list still fills (an explicit override
+    /// layered on top, orthogonal to parent inheritance) — so a client-wide safety
+    /// default reaches the command. Use [`env_clear`](Self::env_clear) instead to
+    /// opt out of client env defaults entirely.
     pub fn inherit_env<I, S>(mut self, names: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -396,8 +416,27 @@ impl Command {
     }
 
     /// Kill the run if it exceeds `timeout`.
+    ///
+    /// Clears a prior [`no_timeout`](Self::no_timeout) — the last of the two wins.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self.no_timeout = false;
+        self
+    }
+
+    /// Run **without** a timeout, and — unlike simply leaving the timeout unset —
+    /// opt out of any client-wide [`default_timeout`](crate::CliClient::default_timeout)
+    /// gap-fill. Use this to say "this one long-running command is *deliberately*
+    /// unbounded" against a client that otherwise imposes a deadline on every call
+    /// (a `tail -f`, a watch loop, an interactive session).
+    ///
+    /// A plain [`Command`] (no client) is already unbounded by default, so this is
+    /// only meaningful when the command is run through a [`CliClient`](crate::CliClient)
+    /// with a `default_timeout`. Clears a prior [`timeout`](Self::timeout) — the
+    /// last of the two wins.
+    pub fn no_timeout(mut self) -> Self {
+        self.timeout = None;
+        self.no_timeout = true;
         self
     }
 
@@ -439,12 +478,16 @@ impl Command {
     /// For tools whose non-zero exit is a normal result — `grep` (1 = no match),
     /// `diff` (1 = differs), rsync's code families — so callers don't hand-match.
     ///
-    /// An empty set is ignored (it would make every exit a failure); the default
-    /// stays `[0]`. Does not change [`exit_code`](Self::exit_code) (always the raw
-    /// code) or [`probe`](Self::probe) (always the 0/1 convention).
+    /// An empty set is **ignored** — a no-op that leaves the previously configured
+    /// codes (or the default `[0]`) in place, rather than resetting to `[0]`, since
+    /// an empty accepted-set would make every exit a failure. Does not change
+    /// [`exit_code`](Self::exit_code) (always the raw code) or
+    /// [`probe`](Self::probe) (always the 0/1 convention).
     pub fn ok_codes(mut self, codes: impl IntoIterator<Item = i32>) -> Self {
         let codes: Vec<i32> = codes.into_iter().collect();
-        self.ok_codes = (!codes.is_empty()).then_some(codes);
+        if !codes.is_empty() {
+            self.ok_codes = Some(codes);
+        }
         self
     }
 
@@ -539,7 +582,9 @@ impl Command {
     ///   re-run that stage within the chain.
     ///
     /// **Counting:** `max_attempts` is the **total** number of runs (so
-    /// `retry(3, …)` runs at most three times: the first plus two more). For
+    /// `retry(3, …)` runs at most three times: the first plus two more).
+    /// `max_attempts` of `0` **and** `1` both mean a single run with no retry — a
+    /// command always runs at least once, so `0` does not mean "never run". For
     /// exponential backoff + cap + jitter instead of a fixed delay, use
     /// [`retry_with`](Self::retry_with), which takes a [`RetryPolicy`] — note that
     /// a `RetryPolicy` counts `max_retries` (the runs *after* the first), so
@@ -681,6 +726,17 @@ impl Command {
     /// Runs **independently** of [`on_stdout_line`](Self::on_stdout_line): set
     /// both and both fire per line (the tee no longer replaces the handler).
     /// A second `stdout_tee` replaces an earlier one.
+    ///
+    /// **Shared across clones and attempts.** The sink is held in an
+    /// `Arc<Mutex<…>>`, so cloning the `Command` shares *one* sink — and a
+    /// `Command` is cloned for every [`Pipeline`](crate::Pipeline) stage, every
+    /// [`Supervisor`](crate::Supervisor) incarnation, and every
+    /// [`retry`](Self::retry) attempt. Concurrent clones (pipeline stages running
+    /// at once) **interleave** their lines into it; sequential re-runs (retries,
+    /// restarts) **append** — a retried command's sink accumulates the failed
+    /// attempt's output *followed by* the successful one's, with no delimiter. For
+    /// per-run or per-attempt separation, tee to distinct sinks (a fresh `Command`
+    /// per run) or have the sink write its own delimiters.
     ///
     /// The tee fires **before** the buffer policy decides retention, so it sees
     /// *every* decoded line — including ones the capture buffer then drops or
@@ -864,11 +920,33 @@ impl Command {
         }
     }
 
-    /// Whether this command already overrides `name` (set or removed), under the
-    /// platform's env case rules — used to gap-fill client defaults without
-    /// clobbering a per-command setting.
+    /// Whether the command has taken control of `name` such that a client-wide
+    /// env default ([`CliClient::default_env`](crate::CliClient::default_env) /
+    /// [`default_env_fn`](crate::CliClient::default_env_fn)) must **not** gap-fill
+    /// it. True when:
+    ///
+    /// 1. an explicit per-command [`env`](Self::env)/[`env_remove`](Self::env_remove)
+    ///    already sets `name` (platform env-case rules); or
+    /// 2. [`env_clear`](Self::env_clear) was called — a clean slate the client
+    ///    must not pierce, for *any* key; or
+    /// 3. `name` is in an [`inherit_env`](Self::inherit_env) allow-list — a client
+    ///    default must not **override** a value the command chose to inherit from
+    ///    the parent.
+    ///
+    /// Note the asymmetry between (2) and (3): `env_clear` blocks every key
+    /// (nothing was asked for), but a bare `inherit_env` blocks only its
+    /// *allow-listed* keys — a client default for a key the command did **not**
+    /// list (a safety default like `GIT_TERMINAL_PROMPT=0`) still fills, since that
+    /// is an explicit override layered on top, orthogonal to which vars are copied
+    /// from the parent. A command that wants none of the client's env defaults uses
+    /// `env_clear` (and sets what it needs with [`env`](Self::env)).
     pub(crate) fn has_env_override(&self, name: &OsStr) -> bool {
-        self.envs.iter().any(|(key, _)| env_key_eq(key, name))
+        self.env_clear
+            || self.envs.iter().any(|(key, _)| env_key_eq(key, name))
+            || self
+                .inherit_env
+                .as_deref()
+                .is_some_and(|list| list.iter().any(|k| env_key_eq(k, name)))
     }
 
     /// Fill a client-wide retry config ([`CliClient::default_retry`](crate::CliClient::default_retry))
@@ -958,6 +1036,14 @@ impl Command {
     /// The configured timeout, if any.
     pub fn configured_timeout(&self) -> Option<Duration> {
         self.timeout
+    }
+
+    /// Whether a client-wide [`default_timeout`](crate::CliClient::default_timeout)
+    /// may gap-fill this command: only if no timeout is set **and**
+    /// [`no_timeout`](Self::no_timeout) was not requested (which opts out of the
+    /// fill to stay deliberately unbounded).
+    pub(crate) fn accepts_default_timeout(&self) -> bool {
+        self.timeout.is_none() && !self.no_timeout
     }
 
     /// The graceful-timeout grace window, if set.
@@ -1233,10 +1319,15 @@ impl fmt::Debug for Command {
             .field("keep_stdin_open", &self.keep_stdin_open)
             .field("unchecked", &self.unchecked)
             .field("timeout", &self.timeout)
+            .field("no_timeout", &self.no_timeout)
+            .field("timeout_grace", &self.timeout_grace)
+            .field("ok_codes", &self.ok_codes)
             .field("stdout_mode", &self.stdout_mode)
             .field("stderr_mode", &self.stderr_mode)
             .field("has_stdout_handler", &self.stdout_handler.is_some())
             .field("has_stderr_handler", &self.stderr_handler.is_some())
+            .field("has_stdout_tee", &self.stdout_tee.is_some())
+            .field("has_stderr_tee", &self.stderr_tee.is_some())
             .field("output_buffer", &self.output_buffer)
             .field("stdout_encoding", &self.stdout_encoding.name())
             .field("stderr_encoding", &self.stderr_encoding.name())
@@ -1244,11 +1335,15 @@ impl fmt::Debug for Command {
             .field("inherit_env", &self.inherit_env)
             .field("uid", &self.uid)
             .field("gid", &self.gid)
+            // Security-relevant: the supplementary-group set of a privilege drop.
+            .field("groups", &self.groups)
             .field("setsid", &self.setsid)
             .field("kill_on_parent_death", &self.kill_on_parent_death)
             .field("creation_flags_extra", &self.creation_flags_extra);
+        #[cfg(feature = "process-control")]
+        d.field("timeout_signal", &self.timeout_signal);
         d.field("has_cancel_token", &self.cancel_token.is_some());
-        d.finish()
+        d.finish_non_exhaustive()
     }
 }
 
@@ -1330,18 +1425,36 @@ fn quote_arg(arg: &str) -> String {
     if !needs_quote {
         return arg.to_owned();
     }
+    // MSVCRT `CommandLineToArgvW` backslash rule: a run of backslashes is literal
+    // unless it precedes a `"`, in which case each backslash is doubled and the
+    // quote is escaped `\"`. A run before the *closing* quote we add is likewise
+    // doubled. Buffer the current run so backslashes-before-a-quote (e.g. `a\"b`)
+    // are handled, not just trailing ones.
     let mut out = String::with_capacity(arg.len() + 4);
     out.push('"');
+    let mut backslashes = 0usize;
     for ch in arg.chars() {
-        if ch == '"' {
-            out.push_str("\\\"");
-        } else {
-            out.push(ch);
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                // Preceding backslashes double, then the quote is escaped.
+                for _ in 0..backslashes * 2 + 1 {
+                    out.push('\\');
+                }
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                out.push(ch);
+                backslashes = 0;
+            }
         }
     }
-    // Double any trailing backslashes so they don't escape the closing quote.
-    let trailing = out.chars().rev().take_while(|&c| c == '\\').count();
-    for _ in 0..trailing {
+    // Trailing backslashes precede the closing quote → double them.
+    for _ in 0..backslashes * 2 {
         out.push('\\');
     }
     out.push('"');
@@ -1605,6 +1718,87 @@ mod tests {
         assert_eq!(quote_arg("C:\\my tools\\\\"), "\"C:\\my tools\\\\\\\\\"");
         // No trailing backslash: no doubling needed.
         assert_eq!(quote_arg("C:\\my tools"), "\"C:\\my tools\"");
+        // G9: a backslash *before an embedded quote* must double AND the quote
+        // escape — `a\"b` → `"a\\\"b"` — so it round-trips through
+        // CommandLineToArgvW (the old code left it `a\"` → re-parsed as `a"`).
+        assert_eq!(quote_arg("a\\\"b"), r#""a\\\"b""#);
+        // An interior backslash NOT before a quote stays literal (single).
+        assert_eq!(quote_arg("a\\b c"), "\"a\\b c\"");
+    }
+
+    #[test]
+    fn no_timeout_opts_out_of_client_default_but_timeout_is_last_wins() {
+        use std::time::Duration;
+        // G4: no_timeout is "explicitly unbounded" — no timeout AND opts out of a
+        // client default_timeout gap-fill.
+        let cmd = Command::new("tail").no_timeout();
+        assert_eq!(cmd.configured_timeout(), None);
+        assert!(
+            !cmd.accepts_default_timeout(),
+            "no_timeout opts out of the client gap-fill"
+        );
+        // An unset command DOES accept the fill.
+        assert!(Command::new("x").accepts_default_timeout());
+        // Last of timeout()/no_timeout() wins, both directions.
+        let re_bounded = Command::new("x")
+            .no_timeout()
+            .timeout(Duration::from_secs(1));
+        assert_eq!(
+            re_bounded.configured_timeout(),
+            Some(Duration::from_secs(1))
+        );
+        assert!(!re_bounded.accepts_default_timeout());
+        let re_unbounded = Command::new("x")
+            .timeout(Duration::from_secs(1))
+            .no_timeout();
+        assert_eq!(re_unbounded.configured_timeout(), None);
+        assert!(!re_unbounded.accepts_default_timeout());
+    }
+
+    #[test]
+    fn ok_codes_empty_is_ignored_keeping_the_previous_set() {
+        // G7: an empty set is a no-op (doc says "ignored"), not a reset to [0].
+        assert_eq!(
+            Command::new("x")
+                .ok_codes([2, 3])
+                .ok_codes([])
+                .ok_codes_vec(),
+            vec![2, 3],
+            "an empty ok_codes must not clobber a previously configured set"
+        );
+        // No previous set: an empty set leaves the default [0].
+        assert_eq!(Command::new("x").ok_codes([]).ok_codes_vec(), vec![0]);
+    }
+
+    #[test]
+    fn env_isolation_opts_out_of_client_env_defaults() {
+        // G2: a client default_env must not pierce env_clear, nor override an
+        // inherit_env allow-listed key — but a non-allow-listed default still fills.
+        let key = OsStr::new("LANG");
+        // env_clear blocks every key (clean slate).
+        assert!(
+            Command::new("x").env_clear().has_env_override(key),
+            "env_clear isolates from client env defaults"
+        );
+        // inherit_env blocks only its allow-listed keys...
+        assert!(
+            Command::new("x")
+                .inherit_env(["LANG"])
+                .has_env_override(key),
+            "an allow-listed key must not be overridden by a client default"
+        );
+        // ...a key NOT in the allow-list still accepts the client default (a
+        // client-wide safety default reaches an inherit_env command).
+        assert!(
+            !Command::new("x")
+                .inherit_env(["HOME"])
+                .has_env_override(key),
+            "a non-allow-listed client default still fills"
+        );
+        // A plain command with no opinion about LANG still accepts the default.
+        assert!(!Command::new("x").has_env_override(key));
+        // An explicit per-command env for the key still counts (unchanged).
+        assert!(Command::new("x").env("LANG", "C").has_env_override(key));
     }
 
     #[test]

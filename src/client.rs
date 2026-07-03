@@ -47,6 +47,14 @@ mod sealed {
 /// the gaps it left** — its own explicit settings win, but a client-wide cancel
 /// token / timeout / env still reaches a per-call-customized command rather than
 /// being silently dropped.
+///
+/// **Program note:** a ready-made [`Command`] keeps *its own* `program` — the
+/// client fills only defaults, it does **not** substitute its program. So
+/// `git_client.run(Command::new("rsync"))` runs `rsync`, but with git's
+/// env/timeout/cancel defaults grafted on (e.g. `GIT_TERMINAL_PROMPT=0` on an
+/// rsync process). Pass a [`Command`] to a client's verb only when you want *that
+/// client's* defaults on it; otherwise build from an argument list (which uses
+/// the client's own program) or run the command through its own client.
 pub trait IntoCommand<R: ProcessRunner>: sealed::Sealed {
     /// Build the [`Command`] to run for `client` — used by the verbs.
     #[doc(hidden)]
@@ -174,20 +182,29 @@ impl<R: ProcessRunner> CliClient<R> {
     /// Set an environment variable on every command this client builds — e.g.
     /// `GIT_TERMINAL_PROMPT=0` so a probe can never block on a credential
     /// prompt. Per-command [`Command::env`] still works and is layered after.
+    ///
+    /// **Duplicate keys: last registration wins** (matching [`Command::env`]'s
+    /// later-wins): `default_env("K", "a").default_env("K", "b")` yields `K=b`. A
+    /// later [`default_env_remove`](Self::default_env_remove) of the same key
+    /// likewise supersedes an earlier set.
     #[must_use]
     pub fn default_env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
-        self.envs.push((
-            key.as_ref().to_os_string(),
-            Some(value.as_ref().to_os_string()),
-        ));
+        let key = key.as_ref().to_os_string();
+        self.envs
+            .retain(|(k, _)| !crate::command::env_key_eq(k, &key));
+        self.envs.push((key, Some(value.as_ref().to_os_string())));
         self
     }
 
     /// Remove an inherited environment variable on every command this client
-    /// builds.
+    /// builds. Last registration wins for a repeated key (see
+    /// [`default_env`](Self::default_env)).
     #[must_use]
     pub fn default_env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
-        self.envs.push((key.as_ref().to_os_string(), None));
+        let key = key.as_ref().to_os_string();
+        self.envs
+            .retain(|(k, _)| !crate::command::env_key_eq(k, &key));
+        self.envs.push((key, None));
         self
     }
 
@@ -233,10 +250,12 @@ impl<R: ProcessRunner> CliClient<R> {
         V: Into<OsString>,
         F: Fn() -> V + Send + Sync + 'static,
     {
-        self.env_fns.push((
-            key.as_ref().to_os_string(),
-            Arc::new(move || resolver().into()),
-        ));
+        let key = key.as_ref().to_os_string();
+        // Last registration wins for a repeated key, like `default_env`.
+        self.env_fns
+            .retain(|(k, _)| !crate::command::env_key_eq(k, &key));
+        self.env_fns
+            .push((key, Arc::new(move || resolver().into())));
         self
     }
 
@@ -334,7 +353,7 @@ impl<R: ProcessRunner> CliClient<R> {
     /// applies it to a command that `command()` already defaulted) is a no-op
     /// the second time.
     fn apply_defaults(&self, mut command: Command) -> Command {
-        if command.configured_timeout().is_none()
+        if command.accepts_default_timeout()
             && let Some(timeout) = self.timeout
         {
             command = command.timeout(timeout);
@@ -826,6 +845,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn duplicate_default_env_is_last_registration_wins() {
+        use std::ffi::OsString;
+        // G3: matches Command::env's later-wins (was first-wins).
+        let client = CliClient::new("tool")
+            .default_env("K", "a")
+            .default_env("K", "b");
+        let cmd = client.command(["x"]);
+        let vals: Vec<_> = cmd
+            .env_overrides()
+            .iter()
+            .filter(|(k, _)| k == "K")
+            .collect();
+        assert_eq!(
+            vals.len(),
+            1,
+            "duplicate default_env collapses to one entry"
+        );
+        assert_eq!(
+            vals[0].1.as_deref(),
+            Some(OsString::from("b").as_os_str()),
+            "last registration wins"
+        );
+        // A later remove of the same key supersedes an earlier set.
+        let removed = CliClient::new("tool")
+            .default_env("K", "a")
+            .default_env_remove("K")
+            .command(["x"]);
+        let k: Vec<_> = removed
+            .env_overrides()
+            .iter()
+            .filter(|(k, _)| k == "K")
+            .collect();
+        assert_eq!(k.len(), 1);
+        assert_eq!(k[0].1, None, "the later remove wins");
+    }
+
+    #[test]
+    fn no_timeout_command_ignores_a_client_default_timeout() {
+        // G4: an explicitly-unbounded command opts out of the client gap-fill.
+        let client = CliClient::new("tail").default_timeout(Duration::from_secs(9));
+        let bounded = Command::new("tail").into_command(&client);
+        assert_eq!(
+            bounded.configured_timeout(),
+            Some(Duration::from_secs(9)),
+            "the default fills an unset command"
+        );
+        let unbounded = Command::new("tail").no_timeout().into_command(&client);
+        assert_eq!(
+            unbounded.configured_timeout(),
+            None,
+            "no_timeout opts out of the client default_timeout"
+        );
+    }
+
+    #[test]
+    fn env_isolation_ignores_client_env_defaults() {
+        // G2: a client default_env must not pierce env_clear/inherit_env isolation.
+        let client = CliClient::new("tool").default_env("LANG", "C");
+        let isolated = Command::new("tool").env_clear().into_command(&client);
+        assert!(
+            !isolated.env_overrides().iter().any(|(k, _)| k == "LANG"),
+            "env_clear isolates from a client default_env"
+        );
+        let plain = Command::new("tool").into_command(&client);
+        assert!(
+            plain.env_overrides().iter().any(|(k, _)| k == "LANG"),
+            "a non-isolated command still gets the client default"
+        );
+    }
+
     #[tokio::test]
     async fn a_prebuilt_command_passed_to_a_verb_still_gets_client_defaults() {
         let token = crate::CancellationToken::new();
@@ -1091,19 +1181,27 @@ mod tests {
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-        // (c) Two resolvers for the same key: the first registered wins (consistent
-        //     with the static `default_env` gap-fill), the second never runs.
-        let second_ran = Arc::new(AtomicU32::new(0));
-        let s = Arc::clone(&second_ran);
+        // (c) Two resolvers for the same key: the LAST registered wins (G3 —
+        //     consistent with `default_env`'s later-wins), and the superseded
+        //     first resolver never runs (it is dropped at registration time).
+        let first_ran = Arc::new(AtomicU32::new(0));
+        let f = Arc::clone(&first_ran);
         let client = CliClient::new("git")
-            .default_env_fn("TOKEN", || "first")
             .default_env_fn("TOKEN", move || {
-                s.fetch_add(1, Ordering::SeqCst);
-                "second"
-            });
+                f.fetch_add(1, Ordering::SeqCst);
+                "first"
+            })
+            .default_env_fn("TOKEN", || "second");
         let inv = Invocation::from_command(&client.command(["status"]));
-        assert!(inv.env_is("TOKEN", "first"));
-        assert_eq!(second_ran.load(Ordering::SeqCst), 0);
+        assert!(
+            inv.env_is("TOKEN", "second"),
+            "the last-registered resolver wins"
+        );
+        assert_eq!(
+            first_ran.load(Ordering::SeqCst),
+            0,
+            "the superseded resolver never runs"
+        );
     }
 
     #[test]
