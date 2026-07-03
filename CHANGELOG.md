@@ -77,6 +77,24 @@ to a dated version section.
   for a key always beats a `default_env_fn` for it, regardless of order.
 
 ### Fixed
+- `ProcessResult`'s `Debug` no longer dumps stdout/stderr in full: a
+  `panic!("{result:?}")` or tracing line on a multi-MiB capture previously printed
+  it all. Now bounded to a preview (text) / byte-length summary (raw bytes), the
+  same "no unbounded text in `Debug`" rule `Error` follows. (`Debug` output is not
+  semver-covered; the impl is now concrete for `ProcessResult<String>` /
+  `ProcessResult<Vec<u8>>`.)
+- `Error::Timeout`'s `Display` no longer renders the misleading "timed out after
+  0ns" when the deadline is unknown to the checking verb (a scripted / cassette-
+  replayed timeout whose command carried no `timeout`) — it now reads just "timed
+  out". A real, known deadline still shows the duration.
+- `Outcome::code`/`signal` (and the cassette recorder, and the pipeline's clean/
+  culprit classification) now match `Outcome` **exhaustively** instead of with a
+  `_ => None`/`_ => false` wildcard, so a future `#[non_exhaustive]` variant is a
+  compile error forcing a decision rather than silently misclassifying.
+- The one-line error diagnostic tail no longer mangles a legitimate **tab** (`\t`)
+  to `U+FFFD` — tabs are common column separators in tool output (TSV, `git diff`,
+  `ls -l`) and are harmless in a one-line context; only genuinely display-unsafe
+  controls (escapes, `CR`, bidi overrides) are still replaced.
 - A client-wide `default_env`/`default_env_fn` no longer **pierces a command's env
   isolation**: `env_clear()` now opts the command out of the gap-fill for *every*
   key (a clean slate the client must not pierce), and `inherit_env([...])` blocks a
@@ -171,6 +189,23 @@ to a dated version section.
   backoff to the cap on the second retry while `Supervisor` treated it as constant.
 
 ### Documentation
+- `Error::Exit`/`Timeout`/`Signalled` stdout docs: corrected the claim that a
+  raw-bytes error's exact bytes "remain on the originating `ProcessResult`" — a
+  consuming checking verb (`run`/`ensure_success`) drops the result, so the exact
+  bytes are not preserved on that path; inspect the `ProcessResult` yourself if you
+  need them on failure.
+- `Error::Signalled`: clarified it is **Unix-only** for real runs — a killed
+  Windows process reports `Exit`, and a `Signalled` there arises only from a test
+  double / cassette replay.
+- `Signal::Other`: documented that `Other(0)` is the POSIX existence probe (not an
+  `EINVAL`), and that an out-of-range signal's `EINVAL` surfaces only on the cgroup
+  mechanism — the process-group mechanism (macOS/BSD, Linux fallback) swallows it.
+- `ProcessResult::combined`: corrected the `\n`-separator condition (both streams
+  non-empty) and clarified it is stdout-then-stderr **concatenation**, not a
+  temporal interleaving.
+- Fixed a self-contradiction in the cgroup zombie docs: an unreaped zombie does
+  **not** appear in `cgroup.procs` (it leaves on exit, before reap — per the
+  kernel's cgroup-v2 docs), so the stats backend does not zombie-over-count.
 - `Command::stdout_tee`/`stderr_tee`: documented that the sink is shared through
   `Clone` (an `Arc<Mutex<…>>`), so concurrent `Pipeline` stages **interleave** and
   sequential `retry`/`Supervisor` re-runs **append** (a retried command's sink

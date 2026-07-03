@@ -1,5 +1,6 @@
 //! The captured outcome of a finished process run.
 
+use std::fmt;
 use std::time::Duration;
 
 use crate::error::Error;
@@ -54,9 +55,12 @@ impl Outcome {
     /// [`ProcessResult::code`](crate::ProcessResult::code). Because `Outcome` is
     /// `#[non_exhaustive]`, prefer these accessors over a `match` with a wildcard.
     pub fn code(&self) -> Option<i32> {
+        // Exhaustive (no wildcard) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, forcing a
+        // deliberate decision rather than silently returning `None` for it.
         match self {
             Outcome::Exited(code) => Some(*code),
-            _ => None,
+            Outcome::Signalled(_) | Outcome::TimedOut => None,
         }
     }
 
@@ -65,9 +69,11 @@ impl Outcome {
     /// did not expose). **Unix only** — a killed process reports
     /// [`Exited`](Self::Exited) on Windows.
     pub fn signal(&self) -> Option<i32> {
+        // Exhaustive on purpose (see `code`): a future variant must be classified
+        // here rather than defaulting to `None`.
         match self {
             Outcome::Signalled(signal) => *signal,
-            _ => None,
+            Outcome::Exited(_) | Outcome::TimedOut => None,
         }
     }
 
@@ -95,7 +101,7 @@ impl Outcome {
 /// [`exit_code`](crate::Command::exit_code) — rather than capturing and binding
 /// to `let _`.
 #[must_use = "a ProcessResult carries the exit status; inspect is_success()/code()/ensure_success() or it is silently discarded"]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProcessResult<T> {
     program: String,
     stdout: T,
@@ -116,6 +122,55 @@ pub struct ProcessResult<T> {
     /// [`ensure_success`](Self::ensure_success). Default `[0]`; widened via
     /// [`Command::ok_codes`](crate::Command::ok_codes).
     ok_codes: Vec<i32>,
+}
+
+/// Debug wrapper for a raw-bytes stdout: a length summary, never the content —
+/// it may be binary, may carry secrets, and can be multi-MiB.
+struct BytesLen(usize);
+impl fmt::Debug for BytesLen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{} bytes>", self.0)
+    }
+}
+
+// Shared body of the manual `Debug` — `stdout` is pre-wrapped so the caller
+// controls how the payload is bounded (a `StreamPreview` for text, a `BytesLen`
+// for raw bytes). Concrete impls below (rather than a generic bound) keep the
+// private preview types out of the public API surface.
+fn fmt_process_result<T>(
+    r: &ProcessResult<T>,
+    stdout: &dyn fmt::Debug,
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    f.debug_struct("ProcessResult")
+        .field("program", &r.program)
+        .field("stdout", stdout)
+        .field("stderr", &crate::error::StreamPreview(r.stderr.as_str()))
+        .field("outcome", &r.outcome)
+        .field("timeout", &r.timeout)
+        .field("duration", &r.duration)
+        .field("truncated", &r.truncated)
+        .field("total_lines", &r.total_lines)
+        .field("total_bytes", &r.total_bytes)
+        .field("ok_codes", &r.ok_codes)
+        .finish()
+}
+
+// Manual `Debug`: bound the captured streams to a preview rather than the derived
+// full dump — a `panic!("{result:?}")` (or a tracing line) on a 100 MB capture
+// must not print it all, the same "no unbounded text in Debug" rule `Error`
+// follows. `Debug` output is not semver-covered. Concrete impls for the only two
+// payload types (`String`, `Vec<u8>`).
+impl fmt::Debug for ProcessResult<String> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_process_result(self, &crate::error::StreamPreview(self.stdout.as_str()), f)
+    }
+}
+
+impl fmt::Debug for ProcessResult<Vec<u8>> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_process_result(self, &BytesLen(self.stdout.len()), f)
+    }
 }
 
 // Equality is over the *logical* outcome: `duration`, `truncated`, and the
@@ -366,12 +421,16 @@ impl<T> ProcessResult<T> {
 }
 
 impl ProcessResult<String> {
-    /// Standard output followed by standard error, joined — handy when a tool
-    /// interleaves diagnostics across both streams.
+    /// Standard output followed by standard error, **concatenated** — handy when a
+    /// tool splits diagnostics across both streams. This is `stdout` then `stderr`
+    /// (each captured in full), **not** a temporal interleaving of the two — the
+    /// crate captures the streams separately, so their relative ordering is not
+    /// preserved.
     ///
-    /// A `\n` separator is inserted between the streams when stdout is
-    /// non-empty and does not already end with a newline, preventing the last
-    /// stdout line from being glued to the first stderr line.
+    /// A `\n` separator is inserted between them only when **both** streams are
+    /// non-empty and stdout does not already end with a newline, preventing the
+    /// last stdout line from being glued to the first stderr line. (Matches
+    /// [`Error::combined`](crate::Error::combined).)
     pub fn combined(&self) -> String {
         combine_streams(self.stdout(), self.stderr())
     }
@@ -984,5 +1043,72 @@ mod tests {
         assert_ne!(base, different);
         let widened = base.clone().with_ok_codes(vec![0, 1]);
         assert_ne!(base, widened, "ok_codes is part of identity");
+    }
+
+    #[test]
+    fn debug_bounds_a_large_capture() {
+        // H1: a multi-MiB capture must not be dumped in full by `{result:?}`.
+        let big = "x".repeat(10_000);
+        let text = ProcessResult::new(
+            "tool".into(),
+            big.clone(),
+            String::new(),
+            Outcome::Exited(0),
+            None,
+        );
+        let dbg = format!("{text:?}");
+        assert!(
+            dbg.len() < 500,
+            "Debug must bound the 10k stdout, got {} chars",
+            dbg.len()
+        );
+        assert!(dbg.contains("(+"), "Debug shows a truncation note: {dbg}");
+        // A byte payload renders a length summary, never the (possibly binary /
+        // secret) content.
+        let bytes = ProcessResult::new(
+            "tool".into(),
+            big.into_bytes(),
+            String::new(),
+            Outcome::Exited(0),
+            None,
+        );
+        assert!(
+            format!("{bytes:?}").contains("<10000 bytes>"),
+            "byte stdout is a length summary"
+        );
+    }
+
+    #[test]
+    fn zero_timeout_omits_the_misleading_after_clause() {
+        // H3: a TimedOut result whose command carried no `timeout` (a scripted /
+        // cassette-replayed timeout) renders "timed out", not "timed out after 0ns".
+        let replayed = ProcessResult::new(
+            "tool".into(),
+            String::new(),
+            String::new(),
+            Outcome::TimedOut,
+            None,
+        );
+        let msg = replayed
+            .ensure_success()
+            .expect_err("a timeout is an error")
+            .to_string();
+        assert!(msg.contains("timed out"), "got {msg}");
+        assert!(!msg.contains("0ns"), "must omit the 0ns clause, got {msg}");
+        // A known timeout still shows the duration.
+        let real = ProcessResult::new(
+            "tool".into(),
+            String::new(),
+            String::new(),
+            Outcome::TimedOut,
+            Some(Duration::from_secs(5)),
+        );
+        assert!(
+            real.ensure_success()
+                .expect_err("timeout")
+                .to_string()
+                .contains("5s"),
+            "a known timeout shows the duration"
+        );
     }
 }

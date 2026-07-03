@@ -35,11 +35,21 @@ pub enum Signal {
     Usr1,
     /// `SIGUSR2` — user-defined.
     Usr2,
-    /// A raw signal number, passed through verbatim (Unix only). It must be a
-    /// valid signal (`1..=SIGRTMAX`); it lands in the *signal* argument of
-    /// `kill(pid, sig)` (never the pid/target), so an out-of-range or non-positive
-    /// value simply fails the send with `EINVAL` — it cannot retarget the signal
-    /// at a process group.
+    /// A raw signal number, passed through verbatim (Unix only). It lands in the
+    /// *signal* argument of `kill(pid, sig)` (never the pid/target), so it can only
+    /// ever send a signal — it cannot retarget one at a process group.
+    ///
+    /// It should be a valid signal (`1..=SIGRTMAX`). Two caveats on an unusual
+    /// value:
+    /// - **`Other(0)` is not an error.** Signal `0` is the POSIX *existence probe*
+    ///   (`kill(pid, 0)` checks whether the target exists and delivers nothing), so
+    ///   it is a no-op "is it alive?" send, not `EINVAL`.
+    /// - An **out-of-range** number makes the underlying `kill`/`killpg` fail
+    ///   `EINVAL`, but whether that **surfaces** is backend-dependent: the Linux
+    ///   **cgroup** mechanism propagates the send error, while the **process-group**
+    ///   mechanism (macOS/BSD and the Linux fallback) is best-effort and *swallows*
+    ///   it (the send appears to succeed, having delivered nothing). Pass a real
+    ///   signal number rather than relying on either behavior.
     Other(i32),
 }
 

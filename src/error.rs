@@ -106,8 +106,13 @@ pub enum Error {
         code: i32,
         /// Captured standard output, in full. Not shown in the `Display`
         /// message; kept for callers that need a stdout-borne failure message.
-        /// For the raw-bytes helper (`output_bytes`) this is a lossy UTF-8 decode
-        /// of stdout — the exact bytes remain on the originating `ProcessResult`.
+        /// For the raw-bytes helper (`output_bytes`) this is a **lossy UTF-8
+        /// decode** of stdout. The checking verbs (`run`/`checked`/`ensure_success`)
+        /// **consume** the `ProcessResult` to build this error, so the exact bytes
+        /// are *not* preserved on that path — if you need them on failure, inspect
+        /// the `ProcessResult` yourself (`output_bytes().await?` then
+        /// [`is_success`](crate::ProcessResult::is_success)/[`code`](crate::ProcessResult::code))
+        /// rather than using a consuming verb.
         stdout: String,
         /// Captured standard error, in full. Only its **last non-empty
         /// line** (bounded) appears in the `Display` message — the complete
@@ -136,9 +141,9 @@ pub enum Error {
         timeout: Duration,
         /// Standard output captured before the kill, in full. Not shown in the
         /// `Display` message (only its bounded diagnostic tail is). Empty when
-        /// the path captured nothing. For the raw-bytes helper this is a lossy
-        /// UTF-8 decode; the exact bytes remain on the originating
-        /// `ProcessResult`.
+        /// the path captured nothing. For the raw-bytes helper this is a **lossy
+        /// UTF-8 decode**; the exact bytes are not preserved when a consuming
+        /// checking verb produced this error (see [`Error::Exit`]'s `stdout`).
         stdout: String,
         /// Standard error captured before the kill, in full — often the
         /// explanation of *why* the tool hung. Only its last non-empty line
@@ -268,9 +273,13 @@ pub enum Error {
         program: String,
     },
 
-    /// The process was terminated by a signal (Unix) without producing an exit
-    /// code. `signal` carries the signal number when the platform reports one
-    /// (`None` on Windows or when the kernel does not expose it).
+    /// The process was terminated by a signal (**Unix only**) without producing an
+    /// exit code. `signal` carries the signal number when the kernel reports one,
+    /// else `None`. On **Windows** a killed process reports [`Exit`](Error::Exit)
+    /// with a platform code, never this — a live `Signalled` cannot occur there; it
+    /// arises only from a [`ScriptedRunner`](crate::testing::ScriptedRunner) or a
+    /// `record`-feature cassette replay, which report `Signalled(None)` to mirror
+    /// Unix.
     ///
     /// Distinct from [`Exit`](Error::Exit): a signal-terminated run has no exit
     /// code to check — it is always a failure. Produced by
@@ -791,7 +800,7 @@ impl fmt::Debug for Error {
 /// with a `(+N bytes)` note — the [`Exit`](Error::Exit) streams can be multi-MiB
 /// and must never flood a `{e:?}` log line or `.unwrap()` panic message. Mirrors
 /// the [`Display`](std::fmt::Display) tail cap in [`display_exit`].
-struct StreamPreview<'a>(&'a str);
+pub(crate) struct StreamPreview<'a>(pub(crate) &'a str);
 
 impl fmt::Debug for StreamPreview<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -868,8 +877,17 @@ fn display_signalled(program: &str, signal: Option<i32>, stdout: &str, stderr: &
 /// the bounded diagnostic tail of whatever the run captured before the kill
 /// — a hung tool's last stderr line is often the explanation. Same tail cap as
 /// [`display_exit`].
+///
+/// A **zero** `timeout` renders just `` `{program}` timed out `` (no "after 0ns"):
+/// a `Duration::ZERO` here means the deadline wasn't known to the checking verb
+/// (a scripted / cassette-replayed timeout whose command carried no `timeout`),
+/// not that the run was killed at 0ns — "after 0ns" would be actively misleading.
 fn display_timeout(program: &str, timeout: Duration, stdout: &str, stderr: &str) -> String {
-    let mut message = format!("`{program}` timed out after {timeout:?}");
+    let mut message = if timeout.is_zero() {
+        format!("`{program}` timed out")
+    } else {
+        format!("`{program}` timed out after {timeout:?}")
+    };
     append_diagnostic_tail(&mut message, stdout, stderr);
     message
 }
@@ -959,8 +977,13 @@ fn push_sanitized_capped(out: &mut String, text: &str, cap: usize) {
 /// line" intent), **or** a Unicode bidirectional-formatting control — the
 /// "Trojan Source" class (CVE-2021-42574) that can visually reorder the
 /// surrounding text in a terminal or editor.
+///
+/// **Tab (`\t`) is exempt:** it is a legitimate, common column separator in tool
+/// output (TSV, `git diff`, `ls -l`) and is harmless in a one-line context — it
+/// advances to a tab stop, it cannot inject an escape sequence or reorder text — so
+/// mangling it to `U+FFFD` would corrupt ordinary output for no security gain.
 fn is_display_unsafe(ch: char) -> bool {
-    ch.is_control()
+    (ch.is_control() && ch != '\t')
         || matches!(ch,
             '\u{2028}' | '\u{2029}'   // LS PS (line/paragraph separators — `is_control` misses these)
             | '\u{202A}'..='\u{202E}' // LRE RLE PDF LRO RLO (embeddings/overrides)

@@ -242,9 +242,11 @@ impl Entry {
             stderr: result.stderr().to_owned(),
             code: result.code(),
             timed_out: result.timed_out(),
+            // Exhaustive (no wildcard) so a future `Outcome` variant is a compile
+            // error here rather than silently recorded as "no signal" (H2).
             signal: match result.outcome() {
                 Outcome::Signalled(s) => s,
-                _ => None,
+                Outcome::Exited(_) | Outcome::TimedOut => None,
             },
             truncated: result.truncated(),
             total_lines: result.total_lines(),

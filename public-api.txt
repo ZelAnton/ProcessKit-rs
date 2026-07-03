@@ -716,13 +716,15 @@ pub fn processkit::ProcessResult<T>::stderr(&self) -> &str
 pub fn processkit::ProcessResult<T>::stdout(&self) -> &T
 pub fn processkit::ProcessResult<T>::timed_out(&self) -> bool
 pub fn processkit::ProcessResult<T>::truncated(&self) -> bool
+impl core::fmt::Debug for processkit::ProcessResult<alloc::string::String>
+pub fn processkit::ProcessResult<alloc::string::String>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Debug for processkit::ProcessResult<alloc::vec::Vec<u8>>
+pub fn processkit::ProcessResult<alloc::vec::Vec<u8>>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T: core::clone::Clone> core::clone::Clone for processkit::ProcessResult<T>
 pub fn processkit::ProcessResult<T>::clone(&self) -> processkit::ProcessResult<T>
 impl<T: core::cmp::Eq> core::cmp::Eq for processkit::ProcessResult<T>
 impl<T: core::cmp::PartialEq> core::cmp::PartialEq for processkit::ProcessResult<T>
 pub fn processkit::ProcessResult<T>::eq(&self, &Self) -> bool
-impl<T: core::fmt::Debug> core::fmt::Debug for processkit::ProcessResult<T>
-pub fn processkit::ProcessResult<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T> core::marker::Freeze for processkit::ProcessResult<T> where T: core::marker::Freeze
 impl<T> core::marker::Send for processkit::ProcessResult<T> where T: core::marker::Send
 impl<T> core::marker::Sync for processkit::ProcessResult<T> where T: core::marker::Sync

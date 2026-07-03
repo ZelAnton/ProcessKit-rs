@@ -422,9 +422,11 @@ fn is_sigpipe(outcome: &Outcome) -> bool {
 /// - Among checked failures, a non-SIGPIPE culprit is preferred over a SIGPIPE
 ///   victim; otherwise the leftmost wins.
 fn pipefail<T>(stages: Vec<StageOutcome>, last_stdout: T) -> ProcessResult<T> {
+    // Exhaustive (no wildcard) so a future `Outcome` variant forces a decision
+    // here rather than being silently treated as unclean (H2).
     let is_clean = |stage: &StageOutcome| match stage.outcome {
         Outcome::Exited(code) => stage.ok_codes.contains(&code),
-        _ => false, // signal kill or timeout → unclean regardless
+        Outcome::Signalled(_) | Outcome::TimedOut => false, // kill/timeout → unclean
     };
 
     let checked_failures: Vec<_> = stages

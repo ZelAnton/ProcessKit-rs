@@ -259,13 +259,16 @@ impl Job {
                 // available from the cgroup itself — sum per-process /proc
                 // counters of the live members instead.
                 //
-                // Note: `cgroup.procs` retains an unreaped zombie's pid until its
-                // parent reaps it, and `/proc/<pid>/stat` still reports the
-                // zombie's final counters — so a tree with unreaped zombies can
-                // momentarily over-report `active_process_count` and fold dead
-                // members' CPU/memory. (The pgroup backend over-reports the count
-                // the same way; it reports no CPU/memory at all, so only the count
-                // is affected there.)
+                // Note: `cgroup.procs` lists only *live* members — a process
+                // leaves it on **exit**, before it is reaped, so an unreaped zombie
+                // never appears there (per the kernel's cgroup-v2 docs: "a zombie
+                // process does not appear in cgroup.procs"). The count and the
+                // summed `/proc` counters therefore reflect live processes, not
+                // dead ones. A member can still exit in the TOCTOU window between
+                // reading `cgroup.procs` and reading its `/proc/<pid>/stat`, in
+                // which case that pid's stat is either gone (skipped) or a brief
+                // zombie snapshot — a momentary, self-correcting skew, not a
+                // persistent zombie over-count.
                 let pids = cg.members();
                 let active = pids.len();
                 let mut cpu = Duration::ZERO;
