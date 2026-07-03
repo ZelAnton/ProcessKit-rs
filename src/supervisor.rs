@@ -455,7 +455,7 @@ impl<R: ProcessRunner> Supervisor<R> {
                     backoff_restarts = backoff_restarts.saturating_add(1);
                 }
                 Err(err) => {
-                    if matches!(err, crate::Error::Cancelled { .. }) {
+                    if err.is_cancelled() {
                         return Err(err);
                     }
                     let wants_restart = !matches!(self.policy, RestartPolicy::Never);
@@ -1276,13 +1276,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn backoff_is_cancellable() {
-        // E1: a cancel token firing during a backoff ends supervision promptly
-        // with Cancelled, not after the full (here 60s) delay.
+        // E1: a cancel token firing 100ms into a backoff ends supervision promptly
+        // with Cancelled. The backoff is a 60s base capped to a 60s max_backoff, so
+        // a *broken* cancel would wait the full 60s; the token fires at 100ms, so a
+        // working cancel returns in well under 1s (virtual time).
         let token = crate::CancellationToken::new();
         let sv = Supervisor::new(Command::new("fake").cancel_on(token.clone()))
             .with_runner(SeqRunner::new(vec![fail(1), fail(1)]))
             .restart(RestartPolicy::Always)
             .backoff(Duration::from_secs(60), 1.0)
+            .max_backoff(Duration::from_secs(60))
             .jitter(false);
         let canceller = tokio::spawn({
             let token = token.clone();
@@ -1295,8 +1298,8 @@ mod tests {
         let err = sv.run().await.expect_err("cancelled during backoff");
         assert!(matches!(err, crate::Error::Cancelled { .. }), "got {err:?}");
         assert!(
-            start.elapsed() < Duration::from_secs(60),
-            "backoff must be cancellable, took {:?}",
+            start.elapsed() < Duration::from_secs(1),
+            "backoff must be cancellable promptly (~100ms), took {:?}",
             start.elapsed()
         );
         canceller.await.expect("canceller");

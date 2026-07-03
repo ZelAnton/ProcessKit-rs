@@ -82,6 +82,15 @@ base=200ms, factor=2.0, cap=30s:
 restart #0 → ~200ms   #1 → ~400ms   #2 → ~800ms … #7 → ~25.6s   #8+ → 30s (cap)
 ```
 
+The exponent *n* is **not** the lifetime restart count — it **resets** whenever a
+run stays up at least as long as `max_backoff`. So a long-lived service that
+crashes now and then restarts near `base` each time (it demonstrated health
+between crashes), while only a tight loop — each incarnation shorter than the cap
+— climbs to the ceiling. The floor is on **uptime, not exit kind**: under `Always`
+a worker that exits (cleanly or not) in under `max_backoff` is treated as
+flapping and escalates, which is what stops an `exit 0` spin loop from hammering
+at the base delay. A single jittered delay can reach up to `1.5 × max_backoff`.
+
 ## Failure storms
 
 Backoff spaces *individual* restarts; `max_restarts` is a *lifetime* cap.

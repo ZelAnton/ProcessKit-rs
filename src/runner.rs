@@ -384,7 +384,7 @@ where
             Err(err) => {
                 // Cancelled is terminal — token stays cancelled, every retry
                 // would hit the pre-spawn short-circuit again.
-                if matches!(err, crate::Error::Cancelled { .. }) {
+                if err.is_cancelled() {
                     return Err(err);
                 }
                 if one_shot_stdin {
