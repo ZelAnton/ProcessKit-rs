@@ -184,6 +184,8 @@ async fn spawning_after_shutdown_ref_rearms_kill_on_drop() {
     );
 }
 
+// `ProcessGroup::adopt` is gated on `process-control`.
+#[cfg(feature = "process-control")]
 #[tokio::test]
 #[ignore = "spawns and adopts a real subprocess; verifies adopt re-arms kill-on-drop"]
 async fn adopting_after_shutdown_ref_rearms_kill_on_drop() {
