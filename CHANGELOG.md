@@ -200,6 +200,13 @@ to a dated version section.
   backoff to the cap on the second retry while `Supervisor` treated it as constant.
 
 ### Documentation
+- Streaming/pipeline honesty: documented that **carriage-return progress output**
+  (`curl`/`pip`/`apt` — a `\r`-redrawn bar with no `\n`) is a single growing line
+  that doesn't stream and is dropped whole under a byte cap (B4); that a pipeline
+  **stage failure** tears the other stages down only *passively* (pipe EOF) and is
+  collected in order, so a quiet upstream stage can delay a downstream failure —
+  while token *cancellation* is proactive (F2); and that `output_all` yields **no
+  partial results** on a mid-batch drop (F3).
 - Teardown honesty (process-group / platform caveats): documented the adopt
   **pid-reuse hazard** (an individually-tracked adopted child remembered by pid can,
   if reaped elsewhere, alias a recycled pid at teardown — C3); that a graceful

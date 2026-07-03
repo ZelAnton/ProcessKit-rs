@@ -28,7 +28,11 @@ type OutputFut<'a, T> = Pin<Box<dyn Future<Output = Result<ProcessResult<T>>> + 
 /// Not cancel-safe: dropping the returned future mid-batch drops the in-flight
 /// handles. With an own-group runner ([`JobRunner`](crate::JobRunner)) this kills
 /// those children; with a shared-group runner (`&ProcessGroup`) they live until
-/// the caller tears the group down.
+/// the caller tears the group down. **No partial results (F3):** the `Vec` is
+/// produced only when the whole batch finishes, so a mid-batch drop also discards
+/// the results of commands that *had* already completed — there is no partial
+/// recovery. If you need each result as it lands (to survive a cancellation),
+/// drive the commands yourself (e.g. a `JoinSet`) rather than through this helper.
 pub async fn output_all<R, I>(
     commands: I,
     concurrency: usize,

@@ -130,9 +130,21 @@ impl Pipeline {
         self
     }
 
-    /// Cancel the **whole chain** when `token` fires: the shared kill-on-drop
-    /// group tears every stage down and the run resolves to
-    /// [`Error::Cancelled`](crate::Error::Cancelled).
+    /// Cancel the **whole chain** when `token` fires: the token reaches every
+    /// stage (see gap-fill below), so each stage's run is cancelled and kills its
+    /// own subtree, and the run resolves to
+    /// [`Error::Cancelled`](crate::Error::Cancelled). This is **proactive** —
+    /// firing the token cancels the stages directly, it does not wait for them to
+    /// notice a closed pipe.
+    ///
+    /// Contrast a plain **stage failure** (a stage exits non-zero, or hits its own
+    /// timeout, *without* the chain being cancelled): teardown of the *other*
+    /// stages is **passive** — they end when the failed stage's pipe closes (EOF /
+    /// broken pipe) — and the chain is collected stage-by-stage in order, so a
+    /// downstream failure surfaces only once the upstream stages have themselves
+    /// ended. A quiet, still-running upstream stage can therefore delay the error.
+    /// Bound such a chain with [`timeout`](Self::timeout) (which kills the whole
+    /// group) if a stuck stage must not hold the run open.
     ///
     /// The token **gap-fills** — at launch it is applied to every stage that does
     /// not already carry its own [`Command::cancel_on`], leaving an explicit

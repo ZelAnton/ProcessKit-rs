@@ -112,6 +112,15 @@ pub enum OverflowMode {
 /// assembled, is also **not** delivered to a per-line handler or
 /// [`stdout_tee`](crate::Command::stdout_tee) (set no byte cap if a tee must see
 /// arbitrarily long lines verbatim).
+///
+/// **Carriage-return progress output** (`curl`, `pip`, `apt` — a bar redrawn with
+/// `\r`, no `\n` until the end) is the common shape of this: the pump splits on
+/// `\n` only, so the whole progress stream is a *single* growing line. It doesn't
+/// stream live (nothing is delivered until a `\n` arrives), and under a byte cap
+/// the one over-cap line is dropped whole — so a caller watching `stdout_lines`
+/// sees no progress. Capture such output through a real pipe with **no byte cap**
+/// (accepting the memory) if you need it, or read the raw stream yourself; a `\r`
+/// line-terminator mode is tracked for a future version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OutputBufferPolicy {
