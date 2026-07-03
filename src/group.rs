@@ -364,13 +364,16 @@ impl ProcessGroup {
     /// [`Supervisor::with_runner(&group)`](crate::Supervisor::with_runner)
     /// restarting into it) — resume first.
     ///
-    /// A **graceful [`shutdown`](Self::shutdown) of a suspended group cannot
-    /// drain** (C7): frozen members don't run their `SIGTERM` handlers (and a
-    /// `SIGSTOP`'d member keeps the signal pending), so the graceful phase always
-    /// burns its full `shutdown_timeout` and then hard-kills — or, under
-    /// `escalate_to_kill = false`, spares the still-frozen survivors. [`resume`](Self::resume)
-    /// before a graceful shutdown if you want the members to actually handle the
-    /// signal.
+    /// On **Unix**, a graceful [`shutdown`](Self::shutdown) of a suspended group
+    /// cannot drain (C7): frozen members don't run their `SIGTERM` handlers (and a
+    /// `SIGSTOP`'d member keeps the signal pending), so the graceful phase burns
+    /// its full `shutdown_timeout` and then hard-kills — or, under
+    /// `escalate_to_kill = false`, spares the still-frozen survivors.
+    /// [`resume`](Self::resume) before a graceful shutdown if you want the members
+    /// to actually handle the signal. (On **Windows** the point is moot: a graceful
+    /// shutdown is a prompt hard kill regardless — there's no soft-signal tier and
+    /// no grace wait — so a suspended group is torn down at once, not after the
+    /// timeout.)
     #[cfg(feature = "process-control")]
     pub fn suspend(&self) -> Result<()> {
         self.job
