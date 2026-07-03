@@ -148,14 +148,17 @@ impl Tracked {
     }
 
     /// Send `sig` to every still-existing entry, pruning the drained ones.
-    /// Returns the last **delivery failure** (e.g. `EPERM` against a tree that
-    /// changed uid), or `Ok(())` if every live entry was signalled. `ESRCH` — the
-    /// process is gone — is not a failure: the entry drained. This lets the hard
-    /// teardown (`kill_all`/`hard_kill`) report an *un*killed tree instead of a
-    /// false success, matching the cgroup backend's `signal`.
-    fn signal_all(&self, sig: i32) -> io::Result<()> {
+    ///
+    /// Best-effort: delivery failures are **not** surfaced. On the process-group
+    /// mechanism's own platforms (macOS/BSD) `EPERM` is ambiguous — it is returned
+    /// both for a genuinely-alive tree that changed uid (a `sudo`/setuid child, a
+    /// real "couldn't kill" case) *and* for a `killpg` against a group whose only
+    /// member is an unreaped **zombie** (dead, harmless). We can't tell them apart
+    /// from the errno alone, so surfacing `EPERM` here would falsely fail a
+    /// perfectly normal `kill_all`/`shutdown` of a group with unreaped children.
+    /// The uid-changed limitation is documented on `ProcessGroup::kill_all`.
+    fn signal_all(&self, sig: i32) {
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
-        let mut last_err: Option<io::Error> = None;
         ids.retain_mut(|e| {
             if !self.probe_entry(e) {
                 return false; // gone — forget it.
@@ -172,36 +175,18 @@ impl Tracked {
                     // latched (`probe_entry` set it above), an ESRCH means the
                     // group is genuinely gone — do NOT direct-signal, or that
                     // would SIGKILL a process that recycled the pid.
-                    if libc::killpg(id, sig) == -1 {
-                        let err = io::Error::last_os_error();
-                        match err.raw_os_error() {
-                            Some(libc::ESRCH) if !e.group_seen => {
-                                if libc::kill(id, sig) == -1 {
-                                    let e2 = io::Error::last_os_error();
-                                    if e2.raw_os_error() != Some(libc::ESRCH) {
-                                        last_err = Some(e2);
-                                    }
-                                }
-                            }
-                            // `group_seen` + ESRCH: genuinely gone — not a failure.
-                            Some(libc::ESRCH) => {}
-                            // EPERM etc.: alive but not signalled — a real failure.
-                            _ => last_err = Some(err),
-                        }
+                    if libc::killpg(id, sig) == -1
+                        && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                        && !e.group_seen
+                    {
+                        libc::kill(id, sig);
                     }
-                } else if libc::kill(id, sig) == -1 {
-                    let err = io::Error::last_os_error();
-                    if err.raw_os_error() != Some(libc::ESRCH) {
-                        last_err = Some(err);
-                    }
+                } else {
+                    libc::kill(id, sig);
                 }
             }
             true
         });
-        match last_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
     }
 
     /// Whether any tracked entry still exists.
@@ -338,38 +323,37 @@ impl ProcessGroup {
     }
 
     pub(crate) fn kill_all(&self) -> io::Result<()> {
-        self.broadcast(libc::SIGKILL)
+        self.broadcast(libc::SIGKILL);
+        Ok(())
     }
 
     /// Broadcast `sig` to every tracked process group and solo-adopted child.
-    /// Surfaces a delivery failure (e.g. `EPERM` against a uid-changed member) so
-    /// a "reload" signal that silently didn't land isn't reported as success;
-    /// entries that already drained are skipped (and pruned), an empty set is a
-    /// no-op.
+    /// Best-effort: entries that already drained are skipped (and pruned); an
+    /// empty set is a no-op.
     #[cfg(feature = "process-control")]
     pub(crate) fn signal(&self, sig: i32) -> io::Result<()> {
-        self.broadcast(sig)
+        self.broadcast(sig);
+        Ok(())
     }
 
     /// Freeze every tracked group (`SIGSTOP` — unblockable, idempotent).
     #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {
-        self.broadcast(libc::SIGSTOP)
+        self.broadcast(libc::SIGSTOP);
+        Ok(())
     }
 
     /// Thaw every tracked group (`SIGCONT`).
     #[cfg(feature = "process-control")]
     pub(crate) fn resume(&self) -> io::Result<()> {
-        self.broadcast(libc::SIGCONT)
+        self.broadcast(libc::SIGCONT);
+        Ok(())
     }
 
-    /// One signal sweep over both tracking sets. Runs both sweeps, then surfaces
-    /// the first delivery failure (a swallowed `EPERM` on `SIGKILL` would be a
-    /// silent orphaned tree reported as a clean kill).
-    fn broadcast(&self, sig: i32) -> io::Result<()> {
-        let groups = self.groups.signal_all(sig);
-        let solos = self.solos.signal_all(sig);
-        groups.and(solos)
+    /// One signal sweep over both tracking sets.
+    fn broadcast(&self, sig: i32) {
+        self.groups.signal_all(sig);
+        self.solos.signal_all(sig);
     }
 
     /// Whether anything tracked is still alive.
@@ -411,10 +395,7 @@ impl ProcessGroup {
 
 impl super::graceful::GracefulTarget for ProcessGroup {
     fn signal_all(&self, signal: i32) {
-        // The graceful tier is best-effort — the driver polls for drain
-        // regardless, so a failed SIGTERM is swallowed here (the escalation's
-        // `hard_kill` is where a delivery failure must surface).
-        let _ = self.broadcast(signal);
+        self.broadcast(signal);
     }
 
     fn is_drained(&self) -> bool {
@@ -422,18 +403,20 @@ impl super::graceful::GracefulTarget for ProcessGroup {
     }
 
     fn hard_kill(&self) -> io::Result<()> {
-        // Surface a `SIGKILL` delivery failure (e.g. `EPERM` against a tree that
-        // changed uid via sudo/setuid): a swallowed failure here would report a
-        // still-alive orphaned tree as a clean teardown.
-        self.broadcast(libc::SIGKILL)
+        // Best-effort `SIGKILL` sweep. A delivery `EPERM` is not surfaced: on
+        // macOS/BSD it is indistinguishable from a `killpg` against an unreaped
+        // zombie, so surfacing it would falsely fail a normal shutdown (see
+        // `Tracked::signal_all`). The uid-changed limitation is documented on
+        // `ProcessGroup::kill_all`.
+        self.broadcast(libc::SIGKILL);
+        Ok(())
     }
 }
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if !self.skip_drop_kill.is_set() {
-            // Drop can't surface an error; best-effort SIGKILL.
-            let _ = self.broadcast(libc::SIGKILL);
+            self.broadcast(libc::SIGKILL);
         }
     }
 }

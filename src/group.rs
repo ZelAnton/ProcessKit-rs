@@ -258,10 +258,17 @@ impl ProcessGroup {
     /// pre-5.14), a tree that won't drain within the bounded sweep — a fork bomb
     /// still out-spawning, or un-reapable `D`-state zombies — surfaces as an `Err`
     /// rather than a false success; the atomic backends (`cgroup.kill`, Windows
-    /// Job Object) don't need to. On the **process-group** mechanism (macOS/BSD,
-    /// and the Linux fallback) a `SIGKILL` **delivery** failure — `EPERM` against a
-    /// tree that changed its real/saved uid (a `sudo`/setuid child) — likewise
-    /// surfaces as an `Err` instead of a clean-kill that left the tree running.
+    /// Job Object) don't need to.
+    ///
+    /// **Limitation (process-group mechanism only).** On macOS/BSD and the Linux
+    /// process-group fallback, a member that changed its real/saved uid (a
+    /// `sudo`/setuid child) can reject `SIGKILL` with `EPERM` and survive; this is
+    /// **not** surfaced as an `Err` here, because on those platforms `EPERM` is
+    /// indistinguishable from a `killpg` against an unreaped zombie (a normal,
+    /// harmless case), and reporting it would falsely fail an ordinary teardown.
+    /// A privileged child under the process-group mechanism can therefore outlive
+    /// `kill_all` — the atomic mechanisms (`cgroup.kill`, Job Object) have no such
+    /// gap.
     pub fn kill_all(&self) -> Result<()> {
         #[cfg(feature = "tracing")]
         tracing::debug!(
