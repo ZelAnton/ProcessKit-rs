@@ -459,17 +459,19 @@ impl Command {
     /// Unlike [`timeout`](Self::timeout) — which is *captured* in the
     /// [`ProcessResult`] (`timed_out`) without erroring on the non-checking
     /// paths — a cancellation is **always** an error, on every path. When both
-    /// fire, cancellation wins (it is checked first). An already-cancelled
-    /// token short-circuits before spawning. On a private group the whole tree
-    /// is killed; on a shared group
-    /// ([`ProcessGroup::start`](crate::ProcessGroup::start)) only the child
-    /// is, exactly like `timeout`. [`wait_any`](crate::wait_any) and
-    /// [`first_line`](Self::first_line) don't synthesize the error for a
-    /// *mid-run* cancel — their stream simply ends, mirroring how they treat
-    /// `timeout` — though a token that was already cancelled still surfaces
-    /// the pre-spawn `Err(Cancelled)` short-circuit. Likewise a mid-run cancel
-    /// during [`wait_for_line`](crate::RunningProcess::wait_for_line) closes
-    /// the stream and surfaces as that probe's
+    /// fire, cancellation wins (it is checked first — except in `first_line`'s
+    /// narrow tie where the deadline watchdog closes the stream in the same poll
+    /// the token fires, which surfaces as `Timeout`). An already-cancelled token
+    /// short-circuits before spawning. On a private group the whole tree is
+    /// killed; on a shared group
+    /// ([`ProcessGroup::start`](crate::ProcessGroup::start)) only the direct
+    /// child is, like `timeout`. Both [`wait_any`](crate::wait_any) and
+    /// [`first_line`](Self::first_line) surface a *mid-run* cancel as
+    /// `Err(Cancelled)` — their streaming race resolves the cancellation and
+    /// tears the child down — as does an already-cancelled token via the
+    /// pre-spawn short-circuit. A mid-run cancel during
+    /// [`wait_for_line`](crate::RunningProcess::wait_for_line), by contrast,
+    /// closes the stream and surfaces as that probe's
     /// [`Error::NotReady`](crate::Error::NotReady), not `Cancelled` — the
     /// consuming finisher afterwards still reports `Cancelled`.
     ///

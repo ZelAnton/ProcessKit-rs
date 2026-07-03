@@ -341,6 +341,12 @@ pub trait ProcessRunnerExt: ProcessRunner {
         };
         // Distinguish a deadline kill (arbiter `TS_TIMED_OUT`, set before the kill,
         // so the child is already dead when the stream closed) from a natural end.
+        // In the narrow tie where a cancel token also fired in the same poll that
+        // saw the deadline-closed stream, the biased search-first arm already
+        // committed `Ok(None)` here, so this surfaces as `Timeout` rather than
+        // `Cancelled` — the arbiter is a committed record of the deadline, whereas
+        // re-reading the token would reintroduce the natural-end-vs-late-token race
+        // the drain fixed. Both still error; a retry re-hits the cancel short-circuit.
         if found.is_none()
             && arbiter.load(std::sync::atomic::Ordering::Acquire) == crate::running::TS_TIMED_OUT
         {
@@ -905,5 +911,22 @@ mod tests {
             .await
             .expect("first_line");
         assert_eq!(found.as_deref(), Some("ready: yes"));
+    }
+
+    #[tokio::test]
+    async fn first_line_with_an_unfired_timeout_still_returns_none_on_a_natural_end() {
+        use crate::testing::{Reply, ScriptedRunner};
+        // A timeout is *set* but the fast scripted stream ends with no match well
+        // before it, so the deadline arbiter stays `PENDING` and first_line reports
+        // `Ok(None)`, not `Timeout`. Locks in that reading the arbiter to classify a
+        // deadline kill doesn't misclassify a natural end when a deadline was
+        // configured but never fired.
+        let runner = ScriptedRunner::new().on(["tool"], Reply::lines(["alpha", "beta"]));
+        let cmd = Command::new("tool").timeout(Duration::from_secs(30));
+        let found = runner
+            .first_line(&cmd, |l| l.contains("zzz"))
+            .await
+            .expect("a natural no-match end with an unfired timeout is Ok(None)");
+        assert_eq!(found, None);
     }
 }
