@@ -14,13 +14,11 @@ use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_MORE_DATA};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
-// Unconditional: the C6 graceful drain-poll (`active_process_count`) uses it
-// regardless of features, alongside `members()`/`stats()`.
+#[cfg(any(feature = "process-control", feature = "stats"))]
 use windows_sys::Win32::System::JobObjects::QueryInformationJobObject;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
 #[cfg(feature = "limits")]
@@ -28,6 +26,10 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
     JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JobObjectCpuRateControlInformation,
+};
+#[cfg(feature = "stats")]
+use windows_sys::Win32::System::JobObjects::{
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
 };
 #[cfg(feature = "process-control")]
 use windows_sys::Win32::System::JobObjects::{
@@ -352,20 +354,26 @@ impl Job {
     pub(crate) async fn graceful_shutdown(
         &self,
         _signal: i32,
-        timeout: Duration,
+        _timeout: Duration,
         escalate: bool,
     ) -> io::Result<()> {
-        // A Job Object has no *soft-signal* tier: there is no Windows equivalent
-        // of SIGTERM, so the crate cannot ask the tree to exit. But it can honor
-        // the grace `timeout` as a **drain window** (C6): give a tree that is
-        // already winding down (a self-terminating service, or one signaled
-        // out-of-band — a console CTRL event, a named-pipe stop) up to `timeout`
-        // to exit and flush on its own before the atomic kill, matching the
-        // cross-platform "wait `grace`, then hard-kill" timing (on Unix a tree
-        // that ignores SIGTERM likewise burns the grace before SIGKILL). A tree
-        // that won't self-exit still gets killed at the deadline.
+        // A Job Object has no graceful tier: there is no Windows equivalent of
+        // SIGTERM, and the kill is atomic. When `escalate=true`, kill the tree
+        // immediately. When `escalate=false`, skip the kill and let survivors
+        // run; `Drop` will clear `KILL_ON_JOB_CLOSE` before closing the handle
+        // so the tree is not implicitly killed then either.
+        //
+        // The `timeout` is deliberately NOT used as a drain window (C6): Windows
+        // can't *trigger* a graceful exit (no soft signal), so polling for a
+        // natural exit up to `timeout` would, for the common case of a child that
+        // ignores the (absent) signal, only delay the inevitable kill by the whole
+        // grace — a data-losing 30 s stall, not a graceful drain. Prompt hard-kill
+        // at the deadline is the honest behavior; the grace/soft-signal tiers are
+        // Unix-only. (A tree that wants a real shutdown handshake on Windows must
+        // be signaled out-of-band — a console CTRL event, a named-pipe stop —
+        // before this call.)
         if escalate {
-            self.drain_then_kill(timeout).await
+            self.kill_all()
         } else {
             // Mark Drop to preserve survivors; the latch makes the flag visible
             // whichever thread drops the `Job` (it may differ from the one that
@@ -373,52 +381,6 @@ impl Job {
             self.skip_drop_kill.request();
             Ok(())
         }
-    }
-
-    /// The number of processes still live in the job (C6 drain-poll helper).
-    /// Always available (unlike `stats()`), so a graceful shutdown can wait for a
-    /// self-exiting tree regardless of the `stats` feature.
-    fn active_process_count(&self) -> io::Result<u32> {
-        let mut acct: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: out param matches the accounting info class and its size.
-        let ok = unsafe {
-            QueryInformationJobObject(
-                self.handle,
-                JobObjectBasicAccountingInformation,
-                std::ptr::from_mut(&mut acct).cast(),
-                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(acct.ActiveProcesses)
-    }
-
-    /// Poll for the job to drain (all members exit on their own) up to `timeout`,
-    /// then atomically kill whatever remains. A zero `timeout` kills immediately.
-    async fn drain_then_kill(&self, timeout: Duration) -> io::Result<()> {
-        if !timeout.is_zero() {
-            // Short poll so a prompt self-exit is noticed quickly, capped at the
-            // remaining grace so we never overshoot the deadline.
-            const POLL: Duration = Duration::from_millis(25);
-            let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                // A count-query failure (the job handle went away) means nothing
-                // left to kill — treat as drained.
-                if self.active_process_count().unwrap_or(0) == 0 {
-                    return Ok(());
-                }
-                let now = tokio::time::Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                let step = POLL.min(deadline - now);
-                tokio::time::sleep(step).await;
-            }
-        }
-        self.kill_all()
     }
 
     #[cfg(feature = "stats")]

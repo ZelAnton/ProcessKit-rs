@@ -77,11 +77,6 @@ to a dated version section.
   for a key always beats a `default_env_fn` for it, regardless of order.
 
 ### Fixed
-- Windows graceful `shutdown` now honors the grace `timeout` as a **drain window**:
-  with `escalate_to_kill`, the job is polled for up to `timeout` and killed
-  atomically only once it hasn't drained on its own — so a self-exiting (or
-  out-of-band-signaled) tree flushes and exits within grace instead of being
-  `TerminateJobObject`'d instantly, matching the Unix wait-then-kill timing (C6).
 - Windows `suspend`/`resume` now verifies a thread's **owning process** (via
   `GetProcessIdOfThread`) before touching it, so a thread id recycled between the
   system-wide snapshot and `OpenThread` can no longer land a suspend/resume on an
@@ -215,7 +210,10 @@ to a dated version section.
   setuid/setgid `execve`**, so it's void for a `sudo …` child (C9); the Windows
   **spawn→assign window** that can leak a suspended orphan on abrupt parent death
   (C10); and that macOS/BSD `process_metrics` are un-implemented (not impossible —
-  `libproc`/`proc_pidinfo` exist) rather than absent (C12).
+  `libproc`/`proc_pidinfo` exist) rather than absent (C12). Also clarified that a
+  Windows graceful `shutdown` is a **prompt hard kill** at the deadline — `signal`
+  and the grace `timeout` are both ignored (no soft-signal tier to trigger a
+  drain), so the "signal → grace → kill" tiers are Unix-only (C6).
 - Guide/README/rustdoc sweep — corrected several inaccuracies verified against the
   source: `wait_any` **does** surface `Err(Cancelled)` mid-run; the ext verbs
   (`parse`/`try_parse`/`first_line`) are callable on `&dyn ProcessRunner` (they
