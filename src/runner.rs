@@ -266,22 +266,34 @@ pub trait ProcessRunnerExt: ProcessRunner {
             }
             None
         };
-        // Race the search against cancellation. Once the search resolves — a
-        // match or a natural end-of-stream — we commit to that result and never
-        // re-inspect the token, so a run that ended with no match is reported as
-        // `Ok(None)` even if the shared token fires an instant later (the old
-        // post-hoc `is_cancelled()` re-check turned that natural `None` into a
-        // spurious `Cancelled`). A firing token only wins while the search is
-        // still pending; the tree teardown that closes the pipes is driven by the
-        // cancel watchdog independently.
+        // Race the search against cancellation. On a match or a natural
+        // end-of-stream (the biased `&mut search` arm) we commit to that result
+        // and never re-inspect the token, so a run that ended with no match is
+        // reported as `Ok(None)` even if the shared token fires an instant later
+        // (the old post-hoc `is_cancelled()` re-check turned that natural `None`
+        // into a spurious `Cancelled`).
+        //
+        // On a firing token we DRAIN the search to its end before reporting
+        // `Cancelled`, rather than dropping it early. `search` owns the
+        // `RunningProcess`; dropping it runs `RunningProcess::Drop`, which aborts
+        // the cancel watchdog — and that watchdog is the *only* thing that kills a
+        // shared-group child on cancel (a shared-group handle's own `Drop` does
+        // not kill the tree). Draining keeps the process alive until the watchdog
+        // has torn the tree down and closed the pipes (which is what ends the
+        // stream), so the child is actually reaped instead of leaked. A
+        // private-group handle self-kills on drop either way; the drain is
+        // bounded by the watchdog's kill (and, when set, the outer deadline).
         let search_or_cancel = async move {
+            tokio::pin!(search);
             match cancel {
                 Some(token) => {
-                    tokio::pin!(search);
                     tokio::select! {
                         biased;
                         found = &mut search => Ok(found),
-                        () = token.cancelled() => Err(()),
+                        () = token.cancelled() => {
+                            let _ = (&mut search).await;
+                            Err(())
+                        }
                     }
                 }
                 None => Ok(search.await),

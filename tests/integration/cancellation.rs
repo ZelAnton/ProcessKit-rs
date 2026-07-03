@@ -246,3 +246,64 @@ async fn first_line_cancel_surfaces_cancelled_promptly() {
         "a cancelled streaming probe must error Cancelled, got {result:?}"
     );
 }
+
+// `members()` (the no-leak assertion) is gated on `process-control`.
+#[cfg(feature = "process-control")]
+#[tokio::test]
+#[ignore = "spawns a real subprocess in a shared group and cancels a first_line probe"]
+async fn shared_group_first_line_cancel_tears_down_the_child() {
+    // first_line on a SHARED group: on cancel the search is drained to its
+    // watchdog-closed end before returning, so the child is actually torn down
+    // rather than leaked. (A shared-group handle's Drop doesn't kill the tree and,
+    // where `kill_on_drop` is disarmed after containment — Windows Job Objects —
+    // returning early would abort the cancel watchdog before it fires, stranding
+    // the child.) Verify both the Cancelled result and that the group has no
+    // surviving member afterward. A single-process idle keeps the watchdog's
+    // direct-child kill sufficient (a forking tree is the separate shared-group
+    // teardown gap).
+    use processkit::ProcessRunnerExt;
+    let group = ProcessGroup::new().expect("create group");
+    let token = CancellationToken::new();
+    let idle = if cfg!(windows) {
+        Command::new("ping").args(["-n", "31", "127.0.0.1"])
+    } else {
+        Command::new("sleep").arg("30")
+    };
+    let probe = idle.cancel_on(token.clone());
+
+    let canceller = tokio::spawn({
+        let token = token.clone();
+        async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            token.cancel();
+        }
+    });
+
+    let result = completes_within(
+        Duration::from_secs(15),
+        "shared-group first_line cancel",
+        group.first_line(&probe, |_| false),
+    )
+    .await;
+    canceller.await.expect("canceller task");
+    assert!(
+        matches!(result, Err(processkit::Error::Cancelled { .. })),
+        "a cancelled shared-group probe must error Cancelled, got {result:?}"
+    );
+
+    // No leak: the shared group has no surviving member. The old early-return
+    // code would (on a job-owned-teardown platform) abort the watchdog on drop
+    // and leave the idle alive for its full run.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let members = group.members().expect("members");
+        if members.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first_line leaked a shared-group child: still-live members {members:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

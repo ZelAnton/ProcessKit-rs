@@ -680,7 +680,13 @@ impl Command {
     /// The tee fires **before** the buffer policy decides retention, so it sees
     /// *every* decoded line — including ones the capture buffer then drops or
     /// rejects, e.g. output past a [`fail_loud`](crate::OutputBufferPolicy::fail_loud)
-    /// ceiling (that ceiling bounds retained memory, not what streams past).
+    /// *line* ceiling (that ceiling bounds retained memory, not what streams past).
+    /// One exception: a single line whose length exceeds a **byte** cap
+    /// ([`with_max_bytes`](crate::OutputBufferPolicy::with_max_bytes)) is never
+    /// assembled, so it is neither retained nor teed. The discard verbs
+    /// ([`wait`](crate::RunningProcess::wait) / `profile`) apply a large internal
+    /// in-flight byte cap for the same memory bound, so a line exceeding it is
+    /// likewise not teed under those verbs.
     ///
     /// Requires stdout to be [`Piped`](crate::StdioMode::Piped) (the default):
     /// the tee fires from the capture pump, so it is a no-op under

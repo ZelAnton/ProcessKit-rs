@@ -63,24 +63,25 @@ to a dated version section.
   stage whose `ok_codes` exclude `0` that nonetheless exited `0` (a rejected-zero
   failure) was rebuilt with the default accepted set `[0]`, so the whole chain
   reported `is_success()` / `Ok` even though the fold had deemed that stage
-  failed. `run`/`checked`/`run_unit`/`probe` on such a chain now correctly surface
-  the failure.
-- `RunningProcess::output_bytes` now honors the `OutputBufferPolicy` **byte**
-  ceiling (`max_bytes`) on its raw stdout capture — previously only the
-  line-pumped *stderr* was capped, so a caller that set `with_max_bytes(..)` /
-  `fail_loud(..).with_max_bytes(..)` expecting a memory bound could still be
-  OOM'd by a flooding child. `OverflowMode::Error` now errors with
-  `OutputTooLarge`; the drop modes bound the retained bytes (tail/head) and set
-  `truncated`. The line cap (`max_lines`) still does not apply to a non-line
-  stream, and the default (no byte cap) capture is byte-for-byte unchanged.
-- `wait` / `profile` no longer let a newline-free flood (e.g. `base64 -w0`) grow
-  the pump's in-flight line-assembly buffer without bound: their internal
-  retain-nothing discard sink now also carries a 1 MiB in-flight byte cap.
+  failed. `run`/`checked`/`run_unit` on such a chain now correctly surface the
+  failure (matching how the same rejected-zero exit behaves on a single
+  `Command`). `probe` and `exit_code` are unchanged by design — both read the raw
+  `0` exit (`probe` is strictly 0/1, `exit_code` returns the code as data).
+- `wait` / `profile` no longer let a newline-free flood (e.g. `base64 -w0`) or a
+  single enormous terminated line grow the pump's in-flight line-assembly buffer
+  without bound (a potential OOM): their internal retain-nothing discard sink now
+  carries a 64 MiB in-flight byte cap. The cap is far above any realistic line,
+  so the only observable effect is that a single line exceeding it is not
+  delivered to a per-line handler / `stdout_tee` during those discard verbs — the
+  same skip a user-set byte cap already applies to over-cap lines.
 - `ProcessRunnerExt::first_line` no longer misreports a run that ends naturally
   with no match as `Error::Cancelled` when its `cancel_on` token fires an instant
   after the stream closes; the search is now raced against the token (a firing
   token wins only while the search is still pending), so a natural end still
-  reports `Ok(None)` and genuine cancellation is surfaced more promptly.
+  reports `Ok(None)`. On genuine cancellation the search is drained to its
+  watchdog-closed end before returning, so a `first_line` run on a **shared**
+  process group (`ProcessGroup::first_line`) reliably tears its child down on
+  cancel instead of racing the watchdog against handle teardown.
 
 ### Documentation
 - `Command::env` documents how to pass secrets: env values are redacted from

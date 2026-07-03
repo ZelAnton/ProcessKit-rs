@@ -38,21 +38,15 @@ pub enum OverflowMode {
     /// silently dropping lines. The pipe is still drained (so the child never
     /// blocks); excess lines are counted but not retained.
     ///
-    /// The **line** ceiling ([`max_lines`](OutputBufferPolicy::max_lines)) applies
-    /// to line-pumped output: it fires on the line-capturing verbs —
-    /// [`output_string`](crate::Command::output_string) (stdout *and* stderr) and
-    /// the streaming [`finish`](crate::RunningProcess::finish). On
+    /// The ceiling applies to **line-pumped** output. It fires on the
+    /// line-capturing verbs — [`output_string`](crate::Command::output_string)
+    /// (stdout *and* stderr) and the streaming
+    /// [`finish`](crate::RunningProcess::finish). On
     /// [`output_bytes`](crate::Command::output_bytes) stdout is captured **raw**
-    /// (no line buffer), so the line ceiling covers only its line-pumped
-    /// *stderr*. The **byte** ceiling
-    /// ([`max_bytes`](OutputBufferPolicy::max_bytes)) *is* honored on the raw
-    /// stdout too — `output_bytes` errors (Error mode) or bounds the retained
-    /// bytes (drop modes) exactly as the line verbs do — so a byte cap is a real
-    /// memory bound there. Because a fail-loud ceiling for `output_bytes` needs a
-    /// *byte* cap (its `max_lines` is meaningless for a non-line stream), pair
-    /// Error mode with [`with_max_bytes`](OutputBufferPolicy::with_max_bytes) when
-    /// capturing raw bytes; a `timeout` additionally bounds wall-time. Discard-only
-    /// verbs ([`wait`](crate::RunningProcess::wait), and `profile` under the `stats`
+    /// (no line buffer), so the cap applies only to its line-pumped *stderr* —
+    /// the raw stdout is never line-capped (bound a flooding child with a
+    /// [`timeout`](crate::Command::timeout) instead). Discard-only verbs
+    /// ([`wait`](crate::RunningProcess::wait), and `profile` under the `stats`
     /// feature) use a retain-nothing sink internally and are not affected.
     ///
     /// Use this when unbounded *line* output is itself a misbehavior — an
