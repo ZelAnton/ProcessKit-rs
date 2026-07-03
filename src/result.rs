@@ -118,9 +118,11 @@ pub struct ProcessResult<T> {
     ok_codes: Vec<i32>,
 }
 
-// Equality is over the *logical* outcome: `duration` and `truncated` are excluded
-// so a recorded result compares equal to its replay (which rebuilds duration as
-// `Duration::ZERO`), keeping the cassette round-trip contract intact.
+// Equality is over the *logical* outcome: `duration`, `truncated`, and the
+// overflow totals are excluded so a recorded result compares equal to its replay.
+// A cassette records the duration at millisecond granularity, so a sub-millisecond
+// run's replay won't byte-match its `duration` even though it is logically the
+// same run — excluding these keeps the round-trip contract intact.
 impl<T: PartialEq> PartialEq for ProcessResult<T> {
     fn eq(&self, other: &Self) -> bool {
         self.program == other.program

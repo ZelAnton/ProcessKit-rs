@@ -104,6 +104,24 @@ to a dated version section.
   afterwards was silently spared by `Drop` too. Spawning now **re-arms** the
   kill-on-drop backstop for the whole group (a group left untouched still keeps
   its spared survivors).
+- Cassette replay (`record` feature) is more faithful on the **capturing** verbs
+  (`output_string` and the checking verbs `run`/`parse` that route through it):
+  (1) a recording made under a bounded `OutputBufferPolicy` now replays as
+  **truncated**, so `run`/`parse` still fail loud on the clipped tail instead of
+  silently passing it; (2) a pre-cancelled `cancel_on` token now **short-circuits**
+  replay with `Error::Cancelled` (both `output_string` and `start`), mirroring the
+  real runner's pre-spawn check, instead of handing back a recorded `Ok`; (3) the
+  recorded wall-clock **duration** survives replay, so `duration()` is the
+  recording's, not a synthetic `0`; (4) the overflow line/byte totals behind an
+  `OutputTooLarge` are carried across replay. (The `start`/streaming replay
+  re-pumps the canned output through the command's pumps, so its `finish` result
+  re-derives truncation/duration rather than reading the recorded flags — a known
+  doubles-layer gap.) Old cassettes load the new fields as defaults and can be
+  re-recorded.
+- Writing a cassette is now **crash-safe**: it writes a sibling temp file and
+  atomically renames it over the target, so an interrupted write can no longer
+  truncate or destroy an existing good cassette (the symlink-refusal guard is
+  preserved).
 
 ### Documentation
 - `Command::env` documents how to pass secrets: env values are redacted from

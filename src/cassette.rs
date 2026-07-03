@@ -7,6 +7,15 @@
 //! captured to a human-diffable JSON cassette; switch to *replay* mode and the
 //! cassette serves results that compare equal to the recorded ones — fast,
 //! hermetic, no subprocess in CI.
+//!
+//! **Portability of the match key.** An invocation is matched on `program` +
+//! `args` + `cwd` + the stdin digest. `cwd` is stored **verbatim** and a
+//! `from_file` stdin source keys on its **path**, so a cassette recorded with an
+//! absolute `current_dir` (a tempdir, a CI workspace like `/home/alice/repo` or
+//! `C:\actions\work\…`) will `CassetteMiss` on another machine — and, for a
+//! per-run tempdir, on the very next run. Record with a **stable, relative**
+//! working directory (or none) and prefer `Stdin::from_bytes`/`from_string` over
+//! `from_file` when the cassette must travel.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -77,11 +86,37 @@ struct Entry {
     // cassettes written before this field was added (loaded as None).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     signal: Option<i32>,
+    /// Whether a bounded `OutputBufferPolicy` clipped the output. Recorded so the
+    /// checking verbs' fail-loud-on-truncation (`run`/`parse` reject a clipped
+    /// tail) survives replay instead of silently passing a truncated capture. Old
+    /// cassettes (no field) load `false` — re-record to reproduce a clipped run.
+    #[serde(default, skip_serializing_if = "is_false")]
+    truncated: bool,
+    /// Cumulative line / byte counts behind an `OutputTooLarge`, so a replayed
+    /// rejection reports the same totals as the recording.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    total_lines: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    total_bytes: usize,
+    /// Recorded wall-clock duration (ms), so a replayed `duration()` is the
+    /// recording's, not a synthetic `0`. Old cassettes load `0`.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    duration_ms: u64,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // signature dictated by serde
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // signature dictated by serde
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // signature dictated by serde
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Write `json` to `path`, restricting the file to owner-only (`0600`) on Unix.
@@ -98,29 +133,78 @@ fn is_false(b: &bool) -> bool {
 /// there); **restrict the containing directory** (or use a per-user temp dir,
 /// not a world-writable shared one) if the fixture can carry secrets.
 fn write_cassette(path: &Path, json: &str) -> std::io::Result<()> {
+    // Write to a sibling temp file, then atomically `rename` it over the target,
+    // so a crash / interrupted write can never truncate or destroy an existing
+    // good cassette — the old file survives intact until the rename swaps in the
+    // fully-written new one. The temp shares the target's directory so the rename
+    // stays on one filesystem (a cross-device rename is not atomic).
+    // Defense-in-depth alert: refuse a symlinked cassette path (`O_NOFOLLOW` on
+    // the temp can't see the target). The rename below is safe regardless — it
+    // replaces the link, never writes *through* it to the secret-bearing target —
+    // but a symlink at a cassette path is suspicious, so fail loud (`ELOOP`).
+    #[cfg(unix)]
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::from_raw_os_error(libc::ELOOP));
+    }
+    let tmp = tmp_sibling(path);
+    // Clear a stale temp left by a prior crashed run (a recycled pid could leave
+    // one behind) so `create_new` below doesn't spuriously fail; removing a
+    // symlink here drops the link, not its target.
+    let _ = std::fs::remove_file(&tmp);
+    let written = write_new_file(&tmp, json);
+    match written.and_then(|()| std::fs::rename(&tmp, path)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Best-effort cleanup of the temp file; the original cassette (if any)
+            // is untouched.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// A sibling temp path in the same directory as `path` (so a later `rename` is
+/// same-filesystem/atomic). The pid disambiguates one process's temp from
+/// another's; concurrent recorders to *one* cassette are still unsupported.
+fn tmp_sibling(path: &Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{}.tmp", std::process::id()));
+    std::path::PathBuf::from(name)
+}
+
+/// Create-and-write a brand-new file at `path` (owner-only on Unix), fsync'd so
+/// the content is durable before the caller renames it into place.
+fn write_new_file(path: &Path, json: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        // `mode(0o600)` applies only at *creation*. A pre-existing (possibly
-        // world-readable) cassette being rewritten keeps its old perms through
-        // the truncating `open`, so tighten the fd *before* writing the content,
-        // never holding it at loose perms. `O_NOFOLLOW`: never write through a
-        // symlink planted at `path`.
+        // `create_new` + `O_NOFOLLOW`: a fresh owner-only (`0600`) file — no
+        // symlink to follow, no pre-existing perms to inherit. `set_permissions`
+        // tightens even if a restrictive umask were somehow looser.
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         file.write_all(json.as_bytes())?;
+        file.sync_all()?; // durable before the rename swaps it in
         Ok(())
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, json)
+        use std::io::Write;
+        // `create_new` so a planted temp can't be written through; the target
+        // directory's ACL governs access on Windows (see the type doc).
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
     }
 }
 
@@ -162,7 +246,38 @@ impl Entry {
                 Outcome::Signalled(s) => s,
                 _ => None,
             },
+            truncated: result.truncated(),
+            total_lines: result.total_lines(),
+            total_bytes: result.total_bytes(),
+            duration_ms: result.duration().as_millis() as u64,
         }
+    }
+
+    /// Rebuild the recorded [`ProcessResult`] (shared by both replay verbs), so
+    /// the truncation/overflow/duration signals recorded at capture time survive
+    /// replay. `timeout` is the *replaying command's* configuration, re-read like
+    /// the live runner (never stored on the entry).
+    fn to_result(
+        &self,
+        timeout: Option<std::time::Duration>,
+        ok_codes: Vec<i32>,
+    ) -> ProcessResult<String> {
+        let outcome = match (self.code, self.timed_out) {
+            (_, true) => Outcome::TimedOut,
+            (Some(code), false) => Outcome::Exited(code),
+            (None, false) => Outcome::Signalled(self.signal),
+        };
+        ProcessResult::new(
+            self.program.clone(),
+            self.stdout.clone(),
+            self.stderr.clone(),
+            outcome,
+            timeout,
+        )
+        .with_ok_codes(ok_codes)
+        .with_truncated(self.truncated)
+        .with_overflow_totals(self.total_lines, self.total_bytes)
+        .with_duration(std::time::Duration::from_millis(self.duration_ms))
     }
 }
 
@@ -473,6 +588,16 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 Ok(result)
             }
             Mode::Replay { slots } => {
+                // Cancellation is terminal on every path — mirror the real
+                // runner's pre-spawn short-circuit so replay-driven tests see the
+                // same `Cancelled` a live run would, rather than a recorded `Ok` (D2).
+                if let Some(token) = command.cancel_token()
+                    && token.is_cancelled()
+                {
+                    return Err(Error::Cancelled {
+                        program: command.program_name(),
+                    });
+                }
                 let invocation = Invocation::from_command(command);
                 let stdin_digest = stdin_digest_of(command);
                 // Release the lock before invoking line handlers — a handler that
@@ -487,19 +612,7 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                     slot.play().clone()
                 };
                 crate::doubles::replay_line_handlers(command, &entry.stdout, &entry.stderr);
-                let outcome = match (entry.code, entry.timed_out) {
-                    (_, true) => Outcome::TimedOut,
-                    (Some(code), false) => Outcome::Exited(code),
-                    (None, false) => Outcome::Signalled(entry.signal),
-                };
-                Ok(ProcessResult::new(
-                    entry.program,
-                    entry.stdout,
-                    entry.stderr,
-                    outcome,
-                    command.configured_timeout(),
-                )
-                .with_ok_codes(command.ok_codes_vec()))
+                Ok(entry.to_result(command.configured_timeout(), command.ok_codes_vec()))
             }
         }
     }
@@ -566,6 +679,15 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 ))
             }
             Mode::Replay { slots } => {
+                // Cancellation is terminal — mirror the real runner's pre-spawn
+                // short-circuit (D2), matching `output_string`'s replay arm.
+                if let Some(token) = command.cancel_token()
+                    && token.is_cancelled()
+                {
+                    return Err(Error::Cancelled {
+                        program: command.program_name(),
+                    });
+                }
                 let invocation = Invocation::from_command(command);
                 let stdin_digest = stdin_digest_of(command);
                 let entry = {
@@ -1333,5 +1455,102 @@ mod tests {
         let replayer = RecordReplayRunner::replay(&path).expect("load");
         let out = replayer.run(&cmd).await.expect("replay matches lossily");
         assert_eq!(out, "ok");
+    }
+
+    /// An inner runner that returns a bounded-buffer-clipped result (truncated,
+    /// with overflow totals and a non-zero duration) so record can capture them.
+    struct TruncatedInner;
+    #[async_trait::async_trait]
+    impl ProcessRunner for TruncatedInner {
+        async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+            Ok(ProcessResult::new(
+                command.program_name(),
+                "clipped".to_owned(),
+                String::new(),
+                Outcome::Exited(0),
+                None,
+            )
+            .with_truncated(true)
+            .with_overflow_totals(100, 9999)
+            .with_duration(Duration::from_millis(1234)))
+        }
+    }
+
+    #[tokio::test]
+    async fn truncation_and_duration_survive_replay() {
+        // D1/D12: a bounded-buffer-clipped recording must replay as truncated
+        // (so the checking verbs still fail loud) and carry its recorded
+        // duration, not a synthetic zero.
+        let (_dir, path) = temp_cassette();
+        let recorder = RecordReplayRunner::record(&path, TruncatedInner);
+        let recorded = recorder
+            .output_string(&Command::new("tool"))
+            .await
+            .expect("record");
+        assert!(recorded.truncated());
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load");
+        let replayed = replayer
+            .output_string(&Command::new("tool"))
+            .await
+            .expect("replay");
+        assert!(replayed.truncated(), "truncation must survive replay (D1)");
+        assert_eq!(
+            replayed.duration(),
+            Duration::from_millis(1234),
+            "the recorded duration must survive replay (D12)"
+        );
+        // A checking verb must fail loud on the truncated replay, not feed a
+        // caller the clipped tail.
+        let err = replayer
+            .run(&Command::new("tool"))
+            .await
+            .expect_err("run must reject a truncated replay");
+        assert!(matches!(err, Error::OutputTooLarge { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn replay_short_circuits_a_cancelled_token() {
+        // D2: replay must honor a pre-cancelled `cancel_on` token exactly like the
+        // real runner's pre-spawn short-circuit, not hand back a recorded `Ok`.
+        let (_dir, path) = temp_cassette();
+        let recorder = RecordReplayRunner::record(&path, scripted());
+        let _ = recorder
+            .output_string(&Command::new("tool").arg("--version"))
+            .await
+            .expect("record");
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load");
+        let token = crate::CancellationToken::new();
+        token.cancel();
+        let err = replayer
+            .output_string(&Command::new("tool").arg("--version").cancel_on(token))
+            .await
+            .expect_err("a pre-cancelled token must short-circuit replay");
+        assert!(matches!(err, Error::Cancelled { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn start_replay_short_circuits_a_cancelled_token() {
+        // D2: the `start` replay arm must short-circuit a pre-cancelled token too
+        // (it is separate code from the `output_string` arm).
+        let (_dir, path) = temp_cassette();
+        let recorder = RecordReplayRunner::record(&path, scripted());
+        let _ = recorder
+            .output_string(&Command::new("tool").arg("--version"))
+            .await
+            .expect("record");
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load");
+        let token = crate::CancellationToken::new();
+        token.cancel();
+        let err = replayer
+            .start(&Command::new("tool").arg("--version").cancel_on(token))
+            .await
+            .expect_err("a pre-cancelled token must short-circuit start replay");
+        assert!(matches!(err, Error::Cancelled { .. }), "got {err:?}");
     }
 }
