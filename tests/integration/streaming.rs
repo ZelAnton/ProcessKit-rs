@@ -99,7 +99,10 @@ async fn shared_group_streaming_honors_timeout() {
         Outcome::TimedOut,
         "a timed-out shared-group streamed run must report TimedOut (got {outcome:?})"
     );
-    assert!(!seen.is_empty(), "the stream should have seen some output first");
+    assert!(
+        !seen.is_empty(),
+        "the stream should have seen some output first"
+    );
 }
 
 #[tokio::test]
