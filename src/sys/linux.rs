@@ -137,10 +137,17 @@ impl Job {
                         .pre_exec(move || write_self_pid(procs.as_c_str()));
                 }
                 arm(cmd);
-                cmd.spawn()
+                let child = cmd.spawn()?;
+                // Re-arm the kill-on-drop backstop now a child has joined: a
+                // prior graceful_shutdown(escalate=false) latched this flag to
+                // spare survivors; a fresh member must not be spared by it. Done
+                // after the spawn so a failed spawn leaves the survivors alone.
+                self.skip_drop_kill.clear();
+                Ok(child)
             }
             Backend::ProcessGroup(pg) => {
                 arm(cmd);
+                // `pg.spawn` re-arms the ProcessGroup's own latch on success.
                 pg.spawn(cmd, opts)
             }
         }

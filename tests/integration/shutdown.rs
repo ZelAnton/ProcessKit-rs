@@ -146,6 +146,44 @@ async fn shutdown_escalates_to_kill_after_the_grace_window() {
     );
 }
 
+#[tokio::test]
+#[ignore = "spawns a real subprocess; verifies a reused group re-arms kill-on-drop"]
+async fn spawning_after_shutdown_ref_rearms_kill_on_drop() {
+    // C1: `shutdown_ref` with `escalate_to_kill = false` latches skip_drop_kill
+    // (to spare any survivors). Spawning a fresh child into the still-usable group
+    // must RE-ARM Drop's kill backstop, so the new child is torn down on Drop
+    // rather than orphaned by the stale latch.
+    let group = ProcessGroup::with_options(
+        processkit::ProcessGroupOptions::default()
+            .escalate_to_kill(false)
+            .shutdown_timeout(Duration::from_millis(200)),
+    )
+    .expect("group");
+    // Latch skip_drop_kill via a graceful shutdown of the (empty) group.
+    group.shutdown_ref().await.expect("shutdown_ref");
+
+    // Reuse the group: this spawn must clear the latch. (This module is unix-only;
+    // the Windows skip-drop-kill/reuse path is covered by the SkipDropKill unit
+    // test and the clear-on-spawn call in the Job Object backend.)
+    let child = group
+        .start(&Command::new("sleep").arg("60"))
+        .await
+        .expect("start after shutdown_ref");
+
+    // Drop the group — the re-armed backstop must kill the fresh child. If the
+    // stale latch orphaned it, `wait()` blocks the full 60s and the timeout fails
+    // the test; a re-armed backstop kills it promptly.
+    drop(group);
+    let outcome = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("a child spawned after shutdown_ref must be killed on group Drop, not orphaned")
+        .expect("wait");
+    assert!(
+        !matches!(outcome, Outcome::Exited(0)),
+        "the child was killed by the group's Drop, not a clean exit (got {outcome:?})"
+    );
+}
+
 // --- Run-level graceful timeout (`Command::timeout` + `timeout_grace`) ---
 //
 // Children busy-wait in the shell (no separate `sleep` child to die to the

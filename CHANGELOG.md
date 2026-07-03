@@ -97,6 +97,21 @@ to a dated version section.
   (and, on the Linux cgroup mechanism, a direct child that catches the graceful
   signal and closes stdout but keeps running) may outlive the probe until the
   group is dropped, same as the other shared-group teardown edges.
+- Reusing a `ProcessGroup` after a graceful `shutdown`/`shutdown_ref` with
+  `escalate_to_kill = false` no longer orphans the fresh children: that shutdown
+  latches "skip the kill on Drop" to spare the survivors it left running, and the
+  latch was never cleared, so a child spawned into the still-usable group
+  afterwards was silently spared by `Drop` too. Spawning now **re-arms** the
+  kill-on-drop backstop for the whole group (a group left untouched still keeps
+  its spared survivors).
+- The **process-group** teardown mechanism (macOS/BSD, and the Linux
+  `cgroup.kill`-less fallback) now surfaces a `SIGKILL` **delivery** failure —
+  `EPERM` against a tree that changed its real/saved uid (a `sudo`/setuid child) —
+  from `kill_all` and the graceful shutdown's final kill, instead of reporting a
+  clean teardown while the tree kept running. `ProcessGroup::{signal, suspend,
+  resume}` likewise surface a delivery failure rather than swallowing it (the
+  best-effort graceful `SIGTERM` still proceeds regardless). Matches how the
+  cgroup mechanism already reports an unenforced kill.
 
 ### Documentation
 - `Command::env` documents how to pass secrets: env values are redacted from

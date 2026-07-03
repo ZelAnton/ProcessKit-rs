@@ -212,6 +212,12 @@ impl Job {
         // Contained — release the primary thread. A failure here would strand a
         // suspended-but-contained process; the reaper kills it as `guard` drops.
         resume_process_threads(pid)?;
+        // Re-arm the kill-on-drop backstop now the child is contained: a prior
+        // graceful_shutdown(escalate=false) latched skip_drop_kill to spare
+        // survivors; a fresh member must not be spared by that stale latch on
+        // Drop. Done after successful containment so a failed spawn leaves the
+        // spared survivors alone.
+        self.skip_drop_kill.clear();
         Ok(guard.disarm())
     }
 

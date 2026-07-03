@@ -61,10 +61,40 @@ impl SkipDropKill {
         self.0.store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Re-arm `Drop`'s hard kill, clearing a prior [`request`](Self::request).
+    /// Spawning a new child into a group that was gracefully shut down with
+    /// `escalate = false` re-arms the kill-on-drop backstop, so the fresh child
+    /// (and the rest of the reused group) is not silently spared by the stale
+    /// latch — a group left with the latch set but never reused keeps its spared
+    /// survivors. `Release` pairs with the `Acquire` in [`is_set`](Self::is_set).
+    pub(crate) fn clear(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+
     /// Whether `Drop` should skip the kill. `Acquire` pairs with the `Release`
     /// in [`request`](Self::request).
     pub(crate) fn is_set(&self) -> bool {
         self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod skip_drop_kill_tests {
+    use super::SkipDropKill;
+
+    #[test]
+    fn request_then_clear_re_arms_the_drop_kill() {
+        let latch = SkipDropKill::new();
+        assert!(!latch.is_set(), "a fresh latch does not skip Drop's kill");
+        latch.request();
+        assert!(latch.is_set(), "request() spares survivors on Drop");
+        // Spawning into a reused group calls clear() so a fresh child is not
+        // spared by the stale latch.
+        latch.clear();
+        assert!(
+            !latch.is_set(),
+            "clear() re-arms Drop's kill for a reused group"
+        );
     }
 }
 

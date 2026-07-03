@@ -258,7 +258,10 @@ impl ProcessGroup {
     /// pre-5.14), a tree that won't drain within the bounded sweep — a fork bomb
     /// still out-spawning, or un-reapable `D`-state zombies — surfaces as an `Err`
     /// rather than a false success; the atomic backends (`cgroup.kill`, Windows
-    /// Job Object) and the process-group fallback do not report this.
+    /// Job Object) don't need to. On the **process-group** mechanism (macOS/BSD,
+    /// and the Linux fallback) a `SIGKILL` **delivery** failure — `EPERM` against a
+    /// tree that changed its real/saved uid (a `sudo`/setuid child) — likewise
+    /// surfaces as an `Err` instead of a clean-kill that left the tree running.
     pub fn kill_all(&self) -> Result<()> {
         #[cfg(feature = "tracing")]
         tracing::debug!(
@@ -427,7 +430,11 @@ impl ProcessGroup {
     /// survivors when [`escalate_to_kill`](ProcessGroupOptions::escalate_to_kill)
     /// is set; on Windows the kill is atomic and the timeout is ignored. The group
     /// stays usable afterwards (a re-`shutdown_ref` on an already-drained tree is a
-    /// near no-op), and its `Drop` still backstops any straggler.
+    /// near no-op). Spawning a new child **re-arms** `Drop`'s kill backstop for the
+    /// whole group, so a straggler started after this shutdown is still torn down
+    /// on `Drop`; a group left untouched keeps the survivors an
+    /// [`escalate_to_kill`](ProcessGroupOptions::escalate_to_kill)` = false`
+    /// shutdown chose to spare.
     ///
     /// The same reaping caveat as [`shutdown`](Self::shutdown) applies on the
     /// POSIX process-group mechanism: await each child you started into the group,
