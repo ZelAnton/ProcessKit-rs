@@ -165,7 +165,13 @@ impl Job {
                 // the kernel re-parents that process (its existing descendants are
                 // not retroactively pulled in — only future forks).
                 match std::fs::write(cg.path.join("cgroup.procs"), pid.to_string().as_bytes()) {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        // A new killable member joined the cgroup — re-arm Drop's
+                        // backstop so a prior graceful_shutdown(escalate=false)
+                        // latch doesn't spare it.
+                        self.skip_drop_kill.clear();
+                        Ok(())
+                    }
                     // The child already exited (a zombie pid) — the write fails
                     // ESRCH. Nothing to contain, so return Ok, matching the
                     // process-group backend (which maps ESRCH→Ok).
@@ -173,6 +179,7 @@ impl Job {
                     Err(e) => Err(e),
                 }
             }
+            // `pg.adopt` re-arms the ProcessGroup's own latch on success.
             Backend::ProcessGroup(pg) => pg.adopt(child),
         }
     }

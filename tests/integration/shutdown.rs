@@ -184,6 +184,37 @@ async fn spawning_after_shutdown_ref_rearms_kill_on_drop() {
     );
 }
 
+#[tokio::test]
+#[ignore = "spawns and adopts a real subprocess; verifies adopt re-arms kill-on-drop"]
+async fn adopting_after_shutdown_ref_rearms_kill_on_drop() {
+    // C1 (adopt path): `shutdown_ref(escalate=false)` latches skip_drop_kill;
+    // ADOPTING a fresh member must re-arm Drop's kill backstop, the same as
+    // spawning — otherwise the adopted child is orphaned by the stale latch.
+    let group = ProcessGroup::with_options(
+        processkit::ProcessGroupOptions::default()
+            .escalate_to_kill(false)
+            .shutdown_timeout(Duration::from_millis(200)),
+    )
+    .expect("group");
+    group.shutdown_ref().await.expect("shutdown_ref");
+
+    // A long-lived child spawned OUTSIDE the group, then adopted into it (an
+    // already-exec'd child is solo-tracked via the EACCES/EPERM path).
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn external child");
+    group.adopt(&child).expect("adopt after shutdown_ref");
+
+    // Drop the group — the re-armed backstop must kill the adopted child. A stale
+    // latch would spare it, making `wait()` block the full 60s.
+    drop(group);
+    tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("an adopted child must be killed on group Drop, not orphaned")
+        .expect("wait");
+}
+
 // --- Run-level graceful timeout (`Command::timeout` + `timeout_grace`) ---
 //
 // Children busy-wait in the shell (no separate `sleep` child to die to the

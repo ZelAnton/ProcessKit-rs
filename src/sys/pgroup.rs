@@ -293,6 +293,9 @@ impl ProcessGroup {
             // It now leads group `pid` — track the group; future forks inherit
             // it and are reaped with it. The group exists (setpgid succeeded), so
             // seed the latch true. `track` de-duplicates a re-adopt.
+            // A new killable member joined — re-arm Drop's backstop so a prior
+            // graceful_shutdown(escalate=false) latch doesn't spare it.
+            self.skip_drop_kill.clear();
             self.groups.track(pid, true);
             return Ok(());
         }
@@ -314,6 +317,8 @@ impl ProcessGroup {
                 // `stats()` and double-deliver every broadcast) — only solo-track a
                 // genuinely external child.
                 if !self.groups.contains(pid) {
+                    // A new killable solo member joined — re-arm Drop's backstop.
+                    self.skip_drop_kill.clear();
                     self.solos.track(pid, false);
                 }
                 Ok(())

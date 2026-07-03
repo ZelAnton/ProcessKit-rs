@@ -239,6 +239,9 @@ impl Job {
             }
             return Err(err);
         }
+        // A new killable member joined the job — re-arm the kill-on-drop backstop
+        // so a prior graceful_shutdown(escalate=false) latch doesn't spare it.
+        self.skip_drop_kill.clear();
         Ok(())
     }
 
