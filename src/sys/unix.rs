@@ -109,6 +109,11 @@ impl Job {
 
 #[cfg(feature = "stats")]
 pub(crate) fn process_metrics(_pid: u32) -> ProcMetrics {
-    // No `/proc` on these targets; per-process accounting is not available.
+    // Not *implemented* on these targets (returns the empty default), rather than
+    // impossible: macOS/BSD have no `/proc`, so the Linux `/proc/<pid>/stat` path
+    // doesn't apply, but per-process CPU/memory IS obtainable here via
+    // `libproc`/`proc_pidinfo` (macOS) or `kvm`/`sysctl` (BSD) — just not wired up
+    // (C12). Group-level `stats()` is likewise unavailable on the process-group
+    // mechanism; the count is all it can report.
     ProcMetrics::default()
 }

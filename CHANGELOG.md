@@ -77,6 +77,22 @@ to a dated version section.
   for a key always beats a `default_env_fn` for it, regardless of order.
 
 ### Fixed
+- Windows graceful `shutdown` now honors the grace `timeout` as a **drain window**:
+  with `escalate_to_kill`, the job is polled for up to `timeout` and killed
+  atomically only once it hasn't drained on its own — so a self-exiting (or
+  out-of-band-signaled) tree flushes and exits within grace instead of being
+  `TerminateJobObject`'d instantly, matching the Unix wait-then-kill timing (C6).
+- Windows `suspend`/`resume` now verifies a thread's **owning process** (via
+  `GetProcessIdOfThread`) before touching it, so a thread id recycled between the
+  system-wide snapshot and `OpenThread` can no longer land a suspend/resume on an
+  unrelated process's thread (C11).
+- Linux cgroup-v2 detection also probes the systemd **hybrid** mount
+  (`/sys/fs/cgroup/unified`), not only `/sys/fs/cgroup` — a hybrid host no longer
+  falls back to the weaker process-group mechanism despite a usable v2 hierarchy (C5).
+- A cgroup→process-group **containment downgrade** (unprivileged container,
+  read-only `/sys/fs/cgroup`) now emits one `warn!` per process (`tracing` feature)
+  — previously only debug traces + `mechanism()` polling surfaced it, so a
+  `setsid`-escaping child could slip past an operator watching warn-level logs (C4).
 - `ProcessResult`'s `Debug` no longer dumps stdout/stderr in full: a
   `panic!("{result:?}")` or tracing line on a multi-MiB capture previously printed
   it all. Now bounded to a preview (text) / byte-length summary (raw bytes), the
@@ -189,6 +205,17 @@ to a dated version section.
   backoff to the cap on the second retry while `Supervisor` treated it as constant.
 
 ### Documentation
+- Teardown honesty (process-group / platform caveats): documented the adopt
+  **pid-reuse hazard** (an individually-tracked adopted child remembered by pid can,
+  if reaped elsewhere, alias a recycled pid at teardown — C3); that a graceful
+  `shutdown` of a **suspended** group can't drain (frozen members don't run signal
+  handlers — C7); that a **nested-PID-namespace** cgroup member reads as pid `0`,
+  skips the graceful `SIGTERM` tier, and is reaped only by the final `cgroup.kill`
+  (C8); that `PR_SET_PDEATHSIG` (`kill_on_parent_death`) is **cleared across a
+  setuid/setgid `execve`**, so it's void for a `sudo …` child (C9); the Windows
+  **spawn→assign window** that can leak a suspended orphan on abrupt parent death
+  (C10); and that macOS/BSD `process_metrics` are un-implemented (not impossible —
+  `libproc`/`proc_pidinfo` exist) rather than absent (C12).
 - Guide/README/rustdoc sweep — corrected several inaccuracies verified against the
   source: `wait_any` **does** surface `Err(Cancelled)` mid-run; the ext verbs
   (`parse`/`try_parse`/`first_line`) are callable on `&dyn ProcessRunner` (they

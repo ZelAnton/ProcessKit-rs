@@ -243,10 +243,13 @@ impl Job {
     ///
     /// On Unix: send `signal` (typically `SIGTERM`), wait up to `timeout` for the
     /// members to leave, then `SIGKILL` survivors when `escalate` is set. On
-    /// Windows the job kill is atomic, so `signal` and `timeout` are ignored, but
-    /// `escalate` is still honored: `true` kills the tree immediately (equivalent
-    /// to [`kill_all`](Self::kill_all)), while `false` leaves survivors alive
-    /// (`Drop` then closes the handle without `KILL_ON_JOB_CLOSE`).
+    /// Windows `signal` is ignored (no soft-signal tier), but `timeout` is honored
+    /// as a **drain window**: with `escalate = true` the job is polled for up to
+    /// `timeout` and killed atomically only once it hasn't drained on its own — so
+    /// a self-exiting tree flushes and exits within grace instead of being killed
+    /// instantly (matching the Unix wait-then-kill timing). `escalate = false`
+    /// leaves survivors alive (`Drop` then closes the handle without
+    /// `KILL_ON_JOB_CLOSE`).
     ///
     /// `escalate = false` survivor-sparing is **best-effort on Windows**: `Drop`
     /// clears `KILL_ON_JOB_CLOSE` before closing the handle, but if that

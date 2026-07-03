@@ -14,11 +14,13 @@ use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_MORE_DATA};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
-#[cfg(any(feature = "process-control", feature = "stats"))]
+// Unconditional: the C6 graceful drain-poll (`active_process_count`) uses it
+// regardless of features, alongside `members()`/`stats()`.
 use windows_sys::Win32::System::JobObjects::QueryInformationJobObject;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
 #[cfg(feature = "limits")]
@@ -26,10 +28,6 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
     JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JobObjectCpuRateControlInformation,
-};
-#[cfg(feature = "stats")]
-use windows_sys::Win32::System::JobObjects::{
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
 };
 #[cfg(feature = "process-control")]
 use windows_sys::Win32::System::JobObjects::{
@@ -41,7 +39,9 @@ use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
 };
 #[cfg(feature = "process-control")]
-use windows_sys::Win32::System::Threading::{GetExitCodeProcess, SuspendThread};
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, GetProcessIdOfThread, SuspendThread, THREAD_QUERY_LIMITED_INFORMATION,
+};
 #[cfg(feature = "stats")]
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -64,6 +64,14 @@ pub(crate) struct Job {
     /// kill-on-parent-death guarantee (documented on
     /// `Command::kill_on_parent_death`) breaks if a refactor ever duplicates
     /// or inherits this handle.
+    ///
+    /// One inherent gap (C10): a child is spawned `CREATE_SUSPENDED` and only then
+    /// assigned to the job. If the **parent dies abruptly in that spawn→assign
+    /// window** — after `CreateProcess` returns but before `AssignProcessToJobObject`
+    /// — the child is not yet a job member, so kill-on-close can't reach it and it
+    /// leaks as a permanently-*suspended* orphan (it never ran). The window is a
+    /// few instructions wide and the orphan is inert (suspended), but it is not
+    /// covered by the "kernel kills the tree even on abrupt parent death" headline.
     handle: HANDLE,
     /// Serializes `spawn`'s create-suspended → assign → resume sequence against
     /// the [`suspend`](Self::suspend)/[`resume`](Self::resume) member-thread
@@ -324,7 +332,8 @@ impl Job {
         let mut ok = unsafe { Thread32First(snapshot, &mut entry) };
         while ok != 0 {
             if members.contains(&entry.th32OwnerProcessID)
-                && let Err(err) = suspend_or_resume_thread(entry.th32ThreadID, suspend)
+                && let Err(err) =
+                    suspend_or_resume_thread(entry.th32ThreadID, entry.th32OwnerProcessID, suspend)
             {
                 last_err = Some(err);
             }
@@ -343,16 +352,20 @@ impl Job {
     pub(crate) async fn graceful_shutdown(
         &self,
         _signal: i32,
-        _timeout: Duration,
+        timeout: Duration,
         escalate: bool,
     ) -> io::Result<()> {
-        // A Job Object has no graceful tier: there is no Windows equivalent of
-        // SIGTERM, and the kill is atomic. When `escalate=true`, kill the tree
-        // immediately. When `escalate=false`, skip the kill and let survivors
-        // run; `Drop` will clear `KILL_ON_JOB_CLOSE` before closing the handle
-        // so the tree is not implicitly killed then either.
+        // A Job Object has no *soft-signal* tier: there is no Windows equivalent
+        // of SIGTERM, so the crate cannot ask the tree to exit. But it can honor
+        // the grace `timeout` as a **drain window** (C6): give a tree that is
+        // already winding down (a self-terminating service, or one signaled
+        // out-of-band — a console CTRL event, a named-pipe stop) up to `timeout`
+        // to exit and flush on its own before the atomic kill, matching the
+        // cross-platform "wait `grace`, then hard-kill" timing (on Unix a tree
+        // that ignores SIGTERM likewise burns the grace before SIGKILL). A tree
+        // that won't self-exit still gets killed at the deadline.
         if escalate {
-            self.kill_all()
+            self.drain_then_kill(timeout).await
         } else {
             // Mark Drop to preserve survivors; the latch makes the flag visible
             // whichever thread drops the `Job` (it may differ from the one that
@@ -360,6 +373,52 @@ impl Job {
             self.skip_drop_kill.request();
             Ok(())
         }
+    }
+
+    /// The number of processes still live in the job (C6 drain-poll helper).
+    /// Always available (unlike `stats()`), so a graceful shutdown can wait for a
+    /// self-exiting tree regardless of the `stats` feature.
+    fn active_process_count(&self) -> io::Result<u32> {
+        let mut acct: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: out param matches the accounting info class and its size.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectBasicAccountingInformation,
+                std::ptr::from_mut(&mut acct).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(acct.ActiveProcesses)
+    }
+
+    /// Poll for the job to drain (all members exit on their own) up to `timeout`,
+    /// then atomically kill whatever remains. A zero `timeout` kills immediately.
+    async fn drain_then_kill(&self, timeout: Duration) -> io::Result<()> {
+        if !timeout.is_zero() {
+            // Short poll so a prompt self-exit is noticed quickly, capped at the
+            // remaining grace so we never overshoot the deadline.
+            const POLL: Duration = Duration::from_millis(25);
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                // A count-query failure (the job handle went away) means nothing
+                // left to kill — treat as drained.
+                if self.active_process_count().unwrap_or(0) == 0 {
+                    return Ok(());
+                }
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let step = POLL.min(deadline - now);
+                tokio::time::sleep(step).await;
+            }
+        }
+        self.kill_all()
     }
 
     #[cfg(feature = "stats")]
@@ -541,9 +600,16 @@ fn resume_thread(tid: u32) -> io::Result<()> {
 
 /// Suspend (increment) or resume (decrement) a single thread's suspend count.
 #[cfg(feature = "process-control")]
-fn suspend_or_resume_thread(tid: u32, suspend: bool) -> io::Result<()> {
+fn suspend_or_resume_thread(tid: u32, expected_pid: u32, suspend: bool) -> io::Result<()> {
+    // Also request QUERY access so we can confirm the thread's owner below (C11).
     // SAFETY: opens the thread by id; returns null on failure (e.g. exited).
-    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, tid) };
+    let thread = unsafe {
+        OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+            0,
+            tid,
+        )
+    };
     if thread.is_null() {
         let err = io::Error::last_os_error();
         // A STALE tid — a thread that exited between the system-wide snapshot and
@@ -556,6 +622,18 @@ fn suspend_or_resume_thread(tid: u32, suspend: bool) -> io::Result<()> {
             return Ok(());
         }
         return Err(err);
+    }
+    // C11: the system-wide thread snapshot named this tid as owned by a member
+    // process, but a tid can be **recycled** between the snapshot and this open —
+    // to a thread of an entirely different process. Verify the live owner before
+    // touching it, so a suspend/resume never lands on a foreign process's thread.
+    // SAFETY: valid thread handle from OpenThread; returns 0 on failure.
+    let owner = unsafe { GetProcessIdOfThread(thread) };
+    if owner != expected_pid {
+        // Recycled (or unqueryable) — not our member's thread; leave it alone.
+        // SAFETY: handle came from OpenThread; closed exactly once.
+        unsafe { CloseHandle(thread) };
+        return Ok(());
     }
     // SAFETY: valid thread handle; both calls signal failure with `u32::MAX`.
     let prev = unsafe {
@@ -750,8 +828,10 @@ mod thread_tests {
     /// the fix returns `Ok` — and it can never open or suspend a real thread.
     #[test]
     fn suspend_or_resume_a_stale_tid_is_ok() {
-        assert!(suspend_or_resume_thread(1, true).is_ok());
-        assert!(suspend_or_resume_thread(1, false).is_ok());
+        // `expected_pid` is irrelevant here: `tid = 1` fails `OpenThread` before
+        // the C11 owner check ever runs.
+        assert!(suspend_or_resume_thread(1, 0, true).is_ok());
+        assert!(suspend_or_resume_thread(1, 0, false).is_ok());
     }
 }
 

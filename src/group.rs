@@ -227,6 +227,15 @@ impl ProcessGroup {
     /// a graceful [`shutdown`](Self::shutdown) can wait out its full timeout
     /// on the zombie before escalating.
     ///
+    /// **Reap promptly (pid-reuse hazard).** An individually-tracked adopted child
+    /// is remembered by **pid**. If you let it exit *and be reaped* elsewhere
+    /// without dropping/tearing down this group, that pid can be recycled by the OS
+    /// to an **unrelated** process — and this group's later teardown would then
+    /// signal that stranger. The crate has no start-time identity to detect the
+    /// reuse (and macOS's small pid space makes it likelier). Reap an adopted child
+    /// through this group's lifetime, or tear the group down when done, so a stale
+    /// pid is never carried across a reuse.
+    ///
     /// On the containment backends, adopting a child that has already **exited
     /// but not yet been reaped** is a successful no-op (`Ok`) — there is nothing
     /// left to contain — while an **already-reaped** child (one that was
@@ -354,6 +363,14 @@ impl ProcessGroup {
     /// suspended group (e.g. a
     /// [`Supervisor::with_runner(&group)`](crate::Supervisor::with_runner)
     /// restarting into it) — resume first.
+    ///
+    /// A **graceful [`shutdown`](Self::shutdown) of a suspended group cannot
+    /// drain** (C7): frozen members don't run their `SIGTERM` handlers (and a
+    /// `SIGSTOP`'d member keeps the signal pending), so the graceful phase always
+    /// burns its full `shutdown_timeout` and then hard-kills — or, under
+    /// `escalate_to_kill = false`, spares the still-frozen survivors. [`resume`](Self::resume)
+    /// before a graceful shutdown if you want the members to actually handle the
+    /// signal.
     #[cfg(feature = "process-control")]
     pub fn suspend(&self) -> Result<()> {
         self.job

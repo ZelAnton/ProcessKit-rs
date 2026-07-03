@@ -333,13 +333,20 @@ impl Command {
     /// | Linux | `prctl(PR_SET_PDEATHSIG, SIGKILL)` on the **direct child only** — grandchildren are not covered (with the parent gone, nothing tears the cgroup/pgroup down). |
     /// | macOS / BSD / other | No `pdeathsig` equivalent — does nothing (the graceful-exit guarantee via `Drop` still holds). |
     ///
-    /// One honest Linux caveat: the death signal fires when the spawning
-    /// **thread** dies, not only the process — on a multi-threaded tokio
-    /// runtime, a worker thread retired while the child lives would kill it
-    /// early (for the strongest guarantee spawn from a current-thread
-    /// runtime). The parent-died-before-arming race is closed in the child
-    /// by re-checking `getppid()` against the spawner's pid captured before
-    /// the fork — safe in containers where the spawner itself is PID 1.
+    /// Two honest Linux caveats:
+    /// - The death signal fires when the spawning **thread** dies, not only the
+    ///   process — on a multi-threaded tokio runtime, a worker thread retired
+    ///   while the child lives would kill it early (for the strongest guarantee
+    ///   spawn from a current-thread runtime). The parent-died-before-arming race
+    ///   is closed in the child by re-checking `getppid()` against the spawner's
+    ///   pid captured before the fork — safe in containers where the spawner
+    ///   itself is PID 1.
+    /// - The kernel **clears `PR_SET_PDEATHSIG` across an `execve` of a set-uid /
+    ///   set-gid binary** (a security measure), so this is silently void for a
+    ///   `sudo …` / setuid child — it inherits the pdeathsig for the tiny window
+    ///   before `execve`, then loses it. Contain such a child with the
+    ///   kill-on-drop group (the default) rather than relying on this knob.
+    ///
     /// (Idea borrowed from `execa`'s cleanup-on-exit, mapped to native
     /// primitives.)
     pub fn kill_on_parent_death(mut self) -> Self {

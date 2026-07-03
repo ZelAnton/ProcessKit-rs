@@ -72,6 +72,25 @@ enum Backend {
     ProcessGroup(ProcessGroup),
 }
 
+/// Warn **once per process** that containment degraded from cgroup to the POSIX
+/// process-group fallback (C4). A latch keeps a chatty spawner from flooding logs;
+/// the per-spawn detail stays at `debug`. No-op without the `tracing` feature.
+fn warn_containment_degraded_once() {
+    #[cfg(feature = "tracing")]
+    {
+        use std::sync::Once;
+        static WARNED: Once = Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                target: "processkit",
+                "cgroup v2 unavailable — containment degraded to the POSIX \
+                 process-group fallback; a child that calls setsid can escape \
+                 teardown. Fires once per process (per-spawn detail is at debug)."
+            );
+        });
+    }
+}
+
 impl Job {
     pub(crate) fn new(#[cfg(feature = "limits")] limits: &ResourceLimits) -> io::Result<Self> {
         // Prefer a cgroup; degrade to a process group if we can't make one
@@ -91,6 +110,13 @@ impl Job {
                 if limits.any() {
                     return Err(_e);
                 }
+                // C4: surface the containment *downgrade* once at warn level. A
+                // cgroup→pgroup fallback (unprivileged container, read-only
+                // `/sys/fs/cgroup`, no delegation) weakens teardown — a `setsid`
+                // child then escapes it — and per-spawn `debug` traces plus
+                // `mechanism()` polling don't make that visible to an operator who
+                // only watches warn-level logs.
+                warn_containment_degraded_once();
                 Backend::ProcessGroup(ProcessGroup::new())
             }
         };
@@ -398,20 +424,34 @@ impl Drop for Job {
     }
 }
 
+/// The cgroup v2 (unified) mount root, if one is present (C5). Checks the pure-v2
+/// location (`/sys/fs/cgroup`) first, then the systemd **hybrid** location
+/// (`/sys/fs/cgroup/unified`); the presence of `cgroup.controllers` at the root is
+/// the v2 marker. Returns `None` when no v2 hierarchy is mounted (v1-only or no
+/// cgroups), which routes to the process-group fallback.
+fn cgroup2_root() -> Option<PathBuf> {
+    for candidate in ["/sys/fs/cgroup", "/sys/fs/cgroup/unified"] {
+        let root = Path::new(candidate);
+        if root.join("cgroup.controllers").exists() {
+            return Some(root.to_path_buf());
+        }
+    }
+    None
+}
+
 struct Cgroup {
     path: PathBuf,
 }
 
 impl Cgroup {
     fn create(#[cfg(feature = "limits")] limits: &ResourceLimits) -> io::Result<Self> {
-        // Only the cgroup v2 unified hierarchy exposes this file at the root.
-        let root = Path::new("/sys/fs/cgroup");
-        if !root.join("cgroup.controllers").exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "cgroup v2 not mounted",
-            ));
-        }
+        // Locate the cgroup v2 (unified) mount root. The common case is
+        // `/sys/fs/cgroup` (pure v2), but a systemd **hybrid** host mounts the v2
+        // hierarchy at `/sys/fs/cgroup/unified` — checking only the former (C5)
+        // would fall back to pgroup despite a usable v2 tree.
+        let root = cgroup2_root()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "cgroup v2 not mounted"))?;
+        let root = root.as_path();
 
         // Our own cgroup: on v2, `/proc/self/cgroup` is a single `0::<path>` line.
         let self_cgroup = std::fs::read_to_string("/proc/self/cgroup")?;
@@ -564,10 +604,15 @@ impl Cgroup {
         match std::fs::read_to_string(self.path.join("cgroup.procs")) {
             Ok(procs) => procs
                 .lines()
-                // Keep only real pids: a `0`/negative line (never emitted by the
-                // kernel, but cheap to guard) would otherwise reach `kill(pid, …)`
-                // as "the caller's whole process group" (0) or "a process group"
-                // (negative) — never a single tracked member.
+                // Keep only real pids: a `0`/negative line would otherwise reach
+                // `kill(pid, …)` as "the caller's whole process group" (0) or "a
+                // process group" (negative) — never a single tracked member. Note
+                // a `0` here is not only the (never-emitted) kernel guard: a member
+                // living in a **nested PID namespace** not mapped into the reader's
+                // namespace reads as `0` in `cgroup.procs`, so it is dropped here
+                // and thus skips the per-pid graceful `SIGTERM` tier (C8) — the
+                // final `cgroup.kill`, which acts on the whole cgroup regardless of
+                // pid visibility, still reaps it.
                 .filter_map(|l| l.trim().parse::<i32>().ok())
                 .filter(|&pid| pid > 0)
                 .collect(),
