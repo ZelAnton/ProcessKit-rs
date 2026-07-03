@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [1.2.0] - 2026-07-03
+
+### Added
 - `impl<R: ProcessRunner + ?Sized> ProcessRunner for Box<R>` and `Arc<R>` — a
   runner chosen at **runtime** (the real `JobRunner` vs a `record`-feature
   cassette, picked from config) can now be stored type-erased as
@@ -1808,7 +1819,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v0.11.1...v1.0.0
