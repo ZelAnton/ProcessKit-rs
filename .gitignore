@@ -23,3 +23,8 @@ None
 # Rust
 **/*.rs.bk
 *.pdb
+
+# Stray rustc build artifacts (loose .rlib/.rmeta from ad-hoc `rustc` runs;
+# real builds live under /target above)
+*.rlib
+*.rmeta
