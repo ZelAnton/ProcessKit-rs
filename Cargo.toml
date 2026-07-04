@@ -1,6 +1,6 @@
 [package]
 name = "processkit"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 description = "Async child-process management for tokio: whole-tree kill-on-drop (no orphans), plus streaming, pipelines, timeouts, and supervision"
 license = "MIT"

@@ -20,6 +20,17 @@ to a dated version section.
 ### Fixed
 -
 
+## [1.2.1] - 2026-07-04
+
+### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
 ### Documentation
 - Noted [`processkit-py`](https://pypi.org/project/processkit-py/), a Python
   (PyO3/asyncio) wrapper over this crate's core, in the README, the docs guide
@@ -1824,7 +1835,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.0.0...v1.0.1
