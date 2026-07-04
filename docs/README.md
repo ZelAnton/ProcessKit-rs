@@ -102,3 +102,9 @@ The rustdoc on [docs.rs](https://docs.rs/processkit) is the authoritative
 per-item reference; these guides are the narrative layer on top — they explain
 how the pieces compose, with the platform fine print collected in
 [Platform support](platform-support.md).
+
+## Other languages
+
+Not on Rust? [`processkit-py`](https://pypi.org/project/processkit-py/) wraps
+this crate's core in a Python (PyO3/asyncio) API — this crate stays the single
+source of truth for the containment/runner logic underneath.

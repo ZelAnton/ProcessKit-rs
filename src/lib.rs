@@ -120,6 +120,13 @@
 //!   JSON fixture once, then replays them hermetically — no subprocess in CI.
 //!   Pulls in `serde` + `serde_json`.
 //!
+//! # Other languages
+//!
+//! Not on Rust? [`processkit-py`](https://pypi.org/project/processkit-py/) is a
+//! Python wrapper (PyO3 bindings) over this crate's core, with an asyncio-facing
+//! API. This crate remains the single source of truth for the containment/runner
+//! logic underneath.
+//!
 //! [Job Object]: https://learn.microsoft.com/windows/win32/procthread/job-objects
 //! [cgroup v2]: https://docs.kernel.org/admin-guide/cgroup-v2.html
 

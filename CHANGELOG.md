@@ -20,6 +20,11 @@ to a dated version section.
 ### Fixed
 -
 
+### Documentation
+- Noted [`processkit-py`](https://pypi.org/project/processkit-py/), a Python
+  (PyO3/asyncio) wrapper over this crate's core, in the README, the docs guide
+  index, and the crate-level rustdoc.
+
 ## [1.2.0] - 2026-07-03
 
 ### Added

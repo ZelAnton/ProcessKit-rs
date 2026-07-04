@@ -748,6 +748,14 @@ misreading old fixtures.
 
 *Deeper: [Testing your code → record/replay](docs/testing.md).*
 
+## Other languages
+
+Not on Rust? [**`processkit-py`**](https://pypi.org/project/processkit-py/) is a
+Python wrapper (PyO3 bindings) over this crate's core — same kill-on-drop
+containment, same underlying engine, an asyncio-facing API on top. This crate
+remains the single source of truth for the containment/runner logic; file
+core bugs and feature requests here.
+
 ## Contributing
 
 Running the tests and the (maintainer-only) release process are documented in
