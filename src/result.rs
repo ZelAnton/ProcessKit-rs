@@ -935,7 +935,13 @@ mod tests {
         let mut raw = b"before-".to_vec();
         raw.extend_from_slice(&[0xFF, 0xFE, 0x00, 0xC3, 0x28]); // not valid UTF-8
         raw.extend_from_slice(b"-after");
-        let bad = ProcessResult::new("p".into(), raw.clone(), String::new(), Outcome::Exited(1), None);
+        let bad = ProcessResult::new(
+            "p".into(),
+            raw.clone(),
+            String::new(),
+            Outcome::Exited(1),
+            None,
+        );
         let err = bad.ensure_success().unwrap_err();
         assert_eq!(
             err.stdout_bytes(),

@@ -641,7 +641,10 @@ mod tests {
                 ProcessGroupOptions::default().max_processes(0),
                 LimitKind::Processes,
             ),
-            (ProcessGroupOptions::default().cpu_quota(0.0), LimitKind::Cpu),
+            (
+                ProcessGroupOptions::default().cpu_quota(0.0),
+                LimitKind::Cpu,
+            ),
             (
                 ProcessGroupOptions::default().cpu_quota(-1.0),
                 LimitKind::Cpu,
