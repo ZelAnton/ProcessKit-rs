@@ -118,9 +118,11 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
 pub(crate) mod pgroup;
 
 // Shared graceful-shutdown escalation driver for both unix backends. Windows'
-// atomic Job kill has no graceful tier, so it is unix-only.
+// atomic Job kill has no graceful tier, so it is unix-only. `pub(crate)` so the
+// shared-group single-child kill-and-reap primitive ([`graceful::run_pid`]) is
+// reachable from `crate::running`, which drives the streaming-timeout teardown.
 #[cfg(unix)]
-mod graceful;
+pub(crate) mod graceful;
 
 /// Per-spawn knobs that must reach the platform backend (the
 /// `tokio::process::Command` can't carry them: creation flags have no getter,

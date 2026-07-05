@@ -418,6 +418,90 @@ async fn graceful_timeout_in_a_shared_group_escalates_to_kill() {
     );
 }
 
+// T-017: on a SHARED-group STREAMING handle the deadline watchdog runs the
+// graceful kill-and-reap DETACHED, so its final SIGKILL survives the handle's
+// `Drop` aborting the watchdog mid-grace. This reproduces the exact hazard the
+// primitive fixes: a child that catches SIGTERM, closes its stdout (ending the
+// stream, which drops the handle — as `first_line` does), and keeps running.
+// Before the fix `Drop` aborted the watchdog before the SIGKILL and the child
+// leaked until the shared group itself was dropped; now it is forced down (and
+// reaped by the runtime) ~grace after the deadline, regardless of the handle.
+#[tokio::test]
+#[ignore = "spawns a signal-catching child in a SHARED group and streams it to a timeout"]
+async fn shared_group_streaming_timeout_kills_a_signal_catching_child_despite_drop() {
+    use tokio_stream::StreamExt;
+
+    let group = ProcessGroup::new().expect("create group");
+    // On SIGTERM the trap closes stdout (`exec 1>&-`) so our read end sees EOF and
+    // the stream ends, then `exec`s a survivor (`sleep 30`) that keeps the SAME
+    // pid alive with no stdout holder. The busy-loop main body runs the trap at
+    // the next command boundary — promptly, and with no foreground child that
+    // could inherit and pin the stdout pipe open.
+    let cmd = Command::new("sh")
+        .args([
+            "-c",
+            "trap 'exec 1>&-; exec sleep 30' TERM; echo ready; while :; do :; done",
+        ])
+        .timeout(Duration::from_millis(400))
+        .timeout_grace(Duration::from_millis(600));
+
+    let mut run = group.start(&cmd).await.expect("start");
+    let pid = run.pid().expect("a real child has a pid");
+    let mut lines = run.stdout_lines().expect("stream stdout");
+
+    // Drain to end-of-stream: the deadline fires → SIGTERM → the trap closes
+    // stdout → EOF → the stream ends here (it must not hang).
+    let seen = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut seen = Vec::new();
+        while let Some(line) = lines.next().await {
+            seen.push(line);
+        }
+        seen
+    })
+    .await
+    .expect("the deadline must end the stream, not hang");
+    assert!(seen.iter().any(|l| l == "ready"), "saw: {seen:?}");
+
+    // Drop the streaming handle mid-grace (as `first_line` does), which aborts the
+    // deadline watchdog. It must return PROMPTLY — the rejected "await the
+    // watchdog in Drop" alternative would instead block for the whole grace.
+    let dropped_at = Instant::now();
+    drop(lines);
+    drop(run);
+    assert!(
+        dropped_at.elapsed() < Duration::from_millis(250),
+        "dropping the streaming handle must not block on the grace (took {:?})",
+        dropped_at.elapsed()
+    );
+
+    // The GROUP is still alive, so the group-drop backstop is NOT what ends the
+    // survivor — only the detached primitive's non-abortable SIGKILL can, ~grace
+    // after the deadline. Poll until the pid is gone (killed and then reaped by
+    // the runtime's orphan reaper).
+    let killed = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            // SAFETY: signal 0 is a pure existence probe.
+            if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+
+    // Never leak a 30s sleeper if the guarantee regressed: clean it up ourselves
+    // before asserting, while the group is still around to tear down its cgroup.
+    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+    drop(group);
+
+    killed.expect(
+        "the detached kill-and-reap must SIGKILL the signal-catching child after the grace, \
+         even though Drop aborted the deadline watchdog",
+    );
+}
+
 #[cfg(feature = "process-control")]
 #[tokio::test]
 #[ignore = "spawns a real subprocess; verifies the configurable timeout signal"]

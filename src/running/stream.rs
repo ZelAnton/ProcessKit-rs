@@ -188,7 +188,13 @@ impl RunningProcess {
                         // forking child are the shared-group teardown gap — pair a
                         // per-stage timeout with a whole-chain one).
                         None => match grace {
-                            Some(grace) => graceful_kill_pid(pid, grace, signal).await,
+                            // Detach the graceful kill-and-reap so its final
+                            // SIGKILL survives THIS watchdog being aborted by
+                            // `RunningProcess::Drop` mid-grace — the case where a
+                            // child catches the signal, closes stdout (ending the
+                            // stream), and keeps running. See
+                            // `spawn_graceful_kill_and_reap`.
+                            Some(grace) => spawn_graceful_kill_and_reap(pid, grace, signal),
                             None => kill_direct_child(pid),
                         },
                     }
@@ -362,49 +368,52 @@ pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, pid: Option<u32>) {
     kill_direct_child(pid);
 }
 
-/// Gracefully terminate a single child by pid (shared-group timeout path —
-/// no owned group). Sends `signal`, polls liveness up to `grace`, then
-/// `SIGKILL`. The caller reaps concurrently, so a child that exits on the
-/// signal is collected and the poll ends early. Windows has no signal tier —
-/// hard kill.
+/// Gracefully terminate (and let the runtime reap) a single child by pid — the
+/// shared-group timeout path, which owns no group and so reaches only its own
+/// direct child. Sends `signal`, polls liveness up to `grace`, then `SIGKILL`s a
+/// survivor; a child that exits on the signal ends the poll early and skips the
+/// hard kill. Windows has no signal tier — hard kill.
 ///
-/// Relies on the concurrent reap winning the pid-recycle race; the window is
-/// narrow and the alternative (no force-kill) is worse.
+/// The signal → poll → kill algorithm lives in the shared unix driver
+/// [`crate::sys::graceful::run_pid`], which documents the load-bearing
+/// guarantee: the final `SIGKILL` still fires for a child that caught the
+/// signal, closed stdout, and kept running. To make that guarantee hold when a
+/// streaming consumer drops its handle mid-grace, arm this via
+/// [`spawn_graceful_kill_and_reap`] (a detached task) rather than inline in the
+/// abortable deadline watchdog.
 pub(crate) async fn graceful_kill_pid(pid: Option<u32>, grace: std::time::Duration, signal: i32) {
     #[cfg(unix)]
     {
         let Some(pid) = pid else { return };
-        let pid = pid as i32;
-        // SAFETY: sending a signal to a pid is safe; ESRCH (gone) is ignored.
-        unsafe {
-            libc::kill(pid, signal);
-        }
-        // Clamp so a huge grace can't overflow `Instant + Duration`.
-        let deadline = tokio::time::Instant::now() + grace.min(crate::MAX_DEADLINE);
-        loop {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                break;
-            }
-            // SAFETY: signal 0 probes existence. ESRCH → gone; EPERM → alive but
-            // unsignallable (treat as exists). Other non-zero treated as alive.
-            let probe = unsafe { libc::kill(pid, 0) };
-            if probe != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
-                return; // ESRCH: gone
-            }
-            let poll = std::time::Duration::from_millis(20);
-            tokio::time::sleep(poll.min(deadline - now)).await;
-        }
-        // SAFETY: force the survivor down (no-op if already gone).
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
+        let target = crate::sys::graceful::UnixChild::new(pid as i32);
+        crate::sys::graceful::run_pid(&target, signal, grace).await;
     }
     #[cfg(not(unix))]
     {
         let _ = (grace, signal);
         kill_direct_child(pid);
     }
+}
+
+/// Run [`graceful_kill_pid`] as a **detached** task, dropping its `JoinHandle`
+/// so no abort site tracks it.
+///
+/// The shared-group streaming deadline watchdog lives in `self.deadline_task`,
+/// which `RunningProcess::Drop` aborts. When the timed-out child catches the
+/// graceful signal, closes its stdout, and keeps running, the stream ends (EOF)
+/// and the streaming consumer (e.g. `first_line`) drops its handle — aborting
+/// that watchdog. Running the kill-and-reap **inline** in the watchdog would
+/// then cancel the final `SIGKILL` mid-grace, stranding the survivor until the
+/// shared group itself is dropped. Detaching it here severs that abort: the task
+/// runs to completion independently, delivering the guaranteed `SIGKILL`. The
+/// shared-group child carries no `kill_on_drop`, so this kill never races a
+/// Drop-triggered kill+reap of a recycled pid; the reap is the runtime's — the
+/// dropped `tokio::process::Child` is collected by tokio's orphan reaper once
+/// the kill lands.
+fn spawn_graceful_kill_and_reap(pid: Option<u32>, grace: std::time::Duration, signal: i32) {
+    // Detached on purpose: dropping the handle lets it outlive the (abortable)
+    // deadline watchdog that spawned it.
+    drop(tokio::spawn(graceful_kill_pid(pid, grace, signal)));
 }
 
 /// Best-effort kill of the direct child by pid — called by deadline/cancel
