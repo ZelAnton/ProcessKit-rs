@@ -1,0 +1,30 @@
+[package]
+name = "processkit-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# Structured fuzz input (raw bytes, chunk sizes, encoding selector) instead of
+# a single flat `&[u8]`, so libFuzzer can vary the chunk boundaries and
+# encoding independently of the payload bytes.
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+
+[dependencies.processkit]
+path = ".."
+
+# Isolate this crate's dependency resolution (and Cargo.lock) from the parent
+# crate: fuzz targets are dev tooling, never part of the published/workspace
+# build, and must not be swept into a workspace the root crate might grow later.
+[workspace]
+
+[[bin]]
+name = "decode_pump_lines"
+path = "fuzz_targets/decode_pump_lines.rs"
+test = false
+doc = false
+bench = false

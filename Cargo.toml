@@ -35,6 +35,11 @@ exclude = [
   "cliff.toml",
   "deny.toml",
   "rust-toolchain.toml",
+  # cargo-fuzz harness (nightly-only, its own Cargo.toml/Cargo.lock) — dev
+  # tooling that never ships in the published crate; see fuzz/Cargo.toml and
+  # the fuzzing-only entry point it drives, `pump::fuzz_decode_pump_lines`
+  # (`cfg(fuzzing)`, src/pump.rs).
+  "fuzz/",
   # 3.5 MB README banner — rendered from its absolute raw.githubusercontent URL,
   # so it never needs to ship inside the published crate.
   "cover.png",
@@ -62,6 +67,14 @@ missing_debug_implementations = "warn"
 # forgets to keep that discipline. (`missing_docs` is enforced lib-scoped in
 # `src/lib.rs` so it doesn't burden examples/tests.)
 unsafe_op_in_unsafe_fn = "deny"
+# `cfg(fuzzing)` is not a Cargo feature: `cargo fuzz build` sets it
+# automatically (via `RUSTFLAGS`) for every crate in the dependency graph, so
+# `fuzz/fuzz_targets/*.rs` can call into a fuzzing-only entry point (see
+# `src/pump.rs`'s `fuzz_decode_pump_lines`) without that entry point ever
+# appearing in an ordinary build's public API. Declare it so rustc's
+# `unexpected_cfgs` lint (which `-D warnings` would otherwise turn into a
+# build failure on every normal `cargo build`/`clippy`) does not fire on it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 # ---------------------------------------------------------------------------
 # Dependencies — every entry carries a "why" (see AGENTS.md "Dependency

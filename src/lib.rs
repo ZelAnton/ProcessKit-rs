@@ -174,6 +174,13 @@ pub use group::{ProcessGroup, ProcessGroupOptions};
 pub use limits::{LimitKind, LimitReason, ResourceLimits};
 pub use mechanism::Mechanism;
 pub use pipeline::Pipeline;
+// Fuzzing-only entry point for `fuzz/fuzz_targets/decode_pump_lines.rs` (see
+// `src/pump.rs`). `cfg(fuzzing)` is set automatically by `cargo fuzz build`
+// for the whole dependency graph, never in an ordinary build — so this
+// never shows up in `cargo public-api`'s (`--all-features`, no `--cfg
+// fuzzing`) surface, and thus never touches `public-api.txt`.
+#[cfg(fuzzing)]
+pub use pump::fuzz_decode_pump_lines;
 pub use result::{Outcome, ProcessResult};
 pub use retry::RetryPolicy;
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
