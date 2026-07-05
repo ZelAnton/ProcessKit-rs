@@ -1,25 +1,5 @@
 /target
 
-# Per-user scratch notes — never committed. Use these names freely for
-# throwaway planning/working files.
-*.local.md
-task_plan.md
-findings.md
-progress.md
-
-# Agent instruction / config files are kept local only — never shared via the
-# remote. Each contributor brings their own; the repo does not ship them.
-AGENTS.md
-CLAUDE.md
-.claude/
-
-# Local-only working directories — not pushed to remote
-ideas/
-reviews/
-decisions/
-ROADMAP.md
-None
-
 # Rust
 **/*.rs.bk
 *.pdb

@@ -1,0 +1,10 @@
+[jj-workflow] New user prompt — before any edits, evaluate the change scope:
+
+1. Run `jj st` to see the current change description.
+2. Classify this prompt:
+   - **Continuation**: same topic, refinement, or follow-up of in-progress work → just work; jj folds edits into current change.
+   - **Scope shift**: same change, but the goal has been refined or expanded → `jj describe -m "<refined summary>"`.
+   - **New work**: orthogonal topic or different area → `jj new -m "<concise summary>"` (descendant) or `jj new @- -m "..."` (sibling if current work is unfinished).
+3. If unclear which category this prompt falls in, ask the user before editing.
+
+See AGENTS.md "Version control workflow" for the full rationale.
