@@ -294,18 +294,21 @@ impl<T> ProcessResult<T> {
                 timeout: self.timeout.unwrap_or_default(),
                 stdout: self.stdout.as_text(),
                 stderr: self.stderr.clone(),
+                stdout_bytes: self.stdout.into_raw(),
             }),
             Outcome::Signalled(signal) => Err(Error::Signalled {
                 program: self.program.clone(),
                 signal,
                 stdout: self.stdout.as_text(),
                 stderr: self.stderr.clone(),
+                stdout_bytes: self.stdout.into_raw(),
             }),
             Outcome::Exited(code) => Err(Error::Exit {
                 program: self.program.clone(),
                 code,
                 stdout: self.stdout.as_text(),
                 stderr: self.stderr.clone(),
+                stdout_bytes: self.stdout.into_raw(),
             }),
         }
     }
@@ -313,8 +316,11 @@ impl<T> ProcessResult<T> {
     /// The exit code for the code-returning convenience helpers
     /// (`Command::exit_code`, `ProcessRunnerExt::exit_code`, `CliClient::exit_code`):
     /// a timeout surfaces as [`Error::Timeout`], a signal-kill (no code) as
-    /// [`Error::Signalled`], otherwise the code.
-    pub(crate) fn require_code(&self) -> Result<i32, Error>
+    /// [`Error::Signalled`], otherwise the code. Takes `self` by value (rather
+    /// than `&self`) so the bytes-path payload can move its raw stdout into the
+    /// error instead of cloning it — every call site already holds a
+    /// freshly-produced, otherwise-unused `ProcessResult`.
+    pub(crate) fn require_code(self) -> Result<i32, Error>
     where
         T: StdoutText,
     {
@@ -325,12 +331,14 @@ impl<T> ProcessResult<T> {
                 timeout: self.timeout.unwrap_or_default(),
                 stdout: self.stdout.as_text(),
                 stderr: self.stderr.clone(),
+                stdout_bytes: self.stdout.into_raw(),
             }),
             Outcome::Signalled(signal) => Err(Error::Signalled {
                 program: self.program.clone(),
                 signal,
                 stdout: self.stdout.as_text(),
                 stderr: self.stderr.clone(),
+                stdout_bytes: self.stdout.into_raw(),
             }),
         }
     }
@@ -494,7 +502,11 @@ fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
 }
 
 /// Render captured stdout as text for [`Error::Exit`], whatever the payload type:
-/// a [`String`] is taken as-is; raw bytes are decoded lossily.
+/// a [`String`] is taken as-is; raw bytes are decoded lossily. Also exposes the
+/// exact captured bytes when the payload type carries them losslessly
+/// (`Vec<u8>` — the `output_bytes()` path), so a checking verb
+/// (`ensure_success`/`require_code`) can populate the `Exit`/`Timeout`/
+/// `Signalled` variants' `stdout_bytes` field without a second lossy round trip.
 ///
 /// An implementation detail of [`ensure_success`](ProcessResult::ensure_success):
 /// `pub` only to satisfy the bound's visibility (the `result` module is private,
@@ -503,17 +515,31 @@ fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
 #[doc(hidden)]
 pub trait StdoutText {
     fn as_text(&self) -> String;
+
+    /// The exact captured bytes, when the payload type carries them losslessly
+    /// (`Vec<u8>`); `None` for an already-decoded text payload (`String`) —
+    /// there is no separate "raw" form to recover there (`as_text` above is
+    /// already the complete, non-lossy text).
+    fn into_raw(self) -> Option<Vec<u8>>;
 }
 
 impl StdoutText for String {
     fn as_text(&self) -> String {
         self.clone()
     }
+
+    fn into_raw(self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 impl StdoutText for Vec<u8> {
     fn as_text(&self) -> String {
         String::from_utf8_lossy(self).into_owned()
+    }
+
+    fn into_raw(self) -> Option<Vec<u8>> {
+        Some(self)
     }
 }
 
@@ -682,6 +708,7 @@ mod tests {
                 code,
                 stdout,
                 stderr,
+                ..
             } => {
                 assert_eq!(program, "git");
                 assert_eq!(code, 2);
@@ -782,7 +809,7 @@ mod tests {
         assert_eq!(killed.code(), None);
         assert!(!killed.is_success());
         assert!(matches!(
-            killed.require_code().unwrap_err(),
+            killed.clone().require_code().unwrap_err(),
             Error::Signalled { .. }
         ));
         match killed.ensure_success().unwrap_err() {
@@ -897,6 +924,46 @@ mod tests {
         assert_eq!(stderr.len(), 10_000, "full stderr carried, untruncated");
         assert!(stdout.chars().all(|c| c == 'x'));
         assert!(stderr.chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn bytes_path_error_carries_the_exact_raw_stdout() {
+        // H4: after a failed `output_bytes().await?.ensure_success()?`, the exact
+        // raw stdout bytes must be reachable — not just a lossy UTF-8 re-decode.
+        // Invalid UTF-8 exercises the case where `stdout` (the lossy text field)
+        // and `stdout_bytes` (the exact bytes) necessarily differ.
+        let mut raw = b"before-".to_vec();
+        raw.extend_from_slice(&[0xFF, 0xFE, 0x00, 0xC3, 0x28]); // not valid UTF-8
+        raw.extend_from_slice(b"-after");
+        let bad = ProcessResult::new("p".into(), raw.clone(), String::new(), Outcome::Exited(1), None);
+        let err = bad.ensure_success().unwrap_err();
+        assert_eq!(
+            err.stdout_bytes(),
+            Some(raw.as_slice()),
+            "the exact pre-decode bytes must survive, byte for byte"
+        );
+        match &err {
+            Error::Exit { stdout_bytes, .. } => {
+                assert_eq!(stdout_bytes.as_deref(), Some(raw.as_slice()));
+            }
+            other => panic!("expected Exit, got {other:?}"),
+        }
+        // The lossy text field is still populated (with replacement chars),
+        // but is *not* required to byte-match the raw capture.
+        assert!(err.stdout().unwrap().contains('\u{FFFD}'));
+
+        // The text path (`String` payload) has no separate raw form to recover:
+        // `stdout_bytes` is `None`, never a re-encoding of the text field.
+        let text_bad = ProcessResult::new(
+            "p".into(),
+            "hello".to_owned(),
+            String::new(),
+            Outcome::Exited(1),
+            None,
+        );
+        let text_err = text_bad.ensure_success().unwrap_err();
+        assert_eq!(text_err.stdout_bytes(), None);
+        assert_eq!(text_err.stdout(), Some("hello"));
     }
 
     #[test]

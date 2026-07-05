@@ -376,6 +376,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
                             timeout: limit,
                             stdout: String::new(), // streaming probe buffers nothing
                             stderr: String::new(),
+                            stdout_bytes: None,
                         });
                     }
                 }
@@ -401,6 +402,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
                 timeout: timeout.unwrap_or_default(),
                 stdout: String::new(),
                 stderr: String::new(),
+                stdout_bytes: None,
             });
         }
         Ok(found)

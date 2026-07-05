@@ -148,6 +148,7 @@ pub processkit::Error::Exit::code: i32
 pub processkit::Error::Exit::program: alloc::string::String
 pub processkit::Error::Exit::stderr: alloc::string::String
 pub processkit::Error::Exit::stdout: alloc::string::String
+pub processkit::Error::Exit::stdout_bytes: core::option::Option<alloc::vec::Vec<u8>>
 pub processkit::Error::Io(std::io::error::Error)
 #[non_exhaustive] pub processkit::Error::NotFound
 pub processkit::Error::NotFound::program: alloc::string::String
@@ -171,6 +172,7 @@ pub processkit::Error::Signalled::program: alloc::string::String
 pub processkit::Error::Signalled::signal: core::option::Option<i32>
 pub processkit::Error::Signalled::stderr: alloc::string::String
 pub processkit::Error::Signalled::stdout: alloc::string::String
+pub processkit::Error::Signalled::stdout_bytes: core::option::Option<alloc::vec::Vec<u8>>
 #[non_exhaustive] pub processkit::Error::Spawn
 pub processkit::Error::Spawn::program: alloc::string::String
 pub processkit::Error::Spawn::source: std::io::error::Error
@@ -181,6 +183,7 @@ pub processkit::Error::Stdin::source: std::io::error::Error
 pub processkit::Error::Timeout::program: alloc::string::String
 pub processkit::Error::Timeout::stderr: alloc::string::String
 pub processkit::Error::Timeout::stdout: alloc::string::String
+pub processkit::Error::Timeout::stdout_bytes: core::option::Option<alloc::vec::Vec<u8>>
 pub processkit::Error::Timeout::timeout: core::time::Duration
 pub processkit::Error::Unsupported
 pub processkit::Error::Unsupported::operation: alloc::string::String
@@ -198,6 +201,7 @@ pub fn processkit::Error::program(&self) -> core::option::Option<&str>
 pub fn processkit::Error::signal(&self) -> core::option::Option<i32>
 pub fn processkit::Error::stderr(&self) -> core::option::Option<&str>
 pub fn processkit::Error::stdout(&self) -> core::option::Option<&str>
+pub fn processkit::Error::stdout_bytes(&self) -> core::option::Option<&[u8]>
 impl core::error::Error for processkit::Error
 pub fn processkit::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Debug for processkit::Error

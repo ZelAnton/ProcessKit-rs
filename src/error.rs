@@ -110,17 +110,24 @@ pub enum Error {
         /// Captured standard output, in full. Not shown in the `Display`
         /// message; kept for callers that need a stdout-borne failure message.
         /// For the raw-bytes helper (`output_bytes`) this is a **lossy UTF-8
-        /// decode** of stdout. The checking verbs (`run`/`checked`/`ensure_success`)
-        /// **consume** the `ProcessResult` to build this error, so the exact bytes
-        /// are *not* preserved on that path — if you need them on failure, inspect
-        /// the `ProcessResult` yourself (`output_bytes().await?` then
-        /// [`is_success`](crate::ProcessResult::is_success)/[`code`](crate::ProcessResult::code))
-        /// rather than using a consuming verb.
+        /// decode** of stdout — see this variant's `stdout_bytes` field for
+        /// the exact bytes on that path.
         stdout: String,
         /// Captured standard error, in full. Only its **last non-empty
         /// line** (bounded) appears in the `Display` message — the complete
         /// captured text lives here, never poisoning a log line.
         stderr: String,
+        /// The exact captured stdout bytes, when the producing path captured
+        /// raw bytes rather than already-decoded text — `Some` for a checking
+        /// verb built over [`output_bytes`](crate::Command::output_bytes)
+        /// (e.g. `output_bytes().await?.ensure_success()?`), `None` for the
+        /// text path (`output_string`/`run`/`checked`/…), where `stdout` above
+        /// is already the complete, non-lossy text and there is no separate
+        /// "raw" form to recover. When `Some`, these bytes are the exact
+        /// pre-decode stdout — `stdout` is a lossy UTF-8 decode of this same
+        /// data, so the two may differ when the stream was not valid UTF-8.
+        /// Read via [`Error::stdout_bytes`].
+        stdout_bytes: Option<Vec<u8>>,
     },
 
     /// The process exceeded its configured timeout and was killed.
@@ -146,13 +153,19 @@ pub enum Error {
         /// Standard output captured before the kill, in full. Not shown in the
         /// `Display` message (only its bounded diagnostic tail is). Empty when
         /// the path captured nothing. For the raw-bytes helper this is a **lossy
-        /// UTF-8 decode**; the exact bytes are not preserved when a consuming
-        /// checking verb produced this error (see [`Error::Exit`]'s `stdout`).
+        /// UTF-8 decode** — see this variant's `stdout_bytes` field for the
+        /// exact bytes on that path.
         stdout: String,
         /// Standard error captured before the kill, in full — often the
         /// explanation of *why* the tool hung. Only its last non-empty line
         /// (bounded) reaches the `Display` message.
         stderr: String,
+        /// The exact captured stdout bytes before the kill, when the producing
+        /// path captured raw bytes — see [`Exit`](Error::Exit)'s `stdout_bytes`
+        /// field for the full contract. `None` on the text path, or when the
+        /// producing path captured nothing (a streaming probe). Read via
+        /// [`Error::stdout_bytes`].
+        stdout_bytes: Option<Vec<u8>>,
     },
 
     /// The captured output exceeded the
@@ -307,11 +320,17 @@ pub enum Error {
         signal: Option<i32>,
         /// Standard output captured before the kill, in full. Not shown in the
         /// `Display` message (only its bounded diagnostic tail is). For the
-        /// raw-bytes helper this is a lossy UTF-8 decode of stdout.
+        /// raw-bytes helper this is a lossy UTF-8 decode of stdout — see this
+        /// variant's `stdout_bytes` field for the exact bytes on that path.
         stdout: String,
         /// Standard error captured before the kill, in full. Only its last
         /// non-empty line (bounded) reaches the `Display` message.
         stderr: String,
+        /// The exact captured stdout bytes before the kill, when the producing
+        /// path captured raw bytes — see [`Exit`](Error::Exit)'s `stdout_bytes`
+        /// field for the full contract. `None` on the text path. Read via
+        /// [`Error::stdout_bytes`].
+        stdout_bytes: Option<Vec<u8>>,
     },
 
     /// The child ran but feeding its standard input failed for a reason other
@@ -411,6 +430,38 @@ impl Error {
     /// [`stdout`](Self::stdout)); `None` otherwise. The raw stream in full.
     pub fn stderr(&self) -> Option<&str> {
         self.streams().map(|(_, stderr)| stderr)
+    }
+
+    /// The **exact** captured stdout bytes, when available — `Some` only for a
+    /// stream-bearing variant ([`Exit`](Error::Exit) / [`Timeout`](Error::Timeout)
+    /// / [`Signalled`](Error::Signalled)) produced by a checking verb built over
+    /// [`output_bytes`](crate::Command::output_bytes) (e.g.
+    /// `output_bytes().await?.ensure_success()?`); `None` for every other
+    /// variant, and for a stream-bearing variant produced on the text path
+    /// (`output_string`/`run`/`checked`/…), where [`stdout`](Self::stdout)
+    /// above is already the complete, non-lossy text. When `Some`, these bytes
+    /// are the exact pre-decode stdout that [`stdout`](Self::stdout) is a lossy
+    /// UTF-8 decode of — the two differ when the stream was not valid UTF-8.
+    pub fn stdout_bytes(&self) -> Option<&[u8]> {
+        // Exhaustive on purpose (like `streams`): a future stream-carrying
+        // variant must add itself here, not fall through a `_`.
+        match self {
+            Error::Exit { stdout_bytes, .. }
+            | Error::Timeout { stdout_bytes, .. }
+            | Error::Signalled { stdout_bytes, .. } => stdout_bytes.as_deref(),
+            Error::Spawn { .. }
+            | Error::NotFound { .. }
+            | Error::CassetteMiss { .. }
+            | Error::OutputTooLarge { .. }
+            | Error::NotReady { .. }
+            | Error::Parse { .. }
+            | Error::Unsupported { .. }
+            | Error::Cancelled { .. }
+            | Error::Stdin { .. }
+            | Error::Io(_) => None,
+            #[cfg(feature = "limits")]
+            Error::ResourceLimit { .. } => None,
+        }
     }
 
     /// Standard output followed by standard error, joined — the [`Error`] twin of
@@ -647,6 +698,12 @@ impl Error {
     /// field addition would otherwise break) and go through one insulated
     /// constructor instead. Off the documented surface, but `pub` so downstream
     /// test code can call it; semver-covered like any public item.
+    ///
+    /// Always builds a text-path error (`stdout_bytes: None`) — this constructor
+    /// takes text, not raw bytes. A bytes-path `Exit` (`stdout_bytes: Some(..)`)
+    /// only comes from a real checking verb built over
+    /// [`output_bytes`](crate::Command::output_bytes)
+    /// (e.g. `ProcessResult<Vec<u8>>::ensure_success`).
     #[doc(hidden)]
     pub fn exit(
         program: impl Into<String>,
@@ -659,6 +716,7 @@ impl Error {
             code,
             stdout: stdout.into(),
             stderr: stderr.into(),
+            stdout_bytes: None,
         }
     }
 
@@ -675,6 +733,7 @@ impl Error {
             timeout,
             stdout: stdout.into(),
             stderr: stderr.into(),
+            stdout_bytes: None,
         }
     }
 
@@ -691,6 +750,7 @@ impl Error {
             signal,
             stdout: stdout.into(),
             stderr: stderr.into(),
+            stdout_bytes: None,
         }
     }
 }
@@ -723,24 +783,28 @@ impl fmt::Debug for Error {
                 code,
                 stdout,
                 stderr,
+                stdout_bytes,
             } => f
                 .debug_struct("Exit")
                 .field("program", program)
                 .field("code", code)
                 .field("stdout", &StreamPreview(stdout))
                 .field("stderr", &StreamPreview(stderr))
+                .field("stdout_bytes", &BytesPreview(stdout_bytes.as_deref()))
                 .finish(),
             Error::Timeout {
                 program,
                 timeout,
                 stdout,
                 stderr,
+                stdout_bytes,
             } => f
                 .debug_struct("Timeout")
                 .field("program", program)
                 .field("timeout", timeout)
                 .field("stdout", &StreamPreview(stdout))
                 .field("stderr", &StreamPreview(stderr))
+                .field("stdout_bytes", &BytesPreview(stdout_bytes.as_deref()))
                 .finish(),
             Error::OutputTooLarge {
                 program,
@@ -788,12 +852,14 @@ impl fmt::Debug for Error {
                 signal,
                 stdout,
                 stderr,
+                stdout_bytes,
             } => f
                 .debug_struct("Signalled")
                 .field("program", program)
                 .field("signal", signal)
                 .field("stdout", &StreamPreview(stdout))
                 .field("stderr", &StreamPreview(stderr))
+                .field("stdout_bytes", &BytesPreview(stdout_bytes.as_deref()))
                 .finish(),
             Error::Stdin { program, source } => f
                 .debug_struct("Stdin")
@@ -823,6 +889,23 @@ impl fmt::Debug for StreamPreview<'_> {
             cut -= 1;
         }
         write!(f, "{:?}… (+{} bytes)", &s[..cut], s.len() - cut)
+    }
+}
+
+/// `Debug` for the `stdout_bytes` field of [`Exit`](Error::Exit) /
+/// [`Timeout`](Error::Timeout) / [`Signalled`](Error::Signalled): never dumps
+/// the raw bytes (they may be binary, may carry secrets, and can be
+/// multi-MiB — the same "no unbounded payload in Debug" rule
+/// [`StreamPreview`] follows for the text streams) — only a length summary
+/// when present, `None` otherwise.
+struct BytesPreview<'a>(Option<&'a [u8]>);
+
+impl fmt::Debug for BytesPreview<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(bytes) => write!(f, "Some(<{} bytes>)", bytes.len()),
+            None => write!(f, "None"),
+        }
     }
 }
 
@@ -1168,6 +1251,7 @@ mod tests {
             code: 1,
             stdout: String::new(),
             stderr: "boom\x1b[31m\x07\x00danger".into(),
+            stdout_bytes: None,
         };
         let msg = err.to_string();
         assert!(!msg.contains('\x1b'), "ESC must be sanitized: {msg:?}");
@@ -1186,6 +1270,7 @@ mod tests {
             code: 1,
             stdout: String::new(),
             stderr: "safe\u{202E}reversed\u{202C}\u{2066}iso".into(),
+            stdout_bytes: None,
         };
         let msg = err.to_string();
         assert!(!msg.contains('\u{202E}'), "RLO must be sanitized: {msg:?}");
@@ -1204,6 +1289,7 @@ mod tests {
             code: 1,
             stdout: String::new(),
             stderr: "before\u{2028}after\u{2029}end".into(),
+            stdout_bytes: None,
         };
         let msg = err.to_string();
         assert!(!msg.contains('\u{2028}'), "LS must be sanitized: {msg:?}");
@@ -1241,6 +1327,7 @@ mod tests {
             code: 1,
             stdout: huge.clone(),
             stderr: huge,
+            stdout_bytes: None,
         };
         let dbg = format!("{err:?}");
         assert!(
@@ -1260,6 +1347,7 @@ mod tests {
             code: 2,
             stdout: "hello".into(),
             stderr: String::new(),
+            stdout_bytes: None,
         };
         let dbg = format!("{small:?}");
         assert!(dbg.contains("\"hello\""), "got: {dbg}");
@@ -1267,6 +1355,39 @@ mod tests {
             !dbg.contains("bytes)"),
             "no truncation note for a short stream: {dbg}"
         );
+    }
+
+    #[test]
+    fn debug_bounds_stdout_bytes_to_a_length_summary() {
+        // `stdout_bytes` may carry the same multi-MiB payload as `stdout` (just
+        // pre-decode) — Debug must summarize its length, never dump the bytes.
+        let huge_bytes = vec![b'y'; 10_000];
+        let err = Error::Exit {
+            program: "tool".into(),
+            code: 1,
+            stdout: String::from_utf8_lossy(&huge_bytes).into_owned(),
+            stderr: String::new(),
+            stdout_bytes: Some(huge_bytes),
+        };
+        let dbg = format!("{err:?}");
+        assert!(
+            dbg.contains("stdout_bytes: Some(<10000 bytes>)"),
+            "got: {dbg}"
+        );
+        assert!(
+            !dbg.contains(&"y".repeat(300)),
+            "must not dump the raw bytes: {dbg}"
+        );
+
+        let none_err = Error::Exit {
+            program: "tool".into(),
+            code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_bytes: None,
+        };
+        let dbg = format!("{none_err:?}");
+        assert!(dbg.contains("stdout_bytes: None"), "got: {dbg}");
     }
 
     #[test]
@@ -1297,6 +1418,7 @@ mod tests {
             code: 2,
             stdout: "CONFLICT (content): merge conflict in a.rs".into(),
             stderr: "warning: something\nfatal: boom\n".into(),
+            stdout_bytes: None,
         };
         assert_eq!(err.to_string(), "`git` exited with code 2: fatal: boom");
 
@@ -1306,6 +1428,7 @@ mod tests {
             code: 2,
             stdout: "CONFLICT (content): merge conflict in a.rs".into(),
             stderr: "   ".into(),
+            stdout_bytes: None,
         };
         assert_eq!(
             err.to_string(),
@@ -1320,6 +1443,7 @@ mod tests {
             code: 2,
             stdout: String::new(),
             stderr: "  \n ".into(),
+            stdout_bytes: None,
         };
         assert_eq!(err.to_string(), "`git` exited with code 2");
     }
@@ -1334,6 +1458,7 @@ mod tests {
             code: 1,
             stdout: String::new(),
             stderr: huge,
+            stdout_bytes: None,
         };
         let message = err.to_string();
         assert!(message.len() < 250, "capped, got {} bytes", message.len());
@@ -1350,6 +1475,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             stdout: String::new(),
             stderr: String::new(),
+            stdout_bytes: None,
         };
         assert_eq!(timeout.diagnostic(), None);
         let unsupported = Error::Unsupported {
@@ -1395,6 +1521,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             stdout: String::new(),
             stderr: "connecting…\nwaiting for lock held by pid 4123\n".into(),
+            stdout_bytes: None,
         };
         assert_eq!(
             timeout.diagnostic(),
@@ -1411,6 +1538,7 @@ mod tests {
             signal: Some(11),
             stdout: "processing batch 7\n".into(),
             stderr: String::new(),
+            stdout_bytes: None,
         };
         assert_eq!(signalled.diagnostic(), Some("processing batch 7"));
         assert_eq!(
@@ -1429,6 +1557,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             stdout: huge.clone(),
             stderr: huge.clone(),
+            stdout_bytes: None,
         };
         let dbg = format!("{timeout:?}");
         assert!(dbg.len() < 800, "Debug must be bounded, got {}", dbg.len());
@@ -1440,6 +1569,7 @@ mod tests {
             signal: None,
             stdout: huge.clone(),
             stderr: huge,
+            stdout_bytes: None,
         };
         let dbg = format!("{signalled:?}");
         assert!(dbg.len() < 800, "Debug must be bounded, got {}", dbg.len());
@@ -1530,6 +1660,7 @@ mod tests {
             signal: Some(9),
             stdout: String::new(),
             stderr: String::new(),
+            stdout_bytes: None,
         };
         assert_eq!(with_signal.to_string(), "`git` was terminated by signal 9");
         assert_eq!(with_signal.diagnostic(), None);
@@ -1542,6 +1673,7 @@ mod tests {
             signal: None,
             stdout: String::new(),
             stderr: String::new(),
+            stdout_bytes: None,
         };
         assert_eq!(no_signal.to_string(), "`git` was terminated by a signal");
     }
@@ -1669,6 +1801,7 @@ mod tests {
             code: 128,
             stdout: String::new(),
             stderr: "could not resolve host".into(),
+            stdout_bytes: None,
         };
         assert!(!exit.is_not_found() && !exit.is_permission_denied() && !exit.is_transient());
         let timeout = Error::Timeout {
@@ -1676,6 +1809,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             stdout: String::new(),
             stderr: String::new(),
+            stdout_bytes: None,
         };
         assert!(
             !timeout.is_transient(),

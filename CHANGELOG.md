@@ -12,7 +12,14 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- `Error::stdout_bytes() -> Option<&[u8]>` — the **exact** captured stdout bytes
+  for a checking-verb error (`Error::Exit` / `Timeout` / `Signalled`) built over
+  `output_bytes` (e.g. `output_bytes().await?.ensure_success()?`). Previously
+  those bytes existed nowhere after a consuming verb ran: `stdout` on the error
+  is a lossy UTF-8 decode, and the source `ProcessResult<Vec<u8>>` was already
+  gone. `None` on the text path (`output_string`/`run`/`checked`/…), where the
+  decoded `stdout` text is already complete and there is no separate raw form
+  to recover.
 
 ### Changed
 - **Breaking:** the data-carrying struct variants of `Error` — `Exit`, `Timeout`,
@@ -27,6 +34,13 @@ to a dated version section.
   fields to any of these variants (e.g. a structured `ResourceLimit`, or raw
   bytes alongside the lossy-UTF-8 `stdout`/`stderr` strings) without another
   breaking change.
+- **Breaking:** `Error::Exit`, `Error::Timeout`, and `Error::Signalled` each gain
+  a new field, `stdout_bytes: Option<Vec<u8>>` — read it through
+  `Error::stdout_bytes`, not by destructuring the variant directly (all three
+  are `#[non_exhaustive]` — see above). The `#[doc(hidden)]` constructors
+  (`Error::exit`/`timeout`/`signalled`) always build a text-path error
+  (`stdout_bytes: None`); only a real checking verb over `output_bytes`
+  populates it.
 
 ### Fixed
 -

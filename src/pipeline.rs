@@ -605,6 +605,7 @@ mod tests {
                 code,
                 stdout,
                 stderr,
+                ..
             }) => {
                 assert_eq!(program, "b", "diagnostics from the failing stage");
                 assert_eq!(code, 2);
