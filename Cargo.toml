@@ -23,12 +23,11 @@ categories = [
   "concurrency",
 ]
 # Keep the published crate lean: ship code, docs, and license — not the
-# dev/CI/agent tooling that only matters in the repo.
+# dev/CI/agent tooling that only matters in the repo. (.claude/, ideas/, and
+# decisions/ aren't listed here: they're untracked — see the global gitignore —
+# so cargo's git-tracked-files package source never sees them regardless.)
 exclude = [
-  ".claude/",
   ".github/",
-  "ideas/",
-  "decisions/",
   ".editorconfig",
   ".gitattributes",
   "AGENTS.md",
