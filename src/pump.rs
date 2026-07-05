@@ -1352,4 +1352,131 @@ mod tests {
             "tee fired"
         );
     }
+
+    /// Property tests over the pump + decoder for arbitrary input, chunked at
+    /// arbitrary read boundaries: the hand-written cases above pin known
+    /// tricky shapes (Shift-JIS, lone lead bytes, CRLF-at-a-boundary), while
+    /// these generate the shapes themselves so the invariants hold for any
+    /// chunking, not just the ones a human thought to write down.
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Split `bytes` into consecutive, non-empty chunks whose lengths cycle
+        /// through `sizes` (each clamped to at least 1 so `ChunkedReader` never
+        /// sees a zero-length chunk, which it — like a real EOF read — would
+        /// read as end of stream). An empty `bytes` yields no chunks.
+        fn to_chunks(bytes: &[u8], sizes: &[usize]) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut pos = 0;
+            let mut i = 0;
+            while pos < bytes.len() {
+                let size = sizes[i % sizes.len()].max(1);
+                let end = (pos + size).min(bytes.len());
+                out.push(bytes[pos..end].to_vec());
+                pos = end;
+                i += 1;
+            }
+            out
+        }
+
+        /// Arbitrary Unicode content for one "line": any scalar value except
+        /// `\n`/`\r` (so joining lines unambiguously marks line boundaries —
+        /// CRLF-terminator stripping is already covered by the hand-written
+        /// cases above) and except U+FEFF (BOM), which `with_bom_removal`
+        /// strips once *if it opens the stream* — a per-line oracle can't tell
+        /// a real leading BOM from content that merely starts with the same
+        /// scalar value, and that stripping is covered by the hand-written
+        /// BOM cases above too.
+        fn arb_line_content() -> impl Strategy<Value = String> {
+            prop::collection::vec(
+                any::<char>().prop_filter("no CR/LF/BOM in line content", |c| {
+                    !matches!(*c, '\n' | '\r' | '\u{feff}')
+                }),
+                0..12,
+            )
+            .prop_map(|chars| chars.into_iter().collect())
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            /// Arbitrary UTF-8 text, built from a known list of lines each properly
+            /// `\n`-terminated plus an optional non-empty unterminated tail, then
+            /// chunked at arbitrary byte boundaries (so multibyte UTF-8 sequences
+            /// routinely split across reads) and pumped through unbounded. The
+            /// pump must lose no line, count every line/byte exactly, and never
+            /// panic, regardless of chunking.
+            #[test]
+            fn pump_preserves_lines_and_counts_across_arbitrary_chunking(
+                lines in prop::collection::vec(arb_line_content(), 0..12),
+                tail in prop::option::of(
+                    arb_line_content().prop_filter("tail must be non-empty", |s| !s.is_empty())
+                ),
+                chunk_sizes in prop::collection::vec(1usize..=7, 1..20),
+            ) {
+                let mut text = String::new();
+                for line in &lines {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+                if let Some(t) = &tail {
+                    text.push_str(t);
+                }
+                let mut expected = lines.clone();
+                if let Some(t) = &tail {
+                    expected.push(t.clone());
+                }
+
+                let bytes = text.into_bytes();
+                let chunks = to_chunks(&bytes, &chunk_sizes);
+                let reader = ChunkedReader::new(chunks);
+                let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("current-thread runtime");
+                rt.block_on(pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()));
+
+                let expected_bytes: usize = expected.iter().map(String::len).sum();
+                prop_assert_eq!(sink.count(), expected.len(), "no line lost or fabricated");
+                prop_assert_eq!(sink.seen_bytes(), expected_bytes, "byte counter is exact");
+                prop_assert_eq!(sink.dropped(), 0, "unbounded policy drops nothing");
+                prop_assert_eq!(sink.drain(), expected, "every line reassembled correctly");
+            }
+
+            /// Arbitrary (possibly invalid) bytes, chunked at arbitrary boundaries
+            /// and pumped under a handful of encodings including multi-byte-unit
+            /// ones (Shift-JIS, UTF-16LE). `encoding_rs` decoders must never panic
+            /// on malformed input, and the pump's own counters must stay
+            /// internally consistent no matter how garbled the bytes are.
+            #[test]
+            fn pump_never_panics_on_arbitrary_bytes_under_any_chunking(
+                raw in prop::collection::vec(any::<u8>(), 0..512),
+                chunk_sizes in prop::collection::vec(1usize..=9, 1..20),
+                encoding_idx in 0usize..4,
+            ) {
+                const ENCODINGS: [&encoding_rs::Encoding; 4] = [
+                    encoding_rs::UTF_8,
+                    encoding_rs::SHIFT_JIS,
+                    encoding_rs::UTF_16LE,
+                    encoding_rs::WINDOWS_1252,
+                ];
+                let encoding = ENCODINGS[encoding_idx];
+
+                let chunks = to_chunks(&raw, &chunk_sizes);
+                let reader = ChunkedReader::new(chunks);
+                let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("current-thread runtime");
+                rt.block_on(pump_lines(reader, encoding, None, sink.clone()));
+
+                // Reaching here without panicking (or hanging) is the primary
+                // invariant. The counters must also stay internally consistent:
+                // the retained backlog can never exceed the total lines seen.
+                let lines = sink.drain();
+                prop_assert!(lines.len() <= sink.count());
+            }
+        }
+    }
 }
