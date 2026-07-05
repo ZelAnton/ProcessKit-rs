@@ -274,7 +274,10 @@ fn forking_stage(pidfile: &std::path::Path) -> Command {
     Command::new("sh")
         .args([
             "-c",
-            &format!("sleep 30 & printf %s \"$!\" > '{}'; sleep 30", pidfile.display()),
+            &format!(
+                "sleep 30 & printf %s \"$!\" > '{}'; sleep 30",
+                pidfile.display()
+            ),
         ])
         .unchecked_in_pipe()
         .timeout(Duration::from_millis(500))
@@ -292,14 +295,16 @@ async fn per_stage_timeout_on_a_forking_stage_frees_downstream() {
     // deliberately NO `Pipeline::timeout` backstop, and the stage is
     // `unchecked_in_pipe` so no proactive teardown fires either: a prompt finish is
     // proof the per-stage deadline alone reaped the grandchild, freeing downstream.
-    let pidfile = std::env::temp_dir()
-        .join(format!("processkit_t016_free_{}.pid", std::process::id()));
+    let pidfile =
+        std::env::temp_dir().join(format!("processkit_t016_free_{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&pidfile);
 
     let result = completes_within(
         Duration::from_secs(15),
         "forking pipeline stage bounded by a per-stage timeout",
-        forking_stage(&pidfile).pipe(Command::new("cat")).output_string(),
+        forking_stage(&pidfile)
+            .pipe(Command::new("cat"))
+            .output_string(),
     )
     .await
     .expect("a per-stage-timed-out chain still reports a result");
@@ -321,14 +326,16 @@ async fn per_stage_timeout_reaps_a_forking_stages_grandchild() {
     // *gone*, not merely detached. Before T-016 the shared-group per-stage kill
     // reached only the shell, so the grandchild survived; a per-stage sub-group
     // tears the whole subtree down.
-    let pidfile = std::env::temp_dir()
-        .join(format!("processkit_t016_reap_{}.pid", std::process::id()));
+    let pidfile =
+        std::env::temp_dir().join(format!("processkit_t016_reap_{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&pidfile);
 
-    completes_within(
+    let _ = completes_within(
         Duration::from_secs(15),
         "forking pipeline stage bounded by a per-stage timeout",
-        forking_stage(&pidfile).pipe(Command::new("cat")).output_string(),
+        forking_stage(&pidfile)
+            .pipe(Command::new("cat"))
+            .output_string(),
     )
     .await
     .expect("a per-stage-timed-out chain still reports a result");
