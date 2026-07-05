@@ -1856,7 +1856,9 @@ mod tests {
                 .configured_timeout(),
         );
         assert_eq!(
-            Command::new("x").timeout_opt(None).accepts_default_timeout(),
+            Command::new("x")
+                .timeout_opt(None)
+                .accepts_default_timeout(),
             Command::new("x").no_timeout().accepts_default_timeout(),
         );
         // Last-write-wins with an earlier timeout call.
