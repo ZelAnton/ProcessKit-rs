@@ -155,13 +155,14 @@ jobs:
       # Linux job alone never compiles windows.rs (Job Objects) or unix.rs
       # (macOS/BSD pgroup), so a newer-than-MSRV API there would slip through.
       # `check` doesn't link, so no foreign linkers are needed. Scoped to
-      # `--lib --bins --tests` (not `--all-targets`): that still covers
-      # windows.rs/unix.rs via `--lib`, but skips benches/examples, whose dev-deps
-      # (e.g. criterion -> alloca) need a real C toolchain to build their build
-      # scripts even under `check`, which this Linux runner doesn't have for
-      # these cross targets.
-      - run: cargo check --target x86_64-pc-windows-msvc --lib --bins --tests --all-features
-      - run: cargo check --target aarch64-apple-darwin --lib --bins --tests --all-features
+      # `--lib --bins` (not `--all-targets`): that still covers windows.rs/unix.rs
+      # via `--lib`, but skips benches/examples/tests. `--tests` is excluded too,
+      # not just benches/examples: even under `check`, compiling the `tests`
+      # target still resolves and builds the crate's dev-dependency closure
+      # (criterion -> alloca), and alloca's build script needs a real C
+      # toolchain, which this Linux runner doesn't have for these cross targets.
+      - run: cargo check --target x86_64-pc-windows-msvc --lib --bins --all-features
+      - run: cargo check --target aarch64-apple-darwin --lib --bins --all-features
 
   public-api:
     name: public-api diff
