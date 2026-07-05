@@ -143,41 +143,41 @@ pub processkit::Error::Cancelled
 pub processkit::Error::Cancelled::program: alloc::string::String
 pub processkit::Error::CassetteMiss
 pub processkit::Error::CassetteMiss::program: alloc::string::String
-pub processkit::Error::Exit
+#[non_exhaustive] pub processkit::Error::Exit
 pub processkit::Error::Exit::code: i32
 pub processkit::Error::Exit::program: alloc::string::String
 pub processkit::Error::Exit::stderr: alloc::string::String
 pub processkit::Error::Exit::stdout: alloc::string::String
 pub processkit::Error::Io(std::io::error::Error)
-pub processkit::Error::NotFound
+#[non_exhaustive] pub processkit::Error::NotFound
 pub processkit::Error::NotFound::program: alloc::string::String
 pub processkit::Error::NotFound::searched: core::option::Option<alloc::string::String>
 pub processkit::Error::NotReady
 pub processkit::Error::NotReady::program: alloc::string::String
 pub processkit::Error::NotReady::timeout: core::time::Duration
-pub processkit::Error::OutputTooLarge
+#[non_exhaustive] pub processkit::Error::OutputTooLarge
 pub processkit::Error::OutputTooLarge::byte_limit: core::option::Option<usize>
 pub processkit::Error::OutputTooLarge::line_limit: core::option::Option<usize>
 pub processkit::Error::OutputTooLarge::program: alloc::string::String
 pub processkit::Error::OutputTooLarge::total_bytes: usize
 pub processkit::Error::OutputTooLarge::total_lines: usize
-pub processkit::Error::Parse
+#[non_exhaustive] pub processkit::Error::Parse
 pub processkit::Error::Parse::message: alloc::string::String
 pub processkit::Error::Parse::program: alloc::string::String
-pub processkit::Error::ResourceLimit
+#[non_exhaustive] pub processkit::Error::ResourceLimit
 pub processkit::Error::ResourceLimit::message: alloc::string::String
-pub processkit::Error::Signalled
+#[non_exhaustive] pub processkit::Error::Signalled
 pub processkit::Error::Signalled::program: alloc::string::String
 pub processkit::Error::Signalled::signal: core::option::Option<i32>
 pub processkit::Error::Signalled::stderr: alloc::string::String
 pub processkit::Error::Signalled::stdout: alloc::string::String
-pub processkit::Error::Spawn
+#[non_exhaustive] pub processkit::Error::Spawn
 pub processkit::Error::Spawn::program: alloc::string::String
 pub processkit::Error::Spawn::source: std::io::error::Error
-pub processkit::Error::Stdin
+#[non_exhaustive] pub processkit::Error::Stdin
 pub processkit::Error::Stdin::program: alloc::string::String
 pub processkit::Error::Stdin::source: std::io::error::Error
-pub processkit::Error::Timeout
+#[non_exhaustive] pub processkit::Error::Timeout
 pub processkit::Error::Timeout::program: alloc::string::String
 pub processkit::Error::Timeout::stderr: alloc::string::String
 pub processkit::Error::Timeout::stdout: alloc::string::String

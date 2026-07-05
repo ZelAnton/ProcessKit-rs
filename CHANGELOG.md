@@ -15,7 +15,18 @@ to a dated version section.
 -
 
 ### Changed
--
+- **Breaking:** the data-carrying struct variants of `Error` — `Exit`, `Timeout`,
+  `Signalled`, `Spawn`, `NotFound`, `Parse`, `OutputTooLarge`, `Stdin`, and
+  `ResourceLimit` (`limits` feature) — are now individually `#[non_exhaustive]`.
+  A struct-literal construction or a field-exhaustive destructuring of any of
+  these variants outside the crate no longer compiles; match on the variant
+  (with `..` in the pattern) and read fields through the existing accessors
+  (`program()`, `stdout()`/`stderr()`/`combined()`, `code()`, `signal()`,
+  `is_*()`) or the `#[doc(hidden)]` constructors (`Error::exit`/`timeout`/
+  `signalled`) instead. This is prep work for 2.0: it lets a future release add
+  fields to any of these variants (e.g. a structured `ResourceLimit`, or raw
+  bytes alongside the lossy-UTF-8 `stdout`/`stderr` strings) without another
+  breaking change.
 
 ### Fixed
 -

@@ -24,6 +24,7 @@ pub enum Error {
     /// The child process could not be started (binary not found, permission
     /// denied, …).
     #[error("could not start `{program}`: {source}")]
+    #[non_exhaustive]
     Spawn {
         /// The program we tried to launch.
         program: String,
@@ -55,6 +56,7 @@ pub enum Error {
     /// says "on PATH" only when a `PATH` search actually happened (`searched` is
     /// `Some`); a path-form or customized-PATH program reads simply "not found".
     #[error("{}", display_not_found(program, searched))]
+    #[non_exhaustive]
     NotFound {
         /// The program name that was looked up.
         program: String,
@@ -99,6 +101,7 @@ pub enum Error {
     /// with code 2: fatal: boom `` — actionable in a log line without dumping
     /// multi-KiB streams into it.
     #[error("{}", display_exit(program, *code, stdout, stderr))]
+    #[non_exhaustive]
     Exit {
         /// The program that exited non-zero.
         program: String,
@@ -134,6 +137,7 @@ pub enum Error {
     /// [`Exit`](Error::Exit) — so a log line stays actionable without dumping
     /// the captured streams.
     #[error("{}", display_timeout(program, *timeout, stdout, stderr))]
+    #[non_exhaustive]
     Timeout {
         /// The program that timed out.
         program: String,
@@ -163,6 +167,7 @@ pub enum Error {
     #[error(
         "`{program}` output exceeded its capture ceiling ({total_lines} lines, {total_bytes} bytes total)"
     )]
+    #[non_exhaustive]
     OutputTooLarge {
         /// The program whose output exceeded the ceiling.
         program: String,
@@ -214,6 +219,7 @@ pub enum Error {
     /// `Debug` bound it to a 200-byte preview; the complete text stays
     /// reachable via the public field.
     #[error("{}", display_parse(program, message))]
+    #[non_exhaustive]
     Parse {
         /// The program whose output failed to parse.
         program: String,
@@ -233,6 +239,7 @@ pub enum Error {
     /// is raised rather than leaving the tree silently unbounded.
     #[cfg(feature = "limits")]
     #[error("could not enforce resource limits: {message}")]
+    #[non_exhaustive]
     ResourceLimit {
         /// Human-readable detail of which limit could not be enforced and why.
         message: String,
@@ -292,6 +299,7 @@ pub enum Error {
     /// [`diagnostic`](Self::diagnostic) and the public fields. The one-line
     /// `Display` appends the bounded diagnostic tail, like [`Exit`](Error::Exit).
     #[error("{}", display_signalled(program, *signal, stdout, stderr))]
+    #[non_exhaustive]
     Signalled {
         /// The program that was killed by a signal.
         program: String,
@@ -326,6 +334,7 @@ pub enum Error {
     /// *succeeded* — a blanket retry would re-run a command that worked. Inspect
     /// `source` directly if a stdin-specific retry is wanted.
     #[error("failed to write to `{program}` stdin: {source}")]
+    #[non_exhaustive]
     Stdin {
         /// The program whose standard-input write failed.
         program: String,
@@ -633,11 +642,11 @@ impl Error {
 
     /// Construct an [`Exit`](Error::Exit) — a `#[doc(hidden)]` convenience for
     /// custom [`ProcessRunner`](crate::ProcessRunner) doubles and error-classifier
-    /// tests, so they stop spelling out the struct literal (which any future field
-    /// addition to the variant — a 2.0 change, see the variant-`#[non_exhaustive]`
-    /// plan — would break) and go through one insulated constructor instead. Off
-    /// the documented surface, but `pub` so downstream test code can call it;
-    /// semver-covered like any public item.
+    /// tests, so they stop spelling out the struct literal (which the variant's
+    /// `#[non_exhaustive]` already rejects outside this crate, and which a future
+    /// field addition would otherwise break) and go through one insulated
+    /// constructor instead. Off the documented surface, but `pub` so downstream
+    /// test code can call it; semver-covered like any public item.
     #[doc(hidden)]
     pub fn exit(
         program: impl Into<String>,
