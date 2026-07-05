@@ -532,7 +532,7 @@ impl Cgroup {
     fn apply_limits(&self, parent: &Path, limits: &ResourceLimits) -> io::Result<()> {
         // The controllers each requested limit needs.
         let mut needed: Vec<&str> = Vec::new();
-        if limits.memory_max.is_some() {
+        if limits.max_memory.is_some() {
             needed.push("memory");
         }
         if limits.max_processes.is_some() {
@@ -587,7 +587,7 @@ impl Cgroup {
             })?;
         }
 
-        if let Some(bytes) = limits.memory_max {
+        if let Some(bytes) = limits.max_memory {
             std::fs::write(self.path.join("memory.max"), bytes.to_string())?;
         }
         if let Some(n) = limits.max_processes {

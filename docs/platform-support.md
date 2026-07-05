@@ -86,7 +86,7 @@ than swallowing it — consistent with the "never silently skipped" philosophy; 
 
 | Capability | Windows | Linux cgroup | Linux pgroup | macOS/BSD |
 |---|---|---|---|---|
-| `memory_max` (whole tree) | ✅ | ✅ | ❌ | ❌ |
+| `max_memory` (whole tree) | ✅ | ✅ | ❌ | ❌ |
 | `max_processes` | ✅ | ✅ | ❌ | ❌ |
 | `cpu_quota` | 🟡 approximate | ✅ | ❌ | ❌ |
 

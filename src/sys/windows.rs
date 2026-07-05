@@ -112,7 +112,7 @@ impl Job {
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         #[cfg(feature = "limits")]
         {
-            if let Some(bytes) = limits.memory_max {
+            if let Some(bytes) = limits.max_memory {
                 info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
                 // `JobMemoryLimit` is SIZE_T; saturate rather than wrap on a 32-bit host.
                 info.JobMemoryLimit = usize::try_from(bytes).unwrap_or(usize::MAX);

@@ -3,7 +3,7 @@
 /// Resource limits enforced on a process group as a whole.
 ///
 /// Set these via [`ProcessGroupOptions`](crate::ProcessGroupOptions) (the
-/// `memory_max` / `max_processes` / `cpu_quota` builders, or by setting the
+/// `max_memory` / `max_processes` / `cpu_quota` builders, or by setting the
 /// public fields on a `ResourceLimits::default()` value) before creating the
 /// group. Every limit bounds the **whole tree**, not a single process, and is
 /// applied to the kernel container at creation time.
@@ -45,7 +45,7 @@
 pub struct ResourceLimits {
     /// Maximum total memory for the tree, in bytes. `None` leaves memory
     /// unbounded.
-    pub memory_max: Option<u64>,
+    pub max_memory: Option<u64>,
     /// Maximum number of live processes in the tree. `None` leaves the count
     /// unbounded.
     ///
@@ -74,13 +74,13 @@ pub struct ResourceLimits {
 impl ResourceLimits {
     /// Whether any limit is set (i.e. the group needs a limit-capable mechanism).
     pub(crate) fn any(&self) -> bool {
-        self.memory_max.is_some() || self.max_processes.is_some() || self.cpu_quota.is_some()
+        self.max_memory.is_some() || self.max_processes.is_some() || self.cpu_quota.is_some()
     }
 }
 
 /// Which [`ResourceLimits`] field an
 /// [`Error::ResourceLimit`](crate::Error::ResourceLimit) failure is about —
-/// [`Memory`](Self::Memory) for [`memory_max`](ResourceLimits::memory_max),
+/// [`Memory`](Self::Memory) for [`max_memory`](ResourceLimits::max_memory),
 /// [`Processes`](Self::Processes) for
 /// [`max_processes`](ResourceLimits::max_processes), [`Cpu`](Self::Cpu) for
 /// [`cpu_quota`](ResourceLimits::cpu_quota).
@@ -88,12 +88,12 @@ impl ResourceLimits {
 /// When a caller requests more than one limit at once and the failure can't be
 /// pinned to a single one (e.g. a Linux cgroup that can't enable any controller
 /// because this process isn't at the real hierarchy root), `kind` names the
-/// **first** requested limit in `memory_max`, `max_processes`, `cpu_quota` order
+/// **first** requested limit in `max_memory`, `max_processes`, `cpu_quota` order
 /// — a fixed, documented tie-break rather than an arbitrary one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LimitKind {
-    /// [`ResourceLimits::memory_max`].
+    /// [`ResourceLimits::max_memory`].
     Memory,
     /// [`ResourceLimits::max_processes`].
     Processes,
@@ -108,7 +108,7 @@ pub enum LimitKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LimitReason {
-    /// The requested value itself is nonsensical (e.g. `memory_max(0)`,
+    /// The requested value itself is nonsensical (e.g. `max_memory(0)`,
     /// a non-finite or non-positive `cpu_quota`) — rejected before the OS is
     /// ever touched.
     Invalid,

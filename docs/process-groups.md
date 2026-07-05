@@ -221,7 +221,7 @@ use processkit::{Command, ProcessGroup, ProcessGroupOptions};
 
 let group = ProcessGroup::with_options(
     ProcessGroupOptions::default()
-        .memory_max(512 * 1024 * 1024) // bytes, whole tree
+        .max_memory(512 * 1024 * 1024) // bytes, whole tree
         .max_processes(64)             // fork-bomb ceiling
         .cpu_quota(0.5),               // half of one core
 )?;
@@ -239,7 +239,7 @@ need a real container; when a requested cap can't be enforced — no Job
 Object/cgroup, or a Linux cgroup whose controllers can't be enabled —
 `with_options` returns `Error::ResourceLimit { kind, reason, detail }` instead
 of handing back a silently-unbounded group: `kind` names the limit
-(`memory_max`/`max_processes`/`cpu_quota`), `reason` says whether the value was
+(`max_memory`/`max_processes`/`cpu_quota`), `reason` says whether the value was
 simply invalid, the platform has no whole-tree mechanism at all
 (`Unsupported`), or a mechanism exists but rejected this request
 (`Unenforceable`) — branch on these instead of parsing `detail`. On Linux this

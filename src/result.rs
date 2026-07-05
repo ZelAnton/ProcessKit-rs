@@ -400,17 +400,17 @@ impl<T> ProcessResult<T> {
     /// rather than feeding a parser a truncated tail. The lenient capture verbs
     /// (`output_string`/`output_bytes`/`checked`) do **not** call it — they
     /// return the result with [`truncated`](Self::truncated) set so the caller
-    /// decides. `line_limit`/`byte_limit` are the command's configured ceilings.
+    /// decides. `max_lines`/`max_bytes` are the command's configured ceilings.
     pub(crate) fn reject_if_truncated(
         &self,
-        line_limit: Option<usize>,
-        byte_limit: Option<usize>,
+        max_lines: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> Result<(), Error> {
         if self.truncated {
             return Err(Error::OutputTooLarge {
                 program: self.program.clone(),
-                line_limit,
-                byte_limit,
+                max_lines,
+                max_bytes,
                 total_lines: self.total_lines,
                 total_bytes: self.total_bytes,
             });
@@ -450,10 +450,16 @@ impl ProcessResult<String> {
     /// stream by hand each time. **Allocation-free** (it never materializes a
     /// lowercased copy of a possibly-large captured stream). The two streams are
     /// searched independently, so a needle never matches across the stdout/stderr
-    /// boundary. An empty `needles` slice is `false`; an empty `""` needle follows
-    /// [`str::contains`] (always present).
-    pub fn output_contains_any(&self, needles: &[&str]) -> bool {
-        needles.iter().any(|needle| {
+    /// boundary. An empty `needles` iterator is `false`; an empty `""` needle
+    /// follows [`str::contains`] (always present).
+    ///
+    /// Accepts any iterable of string-like items — `&["a", "b"]`, `Vec<String>`,
+    /// a single `["a"]` array, … — matching the other multi-input builders
+    /// ([`Command::args`](crate::Command::args),
+    /// [`Command::envs`](crate::Command::envs)).
+    pub fn output_contains_any(&self, needles: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
+        needles.into_iter().any(|needle| {
+            let needle = needle.as_ref();
             contains_ascii_ci(&self.stdout, needle) || contains_ascii_ci(&self.stderr, needle)
         })
     }
@@ -847,14 +853,17 @@ mod tests {
             None,
         );
         // Case-insensitive; matches a marker on stdout OR stderr; any-of semantics.
-        assert!(r.output_contains_any(&["no checks reported"]));
-        assert!(r.output_contains_any(&["http 401"]));
-        assert!(r.output_contains_any(&["missing", "HTTP 401"]));
-        assert!(!r.output_contains_any(&["nothing to commit"]));
-        // An empty needle slice matches nothing; an empty `""` needle follows
+        assert!(r.output_contains_any(["no checks reported"]));
+        assert!(r.output_contains_any(["http 401"]));
+        assert!(r.output_contains_any(["missing", "HTTP 401"]));
+        assert!(!r.output_contains_any(["nothing to commit"]));
+        // An empty needle iterator matches nothing; an empty `""` needle follows
         // `str::contains` (always present).
-        assert!(!r.output_contains_any(&[]));
-        assert!(r.output_contains_any(&[""]));
+        assert!(!r.output_contains_any([] as [&str; 0]));
+        assert!(r.output_contains_any([""]));
+        // A `Vec` and a slice work too — any `IntoIterator<Item: AsRef<str>>` does.
+        assert!(r.output_contains_any(vec!["http 401".to_owned()]));
+        assert!(r.output_contains_any(["missing", "HTTP 401"].as_slice()));
 
         // The streams are searched independently — a needle never matches across
         // the stdout/stderr seam.
@@ -865,8 +874,8 @@ mod tests {
             Outcome::Exited(1),
             None,
         );
-        assert!(!seam.output_contains_any(&["foobar"]));
-        assert!(!seam.output_contains_any(&["foo\nbar"]));
+        assert!(!seam.output_contains_any(["foobar"]));
+        assert!(!seam.output_contains_any(["foo\nbar"]));
     }
 
     #[test]
@@ -1044,14 +1053,14 @@ mod tests {
         match truncated.reject_if_truncated(Some(100), None) {
             Err(Error::OutputTooLarge {
                 program,
-                line_limit,
-                byte_limit,
+                max_lines,
+                max_bytes,
                 total_lines,
                 total_bytes,
             }) => {
                 assert_eq!(program, "p");
-                assert_eq!(line_limit, Some(100));
-                assert_eq!(byte_limit, None);
+                assert_eq!(max_lines, Some(100));
+                assert_eq!(max_bytes, None);
                 assert_eq!(total_lines, 5000);
                 assert_eq!(total_bytes, 1_000_000);
             }

@@ -157,8 +157,8 @@ pub processkit::Error::NotReady
 pub processkit::Error::NotReady::program: alloc::string::String
 pub processkit::Error::NotReady::timeout: core::time::Duration
 #[non_exhaustive] pub processkit::Error::OutputTooLarge
-pub processkit::Error::OutputTooLarge::byte_limit: core::option::Option<usize>
-pub processkit::Error::OutputTooLarge::line_limit: core::option::Option<usize>
+pub processkit::Error::OutputTooLarge::max_bytes: core::option::Option<usize>
+pub processkit::Error::OutputTooLarge::max_lines: core::option::Option<usize>
 pub processkit::Error::OutputTooLarge::program: alloc::string::String
 pub processkit::Error::OutputTooLarge::total_bytes: usize
 pub processkit::Error::OutputTooLarge::total_lines: usize
@@ -708,8 +708,8 @@ pub processkit::ProcessGroupOptions::limits: processkit::ResourceLimits
 pub processkit::ProcessGroupOptions::shutdown_timeout: core::time::Duration
 impl processkit::ProcessGroupOptions
 pub fn processkit::ProcessGroupOptions::cpu_quota(self, f64) -> Self
+pub fn processkit::ProcessGroupOptions::max_memory(self, u64) -> Self
 pub fn processkit::ProcessGroupOptions::max_processes(self, u32) -> Self
-pub fn processkit::ProcessGroupOptions::memory_max(self, u64) -> Self
 impl processkit::ProcessGroupOptions
 pub fn processkit::ProcessGroupOptions::escalate_to_kill(self, bool) -> Self
 pub fn processkit::ProcessGroupOptions::shutdown_timeout(self, core::time::Duration) -> Self
@@ -750,7 +750,7 @@ pub struct processkit::ProcessResult<T>
 impl processkit::ProcessResult<alloc::string::String>
 pub fn processkit::ProcessResult<alloc::string::String>::combined(&self) -> alloc::string::String
 pub fn processkit::ProcessResult<alloc::string::String>::diagnostic(&self) -> &str
-pub fn processkit::ProcessResult<alloc::string::String>::output_contains_any(&self, &[&str]) -> bool
+pub fn processkit::ProcessResult<alloc::string::String>::output_contains_any(&self, impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::AsRef<str>>) -> bool
 impl<T> processkit::ProcessResult<T>
 pub fn processkit::ProcessResult<T>::code(&self) -> core::option::Option<i32>
 pub fn processkit::ProcessResult<T>::duration(&self) -> core::time::Duration
@@ -797,8 +797,8 @@ impl core::panic::unwind_safe::RefUnwindSafe for processkit::ProcessStdin
 impl core::panic::unwind_safe::UnwindSafe for processkit::ProcessStdin
 #[non_exhaustive] pub struct processkit::ResourceLimits
 pub processkit::ResourceLimits::cpu_quota: core::option::Option<f64>
+pub processkit::ResourceLimits::max_memory: core::option::Option<u64>
 pub processkit::ResourceLimits::max_processes: core::option::Option<u32>
-pub processkit::ResourceLimits::memory_max: core::option::Option<u64>
 impl core::clone::Clone for processkit::ResourceLimits
 pub fn processkit::ResourceLimits::clone(&self) -> processkit::ResourceLimits
 impl core::cmp::PartialEq for processkit::ResourceLimits

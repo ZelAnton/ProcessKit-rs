@@ -12,7 +12,7 @@ async fn limits_are_enforced_or_rejected_per_platform() {
     // Object / Linux cgroup) or fail fast with `Error::ResourceLimit` — never
     // silently hand back an unbounded group.
     let res =
-        ProcessGroup::with_options(ProcessGroupOptions::default().memory_max(64 * 1024 * 1024));
+        ProcessGroup::with_options(ProcessGroupOptions::default().max_memory(64 * 1024 * 1024));
     if cfg!(windows) {
         let group = res.expect("Windows Job Objects enforce a memory cap");
         assert!(matches!(group.mechanism(), Mechanism::JobObject));
@@ -77,7 +77,7 @@ async fn windows_memory_and_cpu_limits_accept_and_run() {
     // short-lived child.
     let group = ProcessGroup::with_options(
         ProcessGroupOptions::default()
-            .memory_max(512 * 1024 * 1024)
+            .max_memory(512 * 1024 * 1024)
             .cpu_quota(0.5),
     )
     .expect("create capped group");

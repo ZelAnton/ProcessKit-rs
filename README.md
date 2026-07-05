@@ -195,7 +195,7 @@ use processkit::{Command, ProcessGroup, ProcessGroupOptions};
 async fn main() -> processkit::Result<()> {
     let group = ProcessGroup::with_options(
         ProcessGroupOptions::default()
-            .memory_max(512 * 1024 * 1024) // 512 MiB across the tree
+            .max_memory(512 * 1024 * 1024) // 512 MiB across the tree
             .max_processes(64)
             .cpu_quota(0.5),               // half of one core
     )?;

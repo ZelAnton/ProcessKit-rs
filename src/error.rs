@@ -186,10 +186,10 @@ pub enum Error {
         program: String,
         /// The configured line ceiling, if any
         /// (`OutputBufferPolicy::max_lines`).
-        line_limit: Option<usize>,
+        max_lines: Option<usize>,
         /// The configured byte ceiling, if any
         /// (`OutputBufferPolicy::max_bytes`).
-        byte_limit: Option<usize>,
+        max_bytes: Option<usize>,
         /// Total lines that arrived (retained + dropped).
         total_lines: usize,
         /// Total bytes of decoded line text seen (retained + dropped) — the
@@ -871,15 +871,15 @@ impl fmt::Debug for Error {
                 .finish(),
             Error::OutputTooLarge {
                 program,
-                line_limit,
-                byte_limit,
+                max_lines,
+                max_bytes,
                 total_lines,
                 total_bytes,
             } => f
                 .debug_struct("OutputTooLarge")
                 .field("program", program)
-                .field("line_limit", line_limit)
-                .field("byte_limit", byte_limit)
+                .field("max_lines", max_lines)
+                .field("max_bytes", max_bytes)
                 .field("total_lines", total_lines)
                 .field("total_bytes", total_bytes)
                 .finish(),

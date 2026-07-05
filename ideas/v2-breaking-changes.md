@@ -19,13 +19,15 @@
   `LimitReason::Unsupported`; every other `Job::new` failure to `Unenforceable`;
   `validate_limits` rejections to `Invalid`), not a parse of `validate_limits` text alone.
   (`src/error.rs`, `src/group.rs`, `src/limits.rs`.)
-- **G — `OutputTooLarge` field names.** Rename `line_limit`/`byte_limit` →
-  `max_lines`/`max_bytes` to match `OutputBufferPolicy`. Breaking (struct-variant field
-  rename; no clean alias path). (`src/error.rs:161`, `src/buffer.rs`.)
-- **H — one word order for the resource-limit knobs.** Rename
+- **G — `OutputTooLarge` field names — IMPLEMENTED.** Renamed `line_limit`/`byte_limit`
+  → `max_lines`/`max_bytes` to match `OutputBufferPolicy` — the variant, its manual
+  `Debug`, and every constructor (`src/running/mod.rs`, `src/running/stream.rs`,
+  `ProcessResult::reject_if_truncated`) use the new names. (`src/error.rs`.)
+- **H — one word order for the resource-limit knobs — IMPLEMENTED.** Renamed
   `ResourceLimits::memory_max` → `max_memory` (to match `max_processes`), field **and**
-  builder together (the builder alone is aliasable, but splitting them creates a transient
-  field/builder mismatch). (`src/limits.rs`, `src/group.rs`.)
+  builder (`ProcessGroupOptions::max_memory`) together, including the Linux/Windows
+  backends and `validate_limits`. (`src/limits.rs`, `src/group.rs`, `src/sys/linux.rs`,
+  `src/sys/windows.rs`.)
 
 ## Deprecated-alias removals (added in 1.1.0, remove in 2.0)
 
@@ -241,10 +243,10 @@ can fail on the real runner.*
 
 ## Low-priority / opportunistic
 
-- **Consider widening `ProcessResult::output_contains_any(&[&str])`** to
-  `impl IntoIterator<Item = impl AsRef<str>>` to match the crate's other multi-value
-  inputs (`args`/`envs`/`ok_codes`). Deliberately kept as `&[&str]` in 1.x: the needles
-  are compile-time CLI-grammar literals (not runtime collections), `&[&str]` reads
-  cleanest for that, and empty-slice call sites (used in tests) infer cleanly — whereas
-  the generic form does not. Breaking-but-source-compatible for literal call sites, so a
-  cheap 2.0 change *if* a `Vec<String>`-needles consumer ever appears. (`src/result.rs`.)
+- **Widen `ProcessResult::output_contains_any(&[&str])` — IMPLEMENTED.** Now
+  `impl IntoIterator<Item = impl AsRef<str>>`, matching the crate's other multi-value
+  inputs (`args`/`envs`/`ok_codes`) — a bare array, `Vec<String>`, or slice all work
+  directly. Source-compatible for literal call sites (`&["a"]` still coerces); the one
+  wrinkle is an empty-literal call site, which now needs a type annotation (e.g.
+  `[] as [&str; 0]`) since the generic form can't infer the element type from `&[]`
+  alone. (`src/result.rs`.)

@@ -99,7 +99,7 @@
 //! - **`process-control`** *(default)* — tree control beyond contain+kill:
 //!   `Signal` and `ProcessGroup::{signal, suspend, resume, members, adopt}`.
 //! - **`limits`** — whole-tree resource caps: `ResourceLimits`, the
-//!   `memory_max`/`max_processes`/`cpu_quota` builders on
+//!   `max_memory`/`max_processes`/`cpu_quota` builders on
 //!   [`ProcessGroupOptions`], and `Error::ResourceLimit`. Implies `stats`.
 //! - **`mock`** — the `mockall`-generated `testing::MockRunner` for
 //!   consumers' tests. Its

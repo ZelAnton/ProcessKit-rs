@@ -129,7 +129,7 @@ default = ["process-control"]
 # dependency (on Windows, the ProcessStatus FFI used solely for the peak-memory
 # readout), and metrics are a specialized add-on most callers don't need.
 stats = ["windows-sys/Win32_System_ProcessStatus"]
-# Whole-tree resource caps: `ResourceLimits`, the `memory_max`/`max_processes`/
+# Whole-tree resource caps: `ResourceLimits`, the `max_memory`/`max_processes`/
 # `cpu_quota` builders on `ProcessGroupOptions`, and `Error::ResourceLimit`.
 # Implies `stats` as policy — resource read and write travel together toward the
 # possible `processkit-resource` split (see ideas/) — not as a code dependency.

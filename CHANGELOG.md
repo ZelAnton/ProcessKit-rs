@@ -56,6 +56,17 @@ to a dated version section.
   `Error::ResourceLimit { message }` → `Error::ResourceLimit { detail, .. }` (or
   use the new `limit_kind()`/`limit_reason()` accessors instead of
   destructuring the `#[non_exhaustive]` variant at all).
+- **Breaking:** an API-consistency batch —
+  - `Error::OutputTooLarge`'s fields `line_limit`/`byte_limit` are renamed
+    `max_lines`/`max_bytes`, matching the `OutputBufferPolicy` knobs they
+    report (what you configure is now what you read back).
+  - `ResourceLimits::memory_max` (field and builder, `limits` feature) is
+    renamed `max_memory`, matching the `max_processes` word order.
+  - `ProcessResult::output_contains_any` now takes
+    `impl IntoIterator<Item = impl AsRef<str>>` instead of `&[&str]`, matching
+    the crate's other multi-input builders (`Command::args`/`envs`,
+    `Command::ok_codes`) — a bare array (`["a", "b"]`), a `Vec<String>`, or a
+    slice all work directly, without an explicit `&`.
 
 ### Fixed
 -

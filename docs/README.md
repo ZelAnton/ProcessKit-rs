@@ -55,7 +55,7 @@ guarantee is unconditional in every configuration.
 |---|---|---|---|
 | `stats` | off | `ProcessGroup::stats` / `sample_stats`, `RunningProcess::cpu_time` / `peak_memory_bytes` / `profile` | `windows-sys/ProcessStatus` (Windows) |
 | `process-control` | **on** | `Signal`, `ProcessGroup::{signal, suspend, resume, members, adopt}` | — |
-| `limits` | off | Whole-tree resource caps on `ProcessGroupOptions` (`memory_max` / `max_processes` / `cpu_quota`), `Error::ResourceLimit`; implies `stats` | — |
+| `limits` | off | Whole-tree resource caps on `ProcessGroupOptions` (`max_memory` / `max_processes` / `cpu_quota`), `Error::ResourceLimit`; implies `stats` | — |
 | `mock` | off | A `mockall`-generated `MockRunner` for expectation-style tests (test-only; its `expect_*` surface is **semver-exempt**, tracking `mockall` — prefer `ScriptedRunner`/`RecordingRunner` for a stable double) | `mockall` |
 | `tracing` | off | Events on the `processkit` target: spawn/exit, timeout & cancel firing, group teardown, retries, supervisor storms, teardown anomalies (never argv/env) | `tracing` |
 | `record` | off | `RecordReplayRunner` JSON cassettes over the runner seam | `serde`, `serde_json` |

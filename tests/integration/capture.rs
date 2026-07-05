@@ -703,12 +703,12 @@ async fn fail_loud_buffer_surfaces_output_too_large() {
         .expect_err("5 lines over a 2-line fail-loud cap must error");
     match err {
         processkit::Error::OutputTooLarge {
-            line_limit,
+            max_lines,
             total_lines,
             ..
         } => {
             assert_eq!(
-                line_limit,
+                max_lines,
                 Some(2),
                 "the configured line cap is reported: {err:?}"
             );
@@ -755,7 +755,7 @@ async fn checking_verbs_reject_truncated_output_e2e() {
         matches!(
             err,
             processkit::Error::OutputTooLarge {
-                line_limit: Some(2),
+                max_lines: Some(2),
                 ..
             }
         ),

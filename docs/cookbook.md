@@ -296,7 +296,7 @@ use processkit::{ProcessGroup, ProcessGroupOptions};
 // Cap the whole tree (requires the `limits` feature; Windows Job / Linux cgroup):
 let group = ProcessGroup::with_options(
     ProcessGroupOptions::default()
-        .memory_max(512 * 1024 * 1024)
+        .max_memory(512 * 1024 * 1024)
         .max_processes(64)
         .cpu_quota(0.5),
 )?;

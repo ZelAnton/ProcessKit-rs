@@ -722,8 +722,8 @@ impl RunningProcess {
         if stderr_sink.overflowed() {
             return Err(crate::Error::OutputTooLarge {
                 program: self.program.clone(),
-                line_limit: self.buffer.max_lines,
-                byte_limit: self.buffer.max_bytes,
+                max_lines: self.buffer.max_lines,
+                max_bytes: self.buffer.max_bytes,
                 total_lines: stderr_sink.count(),
                 total_bytes: stderr_sink.seen_bytes(),
             });
@@ -1003,8 +1003,8 @@ impl RunningProcess {
                 if sink.overflowed() {
                     return Err(crate::Error::OutputTooLarge {
                         program: self.program.clone(),
-                        line_limit: self.buffer.max_lines,
-                        byte_limit: self.buffer.max_bytes,
+                        max_lines: self.buffer.max_lines,
+                        max_bytes: self.buffer.max_bytes,
                         total_lines: sink.count(),
                         total_bytes: sink.seen_bytes(),
                     });

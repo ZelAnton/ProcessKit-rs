@@ -76,8 +76,8 @@ impl ProcessGroupOptions {
     /// Cap the tree's total memory at `bytes`. See [`ResourceLimits`] for platform
     /// support.
     #[must_use]
-    pub fn memory_max(mut self, bytes: u64) -> Self {
-        self.limits.memory_max = Some(bytes);
+    pub fn max_memory(mut self, bytes: u64) -> Self {
+        self.limits.max_memory = Some(bytes);
         self
     }
 
@@ -565,11 +565,11 @@ fn map_unsupported(source: std::io::Error, operation: impl Into<String>) -> Erro
 /// kernel error.
 #[cfg(feature = "limits")]
 fn validate_limits(limits: &ResourceLimits) -> Result<()> {
-    if limits.memory_max == Some(0) {
+    if limits.max_memory == Some(0) {
         return Err(Error::ResourceLimit {
             kind: LimitKind::Memory,
             reason: LimitReason::Invalid,
-            detail: "memory_max must be greater than 0".into(),
+            detail: "max_memory must be greater than 0".into(),
         });
     }
     if limits.max_processes == Some(0) {
@@ -593,13 +593,13 @@ fn validate_limits(limits: &ResourceLimits) -> Result<()> {
 
 /// Which limit an enforcement failure (as opposed to a `validate_limits`
 /// rejection) should be attributed to, when the backend's error can't be
-/// pinned to a single one: the **first** requested limit in `memory_max`,
+/// pinned to a single one: the **first** requested limit in `max_memory`,
 /// `max_processes`, `cpu_quota` order — see [`LimitKind`]'s doc for why this
 /// fixed tie-break is honest rather than arbitrary. `limits.any()` is a
 /// precondition (checked by the caller), so at least one arm always matches.
 #[cfg(feature = "limits")]
 fn first_requested_kind(limits: &ResourceLimits) -> LimitKind {
-    if limits.memory_max.is_some() {
+    if limits.max_memory.is_some() {
         LimitKind::Memory
     } else if limits.max_processes.is_some() {
         LimitKind::Processes
@@ -615,10 +615,10 @@ mod tests {
     #[test]
     fn builders_set_limits() {
         let opts = ProcessGroupOptions::default()
-            .memory_max(1024)
+            .max_memory(1024)
             .max_processes(8)
             .cpu_quota(0.5);
-        assert_eq!(opts.limits.memory_max, Some(1024));
+        assert_eq!(opts.limits.max_memory, Some(1024));
         assert_eq!(opts.limits.max_processes, Some(8));
         assert_eq!(opts.limits.cpu_quota, Some(0.5));
         assert!(opts.limits.any());
@@ -634,7 +634,7 @@ mod tests {
     fn validate_rejects_nonsense() {
         for (opts, expected_kind) in [
             (
-                ProcessGroupOptions::default().memory_max(0),
+                ProcessGroupOptions::default().max_memory(0),
                 LimitKind::Memory,
             ),
             (
@@ -679,16 +679,16 @@ mod tests {
 
     #[test]
     fn first_requested_kind_follows_the_documented_tie_break_order() {
-        // memory_max wins over the others when several are set...
+        // max_memory wins over the others when several are set...
         let mut limits = ResourceLimits {
-            memory_max: Some(1),
+            max_memory: Some(1),
             max_processes: Some(1),
             cpu_quota: Some(1.0),
         };
         assert_eq!(first_requested_kind(&limits), LimitKind::Memory);
 
-        // ...then max_processes, when memory_max is unset...
-        limits.memory_max = None;
+        // ...then max_processes, when max_memory is unset...
+        limits.max_memory = None;
         assert_eq!(first_requested_kind(&limits), LimitKind::Processes);
 
         // ...and cpu_quota is the last resort.
