@@ -533,6 +533,122 @@ pub(crate) async fn pump_lines_core<R>(
     // `sink` (the guard) closes here.
 }
 
+/// A reader that yields predefined byte chunks one `poll_read` at a time,
+/// then EOFs (or returns one IO error) — to exercise cross-read decoding and
+/// the mid-stream-error flush deterministically. Shared by the unit tests,
+/// the `proptests` below, and the `fuzz_decode_pump_lines` fuzz entry point
+/// (`cfg(fuzzing)`) so none of them re-implement chunked-read simulation.
+#[cfg(any(test, fuzzing))]
+struct ChunkedReader {
+    chunks: VecDeque<Vec<u8>>,
+    err_at_end: bool,
+}
+
+#[cfg(any(test, fuzzing))]
+impl ChunkedReader {
+    fn new(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        Self {
+            chunks: chunks.into_iter().collect(),
+            err_at_end: false,
+        }
+    }
+
+    #[allow(dead_code, reason = "only exercised by the hand-written unit tests")]
+    fn erroring(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        Self {
+            chunks: chunks.into_iter().collect(),
+            err_at_end: true,
+        }
+    }
+}
+
+#[cfg(any(test, fuzzing))]
+impl AsyncRead for ChunkedReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(chunk) = self.chunks.pop_front() {
+            let n = chunk.len().min(buf.remaining());
+            buf.put_slice(&chunk[..n]);
+            if n < chunk.len() {
+                self.chunks.push_front(chunk[n..].to_vec());
+            }
+            std::task::Poll::Ready(Ok(()))
+        } else if self.err_at_end {
+            self.err_at_end = false;
+            std::task::Poll::Ready(Err(std::io::Error::other("boom")))
+        } else {
+            std::task::Poll::Ready(Ok(())) // 0 bytes filled == EOF
+        }
+    }
+}
+
+/// Split `bytes` into consecutive, non-empty chunks whose lengths cycle
+/// through `sizes` (each clamped to at least 1 so [`ChunkedReader`] never
+/// sees a zero-length chunk, which it — like a real EOF read — would read as
+/// end of stream). An empty `bytes` yields no chunks. Shared by the
+/// `proptests` below and `fuzz_decode_pump_lines`.
+#[cfg(any(test, fuzzing))]
+fn to_chunks(bytes: &[u8], sizes: &[usize]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    let mut i = 0;
+    while pos < bytes.len() {
+        let size = sizes[i % sizes.len()].max(1);
+        let end = (pos + size).min(bytes.len());
+        out.push(bytes[pos..end].to_vec());
+        pos = end;
+        i += 1;
+    }
+    out
+}
+
+/// Fuzzing-only entry point driving the `pump_lines` decode path from
+/// `fuzz/fuzz_targets/decode_pump_lines.rs`: arbitrary raw bytes, chunked at
+/// arbitrary boundaries (`chunk_sizes`), decoded under one of a handful of
+/// encodings (`encoding_idx`) — the exact same oracle as the
+/// `pump_never_panics_on_arbitrary_bytes_under_any_chunking` proptest below,
+/// reusing its [`ChunkedReader`]/[`to_chunks`] rather than re-deriving them,
+/// but driven by libFuzzer-guided input instead of proptest-shrunk cases so it
+/// can run far more iterations and keep the long tail shrinking discards.
+///
+/// Gated behind the `fuzzing` cfg that `cargo fuzz build` sets automatically
+/// for every crate in the dependency graph (see the cargo-fuzz guide) — inert
+/// in every ordinary build, so it never appears on the public API surface
+/// tracked in `public-api.txt` (that check runs with `--all-features`, never
+/// `--cfg fuzzing`).
+#[cfg(fuzzing)]
+pub fn fuzz_decode_pump_lines(raw: &[u8], chunk_sizes: &[u8], encoding_idx: u8) {
+    const ENCODINGS: [&Encoding; 4] = [
+        encoding_rs::UTF_8,
+        encoding_rs::SHIFT_JIS,
+        encoding_rs::UTF_16LE,
+        encoding_rs::WINDOWS_1252,
+    ];
+    let encoding = ENCODINGS[encoding_idx as usize % ENCODINGS.len()];
+
+    let sizes: Vec<usize> = if chunk_sizes.is_empty() {
+        vec![raw.len().max(1)]
+    } else {
+        chunk_sizes.iter().map(|&b| b as usize + 1).collect()
+    };
+    let chunks = to_chunks(raw, &sizes);
+    let reader = ChunkedReader::new(chunks);
+    let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("current-thread runtime");
+    rt.block_on(pump_lines_core(reader, encoding, None, None, sink.clone()));
+
+    // Same invariant the proptest asserts: the retained backlog can never
+    // exceed the total lines seen, no matter how garbled the input.
+    let lines = sink.drain();
+    assert!(lines.len() <= sink.count(), "backlog exceeds lines seen");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,51 +920,8 @@ mod tests {
         );
     }
 
-    /// A reader that yields predefined byte chunks one `poll_read` at a time,
-    /// then EOFs (or returns one IO error) — to exercise cross-read decoding and
-    /// the mid-stream-error flush deterministically.
-    struct ChunkedReader {
-        chunks: VecDeque<Vec<u8>>,
-        err_at_end: bool,
-    }
-
-    impl ChunkedReader {
-        fn new(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
-            Self {
-                chunks: chunks.into_iter().collect(),
-                err_at_end: false,
-            }
-        }
-
-        fn erroring(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
-            Self {
-                chunks: chunks.into_iter().collect(),
-                err_at_end: true,
-            }
-        }
-    }
-
-    impl AsyncRead for ChunkedReader {
-        fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            if let Some(chunk) = self.chunks.pop_front() {
-                let n = chunk.len().min(buf.remaining());
-                buf.put_slice(&chunk[..n]);
-                if n < chunk.len() {
-                    self.chunks.push_front(chunk[n..].to_vec());
-                }
-                std::task::Poll::Ready(Ok(()))
-            } else if self.err_at_end {
-                self.err_at_end = false;
-                std::task::Poll::Ready(Err(std::io::Error::other("boom")))
-            } else {
-                std::task::Poll::Ready(Ok(())) // 0 bytes filled == EOF
-            }
-        }
-    }
+    // `ChunkedReader` lives at module scope (shared with the `proptests`
+    // module below and the `fuzz_decode_pump_lines` fuzz entry point).
 
     #[tokio::test]
     async fn utf16le_lines_decode_and_split_correctly() {
@@ -1362,23 +1435,8 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
-        /// Split `bytes` into consecutive, non-empty chunks whose lengths cycle
-        /// through `sizes` (each clamped to at least 1 so `ChunkedReader` never
-        /// sees a zero-length chunk, which it — like a real EOF read — would
-        /// read as end of stream). An empty `bytes` yields no chunks.
-        fn to_chunks(bytes: &[u8], sizes: &[usize]) -> Vec<Vec<u8>> {
-            let mut out = Vec::new();
-            let mut pos = 0;
-            let mut i = 0;
-            while pos < bytes.len() {
-                let size = sizes[i % sizes.len()].max(1);
-                let end = (pos + size).min(bytes.len());
-                out.push(bytes[pos..end].to_vec());
-                pos = end;
-                i += 1;
-            }
-            out
-        }
+        // `to_chunks` lives at module scope (shared with the
+        // `fuzz_decode_pump_lines` fuzz entry point above).
 
         /// Arbitrary Unicode content for one "line": any scalar value except
         /// `\n`/`\r` (so joining lines unambiguously marks line boundaries —

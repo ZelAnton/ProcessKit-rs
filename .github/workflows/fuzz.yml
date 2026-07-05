@@ -1,0 +1,34 @@
+name: fuzz
+
+# The fuzz tier drives the pump decode path (src/pump.rs, `pump_lines`) with
+# libFuzzer-guided input far beyond what proptest's shrinking-oriented cases
+# explore. cargo-fuzz needs a nightly toolchain and a real (if bounded) time
+# budget, so — like the stress tier (stress.yml) — it stays OUTSIDE the PR
+# matrix: scheduled and on-demand only, never blocking a push/PR.
+on:
+  schedule:
+    # 04:07 UTC daily — off the top of the hour, staggered from stress.yml's 03:17.
+    - cron: '7 4 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz (decode_pump_lines)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - run: cargo +nightly fuzz build
+      # Bounded wall-clock budget (10 minutes): enough to catch regressions on
+      # a schedule without an open-ended job. Run longer locally for a deeper
+      # sweep: `cargo +nightly fuzz run decode_pump_lines`.
+      - run: cargo +nightly fuzz run decode_pump_lines -- -max_total_time=600
