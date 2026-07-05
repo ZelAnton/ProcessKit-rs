@@ -252,6 +252,110 @@ async fn pipeline_timeout_kills_the_whole_chain() {
     );
 }
 
+/// Whether a process with `pid` is still alive (Unix `kill(pid, 0)` probe:
+/// succeeds while it lives or is an unreaped zombie, fails `ESRCH` once gone).
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 runs the existence/permission check without delivering a signal.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// A forking pipeline stage whose **grandchild** (a backgrounded `sleep`)
+/// inherits and holds the stdout pipe open while the foreground shell also
+/// sleeps — neither writes. It records the grandchild's PID to `pidfile`, then
+/// carries an `unchecked_in_pipe` per-stage timeout. `unchecked` is deliberate:
+/// the stage's own timeout death is forgiven AND it never triggers the chain's
+/// proactive teardown, so the per-stage deadline is the *only* thing that can end
+/// the stage. Before T-016 that deadline reached only the shell (the direct
+/// child), leaving the grandchild holding stdout; a per-stage sub-group now tears
+/// the whole subtree down.
+#[cfg(unix)]
+fn forking_stage(pidfile: &std::path::Path) -> Command {
+    Command::new("sh")
+        .args([
+            "-c",
+            &format!("sleep 30 & printf %s \"$!\" > '{}'; sleep 30", pidfile.display()),
+        ])
+        .unchecked_in_pipe()
+        .timeout(Duration::from_millis(500))
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real forking pipeline stage and bounds it with a per-stage timeout"]
+async fn per_stage_timeout_on_a_forking_stage_frees_downstream() {
+    // The last stage (`cat`, consumed to EOF) can only finish once every writer of
+    // its stdin pipe is gone. The producer's foreground shell AND its backgrounded
+    // grandchild both hold that pipe and neither writes, so a per-stage deadline
+    // that reached only the shell would leave the grandchild holding stdout and
+    // `cat` would block until the grandchild's own 30s `sleep` elapsed. There is
+    // deliberately NO `Pipeline::timeout` backstop, and the stage is
+    // `unchecked_in_pipe` so no proactive teardown fires either: a prompt finish is
+    // proof the per-stage deadline alone reaped the grandchild, freeing downstream.
+    let pidfile = std::env::temp_dir()
+        .join(format!("processkit_t016_free_{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pidfile);
+
+    let result = completes_within(
+        Duration::from_secs(15),
+        "forking pipeline stage bounded by a per-stage timeout",
+        forking_stage(&pidfile).pipe(Command::new("cat")).output_string(),
+    )
+    .await
+    .expect("a per-stage-timed-out chain still reports a result");
+    let _ = std::fs::remove_file(&pidfile);
+
+    // The inner unchecked stage's timeout is forgiven; the clean last stage speaks.
+    assert!(
+        result.is_success(),
+        "unchecked forking producer's per-stage timeout is forgiven, `cat` ends clean: {result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real forking pipeline stage and asserts its grandchild is reaped"]
+async fn per_stage_timeout_reaps_a_forking_stages_grandchild() {
+    // The direct-proof companion to the promptness test above: after the per-stage
+    // deadline fires, the backgrounded grandchild that held the stdout pipe must be
+    // *gone*, not merely detached. Before T-016 the shared-group per-stage kill
+    // reached only the shell, so the grandchild survived; a per-stage sub-group
+    // tears the whole subtree down.
+    let pidfile = std::env::temp_dir()
+        .join(format!("processkit_t016_reap_{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pidfile);
+
+    completes_within(
+        Duration::from_secs(15),
+        "forking pipeline stage bounded by a per-stage timeout",
+        forking_stage(&pidfile).pipe(Command::new("cat")).output_string(),
+    )
+    .await
+    .expect("a per-stage-timed-out chain still reports a result");
+
+    // The producer wrote its grandchild's PID before its own deadline elapsed.
+    let pid = std::fs::read_to_string(&pidfile)
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok())
+        .expect("forking stage recorded its grandchild's PID");
+
+    // The grandchild was killed with the stage subtree; allow a brief window for
+    // the reparent-to-init reap to clear the pid.
+    let mut reaped = false;
+    for _ in 0..80 {
+        if !pid_alive(pid) {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = std::fs::remove_file(&pidfile);
+    assert!(
+        reaped,
+        "grandchild {pid} of the forking stage outlived the per-stage deadline — the subtree kill leaked"
+    );
+}
+
 #[tokio::test]
 #[ignore = "spawns a real pipeline and captures raw bytes"]
 async fn pipeline_output_bytes_captures_the_last_stage_stdout() {

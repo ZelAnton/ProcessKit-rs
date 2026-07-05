@@ -7,11 +7,15 @@
 //! early stops on a [broken pipe](crate::Error) when the relay's next write fails
 //! (rather than instantly via SIGPIPE), and the relay's own I/O is plumbing — a
 //! closed sibling reads as EOF / writes as a broken pipe, neither reported as a
-//! stage's stdin failure. Every stage spawns into one shared kill-on-drop
-//! [`ProcessGroup`](crate::ProcessGroup), so the whole chain dies as a unit, and
-//! the outcome is **pipefail**: the first stage without a clean exit decides the
-//! reported code/diagnostics.
+//! stage's stdin failure. Each stage spawns into its **own** kill-on-drop
+//! [`ProcessGroup`](crate::ProcessGroup) sub-group, so a per-stage
+//! [`Command::timeout`] tears down that stage's *whole* subtree (grandchildren of
+//! a forking `sh -c …` included), while a chain-wide
+//! [`Pipeline::timeout`]/teardown fans the kill across every sub-group so the
+//! whole chain still dies as a unit. The outcome is **pipefail**: the first stage
+//! without a clean exit decides the reported code/diagnostics.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::command::Command;
@@ -50,8 +54,12 @@ impl Drop for AbortTasksOnDrop {
 ///
 /// Semantics:
 ///
-/// - **One group, one fate** — cancelling the future or a
-///   [`timeout`](Self::timeout) elapsing tears the whole chain down.
+/// - **Per-stage subtree, one chain fate** — each stage runs in its own
+///   kill-on-drop group, so a per-stage [`Command::timeout`] tears down that
+///   stage's whole subtree (a forking `sh -c …`'s grandchildren included).
+///   Cancelling the future or a chain-wide [`timeout`](Self::timeout) elapsing
+///   still tears the *whole* chain down — the kill fans across every stage's
+///   sub-group.
 /// - **Pipefail** — `stdout` is always the *last* stage's output; `code`,
 ///   `stderr`, and the reported program come from the **first** stage that
 ///   didn't exit cleanly, or from the last stage when every stage succeeded.
@@ -118,18 +126,19 @@ impl Pipeline {
         self
     }
 
-    /// Kill the **whole chain** if it exceeds `timeout` (the group is torn
-    /// down; the result reports `timed_out`). Unlike a single
+    /// Kill the **whole chain** if it exceeds `timeout` (every stage's sub-group
+    /// is torn down; the result reports `timed_out`). Unlike a single
     /// [`Command::timeout`] capture, no partial stdout is reported for a
     /// timed-out chain.
     ///
-    /// Prefer this over a **per-stage** [`Command::timeout`] when a stage may
-    /// fork. Every stage shares one kill-on-drop group, so a per-stage deadline
-    /// reaches only that stage's *direct* child (by pid) — a grandchild it forked
-    /// can keep the stdout pipe open past the kill, stalling the downstream stage.
-    /// A whole-chain timeout tears the entire group down (grandchildren
-    /// included), so it always bounds the run; a per-stage timeout alone does not
-    /// for a forking stage. Single-process stages are bounded by either.
+    /// This is the chain-wide backstop. A **per-stage** [`Command::timeout`] now
+    /// also bounds a forking stage on its own: each stage runs in its own
+    /// kill-on-drop group, so a per-stage deadline tears down that stage's whole
+    /// subtree — a grandchild it forked (`sh -c …`) can no longer keep the stdout
+    /// pipe open past the kill and stall the downstream stage. Reach for this
+    /// whole-chain timeout when you want a single ceiling on the *entire* run
+    /// regardless of which stage is slow; use a per-stage timeout to bound an
+    /// individual stage. Either bounds a single-process stage.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -198,7 +207,14 @@ impl Pipeline {
         C: FnOnce(crate::running::RunningProcess) -> F,
         F: std::future::Future<Output = Result<ProcessResult<T>>> + Send + 'static,
     {
-        let group = ProcessGroup::new()?;
+        // Each stage gets its own kill-on-drop sub-group, retained here as a
+        // strong handle. A per-stage `Command::timeout`/`cancel_on` then tears
+        // down that stage's *whole* subtree (grandchildren of a forking `sh -c …`
+        // included) rather than only its direct child, and the chain-wide backstop
+        // below fans a kill across every sub-group. Holding the strong handles for
+        // the whole capture keeps the old lifetime — a stage's tree lives until the
+        // chain ends, then kill-on-drop reaps any straggler.
+        let mut stage_groups: Vec<Arc<ProcessGroup>> = Vec::with_capacity(self.stages.len());
 
         let mut running = Vec::with_capacity(self.stages.len());
         let mut upstream = None;
@@ -213,7 +229,15 @@ impl Pipeline {
             if let Some(reader) = upstream.take() {
                 command.set_pipe_stdin(reader);
             }
+            // Spawn into a fresh per-stage group, then hand it to the stage handle
+            // (`attach_group` also upgrades the cancel watchdog to a group+pid kill)
+            // and keep a strong clone for the chain-wide teardown.
+            let group = ProcessGroup::new()?;
             let mut process = group.start(&command).await?;
+            process.attach_group(group);
+            if let Some(handle) = process.own_group_handle() {
+                stage_groups.push(handle);
+            }
             if index + 1 < self.stages.len() {
                 upstream = process.take_stdout_pipe();
             }
@@ -222,10 +246,10 @@ impl Pipeline {
         }
 
         // Proactive teardown: the first stage to finish with a *checked failure*
-        // fires this token; a concurrent killer then tears the whole group down so
-        // a quiet, still-running sibling (classically an upstream producer that
-        // never writes, so never dies of a broken pipe) cannot hold the chain open
-        // after the failure. Stages ended by that kill are flagged `torn_down` and
+        // fires this token; a concurrent killer then tears every stage's sub-group
+        // down so a quiet, still-running sibling (classically an upstream producer
+        // that never writes, so never dies of a broken pipe) cannot hold the chain
+        // open after the failure. Stages ended by that kill are flagged `torn_down` and
         // de-prioritized in the pipefail fold, so the real culprit is still blamed.
         // This is distinct from the user's `cancel_token`: a cancelled stage errors
         // out (`Err(Cancelled)`) before producing a `StageOutcome`, so cancellation
@@ -297,9 +321,9 @@ impl Pipeline {
 
         let collect = async {
             // Ordered gather (leftmost-first) — the success path is byte-for-byte
-            // the old behavior. On failure the killer arm below wakes and tears the
-            // group down, unblocking whichever ordered await was stalled on a quiet
-            // sibling; the gather then completes and wins the `select!`.
+            // the old behavior. On failure the killer arm below wakes and tears
+            // every stage's sub-group down, unblocking whichever ordered await was
+            // stalled on a quiet sibling; the gather then completes and wins the `select!`.
             let gather = async {
                 let mut outcomes = Vec::with_capacity(inner_tasks.len() + 1);
                 for task in inner_tasks {
@@ -314,7 +338,7 @@ impl Pipeline {
                 // it only exists for its kill side effect, letting `gather` finish.
                 () = async {
                     teardown.cancelled().await;
-                    let _ = group.kill_all();
+                    kill_all_stage_groups(&stage_groups);
                     std::future::pending::<()>().await
                 } => unreachable!("the teardown killer pends forever after firing"),
             }
@@ -325,8 +349,8 @@ impl Pipeline {
             Some(limit) => match tokio::time::timeout(limit, collect).await {
                 Ok(collected) => collected?,
                 Err(_elapsed) => {
-                    // Kill the chain; `_abort_guard` reaps the drain tasks as this returns.
-                    let _ = group.kill_all();
+                    // Kill every stage's subtree; `_abort_guard` reaps the drain tasks as this returns.
+                    kill_all_stage_groups(&stage_groups);
                     return Ok(ProcessResult::new(
                         self.pipeline_name(),
                         T::default(),
@@ -476,6 +500,17 @@ impl Pipeline {
             .map(|stage| stage.program_name())
             .collect::<Vec<_>>()
             .join(" | ")
+    }
+}
+
+/// Fan a hard kill across every stage's sub-group — the chain-wide backstop when
+/// a [`Pipeline::timeout`] elapses or a stage's failure triggers proactive
+/// teardown, now that each stage owns its own kill-on-drop group rather than
+/// sharing one. Best-effort: a per-group error is swallowed, exactly as the old
+/// single-group `kill_all()` was.
+fn kill_all_stage_groups(groups: &[Arc<ProcessGroup>]) {
+    for group in groups {
+        let _ = group.kill_all();
     }
 }
 
