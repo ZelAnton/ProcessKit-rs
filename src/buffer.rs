@@ -26,6 +26,60 @@ pub enum StdioMode {
     Null,
 }
 
+/// How the output pump decides where one captured/streamed line ends.
+///
+/// Set per stream on [`Command`](crate::Command) via
+/// [`line_terminator`](crate::Command::line_terminator) (both streams at once)
+/// or [`stdout_line_terminator`](crate::Command::stdout_line_terminator) /
+/// [`stderr_line_terminator`](crate::Command::stderr_line_terminator). The
+/// default is [`Newline`](LineTerminator::Newline) — the crate's pre-1.0
+/// behavior, splitting only on `\n`.
+///
+/// This is one shared definition of "a line" for the whole line-pumped path:
+/// what [`stdout_lines`](crate::RunningProcess::stdout_lines) /
+/// [`output_events`](crate::RunningProcess::output_events) yield, what the
+/// per-line handlers ([`on_stdout_line`](crate::Command::on_stdout_line)) see,
+/// what a [`stdout_tee`](crate::Command::stdout_tee) writes (each line followed
+/// by a `\n`), and what [`output_string`](crate::Command::output_string) joins.
+/// Choosing a mode moves all of them together — there is never a per-sink
+/// disagreement about what a line is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum LineTerminator {
+    /// Split on `\n` only (the default, and the crate's pre-1.0 behavior).
+    ///
+    /// A `\r` immediately before a `\n` is a CRLF terminator and is stripped;
+    /// every other `\r` — a lone one, or a run of them — is line *content*.
+    /// Carriage-return progress output (a bar redrawn in place with `\r`, no
+    /// `\n` until the very end) therefore accumulates as one ever-growing line:
+    /// nothing is delivered until the final `\n`, and under a byte cap
+    /// ([`with_max_bytes`](OutputBufferPolicy::with_max_bytes)) that single
+    /// over-cap line is dropped whole. Reach for
+    /// [`CarriageReturn`](LineTerminator::CarriageReturn) when you need such
+    /// output live.
+    #[default]
+    Newline,
+    /// Treat a bare `\r` as a line terminator *in addition to* `\n` —
+    /// "`\r`-aware" mode, for carriage-return progress output.
+    ///
+    /// Each carriage-return frame is delivered as its own line the instant it is
+    /// seen, so `Progress: 50%\rProgress: 100%\n` streams as the frames
+    /// `Progress: 50%` then `Progress: 100%` — live, one at a time — instead of
+    /// piling up as a single line that surfaces only at EOF. A `\r\n` pair stays
+    /// a **single** terminator (it does not emit a spurious empty line between
+    /// the `\r` and the `\n`), so ordinary CRLF text reads identically to
+    /// [`Newline`](LineTerminator::Newline) mode; only a `\r` *not* followed by a
+    /// `\n` splits a frame.
+    ///
+    /// The framing is the shared one described on the type: the handlers, the
+    /// tee, the streaming verbs, and `output_string` all observe the same
+    /// per-frame lines. It composes with the byte cap too — a frame whose
+    /// content exceeds [`max_bytes`](OutputBufferPolicy::max_bytes) is skipped as
+    /// it arrives (never assembled whole), exactly as an over-cap `\n` line is,
+    /// so a runaway `\r`-free frame cannot exhaust memory.
+    CarriageReturn,
+}
+
 /// What to drop when a bounded output buffer is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -122,13 +176,17 @@ pub enum OverflowMode {
 /// arbitrarily long lines verbatim).
 ///
 /// **Carriage-return progress output** (`curl`, `pip`, `apt` — a bar redrawn with
-/// `\r`, no `\n` until the end) is the common shape of this: the pump splits on
-/// `\n` only, so the whole progress stream is a *single* growing line. It doesn't
-/// stream live (nothing is delivered until a `\n` arrives), and under a byte cap
-/// the one over-cap line is dropped whole — so a caller watching `stdout_lines`
-/// sees no progress. Capture such output through a real pipe with **no byte cap**
-/// (accepting the memory) if you need it, or read the raw stream yourself; a `\r`
-/// line-terminator mode is tracked for a future version.
+/// `\r`, no `\n` until the end) is the common shape of this under the default
+/// [`LineTerminator::Newline`]: the pump splits on `\n` only, so the whole
+/// progress stream is a *single* growing line. It doesn't stream live (nothing is
+/// delivered until a `\n` arrives), and under a byte cap the one over-cap line is
+/// dropped whole — so a caller watching `stdout_lines` sees no progress. Set
+/// [`Command::line_terminator(LineTerminator::CarriageReturn)`](crate::Command::line_terminator)
+/// to split on `\r` too: each frame is then delivered live, and the byte cap
+/// bounds an individual runaway frame instead of the whole stream (an over-cap
+/// frame is skipped as it arrives, never assembled). Alternatively, keep the
+/// default and capture the output through a real pipe with **no byte cap**
+/// (accepting the memory), or read the raw stream yourself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OutputBufferPolicy {

@@ -712,6 +712,8 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         stderr_handler: command.stderr_handler(),
         stdout_tee: command.stdout_tee_sink(),
         stderr_tee: command.stderr_tee_sink(),
+        stdout_line_terminator: command.out_line_terminator(),
+        stderr_line_terminator: command.err_line_terminator(),
         buffer: command.output_buffer_policy(),
         ok_codes: command.ok_codes_vec(),
         stdout_piped: command.stdout_is_piped(),

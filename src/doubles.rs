@@ -990,6 +990,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scripted_carriage_return_mode_streams_each_progress_frame() {
+        // End-to-end wiring of the `\r`-aware knob: a scripted child emits
+        // carriage-return progress, and `line_terminator(CarriageReturn)` splits it
+        // into live frames through the same pump the real path uses.
+        use crate::LineTerminator;
+        use tokio_stream::StreamExt;
+        let runner = ScriptedRunner::new()
+            .fallback(Reply::ok("Progress: 0%\rProgress: 50%\rProgress: 100%\n"));
+        let cmd = crate::Command::new("dl").line_terminator(LineTerminator::CarriageReturn);
+        let mut run = runner.start(&cmd).await.expect("scripted start");
+        let mut lines = run.stdout_lines().unwrap();
+        let mut seen = Vec::new();
+        while let Some(line) = lines.next().await {
+            seen.push(line);
+        }
+        assert_eq!(
+            seen,
+            ["Progress: 0%", "Progress: 50%", "Progress: 100%"],
+            "each `\\r` frame streams as its own line"
+        );
+        let finish = run.finish().await.expect("finish");
+        assert_eq!(finish.outcome, Outcome::Exited(0));
+    }
+
+    #[tokio::test]
+    async fn scripted_default_newline_keeps_carriage_return_progress_as_one_line() {
+        // Without the knob (default `Newline`), the same progress output is one
+        // accumulated line — the pre-existing behavior is unchanged.
+        let runner = ScriptedRunner::new()
+            .fallback(Reply::ok("Progress: 0%\rProgress: 50%\rProgress: 100%\n"));
+        let run = runner
+            .start(&crate::Command::new("dl"))
+            .await
+            .expect("scripted start");
+        let result = run.output_string().await.expect("consume");
+        assert_eq!(
+            result.stdout(),
+            "Progress: 0%\rProgress: 50%\rProgress: 100%",
+            "default mode keeps the `\\r`s as content in one line"
+        );
+    }
+
+    #[tokio::test]
     async fn scripted_start_supports_probes_and_failing_finish() {
         let runner = ScriptedRunner::new().fallback(
             Reply::fail(7, "boom: detail\n").with_stdout("starting up\nready to serve\n"),

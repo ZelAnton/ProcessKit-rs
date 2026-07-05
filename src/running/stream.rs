@@ -87,6 +87,7 @@ impl RunningProcess {
                 self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                     pipe,
                     self.stderr_encoding,
+                    self.stderr_line_terminator,
                     self.stderr_handler.clone(),
                     self.stderr_tee.clone(),
                     stderr_sink.clone(),
@@ -101,6 +102,7 @@ impl RunningProcess {
                 self.stdout_pump = Some(tokio::spawn(pump_lines_core(
                     pipe,
                     self.stdout_encoding,
+                    self.stdout_line_terminator,
                     self.stdout_handler.clone(),
                     self.stdout_tee.clone(),
                     stdout_sink.clone(),
@@ -214,6 +216,7 @@ impl RunningProcess {
             self.stdout_pump = Some(tokio::spawn(crate::pump::pump_lines_core(
                 pipe,
                 self.stdout_encoding,
+                self.stdout_line_terminator,
                 self.stdout_handler.clone(),
                 self.stdout_tee.clone(),
                 sink.clone(),
@@ -227,6 +230,7 @@ impl RunningProcess {
             self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,
                 self.stderr_encoding,
+                self.stderr_line_terminator,
                 self.stderr_handler.clone(),
                 self.stderr_tee.clone(),
                 sink.clone(),
@@ -280,6 +284,7 @@ impl RunningProcess {
                 self.stdout_pump = Some(tokio::spawn(pump_lines_core(
                     pipe,
                     self.stdout_encoding,
+                    self.stdout_line_terminator,
                     self.stdout_handler.clone(),
                     self.stdout_tee.clone(),
                     stdout_sink.clone(),
@@ -301,6 +306,7 @@ impl RunningProcess {
                 self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                     pipe,
                     self.stderr_encoding,
+                    self.stderr_line_terminator,
                     self.stderr_handler.clone(),
                     self.stderr_tee.clone(),
                     sink.clone(),
