@@ -410,6 +410,16 @@ impl RunningProcess {
         self.arm_cancel_watchdog();
     }
 
+    /// A strong handle to this process's own group, if it owns one — so a
+    /// [`Pipeline`](crate::Pipeline) can retain each stage's sub-group and fan a
+    /// chain-wide teardown across every one. Cloning the `Arc` keeps the group
+    /// (and its kill-on-drop backstop) alive alongside this handle; the handle
+    /// still owns its own strong reference, so per-stage timeout/cancel kills
+    /// stay routed through it. `None` for a shared-group or scripted handle.
+    pub(crate) fn own_group_handle(&self) -> Option<Arc<ProcessGroup>> {
+        self.backend.own_group().cloned()
+    }
+
     /// Arm (or re-arm) the cancel kill task. Aborts any existing task first so
     /// `attach_group` upgrades from pid-only to group+pid. No-op without a token.
     pub(crate) fn arm_cancel_watchdog(&mut self) {
