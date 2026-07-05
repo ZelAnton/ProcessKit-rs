@@ -124,6 +124,42 @@ async fn pipeline_pipefail_attributes_the_first_failure() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a pipeline with a quiet upstream and a failing middle stage"]
+async fn pipeline_failure_tears_down_a_quiet_upstream_immediately() {
+    // A quiet upstream that writes nothing and would otherwise stay alive for ~30s,
+    // feeding a middle stage that fails at once. A purely passive teardown would
+    // wait on the silent producer — it never writes, so it never dies of a broken
+    // pipe — holding the failed chain open. Proactive teardown kills the group the
+    // moment the middle stage fails, so the error surfaces without the long wait,
+    // and pipefail still blames the genuine failure (exit 3), not the killed
+    // producer (a torn-down victim).
+    let quiet_upstream = if cfg!(windows) {
+        Command::new("powershell").args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+    } else {
+        Command::new("sleep").arg("30")
+    };
+
+    let start = Instant::now();
+    let result = quiet_upstream
+        .pipe(failing_exit(3))
+        .pipe(sort_stage())
+        .output_string()
+        .await
+        .expect("pipeline completes with a result");
+    assert_eq!(
+        result.code(),
+        Some(3),
+        "the downstream failure is attributed, not the killed upstream: {result:?}"
+    );
+    assert!(!result.is_success());
+    assert!(
+        start.elapsed() < Duration::from_secs(15),
+        "a quiet upstream must not hold the failed chain open (took {:?})",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a real producer|head pipeline killed by the closing pipe"]
 async fn unchecked_producer_forgives_the_head_pattern() {
     // The motivating case for `unchecked_in_pipe()`: the consumer takes one line and

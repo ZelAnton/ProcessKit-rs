@@ -104,6 +104,21 @@ assert_eq!(result.code(), Some(2));
 println!("blamed: {}", result.ensure_success().unwrap_err()); // names `grep`
 ```
 
+**Failure tears the chain down proactively.** The moment a stage ends with a
+checked failure (a non-zero exit outside its `ok_codes`, a signal kill, or its
+own per-stage timeout), the whole group is torn down at once — the failure does
+not wait to trickle out through closing pipes. This matters for a *quiet*
+sibling that would otherwise hang: an upstream producer that never writes never
+dies of a broken pipe, so under a purely passive teardown a downstream failure
+could be held open indefinitely by that silent producer. Now the failure
+surfaces immediately, and the killed siblings are treated as victims (like a
+downstream `SIGPIPE` death) — the stage that actually failed keeps the blame.
+The one death that does **not** trigger this is an
+[`unchecked_in_pipe()`](#unchecked-stages) stage's: its unclean exit is forgiven,
+so it leaves the rest of the chain running. (A stuck stage that never *fails* —
+a healthy producer that simply never finishes — is still bounded only by
+[`Pipeline::timeout`](#timeouts) or [cancellation](#timeouts).)
+
 The ends of the chain behave like a single `Command`:
 
 - The **first** stage's configured [`stdin`](commands.md#standard-input)
