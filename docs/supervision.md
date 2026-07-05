@@ -14,6 +14,7 @@ keeper, platform-agnostic because it sits entirely on the
 - [Backoff and jitter](#backoff-and-jitter)
 - [Failure storms](#failure-storms)
 - [Stopping](#stopping)
+- [Giving up on permanent failures](#giving-up-on-permanent-failures)
 - [Outcomes](#outcomes)
 - [Supervising inside a shared group](#supervising-inside-a-shared-group)
 - [Errors and cancellation](#errors-and-cancellation)
@@ -134,16 +135,69 @@ storm pause never extends an exhausted budget. Pauses taken are reported in
 
 ## Stopping
 
-Three gates, checked in this order after every completed run:
+Four gates, checked in this order after every completed run:
 
 1. **`stop_when(predicate)`** — sees the run's `ProcessResult`; returning
    `true` ends supervision *regardless of policy* (→ `StopReason::Predicate`).
    "Exit 0 is done, anything else is a crash" is the classic:
    `stop_when(|res| res.code() == Some(0))` under `RestartPolicy::Always`.
 2. **The policy** — `OnCrash` stops on a clean exit (→ `PolicySatisfied`).
-3. **`max_restarts(n)`** — at most *n* restarts = *n + 1* total runs; an
+3. **`give_up_when(classifier)`** — only consulted for a crash the policy
+   would otherwise restart; recognizing it as *permanent* ends supervision
+   (→ `StopReason::GaveUp`). See
+   [Giving up on permanent failures](#giving-up-on-permanent-failures).
+4. **`max_restarts(n)`** — at most *n* restarts = *n + 1* total runs; an
    exhausted budget reports the last result (→ `RestartsExhausted`).
    `max_restarts(0)` means exactly one run.
+
+`give_up_when` is checked *before* `max_restarts`, so a recognized-permanent
+crash reports the more specific `GaveUp` even when the budget hasn't run out
+yet — and before the [failure-storm guard](#failure-storms), so giving up
+never pays for a storm pause it was going to end anyway.
+
+## Giving up on permanent failures
+
+Without more, the supervisor cannot tell a *transient* crash from a
+*permanent* one — a command that can never succeed (a missing binary, a
+config error that crashes on startup, a permanently-taken port) restarts
+**forever** under the default unlimited `OnCrash`, throttled only by backoff.
+`give_up_when` lets you recognize the unrecoverable case and stop instead:
+
+```rust,no_run
+use processkit::{Command, GiveUpAttempt, Supervisor};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let outcome = Supervisor::new(Command::new("maybe-typo'd-binary"))
+        .give_up_when(|attempt| match attempt {
+            // The child never even started — e.g. ENOENT for a mistyped name.
+            GiveUpAttempt::Failed(err) => err.is_not_found(),
+            // A completed crash your own domain knows is permanent, e.g. a
+            // documented "config invalid, do not restart" exit code.
+            GiveUpAttempt::Crashed(res) => res.code() == Some(78),
+            _ => false,
+        })
+        .run()
+        .await?;
+    println!("stopped: {:?}", outcome.stopped);
+    Ok(())
+}
+```
+
+`GiveUpAttempt` distinguishes the two shapes a permanent failure can take:
+
+- **`Crashed(&ProcessResult<String>)`** — a completed run that counts as a
+  crash. A match reports `StopReason::GaveUp` in the `SupervisionOutcome`,
+  same as any other stop reason.
+- **`Failed(&Error)`** — the child never started at all (spawn/IO failure,
+  e.g. `ENOENT`). There is no `ProcessResult` to report here, so a match
+  surfaces the classified error directly as `run()`'s `Err` — the same
+  contract an exhausted budget already has on this path (see
+  [Errors and cancellation](#errors-and-cancellation)).
+
+Unset by default: a permanent failure restarts forever exactly as before,
+bounded only by `max_restarts` / the storm guard — adding `give_up_when` never
+changes existing behavior until you set it.
 
 ## Outcomes
 
@@ -154,7 +208,7 @@ let outcome = Supervisor::new(Command::new("job")).run().await?;
 
 outcome.final_result; // ProcessResult<String> of the LAST run
 outcome.restarts;     // how many restarts happened (not counting run #1)
-outcome.stopped;      // StopReason::{Predicate, PolicySatisfied, RestartsExhausted}
+outcome.stopped;      // StopReason::{Predicate, PolicySatisfied, GaveUp, RestartsExhausted}
 outcome.storm_pauses; // failure-storm pauses taken (0 unless storm_pause is set)
 ```
 
@@ -195,9 +249,11 @@ no real process; see [Testing your code](testing.md#scripting-replies).
 ## Errors and cancellation
 
 A run that produces no result at all (spawn/IO failure) can't be judged by
-`stop_when`; the policy treats it as a crash and restarts (with backoff)
-unless the policy is `Never` or the budget is exhausted — then the error
-itself surfaces as `run()`'s `Err`.
+`stop_when` (it needs a `ProcessResult`) — but it *is* visible to
+`give_up_when` as `GiveUpAttempt::Failed`. The policy treats it as a crash and
+restarts (with backoff) unless the policy is `Never`, `give_up_when`
+classifies it as permanent, or the budget is exhausted — any of those surfaces
+the error itself as `run()`'s `Err`.
 
 A [cancelled](timeouts-and-cancellation.md#cancellation) incarnation is
 **terminal**: `run()` returns

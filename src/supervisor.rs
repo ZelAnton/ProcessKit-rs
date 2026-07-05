@@ -73,9 +73,37 @@ pub enum StopReason {
     /// [`OnCrash`](RestartPolicy::OnCrash), or the single
     /// [`Never`](RestartPolicy::Never) run completing.
     PolicySatisfied,
+    /// The [`give_up_when`](Supervisor::give_up_when) classifier recognized a
+    /// crash as **permanent** — the supervisor stopped instead of restarting it
+    /// forever. Only reported for a crashed run that produced a
+    /// [`ProcessResult`] ([`GiveUpAttempt::Crashed`]); a permanent *spawn*
+    /// failure (e.g. `ENOENT`, [`GiveUpAttempt::Failed`]) has no result to
+    /// report and instead surfaces directly as `run()`'s `Err` (see
+    /// [`give_up_when`](Supervisor::give_up_when) and the `run()` docs'
+    /// "Errors" section).
+    GaveUp,
     /// The [`max_restarts`](Supervisor::max_restarts) budget ran out while the
     /// policy still wanted another restart.
     RestartsExhausted,
+}
+
+/// What the [`give_up_when`](Supervisor::give_up_when) classifier inspects: a
+/// crashed run that produced a [`ProcessResult`], or a spawn/IO failure that
+/// prevented the child from ever starting (e.g. `ENOENT` for a mistyped
+/// program name) and so never produced one.
+///
+/// Non-exhaustive: a future kind of "the child never got a chance to run"
+/// failure could be added without a breaking change.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum GiveUpAttempt<'a> {
+    /// A completed run that counts as a crash (see
+    /// [`RestartPolicy::OnCrash`]'s definition) — the last full
+    /// [`ProcessResult`] the supervisor would otherwise restart.
+    Crashed(&'a ProcessResult<String>),
+    /// The child could not even be started — the [`Error`](crate::Error) the
+    /// runner returned instead of a result.
+    Failed(&'a crate::Error),
 }
 
 /// What a finished supervision reports — the last run plus the keeper's
@@ -124,6 +152,10 @@ pub struct Supervisor<R: ProcessRunner = JobRunner> {
     storm_pause: Option<Duration>,
     #[allow(clippy::type_complexity)]
     stop_when: Option<Box<dyn Fn(&ProcessResult<String>) -> bool + Send + Sync>>,
+    /// The permanent-failure classifier; see
+    /// [`give_up_when`](Self::give_up_when).
+    #[allow(clippy::type_complexity)]
+    give_up_when: Option<Box<dyn Fn(&GiveUpAttempt<'_>) -> bool + Send + Sync>>,
     /// The output-capture policy applied to every incarnation. Defaults to a
     /// bounded tail (see [`default_supervision_capture`]); override with
     /// [`capture`](Self::capture).
@@ -144,6 +176,7 @@ impl<R: ProcessRunner> std::fmt::Debug for Supervisor<R> {
             .field("failure_threshold", &self.failure_threshold)
             .field("storm_pause", &self.storm_pause)
             .field("has_stop_when", &self.stop_when.is_some())
+            .field("has_give_up_when", &self.give_up_when.is_some())
             .field("capture", &self.capture)
             .finish_non_exhaustive()
     }
@@ -167,6 +200,7 @@ impl Supervisor<JobRunner> {
             failure_threshold: 5.0,
             storm_pause: None,
             stop_when: None,
+            give_up_when: None,
             capture,
         }
     }
@@ -197,6 +231,7 @@ impl<R: ProcessRunner> Supervisor<R> {
             failure_threshold: self.failure_threshold,
             storm_pause: self.storm_pause,
             stop_when: self.stop_when,
+            give_up_when: self.give_up_when,
             capture: self.capture,
         }
     }
@@ -349,21 +384,66 @@ impl<R: ProcessRunner> Supervisor<R> {
         self
     }
 
+    /// Classify a crash — or a spawn failure that never produced a result —
+    /// as **permanent**, so the supervisor gives up instead of restarting it
+    /// forever (see the "Permanent failures" section of [`run`](Self::run)'s
+    /// docs). `classifier` receives a [`GiveUpAttempt`]: [`Crashed`](GiveUpAttempt::Crashed)
+    /// for a completed run that counts as a crash, [`Failed`](GiveUpAttempt::Failed)
+    /// for a launch that never started the child at all (the ENOENT case —
+    /// a mistyped program name — is a [`Failed`](GiveUpAttempt::Failed), not a
+    /// `Crashed`, since no [`ProcessResult`] exists to inspect).
+    ///
+    /// ```
+    /// use processkit::GiveUpAttempt;
+    ///
+    /// let classify = |attempt: &GiveUpAttempt<'_>| match attempt {
+    ///     GiveUpAttempt::Failed(err) => err.is_not_found(), // missing binary — never recovers
+    ///     GiveUpAttempt::Crashed(_) => false,
+    ///     _ => false, // future GiveUpAttempt variants: not permanent until classified
+    /// };
+    /// # let _ = classify;
+    /// ```
+    ///
+    /// Not checked for a clean exit, nor for a run [`stop_when`](Self::stop_when)
+    /// already ended, nor for a crash the [`RestartPolicy`] itself would not have
+    /// restarted (e.g. under [`Never`](RestartPolicy::Never)) — those already stop
+    /// supervision with a more specific reason. When checked, it runs **before**
+    /// [`max_restarts`](Self::max_restarts) and the [failure-storm guard](Self::storm_pause):
+    /// a permanent-failure verdict wins over "budget not yet exhausted" and never
+    /// pays for a storm pause it was going to end anyway. A `Crashed` match reports
+    /// [`StopReason::GaveUp`]; a `Failed` match has no result to report and
+    /// surfaces the classified error directly as `run()`'s `Err`, same as an
+    /// exhausted budget on that path.
+    ///
+    /// Default: unset — a permanent failure restarts forever (throttled only by
+    /// backoff/`max_restarts`/the storm guard), matching the crate's prior
+    /// behavior.
+    #[must_use]
+    pub fn give_up_when(
+        mut self,
+        classifier: impl Fn(&GiveUpAttempt<'_>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.give_up_when = Some(Box::new(classifier));
+        self
+    }
+
     /// Supervise until the policy, the predicate, or the restart budget ends
     /// it, and report the [`SupervisionOutcome`].
     ///
     /// # Permanent failures
     ///
-    /// The supervisor does **not** distinguish a transient crash from a permanent
-    /// one — a command that can never succeed (a missing binary, a config error
-    /// that crashes on startup, a port that is permanently taken) restarts
-    /// **forever** under the default unlimited [`OnCrash`](RestartPolicy::OnCrash)
-    /// policy, throttled only by the backoff: a fast-failing one climbs to
-    /// [`max_backoff`](Self::max_backoff) (each incarnation is shorter than the
-    /// ceiling, so never healthy), while one that takes `≥ max_backoff` to fail is
-    /// throttled by its own runtime instead. Either way it loops indefinitely —
-    /// bound it with [`max_restarts`](Self::max_restarts) and/or a
-    /// [`stop_when`](Self::stop_when) predicate that recognizes the unrecoverable
+    /// Without [`give_up_when`](Self::give_up_when), the supervisor does **not**
+    /// distinguish a transient crash from a permanent one — a command that can
+    /// never succeed (a missing binary, a config error that crashes on startup, a
+    /// port that is permanently taken) restarts **forever** under the default
+    /// unlimited [`OnCrash`](RestartPolicy::OnCrash) policy, throttled only by the
+    /// backoff: a fast-failing one climbs to [`max_backoff`](Self::max_backoff)
+    /// (each incarnation is shorter than the ceiling, so never healthy), while one
+    /// that takes `≥ max_backoff` to fail is throttled by its own runtime instead.
+    /// Either way it loops indefinitely — bound it with
+    /// [`max_restarts`](Self::max_restarts) and/or a
+    /// [`give_up_when`](Self::give_up_when) classifier (or the coarser
+    /// [`stop_when`](Self::stop_when) predicate) that recognizes the unrecoverable
     /// case, so supervision gives up.
     ///
     /// # Errors
@@ -424,6 +504,12 @@ impl<R: ProcessRunner> Supervisor<R> {
                             StopReason::PolicySatisfied,
                         ));
                     }
+                    if crashed
+                        && let Some(classifier) = &self.give_up_when
+                        && classifier(&GiveUpAttempt::Crashed(&result))
+                    {
+                        return Ok(self.outcome(result, restarts, &storm, StopReason::GaveUp));
+                    }
                     if self.max_restarts.is_some_and(|max| restarts >= max) {
                         return Ok(self.outcome(
                             result,
@@ -459,7 +545,15 @@ impl<R: ProcessRunner> Supervisor<R> {
                         return Err(err);
                     }
                     let wants_restart = !matches!(self.policy, RestartPolicy::Never);
-                    if !wants_restart || self.max_restarts.is_some_and(|max| restarts >= max) {
+                    if !wants_restart {
+                        return Err(err);
+                    }
+                    if let Some(classifier) = &self.give_up_when
+                        && classifier(&GiveUpAttempt::Failed(&err))
+                    {
+                        return Err(err);
+                    }
+                    if self.max_restarts.is_some_and(|max| restarts >= max) {
                         return Err(err);
                     }
                     // A spawn-side failure carries no run duration, so it never
@@ -887,6 +981,80 @@ mod tests {
         assert_eq!(outcome.restarts, 2, "two restarts = three runs");
         assert_eq!(outcome.stopped, StopReason::RestartsExhausted);
         assert_eq!(outcome.final_result.code(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn give_up_when_stops_a_permanently_crashing_run() {
+        let outcome = supervise(SeqRunner::new(vec![fail(13)]))
+            .give_up_when(
+                |attempt| matches!(attempt, GiveUpAttempt::Crashed(res) if res.code() == Some(13)),
+            )
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(
+            outcome.restarts, 0,
+            "must not restart a run the classifier recognized as permanent"
+        );
+        assert_eq!(outcome.stopped, StopReason::GaveUp);
+        assert_eq!(outcome.final_result.code(), Some(13));
+    }
+
+    #[tokio::test]
+    async fn give_up_when_does_not_affect_an_unrecognized_transient_crash() {
+        let outcome = supervise(SeqRunner::new(vec![fail(1), ok()]))
+            .give_up_when(
+                |attempt| matches!(attempt, GiveUpAttempt::Crashed(res) if res.code() == Some(13)),
+            )
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.restarts, 1, "an unrecognized crash still restarts");
+        assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
+    }
+
+    #[tokio::test]
+    async fn give_up_when_stops_a_permanent_spawn_failure() {
+        // Without a classifier this would restart forever (and panic once the
+        // scripted single reply is exhausted) — the ENOENT-style case from the
+        // task: a mistyped program name never recovers on its own.
+        let err = supervise(SeqRunner::new(vec![spawn_err()]))
+            .give_up_when(|attempt| match attempt {
+                GiveUpAttempt::Failed(err) => matches!(err, crate::Error::Spawn { .. }),
+                GiveUpAttempt::Crashed(_) => false,
+            })
+            .run()
+            .await
+            .expect_err("a classified-permanent spawn failure must not restart forever");
+        assert!(matches!(err, crate::Error::Spawn { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn give_up_when_takes_precedence_over_an_exhausted_budget() {
+        let outcome = supervise(SeqRunner::new(vec![fail(13)]))
+            .max_restarts(0)
+            .give_up_when(
+                |attempt| matches!(attempt, GiveUpAttempt::Crashed(res) if res.code() == Some(13)),
+            )
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(
+            outcome.stopped,
+            StopReason::GaveUp,
+            "a permanent-failure verdict wins over an exhausted budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn give_up_when_is_not_consulted_when_the_policy_already_stops() {
+        let outcome = supervise(SeqRunner::new(vec![fail(13)]))
+            .restart(RestartPolicy::Never)
+            .give_up_when(|_| panic!("classifier must not run once the policy already stopped"))
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
     }
 
     #[tokio::test]
