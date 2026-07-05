@@ -184,6 +184,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-ut
 # Auto-cleaned, parallel-safe temp files for the `record` cassette round-trip
 # tests (hand-rolled temp_dir paths leak and race under parallel test runs).
 tempfile = "3"
+# Property-based tests over the line pump + `encoding_rs` decoder
+# (`src/pump.rs`): generates arbitrary byte streams chunked at arbitrary read
+# boundaries to check line/byte counters and multibyte reassembly hold for
+# any chunking, and that no chunking makes the pump panic.
+proptest = "1"
 
 [target.'cfg(windows)'.dev-dependencies]
 # Liveness probe (OpenProcess) in the integration test that proves a grandchild
