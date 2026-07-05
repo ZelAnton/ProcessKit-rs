@@ -511,22 +511,21 @@ pub(crate) async fn pump_lines_core<R>(
         }
     }
 
-    // Discard the buffered prefix of an over-cap line being skipped, returning its
-    // content-byte count and emptying `pending` — EXCEPT a single trailing `\r`,
-    // held back rather than counted in case it is the CR of a CRLF whose `\n`
-    // lands in the next chunk (a terminator, which `content_len` excludes).
-    // Deferring keeps the recorded length identical regardless of read boundary; a
-    // `\r` that turns out to be mid-line content is counted later (a subsequent
-    // split, another `skip_over_cap` pass, or the EOF finalizer carries it on).
-    fn skip_over_cap(pending: &mut String) -> usize {
-        if pending.ends_with('\r') {
-            let counted = pending.len() - 1;
-            pending.drain(..counted); // keep only the trailing '\r'
-            counted
+    // How many leading bytes of `sub` (the buffered prefix of an over-cap line
+    // being skipped) to advance past, EXCEPT a single trailing `\r`, held back
+    // rather than counted in case it is the CR of a CRLF whose `\n` lands in the
+    // next chunk (a terminator, which `content_len` excludes). Deferring keeps
+    // the recorded length identical regardless of read boundary; a `\r` that
+    // turns out to be mid-line content is counted later (a subsequent split,
+    // another `skip_over_cap_len` pass, or the EOF finalizer carries it on).
+    // Index-only (no buffer mutation): the caller advances its cursor by the
+    // returned amount and bulk-drains the consumed prefix once per chunk,
+    // instead of memmove-ing the tail on every skipped line.
+    fn skip_over_cap_len(sub: &str) -> usize {
+        if sub.ends_with('\r') {
+            sub.len() - 1 // keep only the trailing '\r' unconsumed
         } else {
-            let counted = pending.len();
-            pending.clear();
-            counted
+            sub.len()
         }
     }
 
@@ -565,37 +564,47 @@ pub(crate) async fn pump_lines_core<R>(
         }
         let _ = decoder.decode_to_string(&chunk[..n], &mut pending, last);
 
-        // Split out every complete line decoded so far, bounding memory by `cap`.
+        // Split out every complete line decoded so far, bounding memory by
+        // `cap`. `start` is a byte cursor into `pending`: instead of draining
+        // (and memmove-ing the remaining tail) on every single line — the
+        // write-amplification a busy stream of short lines used to pay for —
+        // the cursor only advances here, over an index subslice of `pending`,
+        // and the whole consumed prefix is removed in one bulk `drain` after
+        // the loop (below), amortized over every line the chunk produced.
+        let mut start = 0usize;
         loop {
+            let sub = &pending[start..];
             if let Some(skipped) = oversized {
                 // Skipping an over-cap line: discard through its terminator, keeping
                 // only its length for accounting.
-                match next_terminator(&pending, terminator, eof) {
+                match next_terminator(sub, terminator, eof) {
                     Some(term) => {
                         let line_len = skipped.saturating_add(term.content_len);
-                        pending.drain(..term.resume);
+                        start += term.resume;
                         oversized = None;
                         sink.0.record_oversized_line(line_len);
                     }
                     None => {
-                        oversized = Some(skipped.saturating_add(skip_over_cap(&mut pending)));
+                        let advance = skip_over_cap_len(sub);
+                        start += advance;
+                        oversized = Some(skipped.saturating_add(advance));
                         break;
                     }
                 }
             } else {
-                match next_terminator(&pending, terminator, eof) {
+                match next_terminator(sub, terminator, eof) {
                     Some(term) => {
                         // Compare *content* length (excluding the terminator) to the
                         // cap, so a CRLF/CR line is judged exactly like its LF twin.
                         let len = term.content_len;
                         if cap.is_none_or(|c| len <= c) {
-                            let mut line: String = pending.drain(..term.resume).collect();
-                            line.truncate(len); // drop the terminator sequence
+                            let line = sub[..len].to_owned(); // drop the terminator sequence
+                            start += term.resume;
                             emit(&mut handler, &mut tee, &sink.0, line).await;
                         } else {
                             // Over-cap line, terminator already here: drop it whole,
                             // counting its content length.
-                            pending.drain(..term.resume);
+                            start += term.resume;
                             sink.0.record_oversized_line(len);
                         }
                     }
@@ -606,16 +615,24 @@ pub(crate) async fn pump_lines_core<R>(
                     // `\r`/`\n` straddle a read but retained in one chunk. Exclude
                     // that byte; the next read re-decides (terminator → fits, or
                     // content → counts).
-                    None if cap.is_some_and(|c| {
-                        pending.len() - usize::from(pending.ends_with('\r')) > c
-                    }) =>
+                    None if cap
+                        .is_some_and(|c| sub.len() - usize::from(sub.ends_with('\r')) > c) =>
                     {
-                        oversized = Some(skip_over_cap(&mut pending));
+                        let advance = skip_over_cap_len(sub);
+                        start += advance;
+                        oversized = Some(advance);
                         break;
                     }
                     None => break,
                 }
             }
+        }
+        if start > 0 {
+            // The single bulk memmove for this chunk: drop exactly the
+            // consumed prefix, leaving `pending` holding only the unconsumed
+            // remainder for the next read to append to (same invariant the
+            // per-line drains used to maintain one line at a time).
+            pending.drain(..start);
         }
 
         if eof {
