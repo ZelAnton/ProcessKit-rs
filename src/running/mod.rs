@@ -1027,7 +1027,7 @@ impl RunningProcess {
         // heap in wait/profile. The byte cap bounds the pump's in-flight line
         // assembly too — `bounded(0)` alone retains no lines but would still let
         // a newline-free flood grow the in-flight buffer without limit.
-        let discard_policy = OutputBufferPolicy::bounded(0).with_max_bytes(DISCARD_INFLIGHT_CAP);
+        let discard_policy = discard_sink_policy();
         let sink_policy: &OutputBufferPolicy = match capture {
             CaptureMode::Discard => &discard_policy,
             CaptureMode::Lines => &self.buffer,
@@ -1040,6 +1040,18 @@ impl RunningProcess {
             .stderr_sink
             .clone()
             .unwrap_or_else(|| SharedLines::new(sink_policy));
+        // The discard verbs must never accumulate a user-policy backlog. A sink
+        // adopted from a *dropped* stream is still in the caller's
+        // `OutputBufferPolicy` (possibly unbounded); switch it to retain-nothing
+        // *before* `drive_to_exit` so a chatty child can't grow O(total) heap
+        // while we wait for it to exit. A freshly built sink already uses
+        // `discard_sink_policy`, so this is a no-op there. The capture path
+        // (`output_string`) leaves the sink untouched so it can still hand back
+        // the streamed tail.
+        if matches!(capture, CaptureMode::Discard) {
+            stdout_sink.start_discarding();
+            stderr_sink.start_discarding();
+        }
         self.spawn_line_pumps(&stdout_sink, &stderr_sink);
         if expose_counts {
             if self.stdout_sink.is_none() {
@@ -1512,6 +1524,15 @@ fn is_broken_pipe(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::BrokenPipe || matches!(e.raw_os_error(), Some(109 | 232))
 }
 
+/// The retain-nothing sink policy shared by the discard paths (`wait`/`profile`
+/// and a bare `finish`): keep no lines, but bound the pump's in-flight line
+/// assembly with [`DISCARD_INFLIGHT_CAP`] so a newline-free flood can't grow it
+/// unboundedly (`bounded(0)` alone retains no lines but would still let the
+/// in-flight buffer grow without limit).
+fn discard_sink_policy() -> OutputBufferPolicy {
+    OutputBufferPolicy::bounded(0).with_max_bytes(DISCARD_INFLIGHT_CAP)
+}
+
 /// Await the output pumps, bounded by [`PUMP_TEARDOWN`]; abort stragglers.
 async fn join_pumps(tasks: Vec<JoinHandle<()>>) {
     if tasks.is_empty() {
@@ -1688,6 +1709,90 @@ mod tests {
             result.truncated(),
             "a bounded buffer that dropped lines during streaming must report truncation: {result:?}"
         );
+    }
+
+    /// A bare `finish()` (no prior `stdout_lines`) drains stdout through the
+    /// internal discard sink, so a `fail_loud` policy must NOT raise
+    /// `OutputTooLarge` for output the caller never asked to capture — the outcome
+    /// is consistent with a successful `wait()` for the same process.
+    #[tokio::test]
+    async fn bare_finish_does_not_error_under_fail_loud_on_uncaptured_stdout() {
+        let cmd = Command::new("tool").output_buffer(OutputBufferPolicy::fail_loud(1));
+
+        let finished = ScriptedRunner::new()
+            .fallback(Reply::lines(["a", "b", "c", "d"]))
+            .start(&cmd)
+            .await
+            .expect("scripted start")
+            .finish()
+            .await
+            .expect("bare finish must not error under fail_loud");
+        assert_eq!(finished.outcome, Outcome::Exited(0));
+
+        // The same fail_loud process reaches the same success through wait().
+        let outcome = ScriptedRunner::new()
+            .fallback(Reply::lines(["a", "b", "c", "d"]))
+            .start(&cmd)
+            .await
+            .expect("scripted start")
+            .wait()
+            .await
+            .expect("wait must not error under fail_loud either");
+        assert_eq!(
+            outcome, finished.outcome,
+            "bare finish and wait agree on the uncaptured-stdout outcome"
+        );
+    }
+
+    /// A bare `finish()` still drains BOTH pipes under the default (unbounded)
+    /// policy: stdout is discarded (never returned — `Finished` carries no stdout),
+    /// stderr is captured in the background and handed back.
+    #[tokio::test]
+    async fn bare_finish_discards_stdout_but_returns_stderr() {
+        let finished = ScriptedRunner::new()
+            .fallback(Reply::fail(0, "e1\ne2\n").with_stdout("o1\no2\n"))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start")
+            .finish()
+            .await
+            .expect("bare finish");
+        assert_eq!(finished.outcome, Outcome::Exited(0));
+        assert_eq!(finished.stderr, "e1\ne2");
+    }
+
+    /// `stdout_lines()` → drop → `wait()`: the discard verb must complete cleanly
+    /// after a dropped live stream (the adopted sink is switched to retain-nothing
+    /// so it never reuses the stream's user-policy sink to grow O(total) heap).
+    #[tokio::test]
+    async fn wait_after_a_dropped_stream_completes() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::lines(["a", "b", "c", "d"]))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+        drop(run.stdout_lines().expect("stdout_lines"));
+        assert_eq!(
+            run.wait().await.expect("wait after a dropped stream"),
+            Outcome::Exited(0)
+        );
+    }
+
+    /// Same as above for `profile()` — the other discard verb.
+    #[cfg(feature = "stats")]
+    #[tokio::test]
+    async fn profile_after_a_dropped_stream_completes() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::lines(["a", "b", "c", "d"]))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+        drop(run.stdout_lines().expect("stdout_lines"));
+        let profile = run
+            .profile(Duration::from_millis(1))
+            .await
+            .expect("profile after a dropped stream");
+        assert_eq!(profile.outcome, Outcome::Exited(0));
     }
 
     #[tokio::test]

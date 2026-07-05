@@ -52,6 +52,11 @@ struct Inner {
     /// Set when `OverflowMode::Error` is active and a ceiling is reached — the
     /// consuming path turns this into [`Error::OutputTooLarge`](crate::Error::OutputTooLarge).
     overflowed: bool,
+    /// Flipped on by [`start_discarding`](SharedLines::start_discarding) when a
+    /// streaming consumer is gone and a discard verb adopts this sink: the
+    /// still-running pump keeps draining the pipe (so the child never blocks) but
+    /// retains nothing, so the backlog can't grow O(total).
+    discarding: bool,
 }
 
 impl Inner {
@@ -90,6 +95,7 @@ impl SharedLines {
                 mode: policy.overflow,
                 closed: false,
                 overflowed: false,
+                discarding: false,
             }),
             notify: Notify::new(),
             count: AtomicUsize::new(0),
@@ -106,53 +112,61 @@ impl SharedLines {
         {
             let mut inner = self.inner.lock().expect("SharedLines poisoned");
             inner.seen_bytes = inner.seen_bytes.saturating_add(line.len());
-            match inner.mode {
-                // Fires on the CUMULATIVE total seen, not the current backlog: a
-                // streaming consumer draining lines frees space but must not reset
-                // the ceiling. With neither cap set it is a ceiling with no
-                // ceiling — a misconfiguration treated as zero-tolerance. The pipe
-                // is still drained so the child never blocks; the consuming verb
-                // turns `overflowed` into `Error::OutputTooLarge`.
-                OverflowMode::Error => {
-                    let over = match (inner.max_lines, inner.max_bytes) {
-                        (None, None) => true,
-                        (lines_cap, bytes_cap) => {
-                            lines_cap.is_some_and(|n| total_lines > n)
-                                || bytes_cap.is_some_and(|b| inner.seen_bytes > b)
-                        }
-                    };
-                    if over {
-                        inner.overflowed = true;
-                        policy_dropped = true;
-                    } else {
-                        inner.bytes += line.len();
-                        inner.lines.push_back(line);
-                    }
-                }
-                // Ring-buffer "tail": append, then evict the oldest until the
-                // backlog is back within both ceilings (a single line larger than
-                // `max_bytes` is evicted whole).
-                OverflowMode::DropOldest => {
-                    inner.bytes += line.len();
-                    inner.lines.push_back(line);
-                    while inner.over_backlog() {
-                        match inner.lines.pop_front() {
-                            Some(old) => {
-                                inner.bytes = inner.bytes.saturating_sub(old.len());
-                                policy_dropped = true;
+            // A dropped streaming consumer flips `discarding` on (via
+            // `start_discarding`): keep counting/draining, but skip all
+            // retention and overflow bookkeeping so an adopting discard verb
+            // (wait/profile) can't grow O(total) heap.
+            if inner.discarding {
+                // Retain nothing.
+            } else {
+                match inner.mode {
+                    // Fires on the CUMULATIVE total seen, not the current backlog: a
+                    // streaming consumer draining lines frees space but must not reset
+                    // the ceiling. With neither cap set it is a ceiling with no
+                    // ceiling — a misconfiguration treated as zero-tolerance. The pipe
+                    // is still drained so the child never blocks; the consuming verb
+                    // turns `overflowed` into `Error::OutputTooLarge`.
+                    OverflowMode::Error => {
+                        let over = match (inner.max_lines, inner.max_bytes) {
+                            (None, None) => true,
+                            (lines_cap, bytes_cap) => {
+                                lines_cap.is_some_and(|n| total_lines > n)
+                                    || bytes_cap.is_some_and(|b| inner.seen_bytes > b)
                             }
-                            None => break,
+                        };
+                        if over {
+                            inner.overflowed = true;
+                            policy_dropped = true;
+                        } else {
+                            inner.bytes += line.len();
+                            inner.lines.push_back(line);
                         }
                     }
-                }
-                // "Head": keep what is buffered; drop the incoming line if it
-                // would breach either ceiling.
-                OverflowMode::DropNewest => {
-                    if inner.would_fit(line.len()) {
+                    // Ring-buffer "tail": append, then evict the oldest until the
+                    // backlog is back within both ceilings (a single line larger than
+                    // `max_bytes` is evicted whole).
+                    OverflowMode::DropOldest => {
                         inner.bytes += line.len();
                         inner.lines.push_back(line);
-                    } else {
-                        policy_dropped = true;
+                        while inner.over_backlog() {
+                            match inner.lines.pop_front() {
+                                Some(old) => {
+                                    inner.bytes = inner.bytes.saturating_sub(old.len());
+                                    policy_dropped = true;
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                    // "Head": keep what is buffered; drop the incoming line if it
+                    // would breach either ceiling.
+                    OverflowMode::DropNewest => {
+                        if inner.would_fit(line.len()) {
+                            inner.bytes += line.len();
+                            inner.lines.push_back(line);
+                        } else {
+                            policy_dropped = true;
+                        }
                     }
                 }
             }
@@ -206,6 +220,19 @@ impl SharedLines {
     /// call has no pipe left to drain), so a streaming consumer ends promptly.
     pub(crate) fn close_now(&self) {
         self.close();
+    }
+
+    /// Switch the sink to retain nothing and drop its current backlog. A discard
+    /// verb (`wait`/`profile`) calls this when it adopts a sink a **dropped**
+    /// stream left populated under the caller's `OutputBufferPolicy`, so the
+    /// still-running pump stops accumulating lines nobody will read. The line
+    /// counter is untouched (it still reflects the total the pump has seen); only
+    /// the retained backlog and future retention are dropped.
+    pub(crate) fn start_discarding(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.discarding = true;
+        inner.lines.clear();
+        inner.bytes = 0;
     }
 
     /// Total lines seen by the pump (including dropped ones).
@@ -895,6 +922,24 @@ mod tests {
             2,
             "DropNewest discarded the two newest lines"
         );
+    }
+
+    #[tokio::test]
+    async fn start_discarding_drops_the_backlog_and_retains_nothing_after() {
+        // The mechanism behind "a discard verb adopts a dropped stream's sink":
+        // the buffered backlog is freed and later pushes keep nothing, while the
+        // total line count stays exact (still every line the pump has seen).
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        sink.push("a".into());
+        sink.push("b".into());
+        sink.start_discarding();
+        assert!(sink.drain().is_empty(), "the buffered backlog is dropped");
+        sink.push("c".into());
+        assert!(
+            sink.drain().is_empty(),
+            "lines pushed after discarding are not retained"
+        );
+        assert_eq!(sink.count(), 3, "every line is still counted");
     }
 
     #[tokio::test]

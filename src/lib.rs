@@ -665,10 +665,11 @@ mod tests {
 
     // ── output-capture integrity ─────────────────────────────────────────────
 
-    // finish without a prior stdout_lines must route untaken stdout through the
-    // policy-aware pump (enforcing fail_loud), not read_to_end into a Vec.
+    // A bare finish (no prior stdout_lines) drains untaken stdout through the
+    // internal discard sink — the caller never asked to capture it — so it does
+    // NOT enforce fail_loud on that output, matching wait() (see below).
     #[tokio::test]
-    async fn finish_on_untaken_stdout_respects_fail_loud() {
+    async fn bare_finish_does_not_enforce_fail_loud_on_untaken_stdout() {
         use crate::buffer::OutputBufferPolicy;
         use crate::doubles::{Reply, ScriptedRunner};
         use crate::runner::ProcessRunner;
@@ -677,14 +678,11 @@ mod tests {
             .start(&crate::Command::new("prog").output_buffer(OutputBufferPolicy::fail_loud(2)))
             .await
             .expect("start");
-        let err = run
+        let finished = run
             .finish()
             .await
-            .expect_err("fail_loud(2) with 3 lines must error");
-        assert!(
-            matches!(err, crate::Error::OutputTooLarge { .. }),
-            "expected OutputTooLarge, got {err:?}"
-        );
+            .expect("a bare finish discards untaken stdout, so fail_loud does not fire");
+        assert_eq!(finished.outcome, Outcome::Exited(0));
     }
 
     // wait discards output, so it must never fire fail_loud (retain-nothing sink).

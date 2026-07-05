@@ -211,9 +211,18 @@ impl RunningProcess {
     /// but safe to call on its own — any pipe the stream didn't take is drained
     /// here so the child can never block on a full pipe.
     pub async fn finish(mut self) -> Result<Finished> {
+        // A bare `finish()` (no prior `stdout_lines`/`output_events` took stdout)
+        // still has to drain the leftover stdout so the child can't block on a full
+        // pipe — but the caller never asked to capture it. Pump it through the
+        // internal retain-nothing discard sink (not the user's `OutputBufferPolicy`):
+        // lines nobody will read aren't retained, and a `fail_loud` policy doesn't
+        // raise `OutputTooLarge` for output the caller didn't request — matching
+        // `wait()`. When stdout was already streamed, the reader is gone and the
+        // stream's user-policy sink stays in place (and is overflow-checked below).
+        let mut stdout_discarded = false;
         if let Some(pipe) = self.backend.take_stdout_reader() {
-            let sink = crate::pump::SharedLines::new(&self.buffer);
-            self.stdout_pump = Some(tokio::spawn(crate::pump::pump_lines_core(
+            let sink = SharedLines::new(&super::discard_sink_policy());
+            self.stdout_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,
                 self.stdout_encoding,
                 self.stdout_line_terminator,
@@ -222,6 +231,7 @@ impl RunningProcess {
                 sink.clone(),
             )));
             self.stdout_sink = Some(sink);
+            stdout_discarded = true;
         }
         if self.stderr_pump.is_none()
             && let Some(pipe) = self.backend.take_stderr_reader()
@@ -246,7 +256,15 @@ impl RunningProcess {
             .collect();
         super::join_pumps(pumps).await;
         let outcome = self.checked_outcome(raw_outcome)?;
-        for sink in [self.stdout_sink.as_ref(), self.stderr_sink.as_ref()]
+        // Skip the stdout overflow check when stdout went to the discard sink: the
+        // caller didn't ask to capture it, so an over-cap flood is not their error
+        // (the discard sink's DropOldest mode never trips it anyway). A stdout sink
+        // populated by a prior *stream* is still checked — the caller opted into
+        // that capture.
+        let stdout_check = (!stdout_discarded)
+            .then_some(self.stdout_sink.as_ref())
+            .flatten();
+        for sink in [stdout_check, self.stderr_sink.as_ref()]
             .into_iter()
             .flatten()
         {
