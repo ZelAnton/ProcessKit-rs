@@ -36,7 +36,12 @@ session/scope/service. The crate does not migrate your process into a sub-cgroup
 to work around it, so in practice limits apply only at a minimal non-systemd init
 sitting at the real root. Without a usable cgroup it quietly falls back to `ProcessGroup` —
 unless you requested [resource limits](#capability-matrices), which fail fast
-instead (`Error::ResourceLimit`), because an unapplied cap is no protection.
+instead (`Error::ResourceLimit`), because an unapplied cap is no protection. The
+error's `reason` distinguishes the two ways this happens: `LimitReason::Unsupported`
+when no cgroup v2 is mounted at all (or on macOS/BSD, which has no whole-tree
+container of any kind), `LimitReason::Unenforceable` when cgroup v2 exists but this
+process isn't at the real hierarchy root (the delegation case above) or the OS
+otherwise rejected the request.
 
 ## Capability matrices
 

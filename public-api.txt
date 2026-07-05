@@ -166,7 +166,9 @@ pub processkit::Error::OutputTooLarge::total_lines: usize
 pub processkit::Error::Parse::message: alloc::string::String
 pub processkit::Error::Parse::program: alloc::string::String
 #[non_exhaustive] pub processkit::Error::ResourceLimit
-pub processkit::Error::ResourceLimit::message: alloc::string::String
+pub processkit::Error::ResourceLimit::detail: alloc::string::String
+pub processkit::Error::ResourceLimit::kind: processkit::LimitKind
+pub processkit::Error::ResourceLimit::reason: processkit::LimitReason
 #[non_exhaustive] pub processkit::Error::Signalled
 pub processkit::Error::Signalled::program: alloc::string::String
 pub processkit::Error::Signalled::signal: core::option::Option<i32>
@@ -197,6 +199,8 @@ pub fn processkit::Error::is_permission_denied(&self) -> bool
 pub fn processkit::Error::is_signalled(&self) -> bool
 pub fn processkit::Error::is_timeout(&self) -> bool
 pub fn processkit::Error::is_transient(&self) -> bool
+pub fn processkit::Error::limit_kind(&self) -> core::option::Option<processkit::LimitKind>
+pub fn processkit::Error::limit_reason(&self) -> core::option::Option<processkit::LimitReason>
 pub fn processkit::Error::program(&self) -> core::option::Option<&str>
 pub fn processkit::Error::signal(&self) -> core::option::Option<i32>
 pub fn processkit::Error::stderr(&self) -> core::option::Option<&str>
@@ -215,6 +219,46 @@ impl core::marker::Unpin for processkit::Error
 impl core::marker::UnsafeUnpin for processkit::Error
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Error
 impl !core::panic::unwind_safe::UnwindSafe for processkit::Error
+#[non_exhaustive] pub enum processkit::LimitKind
+pub processkit::LimitKind::Cpu
+pub processkit::LimitKind::Memory
+pub processkit::LimitKind::Processes
+impl core::clone::Clone for processkit::LimitKind
+pub fn processkit::LimitKind::clone(&self) -> processkit::LimitKind
+impl core::cmp::Eq for processkit::LimitKind
+impl core::cmp::PartialEq for processkit::LimitKind
+pub fn processkit::LimitKind::eq(&self, &processkit::LimitKind) -> bool
+impl core::fmt::Debug for processkit::LimitKind
+pub fn processkit::LimitKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for processkit::LimitKind
+impl core::marker::StructuralPartialEq for processkit::LimitKind
+impl core::marker::Freeze for processkit::LimitKind
+impl core::marker::Send for processkit::LimitKind
+impl core::marker::Sync for processkit::LimitKind
+impl core::marker::Unpin for processkit::LimitKind
+impl core::marker::UnsafeUnpin for processkit::LimitKind
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::LimitKind
+impl core::panic::unwind_safe::UnwindSafe for processkit::LimitKind
+#[non_exhaustive] pub enum processkit::LimitReason
+pub processkit::LimitReason::Invalid
+pub processkit::LimitReason::Unenforceable
+pub processkit::LimitReason::Unsupported
+impl core::clone::Clone for processkit::LimitReason
+pub fn processkit::LimitReason::clone(&self) -> processkit::LimitReason
+impl core::cmp::Eq for processkit::LimitReason
+impl core::cmp::PartialEq for processkit::LimitReason
+pub fn processkit::LimitReason::eq(&self, &processkit::LimitReason) -> bool
+impl core::fmt::Debug for processkit::LimitReason
+pub fn processkit::LimitReason::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for processkit::LimitReason
+impl core::marker::StructuralPartialEq for processkit::LimitReason
+impl core::marker::Freeze for processkit::LimitReason
+impl core::marker::Send for processkit::LimitReason
+impl core::marker::Sync for processkit::LimitReason
+impl core::marker::Unpin for processkit::LimitReason
+impl core::marker::UnsafeUnpin for processkit::LimitReason
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::LimitReason
+impl core::panic::unwind_safe::UnwindSafe for processkit::LimitReason
 #[non_exhaustive] pub enum processkit::Mechanism
 pub processkit::Mechanism::CgroupV2
 pub processkit::Mechanism::JobObject

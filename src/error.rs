@@ -250,12 +250,25 @@ pub enum Error {
     /// enabled — see [`ResourceLimits`](crate::ResourceLimits) for the cgroup-v2
     /// "real root only" requirement). An unenforced limit is no protection, so this
     /// is raised rather than leaving the tree silently unbounded.
+    ///
+    /// Structured so a caller (e.g. the `processkit-py` binding) can branch on
+    /// *which* limit and *why* without parsing `detail`'s English text — see
+    /// [`LimitKind`](crate::LimitKind) / [`LimitReason`](crate::LimitReason), and
+    /// the [`limit_kind`](Self::limit_kind) / [`limit_reason`](Self::limit_reason)
+    /// accessors.
     #[cfg(feature = "limits")]
-    #[error("could not enforce resource limits: {message}")]
+    #[error("{}", display_resource_limit(*kind, *reason, detail))]
     #[non_exhaustive]
     ResourceLimit {
-        /// Human-readable detail of which limit could not be enforced and why.
-        message: String,
+        /// Which limit this failure is about.
+        kind: crate::limits::LimitKind,
+        /// Why the limit could not be applied.
+        reason: crate::limits::LimitReason,
+        /// Human-readable detail — the validation message for
+        /// [`LimitReason::Invalid`](crate::LimitReason::Invalid), or the
+        /// underlying OS error text otherwise. Bounded like other free-text
+        /// fields (see [`Parse`](Error::Parse)'s `message`) in `Display`/`Debug`.
+        detail: String,
     },
 
     /// An operation is not supported by the active containment mechanism on
@@ -632,6 +645,56 @@ impl Error {
         }
     }
 
+    /// Which limit a [`ResourceLimit`](Error::ResourceLimit) failure is about;
+    /// `None` for every other variant. Reads the field off the error without
+    /// destructuring the `#[non_exhaustive]` variant.
+    #[cfg(feature = "limits")]
+    pub fn limit_kind(&self) -> Option<crate::limits::LimitKind> {
+        // Exhaustive on purpose (like `signal`/`program`): a future variant
+        // must add itself here, not fall through a `_`.
+        match self {
+            Error::ResourceLimit { kind, .. } => Some(*kind),
+            Error::Spawn { .. }
+            | Error::NotFound { .. }
+            | Error::CassetteMiss { .. }
+            | Error::Exit { .. }
+            | Error::Timeout { .. }
+            | Error::OutputTooLarge { .. }
+            | Error::NotReady { .. }
+            | Error::Parse { .. }
+            | Error::Unsupported { .. }
+            | Error::Cancelled { .. }
+            | Error::Signalled { .. }
+            | Error::Stdin { .. }
+            | Error::Io(_) => None,
+        }
+    }
+
+    /// Why a [`ResourceLimit`](Error::ResourceLimit) failure occurred; `None`
+    /// for every other variant. Reads the field off the error without
+    /// destructuring the `#[non_exhaustive]` variant.
+    #[cfg(feature = "limits")]
+    pub fn limit_reason(&self) -> Option<crate::limits::LimitReason> {
+        // Exhaustive on purpose (like `signal`/`program`): a future variant
+        // must add itself here, not fall through a `_`.
+        match self {
+            Error::ResourceLimit { reason, .. } => Some(*reason),
+            Error::Spawn { .. }
+            | Error::NotFound { .. }
+            | Error::CassetteMiss { .. }
+            | Error::Exit { .. }
+            | Error::Timeout { .. }
+            | Error::OutputTooLarge { .. }
+            | Error::NotReady { .. }
+            | Error::Parse { .. }
+            | Error::Unsupported { .. }
+            | Error::Cancelled { .. }
+            | Error::Signalled { .. }
+            | Error::Stdin { .. }
+            | Error::Io(_) => None,
+        }
+    }
+
     /// Whether the run was killed because it exceeded its
     /// [`Command::timeout`](crate::Command::timeout) — i.e. this is a
     /// [`Timeout`](Error::Timeout). First-class here so the
@@ -832,12 +895,18 @@ impl fmt::Debug for Error {
                 .field("message", &StreamPreview(message))
                 .finish(),
             #[cfg(feature = "limits")]
-            Error::ResourceLimit { message } => f
+            Error::ResourceLimit {
+                kind,
+                reason,
+                detail,
+            } => f
                 .debug_struct("ResourceLimit")
+                .field("kind", kind)
+                .field("reason", reason)
                 // Bounded like every text-bearing variant to keep the "no
-                // unbounded text in Debug" invariant uniform, though `message`
+                // unbounded text in Debug" invariant uniform, though `detail`
                 // is short today.
-                .field("message", &StreamPreview(message))
+                .field("detail", &StreamPreview(detail))
                 .finish(),
             Error::Unsupported { operation } => f
                 .debug_struct("Unsupported")
@@ -949,6 +1018,36 @@ fn display_not_found(program: &str, searched: &Option<String>) -> String {
 fn display_parse(program: &str, message: &str) -> String {
     let mut out = format!("failed to parse `{program}` output: ");
     push_sanitized_capped(&mut out, message, DIAG_CAP);
+    out
+}
+
+/// `ResourceLimit`'s one-line `Display`: `` {kind} limit {reason}: {detail} ``,
+/// e.g. `` memory limit could not be enforced: enabling cgroup controllers... ``
+/// or `` CPU limit is invalid: cpu_quota must be a finite value greater than 0 ``.
+/// `detail` is bounded/sanitized like [`Parse`](Error::Parse)'s `message` — it
+/// may embed a raw OS error string, never trusted to be short or clean.
+#[cfg(feature = "limits")]
+fn display_resource_limit(
+    kind: crate::limits::LimitKind,
+    reason: crate::limits::LimitReason,
+    detail: &str,
+) -> String {
+    use crate::limits::{LimitKind, LimitReason};
+    let kind_str = match kind {
+        LimitKind::Memory => "memory limit",
+        LimitKind::Processes => "process-count limit",
+        LimitKind::Cpu => "CPU limit",
+    };
+    let reason_str = match reason {
+        LimitReason::Invalid => "is invalid",
+        LimitReason::Unsupported => "is not supported on this platform",
+        LimitReason::Unenforceable => "could not be enforced",
+    };
+    let mut out = format!("{kind_str} {reason_str}");
+    if !detail.is_empty() {
+        out.push_str(": ");
+        push_sanitized_capped(&mut out, detail, DIAG_CAP);
+    }
     out
 }
 
@@ -1216,7 +1315,9 @@ mod tests {
         #[cfg(feature = "limits")]
         assert_eq!(
             Error::ResourceLimit {
-                message: "no container".into()
+                kind: crate::limits::LimitKind::Memory,
+                reason: crate::limits::LimitReason::Unsupported,
+                detail: "no container".into()
             }
             .program(),
             None
@@ -1496,7 +1597,9 @@ mod tests {
         #[cfg(feature = "limits")]
         {
             let limit = Error::ResourceLimit {
-                message: "cgroup controller delegation unavailable".into(),
+                kind: crate::limits::LimitKind::Memory,
+                reason: crate::limits::LimitReason::Unenforceable,
+                detail: "cgroup controller delegation unavailable".into(),
             };
             assert_eq!(limit.diagnostic(), None);
         }
@@ -1643,14 +1746,68 @@ mod tests {
 
     #[cfg(feature = "limits")]
     #[test]
-    fn resource_limit_display_carries_reason() {
-        let err = Error::ResourceLimit {
-            message: "no cgroup or Job Object available".into(),
+    fn resource_limit_display_carries_kind_and_reason() {
+        use crate::limits::{LimitKind, LimitReason};
+
+        let unsupported = Error::ResourceLimit {
+            kind: LimitKind::Memory,
+            reason: LimitReason::Unsupported,
+            detail: "no cgroup or Job Object available".into(),
         };
         assert_eq!(
-            err.to_string(),
-            "could not enforce resource limits: no cgroup or Job Object available"
+            unsupported.to_string(),
+            "memory limit is not supported on this platform: no cgroup or Job Object available"
         );
+
+        let unenforceable = Error::ResourceLimit {
+            kind: LimitKind::Cpu,
+            reason: LimitReason::Unenforceable,
+            detail: "delegation unavailable".into(),
+        };
+        assert_eq!(
+            unenforceable.to_string(),
+            "CPU limit could not be enforced: delegation unavailable"
+        );
+
+        let invalid = Error::ResourceLimit {
+            kind: LimitKind::Processes,
+            reason: LimitReason::Invalid,
+            detail: "max_processes must be greater than 0".into(),
+        };
+        assert_eq!(
+            invalid.to_string(),
+            "process-count limit is invalid: max_processes must be greater than 0"
+        );
+
+        // A blank detail omits the trailing colon.
+        let no_detail = Error::ResourceLimit {
+            kind: LimitKind::Memory,
+            reason: LimitReason::Unsupported,
+            detail: String::new(),
+        };
+        assert_eq!(
+            no_detail.to_string(),
+            "memory limit is not supported on this platform"
+        );
+    }
+
+    #[cfg(feature = "limits")]
+    #[test]
+    fn resource_limit_accessors_read_kind_and_reason_without_destructuring() {
+        use crate::limits::{LimitKind, LimitReason};
+
+        let err = Error::ResourceLimit {
+            kind: LimitKind::Cpu,
+            reason: LimitReason::Invalid,
+            detail: "boom".into(),
+        };
+        assert_eq!(err.limit_kind(), Some(LimitKind::Cpu));
+        assert_eq!(err.limit_reason(), Some(LimitReason::Invalid));
+
+        // Every other variant reports None for both accessors.
+        let other = Error::exit("git", 1, "", "");
+        assert_eq!(other.limit_kind(), None);
+        assert_eq!(other.limit_reason(), None);
     }
 
     #[test]

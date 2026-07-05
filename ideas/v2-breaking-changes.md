@@ -11,12 +11,14 @@
 
 ## From the python-binding feedback (`next-python-binding-feedback.md`)
 
-- **C — structured `ResourceLimit`.** Replace `Error::ResourceLimit { message: String }`
-  with `ResourceLimit { kind: LimitKind /* Memory|Processes|Cpu */, reason: LimitReason
-  /* Invalid|Unenforceable|Unsupported */, detail: String }`. Breaking (restructures an
-  existing variant's fields — `#[non_exhaustive]` on the enum does not cover that). Cost
-  *moderate*: an honest `reason` needs a real signal from the backend on the `Job::new`
-  path, not just `validate_limits`. (`src/error.rs`, `src/group.rs`, `src/limits.rs`.)
+- **C — structured `ResourceLimit` — IMPLEMENTED.** Replaced
+  `Error::ResourceLimit { message: String }` with `ResourceLimit { kind: LimitKind
+  /* Memory|Processes|Cpu */, reason: LimitReason /* Invalid|Unenforceable|Unsupported */,
+  detail: String }`, plus `Error::limit_kind()`/`limit_reason()` accessors. `reason` is
+  a real backend signal (`io::ErrorKind::Unsupported` from the platform backend maps to
+  `LimitReason::Unsupported`; every other `Job::new` failure to `Unenforceable`;
+  `validate_limits` rejections to `Invalid`), not a parse of `validate_limits` text alone.
+  (`src/error.rs`, `src/group.rs`, `src/limits.rs`.)
 - **G — `OutputTooLarge` field names.** Rename `line_limit`/`byte_limit` →
   `max_lines`/`max_bytes` to match `OutputBufferPolicy`. Breaking (struct-variant field
   rename; no clean alias path). (`src/error.rs:161`, `src/buffer.rs`.)

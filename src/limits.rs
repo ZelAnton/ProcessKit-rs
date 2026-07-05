@@ -77,3 +77,50 @@ impl ResourceLimits {
         self.memory_max.is_some() || self.max_processes.is_some() || self.cpu_quota.is_some()
     }
 }
+
+/// Which [`ResourceLimits`] field an
+/// [`Error::ResourceLimit`](crate::Error::ResourceLimit) failure is about —
+/// [`Memory`](Self::Memory) for [`memory_max`](ResourceLimits::memory_max),
+/// [`Processes`](Self::Processes) for
+/// [`max_processes`](ResourceLimits::max_processes), [`Cpu`](Self::Cpu) for
+/// [`cpu_quota`](ResourceLimits::cpu_quota).
+///
+/// When a caller requests more than one limit at once and the failure can't be
+/// pinned to a single one (e.g. a Linux cgroup that can't enable any controller
+/// because this process isn't at the real hierarchy root), `kind` names the
+/// **first** requested limit in `memory_max`, `max_processes`, `cpu_quota` order
+/// — a fixed, documented tie-break rather than an arbitrary one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LimitKind {
+    /// [`ResourceLimits::memory_max`].
+    Memory,
+    /// [`ResourceLimits::max_processes`].
+    Processes,
+    /// [`ResourceLimits::cpu_quota`].
+    Cpu,
+}
+
+/// Why a requested resource limit could not be applied — the classification an
+/// [`Error::ResourceLimit`](crate::Error::ResourceLimit) failure carries so a
+/// caller (e.g. the `processkit-py` binding) can branch on the *kind* of failure
+/// without parsing the English `detail` text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LimitReason {
+    /// The requested value itself is nonsensical (e.g. `memory_max(0)`,
+    /// a non-finite or non-positive `cpu_quota`) — rejected before the OS is
+    /// ever touched.
+    Invalid,
+    /// The active containment mechanism has **no whole-tree resource
+    /// accounting at all** on this platform — macOS/the BSDs (a POSIX process
+    /// group only), or a Linux host with no cgroup v2 mounted. No container
+    /// capable of carrying the cap exists here, full stop.
+    Unsupported,
+    /// A capable mechanism **exists**, but this particular request could not
+    /// be applied to it — e.g. a Linux cgroup whose controllers can't be
+    /// enabled (this process isn't at the real cgroup-v2 hierarchy root — see
+    /// [`ResourceLimits`] for the "real root only" requirement), or a Windows
+    /// Job Object that rejected the limit.
+    Unenforceable,
+}

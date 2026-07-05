@@ -6,7 +6,7 @@ use tokio::process::{Child, Command};
 
 use crate::error::{Error, Result};
 #[cfg(feature = "limits")]
-use crate::limits::ResourceLimits;
+use crate::limits::{LimitKind, LimitReason, ResourceLimits};
 use crate::mechanism::Mechanism;
 #[cfg(feature = "process-control")]
 use crate::signal::Signal;
@@ -153,8 +153,25 @@ impl ProcessGroup {
             validate_limits(&options.limits)?;
             Job::new(&options.limits).map_err(|source| {
                 if options.limits.any() {
+                    // A real signal from the backend, not a guess: every
+                    // backend reports `ErrorKind::Unsupported` exactly when no
+                    // whole-tree container mechanism exists at all on this
+                    // platform (macOS/BSD's POSIX-only fallback, a Linux host
+                    // with no cgroup v2 mounted) — the same convention
+                    // `map_unsupported` relies on for the signal/suspend/resume
+                    // paths. Every other failure (Linux delegation/
+                    // subtree_control rejected, a Windows Job Object call
+                    // failing) means a capable mechanism exists but this
+                    // request could not be applied to it.
+                    let reason = if source.kind() == std::io::ErrorKind::Unsupported {
+                        LimitReason::Unsupported
+                    } else {
+                        LimitReason::Unenforceable
+                    };
                     Error::ResourceLimit {
-                        message: source.to_string(),
+                        kind: first_requested_kind(&options.limits),
+                        reason,
+                        detail: source.to_string(),
                     }
                 } else {
                     Error::Io(source)
@@ -544,27 +561,51 @@ fn map_unsupported(source: std::io::Error, operation: impl Into<String>) -> Erro
 }
 
 /// Reject nonsensical limit values before touching the OS, so a typo surfaces as a
-/// clear [`Error::ResourceLimit`] rather than an opaque kernel error.
+/// clear [`Error::ResourceLimit`] (`reason: Invalid`) rather than an opaque
+/// kernel error.
 #[cfg(feature = "limits")]
 fn validate_limits(limits: &ResourceLimits) -> Result<()> {
     if limits.memory_max == Some(0) {
         return Err(Error::ResourceLimit {
-            message: "memory_max must be greater than 0".into(),
+            kind: LimitKind::Memory,
+            reason: LimitReason::Invalid,
+            detail: "memory_max must be greater than 0".into(),
         });
     }
     if limits.max_processes == Some(0) {
         return Err(Error::ResourceLimit {
-            message: "max_processes must be greater than 0".into(),
+            kind: LimitKind::Processes,
+            reason: LimitReason::Invalid,
+            detail: "max_processes must be greater than 0".into(),
         });
     }
     if let Some(cores) = limits.cpu_quota
         && !(cores.is_finite() && cores > 0.0)
     {
         return Err(Error::ResourceLimit {
-            message: "cpu_quota must be a finite value greater than 0".into(),
+            kind: LimitKind::Cpu,
+            reason: LimitReason::Invalid,
+            detail: "cpu_quota must be a finite value greater than 0".into(),
         });
     }
     Ok(())
+}
+
+/// Which limit an enforcement failure (as opposed to a `validate_limits`
+/// rejection) should be attributed to, when the backend's error can't be
+/// pinned to a single one: the **first** requested limit in `memory_max`,
+/// `max_processes`, `cpu_quota` order — see [`LimitKind`]'s doc for why this
+/// fixed tie-break is honest rather than arbitrary. `limits.any()` is a
+/// precondition (checked by the caller), so at least one arm always matches.
+#[cfg(feature = "limits")]
+fn first_requested_kind(limits: &ResourceLimits) -> LimitKind {
+    if limits.memory_max.is_some() {
+        LimitKind::Memory
+    } else if limits.max_processes.is_some() {
+        LimitKind::Processes
+    } else {
+        LimitKind::Cpu
+    }
 }
 
 #[cfg(all(test, feature = "limits"))]
@@ -591,22 +632,64 @@ mod tests {
 
     #[test]
     fn validate_rejects_nonsense() {
-        for opts in [
-            ProcessGroupOptions::default().memory_max(0),
-            ProcessGroupOptions::default().max_processes(0),
-            ProcessGroupOptions::default().cpu_quota(0.0),
-            ProcessGroupOptions::default().cpu_quota(-1.0),
-            ProcessGroupOptions::default().cpu_quota(f64::NAN),
-            ProcessGroupOptions::default().cpu_quota(f64::INFINITY),
+        for (opts, expected_kind) in [
+            (
+                ProcessGroupOptions::default().memory_max(0),
+                LimitKind::Memory,
+            ),
+            (
+                ProcessGroupOptions::default().max_processes(0),
+                LimitKind::Processes,
+            ),
+            (ProcessGroupOptions::default().cpu_quota(0.0), LimitKind::Cpu),
+            (
+                ProcessGroupOptions::default().cpu_quota(-1.0),
+                LimitKind::Cpu,
+            ),
+            (
+                ProcessGroupOptions::default().cpu_quota(f64::NAN),
+                LimitKind::Cpu,
+            ),
+            (
+                ProcessGroupOptions::default().cpu_quota(f64::INFINITY),
+                LimitKind::Cpu,
+            ),
         ] {
-            assert!(matches!(
-                validate_limits(&opts.limits),
-                Err(Error::ResourceLimit { .. })
-            ));
-            assert!(matches!(
-                ProcessGroup::with_options(opts),
-                Err(Error::ResourceLimit { .. })
-            ));
+            // `validate_limits` classifies as `Invalid` with the specific
+            // field that failed — never a guess, and never touching the OS.
+            match validate_limits(&opts.limits) {
+                Err(Error::ResourceLimit { kind, reason, .. }) => {
+                    assert_eq!(kind, expected_kind);
+                    assert_eq!(reason, LimitReason::Invalid);
+                }
+                other => panic!("expected ResourceLimit, got {other:?}"),
+            }
+            match ProcessGroup::with_options(opts) {
+                Err(Error::ResourceLimit { kind, reason, .. }) => {
+                    assert_eq!(kind, expected_kind);
+                    assert_eq!(reason, LimitReason::Invalid);
+                }
+                other => panic!("expected ResourceLimit, got {other:?}"),
+            }
         }
+    }
+
+    #[test]
+    fn first_requested_kind_follows_the_documented_tie_break_order() {
+        // memory_max wins over the others when several are set...
+        let mut limits = ResourceLimits {
+            memory_max: Some(1),
+            max_processes: Some(1),
+            cpu_quota: Some(1.0),
+        };
+        assert_eq!(first_requested_kind(&limits), LimitKind::Memory);
+
+        // ...then max_processes, when memory_max is unset...
+        limits.memory_max = None;
+        assert_eq!(first_requested_kind(&limits), LimitKind::Processes);
+
+        // ...and cpu_quota is the last resort.
+        limits.max_processes = None;
+        assert_eq!(first_requested_kind(&limits), LimitKind::Cpu);
     }
 }

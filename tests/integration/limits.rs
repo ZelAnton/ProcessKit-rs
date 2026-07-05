@@ -3,7 +3,7 @@
 
 #[cfg(windows)]
 use processkit::Command;
-use processkit::{Error, Mechanism, ProcessGroup, ProcessGroupOptions};
+use processkit::{Error, LimitKind, LimitReason, Mechanism, ProcessGroup, ProcessGroupOptions};
 
 #[tokio::test]
 #[ignore = "creates an OS job/cgroup with a resource limit"]
@@ -19,18 +19,29 @@ async fn limits_are_enforced_or_rejected_per_platform() {
     } else if cfg!(target_os = "linux") {
         match res {
             Ok(group) => assert!(matches!(group.mechanism(), Mechanism::CgroupV2)),
-            // Common on dev boxes / CI without cgroup delegation — the fail-fast path.
-            Err(Error::ResourceLimit { .. }) => {
+            // Common on dev boxes / CI without cgroup delegation — the fail-fast
+            // path. A capable mechanism (cgroup v2 is mounted) exists here; this
+            // *specific* request just couldn't be applied — `Unenforceable`, not
+            // `Unsupported`.
+            Err(Error::ResourceLimit { kind, reason, .. }) => {
+                assert_eq!(kind, LimitKind::Memory);
+                assert_eq!(reason, LimitReason::Unenforceable);
                 eprintln!("skipping cgroup enforcement: controller delegation unavailable");
             }
             Err(other) => panic!("unexpected error: {other:?}"),
         }
     } else {
-        // macOS/BSD have no whole-tree cap.
-        assert!(
-            matches!(res, Err(Error::ResourceLimit { .. })),
-            "a limit on a container-less mechanism must be rejected, not silently dropped"
-        );
+        // macOS/BSD have no whole-tree cap at all — `Unsupported`, not
+        // `Unenforceable` (no mechanism exists to even attempt this against).
+        match res {
+            Err(Error::ResourceLimit { kind, reason, .. }) => {
+                assert_eq!(kind, LimitKind::Memory);
+                assert_eq!(reason, LimitReason::Unsupported);
+            }
+            other => panic!(
+                "a limit on a container-less mechanism must be rejected, not silently dropped: {other:?}"
+            ),
+        }
     }
 }
 

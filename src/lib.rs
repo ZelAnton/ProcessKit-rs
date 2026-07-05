@@ -178,7 +178,7 @@ pub use encoding_rs::Encoding;
 pub use error::{Error, Result};
 pub use group::{ProcessGroup, ProcessGroupOptions};
 #[cfg(feature = "limits")]
-pub use limits::ResourceLimits;
+pub use limits::{LimitKind, LimitReason, ResourceLimits};
 pub use mechanism::Mechanism;
 pub use pipeline::Pipeline;
 pub use result::{Outcome, ProcessResult};

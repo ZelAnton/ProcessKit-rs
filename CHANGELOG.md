@@ -20,6 +20,16 @@ to a dated version section.
   gone. `None` on the text path (`output_string`/`run`/`checked`/…), where the
   decoded `stdout` text is already complete and there is no separate raw form
   to recover.
+- `LimitKind` / `LimitReason` (`limits` feature) — classify an
+  `Error::ResourceLimit` failure by *which* limit (`Memory`/`Processes`/`Cpu`)
+  and *why* (`Invalid`/`Unsupported`/`Unenforceable`) without parsing English
+  text, via the new `Error::limit_kind()` / `limit_reason()` accessors.
+  `reason` reflects a real backend signal: `Unsupported` when the platform has
+  no whole-tree containment mechanism at all (macOS/BSD, or Linux with no
+  cgroup v2 mounted), `Unenforceable` when a capable mechanism exists but this
+  request was rejected (Linux cgroup delegation missing, a Windows Job Object
+  call failing), `Invalid` for a nonsensical value caught before the OS is ever
+  touched.
 
 ### Changed
 - **Breaking:** the data-carrying struct variants of `Error` — `Exit`, `Timeout`,
@@ -41,6 +51,11 @@ to a dated version section.
   (`Error::exit`/`timeout`/`signalled`) always build a text-path error
   (`stdout_bytes: None`); only a real checking verb over `output_bytes`
   populates it.
+- **Breaking:** `Error::ResourceLimit { message: String }` (`limits` feature) is
+  now `{ kind: LimitKind, reason: LimitReason, detail: String }` — fix a match
+  `Error::ResourceLimit { message }` → `Error::ResourceLimit { detail, .. }` (or
+  use the new `limit_kind()`/`limit_reason()` accessors instead of
+  destructuring the `#[non_exhaustive]` variant at all).
 
 ### Fixed
 -

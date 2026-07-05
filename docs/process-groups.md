@@ -237,8 +237,13 @@ let _sandboxed = group.start(&Command::new("untrusted-tool")).await?;
 `cpu_quota` is a fraction of a **single** core (`2.0` = two cores). Limits
 need a real container; when a requested cap can't be enforced — no Job
 Object/cgroup, or a Linux cgroup whose controllers can't be enabled —
-`with_options` returns `Error::ResourceLimit` instead of handing back a
-silently-unbounded group. On Linux this needs the process to run at the
+`with_options` returns `Error::ResourceLimit { kind, reason, detail }` instead
+of handing back a silently-unbounded group: `kind` names the limit
+(`memory_max`/`max_processes`/`cpu_quota`), `reason` says whether the value was
+simply invalid, the platform has no whole-tree mechanism at all
+(`Unsupported`), or a mechanism exists but rejected this request
+(`Unenforceable`) — branch on these instead of parsing `detail`. On Linux this
+needs the process to run at the
 **real cgroup-v2 root**: the crate enables the controllers in this process's own
 cgroup, which cgroup v2's "no internal processes" rule allows only for the real
 hierarchy root — *not* a cgroup-namespace root (so an ordinary container fails
