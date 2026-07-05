@@ -890,7 +890,11 @@ mod tests {
         // culprits by position.
         let torn_upstream = StageOutcome {
             torn_down: true,
-            ..unclean("upstream", Outcome::Signalled(Some(9)), "killed by teardown")
+            ..unclean(
+                "upstream",
+                Outcome::Signalled(Some(9)),
+                "killed by teardown",
+            )
         };
         let culprit = unclean("downstream", Outcome::Exited(3), "the real failure");
         let torn_last = StageOutcome {
@@ -927,7 +931,11 @@ mod tests {
             ..unclean("b", Outcome::Signalled(Some(9)), "second killed")
         };
         let result = pf(vec![first, second], last(Outcome::Exited(0), false), "");
-        assert_eq!(result.program(), "a", "leftmost victim when all are torn down");
+        assert_eq!(
+            result.program(),
+            "a",
+            "leftmost victim when all are torn down"
+        );
         assert!(!result.is_success());
     }
 
