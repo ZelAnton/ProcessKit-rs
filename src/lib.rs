@@ -190,7 +190,7 @@ pub use signal::Signal;
 #[cfg(feature = "stats")]
 pub use stats::{ProcessGroupStats, RunProfile, StatsSampler};
 pub use stdin::{ProcessStdin, Stdin};
-pub use supervisor::{RestartPolicy, StopReason, SupervisionOutcome, Supervisor};
+pub use supervisor::{GiveUpAttempt, RestartPolicy, StopReason, SupervisionOutcome, Supervisor};
 
 use std::ffi::OsStr;
 
