@@ -100,6 +100,17 @@ to a dated version section.
   `ProcessResult::truncated`. The default (no byte cap) is unchanged — capture
   stays unbounded as before; bound a flooding child with `with_max_bytes(..)`
   or a `timeout`.
+- `RecordReplayRunner` (`record` feature) no longer matches on `cwd`: a
+  cassette recorded from one absolute working directory (a dev box, a tempdir)
+  now replays against the same invocation run from a different one (a CI
+  workspace, a teammate's checkout) instead of `CassetteMiss`ing — the leading
+  blocker to recording on one machine and replaying on another. `cwd` is still
+  stored on each entry, verbatim, for visibility; it just no longer
+  discriminates two otherwise-identical recorded runs (an existing cassette
+  that relied on that — two entries differing only in `cwd` — now collides,
+  with the first-recorded entry answering for both). The on-disk format
+  revision bumped to `3`, but this is not a compatibility gate: a cassette
+  written by a previous build still loads and replays fine.
 
 ### Fixed
 -

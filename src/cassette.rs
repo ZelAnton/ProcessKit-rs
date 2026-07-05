@@ -9,13 +9,17 @@
 //! hermetic, no subprocess in CI.
 //!
 //! **Portability of the match key.** An invocation is matched on `program` +
-//! `args` + `cwd` + the stdin digest. `cwd` is stored **verbatim** and a
-//! `from_file` stdin source keys on its **path**, so a cassette recorded with an
-//! absolute `current_dir` (a tempdir, a CI workspace like `/home/alice/repo` or
-//! `C:\actions\work\…`) will `CassetteMiss` on another machine — and, for a
-//! per-run tempdir, on the very next run. Record with a **stable, relative**
-//! working directory (or none) and prefer `Stdin::from_bytes`/`from_string` over
-//! `from_file` when the cassette must travel.
+//! `args` + the stdin digest — **not** `cwd` (see [`CASSETTE_VERSION`] for why),
+//! so a cassette recorded in one absolute working directory (a tempdir, a CI
+//! workspace like `/home/alice/repo` or `C:\actions\work\…`) replays cleanly in
+//! another: the leading portability blocker (`cwd` pinning a cassette to the
+//! machine/checkout it was recorded on) is gone. `cwd` is still stored on the
+//! entry, verbatim, for visibility — just not matched on. A `from_file` stdin
+//! source keys on its **path**, though, so that source is still machine-bound if
+//! the path itself is absolute and varies across machines (a tempdir file); a
+//! per-run tempdir path will still miss on the very next run too. Prefer
+//! `Stdin::from_bytes`/`from_string` over `from_file` when the cassette must
+//! travel.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -42,7 +46,20 @@ use crate::runner::{JobRunner, ProcessRunner};
 /// replays exactly as before — the bump only guards against an *older* build
 /// misreading a *newer*-shaped cassette it doesn't understand yet, not the
 /// reverse.
-const CASSETTE_VERSION: u32 = 2;
+///
+/// Bumped to `3`: `cwd` is no longer part of the match key (see the type doc's
+/// "Portability of the match key"). A cassette recorded with the *previous*
+/// (cwd-keying) build and replayed with this one still **loads and replays
+/// fine** — the field is untouched on disk, still deserialized, still stored on
+/// the entry for visibility, only dropped from the key computation — so this
+/// bump is not a compatibility gate the way `2`'s was; it exists purely so a
+/// cassette on disk records *which* matching rules produced it, for a human
+/// skimming the file. A leading candidate that was *not* taken: normalizing
+/// `cwd` to a path relative to a `record_root` (preserves cwd distinctions, but
+/// needs a "root" concept the runner doesn't otherwise have, and no in-tree
+/// consumer has ever needed two recorded runs to be told apart *only* by their
+/// cwd — see `ideas/later-cassette-cwd-portability.md`).
+const CASSETTE_VERSION: u32 = 3;
 
 /// The whole fixture file: a format version plus the entries in capture order.
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,8 +82,6 @@ struct Entry {
     // --- the match key ---
     program: String,
     args: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cwd: Option<String>,
     /// FNV-1a digest of the stdin *source identity* — keyed so two invocations
     /// differing only in stdin don't collide on replay. In-memory bytes hash
     /// their content; a `from_file` source hashes its **path** (the file is not
@@ -80,6 +95,12 @@ struct Entry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stdin_digest: Option<u64>,
     // --- stored for visibility, not matched on ---
+    /// The invocation's working directory, verbatim — **not** part of the match
+    /// key (see the type doc's "Portability of the match key" / [`CASSETTE_VERSION`]'s
+    /// `3` bump). Kept only so a human reviewing the cassette can see where the
+    /// recording ran; two entries differing only in `cwd` collide on replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
     /// Whether stdin was supplied (human-readable; matching uses `stdin_digest`).
     #[serde(default, skip_serializing_if = "is_false")]
     has_stdin: bool,
@@ -342,8 +363,10 @@ fn io_kind_from_name(name: &str) -> std::io::ErrorKind {
     }
 }
 
-/// The match-key + visibility fields both [`Entry`] constructors derive the
-/// same way — see [`Entry::key_fields`].
+/// The match-key fields (`program`/`args`/`stdin_digest`) plus the
+/// visibility-only ones (`cwd`/`has_stdin`/`env_names`) both [`Entry`]
+/// constructors derive the same way — see [`Entry::key_fields`]. `cwd` rides
+/// along here for storage, not matching (see [`Key`]'s doc).
 struct KeyFields {
     program: String,
     args: Vec<String>,
@@ -458,7 +481,7 @@ fn write_new_file(path: &Path, json: &str) -> std::io::Result<()> {
 }
 
 impl Entry {
-    /// The match-key + visibility fields shared by both entry shapes
+    /// The match-key and visibility-only fields shared by both entry shapes
     /// (successful-call and `Err`-call) — everything [`from_parts`](Self::from_parts)
     /// and [`from_error`](Self::from_error) build identically, so the two
     /// constructors can't drift on how the key is derived.
@@ -579,17 +602,20 @@ impl Entry {
     }
 }
 
-/// What an invocation is matched on: program + args + cwd + the stdin source
-/// digest (content for in-memory bytes, path for a `from_file` source).
-/// Env overrides are excluded so an irrelevant env difference between the
-/// record and replay environments can't cause a spurious miss.
+/// What an invocation is matched on: program + args + the stdin source digest
+/// (content for in-memory bytes, path for a `from_file` source). Env overrides
+/// are excluded so an irrelevant env difference between the record and replay
+/// environments can't cause a spurious miss. `cwd` is excluded too — see the
+/// type doc's "Portability of the match key" / [`CASSETTE_VERSION`]'s `3` bump
+/// — so a cassette recorded in one absolute working directory still matches an
+/// otherwise-identical invocation run from a different one.
 ///
 /// The string components are *lossy* UTF-8 decodes, so two distinct non-UTF-8
 /// invocations that differ only in their invalid bytes produce the same key and
 /// collide on replay (the first recorded one answers for both). Accepted: keying
 /// on raw bytes would defeat the human-diffable text fixture, and valid-UTF-8
 /// invocations (the common case) never collide.
-type Key = (String, Vec<String>, Option<String>, bool, Option<u64>);
+type Key = (String, Vec<String>, bool, Option<u64>);
 
 /// The stdin source digest keyed into a cassette match — `None` for an
 /// empty/absent stdin. The digest never persists the stdin payload: in-memory
@@ -626,7 +652,8 @@ fn reject_unrecordable_stdin(command: &Command) -> Result<()> {
 /// [`Invocation`] (which records only *whether* stdin was supplied). The
 /// `has_stdin` bool is keyed alongside the digest so an older entry that loads
 /// `stdin_digest: None` regardless of its stored `has_stdin` cannot match a
-/// no-stdin replay — only miss.
+/// no-stdin replay — only miss. `invocation.cwd` is deliberately **not**
+/// included — see [`Key`]'s doc.
 fn key_of(invocation: &Invocation, stdin_digest: Option<u64>) -> Key {
     (
         invocation.program.to_string_lossy().into_owned(),
@@ -635,10 +662,6 @@ fn key_of(invocation: &Invocation, stdin_digest: Option<u64>) -> Key {
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect(),
-        invocation
-            .cwd
-            .as_ref()
-            .map(|c| c.to_string_lossy().into_owned()),
         invocation.has_stdin,
         stdin_digest,
     )
@@ -649,7 +672,6 @@ fn key_of_entry(entry: &Entry) -> Key {
     (
         entry.program.clone(),
         entry.args.clone(),
-        entry.cwd.clone(),
         entry.has_stdin,
         entry.stdin_digest,
     )
@@ -706,10 +728,13 @@ enum Mode<R> {
 ///
 /// **Replay** mode loads the cassette and serves results without spawning:
 ///
-/// - **Matching**: program + args + cwd + stdin source digest. Env override
-///   *values* are never written — only sorted variable names. Everything else
-///   (argv, cwd, stdout, stderr) is stored verbatim, so review fixtures
-///   before committing. File is written owner-only (`0600`) on Unix.
+/// - **Matching**: program + args + stdin source digest — **not** `cwd`, so a
+///   cassette recorded in one absolute working directory replays against an
+///   otherwise-identical invocation run from a different one (see the type
+///   doc's "Portability of the match key"). Env override *values* are never
+///   written — only sorted variable names. Everything else (argv, cwd, stdout,
+///   stderr) is stored verbatim, so review fixtures before committing. File is
+///   written owner-only (`0600`) on Unix.
 /// - **Duplicates** replay in capture order, then the last entry repeats.
 /// - **A miss is [`Error::CassetteMiss`]** (not `is_not_found()`): never a
 ///   surprise subprocess. A **recorded `Err`** replays as that same `Error`
@@ -1725,32 +1750,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cwd_is_part_of_the_match_key() {
+    async fn cwd_is_not_part_of_the_match_key() {
+        // The portability fix this task is about: a cassette recorded from one
+        // absolute working directory (a dev box, a tempdir) still replays when
+        // the same logical invocation runs from a different one (CI, another
+        // checkout) — cwd is stored on the entry for visibility but excluded
+        // from the match key (CASSETTE_VERSION 3).
         let (_dir, path) = temp_cassette();
         let recorder =
             RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("from-a")));
         let _ = recorder
-            .output_string(&Command::new("tool").current_dir("dir-a"))
+            .output_string(&Command::new("tool").current_dir("/home/dev/checkout"))
             .await
-            .expect("record in dir-a");
+            .expect("record in one absolute cwd");
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load");
+        let cross_dir = replayer
+            .run(&Command::new("tool").current_dir(r"C:\actions\work\checkout"))
+            .await
+            .expect(
+                "a differing absolute cwd (dev box -> CI workspace) must still replay: \
+                 cwd is not part of the match key",
+            );
+        assert_eq!(cross_dir, "from-a");
+
+        let no_cwd = replayer
+            .run(&Command::new("tool"))
+            .await
+            .expect("no cwd at all must replay the same recorded entry too");
+        assert_eq!(no_cwd, "from-a");
+
+        // cwd is still stored verbatim on the entry, just not matched on.
+        let json = std::fs::read_to_string(&path).expect("read cassette");
+        assert!(
+            json.contains("/home/dev/checkout"),
+            "cwd must still be stored for visibility: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn differing_program_or_args_still_miss_with_cwd_excluded() {
+        // Guards against a too-broad fix: dropping `cwd` from the key must not
+        // also loosen matching on `program`/`args` — the remaining key fields
+        // still discriminate as before.
+        let (_dir, path) = temp_cassette();
+        let recorder =
+            RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("from-a")));
+        let _ = recorder
+            .output_string(&Command::new("tool").arg("build").current_dir("dir-a"))
+            .await
+            .expect("record");
         recorder.save().expect("save");
 
         let replayer = RecordReplayRunner::replay(&path).expect("load");
         let err = replayer
-            .output_string(&Command::new("tool").current_dir("dir-b"))
+            .output_string(&Command::new("other").arg("build").current_dir("dir-b"))
             .await
-            .expect_err("a different cwd is a different invocation");
+            .expect_err("a different program is still a miss");
         assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
         let err = replayer
-            .output_string(&Command::new("tool"))
+            .output_string(&Command::new("tool").arg("test").current_dir("dir-b"))
             .await
-            .expect_err("a missing cwd is a different invocation too");
+            .expect_err("different args are still a miss");
         assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
-        let out = replayer
-            .run(&Command::new("tool").current_dir("dir-a"))
-            .await
-            .expect("the recorded cwd matches");
-        assert_eq!(out, "from-a");
     }
 
     #[cfg(unix)]

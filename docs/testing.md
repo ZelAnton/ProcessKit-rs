@@ -251,7 +251,7 @@ Semantics worth knowing before you commit a cassette:
 
 | Aspect | Behavior |
 |---|---|
-| Match key | program + args + cwd + a stdin **source digest** (hashed, never persisted: in-memory bytes hash their content, a `from_file` source hashes its path) — no stdin (absent or `Stdin::empty()`) keys distinctly; lossy UTF-8 on the text parts |
+| Match key | program + args + a stdin **source digest** (hashed, never persisted: in-memory bytes hash their content, a `from_file` source hashes its path) — no stdin (absent or `Stdin::empty()`) keys distinctly; lossy UTF-8 on the text parts. **`cwd` is not part of the key** — a cassette recorded from one absolute working directory still replays when the same invocation runs from another (a dev box vs. a CI workspace); `cwd` is still stored on the entry, verbatim, for visibility |
 | Environment | **values never reach the file** — only sorted variable names, so *env* secrets can't leak through a committed fixture; env is *not* matched, so env differences can't cause spurious misses |
 | Duplicates of one key | replay in capture order, then the **last entry repeats** — a recorded sequence (`git rev-parse HEAD` before/after a commit) replays faithfully, while retry/probe loops keep getting a stable final answer |
 | Miss | strict `Error::CassetteMiss` (distinct from a missing program — `is_not_found()` is `false`) — replay never spawns a surprise subprocess; a stale cassette fails loudly |

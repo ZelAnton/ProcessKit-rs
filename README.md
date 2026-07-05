@@ -734,9 +734,12 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-Entries are matched by program + args + cwd + a stdin **source digest** (hashed,
+Entries are matched by program + args + a stdin **source digest** (hashed,
 never persisted: in-memory bytes hash their content, a `from_file` source hashes
-its path). Environment override **values never reach the file** — only the
+its path) — **not** `cwd`, so a cassette recorded from one absolute working
+directory (a dev box, a tempdir) still replays when the same invocation runs
+from a different one (a CI workspace, a teammate's checkout). Environment
+override **values never reach the file** — only the
 sorted variable names, so env values can't leak through a committed fixture (and
 env differences can't cause spurious misses). **Note:** argv, cwd, stdout, and
 stderr *are* stored **verbatim** and can carry secrets (a `--password=…` flag, a
