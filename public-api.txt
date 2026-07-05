@@ -1,7 +1,8 @@
 pub mod processkit
 pub use processkit::CancellationToken
-pub use processkit::Encoding
-pub use processkit::StreamExt
+pub mod processkit::prelude
+pub use processkit::prelude::Encoding
+pub use processkit::prelude::StreamExt
 pub mod processkit::testing
 pub struct processkit::testing::Invocation
 pub processkit::testing::Invocation::args: alloc::vec::Vec<std::ffi::os_str::OsString>

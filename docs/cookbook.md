@@ -162,7 +162,8 @@ of silently seeing empty stdin. For a conversation, see the next recipe but one.
 ## Stream output as it arrives
 
 ```rust,no_run
-use processkit::{StreamExt, Finished}; // StreamExt re-exported; provides `.next()`
+use processkit::Finished;
+use processkit::prelude::StreamExt; // re-exported; provides `.next()`
 
 let mut run = Command::new("cargo").args(["build", "--verbose"]).start().await?;
 let mut lines = run.stdout_lines()?;
@@ -182,7 +183,7 @@ while any capture verb drives the run.
 ## Talk to an interactive child
 
 ```rust,no_run
-use processkit::StreamExt;
+use processkit::prelude::StreamExt;
 
 let mut run = Command::new("bc").keep_stdin_open().start().await?;
 let mut stdin = run.take_stdin().expect("stdin was kept open");

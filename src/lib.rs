@@ -168,13 +168,6 @@ pub use batch::{output_all, output_all_bytes};
 pub use buffer::{OutputBufferPolicy, OverflowMode, StdioMode};
 pub use client::{CliClient, IntoCommand};
 pub use command::Command;
-/// Re-exported from [`encoding_rs`] so a caller can name the type passed to
-/// [`Command::stdout_encoding`]/[`stderr_encoding`](Command::stderr_encoding)
-/// without a direct dependency. **Semver note:** this is a flat re-export of a
-/// `0.x` dependency's type, so a major bump of `encoding_rs` is a breaking change
-/// here, and `use processkit::*` pulls `Encoding` into scope (a glob-collision
-/// risk). A future major version may move it behind a dedicated module.
-pub use encoding_rs::Encoding;
 pub use error::{Error, Result};
 pub use group::{ProcessGroup, ProcessGroupOptions};
 #[cfg(feature = "limits")]
@@ -191,14 +184,6 @@ pub use signal::Signal;
 pub use stats::{ProcessGroupStats, RunProfile, StatsSampler};
 pub use stdin::{ProcessStdin, Stdin};
 pub use supervisor::{RestartPolicy, StopReason, SupervisionOutcome, Supervisor};
-/// Re-exported from [`tokio_stream`] so callers consume the stdout/event streams
-/// (e.g. [`StdoutLines`], [`OutputEvents`]) without a direct `tokio-stream`
-/// dependency. **Semver note:** a flat re-export of a `0.x` dependency's trait —
-/// a major bump of `tokio-stream` is breaking here, and `use processkit::*` pulls
-/// `StreamExt` into scope (it collides with `futures::StreamExt` /
-/// `tokio_stream::StreamExt` under a glob). Prefer importing it by path, or the
-/// upstream trait directly. A future major version may move it behind a module.
-pub use tokio_stream::StreamExt;
 
 use std::ffi::OsStr;
 
@@ -370,6 +355,29 @@ pub mod testing {
     /// assertions).
     #[cfg(feature = "mock")]
     pub use crate::runner::MockProcessRunner as MockRunner;
+}
+
+/// Re-exports of small vocabulary types from the crate's `0.x` dependencies,
+/// kept out of the crate root so `use processkit::*` doesn't pull them in (and
+/// so a future `0.x` major bump of either dependency stays contained to this
+/// module rather than the whole crate surface).
+///
+/// ```
+/// use processkit::prelude::StreamExt;
+/// ```
+pub mod prelude {
+    /// Re-exported from [`encoding_rs`] so a caller can name the type passed to
+    /// [`Command::stdout_encoding`](crate::Command::stdout_encoding) /
+    /// [`stderr_encoding`](crate::Command::stderr_encoding) without a direct
+    /// dependency on `encoding_rs`.
+    pub use encoding_rs::Encoding;
+
+    /// Re-exported from [`tokio_stream`] so callers can `.next()` the stdout/event
+    /// streams (e.g. [`StdoutLines`](crate::StdoutLines) /
+    /// [`OutputEvents`](crate::OutputEvents)) without a direct `tokio-stream`
+    /// dependency. Collides with `futures::StreamExt` under a glob import — import
+    /// by path (`processkit::prelude::StreamExt`) if both traits are in scope.
+    pub use tokio_stream::StreamExt;
 }
 
 /// Re-exported so callers can `use processkit::CancellationToken;` without a
@@ -714,9 +722,9 @@ mod tests {
     // silent empty stream — and the first pump's overflow is still seen by finish.
     #[tokio::test]
     async fn second_stdout_lines_errors_and_first_overflow_is_preserved() {
-        use crate::StreamExt;
         use crate::buffer::OutputBufferPolicy;
         use crate::doubles::{Reply, ScriptedRunner};
+        use crate::prelude::StreamExt;
         use crate::runner::ProcessRunner;
         let runner = ScriptedRunner::new().fallback(Reply::lines(["a", "b", "c"]));
         let cmd = crate::Command::new("prog").output_buffer(OutputBufferPolicy::fail_loud(2));
@@ -740,8 +748,8 @@ mod tests {
     // A second output_events call is likewise a loud error.
     #[tokio::test]
     async fn second_output_events_is_a_loud_error() {
-        use crate::StreamExt;
         use crate::doubles::{Reply, ScriptedRunner};
+        use crate::prelude::StreamExt;
         use crate::runner::ProcessRunner;
         let runner = ScriptedRunner::new().fallback(Reply::fail(1, "stderr-only"));
         let mut run = runner

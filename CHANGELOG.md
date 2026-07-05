@@ -73,6 +73,14 @@ to a dated version section.
 - **Breaking:** `RunProfile::exit_code` (the field) is removed — it duplicated
   `outcome.code()`, which the crate's `code()` method already exposes; use
   `profile.code()` instead of `profile.exit_code`.
+- **Breaking:** the flat crate-root re-exports of two `0.x` dependencies'
+  vocabulary types — `Encoding` (from `encoding_rs`) and `StreamExt` (from
+  `tokio-stream`) — move behind a new `processkit::prelude` module: fix
+  `use processkit::Encoding` → `use processkit::prelude::Encoding`, and
+  `use processkit::StreamExt` → `use processkit::prelude::StreamExt`. Keeps
+  `use processkit::*` from pulling in a trait that collides with
+  `futures::StreamExt`, and contains a future `0.x` major bump of either
+  dependency to the `prelude` module instead of the whole crate surface.
 
 ### Fixed
 -

@@ -131,8 +131,9 @@ hermetically — `stdout_lines` yields the lines, `wait_for_line` probes them,
 `finish` reports the canned outcome and stderr:
 
 ```rust,no_run
-use processkit::{Command, Outcome, ProcessRunner, StreamExt, Finished};
+use processkit::prelude::StreamExt;
 use processkit::testing::{Reply, ScriptedRunner};
+use processkit::{Command, Finished, Outcome, ProcessRunner};
 use std::time::Duration;
 
 #[tokio::test]

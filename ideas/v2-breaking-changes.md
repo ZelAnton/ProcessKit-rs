@@ -41,18 +41,16 @@
 
 ## From the vcs-toolkit additive sweep (`next-vcs-toolkit-feedback.md`)
 
-- **`#[non_exhaustive]` on the data-bearing `Error` variants.** The `Error` *enum* is
-  `#[non_exhaustive]`, but its variants are not — so adding a field to `Exit` / `Timeout` /
-  `Signalled` (and `Spawn` / `NotFound` / `Parse` / `OutputTooLarge` / `Stdin` /
-  `ResourceLimit`) is **breaking** in 1.x, exactly as the 0.8→0.11 line treated it.
-  Mark those variants `#[non_exhaustive]` in 2.0 so future field additions become
-  non-breaking. The access path is **already shipped** in 1.x and needs no further
-  prep: the `Error` accessor family (`program`/`code`/`signal`/`stdout`/`stderr`/
-  `combined`/`is_*`) lets consumers read every field without a struct match, and the
-  `#[doc(hidden)]` `Error::{exit,timeout,signalled}` constructors replace the literals
-  in doubles/tests. So 2.0 is just adding the attribute. (`src/error.rs`.) Until then,
-  the CHANGELOG/docs correctly promise only that a future *variant* addition (which the
-  enum-level `#[non_exhaustive]` already allows) is a non-event.
+- **`#[non_exhaustive]` on the data-bearing `Error` variants — IMPLEMENTED.** The
+  `Error` *enum* was already `#[non_exhaustive]`, but its variants were not — so
+  adding a field to `Exit` / `Timeout` / `Signalled` / `Spawn` / `NotFound` /
+  `Parse` / `OutputTooLarge` / `Stdin` / `ResourceLimit` was breaking. All nine are
+  now individually `#[non_exhaustive]` (`src/error.rs`), so a future field addition
+  to any of them is a non-event. The existing `Error` accessor family
+  (`program`/`code`/`signal`/`stdout`/`stderr`/`combined`/`is_*`) and the
+  `#[doc(hidden)]` `Error::{exit,timeout,signalled}` constructors already let
+  consumers read/build these variants without a struct match, so no further
+  migration was needed on top of the attribute.
 
 ## From the deep-audit-2026-07 sweep (`next-deep-audit-2026-07.md`)
 
@@ -171,13 +169,13 @@ can fail on the real runner.*
 
 ## From deep-audit-2026-07 Stage 6 (API additions — additive shipped, breaking deferred)
 
-- **G8 — flat crate-root re-exports → `prelude` module.** `pub use encoding_rs::Encoding`
-  and `pub use tokio_stream::StreamExt` sit at the crate root: a `use processkit::*`
-  glob pulls them in (StreamExt collides with `futures`/`tokio_stream`'s own), and a
-  `0.x` major bump of either dep is a breaking change to this crate's surface. *1.x:*
-  documented the coupling on both re-exports. *v2:* move them behind a
-  `processkit::prelude` (or re-export `StreamExt` under a distinct name), so the root
-  namespace isn't hostage to a `0.x` dep. (`src/lib.rs`.)
+- **G8 — flat crate-root re-exports → `prelude` module — IMPLEMENTED.** Moved
+  `encoding_rs::Encoding` and `tokio_stream::StreamExt` off the crate root into
+  a new `processkit::prelude` module — `use processkit::*` no longer pulls
+  either in, and a future `0.x` major bump of either dependency is contained to
+  `prelude`. `CancellationToken` (from `tokio-util`) stays at the root: out of
+  this item's scope (a stable 0.7 dependency, not part of the G8 complaint).
+  (`src/lib.rs`.)
 - **G4 — timeout as a tri-state `enum` + a `timeout_opt(Option<Duration>)` verb.**
   1.x ships `no_timeout()` alongside `timeout(Duration)`, with the "explicitly
   unbounded" state modeled as a `bool` next to `Option<Duration>` (the two setters
@@ -196,16 +194,16 @@ can fail on the real runner.*
 
 ## From deep-audit-2026-07 Stage 7 (error/result design)
 
-- **H4 — carry the `ProcessResult` in the failure error, so exact bytes survive the
-  consuming path.** The checking verbs (`run`/`ensure_success`/…) *consume* the
-  `ProcessResult` to build `Error::Exit`/`Timeout`/`Signalled`, which store stdout as
-  a **lossy UTF-8 `String`** — so after `output_bytes().await?.ensure_success()?`
-  fails, the exact bytes exist nowhere (documented in 1.x: "inspect the
-  `ProcessResult` yourself if you need them"). A cleaner v2 shape: give the failure
-  variants an `Option<ProcessResult<Vec<u8>>>` (or a generic result payload) so the
-  raw bytes ride along on the error. Breaking (adds/retypes error fields; pairs with
-  the `#[non_exhaustive]`-variants change already tracked). (`src/error.rs`,
-  `src/result.rs`.)
+- **H4 — carry the raw bytes in the failure error, so exact bytes survive the
+  consuming path — IMPLEMENTED.** The checking verbs (`run`/`ensure_success`/…)
+  *consumed* the `ProcessResult` to build `Error::Exit`/`Timeout`/`Signalled`,
+  which store stdout as a **lossy UTF-8 `String`** — so after
+  `output_bytes().await?.ensure_success()?` failed, the exact bytes existed
+  nowhere. Fixed with a lightweight payload rather than the originally-sketched
+  `Option<ProcessResult<Vec<u8>>>`: all three variants gain
+  `stdout_bytes: Option<Vec<u8>>` (`Some` on the bytes path via
+  `StdoutText::into_raw`, `None` on the text path), readable through the new
+  `Error::stdout_bytes()` accessor. (`src/error.rs`, `src/result.rs`.)
 - **D11 — record the error *type* in a cassette so a record-mode failure replays as
   the same `Error`, not a `CassetteMiss`.** Today a record-mode call that returns
   `Err` records **nothing** (only `Ok` results become `Entry`s), so replaying that

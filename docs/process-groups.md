@@ -257,7 +257,8 @@ interaction lives under its [Caveats](platform-support.md#caveats).
 Requires the opt-in **`stats`** feature (`features = ["stats"]`, or `limits`).
 
 ```rust,no_run
-use processkit::{Command, ProcessGroup, StreamExt};
+use processkit::prelude::StreamExt;
+use processkit::{Command, ProcessGroup};
 use std::time::Duration;
 
 let group = ProcessGroup::new()?;

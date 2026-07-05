@@ -44,11 +44,12 @@ for the code myself".
 ## Streaming stdout
 
 `stdout_lines()` yields decoded lines as the child produces them — no waiting
-for exit, no full-output buffering. `StreamExt` (re-exported from
-`tokio-stream`) provides `.next()`:
+for exit, no full-output buffering. `StreamExt` (in `processkit::prelude`,
+re-exported from `tokio-stream`) provides `.next()`:
 
 ```rust,no_run
-use processkit::{Command, Outcome, StreamExt, Finished};
+use processkit::prelude::StreamExt;
+use processkit::{Command, Finished, Outcome};
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {
@@ -102,7 +103,8 @@ Conversational tools — write a request, read the response, repeat. Keep stdin
 open with `keep_stdin_open()`, take the writer with `take_stdin()`:
 
 ```rust,no_run
-use processkit::{Command, Outcome, StreamExt, Finished};
+use processkit::prelude::StreamExt;
+use processkit::{Command, Finished, Outcome};
 
 // `ProcessStdin`'s writer methods return `std::io::Result`; `Box<dyn Error>`
 // mixes them with the crate's `Result` (or `.map_err(processkit::Error::Io)?`).

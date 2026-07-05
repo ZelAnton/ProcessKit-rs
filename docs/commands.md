@@ -132,7 +132,7 @@ let out = Command::new("legacy-tool")
     .await?;
 ```
 
-(`processkit::Encoding` re-exports `encoding_rs::Encoding`, so any of its
+(`processkit::prelude::Encoding` re-exports `encoding_rs::Encoding`, so any of its
 encodings works — the single-byte and ASCII-compatible multibyte ones
 (`WINDOWS_1252`, `GBK`, `SHIFT_JIS`, …) **and** the non-ASCII-compatible ones
 (`UTF_16LE`/`UTF_16BE`): output is fed through one persistent decoder and split

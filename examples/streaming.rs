@@ -4,7 +4,8 @@
 //!
 //! Run with: `cargo run --example streaming`
 
-use processkit::{Command, Finished, StreamExt};
+use processkit::prelude::StreamExt;
+use processkit::{Command, Finished};
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {

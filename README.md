@@ -328,7 +328,8 @@ A point-in-time `stats()` becomes a series with `sample_stats`, and a single run
 can be profiled end-to-end (requires the opt-in `stats` feature):
 
 ```rust,no_run
-use processkit::{Command, ProcessGroup, StreamExt};
+use processkit::prelude::StreamExt;
+use processkit::{Command, ProcessGroup};
 use std::time::Duration;
 
 #[tokio::main]
@@ -583,10 +584,12 @@ drive asynchronously.
 ### Stream stdout line by line
 
 Process each line as it arrives — no waiting for the child to exit, no buffering
-the full output. `StreamExt` (re-exported from `tokio-stream`) provides `.next()`:
+the full output. `StreamExt` (in `processkit::prelude`, re-exported from
+`tokio-stream`) provides `.next()`:
 
 ```rust,no_run
-use processkit::{Command, Outcome, StreamExt, Finished};
+use processkit::prelude::StreamExt;
+use processkit::{Command, Finished, Outcome};
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {
@@ -625,7 +628,8 @@ Keep stdin open with `keep_stdin_open()`, take the writer with
 `take_stdin()`, then interleave async writes and reads:
 
 ```rust,no_run
-use processkit::{Command, StreamExt};
+use processkit::prelude::StreamExt;
+use processkit::Command;
 
 // `ProcessStdin`'s writer methods return `std::io::Result` (idiomatic for a
 // writer), so this example uses `Box<dyn std::error::Error>` to mix them with the
