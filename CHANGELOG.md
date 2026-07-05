@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- `Command::timeout_opt(Option<Duration>)` — a composable timeout verb for
+  config-driven call sites: `Some(d)` is exactly `timeout(d)`, `None` is exactly
+  `no_timeout()` (deliberately unbounded, opting out of a client `default_timeout`
+  gap-fill), folding the `match cfg { Some(d) => c.timeout(d), None => c.no_timeout() }`
+  dance into one call. Internally the timeout is now modeled as a three-case type
+  (unset / explicitly unbounded / a deadline) instead of a `bool` maintained next
+  to an `Option<Duration>`.
+- `Command::retry_never()` — an explicit per-command opt-out of a client
+  `default_retry`, symmetric with `no_timeout()`. Runs the command exactly once
+  and suppresses the gap-fill; tidier than, and behaviorally identical to, the
+  `retry(1, Duration::ZERO, |_| false)` idiom.
 - `Error::stdout_bytes() -> Option<&[u8]>` — the **exact** captured stdout bytes
   for a checking-verb error (`Error::Exit` / `Timeout` / `Signalled`) built over
   `output_bytes` (e.g. `output_bytes().await?.ensure_success()?`). Previously

@@ -240,6 +240,15 @@ impl RetryConfig {
             classifier: Arc::new(retry_if),
         }
     }
+
+    /// A config that never retries: exactly one run, and a classifier that
+    /// rejects every error. Behind [`Command::retry_never`](crate::Command::retry_never)
+    /// — the explicit form of the `retry(1, ZERO, |_| false)` opt-out
+    /// (`max_attempts` 1 is a single run, and setting *any* config suppresses a
+    /// client `default_retry` gap-fill).
+    pub(crate) fn never() -> Self {
+        Self::fixed(1, Duration::ZERO, |_| false)
+    }
 }
 
 #[cfg(test)]
