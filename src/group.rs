@@ -306,18 +306,6 @@ impl ProcessGroup {
         Ok(())
     }
 
-    /// Renamed to [`kill_all`](Self::kill_all): the verb "terminate" reads as a
-    /// graceful `SIGTERM`, but this has always been an unconditional **hard**
-    /// kill, so the name fought the behaviour. A thin forwarding shim kept for
-    /// one minor; **removed in 2.0**.
-    #[deprecated(
-        since = "1.1.0",
-        note = "renamed to `kill_all` (it hard-kills, not a graceful SIGTERM); removed in 2.0"
-    )]
-    pub fn terminate_all(&self) -> Result<()> {
-        self.kill_all()
-    }
-
     /// Broadcast `sig` to every process in the group.
     ///
     /// Best-effort: a member that has already exited is skipped, and an empty

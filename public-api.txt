@@ -685,7 +685,6 @@ pub fn processkit::ProcessGroup::signal(&self, processkit::Signal) -> processkit
 pub fn processkit::ProcessGroup::spawn(&self, tokio::process::Command) -> processkit::Result<tokio::process::Child>
 pub fn processkit::ProcessGroup::stats(&self) -> processkit::Result<processkit::ProcessGroupStats>
 pub fn processkit::ProcessGroup::suspend(&self) -> processkit::Result<()>
-pub fn processkit::ProcessGroup::terminate_all(&self) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::with_options(processkit::ProcessGroupOptions) -> processkit::Result<Self>
 impl processkit::ProcessGroup
 pub async fn processkit::ProcessGroup::start(&self, &processkit::Command) -> processkit::Result<processkit::RunningProcess>
@@ -848,12 +847,10 @@ impl core::panic::unwind_safe::UnwindSafe for processkit::RetryPolicy
 #[non_exhaustive] pub struct processkit::RunProfile
 pub processkit::RunProfile::cpu_time: core::option::Option<core::time::Duration>
 pub processkit::RunProfile::duration: core::time::Duration
-pub processkit::RunProfile::exit_code: core::option::Option<i32>
 pub processkit::RunProfile::outcome: processkit::Outcome
 pub processkit::RunProfile::peak_memory_bytes: core::option::Option<u64>
 pub processkit::RunProfile::samples: usize
 impl processkit::RunProfile
-pub fn processkit::RunProfile::avg_cpu(&self) -> core::option::Option<f64>
 pub fn processkit::RunProfile::avg_cpu_cores(&self) -> core::option::Option<f64>
 pub fn processkit::RunProfile::code(&self) -> core::option::Option<i32>
 pub fn processkit::RunProfile::signal(&self) -> core::option::Option<i32>

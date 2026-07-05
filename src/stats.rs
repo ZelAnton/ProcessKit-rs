@@ -135,17 +135,13 @@ impl tokio_stream::Stream for StatsSampler<'_> {
 pub struct RunProfile {
     /// How the run ended — the full [`Outcome`](crate::Outcome), so a profile can
     /// distinguish a clean exit from a signal kill from a timeout (all three of
-    /// which leave [`exit_code`](Self::exit_code) `None`). Read it directly, or
-    /// via the [`signal`](Self::signal) / [`timed_out`](Self::timed_out)
-    /// convenience accessors. The profile is therefore a superset of
+    /// which leave [`code`](Self::code) `None`). Read it directly, or
+    /// via the [`code`](Self::code) / [`signal`](Self::signal) /
+    /// [`timed_out`](Self::timed_out) convenience accessors. The profile is
+    /// therefore a superset of
     /// [`RunningProcess::wait`](crate::RunningProcess::wait): one call yields both
     /// the resource telemetry and the run's actual outcome.
     pub outcome: Outcome,
-    /// The exit code if the run [exited](crate::Outcome::Exited); `None` for a run
-    /// killed by its timeout or a signal. Equals
-    /// [`outcome.code()`](crate::Outcome::code) — a convenience for the common
-    /// case; consult [`outcome`](Self::outcome) to tell a timeout from a signal.
-    pub exit_code: Option<i32>,
     /// Wall-clock time from process start until the run finished (exit reaped
     /// and output drained).
     pub duration: Duration,
@@ -169,23 +165,12 @@ impl RunProfile {
         Some(cpu.as_secs_f64() / self.duration.as_secs_f64())
     }
 
-    /// Renamed to [`avg_cpu_cores`](Self::avg_cpu_cores): the value is in CPU
-    /// **cores**, and the suffix makes the unit self-documenting. A thin
-    /// forwarding shim kept for one minor; **removed in 2.0**.
-    #[deprecated(
-        since = "1.1.0",
-        note = "renamed to `avg_cpu_cores` (the unit is cores); removed in 2.0"
-    )]
-    pub fn avg_cpu(&self) -> Option<f64> {
-        self.avg_cpu_cores()
-    }
-
     /// The exit code if the run [exited](crate::Outcome::Exited), else `None`
-    /// (a signal kill or a timeout). Equals the [`exit_code`](Self::exit_code)
-    /// field and [`outcome.code()`](crate::Outcome::code); the method form
-    /// completes the `code()` / [`signal()`](Self::signal) /
-    /// [`timed_out()`](Self::timed_out) accessor trio that mirrors
-    /// [`ProcessResult`](crate::ProcessResult) and [`Outcome`](crate::Outcome).
+    /// (a signal kill or a timeout). Equals
+    /// [`outcome.code()`](crate::Outcome::code); the method form completes the
+    /// `code()` / [`signal()`](Self::signal) / [`timed_out()`](Self::timed_out)
+    /// accessor trio that mirrors [`ProcessResult`](crate::ProcessResult) and
+    /// [`Outcome`](crate::Outcome).
     pub fn code(&self) -> Option<i32> {
         self.outcome.code()
     }
@@ -201,8 +186,8 @@ impl RunProfile {
     /// Whether the run was killed by its
     /// [timeout](crate::Outcome::TimedOut). Shorthand for
     /// [`outcome.timed_out()`](crate::Outcome::timed_out) — distinguishes a
-    /// deadline kill from a signal kill, which [`exit_code`](Self::exit_code)
-    /// alone (both `None`) cannot.
+    /// deadline kill from a signal kill, which [`code`](Self::code) alone
+    /// (both `None`) cannot.
     pub fn timed_out(&self) -> bool {
         self.outcome.timed_out()
     }
@@ -224,7 +209,6 @@ mod tests {
     fn avg_cpu_cores_is_cpu_time_over_duration() {
         let profile = RunProfile {
             outcome: Outcome::Exited(0),
-            exit_code: Some(0),
             duration: Duration::from_secs(2),
             cpu_time: Some(Duration::from_secs(1)),
             peak_memory_bytes: None,
@@ -237,7 +221,6 @@ mod tests {
     fn avg_cpu_cores_is_none_without_cpu_or_duration() {
         let no_cpu = RunProfile {
             outcome: Outcome::Exited(0),
-            exit_code: Some(0),
             duration: Duration::from_secs(1),
             cpu_time: None,
             peak_memory_bytes: None,
@@ -247,7 +230,6 @@ mod tests {
 
         let no_duration = RunProfile {
             outcome: Outcome::Exited(0),
-            exit_code: Some(0),
             duration: Duration::ZERO,
             cpu_time: Some(Duration::from_secs(1)),
             peak_memory_bytes: None,
@@ -257,29 +239,11 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
-    fn avg_cpu_forwards_to_avg_cpu_cores() {
-        // The deprecated alias must keep returning exactly what its replacement does
-        // until it is removed in 2.0.
-        let profile = RunProfile {
-            outcome: Outcome::Exited(0),
-            exit_code: Some(0),
-            duration: Duration::from_secs(2),
-            cpu_time: Some(Duration::from_secs(1)),
-            peak_memory_bytes: None,
-            samples: 4,
-        };
-        assert_eq!(profile.avg_cpu(), profile.avg_cpu_cores());
-        assert_eq!(profile.avg_cpu(), Some(0.5));
-    }
-
-    #[test]
-    fn outcome_distinguishes_timeout_from_signal_when_exit_code_is_none() {
+    fn outcome_distinguishes_timeout_from_signal_when_code_is_none() {
         // The whole point of carrying `outcome`: a timeout and a signal kill both
-        // leave `exit_code == None`, yet the profile must tell them apart.
+        // leave `code() == None`, yet the profile must tell them apart.
         let timed_out = RunProfile {
             outcome: Outcome::TimedOut,
-            exit_code: None,
             duration: Duration::from_secs(1),
             cpu_time: None,
             peak_memory_bytes: None,
@@ -290,7 +254,6 @@ mod tests {
 
         let signalled = RunProfile {
             outcome: Outcome::Signalled(Some(9)),
-            exit_code: None,
             duration: Duration::from_secs(1),
             cpu_time: None,
             peak_memory_bytes: None,
@@ -298,7 +261,7 @@ mod tests {
         };
         assert!(!signalled.timed_out());
         assert_eq!(signalled.signal(), Some(9));
-        // Both leave `exit_code` empty — only `outcome` separates them.
-        assert_eq!(timed_out.exit_code, signalled.exit_code);
+        // Both leave `code()` empty — only `outcome` separates them.
+        assert_eq!(timed_out.code(), signalled.code());
     }
 }

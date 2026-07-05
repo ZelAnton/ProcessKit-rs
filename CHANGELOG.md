@@ -67,6 +67,12 @@ to a dated version section.
     the crate's other multi-input builders (`Command::args`/`envs`,
     `Command::ok_codes`) — a bare array (`["a", "b"]`), a `Vec<String>`, or a
     slice all work directly, without an explicit `&`.
+- **Breaking:** the 1.1.0-deprecated forwarding aliases are removed: fix
+  `ProcessGroup::terminate_all` → `kill_all`, and `RunProfile::avg_cpu` →
+  `avg_cpu_cores`.
+- **Breaking:** `RunProfile::exit_code` (the field) is removed — it duplicated
+  `outcome.code()`, which the crate's `code()` method already exposes; use
+  `profile.code()` instead of `profile.exit_code`.
 
 ### Fixed
 -

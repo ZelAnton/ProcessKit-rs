@@ -29,12 +29,13 @@
   backends and `validate_limits`. (`src/limits.rs`, `src/group.rs`, `src/sys/linux.rs`,
   `src/sys/windows.rs`.)
 
-## Deprecated-alias removals (added in 1.1.0, remove in 2.0)
+## Deprecated-alias removals (added in 1.1.0, removed in 2.0) — IMPLEMENTED
 
 - `ProcessGroup::terminate_all` → removed (use `kill_all`). (`src/group.rs`.)
 - `RunProfile::avg_cpu` → removed (use `avg_cpu_cores`). (`src/stats.rs`.)
-- Consider `#[deprecated]` on the `RunProfile::exit_code` *field* (now redundant with
-  `outcome.code()` / `code()`), removed/kept-as-field-only in 2.0 — low priority.
+- `RunProfile::exit_code` *field* removed (was redundant with `outcome.code()` /
+  the `code()` method — kept the method, dropped the duplicate field).
+  (`src/stats.rs`, `src/running/mod.rs`.)
 
 <!-- Append items discovered while doing the 1.x additive ergonomics work below. -->
 
