@@ -81,6 +81,14 @@ to a dated version section.
   `use processkit::*` from pulling in a trait that collides with
   `futures::StreamExt`, and contains a future `0.x` major bump of either
   dependency to the `prelude` module instead of the whole crate surface.
+- **Breaking:** `output_bytes` now honors the `OutputBufferPolicy` **byte**
+  ceiling (`max_bytes`) on its raw stdout capture, not just the line-pumped
+  stderr: `OverflowMode::Error` past the cap errors with
+  `Error::OutputTooLarge` (`max_lines: None` — raw bytes have no lines), and
+  the drop modes bound the retained bytes to a head/tail and set
+  `ProcessResult::truncated`. The default (no byte cap) is unchanged — capture
+  stays unbounded as before; bound a flooding child with `with_max_bytes(..)`
+  or a `timeout`.
 
 ### Fixed
 -

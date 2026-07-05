@@ -1,5 +1,7 @@
 //! Policy for capping the in-memory backlog of captured output lines.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 /// How a child process's standard output or error stream is connected.
 ///
 /// Set per-stream on [`Command`](crate::Command) via
@@ -38,15 +40,21 @@ pub enum OverflowMode {
     /// silently dropping lines. The pipe is still drained (so the child never
     /// blocks); excess lines are counted but not retained.
     ///
-    /// The ceiling applies to **line-pumped** output. It fires on the
-    /// line-capturing verbs — [`output_string`](crate::Command::output_string)
-    /// (stdout *and* stderr) and the streaming
-    /// [`finish`](crate::RunningProcess::finish). On
+    /// The **line** ceiling ([`max_lines`](OutputBufferPolicy::max_lines)) applies
+    /// to line-pumped output: it fires on the line-capturing verbs —
+    /// [`output_string`](crate::Command::output_string) (stdout *and* stderr) and
+    /// the streaming [`finish`](crate::RunningProcess::finish). On
     /// [`output_bytes`](crate::Command::output_bytes) stdout is captured **raw**
-    /// (no line buffer), so the cap applies only to its line-pumped *stderr* —
-    /// the raw stdout is never line-capped (bound a flooding child with a
-    /// [`timeout`](crate::Command::timeout) instead). Discard-only verbs
-    /// ([`wait`](crate::RunningProcess::wait), and `profile` under the `stats`
+    /// (no line buffer), so the line ceiling covers only its line-pumped
+    /// *stderr*. The **byte** ceiling
+    /// ([`max_bytes`](OutputBufferPolicy::max_bytes)) *is* honored on the raw
+    /// stdout too — `output_bytes` errors (Error mode) or bounds the retained
+    /// bytes (drop modes) exactly as the line verbs do — so a byte cap is a real
+    /// memory bound there. Because a fail-loud ceiling for `output_bytes` needs a
+    /// *byte* cap (its `max_lines` is meaningless for a non-line stream), pair
+    /// Error mode with [`with_max_bytes`](OutputBufferPolicy::with_max_bytes) when
+    /// capturing raw bytes; a `timeout` additionally bounds wall-time. Discard-only
+    /// verbs ([`wait`](crate::RunningProcess::wait), and `profile` under the `stats`
     /// feature) use a retain-nothing sink internally and are not affected.
     ///
     /// Use this when unbounded *line* output is itself a misbehavior — an
@@ -207,5 +215,79 @@ impl OutputBufferPolicy {
 impl Default for OutputBufferPolicy {
     fn default() -> Self {
         Self::unbounded()
+    }
+}
+
+/// Append `chunk` to a raw-byte capture buffer (used by
+/// [`output_bytes`](crate::Command::output_bytes)) under an
+/// [`OutputBufferPolicy`] byte ceiling ([`max_bytes`](OutputBufferPolicy::max_bytes)),
+/// updating the overflow and truncation signals. This mirrors the line pump's
+/// byte-cap semantics for a stream that has no lines: `max_lines` does not
+/// apply here.
+///
+/// - No cap (`None`): retain everything (the default — byte-for-byte the old
+///   behavior).
+/// - [`OverflowMode::Error`]: flag overflow and stop retaining past the cap; the
+///   caller drains the pipe to EOF and then raises `Error::OutputTooLarge`.
+/// - [`OverflowMode::DropNewest`]: keep the first `cap` bytes (head), flag
+///   truncation.
+/// - [`OverflowMode::DropOldest`]: keep roughly the last `cap` bytes (tail). The
+///   tail is allowed to grow to `2 * cap` before a single compaction reclaims
+///   it, so a multi-GB stream costs O(total) memmoves rather than O(total×cap);
+///   [`clamp_dropoldest_tail`] trims the final buffer back to exactly `cap`.
+pub(crate) fn push_capped_bytes(
+    buf: &mut Vec<u8>,
+    chunk: &[u8],
+    cap: Option<usize>,
+    mode: OverflowMode,
+    overflowed: &AtomicBool,
+    truncated: &AtomicBool,
+) {
+    let Some(cap) = cap else {
+        buf.extend_from_slice(chunk);
+        return;
+    };
+    match mode {
+        OverflowMode::Error => {
+            if buf.len() + chunk.len() > cap {
+                overflowed.store(true, Ordering::Relaxed);
+                let room = cap.saturating_sub(buf.len());
+                buf.extend_from_slice(&chunk[..room.min(chunk.len())]);
+            } else {
+                buf.extend_from_slice(chunk);
+            }
+        }
+        OverflowMode::DropNewest => {
+            let room = cap.saturating_sub(buf.len());
+            let take = room.min(chunk.len());
+            if take < chunk.len() {
+                truncated.store(true, Ordering::Relaxed);
+            }
+            buf.extend_from_slice(&chunk[..take]);
+        }
+        OverflowMode::DropOldest => {
+            buf.extend_from_slice(chunk);
+            if buf.len() > cap {
+                truncated.store(true, Ordering::Relaxed);
+                // Amortize: only compact once the tail has grown to ~2×cap, so
+                // the reclaimed prefix is large relative to the memmove cost.
+                if buf.len() > cap.saturating_mul(2) {
+                    let excess = buf.len() - cap;
+                    buf.drain(..excess);
+                }
+            }
+        }
+    }
+}
+
+/// Trim an [`OverflowMode::DropOldest`] raw-byte capture back to exactly the
+/// last `cap` bytes. [`push_capped_bytes`] lets the tail run up to `2 * cap`
+/// during streaming to amortize compaction; this clamps the retained result.
+pub(crate) fn clamp_dropoldest_tail(buf: &mut Vec<u8>, cap: Option<usize>, mode: OverflowMode) {
+    if let (OverflowMode::DropOldest, Some(cap)) = (mode, cap)
+        && buf.len() > cap
+    {
+        let excess = buf.len() - cap;
+        buf.drain(..excess);
     }
 }
