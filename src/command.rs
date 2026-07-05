@@ -18,6 +18,37 @@ use crate::runner::{JobRunner, ProcessRunnerExt};
 use crate::running::RunningProcess;
 use crate::stdin::Stdin;
 
+/// A command's timeout as three type-level cases, so the "explicitly unbounded"
+/// state is a variant rather than a `bool` maintained next to an
+/// `Option<Duration>` (the old pair could otherwise encode the nonsensical
+/// "bounded *and* explicitly unbounded"). Private — the surface is the
+/// [`timeout`](Command::timeout) / [`no_timeout`](Command::no_timeout) /
+/// [`timeout_opt`](Command::timeout_opt) verbs and the
+/// [`configured_timeout`](Command::configured_timeout) accessor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Timeout {
+    /// No timeout set — a client-wide
+    /// [`default_timeout`](crate::CliClient::default_timeout) may gap-fill a
+    /// deadline (see [`Command::accepts_default_timeout`]).
+    Unset,
+    /// Explicitly unbounded ([`Command::no_timeout`]): no deadline, and opts out
+    /// of a client `default_timeout` gap-fill.
+    Unbounded,
+    /// A deadline of this duration ([`Command::timeout`]).
+    After(Duration),
+}
+
+impl Timeout {
+    /// The deadline duration, if one is set (`After`). `None` for both `Unset`
+    /// and the explicitly `Unbounded` state — neither imposes a deadline.
+    fn as_duration(self) -> Option<Duration> {
+        match self {
+            Timeout::After(d) => Some(d),
+            Timeout::Unset | Timeout::Unbounded => None,
+        }
+    }
+}
+
 /// A description of a child process to launch: program, arguments, working
 /// directory, environment, stdin source, and an optional timeout.
 ///
@@ -38,11 +69,11 @@ pub struct Command {
     keep_stdin_open: bool,
     /// Exempt this stage from pipefail attribution (see [`Self::unchecked_in_pipe`]).
     unchecked: bool,
-    timeout: Option<Duration>,
-    /// Set by [`no_timeout`](Self::no_timeout): "explicitly unbounded" — distinct
-    /// from `timeout: None` ("unset"), so a client `default_timeout` gap-fill
-    /// leaves it alone instead of imposing a deadline.
-    no_timeout: bool,
+    /// The timeout state — unset, explicitly unbounded, or a deadline (see
+    /// [`Timeout`]). This three-case type replaces the old `Option<Duration>` +
+    /// `no_timeout: bool` pair, so "explicitly unbounded" is modeled at the type
+    /// level instead of via a setter-maintained invariant.
+    timeout: Timeout,
     /// Grace window after the deadline before `SIGKILL`; its presence makes the
     /// timeout graceful (see [`Self::timeout_grace`]).
     timeout_grace: Option<Duration>,
@@ -98,8 +129,7 @@ impl Command {
             stdin: None,
             keep_stdin_open: false,
             unchecked: false,
-            timeout: None,
-            no_timeout: false,
+            timeout: Timeout::Unset,
             timeout_grace: None,
             #[cfg(feature = "process-control")]
             timeout_signal: None,
@@ -426,8 +456,7 @@ impl Command {
     ///
     /// Clears a prior [`no_timeout`](Self::no_timeout) — the last of the two wins.
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self.no_timeout = false;
+        self.timeout = Timeout::After(timeout);
         self
     }
 
@@ -442,8 +471,28 @@ impl Command {
     /// with a `default_timeout`. Clears a prior [`timeout`](Self::timeout) — the
     /// last of the two wins.
     pub fn no_timeout(mut self) -> Self {
-        self.timeout = None;
-        self.no_timeout = true;
+        self.timeout = Timeout::Unbounded;
+        self
+    }
+
+    /// Set the timeout from an optional [`Duration`], folding the
+    /// [`timeout`](Self::timeout) / [`no_timeout`](Self::no_timeout) split into a
+    /// single composable verb for config-driven call sites. `Some(d)` is exactly
+    /// [`timeout(d)`](Self::timeout); `None` is exactly
+    /// [`no_timeout()`](Self::no_timeout).
+    ///
+    /// Reach for it when you hold an `Option<Duration>` (a parsed config value, a
+    /// caller-supplied override) instead of the
+    /// `match cfg { Some(d) => c.timeout(d), None => c.no_timeout() }` dance. Mind
+    /// the `None` mapping: it means *deliberately unbounded* — opting out of a
+    /// client-wide [`default_timeout`](crate::CliClient::default_timeout) gap-fill,
+    /// **not** "leave the timeout unset for a default to fill". Like the two verbs
+    /// it folds, it is last-write-wins with any earlier timeout call.
+    pub fn timeout_opt(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = match timeout {
+            Some(d) => Timeout::After(d),
+            None => Timeout::Unbounded,
+        };
         self
     }
 
@@ -621,6 +670,23 @@ impl Command {
         retry_if: impl Fn(&Error) -> bool + Send + Sync + 'static,
     ) -> Self {
         self.retry = Some(RetryConfig::new(policy, retry_if));
+        self
+    }
+
+    /// Opt out of retries entirely: run this command **exactly once** and
+    /// suppress any client-wide
+    /// [`default_retry`](crate::CliClient::default_retry) gap-fill.
+    ///
+    /// The explicit, symmetric counterpart to [`no_timeout`](Self::no_timeout):
+    /// a bare [`Command`] already retries nothing, so this is only meaningful
+    /// against a [`CliClient`](crate::CliClient) whose `default_retry` would
+    /// otherwise be filled in — it pins "run this one command once, whatever the
+    /// client policy". Tidier than, and behaviorally identical to, the
+    /// `retry(1, Duration::ZERO, |_| false)` idiom (one attempt, a classifier that
+    /// accepts nothing). Last-write-wins with any earlier
+    /// [`retry`](Self::retry) / [`retry_with`](Self::retry_with).
+    pub fn retry_never(mut self) -> Self {
+        self.retry = Some(RetryConfig::never());
         self
     }
 
@@ -1040,17 +1106,20 @@ impl Command {
         self.stdin.as_ref()
     }
 
-    /// The configured timeout, if any.
+    /// The configured deadline, if any — `Some(d)` for a
+    /// [`timeout(d)`](Self::timeout), `None` for both an unset timeout and an
+    /// explicitly [`no_timeout`](Self::no_timeout) (neither imposes a deadline).
     pub fn configured_timeout(&self) -> Option<Duration> {
-        self.timeout
+        self.timeout.as_duration()
     }
 
     /// Whether a client-wide [`default_timeout`](crate::CliClient::default_timeout)
-    /// may gap-fill this command: only if no timeout is set **and**
-    /// [`no_timeout`](Self::no_timeout) was not requested (which opts out of the
-    /// fill to stay deliberately unbounded).
+    /// may gap-fill this command: only when the timeout is still
+    /// [`Unset`](Timeout::Unset). An explicit [`timeout`](Self::timeout)
+    /// ([`After`](Timeout::After)) or [`no_timeout`](Self::no_timeout)
+    /// ([`Unbounded`](Timeout::Unbounded), deliberately unbounded) both opt out.
     pub(crate) fn accepts_default_timeout(&self) -> bool {
-        self.timeout.is_none() && !self.no_timeout
+        matches!(self.timeout, Timeout::Unset)
     }
 
     /// The graceful-timeout grace window, if set.
@@ -1326,7 +1395,6 @@ impl fmt::Debug for Command {
             .field("keep_stdin_open", &self.keep_stdin_open)
             .field("unchecked", &self.unchecked)
             .field("timeout", &self.timeout)
-            .field("no_timeout", &self.no_timeout)
             .field("timeout_grace", &self.timeout_grace)
             .field("ok_codes", &self.ok_codes)
             .field("stdout_mode", &self.stdout_mode)
@@ -1760,6 +1828,71 @@ mod tests {
             .no_timeout();
         assert_eq!(re_unbounded.configured_timeout(), None);
         assert!(!re_unbounded.accepts_default_timeout());
+    }
+
+    #[test]
+    fn timeout_opt_folds_option_into_timeout_and_no_timeout() {
+        use std::time::Duration;
+        // G4: Some(d) is exactly timeout(d) — a bounded deadline that also opts
+        // out of a client default fill.
+        let some = Command::new("x").timeout_opt(Some(Duration::from_secs(2)));
+        assert_eq!(some.configured_timeout(), Some(Duration::from_secs(2)));
+        assert!(!some.accepts_default_timeout());
+        // None is exactly no_timeout() — deliberately unbounded, opts out of the
+        // fill (NOT "leave unset").
+        let none = Command::new("x").timeout_opt(None);
+        assert_eq!(none.configured_timeout(), None);
+        assert!(
+            !none.accepts_default_timeout(),
+            "timeout_opt(None) is no_timeout, not 'leave the timeout unset'"
+        );
+        // Equivalences against the verbs it folds.
+        assert_eq!(
+            Command::new("x")
+                .timeout_opt(Some(Duration::from_secs(5)))
+                .configured_timeout(),
+            Command::new("x")
+                .timeout(Duration::from_secs(5))
+                .configured_timeout(),
+        );
+        assert_eq!(
+            Command::new("x").timeout_opt(None).accepts_default_timeout(),
+            Command::new("x").no_timeout().accepts_default_timeout(),
+        );
+        // Last-write-wins with an earlier timeout call.
+        let overridden = Command::new("x")
+            .timeout(Duration::from_secs(9))
+            .timeout_opt(None);
+        assert_eq!(overridden.configured_timeout(), None);
+        assert!(!overridden.accepts_default_timeout());
+    }
+
+    #[test]
+    fn retry_never_is_a_single_run_that_suppresses_a_client_default() {
+        use crate::retry::RetryConfig;
+        use std::time::Duration;
+        // G4: retry_never sets a config (so it survives a default_retry gap-fill)
+        // whose schedule is a single attempt — behaviorally identical to
+        // retry(1, ZERO, |_| false).
+        let mut cmd = Command::new("x").retry_never();
+        let cfg = cmd.retry_config().expect("retry_never sets a retry config");
+        assert_eq!(cfg.policy.max_attempts(), 1, "exactly one run, no retry");
+        // A client default_retry must NOT override the explicit opt-out.
+        let client_default = Some(RetryConfig::fixed(5, Duration::ZERO, |_| true));
+        cmd.fill_default_retry(&client_default);
+        assert_eq!(
+            cmd.retry_config().expect("still set").policy.max_attempts(),
+            1,
+            "retry_never suppresses the client default_retry gap-fill"
+        );
+        // A command with no retry opinion DOES accept the client default.
+        let mut plain = Command::new("x");
+        plain.fill_default_retry(&client_default);
+        assert_eq!(
+            plain.retry_config().expect("filled").policy.max_attempts(),
+            5,
+            "a command without retry_never still accepts the client default"
+        );
     }
 
     #[test]

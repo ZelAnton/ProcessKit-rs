@@ -506,6 +506,7 @@ pub fn processkit::Command::pipe(self, processkit::Command) -> processkit::Pipel
 pub async fn processkit::Command::probe(&self) -> processkit::Result<bool>
 pub fn processkit::Command::program(&self) -> &std::ffi::os_str::OsStr
 pub fn processkit::Command::retry(self, u32, core::time::Duration, impl core::ops::function::Fn(&processkit::Error) -> bool + core::marker::Send + core::marker::Sync + 'static) -> Self
+pub fn processkit::Command::retry_never(self) -> Self
 pub fn processkit::Command::retry_with(self, processkit::RetryPolicy, impl core::ops::function::Fn(&processkit::Error) -> bool + core::marker::Send + core::marker::Sync + 'static) -> Self
 pub async fn processkit::Command::run(&self) -> processkit::Result<alloc::string::String>
 pub async fn processkit::Command::run_unit(&self) -> processkit::Result<()>
@@ -521,6 +522,7 @@ pub fn processkit::Command::stdout_encoding(self, &'static encoding_rs::Encoding
 pub fn processkit::Command::stdout_tee<W>(self, W) -> Self where W: tokio::io::async_write::AsyncWrite + core::marker::Send + core::marker::Unpin + 'static
 pub fn processkit::Command::timeout(self, core::time::Duration) -> Self
 pub fn processkit::Command::timeout_grace(self, core::time::Duration) -> Self
+pub fn processkit::Command::timeout_opt(self, core::option::Option<core::time::Duration>) -> Self
 pub fn processkit::Command::timeout_signal(self, processkit::Signal) -> Self
 pub async fn processkit::Command::try_parse<T, F>(&self, F) -> processkit::Result<T> where T: core::marker::Send, F: core::ops::function::FnOnce(&str) -> processkit::Result<T> + core::marker::Send
 pub fn processkit::Command::uid(self, u32) -> Self
