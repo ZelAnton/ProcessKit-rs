@@ -64,6 +64,27 @@ pub struct Reply {
     /// On a scripted `start`, sleep this long before each stdout line (see
     /// [`with_line_delay`](Self::with_line_delay)). Bulk `output_string` ignores it.
     line_delay: Option<std::time::Duration>,
+    /// Set by [`not_found`](Self::not_found)/[`spawn_error`](Self::spawn_error): the
+    /// reply is a spawn-side failure — the match never "runs" at all, so every
+    /// other field is unused. Checked before both bulk and streaming consumption.
+    spawn_error: Option<SpawnError>,
+}
+
+/// A spawn-side failure a [`Reply`] can express (see
+/// [`Reply::not_found`]/[`Reply::spawn_error`]) — the fake's analogue of the
+/// live launch path failing before a child ever ran, as opposed to a completed
+/// run with a failing exit code.
+#[derive(Debug, Clone)]
+enum SpawnError {
+    /// Drives [`Error::NotFound`](crate::Error::NotFound) (`is_not_found() ==
+    /// true`).
+    NotFound,
+    /// Drives [`Error::Spawn`](crate::Error::Spawn) carrying the given
+    /// [`std::io::ErrorKind`] and message.
+    Spawn {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
 }
 
 impl Reply {
@@ -78,6 +99,7 @@ impl Reply {
             signal: None,
             pending: false,
             line_delay: None,
+            spawn_error: None,
         }
     }
 
@@ -92,6 +114,7 @@ impl Reply {
             signal: None,
             pending: false,
             line_delay: None,
+            spawn_error: None,
         }
     }
 
@@ -116,6 +139,7 @@ impl Reply {
             signal: None,
             pending: false,
             line_delay: None,
+            spawn_error: None,
         }
     }
 
@@ -133,6 +157,7 @@ impl Reply {
             signal,
             pending: false,
             line_delay: None,
+            spawn_error: None,
         }
     }
 
@@ -158,6 +183,7 @@ impl Reply {
             signal: None,
             pending: true,
             line_delay: None,
+            spawn_error: None,
         }
     }
 
@@ -200,6 +226,58 @@ impl Reply {
         self
     }
 
+    /// A reply that fails as if the program could not be located at all — not
+    /// installed, not on `PATH`, or the given path doesn't resolve — driving
+    /// [`Error::NotFound`](crate::Error::NotFound)
+    /// (`is_not_found() == true`), the hermetic mirror of a live spawn hitting a
+    /// missing binary. A rule miss on the real runner instead lands on
+    /// [`Error::Spawn`](crate::Error::Spawn) (`is_not_found() == false` — a
+    /// double-specific "no rule matched" config error, not a modeled spawn
+    /// failure), so script this reply explicitly to test a "tool not installed →
+    /// fallback" branch: `.on(["rg", …], Reply::not_found())` (or
+    /// `.fallback(Reply::not_found())`) lets a caller's
+    /// `if err.is_not_found() { try_fallback_tool() }` branch run hermetically.
+    pub fn not_found() -> Self {
+        let mut reply = Self::ok(String::new());
+        reply.spawn_error = Some(SpawnError::NotFound);
+        reply
+    }
+
+    /// A reply that fails at spawn time with a generic OS-level error —
+    /// permission denied, a busy executable, and so on — as opposed to
+    /// [`not_found`](Self::not_found)'s "the program doesn't exist at all".
+    /// Drives [`Error::Spawn`](crate::Error::Spawn) with an `io::Error` of the
+    /// given `kind` and `message`, so classifiers built on it
+    /// (e.g. [`Error::is_permission_denied`](crate::Error::is_permission_denied))
+    /// answer on the fake exactly as they would for a live spawn failure.
+    pub fn spawn_error(kind: std::io::ErrorKind, message: impl Into<String>) -> Self {
+        let mut reply = Self::ok(String::new());
+        reply.spawn_error = Some(SpawnError::Spawn {
+            kind,
+            message: message.into(),
+        });
+        reply
+    }
+
+    /// The [`Error`](crate::Error) this reply's spawn failure stands for,
+    /// attributed to `program` — or `None` for an ordinary (non-spawn-error)
+    /// reply. Checked by both `output_string` and `start` before any other
+    /// field is consulted: a spawn-side failure means the match never "ran" at
+    /// all.
+    fn spawn_error_for(&self, program: String) -> Option<crate::error::Error> {
+        match &self.spawn_error {
+            Some(SpawnError::NotFound) => Some(crate::error::Error::NotFound {
+                program,
+                searched: None,
+            }),
+            Some(SpawnError::Spawn { kind, message }) => Some(crate::error::Error::Spawn {
+                program,
+                source: std::io::Error::new(*kind, message.clone()),
+            }),
+            None => None,
+        }
+    }
+
     /// A reply reconstructed from a recorded outcome — the decode model shared
     /// with the cassette's `Entry`: `timed_out` → timed out; else a present
     /// `code` → exited; else a signal kill (`signal` optionally absent). Lets the
@@ -223,6 +301,7 @@ impl Reply {
             signal,
             pending: false,
             line_delay: None,
+            spawn_error: None,
         }
     }
 
@@ -321,16 +400,66 @@ impl Rule {
         match self {
             // Match the program *and* the argument prefix, so `.on(["git",
             // "status"])` answers for `git status …` but not `rm status`. An empty
-            // prefix matches any command.
+            // prefix matches any command. The program name itself compares via
+            // `program_names_match` (Windows case/extension normalization); the
+            // argument prefix is always an exact, case-sensitive comparison.
             Rule::Prefix(prefix) => match prefix.split_first() {
                 Some((program, args)) => {
-                    command.program() == program.as_os_str()
+                    program_names_match(program.as_os_str(), command.program())
                         && command.arguments().starts_with(args)
                 }
                 None => true,
             },
             Rule::Predicate(pred) => pred(command),
         }
+    }
+}
+
+/// Compare a rule's registered program name against a command's actual program
+/// name — exact on every platform except Windows, where it also tolerates the
+/// differences the platform's own executable resolution shrugs off: case
+/// (`Git` vs `git`) and a trailing executable extension (`git` vs `git.exe`).
+/// Without this, `.on(["git", …])` would silently miss a `Command::new("git.exe")`
+/// (or vice versa) even though both name the same tool a live spawn would run.
+/// Only the program is compared this way — the argument prefix stays an exact,
+/// case-sensitive match.
+fn program_names_match(rule: &OsStr, actual: &OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        windows_program_key(rule) == windows_program_key(actual)
+    }
+    #[cfg(not(windows))]
+    {
+        rule == actual
+    }
+}
+
+/// Recognized Windows executable extensions a bare tool name commonly carries
+/// (mirrors the common subset of `PATHEXT`) — stripped before comparing, so
+/// `git` and `git.exe` normalize to the same key. A hardcoded list rather than
+/// reading `PATHEXT` itself: this is a *matching-fidelity* normalization for
+/// the fake, not a `PATH`-resolution lookup, and must not vary with the test
+/// machine's environment.
+#[cfg(windows)]
+const WINDOWS_EXECUTABLE_EXTENSIONS: &[&str] = &["exe", "cmd", "bat", "com", "ps1"];
+
+/// The case/extension-normalized key `program_names_match` compares on
+/// Windows: lowercased, with a recognized executable extension (see
+/// [`WINDOWS_EXECUTABLE_EXTENSIONS`]) stripped. A name whose extension isn't
+/// one of those (or has none) is just lowercased whole.
+#[cfg(windows)]
+fn windows_program_key(name: &OsStr) -> String {
+    let lossy = name.to_string_lossy();
+    let path = std::path::Path::new(lossy.as_ref());
+    match (path.file_stem(), path.extension()) {
+        (Some(stem), Some(ext))
+            if WINDOWS_EXECUTABLE_EXTENSIONS
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known)) =>
+        {
+            stem.to_string_lossy().to_ascii_lowercase()
+        }
+        _ => lossy.to_ascii_lowercase(),
     }
 }
 
@@ -576,6 +705,12 @@ impl ProcessRunner for ScriptedRunner {
         {
             return Err(crate::error::Error::Cancelled { program });
         }
+        // Consume a one-shot streaming stdin source exactly like the live launch
+        // path: a second run of a command whose stdin was `from_reader`/`from_lines`
+        // must fail loud here too, not pass silently on the fake and only blow up
+        // live. Checked before `matched_reply` so this never advances an
+        // `on_sequence` rule's reply cursor either.
+        crate::runner::take_stdin_for_run(command).await?;
         // Honor the non-piped-stdout contract: a capture verb on
         // `stdout(Inherit/Null)` errors rather than handing back output it could
         // never have captured. Checked before `matched_reply` so this config error
@@ -591,6 +726,9 @@ impl ProcessRunner for ScriptedRunner {
         }
         let timeout = command.configured_timeout();
         let reply = self.matched_reply(command, &program)?;
+        if let Some(err) = reply.spawn_error_for(program.clone()) {
+            return Err(err);
+        }
         if reply.pending {
             return park_until_cancelled(command, program).await;
         }
@@ -616,7 +754,14 @@ impl ProcessRunner for ScriptedRunner {
         {
             return Err(crate::error::Error::Cancelled { program });
         }
+        // See the matching comment in `output_string`: a one-shot streaming stdin
+        // source is consumed here too, so a second scripted `start` of the same
+        // command fails loud exactly as a second live spawn would.
+        crate::runner::take_stdin_for_run(command).await?;
         let reply = self.matched_reply(command, &program)?;
+        if let Some(err) = reply.spawn_error_for(program) {
+            return Err(err);
+        }
         Ok(reply.clone().into_running(command))
     }
 }
@@ -1806,5 +1951,194 @@ mod tests {
         assert_eq!(call.cwd, Some(PathBuf::from("/repo")));
         assert!(call.has_flag("--title"));
         assert!(!call.has_flag("--base"), "no --base flag was passed");
+    }
+
+    #[tokio::test]
+    async fn output_string_consumes_a_one_shot_stdin_source_like_a_live_run() {
+        // A second run of a command whose stdin is `from_reader`/`from_lines`
+        // must fail loud on the fake exactly as it does live (D7) — not pass
+        // silently a second time.
+        let runner = ScriptedRunner::new().fallback(Reply::ok("done"));
+        let stdin = crate::Stdin::from_reader(&b"payload"[..]);
+        let cmd = Command::new("tool").stdin(stdin);
+
+        let first = runner.output_string(&cmd).await;
+        assert!(first.is_ok(), "the first run consumes the source fine");
+
+        let second = runner
+            .output_string(&cmd)
+            .await
+            .expect_err("a re-run of a consumed one-shot stdin source must fail loud");
+        match second {
+            crate::error::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+            other => panic!("expected Io(InvalidInput), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn scripted_start_also_consumes_a_one_shot_stdin_source() {
+        // Parity for the streaming verb: `start` must take the one-shot source
+        // too, so a second scripted `start` observes it consumed.
+        let runner = ScriptedRunner::new().fallback(Reply::lines(["a", "b"]));
+        let stdin = crate::Stdin::from_reader(&b"payload"[..]);
+        let cmd = Command::new("tool").stdin(stdin);
+
+        let first = runner.start(&cmd).await;
+        assert!(
+            first.is_ok(),
+            "the first scripted start consumes the source"
+        );
+
+        let second = runner
+            .start(&cmd)
+            .await
+            .expect_err("a re-run of a consumed one-shot stdin source must fail loud");
+        match second {
+            crate::error::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+            other => panic!("expected Io(InvalidInput), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reusable_stdin_sources_are_not_consumed_by_the_fake() {
+        // Control: a re-runnable source (`from_bytes`/`from_string`/…) must NOT
+        // be affected by the new consumption check — every existing test that
+        // reuses a `Command` (or clones one) across calls keeps working.
+        let runner = ScriptedRunner::new().fallback(Reply::ok("done"));
+        let cmd = Command::new("tool").stdin(crate::Stdin::from_string("hi"));
+        for _ in 0..3 {
+            let _ = runner
+                .output_string(&cmd)
+                .await
+                .expect("a reusable stdin source never gets 'consumed'");
+        }
+    }
+
+    #[tokio::test]
+    async fn not_found_reply_drives_is_not_found() {
+        // `Reply::not_found()` fails as a spawn-side "the program doesn't
+        // exist", not a completed run with a failing exit code — the fake's
+        // analogue of a live spawn hitting a missing binary (D8).
+        use crate::error::Error;
+        let runner = ScriptedRunner::new().on(["rg", "--version"], Reply::not_found());
+        let err = runner
+            .output_string(&Command::new("rg").arg("--version"))
+            .await
+            .expect_err("a not_found reply must error, not return a canned exit code");
+        assert!(err.is_not_found(), "expected is_not_found(), got {err:?}");
+        match err {
+            Error::NotFound { program, .. } => assert_eq!(program, "rg"),
+            other => panic!("expected Error::NotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn not_found_reply_lets_a_tool_not_installed_fallback_branch_be_tested() {
+        // The scenario D8 calls out by name: "try the fast tool, fall back to
+        // the slow one if it's missing" is untestable on the fake without a way
+        // to script `is_not_found()`. `Reply::not_found()` closes that gap.
+        async fn pick_grep_tool(runner: &dyn crate::ProcessRunner) -> &'static str {
+            match runner
+                .output_string(&Command::new("rg").arg("--version"))
+                .await
+            {
+                Ok(_) => "rg",
+                Err(e) if e.is_not_found() => "grep",
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        let installed = ScriptedRunner::new().on(["rg", "--version"], Reply::ok("13.0.0"));
+        assert_eq!(pick_grep_tool(&installed).await, "rg");
+
+        let missing = ScriptedRunner::new().on(["rg", "--version"], Reply::not_found());
+        assert_eq!(pick_grep_tool(&missing).await, "grep");
+    }
+
+    #[tokio::test]
+    async fn not_found_reply_also_surfaces_through_start() {
+        let runner = ScriptedRunner::new().fallback(Reply::not_found());
+        let err = runner
+            .start(&Command::new("missing-tool"))
+            .await
+            .expect_err("a not_found reply must error on start too");
+        assert!(err.is_not_found(), "expected is_not_found(), got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn spawn_error_reply_carries_the_io_kind() {
+        // A generic OS-level spawn failure (as opposed to `not_found`'s "the
+        // program doesn't exist at all") — e.g. permission denied — so
+        // classifiers built on `Error::Spawn`'s io kind answer on the fake
+        // exactly as they would live.
+        use crate::error::Error;
+        let runner = ScriptedRunner::new().fallback(Reply::spawn_error(
+            std::io::ErrorKind::PermissionDenied,
+            "eacces",
+        ));
+        let err = runner
+            .output_string(&Command::new("locked-tool"))
+            .await
+            .expect_err("a spawn_error reply must error");
+        assert!(
+            err.is_permission_denied(),
+            "expected is_permission_denied(), got {err:?}"
+        );
+        assert!(
+            !err.is_not_found(),
+            "a generic spawn error is not is_not_found()"
+        );
+        match err {
+            Error::Spawn { program, source } => {
+                assert_eq!(program, "locked-tool");
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+                assert_eq!(source.to_string(), "eacces");
+            }
+            other => panic!("expected Error::Spawn, got {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn prefix_rule_program_match_is_case_and_extension_insensitive_on_windows() {
+        // `git` and `git.exe` (and any casing) name the same tool a live spawn
+        // would resolve identically — the fake must agree (D9/D13's Windows gap).
+        let runner = ScriptedRunner::new().on(["git", "status"], Reply::ok("clean"));
+
+        for program in ["git.exe", "GIT", "Git.EXE"] {
+            let out = runner
+                .output_string(&Command::new(program).arg("status"))
+                .await
+                .unwrap_or_else(|e| panic!("`{program}` should match the `git` rule: {e}"));
+            assert_eq!(out.stdout(), "clean");
+        }
+
+        // The reverse direction: a rule registered with the `.exe` suffix still
+        // answers for the bare name.
+        let runner = ScriptedRunner::new().on(["git.exe", "status"], Reply::ok("clean"));
+        let out = runner
+            .output_string(&Command::new("git").arg("status"))
+            .await
+            .expect("a bare `git` should match a `git.exe`-registered rule");
+        assert_eq!(out.stdout(), "clean");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn prefix_rule_still_requires_the_same_underlying_program_on_windows() {
+        // The normalization must not turn the matcher into a free-for-all: a
+        // genuinely different program name still misses.
+        let runner = ScriptedRunner::new()
+            .on(["git", "status"], Reply::ok("clean"))
+            .fallback(Reply::fail(1, "unmatched"));
+        let miss = runner
+            .output_string(&Command::new("gitk.exe").arg("status"))
+            .await
+            .unwrap();
+        assert_eq!(
+            miss.code(),
+            Some(1),
+            "`gitk` is a different tool than `git`"
+        );
     }
 }
