@@ -95,6 +95,11 @@ struct StageOutcome {
     ok_codes: Vec<i32>,
     /// Stage's own configured timeout — carried so a timed-out stage reports its real deadline.
     timeout: Option<Duration>,
+    /// Stage was ended by the chain's proactive teardown (the group was killed
+    /// after a *sibling* failed), not by a failure of its own. Treated like a
+    /// SIGPIPE victim in attribution: de-prioritized so the real culprit — the
+    /// stage that triggered teardown — is the one blamed.
+    torn_down: bool,
 }
 
 impl Pipeline {
@@ -137,14 +142,17 @@ impl Pipeline {
     /// firing the token cancels the stages directly, it does not wait for them to
     /// notice a closed pipe.
     ///
-    /// Contrast a plain **stage failure** (a stage exits non-zero, or hits its own
-    /// timeout, *without* the chain being cancelled): teardown of the *other*
-    /// stages is **passive** — they end when the failed stage's pipe closes (EOF /
-    /// broken pipe) — and the chain is collected stage-by-stage in order, so a
-    /// downstream failure surfaces only once the upstream stages have themselves
-    /// ended. A quiet, still-running upstream stage can therefore delay the error.
-    /// Bound such a chain with [`timeout`](Self::timeout) (which kills the whole
-    /// group) if a stuck stage must not hold the run open.
+    /// A plain **stage failure** (a stage exits non-zero, is signal-killed, or hits
+    /// its own timeout, *without* the chain being cancelled) is **also** proactive:
+    /// the first such failure tears the whole group down at once, so a quiet,
+    /// still-running sibling — classically an upstream producer that never writes,
+    /// and so never dies of a broken pipe — cannot hold the run open. The failure
+    /// still keeps its **pipefail** attribution: the stage that triggered teardown
+    /// is blamed, while the siblings the teardown killed are treated as victims
+    /// (like a downstream `SIGPIPE` death), never stealing the blame. The one
+    /// death that does *not* trigger teardown is an
+    /// [`unchecked_in_pipe`](Command::unchecked_in_pipe) stage's — its unclean exit
+    /// is forgiven, so it leaves the rest of the chain running.
     ///
     /// The token **gap-fills** — at launch it is applied to every stage that does
     /// not already carry its own [`Command::cancel_on`], leaving an explicit
@@ -213,6 +221,17 @@ impl Pipeline {
             running.push((process, stage.is_unchecked()));
         }
 
+        // Proactive teardown: the first stage to finish with a *checked failure*
+        // fires this token; a concurrent killer then tears the whole group down so
+        // a quiet, still-running sibling (classically an upstream producer that
+        // never writes, so never dies of a broken pipe) cannot hold the chain open
+        // after the failure. Stages ended by that kill are flagged `torn_down` and
+        // de-prioritized in the pipefail fold, so the real culprit is still blamed.
+        // This is distinct from the user's `cancel_token`: a cancelled stage errors
+        // out (`Err(Cancelled)`) before producing a `StageOutcome`, so cancellation
+        // never fires this teardown and the cancel path is unchanged.
+        let teardown = tokio_util::sync::CancellationToken::new();
+
         // Drain concurrently: a stderr-chatty inner stage must not block on a full pipe.
         let (last, last_unchecked) = running.pop().expect("a pipeline has at least two stages");
         let last_stage = self
@@ -226,8 +245,16 @@ impl Pipeline {
             let program = process.program_name().to_owned();
             let ok_codes = stage.ok_codes_vec();
             let timeout = stage.configured_timeout();
+            let teardown = teardown.clone();
             inner_tasks.push(tokio::spawn(async move {
                 let Finished { outcome, stderr } = process.finish().await?;
+                // Snapshot *before* firing: a teardown already in flight when this
+                // stage ended marks it a victim; the first genuine failure sees no
+                // teardown yet, so it fires it and stays the (non-torn) culprit.
+                let torn_down = teardown.is_cancelled();
+                if !torn_down && is_checked_failure(outcome, &ok_codes, unchecked) {
+                    teardown.cancel();
+                }
                 Ok::<_, crate::Error>(StageOutcome {
                     program,
                     outcome,
@@ -235,10 +262,30 @@ impl Pipeline {
                     unchecked,
                     ok_codes,
                     timeout,
+                    torn_down,
                 })
             }));
         }
-        let last_task = tokio::spawn(capture_last(last));
+        // Call `capture_last` here (not inside the spawned future): it yields a
+        // `Send` future `F`, whereas the closure `C` itself is not `Send` and must
+        // not be captured across the `tokio::spawn` boundary.
+        let last_future = capture_last(last);
+        let last_task = tokio::spawn({
+            let teardown = teardown.clone();
+            let last_ok_codes = last_ok_codes.clone();
+            async move {
+                let result = last_future.await?;
+                // The last stage triggers teardown too (a failing last stage should
+                // not wait on a quiet upstream either); torn if a sibling already did.
+                let torn_down = teardown.is_cancelled();
+                if !torn_down
+                    && is_checked_failure(result.outcome(), &last_ok_codes, last_unchecked)
+                {
+                    teardown.cancel();
+                }
+                Ok::<_, crate::Error>((result, torn_down))
+            }
+        });
 
         let _abort_guard = AbortTasksOnDrop(
             inner_tasks
@@ -249,15 +296,31 @@ impl Pipeline {
         );
 
         let collect = async {
-            let mut outcomes = Vec::with_capacity(inner_tasks.len() + 1);
-            for task in inner_tasks {
-                outcomes.push(task.await.map_err(join_error)??);
+            // Ordered gather (leftmost-first) — the success path is byte-for-byte
+            // the old behavior. On failure the killer arm below wakes and tears the
+            // group down, unblocking whichever ordered await was stalled on a quiet
+            // sibling; the gather then completes and wins the `select!`.
+            let gather = async {
+                let mut outcomes = Vec::with_capacity(inner_tasks.len() + 1);
+                for task in inner_tasks {
+                    outcomes.push(task.await.map_err(join_error)??);
+                }
+                let (last_result, last_torn_down) = last_task.await.map_err(join_error)??;
+                Ok::<_, crate::Error>((outcomes, last_result, last_torn_down))
+            };
+            tokio::select! {
+                collected = gather => collected,
+                // Fires once on the first checked failure, then never resolves —
+                // it only exists for its kill side effect, letting `gather` finish.
+                () = async {
+                    teardown.cancelled().await;
+                    let _ = group.kill_all();
+                    std::future::pending::<()>().await
+                } => unreachable!("the teardown killer pends forever after firing"),
             }
-            let last_result = last_task.await.map_err(join_error)??;
-            Ok::<_, crate::Error>((outcomes, last_result))
         };
 
-        let (mut stages, last_result) = match self.timeout {
+        let (mut stages, last_result, last_torn_down) = match self.timeout {
             None => collect.await?,
             Some(limit) => match tokio::time::timeout(limit, collect).await {
                 Ok(collected) => collected?,
@@ -282,6 +345,7 @@ impl Pipeline {
             unchecked: last_unchecked,
             ok_codes: last_ok_codes,
             timeout: last_timeout,
+            torn_down: last_torn_down,
         };
         // `pipefail` rebuilds via `ProcessResult::new` (which defaults `truncated=false`);
         // re-stamp truncation so the `parse`/`try_parse` guard fires correctly.
@@ -425,30 +489,45 @@ fn is_sigpipe(outcome: &Outcome) -> bool {
     false
 }
 
+/// Did this outcome count as a *clean* exit given the stage's accepted codes?
+/// Exhaustive (no wildcard) so a future [`Outcome`] variant forces a decision
+/// here rather than being silently treated as clean (H2).
+fn is_clean_exit(outcome: Outcome, ok_codes: &[i32]) -> bool {
+    match outcome {
+        Outcome::Exited(code) => ok_codes.contains(&code),
+        Outcome::Signalled(_) | Outcome::TimedOut => false, // kill/timeout → unclean
+    }
+}
+
+/// A stage whose unclean, non-forgiven exit makes it a genuine pipefail culprit —
+/// the trigger for proactive teardown. An [`unchecked_in_pipe`](Command::unchecked_in_pipe)
+/// stage never qualifies (its unclean exit is forgiven, so it must not tear the
+/// chain down).
+fn is_checked_failure(outcome: Outcome, ok_codes: &[i32], unchecked: bool) -> bool {
+    !unchecked && !is_clean_exit(outcome, ok_codes)
+}
+
 /// Fold all stages (last included) into one pipefail result.
 ///
 /// Key invariants:
 /// - An `unchecked` inner stage is fully exempt from attribution regardless of
 ///   how it ended. An `unchecked` last stage is the one carve-out: only its
 ///   non-zero *exit* is forgiven; a last-stage timeout or signal still surfaces.
-/// - Among checked failures, a non-SIGPIPE culprit is preferred over a SIGPIPE
-///   victim; otherwise the leftmost wins.
+/// - Among checked failures, a genuine culprit is preferred over a *victim* — a
+///   downstream SIGPIPE death, or a stage the chain's proactive teardown killed
+///   (`torn_down`) after a sibling failed; otherwise the leftmost wins.
 fn pipefail<T>(stages: Vec<StageOutcome>, last_stdout: T) -> ProcessResult<T> {
-    // Exhaustive (no wildcard) so a future `Outcome` variant forces a decision
-    // here rather than being silently treated as unclean (H2).
-    let is_clean = |stage: &StageOutcome| match stage.outcome {
-        Outcome::Exited(code) => stage.ok_codes.contains(&code),
-        Outcome::Signalled(_) | Outcome::TimedOut => false, // kill/timeout → unclean
-    };
-
     let checked_failures: Vec<_> = stages
         .iter()
-        .filter(|s| !s.unchecked && !is_clean(s))
+        .filter(|s| !s.unchecked && !is_clean_exit(s.outcome, &s.ok_codes))
         .collect();
 
     if let Some(stage) = checked_failures
         .iter()
-        .find(|s| !is_sigpipe(&s.outcome)) // prefer non-SIGPIPE culprit over SIGPIPE victim
+        // Prefer a genuine culprit over a mere victim (a SIGPIPE death or a stage
+        // killed by our own teardown) — a teardown victim never steals the blame
+        // from the failure that triggered the teardown.
+        .find(|s| !is_sigpipe(&s.outcome) && !s.torn_down)
         .or_else(|| checked_failures.first()) // else leftmost
         .copied()
     {
@@ -523,6 +602,7 @@ mod tests {
             unchecked: false,
             ok_codes: vec![0],
             timeout: None,
+            torn_down: false,
         }
     }
 
@@ -552,6 +632,7 @@ mod tests {
             unchecked,
             ok_codes: vec![0],
             timeout: None,
+            torn_down: false,
         }
     }
 
@@ -798,6 +879,56 @@ mod tests {
             "downstream non-SIGPIPE culprit, not upstream SIGPIPE victim"
         );
         assert_eq!(result.code(), Some(2));
+    }
+
+    #[test]
+    fn torn_down_victim_does_not_steal_blame_from_the_real_failure() {
+        // Proactive teardown: a downstream stage fails, the chain kills the group,
+        // and a quiet upstream (and the last stage) come back signal-killed. Those
+        // teardown kills are victims — the genuine downstream failure must still be
+        // blamed, even though its Signalled(9) siblings are leftward / would-be
+        // culprits by position.
+        let torn_upstream = StageOutcome {
+            torn_down: true,
+            ..unclean("upstream", Outcome::Signalled(Some(9)), "killed by teardown")
+        };
+        let culprit = unclean("downstream", Outcome::Exited(3), "the real failure");
+        let torn_last = StageOutcome {
+            torn_down: true,
+            ..last(Outcome::Signalled(Some(9)), false)
+        };
+        let result = pf(vec![torn_upstream, culprit], torn_last, "");
+        assert_eq!(
+            result.program(),
+            "downstream",
+            "the failure that triggered teardown wins, not a torn-down victim"
+        );
+        assert_eq!(result.code(), Some(3));
+        match result.ensure_success() {
+            Err(crate::Error::Exit { program, code, .. }) => {
+                assert_eq!(program, "downstream");
+                assert_eq!(code, 3);
+            }
+            other => panic!("expected Error::Exit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_torn_down_failures_fall_back_to_the_leftmost() {
+        // Degenerate: every checked failure is a teardown victim (no un-torn
+        // culprit survives). Attribution falls back to the leftmost, exactly as it
+        // does when every failure is a SIGPIPE victim.
+        let first = StageOutcome {
+            torn_down: true,
+            ..unclean("a", Outcome::Signalled(Some(9)), "first killed")
+        };
+        let second = StageOutcome {
+            torn_down: true,
+            ..unclean("b", Outcome::Signalled(Some(9)), "second killed")
+        };
+        let result = pf(vec![first, second], last(Outcome::Exited(0), false), "");
+        assert_eq!(result.program(), "a", "leftmost victim when all are torn down");
+        assert!(!result.is_success());
     }
 
     #[test]
