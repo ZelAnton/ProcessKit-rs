@@ -20,7 +20,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::Notify;
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::buffer::{OutputBufferPolicy, clamp_dropoldest_tail, push_capped_bytes};
+use crate::buffer::{LineTerminator, OutputBufferPolicy, clamp_dropoldest_tail, push_capped_bytes};
 use crate::error::Error;
 use crate::error::Result;
 use crate::group::ProcessGroup;
@@ -102,6 +102,9 @@ pub(crate) struct Spawned {
     pub stderr_handler: Option<LineHandler>,
     pub stdout_tee: Option<crate::pump::TeeSink>,
     pub stderr_tee: Option<crate::pump::TeeSink>,
+    /// How each stream's line pump decides where a line ends (default `\n`-only).
+    pub stdout_line_terminator: LineTerminator,
+    pub stderr_line_terminator: LineTerminator,
     pub buffer: OutputBufferPolicy,
     /// Exit codes treated as success (default `[0]`), carried onto the result.
     pub ok_codes: Vec<i32>,
@@ -133,6 +136,9 @@ pub struct RunningProcess {
     stderr_handler: Option<LineHandler>,
     stdout_tee: Option<crate::pump::TeeSink>,
     stderr_tee: Option<crate::pump::TeeSink>,
+    // Per-stream line-termination mode threaded into every pump this handle spawns.
+    stdout_line_terminator: LineTerminator,
+    stderr_line_terminator: LineTerminator,
     buffer: OutputBufferPolicy,
     ok_codes: Vec<i32>,
     stdout_sink: Option<Arc<SharedLines>>,
@@ -338,6 +344,8 @@ impl RunningProcess {
             stderr_handler: s.stderr_handler,
             stdout_tee: s.stdout_tee,
             stderr_tee: s.stderr_tee,
+            stdout_line_terminator: s.stdout_line_terminator,
+            stderr_line_terminator: s.stderr_line_terminator,
             buffer: s.buffer,
             ok_codes: s.ok_codes,
             stdout_sink: None,
@@ -373,6 +381,8 @@ impl RunningProcess {
             stderr_handler: command.stderr_handler(),
             stdout_tee: command.stdout_tee_sink(),
             stderr_tee: command.stderr_tee_sink(),
+            stdout_line_terminator: command.out_line_terminator(),
+            stderr_line_terminator: command.err_line_terminator(),
             buffer: command.output_buffer_policy(),
             ok_codes: command.ok_codes_vec(),
             stdout_sink: None,
@@ -673,6 +683,7 @@ impl RunningProcess {
             tokio::spawn(pump_lines_core(
                 pipe,
                 self.stderr_encoding,
+                self.stderr_line_terminator,
                 self.stderr_handler.clone(),
                 self.stderr_tee.clone(),
                 stderr_sink.clone(),
@@ -1082,6 +1093,7 @@ impl RunningProcess {
             self.stdout_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,
                 self.stdout_encoding,
+                self.stdout_line_terminator,
                 self.stdout_handler.clone(),
                 self.stdout_tee.clone(),
                 stdout_sink.clone(),
@@ -1091,6 +1103,7 @@ impl RunningProcess {
             self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,
                 self.stderr_encoding,
+                self.stderr_line_terminator,
                 self.stderr_handler.clone(),
                 self.stderr_tee.clone(),
                 stderr_sink.clone(),

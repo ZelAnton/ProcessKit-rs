@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use encoding_rs::{Encoding, UTF_8};
 
-use crate::buffer::{OutputBufferPolicy, StdioMode};
+use crate::buffer::{LineTerminator, OutputBufferPolicy, StdioMode};
 use crate::error::{Error, Result};
 use crate::pump::LineHandler;
 use crate::result::ProcessResult;
@@ -94,6 +94,10 @@ pub struct Command {
     output_buffer: OutputBufferPolicy,
     stdout_encoding: &'static Encoding,
     stderr_encoding: &'static Encoding,
+    /// Where each stream's line pump splits lines (default: `\n`-only). See
+    /// [`Self::line_terminator`].
+    stdout_line_terminator: LineTerminator,
+    stderr_line_terminator: LineTerminator,
     retry: Option<RetryConfig>,
     /// `Some` once `inherit_env` was called (even with an empty list): clear
     /// the inherited environment and copy only these parent vars.
@@ -143,6 +147,8 @@ impl Command {
             output_buffer: OutputBufferPolicy::unbounded(),
             stdout_encoding: UTF_8,
             stderr_encoding: UTF_8,
+            stdout_line_terminator: LineTerminator::Newline,
+            stderr_line_terminator: LineTerminator::Newline,
             retry: None,
             inherit_env: None,
             uid: None,
@@ -881,6 +887,51 @@ impl Command {
         self
     }
 
+    /// Choose where the line pump splits **both** streams into lines (see
+    /// [`LineTerminator`]). The default is [`LineTerminator::Newline`] — split on
+    /// `\n` only, unchanged from before this knob existed.
+    ///
+    /// Pass [`LineTerminator::CarriageReturn`] to also treat a bare `\r` as a line
+    /// terminator, so **carriage-return progress output** (`curl`/`pip`/`apt`: a
+    /// bar redrawn in place with `\r`, no `\n` until the end) streams **live, one
+    /// frame at a time** instead of piling up as a single line that only surfaces
+    /// at EOF. In that mode each `\r`-delimited frame is a line for *every* line
+    /// sink alike — [`stdout_lines`](crate::RunningProcess::stdout_lines) /
+    /// [`output_events`](crate::RunningProcess::output_events), the
+    /// [`on_stdout_line`](Self::on_stdout_line)/[`on_stderr_line`](Self::on_stderr_line)
+    /// handlers, the [`stdout_tee`](Self::stdout_tee)/[`stderr_tee`](Self::stderr_tee)
+    /// sinks, and `output_string` — so there is a single, shared notion of a line.
+    /// A `\r\n` pair stays one terminator (no empty line between them), and the
+    /// [`OutputBufferPolicy`] byte cap now bounds an individual runaway frame
+    /// rather than dropping the whole stream.
+    ///
+    /// Set it per stream with
+    /// [`stdout_line_terminator`](Self::stdout_line_terminator) /
+    /// [`stderr_line_terminator`](Self::stderr_line_terminator) when only one
+    /// stream carries progress output (progress usually lands on stderr, while
+    /// stdout stays newline-structured data).
+    pub fn line_terminator(mut self, terminator: LineTerminator) -> Self {
+        self.stdout_line_terminator = terminator;
+        self.stderr_line_terminator = terminator;
+        self
+    }
+
+    /// Choose where the line pump splits **stdout** into lines (see
+    /// [`LineTerminator`]); the stderr framing is left untouched. See
+    /// [`line_terminator`](Self::line_terminator) for both streams at once.
+    pub fn stdout_line_terminator(mut self, terminator: LineTerminator) -> Self {
+        self.stdout_line_terminator = terminator;
+        self
+    }
+
+    /// Choose where the line pump splits **stderr** into lines (see
+    /// [`LineTerminator`]); the stdout framing is left untouched. Handy when
+    /// progress output lands on stderr while stdout stays newline-structured.
+    pub fn stderr_line_terminator(mut self, terminator: LineTerminator) -> Self {
+        self.stderr_line_terminator = terminator;
+        self
+    }
+
     // --- Accessors used by the runner layer --------------------------------
 
     pub(crate) fn keeps_stdin_open(&self) -> bool {
@@ -935,6 +986,14 @@ impl Command {
 
     pub(crate) fn err_encoding(&self) -> &'static Encoding {
         self.stderr_encoding
+    }
+
+    pub(crate) fn out_line_terminator(&self) -> LineTerminator {
+        self.stdout_line_terminator
+    }
+
+    pub(crate) fn err_line_terminator(&self) -> LineTerminator {
+        self.stderr_line_terminator
     }
 
     /// Whether stdout is captured into a pipe (vs `Inherit`/`Null`). The bulk
@@ -1406,6 +1465,8 @@ impl fmt::Debug for Command {
             .field("output_buffer", &self.output_buffer)
             .field("stdout_encoding", &self.stdout_encoding.name())
             .field("stderr_encoding", &self.stderr_encoding.name())
+            .field("stdout_line_terminator", &self.stdout_line_terminator)
+            .field("stderr_line_terminator", &self.stderr_line_terminator)
             .field("has_retry", &self.retry.is_some())
             .field("inherit_env", &self.inherit_env)
             .field("uid", &self.uid)
@@ -1611,7 +1672,46 @@ fn probe_dir(dir: &std::path::Path, program: &OsStr) -> Option<std::path::PathBu
 #[cfg(test)]
 mod tests {
     use super::Command;
+    use crate::buffer::LineTerminator;
     use std::ffi::OsStr;
+
+    #[test]
+    fn line_terminator_defaults_to_newline_and_setters_target_the_right_streams() {
+        // Default: both streams split on `\n` only — the pre-existing behavior.
+        let default = Command::new("x");
+        assert_eq!(default.out_line_terminator(), LineTerminator::Newline);
+        assert_eq!(default.err_line_terminator(), LineTerminator::Newline);
+
+        // The combined setter moves both streams together.
+        let both = Command::new("x").line_terminator(LineTerminator::CarriageReturn);
+        assert_eq!(both.out_line_terminator(), LineTerminator::CarriageReturn);
+        assert_eq!(both.err_line_terminator(), LineTerminator::CarriageReturn);
+
+        // Per-stream setters touch only their own stream.
+        let out_only = Command::new("x").stdout_line_terminator(LineTerminator::CarriageReturn);
+        assert_eq!(
+            out_only.out_line_terminator(),
+            LineTerminator::CarriageReturn
+        );
+        assert_eq!(
+            out_only.err_line_terminator(),
+            LineTerminator::Newline,
+            "stdout_line_terminator must not touch stderr"
+        );
+        let err_only = Command::new("x").stderr_line_terminator(LineTerminator::CarriageReturn);
+        assert_eq!(
+            err_only.err_line_terminator(),
+            LineTerminator::CarriageReturn
+        );
+        assert_eq!(err_only.out_line_terminator(), LineTerminator::Newline);
+
+        // The framing is surfaced in Debug (no secrets involved).
+        let dbg = format!("{both:?}");
+        assert!(
+            dbg.contains("stdout_line_terminator") && dbg.contains("CarriageReturn"),
+            "Debug should surface the line-terminator mode: {dbg}"
+        );
+    }
 
     #[test]
     fn debug_redacts_argv_and_env_values_keeping_names_and_count() {

@@ -97,6 +97,56 @@ Things to know:
   `finish` behave identically with no subprocess. See
   [Testing → scripted streaming](testing.md#scripted-streaming).
 
+### Carriage-return progress output
+
+Tools like `curl`, `pip`, and `apt` redraw a progress bar *in place* with a
+carriage return (`\rProgress: 50%\rProgress: 100%`) and emit no `\n` until the
+very end. By default the pump splits on `\n` only, so that whole sequence is a
+single, ever-growing line: nothing streams live, and under a byte cap the one
+over-cap line is dropped whole.
+
+Set `line_terminator(LineTerminator::CarriageReturn)` to treat a bare `\r` as a
+line terminator too. Each carriage-return frame then arrives as its own line —
+live, one at a time:
+
+```rust,no_run
+use processkit::prelude::StreamExt;
+use processkit::{Command, LineTerminator};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let mut run = Command::new("pip")
+        .args(["install", "big-package"])
+        // Frame the stream you actually consume: `stdout_lines()` surfaces
+        // stdout only (stderr is drained in the background and discarded), so
+        // put the CR framing on stdout. If a tool draws its bar on stderr,
+        // set `line_terminator(..)` for both streams and read `output_events()`.
+        .stdout_line_terminator(LineTerminator::CarriageReturn)
+        .start()
+        .await?;
+
+    let mut lines = run.stdout_lines()?;
+    while let Some(frame) = lines.next().await {
+        // Overwrite your own display with the latest frame.
+        print!("\r{frame}");
+    }
+    run.finish().await?;
+    Ok(())
+}
+```
+
+The chosen framing is **one shared definition of a line** for every sink: the
+streaming verbs, the [`on_stdout_line`/`on_stderr_line`
+handlers](commands.md#output-handling), a `stdout_tee`/`stderr_tee` (which
+writes each frame followed by `\n`), and `output_string` all see the same
+per-frame lines. A `\r\n` pair stays a single terminator (no empty line between
+them), so ordinary CRLF text reads identically to the default; only a `\r` *not*
+followed by a `\n` splits a frame. The `OutputBufferPolicy` byte cap now bounds
+an individual runaway frame — a frame whose content exceeds the cap is skipped
+as it streams (never assembled whole) — rather than dropping the whole progress
+stream. Use `stdout_line_terminator` / `stderr_line_terminator` for one stream,
+or `line_terminator` for both.
+
 ## Interactive stdin
 
 Conversational tools — write a request, read the response, repeat. Keep stdin

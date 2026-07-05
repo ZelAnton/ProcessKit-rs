@@ -260,6 +260,27 @@ impl core::marker::Unpin for processkit::LimitReason
 impl core::marker::UnsafeUnpin for processkit::LimitReason
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::LimitReason
 impl core::panic::unwind_safe::UnwindSafe for processkit::LimitReason
+#[non_exhaustive] pub enum processkit::LineTerminator
+pub processkit::LineTerminator::CarriageReturn
+pub processkit::LineTerminator::Newline
+impl core::clone::Clone for processkit::LineTerminator
+pub fn processkit::LineTerminator::clone(&self) -> processkit::LineTerminator
+impl core::cmp::Eq for processkit::LineTerminator
+impl core::cmp::PartialEq for processkit::LineTerminator
+pub fn processkit::LineTerminator::eq(&self, &processkit::LineTerminator) -> bool
+impl core::default::Default for processkit::LineTerminator
+pub fn processkit::LineTerminator::default() -> processkit::LineTerminator
+impl core::fmt::Debug for processkit::LineTerminator
+pub fn processkit::LineTerminator::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for processkit::LineTerminator
+impl core::marker::StructuralPartialEq for processkit::LineTerminator
+impl core::marker::Freeze for processkit::LineTerminator
+impl core::marker::Send for processkit::LineTerminator
+impl core::marker::Sync for processkit::LineTerminator
+impl core::marker::Unpin for processkit::LineTerminator
+impl core::marker::UnsafeUnpin for processkit::LineTerminator
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::LineTerminator
+impl core::panic::unwind_safe::UnwindSafe for processkit::LineTerminator
 #[non_exhaustive] pub enum processkit::Mechanism
 pub processkit::Mechanism::CgroupV2
 pub processkit::Mechanism::JobObject
@@ -493,6 +514,7 @@ pub fn processkit::Command::groups(self, impl core::convert::AsRef<[u32]>) -> Se
 pub fn processkit::Command::inherit_env<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub fn processkit::Command::keep_stdin_open(self) -> Self
 pub fn processkit::Command::kill_on_parent_death(self) -> Self
+pub fn processkit::Command::line_terminator(self, processkit::LineTerminator) -> Self
 pub fn processkit::Command::new(impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
 pub fn processkit::Command::no_timeout(self) -> Self
 pub fn processkit::Command::ok_codes(self, impl core::iter::traits::collect::IntoIterator<Item = i32>) -> Self
@@ -514,11 +536,13 @@ pub fn processkit::Command::setsid(self) -> Self
 pub async fn processkit::Command::start(&self) -> processkit::Result<processkit::RunningProcess>
 pub fn processkit::Command::stderr(self, processkit::StdioMode) -> Self
 pub fn processkit::Command::stderr_encoding(self, &'static encoding_rs::Encoding) -> Self
+pub fn processkit::Command::stderr_line_terminator(self, processkit::LineTerminator) -> Self
 pub fn processkit::Command::stderr_tee<W>(self, W) -> Self where W: tokio::io::async_write::AsyncWrite + core::marker::Send + core::marker::Unpin + 'static
 pub fn processkit::Command::stdin(self, processkit::Stdin) -> Self
 pub fn processkit::Command::stdin_source(&self) -> core::option::Option<&processkit::Stdin>
 pub fn processkit::Command::stdout(self, processkit::StdioMode) -> Self
 pub fn processkit::Command::stdout_encoding(self, &'static encoding_rs::Encoding) -> Self
+pub fn processkit::Command::stdout_line_terminator(self, processkit::LineTerminator) -> Self
 pub fn processkit::Command::stdout_tee<W>(self, W) -> Self where W: tokio::io::async_write::AsyncWrite + core::marker::Send + core::marker::Unpin + 'static
 pub fn processkit::Command::timeout(self, core::time::Duration) -> Self
 pub fn processkit::Command::timeout_grace(self, core::time::Duration) -> Self

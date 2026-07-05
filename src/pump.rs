@@ -11,7 +11,7 @@ use encoding_rs::Encoding;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Notify;
 
-use crate::buffer::{OutputBufferPolicy, OverflowMode};
+use crate::buffer::{LineTerminator, OutputBufferPolicy, OverflowMode};
 
 /// A push-style per-line callback (e.g. tee each line to a log).
 pub(crate) type LineHandler = Arc<dyn Fn(&str) + Send + Sync>;
@@ -278,8 +278,9 @@ impl SharedLines {
 /// swallowed.
 pub(crate) type TeeSink = Arc<tokio::sync::Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>;
 
-/// The no-tee shorthand over [`pump_lines_core`] — used by this module's tests
-/// (production always threads the optional tee through `pump_lines_core`).
+/// The no-tee, `\n`-only shorthand over [`pump_lines_core`] — used by this
+/// module's tests (production always threads the terminator and optional tee
+/// through `pump_lines_core`).
 #[cfg(test)]
 pub(crate) async fn pump_lines<R>(
     reader: R,
@@ -289,7 +290,29 @@ pub(crate) async fn pump_lines<R>(
 ) where
     R: AsyncRead + Unpin,
 {
-    pump_lines_core(reader, encoding, handler, None, sink).await
+    pump_lines_core(
+        reader,
+        encoding,
+        LineTerminator::Newline,
+        handler,
+        None,
+        sink,
+    )
+    .await
+}
+
+/// The no-tee shorthand over [`pump_lines_core`] for a chosen
+/// [`LineTerminator`] — used by this module's `\r`-aware tests.
+#[cfg(test)]
+pub(crate) async fn pump_lines_term<R>(
+    reader: R,
+    encoding: &'static Encoding,
+    terminator: LineTerminator,
+    sink: Arc<SharedLines>,
+) where
+    R: AsyncRead + Unpin,
+{
+    pump_lines_core(reader, encoding, terminator, None, None, sink).await
 }
 
 /// Drain `reader` into `sink` line by line, decoding text with `encoding`,
@@ -306,21 +329,33 @@ pub(crate) async fn pump_lines<R>(
 /// way: the tee is disabled (with a `tracing` warn) and pumping continues.
 ///
 /// **Decoding:** bytes are fed through a single persistent
-/// `encoding_rs::Decoder` and the *decoded* text is split on the `\n`
-/// character — correct for every encoding, including non-ASCII-compatible ones
-/// (UTF-16LE/BE, whose code units contain `0x0A` bytes that are *not* line
-/// breaks) and stateful ones (ISO-2022-JP shift state carries across reads).
-/// One persistent decoder also means a byte-order mark is handled once at the
-/// stream start (`with_bom_removal`: a leading BOM *of the chosen encoding* is
-/// stripped, never a foreign one — so a legacy line that happens to start with
-/// BOM-looking bytes is not silently re-decoded as UTF-16). Each line is
-/// stripped of its `\n` and, if present, exactly **one** preceding `\r`
-/// (a CRLF terminator — not every trailing CR). The final line is emitted
-/// even without a trailing newline, on both EOF and a mid-stream read error
-/// (the partial tail is flushed, not dropped).
+/// `encoding_rs::Decoder` and the *decoded* text is split into lines — correct
+/// for every encoding, including non-ASCII-compatible ones (UTF-16LE/BE, whose
+/// code units contain `0x0A` bytes that are *not* line breaks) and stateful ones
+/// (ISO-2022-JP shift state carries across reads). One persistent decoder also
+/// means a byte-order mark is handled once at the stream start
+/// (`with_bom_removal`: a leading BOM *of the chosen encoding* is stripped, never
+/// a foreign one — so a legacy line that happens to start with BOM-looking bytes
+/// is not silently re-decoded as UTF-16).
+///
+/// **Line splitting** follows `terminator` (see [`LineTerminator`]):
+/// - [`Newline`](LineTerminator::Newline) (default): split on `\n`; each line is
+///   stripped of its `\n` and, if present, exactly **one** preceding `\r` (a CRLF
+///   terminator — not every trailing CR, so a lone or repeated `\r` is content).
+/// - [`CarriageReturn`](LineTerminator::CarriageReturn): also split on a bare
+///   `\r`, so each carriage-return progress frame is emitted as its own line. A
+///   `\r\n` pair is one terminator (no empty line between them); a `\r` at a read
+///   boundary whose follower is not yet known is held over to the next read (or
+///   resolved as a terminator at EOF).
+///
+/// Either way the final line is emitted even without a trailing terminator, on
+/// both EOF and a mid-stream read error (the partial tail is flushed, not
+/// dropped), and every sink — the handler, the tee, and the buffer — sees the
+/// same lines the split produced.
 pub(crate) async fn pump_lines_core<R>(
     mut reader: R,
     encoding: &'static Encoding,
+    terminator: LineTerminator,
     handler: Option<LineHandler>,
     tee: Option<TeeSink>,
     sink: Arc<SharedLines>,
@@ -382,14 +417,70 @@ pub(crate) async fn pump_lines_core<R>(
         sink.push(line);
     }
 
-    // Byte length of the line content ending at the `\n` at index `nl`, excluding
-    // a CRLF `\r` — matching `push`'s retained-content definition, so the over-cap
-    // decision judges a CRLF line exactly like its LF twin.
-    fn content_len(pending: &str, nl: usize) -> usize {
-        if nl > 0 && pending.as_bytes()[nl - 1] == b'\r' {
-            nl - 1
-        } else {
-            nl
+    // Where the next complete line ends within `pending`.
+    struct Term {
+        // Byte length of the line's content, excluding the terminator sequence —
+        // matching `push`'s retained-content definition, so the over-cap decision
+        // judges a CRLF/CR line exactly like its bare-LF twin.
+        content_len: usize,
+        // Byte offset just past the whole terminator sequence: `drain(..resume)`
+        // removes the line and its terminator in one go.
+        resume: usize,
+    }
+
+    // Locate the next line terminator, honoring `terminator`.
+    //
+    // `Newline` splits on `\n`, treating a `\r` immediately before it as the CR of
+    // a CRLF (excluded from content). `CarriageReturn` additionally splits on a
+    // bare `\r`: a `\r\n` pair stays a single terminator, and a lone trailing `\r`
+    // whose follower is not yet decoded is *deferred* (returns `None`) so a CRLF
+    // straddling a read is not mistaken for a bare-CR frame — unless `eof`, when it
+    // terminates the final frame. Returns `None` when no complete terminator is
+    // present yet (the caller keeps reading or, at EOF, flushes the tail).
+    fn next_terminator(pending: &str, terminator: LineTerminator, eof: bool) -> Option<Term> {
+        let bytes = pending.as_bytes();
+        match terminator {
+            LineTerminator::Newline => {
+                let nl = pending.find('\n')?;
+                let content_len = if nl > 0 && bytes[nl - 1] == b'\r' {
+                    nl - 1
+                } else {
+                    nl
+                };
+                Some(Term {
+                    content_len,
+                    resume: nl + 1,
+                })
+            }
+            LineTerminator::CarriageReturn => {
+                // The earliest `\r` or `\n`. A `\r` is found before the `\n` of a
+                // CRLF, so reaching a `\n` here means it has no preceding `\r`.
+                let pos = bytes.iter().position(|&b| b == b'\n' || b == b'\r')?;
+                if bytes[pos] == b'\n' {
+                    Some(Term {
+                        content_len: pos,
+                        resume: pos + 1,
+                    })
+                } else {
+                    match bytes.get(pos + 1) {
+                        // CRLF: a single terminator; drop both bytes.
+                        Some(b'\n') => Some(Term {
+                            content_len: pos,
+                            resume: pos + 2,
+                        }),
+                        // A `\r` followed by other content: a bare-CR frame end.
+                        Some(_) => Some(Term {
+                            content_len: pos,
+                            resume: pos + 1,
+                        }),
+                        // Trailing `\r`, follower not yet decoded: defer unless EOF.
+                        None => eof.then_some(Term {
+                            content_len: pos,
+                            resume: pos + 1,
+                        }),
+                    }
+                }
+            }
         }
     }
 
@@ -450,12 +541,12 @@ pub(crate) async fn pump_lines_core<R>(
         // Split out every complete line decoded so far, bounding memory by `cap`.
         loop {
             if let Some(skipped) = oversized {
-                // Skipping an over-cap line: discard through its newline, keeping
+                // Skipping an over-cap line: discard through its terminator, keeping
                 // only its length for accounting.
-                match pending.find('\n') {
-                    Some(nl) => {
-                        let line_len = skipped.saturating_add(content_len(&pending, nl));
-                        pending.drain(..=nl);
+                match next_terminator(&pending, terminator, eof) {
+                    Some(term) => {
+                        let line_len = skipped.saturating_add(term.content_len);
+                        pending.drain(..term.resume);
                         oversized = None;
                         sink.0.record_oversized_line(line_len);
                     }
@@ -465,31 +556,29 @@ pub(crate) async fn pump_lines_core<R>(
                     }
                 }
             } else {
-                match pending.find('\n') {
-                    Some(nl) => {
-                        // Compare *content* length (excluding a CRLF `\r`) to the
-                        // cap, so a CRLF line is judged exactly like its LF twin.
-                        let len = content_len(&pending, nl);
+                match next_terminator(&pending, terminator, eof) {
+                    Some(term) => {
+                        // Compare *content* length (excluding the terminator) to the
+                        // cap, so a CRLF/CR line is judged exactly like its LF twin.
+                        let len = term.content_len;
                         if cap.is_none_or(|c| len <= c) {
-                            let mut line: String = pending.drain(..=nl).collect();
-                            line.pop(); // drop the '\n'
-                            if line.ends_with('\r') {
-                                line.pop(); // drop exactly one preceding '\r' (CRLF)
-                            }
+                            let mut line: String = pending.drain(..term.resume).collect();
+                            line.truncate(len); // drop the terminator sequence
                             emit(&mut handler, &mut tee, &sink.0, line).await;
                         } else {
-                            // Over-cap line, newline already here: drop it whole,
-                            // counting its length.
-                            pending.drain(..=nl);
+                            // Over-cap line, terminator already here: drop it whole,
+                            // counting its content length.
+                            pending.drain(..term.resume);
                             sink.0.record_oversized_line(len);
                         }
                     }
-                    // No newline yet and already over the cap: skip to the newline.
-                    // A lone *trailing* `\r` may be a CRLF terminator, so it alone
-                    // must not push the line over the cap — else a content-at-cap
-                    // CRLF line is dropped when its `\r`/`\n` straddle a read but
-                    // retained in one chunk. Exclude that byte; the next read
-                    // re-decides (terminator → fits, or content → counts).
+                    // No terminator yet and already over the cap: skip to it. A lone
+                    // *trailing* `\r` may be a CRLF terminator (or, in `\r`-aware
+                    // mode, a bare-CR frame end), so it alone must not push the line
+                    // over the cap — else a content-at-cap line is dropped when its
+                    // `\r`/`\n` straddle a read but retained in one chunk. Exclude
+                    // that byte; the next read re-decides (terminator → fits, or
+                    // content → counts).
                     None if cap.is_some_and(|c| {
                         pending.len() - usize::from(pending.ends_with('\r')) > c
                     }) =>
@@ -503,18 +592,23 @@ pub(crate) async fn pump_lines_core<R>(
         }
 
         if eof {
-            // Finalize a final line (or an un-terminated over-cap tail).
+            // Finalize a final line (or an un-terminated over-cap tail). At EOF the
+            // split loop above ran with `eof = true`, so in `\r`-aware mode a
+            // trailing `\r` was already resolved as a frame terminator; whatever
+            // remains in `pending` here is pure content with no terminator.
             if let Some(skipped) = oversized.take() {
-                // An un-terminated tail has no '\n', so a trailing '\r' is content.
+                // An un-terminated tail: `pending` is all content (in `Newline`
+                // mode a trailing `\r` is content; in `\r`-aware mode none remains).
                 let line_len = skipped.saturating_add(pending.len());
                 pending.clear();
                 sink.0.record_oversized_line(line_len);
             } else if !pending.is_empty() {
-                // An un-terminated final line: no '\n', so a trailing '\r' is
-                // content. Re-apply the byte cap: the enter-skip deferred a lone
-                // trailing '\r' in case a '\n' followed, but at EOF none does, so
-                // an over-cap tail must be dropped (counted, never handed to the
-                // handler/tee) like any over-cap line — not emitted.
+                // An un-terminated final line: `pending` is all content (in
+                // `Newline` mode a trailing `\r` is content). Re-apply the byte cap:
+                // the enter-skip deferred a lone trailing `\r` in case a `\n`
+                // followed, but at EOF none does, so an over-cap tail must be
+                // dropped (counted, never handed to the handler/tee) like any
+                // over-cap line — not emitted.
                 let line = std::mem::take(&mut pending);
                 if cap.is_some_and(|c| line.len() > c) {
                     sink.0.record_oversized_line(line.len());
@@ -1237,6 +1331,305 @@ mod tests {
         assert_eq!(sink.count(), 1);
     }
 
+    // --- `\r`-aware (CarriageReturn) line-terminator mode --------------------
+
+    #[tokio::test]
+    async fn cr_mode_splits_progress_frames_live() {
+        // The motivating case: carriage-return progress redraws each become their
+        // own line, so a consumer sees them one at a time instead of one giant
+        // line only at EOF.
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_term(
+            &b"Progress: 0%\rProgress: 50%\rProgress: 100%\n"[..],
+            encoding_rs::UTF_8,
+            LineTerminator::CarriageReturn,
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(sink.count(), 3, "three frames, not one accumulated line");
+        assert_eq!(
+            sink.drain(),
+            vec!["Progress: 0%", "Progress: 50%", "Progress: 100%"]
+        );
+    }
+
+    #[tokio::test]
+    async fn cr_mode_leading_cr_and_unterminated_tail() {
+        // A leading `\r` yields a leading empty frame; the final frame has no
+        // trailing terminator and is still emitted at EOF.
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_term(
+            &b"\rA\rB"[..],
+            encoding_rs::UTF_8,
+            LineTerminator::CarriageReturn,
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(sink.drain(), vec!["", "A", "B"]);
+    }
+
+    #[tokio::test]
+    async fn cr_mode_crlf_is_a_single_terminator_no_empty_lines() {
+        // A `\r\n` pair must stay ONE terminator — CRLF text reads identically to
+        // Newline mode, with no spurious empty line between the `\r` and the `\n`.
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_term(
+            &b"a\r\nb\r\n"[..],
+            encoding_rs::UTF_8,
+            LineTerminator::CarriageReturn,
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            sink.drain(),
+            vec!["a", "b"],
+            "no empty line between CR and LF"
+        );
+    }
+
+    #[tokio::test]
+    async fn cr_mode_mixed_terminators() {
+        // Bare `\r`, bare `\n`, and `\r\n` interleaved: each is one line boundary,
+        // and the trailing content with no terminator is the final frame.
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_term(
+            &b"a\rb\nc\r\nd"[..],
+            encoding_rs::UTF_8,
+            LineTerminator::CarriageReturn,
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(sink.drain(), vec!["a", "b", "c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn cr_mode_crlf_split_across_reads_stays_one_terminator() {
+        // The `\r` and `\n` of a CRLF straddle a read boundary. The deferral must
+        // hold the `\r` until the `\n` arrives so it is still one terminator, not a
+        // bare-CR frame plus an empty line.
+        let reader = ChunkedReader::new([b"a\r".to_vec(), b"\nb\r".to_vec(), b"\n".to_vec()]);
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_term(
+            reader,
+            encoding_rs::UTF_8,
+            LineTerminator::CarriageReturn,
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(sink.drain(), vec!["a", "b"], "split CRLF is one terminator");
+    }
+
+    #[tokio::test]
+    async fn cr_mode_lone_cr_at_read_boundary_is_a_frame_terminator() {
+        // A `\r` at a chunk end whose follower (non-`\n`) arrives next read is a
+        // bare-CR frame terminator, resolved once the next byte is seen.
+        let reader = ChunkedReader::new([b"a\r".to_vec(), b"b\n".to_vec()]);
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_term(
+            reader,
+            encoding_rs::UTF_8,
+            LineTerminator::CarriageReturn,
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(sink.drain(), vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn cr_mode_trailing_cr_at_eof_terminates_the_frame() {
+        // Unlike Newline mode (where a lone trailing `\r` is content, "tail\r"),
+        // in `\r`-aware mode it terminates the final frame — so "tail\r" is "tail".
+        let cr = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_term(
+            &b"tail\r"[..],
+            encoding_rs::UTF_8,
+            LineTerminator::CarriageReturn,
+            cr.clone(),
+        )
+        .await;
+        assert_eq!(
+            cr.drain(),
+            vec!["tail"],
+            "CR mode: trailing `\\r` terminates"
+        );
+
+        // The default mode's behavior is unchanged for the same bytes.
+        let nl = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_term(
+            &b"tail\r"[..],
+            encoding_rs::UTF_8,
+            LineTerminator::Newline,
+            nl.clone(),
+        )
+        .await;
+        assert_eq!(
+            nl.drain(),
+            vec!["tail\r"],
+            "Newline mode: trailing `\\r` is content"
+        );
+    }
+
+    #[tokio::test]
+    async fn cr_mode_default_newline_is_unchanged_lone_cr_is_content() {
+        // The default `Newline` mode must keep a mid-line `\r` as content even
+        // though the `\r`-aware mode would split there — proving the knob, not the
+        // pump, changes the framing.
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_term(
+            &b"a\rb\n"[..],
+            encoding_rs::UTF_8,
+            LineTerminator::Newline,
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            sink.drain(),
+            vec!["a\rb"],
+            "Newline mode keeps the inner `\\r`"
+        );
+    }
+
+    #[tokio::test]
+    async fn cr_mode_byte_cap_skips_an_over_cap_frame_but_keeps_small_ones() {
+        // A newline-free `\r`-terminated flood over the byte cap is skipped as it
+        // streams (never assembled whole), while the small following frame is
+        // retained — the byte cap bounds an individual frame, not the whole stream.
+        let reader = ChunkedReader::new([vec![b'X'; 50_000], b"\rtail\n".to_vec()]);
+        let policy = OutputBufferPolicy::unbounded().with_max_bytes(8);
+        let sink = SharedLines::new(&policy);
+        pump_lines_term(
+            reader,
+            encoding_rs::UTF_8,
+            LineTerminator::CarriageReturn,
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            sink.drain(),
+            vec!["tail"],
+            "the over-cap frame is dropped; the small frame is kept"
+        );
+        assert_eq!(sink.count(), 2, "both frames are counted");
+        assert!(sink.dropped() >= 1, "the over-cap frame is a truncation");
+    }
+
+    #[tokio::test]
+    async fn cr_mode_at_cap_frame_retained_regardless_of_read_boundary() {
+        // A frame whose content is exactly `max_bytes` fits and must be retained
+        // whether its bare-CR terminator arrives with the content or in the next
+        // read — the verdict cannot depend on chunking (the trailing `\r` is
+        // excluded from the cap comparison, like a CRLF `\r`). One frame only: a
+        // second retained frame would push the backlog past the 2-byte cap and
+        // evict this one (the unrelated DropOldest path).
+        let single = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(2));
+        pump_lines_term(
+            &b"ab\r"[..],
+            encoding_rs::UTF_8,
+            LineTerminator::CarriageReturn,
+            single.clone(),
+        )
+        .await;
+
+        // Split so the bare CR lands in the next read: ["ab", "\r"].
+        let reader = ChunkedReader::new([b"ab".to_vec(), b"\r".to_vec()]);
+        let split = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(2));
+        pump_lines_term(
+            reader,
+            encoding_rs::UTF_8,
+            LineTerminator::CarriageReturn,
+            split.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            single.drain(),
+            vec!["ab"],
+            "one-chunk: at-cap CR frame retained"
+        );
+        assert_eq!(
+            split.drain(),
+            vec!["ab"],
+            "split CR must retain the at-cap frame identically — not drop it"
+        );
+        assert_eq!(split.dropped(), 0, "nothing was over-cap");
+    }
+
+    #[tokio::test]
+    async fn cr_mode_over_cap_frame_byte_count_is_stable_across_a_read_boundary() {
+        // An over-cap frame must record the same content-byte length whether its
+        // terminating `\r` arrives with the content or in the next read — else the
+        // seen-byte total (driving the Error ceiling and truncation total) would
+        // depend on chunking.
+        let content = vec![b'X'; 10];
+
+        let mut one = content.clone();
+        one.extend_from_slice(b"\rtail\n");
+        let single = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(4));
+        pump_lines_term(
+            &one[..],
+            encoding_rs::UTF_8,
+            LineTerminator::CarriageReturn,
+            single.clone(),
+        )
+        .await;
+
+        let mut first = content.clone();
+        first.push(b'\r');
+        let reader = ChunkedReader::new([first, b"tail\n".to_vec()]);
+        let split = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(4));
+        pump_lines_term(
+            reader,
+            encoding_rs::UTF_8,
+            LineTerminator::CarriageReturn,
+            split.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            split.seen_bytes(),
+            single.seen_bytes(),
+            "the CR terminator must not be counted only when it lands at a chunk end"
+        );
+        assert_eq!(
+            single.seen_bytes(),
+            14,
+            "over-cap content (10) excluding the CR, plus the retained 'tail' (4)"
+        );
+        assert_eq!(split.drain(), vec!["tail"]);
+    }
+
+    #[tokio::test]
+    async fn cr_mode_handler_and_tee_see_each_frame() {
+        // The handler and tee observe the same per-frame lines as the buffer —
+        // one shared notion of "a line" across every sink.
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let handler: LineHandler =
+            Arc::new(move |line: &str| captured.lock().unwrap().push(line.to_owned()));
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"50%\r100%\n"[..],
+            encoding_rs::UTF_8,
+            LineTerminator::CarriageReturn,
+            Some(handler),
+            Some(tee_of(VecSink(buf.clone()))),
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(sink.drain(), vec!["50%", "100%"], "buffer sees frames");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["50%", "100%"],
+            "handler sees frames"
+        );
+        assert_eq!(
+            String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
+            "50%\n100%\n",
+            "the tee writes each frame followed by a newline"
+        );
+    }
+
     /// An in-memory `AsyncWrite` collecting every byte written.
     #[derive(Clone)]
     struct VecSink(Arc<Mutex<Vec<u8>>>);
@@ -1276,6 +1669,7 @@ mod tests {
         pump_lines_core(
             &b"one\ntwo\n"[..],
             encoding_rs::UTF_8,
+            LineTerminator::Newline,
             None,
             Some(tee_of(VecSink(buf.clone()))),
             sink.clone(),
@@ -1316,6 +1710,7 @@ mod tests {
         pump_lines_core(
             &b"a\nb\nc\n"[..],
             encoding_rs::UTF_8,
+            LineTerminator::Newline,
             None,
             Some(tee_of(ErrSink)),
             sink.clone(),
@@ -1340,6 +1735,7 @@ mod tests {
         pump_lines_core(
             &b"x\ny\n"[..],
             encoding_rs::UTF_8,
+            LineTerminator::Newline,
             Some(handler),
             Some(tee_of(VecSink(buf.clone()))),
             sink.clone(),
