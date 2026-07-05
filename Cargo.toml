@@ -202,6 +202,16 @@ tempfile = "3"
 # boundaries to check line/byte counters and multibyte reassembly hold for
 # any chunking, and that no chunking makes the pump panic.
 proptest = "1"
+# Benchmark harness for `benches/pump.rs` — baselines the output pump's hot
+# paths (line splitting, decoding, tee/handler) ahead of optimizing them.
+# `async_tokio` runs an async benchmark body on our own tokio runtime instead
+# of criterion's default synchronous bencher; `harness = false` on the
+# `[[bench]]` entry below hands `main` to criterion instead of `libtest`.
+criterion = { version = "0.8", features = ["async_tokio"] }
+
+[[bench]]
+name = "pump"
+harness = false
 
 [target.'cfg(windows)'.dev-dependencies]
 # Liveness probe (OpenProcess) in the integration test that proves a grandchild
