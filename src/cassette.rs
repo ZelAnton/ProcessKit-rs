@@ -36,7 +36,10 @@ use crate::runner::{JobRunner, ProcessRunner};
 
 /// The on-disk format revision. Bumped if the cassette schema ever changes
 /// incompatibly; loading a cassette with an unknown version fails loudly
-/// instead of misreading it.
+/// instead of misreading it. [`RecordReplayRunner::replay`] checks this
+/// *before* attempting the full `Cassette` decode, so a future version whose
+/// entries this build genuinely can't parse still reports the clear "version N
+/// is not supported" message rather than a raw serde type-mismatch error.
 ///
 /// Bumped to `2`: entries may now carry an optional `error` (see
 /// [`CassetteError`]) recording an `Err` the inner runner returned in record
@@ -604,11 +607,17 @@ impl Entry {
 
 /// What an invocation is matched on: program + args + the stdin source digest
 /// (content for in-memory bytes, path for a `from_file` source). Env overrides
-/// are excluded so an irrelevant env difference between the record and replay
-/// environments can't cause a spurious miss. `cwd` is excluded too — see the
-/// type doc's "Portability of the match key" / [`CASSETTE_VERSION`]'s `3` bump
-/// — so a cassette recorded in one absolute working directory still matches an
-/// otherwise-identical invocation run from a different one.
+/// are excluded — deliberately, so an *irrelevant* env difference between the
+/// record and replay environments can't cause a spurious miss — **but this is
+/// a real collision risk when the env difference is NOT irrelevant**: two
+/// invocations that differ only by an env override that actually changes the
+/// tool's behavior/output collide on one entry (see
+/// [`RecordReplayRunner`]'s "Env is not part of the match key" for the
+/// workarounds; there is no opt-in env-keying knob today). `cwd` is excluded
+/// too — see the type doc's "Portability of the match key" /
+/// [`CASSETTE_VERSION`]'s `3` bump — so a cassette recorded in one absolute
+/// working directory still matches an otherwise-identical invocation run from
+/// a different one.
 ///
 /// The string components are *lossy* UTF-8 decodes, so two distinct non-UTF-8
 /// invocations that differ only in their invalid bytes produce the same key and
@@ -735,6 +744,20 @@ enum Mode<R> {
 ///   written — only sorted variable names. Everything else (argv, cwd, stdout,
 ///   stderr) is stored verbatim, so review fixtures before committing. File is
 ///   written owner-only (`0600`) on Unix.
+/// - **Env is not part of the match key, at all — not even as variable names.**
+///   Two invocations of the same program+args+stdin that differ *only* in an
+///   env override (`LC_ALL=C` vs `LC_ALL=en_US`, a feature-flag env var that
+///   actually changes the tool's output, …) collide on one cassette entry: the
+///   first one recorded silently answers for both on replay. This is a real
+///   collision risk, not just a documented quirk — if your invocations vary
+///   meaningfully by env, either (a) fold the env-sensitive knob into the
+///   command's **args** instead (part of the key), (b) record each env variant
+///   into its **own cassette file**, or (c) drop to a
+///   [`ScriptedRunner`](crate::testing::ScriptedRunner) rule keyed on a
+///   predicate that inspects [`Command::env_overrides`] directly. There is
+///   currently no opt-in "key on these env names too" knob — env-keying was
+///   considered and deferred (see `ideas/v2-breaking-changes.md`, D10) in favor
+///   of this explicit warning, since no in-tree consumer has needed it yet.
 /// - **Duplicates** replay in capture order, then the last entry repeats.
 /// - **A miss is [`Error::CassetteMiss`]** (not `is_not_found()`): never a
 ///   surprise subprocess. A **recorded `Err`** replays as that same `Error`
@@ -885,22 +908,34 @@ impl RecordReplayRunner<JobRunner> {
             )));
         }
         let text = std::fs::read_to_string(path).map_err(Error::Io)?;
-        let cassette: Cassette =
+        // Gate on `version` BEFORE attempting the full `Cassette` decode: every
+        // schema bump to date has been additive (a new `#[serde(default)]`
+        // field), so this build's `Entry` shape happens to still parse an older
+        // cassette — but that is not guaranteed for a *future*, not-yet-understood
+        // version, whose entries could carry a field this build's `Entry` can't
+        // decode at all (a type change, not just an addition). Deserializing the
+        // whole `Cassette` first would then surface a confusing raw serde
+        // type-mismatch error instead of the clear "version N is not supported"
+        // one below. `CassetteHeader` only names `version` — serde silently skips
+        // every other (unknown-shape-tolerant) field — so this first pass can
+        // never fail on an entries shape this build doesn't understand.
+        #[derive(Deserialize)]
+        struct CassetteHeader {
+            version: u32,
+        }
+        let header: CassetteHeader =
             serde_json::from_str(&text).map_err(|e| Error::Io(std::io::Error::from(e)))?;
-        // Accept any version up to the one this build writes: every schema change
-        // to date has been additive (a new `#[serde(default)]` field), so an older
-        // cassette decodes fine — it just loads the new field(s) as their default
-        // (e.g. `error: None`). Only a *newer*, not-yet-understood version is
-        // rejected loudly, rather than silently misreading a future format.
-        if cassette.version > CASSETTE_VERSION {
+        if header.version > CASSETTE_VERSION {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "cassette version {} is not supported (this build reads up to version {CASSETTE_VERSION})",
-                    cassette.version
+                    header.version
                 ),
             )));
         }
+        let cassette: Cassette =
+            serde_json::from_str(&text).map_err(|e| Error::Io(std::io::Error::from(e)))?;
         let mut slots: HashMap<Key, ReplaySlot> = HashMap::new();
         for entry in cassette.entries {
             validate_entry_outcome(&entry)?;
@@ -1728,6 +1763,60 @@ mod tests {
                 assert!(e.to_string().contains("version 99"), "got: {e}");
             }
             other => panic!("expected Io(InvalidData), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn version_gate_fires_before_the_full_entries_decode() {
+        // An unsupported future version whose entries wouldn't even decode
+        // under this build's `Entry` schema (`code` is normally an integer, not
+        // a string) — the version gate must reject this with the clear
+        // "version N is not supported" message, not a raw serde type-mismatch
+        // error from attempting the full `Cassette` decode first.
+        let (_dir, path) = temp_cassette();
+        std::fs::write(
+            &path,
+            r#"{ "version": 99, "entries": [ { "program": "x", "args": [], "code": "not-a-number" } ] }"#,
+        )
+        .unwrap();
+        match RecordReplayRunner::replay(&path) {
+            Err(Error::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+                assert!(
+                    e.to_string().contains("version 99"),
+                    "expected the clear version-gate message, got: {e}"
+                );
+            }
+            other => panic!("expected the version-gate error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_output_string_rejects_non_piped_stdout_even_on_a_match() {
+        // Mirrors the live path (and `ScriptedRunner`'s
+        // `output_on_non_piped_stdout_errors_like_the_live_path`): a capture verb
+        // on `stdout(Null)` has nothing to read, so it must error even when a
+        // cassette entry genuinely matches the invocation — a config mistake
+        // isn't masked by a recorded capture.
+        let (_dir, path) = temp_cassette();
+        let recorder = RecordReplayRunner::record(&path, scripted());
+        let _ = recorder
+            .output_string(&Command::new("tool").arg("--version"))
+            .await
+            .expect("record ok run");
+        recorder.save().expect("save cassette");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load cassette");
+        let cmd = Command::new("tool")
+            .arg("--version")
+            .stdout(crate::StdioMode::Null);
+        let err = replayer
+            .output_string(&cmd)
+            .await
+            .expect_err("a non-piped stdout must error, even against a matching entry");
+        match err {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+            other => panic!("expected Io(InvalidInput), got {other:?}"),
         }
     }
 

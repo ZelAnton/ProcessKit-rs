@@ -542,6 +542,44 @@ impl ProcessRunner for ProcessGroup {
     }
 }
 
+/// Take `command`'s stdin source for one run, exactly as the live launch path
+/// does: atomically consuming a one-shot source
+/// ([`Stdin::from_reader`](crate::Stdin::from_reader)/
+/// [`Stdin::from_lines`](crate::Stdin::from_lines)) so a concurrent or later
+/// re-run observes it exhausted and fails loud, instead of silently feeding
+/// the next run empty stdin. Returns `Ok(None)` when the command keeps stdin
+/// open ([`Command::keep_stdin_open`](crate::Command::keep_stdin_open)) or has
+/// no stdin source configured at all — neither case takes anything.
+///
+/// Shared by [`launch`] (which drives the taken payload into the child's pipe)
+/// and [`ScriptedRunner`](crate::testing::ScriptedRunner) (which only needs the
+/// same fail-loud consumption side effect — a repeated run of a one-shot-stdin
+/// command must fail on the fake exactly as it does live — not the payload
+/// itself), so the two call sites can never drift on the error's wording.
+pub(crate) async fn take_stdin_for_run(
+    command: &Command,
+) -> Result<Option<crate::stdin::TakenStdin>> {
+    if command.keeps_stdin_open() {
+        return Ok(None);
+    }
+    match command.stdin_source() {
+        Some(source) => match source.take_for_run().await {
+            Ok(taken) => Ok(Some(taken)),
+            Err(crate::stdin::OneShotConsumed) => Err(crate::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "`{}`: its one-shot streaming stdin (from_reader/from_lines) was \
+                     already consumed by a previous run — such a source feeds a single \
+                     run and cannot be retried or re-run; use Stdin::from_bytes/from_string \
+                     (re-runnable), or rebuild the command with a fresh source",
+                    command.program_name()
+                ),
+            ))),
+        },
+        None => Ok(None),
+    }
+}
+
 /// Build the OS command, spawn it into `group`, wire stdin, and wrap everything
 /// in a [`RunningProcess`] (with no owned group).
 pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<RunningProcess> {
@@ -602,28 +640,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     // Take stdin atomically so a concurrent second run of a one-shot source sees
     // it consumed and fails loud. Taken before the spawn so a failed spawn never
     // leaves a child to feed.
-    let taken_stdin = if command.keeps_stdin_open() {
-        None
-    } else {
-        match command.stdin_source() {
-            Some(source) => match source.take_for_run().await {
-                Ok(taken) => Some(taken),
-                Err(crate::stdin::OneShotConsumed) => {
-                    return Err(crate::Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "`{}`: its one-shot streaming stdin (from_reader/from_lines) was \
-                             already consumed by a previous run — such a source feeds a single \
-                             run and cannot be retried or re-run; use Stdin::from_bytes/from_string \
-                             (re-runnable), or rebuild the command with a fresh source",
-                            command.program_name()
-                        ),
-                    )));
-                }
-            },
-            None => None,
-        }
-    };
+    let taken_stdin = take_stdin_for_run(command).await?;
 
     let mut tokio_cmd = command.build_tokio();
     let opts = crate::sys::SpawnOptions {
