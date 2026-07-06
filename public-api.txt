@@ -1087,6 +1087,7 @@ impl<R> core::marker::UnsafeUnpin for processkit::Supervisor<R> where R: core::m
 impl<R> !core::panic::unwind_safe::RefUnwindSafe for processkit::Supervisor<R>
 impl<R> !core::panic::unwind_safe::UnwindSafe for processkit::Supervisor<R>
 pub trait processkit::IntoCommand<R: processkit::ProcessRunner>: processkit::client::sealed::Sealed
+impl<R: processkit::ProcessRunner, S: core::convert::AsRef<std::ffi::os_str::OsStr>, const N: usize> processkit::IntoCommand<R> for &[S; N]
 impl<R: processkit::ProcessRunner, S: core::convert::AsRef<std::ffi::os_str::OsStr>, const N: usize> processkit::IntoCommand<R> for [S; N]
 impl<R: processkit::ProcessRunner, S: core::convert::AsRef<std::ffi::os_str::OsStr>> processkit::IntoCommand<R> for &[S]
 impl<R: processkit::ProcessRunner, S: core::convert::AsRef<std::ffi::os_str::OsStr>> processkit::IntoCommand<R> for alloc::vec::Vec<S>
