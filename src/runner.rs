@@ -583,8 +583,10 @@ pub(crate) async fn take_stdin_for_run(
 /// Build the OS command, spawn it into `group`, wire stdin, and wrap everything
 /// in a [`RunningProcess`] (with no owned group).
 pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<RunningProcess> {
-    // A requested privilege drop or session detach must never be silently
-    // skipped: on targets without the POSIX primitives, fail before spawning.
+    // A requested privilege drop, session detach, or umask must never be
+    // silently skipped: on targets without the POSIX primitives, fail before
+    // spawning. (`priority` is deliberately absent here — it is implemented on
+    // both platform families and never gated as Unsupported.)
     #[cfg(not(unix))]
     {
         if command.requested_uid().is_some() {
@@ -605,6 +607,11 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         if command.wants_setsid() {
             return Err(crate::Error::Unsupported {
                 operation: "setsid".into(),
+            });
+        }
+        if command.requested_umask().is_some() {
+            return Err(crate::Error::Unsupported {
+                operation: "umask".into(),
             });
         }
     }

@@ -108,6 +108,13 @@ pub struct Command {
     /// inherited set. See [`Self::groups`].
     groups: Option<Vec<u32>>,
     setsid: bool,
+    /// CPU-scheduling priority (see [`Self::priority`]). Supported on both
+    /// Unix (`nice`/`setpriority`) and Windows (priority class) — never
+    /// gated as `Unsupported`.
+    priority: Option<crate::Priority>,
+    /// File-mode creation mask for the child (Unix `umask(2)`, see
+    /// [`Self::umask`]). Unix-only — `Unsupported` elsewhere.
+    umask: Option<u32>,
     /// Kill the direct child if this process dies abruptly (see
     /// [`Self::kill_on_parent_death`]).
     kill_on_parent_death: bool,
@@ -155,6 +162,8 @@ impl Command {
             gid: None,
             groups: None,
             setsid: false,
+            priority: None,
+            umask: None,
             kill_on_parent_death: false,
             creation_flags_extra: 0,
             cancel_token: None,
@@ -355,6 +364,43 @@ impl Command {
     /// bypasses these builders.
     pub fn setsid(mut self) -> Self {
         self.setsid = true;
+        self
+    }
+
+    /// Launch this child at a lower (or higher) CPU-scheduling priority — for
+    /// background/batch work that shouldn't starve the foreground, or a task
+    /// that should win over it.
+    ///
+    /// Applied on **both** platforms via the existing spawn seams: Unix
+    /// `setpriority` in the same `pre_exec` hook that carries
+    /// [`uid`](Self::uid)/[`gid`](Self::gid)/[`setsid`](Self::setsid); Windows
+    /// a priority-class flag OR'd into `creation_flags`, the same seam as
+    /// [`create_no_window`](Self::create_no_window). Unlike the privilege
+    /// builders this never yields
+    /// [`Error::Unsupported`](crate::Error::Unsupported) — see
+    /// [`Priority`](crate::Priority) for why both platforms cover every
+    /// variant, and the Unix caveat on
+    /// [`Priority::High`](crate::Priority::High) (raising priority needs
+    /// `CAP_SYS_NICE`/root there).
+    ///
+    /// Last-write-wins with an earlier call, like [`timeout`](Self::timeout).
+    pub fn priority(mut self, priority: crate::Priority) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+
+    /// Set the file-mode creation mask for the child (Unix `umask(2)`),
+    /// controlling the default permissions of files it creates.
+    ///
+    /// Applied via `pre_exec`, alongside [`setsid`](Self::setsid)/
+    /// [`groups`](Self::groups) — another knob on that same seam. On
+    /// non-Unix targets the run fails with
+    /// [`Error::Unsupported`](crate::Error::Unsupported) rather than
+    /// silently ignoring the requested mask. Only the low permission bits are
+    /// meaningful (as with the `umask(2)` syscall itself); pass the value you
+    /// would give the `umask` shell builtin, e.g. `0o022`.
+    pub fn umask(mut self, mask: u32) -> Self {
+        self.umask = Some(mask);
         self
     }
 
@@ -1090,9 +1136,24 @@ impl Command {
         }
     }
 
-    /// Extra Windows creation flags (read by the spawn seam on every target).
+    /// Extra Windows creation flags (read by the spawn seam on every target):
+    /// [`create_no_window`](Self::create_no_window)'s bit, OR'd with a
+    /// requested [`priority`](Self::priority)'s priority-class flag on
+    /// Windows (a no-op elsewhere, matching `creation_flags_extra`'s own
+    /// cross-platform harmlessness).
     pub(crate) fn extra_creation_flags(&self) -> u32 {
-        self.creation_flags_extra
+        #[cfg(windows)]
+        {
+            let mut flags = self.creation_flags_extra;
+            if let Some(priority) = self.priority {
+                flags |= priority.creation_flag();
+            }
+            flags
+        }
+        #[cfg(not(windows))]
+        {
+            self.creation_flags_extra
+        }
     }
 
     /// The requested privilege-drop uid — read only by the non-Unix
@@ -1113,6 +1174,13 @@ impl Command {
     #[cfg(not(unix))]
     pub(crate) fn requested_groups(&self) -> bool {
         self.groups.is_some()
+    }
+
+    /// The requested `umask` — read only by the non-Unix unsupported gate
+    /// (Unix consumes the field directly in `build_tokio`).
+    #[cfg(not(unix))]
+    pub(crate) fn requested_umask(&self) -> Option<u32> {
+        self.umask
     }
 
     // ----- Public accessors -----------------------------------------------
@@ -1239,6 +1307,37 @@ impl Command {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
+            // Priority and umask are independent of the privilege-drop hooks
+            // below; register them first so a `Priority::High` that needs
+            // CAP_SYS_NICE/root is still requested while the child holds its
+            // original (pre-drop) privileges. Both the `Some(groups)` and
+            // `None` branches below perform the whole uid/gid drop inside a
+            // user `pre_exec` closure registered *after* these hooks, so this
+            // ordering guarantee holds uniformly regardless of whether
+            // `groups` was set.
+            if let Some(priority) = self.priority {
+                let nice = priority.nice_value();
+                // SAFETY: setpriority is async-signal-safe; `nice` is a plain
+                // i32 copy, not a pointer into anything shared.
+                unsafe {
+                    cmd.as_std_mut().pre_exec(move || {
+                        if libc::setpriority(libc::PRIO_PROCESS, 0, nice) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            if let Some(mask) = self.umask {
+                // SAFETY: umask(2) is async-signal-safe and — unlike the other
+                // hooks here — cannot fail, so no error path is needed.
+                unsafe {
+                    cmd.as_std_mut().pre_exec(move || {
+                        libc::umask(mask as libc::mode_t);
+                        Ok(())
+                    });
+                }
+            }
             match &self.groups {
                 // Do the *whole* drop (setgroups → setgid → setuid) in one
                 // pre_exec: std runs its own setgid/setuid before any user hook,
@@ -1271,14 +1370,39 @@ impl Command {
                         });
                     }
                 }
-                // Keep std's path: it applies gid before uid (changing gid is
-                // barred once the uid drops), before any user pre_exec hook.
+                // Mirror std's own drop path (setgroups(0, ...) to clear
+                // supplementary groups, then setgid before setuid — changing
+                // gid is barred once the uid drops) but inside a user
+                // pre_exec hook registered *after* the priority/umask hooks
+                // above, instead of using `Command::gid`/`uid` directly:
+                // those std builder methods apply their drop *before* any
+                // user pre_exec hook runs, which would silently drop
+                // privileges before `Priority::High` gets to raise them.
                 None => {
-                    if let Some(gid) = self.gid {
-                        cmd.as_std_mut().gid(gid);
-                    }
-                    if let Some(uid) = self.uid {
-                        cmd.as_std_mut().uid(uid);
+                    let gid = self.gid;
+                    let uid = self.uid;
+                    if gid.is_some() || uid.is_some() {
+                        // SAFETY: setgroups/setgid/setuid are async-signal-safe;
+                        // `gid`/`uid` are plain copies, not pointers into
+                        // anything shared.
+                        unsafe {
+                            cmd.as_std_mut().pre_exec(move || {
+                                if libc::setgroups(0, std::ptr::null()) == -1 {
+                                    return Err(std::io::Error::last_os_error());
+                                }
+                                if let Some(gid) = gid
+                                    && libc::setgid(gid) == -1
+                                {
+                                    return Err(std::io::Error::last_os_error());
+                                }
+                                if let Some(uid) = uid
+                                    && libc::setuid(uid) == -1
+                                {
+                                    return Err(std::io::Error::last_os_error());
+                                }
+                                Ok(())
+                            });
+                        }
                     }
                 }
             }
@@ -1300,11 +1424,16 @@ impl Command {
             }
         }
         #[cfg(windows)]
-        if self.creation_flags_extra != 0 {
-            use std::os::windows::process::CommandExt;
-            // Non-group launch paths only; the group spawn overwrites flags with
-            // CREATE_SUSPENDED | these extras.
-            cmd.as_std_mut().creation_flags(self.creation_flags_extra);
+        {
+            // Includes both `create_no_window`'s bit and a requested
+            // `priority`'s class flag (see `extra_creation_flags`).
+            let flags = self.extra_creation_flags();
+            if flags != 0 {
+                use std::os::windows::process::CommandExt;
+                // Non-group launch paths only; the group spawn overwrites flags
+                // with CREATE_SUSPENDED | these extras.
+                cmd.as_std_mut().creation_flags(flags);
+            }
         }
         cmd.stdout(match self.stdout_mode {
             StdioMode::Piped => Stdio::piped(),
@@ -1474,6 +1603,8 @@ impl fmt::Debug for Command {
             // Security-relevant: the supplementary-group set of a privilege drop.
             .field("groups", &self.groups)
             .field("setsid", &self.setsid)
+            .field("priority", &self.priority)
+            .field("umask", &self.umask)
             .field("kill_on_parent_death", &self.kill_on_parent_death)
             .field("creation_flags_extra", &self.creation_flags_extra);
         #[cfg(feature = "process-control")]
@@ -1843,6 +1974,48 @@ mod tests {
         let cmd = Command::new("x").create_no_window();
         assert_eq!(cmd.extra_creation_flags(), 0x0800_0000);
         assert_eq!(Command::new("x").extra_creation_flags(), 0);
+    }
+
+    #[test]
+    fn priority_and_umask_record_their_requests() {
+        let cmd = Command::new("x")
+            .priority(crate::Priority::BelowNormal)
+            .umask(0o022);
+        let debug = format!("{cmd:?}");
+        assert!(debug.contains("BelowNormal"), "debug: {debug}");
+        assert!(debug.contains("umask: Some(18)"), "debug: {debug}"); // 0o022 == 18
+        assert!(
+            !format!("{:?}", Command::new("x")).contains("BelowNormal"),
+            "an unset priority must not appear"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn priority_ors_the_windows_creation_flag_alongside_create_no_window() {
+        use windows_sys::Win32::System::Threading::{
+            BELOW_NORMAL_PRIORITY_CLASS, IDLE_PRIORITY_CLASS,
+        };
+        let cmd = Command::new("x").priority(crate::Priority::Idle);
+        assert_eq!(cmd.extra_creation_flags(), IDLE_PRIORITY_CLASS);
+
+        // Composes with create_no_window (an independent bit).
+        let both = Command::new("x")
+            .priority(crate::Priority::BelowNormal)
+            .create_no_window();
+        assert_eq!(
+            both.extra_creation_flags(),
+            BELOW_NORMAL_PRIORITY_CLASS | 0x0800_0000
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn umask_is_gated_unsupported_on_non_unix_but_priority_is_not() {
+        // The launch-time gate reads these accessors directly; priority has no
+        // such accessor at all, because it is never gated.
+        assert_eq!(Command::new("x").umask(0o022).requested_umask(), Some(18));
+        assert_eq!(Command::new("x").requested_umask(), None);
     }
 
     #[test]

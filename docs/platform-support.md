@@ -99,6 +99,8 @@ than swallowing it — consistent with the "never silently skipped" philosophy; 
 | `setsid` | ❌ `Unsupported` | ✅ |
 | `create_no_window` | ✅ | no-op |
 | `kill_on_parent_death` | ✅ always on (kernel) | Linux: direct child; macOS/BSD: no-op |
+| `priority` | ✅ (priority class) | ✅ (`nice`/`setpriority`) |
+| `umask` | ❌ `Unsupported` | ✅ |
 
 Everything not listed — capture, streaming, interactive stdin, encodings,
 buffer policies, timeouts, retry, pipelines, supervision, readiness probes,
