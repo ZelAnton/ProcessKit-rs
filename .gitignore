@@ -8,3 +8,5 @@
 # real builds live under /target above)
 *.rlib
 *.rmeta
+
+.work/
