@@ -127,6 +127,7 @@ pub fn processkit::testing::Reply::signalled(core::option::Option<i32>) -> Self
 pub fn processkit::testing::Reply::spawn_error(core::io::error::ErrorKind, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn processkit::testing::Reply::timeout() -> Self
 pub fn processkit::testing::Reply::with_line_delay(self, core::time::Duration) -> Self
+pub fn processkit::testing::Reply::with_stderr(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn processkit::testing::Reply::with_stdout(self, impl core::convert::Into<alloc::string::String>) -> Self
 impl core::clone::Clone for processkit::testing::Reply
 pub fn processkit::testing::Reply::clone(&self) -> processkit::testing::Reply

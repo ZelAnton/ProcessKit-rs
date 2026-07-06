@@ -96,7 +96,9 @@ enum SpawnError {
 }
 
 impl Reply {
-    /// A successful reply (exit code 0) producing `stdout`.
+    /// A successful reply (exit code 0) producing `stdout`. Pair with
+    /// [`with_stderr`](Self::with_stderr) to also give the successful reply
+    /// stderr text (e.g. warnings a CLI writes on exit 0).
     pub fn ok(stdout: impl Into<String>) -> Self {
         Self {
             stdout: stdout.into(),
@@ -111,7 +113,9 @@ impl Reply {
         }
     }
 
-    /// A failing reply with exit `code` and `stderr` text.
+    /// A failing reply with exit `code` and `stderr` text. Use
+    /// [`with_stderr`](Self::with_stderr) afterwards to override this
+    /// stderr text.
     pub fn fail(code: i32, stderr: impl Into<String>) -> Self {
         Self {
             stdout: String::new(),
@@ -240,6 +244,15 @@ impl Reply {
     /// [`ProcessResult::diagnostic`](crate::ProcessResult::diagnostic).
     pub fn with_stdout(mut self, stdout: impl Into<String>) -> Self {
         self.stdout = stdout.into();
+        self
+    }
+
+    /// Attach stderr to a reply — e.g. the warnings a CLI like `git`, a
+    /// compiler, or a linter writes to stderr even on a successful (exit 0)
+    /// run, so a test can exercise that stderr without misleadingly reaching
+    /// for [`fail`](Self::fail).
+    pub fn with_stderr(mut self, stderr: impl Into<String>) -> Self {
+        self.stderr = stderr.into();
         self
     }
 
@@ -2255,6 +2268,22 @@ mod tests {
             .expect("scripted output_bytes");
         assert_eq!(result.stdout(), b"raw\x00bytes");
         assert!(result.is_success());
+    }
+
+    #[tokio::test]
+    async fn with_stderr_attaches_stderr_to_a_successful_reply() {
+        // `with_stderr` composes with the success constructors so a scripted
+        // reply can model a CLI (e.g. `git`, a compiler, a linter) that writes
+        // warnings to stderr even on exit 0 — previously only expressible via
+        // the misleading `Reply::fail(0, "warning")`.
+        let runner = ScriptedRunner::new().fallback(Reply::ok("out").with_stderr("warning\n"));
+        let result = runner
+            .output_string(&Command::new("tool"))
+            .await
+            .expect("scripted output_string");
+        assert!(result.is_success(), "exit code stays 0");
+        assert_eq!(result.stdout(), "out");
+        assert_eq!(result.stderr(), "warning");
     }
 
     #[tokio::test]
