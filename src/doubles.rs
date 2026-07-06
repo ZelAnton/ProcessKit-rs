@@ -37,7 +37,10 @@
 //! "exits", on `start`) until the command's token — per-command or
 //! [`CliClient::default_cancel_on`](crate::CliClient::default_cancel_on) —
 //! cancels, then resolves with `Err(Error::Cancelled { .. })`, mirroring the
-//! live contract.
+//! live contract. A pending call is likewise bounded by the command's
+//! [`Command::timeout`](crate::Command::timeout): with a deadline set it resolves
+//! timed-out (`Outcome::TimedOut`) rather than parking, on the bulk verbs and
+//! `start` alike, just as a live child killed for overrunning its deadline would.
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
@@ -62,8 +65,9 @@ pub struct Reply {
     signalled: bool,
     /// Signal number for a signal-killed reply (see [`signalled`](Self::signalled)).
     signal: Option<i32>,
-    /// Park the call until the command's cancellation token fires (see
-    /// [`pending`](Self::pending)); the other fields are unused then.
+    /// Park the call until the command's cancellation token fires or its
+    /// `timeout` deadline elapses (see [`pending`](Self::pending)); the other
+    /// fields are unused then.
     pending: bool,
     /// On a scripted `start`, sleep this long before each stdout line (see
     /// [`with_line_delay`](Self::with_line_delay)). Bulk `output_string` ignores it.
@@ -125,13 +129,14 @@ impl Reply {
     /// A timed-out reply — drives the timeout path so a test can assert that a
     /// command which exceeds its deadline surfaces as [`Error::Timeout`](crate::Error::Timeout).
     ///
-    /// On the bulk verbs (`output_string` and friends) this synthesizes a timed-out
-    /// result directly. On a scripted [`start`](crate::ProcessRunner::start),
-    /// though, it resolves **immediately** as timed-out rather than parking until
-    /// a deadline — it does not exercise the real deadline-watchdog race. To
-    /// model "hangs until the command's `timeout` fires," script
-    /// [`pending`](Self::pending) and set a [`Command::timeout`](crate::Command::timeout):
-    /// the watchdog then drives the timeout exactly as it would for a live child.
+    /// On both the bulk verbs (`output_string` and friends) and a scripted
+    /// [`start`](crate::ProcessRunner::start) this resolves **immediately** as
+    /// timed-out, so it asserts the timeout *classification* without exercising the
+    /// real deadline race. To model "hangs until the command's `timeout` fires,"
+    /// script [`pending`](Self::pending) and set a
+    /// [`Command::timeout`](crate::Command::timeout): the call then parks until the
+    /// deadline and resolves timed-out — on the bulk verbs and `start` alike,
+    /// exactly as the watchdog would drive it for a live child.
     pub fn timeout() -> Self {
         Self {
             stdout: String::new(),
@@ -165,18 +170,26 @@ impl Reply {
         }
     }
 
-    /// A reply that **parks the call until its cancellation token fires**,
-    /// then resolves with [`Error::Cancelled`](crate::Error::Cancelled) naming
-    /// the program — the hermetic mirror of cancelling a live long-runner, for
-    /// testing that an orchestration genuinely cancels (and cleans up), not
-    /// just that it formats a canned error.
+    /// A reply that **parks the call until its cancellation token fires or its
+    /// [`Command::timeout`](crate::Command::timeout) deadline elapses** — the
+    /// hermetic mirror of a live long-runner that is either cancelled or killed
+    /// for overrunning its deadline, for testing that an orchestration genuinely
+    /// cancels (and cleans up) or bounds a hang, not just that it formats a canned
+    /// error. A firing token resolves with
+    /// [`Error::Cancelled`](crate::Error::Cancelled) naming the program; a firing
+    /// deadline resolves as a timed-out run (`Outcome::TimedOut`), exactly as a
+    /// [`timeout`](Self::timeout) reply would.
     ///
     /// The token is the matched command's — set per command
     /// ([`Command::cancel_on`]) or client-wide
-    /// ([`CliClient::default_cancel_on`](crate::CliClient::default_cancel_on)).
-    /// A pending reply for a command **without** a token parks forever, like a
-    /// hung child nobody can cancel — deliberate; pair it with a token (or a
-    /// test timeout) by design.
+    /// ([`CliClient::default_cancel_on`](crate::CliClient::default_cancel_on)); the
+    /// deadline is its [`timeout`](crate::Command::timeout). Whichever fires first
+    /// wins (a tie favors cancellation), on both the bulk `output_string` verb and
+    /// a scripted [`start`](crate::ProcessRunner::start), just as the live runner
+    /// races its cancel token against its deadline. A pending reply for a command
+    /// with **neither** a token **nor** a timeout parks forever, like a hung child
+    /// no one can cancel and no deadline bounds — deliberate; pair it with a token,
+    /// a `Command::timeout` (or a test timeout) by design.
     pub fn pending() -> Self {
         Self {
             stdout: String::new(),
@@ -821,15 +834,51 @@ impl ProcessRunner for ScriptedRunner {
     }
 }
 
-/// Drive a [`Reply::pending`] match: wait for the command's cancellation token
-/// and resolve as the live runner would — `Err(Error::Cancelled)`. With no
-/// token the call parks forever, like a hung child.
+/// Drive a [`Reply::pending`] match on the bulk `output_string` path: race the
+/// command's cancellation token against its configured
+/// [`timeout`](crate::Command::timeout) and resolve exactly as the live bulk
+/// path would for a genuinely hung child.
+///
+/// - the token fires first → `Err(Error::Cancelled)`, the mirror of cancelling
+///   (and cleaning up) a live long-runner;
+/// - the `Command::timeout` deadline fires first → a synthesized timed-out
+///   [`ProcessResult`] (`Outcome::TimedOut`, empty output — the same shape a
+///   [`Reply::timeout`] yields on this verb), mirroring a live watchdog killing a
+///   child that overran its deadline, and matching the scripted `start` path's
+///   own deadline arbiter (`arm_scripted_deadline` / `drive_to_exit`);
+/// - neither knob is set → the call parks forever, like a hung child that no
+///   token can cancel and no deadline bounds.
+///
+/// Cancellation is biased ahead of the deadline so a simultaneous cancel+timeout
+/// resolves as `Cancelled`, matching the live `drive_to_exit_inner` select order.
 async fn park_until_cancelled(command: &Command, program: String) -> Result<ProcessResult<String>> {
-    if let Some(token) = command.cancel_token() {
-        token.cancelled().await;
-        return Err(crate::error::Error::Cancelled { program });
+    let token = command.cancel_token();
+    let timeout = command.configured_timeout();
+    // Unset knobs become never-resolving arms, so a `select!` over both collapses
+    // to "park forever" when neither is configured — the documented hung-child case.
+    let cancelled = async {
+        match &token {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    let deadline = async {
+        match timeout {
+            // Clamp like every other `Instant + Duration` deadline site so a
+            // `Duration::MAX`-ish timeout can't overflow the sleep.
+            Some(limit) => tokio::time::sleep(limit.min(crate::MAX_DEADLINE)).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        () = cancelled => Err(crate::error::Error::Cancelled { program }),
+        // The same construction the bulk verb applies to a `Reply::timeout()`, so a
+        // pending-then-timeout result is byte-for-byte a canned timeout on this verb.
+        () = deadline => Ok(Reply::timeout()
+            .into_result(program, command)
+            .with_ok_codes(command.ok_codes_vec())),
     }
-    std::future::pending().await
 }
 
 /// A captured record of one command a runner was asked to run.
@@ -2218,9 +2267,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn pending_without_a_token_parks_forever() {
-        // Documented: a pending reply for a command with no token behaves like
-        // a hung child nobody can cancel.
+    async fn pending_without_a_token_or_timeout_parks_forever() {
+        // Documented: a pending reply for a command with neither a token nor a
+        // timeout behaves like a hung child nobody can cancel and no deadline bounds.
         let runner = ScriptedRunner::new().fallback(Reply::pending());
         let cmd = Command::new("gh");
         let call = runner.output_string(&cmd);
@@ -2230,6 +2279,63 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bulk_pending_with_a_timeout_and_no_token_times_out_at_the_deadline() {
+        // The fidelity fix: on the bulk `output_string` verb a pending reply is
+        // bounded by the command's `timeout` just like the live bulk path and the
+        // scripted `start` path. With no cancel token but a deadline set, the call
+        // must resolve `TimedOut` at the deadline instead of parking forever.
+        use crate::error::Error;
+        use crate::runner::ProcessRunnerExt;
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let cmd = Command::new("hang").timeout(std::time::Duration::from_secs(3));
+
+        // The capture verb surfaces the timed-out flag without erroring…
+        let result = runner
+            .output_string(&cmd)
+            .await
+            .expect("a pending call under a timeout resolves, it does not hang");
+        assert_eq!(result.outcome(), Outcome::TimedOut);
+        assert!(result.timed_out());
+
+        // …and the checking verbs raise `Error::Timeout` carrying the command's
+        // real configured deadline — byte-for-byte a `Reply::timeout` on this verb.
+        match runner.run(&cmd).await.unwrap_err() {
+            Error::Timeout { timeout, .. } => {
+                assert_eq!(timeout, std::time::Duration::from_secs(3))
+            }
+            other => panic!("expected Error::Timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bulk_pending_cancellation_wins_over_a_later_timeout() {
+        // When both a token and a timeout bound a pending bulk call, the one that
+        // fires first wins — here the token cancels well before the (long) deadline,
+        // so the call reports `Cancelled`, not `TimedOut`.
+        use crate::error::Error;
+        let token = crate::CancellationToken::new();
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let cmd = Command::new("watch")
+            .timeout(std::time::Duration::from_secs(3600))
+            .cancel_on(token.clone());
+
+        let call = runner.output_string(&cmd);
+        tokio::pin!(call);
+        // The generous deadline hasn't elapsed, so the call is still parked.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(60), &mut call)
+                .await
+                .is_err(),
+            "the call must not resolve before either knob fires"
+        );
+        token.cancel();
+        match call.await {
+            Err(Error::Cancelled { program }) => assert_eq!(program, "watch"),
+            other => panic!("expected Error::Cancelled, got {other:?}"),
+        }
     }
 
     #[tokio::test]
