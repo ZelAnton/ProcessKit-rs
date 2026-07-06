@@ -783,13 +783,7 @@ impl ProcessRunner for ScriptedRunner {
         // never have captured. Checked before `matched_reply` so this config error
         // never advances an `on_sequence` rule's reply cursor.
         if !command.stdout_is_piped() {
-            return Err(crate::error::Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "`{program}`: stdout is not piped (Command::stdout was set to Inherit/Null), \
-                     so the capture verbs have nothing to read — use StdioMode::Piped to capture it"
-                ),
-            )));
+            return Err(crate::error::stdout_not_piped_error(&program));
         }
         let reply = self.matched_reply(command, &program)?;
         if let Some(err) = reply.spawn_error_for(program.clone()) {

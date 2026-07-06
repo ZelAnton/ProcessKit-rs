@@ -683,14 +683,7 @@ impl RunningProcess {
         if self.stdout_piped {
             return Ok(());
         }
-        Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "`{}`: stdout is not piped (Command::stdout was set to Inherit/Null), so the \
-                 capture verbs have nothing to read — use StdioMode::Piped to capture it",
-                self.program
-            ),
-        )))
+        Err(crate::error::stdout_not_piped_error(&self.program))
     }
 
     /// Fail loud if streaming is not possible: (a) stdout not piped, or

@@ -1026,15 +1026,7 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 // reject it here so the two replay arms stay symmetric and a config
                 // mistake isn't masked by a recorded capture (D9).
                 if !command.stdout_is_piped() {
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "`{}`: stdout is not piped (Command::stdout was set to \
-                             Inherit/Null), so the capture verbs have nothing to read — \
-                             use StdioMode::Piped to capture it",
-                            command.program_name()
-                        ),
-                    )));
+                    return Err(crate::error::stdout_not_piped_error(&command.program_name()));
                 }
                 let invocation = Invocation::from_command(command);
                 let stdin_digest = stdin_digest_of(command);
