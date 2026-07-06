@@ -2052,7 +2052,7 @@ _No functional changes — republished to recover a failed crates.io upload._
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
 [Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.1.0...HEAD
-[2.1.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.0.0...v2.1.0
+[2.1.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.2.1...v2.1.0
 [1.2.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.0.1...v1.1.0
