@@ -113,7 +113,15 @@ to a dated version section.
   written by a previous build still loads and replays fine.
 
 ### Fixed
--
+- `ScriptedRunner`'s bulk verbs (`output_string` and the helpers over it) now
+  bound a `Reply::pending` call by the command's `timeout`, matching the live
+  runner and the scripted `start` path: a pending reply with a `Command::timeout`
+  but no cancel token resolves timed-out (`Outcome::TimedOut`) at the deadline
+  instead of parking forever. A pending reply with neither a token nor a timeout
+  still parks forever (a hung child no one can cancel and no deadline bounds), and
+  the token path is unchanged. This makes the `Reply::timeout` doc's advice —
+  "script `pending` and set a `Command::timeout` to model a deadline hang" — hold
+  on the bulk verbs, not only `start`.
 
 ## [1.2.1] - 2026-07-04
 

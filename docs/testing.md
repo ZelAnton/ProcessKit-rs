@@ -108,9 +108,12 @@ The pieces:
 - **`Reply::pending()`** — parks the call until the
   command's cancellation token (per-command `cancel_on` or the client-level
   [`default_cancel_on`](timeouts-and-cancellation.md#client-level-default))
-  fires, then resolves with `Error::Cancelled` — so a test can prove an
+  fires, resolving with `Error::Cancelled` — so a test can prove an
   orchestration *actually cancels* a blocked call, not just that it formats a
-  canned error. With no token it parks forever, like a hung child.
+  canned error — or until the command's `timeout` deadline elapses, resolving
+  timed-out (`Outcome::TimedOut`) on the bulk verbs and `start` alike, like a
+  child killed for overrunning its deadline. Whichever fires first wins. With
+  neither a token nor a timeout it parks forever, like a hung child.
 - Rules are tried in **registration order**; first match wins. Prefix
   matching is element-wise over the **program name then the arguments** (the
   first element is the program) — `on(["git", "foo"])` matches `git foo bar`
