@@ -64,6 +64,13 @@ impl RunningProcess {
     ///
     /// Returns `Err` instead of a silently-empty stream when stdout was not piped
     /// or a streaming verb was already called on this handle.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`](crate::Error::Io) when stdout was not piped, or a prior
+    /// streaming verb ([`stdout_lines`](Self::stdout_lines) /
+    /// [`output_events`](Self::output_events) / `wait_for_line`) already consumed
+    /// it — returned instead of a stream that would silently be empty.
     pub fn stdout_lines(&mut self) -> Result<StdoutLines> {
         // Drain stdout AND arm the timeout watchdog. `wait_for_line` instead calls
         // `drain_stdout_lines` directly, so a readiness probe never kills the tree.
@@ -216,6 +223,19 @@ impl RunningProcess {
     /// Designed to pair with `stdout_lines` (consume the stdout stream first),
     /// but safe to call on its own — any pipe the stream didn't take is drained
     /// here so the child can never block on a full pipe.
+    ///
+    /// # Errors
+    ///
+    /// A timeout or signal-kill is *captured* in the returned [`Finished`]'s
+    /// [`outcome`](Finished::outcome), not raised. The `Err` cases are
+    /// [`Error::Cancelled`](crate::Error::Cancelled) (the run was cancelled via
+    /// [`Command::cancel_on`](crate::Command::cancel_on)),
+    /// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge) (a fail-loud
+    /// [`OutputBufferPolicy`](crate::OutputBufferPolicy) overflowed on a sink the
+    /// caller opted into by streaming — a bare `finish` discards untouched stdout
+    /// and never trips it), [`Error::Stdin`](crate::Error::Stdin) (a
+    /// non-broken-pipe stdin-source failure on an otherwise-successful run), or
+    /// [`Error::Io`](crate::Error::Io) (waiting on the child failed).
     pub async fn finish(mut self) -> Result<Finished> {
         // A bare `finish()` (no prior `stdout_lines`/`output_events` took stdout)
         // still has to drain the leftover stdout so the child can't block on a full
@@ -300,6 +320,12 @@ impl RunningProcess {
     /// a silently-empty stream when stdout was not piped or was already consumed.
     /// Call [`finish`](Self::finish) after draining — its `stderr` will be empty
     /// since stderr was delivered as events.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`](crate::Error::Io) when stdout was not piped, or a prior
+    /// streaming verb already consumed it — returned instead of a stream that
+    /// would silently be empty.
     pub fn output_events(&mut self) -> Result<OutputEvents> {
         self.ensure_stdout_streamable()?;
         let stdout_sink = SharedLines::new(&self.buffer);

@@ -279,12 +279,24 @@ impl ProcessStdin {
     }
 
     /// Write raw bytes to stdin.
+    ///
+    /// # Errors
+    ///
+    /// The underlying [`std::io::Error`] from writing to the child's stdin pipe —
+    /// commonly [`BrokenPipe`](std::io::ErrorKind::BrokenPipe) once the child has
+    /// closed stdin (read all it wanted) or exited.
     pub async fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.sink.write_all(bytes).await
     }
 
     /// Write `line` followed by `\n` (UTF-8), flushing so the child sees it
     /// promptly.
+    ///
+    /// # Errors
+    ///
+    /// The underlying [`std::io::Error`] from writing the line, its newline, or
+    /// the flush — commonly [`BrokenPipe`](std::io::ErrorKind::BrokenPipe) once
+    /// the child has closed stdin or exited.
     pub async fn write_line(&mut self, line: &str) -> std::io::Result<()> {
         self.sink.write_all(line.as_bytes()).await?;
         self.sink.write_all(b"\n").await?;
@@ -292,11 +304,23 @@ impl ProcessStdin {
     }
 
     /// Flush buffered bytes to the child.
+    ///
+    /// # Errors
+    ///
+    /// The underlying [`std::io::Error`] from flushing the pipe — commonly
+    /// [`BrokenPipe`](std::io::ErrorKind::BrokenPipe) once the child has closed
+    /// stdin or exited.
     pub async fn flush(&mut self) -> std::io::Result<()> {
         self.sink.flush().await
     }
 
     /// Close stdin, signalling EOF to the child.
+    ///
+    /// # Errors
+    ///
+    /// The underlying [`std::io::Error`] from shutting the pipe down; a child
+    /// that already closed its read end may surface
+    /// [`BrokenPipe`](std::io::ErrorKind::BrokenPipe).
     pub async fn finish(mut self) -> std::io::Result<()> {
         self.sink.shutdown().await
     }

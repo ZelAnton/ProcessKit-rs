@@ -391,6 +391,16 @@ impl<R: ProcessRunner> CliClient<R> {
     /// Accepts an argument list (`git.run(["status"])`) or a customized
     /// [`Command`] (`git.run(git.command(["push"]).timeout(d))`) — see
     /// [`IntoCommand`].
+    ///
+    /// # Errors
+    ///
+    /// The same surface as [`Command::run`](crate::Command::run): a launch
+    /// failure ([`Error::NotFound`] / [`Error::Spawn`] / [`Error::Unsupported`] /
+    /// [`Error::Io`], and — via the client's runner — [`Error::Cancelled`] on a
+    /// pre-cancelled token), a non-accepted exit ([`Error::Exit`]),
+    /// [`Error::Signalled`], [`Error::Timeout`], [`Error::Cancelled`],
+    /// [`Error::OutputTooLarge`] (a fail-loud buffer truncated the presented
+    /// stdout), or [`Error::Stdin`].
     pub async fn run(&self, call: impl IntoCommand<R>) -> Result<String> {
         let command = call.into_command(self);
         let result = self.runner.checked(&command).await?;
@@ -403,12 +413,29 @@ impl<R: ProcessRunner> CliClient<R> {
     /// [`ProcessResult`] (untrimmed) — the [`CliClient`] analogue of
     /// [`ProcessRunnerExt::checked`](crate::ProcessRunnerExt::checked); the
     /// building block when you need the whole result after success-checking.
+    ///
+    /// # Errors
+    ///
+    /// The same surface as [`Command::checked`](crate::Command::checked): the
+    /// launch failures, plus [`Error::Exit`] / [`Error::Signalled`] /
+    /// [`Error::Timeout`] / [`Error::Cancelled`] / [`Error::Stdin`]. Being the
+    /// lenient building block, it does not fail loud on a bounded-buffer
+    /// truncation, so it never returns [`Error::OutputTooLarge`].
     pub async fn checked(&self, call: impl IntoCommand<R>) -> Result<ProcessResult<String>> {
         self.runner.checked(&call.into_command(self)).await
     }
 
     /// Run, capturing the full result without erroring on a non-zero exit — the
     /// same verb as [`ProcessRunner::output_string`].
+    ///
+    /// # Errors
+    ///
+    /// The same surface as
+    /// [`Command::output_string`](crate::Command::output_string): a non-zero
+    /// exit, a timeout, and a signal-kill are *captured* in the returned
+    /// [`ProcessResult`], not raised; beyond the launch failures, only
+    /// [`Error::Cancelled`], [`Error::OutputTooLarge`] (a fail-loud overflow),
+    /// [`Error::Stdin`], and [`Error::Io`] surface.
     pub async fn output_string(&self, call: impl IntoCommand<R>) -> Result<ProcessResult<String>> {
         self.runner.output_string(&call.into_command(self)).await
     }
@@ -416,6 +443,15 @@ impl<R: ProcessRunner> CliClient<R> {
     /// Run, capturing stdout as **raw bytes** (stderr as text), without erroring
     /// on a non-zero exit — the same verb as [`ProcessRunner::output_bytes`].
     /// For binary tools whose stdout is not UTF-8.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`output_string`](Self::output_string), except a fail-loud
+    /// [`Error::OutputTooLarge`] applies to the raw stdout *byte* ceiling. Note
+    /// that a runner that only implements
+    /// [`output_string`](crate::ProcessRunner::output_string) surfaces
+    /// [`Error::Unsupported`] here (byte capture routes through
+    /// [`start`](crate::ProcessRunner::start)).
     pub async fn output_bytes(&self, call: impl IntoCommand<R>) -> Result<ProcessResult<Vec<u8>>> {
         self.runner.output_bytes(&call.into_command(self)).await
     }
@@ -423,6 +459,12 @@ impl<R: ProcessRunner> CliClient<R> {
     /// Run for the side effect, discarding stdout (errors on a non-zero exit) —
     /// the same verb as
     /// [`ProcessRunnerExt::run_unit`](crate::ProcessRunnerExt::run_unit).
+    ///
+    /// # Errors
+    ///
+    /// The same surface as [`checked`](Self::checked) (launch failures plus
+    /// [`Error::Exit`] / [`Error::Signalled`] / [`Error::Timeout`] /
+    /// [`Error::Cancelled`] / [`Error::Stdin`]); only the output is discarded.
     pub async fn run_unit(&self, call: impl IntoCommand<R>) -> Result<()> {
         self.runner.run_unit(&call.into_command(self)).await
     }
@@ -430,6 +472,12 @@ impl<R: ProcessRunner> CliClient<R> {
     /// Run and return the exit code (e.g. `git diff --quiet`, `gh auth status`)
     /// — never errors on a non-zero exit. The same verb as
     /// [`Command::exit_code`](crate::Command::exit_code).
+    ///
+    /// # Errors
+    ///
+    /// The launch failures, plus — when the run produced no code —
+    /// [`Error::Timeout`], [`Error::Signalled`], or [`Error::Cancelled`]. A
+    /// non-zero exit is returned as the code, not raised.
     pub async fn exit_code(&self, call: impl IntoCommand<R>) -> Result<i32> {
         self.runner.exit_code(&call.into_command(self)).await
     }
@@ -439,6 +487,12 @@ impl<R: ProcessRunner> CliClient<R> {
     /// `match code { 0 => …, 1 => …, _ => Err }` idiom for commands whose exit
     /// code is the answer (`git diff --quiet`, `git show-ref --verify --quiet`,
     /// `grep -q`, …); other codes / timeout / signal-kill all error.
+    ///
+    /// # Errors
+    ///
+    /// Any exit code other than `0`/`1` becomes [`Error::Exit`], and — atop the
+    /// launch failures — a run with no code errors as [`Error::Timeout`],
+    /// [`Error::Signalled`], or [`Error::Cancelled`].
     pub async fn probe(&self, call: impl IntoCommand<R>) -> Result<bool> {
         self.runner.probe(&call.into_command(self)).await
     }
@@ -447,6 +501,14 @@ impl<R: ProcessRunner> CliClient<R> {
     /// the stream ends first) — the [`CliClient`] analogue of
     /// [`ProcessRunnerExt::first_line`](crate::ProcessRunnerExt::first_line),
     /// bounded by the command's [`timeout`](crate::Command::timeout).
+    ///
+    /// # Errors
+    ///
+    /// The launch failures, plus [`Error::Timeout`] when a command
+    /// [`timeout`](crate::Command::timeout) is set and its deadline elapses
+    /// mid-stream (tearing the process down), [`Error::Cancelled`], or
+    /// [`Error::Io`] while streaming. A stream that ends with no match is
+    /// `Ok(None)`, not an error.
     pub async fn first_line<F>(
         &self,
         call: impl IntoCommand<R>,
@@ -464,6 +526,14 @@ impl<R: ProcessRunner> CliClient<R> {
     /// `parse` — the shape of git/jj struct-returning commands. Fails loud on a
     /// bounded-buffer truncation. Delegates to
     /// [`ProcessRunnerExt::parse`](crate::ProcessRunnerExt::parse).
+    ///
+    /// # Errors
+    ///
+    /// The success-checking surface of [`run`](Self::run) (launch failures plus
+    /// [`Error::Exit`] / [`Error::Signalled`] / [`Error::Timeout`] /
+    /// [`Error::Cancelled`] / [`Error::Stdin`]), plus [`Error::OutputTooLarge`]
+    /// when a fail-loud buffer truncated the stdout the parser would see. The
+    /// `parse` closure is infallible, so it adds no error.
     pub async fn parse<T, F>(&self, call: impl IntoCommand<R>, parse: F) -> Result<T>
     where
         T: Send,
@@ -477,6 +547,12 @@ impl<R: ProcessRunner> CliClient<R> {
     /// [`Error::Parse`](crate::Error::Parse). Fails loud on a bounded-buffer
     /// truncation. Delegates to
     /// [`ProcessRunnerExt::try_parse`](crate::ProcessRunnerExt::try_parse).
+    ///
+    /// # Errors
+    ///
+    /// Everything [`parse`](Self::parse) can return, plus whatever the fallible
+    /// `parse` closure yields on malformed output — typically
+    /// [`Error::Parse`](crate::Error::Parse).
     pub async fn try_parse<T, F>(&self, call: impl IntoCommand<R>, parse: F) -> Result<T>
     where
         T: Send,

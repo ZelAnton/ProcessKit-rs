@@ -717,6 +717,26 @@ impl RunningProcess {
     /// consumed some lines from the stream, those already-consumed lines are
     /// gone from the buffer; `output_string` returns only the unconsumed tail.
     /// To capture the full output, avoid mixing streaming and `output_string`.
+    ///
+    /// # Errors
+    ///
+    /// A **timeout** or **signal-kill** is *captured* in the returned
+    /// [`ProcessResult`]'s [`outcome`](ProcessResult::outcome), not raised — this
+    /// is a non-checking path; call
+    /// [`ensure_success`](ProcessResult::ensure_success) to turn a non-zero,
+    /// timed-out, or signalled outcome into an error. The `Err` cases are:
+    ///
+    /// - [`Error::Cancelled`] — the run was cancelled via
+    ///   [`Command::cancel_on`](crate::Command::cancel_on). Unlike a timeout,
+    ///   cancellation is *always* raised (and discards any captured output).
+    /// - [`Error::OutputTooLarge`] — the
+    ///   [`OutputBufferPolicy`](crate::OutputBufferPolicy) is fail-loud
+    ///   ([`OverflowMode::Error`](crate::OverflowMode)) and the captured output
+    ///   exceeded its line or byte ceiling.
+    /// - [`Error::Stdin`] — a configured stdin source failed for a reason other
+    ///   than a broken pipe, on an *otherwise-successful* run.
+    /// - [`Error::Io`] — stdout is not piped, a prior streaming call already
+    ///   consumed it as decoded lines, or waiting on the child failed.
     pub async fn output_string(mut self) -> Result<ProcessResult<String>> {
         let finished = self
             .finish_lines(CaptureMode::Lines, /* expose_counts */ true, || {})
@@ -782,6 +802,15 @@ impl RunningProcess {
     /// as decoded lines (the raw bytes cannot be reconstructed). Returns
     /// [`Error::OutputTooLarge`] if the byte ceiling is set to
     /// [`OverflowMode::Error`](crate::OverflowMode) and the raw stdout exceeds it.
+    /// (A cancelled run is [`Error::Cancelled`]; a non-zero exit, a timeout, or a
+    /// signal-kill is *captured* in the returned [`ProcessResult`]'s
+    /// [`outcome`](ProcessResult::outcome), not raised.)
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal raw-stdout capture buffer's mutex is poisoned —
+    /// which happens only if a pump task previously panicked while holding it (a
+    /// crate bug), never from any caller input.
     pub async fn output_bytes(mut self) -> Result<ProcessResult<Vec<u8>>> {
         self.ensure_stdout_capturable()?;
         if self.stdout_sink.is_some() || self.stderr_sink.is_some() {
@@ -933,6 +962,14 @@ impl RunningProcess {
     /// Reports the raw outcome — timeout and signals are not raised as errors
     /// here. Exception: cancellation via `Command::cancel_on` always errors with
     /// `Error::Cancelled`.
+    ///
+    /// # Errors
+    ///
+    /// A timeout or signal-kill is *captured* in the returned [`Outcome`], not
+    /// raised. The `Err` cases are [`Error::Cancelled`] (the run was cancelled
+    /// via [`Command::cancel_on`](crate::Command::cancel_on) — always raised),
+    /// [`Error::Stdin`] (a non-broken-pipe stdin-source failure on an
+    /// otherwise-successful run), or [`Error::Io`] (waiting on the child failed).
     pub async fn wait(mut self) -> Result<Outcome> {
         Ok(self
             .finish_lines(CaptureMode::Discard, /* expose_counts */ false, || {})
@@ -950,6 +987,21 @@ impl RunningProcess {
     ///
     /// If the configured timeout deadline already elapsed when `shutdown` is
     /// called the run is classified as `Outcome::TimedOut`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] — this is a **shared-group** handle, which does
+    ///   not own its group (tearing it down would kill the caller's other
+    ///   children); use [`ProcessGroup::shutdown`](crate::ProcessGroup::shutdown)
+    ///   or [`start_kill`](Self::start_kill) instead.
+    /// - [`Error::Cancelled`] — the run was cancelled via
+    ///   [`Command::cancel_on`](crate::Command::cancel_on).
+    /// - [`Error::Stdin`] — a non-broken-pipe stdin-source failure on an
+    ///   otherwise-successful run.
+    /// - [`Error::Io`] — the graceful teardown or the exit wait failed.
+    ///
+    /// A timeout or signal-kill is *captured* in the returned [`Outcome`], not
+    /// raised.
     pub async fn shutdown(mut self, grace: std::time::Duration) -> Result<Outcome> {
         let Some(group) = self.backend.own_group().cloned() else {
             return Err(Error::Unsupported {
@@ -1025,6 +1077,15 @@ impl RunningProcess {
     /// returning a [`RunProfile`](crate::stats::RunProfile). Behaves like
     /// [`wait`](Self::wait) — output is discarded, timeout applies. A zero
     /// `every` is clamped to 1 ms.
+    ///
+    /// # Errors
+    ///
+    /// The same surface as [`wait`](Self::wait): a timeout or signal-kill is
+    /// *captured* in the returned [`RunProfile`](crate::stats::RunProfile)'s
+    /// outcome, not raised. The `Err` cases are [`Error::Cancelled`] (cancelled
+    /// via [`Command::cancel_on`](crate::Command::cancel_on)), [`Error::Stdin`]
+    /// (a non-broken-pipe stdin-source failure on an otherwise-successful run),
+    /// or [`Error::Io`] (waiting on the child failed).
     #[cfg(feature = "stats")]
     pub async fn profile(mut self, every: Duration) -> Result<crate::stats::RunProfile> {
         use std::sync::{Arc, Mutex};
@@ -1592,6 +1653,11 @@ impl RunningProcess {
     /// `Signalled(None)`.
     ///
     /// **Idempotent:** killing an already-reaped child is a successful no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the OS rejects the kill for a reason other than the
+    /// child having already been reaped (which is treated as a no-op success).
     pub fn start_kill(&mut self) -> Result<()> {
         match &mut self.backend {
             Backend::Real(real) => match real.child.start_kill() {
