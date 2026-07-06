@@ -4,6 +4,27 @@ pub mod processkit::prelude
 pub use processkit::prelude::Encoding
 pub use processkit::prelude::StreamExt
 pub mod processkit::testing
+pub struct processkit::testing::DryRunRunner
+impl processkit::testing::DryRunRunner
+pub fn processkit::testing::DryRunRunner::commands(&self) -> alloc::vec::Vec<alloc::string::String>
+pub fn processkit::testing::DryRunRunner::new() -> Self
+pub fn processkit::testing::DryRunRunner::on_invocation<F>(self, F) -> Self where F: core::ops::function::Fn(&str) + core::marker::Send + core::marker::Sync + 'static
+pub fn processkit::testing::DryRunRunner::only_command(&self) -> alloc::string::String
+impl core::default::Default for processkit::testing::DryRunRunner
+pub fn processkit::testing::DryRunRunner::default() -> processkit::testing::DryRunRunner
+impl core::fmt::Debug for processkit::testing::DryRunRunner
+pub fn processkit::testing::DryRunRunner::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl processkit::ProcessRunner for processkit::testing::DryRunRunner
+pub fn processkit::testing::DryRunRunner::output_bytes<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::vec::Vec<u8>>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn processkit::testing::DryRunRunner::output_string<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn processkit::testing::DryRunRunner::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::RunningProcess>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+impl !core::marker::Freeze for processkit::testing::DryRunRunner
+impl core::marker::Send for processkit::testing::DryRunRunner
+impl core::marker::Sync for processkit::testing::DryRunRunner
+impl core::marker::Unpin for processkit::testing::DryRunRunner
+impl core::marker::UnsafeUnpin for processkit::testing::DryRunRunner
+impl !core::panic::unwind_safe::RefUnwindSafe for processkit::testing::DryRunRunner
+impl !core::panic::unwind_safe::UnwindSafe for processkit::testing::DryRunRunner
 pub struct processkit::testing::Invocation
 pub processkit::testing::Invocation::args: alloc::vec::Vec<std::ffi::os_str::OsString>
 pub processkit::testing::Invocation::cwd: core::option::Option<std::path::PathBuf>
@@ -99,9 +120,11 @@ pub struct processkit::testing::Reply
 impl processkit::testing::Reply
 pub fn processkit::testing::Reply::fail(i32, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn processkit::testing::Reply::lines<I, S>(I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn processkit::testing::Reply::not_found() -> Self
 pub fn processkit::testing::Reply::ok(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn processkit::testing::Reply::pending() -> Self
 pub fn processkit::testing::Reply::signalled(core::option::Option<i32>) -> Self
+pub fn processkit::testing::Reply::spawn_error(core::io::error::ErrorKind, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn processkit::testing::Reply::timeout() -> Self
 pub fn processkit::testing::Reply::with_line_delay(self, core::time::Duration) -> Self
 pub fn processkit::testing::Reply::with_stdout(self, impl core::convert::Into<alloc::string::String>) -> Self
@@ -220,6 +243,18 @@ impl core::marker::Unpin for processkit::Error
 impl core::marker::UnsafeUnpin for processkit::Error
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Error
 impl !core::panic::unwind_safe::UnwindSafe for processkit::Error
+#[non_exhaustive] pub enum processkit::GiveUpAttempt<'a>
+pub processkit::GiveUpAttempt::Crashed(&'a processkit::ProcessResult<alloc::string::String>)
+pub processkit::GiveUpAttempt::Failed(&'a processkit::Error)
+impl<'a> core::fmt::Debug for processkit::GiveUpAttempt<'a>
+pub fn processkit::GiveUpAttempt<'a>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a> core::marker::Freeze for processkit::GiveUpAttempt<'a>
+impl<'a> core::marker::Send for processkit::GiveUpAttempt<'a>
+impl<'a> core::marker::Sync for processkit::GiveUpAttempt<'a>
+impl<'a> core::marker::Unpin for processkit::GiveUpAttempt<'a>
+impl<'a> core::marker::UnsafeUnpin for processkit::GiveUpAttempt<'a>
+impl<'a> !core::panic::unwind_safe::RefUnwindSafe for processkit::GiveUpAttempt<'a>
+impl<'a> !core::panic::unwind_safe::UnwindSafe for processkit::GiveUpAttempt<'a>
 #[non_exhaustive] pub enum processkit::LimitKind
 pub processkit::LimitKind::Cpu
 pub processkit::LimitKind::Memory
@@ -365,6 +400,28 @@ impl core::marker::Unpin for processkit::OverflowMode
 impl core::marker::UnsafeUnpin for processkit::OverflowMode
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::OverflowMode
 impl core::panic::unwind_safe::UnwindSafe for processkit::OverflowMode
+#[non_exhaustive] pub enum processkit::Priority
+pub processkit::Priority::AboveNormal
+pub processkit::Priority::BelowNormal
+pub processkit::Priority::High
+pub processkit::Priority::Idle
+pub processkit::Priority::Normal
+impl core::clone::Clone for processkit::Priority
+pub fn processkit::Priority::clone(&self) -> processkit::Priority
+impl core::cmp::Eq for processkit::Priority
+impl core::cmp::PartialEq for processkit::Priority
+pub fn processkit::Priority::eq(&self, &processkit::Priority) -> bool
+impl core::fmt::Debug for processkit::Priority
+pub fn processkit::Priority::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for processkit::Priority
+impl core::marker::StructuralPartialEq for processkit::Priority
+impl core::marker::Freeze for processkit::Priority
+impl core::marker::Send for processkit::Priority
+impl core::marker::Sync for processkit::Priority
+impl core::marker::Unpin for processkit::Priority
+impl core::marker::UnsafeUnpin for processkit::Priority
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::Priority
+impl core::panic::unwind_safe::UnwindSafe for processkit::Priority
 #[non_exhaustive] pub enum processkit::RestartPolicy
 pub processkit::RestartPolicy::Always
 pub processkit::RestartPolicy::Never
@@ -435,6 +492,7 @@ impl core::marker::UnsafeUnpin for processkit::StdioMode
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::StdioMode
 impl core::panic::unwind_safe::UnwindSafe for processkit::StdioMode
 #[non_exhaustive] pub enum processkit::StopReason
+pub processkit::StopReason::GaveUp
 pub processkit::StopReason::PolicySatisfied
 pub processkit::StopReason::Predicate
 pub processkit::StopReason::RestartsExhausted
@@ -525,6 +583,7 @@ pub async fn processkit::Command::output_bytes(&self) -> processkit::Result<proc
 pub async fn processkit::Command::output_string(&self) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
 pub async fn processkit::Command::parse<T, F>(&self, F) -> processkit::Result<T> where T: core::marker::Send, F: core::ops::function::FnOnce(&str) -> T + core::marker::Send
 pub fn processkit::Command::pipe(self, processkit::Command) -> processkit::Pipeline
+pub fn processkit::Command::priority(self, processkit::Priority) -> Self
 pub async fn processkit::Command::probe(&self) -> processkit::Result<bool>
 pub fn processkit::Command::program(&self) -> &std::ffi::os_str::OsStr
 pub fn processkit::Command::retry(self, u32, core::time::Duration, impl core::ops::function::Fn(&processkit::Error) -> bool + core::marker::Send + core::marker::Sync + 'static) -> Self
@@ -550,6 +609,7 @@ pub fn processkit::Command::timeout_opt(self, core::option::Option<core::time::D
 pub fn processkit::Command::timeout_signal(self, processkit::Signal) -> Self
 pub async fn processkit::Command::try_parse<T, F>(&self, F) -> processkit::Result<T> where T: core::marker::Send, F: core::ops::function::FnOnce(&str) -> processkit::Result<T> + core::marker::Send
 pub fn processkit::Command::uid(self, u32) -> Self
+pub fn processkit::Command::umask(self, u32) -> Self
 pub fn processkit::Command::unchecked_in_pipe(self) -> Self
 pub fn processkit::Command::working_dir(&self) -> core::option::Option<&std::path::Path>
 impl core::clone::Clone for processkit::Command
@@ -1008,6 +1068,7 @@ pub fn processkit::Supervisor<R>::backoff(self, core::time::Duration, f64) -> Se
 pub fn processkit::Supervisor<R>::capture(self, processkit::OutputBufferPolicy) -> Self
 pub fn processkit::Supervisor<R>::failure_decay(self, core::time::Duration) -> Self
 pub fn processkit::Supervisor<R>::failure_threshold(self, f64) -> Self
+pub fn processkit::Supervisor<R>::give_up_when(self, impl core::ops::function::Fn(&processkit::GiveUpAttempt<'_>) -> bool + core::marker::Send + core::marker::Sync + 'static) -> Self
 pub fn processkit::Supervisor<R>::jitter(self, bool) -> Self
 pub fn processkit::Supervisor<R>::max_backoff(self, core::time::Duration) -> Self
 pub fn processkit::Supervisor<R>::max_restarts(self, u32) -> Self
@@ -1042,6 +1103,10 @@ impl processkit::ProcessRunner for processkit::ProcessGroup
 pub fn processkit::ProcessGroup::output_bytes<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::vec::Vec<u8>>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn processkit::ProcessGroup::output_string<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn processkit::ProcessGroup::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::RunningProcess>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+impl processkit::ProcessRunner for processkit::testing::DryRunRunner
+pub fn processkit::testing::DryRunRunner::output_bytes<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::vec::Vec<u8>>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn processkit::testing::DryRunRunner::output_string<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn processkit::testing::DryRunRunner::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::RunningProcess>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 impl processkit::ProcessRunner for processkit::testing::MockRunner
 pub fn processkit::testing::MockRunner::output_bytes<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::vec::Vec<u8>>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn processkit::testing::MockRunner::output_string<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
