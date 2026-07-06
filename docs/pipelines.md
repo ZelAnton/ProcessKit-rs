@@ -5,11 +5,14 @@
 `a | b | c` **without a shell**. Each stage's stdout feeds the next stage's
 stdin through an in-process relay (a `tokio::io::copy` task per boundary) — there
 is no shell string anywhere, so no quoting rules, no word splitting, no injection
-surface. All stages spawn into one shared kill-on-drop
-[process group](process-groups.md), so the chain lives and dies as a unit. (The
-relay is an implementation detail, not a kernel splice: a producer whose consumer
-exits early stops on a *broken pipe* when the relay's next write fails, rather
-than instantly via `SIGPIPE`.)
+surface. Each stage spawns into its **own** kill-on-drop
+[process group](process-groups.md) sub-group, so a per-stage
+[`Command::timeout`](#timeouts) tears down that stage's whole subtree
+(grandchildren of a forking `sh -c …` included); a chain-wide teardown fans the
+kill across every stage's sub-group, so the chain still lives and dies as a
+unit. (The relay is an implementation detail, not a kernel splice: a producer
+whose consumer exits early stops on a *broken pipe* when the relay's next write
+fails, rather than instantly via `SIGPIPE`.)
 
 - [Building and running](#building-and-running)
 - [Semantics: pipefail and the ends](#semantics-pipefail-and-the-ends)
@@ -106,7 +109,7 @@ println!("blamed: {}", result.ensure_success().unwrap_err()); // names `grep`
 
 **Failure tears the chain down proactively.** The moment a stage ends with a
 checked failure (a non-zero exit outside its `ok_codes`, a signal kill, or its
-own per-stage timeout), the whole group is torn down at once — the failure does
+own per-stage timeout), every stage's sub-group is torn down at once — the failure does
 not wait to trickle out through closing pipes. This matters for a *quiet*
 sibling that would otherwise hang: an upstream producer that never writes never
 dies of a broken pipe, so under a purely passive teardown a downstream failure
@@ -195,13 +198,15 @@ let out = Command::new("producer")
     .await?;
 ```
 
-- **`Pipeline::timeout`** bounds the whole chain: at the deadline the shared
-  group is torn down and the result reports `timed_out` (no partial stdout —
-  unlike a single command's captured timeout).
-- A **per-stage `Command::timeout`** kills just that stage. Every stage is
-  evaluated by the same pipefail rule (D14): a stage that hit its own deadline —
-  inner *or* last — surfaces on `run()` as that stage's `Error::Timeout`,
-  reporting **that stage's own deadline** (not the chain's, and never `0ns`).
+- **`Pipeline::timeout`** bounds the whole chain: at the deadline every
+  stage's sub-group is torn down and the result reports `timed_out` (no
+  partial stdout — unlike a single command's captured timeout).
+- A **per-stage `Command::timeout`** kills that stage's *whole subtree* — its
+  own sub-group, grandchildren of a forking `sh -c …` included, not just its
+  direct child. Every stage is evaluated by the same pipefail rule (D14): a
+  stage that hit its own deadline — inner *or* last — surfaces on `run()` as
+  that stage's `Error::Timeout`, reporting **that stage's own deadline** (not
+  the chain's, and never `0ns`).
 
 Cancellation has two forms. **`Pipeline::cancel_on(token)`** is the chain-level
 control: the token **gap-fills** into every stage that doesn't already carry its

@@ -215,10 +215,17 @@ different ways depending on how it was obtained:
   When the handle is the group's last owner and drops, the `Arc` drops the
   group, which hard-kills the tree — this is why "keep the handle in scope" is
   the documented contract on `Command::start`.
-- **Shared group** (`ProcessGroup::start`, `Pipeline` stages, `Supervisor::with_runner`):
+- **Shared group** (`ProcessGroup::start` called directly, `Supervisor::with_runner`):
   the handle does **not** own the group, so dropping it leaves the group (and
   any sibling processes) intact; the *group's* lifetime is what governs, and
   the caller controls that explicitly.
+- **Pipeline stages** spawn through the same shared-group `ProcessGroup::start`
+  seam, but into a **fresh, per-stage** group that `Pipeline::capture` then
+  attaches back onto the handle (`RunningProcess::attach_group`) — so each
+  stage's handle *does* own its own sub-group, closer to the private one-shot
+  case. This is what lets a per-stage `Command::timeout` (or the chain-wide
+  teardown) reach the stage's whole subtree, grandchildren of a forking
+  `sh -c …` included, instead of only its direct child by pid.
 
 Separately, `RunningProcess::Drop` **always** aborts its own background tasks
 regardless of group ownership — the stdin writer, the deadline/cancel

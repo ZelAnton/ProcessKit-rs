@@ -12,7 +12,14 @@ the full record; this page is the "I depend on it, what do I do" view.
 > section here before each major bump. (The `mock` feature's `mockall`-generated
 > `expect_*` surface stays semver-exempt — it tracks the `mockall` version.)
 
-## 2.0.0 (from 1.2.x)
+## 2.1.0 (from 1.2.x)
+
+> **2.0.0 and 1.3.0 were withdrawn — upgrade straight from 1.2.x to 2.1.0.**
+> `2.0.0` was published in error and yanked; `1.3.0` accidentally shipped this
+> breaking batch under a *minor* bump and was yanked too. `2.1.0` is the first
+> supported release of the changes below — the crate follows semver, so this
+> break lands in a major as intended. There is nothing extra to do for the skip;
+> the migration from a `1.2.x` dependency is exactly the notes here.
 
 Mostly mechanical renames — **caught by the compiler** — plus two
 `#[non_exhaustive]` tightenings on `Error` (also compiler-caught, once you stop

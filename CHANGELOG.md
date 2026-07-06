@@ -12,17 +12,6 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
-
-### Changed
--
-
-### Fixed
--
-
-## [1.3.0] - 2026-07-06
-
-### Added
 - `Command::timeout_opt(Option<Duration>)` — a composable timeout verb for
   config-driven call sites: `Some(d)` is exactly `timeout(d)`, `None` is exactly
   `no_timeout()` (deliberately unbounded, opting out of a client `default_timeout`
@@ -52,6 +41,68 @@ to a dated version section.
   request was rejected (Linux cgroup delegation missing, a Windows Job Object
   call failing), `Invalid` for a nonsensical value caught before the OS is ever
   touched.
+- `impl IntoCommand<R> for &[S; N]` — a reference to a fixed-size argument
+  array (`args: [&str; N]`) now passes directly to a `CliClient` verb
+  (`client.run(&args)`), matching the existing `[S; N]`/`Vec<S>`/`&[S]` impls.
+  A `&[S; N]` doesn't unsize-coerce to `&[S]` in generic-parameter position, so
+  the natural call previously failed to compile and needed a manual
+  `&args[..]`. Purely additive.
+- `Command::priority(Priority)` / `Priority` — launch a child at a lower (or
+  higher) CPU-scheduling priority, for background/batch work that shouldn't
+  starve the foreground (or a task that should win over it): `Idle` /
+  `BelowNormal` / `Normal` / `AboveNormal` / `High`, mapped to
+  `nice`/`setpriority` on Unix and a priority-class creation flag on Windows.
+  Unlike the privilege builders (`uid`/`gid`), this never yields
+  `Error::Unsupported` — both platforms cover every variant (`Priority::High`
+  on Unix needs `CAP_SYS_NICE`/root to actually raise priority; the request
+  itself is never rejected as unsupported).
+- `Command::umask(u32)` — set the child's file-mode creation mask
+  (`umask(2)`), controlling the default permissions of files it creates.
+  Unix-only via `pre_exec`; `Error::Unsupported` on other targets rather than
+  silently ignoring the requested mask (matching `uid`/`gid`/`setsid`).
+- `LineTerminator` (`Newline` / `CarriageReturn`) plus
+  `Command::line_terminator` / `stdout_line_terminator` /
+  `stderr_line_terminator` — pick `\r` as the line boundary instead of `\n`
+  (a bare `\r` terminates in `CarriageReturn` mode; a `\r\n` pair still counts
+  as one terminator, whole or split across reads) for carriage-return progress
+  output (`curl`/`pip`/`apt`-style `\rProgress: 50%\rProgress: 100%`), which
+  previously accumulated as one ever-growing unstreamed line and could be
+  dropped whole under a byte cap. Threaded through every sink that consumes "a
+  line" — the streaming verbs, `stdout_tee`/`stderr_tee`,
+  `on_stdout_line`/`on_stderr_line`, and `output_string`. Default (`Newline`,
+  `\n`-only) is unchanged.
+- `testing::DryRunRunner` — a `ProcessRunner` double that never spawns: it
+  renders each command through the crate's own `Command::command_line`
+  quoting and returns a synthetic successful result, the seam behind a tool's
+  own `--dry-run`/`--echo` mode. Rendered invocations are available as a
+  `RecordingRunner`-style collected snapshot (`commands()`/`only_command()`)
+  and/or a live `on_invocation` callback — usable together or alone.
+- `testing::Reply::with_stderr(text)` — attach stderr to a scripted reply,
+  including a **successful** one (`Reply::ok("out").with_stderr("warning\n")`),
+  so a test can model a CLI (`git`, a compiler, a linter) that writes warnings
+  to stderr even on exit 0 — previously only expressible through the
+  misleading `Reply::fail(0, "warning")`. Composes with every `Reply`
+  constructor; on a failing reply it overrides the `fail`-supplied stderr.
+- `Supervisor::give_up_when(classifier)` / `GiveUpAttempt` /
+  `StopReason::GaveUp` — classify a crash (`GiveUpAttempt::Crashed`, a
+  completed run) or a spawn/IO failure that never produced a result
+  (`GiveUpAttempt::Failed`, e.g. `ENOENT` from a typo'd program name) as
+  **permanent**, so the supervisor gives up instead of restarting it forever.
+  Consulted only for a crash the policy would otherwise restart, ahead of
+  `max_restarts` and the failure-storm guard. A `Failed` verdict has no
+  `ProcessResult` to report and surfaces the classified error directly as
+  `run()`'s `Err`; a `Crashed` verdict reports `StopReason::GaveUp`. Default:
+  unset — a permanent failure restarts forever, matching prior behavior.
+- Cassette (`record` feature) now records a **failed** invocation too: an
+  `Err` from `output_string`/`start` (`Error::Spawn`/`NotFound`/`Stdin`/
+  `OutputTooLarge`/`Unsupported`/`Io` — with its `ErrorKind` preserved by name
+  — plus an `Other` fallback) is captured and reconstructed on replay, instead
+  of recording nothing and surfacing `Error::CassetteMiss` in place of the
+  original error. `Error::Cancelled` is deliberately never recorded — replay
+  short-circuits on the replaying command's own token first, before ever
+  consulting the cassette. The version check now accepts any format up to the
+  one this build writes rather than requiring an exact match, so a cassette
+  written before this field existed still loads and replays unchanged.
 
 ### Changed
 - **Breaking:** the data-carrying struct variants of `Error` — `Exit`, `Timeout`,
@@ -133,6 +184,46 @@ to a dated version section.
   the token path is unchanged. This makes the `Reply::timeout` doc's advice —
   "script `pending` and set a `Command::timeout` to model a deadline hang" — hold
   on the bulk verbs, not only `start`.
+- `RecordingRunner::output_bytes` no longer falls through to the trait's
+  `start`-based default: it now records the `Invocation` and delegates
+  directly to the inner runner's own `output_bytes`, so wrapping a runner
+  whose `output_bytes` behaves differently from its `start` (e.g.
+  `RecordReplayRunner`'s honest `Error::Unsupported` for a lossy-UTF-8
+  fixture) is honored instead of silently replaying through `start` and
+  returning lossily re-encoded bytes.
+- Pipeline stages now each spawn into their **own** kill-on-drop
+  `ProcessGroup` sub-group instead of sharing one group across the whole
+  chain: previously a per-stage `Command::timeout` reached only that stage's
+  direct child, so a forking stage's grandchildren (`sh -c …`) survived the
+  kill, kept the stdout pipe open, and stalled the downstream stage — the
+  chain-level `Pipeline::timeout` was the only real backstop. Both a
+  per-stage deadline and the chain-wide teardown now tear down the stage's
+  whole subtree; behavior without a per-stage timeout is unchanged.
+- A pipeline's checked stage failure now tears the rest of the chain down
+  **proactively** instead of only passively through pipe EOF: previously a
+  quiet upstream producer that never writes (and so never dies of a broken
+  pipe) could hold a run open indefinitely after a downstream failure, while
+  `collect()` awaited stages strictly in input order. The first checked
+  failure now fires an internal teardown that kills every stage concurrently
+  with the ordered gather; killed siblings are flagged `torn_down` and
+  de-prioritized in the pipefail fold, so the stage that actually failed
+  keeps the blame.
+- A bare `finish()` (no preceding `stdout_lines()`) no longer pumps stdout
+  into a sink built from the command's `OutputBufferPolicy` and enforces its
+  overflow cap over output nobody asked to capture: it could fail loud with
+  `Error::OutputTooLarge` on a run that `wait()` reports as successful for the
+  same command. Likewise, `wait()`/`profile()` called after a dropped
+  `stdout_lines()` stream no longer keep reusing the prior user-policy sink;
+  both paths now route through an internal discard sink that neither retains
+  lines nor enforces a cap.
+- A shared-group streaming deadline watchdog's final `SIGKILL` no longer
+  loses a race against `RunningProcess::Drop`: if a timed-out child caught
+  the graceful signal, closed stdout, and kept running, the closed stream let
+  the consumer drop its handle mid-grace, aborting the in-flight watchdog
+  before the hard kill fired — the child then survived until the shared
+  group itself was dropped. The graceful kill-and-reap now runs as a detached
+  task that no `Drop`-triggered abort can reach, so the final `SIGKILL`
+  always lands. Own-group and Windows paths are unaffected.
 
 ## [1.2.1] - 2026-07-04
 
@@ -1949,8 +2040,7 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.3.0...HEAD
-[1.3.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.2.1...v1.3.0
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.2.1...HEAD
 [1.2.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.0.1...v1.1.0

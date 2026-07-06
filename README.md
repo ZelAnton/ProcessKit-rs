@@ -451,8 +451,8 @@ the pipes at all.
 ## Pipelines without a shell
 
 `a | b | c` without a shell string — stages connected in-process (a relay, not a
-shell), so no quoting or injection surface, and every stage lives in one shared
-kill-on-drop group:
+shell), so no quoting or injection surface, and each stage lives in its own
+kill-on-drop sub-group (a chain-wide teardown still reaches every stage):
 
 ```rust,no_run
 use processkit::Command;
