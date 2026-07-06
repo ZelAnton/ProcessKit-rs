@@ -27,6 +27,7 @@ mod sealed {
     pub trait Sealed {}
     impl Sealed for crate::Command {}
     impl<S: AsRef<OsStr>, const N: usize> Sealed for [S; N] {}
+    impl<S: AsRef<OsStr>, const N: usize> Sealed for &[S; N] {}
     impl<S: AsRef<OsStr>> Sealed for Vec<S> {}
     impl<S: AsRef<OsStr>> Sealed for &[S] {}
 }
@@ -70,6 +71,12 @@ impl<R: ProcessRunner> IntoCommand<R> for Command {
 }
 
 impl<R: ProcessRunner, S: AsRef<OsStr>, const N: usize> IntoCommand<R> for [S; N] {
+    fn into_command(self, client: &CliClient<R>) -> Command {
+        client.command(self)
+    }
+}
+
+impl<R: ProcessRunner, S: AsRef<OsStr>, const N: usize> IntoCommand<R> for &[S; N] {
     fn into_command(self, client: &CliClient<R>) -> Command {
         client.command(self)
     }
@@ -794,6 +801,7 @@ mod tests {
         assert_eq!(custom.configured_timeout(), Some(Duration::from_secs(3)));
         assert_eq!(client.run(custom).await.unwrap(), "clean");
         let args = ["status"];
+        assert_eq!(client.run(&args).await.unwrap(), "clean");
         assert_eq!(client.run(&args[..]).await.unwrap(), "clean");
         let result = client.checked(["status"]).await.unwrap();
         assert_eq!(result.stdout(), "clean");
