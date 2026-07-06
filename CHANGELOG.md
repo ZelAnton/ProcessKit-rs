@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [2.1.1] - 2026-07-06
+
+### Added
 - `Error::{spawn, not_found, stdin}` — the remaining `#[doc(hidden)]` insulated
   constructors for the `#[non_exhaustive]` data-bearing variants that didn't get
   one alongside `Error::{exit, timeout, signalled}` in 2.1.0: `Spawn` and `Stdin`
@@ -2060,7 +2071,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.2.1...v2.1.0
 [1.2.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.1.0...v1.2.0
