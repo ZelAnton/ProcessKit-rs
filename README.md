@@ -766,7 +766,8 @@ core bugs and feature requests here.
 ## Contributing
 
 Running the tests and the (maintainer-only) release process are documented in
-[CONTRIBUTING.md](CONTRIBUTING.md).
+[CONTRIBUTING.md](CONTRIBUTING.md). New contributors: [ARCHITECTURE.md](ARCHITECTURE.md)
+maps the crate's internal layers, seams, data flow, and invariants.
 
 ## License
 
