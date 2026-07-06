@@ -43,7 +43,8 @@
 //!   path resolves to [`Error::Cancelled`]. Spawn-time sandboxing knobs:
 //!   [`Command::inherit_env`] (env allow-list), [`Command::uid`] /
 //!   [`Command::gid`] (Unix privilege drop), [`Command::setsid`],
-//!   [`Command::create_no_window`].
+//!   [`Command::create_no_window`], [`Command::priority`] (CPU-scheduling
+//!   priority, both platforms), [`Command::umask`] (Unix file-creation mask).
 //!
 //! Async throughout (tokio). Errors are the structured [`Error`]; a non-zero
 //! exit is reported in [`ProcessResult`], not raised, until you call
@@ -143,6 +144,7 @@ mod group;
 mod limits;
 mod mechanism;
 mod pipeline;
+mod priority;
 mod pump;
 mod result;
 mod retry;
@@ -174,6 +176,7 @@ pub use group::{ProcessGroup, ProcessGroupOptions};
 pub use limits::{LimitKind, LimitReason, ResourceLimits};
 pub use mechanism::Mechanism;
 pub use pipeline::Pipeline;
+pub use priority::Priority;
 // Fuzzing-only entry point for `fuzz/fuzz_targets/decode_pump_lines.rs` (see
 // `src/pump.rs`). `cfg(fuzzing)` is set automatically by `cargo fuzz build`
 // for the whole dependency graph, never in an ordinary build — so this

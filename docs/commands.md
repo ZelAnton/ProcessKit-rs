@@ -292,6 +292,36 @@ way. Containment is preserved in every combination; the platform fine print
 the pdeathsig thread caveat) is collected in
 [Platform support](platform-support.md#caveats).
 
+### Scheduling: CPU priority and `umask`
+
+Two more spawn-time knobs, reusing the same seams as the builders above —
+Unix `pre_exec`, Windows `creation_flags` — for background/batch children
+that shouldn't starve the foreground, and for controlling the permissions of
+files a child creates:
+
+```rust,no_run
+use processkit::{Command, Priority};
+
+// Run at a lower CPU-scheduling priority — supported on BOTH platforms.
+Command::new("batch-job")
+    .priority(Priority::BelowNormal)
+    .run().await?;
+
+// Unix only: files this child creates get 0644/0755 instead of 0666/0777.
+Command::new("worker").umask(0o022).run().await?;
+```
+
+`priority` maps onto `nice`/`setpriority` on Unix and a priority class on
+Windows (`Idle`/`BelowNormal`/`Normal`/`AboveNormal`/`High`); unlike the
+privilege builders, **every variant is supported on both platforms**, so this
+knob never yields `Error::Unsupported`. One caveat: raising priority above the
+inherited value on Unix (`Priority::High`) needs `CAP_SYS_NICE`/root — without
+it the OS rejects the change and the spawn fails loud (`Error::Spawn`), never
+silently downgrading to a lower priority.
+
+`umask` is Unix-only — like `setsid`/`groups`, requesting it on Windows fails
+with `Error::Unsupported` rather than being silently ignored.
+
 **Interactive auth / TTY.** processkit wires **pipes**, not a pseudo-terminal,
 so a tool that *demands* a tty — an `ssh`/`sudo` **password** prompt, some
 credential helpers — won't get one (PTY support is not implemented; the
