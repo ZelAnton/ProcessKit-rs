@@ -220,6 +220,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      # cargo-public-api builds its diff from rustdoc JSON, which is only
+      # available on nightly (the `-Z unstable-options --output-format json`
+      # rustdoc flag isn't stabilized). Without this, the job would fail on
+      # every run for a toolchain reason, not on actual API drift.
+      - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-public-api
         run: cargo install cargo-public-api --locked
@@ -229,7 +234,7 @@ jobs:
       # drifting from what's actually exported.
       - name: Diff public API vs baseline
         run: |
-          cargo public-api --simplified --all-features > /tmp/current-api.txt
+          cargo +nightly public-api --simplified --all-features > /tmp/current-api.txt
           echo "=== Changes to the public API surface vs public-api.txt ==="
           diff public-api.txt /tmp/current-api.txt && echo "(no changes)"
 
