@@ -1104,6 +1104,10 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                             entry.code,
                             entry.timed_out,
                             entry.signal,
+                            entry.truncated,
+                            entry.total_lines,
+                            entry.total_bytes,
+                            std::time::Duration::from_millis(entry.duration_ms),
                         ))
                     }
                     Err(err) => {
@@ -1159,6 +1163,10 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                     entry.code,
                     entry.timed_out,
                     entry.signal,
+                    entry.truncated,
+                    entry.total_lines,
+                    entry.total_bytes,
+                    std::time::Duration::from_millis(entry.duration_ms),
                 ))
             }
         }
@@ -1596,18 +1604,16 @@ mod tests {
             .expect("replay B");
         assert_eq!(
             b.stdout(),
-            "out-B\n",
+            // The bulk path strips the recorded trailing newline (line-join
+            // normalization), so the canned "out-B\n" replays as "out-B".
+            "out-B",
             "stdin B must replay its own recording"
         );
         let a = replayer
             .output_string(&Command::new("tool").stdin(crate::Stdin::from_string("A")))
             .await
             .expect("replay A");
-        assert_eq!(
-            a.stdout(),
-            "out-A\n",
-            "stdin A must replay its own recording"
-        );
+        assert_eq!(a.stdout(), "out-A", "stdin A must replay its own recording");
     }
 
     #[tokio::test]
@@ -2050,6 +2056,43 @@ mod tests {
             .await
             .expect_err("run must reject a truncated replay");
         assert!(matches!(err, Error::OutputTooLarge { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn truncation_and_duration_survive_start_replay() {
+        // D4 (Stage-4 related): a caller who consumes a cassette `start` replay via
+        // `output_string` must see the *recorded* truncation/overflow/duration,
+        // threaded through the scripted handle — not the values re-derived from the
+        // (un-truncated, instantly-fed) canned output. This closes the gap the bulk
+        // `output_string` replay already covered but `start` used to lose.
+        let (_dir, path) = temp_cassette();
+        let recorder = RecordReplayRunner::record(&path, TruncatedInner);
+        // Record-mode `start` captures the run whole at `start()`; drop the handle.
+        let _ = recorder
+            .start(&Command::new("tool"))
+            .await
+            .expect("record start");
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load");
+        let replayed = replayer
+            .start(&Command::new("tool"))
+            .await
+            .expect("replay start")
+            .output_string()
+            .await
+            .expect("consume the replayed handle");
+        assert!(
+            replayed.truncated(),
+            "recorded truncation must survive a start replay"
+        );
+        assert_eq!(
+            replayed.duration(),
+            Duration::from_millis(1234),
+            "recorded duration must survive a start replay"
+        );
+        assert_eq!(replayed.total_lines(), 100);
+        assert_eq!(replayed.total_bytes(), 9999);
     }
 
     #[tokio::test]
