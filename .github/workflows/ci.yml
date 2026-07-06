@@ -223,14 +223,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-public-api
         run: cargo install cargo-public-api --locked
-      # Review aid, not a gate: show which public items changed vs the committed
-      # baseline so "did this PR move the surface?" becomes a reviewable diff.
-      # Pre-1.0 freedom means the surface CAN change freely; this makes it
-      # explicit and auditable while we still break. The step never fails CI —
-      # it only annotates the run with what moved.
+      # Real gate: the crate is past 1.0, so any public-surface change is a
+      # deliberate, reviewable act — it must come with an updated `public-api.txt`
+      # in the same PR. A stale baseline fails this job instead of silently
+      # drifting from what's actually exported.
       - name: Diff public API vs baseline
-        continue-on-error: true
         run: |
           cargo public-api --simplified --all-features > /tmp/current-api.txt
           echo "=== Changes to the public API surface vs public-api.txt ==="
           diff public-api.txt /tmp/current-api.txt && echo "(no changes)"
+
+  semver-checks:
+    name: cargo-semver-checks (informational)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-semver-checks
+      # Informational only while the crate works towards its next major: the
+      # surface is still expected to break intentionally, and a hard SemVer gate
+      # would just fail on every deliberate breaking change. Flip
+      # `continue-on-error` to `false` once the major lands, so this starts
+      # blocking accidental breaking changes on the following minor/patch line.
+      - name: Check SemVer compatibility vs published baseline
+        continue-on-error: true
+        run: cargo semver-checks
