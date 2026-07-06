@@ -71,12 +71,102 @@ pub(crate) fn long_sleeper() -> Command {
     }
 }
 
-/// Process file-descriptor count for the current process (Linux only, via
-/// `/proc/self/fd`). Used to assert churn doesn't leak fds. macOS/BSD lack
-/// `/proc`, so the fd-stability assertion there is skipped by the caller.
+/// Best-effort count of this process's open file descriptors/handles, used to
+/// assert spawn/reap churn doesn't leak them. `None` means the platform
+/// mechanism is unavailable or failed (no `/proc`, no `lsof` on `$PATH`, an
+/// unsupported target, …) — the caller skips the leak assertion rather than
+/// let a missing mechanism read as a false pass.
 #[cfg(target_os = "linux")]
-pub(crate) fn open_fd_count() -> usize {
+pub(crate) fn open_handle_count() -> Option<usize> {
     std::fs::read_dir("/proc/self/fd")
+        .ok()
         .map(|dir| dir.count())
-        .unwrap_or(0)
+}
+
+/// macOS/BSD have no `/proc`; shell out to `lsof -p <pid>` and count the rows.
+/// `lsof` lists one row per open descriptor plus a fixed handful of non-fd
+/// rows (cwd, txt, mapped libraries) that don't grow with spawn/reap churn, so
+/// a before/after diff still isolates a real leak without needing to filter
+/// them out.
+#[cfg(target_os = "macos")]
+pub(crate) fn open_handle_count() -> Option<usize> {
+    let pid = std::process::id().to_string();
+    let output = std::process::Command::new("lsof")
+        .args(["-p", &pid])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // The first line is the column header, not an fd row.
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .count()
+            .saturating_sub(1),
+    )
+}
+
+/// Windows counter of open handles (`GetProcessHandleCount`, kernel32) — the
+/// closest analogue to a Unix fd count, covering files/pipes/events/etc. a
+/// leaking child-process pipeline could otherwise accumulate in this process.
+#[cfg(windows)]
+pub(crate) fn open_handle_count() -> Option<usize> {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+
+    let mut count: u32 = 0;
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle that needs no
+    // closing; `count` is a valid, uniquely-owned out-param for the call.
+    let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
+    (ok != 0).then_some(count as usize)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) fn open_handle_count() -> Option<usize> {
+    None
+}
+
+/// The cgroup v2 (unified) mount root this process's own cgroup lives under,
+/// mirroring the discovery `sys/linux.rs`'s `Cgroup::create` performs (root
+/// candidates, then `/proc/self/cgroup`'s `0::` line) — needed here only so
+/// the drop-cleanup stress test can look in the same parent directory a
+/// [`processkit::ProcessGroup`] creates its cgroup under.
+#[cfg(target_os = "linux")]
+pub(crate) fn own_cgroup_v2_parent() -> Option<std::path::PathBuf> {
+    for candidate in ["/sys/fs/cgroup", "/sys/fs/cgroup/unified"] {
+        let root = std::path::Path::new(candidate);
+        if !root.join("cgroup.controllers").exists() {
+            continue;
+        }
+        let self_cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let rel = self_cgroup
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap_or("/")
+            .trim();
+        return Some(root.join(rel.trim_start_matches('/')));
+    }
+    None
+}
+
+/// Every `processkit-<own pid>-*` child directory currently under `parent` —
+/// the naming pattern `Cgroup::create` (`sys/linux.rs`) uses, scoped to our
+/// own pid so a concurrently-running, unrelated processkit instance's dirs
+/// are never mistaken for ours.
+#[cfg(target_os = "linux")]
+pub(crate) fn own_processkit_cgroup_dirs(parent: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let prefix = format!("processkit-{}-", std::process::id());
+    std::fs::read_dir(parent)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with(&prefix))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
