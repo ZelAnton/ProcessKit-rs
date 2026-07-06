@@ -173,7 +173,7 @@ pub processkit::Error::Exit::program: alloc::string::String
 pub processkit::Error::Exit::stderr: alloc::string::String
 pub processkit::Error::Exit::stdout: alloc::string::String
 pub processkit::Error::Exit::stdout_bytes: core::option::Option<alloc::vec::Vec<u8>>
-pub processkit::Error::Io(std::io::error::Error)
+pub processkit::Error::Io(core::io::error::Error)
 #[non_exhaustive] pub processkit::Error::NotFound
 pub processkit::Error::NotFound::program: alloc::string::String
 pub processkit::Error::NotFound::searched: core::option::Option<alloc::string::String>
@@ -201,10 +201,10 @@ pub processkit::Error::Signalled::stdout: alloc::string::String
 pub processkit::Error::Signalled::stdout_bytes: core::option::Option<alloc::vec::Vec<u8>>
 #[non_exhaustive] pub processkit::Error::Spawn
 pub processkit::Error::Spawn::program: alloc::string::String
-pub processkit::Error::Spawn::source: std::io::error::Error
+pub processkit::Error::Spawn::source: core::io::error::Error
 #[non_exhaustive] pub processkit::Error::Stdin
 pub processkit::Error::Stdin::program: alloc::string::String
-pub processkit::Error::Stdin::source: std::io::error::Error
+pub processkit::Error::Stdin::source: core::io::error::Error
 #[non_exhaustive] pub processkit::Error::Timeout
 pub processkit::Error::Timeout::program: alloc::string::String
 pub processkit::Error::Timeout::stderr: alloc::string::String
@@ -868,10 +868,10 @@ impl<T> core::panic::unwind_safe::RefUnwindSafe for processkit::ProcessResult<T>
 impl<T> core::panic::unwind_safe::UnwindSafe for processkit::ProcessResult<T> where T: core::panic::unwind_safe::UnwindSafe
 pub struct processkit::ProcessStdin
 impl processkit::ProcessStdin
-pub async fn processkit::ProcessStdin::finish(self) -> std::io::error::Result<()>
-pub async fn processkit::ProcessStdin::flush(&mut self) -> std::io::error::Result<()>
-pub async fn processkit::ProcessStdin::write(&mut self, &[u8]) -> std::io::error::Result<()>
-pub async fn processkit::ProcessStdin::write_line(&mut self, &str) -> std::io::error::Result<()>
+pub async fn processkit::ProcessStdin::finish(self) -> core::io::error::Result<()>
+pub async fn processkit::ProcessStdin::flush(&mut self) -> core::io::error::Result<()>
+pub async fn processkit::ProcessStdin::write(&mut self, &[u8]) -> core::io::error::Result<()>
+pub async fn processkit::ProcessStdin::write_line(&mut self, &str) -> core::io::error::Result<()>
 impl core::fmt::Debug for processkit::ProcessStdin
 pub fn processkit::ProcessStdin::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for processkit::ProcessStdin
