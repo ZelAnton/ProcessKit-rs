@@ -88,10 +88,25 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 # in examples, `sync` for the oneshot/Notify used in shutdown coordination,
 # `fs` for the async file handle behind `Stdin::from_file`,
 # `net` for the TcpStream the `wait_for_port` readiness probe connects with.
-tokio = { version = "1", features = ["process", "time", "io-util", "rt", "macros", "sync", "fs", "net"] }
+# `1.39` floor: two of our call sites need APIs stabilized well above `1.0` —
+# `JoinHandle::abort_handle` (`running/mod.rs`, `pipeline.rs`; added in
+# `1.27`) and `Command::as_std_mut` (`command.rs`, `sys/windows.rs`; added in
+# `1.39`). Below `1.39` those fail to compile (`E0624`/`E0599`) rather than
+# just missing a feature flag — this floor makes the declared minimum honest.
+# (It also sidesteps an unrelated build trap: below `1.27`ish, tokio's
+# declared `mio` floor can resolve down to a `mio` still depending on
+# `ntapi 0.3.7`, which fails to compile under current rustc with `E0793`,
+# unaligned packed-struct reference promoted to a hard error; `1.39` pulls
+# `mio 1.x`, which dropped `ntapi` entirely.)
+tokio = { version = "1.39", features = ["process", "time", "io-util", "rt", "macros", "sync", "fs", "net"] }
 # `async fn` in the object-safe `ProcessRunner` trait so it stays `dyn`-able
-# and mockable (native async-in-trait isn't object-safe on our MSRV).
-async-trait = "0.1"
+# and mockable (native async-in-trait isn't object-safe on our MSRV). `0.1.9`
+# floor: below it, async-trait's codegen for `impl<R: Trait> Trait for
+# Generic<R>` references the outer impl's generic param from the inner
+# `async fn`'s desugared body, which rustc rejects (`E0401`,
+# "can't use generic parameters from outer item") — our `RecordingRunner<R>`
+# and `&R` blanket impls need the fixed codegen.
+async-trait = "0.1.9"
 # Structured `Error` carrying program / exit code / stderr / timeout instead
 # of stringly-typed failures; `#[non_exhaustive]` so variants can grow.
 thiserror = "2"
@@ -102,11 +117,14 @@ encoding_rs = "0.8"
 # Adapt tokio's `Lines` reader into an `impl Stream` for the streaming-output
 # helper, so callers consume stdout with the standard `Stream` combinators.
 # `io-util` gates the `wrappers::LinesStream` adapter we use.
-tokio-stream = { version = "0.1", features = ["io-util"] }
+tokio-stream = { version = "0.1.1", features = ["io-util"] }
 # Optional per-run observability (program/exit code/duration — deliberately
 # NOT argv or env, which routinely carry secrets). Off by default; zero cost
-# unless the `tracing` feature is enabled.
-tracing = { version = "0.1", optional = true }
+# unless the `tracing` feature is enabled. `0.1.6` floor: below it, the
+# `target: "...", field = ?value, "message"` event-macro syntax our call
+# sites use isn't supported yet (`fieldset!` recursion / "no rules expected"
+# macro-expansion errors).
+tracing = { version = "0.1.6", optional = true }
 # Optional auto-generated `MockRunner` for downstream tests. Test-only; pulled
 # in solely behind the `mock` feature, never in production builds.
 mockall = { version = "0.15", optional = true }
@@ -118,8 +136,8 @@ tokio-util = { version = "0.7", default-features = false }
 # Optional serialization for the `record` feature's JSON cassettes
 # (RecordReplayRunner): `derive` for the cassette structs, serde_json for the
 # human-diffable on-disk format. Never in production builds without `record`.
-serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
+serde = { version = "1.0.166", features = ["derive"], optional = true }
+serde_json = { version = "1.0.100", optional = true }
 
 [features]
 # Feature flags are *visibility* gates: additive, hiding API without changing the
@@ -186,14 +204,17 @@ windows-sys = { version = "0.61", features = [
 # Raw syscalls std can't express: the POSIX process-group backend (setpgid /
 # killpg / kill for teardown and liveness probes) on every unix, plus — on Linux
 # — joining cgroup.procs in pre_exec (async-signal-safe getpid/open/write/close).
-libc = "0.2"
+libc = "0.2.149"
 
 [dev-dependencies]
 # `#[tokio::test]` plus a multi-threaded runtime to drive the async tests;
 # `test-util` provides the paused clock for the supervisor's backoff-timing
 # tests (virtual time instead of real sleeps); `net` binds the ephemeral
 # TcpListener the `wait_for_port` integration test probes against.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "test-util", "net"] }
+# Kept in sync with the `[dependencies]` tokio floor above (`1.39`, forced by
+# the `abort_handle`/`as_std_mut`/`mio`-`ntapi` build-honesty fixes — see that
+# entry for why).
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "time", "io-util", "test-util", "net"] }
 # Auto-cleaned, parallel-safe temp files for the `record` cassette round-trip
 # tests (hand-rolled temp_dir paths leak and race under parallel test runs).
 tempfile = "3"
@@ -221,4 +242,4 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 [target.'cfg(unix)'.dev-dependencies]
 # Liveness probe (kill(pid, 0)) and the root gate (geteuid) in the setsid /
 # privilege-drop integration tests — the test crate can't see the non-dev libc.
-libc = "0.2"
+libc = "0.2.149"
