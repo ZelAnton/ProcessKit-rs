@@ -12,6 +12,137 @@ the full record; this page is the "I depend on it, what do I do" view.
 > section here before each major bump. (The `mock` feature's `mockall`-generated
 > `expect_*` surface stays semver-exempt — it tracks the `mockall` version.)
 
+## 2.0.0 (from 1.2.x)
+
+Mostly mechanical renames — **caught by the compiler** — plus two
+`#[non_exhaustive]` tightenings on `Error` (also compiler-caught, once you stop
+destructuring the affected variants field-exhaustively) and one genuine
+**behavior** change on `output_bytes` that a build alone won't surface.
+
+### Renames (mechanical — compiler-caught)
+
+| Before | After |
+|---|---|
+| `Error::OutputTooLarge { line_limit, byte_limit, .. }` | `Error::OutputTooLarge { max_lines, max_bytes, .. }` |
+| `ResourceLimits::memory_max` (field, `limits` feature) / `.memory_max(n)` builder | `ResourceLimits::max_memory` / `.max_memory(n)` |
+| `ProcessGroup::terminate_all()` | `ProcessGroup::kill_all()` |
+| `RunProfile::avg_cpu()` | `RunProfile::avg_cpu_cores()` |
+| `RunProfile::exit_code` (field) | `profile.code()` (method — same `Option<i32>`) |
+| `use processkit::Encoding;` | `use processkit::prelude::Encoding;` |
+| `use processkit::StreamExt;` | `use processkit::prelude::StreamExt;` |
+| `result.output_contains_any(&["a", "b"])` | `result.output_contains_any(["a", "b"])` (now `impl IntoIterator<Item = impl AsRef<str>>` — a bare array, `Vec<String>`, or slice all work directly, without the `&`; the old `&["a", "b"]` call still compiles too) |
+
+The `terminate_all` / `avg_cpu` entries were deprecated forwarding aliases since
+1.1.0 (see the [1.1.0 changelog entry](../CHANGELOG.md#110---2026-06-28)); this
+release removes them outright. `RunProfile::exit_code` duplicated
+`outcome.code()`, which `RunProfile::code()` already exposed — the field is gone,
+the method is the one accessor now.
+
+### `Error`'s data-carrying variants are now individually `#[non_exhaustive]`
+
+`Exit`, `Timeout`, `Signalled`, `Spawn`, `NotFound`, `Parse`, `OutputTooLarge`,
+`Stdin`, and — with the `limits` feature — `ResourceLimit` can no longer be
+struct-literal-constructed or field-exhaustively destructured outside the crate.
+
+Before:
+
+```rust
+match err {
+    Error::Exit { program, code, stdout, stderr } => { /* ... */ }
+    _ => {}
+}
+```
+
+After — add `..` to the pattern (or, better, use the existing accessors instead
+of destructuring at all):
+
+```rust
+match err {
+    Error::Exit { program, code, stdout, stderr, .. } => { /* ... */ }
+    _ => {}
+}
+
+// or, accessor-based and immune to the next field addition:
+if let Some(code) = err.code() {
+    // err.program() / err.stdout() / err.stderr() / err.combined() also work
+}
+```
+
+This is prep for future field additions to any of these variants without
+another breaking change — the `Exit`/`Timeout`/`Signalled` variants already
+gained one such field this release (next entry).
+
+### `Error::Exit` / `Timeout` / `Signalled` gain a `stdout_bytes` field
+
+A new field, `stdout_bytes: Option<Vec<u8>>`, carries the **exact** captured
+stdout bytes for a checking-verb error built over `output_bytes`
+(e.g. `output_bytes().await?.ensure_success()?`); read it through
+`Error::stdout_bytes() -> Option<&[u8]>`, not by destructuring the variant
+directly (they are `#[non_exhaustive]` — see above). `None` on the text path
+(`output_string`/`run`/`checked`/…), where the decoded `stdout` string is
+already the whole story.
+
+### `Error::ResourceLimit` is restructured (`limits` feature)
+
+| Before | After |
+|---|---|
+| `Error::ResourceLimit { message: String }` | `Error::ResourceLimit { kind: LimitKind, reason: LimitReason, detail: String }` |
+
+Fix a match:
+
+```rust
+// Before
+Error::ResourceLimit { message } => warn!("limit rejected: {message}"),
+
+// After
+Error::ResourceLimit { detail, .. } => warn!("limit rejected: {detail}"),
+
+// or, branch on the structured classification instead of parsing text:
+if let (Some(kind), Some(reason)) = (err.limit_kind(), err.limit_reason()) {
+    match (kind, reason) {
+        (LimitKind::Memory, LimitReason::Unsupported) => { /* ... */ }
+        _ => {}
+    }
+}
+```
+
+### `output_bytes` now honors the byte cap on stdout too — a behavior change
+
+Not compiler-caught: if you configured an `OutputBufferPolicy` byte ceiling
+(`with_max_bytes`) and called `output_bytes`, the cap previously bounded only
+the line-pumped **stderr**; raw **stdout** capture was unbounded regardless of
+the configured `max_bytes`. It now applies to both streams:
+
+- `OverflowMode::Error` past the cap now errors on stdout overflow too, with
+  `Error::OutputTooLarge { max_lines: None, .. }` (raw bytes have no lines).
+- The drop modes (head/tail) now bound retained stdout bytes the same way they
+  already bounded stderr, and set `ProcessResult::truncated`.
+
+If nothing sets a byte cap, capture stays unbounded exactly as before — nothing
+to do. If you do set one and rely on `output_bytes` returning the **full**
+stdout regardless, re-check that call site: it now truncates/errors like every
+other capture path under the same policy.
+
+### Cassette replay: `cwd` no longer part of the match key — no action needed
+
+`RecordReplayRunner` (`record` feature) replays a cassette recorded from one
+absolute working directory against the same invocation run from a different
+one, instead of `CassetteMiss`ing — `cwd` is still stored on each entry for
+visibility, it just no longer discriminates two otherwise-identical recorded
+runs. The on-disk format revision bumped to `3`, but this is not a compatibility
+gate: a cassette written by a 1.x build still loads and replays fine. The one
+edge case: an existing cassette that had two entries differing *only* in `cwd`
+now collides on replay, and the first-recorded entry answers for both —
+re-record it if that matters for your fixtures.
+
+### Verify the upgrade
+
+```sh
+cargo update -p processkit
+cargo build      # the renames and non_exhaustive tightenings are compiler-caught
+cargo test       # catches the output_bytes byte-cap behavior change if you rely on it
+```
+
 ## 1.0.0 (from 0.11.x)
 
 A few breaking changes, all **caught by the compiler** — if it builds after the
