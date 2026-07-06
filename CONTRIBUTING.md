@@ -2,6 +2,11 @@
 
 Contributions land via pull requests into `main` (branch-protected).
 
+New to the codebase? [ARCHITECTURE.md](ARCHITECTURE.md) maps the internal
+layers (`Command` → runner/client → running → pump/buffer → `sys` backends),
+the test-double seams, the run's data flow, and the invariants (kill-on-drop,
+teardown, cancel-vs-timeout) that changes must preserve.
+
 ## Testing
 
 ```bash
