@@ -307,11 +307,26 @@ impl Reply {
 
     /// Build a scripted live handle for `command` from this reply — the
     /// `start` analogue of [`into_result`](Self::into_result). The canned
-    /// stdout/stderr feed the command's real pump machinery (handlers,
-    /// encodings, buffer policy all apply); the scripted "process" exits with
+    /// stdout/stderr feed the command's real pump machinery (handlers, buffer
+    /// policy, line terminators all apply); the scripted "process" exits with
     /// the canned code after the last delayed line (immediately without
     /// delays), or never for a [`pending`](Self::pending) reply.
-    pub(crate) fn into_running(self, command: &Command) -> crate::RunningProcess {
+    ///
+    /// The canned text is the already-*decoded* output the caller should observe,
+    /// so the scripted pumps decode it as UTF-8 (the bytes the feeder writes) —
+    /// **not** through the command's `stdout_encoding`, which would re-decode
+    /// UTF-8 feeder bytes as, say, UTF-16LE and hand back garbage (see
+    /// `RunningProcess::from_scripted`).
+    ///
+    /// `recorded` carries the truncation/overflow/duration a cassette captured, so
+    /// a consumed replay reports the recorded signals instead of re-deriving them
+    /// from the re-pumped canned output; `None` (a plain `ScriptedRunner` reply)
+    /// keeps the derived values.
+    pub(crate) fn into_running(
+        self,
+        command: &Command,
+        recorded: Option<crate::running::ScriptedResultInfo>,
+    ) -> crate::RunningProcess {
         // A pending reply never exits on its own; everything else exits after
         // its (possibly zero) total line-delay budget. A canned timeout exits
         // immediately as a timed-out outcome, mirroring `into_result`.
@@ -345,16 +360,24 @@ impl Reply {
             lifetime,
             self.line_delay,
         );
-        crate::RunningProcess::from_scripted(command, scripted)
+        crate::RunningProcess::from_scripted(command, scripted, recorded)
     }
 
-    fn into_result(
-        self,
-        program: String,
-        timeout: Option<std::time::Duration>,
-    ) -> ProcessResult<String> {
+    /// The bulk-`output_string` analogue of [`into_running`](Self::into_running):
+    /// turn this reply into a [`ProcessResult`] that matches what the live bulk
+    /// path would hand back for the same output.
+    ///
+    /// The live bulk path decodes the child's bytes, splits them into lines under
+    /// the command's [`LineTerminator`], then rejoins with `\n`
+    /// (`stdout_lines.join("\n")`) — so a trailing terminator is dropped and CRLF
+    /// is normalized to LF. Canned text gets the *same* treatment here (via
+    /// [`split_pump_lines`](crate::running::split_pump_lines)), so
+    /// `Reply::ok("done\n")` yields `"done"` on the fake exactly as it does live —
+    /// and the bulk and `start` verbs agree on one double.
+    fn into_result(self, program: String, command: &Command) -> ProcessResult<String> {
         // Carry the command's configured timeout so a timed-out reply surfaces as
         // `Error::Timeout` with the real deadline, not a zero duration.
+        let timeout = command.configured_timeout();
         let outcome = if self.timed_out {
             Outcome::TimedOut
         } else if self.signalled {
@@ -362,7 +385,11 @@ impl Reply {
         } else {
             Outcome::Exited(self.code)
         };
-        ProcessResult::new(program, self.stdout, self.stderr, outcome, timeout)
+        let stdout = crate::running::split_pump_lines(&self.stdout, command.out_line_terminator())
+            .join("\n");
+        let stderr = crate::running::split_pump_lines(&self.stderr, command.err_line_terminator())
+            .join("\n");
+        ProcessResult::new(program, stdout, stderr, outcome, timeout)
     }
 }
 
@@ -372,7 +399,14 @@ impl Reply {
 /// replayed through `start` (its canned output flowing through the command's real
 /// pumps), not only `output_string`. The decode model matches the cassette
 /// `Entry`'s (see [`Reply::from_outcome`]).
+///
+/// The recorded `truncated`/`total_lines`/`total_bytes`/`duration` are threaded
+/// onto the handle so a consumed replay (`output_string`) reports the same
+/// truncation/overflow/duration the bulk `Entry::to_result` path applies —
+/// instead of re-deriving them from the (un-truncated, instantly-fed) canned
+/// output — keeping the two replay verbs in agreement.
 #[cfg(feature = "record")]
+#[allow(clippy::too_many_arguments, reason = "flat recorded-entry parts")]
 pub(crate) fn scripted_running_from_parts(
     command: &Command,
     stdout: String,
@@ -380,8 +414,19 @@ pub(crate) fn scripted_running_from_parts(
     code: Option<i32>,
     timed_out: bool,
     signal: Option<i32>,
+    truncated: bool,
+    total_lines: usize,
+    total_bytes: usize,
+    duration: std::time::Duration,
 ) -> crate::RunningProcess {
-    Reply::from_outcome(stdout, stderr, code, timed_out, signal).into_running(command)
+    let recorded = crate::running::ScriptedResultInfo {
+        truncated,
+        total_lines,
+        total_bytes,
+        duration,
+    };
+    Reply::from_outcome(stdout, stderr, code, timed_out, signal)
+        .into_running(command, Some(recorded))
 }
 
 type Predicate = Box<dyn Fn(&Command) -> bool + Send + Sync>;
@@ -665,14 +710,19 @@ impl ScriptedRunner {
 /// progress-reporting path is exercised hermetically on the bulk `output_string` verb
 /// — both for a [`ScriptedRunner`] reply and a cassette replay. On a
 /// scripted/real `start`, the live pumps invoke the handlers instead.
+///
+/// Splits the canned text with [`split_pump_lines`](crate::running::split_pump_lines)
+/// under the command's per-stream [`LineTerminator`], exactly as the live pump
+/// does — so the lines a handler sees on the fake match the ones a real run would
+/// deliver (and the ones `into_result` joins back into the result).
 pub(crate) fn replay_line_handlers(command: &Command, stdout: &str, stderr: &str) {
     let mut stdout_handler = command.stdout_handler();
-    for line in stdout.lines() {
-        invoke_isolated(&mut stdout_handler, line);
+    for line in crate::running::split_pump_lines(stdout, command.out_line_terminator()) {
+        invoke_isolated(&mut stdout_handler, &line);
     }
     let mut stderr_handler = command.stderr_handler();
-    for line in stderr.lines() {
-        invoke_isolated(&mut stderr_handler, line);
+    for line in crate::running::split_pump_lines(stderr, command.err_line_terminator()) {
+        invoke_isolated(&mut stderr_handler, &line);
     }
 }
 
@@ -724,7 +774,6 @@ impl ProcessRunner for ScriptedRunner {
                 ),
             )));
         }
-        let timeout = command.configured_timeout();
         let reply = self.matched_reply(command, &program)?;
         if let Some(err) = reply.spawn_error_for(program.clone()) {
             return Err(err);
@@ -735,7 +784,7 @@ impl ProcessRunner for ScriptedRunner {
         replay_line_handlers(command, &reply.stdout, &reply.stderr);
         Ok(reply
             .clone()
-            .into_result(program, timeout)
+            .into_result(program, command)
             .with_ok_codes(command.ok_codes_vec()))
     }
 
@@ -762,7 +811,9 @@ impl ProcessRunner for ScriptedRunner {
         if let Some(err) = reply.spawn_error_for(program) {
             return Err(err);
         }
-        Ok(reply.clone().into_running(command))
+        // A plain scripted reply carries no recorded truncation/duration — the
+        // handle derives them from its own (instant) run, as a live child would.
+        Ok(reply.clone().into_running(command, None))
     }
 }
 
@@ -1201,6 +1252,103 @@ mod tests {
         let result = run.output_string().await.expect("consume");
         assert!(result.is_success());
         assert_eq!(result.stdout(), "a\nb");
+    }
+
+    #[tokio::test]
+    async fn bulk_output_normalizes_canned_text_like_the_live_path() {
+        // D3: the bulk `output_string` verb must join decoded lines the way the
+        // live runner does — trailing `\n` dropped, CRLF collapsed to LF — so a
+        // reply reads identically on the fake and a real run, and identically
+        // across the bulk and `start` verbs on one double.
+        let runner = ScriptedRunner::new()
+            .on(["a"], Reply::ok("done\n"))
+            .on(["b"], Reply::ok("one\r\ntwo\r\n"))
+            .fallback(Reply::fail(1, "boom\n"));
+
+        // Trailing newline stripped (matches a live `output_string`, and the
+        // scripted `start` path which already normalizes through the pumps).
+        let a = runner
+            .output_string(&Command::new("a"))
+            .await
+            .expect("run a");
+        assert_eq!(a.stdout(), "done");
+        let a_start = runner
+            .start(&Command::new("a"))
+            .await
+            .expect("start a")
+            .output_string()
+            .await
+            .expect("consume a");
+        assert_eq!(a.stdout(), a_start.stdout(), "bulk and start agree");
+
+        // CRLF normalized to LF, trailing terminator dropped.
+        let b = runner
+            .output_string(&Command::new("b"))
+            .await
+            .expect("run b");
+        assert_eq!(b.stdout(), "one\ntwo");
+
+        // stderr is normalized the same way.
+        let fail = runner
+            .output_string(&Command::new("c"))
+            .await
+            .expect("run c");
+        assert_eq!(fail.stderr(), "boom");
+    }
+
+    #[tokio::test]
+    async fn bulk_output_honors_the_carriage_return_terminator_like_the_pump() {
+        // The bulk normalization follows the command's `line_terminator`, exactly
+        // as the live pump (and the scripted `start` path) do: in `\r`-aware mode
+        // each carriage-return frame is its own line, so the bulk and `start`
+        // verbs agree on one double even under a non-default terminator.
+        use crate::LineTerminator;
+        let runner = ScriptedRunner::new().fallback(Reply::ok("f1\rf2\rf3\r"));
+        let cmd = crate::Command::new("dl").line_terminator(LineTerminator::CarriageReturn);
+
+        let bulk = runner.output_string(&cmd).await.expect("bulk run");
+        assert_eq!(bulk.stdout(), "f1\nf2\nf3");
+
+        let start = runner
+            .start(&cmd)
+            .await
+            .expect("scripted start")
+            .output_string()
+            .await
+            .expect("consume");
+        assert_eq!(
+            bulk.stdout(),
+            start.stdout(),
+            "bulk and start agree under CR"
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_start_does_not_re_decode_canned_text_through_stdout_encoding() {
+        // D4: the scripted feeder writes the canned String's UTF-8 bytes, so the
+        // scripted pump reads them back as UTF-8 — it must NOT re-decode them
+        // through the command's `stdout_encoding`. Before the fix,
+        // `.stdout_encoding(UTF_16LE)` read the UTF-8 feeder bytes as UTF-16LE and
+        // handed back garbage; now the canned text round-trips regardless.
+        let runner = ScriptedRunner::new().fallback(Reply::lines(["héllo", "wörld"]));
+        let cmd = crate::Command::new("tool").stdout_encoding(encoding_rs::UTF_16LE);
+
+        let start = runner
+            .start(&cmd)
+            .await
+            .expect("scripted start")
+            .output_string()
+            .await
+            .expect("consume");
+        assert_eq!(
+            start.stdout(),
+            "héllo\nwörld",
+            "canned text must round-trip regardless of the command's stdout_encoding"
+        );
+
+        // The bulk verb (which never decodes) agrees, so the two verbs match.
+        let bulk = runner.output_string(&cmd).await.expect("bulk run");
+        assert_eq!(bulk.stdout(), start.stdout());
     }
 
     #[tokio::test(start_paused = true)]

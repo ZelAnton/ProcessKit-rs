@@ -113,6 +113,75 @@ pub(crate) struct Spawned {
     pub cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
+/// Recorded result signals a cassette `start`-replay threads onto its scripted
+/// handle, so a consumed replay (`output_string`) reports the *recorded*
+/// truncation/overflow/duration — matching the bulk `Entry::to_result` path —
+/// instead of re-deriving them from the re-pumped canned output. `None` on a
+/// plain [`ScriptedRunner`](crate::testing::ScriptedRunner) reply keeps the
+/// derived values.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScriptedResultInfo {
+    pub(crate) truncated: bool,
+    pub(crate) total_lines: usize,
+    pub(crate) total_bytes: usize,
+    pub(crate) duration: Duration,
+}
+
+/// Split already-decoded `text` into the exact lines the streaming pump
+/// ([`pump_lines_core`](crate::pump)) would yield for `terminator` — CRLF/CR
+/// terminators collapsed and stripped, with no trailing empty line for a final
+/// terminator. Joining the result with `\n` reproduces the live bulk path's
+/// `stdout_lines.join("\n")` byte-for-byte, so the test doubles' canned text
+/// reads identically on the fake and a real run (and across the bulk and `start`
+/// verbs). Models no buffer cap — the bulk replay never truncates.
+///
+/// Mirrors `pump_lines_core`'s terminator handling on whole in-hand text, so a
+/// `\r` in `\r`-aware mode is trailing only at the very end. Kept beside the
+/// scripted handle it serves rather than reaching into the pump's private,
+/// chunk-oriented line splitter.
+pub(crate) fn split_pump_lines(text: &str, terminator: LineTerminator) -> Vec<String> {
+    match terminator {
+        // `str::lines` splits on `\n`, dropping one preceding `\r` (a CRLF
+        // terminator) and yielding no trailing empty line — exactly the pump's
+        // `Newline` mode. A lone `\r` stays content, as it does there.
+        LineTerminator::Newline => text.lines().map(str::to_owned).collect(),
+        // `\r`-aware: split on the earliest `\r` or `\n`; a `\r\n` pair is one
+        // terminator; a bare `\r` ends a frame; the final un-terminated segment is
+        // the last line. (Indices land on ASCII `\r`/`\n`, always char boundaries.)
+        LineTerminator::CarriageReturn => {
+            let mut lines = Vec::new();
+            let bytes = text.as_bytes();
+            let (mut start, mut i) = (0usize, 0usize);
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\n' => {
+                        lines.push(text[start..i].to_owned());
+                        i += 1;
+                    }
+                    b'\r' => {
+                        lines.push(text[start..i].to_owned());
+                        // A `\r\n` pair is a single terminator; drop both.
+                        i += if bytes.get(i + 1) == Some(&b'\n') {
+                            2
+                        } else {
+                            1
+                        };
+                    }
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                }
+                start = i;
+            }
+            if start < bytes.len() {
+                lines.push(text[start..].to_owned());
+            }
+            lines
+        }
+    }
+}
+
 /// A handle to a process spawned by a runner.
 pub struct RunningProcess {
     // The Option fields below encode the handle's de-facto states (fresh /
@@ -164,6 +233,10 @@ pub struct RunningProcess {
     cancel_at_exit: Option<bool>,
     started: Instant,
     start_time: SystemTime,
+    // Recorded truncation/overflow/duration a cassette `start`-replay carries, so
+    // a consumed replay reports them instead of the values the re-pumped canned
+    // output would derive. `None` for a real child or a plain scripted reply.
+    scripted_result: Option<ScriptedResultInfo>,
 }
 
 /// A boxed output reader: real `ChildStdout`/`ChildStderr` or scripted bytes.
@@ -361,13 +434,28 @@ impl RunningProcess {
             cancel_at_exit: None,
             started: Instant::now(),
             start_time: SystemTime::now(),
+            scripted_result: None,
         }
     }
 
-    /// Build a scripted handle: same encodings/handlers/buffer/timeout/token as
-    /// a real run so hermetic tests exercise the same pump machinery. `pid()` is
-    /// `None`.
-    pub(crate) fn from_scripted(command: &crate::command::Command, scripted: ScriptedProc) -> Self {
+    /// Build a scripted handle: same handlers/buffer/timeout/token/line-terminators
+    /// as a real run so hermetic tests exercise the same pump machinery. `pid()`
+    /// is `None`.
+    ///
+    /// The decode encoding is forced to **UTF-8**, not the command's
+    /// `stdout_encoding`/`stderr_encoding`: the scripted feeder writes the canned
+    /// `String`'s UTF-8 bytes (the caller's already-*decoded* output), so the pump
+    /// must read them back as UTF-8. Re-decoding through the command's encoding
+    /// would double-decode — e.g. `.stdout_encoding(UTF_16LE)` would read UTF-8
+    /// feeder bytes as UTF-16LE and hand back garbage.
+    ///
+    /// `recorded` (from a cassette `start`-replay) overrides the
+    /// truncation/overflow/duration a consumed replay reports; `None` derives them.
+    pub(crate) fn from_scripted(
+        command: &crate::command::Command,
+        scripted: ScriptedProc,
+        recorded: Option<ScriptedResultInfo>,
+    ) -> Self {
         Self {
             program: command.program_name(),
             backend: Backend::Scripted(Box::new(scripted)),
@@ -375,8 +463,11 @@ impl RunningProcess {
             timeout_grace: command.configured_timeout_grace(),
             timeout_signal: command.timeout_signal_raw(),
             pid: None,
-            stdout_encoding: command.out_encoding(),
-            stderr_encoding: command.err_encoding(),
+            // Feeder writes UTF-8 (the canned String's bytes); decode as UTF-8 so
+            // the caller sees the exact canned text regardless of the command's
+            // configured encoding (see the doc above).
+            stdout_encoding: encoding_rs::UTF_8,
+            stderr_encoding: encoding_rs::UTF_8,
             stdout_handler: command.stdout_handler(),
             stderr_handler: command.stderr_handler(),
             stdout_tee: command.stdout_tee_sink(),
@@ -398,6 +489,7 @@ impl RunningProcess {
             cancel_at_exit: None,
             started: Instant::now(),
             start_time: SystemTime::now(),
+            scripted_result: recorded,
         }
     }
 
@@ -629,16 +721,31 @@ impl RunningProcess {
         let finished = self
             .finish_lines(CaptureMode::Lines, /* expose_counts */ true, || {})
             .await?;
-        // `dropped()` = lines the buffer policy discarded, NOT lines a prior
-        // stream consumed — so partial streaming under the unbounded policy is
-        // never mis-reported as truncated.
-        let truncated = self.stdout_sink.as_ref().is_some_and(|s| s.dropped() > 0)
-            || self.stderr_sink.as_ref().is_some_and(|s| s.dropped() > 0);
-        let total_lines = self.stdout_sink.as_ref().map_or(0, |s| s.count())
-            + self.stderr_sink.as_ref().map_or(0, |s| s.count());
-        let total_bytes = self.stdout_sink.as_ref().map_or(0, |s| s.seen_bytes())
-            + self.stderr_sink.as_ref().map_or(0, |s| s.seen_bytes());
-        let duration = self.started.elapsed();
+        // A cassette `start`-replay carries the recorded truncation/overflow/
+        // duration, so a consumed replay agrees with the bulk `Entry::to_result`
+        // path instead of re-deriving them from the (un-truncated, instantly-fed)
+        // canned output. A real child or a plain scripted reply (`None`) derives
+        // them from the run itself.
+        let (truncated, total_lines, total_bytes, duration) = match self.scripted_result {
+            Some(rec) => (
+                rec.truncated,
+                rec.total_lines,
+                rec.total_bytes,
+                rec.duration,
+            ),
+            None => {
+                // `dropped()` = lines the buffer policy discarded, NOT lines a prior
+                // stream consumed — so partial streaming under the unbounded policy
+                // is never mis-reported as truncated.
+                let truncated = self.stdout_sink.as_ref().is_some_and(|s| s.dropped() > 0)
+                    || self.stderr_sink.as_ref().is_some_and(|s| s.dropped() > 0);
+                let total_lines = self.stdout_sink.as_ref().map_or(0, |s| s.count())
+                    + self.stderr_sink.as_ref().map_or(0, |s| s.count());
+                let total_bytes = self.stdout_sink.as_ref().map_or(0, |s| s.seen_bytes())
+                    + self.stderr_sink.as_ref().map_or(0, |s| s.seen_bytes());
+                (truncated, total_lines, total_bytes, self.started.elapsed())
+            }
+        };
         Ok(ProcessResult::new(
             self.program.clone(),
             finished.stdout_lines.join("\n"),
