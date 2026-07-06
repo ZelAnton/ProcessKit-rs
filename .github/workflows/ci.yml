@@ -93,6 +93,40 @@ jobs:
       # cfg-gated arms in the suite) against bit-rot.
       - run: cargo test --no-default-features -- --include-ignored
 
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # `--all-features` so the feature-gated stats/limits code counts towards
+      # coverage; `--include-ignored` so the real-subprocess tests (most of the
+      # suite) run instead of being silently skipped.
+      #
+      # Collected on Linux only: `sys/windows.rs` (Job Objects) and the macOS
+      # branch of `sys/unix.rs` (process groups on BSD/macOS) never execute
+      # here, so the reported percentage is a Linux-only lower bound, not a
+      # whole-crate figure. The `test` job above still runs the full suite
+      # (`--include-ignored`) on all three OSes — this job only adds line
+      # coverage, not additional platform exercising.
+      - run: cargo llvm-cov --all-features --lcov --output-path lcov.info -- --include-ignored
+      # Tolerate failure here, not above: a real `cargo llvm-cov` failure
+      # (broken build, failing test) must still fail this job and be visible.
+      # Only the upload itself is allowed to fail — until this repository is
+      # connected to coveralls.io (a one-time external setup this code doesn't
+      # control), this step fails every run, which would otherwise turn the
+      # whole workflow-run conclusion red and defeat the CI badge this task adds.
+      - name: Upload coverage to Coveralls
+        continue-on-error: true
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path-to-lcov: lcov.info
+
   doc:
     name: rustdoc
     runs-on: ubuntu-latest

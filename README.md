@@ -14,6 +14,7 @@ subprocess-free tests.
 [![Crates.io](https://img.shields.io/crates/v/processkit.svg)](https://crates.io/crates/processkit)
 [![Docs.rs](https://docs.rs/processkit/badge.svg)](https://docs.rs/processkit)
 [![CI](https://github.com/ZelAnton/ProcessKit-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/ZelAnton/ProcessKit-rs/actions/workflows/ci.yml)
+[![Coverage Status](https://coveralls.io/repos/github/ZelAnton/ProcessKit-rs/badge.svg?branch=main)](https://coveralls.io/github/ZelAnton/ProcessKit-rs?branch=main)
 [![License: MIT](https://img.shields.io/crates/l/processkit.svg)](LICENSE)
 [![MSRV](https://img.shields.io/crates/msrv/processkit.svg)](Cargo.toml)
 
