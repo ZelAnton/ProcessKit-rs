@@ -131,6 +131,22 @@ jobs:
         with:
           command: check advisories bans licenses
 
+  minimal-versions:
+    name: direct-minimal-versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      # Re-resolve every direct dependency down to the lowest SemVer-compatible
+      # version (indirect dependencies still resolve normally) and build against
+      # that resolution, in a throwaway lockfile — the committed Cargo.lock (built
+      # with normal, highest-version resolution) is untouched. Catches a
+      # `foo = "1.0"` declaration that actually needs `1.0.5`'s API, which the
+      # committed lockfile's higher pin would otherwise mask indefinitely.
+      - run: cargo +nightly -Z direct-minimal-versions generate-lockfile
+      - run: cargo +nightly check --all-targets --all-features --locked
+
   msrv:
     name: msrv (1.88)
     runs-on: ubuntu-latest
