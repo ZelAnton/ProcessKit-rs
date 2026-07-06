@@ -18,12 +18,13 @@ pub trait ProcessRunner: Send + Sync {
 ```
 
 Production code takes a runner (generically or as `&dyn ProcessRunner`); tests
-hand it a double. Four doubles ship with the crate, plus a macro that makes
+hand it a double. Five doubles ship with the crate, plus a macro that makes
 whole CLI wrappers testable for free.
 
 - [The `ProcessRunner` seam](#the-processrunner-seam)
 - [Scripting replies: `ScriptedRunner`](#scripting-replies)
 - [Asserting invocations: `RecordingRunner`](#asserting-invocations)
+- [Echoing without spawning: `DryRunRunner`](#echoing-without-spawning-dryrunrunner)
 - [Expectation-style: `MockRunner`](#expectation-style-mockrunner)
 - [Record/replay cassettes: `RecordReplayRunner`](#recordreplay-cassettes)
 - [Wrapping a CLI tool: `CliClient`](#wrapping-a-cli-tool)
@@ -195,6 +196,52 @@ An `Invocation` captures the *routing* knobs — `program`, `args`, `cwd`,
 I/O-shaping ones (timeout, encodings, buffer policy); assert those through a
 `when` predicate over the `Command` itself. `calls()` returns the full list
 when more than one run is expected.
+
+## Echoing without spawning: `DryRunRunner`
+
+`DryRunRunner` never spawns a process at all: it renders each command through
+[`Command::command_line`](https://docs.rs/processkit) — the crate's own
+display quoting, not a hand-rolled shell-escaper — and hands back a synthetic
+successful result. It's the seam behind a tool's own `--dry-run`/`--echo`
+mode: wire your production code to it (instead of `JobRunner`) and it shows
+what *would* run instead of running it.
+
+```rust,no_run
+use processkit::{Command, ProcessRunner};
+use processkit::testing::DryRunRunner;
+
+#[tokio::test]
+async fn dry_run_shows_the_command_without_running_it() {
+    let runner = DryRunRunner::new();
+    let out = runner
+        .output_string(&Command::new("rm").args(["-rf", "build"]))
+        .await
+        .unwrap();
+    assert!(out.is_success()); // synthetic — no process ever ran
+    assert_eq!(runner.only_command(), "rm -rf build");
+}
+```
+
+Unlike `ScriptedRunner`, there is nothing to script — a dry run has no real
+output to fake, only a command line to show — so every call unconditionally
+succeeds on both `output_string` and `start`: empty stdout/stderr, and an
+exit code drawn from the command's own `ok_codes` (`0` by default) so
+`is_success()` and the ergonomic `run`/`run_unit`/`checked`/`parse` verbs
+agree it succeeded even for a command whose `ok_codes` excludes `0`. The
+rendered lines are available two ways, usable together or alone:
+
+- a collected snapshot, in the style of `RecordingRunner::calls` —
+  `commands()` (all of them, in order) / `only_command()` (panics unless
+  exactly one call was made);
+- a live `on_invocation(|line| …)` callback, invoked with the rendered line as
+  each call happens — e.g. printing it to the terminal immediately, in
+  addition to (not instead of) the collected snapshot:
+
+```rust,no_run
+use processkit::testing::DryRunRunner;
+
+let runner = DryRunRunner::new().on_invocation(|line| println!("+ {line}"));
+```
 
 ## Expectation-style: `MockRunner`
 

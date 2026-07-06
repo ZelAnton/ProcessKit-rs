@@ -5,6 +5,10 @@
 //!   predicate.
 //! - [`RecordingRunner`] wraps another runner and records every [`Invocation`]
 //!   so tests can assert exactly what was run.
+//! - [`DryRunRunner`] never spawns anything: it renders each command through
+//!   [`Command::command_line`], hands the rendered line to a collected
+//!   snapshot and/or a callback, and returns a synthetic successful result —
+//!   the seam behind a tool's own `--dry-run` echo mode.
 //!
 //! Behind the `mock` feature, [`mockall`] additionally generates a `MockRunner`
 //! for expectation-style mocking. All of these live under
@@ -1011,6 +1015,163 @@ impl<R: ProcessRunner> ProcessRunner for RecordingRunner<R> {
             .expect("recorder lock poisoned")
             .push(Invocation::from_command(command));
         self.inner.start(command).await
+    }
+}
+
+/// The [`DryRunRunner::on_invocation`] callback's boxed shape.
+type InvocationCallback = Box<dyn Fn(&str) + Send + Sync>;
+
+/// A [`ProcessRunner`] that never spawns a process: it renders each command
+/// via [`Command::command_line`] — reusing the crate's own display quoting,
+/// not a hand-rolled shell-escaper — and returns a synthetic successful
+/// result for every verb. The seam behind a tool's own `--dry-run`/`--echo`
+/// mode: production code keeps calling the same [`ProcessRunner`], just wired
+/// to this double instead of [`JobRunner`](crate::JobRunner).
+///
+/// Unlike [`ScriptedRunner`], there is nothing to script — a dry run has no
+/// real output to fake, only a command line to show — so every call
+/// unconditionally succeeds: empty stdout/stderr, and an exit code drawn
+/// from the command's own [`ok_codes`](Command::ok_codes) (`0` by default)
+/// so `is_success()`/the Ext verbs agree it succeeded even for a command
+/// whose `ok_codes` excludes `0`. Rendered lines are available two ways,
+/// usable together or alone:
+///
+/// - a collected snapshot, in the style of [`RecordingRunner::calls`] —
+///   [`commands`](Self::commands) / [`only_command`](Self::only_command);
+/// - a live [`on_invocation`](Self::on_invocation) callback, invoked with the
+///   rendered line as each call happens (e.g. to print it immediately).
+///
+/// # Example
+///
+/// ```
+/// use processkit::{Command, ProcessRunner};
+/// use processkit::testing::DryRunRunner;
+///
+/// let rt = tokio::runtime::Builder::new_current_thread()
+///     .enable_all()
+///     .build()
+///     .unwrap();
+/// rt.block_on(async {
+///     let runner = DryRunRunner::new();
+///     let out = runner
+///         .output_string(&Command::new("rm").args(["-rf", "build"]))
+///         .await
+///         .unwrap();
+///     assert!(out.is_success());
+///     assert_eq!(runner.only_command(), "rm -rf build");
+/// });
+/// ```
+#[derive(Default)]
+pub struct DryRunRunner {
+    commands: Mutex<Vec<String>>,
+    on_invocation: Option<InvocationCallback>,
+}
+
+// Manual: the callback field carries no `Debug` bound. Like `Invocation`'s
+// redaction, a rendered line can carry secrets (a `--token=…` argument), so
+// this reports only the call count, not the collected lines.
+impl std::fmt::Debug for DryRunRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let commands = self.commands.lock().map(|c| c.len()).unwrap_or(0);
+        f.debug_struct("DryRunRunner")
+            .field("commands", &commands)
+            .field("has_on_invocation", &self.on_invocation.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DryRunRunner {
+    /// A dry-run runner with no callback — every call is only collected,
+    /// retrievable via [`commands`](Self::commands).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Call `f` with each command's rendered line as it is dry-run
+    /// "executed" — e.g. printing it to the terminal for a tool's `--dry-run`
+    /// echo — **in addition to**, not instead of, the collected snapshot.
+    pub fn on_invocation<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        self.on_invocation = Some(Box::new(f));
+        self
+    }
+
+    /// The rendered command line for every call so far, in order — each
+    /// produced by [`Command::command_line`], the same display quoting a
+    /// caller would reach for by hand.
+    pub fn commands(&self) -> Vec<String> {
+        self.commands.lock().expect("dry-run lock poisoned").clone()
+    }
+
+    /// The single rendered command line; panics unless exactly one call was made.
+    pub fn only_command(&self) -> String {
+        let commands = self.commands();
+        assert_eq!(
+            commands.len(),
+            1,
+            "expected exactly one dry-run call, got {}",
+            commands.len()
+        );
+        commands.into_iter().next().expect("length checked above")
+    }
+
+    /// Render and record `command`'s line, invoking the callback if one was set.
+    fn record(&self, command: &Command) -> String {
+        let line = command.command_line();
+        if let Some(f) = &self.on_invocation {
+            f(&line);
+        }
+        self.commands
+            .lock()
+            .expect("dry-run lock poisoned")
+            .push(line.clone());
+        line
+    }
+}
+
+/// The exit code to synthesize for `command`'s dry-run "success": the first
+/// code in the command's own [`ok_codes`](Command::ok_codes) (falling back
+/// to `0`, `ok_codes_vec`'s own default, if unset). `ok_codes` **replaces**
+/// the accepted set rather than extending it and need not include `0` (the
+/// crate itself has commands configured with e.g. `.ok_codes([2, 3])`), so
+/// hardcoding `Exited(0)` would make `is_success()`/`ensure_success()` (and
+/// therefore the `run`/`run_unit`/`checked`/`parse` verbs) disagree with a
+/// dry run for exactly such a command — the opposite of "unconditionally
+/// succeeds". Synthesizing a code the command's own configuration already
+/// accepts keeps every verb honestly successful regardless of `ok_codes`.
+fn synthetic_success_code(command: &Command) -> i32 {
+    command.ok_codes_vec().first().copied().unwrap_or(0)
+}
+
+#[async_trait::async_trait]
+impl ProcessRunner for DryRunRunner {
+    /// Record `command`'s rendered line and return a synthetic successful
+    /// result — no process spawned, no output to fake.
+    async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+        self.record(command);
+        Ok(ProcessResult::new(
+            command.program().to_string_lossy().into_owned(),
+            String::new(),
+            String::new(),
+            Outcome::Exited(synthetic_success_code(command)),
+            command.configured_timeout(),
+        )
+        .with_ok_codes(command.ok_codes_vec()))
+    }
+
+    /// Record `command`'s rendered line and return a synthetic successful
+    /// live handle whose (empty) output flows through the same pump
+    /// machinery a scripted [`start`](ScriptedRunner::start) uses, so
+    /// `stdout_lines`/`finish` behave consistently with the rest of the seam.
+    async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
+        self.record(command);
+        let reply = Reply {
+            code: synthetic_success_code(command),
+            ..Reply::ok(String::new())
+        };
+        Ok(reply.into_running(command, None))
     }
 }
 
@@ -2288,5 +2449,132 @@ mod tests {
             Some(1),
             "`gitk` is a different tool than `git`"
         );
+    }
+
+    #[tokio::test]
+    async fn dry_run_renders_via_command_line_quoting() {
+        // The rendered line reuses `Command::command_line`'s own display
+        // quoting, not a hand-rolled escaper — same expectation as
+        // `command_line_quotes_args_for_display` in command.rs.
+        let runner = DryRunRunner::new();
+        let cmd = Command::new("git").args(["commit", "-m", "hello world"]);
+        let out = runner.output_string(&cmd).await.expect("dry run");
+        assert!(out.is_success());
+        assert_eq!(out.stdout(), "");
+        assert_eq!(out.stderr(), "");
+        assert_eq!(out.outcome(), Outcome::Exited(0));
+
+        #[cfg(unix)]
+        assert_eq!(runner.only_command(), "git commit -m 'hello world'");
+        #[cfg(not(unix))]
+        assert_eq!(runner.only_command(), "git commit -m \"hello world\"");
+    }
+
+    #[tokio::test]
+    async fn dry_run_never_spawns_and_always_synthesizes_success() {
+        // No rule to miss, no fallback to configure — every command
+        // unconditionally succeeds, unlike `ScriptedRunner`.
+        let runner = DryRunRunner::new();
+        for program in ["rm", "curl", "anything-at-all"] {
+            let out = runner
+                .output_string(&Command::new(program).arg("--flag"))
+                .await
+                .unwrap_or_else(|e| panic!("dry run of `{program}` must never fail: {e}"));
+            assert!(out.is_success());
+        }
+        assert_eq!(runner.commands().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn dry_run_collects_commands_in_order() {
+        let runner = DryRunRunner::new();
+        assert!(
+            runner
+                .output_string(&Command::new("a").arg("1"))
+                .await
+                .unwrap()
+                .is_success()
+        );
+        assert!(
+            runner
+                .output_string(&Command::new("b").arg("2"))
+                .await
+                .unwrap()
+                .is_success()
+        );
+        assert_eq!(runner.commands(), ["a 1", "b 2"]);
+    }
+
+    #[tokio::test]
+    async fn dry_run_start_returns_a_scripted_handle_through_the_real_pumps() {
+        // `start` gets the same synthetic-success treatment, flowing through
+        // the ordinary scripted pump machinery (no OS identity, clean exit).
+        let runner = DryRunRunner::new();
+        let run = runner
+            .start(&Command::new("deploy").args(["--env", "prod"]))
+            .await
+            .expect("dry-run start");
+        assert_eq!(run.pid(), None);
+        let finish = run.finish().await.expect("finish");
+        assert_eq!(finish.outcome, Outcome::Exited(0));
+        assert_eq!(finish.stderr, "");
+        assert_eq!(runner.only_command(), "deploy --env prod");
+    }
+
+    #[tokio::test]
+    async fn dry_run_succeeds_even_when_ok_codes_excludes_zero() {
+        // `ok_codes` REPLACES the accepted set and needn't include `0` — a
+        // command configured with `.ok_codes([2, 3])` must still dry-run as
+        // an unconditional success on every verb, not just `Exited(0)` (which
+        // would fail `is_success()`/`ensure_success()` for this command).
+        let command = Command::new("fsck").ok_codes([2, 3]);
+
+        let runner = DryRunRunner::new();
+        let out = runner.output_string(&command).await.unwrap();
+        assert!(
+            out.is_success(),
+            "output_string must synthesize an accepted code"
+        );
+        assert_eq!(out.outcome(), Outcome::Exited(2));
+
+        let run = runner.start(&command).await.expect("dry-run start");
+        let finish = run.finish().await.expect("finish");
+        assert_eq!(finish.outcome, Outcome::Exited(2));
+
+        // The Ext verb `run()` goes through `checked` → `ensure_success`; it
+        // must succeed rather than surface `Error::Exit` for this command.
+        use crate::runner::ProcessRunnerExt;
+        runner
+            .run(&command)
+            .await
+            .expect("run() must succeed on a dry run regardless of ok_codes");
+    }
+
+    #[tokio::test]
+    async fn dry_run_invokes_the_callback_with_the_rendered_line() {
+        use std::sync::{Arc, Mutex as StdMutex};
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_in_callback = Arc::clone(&seen);
+        let runner = DryRunRunner::new().on_invocation(move |line| {
+            seen_in_callback.lock().unwrap().push(line.to_owned());
+        });
+
+        let out = runner
+            .output_string(&Command::new("echo").arg("hi"))
+            .await
+            .unwrap();
+        assert!(out.is_success());
+
+        assert_eq!(*seen.lock().unwrap(), ["echo hi"]);
+        // The callback augments, rather than replaces, the collected snapshot.
+        assert_eq!(runner.commands(), ["echo hi"]);
+    }
+
+    #[tokio::test]
+    async fn dry_run_only_command_panics_unless_exactly_one_call() {
+        let runner = DryRunRunner::new();
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner.only_command()));
+        assert!(result.is_err(), "zero calls must panic, not default");
     }
 }
