@@ -1077,6 +1077,18 @@ impl<R: ProcessRunner> ProcessRunner for RecordingRunner<R> {
             .push(Invocation::from_command(command));
         self.inner.start(command).await
     }
+
+    async fn output_bytes(&self, command: &Command) -> Result<ProcessResult<Vec<u8>>> {
+        // Don't fall through to the `start`-based default: a runner whose
+        // `output_bytes` override behaves differently (e.g. rejects with
+        // `Error::Unsupported` instead of lossily re-encoding) must be honored,
+        // not silently replayed through `start`.
+        self.calls
+            .lock()
+            .expect("recorder lock poisoned")
+            .push(Invocation::from_command(command));
+        self.inner.output_bytes(command).await
+    }
 }
 
 /// The [`DryRunRunner::on_invocation`] callback's boxed shape.
@@ -1976,6 +1988,42 @@ mod tests {
             .expect("recorded start");
         drop(run); // recorded even though the stream was never consumed
         assert_eq!(rec.only_call().args_str(), ["run", "watch"]);
+    }
+
+    /// An inner runner whose `output_bytes` honestly rejects the call — like
+    /// a `record`-feature cassette, which stores lossy-UTF-8 text and cannot
+    /// reproduce exact bytes — instead of falling back to a `start`-based
+    /// (lossy) capture.
+    struct UnsupportedBytesRunner;
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for UnsupportedBytesRunner {
+        async fn output_string(&self, _command: &Command) -> Result<ProcessResult<String>> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn output_bytes(&self, _command: &Command) -> Result<ProcessResult<Vec<u8>>> {
+            Err(crate::error::Error::Unsupported {
+                operation: "output_bytes".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_runner_forwards_inner_output_bytes_override() {
+        // `RecordingRunner` must honor an inner override of `output_bytes`
+        // rather than silently falling through to the trait's `start`-based
+        // default (which would lossily reconstruct bytes from `output_string`).
+        let rec = RecordingRunner::new(UnsupportedBytesRunner);
+        let err = rec
+            .output_bytes(&Command::new("git").args(["cat-file", "blob", "HEAD"]))
+            .await
+            .expect_err("inner's Unsupported must be forwarded, not masked");
+        assert!(
+            matches!(err, crate::error::Error::Unsupported { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(rec.only_call().args_str(), ["cat-file", "blob", "HEAD"]);
     }
 
     #[tokio::test(start_paused = true)]
