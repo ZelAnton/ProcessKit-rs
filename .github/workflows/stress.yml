@@ -24,6 +24,10 @@ jobs:
       fail-fast: false
       # Each OS exercises a different containment backend at scale: cgroup /
       # process-group (Linux), Job Object (Windows), POSIX process group (macOS).
+      # It also drives that OS's own fd/handle-leak check for the sustained
+      # churn scenario (`/proc/self/fd` / `lsof` / `GetProcessHandleCount`) and,
+      # on Linux, the direct verification that a group's cgroup directory is
+      # actually removed on drop — see tests/stress/{main,common}.rs.
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:

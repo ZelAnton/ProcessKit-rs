@@ -79,30 +79,43 @@ async fn many_private_groups_at_once() {
     );
 }
 
-/// 3. Sustained spawn→reap churn; assert it stays correct and (on Linux) leaks
-///    no file descriptors.
+/// 3. Sustained spawn→reap churn; assert it stays correct and leaks no
+///    file descriptors/handles — Linux (`/proc/self/fd`), macOS (`lsof`), and
+///    Windows (`GetProcessHandleCount`) each have their own counting
+///    mechanism; a platform where none applies (or the mechanism call itself
+///    fails) skips only the leak assertion, never the churn itself.
 #[tokio::test]
 async fn sustained_spawn_reap_churn_does_not_leak() {
     if skip_unless_enabled("sustained_spawn_reap_churn") {
         return;
     }
-    #[cfg(target_os = "linux")]
-    let before = open_fd_count();
+    // Warm up: the very first spawn lazily initializes some OS/runtime-side
+    // handles (observed on Windows — IOCP, DLL loads, cmd.exe path-resolution
+    // caches) that are then reused for every later spawn — a one-time jump,
+    // not a leak. Take the baseline after that settles so the churn below
+    // measures steady-state growth, not cold-start noise.
+    let warmup = quick_exit().output_string().await.expect("warm up a child");
+    assert!(warmup.is_success());
+    let before = open_handle_count();
 
     for _ in 0..100 {
         let result = quick_exit().output_string().await.expect("run a child");
         assert!(result.is_success());
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        let after = open_fd_count();
-        // A real fd leak grows ~linearly with the 100 spawns; a small slack
-        // absorbs runtime bookkeeping noise.
-        assert!(
-            after <= before + 8,
-            "fd count grew across 100 spawn/reap cycles: {before} -> {after}"
-        );
+    match (before, open_handle_count()) {
+        (Some(before), Some(after)) => {
+            // A real fd/handle leak grows ~linearly with the 100 spawns; a
+            // small slack absorbs runtime bookkeeping noise.
+            assert!(
+                after <= before + 8,
+                "fd/handle count grew across 100 spawn/reap cycles: {before} -> {after}"
+            );
+        }
+        _ => eprintln!(
+            "[stress] sustained_spawn_reap_churn: no fd/handle counting mechanism available on \
+             this platform — skipping the leak assertion (the churn itself still ran)"
+        ),
     }
 }
 
@@ -310,4 +323,75 @@ async fn supervisor_storm_guard_trips_under_real_restarts() {
         "the storm guard must trip under a real restart storm, got {}",
         outcome.storm_pauses
     );
+}
+
+/// 9. The cgroup directory backing a group is actually removed on drop — a
+///    direct filesystem check, not a best-effort claim taken on faith
+///    (Linux only; `sys/linux.rs`'s `Job::drop` best-effort-`rmdir`s it after
+///    draining). Skips (not fails) when cgroup v2 isn't mounted/delegated —
+///    `ProcessGroup::new` then falls back to the POSIX process-group
+///    mechanism and there is no cgroup directory to check.
+#[tokio::test]
+async fn cgroup_directory_is_removed_on_drop() {
+    if skip_unless_enabled("cgroup_directory_is_removed_on_drop") {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use processkit::Mechanism;
+
+        let Some(parent) = own_cgroup_v2_parent() else {
+            eprintln!(
+                "[stress] cgroup_directory_is_removed_on_drop: no cgroup v2 mount found — skipping"
+            );
+            return;
+        };
+        let before = own_processkit_cgroup_dirs(&parent);
+
+        let group = ProcessGroup::new().expect("create group");
+        if group.mechanism() != Mechanism::CgroupV2 {
+            eprintln!(
+                "[stress] cgroup_directory_is_removed_on_drop: mechanism is {:?}, not CgroupV2 \
+                 (no delegation on this runner) — skipping",
+                group.mechanism()
+            );
+            return;
+        }
+        let child = group.start(&quick_exit()).await.expect("start child");
+        let _ = child.wait().await.expect("reap child");
+
+        let after_spawn = own_processkit_cgroup_dirs(&parent);
+        let new_dirs: Vec<_> = after_spawn
+            .into_iter()
+            .filter(|p| !before.contains(p))
+            .collect();
+        assert_eq!(
+            new_dirs.len(),
+            1,
+            "expected exactly one new processkit cgroup dir under {}, found {new_dirs:?}",
+            parent.display()
+        );
+        let cgroup_dir = &new_dirs[0];
+        assert!(
+            cgroup_dir.exists(),
+            "the cgroup dir must exist while the group is alive"
+        );
+
+        drop(group);
+
+        // `Job::drop` synchronously drains the cgroup (bounded ~100ms wait)
+        // before `rmdir`-ing it; give a little extra grace beyond that bound
+        // before failing on a slow CI runner.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while cgroup_dir.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !cgroup_dir.exists(),
+            "cgroup directory {} must be removed on drop, not left behind",
+            cgroup_dir.display()
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    eprintln!("[stress] cgroup_directory_is_removed_on_drop: cgroup v2 is Linux-only — skipping");
 }
