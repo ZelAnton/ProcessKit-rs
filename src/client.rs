@@ -402,11 +402,7 @@ impl<R: ProcessRunner> CliClient<R> {
     /// [`Error::OutputTooLarge`] (a fail-loud buffer truncated the presented
     /// stdout), or [`Error::Stdin`].
     pub async fn run(&self, call: impl IntoCommand<R>) -> Result<String> {
-        let command = call.into_command(self);
-        let result = self.runner.checked(&command).await?;
-        let policy = command.output_buffer_policy();
-        result.reject_if_truncated(policy.max_lines, policy.max_bytes)?;
-        Ok(result.into_stdout().trim_end().to_owned())
+        self.runner.run(&call.into_command(self)).await
     }
 
     /// Run, requiring an accepted exit, and return the full
