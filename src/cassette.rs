@@ -818,6 +818,19 @@ impl<R: ProcessRunner> RecordReplayRunner<R> {
     /// cassette each time); a no-op `Ok` in replay mode. Runs recorded *after*
     /// a save are still covered: the drop-time flush fires whenever anything
     /// was recorded since the last successful save.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the recorded entries cannot be serialized to JSON, or if
+    /// writing the cassette file fails. In replay mode there is nothing to write,
+    /// so it returns `Ok(())`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cassette's internal mutex is poisoned — which happens only
+    /// if a prior operation panicked while holding it. No user code runs under
+    /// this lock, so poisoning is a crate bug, never reachable from any caller
+    /// input.
     pub fn save(&self) -> Result<()> {
         let Mode::Record {
             path,
@@ -891,8 +904,11 @@ impl RecordReplayRunner<JobRunner> {
     /// Load the cassette at `path` and serve its entries hermetically — no
     /// subprocess is ever spawned in replay mode.
     ///
-    /// Errors are [`Error::Io`]: a missing file keeps its `NotFound` kind; a
-    /// corrupt file or an unknown format `version` is `InvalidData`.
+    /// # Errors
+    ///
+    /// Always [`Error::Io`]: a missing file keeps its `NotFound` kind; a corrupt
+    /// file, a contradictory entry, an unknown format `version`, or a cassette
+    /// over the 64 MiB size limit is `InvalidData`.
     pub fn replay(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         const MAX_CASSETTE_BYTES: u64 = 64 << 20; // 64 MiB

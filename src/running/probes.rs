@@ -48,6 +48,15 @@ impl RunningProcess {
     ///   later by the consuming verb ([`finish`](Self::finish)). So a probe can
     ///   never tear the tree down or flip the run's outcome to `TimedOut`,
     ///   matching [`wait_for`](Self::wait_for) / [`wait_for_port`](Self::wait_for_port).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotReady`] when `within` elapses with no matching line, or
+    ///   immediately when stdout closes first (no further line can arrive). This
+    ///   is a *probe* deadline — distinct from [`Error::Timeout`], and a failed
+    ///   probe neither kills the child nor flips its outcome to `TimedOut`.
+    /// - [`Error::Io`] when stdout was not piped, or a prior streaming verb
+    ///   already consumed it (so no line stream can be drained).
     pub async fn wait_for_line(
         &mut self,
         predicate: impl Fn(&str) -> bool + Send,
@@ -96,6 +105,13 @@ impl RunningProcess {
     /// that owns the handle), not only `.await`ed in place. The future still
     /// borrows `&mut self`, so spawning it standalone means moving the owned
     /// [`RunningProcess`] into the surrounding `async` block to make it `'static`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotReady`] when `within` elapses before `check` returns `true`,
+    /// or immediately when the child exits first (a dead process never becomes
+    /// ready). This is a *probe* deadline — distinct from [`Error::Timeout`]: a
+    /// failed probe does not kill the child or touch its outcome.
     pub async fn wait_for<F, Fut>(&mut self, check: F, within: Duration) -> Result<()>
     where
         F: FnMut() -> Fut + Send,
@@ -112,6 +128,13 @@ impl RunningProcess {
     /// stalled connect can't overrun the deadline); the probe connection is
     /// dropped as soon as it succeeds. Doesn't touch the child's pipes; a
     /// failed probe does not kill the child.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotReady`] when `within` elapses before a connection to `addr` is
+    /// accepted, or immediately when the child exits first. This is a *probe*
+    /// deadline — distinct from [`Error::Timeout`]: a failed probe does not kill
+    /// the child or touch its outcome.
     pub async fn wait_for_port(&mut self, addr: SocketAddr, within: Duration) -> Result<()> {
         // Clamp so a `Duration::MAX`-ish `within` can't overflow the deadline.
         let deadline = Instant::now() + within.min(crate::MAX_DEADLINE);

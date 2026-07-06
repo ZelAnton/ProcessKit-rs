@@ -1466,6 +1466,30 @@ impl Command {
     /// private group. Use this for streaming stdout
     /// ([`RunningProcess::stdout_lines`]) or inspecting the process while it
     /// runs; keep the handle in scope, as dropping it tears the tree down.
+    ///
+    /// # Errors
+    ///
+    /// The launch surface shared by every run verb on `Command`:
+    ///
+    /// - [`Error::NotFound`] — the program could not be located (not installed,
+    ///   not on `PATH`, or the given path does not resolve to an executable).
+    /// - [`Error::Spawn`] — the program was located but the OS refused to start
+    ///   it (permission denied, a missing or non-directory working directory, a
+    ///   Windows `.cmd`/`.bat` that needs `cmd.exe`, …).
+    /// - [`Error::Unsupported`] — a requested POSIX-only primitive (running as
+    ///   another user/group, a new session via `setsid`, or a `umask`) is not
+    ///   available on this platform.
+    /// - [`Error::Cancelled`] — the [`cancel_on`](Self::cancel_on) token was
+    ///   already cancelled before the spawn.
+    /// - [`Error::Io`] — the private [`ProcessGroup`](crate::ProcessGroup) backing
+    ///   the run could not be created, or a one-shot streaming stdin source
+    ///   ([`Stdin::from_reader`](crate::Stdin::from_reader) /
+    ///   [`Stdin::from_lines`](crate::Stdin::from_lines)) was already consumed by
+    ///   a previous run.
+    #[cfg_attr(
+        feature = "limits",
+        doc = "- [`Error::ResourceLimit`](crate::Error::ResourceLimit) — a resource cap configured on the run's group could not be enforced."
+    )]
     pub async fn start(&self) -> Result<RunningProcess> {
         JobRunner::new().start(self).await
     }
@@ -1475,11 +1499,29 @@ impl Command {
     /// Run to completion and capture stdout as text, stderr, and the exit code.
     /// A non-zero exit is reported, not raised — call
     /// [`ProcessResult::ensure_success`] to turn it into an error.
+    ///
+    /// # Errors
+    ///
+    /// The launch failures listed on [`start`](Self::start). A non-zero exit, a
+    /// timeout, and a signal-kill are *captured* in the returned
+    /// [`ProcessResult`] rather than raised (call
+    /// [`ensure_success`](crate::ProcessResult::ensure_success) to promote them);
+    /// beyond launch, only [`Error::Cancelled`] (a cancellation is always
+    /// raised), [`Error::OutputTooLarge`] (a fail-loud buffer overflowed),
+    /// [`Error::Stdin`] (a non-broken-pipe stdin failure on an
+    /// otherwise-successful run), and [`Error::Io`] surface.
     pub async fn output_string(&self) -> Result<ProcessResult<String>> {
         JobRunner::new().start(self).await?.output_string().await
     }
 
     /// Run to completion and capture stdout as raw bytes (plus stderr/exit code).
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`output_string`](Self::output_string) — a non-zero exit, a
+    /// timeout, or a signal-kill is captured in the [`ProcessResult`], not raised
+    /// — except that a fail-loud [`Error::OutputTooLarge`] applies to the raw
+    /// stdout *byte* ceiling.
     pub async fn output_bytes(&self) -> Result<ProcessResult<Vec<u8>>> {
         JobRunner::new().start(self).await?.output_bytes().await
     }
@@ -1490,6 +1532,13 @@ impl Command {
     /// [`Error::Signalled`](crate::Error::Signalled) — consistent with
     /// [`ProcessRunnerExt::exit_code`](crate::ProcessRunnerExt::exit_code) and
     /// [`CliClient::exit_code`](crate::CliClient::exit_code).
+    ///
+    /// # Errors
+    ///
+    /// The launch failures listed on [`start`](Self::start), plus — when the run
+    /// produced no code — [`Error::Timeout`] (the deadline elapsed),
+    /// [`Error::Signalled`] (killed by a signal), or [`Error::Cancelled`]. A
+    /// non-zero exit is returned as the code, not raised.
     pub async fn exit_code(&self) -> Result<i32> {
         JobRunner::new().exit_code(self).await
     }
@@ -1497,6 +1546,17 @@ impl Command {
     /// Run to completion, requiring an **accepted** exit (`0` by default, widened
     /// by [`ok_codes`](Self::ok_codes)), and return trimmed stdout. Any other
     /// code is [`Error::Exit`](crate::Error::Exit).
+    ///
+    /// # Errors
+    ///
+    /// The launch failures listed on [`start`](Self::start), plus the
+    /// success-checking failures: [`Error::Exit`] (a non-accepted exit code),
+    /// [`Error::Signalled`] (a signal-kill), [`Error::Timeout`] (the deadline
+    /// elapsed — *raised* here, unlike on
+    /// [`output_string`](Self::output_string)), [`Error::Cancelled`],
+    /// [`Error::OutputTooLarge`] (a fail-loud buffer truncated the presented
+    /// stdout), and [`Error::Stdin`] (a non-broken-pipe stdin failure on an
+    /// otherwise-successful run).
     pub async fn run(&self) -> Result<String> {
         JobRunner::new().run(self).await
     }
@@ -1507,6 +1567,16 @@ impl Command {
     /// ([`run`](Self::run)) or the raw result ([`output_string`](Self::output_string)).
     /// Consistent with [`ProcessRunnerExt::checked`](crate::ProcessRunnerExt::checked)
     /// and [`CliClient::checked`](crate::CliClient::checked).
+    ///
+    /// # Errors
+    ///
+    /// The same success-checking surface as [`run`](Self::run) —
+    /// [`Error::Exit`] / [`Error::Signalled`] / [`Error::Timeout`] /
+    /// [`Error::Cancelled`] / [`Error::Stdin`], atop the launch failures on
+    /// [`start`](Self::start) — except that, as the lenient building block,
+    /// `checked` does **not** fail loud on a bounded-buffer truncation (inspect
+    /// [`ProcessResult::truncated`](crate::ProcessResult::truncated) yourself), so
+    /// it never returns [`Error::OutputTooLarge`].
     pub async fn checked(&self) -> Result<ProcessResult<String>> {
         JobRunner::new().checked(self).await
     }
@@ -1515,6 +1585,13 @@ impl Command {
     /// [`ok_codes`](Self::ok_codes)) and discard the output. Consistent with
     /// [`ProcessRunnerExt::run_unit`](crate::ProcessRunnerExt::run_unit) and
     /// [`CliClient::run_unit`](crate::CliClient::run_unit).
+    ///
+    /// # Errors
+    ///
+    /// The same surface as [`checked`](Self::checked) (the launch failures on
+    /// [`start`](Self::start) plus [`Error::Exit`] / [`Error::Signalled`] /
+    /// [`Error::Timeout`] / [`Error::Cancelled`] / [`Error::Stdin`]); only the
+    /// captured output is discarded.
     pub async fn run_unit(&self) -> Result<()> {
         JobRunner::new().run_unit(self).await
     }
@@ -1525,6 +1602,14 @@ impl Command {
     /// a signal-kill as [`Error::Signalled`](crate::Error::Signalled)). For tools
     /// whose exit code *is* the answer —
     /// `git diff --quiet`, `git show-ref --verify --quiet`, `grep -q`, …
+    ///
+    /// # Errors
+    ///
+    /// Any exit code other than `0`/`1` becomes [`Error::Exit`], and — atop the
+    /// launch failures on [`start`](Self::start) — a run that produced no code
+    /// errors as [`Error::Timeout`], [`Error::Signalled`], or
+    /// [`Error::Cancelled`]. The strict `0`/`1` contract holds regardless of the
+    /// command's [`ok_codes`](Self::ok_codes).
     pub async fn probe(&self) -> Result<bool> {
         JobRunner::new().probe(self).await
     }
@@ -1534,6 +1619,14 @@ impl Command {
     /// truncation so the parser never sees a clipped tail. Consistent with
     /// [`ProcessRunnerExt::parse`](crate::ProcessRunnerExt::parse) and
     /// [`CliClient::parse`](crate::CliClient::parse).
+    ///
+    /// # Errors
+    ///
+    /// The success-checking surface of [`run`](Self::run) (the launch failures on
+    /// [`start`](Self::start), plus [`Error::Exit`] / [`Error::Signalled`] /
+    /// [`Error::Timeout`] / [`Error::Cancelled`] / [`Error::Stdin`]), plus
+    /// [`Error::OutputTooLarge`] when a fail-loud buffer truncated the stdout the
+    /// parser would see. The `parse` closure is infallible, so it adds no error.
     pub async fn parse<T, F>(&self, parse: F) -> Result<T>
     where
         T: Send,
@@ -1548,6 +1641,12 @@ impl Command {
     /// Fails loud on truncation. Consistent with
     /// [`ProcessRunnerExt::try_parse`](crate::ProcessRunnerExt::try_parse) and
     /// [`CliClient::try_parse`](crate::CliClient::try_parse).
+    ///
+    /// # Errors
+    ///
+    /// Everything [`parse`](Self::parse) can return, plus whatever the fallible
+    /// `parse` closure yields on malformed output — typically
+    /// [`Error::Parse`](crate::Error::Parse).
     pub async fn try_parse<T, F>(&self, parse: F) -> Result<T>
     where
         T: Send,
@@ -1558,6 +1657,14 @@ impl Command {
 
     /// Return the first stdout line matching `predicate` (or the first line when
     /// the predicate is trivial), then tear the process down.
+    ///
+    /// # Errors
+    ///
+    /// The launch failures listed on [`start`](Self::start), plus
+    /// [`Error::Timeout`] when a [`timeout`](Self::timeout) is set and its
+    /// deadline elapses mid-stream (which tears the process down),
+    /// [`Error::Cancelled`], or [`Error::Io`] while streaming. A stream that ends
+    /// with no match is `Ok(None)`, not an error.
     pub async fn first_line<F>(&self, predicate: F) -> Result<Option<String>>
     where
         F: Fn(&str) -> bool + Send,

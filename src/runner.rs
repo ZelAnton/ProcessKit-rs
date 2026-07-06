@@ -500,6 +500,21 @@ impl JobRunner {
 
     /// Start `command` and return a live handle, backed by a fresh private
     /// group the handle owns. Use this for streaming or incremental stdin.
+    ///
+    /// # Errors
+    ///
+    /// The full launch surface: [`Error::NotFound`](crate::Error::NotFound) or
+    /// [`Error::Spawn`](crate::Error::Spawn) (the program could not be located or
+    /// started), [`Error::Unsupported`](crate::Error::Unsupported) (a POSIX-only
+    /// primitive — user/group switch, `setsid`, umask — unavailable on this
+    /// platform), [`Error::Cancelled`](crate::Error::Cancelled) (the command's
+    /// token was already cancelled), or [`Error::Io`](crate::Error::Io) (the
+    /// private [`ProcessGroup`] could not be created, or a one-shot streaming
+    /// stdin source was already consumed by a previous run).
+    #[cfg_attr(
+        feature = "limits",
+        doc = "A resource cap on the new group that cannot be enforced is [`Error::ResourceLimit`](crate::Error::ResourceLimit)."
+    )]
     pub async fn start(&self, command: &Command) -> Result<RunningProcess> {
         let group = ProcessGroup::new()?;
         let mut process = launch(&group, command).await?;
@@ -523,6 +538,17 @@ impl ProcessGroup {
     /// Start `command` as a member of this (shared) group and return a live
     /// handle. The handle does **not** own the group, so dropping it leaves the
     /// group and any sibling processes intact — the caller controls teardown.
+    ///
+    /// # Errors
+    ///
+    /// The launch surface: [`Error::NotFound`](crate::Error::NotFound) /
+    /// [`Error::Spawn`](crate::Error::Spawn) (locate/start failure),
+    /// [`Error::Unsupported`](crate::Error::Unsupported) (a POSIX-only primitive
+    /// unavailable on this platform),
+    /// [`Error::Cancelled`](crate::Error::Cancelled) (a pre-cancelled token), or
+    /// [`Error::Io`](crate::Error::Io) (e.g. a one-shot stdin source already
+    /// consumed). Unlike [`JobRunner::start`], no new group is created here — the
+    /// child joins this existing group.
     pub async fn start(&self, command: &Command) -> Result<RunningProcess> {
         launch(self, command).await
     }

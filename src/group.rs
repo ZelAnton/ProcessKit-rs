@@ -133,19 +133,31 @@ impl std::fmt::Debug for ProcessGroup {
 
 impl ProcessGroup {
     /// Create an empty group with [default options](ProcessGroupOptions).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the OS rejects creating the group's containment primitive
+    /// (a Job Object on Windows, a cgroup on Linux). The default options set no
+    /// resource caps, so no limit-enforcement failure can arise.
     pub fn new() -> Result<Self> {
         Self::with_options(ProcessGroupOptions::default())
     }
 
     /// Create an empty group with the given options.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the OS rejects creating the group's containment primitive.
     #[cfg_attr(
         feature = "limits",
         doc = "",
-        doc = "If `options.limits` sets any cap, it is enforced now. When the active",
-        doc = "mechanism can't honor a requested limit (no cgroup/Job Object, or a Linux",
-        doc = "cgroup whose controllers can't be enabled — see [`ResourceLimits`] for the",
-        doc = "cgroup-v2 real-root requirement) this returns [`Error::ResourceLimit`]",
-        doc = "rather than handing back an unbounded group."
+        doc = "With the `limits` feature, if `options.limits` sets any cap it is enforced",
+        doc = "now. When the active mechanism can't honor a requested limit (no",
+        doc = "cgroup/Job Object, or a Linux cgroup whose controllers can't be enabled —",
+        doc = "see [`ResourceLimits`] for the cgroup-v2 real-root requirement) this",
+        doc = "returns [`Error::ResourceLimit`] — rather than handing back an unbounded",
+        doc = "group — and an invalid cap value returns it too, with",
+        doc = "[`LimitReason::Invalid`](crate::LimitReason::Invalid)."
     )]
     pub fn with_options(options: ProcessGroupOptions) -> Result<Self> {
         #[cfg(feature = "limits")]
@@ -211,6 +223,13 @@ impl ProcessGroup {
     /// build a fresh `Command` per spawn. (The crate's own run helpers
     /// already rebuild the OS command per run, so this only ever concerned direct
     /// `spawn` callers.)
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Spawn`] if the OS refuses to start `cmd` — the working directory
+    /// is bad, permission is denied, and so on. (This raw path reports every
+    /// launch failure as [`Error::Spawn`]; the `Command`-driven run helpers, by
+    /// contrast, translate a not-found program into [`Error::NotFound`].)
     pub fn spawn(&self, mut cmd: Command) -> Result<Child> {
         self.spawn_with_options(&mut cmd, &crate::sys::SpawnOptions::default())
     }
@@ -258,6 +277,12 @@ impl ProcessGroup {
     /// left to contain — while an **already-reaped** child (one that was
     /// `wait`ed, so its handle/pid is gone) errors, since there is no longer
     /// anything to reference.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if `child` has already been reaped (awaited), leaving no
+    /// live handle/pid to reference. Adopting an exited-but-unreaped child is a
+    /// successful no-op.
     #[cfg(feature = "process-control")]
     pub fn adopt(&self, child: &Child) -> Result<()> {
         self.job.adopt(child).map_err(Error::Io)?;
@@ -295,6 +320,14 @@ impl ProcessGroup {
     /// A privileged child under the process-group mechanism can therefore outlive
     /// `kill_all` — the atomic mechanisms (`cgroup.kill`, Job Object) have no such
     /// gap.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`], only on the legacy per-pid kill fallback (a pre-5.14 Linux
+    /// kernel without `cgroup.kill`), when the tree won't drain within the
+    /// bounded sweep. The atomic backends (`cgroup.kill`, Windows Job Object)
+    /// never fail here, and a setuid member that rejects `SIGKILL` under the
+    /// process-group mechanism is deliberately *not* reported (see above).
     pub fn kill_all(&self) -> Result<()> {
         #[cfg(feature = "tracing")]
         tracing::debug!(
@@ -323,6 +356,12 @@ impl ProcessGroup {
     /// on every backend (`cgroup.kill` / `killpg` / Job Object terminate), so it
     /// cannot miss a process forked mid-broadcast. Other signals are a per-member
     /// broadcast.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] on Windows for any signal other than
+    /// [`Signal::Kill`] (Job Objects have no POSIX signals); otherwise
+    /// [`Error::Io`] if the OS rejects delivering the signal to the tree.
     #[cfg(feature = "process-control")]
     pub fn signal(&self, sig: Signal) -> Result<()> {
         self.job
@@ -379,6 +418,11 @@ impl ProcessGroup {
     /// shutdown is a prompt hard kill regardless — there's no soft-signal tier and
     /// no grace wait — so a suspended group is torn down at once, not after the
     /// timeout.)
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] if the active mechanism cannot freeze the tree;
+    /// otherwise [`Error::Io`] if the OS rejects the freeze / `SIGSTOP`.
     #[cfg(feature = "process-control")]
     pub fn suspend(&self) -> Result<()> {
         self.job
@@ -390,6 +434,11 @@ impl ProcessGroup {
     ///
     /// See [`suspend`](Self::suspend) for the platform matrix and the Windows
     /// suspend-count nesting caveat.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] if the active mechanism cannot thaw the tree;
+    /// otherwise [`Error::Io`] if the OS rejects the resume / `SIGCONT`.
     #[cfg(feature = "process-control")]
     pub fn resume(&self) -> Result<()> {
         self.job
@@ -414,6 +463,11 @@ impl ProcessGroup {
     ///   but not enumerated. An exited child still counts as a member until it
     ///   is reaped (awaited): the liveness probe sees the not-yet-collected
     ///   process.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the group's membership cannot be read (e.g. a failed
+    /// `cgroup.procs` read or Job Object query).
     #[cfg(feature = "process-control")]
     pub fn members(&self) -> Result<Vec<u32>> {
         let pids = self.job.members().map_err(Error::Io)?;
@@ -447,6 +501,13 @@ impl ProcessGroup {
     /// Holding the group behind a shared handle (an `Arc`, a long-lived
     /// supervisor) that can't be moved out by value? Use the borrowing twin
     /// [`shutdown_ref`](Self::shutdown_ref) — same teardown, `&self`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the graceful teardown fails — including the same
+    /// undrained-tree failure as [`kill_all`](Self::kill_all) on the legacy
+    /// pre-5.14 per-pid fallback, when `escalate_to_kill` performs the final hard
+    /// kill.
     pub async fn shutdown(self) -> Result<()> {
         self.shutdown_ref().await
     }
@@ -471,6 +532,12 @@ impl ProcessGroup {
     /// The same reaping caveat as [`shutdown`](Self::shutdown) applies on the
     /// POSIX process-group mechanism: await each child you started into the group,
     /// or an unreaped zombie reads as alive for the whole grace.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the graceful teardown fails (see
+    /// [`shutdown`](Self::shutdown) — the same undrained-tree failure on the
+    /// legacy per-pid fallback applies).
     pub async fn shutdown_ref(&self) -> Result<()> {
         #[cfg(feature = "tracing")]
         tracing::debug!(
@@ -507,6 +574,10 @@ impl ProcessGroup {
     /// Snapshot the group's resource usage (active process count and, where the
     /// platform supports it, total CPU time and peak memory). See
     /// [`ProcessGroupStats`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the platform's resource query fails.
     #[cfg(feature = "stats")]
     pub fn stats(&self) -> Result<ProcessGroupStats> {
         let stats = self.job.stats().map_err(Error::Io)?;

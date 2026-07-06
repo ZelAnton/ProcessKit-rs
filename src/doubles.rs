@@ -980,11 +980,23 @@ impl<R: ProcessRunner> RecordingRunner<R> {
     }
 
     /// A snapshot of every recorded invocation, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the recorder's internal mutex is poisoned — which happens only
+    /// if a prior recording panicked while holding it (a crate bug), never from
+    /// any caller input.
     pub fn calls(&self) -> Vec<Invocation> {
         self.calls.lock().expect("recorder lock poisoned").clone()
     }
 
     /// The single recorded invocation; panics unless exactly one was made.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless **exactly one** invocation was recorded (zero or several is
+    /// a test-assertion failure). Also panics if the recorder's mutex is poisoned
+    /// (see [`calls`](Self::calls)).
     pub fn only_call(&self) -> Invocation {
         let calls = self.calls();
         assert_eq!(
@@ -1101,11 +1113,23 @@ impl DryRunRunner {
     /// The rendered command line for every call so far, in order — each
     /// produced by [`Command::command_line`], the same display quoting a
     /// caller would reach for by hand.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the recorder's internal mutex is poisoned — which happens only
+    /// if a prior recording panicked while holding it (a crate bug), never from
+    /// any caller input.
     pub fn commands(&self) -> Vec<String> {
         self.commands.lock().expect("dry-run lock poisoned").clone()
     }
 
     /// The single rendered command line; panics unless exactly one call was made.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless **exactly one** call was recorded (zero or several is a
+    /// test-assertion failure). Also panics if the recorder's mutex is poisoned
+    /// (see [`commands`](Self::commands)).
     pub fn only_command(&self) -> String {
         let commands = self.commands();
         assert_eq!(

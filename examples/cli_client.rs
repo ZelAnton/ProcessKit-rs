@@ -13,6 +13,11 @@ cli_client!(
 
 impl<R: ProcessRunner> Git<R> {
     /// The current branch name (`git branch --show-current`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any failure from running `git` — the tool not being found, a
+    /// non-zero exit, or a timeout — as the crate's [`Error`](processkit::Error).
     pub async fn current_branch(&self) -> Result<String> {
         self.core
             .run(self.core.command(["branch", "--show-current"]))
@@ -20,6 +25,12 @@ impl<R: ProcessRunner> Git<R> {
     }
 
     /// Whether the working tree is clean (`git diff --quiet` → exit 0).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any failure from running `git diff --quiet` other than the
+    /// `0`/`1` exit that encodes the answer (e.g. `git` not found, or a timeout)
+    /// as the crate's [`Error`](processkit::Error).
     pub async fn is_clean(&self) -> Result<bool> {
         self.core
             .probe(self.core.command(["diff", "--quiet"]))

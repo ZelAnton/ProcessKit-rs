@@ -76,6 +76,16 @@ unsafe_op_in_unsafe_fn = "deny"
 # build failure on every normal `cargo build`/`clippy`) does not fire on it.
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
+# The most valuable pedantic-clippy slice for an error-rich crate (Rust API
+# Guidelines C-FAILURE): every public fallible method must document its error
+# conditions and every public method that can panic must document when. warn
+# here, hard error under CI's `-D warnings`. The crate's error invariants
+# (Timeout captured vs Cancelled raised, NotReady ≠ Timeout) live in the guides;
+# these lints force them into the per-item rustdoc docs.rs shows first.
+[lints.clippy]
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+
 # ---------------------------------------------------------------------------
 # Dependencies — every entry carries a "why" (see AGENTS.md "Dependency
 # management"). Pin major versions, enable only the features used, keep

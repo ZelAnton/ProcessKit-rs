@@ -184,6 +184,19 @@ impl Pipeline {
     /// failing stage is **not** an `Err` here — it is reported in the result
     /// (pipefail attribution, see the type docs); `Err` means a stage could not
     /// be started or driven at all.
+    ///
+    /// # Errors
+    ///
+    /// A failing stage (and a timeout) is *captured* in the returned
+    /// [`ProcessResult`] (pipefail attribution), not raised. `Err` means a stage
+    /// could not be *started or driven*: a launch failure
+    /// ([`Error::NotFound`](crate::Error::NotFound) /
+    /// [`Error::Spawn`](crate::Error::Spawn) /
+    /// [`Error::Unsupported`](crate::Error::Unsupported)),
+    /// [`Error::Cancelled`](crate::Error::Cancelled),
+    /// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge) (a fail-loud
+    /// overflow of the last stage), [`Error::Stdin`](crate::Error::Stdin), or
+    /// [`Error::Io`](crate::Error::Io).
     pub async fn output_string(&self) -> Result<ProcessResult<String>> {
         self.capture(|last| async move { last.output_string().await })
             .await
@@ -194,6 +207,12 @@ impl Pipeline {
     /// — e.g. `curl … | gunzip`). Pipefail attribution is identical; only the
     /// last stage's stdout is captured raw. Stderr (every stage, including the
     /// last) stays decoded text — it is diagnostics, never the binary payload.
+    ///
+    /// # Errors
+    ///
+    /// The same surface as [`output_string`](Self::output_string) — a failing
+    /// stage (and a timeout) is captured, not raised — with the last stage's
+    /// stdout captured as raw bytes.
     pub async fn output_bytes(&self) -> Result<ProcessResult<Vec<u8>>> {
         self.capture(|last| async move { last.output_bytes().await })
             .await
@@ -397,6 +416,18 @@ impl Pipeline {
     /// [`timeout`](Self::timeout) or by **any** stage's own
     /// [`Command::timeout`] — the attributed stage's *own* deadline is reported,
     /// not the chain's.
+    ///
+    /// # Errors
+    ///
+    /// The first failing stage's [`Error::Exit`](crate::Error::Exit) (pipefail
+    /// attribution; [`unchecked_in_pipe`](Command::unchecked_in_pipe) stages are
+    /// exempt), [`Error::Signalled`](crate::Error::Signalled),
+    /// [`Error::Timeout`](crate::Error::Timeout) (the whole-chain
+    /// [`timeout`](Self::timeout) or any stage's own — the attributed stage's
+    /// deadline is reported), [`Error::Cancelled`](crate::Error::Cancelled),
+    /// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge) (a fail-loud
+    /// truncation of the last stage), plus any launch failure or
+    /// [`Error::Stdin`](crate::Error::Stdin).
     pub async fn run(&self) -> Result<String> {
         let out = self.checked().await?;
         self.reject_if_last_truncated(&out)?;
@@ -408,12 +439,27 @@ impl Pipeline {
     /// building block when you need the whole result after success-checking,
     /// rather than trimmed stdout ([`run`](Self::run)). Mirrors
     /// [`Command::checked`](crate::Command::checked).
+    ///
+    /// # Errors
+    ///
+    /// The same pipefail surface as [`run`](Self::run) —
+    /// [`Error::Exit`](crate::Error::Exit) /
+    /// [`Error::Signalled`](crate::Error::Signalled) /
+    /// [`Error::Timeout`](crate::Error::Timeout) /
+    /// [`Error::Cancelled`](crate::Error::Cancelled), plus launch failures and
+    /// [`Error::Stdin`](crate::Error::Stdin) — but, as the lenient building block,
+    /// it does not fail loud on a bounded-buffer truncation.
     pub async fn checked(&self) -> Result<ProcessResult<String>> {
         self.output_string().await?.ensure_success()
     }
 
     /// Run the chain for its side effect: require a clean pipefail outcome and
     /// discard the output. Mirrors [`Command::run_unit`](crate::Command::run_unit).
+    ///
+    /// # Errors
+    ///
+    /// The same surface as [`checked`](Self::checked); only the captured output
+    /// is discarded.
     pub async fn run_unit(&self) -> Result<()> {
         self.output_string().await?.ensure_success().map(drop)
     }
@@ -423,6 +469,14 @@ impl Pipeline {
     /// [`Error::Timeout`](crate::Error::Timeout), a signal-kill as
     /// [`Error::Signalled`](crate::Error::Signalled) — mirroring
     /// [`Command::exit_code`](crate::Command::exit_code).
+    ///
+    /// # Errors
+    ///
+    /// A chain that produced no code errors as
+    /// [`Error::Timeout`](crate::Error::Timeout) (whole-chain or stage),
+    /// [`Error::Signalled`](crate::Error::Signalled), or
+    /// [`Error::Cancelled`](crate::Error::Cancelled), atop any launch failure. A
+    /// non-zero pipefail code is returned, not raised.
     pub async fn exit_code(&self) -> Result<i32> {
         self.output_string().await?.require_code()
     }
@@ -441,6 +495,14 @@ impl Pipeline {
     /// stage's verdict should decide the boolean, mark the earlier stages
     /// [`unchecked_in_pipe`](Command::unchecked_in_pipe) so they never speak for
     /// the chain.
+    ///
+    /// # Errors
+    ///
+    /// A pipefail code other than `0`/`1` becomes
+    /// [`Error::Exit`](crate::Error::Exit); a chain with no code errors as
+    /// [`Error::Timeout`](crate::Error::Timeout),
+    /// [`Error::Signalled`](crate::Error::Signalled), or
+    /// [`Error::Cancelled`](crate::Error::Cancelled), atop any launch failure.
     pub async fn probe(&self) -> Result<bool> {
         let result = self.output_string().await?;
         match result.code() {
@@ -462,6 +524,18 @@ impl Pipeline {
     /// the closure runs *inline* on the awaiting task (not across a `tokio::spawn`
     /// boundary), so it needs no `Send` bound, accepting strictly more closures
     /// than `Command::parse`.
+    ///
+    /// # Errors
+    ///
+    /// The pipefail surface of [`run`](Self::run) (launch failures,
+    /// [`Error::Exit`](crate::Error::Exit) /
+    /// [`Error::Signalled`](crate::Error::Signalled) /
+    /// [`Error::Timeout`](crate::Error::Timeout) /
+    /// [`Error::Cancelled`](crate::Error::Cancelled) /
+    /// [`Error::Stdin`](crate::Error::Stdin)), plus
+    /// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge) when a fail-loud
+    /// buffer truncated the last stage's stdout. The `parse` closure is
+    /// infallible, so it adds no error.
     pub async fn parse<T, F>(&self, parse: F) -> Result<T>
     where
         F: FnOnce(&str) -> T,
@@ -476,6 +550,12 @@ impl Pipeline {
     /// shape; a failure becomes [`Error::Parse`](crate::Error::Parse) or whatever
     /// the closure returns). Fails loud on truncation. Mirrors
     /// [`Command::try_parse`](crate::Command::try_parse).
+    ///
+    /// # Errors
+    ///
+    /// Everything [`parse`](Self::parse) can return, plus whatever the fallible
+    /// `parse` closure yields on malformed output — typically
+    /// [`Error::Parse`](crate::Error::Parse).
     pub async fn try_parse<T, F>(&self, parse: F) -> Result<T>
     where
         F: FnOnce(&str) -> Result<T>,

@@ -201,6 +201,13 @@ use std::ffi::OsStr;
 /// an [`Error`] on a non-zero exit / spawn failure / timeout. A thin shim over
 /// [`Command`]; use the builder for a working directory, env, stdin, timeout, or
 /// the full verb vocabulary.
+///
+/// # Errors
+///
+/// The same surface as [`Command::run`]: a launch failure ([`Error::NotFound`] /
+/// [`Error::Spawn`] / [`Error::Unsupported`] / [`Error::Io`]), a non-accepted
+/// exit ([`Error::Exit`]), [`Error::Signalled`], [`Error::Timeout`], or
+/// [`Error::OutputTooLarge`] on a fail-loud truncation.
 pub async fn run<I, S>(program: impl AsRef<OsStr>, args: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,
@@ -211,6 +218,13 @@ where
 
 /// Run `program` with `args` inside a private job and capture the result
 /// without erroring on a non-zero exit — for commands whose exit code is meaningful.
+///
+/// # Errors
+///
+/// The same surface as [`Command::output_string`]: a non-zero exit, a timeout,
+/// and a signal-kill are *captured* in the returned [`ProcessResult`], not
+/// raised; beyond a launch failure, only [`Error::Cancelled`],
+/// [`Error::OutputTooLarge`], [`Error::Stdin`], and [`Error::Io`] surface.
 pub async fn output_string<I, S>(
     program: impl AsRef<OsStr>,
     args: I,
@@ -256,6 +270,15 @@ where
 /// `Error::Cancelled` for a cancelled run, or [`Error::Stdin`] when its stdin
 /// source failed (non-broken-pipe) on an otherwise-successful exit. A non-zero
 /// exit or signal is *not* an error here — it is returned as its [`Outcome`].
+///
+/// # Errors
+///
+/// [`Error::Io`] with [`InvalidInput`](std::io::ErrorKind::InvalidInput) when
+/// `processes` is empty. Otherwise the first finisher's error surfaces:
+/// [`Error::Cancelled`] (a cancelled run), [`Error::Stdin`] (a non-broken-pipe
+/// stdin-source failure on an otherwise-successful exit), or [`Error::Io`] (a
+/// failed reap). A non-zero exit or signal is returned as an [`Outcome`], not an
+/// error.
 pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, Outcome)> {
     use std::future::Future;
 
@@ -299,6 +322,21 @@ pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, O
 /// `Error::Cancelled` (cancelled run) or [`Error::Stdin`] (a non-broken-pipe
 /// stdin-source failure on its otherwise-successful exit) likewise short-circuits
 /// the join — like the bulk verbs, these surface as an `Err`, not an `Outcome`.
+///
+/// # Errors
+///
+/// A contender's [`Error::Io`] (a failed reap), [`Error::Cancelled`] (a
+/// cancelled run), or [`Error::Stdin`] (a non-broken-pipe stdin-source failure
+/// on its otherwise-successful exit) short-circuits the join; the remaining
+/// processes stay waitable (cancel-safe). A non-zero exit or signal is returned
+/// as an [`Outcome`], not an error. An empty slice resolves to an empty `Vec`.
+///
+/// # Panics
+///
+/// Does not panic on any caller input: the final collection step carries an
+/// internal consistency assertion (every outcome slot is filled once all
+/// contenders have exited, an invariant the join loop maintains). It is
+/// documented only because that assertion is a hard `expect`.
 pub async fn wait_all(processes: &mut [&mut RunningProcess]) -> Result<Vec<Outcome>> {
     use std::future::Future;
     use std::task::Poll;

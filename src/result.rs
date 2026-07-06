@@ -275,14 +275,21 @@ impl<T> ProcessResult<T> {
         matches!(self.outcome, Outcome::Exited(code) if self.ok_codes.contains(&code))
     }
 
-    /// Return `self` unchanged when the run succeeded, otherwise the matching
-    /// error: [`Error::Timeout`] if the run was killed by its deadline (checked
-    /// first), [`Error::Signalled`](crate::Error::Signalled) if it was terminated
-    /// by a signal (no exit code), else [`Error::Exit`] for an exit code outside
-    /// the accepted set (code `0` by default — see
-    /// [`Command::ok_codes`](crate::Command::ok_codes)), carrying the code and
-    /// both captured streams in full (the [`Display`](std::fmt::Display) impl
-    /// bounds what it prints; the fields stay complete for classification).
+    /// Return `self` unchanged when the run succeeded — an **accepted** exit code
+    /// (`0` by default; see [`Command::ok_codes`](crate::Command::ok_codes)) —
+    /// otherwise the matching error.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Timeout`] if the run was killed by its deadline (checked
+    ///   *first*, so a run that both timed out and exited non-zero reports the
+    ///   timeout).
+    /// - [`Error::Signalled`](crate::Error::Signalled) if it was terminated by a
+    ///   signal, with no exit code.
+    /// - [`Error::Exit`] for an exit code outside the accepted set, carrying the
+    ///   code and both captured streams in full (the
+    ///   [`Display`](std::fmt::Display) impl bounds what it prints; the fields
+    ///   stay complete for classification).
     pub fn ensure_success(self) -> Result<Self, Error>
     where
         T: StdoutText,
