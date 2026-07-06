@@ -345,10 +345,12 @@ pub async fn wait_all(processes: &mut [&mut RunningProcess]) -> Result<Vec<Outco
 /// Test doubles for the [`ProcessRunner`] seam: a
 /// [`ScriptedRunner`](testing::ScriptedRunner) that serves canned replies, a
 /// [`RecordingRunner`](testing::RecordingRunner) that asserts on invocations,
-/// the [`Invocation`](testing::Invocation) it captures, and (behind features)
-/// record/replay cassettes and a `mockall` mock.
+/// the [`Invocation`](testing::Invocation) it captures, a
+/// [`DryRunRunner`](testing::DryRunRunner) that renders and echoes commands
+/// without spawning them, and (behind features) record/replay cassettes and a
+/// `mockall` mock.
 pub mod testing {
-    pub use crate::doubles::{Invocation, RecordingRunner, Reply, ScriptedRunner};
+    pub use crate::doubles::{DryRunRunner, Invocation, RecordingRunner, Reply, ScriptedRunner};
 
     /// Record/replay cassette runner (enabled by the `record` feature).
     #[cfg(feature = "record")]
