@@ -45,6 +45,7 @@ every per-OS caveat in one place.
 | [Testing your code](testing.md) | The `ProcessRunner` seam — bulk **and** streaming: `ScriptedRunner` (incl. scripted `start()` with canned, paced lines), `RecordingRunner`, `MockRunner`, record/replay cassettes, and building hermetically-testable CLI wrappers with `CliClient` |
 | [Platform support](platform-support.md) | The containment mechanisms, every per-feature support matrix in one place, and the platform caveats worth knowing before you ship |
 | [Upgrading](upgrading.md) | Per-version consumer upgrade notes — what changed on each release and the exact change to make across a major bump |
+| [Migrating 1.2 → 2.1](migrating-1.2-to-2.1.md) | Mechanical bump checklist for a consuming project: detection greps, find→replace table, the one non-compiler-caught behavior change, and the new opt-in capabilities |
 
 ## Feature flags
 
