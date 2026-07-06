@@ -12,7 +12,16 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- `Error::{spawn, not_found, stdin}` — the remaining `#[doc(hidden)]` insulated
+  constructors for the `#[non_exhaustive]` data-bearing variants that didn't get
+  one alongside `Error::{exit, timeout, signalled}` in 2.1.0: `Spawn` and `Stdin`
+  carry a `std::io::Error` and there is deliberately no `From<std::io::Error>`, so
+  without a constructor a custom `ProcessRunner` double or cassette replay outside
+  this crate could not build them at all. `Error::parse(program, message) ->
+  Error::Parse` is added too, left **on the documented public surface** (not
+  `#[doc(hidden)]`) since building an `Error::Parse` from a caller's own output
+  parser — outside this crate's `try_parse` helpers — is a normal production path,
+  not just a test-doubling convenience.
 
 ### Changed
 -

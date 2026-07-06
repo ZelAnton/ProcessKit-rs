@@ -816,6 +816,48 @@ impl Error {
             stdout_bytes: None,
         }
     }
+
+    /// Construct a [`Spawn`](Error::Spawn) — see [`exit`](Self::exit).
+    #[doc(hidden)]
+    pub fn spawn(program: impl Into<String>, source: std::io::Error) -> Self {
+        Error::Spawn {
+            program: program.into(),
+            source,
+        }
+    }
+
+    /// Construct a [`NotFound`](Error::NotFound) — see [`exit`](Self::exit).
+    #[doc(hidden)]
+    pub fn not_found(program: impl Into<String>, searched: Option<String>) -> Self {
+        Error::NotFound {
+            program: program.into(),
+            searched,
+        }
+    }
+
+    /// Construct a [`Stdin`](Error::Stdin) — see [`exit`](Self::exit).
+    #[doc(hidden)]
+    pub fn stdin(program: impl Into<String>, source: std::io::Error) -> Self {
+        Error::Stdin {
+            program: program.into(),
+            source,
+        }
+    }
+
+    /// Construct a [`Parse`](Error::Parse) from a caller-supplied parser's own
+    /// failure message. Unlike `exit`/`timeout`/`signalled`/`spawn`/`not_found`/
+    /// `stdin` above (`#[doc(hidden)]` insulated constructors meant for test
+    /// doubles), this one is left on the **documented public surface**: an
+    /// external parser that inspects a tool's output outside this crate's own
+    /// `try_parse` helpers has no other way to report a parse failure as an
+    /// `Error::Parse` once the variant is `#[non_exhaustive]`, and that path is
+    /// a normal production use, not just a test-doubling convenience.
+    pub fn parse(program: impl Into<String>, message: impl Into<String>) -> Self {
+        Error::Parse {
+            program: program.into(),
+            message: message.into(),
+        }
+    }
 }
 
 /// Manual `Debug`: bounds the [`Exit`](Error::Exit) streams and redacts
@@ -1989,5 +2031,40 @@ mod tests {
             !timeout.is_transient(),
             "Timeout is excluded from is_transient by design"
         );
+    }
+
+    #[test]
+    fn spawn_not_found_stdin_and_parse_constructors_build_the_expected_variant() {
+        let spawn = Error::spawn("git", std::io::Error::from_raw_os_error(2));
+        match spawn {
+            Error::Spawn { program, source } => {
+                assert_eq!(program, "git");
+                assert_eq!(source.raw_os_error(), Some(2));
+            }
+            other => panic!("expected Error::Spawn, got {other:?}"),
+        }
+
+        let not_found = Error::not_found("my-tool", Some("/usr/bin".into()));
+        assert!(matches!(
+            &not_found,
+            Error::NotFound { program, searched }
+                if program == "my-tool" && searched.as_deref() == Some("/usr/bin")
+        ));
+
+        let stdin = Error::stdin("git", std::io::Error::from_raw_os_error(32));
+        match stdin {
+            Error::Stdin { program, source } => {
+                assert_eq!(program, "git");
+                assert_eq!(source.raw_os_error(), Some(32));
+            }
+            other => panic!("expected Error::Stdin, got {other:?}"),
+        }
+
+        let parse = Error::parse("git", "unexpected token");
+        assert!(matches!(
+            &parse,
+            Error::Parse { program, message }
+                if program == "git" && message == "unexpected token"
+        ));
     }
 }
