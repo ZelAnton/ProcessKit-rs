@@ -226,6 +226,7 @@ pub fn processkit::Error::is_timeout(&self) -> bool
 pub fn processkit::Error::is_transient(&self) -> bool
 pub fn processkit::Error::limit_kind(&self) -> core::option::Option<processkit::LimitKind>
 pub fn processkit::Error::limit_reason(&self) -> core::option::Option<processkit::LimitReason>
+pub fn processkit::Error::parse(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn processkit::Error::program(&self) -> core::option::Option<&str>
 pub fn processkit::Error::signal(&self) -> core::option::Option<i32>
 pub fn processkit::Error::stderr(&self) -> core::option::Option<&str>
