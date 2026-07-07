@@ -45,6 +45,87 @@ async fn limits_are_enforced_or_rejected_per_platform() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "creates a group and asserts the cgroup→pgroup fallback contains a real child"]
+async fn linux_cgroup_or_pgroup_fallback_is_observable_and_contains() {
+    use std::time::{Duration, Instant};
+
+    use crate::common::{completes_within, sleeper};
+
+    // The cgroup→process-group downgrade (no cgroup v2, no delegation, a
+    // read-only `/sys/fs/cgroup`, an unprivileged container) must be OBSERVABLE
+    // — never a silently uncontained group: `mechanism()` is always one of the
+    // two valid Linux values. And whichever mechanism is active, kill-on-drop
+    // must still reap a real child. Run non-root without cgroup delegation, this
+    // exercises the fallback; with delegation, the primary cgroup path.
+    let group = ProcessGroup::new().expect("create group");
+    let mech = group.mechanism();
+    assert!(
+        matches!(mech, Mechanism::CgroupV2 | Mechanism::ProcessGroup),
+        "linux mechanism must be cgroup v2 or its pgroup fallback, got {mech:?}"
+    );
+    if matches!(mech, Mechanism::ProcessGroup) {
+        eprintln!("cgroup delegation unavailable — exercising the process-group fallback");
+    } else {
+        eprintln!("cgroup v2 delegation available — exercising the primary mechanism");
+    }
+
+    // Containment holds under the active mechanism: a long sleeper spawned into a
+    // *shared* group (the handle does not own it) is reaped promptly when the
+    // group drops, far sooner than its ~30s natural runtime.
+    let child = group.start(&sleeper()).await.expect("spawn sleeper");
+    assert!(child.pid().is_some(), "sleeper should report a pid after spawn");
+
+    drop(group);
+    let start = Instant::now();
+    completes_within(
+        Duration::from_secs(10),
+        "child reap after group drop (kill-on-drop under the active mechanism)",
+        child.wait(),
+    )
+    .await
+    .expect("wait");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "child was not reaped promptly under {mech:?} (took {:?})",
+        start.elapsed()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "drops privileges under the cgroup mechanism; meaningful only as root with cgroup delegation"]
+async fn linux_uid_drop_under_cgroup_fails_the_spawn() {
+    use processkit::Command;
+
+    // The documented cgroup×uid incompatibility. Under `Mechanism::CgroupV2` the
+    // child joins its cgroup by writing the auto-created (root-owned)
+    // `cgroup.procs` *after* the OS has dropped the uid, so the join is refused
+    // and the spawn FAILS — rather than handing back an uncontained (or
+    // wrongly-privileged) child. Under the process-group fallback a uid drop
+    // composes cleanly, so this failure path is cgroup-specific.
+    // SAFETY: geteuid is a pure query.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipping: privilege drop requires root");
+        return;
+    }
+    let group = ProcessGroup::new().expect("create group");
+    if !matches!(group.mechanism(), Mechanism::CgroupV2) {
+        eprintln!(
+            "skipping: the cgroup×uid failure path needs the cgroup mechanism \
+             (the process-group fallback composes with a uid drop)"
+        );
+        return;
+    }
+    let result = group.start(&Command::new("id").arg("-u").uid(1).gid(1)).await;
+    assert!(
+        result.is_err(),
+        "a uid drop under the cgroup mechanism must fail the spawn (joining the \
+         root-owned cgroup.procs as the dropped uid is refused), got {result:?}"
+    );
+}
+
 #[cfg(windows)]
 #[tokio::test]
 #[ignore = "spawns real subprocesses to prove the active-process cap is enforced"]

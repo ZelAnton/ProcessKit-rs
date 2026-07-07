@@ -57,7 +57,12 @@ struct-literal-constructed or field-exhaustively destructured outside the crate.
 
 Before:
 
-```rust
+<!-- `text`, not `rust`: the pre-2.1.0 exhaustive-destructure shape this
+     section is *about* removing no longer compiles against
+     `#[non_exhaustive]` `Error::Exit` — and this crate's CI runs doctests
+     with `--include-ignored`, which still compiles `ignore` blocks (only
+     `text`/non-`rust` fences are exempt). -->
+```text
 match err {
     Error::Exit { program, code, stdout, stderr } => { /* ... */ }
     _ => {}
@@ -67,16 +72,20 @@ match err {
 After — add `..` to the pattern (or, better, use the existing accessors instead
 of destructuring at all):
 
-```rust
-match err {
-    Error::Exit { program, code, stdout, stderr, .. } => { /* ... */ }
+```rust,no_run
+# use processkit::Error;
+# fn handle(err: Error) {
+match &err {
+    Error::Exit { program, code, stdout, stderr, .. } => { let _ = (program, code, stdout, stderr); }
     _ => {}
 }
 
 // or, accessor-based and immune to the next field addition:
 if let Some(code) = err.code() {
     // err.program() / err.stdout() / err.stderr() / err.combined() also work
+    let _ = code;
 }
+# }
 ```
 
 This is prep for future field additions to any of these variants without
@@ -101,7 +110,10 @@ already the whole story.
 
 Fix a match:
 
-```rust
+<!-- `text`, not `rust`: bare match arms (no enclosing `match`/subject),
+     mixing the removed pre-2.1.0 `{ message }` shape with the current one —
+     see the note above on why `text` rather than `ignore`. -->
+```text
 // Before
 Error::ResourceLimit { message } => warn!("limit rejected: {message}"),
 
@@ -237,7 +249,13 @@ to a `#[non_exhaustive]` `OutputLine` struct with a public `text` field.
 
 Before:
 
-```rust
+<!-- `text`, not `rust`: `OutputEvent::Stdout`/`Stderr` carrying a bare
+     `String` is the pre-0.11 shape this section is *about* removing — it no
+     longer matches the crate's current `OutputEvent`/`OutputLine` types
+     (`events` is also a free variable); see the note earlier on why `text`
+     rather than `ignore` (this crate's CI runs doctests with
+     `--include-ignored`, which still compiles `ignore` blocks). -->
+```text
 use processkit::OutputEvent;
 
 while let Some(ev) = events.next().await {
@@ -252,7 +270,10 @@ while let Some(ev) = events.next().await {
 After — read `line.text` (in 1.0 this becomes `line.text()`; see the
 [1.0.0 section](#100-from-011x) above):
 
-```rust
+<!-- `text`, not `rust`: `line.text` as a public field is itself the
+     0.11-era shape (1.0 turned it into an accessor, `line.text()` — see
+     above); `ev` is a free variable. -->
+```text
 match ev {
     OutputEvent::Stdout(line) => println!("out: {}", line.text),
     OutputEvent::Stderr(line) => eprintln!("err: {}", line.text),
@@ -262,10 +283,12 @@ match ev {
 
 Or, when you don't care which stream produced the line, use the new accessor:
 
-```rust
+```rust,no_run
+# fn handle(ev: processkit::OutputEvent) {
 if let Some(text) = ev.text() {
     println!("{text}");
 }
+# }
 ```
 
 `OutputLine` is `#[non_exhaustive]`: you receive it from the crate and read its

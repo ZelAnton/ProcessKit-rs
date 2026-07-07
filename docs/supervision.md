@@ -101,6 +101,8 @@ from Go's [`suture`](https://github.com/thejerf/suture) supervisor — the
 idea, not the code):
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::{Command, Supervisor};
 use std::time::Duration;
 
@@ -112,6 +114,8 @@ let outcome = Supervisor::new(Command::new("worker"))
     .await?;
 
 println!("storm pauses taken: {}", outcome.storm_pauses);
+# Ok(())
+# }
 ```
 
 Each failed run adds `1` to a score that **halves every `failure_decay`**:
@@ -204,12 +208,17 @@ changes existing behavior until you set it.
 `run()` resolves to a `SupervisionOutcome`:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
+# use processkit::{Command, Supervisor};
 let outcome = Supervisor::new(Command::new("job")).run().await?;
 
 outcome.final_result; // ProcessResult<String> of the LAST run
 outcome.restarts;     // how many restarts happened (not counting run #1)
 outcome.stopped;      // StopReason::{Predicate, PolicySatisfied, GaveUp, RestartsExhausted}
 outcome.storm_pauses; // failure-storm pauses taken (0 unless storm_pause is set)
+# Ok(())
+# }
 ```
 
 Note `run()` returning `Ok` does **not** mean the child succeeded — it means
@@ -223,6 +232,8 @@ variant injects a [`ProcessGroup`](process-groups.md) so every incarnation —
 and everything it spawns — lives in one kill-on-drop container:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::{Command, ProcessGroup, RestartPolicy, Supervisor};
 
 let group = ProcessGroup::new()?;
@@ -235,6 +246,8 @@ let outcome = Supervisor::new(Command::new("worker"))
     .await?;
 
 // The group outlives supervision: drop it (or shutdown) to reap any strays.
+# Ok(())
+# }
 ```
 
 Mind one interaction: don't supervise into a group you've

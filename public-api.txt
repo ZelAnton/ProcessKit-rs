@@ -872,6 +872,7 @@ pub struct processkit::ProcessStdin
 impl processkit::ProcessStdin
 pub async fn processkit::ProcessStdin::finish(self) -> core::io::error::Result<()>
 pub async fn processkit::ProcessStdin::flush(&mut self) -> core::io::error::Result<()>
+pub async fn processkit::ProcessStdin::send_control(&mut self, char) -> core::io::error::Result<()>
 pub async fn processkit::ProcessStdin::write(&mut self, &[u8]) -> core::io::error::Result<()>
 pub async fn processkit::ProcessStdin::write_line(&mut self, &str) -> core::io::error::Result<()>
 impl core::fmt::Debug for processkit::ProcessStdin
