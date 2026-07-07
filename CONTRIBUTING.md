@@ -24,6 +24,15 @@ cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+Or run the equivalent [`just`](https://github.com/casey/just) recipes from the
+repository root: `just check` for the fast everyday gate (fmt, clippy,
+`--include-ignored` tests), or `just ci` for a fuller local mirror of the CI
+workflow (fmt, clippy and tests in all three feature configurations, the
+`cargo-hack` feature-powerset build, and the doc builds). `just ci` needs
+`cargo-hack` installed (`cargo install cargo-hack`); run `just --list` to see
+the optional recipes (`just ci-nightly`, `just msrv`, `just public-api-diff`)
+that mirror the remaining CI jobs but need a nightly toolchain or extra tools.
+
 ## Releasing
 
 Maintainer-only, via the **Release** GitHub Actions workflow (manual
