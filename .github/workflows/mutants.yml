@@ -1,8 +1,9 @@
 name: mutants
 
 # cargo-mutants exhaustively mutates the examined modules (scope defined in
-# mutants.toml at the repo root) and re-runs the whole test suite for every
-# mutant, which is far too slow and noisy to gate a PR — even over a small,
+# .cargo/mutants.toml, which cargo-mutants auto-loads from the workspace root)
+# and re-runs the whole test suite for every mutant, which is far too slow and
+# noisy to gate a PR — even over a small,
 # hermetic scope a full sweep can take tens of minutes. Like the stress and
 # fuzz tiers, it stays OUTSIDE the PR matrix: nightly on a schedule and
 # on-demand via the Actions tab.
@@ -25,6 +26,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-mutants
-      # Scope, exclusions and `--all-features` all come from mutants.toml, so
-      # the CLI invocation itself stays a plain, un-parameterized run.
+      # Scope, exclusions and `--all-features` all come from
+      # .cargo/mutants.toml (auto-loaded by cargo-mutants), so the CLI
+      # invocation itself stays a plain, un-parameterized run.
       - run: cargo mutants
