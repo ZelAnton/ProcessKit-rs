@@ -89,6 +89,107 @@ fn signal_on_empty_group_is_ok() {
     group.resume().expect("resume on empty group");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a fork storm and broadcasts SIGKILL to the group"]
+async fn unix_fork_storm_is_swept_by_group_broadcast() {
+    // Best-effort boundary of the pgroup mechanism under a fork storm. A group
+    // leader forks a dense burst of grandchildren — each inheriting the leader's
+    // process group, none `setsid`-ing away — while we broadcast `Signal::Kill`.
+    // `killpg` reaches the whole process group in one sweep (the documented
+    // "SIGKILL … cannot miss a process forked mid-broadcast"), and any child
+    // forked in the race window is caught by the next sweep, so the storm is
+    // fully torn down — the only pgroup escape hatch is a member that `setsid`s
+    // into its own session. We record the single-sweep catch count (best-effort,
+    // not a strict 100% guarantee) and assert the group drains completely after
+    // teardown. (Under the Linux cgroup mechanism the whole tree is contained via
+    // `cgroup.kill`; the assertions hold there too.)
+    let tmp = std::env::temp_dir();
+    let dir = tmp.join(format!("processkit_fork_storm_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create storm dir");
+
+    // The leader forks a grandchild every ~20ms; each records its OWN pid (`$$`
+    // of its own `sh -c`) and then sleeps well past the test, so the burst runs
+    // concurrently with the broadcast below.
+    let script = r#"i=0; while [ "$i" -lt 40 ]; do sh -c 'echo live > "$PK_DIR/$$"; exec sleep 30' & i=$((i + 1)); sleep 0.02; done; wait"#;
+    let group = ProcessGroup::new().expect("create group");
+    let forker = group
+        .start(&Command::new("sh").args(["-c", script]).env("PK_DIR", &dir))
+        .await
+        .expect("fork-storm leader spawns");
+
+    // Count grandchildren currently registered *and* alive (files are named by
+    // pid, so the filename is the pid to probe).
+    let alive_registered = || -> usize {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
+            // SAFETY: signal 0 is a sound liveness probe.
+            .filter(|&pid| unsafe { libc::kill(pid, 0) } == 0)
+            .count()
+    };
+
+    // Warm up until a real storm is running, so the broadcast races live forks.
+    poll_until(
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        "fork storm never ramped up",
+        || alive_registered() >= 6,
+    )
+    .await;
+    let before = alive_registered();
+    assert!(
+        before >= 4,
+        "expected a live fork storm, saw {before} grandchildren"
+    );
+
+    // One broadcast sweep, mid-storm.
+    group.signal(Signal::Kill).expect("broadcast SIGKILL to the group");
+
+    // The sweep must catch the bulk of the group. Poll (not a fixed sleep) so a
+    // slow init-reap of the freshly-killed orphans doesn't count lingering
+    // zombies as survivors: killpg is best-effort against the concurrent fork
+    // race, but a whole-group SIGKILL leaves at most a handful forked inside the
+    // syscall's race window — never more than half of a real burst.
+    poll_until(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        "one whole-group sweep did not catch the bulk of the storm",
+        || alive_registered() * 2 <= before,
+    )
+    .await;
+    let survived_one_sweep = alive_registered();
+
+    // Reap the leader (SIGKILL'd above) so the group's liveness probe is driven
+    // purely by the grandchildren, then take a final sweep to catch any
+    // race-window survivor.
+    completes_within(Duration::from_secs(10), "leader reap", forker.wait())
+        .await
+        .expect("leader waits");
+    group.kill_all().expect("final whole-tree sweep");
+
+    // Load-bearing: the whole tracked group must drain. `members()` uses the
+    // crate's own recycle-safe probe and reports empty only once the group is
+    // genuinely gone — no grandchild permanently escaped the mechanism.
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        "fork storm did not fully drain — a grandchild escaped the group",
+        || group.members().is_ok_and(|m| m.is_empty()),
+    )
+    .await;
+
+    eprintln!(
+        "fork storm: {before} grandchildren alive before broadcast, \
+         {survived_one_sweep} survived one sweep, group fully drained after teardown"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(windows)]
 #[test]
 #[ignore = "creates an OS job"]

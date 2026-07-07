@@ -17,6 +17,8 @@ incrementally, probe for readiness, race several children, or profile a run.
 ## Lifecycle
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 
 let mut run = Command::new("dev-server").start().await?;
@@ -30,6 +32,8 @@ run.elapsed();    // time since spawn
 //   finish()                 → after streaming stdout (below)
 //   profile(every)                    → resource samples; output discarded, like wait() (stats feature)
 let outcome = run.wait().await?;   // Outcome: Exited(code) / Signalled(sig) / TimedOut
+# Ok(())
+# }
 ```
 
 `start()` puts the child in a **private group the handle owns**: dropping the
@@ -205,6 +209,9 @@ interactivity — give the command `Stdin::from_lines(stream)` /
 probes replace the arbitrary sleep, each bounded by its own deadline:
 
 ```rust,no_run
+# async fn health_check() -> bool { true }
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 use std::time::Duration;
 
@@ -224,6 +231,9 @@ run.wait_for(|| async { health_check().await }, Duration::from_secs(10))
     .await?;
 
 // ready — use the server…
+# let _ = banner;
+# Ok(())
+# }
 ```
 
 Probe semantics, deliberately uniform:
@@ -246,6 +256,8 @@ whichever exits first — the natural primitive for "restart whatever died" or
 "first answer wins":
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::{Command, ProcessGroup, wait_any};
 
 let group = ProcessGroup::new()?;
@@ -257,6 +269,8 @@ println!("contender #{index} exited first with {outcome:?}");
 
 // Only borrows: the loser is still usable.
 let survivor = if index == 0 { &mut b } else { &mut a };
+# Ok(())
+# }
 ```
 
 `wait_any` takes `&mut` borrows, applies no timeout of its own (wrap it in
@@ -270,6 +284,8 @@ With the opt-in **`stats`** feature, a running child reports its own
 resource usage, and `profile()` turns a whole run into a summary:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 use std::time::Duration;
 
@@ -292,6 +308,8 @@ println!(
     profile.avg_cpu_cores(),    // cpu / wall — e.g. Some(1.7) ≈ 1.7 cores busy
     profile.samples,
 );
+# Ok(())
+# }
 ```
 
 These read the *child process itself* (not a whole tree — that's

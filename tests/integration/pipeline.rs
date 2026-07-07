@@ -32,6 +32,10 @@ async fn pipeline_flows_data_between_stages() {
         .await
         .expect("run pipeline");
     assert!(result.is_success(), "pipeline result: {result:?}");
+    assert!(
+        result.duration() > Duration::ZERO,
+        "T-039: a successful chain must report the measured wall-clock duration, not ZERO: {result:?}"
+    );
     let stdout = result.stdout();
     let alpha = stdout.find("alpha").expect("alpha in output");
     let delta = stdout.find("delta").expect("delta in output");
@@ -99,6 +103,10 @@ async fn pipeline_pipefail_attributes_the_first_failure() {
         .expect("pipeline completes with a result");
     assert_eq!(result.code(), Some(3), "pipefail code: {result:?}");
     assert!(!result.is_success());
+    assert!(
+        result.duration() > Duration::ZERO,
+        "T-039: a failing chain must also report the measured wall-clock duration: {result:?}"
+    );
 
     // run() surfaces the same attribution as a typed error.
     let producer = if cfg!(windows) {
@@ -228,6 +236,38 @@ async fn unchecked_producer_does_not_mask_a_failing_consumer() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real pipeline with a per-stage timeout on a middle stage"]
+async fn per_stage_timeout_ends_a_hanging_middle_stage() {
+    // F: a per-stage `Command::timeout` — distinct from the chain-wide
+    // `Pipeline::timeout` covered below — bounds a single stage. The middle
+    // stage hangs well past its own short deadline while the producer and the
+    // last stage are near-instant; the stage's own timeout must kill just that
+    // subtree and let the chain fold a `TimedOut` result promptly, without a
+    // chain-wide `Pipeline::timeout` in play at all.
+    let producer = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo x"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'x\\n'"])
+    };
+    let slow_stage = sleep_secs(30).timeout(Duration::from_millis(300));
+
+    let start = Instant::now();
+    let result = producer
+        .pipe(slow_stage)
+        .pipe(sort_stage())
+        .output_string()
+        .await
+        .expect("a per-stage-timed-out pipeline still reports a result");
+    assert!(result.timed_out(), "result: {result:?}");
+    assert!(!result.is_success());
+    assert!(
+        start.elapsed() < Duration::from_secs(15),
+        "the per-stage timeout did not end the chain promptly (took {:?})",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a real pipeline and kills it at the deadline"]
 async fn pipeline_timeout_kills_the_whole_chain() {
     let producer = if cfg!(windows) {
@@ -249,6 +289,11 @@ async fn pipeline_timeout_kills_the_whole_chain() {
         start.elapsed() < Duration::from_secs(15),
         "pipeline did not honor its timeout (took {:?})",
         start.elapsed()
+    );
+    assert!(
+        result.duration() > Duration::ZERO,
+        "T-039: the chain-wide timeout branch must also report the measured wall-clock duration, \
+         not ZERO: {result:?}"
     );
 }
 

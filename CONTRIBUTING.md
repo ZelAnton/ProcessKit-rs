@@ -17,12 +17,31 @@ cargo test --all-features -- --ignored  # real-subprocess + kill-on-drop tests
 cargo test --features mock              # the generated MockRunner
 ```
 
+`cargo test --all-features` also compiles (and, unless a fenced block is
+annotated `no_run` or `ignore`, runs) every Rust code sample in `docs/*.md`
+and the root `README.md` as an ordinary doctest — via the test-only, hidden
+harness in `src/doc_examples.rs` — so a signature change that breaks a
+guide's example fails CI instead of silently going stale. The harness only
+builds under `--all-features` (the guides collectively exercise every
+optional feature), so a plain `cargo test` with the default features does
+**not** check the guides — use `--all-features` (as CI does) when touching a
+public signature and checking whether a guide's snippet needs the same edit.
+
 Before opening a PR:
 
 ```bash
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+Or run the equivalent [`just`](https://github.com/casey/just) recipes from the
+repository root: `just check` for the fast everyday gate (fmt, clippy,
+`--include-ignored` tests), or `just ci` for a fuller local mirror of the CI
+workflow (fmt, clippy and tests in all three feature configurations, the
+`cargo-hack` feature-powerset build, and the doc builds). `just ci` needs
+`cargo-hack` installed (`cargo install cargo-hack`); run `just --list` to see
+the optional recipes (`just ci-nightly`, `just msrv`, `just public-api-diff`)
+that mirror the remaining CI jobs but need a nightly toolchain or extra tools.
 
 ## Releasing
 
