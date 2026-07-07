@@ -459,9 +459,9 @@ async fn stdin_source_failing_during_pump_teardown_still_surfaces_as_error_stdin
                 .get_or_insert_with(|| Box::pin(tokio::time::sleep(delay)));
             match timer.as_mut().poll(cx) {
                 Poll::Pending => Poll::Pending,
-                Poll::Ready(()) => {
-                    Poll::Ready(Err(std::io::Error::other("stdin source failed mid-teardown")))
-                }
+                Poll::Ready(()) => Poll::Ready(Err(std::io::Error::other(
+                    "stdin source failed mid-teardown",
+                ))),
             }
         }
     }

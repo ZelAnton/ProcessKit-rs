@@ -148,7 +148,9 @@ async fn unix_fork_storm_is_swept_by_group_broadcast() {
     );
 
     // One broadcast sweep, mid-storm.
-    group.signal(Signal::Kill).expect("broadcast SIGKILL to the group");
+    group
+        .signal(Signal::Kill)
+        .expect("broadcast SIGKILL to the group");
 
     // The sweep must catch the bulk of the group. Poll (not a fixed sleep) so a
     // slow init-reap of the freshly-killed orphans doesn't count lingering

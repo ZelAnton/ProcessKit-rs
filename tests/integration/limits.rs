@@ -75,7 +75,10 @@ async fn linux_cgroup_or_pgroup_fallback_is_observable_and_contains() {
     // *shared* group (the handle does not own it) is reaped promptly when the
     // group drops, far sooner than its ~30s natural runtime.
     let child = group.start(&sleeper()).await.expect("spawn sleeper");
-    assert!(child.pid().is_some(), "sleeper should report a pid after spawn");
+    assert!(
+        child.pid().is_some(),
+        "sleeper should report a pid after spawn"
+    );
 
     drop(group);
     let start = Instant::now();
@@ -118,7 +121,9 @@ async fn linux_uid_drop_under_cgroup_fails_the_spawn() {
         );
         return;
     }
-    let result = group.start(&Command::new("id").arg("-u").uid(1).gid(1)).await;
+    let result = group
+        .start(&Command::new("id").arg("-u").uid(1).gid(1))
+        .await;
     assert!(
         result.is_err(),
         "a uid drop under the cgroup mechanism must fail the spawn (joining the \
