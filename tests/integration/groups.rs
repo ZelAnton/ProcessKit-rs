@@ -159,6 +159,85 @@ async fn windows_grandchild_is_contained() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a setsid child that forks a grandchild; proves pgroup containment reaches it"]
+async fn unix_setsid_child_forks_grandchild_still_contained() {
+    use processkit::Command;
+
+    // Best-effort boundary of `Mechanism::ProcessGroup`. A child spawned under
+    // `.setsid()` leads a *new session and process group* (pgid == its pid),
+    // which the group tracks. If that child forks a grandchild before exiting,
+    // the grandchild INHERITS the session's process group — it did not `setsid`
+    // away itself — so `killpg(pgid)` on drop still reaches it even after the
+    // direct child is gone. The documented pgroup escape hatch is a process that
+    // calls `setsid` *itself*, not one that merely inherits the session. (Under
+    // the Linux cgroup mechanism the grandchild is contained a fortiori — it
+    // never leaves the cgroup — so this asserts the *weaker* fallback's boundary
+    // explicitly, and holds on every unix backend.)
+    let tmp = std::env::temp_dir();
+    let pidfile = tmp.join(format!("processkit_setsid_gc_{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pidfile);
+
+    // The direct child forks a grandchild (`sleep 30`) that records its own pid
+    // (`$!` — the backgrounded job), then exits at once, orphaning the grandchild
+    // while it stays inside the tracked session process group.
+    let group = ProcessGroup::new().expect("create group");
+    let child = group
+        .start(
+            &Command::new("sh")
+                .args(["-c", "sleep 30 & echo $! > \"$PK_PIDFILE\"; exit 0"])
+                .env("PK_PIDFILE", &pidfile)
+                .setsid(),
+        )
+        .await
+        .expect("setsid child spawns (EPERM would mean the pgroup coordination broke)");
+    // Reap the direct child so it is genuinely gone, not a lingering zombie that
+    // could keep the group probe answering; it exits promptly after the fork.
+    completes_within(Duration::from_secs(10), "direct child exit", child.wait())
+        .await
+        .expect("direct child waits");
+
+    // The grandchild publishes its pid.
+    let mut gc_pid = None;
+    poll_until(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        "grandchild never recorded its pid",
+        || {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                gc_pid = Some(pid);
+                true
+            } else {
+                false
+            }
+        },
+    )
+    .await;
+    let gc = gc_pid.expect("grandchild recorded its pid");
+    // SAFETY: signal 0 is a sound liveness probe.
+    assert!(
+        unsafe { libc::kill(gc, 0) } == 0,
+        "grandchild {gc} should be alive before the group is dropped"
+    );
+
+    drop(group); // killpg the session pgroup — must reach the inherited grandchild
+
+    // The grandchild must die: poll until its pid stops answering the liveness
+    // probe (SIGKILL'd, then reaped by init as an orphan).
+    poll_until(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        "grandchild outlived the group drop — inherited-session containment leaked",
+        // SAFETY: signal 0 is a sound liveness probe.
+        || unsafe { libc::kill(gc, 0) } != 0,
+    )
+    .await;
+    let _ = std::fs::remove_file(&pidfile);
+}
+
 #[tokio::test]
 #[ignore = "spawns a real subprocess and kills it twice"]
 async fn kill_all_is_idempotent() {

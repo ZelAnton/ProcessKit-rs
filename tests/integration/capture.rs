@@ -429,6 +429,70 @@ async fn nonzero_exit_wins_over_a_failing_stdin_source() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real subprocess whose stdin source fails during pump teardown"]
+async fn stdin_source_failing_during_pump_teardown_still_surfaces_as_error_stdin() {
+    use processkit::Error;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A stdin source that parks (yields no byte) and — only after `delay` —
+    /// fails with a non-broken-pipe error. Parking keeps the background writer
+    /// task *unfinished* past the child's exit and past the pre-pump stdin peek,
+    /// so its failure lands in the post-exit teardown window (`join_pumps` /
+    /// `finalize_stdin_task`), not before it. This is the exact race a single
+    /// pre-pump observation lost: T-040's regression guard.
+    struct DelayedFailingReader {
+        delay: Duration,
+        timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+    impl tokio::io::AsyncRead for DelayedFailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let delay = this.delay;
+            let timer = this
+                .timer
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(delay)));
+            match timer.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => {
+                    Poll::Ready(Err(std::io::Error::other("stdin source failed mid-teardown")))
+                }
+            }
+        }
+    }
+
+    // `echo` prints a line and exits 0 *without* consuming stdin, so the run
+    // succeeds while the parked writer is still in flight — a child success plus
+    // a swallowed stdin failure is precisely the `Error::Stdin` case. Its stdout
+    // line gives the pumps something to drain during teardown.
+    let outputs_and_exits = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo hello"])
+    } else {
+        Command::new("sh").args(["-c", "echo hello"])
+    };
+
+    let err = outputs_and_exits
+        .stdin(processkit::Stdin::from_reader(DelayedFailingReader {
+            // Comfortably under PUMP_TEARDOWN (5s), so the bounded post-pump wait
+            // catches it, yet long enough to land after the pre-pump peek.
+            delay: Duration::from_millis(300),
+            timer: None,
+        }))
+        .output_string()
+        .await
+        .expect_err(
+            "a stdin writer that fails during the join_pumps window must still surface as \
+             Error::Stdin, not a silent success",
+        );
+    assert!(matches!(err, Error::Stdin { .. }), "got: {err:?}");
+}
+
+#[tokio::test]
 #[ignore = "spawns a real subprocess echoing 256 KiB through both pipes"]
 async fn large_stdin_and_large_output_do_not_deadlock() {
     // duct's gotcha #10 as a spec: stdin is fed and both outputs are drained
@@ -861,6 +925,59 @@ async fn top_level_run_and_output() {
         .expect("output cargo --version");
     assert!(result.is_success());
     assert!(result.stdout().to_lowercase().contains("cargo"));
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess driven via interactive stdin"]
+async fn send_control_writes_the_exact_control_byte() {
+    // `send_control` writes exactly one raw byte to the pipe — no terminal
+    // interpretation happens, so a byte-for-byte echo child must receive
+    // precisely the mapped control byte (Ctrl-D -> 0x04), not e.g. the text
+    // 'd' or an EOF with no byte at all.
+    let mut process = raw_stdin_echo()
+        .keep_stdin_open()
+        .start()
+        .await
+        .expect("start raw echo");
+    let mut stdin = process.take_stdin().expect("stdin kept open");
+    stdin.send_control('d').await.expect("send Ctrl-D");
+    stdin.finish().await.expect("eof");
+
+    let result = process.output_bytes().await.expect("collect");
+    assert!(result.is_success(), "result: {result:?}");
+    assert_eq!(
+        result.stdout(),
+        &[0x04][..],
+        "the exact control byte must reach the child: {:?}",
+        result.stdout()
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess driven via interactive stdin"]
+async fn send_control_rejects_an_unrecognized_character_without_writing() {
+    // An unrecognized character must error loudly and write nothing — not a
+    // silent, meaningless byte.
+    let mut process = raw_stdin_echo()
+        .keep_stdin_open()
+        .start()
+        .await
+        .expect("start raw echo");
+    let mut stdin = process.take_stdin().expect("stdin kept open");
+    let err = stdin
+        .send_control('0')
+        .await
+        .expect_err("a digit is not a recognized control character");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    stdin.finish().await.expect("eof");
+
+    let result = process.output_bytes().await.expect("collect");
+    assert!(result.is_success(), "result: {result:?}");
+    assert!(
+        result.stdout().is_empty(),
+        "a rejected control character must write no byte: {:?}",
+        result.stdout()
+    );
 }
 
 #[tokio::test]

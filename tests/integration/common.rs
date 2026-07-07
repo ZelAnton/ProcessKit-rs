@@ -135,6 +135,25 @@ pub(crate) fn failing_exit(code: i32) -> Command {
     }
 }
 
+/// A child that copies its stdin to stdout byte-for-byte (no line buffering,
+/// no text-encoding translation), per platform — used to assert that a
+/// specific raw byte (e.g. a control byte from `send_control`) reaches the
+/// child unmodified. `cat` already does this on Unix; on Windows there is no
+/// standard line-oriented tool that passes arbitrary bytes through untouched,
+/// so a short PowerShell one-liner copies the raw stdin/stdout streams.
+pub(crate) fn raw_stdin_echo() -> Command {
+    if cfg!(windows) {
+        Command::new("powershell").args([
+            "-NoProfile",
+            "-Command",
+            "$in=[Console]::OpenStandardInput(); $out=[Console]::OpenStandardOutput(); \
+             $in.CopyTo($out); $out.Flush()",
+        ])
+    } else {
+        Command::new("cat")
+    }
+}
+
 /// A child that prints its whole environment, per platform.
 pub(crate) fn print_env() -> Command {
     if cfg!(windows) {

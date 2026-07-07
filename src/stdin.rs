@@ -324,6 +324,63 @@ impl ProcessStdin {
     pub async fn finish(mut self) -> std::io::Result<()> {
         self.sink.shutdown().await
     }
+
+    /// Send a control character to the child's stdin — e.g. `send_control('c')`
+    /// for Ctrl-C (`\x03`, ETX) or `send_control('d')` for Ctrl-D (`\x04`, EOT).
+    ///
+    /// Accepts the ASCII letters `'a'..='z'`/`'A'..='Z'` (mapped to their
+    /// control-code equivalent, `(c.to_ascii_uppercase() as u8) & 0x1f`) plus a
+    /// few control characters commonly reachable from a terminal driver:
+    /// `'['`/`'\\'`/`']'`/`'^'`/`'_'` (Ctrl-`[`/Ctrl-`\`/Ctrl-`]`/Ctrl-`^`/Ctrl-`_`,
+    /// the same `& 0x1f` mapping) and `'?'` (Ctrl-`?`, i.e. DEL/`0x7f`, which does
+    /// not fit the `& 0x1f` pattern). Any other character is rejected with an
+    /// [`InvalidInput`](std::io::ErrorKind::InvalidInput) error rather than
+    /// silently writing a meaningless byte.
+    ///
+    /// **This writes exactly one raw byte into the child's stdin pipe — it is
+    /// not a real terminal signal.** A genuine SIGINT/SIGTSTP/etc. is something
+    /// the OS terminal driver raises for a *foreground process group attached to
+    /// a TTY*; here there is no TTY, only a plain pipe, so the child only
+    /// "reacts" if the child itself reads its stdin and recognizes the byte
+    /// (as many REPLs and line editors do — e.g. readline treats `\x04` as
+    /// end-of-input). A child that doesn't inspect its stdin for control bytes
+    /// will not be interrupted or signaled by this call. Real terminal-signal
+    /// semantics (the kernel actually delivering `SIGINT` etc. to the child)
+    /// require a pseudo-terminal, which this crate does not yet provide — see
+    /// the (git-untracked) design note `ideas/later-pty-support.md` for that
+    /// direction.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidInput`](std::io::ErrorKind::InvalidInput) if `c` is not one of
+    /// the accepted characters above. Otherwise, the underlying
+    /// [`std::io::Error`] from writing to the child's stdin pipe — commonly
+    /// [`BrokenPipe`](std::io::ErrorKind::BrokenPipe) once the child has closed
+    /// stdin or exited.
+    pub async fn send_control(&mut self, c: char) -> std::io::Result<()> {
+        let byte = control_byte(c)?;
+        self.sink.write_all(&[byte]).await
+    }
+}
+
+/// The single control byte that [`ProcessStdin::send_control`] would write for
+/// `c`, or an `InvalidInput` error for an unrecognized character. Split out
+/// from `send_control` so the validation/mapping logic is unit-testable
+/// without a real child process.
+fn control_byte(c: char) -> std::io::Result<u8> {
+    match c {
+        'a'..='z' | 'A'..='Z' | '[' | '\\' | ']' | '^' | '_' => {
+            Ok((c.to_ascii_uppercase() as u8) & 0x1f)
+        }
+        '?' => Ok(0x7f),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "send_control: {c:?} is not a recognized control character \
+                 (expected 'a'..='z'/'A'..='Z', '[', '\\\\', ']', '^', '_', or '?')"
+            ),
+        )),
+    }
 }
 
 impl fmt::Debug for ProcessStdin {
@@ -460,5 +517,32 @@ mod tests {
         );
 
         run1.abort();
+    }
+
+    #[test]
+    fn control_byte_maps_letters_to_the_control_range() {
+        // Ctrl-C / Ctrl-D, case-insensitive, both map to the same byte.
+        assert_eq!(control_byte('c').expect("valid"), 0x03);
+        assert_eq!(control_byte('C').expect("valid"), 0x03);
+        assert_eq!(control_byte('d').expect("valid"), 0x04);
+        assert_eq!(control_byte('D').expect("valid"), 0x04);
+        // Ctrl-Z, common EOF-on-Windows control character.
+        assert_eq!(control_byte('z').expect("valid"), 0x1a);
+        // The special terminal-driver characters, including DEL/0x7f which does
+        // not fit the `& 0x1f` mapping.
+        assert_eq!(control_byte('[').expect("valid"), 0x1b);
+        assert_eq!(control_byte('\\').expect("valid"), 0x1c);
+        assert_eq!(control_byte(']').expect("valid"), 0x1d);
+        assert_eq!(control_byte('^').expect("valid"), 0x1e);
+        assert_eq!(control_byte('_').expect("valid"), 0x1f);
+        assert_eq!(control_byte('?').expect("valid"), 0x7f);
+    }
+
+    #[test]
+    fn control_byte_rejects_unrecognized_characters() {
+        for bad in ['0', ' ', '!', '@', 'é', '\u{1}'] {
+            let err = control_byte(bad).expect_err("must reject an unrecognized character");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
     }
 }

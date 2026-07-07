@@ -12,7 +12,13 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- `ProcessStdin::send_control(char)` — validates and writes a single control
+  byte (e.g. `send_control('c')` for Ctrl-C, `send_control('d')` for Ctrl-D)
+  to a child's stdin still held open via `keep_stdin_open()`/`take_stdin()`,
+  so driving REPLs and other interactive tools no longer requires manually
+  writing raw `\x03`/`\x04` bytes. This is just a byte written into a plain
+  pipe, not a real terminal signal — genuine `SIGINT`/`SIGTSTP`-style delivery
+  still requires a pseudo-terminal, which this crate does not yet provide.
 
 ### Changed
 -
