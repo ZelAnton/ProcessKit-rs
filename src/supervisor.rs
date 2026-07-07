@@ -709,16 +709,11 @@ fn decayed_failure_score(prev: f64, elapsed: Duration, half_life: Duration) -> f
     }
 }
 
-/// `base × factor^n`, capped at `cap`.
+/// `min(base × factor^n, cap)`, delegating to the shared
+/// [`backoff::capped_exponential`](crate::backoff) core (also used by
+/// `RetryPolicy::backoff_at`).
 fn backoff_delay(base: Duration, factor: f64, n: u32, cap: Duration) -> Duration {
-    if base.is_zero() {
-        return Duration::ZERO;
-    }
-    let scaled = base.as_secs_f64() * factor.powi(n.min(i32::MAX as u32) as i32);
-    if !scaled.is_finite() || scaled >= cap.as_secs_f64() {
-        return cap;
-    }
-    Duration::from_secs_f64(scaled).min(cap)
+    crate::backoff::capped_exponential(base, factor, n, cap)
 }
 
 /// Multiply `delay` by a uniform random factor in `[0.5, 1.5)` when `enabled`.
@@ -732,17 +727,10 @@ fn apply_jitter(delay: Duration, enabled: bool) -> Duration {
         .min(crate::MAX_DEADLINE)
 }
 
-/// A pseudo-random factor in `[0.5, 1.5)`: hash a constant through a fresh
-/// `RandomState` to get a fresh `u64` per call, no extra dependency.
+/// A pseudo-random factor in `[0.5, 1.5)`, built from the shared
+/// [`backoff::unit_random_f64`](crate::backoff) source.
 fn jitter_factor() -> f64 {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u64(0x9E37_79B9_7F4A_7C15);
-    let bits = hasher.finish();
-    let unit = (bits >> 11) as f64 / (1u64 << 53) as f64; // top 53 bits → [0, 1)
-    0.5 + unit
+    0.5 + crate::backoff::unit_random_f64()
 }
 
 #[cfg(test)]

@@ -127,36 +127,17 @@ impl RetryPolicy {
 
     /// The **deterministic** capped exponential delay before the `retry_index`-th
     /// retry (0-based) — `min(initial × multiplier^index, max_backoff)`, before any
-    /// jitter. Computed in `f64` seconds so a large index/multiplier saturates to
-    /// the cap rather than overflowing `Duration`.
+    /// jitter. Delegates to the shared [`backoff::capped_exponential`](crate::backoff)
+    /// core (also used by `Supervisor`'s restart backoff), which folds a
+    /// sub-unit/non-finite multiplier to `1.0` and saturates to `max_backoff`
+    /// rather than overflowing `Duration`.
     pub(crate) fn backoff_at(&self, retry_index: u32) -> Duration {
-        // A zero base never waits, whatever the index/multiplier — and short-circuits
-        // the `0.0 * inf = NaN` an overflowing factor would otherwise produce.
-        if self.initial_backoff.is_zero() {
-            return Duration::ZERO;
-        }
-        // Treat a sub-unit, NaN, non-positive, OR non-finite (±∞) multiplier as
-        // `1.0` (backoff never shrinks or explodes to the cap on the second retry),
-        // matching the field doc and `Supervisor::backoff`, which likewise folds a
-        // non-finite factor to `1.0`. The fixed case (and the first retry) is the
-        // byte-exact `initial`, capped — no f64 round-trip.
-        let multiplier = if self.multiplier.is_finite() && self.multiplier > 1.0 {
-            self.multiplier
-        } else {
-            1.0
-        };
-        if multiplier == 1.0 || retry_index == 0 {
-            return self.initial_backoff.min(self.max_backoff);
-        }
-        // Clamp the exponent so `retry_index as i32` can't wrap negative (which would
-        // *shrink* the backoff) for an absurd retry count; any realistic index is far
-        // below the cap anyway. A finite non-zero base × `inf` factor saturates to
-        // `inf`, which `.min(cap)` reduces to the cap — no NaN.
-        let exponent = retry_index.min(i32::MAX as u32) as i32;
-        let secs = (self.initial_backoff.as_secs_f64() * multiplier.powi(exponent))
-            .min(self.max_backoff.as_secs_f64());
-        // `try_from_secs_f64` rejects negative/NaN/overflow — fall back to the cap.
-        Duration::try_from_secs_f64(secs).unwrap_or(self.max_backoff)
+        crate::backoff::capped_exponential(
+            self.initial_backoff,
+            self.multiplier,
+            retry_index,
+            self.max_backoff,
+        )
     }
 
     /// The actual wait before the `retry_index`-th retry: [`backoff_at`](Self::backoff_at)
@@ -164,39 +145,11 @@ impl RetryPolicy {
     pub(crate) fn delay_for(&self, retry_index: u32) -> Duration {
         let base = self.backoff_at(retry_index);
         if self.jitter && !base.is_zero() {
-            base.mul_f64(jitter_scale())
+            base.mul_f64(crate::backoff::unit_random_f64())
         } else {
             base
         }
     }
-}
-
-/// A uniform random `f64` in `[0, 1)` from a per-thread xorshift PRNG, seeded once
-/// from system entropy. For backoff jitter only — not cryptographic, and chosen to
-/// avoid pulling in a PRNG dependency.
-fn jitter_scale() -> f64 {
-    use std::cell::Cell;
-    thread_local! {
-        static STATE: Cell<u64> = Cell::new(jitter_seed());
-    }
-    STATE.with(|state| {
-        let mut x = state.get();
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        state.set(x);
-        // Top 53 bits → a uniform double in [0, 1).
-        (x >> 11) as f64 / (1u64 << 53) as f64
-    })
-}
-
-/// A nonzero per-thread seed from `RandomState` (system-entropy-seeded, the same
-/// source `HashMap` uses), so threads decorrelate without a dependency.
-fn jitter_seed() -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    hasher.write_u64(0x9E37_79B9_7F4A_7C15);
-    hasher.finish() | 1 // xorshift needs nonzero state
 }
 
 /// A [`RetryPolicy`] schedule paired with the classifier that decides which
