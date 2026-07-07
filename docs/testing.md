@@ -7,7 +7,7 @@ seam. In `processkit` that seam is one small trait. Only `output_string` is requ
 `output_bytes` (raw-byte stdout) and `start` (a live handle for streaming/probes)
 are **defaulted**, so a minimal double implements just `output_string`:
 
-```rust,ignore
+```text
 #[async_trait]
 pub trait ProcessRunner: Send + Sync {
     async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>>;
@@ -277,7 +277,7 @@ expectations) — the right tool when the *interaction* is the contract.
 > dependency, not a frozen API. For a stable double, prefer `ScriptedRunner`
 > (canned replies) or `RecordingRunner` (input assertions) above.
 
-```rust,ignore
+```rust,no_run
 use processkit::testing::MockRunner;
 
 let mut mock = MockRunner::new();

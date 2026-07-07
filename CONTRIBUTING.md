@@ -17,12 +17,15 @@ cargo test --all-features -- --ignored  # real-subprocess + kill-on-drop tests
 cargo test --features mock              # the generated MockRunner
 ```
 
-`cargo test` also compiles (and, unless a fenced block is annotated `no_run`
-or `ignore`, runs) every Rust code sample in `docs/*.md` and the root
-`README.md` as an ordinary doctest — via the test-only, hidden harness in
-`src/doc_examples.rs` — so a signature change that breaks a guide's example
-fails CI instead of silently going stale. When you touch a public signature,
-check whether a guide's snippet needs the same edit.
+`cargo test --all-features` also compiles (and, unless a fenced block is
+annotated `no_run` or `ignore`, runs) every Rust code sample in `docs/*.md`
+and the root `README.md` as an ordinary doctest — via the test-only, hidden
+harness in `src/doc_examples.rs` — so a signature change that breaks a
+guide's example fails CI instead of silently going stale. The harness only
+builds under `--all-features` (the guides collectively exercise every
+optional feature), so a plain `cargo test` with the default features does
+**not** check the guides — use `--all-features` (as CI does) when touching a
+public signature and checking whether a guide's snippet needs the same edit.
 
 Before opening a PR:
 

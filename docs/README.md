@@ -106,10 +106,12 @@ how the pieces compose, with the platform fine print collected in
 
 **These examples are compiler-checked.** Every fenced Rust block across these
 guides and the root `README.md` is compiled (and, unless annotated `no_run` or
-`ignore`, actually run) as an ordinary doctest by `cargo test` — a signature
-change that stops matching a guide's snippet fails CI instead of silently
-lying to a reader. See `src/doc_examples.rs` for the (test-only, hidden)
-harness.
+`ignore`, actually run) as an ordinary doctest by `cargo test --all-features`
+(as CI does) — a signature change that stops matching a guide's snippet fails
+CI instead of silently lying to a reader. The hidden harness only builds under
+`--all-features`, so a plain `cargo test` with the default features does
+**not** exercise this check. See `src/doc_examples.rs` for the (test-only,
+hidden) harness.
 
 ## Other languages
 

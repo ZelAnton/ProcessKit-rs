@@ -448,13 +448,6 @@ pub mod prelude {
 pub use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
-mod cfgtest_doctest_experiment {
-    //! ```
-    //! compile_error!("cfg-test doctest experiment fired");
-    //! ```
-}
-
-#[cfg(test)]
 mod tests {
     use super::Outcome;
 
