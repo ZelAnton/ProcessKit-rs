@@ -131,6 +131,7 @@
 //! [Job Object]: https://learn.microsoft.com/windows/win32/procthread/job-objects
 //! [cgroup v2]: https://docs.kernel.org/admin-guide/cgroup-v2.html
 
+mod backoff;
 mod batch;
 mod buffer;
 #[cfg(feature = "record")]
