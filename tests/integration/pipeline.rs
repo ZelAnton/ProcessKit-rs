@@ -228,6 +228,38 @@ async fn unchecked_producer_does_not_mask_a_failing_consumer() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real pipeline with a per-stage timeout on a middle stage"]
+async fn per_stage_timeout_ends_a_hanging_middle_stage() {
+    // F: a per-stage `Command::timeout` — distinct from the chain-wide
+    // `Pipeline::timeout` covered below — bounds a single stage. The middle
+    // stage hangs well past its own short deadline while the producer and the
+    // last stage are near-instant; the stage's own timeout must kill just that
+    // subtree and let the chain fold a `TimedOut` result promptly, without a
+    // chain-wide `Pipeline::timeout` in play at all.
+    let producer = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo x"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'x\\n'"])
+    };
+    let slow_stage = sleep_secs(30).timeout(Duration::from_millis(300));
+
+    let start = Instant::now();
+    let result = producer
+        .pipe(slow_stage)
+        .pipe(sort_stage())
+        .output_string()
+        .await
+        .expect("a per-stage-timed-out pipeline still reports a result");
+    assert!(result.timed_out(), "result: {result:?}");
+    assert!(!result.is_success());
+    assert!(
+        start.elapsed() < Duration::from_secs(15),
+        "the per-stage timeout did not end the chain promptly (took {:?})",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a real pipeline and kills it at the deadline"]
 async fn pipeline_timeout_kills_the_whole_chain() {
     let producer = if cfg!(windows) {

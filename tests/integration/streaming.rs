@@ -122,6 +122,111 @@ async fn stdout_line_handler_sees_every_line() {
 
 #[tokio::test]
 #[ignore = "spawns a real subprocess"]
+async fn stdout_line_handler_panic_is_isolated_on_a_real_subprocess() {
+    // F: the real-subprocess analogue of `pump::panicking_handler_is_isolated_
+    // and_capture_completes` (unit-covered only until now) — a handler that
+    // panics on the second line must not fail the run, hang the pump, or lose
+    // any already-produced output. Called `#[ignore]`'d suite-wide; this test
+    // proves the contract holds against the real pump wiring, not a hand-fed
+    // in-memory byte stream.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let result = five_lines()
+        .on_stdout_line(move |_line| {
+            if counted.fetch_add(1, Ordering::SeqCst) == 1 {
+                panic!("boom on the second line");
+            }
+        })
+        .output_string()
+        .await
+        .expect("a panicking handler must not fail the run");
+    assert!(result.is_success(), "result: {result:?}");
+    assert_eq!(
+        result.stdout().lines().count(),
+        5,
+        "every line is still captured despite the panic: {:?}",
+        result.stdout()
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the handler is disabled after its panic (called for lines 1 and 2 only)"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess fed stdin from a file"]
+async fn stdin_from_file_round_trips_end_to_end() {
+    // F: `Stdin::from_file` end-to-end — write a real file, feed it as stdin,
+    // and confirm the child sees the exact bytes.
+    let path = std::env::temp_dir().join(format!(
+        "processkit_t052_stdin_from_file_{}.txt",
+        std::process::id()
+    ));
+    std::fs::write(&path, "banana\napple\n").expect("write fixture file");
+
+    let program = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "sort"])
+    } else {
+        Command::new("sort")
+    };
+    let result = program
+        .stdin(processkit::Stdin::from_file(&path))
+        .output_string()
+        .await
+        .expect("run sort fed from a file");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(result.is_success(), "result: {result:?}");
+    let first = result
+        .stdout()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    assert_eq!(first, "apple", "sorted output: {:?}", result.stdout());
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess and writes to its stdin after it exits"]
+async fn write_after_child_exit_reports_the_windows_pipe_error_code() {
+    // F: the Windows broken-pipe error-code gap — a write to a pipe whose
+    // reader is gone commonly surfaces here as raw OS error 109
+    // (`ERROR_BROKEN_PIPE`) or 232 (`ERROR_NO_DATA`), which don't always map
+    // to `ErrorKind::BrokenPipe` (see `is_broken_pipe` in
+    // `src/running/mod.rs`). The POSIX EPIPE-equivalent forgiveness is already
+    // covered cross-platform by
+    // `capture::early_exiting_child_does_not_fail_a_large_stdin_feed`; this
+    // pins the raw Windows code on the interactive writer, which hands the
+    // caller a bare `io::Error` instead of forgiving it internally.
+    let exits_zero = Command::new("cmd").args(["/c", "exit", "0"]);
+    let mut process = exits_zero.keep_stdin_open().start().await.expect("start");
+    let mut stdin = process.take_stdin().expect("stdin kept open");
+
+    let outcome = completes_within(Duration::from_secs(10), "child exit", process.wait())
+        .await
+        .expect("wait");
+    assert_eq!(outcome, Outcome::Exited(0));
+
+    let err = stdin
+        .write_line("data")
+        .await
+        .expect_err("a write after the child exited must fail");
+    assert!(
+        err.kind() == std::io::ErrorKind::BrokenPipe
+            || matches!(err.raw_os_error(), Some(109 | 232)),
+        "expected a broken-pipe-shaped error, got kind={:?} raw={:?}",
+        err.kind(),
+        err.raw_os_error()
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess"]
 async fn output_buffer_drops_oldest_lines() {
     // Keep only the last two lines; the rest are dropped from the buffer.
     let result = five_lines()

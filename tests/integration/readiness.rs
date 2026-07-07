@@ -111,6 +111,42 @@ async fn wait_for_port_succeeds_against_a_late_listener() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real subprocess and probes a TCP port whose listener closes mid-retry"]
+async fn wait_for_port_gives_up_after_the_listener_closes_mid_retry() {
+    // F: a listener that is briefly up, then closes before the probe ever
+    // connects — several poll ticks (50ms cadence) land on a refused connect
+    // afterward. `wait_for_port` must keep retrying past the refusal (not
+    // error or hang on it) and give up cleanly with `NotReady` once `within`
+    // elapses, rather than mistaking the earlier "was listening" moment for
+    // lasting readiness.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    drop(listener);
+
+    let mut process = sleep_secs(10).start().await.expect("start context child");
+    let start = Instant::now();
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        process.wait_for_port(addr, Duration::from_millis(600)),
+    )
+    .await
+    .expect("probe finished in time")
+    .expect_err("the closed listener never becomes ready again");
+    assert!(
+        matches!(err, processkit::Error::NotReady { .. }),
+        "expected NotReady, got {err:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "the probe must give up promptly after the listener closes, took {:?}",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a real subprocess and polls an async readiness check"]
 async fn wait_for_passes_once_the_check_turns_true() {
     use std::sync::atomic::{AtomicU32, Ordering};
