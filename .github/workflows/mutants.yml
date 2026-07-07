@@ -1,0 +1,30 @@
+name: mutants
+
+# cargo-mutants exhaustively mutates the examined modules (scope defined in
+# mutants.toml at the repo root) and re-runs the whole test suite for every
+# mutant, which is far too slow and noisy to gate a PR — even over a small,
+# hermetic scope a full sweep can take tens of minutes. Like the stress and
+# fuzz tiers, it stays OUTSIDE the PR matrix: nightly on a schedule and
+# on-demand via the Actions tab.
+on:
+  schedule:
+    # 05:29 UTC daily — staggered from stress.yml (03:17) and fuzz.yml (04:07).
+    - cron: '29 5 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutants:
+    name: mutants
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-mutants
+      # Scope, exclusions and `--all-features` all come from mutants.toml, so
+      # the CLI invocation itself stays a plain, un-parameterized run.
+      - run: cargo mutants

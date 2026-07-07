@@ -1,0 +1,38 @@
+# Mutation-testing scope for the `mutants` CI tier (.github/workflows/mutants.yml).
+#
+# cargo-mutants mutates library code and re-runs the test suite to check that a
+# mutated build still fails a test (a "missed" mutant means the tests didn't
+# notice). Running it over the whole crate would also mutate the FFI/subprocess
+# layer (src/running/**, src/sys/**, src/supervisor.rs), where most functions
+# talk to a real child process or a platform API — a mutant there either fails
+# to build (compile errors in an FFI shim on the "wrong" OS) or only gets
+# caught after paying for a real process spawn/kill, which is exactly what
+# makes this tier slow and noisy without adding a useful signal.
+#
+# The starting scope is limited to hermetic, pure-logic modules that are fully
+# exercised by fast unit tests with no live subprocess: the line-decode pump
+# (pump.rs), the capture buffer's cap/eviction logic (buffer.rs), the backoff/
+# retry policy (retry.rs), the run outcome classification (result.rs) and the
+# error type (error.rs). Grow this list as more modules gain hermetic coverage
+# (e.g. a standalone backoff.rs, once split out) rather than widening it
+# wholesale.
+examine_globs = [
+    "src/pump.rs",
+    "src/buffer.rs",
+    "src/retry.rs",
+    "src/result.rs",
+    "src/error.rs",
+]
+
+# Belt-and-suspenders: explicitly keep the FFI/real-subprocess layer out of
+# scope even if examine_globs above is ever widened by mistake.
+exclude_globs = [
+    "src/running/**",
+    "src/sys/**",
+    "src/supervisor.rs",
+]
+
+# Build with every feature enabled so feature-gated code in the examined
+# modules (e.g. the `limits`-gated Error variants in error.rs) is mutated and
+# checked too — matches how the rest of CI exercises the crate (see stress.yml).
+additional_cargo_args = ["--all-features"]
