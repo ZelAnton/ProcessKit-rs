@@ -1,0 +1,63 @@
+name: bench
+
+# `benches/pump.rs` (criterion) measures the output pump's hot paths by
+# spawning real child processes and timing wall-clock decode/split/buffer
+# work -- hosted runners are shared and load-sensitive, so raw numbers are
+# too noisy to gate an ordinary PR. This tier therefore runs OUTSIDE the
+# PR matrix (ci.yml), same pattern as stress.yml: nightly on a schedule and
+# on-demand via the Actions tab, always against `main` (schedule) or
+# whatever ref is manually dispatched -- never a PR head.
+#
+# Baseline mechanism: criterion `--save-baseline` + a cached
+# `target/criterion` directory (chosen over github-action-benchmark), not
+# because the two are unequal in capability, but because this crate has a
+# single hot-path bench file and no history-hosting branch (gh-pages) set
+# up yet -- criterion's own comparison output (printed straight into the job
+# log) plus an uploaded HTML report is enough signal without standing up a
+# second piece of infrastructure. Revisit github-action-benchmark if/when
+# more bench suites or an alerting threshold are needed.
+on:
+  schedule:
+    # 04:07 UTC daily -- off the top of the hour, after the stress tier (03:17).
+    - cron: '7 4 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: bench (pump)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Persists criterion's own `target/criterion` baseline directory across
+      # runs so `--save-baseline main` below has something to compare
+      # against and prints a regressed/improved delta into the job log. The
+      # cache key includes the run id, so it never hits an exact match --
+      # actions/cache then always saves the freshly written baseline at the
+      # end of the job, and the next run picks it up via `restore-keys`,
+      # keeping the entry rolling forward run over run.
+      - uses: actions/cache@v4
+        with:
+          path: target/criterion
+          key: criterion-pump-${{ github.run_id }}
+          restore-keys: |
+            criterion-pump-
+      # Single OS (ubuntu-latest): the benched code (line splitting/decoding
+      # in the shared pump) isn't platform-specific, and comparing baselines
+      # run-over-run only makes sense if every run comes from the same kind
+      # of machine -- mixing runners would show up as noise, not signal.
+      - run: cargo bench --bench pump -- --save-baseline main
+      # The HTML report (plots, per-benchmark stats) isn't visible from the
+      # job log alone -- upload it so a regression can be inspected visually,
+      # not just read off the printed percentage change.
+      - name: Upload criterion report
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-pump-report
+          path: target/criterion
+          retention-days: 30
