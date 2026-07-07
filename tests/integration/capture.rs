@@ -864,6 +864,59 @@ async fn top_level_run_and_output() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real subprocess driven via interactive stdin"]
+async fn send_control_writes_the_exact_control_byte() {
+    // `send_control` writes exactly one raw byte to the pipe — no terminal
+    // interpretation happens, so a byte-for-byte echo child must receive
+    // precisely the mapped control byte (Ctrl-D -> 0x04), not e.g. the text
+    // 'd' or an EOF with no byte at all.
+    let mut process = raw_stdin_echo()
+        .keep_stdin_open()
+        .start()
+        .await
+        .expect("start raw echo");
+    let mut stdin = process.take_stdin().expect("stdin kept open");
+    stdin.send_control('d').await.expect("send Ctrl-D");
+    stdin.finish().await.expect("eof");
+
+    let result = process.output_bytes().await.expect("collect");
+    assert!(result.is_success(), "result: {result:?}");
+    assert_eq!(
+        result.stdout(),
+        &[0x04][..],
+        "the exact control byte must reach the child: {:?}",
+        result.stdout()
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess driven via interactive stdin"]
+async fn send_control_rejects_an_unrecognized_character_without_writing() {
+    // An unrecognized character must error loudly and write nothing — not a
+    // silent, meaningless byte.
+    let mut process = raw_stdin_echo()
+        .keep_stdin_open()
+        .start()
+        .await
+        .expect("start raw echo");
+    let mut stdin = process.take_stdin().expect("stdin kept open");
+    let err = stdin
+        .send_control('0')
+        .await
+        .expect_err("a digit is not a recognized control character");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    stdin.finish().await.expect("eof");
+
+    let result = process.output_bytes().await.expect("collect");
+    assert!(result.is_success(), "result: {result:?}");
+    assert!(
+        result.stdout().is_empty(),
+        "a rejected control character must write no byte: {:?}",
+        result.stdout()
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a real subprocess"]
 async fn first_line_returns_none_when_the_stream_ends_without_a_match() {
     // stdout closing without a matching line is Ok(None) — not a hang and not
