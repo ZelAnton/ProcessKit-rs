@@ -20,6 +20,8 @@ future can never leak a process tree.
 ## Program, arguments, working directory
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 
 let out = Command::new("git")
@@ -28,6 +30,8 @@ let out = Command::new("git")
     .current_dir("/path/to/repo")        // run there
     .run()
     .await?;
+# Ok(())
+# }
 ```
 
 Arguments are passed as an array — there is **no shell** between you and the
@@ -46,8 +50,12 @@ win). Pass absolute program paths when combining the two.
 For quick one-liners the free functions skip the builder:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 let version = processkit::run("cargo", ["--version"]).await?;       // trimmed stdout, success required
 let result  = processkit::output_string("git", ["status", "-s"]).await?;   // full ProcessResult
+# Ok(())
+# }
 ```
 
 ## Environment
@@ -55,6 +63,8 @@ let result  = processkit::output_string("git", ["status", "-s"]).await?;   // fu
 Four builders compose, applied in a fixed order at spawn:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 
 Command::new("worker")
@@ -70,6 +80,8 @@ Command::new("sandboxed-tool")
 
 // Scorched earth: the child starts with an empty environment.
 Command::new("hermetic-tool").env_clear().run().await?;
+# Ok(())
+# }
 ```
 
 `inherit_env` is the sandboxing middle ground: it implies `env_clear`, then
@@ -94,6 +106,8 @@ can never hang waiting for input. Everything else is opt-in via
 | `Stdin::from_lines(stream)` | ❌ one-shot | Any `Stream<Item = String>` — a channel, a tail, … |
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::{Command, Stdin};
 
 let sorted = Command::new("sort")
@@ -101,6 +115,8 @@ let sorted = Command::new("sort")
     .run()
     .await?;
 assert_eq!(sorted, "apple\nbanana\ncherry");
+# Ok(())
+# }
 ```
 
 The payload is written on a background task (so a large input can't deadlock
@@ -123,6 +139,8 @@ Output is decoded line by line, UTF-8 by default (invalid bytes become
 `U+FFFD`, never an error). Legacy-encoding tools can override per stream:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 
 let out = Command::new("legacy-tool")
@@ -130,6 +148,8 @@ let out = Command::new("legacy-tool")
     // .stdout_encoding(…) / .stderr_encoding(…) // …or each its own
     .output_string()
     .await?;
+# Ok(())
+# }
 ```
 
 (`processkit::prelude::Encoding` re-exports `encoding_rs::Encoding`, so any of its
@@ -147,6 +167,8 @@ the buffer to match. `output_buffer` bounds *retention* (the pipe is always
 fully drained, so the child never blocks):
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::{Command, OutputBufferPolicy, OverflowMode};
 
 let tail = Command::new("verbose-build")
@@ -156,6 +178,8 @@ let tail = Command::new("verbose-build")
 
 // …or keep the head instead of the tail:
 let head_policy = OutputBufferPolicy::bounded(1_000).with_overflow(OverflowMode::DropNewest);
+# Ok(())
+# }
 ```
 
 `DropOldest` (the default) keeps a rolling tail; `DropNewest` freezes the
@@ -195,6 +219,8 @@ the partial result with `truncated()` set for you to inspect.
 addition to* capture or streaming — logging, progress bars, metrics:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 
 let result = Command::new("cargo")
@@ -202,6 +228,8 @@ let result = Command::new("cargo")
     .on_stderr_line(|line| eprintln!("[build] {line}"))
     .output_string()
     .await?;
+# Ok(())
+# }
 ```
 
 The handler runs on the read pump — keep it cheap. The contract is forgiving
@@ -234,6 +262,8 @@ fire per line.
 ## Timeouts and retries
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::{Command, Error};
 use std::time::Duration;
 
@@ -244,6 +274,8 @@ let out = Command::new("flaky-network-tool")
     })
     .run()
     .await?;
+# Ok(())
+# }
 ```
 
 - **`timeout`** kills the whole process tree at the deadline. On the capturing
@@ -261,6 +293,8 @@ let out = Command::new("flaky-network-tool")
 Spawn-time controls for sandboxing and service launch:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 
 // Unix: drop privileges (uid + gid + supplementary groups) and detach.
@@ -277,6 +311,8 @@ Command::new("helper").create_no_window().run().await?;
 // Hardening: take the direct child down even if THIS process is SIGKILLed
 // (Drop never runs). Windows has this for free; Linux arms PDEATHSIG.
 Command::new("worker").kill_on_parent_death().start().await?;
+# Ok(())
+# }
 ```
 
 `uid` / `gid` / `groups` / `setsid` are POSIX-only — on Windows the run
@@ -300,6 +336,8 @@ that shouldn't starve the foreground, and for controlling the permissions of
 files a child creates:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::{Command, Priority};
 
 // Run at a lower CPU-scheduling priority — supported on BOTH platforms.
@@ -309,6 +347,8 @@ Command::new("batch-job")
 
 // Unix only: files this child creates get 0644/0755 instead of 0666/0777.
 Command::new("worker").umask(0o022).run().await?;
+# Ok(())
+# }
 ```
 
 `priority` maps onto `nice`/`setpriority` on Unix and a priority class on
@@ -345,6 +385,8 @@ tools that read stdin without needing a tty already work today via
 | `start()` | live `RunningProcess` | — | bounds the stream | [Streaming, interactive I/O, probes](streaming.md) |
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 
 // probe(): the exit code as a boolean.
@@ -355,6 +397,8 @@ let first_match = Command::new("git")
     .args(["log", "--oneline"])
     .first_line(|l| l.contains("fix:"))
     .await?;
+# Ok(())
+# }
 ```
 
 `first_line` returns `Ok(None)` when stdout closes without a match, and kills
@@ -370,6 +414,8 @@ never appeared" — while a run that genuinely ends with no match still reports
 The capturing verbs hand back a `ProcessResult`:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 
 let result = Command::new("git").args(["merge", "feature"]).output_string().await?;
@@ -387,14 +433,19 @@ result.diagnostic();   // stderr if non-empty, else stdout — the human-facing 
 
 // Opt into erroring whenever you're ready:
 let ok = result.ensure_success()?; // Exit / Timeout / Signalled (signal-kill) as typed errors
+# Ok(())
+# }
 ```
 
 When the three-way distinction matters, match on `Outcome` instead of
 mentally decoding the `code()`/`timed_out()` pair:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::Outcome;
 
+# let result = processkit::Command::new("git").args(["merge", "feature"]).output_string().await?;
 match result.outcome() {
     Outcome::Exited(0) => println!("clean"),
     Outcome::Exited(code) => println!("failed with {code}"),
@@ -402,6 +453,8 @@ match result.outcome() {
     Outcome::TimedOut => println!("hit its deadline"),
     _ => {} // non_exhaustive: future dispositions
 }
+# Ok(())
+# }
 ```
 
 For a single query you usually don't need the `match` (and its

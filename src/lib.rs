@@ -131,12 +131,26 @@
 //! [Job Object]: https://learn.microsoft.com/windows/win32/procthread/job-objects
 //! [cgroup v2]: https://docs.kernel.org/admin-guide/cgroup-v2.html
 
+mod backoff;
 mod batch;
 mod buffer;
 #[cfg(feature = "record")]
 mod cassette;
 mod client;
 mod command;
+// Test-only: compiles docs/*.md + README.md's fenced Rust blocks as doctests
+// (see the module's own doc comment). Only under `--all-features` — the
+// guides collectively use every optional feature, and the default /
+// `--no-default-features` CI legs don't need a second copy of this check.
+#[cfg(all(
+    feature = "process-control",
+    feature = "stats",
+    feature = "limits",
+    feature = "mock",
+    feature = "tracing",
+    feature = "record"
+))]
+mod doc_examples;
 mod doubles;
 mod error;
 mod group;

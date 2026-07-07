@@ -1886,13 +1886,26 @@ fn probe_dir(dir: &std::path::Path, program: &OsStr) -> Option<std::path::PathBu
 /// Check whether `program` (with PATHEXT expansion) exists in `dir`.
 #[cfg(not(unix))]
 fn probe_dir(dir: &std::path::Path, program: &OsStr) -> Option<std::path::PathBuf> {
-    // Exact name first (handles `git.exe` already carrying an ext).
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let carries_exec_ext = |path: &std::path::Path| -> bool {
+        path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+            pathext
+                .split(';')
+                .map(|pe| pe.trim_start_matches('.'))
+                .any(|pe| !pe.is_empty() && pe.eq_ignore_ascii_case(e))
+        })
+    };
+    // Exact name first — but only accept it if it already carries a
+    // recognized executable extension (handles `git.exe`, `git.cmd`, ...). A
+    // same-named file with no extension (or an unrecognized one) is not
+    // directly executable on Windows, so it must not be reported as found —
+    // that would falsely short-circuit the PATHEXT search below and turn a
+    // genuinely missing `git.exe` into a false "found but not executable".
     let candidate = dir.join(program);
-    if candidate.is_file() {
+    if carries_exec_ext(&candidate) && candidate.is_file() {
         return Some(candidate);
     }
-    // Then each PATHEXT extension.
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    // Then each PATHEXT extension appended to the bare name.
     for ext in pathext.split(';') {
         if ext.is_empty() {
             continue;
@@ -2420,6 +2433,56 @@ mod tests {
                 .timeout_signal(Signal::Int)
                 .timeout_signal_raw(),
             Signal::Int.raw(),
+        );
+    }
+
+    // T-041: a same-named file with no recognized executable extension (e.g.
+    // a unix shell script named `git` living beside a missing `git.exe`) must
+    // not make `probe_dir` report a match — otherwise `find_in_path` returns
+    // `found == Some(..)` for a file that Windows cannot actually run, and the
+    // error-enrichment branch in `runner::launch` turns a genuinely missing
+    // `git.exe` into `Error::Spawn` instead of `Error::NotFound`, breaking
+    // `is_not_found()` for callers.
+    #[cfg(windows)]
+    #[test]
+    fn probe_dir_rejects_extensionless_same_named_file_but_still_finds_pathext_sibling() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("git"), b"#!/bin/sh\necho hi\n")
+            .expect("write extensionless file");
+
+        assert!(
+            super::probe_dir(dir.path(), OsStr::new("git")).is_none(),
+            "an extensionless same-named file must not be reported as found"
+        );
+
+        // Once a real `.exe` sibling shows up, PATHEXT expansion must still
+        // find it — the exact-name check tightening must not regress the
+        // extension-search fallback. The resolved name's *case* follows
+        // whatever the `PATHEXT` env var carries (commonly `.EXE`), so
+        // compare case-insensitively rather than pinning an exact case.
+        std::fs::write(dir.path().join("git.exe"), b"stub").expect("write git.exe");
+        let found =
+            super::probe_dir(dir.path(), OsStr::new("git")).expect("git.exe must now be found");
+        assert!(
+            found
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&dir.path().join("git.exe").to_string_lossy()),
+            "PATHEXT expansion must still resolve the real executable, got {found:?}"
+        );
+    }
+
+    // Existing behavior must not regress: a candidate whose exact name
+    // already carries a recognized executable extension (`git.cmd`) is
+    // accepted directly, without needing the PATHEXT expansion loop.
+    #[cfg(windows)]
+    #[test]
+    fn probe_dir_accepts_exact_name_already_carrying_a_recognized_extension() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("git.cmd"), b"@echo off").expect("write git.cmd");
+
+        assert_eq!(
+            super::probe_dir(dir.path(), OsStr::new("git.cmd")),
+            Some(dir.path().join("git.cmd"))
         );
     }
 }

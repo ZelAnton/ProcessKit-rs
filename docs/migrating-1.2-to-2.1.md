@@ -77,15 +77,26 @@ outside the crate. Fixes:
 
 - **Reading fields** → add `..` to the pattern and use accessors instead of
   raw fields:
-  ```rust
+  <!-- `text`, not `rust`: the "Before" line is the pre-2.1.0 exhaustive
+       destructure this section is *about* removing — it no longer compiles
+       against `#[non_exhaustive]` `Error::Exit`, and this crate's CI runs
+       doctests with `--include-ignored`, which still compiles `ignore`
+       blocks (only `text`/non-`rust` fences are exempt). -->
+  ```text
   // Before:
   if let Error::Exit { code, stderr, program } = &err { /* ... */ }
+  ```
+  ```rust,no_run
+  # use processkit::Error;
+  # fn handle(err: Error) {
   // After:
   if let Error::Exit { .. } = &err {
       let code = err.code();        // Option<i32>
       let stderr = err.stderr();    // Option<&str>
       let program = err.program();  // Option<&str>
+      let _ = (code, stderr, program);
   }
+  # }
   ```
 - **Prefer the accessors over matching at all** — they read every failure shape
   without a `match`:
@@ -101,7 +112,11 @@ outside the crate. Fixes:
   | `err.is_not_found()` / `is_permission_denied()` / `is_transient()` | `bool` |
 
 - **`ResourceLimit` changed shape** (`limits` feature):
-  ```rust
+  <!-- `text`, not `rust`: a Before/After diff (the "Before" line is the
+       removed pre-2.1.0 shape) plus a bare-arm fragment over a free `err` —
+       not a standalone compilable example; see the note above on why `text`
+       rather than `ignore`. -->
+  ```text
   // Before:  Error::ResourceLimit { message }
   // After:   Error::ResourceLimit { detail, .. }
   // Better:  classify without destructuring the non_exhaustive variant —
