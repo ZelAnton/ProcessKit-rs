@@ -32,6 +32,10 @@ async fn pipeline_flows_data_between_stages() {
         .await
         .expect("run pipeline");
     assert!(result.is_success(), "pipeline result: {result:?}");
+    assert!(
+        result.duration() > Duration::ZERO,
+        "T-039: a successful chain must report the measured wall-clock duration, not ZERO: {result:?}"
+    );
     let stdout = result.stdout();
     let alpha = stdout.find("alpha").expect("alpha in output");
     let delta = stdout.find("delta").expect("delta in output");
@@ -99,6 +103,10 @@ async fn pipeline_pipefail_attributes_the_first_failure() {
         .expect("pipeline completes with a result");
     assert_eq!(result.code(), Some(3), "pipefail code: {result:?}");
     assert!(!result.is_success());
+    assert!(
+        result.duration() > Duration::ZERO,
+        "T-039: a failing chain must also report the measured wall-clock duration: {result:?}"
+    );
 
     // run() surfaces the same attribution as a typed error.
     let producer = if cfg!(windows) {
@@ -249,6 +257,11 @@ async fn pipeline_timeout_kills_the_whole_chain() {
         start.elapsed() < Duration::from_secs(15),
         "pipeline did not honor its timeout (took {:?})",
         start.elapsed()
+    );
+    assert!(
+        result.duration() > Duration::ZERO,
+        "T-039: the chain-wide timeout branch must also report the measured wall-clock duration, \
+         not ZERO: {result:?}"
     );
 }
 
