@@ -104,6 +104,13 @@ per-item reference; these guides are the narrative layer on top — they explain
 how the pieces compose, with the platform fine print collected in
 [Platform support](platform-support.md).
 
+**These examples are compiler-checked.** Every fenced Rust block across these
+guides and the root `README.md` is compiled (and, unless annotated `no_run` or
+`ignore`, actually run) as an ordinary doctest by `cargo test` — a signature
+change that stops matching a guide's snippet fails CI instead of silently
+lying to a reader. See `src/doc_examples.rs` for the (test-only, hidden)
+harness.
+
 ## Other languages
 
 Not on Rust? [`processkit-py`](https://pypi.org/project/processkit-py/) wraps

@@ -56,6 +56,8 @@ identically, with no subprocess (see
 runner keeps compiling: `start` is defaulted to `Error::Unsupported`.
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::{Command, ProcessRunner, ProcessRunnerExt, Result};
 
 // Production code: generic over the runner.
@@ -64,6 +66,8 @@ async fn current_branch(runner: &impl ProcessRunner) -> Result<String> {
         .run(&Command::new("git").args(["branch", "--show-current"]))
         .await
 }
+# Ok(())
+# }
 ```
 
 ## Scripting replies
@@ -72,6 +76,8 @@ async fn current_branch(runner: &impl ProcessRunner) -> Result<String> {
 work-horse double:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::{Command, ProcessRunnerExt};
 use processkit::testing::{Reply, ScriptedRunner};
 
@@ -91,6 +97,8 @@ async fn detects_the_branch() {
 
     assert_eq!(current_branch(&runner).await.unwrap(), "main");
 }
+# Ok(())
+# }
 ```
 
 The pieces:
@@ -135,6 +143,8 @@ hermetically — `stdout_lines` yields the lines, `wait_for_line` probes them,
 `finish` reports the canned outcome and stderr:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::prelude::StreamExt;
 use processkit::testing::{Reply, ScriptedRunner};
 use processkit::{Command, Finished, Outcome, ProcessRunner};
@@ -153,6 +163,8 @@ async fn server_becomes_ready() {
     let Finished { outcome, .. } = run.finish().await.unwrap();
     assert_eq!(outcome, Outcome::Exited(0));
 }
+# Ok(())
+# }
 ```
 
 `Reply::lines([...])` scripts the stdout lines; `.with_line_delay(d)` paces
@@ -172,6 +184,8 @@ tier, so — like on Windows — it ignores `timeout_grace` and ends at once.
 was *asked* — so a test asserts inputs, not just outputs:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::{Command, ProcessRunnerExt};
 use processkit::testing::{RecordingRunner, Reply, ScriptedRunner};
 
@@ -192,6 +206,8 @@ async fn passes_the_right_flags() {
     assert_eq!(call.cwd.as_deref().map(|c| c.to_str().unwrap()), Some("/repo"));
     assert!(!call.has_stdin);
 }
+# Ok(())
+# }
 ```
 
 An `Invocation` captures the *routing* knobs — `program`, `args`, `cwd`,
@@ -210,6 +226,8 @@ mode: wire your production code to it (instead of `JobRunner`) and it shows
 what *would* run instead of running it.
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::{Command, ProcessRunner};
 use processkit::testing::DryRunRunner;
 
@@ -223,6 +241,8 @@ async fn dry_run_shows_the_command_without_running_it() {
     assert!(out.is_success()); // synthetic — no process ever ran
     assert_eq!(runner.only_command(), "rm -rf build");
 }
+# Ok(())
+# }
 ```
 
 Unlike `ScriptedRunner`, there is nothing to script — a dry run has no real
@@ -263,7 +283,7 @@ use processkit::testing::MockRunner;
 let mut mock = MockRunner::new();
 mock.expect_output_string()
     .times(1)
-    .returning(|_cmd| /* build a Result<ProcessResult<String>> */ …);
+    .returning(|_cmd| todo!("build a Result<ProcessResult<String>>"));
 ```
 
 > **`MockRunner` does not inherit the defaults.** Unlike a hand-written runner
@@ -283,6 +303,8 @@ real runs to a JSON *cassette* once, then replay them deterministically —
 fast, hermetic, byte-stable, no subprocess in CI:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::{Command, JobRunner, ProcessRunnerExt};
 use processkit::testing::RecordReplayRunner;
 
@@ -295,6 +317,8 @@ runner.save()?;                                  // the error-surfacing flush
 // Replay everywhere else:
 let runner = RecordReplayRunner::replay("fixtures/git.json")?;
 assert_eq!(runner.run(&Command::new("git").arg("--version")).await?, version);
+# Ok(())
+# }
 ```
 
 Semantics worth knowing before you commit a cassette:
@@ -332,6 +356,8 @@ defaults, and the runner; your wrapper contributes only commands and parsers.
 The `cli_client!` macro generates the boilerplate:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 use processkit::{cli_client, Error, ProcessRunner, Result};
 use std::path::Path;
 use std::time::Duration;
@@ -361,10 +387,7 @@ impl<R: ProcessRunner> Git<R> {
                 |out| {
                     let list: Vec<String> = out.lines().map(str::to_owned).collect();
                     if list.is_empty() {
-                        Err(Error::Parse {
-                            program: "git".into(),
-                            message: "no branches".into(),
-                        })
+                        Err(Error::parse("git", "no branches"))
                     } else {
                         Ok(list)
                     }
@@ -377,6 +400,8 @@ impl<R: ProcessRunner> Git<R> {
 // Production: the real runner, with per-client defaults.
 let git = Git::new().default_timeout(Duration::from_secs(30));
 let head = git.head(Path::new(".")).await?;
+# Ok(())
+# }
 ```
 
 The generated type is `Git<R: ProcessRunner = JobRunner>` with `Git::new()`,
@@ -390,6 +415,8 @@ result), `run_unit` (success only), `exit_code`, `probe`, plus `parse`
 And the payoff — the wrapper tests hermetically with any double:
 
 ```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
 #[tokio::test]
 async fn head_is_trimmed() {
     let git = Git::with_runner(
@@ -397,6 +424,8 @@ async fn head_is_trimmed() {
     );
     assert_eq!(git.head(Path::new("/repo")).await.unwrap(), "abc123");
 }
+# Ok(())
+# }
 ```
 
 …or with a [cassette](#recordreplay-cassettes) recorded against the real tool

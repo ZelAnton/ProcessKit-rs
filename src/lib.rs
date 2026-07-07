@@ -137,6 +137,19 @@ mod buffer;
 mod cassette;
 mod client;
 mod command;
+// Test-only: compiles docs/*.md + README.md's fenced Rust blocks as doctests
+// (see the module's own doc comment). Only under `--all-features` — the
+// guides collectively use every optional feature, and the default /
+// `--no-default-features` CI legs don't need a second copy of this check.
+#[cfg(all(
+    feature = "process-control",
+    feature = "stats",
+    feature = "limits",
+    feature = "mock",
+    feature = "tracing",
+    feature = "record"
+))]
+mod doc_examples;
 mod doubles;
 mod error;
 mod group;
@@ -433,6 +446,13 @@ pub mod prelude {
 /// Re-exported so callers can `use processkit::CancellationToken;` without a
 /// direct `tokio-util` dependency. See [`Command::cancel_on`].
 pub use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+mod cfgtest_doctest_experiment {
+    //! ```
+    //! compile_error!("cfg-test doctest experiment fired");
+    //! ```
+}
 
 #[cfg(test)]
 mod tests {
