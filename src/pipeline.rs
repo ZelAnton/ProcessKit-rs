@@ -226,6 +226,11 @@ impl Pipeline {
         C: FnOnce(crate::running::RunningProcess) -> F,
         F: std::future::Future<Output = Result<ProcessResult<T>>> + Send + 'static,
     {
+        // Wall-clock start of the whole chain — from here to the moment the final
+        // `ProcessResult` is assembled (success, pipefail failure, or chain-wide
+        // timeout), so `duration()` reflects the run, not just the last stage.
+        let started = std::time::Instant::now();
+
         // Each stage gets its own kill-on-drop sub-group, retained here as a
         // strong handle. A per-stage `Command::timeout`/`cancel_on` then tears
         // down that stage's *whole* subtree (grandchildren of a forking `sh -c …`
@@ -376,7 +381,8 @@ impl Pipeline {
                         String::new(),
                         Outcome::TimedOut,
                         Some(limit),
-                    ));
+                    )
+                    .with_duration(started.elapsed()));
                 }
             },
         };
@@ -398,7 +404,7 @@ impl Pipeline {
         let last_stdout = last_result.into_stdout();
         stages.push(last_outcome);
 
-        let mut result = pipefail(stages, last_stdout);
+        let mut result = pipefail(stages, last_stdout).with_duration(started.elapsed());
         if last_truncated {
             result = result
                 .with_truncated(true)
