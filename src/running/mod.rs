@@ -904,6 +904,9 @@ impl RunningProcess {
         let mut stdout = std::mem::take(&mut *out_buf.lock().expect("stdout buffer poisoned"));
         clamp_dropoldest_tail(&mut stdout, stdout_cap, stdout_mode);
         join_pumps(self.stderr_pump.take().into_iter().collect()).await;
+        // Re-observe stdin after the pumps drained: a writer that failed inside
+        // the teardown window is only visible now (see `finalize_stdin_task`).
+        self.finalize_stdin_task().await;
         let outcome = self.checked_outcome(outcome)?;
 
         // A raw-stdout fail-loud (Error mode) byte overflow surfaces first, like
@@ -1242,6 +1245,9 @@ impl RunningProcess {
             .flatten()
             .collect();
         join_pumps(pumps).await;
+        // Re-observe stdin after the pumps drained: a writer that failed inside
+        // the teardown window is only visible now (see `finalize_stdin_task`).
+        self.finalize_stdin_task().await;
         let outcome = self.checked_outcome(outcome)?;
 
         if matches!(capture, CaptureMode::Lines) {
@@ -1317,9 +1323,13 @@ impl RunningProcess {
         Ok(outcome)
     }
 
-    /// Stash a non-broken-pipe stdin writer failure in `self.stdin_error` for
-    /// `checked_outcome`. Only a writer that already finished is observed; a
-    /// still-parked task is left for `Drop`'s abort.
+    /// Non-blocking pre-pump peek at the stdin writer: stash a non-broken-pipe
+    /// failure of a writer that has *already finished* in `self.stdin_error` for
+    /// `checked_outcome`. A still-running writer is re-parked — it might yet fail
+    /// inside the `join_pumps` window — and picked up by the final,
+    /// post-pump [`finalize_stdin_task`](Self::finalize_stdin_task). Peeking
+    /// (never blocking) here keeps the fast path cheap and never waits on a
+    /// hung writer.
     async fn observe_stdin_task(&mut self) {
         let task = match &mut self.backend {
             Backend::Real(real) => real.stdin_task.take(),
@@ -1329,23 +1339,80 @@ impl RunningProcess {
             return;
         };
         if !task.is_finished() {
+            // Not done yet — re-park for the post-pump `finalize_stdin_task`, so
+            // a writer that fails during `join_pumps` is not silently lost.
             if let Backend::Real(real) = &mut self.backend {
                 real.stdin_task = Some(task);
             }
             return;
         }
-        let observed = match task.await {
+        let observed = Self::classify_stdin_join(task.await);
+        self.record_stdin_error(observed);
+    }
+
+    /// Final stdin-writer observation, run after `join_pumps` and before
+    /// `checked_outcome` in every pump-draining consuming path. The pre-pump
+    /// [`observe_stdin_task`](Self::observe_stdin_task) only peeks
+    /// non-blockingly, so a writer that failed with a non-broken-pipe error
+    /// *inside* the `join_pumps` window (up to [`PUMP_TEARDOWN`]) — e.g. a
+    /// `from_reader`/`from_file` source that erred while the pumps were still
+    /// draining the child's output — was re-parked and would otherwise never
+    /// reach `self.stdin_error`, letting an otherwise-successful run report a
+    /// silent success (exactly the case `Error::Stdin` exists to diagnose).
+    ///
+    /// This waits for that writer, but only *bounded* by [`PUMP_TEARDOWN`]: a
+    /// writer still blocked on a genuinely hung source is aborted and left
+    /// unreported rather than stalling the caller forever — the same "never wait
+    /// on a hung writer" contract the pre-fix single peek kept. In the common
+    /// case the writer already finished (the pre-pump peek took it, or it wraps
+    /// up during pump teardown), so the timeout resolves immediately.
+    async fn finalize_stdin_task(&mut self) {
+        let task = match &mut self.backend {
+            Backend::Real(real) => real.stdin_task.take(),
+            Backend::Scripted(_) => None,
+        };
+        let Some(task) = task else {
+            return;
+        };
+        let abort = task.abort_handle();
+        let observed = match tokio::time::timeout(PUMP_TEARDOWN, task).await {
+            Ok(joined) => Self::classify_stdin_join(joined),
+            // Still writing after the teardown grace — a hung source. Abort it
+            // (a dropped `timeout` future only detaches the handle) and move on
+            // unreported, never blocking the caller unboundedly.
+            Err(_elapsed) => {
+                abort.abort();
+                None
+            }
+        };
+        self.record_stdin_error(observed);
+    }
+
+    /// Classify a finished stdin-writer join into a recordable failure, if any.
+    /// A routine EPIPE (the child closed stdin before consuming all input) is not
+    /// a failure; a genuine read/write error or a task panic is. A cancelled
+    /// `JoinError` is never seen here — the abort sites (`Drop` and
+    /// `finalize_stdin_task`'s timeout) never await the handle afterward.
+    fn classify_stdin_join(
+        joined: std::result::Result<std::io::Result<()>, tokio::task::JoinError>,
+    ) -> Option<std::io::Error> {
+        match joined {
             Ok(Ok(())) => None,
             // Routine EPIPE (child exited before reading all stdin) — not a failure.
             Ok(Err(e)) if is_broken_pipe(&e) => None,
             Ok(Err(e)) => Some(e),
-            // In practice a panic; the only abort site (`Drop`) takes the handle first.
+            // In practice a panic; the abort sites take the handle without awaiting it.
             Err(join_err) => Some(std::io::Error::other(if join_err.is_panic() {
                 format!("stdin writer task panicked: {join_err}")
             } else {
                 format!("stdin writer task did not complete: {join_err}")
             })),
-        };
+        }
+    }
+
+    /// Record a classified stdin-writer failure for `checked_outcome`, tracing it
+    /// once. A no-op when there was no failure.
+    fn record_stdin_error(&mut self, observed: Option<std::io::Error>) {
         if let Some(e) = observed {
             #[cfg(feature = "tracing")]
             tracing::warn!(
