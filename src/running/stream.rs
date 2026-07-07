@@ -281,6 +281,9 @@ impl RunningProcess {
             .flatten()
             .collect();
         super::join_pumps(pumps).await;
+        // Re-observe stdin after the pumps drained: a writer that failed inside
+        // the teardown window is only visible now (see `finalize_stdin_task`).
+        self.finalize_stdin_task().await;
         let outcome = self.checked_outcome(raw_outcome)?;
         // Skip the stdout overflow check when stdout went to the discard sink: the
         // caller didn't ask to capture it, so an over-cap flood is not their error
