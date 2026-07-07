@@ -83,6 +83,14 @@ jobs:
       - run: cargo build --all-targets --all-features
       # `--include-ignored` runs the real-subprocess tests too, so kill-on-drop is
       # actually exercised on each OS — including the macOS process-group teardown.
+      # This step's doctest pass is also where every `docs/*.md` guide's and the
+      # root `README.md`'s fenced Rust blocks get compiler-checked (T-047): the
+      # hidden `src/doc_examples.rs` harness only builds under `--all-features`
+      # (the guides collectively exercise every optional feature). Note
+      # `--include-ignored` still *compiles* an `ignore`-tagged doc block (only
+      # `no_run` skips running it, and only a non-`rust` fence like `text` skips
+      # compiling it) — see `docs/upgrading.md` / `docs/migrating-1.2-to-2.1.md`
+      # for the historical-API snippets that use `text` for exactly that reason.
       - run: cargo test --all-features -- --include-ignored
       # Also exercise the default configuration (process-control only — stats and
       # limits off) at runtime: it takes the `limits`-free `Job::new()` path — the
