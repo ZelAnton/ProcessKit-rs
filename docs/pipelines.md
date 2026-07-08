@@ -230,7 +230,7 @@ let out = Command::new("producer")
 
 Cancellation has two forms. **`Pipeline::cancel_on(token)`** is the chain-level
 control: the token **gap-fills** into every stage that doesn't already carry its
-own [`Command::cancel_on`] (an explicit per-stage token is left intact), so firing
+own `Command::cancel_on` (an explicit per-stage token is left intact), so firing
 it tears the whole chain down and the run resolves to `Error::Cancelled`. (A
 `cancel_on` token on an individual stage `Command` also cancels that stage and
 errors the pipeline, but

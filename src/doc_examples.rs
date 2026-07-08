@@ -13,9 +13,10 @@
 // on a private, hidden module purely so rustdoc's doctest extractor walks its
 // fenced blocks — the text itself is never published anywhere.
 //
-// Gated on every non-default feature so it only builds under
-// `cargo test --all-features` (the guides collectively demonstrate the
-// `stats`/`limits`/`mock`/`tracing`/`record` surfaces); the default and
+// Gated on all six optional features, including the default
+// `process-control`, so it only builds under `cargo test --all-features`
+// (the guides collectively demonstrate the `process-control`/`stats`/
+// `limits`/`mock`/`tracing`/`record` surfaces); the default and
 // `--no-default-features` CI legs never see this module at all.
 #![allow(dead_code)]
 
