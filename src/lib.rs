@@ -52,8 +52,9 @@
 //!
 //! **Stability.** Since **1.0**, `processkit` follows [Semantic Versioning]: the
 //! public API is stable, and any breaking change lands only in a new *major*
-//! version, so `1.x` upgrades are backward-compatible. (The lone exception is the
-//! `mock` feature's `mockall`-generated `expect_*` surface — see below.)
+//! version, so `2.x` upgrades are backward-compatible (the last breaking release
+//! was **2.1.0**). (The lone exception is the `mock` feature's `mockall`-generated
+//! `expect_*` surface — see below.)
 //!
 //! [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
 //!

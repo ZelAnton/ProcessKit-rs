@@ -6,11 +6,12 @@ the full record; this page is the "I depend on it, what do I do" view.
 
 > **Versioning.** From 1.0.0 onward `processkit` follows
 > [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the public API is
-> stable, and any breaking change lands only in a new **major** version, so `1.x`
-> upgrades are backward-compatible. The default Cargo requirement `processkit = "1"`
-> already does the right thing — it allows `1.*` but not `2.0`. Skim the relevant
-> section here before each major bump. (The `mock` feature's `mockall`-generated
-> `expect_*` surface stays semver-exempt — it tracks the `mockall` version.)
+> stable, and any breaking change lands only in a new **major** version, so `2.x`
+> upgrades are backward-compatible. The default Cargo requirement `processkit = "2"`
+> (or `"2.1"` to also require the latest breaking release) already does the right
+> thing — it allows `2.*` but not `3.0`. Skim the relevant section here before each
+> major bump. (The `mock` feature's `mockall`-generated `expect_*` surface stays
+> semver-exempt — it tracks the `mockall` version.)
 
 ## 2.1.0 (from 1.2.x)
 

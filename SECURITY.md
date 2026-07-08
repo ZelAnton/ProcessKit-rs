@@ -27,5 +27,5 @@ just functional ones.
 
 Security fixes land on the **latest published version** on
 [crates.io](https://crates.io/crates/processkit); please reproduce on the latest
-release before reporting. Within the current `1.x` line, fixes ship as patch
+release before reporting. Within the current `2.x` line, fixes ship as patch
 releases.

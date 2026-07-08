@@ -71,10 +71,11 @@ The first column is the differentiator: a child's *descendants* are contained
 and reaped as a unit (Job Object / cgroup v2 / process group), not just the
 direct child.
 
-> **Status:** stable — **1.0**, feature-complete. The public API follows
+> **Status:** stable — **2.x**, feature-complete. The public API follows
 > [Semantic Versioning](https://semver.org/): breaking changes land only in a new
-> major version, so `1.x` upgrades are backward-compatible. See
-> [`CHANGELOG.md`](CHANGELOG.md).
+> major version, so `2.x` upgrades are backward-compatible; the last breaking
+> release was **2.1.0** (renamed from a withdrawn `1.3.0`/`2.0.0`; see
+> [Upgrading](docs/upgrading.md)). See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Install
 
