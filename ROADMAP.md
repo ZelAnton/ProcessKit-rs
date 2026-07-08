@@ -154,21 +154,26 @@ the choice. Right now it's drift-by-default with no rationale on file.
 the README and docs guides; duplicated verb table / feature list removed. Decision rationale
 recorded in `decisions/readme-crate-doc-sourcing.md`. Verified fmt/clippy/doc/test.
 
-### 7. Project-local executable preference ✅ SHIPPED (2026-06-10)
+## Now — 2.x additive sweep (2026-07-08)
+
+Two `next-` ideas from [`ideas/next-launch-ergonomics.md`](ideas/next-launch-ergonomics.md) came
+ripe and shipped directly, ahead of a dedicated sweep write-up.
+
+### 7. Project-local executable preference ✅ SHIPPED (2026-07-08)
 *Dimension: user-scenario / ergonomics · Cost: trivial*
 
 Moved from [`ideas/next-launch-ergonomics.md`](ideas/next-launch-ergonomics.md) §B.
 **Shipped:** `Command::prefer_local(self, impl Into<PathBuf>) -> Self`, which prepends a
-project-local bin directory to `PATH` during command resolution. Additive in the 0.9.x
-release cycle. Verified fmt/clippy/doc/test/cross-compile.
+project-local bin directory to `PATH` during command resolution. Additive in the `2.x`
+release line. Verified fmt/clippy/doc/test/cross-compile.
 
-### 8. Send stdin control characters ✅ SHIPPED (2026-06-10)
+### 8. Send stdin control characters ✅ SHIPPED (2026-07-08)
 *Dimension: user-scenario / ergonomics · Cost: trivial*
 
 Moved from [`ideas/next-launch-ergonomics.md`](ideas/next-launch-ergonomics.md) §E.
 **Shipped:** `ProcessStdin::send_control(&mut self, char) -> Result<()>`, enabling callers
-to send Ctrl+C or Ctrl+D to the stdin of a live subprocess. Additive in the 0.9.x release
-cycle. Verified fmt/clippy/doc/test/cross-compile.
+to send Ctrl+C or Ctrl+D to the stdin of a live subprocess. Additive in the `2.x` release
+line. Verified fmt/clippy/doc/test/cross-compile.
 
 ---
 
