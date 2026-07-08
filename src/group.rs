@@ -347,7 +347,7 @@ impl ProcessGroup {
     /// # Platform support
     ///
     /// - **Linux (cgroup or process-group fallback), macOS/BSD** — any signal,
-    ///   delivered to every live member of the tree.
+    ///   attempted for every live member of the tree.
     /// - **Windows** — only [`Signal::Kill`]; any other signal — including
     ///   [`Signal::Other`] — returns [`Error::Unsupported`].
     ///
@@ -357,11 +357,21 @@ impl ProcessGroup {
     /// cannot miss a process forked mid-broadcast. Other signals are a per-member
     /// broadcast.
     ///
+    /// **Limitation (process-group mechanism only).** On macOS/BSD and the Linux
+    /// process-group fallback, delivery failures such as `EPERM` are not surfaced:
+    /// signalling is best-effort and returns `Ok`. As with
+    /// [`kill_all`](Self::kill_all), `EPERM` cannot be distinguished from signalling
+    /// an unreaped zombie, so reporting it would falsely fail a normal operation.
+    /// The Linux cgroup mechanism does surface delivery failures for signals other
+    /// than `SIGKILL`.
+    ///
     /// # Errors
     ///
     /// [`Error::Unsupported`] on Windows for any signal other than
-    /// [`Signal::Kill`] (Job Objects have no POSIX signals); otherwise
-    /// [`Error::Io`] if the OS rejects delivering the signal to the tree.
+    /// [`Signal::Kill`] (Job Objects have no POSIX signals). On the Linux cgroup
+    /// mechanism, [`Error::Io`] if the OS rejects delivering the signal to a
+    /// member. Delivery errors are deliberately not reported by the process-group
+    /// mechanism (see above).
     #[cfg(feature = "process-control")]
     pub fn signal(&self, sig: Signal) -> Result<()> {
         self.job

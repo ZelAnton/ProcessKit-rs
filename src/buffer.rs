@@ -258,6 +258,15 @@ impl OutputBufferPolicy {
     /// lines or 1 MiB — is reached first. Under the drop modes a single line
     /// larger than the cap is dropped whole (it cannot fit); under
     /// [`OverflowMode::Error`] it trips the fail-loud ceiling.
+    ///
+    /// **This affects every sink, not just the buffer:** a line longer than
+    /// `max_bytes` is never assembled by the pump, so it is silently skipped
+    /// for the capture buffer *and* for
+    /// [`Command::stdout_tee`](crate::Command::stdout_tee)/`stderr_tee` and the
+    /// per-line handlers ([`on_stdout_line`](crate::Command::on_stdout_line)/
+    /// `on_stderr_line`) alike — counted only via the truncation/`dropped()`
+    /// signal. If every line must reach those sinks, leave the byte cap unset
+    /// (or bound with [`max_lines`](Self::max_lines) — a line cap — instead).
     #[must_use]
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = Some(max_bytes);
