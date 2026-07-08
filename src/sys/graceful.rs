@@ -15,6 +15,11 @@
 use std::io;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 // `tokio::time::Instant` (not `std::time::Instant`): the deadline must share the
 // same clock as the `sleep` below so it tracks tokio's virtual time under a
 // paused runtime, which the hermetic tests here rely on.
@@ -144,40 +149,68 @@ pub(crate) async fn run_pid(target: &impl PidTarget, signal: i32, grace: Duratio
 }
 
 /// The real single-child target: a live pid signalled, probed, and killed via
-/// `libc`. Wraps only the pid; the graceful signal is passed per call so the
-/// value stays stateless (mirroring [`GracefulTarget::signal_all`]).
+/// `libc`. The graceful signal is passed per call so the value stays stateless
+/// (mirroring [`GracefulTarget::signal_all`]); the only carried state is a
+/// `stand_down` latch its owner flips once the pid is reaped.
 #[cfg(unix)]
-pub(crate) struct UnixChild(i32);
+pub(crate) struct UnixChild {
+    pid: i32,
+    /// Flipped `true` by the pid's owner the instant it reaps (or otherwise
+    /// retires) the pid. While set, [`signal`](Self::signal)/
+    /// [`hard_kill`](Self::hard_kill) are no-ops and [`is_alive`](Self::is_alive)
+    /// reports "gone", so the driver ends the grace early and skips the final
+    /// `SIGKILL` — never signalling a pid the OS may have recycled after the
+    /// reap. This is the pid-teardown counterpart of the `handed_off` latch the
+    /// detached deadline/cancel watchdogs consult.
+    stand_down: Arc<AtomicBool>,
+}
 
 #[cfg(unix)]
 impl UnixChild {
-    pub(crate) fn new(pid: i32) -> Self {
-        Self(pid)
+    pub(crate) fn new(pid: i32, stand_down: Arc<AtomicBool>) -> Self {
+        Self { pid, stand_down }
+    }
+
+    /// Whether the pid's owner has retired it (reaped) — a hard "treat as gone".
+    fn retired(&self) -> bool {
+        self.stand_down.load(Ordering::Acquire)
     }
 }
 
 #[cfg(unix)]
 impl PidTarget for UnixChild {
     fn signal(&self, signal: i32) {
+        if self.retired() {
+            return;
+        }
         // SAFETY: sending a signal to a pid is sound; `ESRCH` (already gone) is
         // ignored — the poll below observes the drain regardless.
         unsafe {
-            libc::kill(self.0, signal);
+            libc::kill(self.pid, signal);
         }
     }
 
     fn is_alive(&self) -> bool {
+        // A reaped pid is gone by definition, whatever `kill(pid, 0)` says about
+        // whoever recycled it — this is the check that stops a recycled-pid
+        // `SIGKILL`.
+        if self.retired() {
+            return false;
+        }
         // SAFETY: signal 0 is a pure existence probe. `ESRCH` → gone; `EPERM` →
         // alive but unsignallable (a uid-changed child) — treat as exists so a
         // still-live tree is not abandoned; any other rc is treated as alive.
-        let rc = unsafe { libc::kill(self.0, 0) };
+        let rc = unsafe { libc::kill(self.pid, 0) };
         rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
     fn hard_kill(&self) {
+        if self.retired() {
+            return;
+        }
         // SAFETY: `SIGKILL` to the pid; a no-op `ESRCH` if it is already gone.
         unsafe {
-            libc::kill(self.0, libc::SIGKILL);
+            libc::kill(self.pid, libc::SIGKILL);
         }
     }
 }
@@ -421,6 +454,52 @@ mod tests {
             target.hard_kills.load(Ordering::Relaxed),
             0,
             "an already-gone child is not force-killed"
+        );
+    }
+
+    // A `UnixChild` whose owner has flipped the `stand_down` latch (it reaped the
+    // pid) must report the pid *gone* regardless of what `kill(pid, 0)` says about
+    // whoever the OS recycled the pid to. This is the load-bearing gate behind
+    // T-066: winning the timeout arbiter's CAS is not proof the pid is un-reaped,
+    // so the pid-only graceful kill leans on this latch instead. We probe our own
+    // pid — unquestionably alive — so a broken gate would report `true` (and, in
+    // `run_pid`, would try to signal us) rather than silently pass against an
+    // already-dead ESRCH pid.
+    #[cfg(unix)]
+    #[test]
+    fn a_retired_unix_child_reports_gone_even_for_a_live_pid() {
+        let stand_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let child = UnixChild::new(std::process::id() as i32, stand_down.clone());
+        assert!(
+            !child.is_alive(),
+            "a retired pid must report gone, not probe the recycled pid alive"
+        );
+        // Sanity: it is the latch, not a broken probe, that flips liveness — the
+        // same live pid probes alive once the latch is clear.
+        stand_down.store(false, std::sync::atomic::Ordering::Release);
+        assert!(child.is_alive(), "a live, un-retired pid still probes alive");
+    }
+
+    // End to end through the driver: a target retired before `run_pid` runs is
+    // left completely alone — no graceful signal, no final `SIGKILL` — even though
+    // its pid resolves to a live process (ours). `signal`/`hard_kill` are guarded
+    // by the same latch, so a regression is caught by the timing assertion below,
+    // never by signalling the test runner.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn run_pid_leaves_a_retired_live_pid_untouched() {
+        let stand_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let target = UnixChild::new(std::process::id() as i32, stand_down);
+        let start = Instant::now();
+        run_pid(&target, 15, Duration::from_secs(10)).await;
+        // `is_alive` returns false on the first poll, so the driver returns
+        // without consuming any of the grace: no sleep is awaited, so paused
+        // virtual time never advances. A regression that kept polling a retired
+        // pid would instead burn the whole 10 s grace before its (guarded) hard
+        // kill, tripping this bound.
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "a retired target ends the grace immediately, before any hard kill"
         );
     }
 }

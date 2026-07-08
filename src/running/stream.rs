@@ -4,6 +4,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
@@ -160,15 +161,30 @@ impl RunningProcess {
                 let started = self.started;
                 // Claim the timeout via the shared arbiter so the finisher
                 // classifies `TimedOut` even if the child exits cleanly within the
-                // grace. Only kill if we won the race against the natural reap: if
-                // the child already exited, the CAS fails and we skip the kill,
-                // avoiding a signal to a recycled pid.
+                // grace. But winning that CAS is NOT proof the pid is still
+                // un-reaped: a natural reap (`backend_wait`) frees the pid inside
+                // `wait()` and only claims `TS_EXITED` a few frames later, so this
+                // task can win `TS_TIMED_OUT` in that gap on an already-freed pid.
+                // The `handed_off` latch is the real gate: a consuming finisher
+                // flips it *before* it frees the pid (and reclaims this watchdog),
+                // so a `false` read below guarantees the child is not yet reaped
+                // and the pid-only kill is safe. During pure streaming (no
+                // finisher, so nothing reaps) it stays `false` and this task is the
+                // sole killer, as it must be to bound the timeout.
                 let timeout_state = self.timeout_state.clone();
+                let handed_off = self.handed_off.clone();
                 self.deadline_task = Some(tokio::spawn(async move {
                     if !super::deadline::wait_deadline_and_claim(started, limit, &timeout_state)
                         .await
                     {
                         return; // child already exited — no kill
+                    }
+                    // A `Child`-owning finisher has taken over teardown/reap: it
+                    // kills through the owned `Child` (`start_kill`, a no-op post
+                    // reap), so stand down rather than race its reap with a raw pid
+                    // kill that could hit a recycled pid.
+                    if handed_off.load(Ordering::Acquire) {
+                        return;
                     }
                     // This watchdog can't reap the child, so a child that exits on
                     // the signal still waits the full grace before a no-op SIGKILL.
@@ -191,8 +207,12 @@ impl RunningProcess {
                             // `RunningProcess::Drop` mid-grace — the case where a
                             // child catches the signal, closes stdout (ending the
                             // stream), and keeps running. See
-                            // `spawn_graceful_kill_and_reap`.
-                            Some(grace) => spawn_graceful_kill_and_reap(pid, grace, signal),
+                            // `spawn_graceful_kill_and_reap`. It re-reads
+                            // `handed_off` each poll, so a finisher that reclaims
+                            // mid-grace still stands it down.
+                            Some(grace) => {
+                                spawn_graceful_kill_and_reap(pid, grace, signal, handed_off)
+                            }
                             None => kill_direct_child(pid),
                         },
                     }
@@ -400,16 +420,31 @@ pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, pid: Option<u32>) {
 /// streaming consumer drops its handle mid-grace, arm this via
 /// [`spawn_graceful_kill_and_reap`] (a detached task) rather than inline in the
 /// abortable deadline watchdog.
-pub(crate) async fn graceful_kill_pid(pid: Option<u32>, grace: std::time::Duration, signal: i32) {
+///
+/// `stand_down` is a latch that retires the pid the instant its owner reaps it:
+/// once set, the driver's liveness poll reports "gone" and the final `SIGKILL`
+/// is suppressed, so this pid-only kill can never signal a pid the OS recycled
+/// after the reap. The streaming watchdog passes its `handed_off` latch (a
+/// finisher reclaimed it); `teardown_on_timeout` passes a latch its own
+/// concurrent reap flips.
+pub(crate) async fn graceful_kill_pid(
+    pid: Option<u32>,
+    grace: std::time::Duration,
+    signal: i32,
+    stand_down: Arc<AtomicBool>,
+) {
     #[cfg(unix)]
     {
         let Some(pid) = pid else { return };
-        let target = crate::sys::graceful::UnixChild::new(pid as i32);
+        let target = crate::sys::graceful::UnixChild::new(pid as i32, stand_down);
         crate::sys::graceful::run_pid(&target, signal, grace).await;
     }
     #[cfg(not(unix))]
     {
         let _ = (grace, signal);
+        if stand_down.load(Ordering::Acquire) {
+            return;
+        }
         kill_direct_child(pid);
     }
 }
@@ -429,10 +464,20 @@ pub(crate) async fn graceful_kill_pid(pid: Option<u32>, grace: std::time::Durati
 /// Drop-triggered kill+reap of a recycled pid; the reap is the runtime's — the
 /// dropped `tokio::process::Child` is collected by tokio's orphan reaper once
 /// the kill lands.
-fn spawn_graceful_kill_and_reap(pid: Option<u32>, grace: std::time::Duration, signal: i32) {
+///
+/// `handed_off` rides along as the [`graceful_kill_pid`] stand-down latch: if a
+/// consuming finisher reclaims teardown mid-grace (it flips `handed_off` and
+/// reaps through the owned `Child`), this detached task's liveness poll stops
+/// and its `SIGKILL` is suppressed, so it can't fire on the recycled pid.
+fn spawn_graceful_kill_and_reap(
+    pid: Option<u32>,
+    grace: std::time::Duration,
+    signal: i32,
+    handed_off: Arc<AtomicBool>,
+) {
     // Detached on purpose: dropping the handle lets it outlive the (abortable)
     // deadline watchdog that spawned it.
-    drop(tokio::spawn(graceful_kill_pid(pid, grace, signal)));
+    drop(tokio::spawn(graceful_kill_pid(pid, grace, signal, handed_off)));
 }
 
 /// Best-effort kill of the direct child by pid — called by deadline/cancel

@@ -300,6 +300,7 @@ impl RunningProcess {
             stdout_piped: command.stdout_is_piped(),
             deadline_task: None,
             timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
+            handed_off: Arc::new(AtomicBool::new(false)),
             cancel_token: command.cancel_token(),
             cancel_task: None,
             cancel_at_exit: None,
