@@ -129,11 +129,8 @@ async fn prefer_local_resolves_the_program_before_the_system_path() {
         std::fs::copy(r"C:\Windows\System32\where.exe", &path).expect("copy where.exe");
     }
 
-    let mut cmd = Command::new(unique).prefer_local(dir.path());
-    #[cfg(windows)]
-    {
-        cmd = cmd.arg("/?");
-    }
+    let cmd = Command::new(unique).prefer_local(dir.path());
+    let cmd = if cfg!(windows) { cmd.arg("/?") } else { cmd };
     let result = cmd
         .output_string()
         .await
@@ -203,7 +200,8 @@ async fn missing_program_not_found_searched_includes_prefer_local_dirs() {
 // not the `prefer_local` portion, which never depended on it.
 #[tokio::test]
 #[ignore = "exercises the real spawn path"]
-async fn missing_program_not_found_searched_includes_prefer_local_dirs_even_with_a_customized_path() {
+async fn missing_program_not_found_searched_includes_prefer_local_dirs_even_with_a_customized_path()
+{
     let dir = tempfile::tempdir().expect("temp dir"); // deliberately empty
 
     let err = Command::new("processkit-definitely-not-installed-565656")

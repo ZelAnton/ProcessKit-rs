@@ -25,8 +25,15 @@ pub(super) async fn wait_deadline_and_claim(
     limit: Duration,
     flag: &AtomicU8,
 ) -> bool {
-    let remaining = limit.checked_sub(started.elapsed()).unwrap_or(Duration::ZERO);
+    let remaining = limit
+        .checked_sub(started.elapsed())
+        .unwrap_or(Duration::ZERO);
     tokio::time::sleep(remaining).await;
-    flag.compare_exchange(TS_PENDING, TS_TIMED_OUT, Ordering::AcqRel, Ordering::Relaxed)
-        .is_ok()
+    flag.compare_exchange(
+        TS_PENDING,
+        TS_TIMED_OUT,
+        Ordering::AcqRel,
+        Ordering::Relaxed,
+    )
+    .is_ok()
 }
