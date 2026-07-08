@@ -8,6 +8,7 @@
 - [Streaming & interactive I/O](streaming.md)
 - [Pipelines](pipelines.md)
 - [Timeouts, retries & cancellation](timeouts-and-cancellation.md)
+- [Errors](errors.md)
 - [Supervision](supervision.md)
 - [Testing your code](testing.md)
 - [Platform support](platform-support.md)

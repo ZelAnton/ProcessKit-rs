@@ -153,6 +153,7 @@ first — it maps "I want to …" tasks to working snippets — then read
 | [Streaming & interactive I/O](docs/streaming.md) | Line streaming, conversational stdin, readiness probes, `wait_any`, profiling |
 | [Pipelines](docs/pipelines.md) | Shell-free `a \| b \| c`, pipefail attribution, chain timeouts |
 | [Timeouts, retries & cancellation](docs/timeouts-and-cancellation.md) | Captured vs raised deadlines, retry classifiers, `CancellationToken` |
+| [Errors](docs/errors.md) | Every `Error` variant → source → recommended reaction, the subtle look-alikes, classifiers, matching under `#[non_exhaustive]`, ties to retries & supervision |
 | [Supervision](docs/supervision.md) | Restart policies, backoff & jitter, stop conditions, outcomes |
 | [Testing your code](docs/testing.md) | The `ProcessRunner` seam, scripted/recording/mock doubles, cassettes, `CliClient` |
 | [Platform support](docs/platform-support.md) | Mechanisms, all capability matrices, every caveat |
