@@ -1,0 +1,22 @@
+# Config for the `linkcheck` CI job (.github/workflows/ci.yml) — kept as a
+# checked-in file rather than inline `--exclude` args so it's also usable
+# locally (`lychee --config .lychee.toml README.md ARCHITECTURE.md ROADMAP.md docs`).
+
+# `ideas/` and `decisions/` are deliberately untracked by git (see the Cargo.toml
+# `exclude` comment) — they exist on disk locally but never reach GitHub, so any
+# link to them is unconditionally broken there. Excluding the paths, not
+# rewriting every README/ARCHITECTURE/ROADMAP link, keeps those docs readable
+# for local (checkout-based) readers who do have the directories.
+exclude = [
+  "^ideas/",
+  "^decisions/",
+]
+
+# Retry transient failures (rate limiting, flaky hosts) instead of flaking the
+# whole CI job on a temporary network hiccup.
+max_retries = 3
+retry_wait_time = 5
+
+# Some external hosts (docs.rs, crates.io mirrors) are slow under CI network
+# conditions; give them more room than lychee's 20s default before giving up.
+timeout = 30

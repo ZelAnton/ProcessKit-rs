@@ -162,6 +162,39 @@ jobs:
         env:
           RUSTDOCFLAGS: --cfg docsrs -D warnings
 
+  linkcheck:
+    name: markdown links (lychee)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The crate's docs are cross-linked (README/ARCHITECTURE/ROADMAP/docs/*.md);
+      # doc-rich but nothing else checks that those links actually resolve —
+      # `doc` above only compiles rustdoc's intra-doc links.
+      - name: Restore lychee cache
+        uses: actions/cache@v4
+        with:
+          path: .lycheecache
+          key: lychee-${{ github.sha }}
+          restore-keys: lychee-
+      - name: Link Checker
+        uses: lycheeverse/lychee-action@v2
+        env:
+          # Authenticated GitHub API requests get a much higher rate limit,
+          # avoiding flaky 429s on the many github.com links in these docs.
+          # No secret beyond the workflow's own token is required.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # `.lychee.toml` excludes `ideas/`/`decisions/`: those dirs are
+          # deliberately untracked by git (see the Cargo.toml `exclude`
+          # comment), so links to them 404 on GitHub even though they resolve
+          # locally for checkout-based readers.
+          args: >-
+            --config .lychee.toml
+            --cache --max-cache-age 2d
+            --no-progress
+            README.md ARCHITECTURE.md ROADMAP.md docs
+          fail: true
+
   audit:
     name: cargo-deny
     runs-on: ubuntu-latest
