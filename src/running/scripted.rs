@@ -252,7 +252,9 @@ impl ScriptedProc {
     /// non-blocking poll of whether the script has already ended.
     pub(super) fn has_exited_now(&self) -> bool {
         self.kill.killed.load(Ordering::Acquire)
-            || self.exit_at.is_some_and(|at| tokio::time::Instant::now() >= at)
+            || self
+                .exit_at
+                .is_some_and(|at| tokio::time::Instant::now() >= at)
     }
 }
 
@@ -332,7 +334,12 @@ impl RunningProcess {
                 .unwrap_or(Duration::ZERO);
             tokio::time::sleep(remaining).await;
             if timeout_state
-                .compare_exchange(TS_PENDING, TS_TIMED_OUT, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange(
+                    TS_PENDING,
+                    TS_TIMED_OUT,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
                 .is_err()
             {
                 return; // the script already exited on its own — no kill

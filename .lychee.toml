@@ -7,9 +7,16 @@
 # link to them is unconditionally broken there. Excluding the paths, not
 # rewriting every README/ARCHITECTURE/ROADMAP link, keeps those docs readable
 # for local (checkout-based) readers who do have the directories.
+#
+# lychee resolves relative Markdown links to absolute filesystem paths (e.g.
+# `file:///home/runner/work/ProcessKit-rs/ProcessKit-rs/ideas/README.md`)
+# before applying `exclude`, so an anchored `^ideas/`/`^decisions/` pattern
+# never matches. Match the directory as a path segment instead, anywhere in
+# the resolved URI, with or without a trailing path (a bare `.../decisions`
+# link with no trailing slash is also reported by lychee).
 exclude = [
-  "^ideas/",
-  "^decisions/",
+  "/ideas($|/)",
+  "/decisions($|/)",
 ]
 
 # Retry transient failures (rate limiting, flaky hosts) instead of flaking the
