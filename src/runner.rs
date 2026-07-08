@@ -14,6 +14,16 @@ use crate::group::ProcessGroup;
 use crate::result::ProcessResult;
 use crate::running::{RunningProcess, Spawned};
 
+/// Fixed teardown headroom past a streamed run's own deadline/grace before
+/// [`first_line`](ProcessRunnerExt::first_line)'s drain backstop gives up. It sits
+/// well beyond any legitimate kill, so a backstop built on it only ever trips in
+/// the shared-group forking gap — a grandchild that inherited stdout and holds the
+/// pipe open past the watchdog's pid-only kill, so the stream never closes and the
+/// drain would otherwise hang. It never preempts a slow-but-legitimate
+/// single-process teardown. Shared by both drain backstops (cancel and deadline)
+/// so they can't drift.
+const TEARDOWN_BACKSTOP_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Runs a [`Command`] — to a captured result ([`output_string`](Self::output_string) /
 /// [`output_bytes`](Self::output_bytes)) or a live handle ([`start`](Self::start)).
 ///
@@ -347,28 +357,47 @@ pub trait ProcessRunnerExt: ProcessRunner {
                     biased;
                     found = &mut search => Ok(found),
                     () = token.cancelled() => {
-                        let _ = (&mut search).await;
+                        // The cancel watchdog fired its kill the instant the token
+                        // did; drain the search to EOF before reporting `Cancelled`
+                        // rather than dropping it early — dropping `search` drops
+                        // the `RunningProcess` and aborts that watchdog before it
+                        // kills (strand-on-cancel). But BOUND the drain: on a
+                        // shared-group handle the watchdog's pid-only kill can't
+                        // close a stdout that the direct child's grandchild
+                        // inherited and holds open, so the pipe never closes and
+                        // the drain would hang forever. `grace` + a fixed margin
+                        // sits past any legitimate teardown, so this backstop only
+                        // trips in that forking gap — where the kill has already
+                        // been attempted, making it safe to stop draining. It
+                        // applies in BOTH timeout branches: the `None` branch has
+                        // no outer whole-race backstop to lean on, so this is its
+                        // only bound. Either way the honest reason is cancellation,
+                        // so it stays `Cancelled`, never a false `Timeout`.
+                        let drain_backstop = grace.saturating_add(TEARDOWN_BACKSTOP_MARGIN);
+                        let _ = tokio::time::timeout(drain_backstop, &mut search).await;
                         Err(())
                     }
                 },
                 None => Ok(search.await),
             }
         };
-        // The deadline is enforced by the watchdog (it kills → the stream closes →
-        // the search returns `None`). We bound the whole race only as a *backstop*
-        // for a forking shared-group child, whose grandchild can hold stdout open
-        // past the watchdog's pid-only kill so the stream never closes (the
-        // shared-group teardown gap). The backstop sits well past the deadline (+
-        // its grace + a teardown margin), so it never preempts a legitimate slow
-        // kill of a single-process child. (In that same forking gap a *cancel*
-        // whose drain can't complete also surfaces as `Timeout` via the backstop
-        // rather than `Cancelled` — acceptable: it is bounded, not hung, and only
-        // reachable when teardown itself can't finish.)
+        // A firing cancel is already bounded inside `raced` (its drain carries its
+        // own backstop). What remains to bound here is the *deadline* drain: the
+        // watchdog kills at the deadline → the stream closes → the search returns
+        // `None`, EXCEPT on a forking shared-group child whose grandchild holds
+        // stdout open past the watchdog's pid-only kill, so the stream never closes
+        // (the shared-group teardown gap). Only the `Some(limit)` branch has a
+        // natural anchor for that whole-race bound — `limit` (+ its grace + a
+        // teardown margin) sits well past the deadline, so it never preempts a
+        // legitimate slow kill of a single-process child, and it surfaces the stuck
+        // deadline drain as `Timeout`. The `None` branch has no deadline (so no
+        // such drain): an un-cancelled search there is legitimately unbounded and
+        // is left to run — its only bounded exit is the cancel drain above.
         let found = match timeout {
             Some(limit) => {
                 let backstop = limit
                     .saturating_add(grace)
-                    .saturating_add(std::time::Duration::from_secs(5));
+                    .saturating_add(TEARDOWN_BACKSTOP_MARGIN);
                 match tokio::time::timeout(backstop, raced).await {
                     Ok(Ok(found)) => found,
                     Ok(Err(())) => return Err(crate::Error::Cancelled { program }),

@@ -21,12 +21,27 @@ pub enum Priority {
     /// Below the default priority — polite background work that still makes
     /// steady progress. Unix: `nice(10)`. Windows: `BELOW_NORMAL_PRIORITY_CLASS`.
     BelowNormal,
-    /// The default OS priority. Setting this explicitly is a no-op
-    /// functionally equivalent to not calling [`priority`](crate::Command::priority)
-    /// at all. Unix: `nice(0)`. Windows: `NORMAL_PRIORITY_CLASS`.
+    /// The default OS priority. Unix: `nice(0)`. Windows: `NORMAL_PRIORITY_CLASS`.
+    ///
+    /// **Unix caveat:** this is a no-op *only* when the spawning process
+    /// itself has `nice == 0`. A child normally inherits its parent's `nice`
+    /// value, so setting `Normal` explicitly under a positively-niced parent
+    /// (e.g. a process launched via `nice(1)` in a CI/batch scheduler) asks
+    /// the kernel to *lower* the child's `nice` back to `0` — the same kind
+    /// of decrease as [`AboveNormal`](Priority::AboveNormal)/[`High`](Priority::High),
+    /// and subject to the same `CAP_SYS_NICE`/root requirement and
+    /// [`Error::Spawn`](crate::Error::Spawn) failure mode described there.
+    /// Windows is unaffected: `NORMAL_PRIORITY_CLASS` never needs a privilege
+    /// check.
     Normal,
     /// Above the default priority. Unix: `nice(-5)`. Windows:
     /// `ABOVE_NORMAL_PRIORITY_CLASS`.
+    ///
+    /// **Unix caveat:** same privilege requirement as
+    /// [`High`](Priority::High) — lowering `nice` below its inherited value
+    /// needs `CAP_SYS_NICE`/root, and without it the spawn fails as
+    /// [`Error::Spawn`](crate::Error::Spawn) rather than silently applying a
+    /// smaller increase.
     AboveNormal,
     /// Highest ordinary (non-real-time) priority.
     ///

@@ -522,22 +522,29 @@ const WINDOWS_EXECUTABLE_EXTENSIONS: &[&str] = &["exe", "cmd", "bat", "com", "ps
 
 /// The case/extension-normalized key `program_names_match` compares on
 /// Windows: lowercased, with a recognized executable extension (see
-/// [`WINDOWS_EXECUTABLE_EXTENSIONS`]) stripped. A name whose extension isn't
-/// one of those (or has none) is just lowercased whole.
+/// [`WINDOWS_EXECUTABLE_EXTENSIONS`]) stripped from the end. Only the
+/// extension is trimmed — any directory component is left untouched, so a
+/// bare name and an absolute path normalize consistently whether or not the
+/// path happens to carry a recognized extension (matching the exact,
+/// path-preserving comparison the non-Windows branch of
+/// `program_names_match` uses).
 #[cfg(windows)]
 fn windows_program_key(name: &OsStr) -> String {
     let lossy = name.to_string_lossy();
     let path = std::path::Path::new(lossy.as_ref());
-    match (path.file_stem(), path.extension()) {
-        (Some(stem), Some(ext))
+    let without_extension = match path.extension() {
+        Some(ext)
             if WINDOWS_EXECUTABLE_EXTENSIONS
                 .iter()
                 .any(|known| ext.eq_ignore_ascii_case(known)) =>
         {
-            stem.to_string_lossy().to_ascii_lowercase()
+            let ext_len = ext.to_string_lossy().len();
+            // `+ 1` drops the separating `.` along with the extension itself.
+            &lossy[..lossy.len() - ext_len - 1]
         }
-        _ => lossy.to_ascii_lowercase(),
-    }
+        _ => lossy.as_ref(),
+    };
+    without_extension.to_ascii_lowercase()
 }
 
 /// Collect a program-and-args prefix (`["git", "status"]`) into owned `OsString`s.
@@ -2635,6 +2642,47 @@ mod tests {
             .await
             .expect("a bare `git` should match a `git.exe`-registered rule");
         assert_eq!(out.stdout(), "clean");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn prefix_rule_program_match_on_absolute_paths_is_consistent_on_windows() {
+        // An absolute-path program must be treated the same whether or not it
+        // happens to carry a recognized extension: a bare-name rule matches
+        // neither form (the directory is never silently stripped — only the
+        // extension and case are normalized), so `.on(["git", …])` correctly
+        // misses both `C:\tools\git.exe` and `C:\tools\git`, and a rule that
+        // itself names the full absolute path matches regardless of the
+        // command's `.exe` suffix.
+        let bare_rule = ScriptedRunner::new()
+            .on(["git", "status"], Reply::ok("clean"))
+            .fallback(Reply::fail(1, "unmatched"));
+        for program in [r"C:\tools\git.exe", r"C:\tools\git", r"C:\Tools\GIT.EXE"] {
+            let out = bare_rule
+                .output_string(&Command::new(program).arg("status"))
+                .await
+                .unwrap();
+            assert_eq!(
+                out.code(),
+                Some(1),
+                "an absolute path must not silently match a bare-name rule (program: {program})"
+            );
+        }
+
+        let absolute_rule = ScriptedRunner::new()
+            .on([r"C:\tools\git", "status"], Reply::ok("clean"))
+            .fallback(Reply::fail(1, "unmatched"));
+        for program in [r"C:\tools\git.exe", r"C:\tools\git", r"C:\Tools\Git.Exe"] {
+            let out = absolute_rule
+                .output_string(&Command::new(program).arg("status"))
+                .await
+                .unwrap_or_else(|e| panic!("`{program}` should match the absolute rule: {e}"));
+            assert_eq!(
+                out.stdout(),
+                "clean",
+                "extension/case must not change the absolute-path match (program: {program})"
+            );
+        }
     }
 
     #[cfg(windows)]
