@@ -415,10 +415,12 @@ impl Reply {
         } else {
             Outcome::Exited(self.code)
         };
-        let stdout = crate::running::split_pump_lines(&self.stdout, command.out_line_terminator())
-            .join("\n");
-        let stderr = crate::running::split_pump_lines(&self.stderr, command.err_line_terminator())
-            .join("\n");
+        let stdout =
+            crate::running::split_pump_lines(&self.stdout, command.stdout_config().terminator)
+                .join("\n");
+        let stderr =
+            crate::running::split_pump_lines(&self.stderr, command.stderr_config().terminator)
+                .join("\n");
         ProcessResult::new(program, stdout, stderr, outcome, timeout)
     }
 }
@@ -746,12 +748,14 @@ impl ScriptedRunner {
 /// does — so the lines a handler sees on the fake match the ones a real run would
 /// deliver (and the ones `into_result` joins back into the result).
 pub(crate) fn replay_line_handlers(command: &Command, stdout: &str, stderr: &str) {
-    let mut stdout_handler = command.stdout_handler();
-    for line in crate::running::split_pump_lines(stdout, command.out_line_terminator()) {
+    let stdout_cfg = command.stdout_config();
+    let mut stdout_handler = stdout_cfg.handler;
+    for line in crate::running::split_pump_lines(stdout, stdout_cfg.terminator) {
         invoke_isolated(&mut stdout_handler, &line);
     }
-    let mut stderr_handler = command.stderr_handler();
-    for line in crate::running::split_pump_lines(stderr, command.err_line_terminator()) {
+    let stderr_cfg = command.stderr_config();
+    let mut stderr_handler = stderr_cfg.handler;
+    for line in crate::running::split_pump_lines(stderr, stderr_cfg.terminator) {
         invoke_isolated(&mut stderr_handler, &line);
     }
 }

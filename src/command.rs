@@ -7,11 +7,11 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use encoding_rs::{Encoding, UTF_8};
+use encoding_rs::Encoding;
 
 use crate::buffer::{LineTerminator, OutputBufferPolicy, StdioMode};
 use crate::error::{Error, Result};
-use crate::pump::LineHandler;
+use crate::pump::StreamConfig;
 use crate::result::ProcessResult;
 use crate::retry::{RetryConfig, RetryPolicy};
 use crate::runner::{JobRunner, ProcessRunnerExt};
@@ -83,21 +83,15 @@ pub struct Command {
     /// Exit codes treated as success by the checking verbs (`run`/`run_unit`/
     /// `checked` via [`ProcessResult::ensure_success`]). `None` accepts only `0`.
     ok_codes: Option<Vec<i32>>,
-    stdout_handler: Option<LineHandler>,
-    stderr_handler: Option<LineHandler>,
-    /// Async tee sinks: each decoded line is also written here. Independent of
-    /// the line handlers above — both run.
-    stdout_tee: Option<crate::pump::TeeSink>,
-    stderr_tee: Option<crate::pump::TeeSink>,
+    /// Per-stream pump config — decode encoding, optional per-line handler,
+    /// optional tee sink, and line-terminator mode — one value per stream instead
+    /// of four parallel `stdout_*`/`stderr_*` field pairs. See [`StreamConfig`].
+    /// The connection mode (`Piped`/`Inherit`/`Null`) stays separate below.
+    stdout_config: StreamConfig,
+    stderr_config: StreamConfig,
     stdout_mode: StdioMode,
     stderr_mode: StdioMode,
     output_buffer: OutputBufferPolicy,
-    stdout_encoding: &'static Encoding,
-    stderr_encoding: &'static Encoding,
-    /// Where each stream's line pump splits lines (default: `\n`-only). See
-    /// [`Self::line_terminator`].
-    stdout_line_terminator: LineTerminator,
-    stderr_line_terminator: LineTerminator,
     retry: Option<RetryConfig>,
     /// `Some` once `inherit_env` was called (even with an empty list): clear
     /// the inherited environment and copy only these parent vars.
@@ -145,17 +139,11 @@ impl Command {
             #[cfg(feature = "process-control")]
             timeout_signal: None,
             ok_codes: None,
-            stdout_handler: None,
-            stderr_handler: None,
-            stdout_tee: None,
-            stderr_tee: None,
+            stdout_config: StreamConfig::new(),
+            stderr_config: StreamConfig::new(),
             stdout_mode: StdioMode::Piped,
             stderr_mode: StdioMode::Piped,
             output_buffer: OutputBufferPolicy::unbounded(),
-            stdout_encoding: UTF_8,
-            stderr_encoding: UTF_8,
-            stdout_line_terminator: LineTerminator::Newline,
-            stderr_line_terminator: LineTerminator::Newline,
             retry: None,
             inherit_env: None,
             uid: None,
@@ -788,7 +776,7 @@ impl Command {
     where
         F: Fn(&str) + Send + Sync + 'static,
     {
-        self.stdout_handler = Some(Arc::new(handler));
+        self.stdout_config.handler = Some(Arc::new(handler));
         self
     }
 
@@ -800,7 +788,7 @@ impl Command {
     where
         F: Fn(&str) + Send + Sync + 'static,
     {
-        self.stderr_handler = Some(Arc::new(handler));
+        self.stderr_config.handler = Some(Arc::new(handler));
         self
     }
 
@@ -886,7 +874,7 @@ impl Command {
         W: tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
         let boxed: Box<dyn tokio::io::AsyncWrite + Send + Unpin> = Box::new(writer);
-        self.stdout_tee = Some(Arc::new(tokio::sync::Mutex::new(boxed)));
+        self.stdout_config.tee = Some(Arc::new(tokio::sync::Mutex::new(boxed)));
         self
     }
 
@@ -901,7 +889,7 @@ impl Command {
         W: tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
         let boxed: Box<dyn tokio::io::AsyncWrite + Send + Unpin> = Box::new(writer);
-        self.stderr_tee = Some(Arc::new(tokio::sync::Mutex::new(boxed)));
+        self.stderr_config.tee = Some(Arc::new(tokio::sync::Mutex::new(boxed)));
         self
     }
 
@@ -916,20 +904,20 @@ impl Command {
     /// Decode stdout with `encoding` instead of UTF-8 (e.g.
     /// `encoding_rs::SHIFT_JIS`).
     pub fn stdout_encoding(mut self, encoding: &'static Encoding) -> Self {
-        self.stdout_encoding = encoding;
+        self.stdout_config.encoding = encoding;
         self
     }
 
     /// Decode stderr with `encoding` instead of UTF-8.
     pub fn stderr_encoding(mut self, encoding: &'static Encoding) -> Self {
-        self.stderr_encoding = encoding;
+        self.stderr_config.encoding = encoding;
         self
     }
 
     /// Decode both stdout and stderr with `encoding`.
     pub fn encoding(mut self, encoding: &'static Encoding) -> Self {
-        self.stdout_encoding = encoding;
-        self.stderr_encoding = encoding;
+        self.stdout_config.encoding = encoding;
+        self.stderr_config.encoding = encoding;
         self
     }
 
@@ -957,8 +945,8 @@ impl Command {
     /// stream carries progress output (progress usually lands on stderr, while
     /// stdout stays newline-structured data).
     pub fn line_terminator(mut self, terminator: LineTerminator) -> Self {
-        self.stdout_line_terminator = terminator;
-        self.stderr_line_terminator = terminator;
+        self.stdout_config.terminator = terminator;
+        self.stderr_config.terminator = terminator;
         self
     }
 
@@ -966,7 +954,7 @@ impl Command {
     /// [`LineTerminator`]); the stderr framing is left untouched. See
     /// [`line_terminator`](Self::line_terminator) for both streams at once.
     pub fn stdout_line_terminator(mut self, terminator: LineTerminator) -> Self {
-        self.stdout_line_terminator = terminator;
+        self.stdout_config.terminator = terminator;
         self
     }
 
@@ -974,7 +962,7 @@ impl Command {
     /// [`LineTerminator`]); the stdout framing is left untouched. Handy when
     /// progress output lands on stderr while stdout stays newline-structured.
     pub fn stderr_line_terminator(mut self, terminator: LineTerminator) -> Self {
-        self.stderr_line_terminator = terminator;
+        self.stderr_config.terminator = terminator;
         self
     }
 
@@ -995,27 +983,24 @@ impl Command {
     #[cfg(feature = "record")]
     pub(crate) fn without_line_side_effects(&self) -> Self {
         let mut clone = self.clone();
-        clone.stdout_handler = None;
-        clone.stderr_handler = None;
-        clone.stdout_tee = None;
-        clone.stderr_tee = None;
+        clone.stdout_config.handler = None;
+        clone.stderr_config.handler = None;
+        clone.stdout_config.tee = None;
+        clone.stderr_config.tee = None;
         clone
     }
 
-    pub(crate) fn stdout_handler(&self) -> Option<LineHandler> {
-        self.stdout_handler.clone()
+    /// The stdout stream's pump config (encoding/handler/tee/terminator), cloned
+    /// for the spawn. Replaces the four individual `out_encoding`/`stdout_handler`/
+    /// `stdout_tee_sink`/`out_line_terminator` proxies — the launch paths take the
+    /// whole [`StreamConfig`]. Cheap: handler and tee are `Arc`s.
+    pub(crate) fn stdout_config(&self) -> StreamConfig {
+        self.stdout_config.clone()
     }
 
-    pub(crate) fn stderr_handler(&self) -> Option<LineHandler> {
-        self.stderr_handler.clone()
-    }
-
-    pub(crate) fn stdout_tee_sink(&self) -> Option<crate::pump::TeeSink> {
-        self.stdout_tee.clone()
-    }
-
-    pub(crate) fn stderr_tee_sink(&self) -> Option<crate::pump::TeeSink> {
-        self.stderr_tee.clone()
+    /// The stderr stream's pump config — see [`stdout_config`](Self::stdout_config).
+    pub(crate) fn stderr_config(&self) -> StreamConfig {
+        self.stderr_config.clone()
     }
 
     pub(crate) fn output_buffer_policy(&self) -> OutputBufferPolicy {
@@ -1024,22 +1009,6 @@ impl Command {
 
     pub(crate) fn retry_config(&self) -> Option<RetryConfig> {
         self.retry.clone()
-    }
-
-    pub(crate) fn out_encoding(&self) -> &'static Encoding {
-        self.stdout_encoding
-    }
-
-    pub(crate) fn err_encoding(&self) -> &'static Encoding {
-        self.stderr_encoding
-    }
-
-    pub(crate) fn out_line_terminator(&self) -> LineTerminator {
-        self.stdout_line_terminator
-    }
-
-    pub(crate) fn err_line_terminator(&self) -> LineTerminator {
-        self.stderr_line_terminator
     }
 
     /// Whether stdout is captured into a pipe (vs `Inherit`/`Null`). The bulk
@@ -1694,15 +1663,15 @@ impl fmt::Debug for Command {
             .field("ok_codes", &self.ok_codes)
             .field("stdout_mode", &self.stdout_mode)
             .field("stderr_mode", &self.stderr_mode)
-            .field("has_stdout_handler", &self.stdout_handler.is_some())
-            .field("has_stderr_handler", &self.stderr_handler.is_some())
-            .field("has_stdout_tee", &self.stdout_tee.is_some())
-            .field("has_stderr_tee", &self.stderr_tee.is_some())
+            .field("has_stdout_handler", &self.stdout_config.handler.is_some())
+            .field("has_stderr_handler", &self.stderr_config.handler.is_some())
+            .field("has_stdout_tee", &self.stdout_config.tee.is_some())
+            .field("has_stderr_tee", &self.stderr_config.tee.is_some())
             .field("output_buffer", &self.output_buffer)
-            .field("stdout_encoding", &self.stdout_encoding.name())
-            .field("stderr_encoding", &self.stderr_encoding.name())
-            .field("stdout_line_terminator", &self.stdout_line_terminator)
-            .field("stderr_line_terminator", &self.stderr_line_terminator)
+            .field("stdout_encoding", &self.stdout_config.encoding.name())
+            .field("stderr_encoding", &self.stderr_config.encoding.name())
+            .field("stdout_line_terminator", &self.stdout_config.terminator)
+            .field("stderr_line_terminator", &self.stderr_config.terminator)
             .field("has_retry", &self.retry.is_some())
             .field("inherit_env", &self.inherit_env)
             .field("uid", &self.uid)
@@ -1930,31 +1899,31 @@ mod tests {
     fn line_terminator_defaults_to_newline_and_setters_target_the_right_streams() {
         // Default: both streams split on `\n` only — the pre-existing behavior.
         let default = Command::new("x");
-        assert_eq!(default.out_line_terminator(), LineTerminator::Newline);
-        assert_eq!(default.err_line_terminator(), LineTerminator::Newline);
+        assert_eq!(default.stdout_config.terminator, LineTerminator::Newline);
+        assert_eq!(default.stderr_config.terminator, LineTerminator::Newline);
 
         // The combined setter moves both streams together.
         let both = Command::new("x").line_terminator(LineTerminator::CarriageReturn);
-        assert_eq!(both.out_line_terminator(), LineTerminator::CarriageReturn);
-        assert_eq!(both.err_line_terminator(), LineTerminator::CarriageReturn);
+        assert_eq!(both.stdout_config.terminator, LineTerminator::CarriageReturn);
+        assert_eq!(both.stderr_config.terminator, LineTerminator::CarriageReturn);
 
         // Per-stream setters touch only their own stream.
         let out_only = Command::new("x").stdout_line_terminator(LineTerminator::CarriageReturn);
         assert_eq!(
-            out_only.out_line_terminator(),
+            out_only.stdout_config.terminator,
             LineTerminator::CarriageReturn
         );
         assert_eq!(
-            out_only.err_line_terminator(),
+            out_only.stderr_config.terminator,
             LineTerminator::Newline,
             "stdout_line_terminator must not touch stderr"
         );
         let err_only = Command::new("x").stderr_line_terminator(LineTerminator::CarriageReturn);
         assert_eq!(
-            err_only.err_line_terminator(),
+            err_only.stderr_config.terminator,
             LineTerminator::CarriageReturn
         );
-        assert_eq!(err_only.out_line_terminator(), LineTerminator::Newline);
+        assert_eq!(err_only.stdout_config.terminator, LineTerminator::Newline);
 
         // The framing is surfaced in Debug (no secrets involved).
         let dbg = format!("{both:?}");

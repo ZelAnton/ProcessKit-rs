@@ -18,16 +18,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use encoding_rs::Encoding;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
 
-use crate::buffer::{LineTerminator, OutputBufferPolicy, clamp_dropoldest_tail, push_capped_bytes};
+use crate::buffer::{OutputBufferPolicy, clamp_dropoldest_tail, push_capped_bytes};
 use crate::error::Error;
 use crate::error::Result;
 use crate::group::ProcessGroup;
-use crate::pump::{LineHandler, SharedLines, pump_lines_core};
+use crate::pump::{SharedLines, StreamConfig, pump_lines_core};
 use crate::result::{Outcome, ProcessResult};
 use crate::stdin::ProcessStdin;
 
@@ -99,15 +98,10 @@ pub(crate) struct Spawned {
     /// Raw signal for the graceful-timeout phase (default `SIGTERM`).
     pub timeout_signal: i32,
     pub pid: Option<u32>,
-    pub stdout_encoding: &'static Encoding,
-    pub stderr_encoding: &'static Encoding,
-    pub stdout_handler: Option<LineHandler>,
-    pub stderr_handler: Option<LineHandler>,
-    pub stdout_tee: Option<crate::pump::TeeSink>,
-    pub stderr_tee: Option<crate::pump::TeeSink>,
-    /// How each stream's line pump decides where a line ends (default `\n`-only).
-    pub stdout_line_terminator: LineTerminator,
-    pub stderr_line_terminator: LineTerminator,
+    /// Per-stream pump config (encoding/handler/tee/terminator) — one value per
+    /// stream, carried straight onto the [`RunningProcess`]. See [`StreamConfig`].
+    pub stdout_config: StreamConfig,
+    pub stderr_config: StreamConfig,
     pub buffer: OutputBufferPolicy,
     /// Exit codes treated as success (default `[0]`), carried onto the result.
     pub ok_codes: Vec<i32>,
@@ -133,15 +127,10 @@ pub struct RunningProcess {
     timeout_grace: Option<Duration>,
     timeout_signal: i32,
     pid: Option<u32>,
-    stdout_encoding: &'static Encoding,
-    stderr_encoding: &'static Encoding,
-    stdout_handler: Option<LineHandler>,
-    stderr_handler: Option<LineHandler>,
-    stdout_tee: Option<crate::pump::TeeSink>,
-    stderr_tee: Option<crate::pump::TeeSink>,
-    // Per-stream line-termination mode threaded into every pump this handle spawns.
-    stdout_line_terminator: LineTerminator,
-    stderr_line_terminator: LineTerminator,
+    // Per-stream pump config (encoding/handler/tee/terminator) threaded whole into
+    // every pump this handle spawns — one value per stream.
+    stdout_config: StreamConfig,
+    stderr_config: StreamConfig,
     buffer: OutputBufferPolicy,
     ok_codes: Vec<i32>,
     stdout_sink: Option<Arc<SharedLines>>,
@@ -244,14 +233,8 @@ impl RunningProcess {
             timeout_grace: s.timeout_grace,
             timeout_signal: s.timeout_signal,
             pid: s.pid,
-            stdout_encoding: s.stdout_encoding,
-            stderr_encoding: s.stderr_encoding,
-            stdout_handler: s.stdout_handler,
-            stderr_handler: s.stderr_handler,
-            stdout_tee: s.stdout_tee,
-            stderr_tee: s.stderr_tee,
-            stdout_line_terminator: s.stdout_line_terminator,
-            stderr_line_terminator: s.stderr_line_terminator,
+            stdout_config: s.stdout_config,
+            stderr_config: s.stderr_config,
             buffer: s.buffer,
             ok_codes: s.ok_codes,
             stdout_sink: None,
@@ -565,10 +548,7 @@ impl RunningProcess {
         self.stderr_pump = self.backend.take_stderr_reader().map(|pipe| {
             tokio::spawn(pump_lines_core(
                 pipe,
-                self.stderr_encoding,
-                self.stderr_line_terminator,
-                self.stderr_handler.clone(),
-                self.stderr_tee.clone(),
+                self.stderr_config.clone(),
                 stderr_sink.clone(),
             ))
         });
@@ -1025,20 +1005,14 @@ impl RunningProcess {
         if let Some(pipe) = self.backend.take_stdout_reader() {
             self.stdout_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,
-                self.stdout_encoding,
-                self.stdout_line_terminator,
-                self.stdout_handler.clone(),
-                self.stdout_tee.clone(),
+                self.stdout_config.clone(),
                 stdout_sink.clone(),
             )));
         }
         if let Some(pipe) = self.backend.take_stderr_reader() {
             self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,
-                self.stderr_encoding,
-                self.stderr_line_terminator,
-                self.stderr_handler.clone(),
-                self.stderr_tee.clone(),
+                self.stderr_config.clone(),
                 stderr_sink.clone(),
             )));
         }

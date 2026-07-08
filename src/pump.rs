@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use encoding_rs::Encoding;
+use encoding_rs::{Encoding, UTF_8};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Notify;
 
@@ -305,6 +305,52 @@ impl SharedLines {
 /// swallowed.
 pub(crate) type TeeSink = Arc<tokio::sync::Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>;
 
+/// The four per-stream pump knobs that differ between stdout and stderr — the
+/// decode [`encoding`](Self::encoding), an optional per-line
+/// [`handler`](Self::handler), an optional [`tee`](Self::tee) sink, and the line
+/// [`terminator`](Self::terminator) mode — carried as one value.
+///
+/// Held one-per-stream by [`Command`](crate::Command),
+/// [`Spawned`](crate::running::Spawned), and
+/// [`RunningProcess`](crate::RunningProcess), and handed to [`pump_lines_core`]
+/// whole. Folding the four knobs into a single struct means a new per-stream knob
+/// is threaded through *this* type instead of duplicated across every field pair
+/// and pump call site. Cheap to clone: `handler`/`tee` are `Arc`s and the rest is
+/// `Copy`.
+#[derive(Clone)]
+pub(crate) struct StreamConfig {
+    /// Decode bytes with this encoding (default UTF-8).
+    pub encoding: &'static Encoding,
+    /// Optional per-line callback invoked on the pump task.
+    pub handler: Option<LineHandler>,
+    /// Optional async sink each decoded line is also written to.
+    pub tee: Option<TeeSink>,
+    /// Where the pump splits the stream into lines (default `\n`-only).
+    pub terminator: LineTerminator,
+}
+
+impl StreamConfig {
+    /// The default per-stream config: UTF-8 decode, no handler, no tee, split on
+    /// `\n` only — the state a freshly built [`Command`](crate::Command) stream
+    /// starts in.
+    pub(crate) fn new() -> Self {
+        Self {
+            encoding: UTF_8,
+            handler: None,
+            tee: None,
+            terminator: LineTerminator::Newline,
+        }
+    }
+
+    /// This config with the decode `encoding` replaced. Used by the scripted
+    /// feeder, which forces UTF-8 (it writes the canned `String`'s UTF-8 bytes)
+    /// while keeping the command's handler/tee/terminator.
+    pub(crate) fn with_encoding(mut self, encoding: &'static Encoding) -> Self {
+        self.encoding = encoding;
+        self
+    }
+}
+
 /// The no-tee, `\n`-only shorthand over [`pump_lines_core`] — used by this
 /// module's tests (production always threads the terminator and optional tee
 /// through `pump_lines_core`).
@@ -319,10 +365,12 @@ pub(crate) async fn pump_lines<R>(
 {
     pump_lines_core(
         reader,
-        encoding,
-        LineTerminator::Newline,
-        handler,
-        None,
+        StreamConfig {
+            encoding,
+            handler,
+            tee: None,
+            terminator: LineTerminator::Newline,
+        },
         sink,
     )
     .await
@@ -339,7 +387,17 @@ pub(crate) async fn pump_lines_term<R>(
 ) where
     R: AsyncRead + Unpin,
 {
-    pump_lines_core(reader, encoding, terminator, None, None, sink).await
+    pump_lines_core(
+        reader,
+        StreamConfig {
+            encoding,
+            handler: None,
+            tee: None,
+            terminator,
+        },
+        sink,
+    )
+    .await
 }
 
 /// Drain `reader` into `sink` line by line, decoding text with `encoding`,
@@ -381,14 +439,17 @@ pub(crate) async fn pump_lines_term<R>(
 /// same lines the split produced.
 pub(crate) async fn pump_lines_core<R>(
     mut reader: R,
-    encoding: &'static Encoding,
-    terminator: LineTerminator,
-    handler: Option<LineHandler>,
-    tee: Option<TeeSink>,
+    config: StreamConfig,
     sink: Arc<SharedLines>,
 ) where
     R: AsyncRead + Unpin,
 {
+    let StreamConfig {
+        encoding,
+        handler,
+        tee,
+        terminator,
+    } = config;
     // Close the sink on *every* exit from this task: a panic out of this loop
     // must never leave a streaming `StdoutLines` consumer parked.
     struct CloseOnDrop(Arc<SharedLines>);
@@ -781,10 +842,12 @@ pub fn fuzz_decode_pump_lines(raw: &[u8], chunk_sizes: &[u8], encoding_idx: u8) 
         .expect("current-thread runtime");
     rt.block_on(pump_lines_core(
         reader,
-        encoding,
-        LineTerminator::Newline,
-        None,
-        None,
+        StreamConfig {
+            encoding,
+            handler: None,
+            tee: None,
+            terminator: LineTerminator::Newline,
+        },
         sink.clone(),
     ));
 
@@ -1752,10 +1815,12 @@ mod tests {
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
         pump_lines_core(
             &b"50%\r100%\n"[..],
-            encoding_rs::UTF_8,
-            LineTerminator::CarriageReturn,
-            Some(handler),
-            Some(tee_of(VecSink(buf.clone()))),
+            StreamConfig {
+                encoding: encoding_rs::UTF_8,
+                handler: Some(handler),
+                tee: Some(tee_of(VecSink(buf.clone()))),
+                terminator: LineTerminator::CarriageReturn,
+            },
             sink.clone(),
         )
         .await;
@@ -1810,10 +1875,12 @@ mod tests {
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
         pump_lines_core(
             &b"one\ntwo\n"[..],
-            encoding_rs::UTF_8,
-            LineTerminator::Newline,
-            None,
-            Some(tee_of(VecSink(buf.clone()))),
+            StreamConfig {
+                encoding: encoding_rs::UTF_8,
+                handler: None,
+                tee: Some(tee_of(VecSink(buf.clone()))),
+                terminator: LineTerminator::Newline,
+            },
             sink.clone(),
         )
         .await;
@@ -1851,10 +1918,12 @@ mod tests {
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
         pump_lines_core(
             &b"a\nb\nc\n"[..],
-            encoding_rs::UTF_8,
-            LineTerminator::Newline,
-            None,
-            Some(tee_of(ErrSink)),
+            StreamConfig {
+                encoding: encoding_rs::UTF_8,
+                handler: None,
+                tee: Some(tee_of(ErrSink)),
+                terminator: LineTerminator::Newline,
+            },
             sink.clone(),
         )
         .await;
@@ -1876,10 +1945,12 @@ mod tests {
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
         pump_lines_core(
             &b"x\ny\n"[..],
-            encoding_rs::UTF_8,
-            LineTerminator::Newline,
-            Some(handler),
-            Some(tee_of(VecSink(buf.clone()))),
+            StreamConfig {
+                encoding: encoding_rs::UTF_8,
+                handler: Some(handler),
+                tee: Some(tee_of(VecSink(buf.clone()))),
+                terminator: LineTerminator::Newline,
+            },
             sink.clone(),
         )
         .await;

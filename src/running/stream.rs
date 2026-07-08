@@ -100,10 +100,7 @@ impl RunningProcess {
             if let Some(pipe) = self.backend.take_stderr_reader() {
                 self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                     pipe,
-                    self.stderr_encoding,
-                    self.stderr_line_terminator,
-                    self.stderr_handler.clone(),
-                    self.stderr_tee.clone(),
+                    self.stderr_config.clone(),
                     stderr_sink.clone(),
                 )));
             }
@@ -115,10 +112,7 @@ impl RunningProcess {
             Some(pipe) => {
                 self.stdout_pump = Some(tokio::spawn(pump_lines_core(
                     pipe,
-                    self.stdout_encoding,
-                    self.stdout_line_terminator,
-                    self.stdout_handler.clone(),
-                    self.stdout_tee.clone(),
+                    self.stdout_config.clone(),
                     stdout_sink.clone(),
                 )));
             }
@@ -260,10 +254,7 @@ impl RunningProcess {
             let sink = SharedLines::new(&super::discard_sink_policy());
             self.stdout_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,
-                self.stdout_encoding,
-                self.stdout_line_terminator,
-                self.stdout_handler.clone(),
-                self.stdout_tee.clone(),
+                self.stdout_config.clone(),
                 sink.clone(),
             )));
             self.stdout_sink = Some(sink);
@@ -275,10 +266,7 @@ impl RunningProcess {
             let sink = SharedLines::new(&self.buffer);
             self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,
-                self.stderr_encoding,
-                self.stderr_line_terminator,
-                self.stderr_handler.clone(),
-                self.stderr_tee.clone(),
+                self.stderr_config.clone(),
                 sink.clone(),
             )));
             self.stderr_sink = Some(sink);
@@ -354,10 +342,7 @@ impl RunningProcess {
             Some(pipe) => {
                 self.stdout_pump = Some(tokio::spawn(pump_lines_core(
                     pipe,
-                    self.stdout_encoding,
-                    self.stdout_line_terminator,
-                    self.stdout_handler.clone(),
-                    self.stdout_tee.clone(),
+                    self.stdout_config.clone(),
                     stdout_sink.clone(),
                 )));
             }
@@ -376,10 +361,7 @@ impl RunningProcess {
             if let Some(pipe) = self.backend.take_stderr_reader() {
                 self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                     pipe,
-                    self.stderr_encoding,
-                    self.stderr_line_terminator,
-                    self.stderr_handler.clone(),
-                    self.stderr_tee.clone(),
+                    self.stderr_config.clone(),
                     sink.clone(),
                 )));
             } else {

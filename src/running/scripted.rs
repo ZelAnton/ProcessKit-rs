@@ -284,17 +284,12 @@ impl RunningProcess {
             timeout_grace: command.configured_timeout_grace(),
             timeout_signal: command.timeout_signal_raw(),
             pid: None,
-            // Feeder writes UTF-8 (the canned String's bytes); decode as UTF-8 so
-            // the caller sees the exact canned text regardless of the command's
-            // configured encoding (see the doc above).
-            stdout_encoding: encoding_rs::UTF_8,
-            stderr_encoding: encoding_rs::UTF_8,
-            stdout_handler: command.stdout_handler(),
-            stderr_handler: command.stderr_handler(),
-            stdout_tee: command.stdout_tee_sink(),
-            stderr_tee: command.stderr_tee_sink(),
-            stdout_line_terminator: command.out_line_terminator(),
-            stderr_line_terminator: command.err_line_terminator(),
+            // Feeder writes UTF-8 (the canned String's bytes); force UTF-8 decode
+            // so the caller sees the exact canned text regardless of the command's
+            // configured encoding (see the doc above), while keeping the command's
+            // handler/tee/terminator.
+            stdout_config: command.stdout_config().with_encoding(encoding_rs::UTF_8),
+            stderr_config: command.stderr_config().with_encoding(encoding_rs::UTF_8),
             buffer: command.output_buffer_policy(),
             ok_codes: command.ok_codes_vec(),
             stdout_sink: None,
