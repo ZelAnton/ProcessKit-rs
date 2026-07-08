@@ -717,6 +717,35 @@ impl Cgroup {
         // thaw — that hazard does NOT apply to `cgroup.freeze`.
         // Sleep between sweeps rather than busy-spin while the kernel reaps, and
         // bound it so teardown (incl. Drop) can never hang on un-reaped zombies.
+        //
+        // This fallback — hence this blocking `sleep` — is reachable only on a
+        // kernel < 5.14 (no `cgroup.kill` file) or a write-restricted delegated
+        // cgroup (the `cgroup.kill` write above fails with e.g. EACCES); on a
+        // modern, non-restricted cgroup the atomic write above already returned.
+        // `kill_all`/`Job::kill_all` is called synchronously from three ASYNC
+        // watchdog paths — `stream::kill_via_weak` (streaming deadline),
+        // `RunningProcess::arm_cancel_watchdog`'s cancel task, and
+        // `kill_tree`/`teardown_on_timeout` (bulk deadline/cancel) — none of
+        // which route through `spawn_blocking`, so on a reachable config this
+        // loop stalls whatever tokio worker thread is running the watchdog for
+        // up to ~100ms (this loop) plus the ~100ms drain wait in `Job::drop`
+        // below if the same `Job` is then also dropped synchronously.
+        //
+        // Accepted as a bounded, rare-path cost rather than routed through
+        // `spawn_blocking`: on the vastly common case (kernel ≥ 5.14, standard
+        // delegated cgroup) this branch is never taken at all, so
+        // unconditionally wrapping every `kill_all()` call in `spawn_blocking`
+        // would tax the atomic fast path (extra thread-pool dispatch latency,
+        // plus a new call pattern with no existing precedent in this codebase)
+        // to guard a ~100ms stall reachable only on legacy/restricted setups.
+        // Unlike `Job::drop` (which *cannot* await — Rust's `Drop` is
+        // inherently synchronous, so blocking there is unavoidable regardless
+        // of caller), the watchdog call sites here run inside `async fn`s and
+        // *could* in principle `.await` a `spawn_blocking` wrapper; this is a
+        // deliberate choice to keep those paths simple, not a hard constraint
+        // like `Job::drop`'s. Revisit (route through `spawn_blocking`) if a
+        // legacy/restricted-cgroup deployment reports worker-thread starvation
+        // under load.
         let _ = std::fs::write(self.path.join("cgroup.freeze"), b"1");
         for _ in 0..50 {
             let members = self.members();

@@ -402,6 +402,10 @@ impl RunningProcess {
 /// Tear down the group if still alive, then best-effort kill the direct child.
 pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, pid: Option<u32>) {
     if let Some(group) = group.upgrade() {
+        // On Linux + legacy/restricted cgroup this can synchronously block
+        // this worker thread up to ~100ms — accepted, not routed through
+        // `spawn_blocking`; see the sweep loop in `Cgroup::kill`
+        // (src/sys/linux.rs) for the full rationale.
         let _ = group.kill_all();
     }
     kill_direct_child(pid);

@@ -316,6 +316,10 @@ impl RunningProcess {
                     return;
                 }
                 if let Some(g) = group_weak.and_then(|w| w.upgrade()) {
+                    // On Linux + legacy/restricted cgroup this can synchronously
+                    // block this worker thread up to ~100ms — accepted, not
+                    // routed through `spawn_blocking`; see the sweep loop in
+                    // `Cgroup::kill` (src/sys/linux.rs) for the full rationale.
                     let _ = g.kill_all();
                 }
                 stream::kill_direct_child(pid);
@@ -1357,6 +1361,10 @@ impl RunningProcess {
                 // `kill(pid)` that could land on a recycled pid.
                 handed_off.store(true, Ordering::Release);
                 if let Some(group) = &real.own_group {
+                    // On Linux + legacy/restricted cgroup this can synchronously
+                    // block this worker thread up to ~100ms — accepted, not
+                    // routed through `spawn_blocking`; see the sweep loop in
+                    // `Cgroup::kill` (src/sys/linux.rs) for the full rationale.
                     let _ = group.kill_all();
                 }
                 // Bound the reap: a D-state child can ignore SIGKILL until I/O
