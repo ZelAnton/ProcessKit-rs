@@ -23,7 +23,7 @@ use super::RunningProcess;
 /// [`RunningProcess::finish`].
 ///
 /// `#[non_exhaustive]`: a future release may attach more about the finished run
-/// (e.g. a duration or a truncation flag, mirroring [`ProcessResult`](crate::ProcessResult))
+/// (e.g. a duration, mirroring [`ProcessResult`](crate::ProcessResult))
 /// without a breaking change — read the public fields rather than destructuring
 /// it exhaustively.
 ///
@@ -50,6 +50,13 @@ pub struct Finished {
     /// Standard error captured in the background while stdout was streaming.
     /// `String::new()` when no stderr was produced or stderr was not piped.
     pub stderr: String,
+    /// Whether a bounded, non-fail-loud [`OutputBufferPolicy`](crate::OutputBufferPolicy)
+    /// silently dropped lines from the background stderr drain (`false` when
+    /// stderr was not piped, or nothing was dropped). Mirrors
+    /// [`ProcessResult::truncated`](crate::ProcessResult::truncated), scoped to
+    /// stderr only — `stdout` here was already handed to the caller line by
+    /// line and is that caller's own responsibility to track.
+    pub stderr_truncated: bool,
 }
 
 impl RunningProcess {
@@ -214,7 +221,10 @@ impl RunningProcess {
 
     /// Finish a streamed run: wait for exit and return a [`Finished`]
     /// carrying the [`Outcome`] and the stderr collected in the background by
-    /// [`stdout_lines`](Self::stdout_lines).
+    /// [`stdout_lines`](Self::stdout_lines). If a bounded
+    /// [`OutputBufferPolicy`](crate::OutputBufferPolicy) silently dropped stderr
+    /// lines, [`Finished::stderr_truncated`] is `true` — the streamed stdout
+    /// itself is the caller's own responsibility and is not tracked here.
     ///
     /// A run killed by its [`timeout`](crate::Command::timeout) reports
     /// [`Outcome::TimedOut`](crate::Outcome::TimedOut), even if the child caught
@@ -307,12 +317,20 @@ impl RunningProcess {
                 });
             }
         }
+        // `dropped()` = lines the buffer policy discarded from the background
+        // stderr drain, not lines this call itself failed to observe — matches
+        // the same signal `output_string`/`output_bytes` derive `truncated` from.
+        let stderr_truncated = self.stderr_sink.as_ref().is_some_and(|s| s.dropped() > 0);
         let stderr = self
             .stderr_sink
             .as_ref()
             .map(|sink| sink.drain().join("\n"))
             .unwrap_or_default();
-        Ok(Finished { outcome, stderr })
+        Ok(Finished {
+            outcome,
+            stderr,
+            stderr_truncated,
+        })
     }
 
     /// Stream both stdout and stderr as a single ordered sequence of
