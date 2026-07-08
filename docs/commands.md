@@ -117,6 +117,16 @@ spawned via that resolved absolute path instead of the bare name; a
 grandchild the program itself spawns does not inherit this reach — only the
 one program named in this `Command` benefits.
 
+**Interaction with `current_dir`.** A relative `prefer_local` directory (as in
+the examples above) is probed against the *process's* actual current
+directory, never against whatever is set via `current_dir` on the same
+`Command`. The resolved match is then always turned into an absolute path
+before being handed to the OS, so it can't later be reinterpreted against the
+child's working directory once `current_dir` is set — unlike a relative-path
+`program` passed straight to `Command::new`, which *is* subject to that
+footgun (see [Program, arguments, working directory](#program-arguments-working-directory)
+above).
+
 **Diagnostics.** If resolution fails everywhere, `Error::NotFound`'s
 `searched` field includes the `prefer_local` directories too — first, in
 priority order, ahead of the `PATH` directories — so the diagnostic never

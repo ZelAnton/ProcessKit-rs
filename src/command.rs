@@ -186,6 +186,10 @@ impl Command {
     /// it is resolved against the *caller's* current directory at spawn time —
     /// not against the directory set here. Use an absolute path for the program
     /// when combining `current_dir` with a relative-path executable.
+    /// A bare-name program resolved via [`prefer_local`](Self::prefer_local)
+    /// doesn't share this footgun: a relative `prefer_local` directory is
+    /// always turned into an absolute path before being handed to the OS, so
+    /// it can't be reinterpreted against the directory set here.
     pub fn current_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.cwd = Some(dir.as_ref().as_os_str().to_os_string());
         self
@@ -217,6 +221,14 @@ impl Command {
     /// simply spawned via that resolved absolute path instead of the bare name
     /// (so the OS never has to search anything); a grandchild the program itself
     /// spawns does not inherit this reach.
+    ///
+    /// A relative `dir` here (e.g. `"./node_modules/.bin"`) is probed against
+    /// the *process's* actual current directory, not against whatever is set
+    /// via [`current_dir`](Self::current_dir) — and the resulting match is
+    /// always made absolute (by joining it onto that same current directory)
+    /// before being handed to the OS, so it can never be reinterpreted against
+    /// the child's own working directory once [`current_dir`](Self::current_dir)
+    /// is also set.
     ///
     /// If resolution fails everywhere, [`Error::NotFound`](crate::Error::NotFound)'s
     /// `searched` includes these directories — first, in priority order — ahead
@@ -1071,12 +1083,16 @@ impl Command {
     /// Whether the command customizes the environment in a way that could move
     /// `PATH` away from the process `PATH` — an explicit `PATH` override/removal,
     /// [`env_clear`](Self::env_clear), or [`inherit_env`](Self::inherit_env)
-    /// (which clears the inherited set). When true, the `PATH`-directory naming
-    /// in [`Error::NotFound`](crate::Error::NotFound) is skipped: `find_in_path`
-    /// reads the *process* `PATH`, so against a custom child `PATH` that list
-    /// would be wrong. A missing program still surfaces as `Error::NotFound`
-    /// (so [`is_not_found`](crate::Error::is_not_found) holds), just with
-    /// `searched: None` — no directories to name.
+    /// (which clears the inherited set). When true, the *`PATH`*-directory
+    /// naming in [`Error::NotFound`](crate::Error::NotFound) is skipped:
+    /// `find_in_path` reads the *process* `PATH`, so against a custom child
+    /// `PATH` that list would be wrong. [`prefer_local`](Self::prefer_local)
+    /// directories are unaffected by this gate and still get named — they're
+    /// resolved by plain filesystem probes on the parent side, independent of
+    /// the child's environment. A missing program still surfaces as
+    /// `Error::NotFound` (so [`is_not_found`](crate::Error::is_not_found)
+    /// holds), with `searched: None` only when there are no `prefer_local`
+    /// directories to name either.
     pub(crate) fn customizes_path(&self) -> bool {
         self.env_clear
             || self.inherit_env.is_some()
@@ -1906,8 +1922,34 @@ pub(crate) fn find_in_path(program: &OsStr) -> (Option<std::path::PathBuf>, Stri
 /// the same PATHEXT-aware lookup the `PATH` search uses, not a separate copy.
 /// Returns the first match, i.e. the earliest directory in priority order
 /// (see [`Command::prefer_local`]).
+///
+/// A relative `dir` (e.g. `"./node_modules/.bin"`, the form used throughout
+/// the docs) is probed exactly as before — against the process's actual
+/// current directory, unaffected by anything set via
+/// [`Command::current_dir`] — but the returned match is always made
+/// **absolute** first, by joining it onto that same current directory. A
+/// relative match handed unchanged to `Command::new` would later be
+/// reinterpreted at spawn time against the *child's* working directory (on
+/// Unix) or stay relative to the parent's cwd only by accident (on Windows)
+/// once [`Command::current_dir`] is set — a divergence between "what
+/// `probe_dir` verified exists" and "what the OS actually spawns". Making it
+/// absolute here closes that gap regardless of platform. If the current
+/// directory can't be read (rare), the relative path is probed as-is, same
+/// as before this existed.
 pub(crate) fn probe_prefer_local(dirs: &[PathBuf], program: &OsStr) -> Option<PathBuf> {
-    dirs.iter().find_map(|dir| probe_dir(dir, program))
+    let cwd = std::env::current_dir().ok();
+    dirs.iter().find_map(|dir| {
+        let absolutized;
+        let probe_target: &Path = if dir.is_absolute() {
+            dir
+        } else if let Some(cwd) = &cwd {
+            absolutized = cwd.join(dir);
+            &absolutized
+        } else {
+            dir
+        };
+        probe_dir(probe_target, program)
+    })
 }
 
 /// Build the combined `searched` diagnostic for
@@ -2518,6 +2560,72 @@ mod tests {
             "a prefer_local match must be spawned via its resolved absolute path, \
              so the OS never has to search PATH for it; got {:?}, expected {expected:?}",
             tokio_cmd.as_std().get_program()
+        );
+    }
+
+    // R-01: a relative `prefer_local` directory (the form used throughout the
+    // docs, e.g. `"./node_modules/.bin"`) must resolve to an *absolute* program
+    // path — one that a later `.current_dir(other)` on the same command cannot
+    // reinterpret. Before the fix, `probe_dir` returned `dir.join(program)`
+    // unchanged, so a relative `prefer_local` dir produced a relative resolved
+    // path that `Command::new` would hand to the OS verbatim; combined with
+    // `current_dir`, that's the documented `std::process::Command` footgun
+    // (Unix: relative program resolved against the *child's* cwd after chdir;
+    // Windows: against the parent's cwd) — a spurious `NotFound`, or worse, a
+    // different same-named file executed under the child's working directory.
+    #[test]
+    fn build_tokio_absolutizes_a_relative_prefer_local_match_so_current_dir_cannot_move_it() {
+        // Serialize with any other test in this binary that reads/writes the
+        // process's current directory (none currently do, but this guards
+        // against future additions racing on global process state).
+        static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CWD_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+        let original_cwd = std::env::current_dir().expect("read current dir");
+        let base = tempfile::tempdir().expect("temp dir");
+        std::env::set_current_dir(base.path()).expect("chdir into temp base");
+
+        struct RestoreCwd(PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _restore = RestoreCwd(original_cwd);
+
+        // The `prefer_local` match lives under the (now current) temp base, at
+        // a relative path — exactly the `"./bin"`-style form the docs use.
+        let bin_dir = base.path().join("bin");
+        std::fs::create_dir(&bin_dir).expect("mkdir bin");
+        let expected = write_executable(&bin_dir, "relative-prefer-local-tool");
+
+        // A *different* directory is set as the command's own `current_dir` —
+        // the resolved program path must not be influenced by it.
+        let other_cwd = tempfile::tempdir().expect("other temp dir");
+
+        let cmd = Command::new("relative-prefer-local-tool")
+            .prefer_local("./bin")
+            .current_dir(other_cwd.path());
+        let tokio_cmd = cmd.build_tokio();
+        let resolved = tokio_cmd.as_std().get_program();
+
+        assert!(
+            std::path::Path::new(resolved).is_absolute(),
+            "a relative prefer_local match must be absolutized before reaching \
+             Command::new; got {resolved:?}"
+        );
+        // Compare canonicalized forms: `resolved` is built by literally joining
+        // `"./bin"` onto the cwd (so it carries a `.` component `expected`
+        // doesn't), but both name the exact same on-disk file.
+        let resolved_canon = std::fs::canonicalize(resolved).expect("resolved path must exist");
+        let expected_canon = std::fs::canonicalize(&expected).expect("expected path must exist");
+        assert!(
+            resolved_canon
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&expected_canon.to_string_lossy()),
+            "resolved program must be the absolute path under the temp base cwd \
+             at build time, unaffected by .current_dir(other_cwd); got {resolved:?} \
+             (canonical: {resolved_canon:?}), expected {expected:?} (canonical: {expected_canon:?})"
         );
     }
 

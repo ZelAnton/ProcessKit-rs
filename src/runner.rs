@@ -686,15 +686,45 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     // Translate the OS's opaque NotFound into `Error::NotFound` after the spawn
     // attempt, so the OS stays the source of truth. The cwd was validated above,
     // so NotFound here is genuinely the program. A bare name reports searched dirs;
-    // a path-form program or customized PATH gets `searched: None`.
+    // a path-form program gets `searched: None`.
     let mut child = match group.spawn_with_options(&mut tokio_cmd, &opts) {
         Ok(child) => child,
         Err(crate::Error::Spawn { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
-            if is_bare_name(command.program()) && !command.customizes_path() {
+            if is_bare_name(command.program()) {
+                // `prefer_local` resolution is entirely parent-side (plain
+                // filesystem probes under directories the caller named) and
+                // is independent of the child's own environment, so it's
+                // always safe to report — even when `customizes_path()` is
+                // true. Only the *PATH*-directory naming below that depends
+                // on reading the process's own `PATH` env var is unsafe to
+                // report against a customized child PATH.
                 let prefer_local = command.prefer_local_dirs();
                 let prefer_found = probe_prefer_local(prefer_local, command.program());
+                if command.customizes_path() {
+                    if prefer_found.is_some() {
+                        // Found on a `prefer_local` directory but not directly
+                        // executable (e.g. .cmd/.bat on Windows).
+                        return Err(crate::Error::Spawn {
+                            program: command.program_name(),
+                            source,
+                        });
+                    }
+                    // `path_searched: ""` yields just the `prefer_local`
+                    // portion (or nothing, if there is none) — never the
+                    // process `PATH`, which could be wrong for this child.
+                    let prefer_searched = prepend_prefer_local_to_searched(prefer_local, "");
+                    let searched = if prefer_searched.is_empty() {
+                        None
+                    } else {
+                        Some(prefer_searched)
+                    };
+                    return Err(crate::Error::NotFound {
+                        program: command.program_name(),
+                        searched,
+                    });
+                }
                 let (path_found, path_searched) = find_in_path(command.program());
                 let searched = prepend_prefer_local_to_searched(prefer_local, &path_searched);
                 if prefer_found.is_some() || path_found.is_some() {

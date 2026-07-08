@@ -193,6 +193,41 @@ async fn missing_program_not_found_searched_includes_prefer_local_dirs() {
     }
 }
 
+// R-01 (secondary observation): `prefer_local` resolution is parent-side
+// (plain filesystem probes under caller-named directories) and independent
+// of the child's own environment, so `Error::NotFound`'s `searched` must
+// still name the `prefer_local` directories even when the command also
+// customizes the child's `PATH` (here via `inherit_env`, which clears the
+// inherited set) — only the process-`PATH` portion of the diagnostic is
+// unsafe to report in that case (it wouldn't match the child's actual PATH),
+// not the `prefer_local` portion, which never depended on it.
+#[tokio::test]
+#[ignore = "exercises the real spawn path"]
+async fn missing_program_not_found_searched_includes_prefer_local_dirs_even_with_a_customized_path() {
+    let dir = tempfile::tempdir().expect("temp dir"); // deliberately empty
+
+    let err = Command::new("processkit-definitely-not-installed-565656")
+        .prefer_local(dir.path())
+        .inherit_env(["HOME"]) // customizes_path(): true
+        .output_string()
+        .await
+        .expect_err("an unknown program must error");
+    match err {
+        processkit::Error::NotFound { searched, .. } => {
+            let searched = searched.expect(
+                "a prefer_local directory was probed even though PATH itself is customized",
+            );
+            assert_eq!(
+                searched,
+                dir.path().to_string_lossy().into_owned(),
+                "searched must be exactly the prefer_local directory — no process PATH \
+                 entries, since those don't apply to the customized child env"
+            );
+        }
+        other => panic!("expected Error::NotFound, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 #[ignore = "spawns a real subprocess"]
 async fn output_string_captures_stdout() {
