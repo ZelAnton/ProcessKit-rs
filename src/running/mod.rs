@@ -1375,10 +1375,17 @@ impl RunningProcess {
             );
             self.abort_watchdogs();
             // Snapshot cancel disposition on FIRST reap only — a repeat probe
-            // after a late cancel must not overwrite the cached result.
+            // after a late cancel must not overwrite the cached result. The
+            // observation that won here is a *natural* reap (`try_wait` saw the
+            // child already gone), not the cancel token, so record `false` —
+            // the race *result*, mirroring `on_reaped`'s `ExitCause::Exited`
+            // arm, never a post-hoc `is_cancelled()` read. A token cancelled
+            // after the child exited but before this probe noticed the exit must
+            // not flip the natural exit to `Cancelled`; the later consuming verb
+            // then short-circuits on this `Some(false)` snapshot instead of
+            // re-racing a now-cancelled token (see `drive_to_exit`/`wait_exit`).
             if self.cancel_at_exit.is_none() {
-                self.cancel_at_exit =
-                    Some(self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()));
+                self.cancel_at_exit = Some(false);
             }
         }
         exited
@@ -1814,6 +1821,44 @@ mod tests {
             .wait()
             .await
             .expect("a late cancel must not flip a natural exit");
+        assert_eq!(outcome, Outcome::Exited(0));
+    }
+
+    /// The probe path (`wait_for`/`wait_for_port` → `has_exited_now`) fixes the
+    /// cancel disposition as the *race result*, not a post-hoc token read: a
+    /// non-blocking reap observation is a natural exit (`Some(false)`). Here the
+    /// child exits, then a late cancel fires, and only then does the probe notice
+    /// the exit — the worst-case timing the old `is_cancelled()` read mishandled.
+    /// The consuming verb must still report `Exited(0)`, matching the no-probe
+    /// `wait_any` path at the same temporal picture
+    /// (`a_natural_wait_any_exit_is_not_flipped_by_a_late_cancel`).
+    #[tokio::test]
+    async fn a_probe_reap_is_not_flipped_by_a_cancel_that_preceded_the_observation() {
+        let token = crate::CancellationToken::new();
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok("done\n"))
+            .start(&Command::new("tool").cancel_on(token.clone()))
+            .await
+            .expect("scripted start");
+        // `Reply::ok` gives the scripted child a zero lifetime — it has already
+        // "exited" (exit_at == start). Cancel BEFORE the probe observes that exit:
+        // a post-hoc `is_cancelled()` read at probe time would wrongly latch true.
+        token.cancel();
+        // A never-passing check drives `poll_until` straight into `has_exited_now`,
+        // which observes the reap, snapshots the disposition, and bails NotReady.
+        match run
+            .wait_for(|| async { false }, Duration::from_secs(5))
+            .await
+        {
+            Err(Error::NotReady { .. }) => {}
+            other => panic!("expected Err(NotReady), got {other:?}"),
+        }
+        // The reap observed by the probe wins over the earlier-but-unobserved
+        // cancel: the consuming verb short-circuits on the `Some(false)` snapshot.
+        let outcome = run
+            .wait()
+            .await
+            .expect("a cancel that preceded the probe's reap observation must not flip it");
         assert_eq!(outcome, Outcome::Exited(0));
     }
 
