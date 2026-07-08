@@ -245,9 +245,15 @@ Probe semantics, deliberately uniform:
   deadline on a dead server.
 - A failed probe **never kills the child.** You decide: retry, log and
   continue, or tear down.
-- `wait_for_line` consumes stdout up to (and including) the match — continue
-  with `finish` or further streaming. `wait_for_port` / `wait_for`
-  don't touch the pipes at all.
+- All three probes background-drain stdout/stderr while they poll, so a
+  child with a large startup burst can't stall in `write()` on a full OS pipe
+  buffer. `wait_for_line` consumes stdout up to (and including) the match —
+  continue with `finish` or further streaming. `wait_for_port` / `wait_for`
+  drain the same way but never hand any of it back mid-probe; `wait` /
+  `output_string` afterward still see the full captured output, but
+  `output_bytes` or a fresh `stdout_lines` / `output_events` call do not
+  compose with any of the three probes (same as calling `wait_for_line`
+  first).
 
 ## Racing children with `wait_any`
 

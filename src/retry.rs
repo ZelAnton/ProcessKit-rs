@@ -145,11 +145,28 @@ impl RetryPolicy {
     pub(crate) fn delay_for(&self, retry_index: u32) -> Duration {
         let base = self.backoff_at(retry_index);
         if self.jitter && !base.is_zero() {
-            base.mul_f64(crate::backoff::unit_random_f64())
+            jittered(base, crate::backoff::unit_random_f64())
         } else {
             base
         }
     }
+}
+
+/// Scale `base` by a `[0, 1]` draw (full jitter) without panicking.
+///
+/// Computes the scaled delay via `try_from_secs_f64`, falling back to `base` on
+/// overflow/non-finite — `Duration::mul_f64` (which routes through the panicking
+/// `Duration::from_secs_f64`) would otherwise panic when `base` is saturated near
+/// `Duration::MAX` (e.g. `max_backoff` set to `Duration::MAX` to disable the cap,
+/// the documented way to do so) and the draw rounds the product back up past
+/// `Duration::MAX`. Saturate, don't panic — same discipline as
+/// [`backoff::capped_exponential`](crate::backoff::capped_exponential). Taking an
+/// explicit draw (rather than calling [`unit_random_f64`](crate::backoff::unit_random_f64)
+/// internally) keeps this deterministically testable at the boundary (`draw ==
+/// 1.0`), where the panic used to be reachable.
+fn jittered(base: Duration, draw: f64) -> Duration {
+    let secs = base.as_secs_f64() * draw;
+    Duration::try_from_secs_f64(secs).unwrap_or(base)
 }
 
 /// A [`RetryPolicy`] schedule paired with the classifier that decides which
@@ -301,6 +318,38 @@ mod tests {
         // (a zero base × inf is NaN — the guard short-circuits before that).
         assert_eq!(p.backoff_at(2000), Duration::ZERO);
         assert_eq!(p.backoff_at(u32::MAX), Duration::ZERO);
+    }
+
+    #[test]
+    fn jitter_over_max_backoff_cap_never_panics() {
+        // max_backoff ≈ Duration::MAX (the documented "effectively disable the
+        // cap" configuration) saturates `backoff_at` to `Duration::MAX`.
+        let p = RetryPolicy::new()
+            .initial_backoff(Duration::from_secs(1))
+            .multiplier(2.0)
+            .max_backoff(Duration::MAX)
+            .jitter(true);
+        let base = p.backoff_at(u32::MAX);
+        assert_eq!(base, Duration::MAX);
+
+        // The real jitter draw (unit_random_f64, always < 1.0) exercised many
+        // times over the saturated base — must never panic.
+        for _ in 0..1000 {
+            let d = p.delay_for(u32::MAX);
+            assert!(d <= Duration::MAX);
+        }
+
+        // The exact upper bound of the draw range (1.0) is the one value that
+        // used to round `Duration::MAX.mul_f64(1.0)` back up past
+        // `Duration::MAX` and panic in `Duration::from_secs_f64` — exercise it
+        // directly rather than relying on the RNG to ever land there.
+        assert_eq!(jittered(Duration::MAX, 1.0), Duration::MAX);
+        // A handful of draws spanning the range, including values right at the
+        // top of it, all saturate rather than panic.
+        for draw in [0.0, 0.25, 0.5, 0.75, 0.999_999_999, 1.0] {
+            let d = jittered(Duration::MAX, draw);
+            assert!(d <= Duration::MAX, "draw {draw} produced {d:?} > MAX");
+        }
     }
 
     #[test]
