@@ -33,7 +33,16 @@ to a dated version section.
 -
 
 ### Fixed
--
+- `Priority` docs — the Unix privilege caveat ("lowering `nice` below its
+  inherited value needs `CAP_SYS_NICE`/root, or the spawn fails as
+  `Error::Spawn`") previously called out only `Priority::High`, but
+  `Priority::AboveNormal` (`nice(-5)`) raises priority identically and was
+  silently missing the same warning. `Priority::Normal`'s doc claimed setting
+  it was unconditionally a no-op, which is false under a positively-niced
+  parent (e.g. a `nice`d CI/batch launcher): `nice(0)` there is itself a
+  privileged decrease from the inherited value. Docs on `Priority` and
+  `Command::priority` now state the caveat accurately across all three
+  variants; no behavior change.
 
 ## [2.1.1] - 2026-07-06
 
