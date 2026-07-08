@@ -802,8 +802,7 @@ mod tests {
             // (we don't inspect the exit status) and WNOHANG never blocks.
             let r = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
             if r == pid
-                || (r == -1
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+                || (r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
             {
                 dead = true;
                 break;
@@ -814,7 +813,10 @@ mod tests {
         let _ = unsafe { libc::killpg(pid, libc::SIGKILL) };
         let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
 
-        assert!(dead, "an armed guard drop must terminate the untracked child");
+        assert!(
+            dead,
+            "an armed guard drop must terminate the untracked child"
+        );
     }
 
     /// `disarm` hands back the same child, still running, for `groups` to own —
