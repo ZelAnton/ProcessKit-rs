@@ -307,3 +307,57 @@ async fn shared_group_first_line_cancel_tears_down_the_child() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real forking child in a shared group and cancels a no-timeout first_line probe"]
+async fn shared_group_first_line_cancel_without_timeout_is_bounded_on_a_forking_child() {
+    // T-059: the `None`-timeout branch of `first_line`'s cancel drain. On a shared
+    // group the cancel watchdog kills only the direct child by pid; a child that
+    // forks a grandchild which inherits the piped stdout leaves that pipe open past
+    // the kill, so the drain never sees EOF. With NO timeout there is no outer
+    // whole-race backstop to lean on, so before the fix this `first_line` hung
+    // until the grandchild's own 30s sleep elapsed. Assert it instead returns
+    // promptly with the honest disposition — Cancelled, not a false Timeout (there
+    // is no timeout configured to report).
+    use processkit::ProcessRunnerExt;
+
+    let group = ProcessGroup::new().expect("create group");
+    let token = CancellationToken::new();
+    // A shell that backgrounds a grandchild (`sleep 30 &`) which inherits the
+    // piped stdout and holds it open, then sleeps itself. It writes nothing, so
+    // the `|_| false` predicate never matches and the search stays pending until
+    // the cancel. No `.timeout(..)` — this is deliberately the `None` branch.
+    let forking = Command::new("sh")
+        .args(["-c", "sleep 30 & sleep 30"])
+        .cancel_on(token.clone());
+
+    let canceller = tokio::spawn({
+        let token = token.clone();
+        async move {
+            // Give the shell time to fork the grandchild that pins stdout open, so
+            // the cancel provably lands with the teardown gap in effect.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            token.cancel();
+        }
+    });
+
+    // Broken (unbounded drain): hangs until the grandchild's 30s sleep exits.
+    // Fixed: the drain backstop (~5s past the cancel) frees it well under this bound.
+    let result = completes_within(
+        Duration::from_secs(20),
+        "no-timeout shared-group first_line cancel on a forking child",
+        group.first_line(&forking, |_| false),
+    )
+    .await;
+    canceller.await.expect("canceller task");
+    assert!(
+        matches!(result, Err(processkit::Error::Cancelled { .. })),
+        "a cancelled no-timeout probe on a forking shared-group child must return \
+         Cancelled promptly, got {result:?}"
+    );
+
+    // Reap the grandchild the pid-only cancel kill left behind: the shared group
+    // still contains it, so dropping the group tears the whole subtree down.
+    drop(group);
+}
