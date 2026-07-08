@@ -437,11 +437,8 @@ pub(crate) async fn pump_lines_term<R>(
 /// both EOF and a mid-stream read error (the partial tail is flushed, not
 /// dropped), and every sink — the handler, the tee, and the buffer — sees the
 /// same lines the split produced.
-pub(crate) async fn pump_lines_core<R>(
-    mut reader: R,
-    config: StreamConfig,
-    sink: Arc<SharedLines>,
-) where
+pub(crate) async fn pump_lines_core<R>(mut reader: R, config: StreamConfig, sink: Arc<SharedLines>)
+where
     R: AsyncRead + Unpin,
 {
     let StreamConfig {

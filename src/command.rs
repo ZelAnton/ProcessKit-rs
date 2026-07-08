@@ -1904,8 +1904,14 @@ mod tests {
 
         // The combined setter moves both streams together.
         let both = Command::new("x").line_terminator(LineTerminator::CarriageReturn);
-        assert_eq!(both.stdout_config.terminator, LineTerminator::CarriageReturn);
-        assert_eq!(both.stderr_config.terminator, LineTerminator::CarriageReturn);
+        assert_eq!(
+            both.stdout_config.terminator,
+            LineTerminator::CarriageReturn
+        );
+        assert_eq!(
+            both.stderr_config.terminator,
+            LineTerminator::CarriageReturn
+        );
 
         // Per-stream setters touch only their own stream.
         let out_only = Command::new("x").stdout_line_terminator(LineTerminator::CarriageReturn);
