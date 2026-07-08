@@ -477,7 +477,9 @@ fn spawn_graceful_kill_and_reap(
 ) {
     // Detached on purpose: dropping the handle lets it outlive the (abortable)
     // deadline watchdog that spawned it.
-    drop(tokio::spawn(graceful_kill_pid(pid, grace, signal, handed_off)));
+    drop(tokio::spawn(graceful_kill_pid(
+        pid, grace, signal, handed_off,
+    )));
 }
 
 /// Best-effort kill of the direct child by pid — called by deadline/cancel

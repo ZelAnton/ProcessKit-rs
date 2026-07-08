@@ -477,7 +477,10 @@ mod tests {
         // Sanity: it is the latch, not a broken probe, that flips liveness — the
         // same live pid probes alive once the latch is clear.
         stand_down.store(false, std::sync::atomic::Ordering::Release);
-        assert!(child.is_alive(), "a live, un-retired pid still probes alive");
+        assert!(
+            child.is_alive(),
+            "a live, un-retired pid still probes alive"
+        );
     }
 
     // End to end through the driver: a target retired before `run_pid` runs is
