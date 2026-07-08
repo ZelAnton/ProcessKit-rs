@@ -826,6 +826,13 @@ impl Command {
     /// Requires stdout to be [`Piped`](crate::StdioMode::Piped) (the default):
     /// the handler runs on the capture pump, so it never fires under
     /// [`stdout(Inherit)`](Self::stdout) / [`stdout(Null)`](Self::stdout).
+    ///
+    /// **Byte cap caveat:** a single line whose length exceeds a **byte** cap
+    /// ([`with_max_bytes`](crate::OutputBufferPolicy::with_max_bytes)) is never
+    /// assembled, so the handler never sees it either — it is silently skipped
+    /// for *every* sink (handler, tee, and capture buffer alike), counted only
+    /// via the truncation/`dropped()` signal. If every line matters, leave the
+    /// byte cap unset, or use a line cap instead.
     pub fn on_stdout_line<F>(mut self, handler: F) -> Self
     where
         F: Fn(&str) + Send + Sync + 'static,
@@ -911,7 +918,11 @@ impl Command {
     /// *line* ceiling (that ceiling bounds retained memory, not what streams past).
     /// One exception: a single line whose length exceeds a **byte** cap
     /// ([`with_max_bytes`](crate::OutputBufferPolicy::with_max_bytes)) is never
-    /// assembled, so it is neither retained nor teed. The discard verbs
+    /// assembled, so it is neither retained nor teed — nor delivered to
+    /// [`on_stdout_line`](Self::on_stdout_line): the byte cap silently skips
+    /// that line for *every* sink alike, counted only via the
+    /// truncation/`dropped()` signal. Leave the byte cap unset (or use a line
+    /// cap) if every line must reach the tee. The discard verbs
     /// ([`wait`](crate::RunningProcess::wait) / `profile`) apply a large internal
     /// in-flight byte cap for the same memory bound, so a line exceeding it is
     /// likewise not teed under those verbs.
