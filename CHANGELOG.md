@@ -33,7 +33,24 @@ to a dated version section.
 -
 
 ### Fixed
--
+- Windows `ProcessGroup::{suspend, resume}` no longer risk freezing an unrelated
+  process when a job member's pid is recycled. The member-pid snapshot is taken
+  before the system-wide thread snapshot, so a member (typically a handle-less
+  grandchild) could exit and its pid be reused by a foreign process in that gap;
+  its threads then surfaced under a pid still in the member set and passed the
+  existing owner check. Each thread's live owner is now re-verified as *still a
+  member of this job* (`IsProcessInJob`) immediately before `SuspendThread`/
+  `ResumeThread`, closing the query→snapshot recycle window; any failure to open
+  or query the owner is fail-safe (the thread is left alone).
+- `wait_for` / `wait_for_port` now background-drain the child's piped
+  stdout/stderr while polling, matching `wait_for_line`. Previously a child
+  that wrote more than one OS pipe buffer (~64 KiB on Linux) of startup output
+  before becoming ready would block in `write()`, and the probe would spin
+  until its deadline and fail with a spurious `Error::NotReady` even though
+  the child was alive and about to become ready. `wait` / `output_string`
+  after a probe still see the full output; `output_bytes` and a fresh
+  `stdout_lines` / `output_events` no longer compose with any of the three
+  probes (same restriction `wait_for_line` already had).
 
 ## [2.1.1] - 2026-07-06
 
