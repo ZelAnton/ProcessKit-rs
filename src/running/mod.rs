@@ -6,9 +6,13 @@
 //! incremental stdout streaming surface.
 
 mod probes;
+mod scripted;
 mod stream;
 
 pub use stream::{Finished, OutputEvent, OutputEvents, OutputLine, StdoutLines};
+// Re-exported so `crate::doubles`/`crate::cassette` keep addressing these at
+// `crate::running::...` even though they now live in the `scripted` submodule.
+pub(crate) use scripted::{ScriptedProc, ScriptedResultInfo, split_pump_lines};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -17,8 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 use encoding_rs::Encoding;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
-use tokio::sync::Notify;
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::JoinHandle;
 
 use crate::buffer::{LineTerminator, OutputBufferPolicy, clamp_dropoldest_tail, push_capped_bytes};
 use crate::error::Error;
@@ -113,75 +116,6 @@ pub(crate) struct Spawned {
     pub cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
-/// Recorded result signals a cassette `start`-replay threads onto its scripted
-/// handle, so a consumed replay (`output_string`) reports the *recorded*
-/// truncation/overflow/duration — matching the bulk `Entry::to_result` path —
-/// instead of re-deriving them from the re-pumped canned output. `None` on a
-/// plain [`ScriptedRunner`](crate::testing::ScriptedRunner) reply keeps the
-/// derived values.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ScriptedResultInfo {
-    pub(crate) truncated: bool,
-    pub(crate) total_lines: usize,
-    pub(crate) total_bytes: usize,
-    pub(crate) duration: Duration,
-}
-
-/// Split already-decoded `text` into the exact lines the streaming pump
-/// ([`pump_lines_core`](crate::pump)) would yield for `terminator` — CRLF/CR
-/// terminators collapsed and stripped, with no trailing empty line for a final
-/// terminator. Joining the result with `\n` reproduces the live bulk path's
-/// `stdout_lines.join("\n")` byte-for-byte, so the test doubles' canned text
-/// reads identically on the fake and a real run (and across the bulk and `start`
-/// verbs). Models no buffer cap — the bulk replay never truncates.
-///
-/// Mirrors `pump_lines_core`'s terminator handling on whole in-hand text, so a
-/// `\r` in `\r`-aware mode is trailing only at the very end. Kept beside the
-/// scripted handle it serves rather than reaching into the pump's private,
-/// chunk-oriented line splitter.
-pub(crate) fn split_pump_lines(text: &str, terminator: LineTerminator) -> Vec<String> {
-    match terminator {
-        // `str::lines` splits on `\n`, dropping one preceding `\r` (a CRLF
-        // terminator) and yielding no trailing empty line — exactly the pump's
-        // `Newline` mode. A lone `\r` stays content, as it does there.
-        LineTerminator::Newline => text.lines().map(str::to_owned).collect(),
-        // `\r`-aware: split on the earliest `\r` or `\n`; a `\r\n` pair is one
-        // terminator; a bare `\r` ends a frame; the final un-terminated segment is
-        // the last line. (Indices land on ASCII `\r`/`\n`, always char boundaries.)
-        LineTerminator::CarriageReturn => {
-            let mut lines = Vec::new();
-            let bytes = text.as_bytes();
-            let (mut start, mut i) = (0usize, 0usize);
-            while i < bytes.len() {
-                match bytes[i] {
-                    b'\n' => {
-                        lines.push(text[start..i].to_owned());
-                        i += 1;
-                    }
-                    b'\r' => {
-                        lines.push(text[start..i].to_owned());
-                        // A `\r\n` pair is a single terminator; drop both.
-                        i += if bytes.get(i + 1) == Some(&b'\n') {
-                            2
-                        } else {
-                            1
-                        };
-                    }
-                    _ => {
-                        i += 1;
-                        continue;
-                    }
-                }
-                start = i;
-            }
-            if start < bytes.len() {
-                lines.push(text[start..].to_owned());
-            }
-            lines
-        }
-    }
-}
-
 /// A handle to a process spawned by a runner.
 pub struct RunningProcess {
     // The Option fields below encode the handle's de-facto states (fresh /
@@ -264,133 +198,32 @@ struct RealProc {
     stdin_task: Option<JoinHandle<std::io::Result<()>>>,
 }
 
-/// Shared kill state for a scripted child, clonable so a detached watchdog can
-/// end the run. `fire` hangs up feeders, flags the child dead, and wakes a
-/// parked `backend_wait`.
-#[derive(Clone)]
-struct ScriptedKill {
-    killed: Arc<AtomicBool>,
-    /// `notify_one` stores a permit so a kill before the wait parks is not missed.
-    signal: Arc<Notify>,
-    /// Aborting a writer drops its end, EOF-ing the reader — as a real tree's
-    /// death closes its pipes. `abort` is idempotent.
-    feeders: Arc<Vec<AbortHandle>>,
-}
-
-impl ScriptedKill {
-    fn fire(&self) {
-        self.killed.store(true, Ordering::Release);
-        for feeder in self.feeders.iter() {
-            feeder.abort();
-        }
-        self.signal.notify_one();
-    }
-}
-
-/// A scripted "child": canned output readers (fed by detached writer tasks so
-/// per-line delays work under a paused clock) plus a canned exit.
-pub(crate) struct ScriptedProc {
-    stdout: Option<tokio::io::DuplexStream>,
-    stderr: Option<tokio::io::DuplexStream>,
-    kill: ScriptedKill,
-    code: Option<i32>,
-    timed_out: bool,
-    signal: Option<i32>,
-    /// When the scripted child "exits": `Some(at)` resolves at that instant
-    /// (now = immediately), `None` never exits on its own (`Reply::pending` —
-    /// cancel/timeout still end it).
-    exit_at: Option<tokio::time::Instant>,
-}
-
-impl ScriptedProc {
-    /// Assemble a scripted child. Each output's text is fed through a duplex
-    /// pipe by a detached writer task — with `line_delay`, the writer sleeps
-    /// before each line (virtual-time friendly under a paused clock). The
-    /// "process" exits after `lifetime` (`None` = never on its own).
-    pub(crate) fn new(
-        stdout_text: String,
-        stderr_text: String,
-        code: Option<i32>,
-        timed_out: bool,
-        signal: Option<i32>,
-        lifetime: Option<Duration>,
-        line_delay: Option<Duration>,
-    ) -> Self {
-        let mut feeders = Vec::new();
-        let mut feed = |text: String| {
-            let (mut tx, rx) = tokio::io::duplex(64 * 1024);
-            if text.is_empty() {
-                return rx; // dropped tx → immediate EOF
-            }
-            // Detached: `AbortHandle` is the only way to hang it up early.
-            let task = tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
-                match line_delay {
-                    None => {
-                        let _ = tx.write_all(text.as_bytes()).await;
-                    }
-                    Some(delay) => {
-                        for line in text.split_inclusive('\n') {
-                            tokio::time::sleep(delay).await;
-                            if tx.write_all(line.as_bytes()).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-                // tx drops → EOF
-            });
-            feeders.push(task.abort_handle());
-            rx
-        };
-        let stdout = feed(stdout_text);
-        let stderr = feed(stderr_text);
-        Self {
-            stdout: Some(stdout),
-            stderr: Some(stderr),
-            kill: ScriptedKill {
-                killed: Arc::new(AtomicBool::new(false)),
-                signal: Arc::new(Notify::new()),
-                feeders: Arc::new(feeders),
-            },
-            code,
-            timed_out,
-            signal,
-            exit_at: lifetime.map(|d| tokio::time::Instant::now() + d),
-        }
-    }
-
-    fn kill(&self) {
-        self.kill.fire();
-    }
-}
-
 impl Backend {
     fn own_group(&self) -> Option<&Arc<ProcessGroup>> {
         match self {
             Backend::Real(real) => real.own_group.as_ref(),
-            Backend::Scripted(_) => None,
+            Backend::Scripted(s) => s.own_group(),
         }
     }
 
-    fn scripted_kill(&self) -> Option<ScriptedKill> {
+    fn scripted_kill(&self) -> Option<scripted::ScriptedKill> {
         match self {
             Backend::Real(_) => None,
-            Backend::Scripted(s) => Some(s.kill.clone()),
+            Backend::Scripted(s) => Some(s.kill_handle()),
         }
     }
 
     fn take_stdout_reader(&mut self) -> Option<OutputReader> {
         match self {
             Backend::Real(real) => real.stdout_pipe.take().map(|p| Box::new(p) as OutputReader),
-            Backend::Scripted(s) => s.stdout.take().map(|p| Box::new(p) as OutputReader),
+            Backend::Scripted(s) => s.take_stdout_reader(),
         }
     }
 
     fn take_stderr_reader(&mut self) -> Option<OutputReader> {
         match self {
             Backend::Real(real) => real.stderr_pipe.take().map(|p| Box::new(p) as OutputReader),
-            Backend::Scripted(s) => s.stderr.take().map(|p| Box::new(p) as OutputReader),
+            Backend::Scripted(s) => s.take_stderr_reader(),
         }
     }
 }
@@ -435,61 +268,6 @@ impl RunningProcess {
             started: Instant::now(),
             start_time: SystemTime::now(),
             scripted_result: None,
-        }
-    }
-
-    /// Build a scripted handle: same handlers/buffer/timeout/token/line-terminators
-    /// as a real run so hermetic tests exercise the same pump machinery. `pid()`
-    /// is `None`.
-    ///
-    /// The decode encoding is forced to **UTF-8**, not the command's
-    /// `stdout_encoding`/`stderr_encoding`: the scripted feeder writes the canned
-    /// `String`'s UTF-8 bytes (the caller's already-*decoded* output), so the pump
-    /// must read them back as UTF-8. Re-decoding through the command's encoding
-    /// would double-decode — e.g. `.stdout_encoding(UTF_16LE)` would read UTF-8
-    /// feeder bytes as UTF-16LE and hand back garbage.
-    ///
-    /// `recorded` (from a cassette `start`-replay) overrides the
-    /// truncation/overflow/duration a consumed replay reports; `None` derives them.
-    pub(crate) fn from_scripted(
-        command: &crate::command::Command,
-        scripted: ScriptedProc,
-        recorded: Option<ScriptedResultInfo>,
-    ) -> Self {
-        Self {
-            program: command.program_name(),
-            backend: Backend::Scripted(Box::new(scripted)),
-            timeout: command.configured_timeout(),
-            timeout_grace: command.configured_timeout_grace(),
-            timeout_signal: command.timeout_signal_raw(),
-            pid: None,
-            // Feeder writes UTF-8 (the canned String's bytes); decode as UTF-8 so
-            // the caller sees the exact canned text regardless of the command's
-            // configured encoding (see the doc above).
-            stdout_encoding: encoding_rs::UTF_8,
-            stderr_encoding: encoding_rs::UTF_8,
-            stdout_handler: command.stdout_handler(),
-            stderr_handler: command.stderr_handler(),
-            stdout_tee: command.stdout_tee_sink(),
-            stderr_tee: command.stderr_tee_sink(),
-            stdout_line_terminator: command.out_line_terminator(),
-            stderr_line_terminator: command.err_line_terminator(),
-            buffer: command.output_buffer_policy(),
-            ok_codes: command.ok_codes_vec(),
-            stdout_sink: None,
-            stderr_sink: None,
-            stdout_pump: None,
-            stderr_pump: None,
-            stdin_error: None,
-            stdout_piped: command.stdout_is_piped(),
-            deadline_task: None,
-            timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
-            cancel_token: command.cancel_token(),
-            cancel_task: None,
-            cancel_at_exit: None,
-            started: Instant::now(),
-            start_time: SystemTime::now(),
-            scripted_result: recorded,
         }
     }
 
@@ -540,40 +318,6 @@ impl RunningProcess {
                 stream::kill_direct_child(pid);
             }));
         }
-    }
-
-    /// Arm a deadline watchdog for a scripted streamed run. A scripted handle has
-    /// no process group; this task hangs up the feeders at the deadline instead,
-    /// claiming `TIMED_OUT` via the arbiter. No-op for a real backend or when a
-    /// watchdog is already armed.
-    fn arm_scripted_deadline(&mut self) {
-        if self.deadline_task.is_some() {
-            return;
-        }
-        let (Some(limit), Some(kill)) = (self.timeout, self.backend.scripted_kill()) else {
-            return;
-        };
-        // Anchor to spawn time so a late stream call can't re-grant the full limit.
-        let started = self.started;
-        let timeout_state = self.timeout_state.clone();
-        self.deadline_task = Some(tokio::spawn(async move {
-            let remaining = limit
-                .checked_sub(started.elapsed())
-                .unwrap_or(Duration::ZERO);
-            tokio::time::sleep(remaining).await;
-            if timeout_state
-                .compare_exchange(
-                    TS_PENDING,
-                    TS_TIMED_OUT,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
-                .is_err()
-            {
-                return; // the script already exited on its own — no kill
-            }
-            kill.fire();
-        }));
     }
 
     /// Take the raw stdout pipe for `Pipeline` plumbing. `None` for a scripted
@@ -1514,40 +1258,7 @@ impl RunningProcess {
                     }
                 }
             }
-            Backend::Scripted(s) => {
-                // A kill AFTER the scripted child already exited naturally must
-                // still report the cached natural outcome — a real child's exit
-                // status survives a post-exit kill. Only an un-exited (or
-                // never-exiting `pending`) script that is killed is `Signalled`.
-                let already_exited =
-                    matches!(s.exit_at, Some(at) if at <= tokio::time::Instant::now());
-                let classify = |s: &ScriptedProc| match (s.code, s.timed_out) {
-                    (_, true) => Outcome::TimedOut,
-                    (Some(code), false) => Outcome::Exited(code),
-                    (None, false) => Outcome::Signalled(s.signal),
-                };
-                if s.kill.killed.load(Ordering::Acquire) && !already_exited {
-                    Outcome::Signalled(None)
-                } else if already_exited {
-                    // Cached natural outcome even if a kill landed afterwards.
-                    classify(s)
-                } else {
-                    match s.exit_at {
-                        // Race so a streaming `deadline_task` can still end this wait.
-                        Some(at) => {
-                            tokio::select! {
-                                biased;
-                                () = s.kill.signal.notified() => Outcome::Signalled(None),
-                                () = tokio::time::sleep_until(at) => classify(s),
-                            }
-                        }
-                        None => {
-                            s.kill.signal.notified().await;
-                            Outcome::Signalled(None)
-                        }
-                    }
-                }
-            }
+            Backend::Scripted(s) => s.wait_outcome().await,
         };
         // Claim natural reap. If a deadline already won (`TS_TIMED_OUT`), this
         // CAS fails and the run stays `TimedOut`.
@@ -1678,11 +1389,7 @@ impl RunningProcess {
     fn has_exited_now(&mut self) -> bool {
         let exited = match &mut self.backend {
             Backend::Real(real) => matches!(real.child.try_wait(), Ok(Some(_))),
-            Backend::Scripted(s) => {
-                s.kill.killed.load(Ordering::Acquire)
-                    || s.exit_at
-                        .is_some_and(|at| tokio::time::Instant::now() >= at)
-            }
+            Backend::Scripted(s) => s.has_exited_now(),
         };
         if exited {
             // Claim the arbiter: a deadline watchdog racing on another thread could
@@ -2002,6 +1709,42 @@ mod tests {
             .expect("bare finish");
         assert_eq!(finished.outcome, Outcome::Exited(0));
         assert_eq!(finished.stderr, "e1\ne2");
+    }
+
+    /// T-042: a plain (non-pipeline) streaming `finish()` must surface stderr
+    /// truncation through `Finished::stderr_truncated` when a bounded
+    /// `OutputBufferPolicy` silently dropped stderr lines — previously invisible
+    /// to any streaming consumer, since `Finished` carried no truncation signal
+    /// at all.
+    #[tokio::test]
+    async fn bare_finish_reports_stderr_truncated_when_the_policy_drops_lines() {
+        let cmd = Command::new("tool").output_buffer(OutputBufferPolicy::bounded(2));
+        let finished = ScriptedRunner::new()
+            .fallback(Reply::fail(1, "e1\ne2\ne3\ne4\n"))
+            .start(&cmd)
+            .await
+            .expect("scripted start")
+            .finish()
+            .await
+            .expect("bare finish");
+        assert!(
+            finished.stderr_truncated,
+            "a bounded policy that dropped stderr lines must set stderr_truncated: {finished:?}"
+        );
+
+        // Contrast: the default unbounded policy retains everything — no truncation.
+        let untouched = ScriptedRunner::new()
+            .fallback(Reply::fail(1, "e1\ne2\ne3\ne4\n"))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start")
+            .finish()
+            .await
+            .expect("bare finish");
+        assert!(
+            !untouched.stderr_truncated,
+            "an unbounded policy must not report stderr truncation: {untouched:?}"
+        );
     }
 
     /// `stdout_lines()` → drop → `wait()`: the discard verb must complete cleanly
