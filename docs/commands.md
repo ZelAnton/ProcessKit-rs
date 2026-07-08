@@ -9,6 +9,7 @@ back*. Every one-shot verb spawns the child into a fresh, private kill-on-drop
 future can never leak a process tree.
 
 - [Program, arguments, working directory](#program-arguments-working-directory)
+- [Resolving a locally-installed tool: `prefer_local`](#resolving-a-locally-installed-tool-prefer_local)
 - [Environment](#environment)
 - [Standard input](#standard-input)
 - [Output handling](#output-handling)
@@ -57,6 +58,69 @@ let result  = processkit::output_string("git", ["status", "-s"]).await?;   // fu
 # Ok(())
 # }
 ```
+
+## Resolving a locally-installed tool: `prefer_local`
+
+`prefer_local` adds a directory to check **before** the system `PATH` when
+resolving a bare-name `program` for this one run — for a project's own
+`node_modules/.bin`, a `target/debug` build, or a vendored toolchain, without
+hand-rolling a `PATH` override:
+
+```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
+use processkit::Command;
+
+let out = Command::new("eslint")
+    .prefer_local("./node_modules/.bin")
+    .arg("src/")
+    .output_string()
+    .await?;
+# Ok(())
+# }
+```
+
+**Resolution order.** Repeated calls **accumulate**, in priority order: the
+directory from the first call is probed first, then the second, and so on,
+with the system `PATH` tried last as the final fallback:
+
+```rust,no_run
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
+use processkit::Command;
+
+Command::new("tool")
+    .prefer_local("./vendor/bin")   // checked first
+    .prefer_local("./target/debug") // checked second
+    .run()                          // then the system PATH
+    .await?;
+# Ok(())
+# }
+```
+
+Resolution reuses the exact same PATHEXT-aware lookup as the `PATH` search
+(the same internal `probe_dir` helper — not a separate implementation), so a
+`.exe`/`.cmd`/`.bat` on Windows is found under a `prefer_local` directory
+exactly as it would be on `PATH`.
+
+**Only a bare name is affected.** If the `program` passed to `Command::new` is
+a path — absolute, or relative with a separator (`"./tool"`, `"../bin/x"`) —
+`prefer_local` has no effect at all: the existing contract that such a program
+is never looked up on `PATH` (or here) is unchanged.
+
+**Interaction with `PATH`/`inherit_env`/`env`.** `prefer_local` only changes
+*where the parent looks* to resolve the program for this one launch. It does
+**not** rewrite or extend the `PATH` the child sees in its own environment —
+that is governed entirely by `env`/`inherit_env`/`env_clear`, as usual. When
+the program is found under a `prefer_local` directory, the child is simply
+spawned via that resolved absolute path instead of the bare name; a
+grandchild the program itself spawns does not inherit this reach — only the
+one program named in this `Command` benefits.
+
+**Diagnostics.** If resolution fails everywhere, `Error::NotFound`'s
+`searched` field includes the `prefer_local` directories too — first, in
+priority order, ahead of the `PATH` directories — so the diagnostic never
+hides that they were checked.
 
 ## Environment
 

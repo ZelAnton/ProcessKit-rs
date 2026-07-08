@@ -12,6 +12,15 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- `Command::prefer_local(dir)` — a directory to probe **before** the system
+  `PATH` when resolving a bare-name program for this one run (a project's
+  `node_modules/.bin`, `target/debug`, a vendored toolchain). Repeated calls
+  accumulate in priority order, ahead of the `PATH` fallback; resolution
+  reuses the existing PATHEXT-aware `PATH` lookup, so a `.exe`/`.cmd`/`.bat`
+  on Windows resolves the same way it would on `PATH`. Only affects a
+  bare-name program (a path-form program is unaffected, unchanged) and never
+  rewrites the child's own `PATH`; `Error::NotFound`'s `searched` includes
+  these directories too when resolution fails. See `docs/commands.md`.
 - `ProcessStdin::send_control(char)` — validates and writes a single control
   byte (e.g. `send_control('c')` for Ctrl-C, `send_control('d')` for Ctrl-D)
   to a child's stdin still held open via `keep_stdin_open()`/`take_stdin()`,

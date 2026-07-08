@@ -107,6 +107,92 @@ async fn bare_name_in_the_application_directory_is_not_falsely_not_found() {
     );
 }
 
+// T-054: `Command::prefer_local` must be checked BEFORE the system PATH, so a
+// program that exists only in a prefer_local directory (deliberately absent
+// from PATH) must still be found and spawned.
+#[tokio::test]
+#[ignore = "exercises the real spawn path; writes a temp executable"]
+async fn prefer_local_resolves_the_program_before_the_system_path() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let unique = "pk_prefer_local_probe_881234";
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join(unique);
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write stub");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod +x");
+    }
+    #[cfg(windows)]
+    {
+        let path = dir.path().join(format!("{unique}.exe"));
+        std::fs::copy(r"C:\Windows\System32\where.exe", &path).expect("copy where.exe");
+    }
+
+    let mut cmd = Command::new(unique).prefer_local(dir.path());
+    #[cfg(windows)]
+    {
+        cmd = cmd.arg("/?");
+    }
+    let result = cmd
+        .output_string()
+        .await
+        .expect("prefer_local must resolve the program even though it is not on PATH");
+    assert!(result.is_success(), "got {:?}", result.code());
+}
+
+// T-054: a `prefer_local` directory that does NOT hold the program must not
+// break the existing PATH fallback (the program still resolves normally if
+// it happens to be on PATH).
+#[tokio::test]
+#[ignore = "spawns a real subprocess"]
+async fn prefer_local_miss_falls_back_to_the_system_path() {
+    let dir = tempfile::tempdir().expect("temp dir"); // deliberately empty
+
+    let program = if cfg!(windows) { "cmd" } else { "sh" };
+    let mut cmd = Command::new(program).prefer_local(dir.path());
+    cmd = if cfg!(windows) {
+        cmd.args(["/c", "echo hi"])
+    } else {
+        cmd.args(["-c", "echo hi"])
+    };
+    let result = cmd
+        .output_string()
+        .await
+        .expect("a prefer_local miss must still fall back to the system PATH");
+    assert!(result.is_success(), "got {:?}", result.code());
+    assert!(
+        result.stdout().contains("hi"),
+        "stdout: {:?}",
+        result.stdout()
+    );
+}
+
+// T-054: when resolution fails everywhere, `Error::NotFound`'s `searched`
+// diagnostic must include the `prefer_local` directories too — not just PATH
+// — so the caller can tell they were checked.
+#[tokio::test]
+#[ignore = "exercises the real spawn path"]
+async fn missing_program_not_found_searched_includes_prefer_local_dirs() {
+    let dir = tempfile::tempdir().expect("temp dir"); // deliberately empty
+
+    let err = Command::new("processkit-definitely-not-installed-565656")
+        .prefer_local(dir.path())
+        .output_string()
+        .await
+        .expect_err("an unknown program must error");
+    match err {
+        processkit::Error::NotFound { searched, .. } => {
+            let searched = searched.expect("a bare-name lookup must report searched dirs");
+            assert!(
+                searched.contains(&dir.path().to_string_lossy().into_owned()),
+                "searched must include the prefer_local directory: {searched}"
+            );
+        }
+        other => panic!("expected Error::NotFound, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 #[ignore = "spawns a real subprocess"]
 async fn output_string_captures_stdout() {

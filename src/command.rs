@@ -2,7 +2,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,6 +63,9 @@ pub struct Command {
     program: OsString,
     args: Vec<OsString>,
     cwd: Option<OsString>,
+    /// Directories to probe (in priority order) before the system `PATH` when
+    /// `program` is a bare name — see [`Self::prefer_local`].
+    prefer_local: Vec<PathBuf>,
     envs: Vec<(OsString, Option<OsString>)>,
     env_clear: bool,
     stdin: Option<Stdin>,
@@ -129,6 +132,7 @@ impl Command {
             program: program.as_ref().to_os_string(),
             args: Vec::new(),
             cwd: None,
+            prefer_local: Vec::new(),
             envs: Vec::new(),
             env_clear: false,
             stdin: None,
@@ -184,6 +188,42 @@ impl Command {
     /// when combining `current_dir` with a relative-path executable.
     pub fn current_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.cwd = Some(dir.as_ref().as_os_str().to_os_string());
+        self
+    }
+
+    /// Probe `dir` for the program **before** the system `PATH` — for a
+    /// locally-installed tool (a project's `node_modules/.bin`, `target/debug`,
+    /// a vendored toolchain) that a caller wants to run by bare name without
+    /// hand-rolling a `PATH` override.
+    ///
+    /// Repeated calls **accumulate**, in priority order: the directory from the
+    /// first call is probed first, then the second, and so on, with the system
+    /// `PATH` tried last as the final fallback. Resolution reuses the exact
+    /// same PATHEXT-aware lookup as the `PATH` search (the same `probe_dir`
+    /// helper — no separate copy), so a `.exe`/`.cmd`/`.bat` on Windows is found
+    /// exactly as it would be on `PATH`.
+    ///
+    /// **Only affects a bare-name `program`.** If the program passed to
+    /// [`Command::new`] is a path — absolute, or relative with a separator
+    /// (`"./tool"`, `"../bin/x"`) — `prefer_local` has no effect and the
+    /// existing contract holds unchanged: such a program is never looked up
+    /// here or on `PATH`.
+    ///
+    /// **Does not touch the child's own `PATH`.** This only changes *where the
+    /// parent looks* to resolve the program for this one launch — the `PATH`
+    /// the child sees in its own environment (via inheritance, [`env`](Self::env),
+    /// or [`inherit_env`](Self::inherit_env)) is neither rewritten nor extended.
+    /// When the program is found under one of these directories, the child is
+    /// simply spawned via that resolved absolute path instead of the bare name
+    /// (so the OS never has to search anything); a grandchild the program itself
+    /// spawns does not inherit this reach.
+    ///
+    /// If resolution fails everywhere, [`Error::NotFound`](crate::Error::NotFound)'s
+    /// `searched` includes these directories — first, in priority order — ahead
+    /// of the `PATH` directories, so the diagnostic doesn't hide that they were
+    /// checked too.
+    pub fn prefer_local(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.prefer_local.push(dir.into());
         self
     }
 
@@ -1022,6 +1062,12 @@ impl Command {
         self.program.to_string_lossy().into_owned()
     }
 
+    /// The [`prefer_local`](Self::prefer_local) directories, in priority order
+    /// (read by the `Error::NotFound` diagnostic enrichment in `runner.rs`).
+    pub(crate) fn prefer_local_dirs(&self) -> &[PathBuf] {
+        &self.prefer_local
+    }
+
     /// Whether the command customizes the environment in a way that could move
     /// `PATH` away from the process `PATH` — an explicit `PATH` override/removal,
     /// [`env_clear`](Self::env_clear), or [`inherit_env`](Self::inherit_env)
@@ -1248,7 +1294,21 @@ impl Command {
     /// Build the `tokio` command with stdio wired for capture. Containment
     /// (cgroup/job/process-group) is added by the group's `spawn`.
     pub(crate) fn build_tokio(&self) -> tokio::process::Command {
-        let mut cmd = tokio::process::Command::new(&self.program);
+        // A bare-name program checks `prefer_local` directories first (in
+        // priority order); a match is spawned via its resolved absolute path,
+        // so the OS never has to search anything for it. No match (or a
+        // path-form program, or no `prefer_local` at all) leaves the program
+        // untouched — the OS still resolves it against the child's own `PATH`,
+        // exactly as before this builder existed.
+        let program = if !self.prefer_local.is_empty() && is_bare_name(self.program.as_os_str()) {
+            probe_prefer_local(&self.prefer_local, &self.program)
+        } else {
+            None
+        };
+        let mut cmd = match program {
+            Some(resolved) => tokio::process::Command::new(resolved),
+            None => tokio::process::Command::new(&self.program),
+        };
         cmd.args(&self.args);
         if let Some(cwd) = &self.cwd {
             cmd.current_dir(cwd);
@@ -1653,6 +1713,7 @@ impl fmt::Debug for Command {
         d.field("program", &self.program)
             .field("args", &self.args.len())
             .field("cwd", &self.cwd)
+            .field("prefer_local", &self.prefer_local)
             .field("env_names", &redacted_env_names(&self.envs))
             .field("env_clear", &self.env_clear)
             .field("stdin", &self.stdin)
@@ -1841,6 +1902,41 @@ pub(crate) fn find_in_path(program: &OsStr) -> (Option<std::path::PathBuf>, Stri
     (None, searched)
 }
 
+/// Probe `dirs` in order for `program` (a bare name), reusing [`probe_dir`] —
+/// the same PATHEXT-aware lookup the `PATH` search uses, not a separate copy.
+/// Returns the first match, i.e. the earliest directory in priority order
+/// (see [`Command::prefer_local`]).
+pub(crate) fn probe_prefer_local(dirs: &[PathBuf], program: &OsStr) -> Option<PathBuf> {
+    dirs.iter().find_map(|dir| probe_dir(dir, program))
+}
+
+/// Build the combined `searched` diagnostic for
+/// [`Error::NotFound`](crate::Error::NotFound): the [`Command::prefer_local`]
+/// directories (first, in priority order) followed by the `PATH` directories
+/// (`path_searched`, as returned by [`find_in_path`]) — joined by the
+/// platform's `PATH`-list separator (`:` on Unix, `;` on Windows), matching
+/// `find_in_path`'s own format. An empty `prefer_local` leaves `path_searched`
+/// unchanged.
+pub(crate) fn prepend_prefer_local_to_searched(
+    prefer_local: &[PathBuf],
+    path_searched: &str,
+) -> String {
+    if prefer_local.is_empty() {
+        return path_searched.to_string();
+    }
+    const SEP: char = if cfg!(windows) { ';' } else { ':' };
+    let prefer_str = prefer_local
+        .iter()
+        .map(|d| d.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(&SEP.to_string());
+    if path_searched.is_empty() {
+        prefer_str
+    } else {
+        format!("{prefer_str}{SEP}{path_searched}")
+    }
+}
+
 /// Check whether `program` is an executable in `dir`.
 #[cfg(unix)]
 fn probe_dir(dir: &std::path::Path, program: &OsStr) -> Option<std::path::PathBuf> {
@@ -1894,6 +1990,7 @@ mod tests {
     use super::Command;
     use crate::buffer::LineTerminator;
     use std::ffi::OsStr;
+    use std::path::PathBuf;
 
     #[test]
     fn line_terminator_defaults_to_newline_and_setters_target_the_right_streams() {
@@ -2332,6 +2429,151 @@ mod tests {
         assert!(Command::new("git").env_remove("PATH").customizes_path());
         assert!(Command::new("git").env_clear().customizes_path());
         assert!(Command::new("git").inherit_env(["HOME"]).customizes_path());
+    }
+
+    /// Write a file in `dir` that resolves as directly executable for
+    /// `program` — a `.exe` sibling on Windows (matching `probe_dir`'s PATHEXT
+    /// rules), an executable-bit-set file with the exact name on Unix.
+    /// Returns the resolved absolute path `probe_dir`/`build_tokio` should
+    /// report.
+    fn write_executable(dir: &std::path::Path, program: &str) -> PathBuf {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join(program);
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write stub");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod +x");
+            path
+        }
+        #[cfg(not(unix))]
+        {
+            let path = dir.join(format!("{program}.exe"));
+            std::fs::write(&path, b"stub").expect("write stub");
+            path
+        }
+    }
+
+    #[test]
+    fn prefer_local_accumulates_in_call_order() {
+        let cmd = Command::new("tool")
+            .prefer_local("/opt/first")
+            .prefer_local("/opt/second");
+        assert_eq!(
+            cmd.prefer_local_dirs(),
+            &[PathBuf::from("/opt/first"), PathBuf::from("/opt/second")]
+        );
+        assert!(Command::new("tool").prefer_local_dirs().is_empty());
+    }
+
+    #[test]
+    fn probe_prefer_local_returns_the_first_matching_directory_in_priority_order() {
+        let empty_dir = tempfile::tempdir().expect("temp dir");
+        let match_dir = tempfile::tempdir().expect("temp dir");
+        let also_match_dir = tempfile::tempdir().expect("temp dir");
+        let expected = write_executable(match_dir.path(), "tool-a");
+        write_executable(also_match_dir.path(), "tool-a");
+
+        // The first directory that actually contains a match wins, regardless
+        // of later directories also matching.
+        let dirs = vec![
+            empty_dir.path().to_path_buf(),
+            match_dir.path().to_path_buf(),
+            also_match_dir.path().to_path_buf(),
+        ];
+        let found = super::probe_prefer_local(&dirs, OsStr::new("tool-a")).expect("must find it");
+        // On Windows, PATHEXT expansion's resolved extension case follows
+        // whatever the PATHEXT env var carries (commonly `.EXE`), not
+        // necessarily the on-disk file's case — compare case-insensitively,
+        // same as the existing `probe_dir` PATHEXT tests.
+        assert!(
+            found
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&expected.to_string_lossy()),
+            "expected {expected:?}, got {found:?}"
+        );
+
+        // No match anywhere → None (the fallback to PATH is the caller's job).
+        let none_dirs = vec![empty_dir.path().to_path_buf()];
+        assert_eq!(
+            super::probe_prefer_local(&none_dirs, OsStr::new("tool-a")),
+            None
+        );
+    }
+
+    #[test]
+    fn build_tokio_resolves_bare_program_via_prefer_local_ahead_of_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let expected = write_executable(dir.path(), "prefer-local-tool");
+
+        let cmd = Command::new("prefer-local-tool").prefer_local(dir.path());
+        let tokio_cmd = cmd.build_tokio();
+        // Case-insensitive for the same PATHEXT-casing reason as above.
+        assert!(
+            tokio_cmd
+                .as_std()
+                .get_program()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&expected.to_string_lossy()),
+            "a prefer_local match must be spawned via its resolved absolute path, \
+             so the OS never has to search PATH for it; got {:?}, expected {expected:?}",
+            tokio_cmd.as_std().get_program()
+        );
+    }
+
+    #[test]
+    fn build_tokio_falls_back_to_the_bare_name_when_prefer_local_misses() {
+        let dir = tempfile::tempdir().expect("temp dir"); // no matching file inside
+
+        let cmd = Command::new("not-in-prefer-local").prefer_local(dir.path());
+        let tokio_cmd = cmd.build_tokio();
+        assert_eq!(
+            tokio_cmd.as_std().get_program(),
+            OsStr::new("not-in-prefer-local"),
+            "a prefer_local miss must leave the bare name for the OS's own PATH search"
+        );
+    }
+
+    #[test]
+    fn prefer_local_has_no_effect_on_a_path_form_program() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Even a directory that *would* match if the program were a bare name
+        // must not be consulted for a path-form program.
+        write_executable(dir.path(), "tool");
+        let path_program = "./tool";
+
+        let cmd = Command::new(path_program).prefer_local(dir.path());
+        let tokio_cmd = cmd.build_tokio();
+        assert_eq!(
+            tokio_cmd.as_std().get_program(),
+            OsStr::new(path_program),
+            "a path-form program must reach the OS verbatim, unaffected by prefer_local"
+        );
+    }
+
+    #[test]
+    fn prepend_prefer_local_to_searched_merges_in_priority_order() {
+        // No prefer_local directories: the PATH searched string passes through
+        // unchanged.
+        assert_eq!(
+            super::prepend_prefer_local_to_searched(&[], "/usr/bin:/bin"),
+            "/usr/bin:/bin"
+        );
+
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let dirs = vec![PathBuf::from("/opt/a"), PathBuf::from("/opt/b")];
+
+        // prefer_local dirs, then the PATH dirs, in that order.
+        assert_eq!(
+            super::prepend_prefer_local_to_searched(&dirs, "/usr/bin"),
+            format!("/opt/a{sep}/opt/b{sep}/usr/bin")
+        );
+
+        // An empty PATH searched string still surfaces the prefer_local dirs.
+        assert_eq!(
+            super::prepend_prefer_local_to_searched(&dirs, ""),
+            format!("/opt/a{sep}/opt/b")
+        );
     }
 
     #[test]

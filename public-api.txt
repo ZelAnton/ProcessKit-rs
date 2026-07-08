@@ -585,6 +585,7 @@ pub async fn processkit::Command::output_bytes(&self) -> processkit::Result<proc
 pub async fn processkit::Command::output_string(&self) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
 pub async fn processkit::Command::parse<T, F>(&self, F) -> processkit::Result<T> where T: core::marker::Send, F: core::ops::function::FnOnce(&str) -> T + core::marker::Send
 pub fn processkit::Command::pipe(self, processkit::Command) -> processkit::Pipeline
+pub fn processkit::Command::prefer_local(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn processkit::Command::priority(self, processkit::Priority) -> Self
 pub async fn processkit::Command::probe(&self) -> processkit::Result<bool>
 pub fn processkit::Command::program(&self) -> &std::ffi::os_str::OsStr

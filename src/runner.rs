@@ -6,7 +6,9 @@
 //! both — its `start` hands back a scripted handle that feeds canned lines
 //! through the same pump machinery a real child uses.
 
-use crate::command::{Command, find_in_path, is_bare_name};
+use crate::command::{
+    Command, find_in_path, is_bare_name, prepend_prefer_local_to_searched, probe_prefer_local,
+};
 use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::result::ProcessResult;
@@ -691,9 +693,13 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
             if is_bare_name(command.program()) && !command.customizes_path() {
-                let (found, searched) = find_in_path(command.program());
-                if found.is_some() {
-                    // On PATH but not directly executable (e.g. .cmd/.bat on Windows).
+                let prefer_local = command.prefer_local_dirs();
+                let prefer_found = probe_prefer_local(prefer_local, command.program());
+                let (path_found, path_searched) = find_in_path(command.program());
+                let searched = prepend_prefer_local_to_searched(prefer_local, &path_searched);
+                if prefer_found.is_some() || path_found.is_some() {
+                    // Found (on a `prefer_local` directory or `PATH`) but not
+                    // directly executable (e.g. .cmd/.bat on Windows).
                     return Err(crate::Error::Spawn {
                         program: command.program_name(),
                         source,
