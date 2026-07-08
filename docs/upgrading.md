@@ -220,9 +220,10 @@ after the bump, you're done. Plus one internal fix that needs no action.
 ### 1. `stats` is now opt-in — a `Cargo.toml` change
 
 The default feature set is now just `process-control`; `stats` is no longer on by
-default. (It is the one feature carrying an extra build dependency — the Windows
-`ProcessStatus` FFI used solely for the peak-memory readout — and it gates a
-specialized metrics surface the core never needs.)
+default. (It gates a specialized metrics surface the core never needs; on
+Windows it links an OS library — the `ProcessStatus` FFI used solely for the
+peak-memory readout — but unlike `mock`/`tracing`/`record` it pulls in no extra
+crate.)
 
 **Affected if you use any metrics API:** `ProcessGroup::stats` /
 `ProcessGroupStats`, `RunningProcess::cpu_time` / `peak_memory_bytes`, or

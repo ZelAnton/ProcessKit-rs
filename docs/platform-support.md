@@ -151,10 +151,12 @@ correct when the spawner itself is PID 1 (a container entrypoint).
 
 **Windows: the suspended-spawn handshake.** Children are created
 `CREATE_SUSPENDED`, assigned to the job, then resumed — closing the classic
-race where a fast child forks before it's in the job. A consequence: a raw
-`ProcessGroup::spawn` caller passing its own creation flags gets them OR'd
-with `CREATE_SUSPENDED` (the `Command`-driven paths handle this for you, incl.
-`create_no_window`).
+race where a fast child forks before it's in the job. A consequence: on the raw
+`ProcessGroup::spawn` escape hatch, any creation flags the caller set are
+**overwritten** — the child is forced to `CREATE_SUSPENDED` alone, because Win32
+exposes no way to read the flags back and OR the suspend bit in. The
+`Command`-driven paths don't have this limitation: their extras (incl.
+`create_no_window`) travel alongside the OS command and are OR'd in.
 
 **Windows: nested suspends.** `SuspendThread` keeps per-thread *counts* — two
 `suspend()` calls need two `resume()`s. The POSIX backends are level-triggered

@@ -84,8 +84,9 @@ Things to know:
   `output_events` call (stdout is consumed once), or a non-piped stdout
   (`StdioMode::Inherit`/`Null`), returns `Err` rather than a silently-empty
   stream.
-- **The command's `timeout` bounds the stream** on an own-group handle: at the
-  deadline the tree is killed, the pipes close, and the stream ends — a
+- **The command's `timeout` bounds the stream**: at the deadline the tree
+  (own-group handle) or the direct child (shared-group handle) is killed, the
+  pipes close, and the stream ends — a
   streamed run can't hang past its deadline. A `cancel_on` token ends it the
   same way; the following
   `finish` then reports `Error::Cancelled`. Details in
@@ -248,7 +249,7 @@ Probe semantics, deliberately uniform:
 - All three probes background-drain stdout/stderr while they poll, so a
   child with a large startup burst can't stall in `write()` on a full OS pipe
   buffer. `wait_for_line` consumes stdout up to (and including) the match —
-  continue with `finish` or further streaming. `wait_for_port` / `wait_for`
+  continue with `finish`. `wait_for_port` / `wait_for`
   drain the same way but never hand any of it back mid-probe; `wait` /
   `output_string` afterward still see the full captured output, but
   `output_bytes` or a fresh `stdout_lines` / `output_events` call do not

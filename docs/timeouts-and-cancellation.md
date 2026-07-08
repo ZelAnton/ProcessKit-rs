@@ -135,10 +135,13 @@ Ground rules:
   didn't fail.
 - The classifier sees the typed error — match on variants, codes, even the
   captured stderr.
-- Each attempt re-runs the *same* `Command`: a one-shot stdin source
-  ([table](commands.md#standard-input)) is consumed by attempt #1, so attempt #2
-  **fails loud** with an `Error::Io` (`InvalidInput`) at launch (D10) rather than
-  silently feeding empty stdin. Use reusable sources for retried commands.
+- Each attempt re-runs the *same* `Command` — so a command whose stdin is a
+  **one-shot** source ([table](commands.md#standard-input)), consumed by the
+  first run, is **not retried at all**: the first attempt's error is returned
+  as-is, since a second attempt could only replay empty stdin. Use a reusable
+  stdin source if a stdin-bearing command must retry. (A one-shot source re-run
+  *outside* the retry loop — a `Supervisor` incarnation, a pipeline re-run —
+  instead fails loud with an `Error::Io` (`InvalidInput`) at launch.)
 - A `Cancelled` error is **never retried**, classifier or not — the token
   stays cancelled forever, so another attempt could only fail the same way.
 

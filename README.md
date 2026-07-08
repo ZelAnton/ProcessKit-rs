@@ -174,7 +174,7 @@ guarantee is unconditional in every configuration.
 | Feature | Default | Adds |
 |---|---|---|
 | `process-control` | ✅ | `Signal`, `ProcessGroup::{signal, suspend, resume, members, adopt}` |
-| `stats` | — | group/per-run resource measurement, `sample_stats`, `profile` (opt-in: the one feature with an extra dependency) |
+| `stats` | — | group/per-run resource measurement, `sample_stats`, `profile` (opt-in — specialized to metrics; adds no extra crate, only a Windows OS-library link for the peak-memory readout) |
 | `limits` | — | whole-tree resource caps (implies `stats`) |
 | `record` | — | record/replay cassettes (pulls `serde`) |
 | `mock` | — | `mockall`-generated `MockRunner` (test-only; its surface is semver-exempt — prefer `ScriptedRunner`/`RecordingRunner`) |
@@ -445,8 +445,9 @@ A probe that doesn't pass within its deadline — or that can no longer pass
 `Error::NotReady` (distinct from `Error::Timeout`, which is the run's own
 `Command::timeout`) and **does not kill the child**: the caller decides what
 happens next. `wait_for_line` consumes stdout up to the match
-(continue with `finish`); `wait_for_port` / `wait_for` don't touch
-the pipes at all.
+(continue with `finish`); `wait_for_port` / `wait_for` background-drain and
+discard stdout/stderr (so the child never blocks on a full pipe) but hand
+none of it back.
 
 *Deeper: [Streaming → readiness probes](docs/streaming.md).*
 
@@ -617,9 +618,9 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-> The command's [`timeout`] **bounds the stream**: at the deadline the tree is
-> killed, the pipes close, and the stream ends (on a handle that owns its group —
-> the `start()` path). A `cancel_on` token ends
+> The command's [`timeout`] **bounds the stream**: at the deadline the tree
+> (own-group handle) or the direct child (shared-group handle) is killed, the
+> pipes close, and the stream ends. A `cancel_on` token ends
 > the stream the same way, and the following `finish` reports
 > `Error::Cancelled`. For an ad-hoc bound, wrapping the loop in
 > [`tokio::time::timeout`] and dropping the handle (which kills the tree) still
@@ -707,7 +708,7 @@ use std::path::Path;
 cli_client!(pub struct Git => "git");
 
 impl<R: ProcessRunner> Git<R> {
-    async fn head(&self, dir: &Path) -> Result<String> {
+    pub async fn head(&self, dir: &Path) -> Result<String> {
         self.core.run(self.core.command_in(dir, ["rev-parse", "HEAD"])).await
     }
 }
