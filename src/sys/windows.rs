@@ -14,6 +14,8 @@ use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_MORE_DATA};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
+#[cfg(feature = "process-control")]
+use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 #[cfg(any(feature = "process-control", feature = "stats"))]
 use windows_sys::Win32::System::JobObjects::QueryInformationJobObject;
 use windows_sys::Win32::System::JobObjects::{
@@ -37,6 +39,8 @@ use windows_sys::Win32::System::JobObjects::{
 };
 #[cfg(feature = "stats")]
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+#[cfg(feature = "stats")]
+use windows_sys::Win32::System::Threading::GetProcessTimes;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
 };
@@ -44,10 +48,8 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessIdOfThread, SuspendThread, THREAD_QUERY_LIMITED_INFORMATION,
 };
-#[cfg(feature = "stats")]
-use windows_sys::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-};
+#[cfg(any(feature = "process-control", feature = "stats"))]
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
 use crate::Mechanism;
 #[cfg(feature = "process-control")]
@@ -303,6 +305,13 @@ impl Job {
     /// vacuously handled (not a failure); a genuine `SuspendThread`/
     /// `ResumeThread` failure on a still-open thread does not abort the walk and
     /// is reported after every member has been attempted.
+    ///
+    /// Recycle-safe (C13): the member list is captured before the thread
+    /// snapshot, so a member could exit and its pid be reused by a foreign
+    /// process in that gap. `suspend_or_resume_thread` re-verifies, per thread,
+    /// that the live owner is *still a member of this job* (`IsProcessInJob`)
+    /// before touching it, so a recycled pid can never divert a suspend/resume
+    /// onto an unrelated process.
     #[cfg(feature = "process-control")]
     fn for_each_member_thread(&self, suspend: bool) -> io::Result<()> {
         // Mutually exclusive with `spawn`'s assign → resume window (see the
@@ -334,8 +343,12 @@ impl Job {
         let mut ok = unsafe { Thread32First(snapshot, &mut entry) };
         while ok != 0 {
             if members.contains(&entry.th32OwnerProcessID)
-                && let Err(err) =
-                    suspend_or_resume_thread(entry.th32ThreadID, entry.th32OwnerProcessID, suspend)
+                && let Err(err) = suspend_or_resume_thread(
+                    entry.th32ThreadID,
+                    entry.th32OwnerProcessID,
+                    self.handle,
+                    suspend,
+                )
             {
                 last_err = Some(err);
             }
@@ -561,8 +574,16 @@ fn resume_thread(tid: u32) -> io::Result<()> {
 }
 
 /// Suspend (increment) or resume (decrement) a single thread's suspend count.
+///
+/// `job` is the job whose members are being walked; it backs the pid-recycle
+/// membership re-check (C13) below.
 #[cfg(feature = "process-control")]
-fn suspend_or_resume_thread(tid: u32, expected_pid: u32, suspend: bool) -> io::Result<()> {
+fn suspend_or_resume_thread(
+    tid: u32,
+    expected_pid: u32,
+    job: HANDLE,
+    suspend: bool,
+) -> io::Result<()> {
     // Also request QUERY access so we can confirm the thread's owner below (C11).
     // SAFETY: opens the thread by id; returns null on failure (e.g. exited).
     let thread = unsafe {
@@ -597,6 +618,23 @@ fn suspend_or_resume_thread(tid: u32, expected_pid: u32, suspend: bool) -> io::R
         unsafe { CloseHandle(thread) };
         return Ok(());
     }
+    // C13: the owner check above only proves the thread belongs to `expected_pid`
+    // *now* — but `expected_pid` itself may be a **recycled** pid. Between
+    // `job_member_pids` (member snapshot) and the thread snapshot, a member
+    // (typically a handle-less grandchild) can exit and its pid be reused by a
+    // FOREIGN process X; X's threads then surface under a pid still in `members`,
+    // and the C11 owner check passes because X genuinely owns them — so a bare
+    // owner check would `SuspendThread` all of X's threads, freezing (and later
+    // decrementing the suspend count of) an unrelated process. Close that window
+    // by confirming the owner is STILL a member of THIS job before touching the
+    // thread. Fail-safe: any failure to open the process or query membership is
+    // treated as "not our member", so an uncertain result never suspends/resumes
+    // a foreign thread.
+    if !process_is_in_job(owner, job) {
+        // SAFETY: handle came from OpenThread; closed exactly once.
+        unsafe { CloseHandle(thread) };
+        return Ok(());
+    }
     // SAFETY: valid thread handle; both calls signal failure with `u32::MAX`.
     let prev = unsafe {
         if suspend {
@@ -614,6 +652,32 @@ fn suspend_or_resume_thread(tid: u32, expected_pid: u32, suspend: bool) -> io::R
         Some(err) => Err(err),
         None => Ok(()),
     }
+}
+
+/// Whether the process named by `pid` is currently a member of `job` — the
+/// per-thread pid-recycle guard (C13) for the suspend/resume walk.
+///
+/// Fail-safe by construction: a failure to open the process (gone, denied) or to
+/// query membership yields `false`, i.e. "treat as NOT our member". A false
+/// negative merely skips a suspend/resume for one thread (best-effort, already
+/// the walk's contract), whereas a false positive would freeze a foreign
+/// process — so uncertainty must resolve to "leave it alone".
+#[cfg(feature = "process-control")]
+fn process_is_in_job(pid: u32, job: HANDLE) -> bool {
+    // Least-privilege: `IsProcessInJob` only needs query access.
+    // SAFETY: opens the process by id; returns null on failure (e.g. exited).
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut in_job: i32 = 0;
+    // SAFETY: `handle` is a valid process handle from OpenProcess just above,
+    // `job` is our live job handle, and `in_job` is an owned out-param. Returns 0
+    // on failure, leaving `in_job` untouched (still 0 → treated as not-a-member).
+    let ok = unsafe { IsProcessInJob(handle, job, &mut in_job) };
+    // SAFETY: handle came from OpenProcess; closed exactly once.
+    unsafe { CloseHandle(handle) };
+    ok != 0 && in_job != 0
 }
 
 /// Enumerate the pids currently assigned to the job.
@@ -779,7 +843,10 @@ impl Drop for Job {
 
 #[cfg(all(test, feature = "process-control"))]
 mod thread_tests {
-    use super::suspend_or_resume_thread;
+    use super::{process_is_in_job, suspend_or_resume_thread};
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
     /// A stale/invalid tid — a thread that exited between the system-wide
     /// snapshot and the `OpenThread` — fails `ERROR_INVALID_PARAMETER` and is
@@ -790,10 +857,45 @@ mod thread_tests {
     /// the fix returns `Ok` — and it can never open or suspend a real thread.
     #[test]
     fn suspend_or_resume_a_stale_tid_is_ok() {
-        // `expected_pid` is irrelevant here: `tid = 1` fails `OpenThread` before
-        // the C11 owner check ever runs.
-        assert!(suspend_or_resume_thread(1, 0, true).is_ok());
-        assert!(suspend_or_resume_thread(1, 0, false).is_ok());
+        // `expected_pid`/`job` are irrelevant here: `tid = 1` fails `OpenThread`
+        // before the C11 owner check or the C13 membership check ever runs, so a
+        // null job handle is never dereferenced.
+        let job = std::ptr::null_mut();
+        assert!(suspend_or_resume_thread(1, 0, job, true).is_ok());
+        assert!(suspend_or_resume_thread(1, 0, job, false).is_ok());
+    }
+
+    /// The C13 pid-recycle guard: a process that is NOT a member of *the* job in
+    /// question reads as a non-member, so a suspend/resume is skipped. A freshly
+    /// created job has no members, so the current process (never assigned to it)
+    /// must fail the check — the exact outcome that spares a foreign process whose
+    /// pid recycled into a stale member set. Also covers the fail-safe leg: a pid
+    /// that cannot be opened yields `false` rather than a spurious "member".
+    #[test]
+    fn non_member_and_unopenable_pids_are_rejected() {
+        // SAFETY: null name/attributes request an unnamed job with defaults;
+        // returns null only on failure.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(!job.is_null(), "failed to create a test job object");
+
+        // The current process is openable but was never assigned to `job`, so
+        // `IsProcessInJob` reports it is not a member of THIS job.
+        // SAFETY: a plain read of our own pid.
+        let me = unsafe { GetCurrentProcessId() };
+        assert!(
+            !process_is_in_job(me, job),
+            "a process not assigned to this job must not read as a member"
+        );
+
+        // Fail-safe: `1` is not a valid pid (ids are multiples of 4), so
+        // `OpenProcess` fails and the guard returns false — never a stray suspend.
+        assert!(
+            !process_is_in_job(1, job),
+            "an unopenable pid must be treated as a non-member"
+        );
+
+        // SAFETY: handle came from CreateJobObjectW; closed exactly once.
+        unsafe { CloseHandle(job) };
     }
 }
 

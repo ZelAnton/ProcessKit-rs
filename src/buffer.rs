@@ -175,6 +175,15 @@ pub enum OverflowMode {
 /// [`stdout_tee`](crate::Command::stdout_tee) (set no byte cap if a tee must see
 /// arbitrarily long lines verbatim).
 ///
+/// **A flood of empty (or near-empty) lines is still bounded.** Content-byte
+/// sums alone would let a stream of nothing but newlines (`yes ''`-style)
+/// contribute `0` bytes per line forever, defeating the cap. Every retained
+/// line is therefore also charged against a *derived* per-line minimum, so the
+/// backlog (under the drop modes) or the cumulative total (under
+/// [`OverflowMode::Error`]) cannot exceed roughly `max_bytes` **lines** even
+/// when their content is empty — the byte cap remains a real memory bound, and
+/// [`OverflowMode::Error`] genuinely trips, for that degenerate case too.
+///
 /// **Carriage-return progress output** (`curl`, `pip`, `apt` — a bar redrawn with
 /// `\r`, no `\n` until the end) is the common shape of this under the default
 /// [`LineTerminator::Newline`]: the pump splits on `\n` only, so the whole
