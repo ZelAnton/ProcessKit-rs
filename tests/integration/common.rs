@@ -154,6 +154,28 @@ pub(crate) fn raw_stdin_echo() -> Command {
     }
 }
 
+/// A child that writes `bytes` bytes to stdout in one burst, then creates an
+/// empty marker file at `marker` and exits 0, per platform. `bytes` should be
+/// well past the OS pipe buffer (~64 KiB on Linux, similarly small elsewhere):
+/// if nothing drains piped stdout while the child writes, it stalls in
+/// `write()` and never reaches (creates) the marker — the shape a readiness
+/// check can poll for without touching the child's stdout itself.
+pub(crate) fn big_stdout_then_marker(bytes: usize, marker: &std::path::Path) -> Command {
+    let marker = marker.display();
+    if cfg!(windows) {
+        Command::new("powershell").args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "[Console]::Out.Write(('x' * {bytes})); \
+                 New-Item -ItemType File -Path '{marker}' -Force | Out-Null"
+            ),
+        ])
+    } else {
+        Command::new("sh").args(["-c", &format!("yes | head -c {bytes}; touch '{marker}'")])
+    }
+}
+
 /// A child that prints its whole environment, per platform.
 pub(crate) fn print_env() -> Command {
     if cfg!(windows) {

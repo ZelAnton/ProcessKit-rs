@@ -170,6 +170,40 @@ async fn wait_for_passes_once_the_check_turns_true() {
     );
 }
 
+#[tokio::test]
+#[ignore = "spawns a real subprocess that floods piped stdout past the OS pipe buffer"]
+async fn wait_for_drains_stdout_so_a_large_startup_burst_does_not_block_readiness() {
+    // Comfortably larger than any OS pipe buffer (~64 KiB on Linux/macOS,
+    // similarly small on Windows): if `wait_for` didn't drain stdout in the
+    // background, the child would block partway through this write and never
+    // reach (create) the marker below, so the check would never turn true and
+    // this would spuriously fail with `NotReady` instead of promptly passing.
+    const BURST_BYTES: usize = 4 * 1024 * 1024;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let marker = dir.path().join("ready");
+
+    let mut process = big_stdout_then_marker(BURST_BYTES, &marker)
+        .start()
+        .await
+        .expect("start burst writer");
+
+    let check_marker = marker.clone();
+    completes_within(
+        Duration::from_secs(15),
+        "wait_for readiness after a large stdout burst",
+        process.wait_for(
+            move || {
+                let marker = check_marker.clone();
+                async move { marker.exists() }
+            },
+            Duration::from_secs(10),
+        ),
+    )
+    .await
+    .expect("the marker must appear promptly — the burst must not stall the child");
+}
+
 // Note: R5-1 (a probe reaping a cleanly-exited child must claim the timeout
 // arbiter so a concurrent streaming-deadline watchdog can't misclassify it as
 // TimedOut) is a multi-threaded atomic race between the deadline task and the

@@ -1374,8 +1374,20 @@ impl RunningProcess {
                 Ordering::Relaxed,
             );
             self.abort_watchdogs();
-            // Snapshot cancel disposition on FIRST reap only — a repeat probe
-            // after a late cancel must not overwrite the cached result.
+            // Snapshot the cancel disposition at the moment this probe observes
+            // the reap, first-observation-wins. This is *observation-time*
+            // semantics, matching the bulk paths' biased `select!`
+            // (`drive_to_exit_inner`/`wait_exit`): a token already cancelled when
+            // the exit is observed resolves to `Cancelled` there, so latching
+            // `is_cancelled()` here keeps the probe consistent with a no-probe
+            // wait at the same timeline and honours the contract documented on
+            // `Command::cancel_on` — a mid-run cancel during a probe surfaces as
+            // that probe's `NotReady`, and the consuming finisher afterwards
+            // still reports `Cancelled`. Freezing the disposition on this first
+            // observation stops a *later* cancel (one that fires after the probe
+            // already saw a natural exit) from flipping it, without dropping an
+            // *earlier* cancel that was already active — and already killed the
+            // tree via the cancel watchdog — by the time the probe noticed.
             if self.cancel_at_exit.is_none() {
                 self.cancel_at_exit =
                     Some(self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()));
@@ -1815,6 +1827,74 @@ mod tests {
             .await
             .expect("a late cancel must not flip a natural exit");
         assert_eq!(outcome, Outcome::Exited(0));
+    }
+
+    /// The probe path (`wait_for`/`wait_for_port` → `has_exited_now`) snapshots
+    /// the cancel disposition at observation time, first-observation-wins, so a
+    /// cancel that fires *after* the probe has already seen a natural reap cannot
+    /// flip it — mirroring the no-probe `wait_any` path
+    /// (`a_natural_wait_any_exit_is_not_flipped_by_a_late_cancel`).
+    #[tokio::test]
+    async fn a_probe_reap_is_not_flipped_by_a_later_cancel() {
+        let token = crate::CancellationToken::new();
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok("done\n"))
+            .start(&Command::new("tool").cancel_on(token.clone()))
+            .await
+            .expect("scripted start");
+        // `Reply::ok` gives the scripted child a zero lifetime — it has already
+        // "exited" (exit_at == start). A never-passing check drives `poll_until`
+        // straight into `has_exited_now`, which observes the reap while the token
+        // is still live, snapshots the natural disposition, and bails NotReady.
+        match run
+            .wait_for(|| async { false }, Duration::from_secs(5))
+            .await
+        {
+            Err(Error::NotReady { .. }) => {}
+            other => panic!("expected Err(NotReady), got {other:?}"),
+        }
+        // Cancel only now, after the probe already observed the exit: the frozen
+        // observation-time snapshot wins over this late cancel.
+        token.cancel();
+        let outcome = run
+            .wait()
+            .await
+            .expect("a cancel after the probe's reap observation must not flip it");
+        assert_eq!(outcome, Outcome::Exited(0));
+    }
+
+    /// A cancel already *active* when the probe observes the reap is not dropped:
+    /// the observation-time snapshot latches `Cancelled`, so the consuming
+    /// finisher reports `Err(Cancelled)`. This is the contract documented on
+    /// `Command::cancel_on` (the probe surfaces `NotReady`; the finisher
+    /// afterwards still reports `Cancelled`) and the disposition the bulk
+    /// biased-`select!` paths give for the same "cancel before observation"
+    /// timeline — a real-backend cancel watchdog would have killed the tree
+    /// between the cancel and the probe's observation.
+    #[tokio::test]
+    async fn a_probe_reap_with_an_active_cancel_still_surfaces_cancelled() {
+        let token = crate::CancellationToken::new();
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok("done\n"))
+            .start(&Command::new("tool").cancel_on(token.clone()))
+            .await
+            .expect("scripted start");
+        // Cancel BEFORE the probe observes the (zero-lifetime) child's exit, so
+        // the token is live at observation time and the snapshot must latch it.
+        token.cancel();
+        match run
+            .wait_for(|| async { false }, Duration::from_secs(5))
+            .await
+        {
+            Err(Error::NotReady { .. }) => {}
+            other => panic!("expected Err(NotReady), got {other:?}"),
+        }
+        // The cancel active at observation is preserved: the finisher reports it,
+        // never a silent `Ok` for a run the cancel really tore down.
+        match run.wait().await {
+            Err(Error::Cancelled { .. }) => {}
+            other => panic!("expected Err(Cancelled), got {other:?}"),
+        }
     }
 
     /// `wait_exit` applies `classify_timed_out` so the `stdout_lines` → `wait_any`
