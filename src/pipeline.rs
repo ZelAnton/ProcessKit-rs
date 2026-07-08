@@ -108,6 +108,11 @@ struct StageOutcome {
     /// SIGPIPE victim in attribution: de-prioritized so the real culprit — the
     /// stage that triggered teardown — is the one blamed.
     torn_down: bool,
+    /// Whether a bounded, non-fail-loud `OutputBufferPolicy` silently dropped
+    /// this stage's stderr. Stamped onto the folded result's `truncated` when
+    /// this stage is the one pipefail blames, so an inner stage's clipped
+    /// diagnostics are visible even when it isn't the last stage.
+    stderr_truncated: bool,
 }
 
 impl Pipeline {
@@ -295,7 +300,11 @@ impl Pipeline {
             let timeout = stage.configured_timeout();
             let teardown = teardown.clone();
             inner_tasks.push(tokio::spawn(async move {
-                let Finished { outcome, stderr } = process.finish().await?;
+                let Finished {
+                    outcome,
+                    stderr,
+                    stderr_truncated,
+                } = process.finish().await?;
                 // Snapshot *before* firing: a teardown already in flight when this
                 // stage ended marks it a victim; the first genuine failure sees no
                 // teardown yet, so it fires it and stays the (non-torn) culprit.
@@ -311,6 +320,7 @@ impl Pipeline {
                     ok_codes,
                     timeout,
                     torn_down,
+                    stderr_truncated,
                 })
             }));
         }
@@ -387,6 +397,14 @@ impl Pipeline {
             },
         };
 
+        // `pipefail` rebuilds via `ProcessResult::new` (which defaults `truncated=false`);
+        // re-stamp truncation so the `parse`/`try_parse` guard fires correctly. The
+        // last stage's own `truncated()` covers both its stdout and stderr drops —
+        // reused below as this stage's `stderr_truncated` too, since either one
+        // clips the chain's actual captured content regardless of attribution.
+        let last_truncated = last_result.truncated();
+        let (last_total_lines, last_total_bytes) =
+            (last_result.total_lines(), last_result.total_bytes());
         let last_outcome = StageOutcome {
             program: last_result.program().to_owned(),
             outcome: last_result.outcome(),
@@ -395,16 +413,17 @@ impl Pipeline {
             ok_codes: last_ok_codes,
             timeout: last_timeout,
             torn_down: last_torn_down,
+            stderr_truncated: last_truncated,
         };
-        // `pipefail` rebuilds via `ProcessResult::new` (which defaults `truncated=false`);
-        // re-stamp truncation so the `parse`/`try_parse` guard fires correctly.
-        let last_truncated = last_result.truncated();
-        let (last_total_lines, last_total_bytes) =
-            (last_result.total_lines(), last_result.total_bytes());
         let last_stdout = last_result.into_stdout();
         stages.push(last_outcome);
 
         let mut result = pipefail(stages, last_stdout).with_duration(started.elapsed());
+        // The attributed stage's own stderr truncation is already folded in by
+        // `pipefail` (see below); this additionally ORs in the last stage's own
+        // capture truncation, since the chain's actual `stdout` is always the last
+        // stage's — a clipped last-stage capture is real regardless of which stage
+        // pipefail blames for the failure.
         if last_truncated {
             result = result
                 .with_truncated(true)
@@ -657,6 +676,12 @@ fn pipefail<T>(stages: Vec<StageOutcome>, last_stdout: T) -> ProcessResult<T> {
         // make a rejected-zero failure (a stage with `ok_codes` excluding `0`
         // that exited `0`) — which `is_clean` deemed a *failure* above — report
         // `is_success() == true`, so the whole chain would return `Ok`.
+        //
+        // Also stamp the attributed stage's own stderr truncation: a bounded
+        // `OutputBufferPolicy` may have silently dropped this stage's stderr even
+        // when it isn't the last stage, and pipefail's diagnostics come from
+        // *this* stage — so its truncation must be visible on the folded result,
+        // not just the last stage's.
         return ProcessResult::new(
             stage.program.clone(),
             last_stdout,
@@ -664,7 +689,8 @@ fn pipefail<T>(stages: Vec<StageOutcome>, last_stdout: T) -> ProcessResult<T> {
             stage.outcome,
             stage.timeout,
         )
-        .with_ok_codes(stage.ok_codes.clone());
+        .with_ok_codes(stage.ok_codes.clone())
+        .with_truncated(stage.stderr_truncated);
     }
 
     // No checked failure: the last stage speaks. For an unchecked last stage that
@@ -683,6 +709,7 @@ fn pipefail<T>(stages: Vec<StageOutcome>, last_stdout: T) -> ProcessResult<T> {
         last.timeout,
     )
     .with_ok_codes(ok_codes)
+    .with_truncated(last.stderr_truncated)
 }
 
 /// `a | b` — sugar for [`Command::pipe`]. Parenthesize the chain before a
@@ -724,6 +751,7 @@ mod tests {
             ok_codes: vec![0],
             timeout: None,
             torn_down: false,
+            stderr_truncated: false,
         }
     }
 
@@ -754,6 +782,7 @@ mod tests {
             ok_codes: vec![0],
             timeout: None,
             torn_down: false,
+            stderr_truncated: false,
         }
     }
 
@@ -862,6 +891,42 @@ mod tests {
             }
             other => panic!("expected Error::Exit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn attributed_inner_stage_truncation_survives_the_fold_not_just_the_last_stage() {
+        // T-042: an INNER (non-last) stage's silently-dropped stderr must show up
+        // as `truncated()` on the folded result when pipefail blames *that*
+        // stage — before this, only the last stage's `Finished` carried a
+        // truncation signal, so a bounded-buffer-clipped diagnostic on the real
+        // culprit was reported as complete (`truncated() == false`).
+        let culprit = StageOutcome {
+            stderr_truncated: true,
+            ..unclean("b", Outcome::Exited(2), "b broke (clipped)")
+        };
+        let result = pf(
+            vec![clean("a"), culprit],
+            last(Outcome::Exited(0), false),
+            "final",
+        );
+        assert_eq!(result.program(), "b", "the inner failing stage is blamed");
+        assert!(
+            result.truncated(),
+            "the attributed inner stage's dropped stderr must be visible: {result:?}"
+        );
+
+        // Contrast: the same inner failure WITHOUT truncation must not falsely
+        // report truncated (a plain sanity check the flag isn't stuck on).
+        let clean_culprit = unclean("b", Outcome::Exited(2), "b broke");
+        let untruncated = pf(
+            vec![clean("a"), clean_culprit],
+            last(Outcome::Exited(0), false),
+            "final",
+        );
+        assert!(
+            !untruncated.truncated(),
+            "an inner failure with no dropped stderr must not report truncated: {untruncated:?}"
+        );
     }
 
     #[test]

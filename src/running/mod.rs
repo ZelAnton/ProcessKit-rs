@@ -1711,6 +1711,42 @@ mod tests {
         assert_eq!(finished.stderr, "e1\ne2");
     }
 
+    /// T-042: a plain (non-pipeline) streaming `finish()` must surface stderr
+    /// truncation through `Finished::stderr_truncated` when a bounded
+    /// `OutputBufferPolicy` silently dropped stderr lines — previously invisible
+    /// to any streaming consumer, since `Finished` carried no truncation signal
+    /// at all.
+    #[tokio::test]
+    async fn bare_finish_reports_stderr_truncated_when_the_policy_drops_lines() {
+        let cmd = Command::new("tool").output_buffer(OutputBufferPolicy::bounded(2));
+        let finished = ScriptedRunner::new()
+            .fallback(Reply::fail(1, "e1\ne2\ne3\ne4\n"))
+            .start(&cmd)
+            .await
+            .expect("scripted start")
+            .finish()
+            .await
+            .expect("bare finish");
+        assert!(
+            finished.stderr_truncated,
+            "a bounded policy that dropped stderr lines must set stderr_truncated: {finished:?}"
+        );
+
+        // Contrast: the default unbounded policy retains everything — no truncation.
+        let untouched = ScriptedRunner::new()
+            .fallback(Reply::fail(1, "e1\ne2\ne3\ne4\n"))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start")
+            .finish()
+            .await
+            .expect("bare finish");
+        assert!(
+            !untouched.stderr_truncated,
+            "an unbounded policy must not report stderr truncation: {untouched:?}"
+        );
+    }
+
     /// `stdout_lines()` → drop → `wait()`: the discard verb must complete cleanly
     /// after a dropped live stream (the adopted sink is switched to retain-nothing
     /// so it never reuses the stream's user-policy sink to grow O(total) heap).

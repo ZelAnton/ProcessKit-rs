@@ -635,6 +635,7 @@ impl !core::panic::unwind_safe::UnwindSafe for processkit::Command
 #[non_exhaustive] pub struct processkit::Finished
 pub processkit::Finished::outcome: processkit::Outcome
 pub processkit::Finished::stderr: alloc::string::String
+pub processkit::Finished::stderr_truncated: bool
 impl core::clone::Clone for processkit::Finished
 pub fn processkit::Finished::clone(&self) -> processkit::Finished
 impl core::cmp::Eq for processkit::Finished
