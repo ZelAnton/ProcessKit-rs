@@ -1,0 +1,52 @@
+name: Deploy docs site
+
+# Publishes the mdBook (book.toml, src = docs/) to GitHub Pages whenever a
+# push to `main` touches the book itself. Separate from ci.yml because this
+# workflow needs the `pages`/`id-token` permissions for the Pages deployment
+# API, which the rest of CI has no reason to hold.
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      - book.toml
+      - .github/workflows/pages.yml
+  # Manual re-run without a docs change (e.g. after flipping the repo's Pages
+  # source to "GitHub Actions" for the first time).
+  workflow_dispatch:
+
+# Only one Pages deployment may be in flight at a time; let a newer push win
+# rather than deploying stale content after a slower run.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    name: build book
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@mdbook
+      - run: mdbook build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          # book.toml has no `[build]` override, so this is mdBook's default
+          # output directory (relative to the repo root, where book.toml lives).
+          path: book
+
+  deploy:
+    name: deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

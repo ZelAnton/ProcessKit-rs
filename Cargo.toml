@@ -35,6 +35,11 @@ exclude = [
   "cliff.toml",
   "deny.toml",
   "rust-toolchain.toml",
+  # mdBook config + nav index for the GitHub Pages docs site
+  # (.github/workflows/pages.yml) — only matters for building that site, not
+  # for a consumer of the published crate.
+  "book.toml",
+  "docs/SUMMARY.md",
   # cargo-fuzz harness (nightly-only, its own Cargo.toml/Cargo.lock) — dev
   # tooling that never ships in the published crate; see fuzz/Cargo.toml and
   # the fuzzing-only entry point it drives, `pump::fuzz_decode_pump_lines`

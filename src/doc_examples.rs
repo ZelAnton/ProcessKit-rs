@@ -66,6 +66,11 @@ mod docs_testing {}
 #[doc = include_str!("../docs/timeouts-and-cancellation.md")]
 mod docs_timeouts_and_cancellation {}
 
+/// `docs/errors.md`.
+#[doc(hidden)]
+#[doc = include_str!("../docs/errors.md")]
+mod docs_errors {}
+
 /// `docs/process-groups.md`.
 #[doc(hidden)]
 #[doc = include_str!("../docs/process-groups.md")]
