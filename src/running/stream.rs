@@ -165,18 +165,8 @@ impl RunningProcess {
                 // avoiding a signal to a recycled pid.
                 let timeout_state = self.timeout_state.clone();
                 self.deadline_task = Some(tokio::spawn(async move {
-                    let remaining = limit
-                        .checked_sub(started.elapsed())
-                        .unwrap_or(std::time::Duration::ZERO);
-                    tokio::time::sleep(remaining).await;
-                    if timeout_state
-                        .compare_exchange(
-                            super::TS_PENDING,
-                            super::TS_TIMED_OUT,
-                            std::sync::atomic::Ordering::AcqRel,
-                            std::sync::atomic::Ordering::Relaxed,
-                        )
-                        .is_err()
+                    if !super::deadline::wait_deadline_and_claim(started, limit, &timeout_state)
+                        .await
                     {
                         return; // child already exited — no kill
                     }
