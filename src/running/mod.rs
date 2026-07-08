@@ -5,6 +5,7 @@
 //! [`probes`] holds the non-consuming readiness probes; [`stream`] holds the
 //! incremental stdout streaming surface.
 
+mod deadline;
 mod probes;
 mod scripted;
 mod stream;
@@ -1264,16 +1265,19 @@ impl RunningProcess {
                 None => std::future::pending::<()>().await,
             }
         };
-        // Anchor to spawn time so a late consuming call can't re-grant the full limit.
+        // Anchor to spawn time so a late consuming call can't re-grant the full
+        // limit. The CAS runs as part of this raced future itself (rather than
+        // after `select!` names a winner): since this arm is disabled whenever a
+        // streaming watchdog also races the same arbiter, nothing else can claim
+        // `TS_TIMED_OUT` while this future is polled, so the two orderings are
+        // equivalent — but the shared arbiter core lives in one place either way.
+        let timeout_state = self.timeout_state.clone();
         let deadline = async move {
             match limit {
                 Some(limit) if !watchdog_owns_deadline => {
-                    let remaining = limit
-                        .checked_sub(started.elapsed())
-                        .unwrap_or(Duration::ZERO);
-                    tokio::time::sleep(remaining).await
+                    deadline::wait_deadline_and_claim(started, limit, &timeout_state).await
                 }
-                _ => std::future::pending::<()>().await,
+                _ => std::future::pending::<bool>().await,
             }
         };
         tokio::select! {
@@ -1289,19 +1293,13 @@ impl RunningProcess {
                 Ok(ExitCause::Cancelled)
             }
             outcome = self.backend_wait() => outcome.map(ExitCause::Exited),
-            () = deadline => {
+            _won = deadline => {
                 #[cfg(feature = "tracing")]
                 tracing::warn!(
                     target: "processkit",
                     program = %self.program,
                     timeout_ms = limit.map(|l| l.as_millis() as u64).unwrap_or(0),
                     "timeout elapsed; killing the tree"
-                );
-                let _ = self.timeout_state.compare_exchange(
-                    TS_PENDING,
-                    TS_TIMED_OUT,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
                 );
                 self.teardown_on_timeout().await;
                 Ok(ExitCause::Exited(Outcome::TimedOut))

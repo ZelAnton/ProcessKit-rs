@@ -16,7 +16,7 @@ use crate::buffer::LineTerminator;
 use crate::group::ProcessGroup;
 use crate::result::Outcome;
 
-use super::{Backend, OutputReader, RunningProcess, TS_PENDING, TS_TIMED_OUT};
+use super::{Backend, OutputReader, RunningProcess, TS_PENDING};
 
 /// Recorded result signals a cassette `start`-replay threads onto its scripted
 /// handle, so a consumed replay (`output_string`) reports the *recorded*
@@ -324,19 +324,7 @@ impl RunningProcess {
         let started = self.started;
         let timeout_state = self.timeout_state.clone();
         self.deadline_task = Some(tokio::spawn(async move {
-            let remaining = limit
-                .checked_sub(started.elapsed())
-                .unwrap_or(Duration::ZERO);
-            tokio::time::sleep(remaining).await;
-            if timeout_state
-                .compare_exchange(
-                    TS_PENDING,
-                    TS_TIMED_OUT,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
-                .is_err()
-            {
+            if !super::deadline::wait_deadline_and_claim(started, limit, &timeout_state).await {
                 return; // the script already exited on its own — no kill
             }
             kill.fire();
