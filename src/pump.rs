@@ -464,8 +464,12 @@ pub(crate) async fn pump_lines_term<R>(
 ///
 /// Either way the final line is emitted even without a trailing terminator, on
 /// both EOF and a mid-stream read error (the partial tail is flushed, not
-/// dropped), and every sink — the handler, the tee, and the buffer — sees the
-/// same lines the split produced.
+/// dropped). This holds for every sink — the handler, the tee, and the
+/// buffer — for lines that fit the configured `max_bytes` byte cap. A line
+/// (or unterminated tail) whose length exceeds `max_bytes` is instead counted
+/// via [`record_oversized_line`](SharedLines::record_oversized_line) — visible
+/// through the truncation/`dropped()` signal — but is **not** delivered to the
+/// handler, the tee, or the buffer.
 pub(crate) async fn pump_lines_core<R>(mut reader: R, config: StreamConfig, sink: Arc<SharedLines>)
 where
     R: AsyncRead + Unpin,
