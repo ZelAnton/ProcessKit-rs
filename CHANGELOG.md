@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [2.2.0] - 2026-07-08
+
+### Added
 - `Command::prefer_local(dir)` — a directory to probe **before** the system
   `PATH` when resolving a bare-name program for this one run (a project's
   `node_modules/.bin`, `target/debug`, a vendored toolchain). Repeated calls
@@ -2113,7 +2124,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.1.1...v2.2.0
 [2.1.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.2.1...v2.1.0
 [1.2.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v1.2.0...v1.2.1
