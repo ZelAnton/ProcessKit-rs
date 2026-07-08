@@ -10,6 +10,3 @@
 *.rmeta
 
 .work/
-
-# mdBook build output (book.toml, rendered from docs/ by .github/workflows/pages.yml)
-/book
