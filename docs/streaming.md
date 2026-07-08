@@ -17,23 +17,23 @@ incrementally, probe for readiness, race several children, or profile a run.
 ## Lifecycle
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 
-let mut run = Command::new("dev-server").start().await?;
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let mut run = Command::new("dev-server").start().await?;
 
-run.pid();        // Option<u32> — None once the child is reaped
-run.elapsed();    // time since spawn
+    run.pid();        // Option<u32> — None once the child is reaped
+    run.elapsed();    // time since spawn
 
-// Consume the handle exactly one way:
-//   output_string() / output_bytes()  → capture everything (same as the one-shot verbs)
-//   wait()                            → just the Outcome; output is discarded
-//   finish()                 → after streaming stdout (below)
-//   profile(every)                    → resource samples; output discarded, like wait() (stats feature)
-let outcome = run.wait().await?;   // Outcome: Exited(code) / Signalled(sig) / TimedOut
-# Ok(())
-# }
+    // Consume the handle exactly one way:
+    //   output_string() / output_bytes()  → capture everything (same as the one-shot verbs)
+    //   wait()                            → just the Outcome; output is discarded
+    //   finish()                 → after streaming stdout (below)
+    //   profile(every)                    → resource samples; output discarded, like wait() (stats feature)
+    let outcome = run.wait().await?;   // Outcome: Exited(code) / Signalled(sig) / TimedOut
+    Ok(())
+}
 ```
 
 `start()` puts the child in a **private group the handle owns**: dropping the
@@ -210,31 +210,31 @@ interactivity — give the command `Stdin::from_lines(stream)` /
 probes replace the arbitrary sleep, each bounded by its own deadline:
 
 ```rust,no_run
-# async fn health_check() -> bool { true }
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
+async fn health_check() -> bool { true }
 use processkit::Command;
 use std::time::Duration;
 
-let mut run = Command::new("my-server").start().await?;
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let mut run = Command::new("my-server").start().await?;
 
-// 1. A line on stdout (returns the matching line):
-let banner = run
-    .wait_for_line(|l| l.contains("listening on"), Duration::from_secs(10))
-    .await?;
+    // 1. A line on stdout (returns the matching line):
+    let banner = run
+        .wait_for_line(|l| l.contains("listening on"), Duration::from_secs(10))
+        .await?;
 
-// 2. A TCP port accepting connections:
-run.wait_for_port("127.0.0.1:8080".parse().unwrap(), Duration::from_secs(10))
-    .await?;
+    // 2. A TCP port accepting connections:
+    run.wait_for_port("127.0.0.1:8080".parse().unwrap(), Duration::from_secs(10))
+        .await?;
 
-// 3. Any async predicate (an HTTP /health endpoint, a file appearing, …):
-run.wait_for(|| async { health_check().await }, Duration::from_secs(10))
-    .await?;
+    // 3. Any async predicate (an HTTP /health endpoint, a file appearing, …):
+    run.wait_for(|| async { health_check().await }, Duration::from_secs(10))
+        .await?;
 
-// ready — use the server…
-# let _ = banner;
-# Ok(())
-# }
+    // ready — use the server…
+    let _ = banner;
+    Ok(())
+}
 ```
 
 Probe semantics, deliberately uniform:
@@ -263,21 +263,21 @@ whichever exits first — the natural primitive for "restart whatever died" or
 "first answer wins":
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::{Command, ProcessGroup, wait_any};
 
-let group = ProcessGroup::new()?;
-let mut a = group.start(&Command::new("replica-a")).await?;
-let mut b = group.start(&Command::new("replica-b")).await?;
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::new()?;
+    let mut a = group.start(&Command::new("replica-a")).await?;
+    let mut b = group.start(&Command::new("replica-b")).await?;
 
-let (index, outcome) = wait_any(&mut [&mut a, &mut b]).await?;
-println!("contender #{index} exited first with {outcome:?}");
+    let (index, outcome) = wait_any(&mut [&mut a, &mut b]).await?;
+    println!("contender #{index} exited first with {outcome:?}");
 
-// Only borrows: the loser is still usable.
-let survivor = if index == 0 { &mut b } else { &mut a };
-# Ok(())
-# }
+    // Only borrows: the loser is still usable.
+    let survivor = if index == 0 { &mut b } else { &mut a };
+    Ok(())
+}
 ```
 
 `wait_any` takes `&mut` borrows, applies no timeout of its own (wrap it in
@@ -291,32 +291,32 @@ With the opt-in **`stats`** feature, a running child reports its own
 resource usage, and `profile()` turns a whole run into a summary:
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 use std::time::Duration;
 
-let run = Command::new("crunch").start().await?;
-run.cpu_time();          // Option<Duration> — user+kernel so far
-run.peak_memory_bytes(); // Option<u64>
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let run = Command::new("crunch").start().await?;
+    run.cpu_time();          // Option<Duration> — user+kernel so far
+    run.peak_memory_bytes(); // Option<u64>
 
-// …or capture + sample on an interval until exit:
-let profile = Command::new("crunch")
-    .start().await?
-    .profile(Duration::from_millis(100))
-    .await?;
+    // …or capture + sample on an interval until exit:
+    let profile = Command::new("crunch")
+        .start().await?
+        .profile(Duration::from_millis(100))
+        .await?;
 
-println!(
-    "outcome={:?} wall={:?} cpu={:?} peak_rss={:?} avg_cpu_cores={:?} ({} samples)",
-    profile.outcome,            // Exited(code) / Signalled(sig) / TimedOut
-    profile.duration,
-    profile.cpu_time,
-    profile.peak_memory_bytes,
-    profile.avg_cpu_cores(),    // cpu / wall — e.g. Some(1.7) ≈ 1.7 cores busy
-    profile.samples,
-);
-# Ok(())
-# }
+    println!(
+        "outcome={:?} wall={:?} cpu={:?} peak_rss={:?} avg_cpu_cores={:?} ({} samples)",
+        profile.outcome,            // Exited(code) / Signalled(sig) / TimedOut
+        profile.duration,
+        profile.cpu_time,
+        profile.peak_memory_bytes,
+        profile.avg_cpu_cores(),    // cpu / wall — e.g. Some(1.7) ≈ 1.7 cores busy
+        profile.samples,
+    );
+    Ok(())
+}
 ```
 
 These read the *child process itself* (not a whole tree — that's

@@ -24,29 +24,29 @@ Three ways a run ends early, with three different philosophies:
 just the direct child, so a wrapper script's grandchildren die too.
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 use std::time::Duration;
 
-// Captured: inspect the flag yourself.
-let result = Command::new("slow-tool")
-    .timeout(Duration::from_secs(5))
-    .output_string()
-    .await?;
-if result.timed_out() {
-    println!("partial output before the kill: {}", result.stdout());
-}
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    // Captured: inspect the flag yourself.
+    let result = Command::new("slow-tool")
+        .timeout(Duration::from_secs(5))
+        .output_string()
+        .await?;
+    if result.timed_out() {
+        println!("partial output before the kill: {}", result.stdout());
+    }
 
-// Raised: the checking verbs convert the flag into a typed error.
-let err = Command::new("slow-tool")
-    .timeout(Duration::from_secs(5))
-    .run()
-    .await
-    .unwrap_err();
-assert!(matches!(err, processkit::Error::Timeout { .. }));
-# Ok(())
-# }
+    // Raised: the checking verbs convert the flag into a typed error.
+    let err = Command::new("slow-tool")
+        .timeout(Duration::from_secs(5))
+        .run()
+        .await
+        .unwrap_err();
+    assert!(matches!(err, processkit::Error::Timeout { .. }));
+    Ok(())
+}
 ```
 
 Where each verb lands:
@@ -76,18 +76,18 @@ grace window to exit, then `SIGKILL`ed — the same SIGTERM → wait → SIGKILL
 the grace early.
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 use std::time::Duration;
 
-let result = Command::new("slow-tool")
-    .timeout(Duration::from_secs(30))
-    .timeout_grace(Duration::from_secs(5)) // SIGTERM, wait up to 5s, then SIGKILL
-    .output_string()
-    .await?;
-# Ok(())
-# }
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let result = Command::new("slow-tool")
+        .timeout(Duration::from_secs(30))
+        .timeout_grace(Duration::from_secs(5)) // SIGTERM, wait up to 5s, then SIGKILL
+        .output_string()
+        .await?;
+    Ok(())
+}
 ```
 
 `timed_out()` is `true` regardless of whether the child exited on the signal or was
@@ -108,23 +108,23 @@ teardown timing.
 only while the classifier accepts the error:
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::{Command, Error};
 use std::time::Duration;
 
-let out = Command::new("curl")
-    .args(["-fsS", "https://example.com/api"])
-    .timeout(Duration::from_secs(10))
-    .retry(3, Duration::from_millis(250), |e| {
-        // transient: network timeouts and curl's "couldn't connect" (7)
-        matches!(e, Error::Timeout { .. })
-            || matches!(e, Error::Exit { code: 7, .. })
-    })
-    .run()
-    .await?;
-# Ok(())
-# }
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let out = Command::new("curl")
+        .args(["-fsS", "https://example.com/api"])
+        .timeout(Duration::from_secs(10))
+        .retry(3, Duration::from_millis(250), |e| {
+            // transient: network timeouts and curl's "couldn't connect" (7)
+            matches!(e, Error::Timeout { .. })
+                || matches!(e, Error::Exit { code: 7, .. })
+        })
+        .run()
+        .await?;
+    Ok(())
+}
 ```
 
 Ground rules:
@@ -231,23 +231,23 @@ simpler: build a dedicated client per scope.
 you asked the run to stop mattering, so no result is synthesized:
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::{CancellationToken, Command};
 use std::time::Duration;
 
-let token = CancellationToken::new();
-token.cancel();
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let token = CancellationToken::new();
+    token.cancel();
 
-let err = Command::new("tool")
-    .timeout(Duration::from_millis(1))   // would have been a Timeout…
-    .cancel_on(token)                    // …but cancellation takes priority
-    .run()
-    .await
-    .unwrap_err();
-assert!(matches!(err, processkit::Error::Cancelled { .. }));
-# Ok(())
-# }
+    let err = Command::new("tool")
+        .timeout(Duration::from_millis(1))   // would have been a Timeout…
+        .cancel_on(token)                    // …but cancellation takes priority
+        .run()
+        .await
+        .unwrap_err();
+    assert!(matches!(err, processkit::Error::Cancelled { .. }));
+    Ok(())
+}
 ```
 
 **Which knob for which job:**

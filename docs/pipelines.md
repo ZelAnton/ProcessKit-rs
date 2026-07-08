@@ -70,17 +70,17 @@ The `|` operator is sugar for the same thing — `a | b | c` ≡
 method calls bind tighter than `|`:
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 
-let authors = (Command::new("git").args(["log", "--format=%an"])
-    | Command::new("sort")
-    | Command::new("uniq").arg("-c"))
-    .run()
-    .await?;
-# Ok(())
-# }
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let authors = (Command::new("git").args(["log", "--format=%an"])
+        | Command::new("sort")
+        | Command::new("uniq").arg("-c"))
+        .run()
+        .await?;
+    Ok(())
+}
 ```
 
 ## Semantics: pipefail and the ends
@@ -97,22 +97,22 @@ The outcome is **pipefail**, like `set -o pipefail` in a shell:
   the last stage speaks.
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 
-let result = Command::new("cat").arg("data.txt")
-    .pipe(Command::new("grep").arg("ERROR"))      // suppose grep exits 2 (bad pattern)
-    .pipe(Command::new("wc").arg("-l"))
-    .output_string()
-    .await?;
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let result = Command::new("cat").arg("data.txt")
+        .pipe(Command::new("grep").arg("ERROR"))      // suppose grep exits 2 (bad pattern)
+        .pipe(Command::new("wc").arg("-l"))
+        .output_string()
+        .await?;
 
-// Diagnostics point at grep — the first unclean stage — while stdout is
-// whatever wc managed to print:
-assert_eq!(result.code(), Some(2));
-println!("blamed: {}", result.ensure_success().unwrap_err()); // names `grep`
-# Ok(())
-# }
+    // Diagnostics point at grep — the first unclean stage — while stdout is
+    // whatever wc managed to print:
+    assert_eq!(result.code(), Some(2));
+    println!("blamed: {}", result.ensure_success().unwrap_err()); // names `grep`
+    Ok(())
+}
 ```
 
 **Failure tears the chain down proactively.** The moment a stage ends with a
@@ -140,19 +140,19 @@ The ends of the chain behave like a single `Command`:
   only the last stage's stdout reaches you.
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::{Command, Stdin};
 
-let unique_count = Command::new("sort")
-    .stdin(Stdin::from_iter_lines(["b", "a", "b", "c"]))
-    .pipe(Command::new("uniq"))
-    .pipe(Command::new("wc").arg("-l"))
-    .run()
-    .await?;
-assert_eq!(unique_count.trim(), "3");
-# Ok(())
-# }
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let unique_count = Command::new("sort")
+        .stdin(Stdin::from_iter_lines(["b", "a", "b", "c"]))
+        .pipe(Command::new("uniq"))
+        .pipe(Command::new("wc").arg("-l"))
+        .run()
+        .await?;
+    assert_eq!(unique_count.trim(), "3");
+    Ok(())
+}
 ```
 
 ## Unchecked stages
@@ -165,18 +165,18 @@ or `SIGPIPE` where the OS delivers it) — a perfectly normal death that strict
 pipefail would blame the chain for. Mark that stage [`unchecked_in_pipe()`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.unchecked_in_pipe):
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 
-// seq 1 1000000 | head -1 — the producer's broken-pipe death is expected.
-let first = (Command::new("seq").args(["1", "1000000"]).unchecked_in_pipe()
-    | Command::new("head").args(["-n", "1"]))
-    .run()
-    .await?;
-assert_eq!(first.trim(), "1");
-# Ok(())
-# }
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    // seq 1 1000000 | head -1 — the producer's broken-pipe death is expected.
+    let first = (Command::new("seq").args(["1", "1000000"]).unchecked_in_pipe()
+        | Command::new("head").args(["-n", "1"]))
+        .run()
+        .await?;
+    assert_eq!(first.trim(), "1");
+    Ok(())
+}
 ```
 
 The rules (a design borrowed from `duct`'s `unchecked()` — the idea, not the
@@ -203,19 +203,19 @@ code):
 Two scopes, deliberately distinct:
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::Command;
 use std::time::Duration;
 
-let out = Command::new("producer")
-    .timeout(Duration::from_secs(10))      // per-STAGE: kills just `producer`
-    .pipe(Command::new("consumer"))
-    .timeout(Duration::from_secs(30))      // whole-CHAIN: Pipeline::timeout
-    .output_string()
-    .await?;
-# Ok(())
-# }
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let out = Command::new("producer")
+        .timeout(Duration::from_secs(10))      // per-STAGE: kills just `producer`
+        .pipe(Command::new("consumer"))
+        .timeout(Duration::from_secs(30))      // whole-CHAIN: Pipeline::timeout
+        .output_string()
+        .await?;
+    Ok(())
+}
 ```
 
 - **`Pipeline::timeout`** bounds the whole chain: at the deadline every

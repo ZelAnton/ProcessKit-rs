@@ -700,8 +700,6 @@ through the same pump machinery, so `stdout_lines`/`wait_for_line`-based
 orchestration tests hermetically as well:
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::{cli_client, ProcessRunner, Result};
 use std::path::Path;
 
@@ -712,8 +710,6 @@ impl<R: ProcessRunner> Git<R> {
         self.core.run(self.core.command_in(dir, ["rev-parse", "HEAD"])).await
     }
 }
-# Ok(())
-# }
 ```
 
 *Deeper: [Testing your code → CliClient](docs/testing.md).*

@@ -74,8 +74,8 @@ After — add `..` to the pattern (or, better, use the existing accessors instea
 of destructuring at all):
 
 ```rust,no_run
-# use processkit::Error;
-# fn handle(err: Error) {
+use processkit::Error;
+fn handle(err: Error) {
 match &err {
     Error::Exit { program, code, stdout, stderr, .. } => { let _ = (program, code, stdout, stderr); }
     _ => {}
@@ -86,7 +86,7 @@ if let Some(code) = err.code() {
     // err.program() / err.stdout() / err.stderr() / err.combined() also work
     let _ = code;
 }
-# }
+}
 ```
 
 This is prep for future field additions to any of these variants without
@@ -286,11 +286,11 @@ match ev {
 Or, when you don't care which stream produced the line, use the new accessor:
 
 ```rust,no_run
-# fn handle(ev: processkit::OutputEvent) {
+fn handle(ev: processkit::OutputEvent) {
 if let Some(text) = ev.text() {
     println!("{text}");
 }
-# }
+}
 ```
 
 `OutputLine` is `#[non_exhaustive]`: you receive it from the crate and read its

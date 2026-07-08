@@ -23,24 +23,24 @@ containment is the solution, and the reason this crate exists.)
 ## Creating a group
 
 ```rust,no_run
-# fn main() -> processkit::Result<()> {
 use processkit::{ProcessGroup, ProcessGroupOptions};
 use std::time::Duration;
 
-// Defaults: 2s graceful-shutdown grace, escalate to SIGKILL.
-let group = ProcessGroup::new()?;
+fn main() -> processkit::Result<()> {
+    // Defaults: 2s graceful-shutdown grace, escalate to SIGKILL.
+    let group = ProcessGroup::new()?;
 
-// Tuned:
-let group = ProcessGroup::with_options(
-    ProcessGroupOptions::default()
-        .shutdown_timeout(Duration::from_secs(10))
-        .escalate_to_kill(true),
-)?;
+    // Tuned:
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default()
+            .shutdown_timeout(Duration::from_secs(10))
+            .escalate_to_kill(true),
+    )?;
 
-// Which kernel mechanism is actually containing the tree?
-println!("{:?}", group.mechanism()); // JobObject | CgroupV2 | ProcessGroup
-# Ok(())
-# }
+    // Which kernel mechanism is actually containing the tree?
+    println!("{:?}", group.mechanism()); // JobObject | CgroupV2 | ProcessGroup
+    Ok(())
+}
 ```
 
 `mechanism()` reports what you actually got: `CgroupV2` quietly falls back to
@@ -57,29 +57,29 @@ the group verbs below.
 Three doors, in order of preference:
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> Result<(), Box<dyn std::error::Error>> {
 use processkit::{Command, ProcessGroup};
 
-let group = ProcessGroup::new()?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let group = ProcessGroup::new()?;
 
-// 1. start(): the full Command experience (capture, streaming, timeouts) in a
-//    SHARED group. The handle does not own the group — dropping the handle
-//    kills that child, dropping the group kills everyone.
-let server = group.start(&Command::new("dev-server")).await?;
+    // 1. start(): the full Command experience (capture, streaming, timeouts) in a
+    //    SHARED group. The handle does not own the group — dropping the handle
+    //    kills that child, dropping the group kills everyone.
+    let server = group.start(&Command::new("dev-server")).await?;
 
-// 2. spawn(): the raw escape hatch for a tokio::process::Command you already
-//    have. You get the bare Child back; pipes and reaping are your problem.
-//    spawn() takes the command BY VALUE (reuse would stack pre-exec hooks).
-let raw = tokio::process::Command::new("background-helper");
-let child = group.spawn(raw)?;
+    // 2. spawn(): the raw escape hatch for a tokio::process::Command you already
+    //    have. You get the bare Child back; pipes and reaping are your problem.
+    //    spawn() takes the command BY VALUE (reuse would stack pre-exec hooks).
+    let raw = tokio::process::Command::new("background-helper");
+    let child = group.spawn(raw)?;
 
-// 3. adopt(): contain a child that was spawned OUTSIDE the group.
-let external = tokio::process::Command::new("legacy-launcher").spawn()?;
-group.adopt(&external)?;
-# let _ = (server, child);
-# Ok(())
-# }
+    // 3. adopt(): contain a child that was spawned OUTSIDE the group.
+    let external = tokio::process::Command::new("legacy-launcher").spawn()?;
+    group.adopt(&external)?;
+    let _ = (server, child);
+    Ok(())
+}
 ```
 
 `adopt` moves only the named process: descendants it *already* has keep their
@@ -105,22 +105,22 @@ edges worth knowing:
 | `group.shutdown().await` | Unix: `SIGTERM` → wait `shutdown_timeout` → `SIGKILL` survivors (if `escalate_to_kill`); Windows: atomic job kill when `escalate_to_kill`, else the survivors are **spared** (handle closed without kill-on-close). Consumes the group (`shutdown_ref(&self)` is the same teardown, borrowing — for a group held behind an `Arc`/supervisor) | Graceful service stop |
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::{Command, ProcessGroup, ProcessGroupOptions};
 use std::time::Duration;
 
-let group = ProcessGroup::with_options(
-    ProcessGroupOptions::default()
-        .shutdown_timeout(Duration::from_secs(5))
-        .escalate_to_kill(true),
-)?;
-let _service = group.start(&Command::new("my-service")).await?;
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default()
+            .shutdown_timeout(Duration::from_secs(5))
+            .escalate_to_kill(true),
+    )?;
+    let _service = group.start(&Command::new("my-service")).await?;
 
-// SIGTERM, give it 5s to flush and exit, SIGKILL stragglers:
-group.shutdown().await?;
-# Ok(())
-# }
+    // SIGTERM, give it 5s to flush and exit, SIGKILL stragglers:
+    group.shutdown().await?;
+    Ok(())
+}
 ```
 
 A child that handles `SIGTERM` ends the grace **early** — `shutdown` returns
@@ -138,18 +138,18 @@ hard kill.
 > verbs above are core and always present.
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::{Command, ProcessGroup, Signal};
 
-let group = ProcessGroup::new()?;
-let _server = group.start(&Command::new("my-server")).await?;
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::new()?;
+    let _server = group.start(&Command::new("my-server")).await?;
 
-group.signal(Signal::Hup)?;        // "reload your configuration"
-group.signal(Signal::Usr1)?;       // whatever the tool defines
-group.signal(Signal::Other(34))?;  // raw signal number escape hatch
-# Ok(())
-# }
+    group.signal(Signal::Hup)?;        // "reload your configuration"
+    group.signal(Signal::Usr1)?;       // whatever the tool defines
+    group.signal(Signal::Other(34))?;  // raw signal number escape hatch
+    Ok(())
+}
 ```
 
 | Platform | Deliverable signals |
@@ -173,18 +173,18 @@ Freeze a tree (to snapshot it, to starve a runaway while you investigate, to
 pause background work), then thaw it:
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::{Command, ProcessGroup};
 
-let group = ProcessGroup::new()?;
-let _cruncher = group.start(&Command::new("cpu-hog")).await?;
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::new()?;
+    let _cruncher = group.start(&Command::new("cpu-hog")).await?;
 
-group.suspend()?;   // the whole tree stops consuming CPU
-// … inspect, snapshot, wait for the user …
-group.resume()?;
-# Ok(())
-# }
+    group.suspend()?;   // the whole tree stops consuming CPU
+    // … inspect, snapshot, wait for the user …
+    group.resume()?;
+    Ok(())
+}
 ```
 
 Per-platform machinery — and its visible differences:
@@ -211,18 +211,18 @@ Two caveats that bite in practice:
 ## Listing members
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::{Command, ProcessGroup};
 
-let group = ProcessGroup::new()?;
-let _a = group.start(&Command::new("worker-a")).await?;
-let _b = group.start(&Command::new("worker-b")).await?;
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::new()?;
+    let _a = group.start(&Command::new("worker-a")).await?;
+    let _b = group.start(&Command::new("worker-b")).await?;
 
-let pids: Vec<u32> = group.members()?;
-println!("live members: {pids:?}");
-# Ok(())
-# }
+    let pids: Vec<u32> = group.members()?;
+    println!("live members: {pids:?}");
+    Ok(())
+}
 ```
 
 What "members" means depends on the mechanism: Windows and Linux-cgroup list
@@ -241,19 +241,19 @@ Requires the **`limits`** feature. Caps are a property of the group, set once
 at creation and enforced by the same kernel object that contains the tree:
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::{Command, ProcessGroup, ProcessGroupOptions};
 
-let group = ProcessGroup::with_options(
-    ProcessGroupOptions::default()
-        .max_memory(512 * 1024 * 1024) // bytes, whole tree
-        .max_processes(64)             // fork-bomb ceiling
-        .cpu_quota(0.5),               // half of one core
-)?;
-let _sandboxed = group.start(&Command::new("untrusted-tool")).await?;
-# Ok(())
-# }
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default()
+            .max_memory(512 * 1024 * 1024) // bytes, whole tree
+            .max_processes(64)             // fork-bomb ceiling
+            .cpu_quota(0.5),               // half of one core
+    )?;
+    let _sandboxed = group.start(&Command::new("untrusted-tool")).await?;
+    Ok(())
+}
 ```
 
 | Capability | Windows Job Object | Linux cgroup v2 | pgroup / macOS / BSD |
@@ -285,30 +285,30 @@ interaction lives under its [Caveats](platform-support.md#caveats).
 Requires the opt-in **`stats`** feature (`features = ["stats"]`, or `limits`).
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::prelude::StreamExt;
 use processkit::{Command, ProcessGroup};
 use std::time::Duration;
 
-let group = ProcessGroup::new()?;
-let _worker = group.start(&Command::new("worker")).await?;
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::new()?;
+    let _worker = group.start(&Command::new("worker")).await?;
 
-// Point-in-time:
-let snap = group.stats()?;
-println!(
-    "procs={} cpu={:?} peak_rss={:?}",
-    snap.active_process_count, snap.total_cpu_time, snap.peak_memory_bytes,
-);
+    // Point-in-time:
+    let snap = group.stats()?;
+    println!(
+        "procs={} cpu={:?} peak_rss={:?}",
+        snap.active_process_count, snap.total_cpu_time, snap.peak_memory_bytes,
+    );
 
-// …or a series: first sample immediate, then every 250ms; missed ticks are
-// skipped; the stream ends when the group can no longer report.
-let mut samples = group.sample_stats(Duration::from_millis(250));
-while let Some(s) = samples.next().await {
-    println!("rss now: {:?}", s.peak_memory_bytes);
+    // …or a series: first sample immediate, then every 250ms; missed ticks are
+    // skipped; the stream ends when the group can no longer report.
+    let mut samples = group.sample_stats(Duration::from_millis(250));
+    while let Some(s) = samples.next().await {
+        println!("rss now: {:?}", s.peak_memory_bytes);
+    }
+    Ok(())
 }
-# Ok(())
-# }
 ```
 
 CPU time and peak memory are available where the kernel accounts for the

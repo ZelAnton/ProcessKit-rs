@@ -33,12 +33,13 @@ runtime and `use processkit::Command;` unless shown otherwise.
 ## Run a command and get its output
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
-let head = Command::new("git").args(["rev-parse", "HEAD"]).run().await?;
-# Ok(())
-# }
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let head = Command::new("git").args(["rev-parse", "HEAD"]).run().await?;
+    Ok(())
+}
 ```
 
 `run()` requires a zero exit and returns stdout with trailing whitespace
@@ -50,15 +51,16 @@ one-liner without the builder: `processkit::run("git", ["rev-parse", "HEAD"])`.
 ## Inspect a failure instead of erroring
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
-let result = Command::new("git").args(["merge", "topic"]).output_string().await?;
-if !result.is_success() {
-    eprintln!("merge exited {:?}: {}", result.code(), result.stderr());
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let result = Command::new("git").args(["merge", "topic"]).output_string().await?;
+    if !result.is_success() {
+        eprintln!("merge exited {:?}: {}", result.code(), result.stderr());
+    }
+    Ok(())
 }
-# Ok(())
-# }
 ```
 
 `output_string()` (and `output_bytes()` for raw bytes) treats the exit code as
@@ -71,12 +73,13 @@ typed error `run()` would have produced.
 ## Ask a yes/no question
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
-let dirty = !Command::new("git").args(["diff", "--quiet"]).probe().await?;
-# Ok(())
-# }
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let dirty = !Command::new("git").args(["diff", "--quiet"]).probe().await?;
+    Ok(())
+}
 ```
 
 `probe()` maps exit 0 → `true`, exit 1 → `false`, and anything else to an
@@ -86,18 +89,19 @@ matching.
 ## Accept non-zero exit codes as success
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
-// `grep` exits 1 when it finds no match — not a failure for this call.
-let found = Command::new("grep")
-    .args(["needle", "haystack.txt"])
-    .ok_codes([0, 1])
-    .output_string()
-    .await?;
-let matched = found.code() == Some(0); // 0 = matched, 1 = no match (both "success")
-# Ok(())
-# }
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    // `grep` exits 1 when it finds no match — not a failure for this call.
+    let found = Command::new("grep")
+        .args(["needle", "haystack.txt"])
+        .ok_codes([0, 1])
+        .output_string()
+        .await?;
+    let matched = found.code() == Some(0); // 0 = matched, 1 = no match (both "success")
+    Ok(())
+}
 ```
 
 `ok_codes` widens what the checking verbs (`run`/`run_unit`) and
@@ -109,20 +113,20 @@ convention). An empty set is ignored, so the default stays exit `0`.
 ## Bound a run with a timeout
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
+use processkit::Command;
 use std::time::Duration;
 
-let result = Command::new("slow-tool")
-    .timeout(Duration::from_secs(30))
-    .output_string()
-    .await?;
-if result.timed_out() {
-    eprintln!("gave up after 30s; partial output: {}", result.stdout());
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let result = Command::new("slow-tool")
+        .timeout(Duration::from_secs(30))
+        .output_string()
+        .await?;
+    if result.timed_out() {
+        eprintln!("gave up after 30s; partial output: {}", result.stdout());
+    }
+    Ok(())
 }
-# Ok(())
-# }
 ```
 
 At the deadline the whole tree is killed. On the capture verbs the timeout is
@@ -132,18 +136,18 @@ At the deadline the whole tree is killed. On the capture verbs the timeout is
 ## Let a tool clean up on timeout
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
+use processkit::Command;
 use std::time::Duration;
 
-let result = Command::new("dev-server")
-    .timeout(Duration::from_secs(30))
-    .timeout_grace(Duration::from_secs(5)) // SIGTERM, wait up to 5s, then SIGKILL
-    .output_string()
-    .await?;
-# Ok(())
-# }
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let result = Command::new("dev-server")
+        .timeout(Duration::from_secs(30))
+        .timeout_grace(Duration::from_secs(5)) // SIGTERM, wait up to 5s, then SIGKILL
+        .output_string()
+        .await?;
+    Ok(())
+}
 ```
 
 `timeout_grace` turns the hard deadline kill into a graceful one: `SIGTERM` (or the
@@ -158,14 +162,15 @@ stays `true`. Windows has no signal tier — the deadline kills atomically.
 ## Show a useful error message
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
-if let Err(e) = Command::new("git").args(["merge", "topic"]).run().await {
-    eprintln!("merge failed: {}", e.diagnostic().unwrap_or("(no output)"));
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    if let Err(e) = Command::new("git").args(["merge", "topic"]).run().await {
+        eprintln!("merge failed: {}", e.diagnostic().unwrap_or("(no output)"));
+    }
+    Ok(())
 }
-# Ok(())
-# }
 ```
 
 `Error::diagnostic()` picks the most explanatory captured text — stderr,
@@ -175,23 +180,23 @@ re-implement the same heuristic.
 ## Feed the child's stdin
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> Result<(), Box<dyn std::error::Error>> {
-# use processkit::Command;
+use processkit::Command;
 use processkit::Stdin;
 
-// A string you already have:
-let sorted = Command::new("sort")
-    .stdin(Stdin::from_string("banana\napple\n"))
-    .run()
-    .await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // A string you already have:
+    let sorted = Command::new("sort")
+        .stdin(Stdin::from_string("banana\napple\n"))
+        .run()
+        .await?;
 
-// …or any async source: a reader (file, socket) or a stream of lines.
-let from_file = Stdin::from_reader(tokio::fs::File::open("input.txt").await?);
-let from_chan = Stdin::from_lines(tokio_stream::iter(vec!["one".to_owned()]));
-# let _ = (sorted, from_file, from_chan);
-# Ok(())
-# }
+    // …or any async source: a reader (file, socket) or a stream of lines.
+    let from_file = Stdin::from_reader(tokio::fs::File::open("input.txt").await?);
+    let from_chan = Stdin::from_lines(tokio_stream::iter(vec!["one".to_owned()]));
+    let _ = (sorted, from_file, from_chan);
+    Ok(())
+}
 ```
 
 One-shot sources (`from_reader`/`from_lines`) feed a single run; re-running the
@@ -203,20 +208,21 @@ of silently seeing empty stdin. For a conversation, see the next recipe but one.
 ## Stream output as it arrives
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
+use processkit::Command;
 use processkit::Finished;
-use processkit::prelude::StreamExt; // re-exported; provides `.next()`
 
-let mut run = Command::new("cargo").args(["build", "--verbose"]).start().await?;
-let mut lines = run.stdout_lines()?;
-while let Some(line) = lines.next().await {
-    println!("build: {line}");
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    use processkit::prelude::StreamExt; // re-exported; provides `.next()`
+
+    let mut run = Command::new("cargo").args(["build", "--verbose"]).start().await?;
+    let mut lines = run.stdout_lines()?;
+    while let Some(line) = lines.next().await {
+        println!("build: {line}");
+    }
+    let Finished { outcome, stderr, .. } = run.finish().await?; // outcome + buffered stderr
+    Ok(())
 }
-let Finished { outcome, stderr, .. } = run.finish().await?; // outcome + buffered stderr
-# Ok(())
-# }
 ```
 
 No waiting for exit, no full-output buffering; stderr is drained in the
@@ -229,22 +235,22 @@ while any capture verb drives the run.
 ## Talk to an interactive child
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> Result<(), Box<dyn std::error::Error>> {
-# use processkit::Command;
+use processkit::Command;
 use processkit::prelude::StreamExt;
 
-let mut run = Command::new("bc").keep_stdin_open().start().await?;
-let mut stdin = run.take_stdin().expect("stdin was kept open");
-stdin.write_line("2 + 2").await?;
-stdin.finish().await?; // EOF — bc exits
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut run = Command::new("bc").keep_stdin_open().start().await?;
+    let mut stdin = run.take_stdin().expect("stdin was kept open");
+    stdin.write_line("2 + 2").await?;
+    stdin.finish().await?; // EOF — bc exits
 
-let mut answers = run.stdout_lines()?;
-while let Some(answer) = answers.next().await {
-    println!("{answer}");
+    let mut answers = run.stdout_lines()?;
+    while let Some(answer) = answers.next().await {
+        println!("{answer}");
+    }
+    Ok(())
 }
-# Ok(())
-# }
 ```
 
 `keep_stdin_open()` hands you an async writer instead of closing stdin at
@@ -258,16 +264,17 @@ methods return `std::io::Result` (idiomatic for a writer) — convert with
 ## Pipe commands without a shell
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
-let authors = Command::new("git").args(["log", "--format=%an"])
-    .pipe(Command::new("sort"))
-    .pipe(Command::new("uniq").arg("-c"))
-    .output_string()
-    .await?;
-# Ok(())
-# }
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let authors = Command::new("git").args(["log", "--format=%an"])
+        .pipe(Command::new("sort"))
+        .pipe(Command::new("uniq").arg("-c"))
+        .output_string()
+        .await?;
+    Ok(())
+}
 ```
 
 Native pipes — no shell string, no quoting, no injection surface. The outcome
@@ -282,15 +289,16 @@ closes, or `SIGPIPE` where the OS delivers it) is expected — mark the producer
 `unchecked_in_pipe()` so that death doesn't fail the chain:
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
-let first = (Command::new("seq").args(["1", "1000000"]).unchecked_in_pipe()
-    | Command::new("head").args(["-n", "1"]))
-    .run()
-    .await?;
-# Ok(())
-# }
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let first = (Command::new("seq").args(["1", "1000000"]).unchecked_in_pipe()
+        | Command::new("head").args(["-n", "1"]))
+        .run()
+        .await?;
+    Ok(())
+}
 ```
 
 *Fine print: [Pipelines → unchecked stages](pipelines.md#unchecked-stages).*
@@ -298,21 +306,21 @@ let first = (Command::new("seq").args(["1", "1000000"]).unchecked_in_pipe()
 ## Start a server and wait until it's ready
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
+use processkit::Command;
 use std::time::Duration;
 
-let mut server = Command::new("my-server").args(["--port", "8080"]).start().await?;
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let mut server = Command::new("my-server").args(["--port", "8080"]).start().await?;
 
-// Pick the probe that matches how the server announces readiness:
-server.wait_for_line(|l| l.contains("listening"), Duration::from_secs(10)).await?;
-// server.wait_for_port("127.0.0.1:8080".parse().unwrap(), Duration::from_secs(10)).await?;
-// server.wait_for(|| async { http_health().await }, Duration::from_secs(10)).await?;
+    // Pick the probe that matches how the server announces readiness:
+    server.wait_for_line(|l| l.contains("listening"), Duration::from_secs(10)).await?;
+    // server.wait_for_port("127.0.0.1:8080".parse().unwrap(), Duration::from_secs(10)).await?;
+    // server.wait_for(|| async { http_health().await }, Duration::from_secs(10)).await?;
 
-// …use the server; dropping `server` kills its whole tree.
-# Ok(())
-# }
+    // …use the server; dropping `server` kills its whole tree.
+    Ok(())
+}
 ```
 
 A probe that can't succeed fails fast with `Error::NotReady` and never kills
@@ -323,20 +331,20 @@ the child — you decide what happens next. No more `sleep(2)` and hoping.
 ## Tear down several children as a unit
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
+use processkit::Command;
 use processkit::ProcessGroup;
 
-let group = ProcessGroup::new()?;
-let _db = group.start(&Command::new("dev-db")).await?;
-let _api = group.start(&Command::new("dev-api")).await?;
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::new()?;
+    let _db = group.start(&Command::new("dev-db")).await?;
+    let _api = group.start(&Command::new("dev-api")).await?;
 
-// Either: graceful — SIGTERM, bounded wait, optional SIGKILL escalation…
-group.shutdown().await?;
-// …or just drop(group): hard kill-on-drop of everything, grandchildren included.
-# Ok(())
-# }
+    // Either: graceful — SIGTERM, bounded wait, optional SIGKILL escalation…
+    group.shutdown().await?;
+    // …or just drop(group): hard kill-on-drop of everything, grandchildren included.
+    Ok(())
+}
 ```
 
 The group is the unit of fate: a panic or early return anywhere reaps every
@@ -347,20 +355,20 @@ member. Configure the grace window via `ProcessGroupOptions`.
 ## React to whichever child exits first
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
+use processkit::Command;
 use processkit::{ProcessGroup, wait_any};
 
-let group = ProcessGroup::new()?;
-let mut a = group.start(&Command::new("worker-a")).await?;
-let mut b = group.start(&Command::new("worker-b")).await?;
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::new()?;
+    let mut a = group.start(&Command::new("worker-a")).await?;
+    let mut b = group.start(&Command::new("worker-b")).await?;
 
-let (idx, outcome) = wait_any(&mut [&mut a, &mut b]).await?;
-println!("worker #{idx} exited first with {outcome:?}");
-// `a` and `b` are only borrowed — the loser is still usable here.
-# Ok(())
-# }
+    let (idx, outcome) = wait_any(&mut [&mut a, &mut b]).await?;
+    println!("worker #{idx} exited first with {outcome:?}");
+    // `a` and `b` are only borrowed — the loser is still usable here.
+    Ok(())
+}
 ```
 
 *Fine print: [Streaming & interactive I/O → racing children](streaming.md).*
@@ -368,30 +376,30 @@ println!("worker #{idx} exited first with {outcome:?}");
 ## Sandbox an untrusted tool
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
+use processkit::Command;
 use processkit::{ProcessGroup, ProcessGroupOptions};
 
-// Cap the whole tree (requires the `limits` feature; Windows Job / Linux cgroup):
-let group = ProcessGroup::with_options(
-    ProcessGroupOptions::default()
-        .max_memory(512 * 1024 * 1024)
-        .max_processes(64)
-        .cpu_quota(0.5),
-)?;
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    // Cap the whole tree (requires the `limits` feature; Windows Job / Linux cgroup):
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default()
+            .max_memory(512 * 1024 * 1024)
+            .max_processes(64)
+            .cpu_quota(0.5),
+    )?;
 
-let result = group
-    .start(
-        &Command::new("untrusted-tool")
-            .inherit_env(["PATH"]) // allow-list: everything else is cleared
-            .timeout(std::time::Duration::from_secs(60)),
-    )
-    .await?
-    .output_string()
-    .await?;
-# Ok(())
-# }
+    let result = group
+        .start(
+            &Command::new("untrusted-tool")
+                .inherit_env(["PATH"]) // allow-list: everything else is cleared
+                .timeout(std::time::Duration::from_secs(60)),
+        )
+        .await?
+        .output_string()
+        .await?;
+    Ok(())
+}
 ```
 
 Unenforceable limits are a hard `Error::ResourceLimit`, never a silently
@@ -404,25 +412,25 @@ cgroup-mechanism caveat in the guide).
 ## Keep a crash-prone service running
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
+use processkit::Command;
 use processkit::{RestartPolicy, Supervisor};
 use std::time::Duration;
 
-let outcome = Supervisor::new(Command::new("my-service"))
-    .restart(RestartPolicy::OnCrash)
-    .max_restarts(5)
-    .backoff(Duration::from_millis(200), 2.0)
-    .storm_pause(Duration::from_secs(15)) // crash-loop guard (off by default)
-    .run()
-    .await?;
-println!(
-    "stopped after {} restarts ({} storm pauses): {:?}",
-    outcome.restarts, outcome.storm_pauses, outcome.stopped
-);
-# Ok(())
-# }
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let outcome = Supervisor::new(Command::new("my-service"))
+        .restart(RestartPolicy::OnCrash)
+        .max_restarts(5)
+        .backoff(Duration::from_millis(200), 2.0)
+        .storm_pause(Duration::from_secs(15)) // crash-loop guard (off by default)
+        .run()
+        .await?;
+    println!(
+        "stopped after {} restarts ({} storm pauses): {:?}",
+        outcome.restarts, outcome.storm_pauses, outcome.stopped
+    );
+    Ok(())
+}
 ```
 
 Exponential backoff with jitter by default; `stop_when(…)` ends supervision on
@@ -437,23 +445,23 @@ being the same case.
 ## Retry a flaky command
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
+use processkit::Command;
 use processkit::Error;
 use std::time::Duration;
 
-let fetched = Command::new("git")
-    .args(["fetch", "--quiet"])
-    .timeout(Duration::from_secs(10))
-    .retry(3, Duration::from_millis(200), |e| {
-        matches!(e, Error::Timeout { .. })
-            || e.diagnostic().is_some_and(|m| m.contains("Could not resolve host"))
-    })
-    .run()
-    .await?;
-# Ok(())
-# }
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let fetched = Command::new("git")
+        .args(["fetch", "--quiet"])
+        .timeout(Duration::from_secs(10))
+        .retry(3, Duration::from_millis(200), |e| {
+            matches!(e, Error::Timeout { .. })
+                || e.diagnostic().is_some_and(|m| m.contains("Could not resolve host"))
+        })
+        .run()
+        .await?;
+    Ok(())
+}
 ```
 
 The classifier sees the typed error and decides whether this failure is worth
@@ -465,23 +473,23 @@ success — for keeping a process *alive*, use a `Supervisor` (previous recipe).
 ## Cancel runs on shutdown
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
+use processkit::Command;
 use processkit::CancellationToken;
 
-let token = CancellationToken::new();
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let token = CancellationToken::new();
 
-let job = tokio::spawn({
-    let token = token.child_token();
-    async move { Command::new("long-job").cancel_on(token).run().await }
-});
+    let job = tokio::spawn({
+        let token = token.child_token();
+        async move { Command::new("long-job").cancel_on(token).run().await }
+    });
 
-// On Ctrl-C / shutdown signal / sibling failure:
-token.cancel(); // kills the tree; the run resolves to Error::Cancelled
-let outcome = job.await; // Err(Error::Cancelled { .. }) inside
-# Ok(())
-# }
+    // On Ctrl-C / shutdown signal / sibling failure:
+    token.cancel(); // kills the tree; the run resolves to Error::Cancelled
+    let outcome = job.await; // Err(Error::Cancelled { .. }) inside
+    Ok(())
+}
 ```
 
 Cancellation is always an error (the run was abandoned, there is no result),
@@ -504,17 +512,17 @@ let gh = CliClient::new("gh").default_cancel_on(token.child_token());
 ## Measure what a run cost
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
+use processkit::Command;
 use std::time::Duration;
 
-// One run, summarized (requires the opt-in `stats` feature):
-let profile = Command::new("crunch").start().await?.profile(Duration::from_millis(100)).await?;
-println!("outcome={:?} took={:?} peak_rss={:?} avg_cpu_cores={:?}",
-    profile.outcome, profile.duration, profile.peak_memory_bytes, profile.avg_cpu_cores());
-# Ok(())
-# }
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    // One run, summarized (requires the opt-in `stats` feature):
+    let profile = Command::new("crunch").start().await?.profile(Duration::from_millis(100)).await?;
+    println!("outcome={:?} took={:?} peak_rss={:?} avg_cpu_cores={:?}",
+        profile.outcome, profile.duration, profile.peak_memory_bytes, profile.avg_cpu_cores());
+    Ok(())
+}
 ```
 
 For a live series over a whole group, `group.sample_stats(every)` yields a
@@ -527,21 +535,21 @@ cgroup); elsewhere you still get process counts.
 ## Contain a process you didn't spawn
 
 ```rust,no_run
-# fn main() -> processkit::Result<()> {
 use processkit::{Error, ProcessGroup};
 
-// `tokio`/`std` calls return `io::Error`, which the crate does NOT auto-convert
-// into `processkit::Error` (there is no blanket `From<io::Error>`, by design) —
-// map it explicitly, or use a `Box<dyn std::error::Error>` / `anyhow` return in
-// your own code so both error types `?` freely.
-let child = tokio::process::Command::new("legacy-launcher")
-    .spawn()
-    .map_err(Error::Io)?;
+fn main() -> processkit::Result<()> {
+    // `tokio`/`std` calls return `io::Error`, which the crate does NOT auto-convert
+    // into `processkit::Error` (there is no blanket `From<io::Error>`, by design) —
+    // map it explicitly, or use a `Box<dyn std::error::Error>` / `anyhow` return in
+    // your own code so both error types `?` freely.
+    let child = tokio::process::Command::new("legacy-launcher")
+        .spawn()
+        .map_err(Error::Io)?;
 
-let group = ProcessGroup::new()?; // `adopt` is part of `process-control` (default-on)
-group.adopt(&child)?;            // from now on the group's teardown covers it
-# Ok(())
-# }
+    let group = ProcessGroup::new()?; // `adopt` is part of `process-control` (default-on)
+    group.adopt(&child)?;            // from now on the group's teardown covers it
+    Ok(())
+}
 ```
 
 Adoption is best-effort by mechanism — on Windows/cgroup the whole running
@@ -555,22 +563,22 @@ spells out exactly what each mechanism can promise.
 ## Test code that runs processes — without processes
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
+use processkit::Command;
 use processkit::testing::{Reply, ScriptedRunner};
 
-// Your code takes any `R: ProcessRunner`; in tests, hand it a script.
-// Rules match on a prefix of the *program name followed by its arguments*
-// (the first element is the program):
-let runner = ScriptedRunner::new()
-    .on(["git", "rev-parse"], Reply::ok("abc123\n"))
-    .on(["git", "push"], Reply::fail(128, "remote: permission denied"))
-    .fallback(Reply::ok(""));
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    // Your code takes any `R: ProcessRunner`; in tests, hand it a script.
+    // Rules match on a prefix of the *program name followed by its arguments*
+    // (the first element is the program):
+    let runner = ScriptedRunner::new()
+        .on(["git", "rev-parse"], Reply::ok("abc123\n"))
+        .on(["git", "push"], Reply::fail(128, "remote: permission denied"))
+        .fallback(Reply::ok(""));
 
-// my_deploy(&runner).await? — no subprocess, fully deterministic.
-# Ok(())
-# }
+    // my_deploy(&runner).await? — no subprocess, fully deterministic.
+    Ok(())
+}
 ```
 
 `RecordingRunner` wraps any runner and captures every `Invocation` for
@@ -583,22 +591,22 @@ cassette once and replays them hermetically in CI.
 ## Test streaming code — without processes
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::{Command, Outcome, ProcessRunner, Finished};
 use processkit::testing::{Reply, ScriptedRunner};
 use std::time::Duration;
 
-let runner = ScriptedRunner::new()
-    .on(["gh", "run", "watch"], Reply::lines(["queued", "in_progress", "completed"])
-        .with_line_delay(Duration::from_millis(50))); // paced delivery
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let runner = ScriptedRunner::new()
+        .on(["gh", "run", "watch"], Reply::lines(["queued", "in_progress", "completed"])
+            .with_line_delay(Duration::from_millis(50))); // paced delivery
 
-let mut run = runner.start(&Command::new("gh").args(["run", "watch", "123"])).await?;
-run.wait_for_line(|l| l.contains("completed"), Duration::from_secs(5)).await?;
-let Finished { outcome, .. } = run.finish().await?;
-assert_eq!(outcome, Outcome::Exited(0));
-# Ok(())
-# }
+    let mut run = runner.start(&Command::new("gh").args(["run", "watch", "123"])).await?;
+    run.wait_for_line(|l| l.contains("completed"), Duration::from_secs(5)).await?;
+    let Finished { outcome, .. } = run.finish().await?;
+    assert_eq!(outcome, Outcome::Exited(0));
+    Ok(())
+}
 ```
 
 A scripted `start()` feeds the canned lines through the **same pump
@@ -613,9 +621,6 @@ progress-reporting paths test hermetically too.
 ## Wrap a CLI tool behind a typed API
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
-# use processkit::Command;
 use processkit::{cli_client, ProcessRunner, Result};
 
 cli_client!(pub struct Git => "git");
@@ -630,8 +635,6 @@ impl<R: ProcessRunner> Git<R> {
         self.core.probe(["diff", "--quiet"]).await
     }
 }
-# Ok(())
-# }
 ```
 
 The generated struct carries a runner and per-client defaults

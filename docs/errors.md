@@ -87,23 +87,23 @@ change, but it also means every downstream `match` **must** carry a catch-all
 arm.
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::{Command, Error};
 
-let err = Command::new("maybe-missing-tool").run().await.unwrap_err();
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let err = Command::new("maybe-missing-tool").run().await.unwrap_err();
 
-match err {
-    Error::NotFound { .. } => eprintln!("is it installed?"),
-    Error::Timeout { .. } => eprintln!("hit its deadline"),
-    Error::Cancelled { .. } => { /* caller-initiated, nothing to log */ }
-    Error::Exit { code, .. } => eprintln!("exited with {code}"),
-    // #[non_exhaustive]: a future variant (or a today's variant behind a
-    // feature this build doesn't enable, e.g. ResourceLimit) falls here.
-    other => eprintln!("run failed: {other}"),
+    match err {
+        Error::NotFound { .. } => eprintln!("is it installed?"),
+        Error::Timeout { .. } => eprintln!("hit its deadline"),
+        Error::Cancelled { .. } => { /* caller-initiated, nothing to log */ }
+        Error::Exit { code, .. } => eprintln!("exited with {code}"),
+        // #[non_exhaustive]: a future variant (or a today's variant behind a
+        // feature this build doesn't enable, e.g. ResourceLimit) falls here.
+        other => eprintln!("run failed: {other}"),
+    }
+    Ok(())
 }
-# Ok(())
-# }
 ```
 
 Prefer the classifiers above (`is_not_found()`, `is_timeout()`, …) over
@@ -117,22 +117,22 @@ replays a failed run while your classifier accepts the typed error — the
 classifier is exactly this guide's variant table, read by the caller:
 
 ```rust,no_run
-# #[tokio::main]
-# async fn main() -> processkit::Result<()> {
 use processkit::{Command, Error};
 use std::time::Duration;
 
-let out = Command::new("curl")
-    .args(["-fsS", "https://example.com/api"])
-    .timeout(Duration::from_secs(10))
-    .retry(3, Duration::from_millis(250), |e: &Error| {
-        // Transient: our own deadline, or a spawn/IO condition a bare retry clears.
-        e.is_timeout() || e.is_transient()
-    })
-    .run()
-    .await?;
-# Ok(())
-# }
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let out = Command::new("curl")
+        .args(["-fsS", "https://example.com/api"])
+        .timeout(Duration::from_secs(10))
+        .retry(3, Duration::from_millis(250), |e: &Error| {
+            // Transient: our own deadline, or a spawn/IO condition a bare retry clears.
+            e.is_timeout() || e.is_transient()
+        })
+        .run()
+        .await?;
+    Ok(())
+}
 ```
 
 `Error::Cancelled` is **never** retried, whatever the classifier says — the
