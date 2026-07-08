@@ -61,15 +61,35 @@ struct Inner {
 
 impl Inner {
     /// Whether the retained backlog is over either drop-mode ceiling.
+    ///
+    /// The byte ceiling is checked two ways: the raw content-byte sum
+    /// (`self.bytes`, unchanged), *and* a derived line-count bound
+    /// (`self.lines.len() > b`). Without the latter, a flood of empty lines —
+    /// each contributing `0` to `self.bytes` — would never be judged "over" and
+    /// the backlog would grow without bound even under a byte cap. A `b`-byte
+    /// cap cannot legitimately retain more than `b` lines if every retained
+    /// line is charged a minimum footprint of `1` (its stripped terminator, if
+    /// nothing else), so `lines.len() > b` is a sound, minimal per-line charge
+    /// expressed as a derived cap rather than added to `self.bytes` — which
+    /// keeps every existing exact-content-byte-boundary case (a line whose
+    /// content is exactly `max_bytes` is still retained) unaffected, since it
+    /// only ever bites once the retained *count* alone would already exceed the
+    /// byte budget.
     fn over_backlog(&self) -> bool {
         self.max_lines.is_some_and(|n| self.lines.len() > n)
-            || self.max_bytes.is_some_and(|b| self.bytes > b)
+            || self
+                .max_bytes
+                .is_some_and(|b| self.bytes > b || self.lines.len() > b)
     }
 
     /// Whether a line of `len` bytes would still fit both ceilings if appended.
+    /// See [`over_backlog`](Self::over_backlog) for why the byte ceiling also
+    /// checks the derived line-count bound.
     fn would_fit(&self, len: usize) -> bool {
         self.max_lines.is_none_or(|n| self.lines.len() < n)
-            && self.max_bytes.is_none_or(|b| self.bytes + len <= b)
+            && self
+                .max_bytes
+                .is_none_or(|b| self.bytes + len <= b && self.lines.len() < b)
     }
 }
 
@@ -131,7 +151,16 @@ impl SharedLines {
                             (None, None) => true,
                             (lines_cap, bytes_cap) => {
                                 lines_cap.is_some_and(|n| total_lines > n)
-                                    || bytes_cap.is_some_and(|b| inner.seen_bytes > b)
+                                    || bytes_cap.is_some_and(|b| {
+                                        // Raw content-byte total, *and* the same
+                                        // derived line-count bound `over_backlog`
+                                        // uses: without it, a flood of empty lines
+                                        // (each `+0` to `seen_bytes`) would never
+                                        // trip a byte-only fail-loud ceiling, so
+                                        // `OverflowMode::Error` could never fire and
+                                        // the anti-DoS guarantee would be defeated.
+                                        inner.seen_bytes > b || total_lines > b
+                                    })
                             }
                         };
                         if over {
@@ -1317,6 +1346,74 @@ mod tests {
         let sink = SharedLines::new(&policy);
         pump_lines(&b"ab\ncd\nef\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
         assert_eq!(sink.drain(), vec!["ab", "cd"]);
+    }
+
+    #[tokio::test]
+    async fn max_bytes_bounds_a_flood_of_empty_lines_drop_oldest() {
+        // A stream of nothing but newlines (`yes ''`-style) contributes 0
+        // content bytes per line. Without a derived per-line minimum, DropOldest
+        // would never see the backlog as "over" and it would grow unbounded even
+        // under a byte cap — the anti-DoS gap this fix closes.
+        let policy = OutputBufferPolicy::unbounded().with_max_bytes(100);
+        let sink = SharedLines::new(&policy);
+        let flood = "\n".repeat(10_000);
+        pump_lines(flood.as_bytes(), encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(sink.count(), 10_000, "every empty line is still counted");
+        let retained = sink.drain();
+        assert!(
+            retained.len() <= 100,
+            "the backlog must stay bounded by the byte cap even for all-empty lines, got {}",
+            retained.len()
+        );
+        assert!(
+            sink.dropped() > 0,
+            "the flood must be evicted, not retained without bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_bytes_bounds_a_flood_of_empty_lines_drop_newest() {
+        // Same flood under DropNewest: the "head" retained must also stay
+        // bounded rather than growing without limit.
+        let policy = OutputBufferPolicy::unbounded()
+            .with_overflow(OverflowMode::DropNewest)
+            .with_max_bytes(100);
+        let sink = SharedLines::new(&policy);
+        let flood = "\n".repeat(10_000);
+        pump_lines(flood.as_bytes(), encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(sink.count(), 10_000, "every empty line is still counted");
+        let retained = sink.drain();
+        assert!(
+            retained.len() <= 100,
+            "the retained head must stay bounded by the byte cap even for all-empty lines, got {}",
+            retained.len()
+        );
+        assert!(
+            sink.dropped() > 0,
+            "the excess of the flood must be dropped, not retained without bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_bytes_error_mode_trips_on_a_flood_of_empty_lines() {
+        // Content-byte-only accounting leaves `seen_bytes` at 0 forever for an
+        // all-empty-line flood, so a byte-only fail-loud ceiling would never
+        // fire — defeating the crate's "memory cannot be exhausted" guarantee.
+        // The derived per-line minimum must still trip it.
+        let policy = OutputBufferPolicy::unbounded()
+            .with_overflow(OverflowMode::Error)
+            .with_max_bytes(100);
+        let sink = SharedLines::new(&policy);
+        let flood = "\n".repeat(10_000);
+        pump_lines(flood.as_bytes(), encoding_rs::UTF_8, None, sink.clone()).await;
+        assert!(
+            sink.overflowed(),
+            "a flood of empty lines under a byte cap must trip OverflowMode::Error"
+        );
+        assert!(
+            sink.dropped() > 0,
+            "the excess lines must be flagged dropped"
+        );
     }
 
     #[tokio::test]
