@@ -722,14 +722,17 @@ impl Cgroup {
         // kernel < 5.14 (no `cgroup.kill` file) or a write-restricted delegated
         // cgroup (the `cgroup.kill` write above fails with e.g. EACCES); on a
         // modern, non-restricted cgroup the atomic write above already returned.
-        // `kill_all`/`Job::kill_all` is called synchronously from three ASYNC
-        // watchdog paths — `stream::kill_via_weak` (streaming deadline),
-        // `RunningProcess::arm_cancel_watchdog`'s cancel task, and
-        // `kill_tree`/`teardown_on_timeout` (bulk deadline/cancel) — none of
-        // which route through `spawn_blocking`, so on a reachable config this
-        // loop stalls whatever tokio worker thread is running the watchdog for
-        // up to ~100ms (this loop) plus the ~100ms drain wait in `Job::drop`
-        // below if the same `Job` is then also dropped synchronously.
+        // `kill_all`/`Job::kill_all` is called synchronously from four ASYNC
+        // paths — `stream::kill_via_weak` (streaming deadline),
+        // `RunningProcess::arm_cancel_watchdog`'s cancel task,
+        // `kill_tree`/`teardown_on_timeout` (bulk deadline/cancel), and
+        // `Pipeline`'s `kill_all_stage_groups` (the chain-wide teardown killer
+        // fired on cancellation and on `Pipeline::timeout` elapsing,
+        // `pipeline.rs`) — none of which route through `spawn_blocking`, so on
+        // a reachable config this loop stalls whatever tokio worker thread is
+        // running the caller for up to ~100ms (this loop) plus the ~100ms
+        // drain wait in `Job::drop` below if the same `Job` is then also
+        // dropped synchronously.
         //
         // Accepted as a bounded, rare-path cost rather than routed through
         // `spawn_blocking`: on the vastly common case (kernel ≥ 5.14, standard
@@ -740,9 +743,9 @@ impl Cgroup {
         // to guard a ~100ms stall reachable only on legacy/restricted setups.
         // Unlike `Job::drop` (which *cannot* await — Rust's `Drop` is
         // inherently synchronous, so blocking there is unavoidable regardless
-        // of caller), the watchdog call sites here run inside `async fn`s and
-        // *could* in principle `.await` a `spawn_blocking` wrapper; this is a
-        // deliberate choice to keep those paths simple, not a hard constraint
+        // of caller), all four call sites above run inside `async fn`s/futures
+        // and *could* in principle `.await` a `spawn_blocking` wrapper; this is
+        // a deliberate choice to keep those paths simple, not a hard constraint
         // like `Job::drop`'s. Revisit (route through `spawn_blocking`) if a
         // legacy/restricted-cgroup deployment reports worker-thread starvation
         // under load.

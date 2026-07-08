@@ -613,6 +613,12 @@ impl Pipeline {
 /// teardown, now that each stage owns its own kill-on-drop group rather than
 /// sharing one. Best-effort: a per-group error is swallowed, exactly as the old
 /// single-group `kill_all()` was.
+///
+/// Called synchronously from a spawned async task (both the timeout branch and
+/// the cancellation killer above), so on a cgroup backend it is one of the four
+/// async call sites of the accepted bounded blocking sweep documented on
+/// `Cgroup::kill` (`src/sys/linux.rs`) — see that comment for the pre-5.14/
+/// restricted-cgroup tradeoff.
 fn kill_all_stage_groups(groups: &[Arc<ProcessGroup>]) {
     for group in groups {
         let _ = group.kill_all();
