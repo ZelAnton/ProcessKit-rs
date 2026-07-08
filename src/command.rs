@@ -419,9 +419,11 @@ impl Command {
     /// builders this never yields
     /// [`Error::Unsupported`](crate::Error::Unsupported) — see
     /// [`Priority`](crate::Priority) for why both platforms cover every
-    /// variant, and the Unix caveat on
-    /// [`Priority::High`](crate::Priority::High) (raising priority needs
-    /// `CAP_SYS_NICE`/root there).
+    /// variant, and the Unix caveat that lowering `nice` below its inherited
+    /// value — [`Priority::AboveNormal`](crate::Priority::AboveNormal)/
+    /// [`Priority::High`](crate::Priority::High) always, and even
+    /// [`Priority::Normal`](crate::Priority::Normal) under a positively-niced
+    /// parent — needs `CAP_SYS_NICE`/root there.
     ///
     /// Last-write-wins with an earlier call, like [`timeout`](Self::timeout).
     pub fn priority(mut self, priority: crate::Priority) -> Self {

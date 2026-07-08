@@ -1,5 +1,7 @@
-//! Non-consuming readiness probes: `wait_for_line` / `wait_for` /
-//! `wait_for_port` and their shared polling loop.
+//! Readiness probes: `wait_for_line` / `wait_for` / `wait_for_port` and their
+//! shared polling loop. All three background-drain stdout/stderr while they
+//! poll, so a chatty child can't stall in `write()` on a full OS pipe buffer;
+//! only `wait_for_line` hands any of the drained stdout back to the caller.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -39,8 +41,10 @@ impl RunningProcess {
     ///   stdout was already consumed by an earlier `stdout_lines` /
     ///   `output_events` / `wait_for_line`, or was not piped, this returns an
     ///   `Err` rather than a stream that is forever `NotReady`). Continue
-    ///   with [`finish`](Self::finish) for the outcome and stderr; the other
-    ///   probes don't touch stdout.
+    ///   with [`finish`](Self::finish) for the outcome and stderr;
+    ///   [`wait_for`](Self::wait_for) / [`wait_for_port`](Self::wait_for_port)
+    ///   background-drain stdout the same way, they just never hand any of it
+    ///   back to the caller mid-probe.
     /// - A failed probe does **not** kill the child, and — unlike
     ///   [`stdout_lines`](Self::stdout_lines) — it does **not** arm the
     ///   [`Command::timeout`](crate::Command::timeout) watchdog: this probe is
@@ -90,12 +94,20 @@ impl RunningProcess {
     /// ready).
     ///
     /// The check is any async predicate — an HTTP health endpoint, a file
-    /// appearing, a database accepting connections. Doesn't touch the child's
-    /// pipes, so it composes with any later consumption
-    /// ([`wait`](Self::wait), [`output_string`](Self::output_string), …). A
-    /// failed probe does not kill the child. The deadline bounds the polling
-    /// loop, not an in-flight check: a slow `check` future can overrun
-    /// `within` by its own duration.
+    /// appearing, a database accepting connections. Piped stdout/stderr are
+    /// background-drained (and discarded) for the duration of the poll — like
+    /// [`wait_for_line`](Self::wait_for_line), but the caller never sees the
+    /// lines — so a child with a large startup burst can't stall in `write()`
+    /// on a full OS pipe buffer (~64 KiB on Linux) while this probe is
+    /// polling. It still composes with any later consumption
+    /// ([`wait`](Self::wait), [`output_string`](Self::output_string), …), which
+    /// pick up the same background-drained sink — but *not* with
+    /// [`output_bytes`](Self::output_bytes) or a fresh
+    /// [`stdout_lines`](Self::stdout_lines) / [`output_events`](Self::output_events)
+    /// afterward, exactly like calling `wait_for_line` first (see its
+    /// "Consumes stdout" caveat). A failed probe does not kill the child. The
+    /// deadline bounds the polling loop, not an in-flight check: a slow
+    /// `check` future can overrun `within` by its own duration.
     ///
     /// `check` and its future are `Send` (matching
     /// [`wait_for_line`](Self::wait_for_line)'s predicate and
@@ -126,8 +138,10 @@ impl RunningProcess {
     ///
     /// One connect attempt per ~50 ms tick (each attempt itself bounded so a
     /// stalled connect can't overrun the deadline); the probe connection is
-    /// dropped as soon as it succeeds. Doesn't touch the child's pipes; a
-    /// failed probe does not kill the child.
+    /// dropped as soon as it succeeds. Piped stdout/stderr are
+    /// background-drained (and discarded) for the duration of the poll, like
+    /// [`wait_for`](Self::wait_for) — see its doc for what that does and
+    /// doesn't compose with. A failed probe does not kill the child.
     ///
     /// # Errors
     ///
@@ -165,6 +179,18 @@ impl RunningProcess {
         F: FnMut() -> Fut,
         Fut: Future<Output = bool>,
     {
+        // Background-drain stdout (and, via the same call, stderr) so a child
+        // that writes a large startup burst before becoming ready can't stall in
+        // `write()` on a full OS pipe buffer (~64 KiB on Linux) while we poll —
+        // the same pump `wait_for_line` uses, just without a foreground search:
+        // nothing here ever pops a line back out, but `pump_lines_core` drains
+        // the pipe into the sink regardless of whether anyone reads the sink, so
+        // setting the pump up once is enough. Not arming the `Command::timeout`
+        // watchdog matches every other probe. Errors are not this probe's
+        // concern — stdout not piped, or already drained by an earlier
+        // streaming call — either way there's nothing left to do here.
+        let _ = self.drain_stdout_lines();
+
         // Clamp so a `Duration::MAX`-ish `within` can't overflow the deadline.
         let deadline = Instant::now() + within.min(crate::MAX_DEADLINE);
         loop {

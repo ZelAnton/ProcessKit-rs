@@ -82,6 +82,19 @@
 //!   `-1` sentinel.)
 //! - **`probe`** — run a predicate and read its exit code as a `bool`: `0` →
 //!   `true`, `1` → `false`, anything else is an error (`git diff --quiet`, …).
+//! - **`parse`** / **`try_parse`** — run to a clean success and feed the
+//!   captured stdout to a closure: `parse` for an infallible closure,
+//!   `try_parse` for one returning [`Result`] (the JSON-deserialization
+//!   shape). **`Send`-contract exception:** [`Command::parse`] /
+//!   [`CliClient::parse`] require `F: Send` (and `T: Send`), so the returned
+//!   future is `Send` and movable into `tokio::spawn`; [`Pipeline::parse`]
+//!   deliberately does **not** require `Send` — its closure runs inline on
+//!   the awaiting task rather than across a `tokio::spawn` boundary, so it
+//!   accepts strictly more closures, but the resulting future is `Send` only
+//!   when `F`/`T` happen to be. If you need to move a `Pipeline::parse` /
+//!   `Pipeline::try_parse` call into `tokio::spawn`, make sure your closure
+//!   and its output are `Send` yourself; the compiler won't require it for
+//!   you the way it does for `Command`/`CliClient`.
 //!
 //! # Features
 //!
