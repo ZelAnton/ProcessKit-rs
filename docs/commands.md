@@ -428,10 +428,12 @@ Command::new("worker").umask(0o022).run().await?;
 `priority` maps onto `nice`/`setpriority` on Unix and a priority class on
 Windows (`Idle`/`BelowNormal`/`Normal`/`AboveNormal`/`High`); unlike the
 privilege builders, **every variant is supported on both platforms**, so this
-knob never yields `Error::Unsupported`. One caveat: raising priority above the
-inherited value on Unix (`Priority::High`) needs `CAP_SYS_NICE`/root — without
-it the OS rejects the change and the spawn fails loud (`Error::Spawn`), never
-silently downgrading to a lower priority.
+knob never yields `Error::Unsupported`. One caveat: lowering `nice` below its
+inherited value on Unix — raising priority via `Priority::AboveNormal`/`High`,
+or even requesting `Priority::Normal` under a positively-niced parent (e.g. a
+`nice`d CI/batch launcher) — needs `CAP_SYS_NICE`/root; without it the OS
+rejects the change and the spawn fails loud (`Error::Spawn`), never silently
+downgrading to a lower priority.
 
 `umask` is Unix-only — like `setsid`/`groups`, requesting it on Windows fails
 with `Error::Unsupported` rather than being silently ignored.

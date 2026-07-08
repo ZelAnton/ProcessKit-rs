@@ -8,10 +8,13 @@
 >
 > **Stability since 1.0.** The crate has shipped **1.0** and follows
 > [Semantic Versioning](https://semver.org/): the public API is stable, and any
-> breaking change lands only in a new **major** version. Items below are scoped to
-> respect that — additive work targets the `1.x` line; anything that would reshape
-> the public interface is deferred to a future major. (The history above this point
-> describes the pre-1.0 development sweeps, when the shape could still move freely.)
+> breaking change lands only in a new **major** version. A breaking major has
+> since shipped (**2.1.0**, reshaping parts of the public interface — see
+> [Upgrading](docs/upgrading.md)); items below are scoped to respect the same
+> discipline going forward — additive work targets the `2.x` line, and anything
+> that would reshape the public interface again is deferred to a future major.
+> (The history above this point describes the pre-1.0 development sweeps, when
+> the shape could still move freely.)
 >
 > Items are roughly ordered by leverage, not strict sequence. Cost is a gut
 > estimate (trivial / moderate / major).

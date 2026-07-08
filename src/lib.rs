@@ -52,8 +52,9 @@
 //!
 //! **Stability.** Since **1.0**, `processkit` follows [Semantic Versioning]: the
 //! public API is stable, and any breaking change lands only in a new *major*
-//! version, so `1.x` upgrades are backward-compatible. (The lone exception is the
-//! `mock` feature's `mockall`-generated `expect_*` surface — see below.)
+//! version, so `2.x` upgrades are backward-compatible (the last breaking release
+//! was **2.1.0**). (The lone exception is the `mock` feature's `mockall`-generated
+//! `expect_*` surface — see below.)
 //!
 //! [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
 //!
@@ -82,6 +83,19 @@
 //!   `-1` sentinel.)
 //! - **`probe`** — run a predicate and read its exit code as a `bool`: `0` →
 //!   `true`, `1` → `false`, anything else is an error (`git diff --quiet`, …).
+//! - **`parse`** / **`try_parse`** — run to a clean success and feed the
+//!   captured stdout to a closure: `parse` for an infallible closure,
+//!   `try_parse` for one returning [`Result`] (the JSON-deserialization
+//!   shape). **`Send`-contract exception:** [`Command::parse`] /
+//!   [`CliClient::parse`] require `F: Send` (and `T: Send`), so the returned
+//!   future is `Send` and movable into `tokio::spawn`; [`Pipeline::parse`]
+//!   deliberately does **not** require `Send` — its closure runs inline on
+//!   the awaiting task rather than across a `tokio::spawn` boundary, so it
+//!   accepts strictly more closures, but the resulting future is `Send` only
+//!   when `F`/`T` happen to be. If you need to move a `Pipeline::parse` /
+//!   `Pipeline::try_parse` call into `tokio::spawn`, make sure your closure
+//!   and its output are `Send` yourself; the compiler won't require it for
+//!   you the way it does for `Command`/`CliClient`.
 //!
 //! # Features
 //!

@@ -137,6 +137,12 @@ impl Job {
         // pid is captured HERE, pre-fork, so the child can detect a parent
         // that died before the prctl ran (see `arm_pdeathsig`).
         // SAFETY: see `arm_pdeathsig` — async-signal-safe calls only.
+        //
+        // NOTE: PR_SET_PDEATHSIG tracks the death of *this calling thread*,
+        // not the process — see the caveat on `arm_pdeathsig`. `spawner_pid`
+        // guards only against the parent process already being dead before
+        // arming; it does not protect against this specific thread exiting
+        // later while the process lives on.
         let arm = |cmd: &mut Command| {
             if opts.kill_on_parent_death {
                 let spawner_pid = std::process::id();
@@ -795,6 +801,19 @@ fn cpu_max_value(cores: f64) -> String {
 /// literal `1`) keeps the guard correct when the spawner itself *is* PID 1 —
 /// a container entrypoint, exactly where this hardening matters most.
 /// Runs in the forked child after `fork()` and before `exec()`.
+///
+/// # Caveat: thread death, not process death
+///
+/// `PR_SET_PDEATHSIG` fires when the *thread* that called `fork()` dies, not
+/// when the parent *process* exits. The `getppid()` guard above only closes
+/// the "parent process already dead before arming" race — it does nothing
+/// for the case where the spawning thread itself is later torn down while
+/// the ProcessKit process stays alive (e.g. an async runtime retiring the
+/// blocking/worker thread that performed the fork). In that scenario the
+/// kernel would prematurely `SIGKILL` a still-wanted child. Today's
+/// multi-threaded tokio worker threads live for the whole process, so this
+/// is latent, but any future spawn path on a transient thread would need to
+/// either pin the fork to a long-lived thread or re-derive this guard.
 ///
 /// # Safety
 ///
