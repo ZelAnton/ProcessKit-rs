@@ -15,6 +15,7 @@ use tokio::task::AbortHandle;
 use crate::buffer::LineTerminator;
 use crate::group::ProcessGroup;
 use crate::result::Outcome;
+use crate::sys::pid_gate::PidGate;
 
 use super::{Backend, OutputReader, RunningProcess, TS_PENDING};
 
@@ -300,7 +301,9 @@ impl RunningProcess {
             stdout_piped: command.stdout_is_piped(),
             deadline_task: None,
             timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
-            handed_off: Arc::new(AtomicBool::new(false)),
+            // A scripted double owns no OS process, so its gate is pid-less: every
+            // raw kill through it is a no-op regardless of retirement.
+            pid_gate: Arc::new(PidGate::new(None)),
             cancel_token: command.cancel_token(),
             cancel_task: None,
             cancel_at_exit: None,

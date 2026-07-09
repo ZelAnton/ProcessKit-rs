@@ -124,6 +124,12 @@ pub(crate) mod pgroup;
 #[cfg(unix)]
 pub(crate) mod graceful;
 
+// The linearizable pid gate: serializes every raw direct-child kill a detached
+// teardown watchdog issues against the reap that frees (and lets the OS recycle)
+// the pid. Cross-platform (the state machine is platform-agnostic; only the kill
+// syscall behind `force_kill` differs); driven by `crate::running`.
+pub(crate) mod pid_gate;
+
 /// Per-spawn knobs that must reach the platform backend (the
 /// `tokio::process::Command` can't carry them: creation flags have no getter,
 /// and the pgroup backend must know about `setsid` *before* it sets a process
