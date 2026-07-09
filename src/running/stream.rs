@@ -4,7 +4,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
@@ -14,6 +13,7 @@ use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::pump::{Popped, SharedLines, pump_lines_core};
 use crate::result::Outcome;
+use crate::sys::pid_gate::{PidGate, force_kill};
 
 use super::RunningProcess;
 
@@ -164,15 +164,16 @@ impl RunningProcess {
                 // grace. But winning that CAS is NOT proof the pid is still
                 // un-reaped: a natural reap (`backend_wait`) frees the pid inside
                 // `wait()` and only claims `TS_EXITED` a few frames later, so this
-                // task can win `TS_TIMED_OUT` in that gap on an already-freed pid.
-                // The `handed_off` latch is the real gate: a consuming finisher
-                // flips it *before* it frees the pid (and reclaims this watchdog),
-                // so a `false` read below guarantees the child is not yet reaped
-                // and the pid-only kill is safe. During pure streaming (no
-                // finisher, so nothing reaps) it stays `false` and this task is the
-                // sole killer, as it must be to bound the timeout.
+                // task could win `TS_TIMED_OUT` in that gap on an already-freed pid.
+                // The `PidGate` is the real gate: a consuming finisher `retire`s it
+                // *before* it frees the pid (and reclaims this watchdog), and every
+                // raw kill below runs inside the gate lock — so a kill either lands
+                // before that retire (pid still valid) or is skipped, never on a
+                // freed pid. During pure streaming (no finisher, so nothing retires)
+                // the gate stays live and this task is the sole killer, as it must
+                // be to bound the timeout.
                 let timeout_state = self.timeout_state.clone();
-                let handed_off = self.handed_off.clone();
+                let gate = self.pid_gate.clone();
                 self.deadline_task = Some(tokio::spawn(async move {
                     if !super::deadline::wait_deadline_and_claim(started, limit, &timeout_state)
                         .await
@@ -181,9 +182,11 @@ impl RunningProcess {
                     }
                     // A `Child`-owning finisher has taken over teardown/reap: it
                     // kills through the owned `Child` (`start_kill`, a no-op post
-                    // reap), so stand down rather than race its reap with a raw pid
-                    // kill that could hit a recycled pid.
-                    if handed_off.load(Ordering::Acquire) {
+                    // reap) and retired the gate, so stand down. This early load
+                    // only skips the group kill; the raw direct-child kills below
+                    // re-check retirement *atomically with the kill* under the gate
+                    // lock, so none can race a reap onto a recycled pid.
+                    if gate.is_retired() {
                         return;
                     }
                     // This watchdog can't reap the child, so a child that exits on
@@ -194,9 +197,9 @@ impl RunningProcess {
                                 Some(group) => {
                                     let _ = group.graceful_terminate(grace, signal).await;
                                 }
-                                None => kill_direct_child(pid), // group already gone
+                                None => force_kill(&gate), // group already gone
                             },
-                            None => kill_via_weak(&group, pid),
+                            None => kill_via_weak(&group, &gate),
                         },
                         // Shared group: pid-only teardown (grandchildren of a
                         // forking child are the shared-group teardown gap — pair a
@@ -207,13 +210,11 @@ impl RunningProcess {
                             // `RunningProcess::Drop` mid-grace — the case where a
                             // child catches the signal, closes stdout (ending the
                             // stream), and keeps running. See
-                            // `spawn_graceful_kill_and_reap`. It re-reads
-                            // `handed_off` each poll, so a finisher that reclaims
+                            // `spawn_graceful_kill_and_reap`. Its gated ops re-read
+                            // retirement each poll, so a finisher that reclaims
                             // mid-grace still stands it down.
-                            Some(grace) => {
-                                spawn_graceful_kill_and_reap(pid, grace, signal, handed_off)
-                            }
-                            None => kill_direct_child(pid),
+                            Some(grace) => spawn_graceful_kill_and_reap(gate, grace, signal),
+                            None => force_kill(&gate),
                         },
                     }
                 }));
@@ -399,8 +400,9 @@ impl RunningProcess {
     }
 }
 
-/// Tear down the group if still alive, then best-effort kill the direct child.
-pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, pid: Option<u32>) {
+/// Tear down the group if still alive, then best-effort kill the direct child
+/// through the gate (a no-op if the owner already retired the pid).
+pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, gate: &PidGate) {
     if let Some(group) = group.upgrade() {
         // On Linux + legacy/restricted cgroup this can synchronously block
         // this worker thread up to ~100ms — accepted, not routed through
@@ -408,7 +410,7 @@ pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, pid: Option<u32>) {
         // (src/sys/linux.rs) for the full rationale.
         let _ = group.kill_all();
     }
-    kill_direct_child(pid);
+    force_kill(gate);
 }
 
 /// Gracefully terminate (and let the runtime reap) a single child by pid — the
@@ -425,31 +427,23 @@ pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, pid: Option<u32>) {
 /// [`spawn_graceful_kill_and_reap`] (a detached task) rather than inline in the
 /// abortable deadline watchdog.
 ///
-/// `stand_down` is a latch that retires the pid the instant its owner reaps it:
-/// once set, the driver's liveness poll reports "gone" and the final `SIGKILL`
-/// is suppressed, so this pid-only kill can never signal a pid the OS recycled
-/// after the reap. The streaming watchdog passes its `handed_off` latch (a
-/// finisher reclaimed it); `teardown_on_timeout` passes a latch its own
-/// concurrent reap flips.
-pub(crate) async fn graceful_kill_pid(
-    pid: Option<u32>,
-    grace: std::time::Duration,
-    signal: i32,
-    stand_down: Arc<AtomicBool>,
-) {
+/// The [`PidGate`] retires the pid the instant its owner reaps it: once retired,
+/// the driver's liveness poll reports "gone" and the final `SIGKILL` is
+/// suppressed, and every raw op runs under the gate lock — so this pid-only kill
+/// can never signal a pid the OS recycled after the reap. The streaming watchdog
+/// passes the handle's shared gate (a finisher retires it when it reclaims
+/// teardown).
+pub(crate) async fn graceful_kill_pid(gate: Arc<PidGate>, grace: std::time::Duration, signal: i32) {
     #[cfg(unix)]
     {
-        let Some(pid) = pid else { return };
-        let target = crate::sys::graceful::UnixChild::new(pid as i32, stand_down);
+        let target = crate::sys::graceful::UnixChild::new(gate);
         crate::sys::graceful::run_pid(&target, signal, grace).await;
     }
     #[cfg(not(unix))]
     {
+        // Windows has no graceful tier: force-kill immediately under the gate.
         let _ = (grace, signal);
-        if stand_down.load(Ordering::Acquire) {
-            return;
-        }
-        kill_direct_child(pid);
+        force_kill(&gate);
     }
 }
 
@@ -469,45 +463,28 @@ pub(crate) async fn graceful_kill_pid(
 /// dropped `tokio::process::Child` is collected by tokio's orphan reaper once
 /// the kill lands.
 ///
-/// `handed_off` rides along as the [`graceful_kill_pid`] stand-down latch: if a
-/// consuming finisher reclaims teardown mid-grace (it flips `handed_off` and
-/// reaps through the owned `Child`), this detached task's liveness poll stops
-/// and its `SIGKILL` is suppressed, so it can't fire on the recycled pid.
-fn spawn_graceful_kill_and_reap(
-    pid: Option<u32>,
-    grace: std::time::Duration,
-    signal: i32,
-    handed_off: Arc<AtomicBool>,
-) {
+/// The shared [`PidGate`] rides along as the [`graceful_kill_pid`] stand-down: if
+/// a consuming finisher reclaims teardown mid-grace (it retires the gate and
+/// reaps through the owned `Child`), this detached task's liveness poll stops and
+/// its `SIGKILL` is suppressed, so it can't fire on the recycled pid.
+fn spawn_graceful_kill_and_reap(gate: Arc<PidGate>, grace: std::time::Duration, signal: i32) {
     // Detached on purpose: dropping the handle lets it outlive the (abortable)
     // deadline watchdog that spawned it.
-    drop(tokio::spawn(graceful_kill_pid(
-        pid, grace, signal, handed_off,
-    )));
+    drop(tokio::spawn(graceful_kill_pid(gate, grace, signal)));
 }
 
-/// Best-effort kill of the direct child by pid — called by deadline/cancel
-/// watchdogs after the group teardown. The group kill usually makes this a
-/// no-op; it closes pipes and ends the stream on a group-kill miss.
-pub(super) fn kill_direct_child(pid: Option<u32>) {
+/// Send a raw graceful signal (e.g. `SIGTERM`) to a still-live direct child by
+/// pid — the shared-group graceful-timeout teardown's first step. Unix only; the
+/// caller must know the pid is un-reaped (the owner sends it before its own reap,
+/// with the gate already retired to stand the detached watchdogs down), so this
+/// deliberately does not route through the gate. A no-op for a pid-less handle.
+#[cfg(unix)]
+pub(super) fn signal_direct_child(pid: Option<u32>, signal: i32) {
     let Some(pid) = pid else { return };
-    #[cfg(unix)]
-    // SAFETY: SIGKILL to a pid; ESRCH (exited/reaped) is ignored.
+    // SAFETY: sending a signal to a live pid is sound; ESRCH (already gone) is
+    // ignored — the bounded reap that follows observes the exit regardless.
     unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
-    #[cfg(windows)]
-    // SAFETY: opens by pid with narrowest right; tolerates an already-exited process.
-    unsafe {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
-        };
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if !handle.is_null() {
-            TerminateProcess(handle, 1);
-            CloseHandle(handle);
-        }
+        libc::kill(pid as i32, signal);
     }
 }
 

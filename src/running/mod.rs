@@ -30,6 +30,7 @@ use crate::group::ProcessGroup;
 use crate::pump::{SharedLines, StreamConfig, pump_lines_core};
 use crate::result::{Outcome, ProcessResult};
 use crate::stdin::ProcessStdin;
+use crate::sys::pid_gate::PidGate;
 
 /// How long teardown waits for output pumps to finish before aborting them, so a
 /// surviving grandchild holding a pipe can't hang the run.
@@ -148,19 +149,20 @@ pub struct RunningProcess {
     deadline_task: Option<JoinHandle<()>>,
     // Shared (`Arc`) because the watchdog is detached. See `TS_*` constants.
     timeout_state: Arc<AtomicU8>,
-    // Latch flipped `true` once a `Child`-owning path (a consuming finisher's
-    // `drive_to_exit_inner`, `kill_tree`, `backend_wait`, or an exit probe) takes
-    // over teardown/reap of the direct child. The detached deadline and cancel
-    // watchdogs — and the shared-group graceful pid-killer — read it and stand
-    // down their raw `kill(pid)`: the owner tears the child down through the owned
-    // `Child` (`start_kill`, a no-op once reaped), so once handed off a raw kill
-    // could only signal a pid the OS recycled. Winning the timeout arbiter's CAS
-    // is *not* proof the pid is still un-reaped (the reaping `wait()` frees the
-    // pid before its own CAS lands); this latch is. `drive_to_exit_inner`/
-    // `kill_tree` flip it *before* they free the pid, so a watchdog that still
-    // reads it `false` is guaranteed to be racing an un-reaped child. `Arc`
-    // because the watchdogs are detached.
-    handed_off: Arc<AtomicBool>,
+    // The linearizable gate every raw direct-child `kill(pid)` is funneled
+    // through. A `Child`-owning path (a consuming finisher's `drive_to_exit_inner`,
+    // `kill_tree`, `backend_wait`, `teardown_on_timeout`, or an exit probe) reaps
+    // the child — which frees the pid, letting the OS recycle it — and `retire`s
+    // the gate; the detached deadline and cancel watchdogs, and the shared-group
+    // graceful pid-killer, issue their raw kill *inside* the gate lock, so a kill
+    // and the retire are one indivisible step and a kill can never land after the
+    // reap. This replaces the old `handed_off: AtomicBool`, whose separate
+    // load-then-`kill(pid)` was a check-then-act race: the load proved the child
+    // un-reaped only at the instant of the load, never at the instant of the kill.
+    // The owner-driven paths (`drive_to_exit_inner`/`kill_tree`) retire *before*
+    // they free the pid; the passive backstop (`backend_wait`) retires right after
+    // its async reap. `Arc` because the watchdogs are detached.
+    pid_gate: Arc<PidGate>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
     // Armed at spawn time so every consuming path kills the tree when the token
     // fires, not just `drive_to_exit`.
@@ -259,7 +261,7 @@ impl RunningProcess {
             stdout_piped: s.stdout_piped,
             deadline_task: None,
             timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
-            handed_off: Arc::new(AtomicBool::new(false)),
+            pid_gate: Arc::new(PidGate::new(s.pid)),
             cancel_token: s.cancel_token,
             cancel_task: None,
             cancel_at_exit: None,
@@ -299,20 +301,18 @@ impl RunningProcess {
                 return;
             };
             let group_weak = self.backend.own_group().map(Arc::downgrade);
-            let pid = self.pid;
-            let handed_off = self.handed_off.clone();
+            let gate = self.pid_gate.clone();
             self.cancel_task = Some(tokio::spawn(async move {
                 token.cancelled().await;
                 // Stand down if a `Child`-owning finisher has taken over teardown:
                 // it kills the tree/child through the owned handles (`start_kill`,
                 // a no-op once reaped), so a raw `kill(pid)` here could only signal
-                // a pid the OS recycled. `handed_off` supersedes the old bare
-                // `timeout_state != TS_PENDING` load, whose load→kill gap was
-                // *unbounded* (it never claimed the arbiter): the consuming reaper
-                // flips `handed_off` before it frees the pid — on
-                // `drive_to_exit_inner`/`kill_tree` strictly before the reap — so a
-                // `false` read here guarantees the child is not yet reaped.
-                if handed_off.load(Ordering::Acquire) {
+                // a pid the OS recycled. This early `is_retired` load is only an
+                // optimization to skip even the group kill; the raw direct-child
+                // kill below re-checks retirement *atomically with the kill* under
+                // the gate lock, so — unlike the old bare `handed_off` load whose
+                // load→kill gap let a reap slip in — it can never fire on a freed pid.
+                if gate.is_retired() {
                     return;
                 }
                 if let Some(g) = group_weak.and_then(|w| w.upgrade()) {
@@ -322,7 +322,7 @@ impl RunningProcess {
                     // `Cgroup::kill` (src/sys/linux.rs) for the full rationale.
                     let _ = g.kill_all();
                 }
-                stream::kill_direct_child(pid);
+                crate::sys::pid_gate::force_kill(&gate);
             }));
         }
     }
@@ -1171,6 +1171,11 @@ impl RunningProcess {
     /// Aborting before the pid is freed limits the recycled-pid window to a
     /// scheduler quantum (an already-executing kill cannot be recalled).
     fn abort_watchdogs(&mut self) {
+        // Retire the gate too: `abort_watchdogs` only runs after a reap, so once
+        // it does, no detached watchdog may raw-kill the (now freed) pid. This is
+        // idempotent with the earlier retire the owner-driven reap paths already
+        // did before freeing the pid; here it is the canonical post-reap backstop.
+        self.pid_gate.retire();
         self.pid = None;
         if let Some(task) = self.deadline_task.take() {
             task.abort();
@@ -1259,12 +1264,15 @@ impl RunningProcess {
             Backend::Scripted(s) => s.wait_outcome().await,
         };
         // The child is now reaped and its pid may be recycled at any instant:
-        // retire it from raw-kill use so the cancel/deadline watchdogs stand down
-        // if they fire in the residual window before `abort_watchdogs` stops them.
-        // This is the backstop for reap paths without their own teardown arms
-        // (`wait_exit`); `drive_to_exit_inner` additionally flips it *before* this
-        // reap, which fully closes the window on the consuming path.
-        self.handed_off.store(true, Ordering::Release);
+        // retire the gate so the cancel/deadline watchdogs stand down if they fire
+        // in the residual window before `abort_watchdogs` stops them. This is the
+        // passive backstop: the async `wait()` above frees the pid before we can
+        // retire (a std lock can't be held across the `.await`), so a bounded
+        // reap→retire residual remains here — but the gate still keeps any racing
+        // watchdog's raw kill from *completing* against the freed pid once this
+        // retire lands, and the owner-driven paths (`drive_to_exit_inner`/
+        // `kill_tree`) retire *before* their reap to close the window entirely.
+        self.pid_gate.retire();
         // Claim natural reap. If a deadline already won (`TS_TIMED_OUT`), this
         // CAS fails and the run stays `TimedOut`.
         let _ = self.timeout_state.compare_exchange(
@@ -1285,14 +1293,16 @@ impl RunningProcess {
         // This future owns the `Child` and drives BOTH kills through it — the
         // deadline via `teardown_on_timeout` and cancel via `kill_tree`, whose
         // `start_kill` is a no-op once the child is reaped and so can never signal
-        // a recycled pid. Flip `handed_off` FIRST (so a watchdog racing us skips
-        // its raw-pid kill), THEN abort the deadline watchdog so only our own arm
-        // fires the graceful teardown. Doing this *before* the reap is what closes
-        // the reap→CAS window the old design left open: the watchdog can no longer
-        // win the arbiter and raw-kill a pid this reap is about to free — while a
-        // still-`false` read leaves it free to kill a genuinely un-reaped child
-        // (the pure-streaming case, where no reaper runs and the pid stays valid).
-        self.handed_off.store(true, Ordering::Release);
+        // a recycled pid. `retire` the gate FIRST (so a watchdog racing us stands
+        // down its raw-pid kill), THEN abort the deadline watchdog so only our own
+        // arm fires the graceful teardown. Retiring *before* the reap is what
+        // fully closes the window: a racing watchdog's raw kill runs under the gate
+        // lock, so it either lands before this retire (pid still valid) or is
+        // skipped — it can never win a kill on a pid this reap is about to free.
+        // During pure streaming (no finisher, so nothing retires) the gate stays
+        // live and the watchdog remains the sole killer of a genuinely un-reaped
+        // child, as it must to bound the timeout.
+        self.pid_gate.retire();
         if let Some(task) = self.deadline_task.take() {
             task.abort();
         }
@@ -1351,15 +1361,15 @@ impl RunningProcess {
 
     /// Hard-kill the child and its tree (for a private group), then reap.
     async fn kill_tree(&mut self) {
-        let handed_off = self.handed_off.clone();
+        let gate = self.pid_gate.clone();
         match &mut self.backend {
             Backend::Real(real) => {
                 let _ = real.child.start_kill();
                 // The child is being torn down through the owned `Child`; retire
-                // its pid (before the reap below frees it) so the cancel/deadline
-                // watchdogs stand down rather than racing that reap with a raw
-                // `kill(pid)` that could land on a recycled pid.
-                handed_off.store(true, Ordering::Release);
+                // the gate (before the reap below frees the pid) so the
+                // cancel/deadline watchdogs stand down rather than racing that reap
+                // with a raw `kill(pid)` that could land on a recycled pid.
+                gate.retire();
                 if let Some(group) = &real.own_group {
                     // On Linux + legacy/restricted cgroup this can synchronously
                     // block this worker thread up to ~100ms — accepted, not
@@ -1376,75 +1386,102 @@ impl RunningProcess {
     }
 
     /// Teardown when the deadline elapses. With `timeout_grace`: signal → wait up
-    /// to grace → SIGKILL, concurrent with the reap so a signal-handling child
-    /// ends the grace early. Without grace: hard `kill_tree`. Windows has no signal
-    /// tier; graceful degrades to the atomic kill.
+    /// to grace → SIGKILL, so a signal-handling child ends the grace early. Without
+    /// grace: hard `kill_tree`. Windows has no signal tier; graceful degrades to
+    /// the atomic kill.
     async fn teardown_on_timeout(&mut self) {
         let Some(grace) = self.timeout_grace else {
             self.kill_tree().await;
             return;
         };
         let signal = self.timeout_signal;
+        let gate = self.pid_gate.clone();
         match &mut self.backend {
-            Backend::Real(real) => {
-                let pid = real.child.id();
-                let own = real.own_group.clone();
-                // Latch the shared-group graceful pid-killer's stand-down: the
-                // instant our own concurrent `reap` frees the pid, its liveness
-                // poll / final `SIGKILL` must stop, or the deadline-bounded kill
-                // could land on a pid the OS recycled between the reap and the
-                // grace deadline (the same recycled-pid hazard the watchdogs guard
-                // with `handed_off`, here scoped to this same-task reap). Group
-                // teardown is pgid/cgroup-scoped and needs no such gate.
-                let reaped = Arc::new(AtomicBool::new(false));
-                let teardown = {
-                    let reaped = reaped.clone();
-                    async move {
-                        match &own {
-                            Some(group) => {
-                                let _ = group.graceful_terminate(grace, signal).await;
-                            }
-                            // Shared group: terminate only our direct child.
-                            None => {
-                                crate::running::stream::graceful_kill_pid(
-                                    pid, grace, signal, reaped,
-                                )
-                                .await;
-                            }
+            Backend::Real(real) => match real.own_group.clone() {
+                // Own group: tear the whole tree down pgid/cgroup-scoped (which
+                // never touches the raw pid, so it is recycled-pid safe), reaping
+                // concurrently so a signal-handling child that exits ends the grace
+                // early instead of eating a pointless `SIGKILL`.
+                Some(group) => {
+                    let teardown = async move {
+                        let _ = group.graceful_terminate(grace, signal).await;
+                    };
+                    // Bound the reap: a D-state child can ignore the final SIGKILL.
+                    let reap = async {
+                        let r = tokio::time::timeout(
+                            grace.saturating_add(PUMP_TEARDOWN),
+                            real.child.wait(),
+                        )
+                        .await;
+                        // The group teardown never raw-kills, so retiring here only
+                        // keeps the gate consistent for any lingering external
+                        // watchdog once the pid is freed.
+                        gate.retire();
+                        r
+                    };
+                    let _ = tokio::join!(teardown, reap);
+                }
+                // Shared group: we own no group, so we reach only the direct child.
+                // Escalate the hard kill through the OWNED `Child` (`start_kill`)
+                // instead of a raw `kill(pid)`, so the SIGKILL is reaped by the same
+                // `Child` and can never outlive the reap to hit a recycled pid — the
+                // recycled-pid hazard the pid-only path guards with the gate is
+                // simply absent here. Only the graceful signal is sent by pid, and
+                // only while the child is provably un-reaped: this teardown is the
+                // sole reaper (the deadline arm won `drive_to_exit_inner`'s
+                // `select!`, so `backend_wait` never ran and no watchdog is racing —
+                // `drive_to_exit_inner` retired the gate to stand them down).
+                None => {
+                    #[cfg(unix)]
+                    {
+                        stream::signal_direct_child(real.child.id(), signal);
+                        // Wait up to `grace` for the child to exit on the signal; a
+                        // child that catches it and stays up rides out the grace.
+                        // Only a *clean* reap skips escalation — on a grace elapse
+                        // (or a rare wait error) escalate through the owned `Child`,
+                        // whose `start_kill` is a harmless no-op if it turns out the
+                        // child was already reaped.
+                        let reaped_cleanly = matches!(
+                            tokio::time::timeout(grace, real.child.wait()).await,
+                            Ok(Ok(_))
+                        );
+                        if !reaped_cleanly {
+                            let _ = real.child.start_kill();
+                            let _ =
+                                tokio::time::timeout(PUMP_TEARDOWN, real.child.wait()).await;
                         }
                     }
-                };
-                // Bound the reap: a D-state child can ignore the final SIGKILL.
-                let reap = async {
-                    let r = tokio::time::timeout(
-                        grace.saturating_add(PUMP_TEARDOWN),
-                        real.child.wait(),
-                    )
-                    .await;
-                    // Stand the pid-killer down: on a successful reap the pid is
-                    // freed (and recyclable); on the timeout branch the grace has
-                    // already elapsed, so its `SIGKILL` has already fired and
-                    // standing down is a harmless no-op.
-                    reaped.store(true, Ordering::Release);
-                    r
-                };
-                let _ = tokio::join!(teardown, reap);
-            }
+                    #[cfg(not(unix))]
+                    {
+                        // Windows has no graceful tier: hard-kill immediately
+                        // through the owned Child and reap.
+                        let _ = signal;
+                        let _ = real.child.start_kill();
+                        let _ = tokio::time::timeout(PUMP_TEARDOWN, real.child.wait()).await;
+                    }
+                    // Reaped (pid freed); retire so any lingering external watchdog
+                    // stands down. `drive_to_exit_inner` already retired before
+                    // calling us; this keeps the post-reap invariant explicit.
+                    gate.retire();
+                }
+            },
             Backend::Scripted(s) => s.kill(),
         }
     }
 
     /// Whether the child has already exited, polled without blocking.
     fn has_exited_now(&mut self) -> bool {
-        let exited = match &mut self.backend {
+        let gate = self.pid_gate.clone();
+        // Reap-and-retire in one critical section: the non-blocking `try_wait`
+        // that reaps (and frees) the pid runs under the gate lock and retires it
+        // in the same step, so a watchdog's gated raw kill can never observe the
+        // pid live after this reap freed it. Being synchronous, this fully closes
+        // the window the async `backend_wait` backstop can only bound.
+        let exited = gate.reap_under_lock(|| match &mut self.backend {
             Backend::Real(real) => matches!(real.child.try_wait(), Ok(Some(_))),
             Backend::Scripted(s) => s.has_exited_now(),
-        };
+        });
         if exited {
-            // `try_wait` just reaped the child, freeing (and exposing to reuse)
-            // its pid: retire it so the cancel/deadline watchdogs stand down their
-            // raw kill if they fire before `abort_watchdogs` below stops them.
-            self.handed_off.store(true, Ordering::Release);
             // Claim the arbiter: a deadline watchdog racing on another thread could
             // win `PENDING -> TIMED_OUT` before `abort_watchdogs` stops it,
             // misclassifying a clean exit. Claiming `EXITED` closes that window.
@@ -1976,6 +2013,66 @@ mod tests {
             Err(Error::Cancelled { .. }) => {}
             other => panic!("expected Err(Cancelled), got {other:?}"),
         }
+    }
+
+    /// T-078: every consuming reap retires the shared `PidGate`, so the detached
+    /// cancellation / streaming-deadline watchdogs — which funnel every raw
+    /// `kill(pid)` through it — stand down and can never signal the freed (and
+    /// possibly OS-recycled) pid. The gate's own linearizability (a retired gate
+    /// runs no kill, even under contention) is proven in `sys::pid_gate::tests`;
+    /// these cases prove each reap *path* reaches that retired state. The gate
+    /// `Arc` is cloned before the consuming call so it can be inspected after.
+    #[tokio::test]
+    async fn a_consuming_reap_retires_the_pid_gate() {
+        let run = scripted_handle(&[0]).await;
+        let gate = run.pid_gate.clone();
+        assert!(!gate.is_retired(), "a fresh handle's gate is live");
+        run.wait().await.expect("wait");
+        assert!(
+            gate.is_retired(),
+            "the reap must retire the gate so the watchdogs stand down"
+        );
+    }
+
+    /// The cancellation-watchdog path: cancelling and then finishing retires the
+    /// gate (`drive_to_exit_inner` retires *before* it reaps, and `kill_tree`/
+    /// `abort_watchdogs` keep it retired), so the cancel watchdog cannot race the
+    /// reap with a raw kill.
+    #[tokio::test]
+    async fn a_cancelled_reap_retires_the_pid_gate() {
+        let token = crate::CancellationToken::new();
+        let run = ScriptedRunner::new()
+            .fallback(Reply::ok(""))
+            .start(&Command::new("tool").cancel_on(token.clone()))
+            .await
+            .expect("scripted start");
+        let gate = run.pid_gate.clone();
+        token.cancel();
+        // Consumes the run; the outcome is `Err(Cancelled)`, but the gate must be
+        // retired regardless so the cancel watchdog stands down.
+        let _ = run.wait().await;
+        assert!(
+            gate.is_retired(),
+            "the cancellation reap path must retire the gate"
+        );
+    }
+
+    /// The probe path (`wait_for` → `has_exited_now`) retires the gate *atomically
+    /// with* its synchronous `try_wait` reap via `PidGate::reap_under_lock`, fully
+    /// closing the window rather than merely bounding it.
+    #[tokio::test]
+    async fn a_probe_reap_retires_the_pid_gate() {
+        let mut run = scripted_handle(&[0]).await; // Reply::ok -> zero-lifetime child
+        let gate = run.pid_gate.clone();
+        // A never-passing check drives `poll_until` straight into `has_exited_now`,
+        // which observes (and reaps) the already-exited scripted child.
+        let _ = run
+            .wait_for(|| async { false }, Duration::from_secs(5))
+            .await;
+        assert!(
+            gate.is_retired(),
+            "the probe's reap_under_lock must retire the gate atomically"
+        );
     }
 
     /// `wait_exit` applies `classify_timed_out` so the `stdout_lines` → `wait_any`
