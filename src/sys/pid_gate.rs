@@ -176,8 +176,8 @@ fn raw_force_kill(pid: u32) {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Barrier;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// A retired gate runs no raw kill: `with_live_pid`'s closure never fires, so
     /// `force_kill` (which *is* `with_live_pid` + the kill syscall) is a no-op.

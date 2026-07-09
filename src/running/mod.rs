@@ -1447,8 +1447,7 @@ impl RunningProcess {
                         );
                         if !reaped_cleanly {
                             let _ = real.child.start_kill();
-                            let _ =
-                                tokio::time::timeout(PUMP_TEARDOWN, real.child.wait()).await;
+                            let _ = tokio::time::timeout(PUMP_TEARDOWN, real.child.wait()).await;
                         }
                     }
                     #[cfg(not(unix))]

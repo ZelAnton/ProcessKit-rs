@@ -499,7 +499,7 @@ impl MatchPolicy {
                     h = mix(h, value.as_encoded_bytes());
                 }
                 Some(None) => h = mix(h, &[2]), // explicitly removed
-                None => h = mix(h, &[0]),        // untouched / inherited
+                None => h = mix(h, &[0]),       // untouched / inherited
             }
         }
         Some(h)
@@ -898,7 +898,7 @@ enum Mode<R> {
 ///   *values* of named env variables to the key — for a tool whose output truly
 ///   depends on where it runs or on a given variable. The extra fields key
 ///   through a single digest folded onto each entry
-///   ([`MatchPolicy::digest_of`]); **env values are still never persisted** (only
+///   (`MatchPolicy::digest_of`); **env values are still never persisted** (only
 ///   the digest is), so a stricter policy leaks no more than the default. Set the
 ///   **same** policy on the record and replay runner — a mismatch misses rather
 ///   than misserving. Off by default to keep cassettes portable across machines
@@ -1261,11 +1261,14 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 // re-enters this replayer would otherwise deadlock.
                 let entry = {
                     let mut slots = slots.lock().expect("cassette mutex poisoned");
-                    let Some(slot) = slots.get_mut(&key_of(&invocation, stdin_digest, &self.policy))
-                    else {
-                        return Err(Error::CassetteMiss {
-                            program: command.program_name(),
-                        });
+                    let slot = match slots.get_mut(&key_of(&invocation, stdin_digest, &self.policy))
+                    {
+                        Some(slot) => slot,
+                        None => {
+                            return Err(Error::CassetteMiss {
+                                program: command.program_name(),
+                            });
+                        }
                     };
                     slot.play().clone()
                 };
@@ -1380,11 +1383,14 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 let stdin_digest = stdin_digest_of(command);
                 let entry = {
                     let mut slots = slots.lock().expect("cassette mutex poisoned");
-                    let Some(slot) = slots.get_mut(&key_of(&invocation, stdin_digest, &self.policy))
-                    else {
-                        return Err(Error::CassetteMiss {
-                            program: command.program_name(),
-                        });
+                    let slot = match slots.get_mut(&key_of(&invocation, stdin_digest, &self.policy))
+                    {
+                        Some(slot) => slot,
+                        None => {
+                            return Err(Error::CassetteMiss {
+                                program: command.program_name(),
+                            });
+                        }
                     };
                     slot.play().clone()
                 };
@@ -2624,9 +2630,11 @@ mod tests {
         // variable the policy does NOT name still can't perturb the key
         // (portability preserved for irrelevant env differences).
         let (_dir, path) = temp_cassette();
-        let recorder =
-            RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("recorded")))
-                .match_on_env(["MODE"]);
+        let recorder = RecordReplayRunner::record(
+            &path,
+            ScriptedRunner::new().fallback(Reply::ok("recorded")),
+        )
+        .match_on_env(["MODE"]);
         let _ = recorder
             .output_string(&Command::new("tool").env("MODE", "fast"))
             .await
@@ -2649,7 +2657,11 @@ mod tests {
         assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
 
         let still_hit = replayer
-            .run(&Command::new("tool").env("MODE", "fast").env("UNRELATED", "x"))
+            .run(
+                &Command::new("tool")
+                    .env("MODE", "fast")
+                    .env("UNRELATED", "x"),
+            )
             .await
             .expect("an env var the policy does not name must not perturb the key");
         assert_eq!(still_hit, "recorded");
@@ -2708,7 +2720,10 @@ mod tests {
         recorder.save().expect("save");
 
         let json = std::fs::read_to_string(&path).expect("read cassette");
-        assert!(json.contains("API_TOKEN"), "the name is still stored: {json}");
+        assert!(
+            json.contains("API_TOKEN"),
+            "the name is still stored: {json}"
+        );
         assert!(
             !json.contains("hunter2-very-secret"),
             "the raw value must never be written, even under the env match policy: {json}"
@@ -2724,9 +2739,11 @@ mod tests {
         // Under the policy, a selected variable that is SET vs left UNTOUCHED are
         // distinct keys — not just two different set values.
         let (_dir, path) = temp_cassette();
-        let recorder =
-            RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("with-flag")))
-                .match_on_env(["FLAG"]);
+        let recorder = RecordReplayRunner::record(
+            &path,
+            ScriptedRunner::new().fallback(Reply::ok("with-flag")),
+        )
+        .match_on_env(["FLAG"]);
         let _ = recorder
             .output_string(&Command::new("tool").env("FLAG", "on"))
             .await
