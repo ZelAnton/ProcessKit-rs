@@ -325,8 +325,8 @@ Semantics worth knowing before you commit a cassette:
 
 | Aspect | Behavior |
 |---|---|
-| Match key | program + args + a stdin **source digest** (hashed, never persisted: in-memory bytes hash their content, a `from_file` source hashes its path) — no stdin (absent or `Stdin::empty()`) keys distinctly; lossy UTF-8 on the text parts. **`cwd` is not part of the key** — a cassette recorded from one absolute working directory still replays when the same invocation runs from another (a dev box vs. a CI workspace); `cwd` is still stored on the entry, verbatim, for visibility |
-| Environment | **values never reach the file** — only sorted variable names, so *env* secrets can't leak through a committed fixture; env is *not* matched, so env differences can't cause spurious misses |
+| Match key | program + args + a stdin **source digest** (hashed, never persisted: in-memory bytes hash their content, a `from_file` source hashes its path) — no stdin (absent or `Stdin::empty()`) keys distinctly; lossy UTF-8 on the text parts. **`cwd` is not part of the key by default** — a cassette recorded from one absolute working directory still replays when the same invocation runs from another (a dev box vs. a CI workspace); `cwd` is still stored on the entry, verbatim, for visibility. Opt in to a stricter key with `match_on_cwd` / `match_on_env` (below) |
+| Environment | **values never reach the file** — only sorted variable names, so *env* secrets can't leak through a committed fixture. Env is **not matched by default**, so irrelevant env differences can't cause spurious misses. Opt in with `match_on_env(["NAME", …])` to also key on selected variables' *values* — still via a **digest**, so raw values remain off-disk (see [Opt-in stricter matching](#opt-in-stricter-matching-cwd--selected-env-values)) |
 | Duplicates of one key | replay in capture order, then the **last entry repeats** — a recorded sequence (`git rev-parse HEAD` before/after a commit) replays faithfully, while retry/probe loops keep getting a stable final answer |
 | Miss | strict `Error::CassetteMiss` (distinct from a missing program — `is_not_found()` is `false`) — replay never spawns a surprise subprocess; a stale cassette fails loudly |
 | Timeouts | a recorded timed-out run replays as one, surfacing `Error::Timeout` with the *replaying* command's deadline |
@@ -347,6 +347,67 @@ world-writable shared one) for secret-bearing fixtures.
 A neat trick: in tests, record against a `ScriptedRunner` instead of
 `JobRunner` — the whole record→save→replay round trip is then itself
 hermetic.
+
+### Opt-in stricter matching (cwd / selected env values)
+
+The portable default keys on `program` + `args` + stdin only. It deliberately
+leaves `cwd` and the environment **out** of the key: a cassette recorded in one
+absolute working directory (a dev box, a tempdir) then replays cleanly from a
+different one (a CI workspace), and an env variable that differs between the
+record and replay machines but doesn't change the tool's output can't cause a
+spurious miss. That portability is the right default for most tools.
+
+But some tools' output genuinely depends on where they run or on a specific
+environment variable — and with those out of the key, two such invocations
+collide on one entry: the first recording silently answers for both on replay.
+When that matters, opt in to a stricter key:
+
+```rust,no_run
+use processkit::{Command, JobRunner, ProcessRunnerExt};
+use processkit::testing::RecordReplayRunner;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    // Record: also key on the working directory and on LC_ALL's value.
+    let runner = RecordReplayRunner::record("fixtures/tool.json", JobRunner::new())
+        .match_on_cwd()
+        .match_on_env(["LC_ALL"]);
+    let cmd = Command::new("tool").current_dir("/repo").env("LC_ALL", "C");
+    let _ = runner.run(&cmd).await?;
+    runner.save()?;
+
+    // Replay: set the *same* policy — it must match on both sides.
+    let runner = RecordReplayRunner::replay("fixtures/tool.json")?
+        .match_on_cwd()
+        .match_on_env(["LC_ALL"]);
+    // A differing cwd or LC_ALL value now MISSES (a loud `CassetteMiss`) instead
+    // of replaying the wrong entry; the same cwd + LC_ALL hits.
+    let cmd = Command::new("tool").current_dir("/repo").env("LC_ALL", "C");
+    let _ = runner.run(&cmd).await?;
+    Ok(())
+}
+```
+
+Notes:
+
+- **Env values still never reach the file.** `match_on_env` keys on an FNV
+  *digest* of the selected `(name, value)` pairs, not the raw values — the
+  cassette continues to store variable *names* only, so no env secret is written
+  to disk even under the stricter policy. (`cwd` is keyed the same way; it is
+  also already stored verbatim on the entry, as before.)
+- **Symmetric by contract.** Set the *same* policy on the record and replay
+  runner, exactly as you target the same tool. A mismatched policy simply
+  *misses* (it never serves a wrong entry) — including replaying a policy-keyed
+  cassette with no policy, or vice versa.
+- **Only the named variables participate.** Variables you don't name stay out of
+  the key, preserving portability for env differences that don't matter. A named
+  variable that is *set*, *removed* (`env_remove`), or *untouched* are three
+  distinct keys.
+- **On-disk format.** A policy-keyed entry carries an extra opaque
+  `match_digest` number; a cassette recorded without a policy omits it and is
+  byte-identical to before but for the bumped `version` (now `4`). Older
+  cassettes (no `match_digest`) load and replay unchanged under a no-policy
+  replayer.
 
 ## Wrapping a CLI tool
 

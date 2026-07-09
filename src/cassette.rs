@@ -8,13 +8,18 @@
 //! cassette serves results that compare equal to the recorded ones — fast,
 //! hermetic, no subprocess in CI.
 //!
-//! **Portability of the match key.** An invocation is matched on `program` +
-//! `args` + the stdin digest — **not** `cwd` (see [`CASSETTE_VERSION`] for why),
-//! so a cassette recorded in one absolute working directory (a tempdir, a CI
-//! workspace like `/home/alice/repo` or `C:\actions\work\…`) replays cleanly in
-//! another: the leading portability blocker (`cwd` pinning a cassette to the
+//! **Portability of the match key.** By default an invocation is matched on
+//! `program` + `args` + the stdin digest — **not** `cwd` (see [`CASSETTE_VERSION`]
+//! for why), so a cassette recorded in one absolute working directory (a tempdir,
+//! a CI workspace like `/home/alice/repo` or `C:\actions\work\…`) replays cleanly
+//! in another: the leading portability blocker (`cwd` pinning a cassette to the
 //! machine/checkout it was recorded on) is gone. `cwd` is still stored on the
-//! entry, verbatim, for visibility — just not matched on. A `from_file` stdin
+//! entry, verbatim, for visibility — just not matched on. When a tool's output
+//! genuinely depends on the working directory or on selected environment
+//! variables, opt in with [`RecordReplayRunner::match_on_cwd`] /
+//! [`match_on_env`](RecordReplayRunner::match_on_env) — those fold the field into
+//! the key through a digest, so env *values* still never reach the file. A
+//! `from_file` stdin
 //! source keys on its **path**, though, so that source is still machine-bound if
 //! the path itself is absolute and varies across machines (a tempdir file); a
 //! per-run tempdir path will still miss on the very next run too. Prefer
@@ -62,7 +67,22 @@ use crate::runner::{JobRunner, ProcessRunner};
 /// needs a "root" concept the runner doesn't otherwise have, and no in-tree
 /// consumer has ever needed two recorded runs to be told apart *only* by their
 /// cwd — see `ideas/later-cassette-cwd-portability.md`).
-const CASSETTE_VERSION: u32 = 3;
+///
+/// Bumped to `4`: an entry may now carry an optional `match_digest` (see
+/// [`MatchPolicy`]) — the FNV-1a digest that an **opt-in** match policy
+/// ([`RecordReplayRunner::match_on_cwd`]/[`match_on_env`](RecordReplayRunner::match_on_env))
+/// folds the working directory and/or selected env-variable *values* into. Like
+/// the `3` bump this is *not* a compatibility gate: the field is additive and
+/// optional (`#[serde(default)]`), so a cassette recorded **without** a policy
+/// (the portable default) omits it entirely and stays byte-identical to a
+/// version-3 cassette but for the `version` number, and an older (v1..=v3)
+/// cassette loads and replays exactly as before (no `match_digest` decodes as
+/// `None`, matched by a no-policy replayer). Env *values* are still never
+/// persisted — only this opaque digest is (see [`MatchPolicy::digest_of`]). The
+/// bump exists so a cassette on disk records that it was keyed under a stricter
+/// policy; a *newer*-shaped cassette is still refused by an older build's
+/// version gate, exactly as before.
+const CASSETTE_VERSION: u32 = 4;
 
 /// The whole fixture file: a format version plus the entries in capture order.
 #[derive(Debug, Serialize, Deserialize)]
@@ -97,6 +117,17 @@ struct Entry {
     /// stdin invocation again. See `Stdin::content_digest` for the hashing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stdin_digest: Option<u64>,
+    /// FNV-1a digest of the fields an **opt-in** [`MatchPolicy`] folds into the
+    /// key — the working directory and/or the *values* of selected env
+    /// variables. `None` (absent on disk) for the portable default (no policy),
+    /// so a default cassette keys exactly as a version-3 one did and an older
+    /// cassette without the field loads as `None`. Env values are **hashed into
+    /// this digest, never persisted raw** — the cassette still stores only env
+    /// variable *names* (`env_names`), never their values. See
+    /// [`MatchPolicy::digest_of`] for the hashing and why a policy digest and a
+    /// no-policy `None` are matched separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    match_digest: Option<u64>,
     // --- stored for visibility, not matched on ---
     /// The invocation's working directory, verbatim — **not** part of the match
     /// key (see the type doc's "Portability of the match key" / [`CASSETTE_VERSION`]'s
@@ -379,6 +410,102 @@ struct KeyFields {
     env_names: Vec<String>,
 }
 
+/// An **opt-in** stricter match policy: which normally-excluded routing fields —
+/// the working directory and/or the *values* of selected environment variables —
+/// also participate in the cassette match key. Empty by default (the portable
+/// `program` + `args` + stdin-digest key documented on [`RecordReplayRunner`]);
+/// populated via [`RecordReplayRunner::match_on_cwd`] /
+/// [`match_on_env`](RecordReplayRunner::match_on_env).
+///
+/// **Env values are never persisted.** A policy naming env variables keys on a
+/// *digest* of their `(name, value)` pairs (see [`digest_of`](Self::digest_of)),
+/// keeping the cassette's non-secret-bearing posture intact — the file still
+/// stores only variable *names* (`env_names`), never values. The policy lives on
+/// the runner (outside the record/replay [`Mode`]) because both sides consult it:
+/// record folds the digest onto each entry, replay recomputes it from the live
+/// invocation. Record and replay must therefore use the **same** policy, exactly
+/// as they must target the same tool — a mismatched policy simply misses (never
+/// serves a wrong entry), because the digests won't be equal.
+#[derive(Debug, Clone, Default)]
+struct MatchPolicy {
+    /// Whether the working directory participates in the match key.
+    match_cwd: bool,
+    /// Env variable names whose *values* participate — kept sorted + deduped so
+    /// the digest is order-independent and stable across builder-call order.
+    env_names: Vec<String>,
+}
+
+impl MatchPolicy {
+    /// No stricter matching requested — the portable default. Keeps
+    /// [`digest_of`](Self::digest_of) returning `None` so a no-policy cassette
+    /// keys exactly as before (`match_digest` absent).
+    fn is_empty(&self) -> bool {
+        !self.match_cwd && self.env_names.is_empty()
+    }
+
+    /// The policy digest for an invocation, or `None` when the policy is empty.
+    ///
+    /// FNV-1a (like [`Stdin::content_digest`](crate::Stdin) — stable across Rust
+    /// releases, unlike `DefaultHasher`) over a canonical, **self-describing**
+    /// serialization: the policy's own shape (whether cwd is keyed, which env
+    /// names, in sorted order) is folded in *alongside* the values, with a
+    /// per-field tag byte, so (a) two different policies can't collide on one
+    /// digest, and (b) a variable being *set to a value*, *removed*
+    /// ([`Command::env_remove`](crate::Command::env_remove)), or *untouched* are
+    /// three distinct facts. The effective override value is resolved through
+    /// [`Invocation::env`](crate::testing::Invocation::env) (last-write-wins,
+    /// platform case rules), matching the value a spawn would actually use.
+    ///
+    /// The env *values* are hashed here but **never persisted** — only the
+    /// resulting opaque `u64` reaches the cassette, so a committed fixture leaks
+    /// no more than it did before (still just variable names). Two invocations
+    /// whose selected values differ produce different digests and thus miss each
+    /// other on replay; identical selected values collide (the intended hit).
+    fn digest_of(&self, invocation: &Invocation) -> Option<u64> {
+        if self.is_empty() {
+            return None;
+        }
+        // FNV-1a, matching `Stdin::content_digest`'s constants so the two digests
+        // reason alike (stable across releases).
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        fn mix(mut h: u64, bytes: &[u8]) -> u64 {
+            for &b in bytes {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(PRIME);
+            }
+            h
+        }
+        let mut h = OFFSET;
+        if self.match_cwd {
+            // Tag the field so an empty-cwd policy can't alias a same-length env
+            // digest; `cwd` is lossless bytes (also stored verbatim on the entry).
+            h = mix(h, b"cwd\0");
+            match &invocation.cwd {
+                Some(cwd) => {
+                    h = mix(h, &[1]);
+                    h = mix(h, cwd.as_os_str().as_encoded_bytes());
+                }
+                None => h = mix(h, &[0]),
+            }
+        }
+        for name in &self.env_names {
+            h = mix(h, b"env\0");
+            h = mix(h, name.as_bytes());
+            h = mix(h, &[0]); // name/value boundary
+            match invocation.env(name) {
+                Some(Some(value)) => {
+                    h = mix(h, &[1]); // set to a value
+                    h = mix(h, value.as_encoded_bytes());
+                }
+                Some(None) => h = mix(h, &[2]), // explicitly removed
+                None => h = mix(h, &[0]),        // untouched / inherited
+            }
+        }
+        Some(h)
+    }
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)] // signature dictated by serde
 fn is_false(b: &bool) -> bool {
     !*b
@@ -516,10 +643,14 @@ impl Entry {
     }
 
     /// Capture one record-mode call. Lossy UTF-8 throughout — see the type doc.
+    /// `match_digest` is the active [`MatchPolicy`]'s digest for this invocation
+    /// (`None` for the portable default) — folded onto the entry so replay can
+    /// key on it without re-persisting the raw cwd/env values.
     fn from_parts(
         invocation: &Invocation,
         result: &ProcessResult<String>,
         stdin_digest: Option<u64>,
+        match_digest: Option<u64>,
     ) -> Self {
         let key = Self::key_fields(invocation, stdin_digest);
         Self {
@@ -527,6 +658,7 @@ impl Entry {
             args: key.args,
             cwd: key.cwd,
             stdin_digest: key.stdin_digest,
+            match_digest,
             has_stdin: key.has_stdin,
             env_names: key.env_names,
             stdout: result.stdout().clone(),
@@ -554,6 +686,7 @@ impl Entry {
     fn from_error(
         invocation: &Invocation,
         stdin_digest: Option<u64>,
+        match_digest: Option<u64>,
         error: CassetteError,
     ) -> Self {
         let key = Self::key_fields(invocation, stdin_digest);
@@ -562,6 +695,7 @@ impl Entry {
             args: key.args,
             cwd: key.cwd,
             stdin_digest: key.stdin_digest,
+            match_digest,
             has_stdin: key.has_stdin,
             env_names: key.env_names,
             stdout: String::new(),
@@ -605,26 +739,36 @@ impl Entry {
     }
 }
 
-/// What an invocation is matched on: program + args + the stdin source digest
-/// (content for in-memory bytes, path for a `from_file` source). Env overrides
-/// are excluded — deliberately, so an *irrelevant* env difference between the
-/// record and replay environments can't cause a spurious miss — **but this is
-/// a real collision risk when the env difference is NOT irrelevant**: two
-/// invocations that differ only by an env override that actually changes the
-/// tool's behavior/output collide on one entry (see
-/// [`RecordReplayRunner`]'s "Env is not part of the match key" for the
-/// workarounds; there is no opt-in env-keying knob today). `cwd` is excluded
-/// too — see the type doc's "Portability of the match key" /
-/// [`CASSETTE_VERSION`]'s `3` bump — so a cassette recorded in one absolute
-/// working directory still matches an otherwise-identical invocation run from
-/// a different one.
+/// What an invocation is matched on **by default**: program + args + the stdin
+/// source digest (content for in-memory bytes, path for a `from_file` source).
+/// Env overrides are excluded — deliberately, so an *irrelevant* env difference
+/// between the record and replay environments can't cause a spurious miss —
+/// **but this is a real collision risk when the env difference is NOT
+/// irrelevant**: two invocations that differ only by an env override that
+/// actually changes the tool's behavior/output collide on one entry unless a
+/// [`MatchPolicy`] names that variable (see
+/// [`RecordReplayRunner`]'s "Env is excluded from the match key by default" for
+/// the opt-in [`match_on_env`](RecordReplayRunner::match_on_env) and the other
+/// workarounds). `cwd` is excluded too — see the type doc's "Portability of the
+/// match key" / [`CASSETTE_VERSION`]'s `3` bump — so a cassette recorded in one
+/// absolute working directory still matches an otherwise-identical invocation
+/// run from a different one, unless [`match_on_cwd`](RecordReplayRunner::match_on_cwd)
+/// opts in. The optional trailing [`MatchPolicy`] digest carries those opt-in
+/// fields without persisting raw cwd/env values.
 ///
 /// The string components are *lossy* UTF-8 decodes, so two distinct non-UTF-8
 /// invocations that differ only in their invalid bytes produce the same key and
 /// collide on replay (the first recorded one answers for both). Accepted: keying
 /// on raw bytes would defeat the human-diffable text fixture, and valid-UTF-8
 /// invocations (the common case) never collide.
-type Key = (String, Vec<String>, bool, Option<u64>);
+///
+/// The trailing `Option<u64>` is the **opt-in** [`MatchPolicy`] digest (the last
+/// tuple element; the earlier `Option<u64>` is the stdin digest): `None` for the
+/// portable default, so a no-policy live invocation keys the same as a no-policy
+/// (or older, field-less) entry. When a policy is active it folds cwd and/or
+/// selected env *values* in (see [`MatchPolicy::digest_of`]); a differing
+/// selected cwd/env then yields a different digest and a deliberate miss.
+type Key = (String, Vec<String>, bool, Option<u64>, Option<u64>);
 
 /// The stdin source digest keyed into a cassette match — `None` for an
 /// empty/absent stdin. The digest never persists the stdin payload: in-memory
@@ -661,9 +805,11 @@ fn reject_unrecordable_stdin(command: &Command) -> Result<()> {
 /// [`Invocation`] (which records only *whether* stdin was supplied). The
 /// `has_stdin` bool is keyed alongside the digest so an older entry that loads
 /// `stdin_digest: None` regardless of its stored `has_stdin` cannot match a
-/// no-stdin replay — only miss. `invocation.cwd` is deliberately **not**
-/// included — see [`Key`]'s doc.
-fn key_of(invocation: &Invocation, stdin_digest: Option<u64>) -> Key {
+/// no-stdin replay — only miss. `invocation.cwd` and env values are excluded
+/// from the key **by default** and folded in only under an opt-in `policy` (see
+/// [`Key`]'s doc and [`MatchPolicy`]); an empty policy digests to `None`, keying
+/// the same as a no-policy / older field-less entry.
+fn key_of(invocation: &Invocation, stdin_digest: Option<u64>, policy: &MatchPolicy) -> Key {
     (
         invocation.program.to_string_lossy().into_owned(),
         invocation
@@ -673,16 +819,19 @@ fn key_of(invocation: &Invocation, stdin_digest: Option<u64>) -> Key {
             .collect(),
         invocation.has_stdin,
         stdin_digest,
+        policy.digest_of(invocation),
     )
 }
 
-/// The key of a stored entry (already lossy strings).
+/// The key of a stored entry (already lossy strings). `match_digest` was set by
+/// the recording runner's policy; a field-less (older / no-policy) entry is `None`.
 fn key_of_entry(entry: &Entry) -> Key {
     (
         entry.program.clone(),
         entry.args.clone(),
         entry.has_stdin,
         entry.stdin_digest,
+        entry.match_digest,
     )
 }
 
@@ -737,27 +886,38 @@ enum Mode<R> {
 ///
 /// **Replay** mode loads the cassette and serves results without spawning:
 ///
-/// - **Matching**: program + args + stdin source digest — **not** `cwd`, so a
-///   cassette recorded in one absolute working directory replays against an
-///   otherwise-identical invocation run from a different one (see the type
-///   doc's "Portability of the match key"). Env override *values* are never
+/// - **Matching (default)**: program + args + stdin source digest — **not**
+///   `cwd`, so a cassette recorded in one absolute working directory replays
+///   against an otherwise-identical invocation run from a different one (see the
+///   type doc's "Portability of the match key"). Env override *values* are never
 ///   written — only sorted variable names. Everything else (argv, cwd, stdout,
 ///   stderr) is stored verbatim, so review fixtures before committing. File is
 ///   written owner-only (`0600`) on Unix.
-/// - **Env is not part of the match key, at all — not even as variable names.**
-///   Two invocations of the same program+args+stdin that differ *only* in an
-///   env override (`LC_ALL=C` vs `LC_ALL=en_US`, a feature-flag env var that
-///   actually changes the tool's output, …) collide on one cassette entry: the
-///   first one recorded silently answers for both on replay. This is a real
-///   collision risk, not just a documented quirk — if your invocations vary
-///   meaningfully by env, either (a) fold the env-sensitive knob into the
-///   command's **args** instead (part of the key), (b) record each env variant
-///   into its **own cassette file**, or (c) drop to a
-///   [`ScriptedRunner`](crate::testing::ScriptedRunner) rule keyed on a
-///   predicate that inspects [`Command::env_overrides`] directly. There is
-///   currently no opt-in "key on these env names too" knob — env-keying was
-///   considered and deferred (see `ideas/v2-breaking-changes.md`, D10) in favor
-///   of this explicit warning, since no in-tree consumer has needed it yet.
+/// - **Opt-in stricter matching**: [`match_on_cwd`](Self::match_on_cwd) and
+///   [`match_on_env`](Self::match_on_env) add the working directory and/or the
+///   *values* of named env variables to the key — for a tool whose output truly
+///   depends on where it runs or on a given variable. The extra fields key
+///   through a single digest folded onto each entry
+///   ([`MatchPolicy::digest_of`]); **env values are still never persisted** (only
+///   the digest is), so a stricter policy leaks no more than the default. Set the
+///   **same** policy on the record and replay runner — a mismatch misses rather
+///   than misserving. Off by default to keep cassettes portable across machines
+///   (see "Portability of the match key").
+/// - **Env is excluded from the match key by default — not even as variable
+///   names.** Two invocations of the same program+args+stdin that differ *only*
+///   in an env override (`LC_ALL=C` vs `LC_ALL=en_US`, a feature-flag env var
+///   that actually changes the tool's output, …) collide on one cassette entry
+///   unless a policy names that variable: the first one recorded otherwise
+///   silently answers for both on replay. This is a real collision risk, not
+///   just a documented quirk — if your invocations vary meaningfully by env,
+///   either (a) opt in with [`match_on_env`](Self::match_on_env), (b) fold the
+///   env-sensitive knob into the command's **args** instead (part of the key),
+///   (c) record each env variant into its **own cassette file**, or (d) drop to
+///   a [`ScriptedRunner`](crate::testing::ScriptedRunner) rule keyed on a
+///   predicate that inspects [`Command::env_overrides`] directly. (Env-keying via
+///   `match_on_env` keys on a **digest** of the selected values, never the raw
+///   values — see `ideas/v2-breaking-changes.md`, D10 for the deferred
+///   always-on alternative.)
 /// - **Duplicates** replay in capture order, then the last entry repeats.
 /// - **A miss is [`Error::CassetteMiss`]** (not `is_not_found()`): never a
 ///   surprise subprocess. A **recorded `Err`** replays as that same `Error`
@@ -796,6 +956,10 @@ enum Mode<R> {
 /// while unwinding (a panic never silently persists a cassette).
 pub struct RecordReplayRunner<R: ProcessRunner = JobRunner> {
     mode: Mode<R>,
+    /// The opt-in stricter match policy (empty by default). Consulted on both
+    /// sides: record folds its digest onto each entry, replay recomputes it from
+    /// the live invocation — see [`MatchPolicy`].
+    policy: MatchPolicy,
 }
 
 impl<R: ProcessRunner> RecordReplayRunner<R> {
@@ -810,7 +974,57 @@ impl<R: ProcessRunner> RecordReplayRunner<R> {
                 recorded: Mutex::new(Vec::new()),
                 dirty: AtomicBool::new(false),
             },
+            policy: MatchPolicy::default(),
         }
+    }
+
+    /// Opt in to matching on the **working directory** too, on top of the
+    /// portable default (`program` + `args` + stdin digest). With this set, two
+    /// otherwise-identical invocations that ran in different working directories
+    /// key to different cassette entries instead of colliding — for a tool whose
+    /// output genuinely depends on where it runs.
+    ///
+    /// Off by default deliberately (see the type doc's "Portability of the match
+    /// key"): the default keeps a cassette recorded on a dev box replaying in a
+    /// CI workspace. Turn this on only when cwd actually changes the recorded
+    /// output, and set the **same** policy on the record and replay runner —
+    /// a policy mismatch simply misses (never serves a wrong entry). `cwd` is
+    /// stored verbatim on the entry regardless; this only adds it to the *key*
+    /// (via the entry's `match_digest`, so no new secret-bearing field appears).
+    #[must_use]
+    pub fn match_on_cwd(mut self) -> Self {
+        self.policy.match_cwd = true;
+        self
+    }
+
+    /// Opt in to matching on the **values** of the named environment variables,
+    /// on top of the portable default. With this set, two invocations of the same
+    /// `program`/`args`/stdin that differ only in one of these variables'
+    /// override value key to different entries instead of colliding on the first
+    /// recording (the collision risk documented under "Env is not part of the
+    /// match key").
+    ///
+    /// Only the *values* named here participate, and only via a **digest**: the
+    /// cassette still stores variable *names* only, never values — no env secret
+    /// reaches the file. The value compared is the command's effective override
+    /// for the variable (`env`/`env_remove`, last-write-wins, platform case
+    /// rules); a variable this command never overrides is keyed as "untouched",
+    /// distinct from a set or removed one. Names accumulate across calls and are
+    /// deduped; set the **same** names on the record and replay runner (a policy
+    /// mismatch misses rather than misserving). Unnamed variables stay excluded,
+    /// preserving portability for env differences that don't matter.
+    #[must_use]
+    pub fn match_on_env<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.policy
+            .env_names
+            .extend(names.into_iter().map(Into::into));
+        self.policy.env_names.sort();
+        self.policy.env_names.dedup();
+        self
     }
 
     /// Write the cassette now (record mode). This is the error-surfacing path
@@ -968,6 +1182,7 @@ impl RecordReplayRunner<JobRunner> {
             mode: Mode::Replay {
                 slots: Mutex::new(slots),
             },
+            policy: MatchPolicy::default(),
         })
     }
 }
@@ -985,10 +1200,19 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
             } => {
                 let invocation = Invocation::from_command(command);
                 let stdin_digest = stdin_digest_of(command);
+                // The active policy's digest (None for the portable default),
+                // folded onto the entry so replay keys on cwd/env without
+                // re-persisting the raw values.
+                let match_digest = self.policy.digest_of(&invocation);
                 match inner.output_string(command).await {
                     Ok(result) => {
                         let mut entries = recorded.lock().expect("cassette mutex poisoned");
-                        entries.push(Entry::from_parts(&invocation, &result, stdin_digest));
+                        entries.push(Entry::from_parts(
+                            &invocation,
+                            &result,
+                            stdin_digest,
+                            match_digest,
+                        ));
                         dirty.store(true, Ordering::SeqCst);
                         Ok(result)
                     }
@@ -1001,6 +1225,7 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                             entries.push(Entry::from_error(
                                 &invocation,
                                 stdin_digest,
+                                match_digest,
                                 cassette_err,
                             ));
                             dirty.store(true, Ordering::SeqCst);
@@ -1036,7 +1261,8 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 // re-enters this replayer would otherwise deadlock.
                 let entry = {
                     let mut slots = slots.lock().expect("cassette mutex poisoned");
-                    let Some(slot) = slots.get_mut(&key_of(&invocation, stdin_digest)) else {
+                    let Some(slot) = slots.get_mut(&key_of(&invocation, stdin_digest, &self.policy))
+                    else {
                         return Err(Error::CassetteMiss {
                             program: command.program_name(),
                         });
@@ -1096,12 +1322,14 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 // must stay silent or every handler/tee would fire twice.
                 let invocation = Invocation::from_command(command);
                 let stdin_digest = stdin_digest_of(command);
+                let match_digest = self.policy.digest_of(&invocation);
                 match inner
                     .output_string(&command.without_line_side_effects())
                     .await
                 {
                     Ok(result) => {
-                        let entry = Entry::from_parts(&invocation, &result, stdin_digest);
+                        let entry =
+                            Entry::from_parts(&invocation, &result, stdin_digest, match_digest);
                         {
                             let mut entries = recorded.lock().expect("cassette mutex poisoned");
                             entries.push(entry.clone());
@@ -1129,6 +1357,7 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                             entries.push(Entry::from_error(
                                 &invocation,
                                 stdin_digest,
+                                match_digest,
                                 cassette_err,
                             ));
                             dirty.store(true, Ordering::SeqCst);
@@ -1151,7 +1380,8 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 let stdin_digest = stdin_digest_of(command);
                 let entry = {
                     let mut slots = slots.lock().expect("cassette mutex poisoned");
-                    let Some(slot) = slots.get_mut(&key_of(&invocation, stdin_digest)) else {
+                    let Some(slot) = slots.get_mut(&key_of(&invocation, stdin_digest, &self.policy))
+                    else {
                         return Err(Error::CassetteMiss {
                             program: command.program_name(),
                         });
@@ -2361,5 +2591,236 @@ mod tests {
             Error::Unsupported { operation } => assert_eq!(operation, "signal(Hup)"),
             other => panic!("expected Error::Unsupported, got {other:?}"),
         }
+    }
+
+    // --- T-081: opt-in match policy (cwd / selected env values) ---
+
+    #[tokio::test]
+    async fn default_ignores_differing_env_values_without_a_policy() {
+        // Criterion (b): with NO policy set, two invocations differing only in an
+        // env value still collide on one entry — the portable default is
+        // unchanged, env is not part of the key.
+        let (_dir, path) = temp_cassette();
+        let recorder =
+            RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("from-a")));
+        let _ = recorder
+            .output_string(&Command::new("tool").env("MODE", "a"))
+            .await
+            .expect("record with MODE=a");
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load");
+        let out = replayer
+            .run(&Command::new("tool").env("MODE", "b"))
+            .await
+            .expect("default: env is not keyed, so a differing value still hits");
+        assert_eq!(out, "from-a");
+    }
+
+    #[tokio::test]
+    async fn match_on_env_makes_a_differing_value_miss_and_ignores_unnamed_vars() {
+        // Criterion (a): with the env policy on, a differing selected env value is
+        // a deliberate `CassetteMiss` instead of a silent wrong-entry replay; a
+        // variable the policy does NOT name still can't perturb the key
+        // (portability preserved for irrelevant env differences).
+        let (_dir, path) = temp_cassette();
+        let recorder =
+            RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("recorded")))
+                .match_on_env(["MODE"]);
+        let _ = recorder
+            .output_string(&Command::new("tool").env("MODE", "fast"))
+            .await
+            .expect("record MODE=fast");
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path)
+            .expect("load")
+            .match_on_env(["MODE"]);
+        let hit = replayer
+            .run(&Command::new("tool").env("MODE", "fast"))
+            .await
+            .expect("the same selected env value must replay its recording");
+        assert_eq!(hit, "recorded");
+
+        let err = replayer
+            .output_string(&Command::new("tool").env("MODE", "slow"))
+            .await
+            .expect_err("a differing selected env value must miss under the policy");
+        assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
+
+        let still_hit = replayer
+            .run(&Command::new("tool").env("MODE", "fast").env("UNRELATED", "x"))
+            .await
+            .expect("an env var the policy does not name must not perturb the key");
+        assert_eq!(still_hit, "recorded");
+    }
+
+    #[tokio::test]
+    async fn match_on_env_records_distinct_entries_per_value() {
+        // Two runs differing only in a selected env value must key to SEPARATE
+        // entries (not collide on the first recording), so each replays its own.
+        let (_dir, path) = temp_cassette();
+        let recorder = RecordReplayRunner::record(
+            &path,
+            ScriptedRunner::new()
+                .on_sequence(["tool"], [Reply::ok("out-fast\n"), Reply::ok("out-slow\n")]),
+        )
+        .match_on_env(["MODE"]);
+        let _ = recorder
+            .output_string(&Command::new("tool").env("MODE", "fast"))
+            .await
+            .expect("record fast");
+        let _ = recorder
+            .output_string(&Command::new("tool").env("MODE", "slow"))
+            .await
+            .expect("record slow");
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path)
+            .expect("load")
+            .match_on_env(["MODE"]);
+        // Replay slow FIRST: had the two collided on one key, this would wrongly
+        // return the first recording (out-fast).
+        let slow = replayer
+            .run(&Command::new("tool").env("MODE", "slow"))
+            .await
+            .expect("replay slow");
+        assert_eq!(slow, "out-slow");
+        let fast = replayer
+            .run(&Command::new("tool").env("MODE", "fast"))
+            .await
+            .expect("replay fast");
+        assert_eq!(fast, "out-fast");
+    }
+
+    #[tokio::test]
+    async fn match_on_env_never_writes_raw_values_only_a_digest() {
+        // Criterion (c): even with the env policy on, the RAW value never reaches
+        // the file — only the variable name (as always) and an opaque digest.
+        let (_dir, path) = temp_cassette();
+        let recorder =
+            RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("done")))
+                .match_on_env(["API_TOKEN"]);
+        let _ = recorder
+            .output_string(&Command::new("tool").env("API_TOKEN", "hunter2-very-secret"))
+            .await
+            .expect("record");
+        recorder.save().expect("save");
+
+        let json = std::fs::read_to_string(&path).expect("read cassette");
+        assert!(json.contains("API_TOKEN"), "the name is still stored: {json}");
+        assert!(
+            !json.contains("hunter2-very-secret"),
+            "the raw value must never be written, even under the env match policy: {json}"
+        );
+        assert!(
+            json.contains("match_digest"),
+            "the opaque policy digest is what keys the env value: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn match_on_env_distinguishes_a_set_var_from_an_untouched_one() {
+        // Under the policy, a selected variable that is SET vs left UNTOUCHED are
+        // distinct keys — not just two different set values.
+        let (_dir, path) = temp_cassette();
+        let recorder =
+            RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("with-flag")))
+                .match_on_env(["FLAG"]);
+        let _ = recorder
+            .output_string(&Command::new("tool").env("FLAG", "on"))
+            .await
+            .expect("record with FLAG set");
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path)
+            .expect("load")
+            .match_on_env(["FLAG"]);
+        let err = replayer
+            .output_string(&Command::new("tool")) // FLAG untouched
+            .await
+            .expect_err("an untouched selected var must not match a set-var recording");
+        assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn match_on_cwd_keys_on_working_directory() {
+        // The opt-in cwd policy: the same cwd replays, a differing one misses —
+        // for a tool whose output genuinely depends on where it runs. (Contrast
+        // `cwd_is_not_part_of_the_match_key`, the portable default.)
+        let (_dir, path) = temp_cassette();
+        let recorder = RecordReplayRunner::record(
+            &path,
+            ScriptedRunner::new().fallback(Reply::ok("from-dir-a")),
+        )
+        .match_on_cwd();
+        let _ = recorder
+            .output_string(&Command::new("tool").current_dir("/work/a"))
+            .await
+            .expect("record in /work/a");
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path)
+            .expect("load")
+            .match_on_cwd();
+        let hit = replayer
+            .run(&Command::new("tool").current_dir("/work/a"))
+            .await
+            .expect("the same cwd must replay under match_on_cwd");
+        assert_eq!(hit, "from-dir-a");
+        let err = replayer
+            .output_string(&Command::new("tool").current_dir("/work/b"))
+            .await
+            .expect_err("a differing cwd must miss under match_on_cwd");
+        assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_policy_keyed_cassette_replayed_without_the_policy_misses() {
+        // The policy is symmetric by contract: an entry keyed with a `match_digest`
+        // can't be matched by a no-policy replayer (digest `None`) — it misses
+        // loudly rather than serving a wrong entry. Record and replay must set the
+        // same policy.
+        let (_dir, path) = temp_cassette();
+        let recorder =
+            RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("x")))
+                .match_on_env(["MODE"]);
+        let _ = recorder
+            .output_string(&Command::new("tool").env("MODE", "a"))
+            .await
+            .expect("record under a policy");
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load"); // no policy
+        let err = replayer
+            .output_string(&Command::new("tool").env("MODE", "a"))
+            .await
+            .expect_err("a policy-keyed entry must not match a no-policy replay");
+        assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn match_on_env_names_are_order_independent() {
+        // Names accumulate + dedup, so builder-call order can't change the key:
+        // recording with [A, B] and replaying with [B, A] still matches.
+        let (_dir, path) = temp_cassette();
+        let recorder =
+            RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("ok")))
+                .match_on_env(["ALPHA", "BETA"]);
+        let _ = recorder
+            .output_string(&Command::new("tool").env("ALPHA", "1").env("BETA", "2"))
+            .await
+            .expect("record");
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path)
+            .expect("load")
+            .match_on_env(["BETA"])
+            .match_on_env(["ALPHA"]);
+        let out = replayer
+            .run(&Command::new("tool").env("ALPHA", "1").env("BETA", "2"))
+            .await
+            .expect("policy name order must not affect the key");
+        assert_eq!(out, "ok");
     }
 }
