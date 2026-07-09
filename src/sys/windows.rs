@@ -385,13 +385,24 @@ impl Job {
         // Unix-only. (A tree that wants a real shutdown handshake on Windows must
         // be signaled out-of-band — a console CTRL event, a named-pipe stop —
         // before this call.)
+        //
+        // Snapshot the re-arm generation up front — before the branch — so a
+        // `spawn`/`adopt` that re-arms the backstop concurrently with this shutdown
+        // wins over the (stale) `request` below. This body does not poll, but the
+        // caller's task can migrate across its `.await` and a spawn/adopt on another
+        // thread can still interleave between this snapshot and the request; keying
+        // the spare to the epoch makes that concurrent re-arm win (the fresh child
+        // keeps its kill-on-close backstop), matching the unix backends.
+        let epoch = self.skip_drop_kill.begin_shutdown();
         if escalate {
             self.kill_all()
         } else {
             // Mark Drop to preserve survivors; the latch makes the flag visible
             // whichever thread drops the `Job` (it may differ from the one that
             // ran graceful shutdown, e.g. after a task migrates across `.await`).
-            self.skip_drop_kill.request();
+            // Keyed to `epoch`, so a concurrent spawn/adopt re-arm wins and this
+            // spare no-ops — the fresh child is still killed on job-close.
+            self.skip_drop_kill.request(epoch);
             Ok(())
         }
     }
@@ -992,5 +1003,69 @@ mod tests {
         assert_eq!(cpu_hard_cap_rate(8.0, 4.0), 10_000);
         // A vanishingly small quota floors at 1 — the API rejects a zero rate.
         assert_eq!(cpu_hard_cap_rate(0.0001, 64.0), 1);
+    }
+}
+
+// Un-gated (`graceful_shutdown` and the latch are core, not feature-gated) so the
+// default `cargo test` exercises the Windows re-arm race — no subprocess needed.
+#[cfg(test)]
+mod rearm_race_tests {
+    use std::time::Duration;
+
+    /// Build a bare `Job`, papering over the `limits`-feature gate on `Job::new`.
+    fn new_job() -> super::Job {
+        #[cfg(feature = "limits")]
+        {
+            super::Job::new(&crate::limits::ResourceLimits::default()).expect("create a test job")
+        }
+        #[cfg(not(feature = "limits"))]
+        {
+            super::Job::new().expect("create a test job")
+        }
+    }
+
+    /// The documented reuse semantics, through the real `graceful_shutdown`
+    /// (`escalate = false`) path: with nothing racing it, the shutdown spares
+    /// survivors (Drop clears `KILL_ON_JOB_CLOSE`), and a subsequent spawn/adopt
+    /// (which calls `clear()`) re-arms the kill-on-close backstop for the newcomer.
+    #[tokio::test]
+    async fn non_escalating_shutdown_spares_then_a_rearm_re_arms() {
+        let job = new_job();
+        job.graceful_shutdown(0, Duration::ZERO, false)
+            .await
+            .expect("graceful shutdown");
+        assert!(
+            job.skip_drop_kill.is_set(),
+            "escalate=false spares survivors: Drop clears KILL_ON_JOB_CLOSE"
+        );
+        job.skip_drop_kill.clear();
+        assert!(
+            !job.skip_drop_kill.is_set(),
+            "a member that joined after the spare re-arms Drop's kill-on-close"
+        );
+    }
+
+    /// T-079 (Windows job re-arm race): a spawn/adopt that re-arms the backstop
+    /// between a non-escalating shutdown's epoch snapshot and its final `request`
+    /// must win — the stale request must not re-spare the fresh child. The Windows
+    /// `graceful_shutdown(escalate = false)` body is exactly `begin_shutdown()` …
+    /// `request(epoch)` with the concurrent spawn/adopt's `clear()` interleaving
+    /// between; this reproduces that ordering deterministically on the real `Job`'s
+    /// latch, no subprocess required.
+    #[tokio::test]
+    async fn a_concurrent_rearm_wins_over_a_stale_non_escalating_request() {
+        let job = new_job();
+        job.skip_drop_kill.clear(); // a live reused job — backstop already armed
+        // The shutdown snapshots its generation…
+        let epoch = job.skip_drop_kill.begin_shutdown();
+        // …a concurrent spawn/adopt re-arms the backstop for a fresh child…
+        job.skip_drop_kill.clear();
+        // …and only now does the shutdown's stale request land.
+        job.skip_drop_kill.request(epoch);
+        assert!(
+            !job.skip_drop_kill.is_set(),
+            "a child assigned to the job mid-shutdown must keep its kill-on-close \
+             backstop — the stale request must not re-spare it"
+        );
     }
 }

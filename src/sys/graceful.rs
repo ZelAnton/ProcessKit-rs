@@ -58,6 +58,12 @@ pub(crate) trait GracefulTarget {
 /// - `escalate`: on `true`, hard-kill any survivors once the deadline passes; on
 ///   `false`, leave them running and `request()` the `skip_drop_kill` latch so the
 ///   backend's `Drop` won't kill them either.
+///
+/// The `skip_drop_kill` spare is keyed to a generation snapshotted **before**
+/// signalling or polling: a `spawn`/`adopt` that re-arms the backstop while this
+/// shutdown is in flight (the task may migrate across the poll `.await`s and land
+/// the final `request` on another thread) bumps that generation, so the stale
+/// `request` no-ops and the freshly-spawned child keeps its Drop-kill backstop.
 pub(crate) async fn run(
     target: &impl GracefulTarget,
     skip_drop_kill: &super::SkipDropKill,
@@ -65,6 +71,10 @@ pub(crate) async fn run(
     timeout: Duration,
     escalate: bool,
 ) -> io::Result<()> {
+    // Snapshot the re-arm generation up front: any spawn/adopt that re-arms the
+    // backstop after this point must win over this shutdown's later spare, so the
+    // window has to cover the signal + poll below, not just the final `request`.
+    let epoch = skip_drop_kill.begin_shutdown();
     // Best-effort: the graceful tier proceeds to polling regardless.
     target.signal_all(signal);
     // Clamp so a `Duration::MAX`-ish timeout can't overflow the `Instant` add.
@@ -80,7 +90,9 @@ pub(crate) async fn run(
     } else if !escalate {
         // Tell Drop not to hard-kill the survivors the caller chose to leave
         // alive; the latch makes the decision visible whichever thread runs Drop.
-        skip_drop_kill.request();
+        // Keyed to `epoch`, so a spawn/adopt that re-armed mid-shutdown wins and
+        // this spare becomes a no-op — the fresh child is still torn down.
+        skip_drop_kill.request(epoch);
     }
     Ok(())
 }
@@ -342,6 +354,69 @@ mod tests {
             .expect("graceful run");
         assert_eq!(target.hard_kills.load(Ordering::Relaxed), 0, "no hard kill");
         assert!(skip.is_set(), "skip set so Drop spares survivors");
+    }
+
+    // T-079: a spawn/adopt that re-arms the backstop while a non-escalating
+    // shutdown is mid-poll must win — the shutdown's final (now stale) request
+    // must not re-spare the fresh child. Deterministic via the paused clock: the
+    // fake target re-arms the shared latch on a poll, standing in for a concurrent
+    // spawn/adopt that lands during the drain wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_concurrent_rearm_wins_over_a_stale_non_escalating_request() {
+        // A target that re-arms the shared latch on its second drain check, then
+        // keeps reporting "not drained" so the loop runs to the deadline and issues
+        // its (stale) request.
+        struct RacingRearm<'a> {
+            latch: &'a crate::sys::SkipDropKill,
+            polls: AtomicUsize,
+        }
+        impl GracefulTarget for RacingRearm<'_> {
+            fn signal_all(&self, _signal: i32) {}
+            fn is_drained(&self) -> bool {
+                if self.polls.fetch_add(1, Ordering::Relaxed) == 1 {
+                    // A concurrent spawn/adopt re-arms the backstop for a fresh
+                    // child, exactly as `ProcessGroup::spawn`/cgroup spawn would.
+                    self.latch.clear();
+                }
+                false
+            }
+            fn hard_kill(&self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let skip = crate::sys::SkipDropKill::new();
+        // A live reused group: an earlier spawn re-armed once, so the shutdown
+        // starts from a non-zero generation just like a real group.
+        skip.clear();
+        let target = RacingRearm {
+            latch: &skip,
+            polls: AtomicUsize::new(0),
+        };
+        run(&target, &skip, 15, Duration::from_millis(100), false)
+            .await
+            .expect("graceful run");
+        assert!(
+            !skip.is_set(),
+            "a spawn/adopt that re-armed mid-shutdown must not be re-spared by the \
+             shutdown's stale request — the fresh child keeps its Drop-kill backstop"
+        );
+    }
+
+    // The no-race counterpart: with nothing re-arming during the drain wait, a
+    // non-escalating shutdown still spares the survivors it set out to.
+    #[tokio::test(start_paused = true)]
+    async fn a_non_escalating_shutdown_without_a_race_still_spares() {
+        let target = FakeTarget::new(3); // alive for a few polls, then drained
+        let skip = crate::sys::SkipDropKill::new();
+        skip.clear(); // a pre-existing survivor set (non-zero generation)
+        run(&target, &skip, 15, Duration::from_secs(10), false)
+            .await
+            .expect("graceful run");
+        assert!(
+            skip.is_set(),
+            "an unraced non-escalating shutdown spares its survivors on Drop"
+        );
     }
 
     #[tokio::test]

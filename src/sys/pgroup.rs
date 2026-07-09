@@ -551,6 +551,65 @@ mod tests {
         assert!(alive, "child must survive when escalate_to_kill=false");
     }
 
+    /// T-079 (pgroup re-arm race): a `spawn`/`adopt` that re-arms the backstop
+    /// while a `graceful_shutdown(escalate=false)` is mid-poll must win — the
+    /// shutdown's final (stale) `request` must not re-spare the fresh child.
+    ///
+    /// Deterministic on the paused clock (no real subprocess): a fake
+    /// [`GracefulTarget`](crate::sys::graceful::GracefulTarget) re-arms the
+    /// ProcessGroup's **own** latch during the drain wait, standing in for the
+    /// concurrent spawn/adopt, and the real [`graceful::run`](crate::sys::graceful::run)
+    /// driver — the exact call `ProcessGroup::graceful_shutdown` makes — is exercised
+    /// against that latch. The final `is_set() == false` is the load-bearing
+    /// outcome: `ProcessGroup::drop` then SIGKILLs the tracked groups rather than
+    /// sparing the newcomer.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_request_does_not_override_a_concurrent_rearm() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RacingRearm<'a> {
+            latch: &'a crate::sys::SkipDropKill,
+            polls: AtomicUsize,
+        }
+        impl crate::sys::graceful::GracefulTarget for RacingRearm<'_> {
+            fn signal_all(&self, _signal: i32) {}
+            fn is_drained(&self) -> bool {
+                // Re-arm on the second poll (the concurrent spawn/adopt landing
+                // mid-shutdown), then keep reporting "not drained" so the driver
+                // runs to the deadline and issues its stale request.
+                if self.polls.fetch_add(1, Ordering::Relaxed) == 1 {
+                    self.latch.clear();
+                }
+                false
+            }
+            fn hard_kill(&self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let pg = ProcessGroup::new();
+        // A live reused group: its backstop is already armed by an earlier spawn.
+        pg.skip_drop_kill.clear();
+        let target = RacingRearm {
+            latch: &pg.skip_drop_kill,
+            polls: AtomicUsize::new(0),
+        };
+        crate::sys::graceful::run(
+            &target,
+            &pg.skip_drop_kill,
+            libc::SIGTERM,
+            Duration::from_millis(100),
+            false,
+        )
+        .await
+        .expect("graceful run");
+        assert!(
+            !pg.skip_drop_kill.is_set(),
+            "a child spawned/adopted mid-shutdown must keep the group's Drop-kill \
+             backstop — the stale request must not re-spare it"
+        );
+    }
+
     /// A pid that exists as a process but not as a process-group leader must
     /// not be pruned from a group-mode `Tracked` set — ESRCH on the group probe
     /// does not mean the process is gone.

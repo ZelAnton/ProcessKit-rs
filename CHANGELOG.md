@@ -18,7 +18,14 @@ to a dated version section.
 -
 
 ### Fixed
--
+- Close a re-arm race between a non-escalating `ProcessGroup::shutdown`/
+  `shutdown_ref` (`escalate_to_kill = false`) and a concurrent `start`/`adopt`.
+  A child spawned or adopted into the group while the shutdown was still in
+  flight could be silently spared by the shutdown's stale kill-on-drop request
+  and then leak as an orphan on `Drop`. The skip-on-drop latch now carries a
+  generation the re-arm bumps, so a concurrent spawn/adopt always wins and the
+  fresh child keeps its Drop-kill backstop across all three backends (POSIX
+  process group, Linux cgroup, Windows Job Object).
 
 ## [2.2.1] - 2026-07-08
 

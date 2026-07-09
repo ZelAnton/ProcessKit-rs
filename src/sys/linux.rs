@@ -943,3 +943,64 @@ mod tests {
         assert!(controllers_to_enable(&["pids"], "pids io hugetlb").is_empty());
     }
 }
+
+/// T-079 (Linux cgroup re-arm race). The cgroup arm of [`Job::graceful_shutdown`]
+/// drives the shared [`graceful::run`](crate::sys::graceful::run) with the `Job`'s
+/// own `skip_drop_kill` latch, so a `spawn`/`adopt` that re-arms the backstop while
+/// the shutdown is mid-poll must win over the shutdown's stale spare — exactly like
+/// the pgroup fallback. Deterministic on the paused clock and *not* limits-gated
+/// (so it runs in the default test config, unlike the cgroup-formatting tests
+/// above): a fake `GracefulTarget` re-arms the latch during the drain wait, standing
+/// in for the concurrent spawn/adopt without needing a real cgroup.
+#[cfg(test)]
+mod rearm_race_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// A target that re-arms the shared latch on its second drain check (the
+    /// concurrent spawn/adopt joining the cgroup), then keeps reporting "not
+    /// drained" so the driver runs to the deadline and issues its stale request.
+    struct RacingRearm<'a> {
+        latch: &'a crate::sys::SkipDropKill,
+        polls: AtomicUsize,
+    }
+    impl crate::sys::graceful::GracefulTarget for RacingRearm<'_> {
+        fn signal_all(&self, _signal: i32) {}
+        fn is_drained(&self) -> bool {
+            if self.polls.fetch_add(1, Ordering::Relaxed) == 1 {
+                self.latch.clear();
+            }
+            false
+        }
+        fn hard_kill(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_request_does_not_override_a_concurrent_rearm() {
+        // Models the cgroup `Job`: a non-escalating shutdown driving the shared
+        // graceful driver against the Job's own `skip_drop_kill`.
+        let skip = crate::sys::SkipDropKill::new();
+        skip.clear(); // a live reused group — backstop already armed
+        let target = RacingRearm {
+            latch: &skip,
+            polls: AtomicUsize::new(0),
+        };
+        crate::sys::graceful::run(
+            &target,
+            &skip,
+            libc::SIGTERM,
+            Duration::from_millis(100),
+            false,
+        )
+        .await
+        .expect("graceful run");
+        assert!(
+            !skip.is_set(),
+            "a child that joined the cgroup mid-shutdown must keep its Drop-kill \
+             backstop — the stale request must not re-spare it (Job::drop then \
+             cgroup.kill's the tree)"
+        );
+    }
+}

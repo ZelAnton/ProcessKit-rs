@@ -533,9 +533,12 @@ impl ProcessGroup {
     /// survivors when [`escalate_to_kill`](ProcessGroupOptions::escalate_to_kill)
     /// is set; on Windows the kill is atomic and the timeout is ignored. The group
     /// stays usable afterwards (a re-`shutdown_ref` on an already-drained tree is a
-    /// near no-op). Spawning a new child **re-arms** `Drop`'s kill backstop for the
-    /// whole group, so a straggler started after this shutdown is still torn down
-    /// on `Drop`; a group left untouched keeps the survivors an
+    /// near no-op). Spawning or adopting a new child **re-arms** `Drop`'s kill
+    /// backstop for the whole group, so a straggler started after — or
+    /// *concurrently with* — this shutdown is still torn down on `Drop`: a
+    /// non-escalating shutdown that is still in flight when the child joins cannot
+    /// silently strip the newcomer of its backstop (its spare is keyed to a
+    /// generation the join bumps). A group left untouched keeps the survivors an
     /// [`escalate_to_kill`](ProcessGroupOptions::escalate_to_kill)` = false`
     /// shutdown chose to spare.
     ///
