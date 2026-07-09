@@ -301,42 +301,40 @@ async fn stdout_null_makes_capture_verbs_error_but_discard_verbs_run() {
     );
 }
 
-// stdout_tee: each decoded line is written to the sink *and* still captured.
-// A shared in-memory sink lets the test read back what the tee received without
-// depending on file-handle flush/close timing.
+#[derive(Clone)]
+struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl tokio::io::AsyncWrite for SharedSink {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.0.lock().expect("sink mutex").extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+// A BufWriter keeps this data out of SharedSink until the pump explicitly
+// flushes the tee; dropping a tokio BufWriter cannot perform an async flush.
 #[tokio::test]
 #[ignore = "spawns a real subprocess"]
-async fn stdout_tee_writes_to_the_sink_while_capturing() {
-    // An in-memory `tokio::io::AsyncWrite` sink shared with the test, so it can
-    // read back what the tee received without depending on file flush/close.
-    #[derive(Clone)]
-    struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl tokio::io::AsyncWrite for SharedSink {
-        fn poll_write(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            self.0.lock().expect("sink mutex").extend_from_slice(buf);
-            std::task::Poll::Ready(Ok(buf.len()))
-        }
-        fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-        fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-    }
-
+async fn stdout_buffered_tee_flushes_while_capturing() {
     let sink = SharedSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
     let result = two_line_echo()
-        .stdout_tee(sink.clone())
+        .stdout_tee(tokio::io::BufWriter::with_capacity(4096, sink.clone()))
         .output_string()
         .await
         .expect("a stdout_tee run completes");
@@ -352,6 +350,33 @@ async fn stdout_tee_writes_to_the_sink_while_capturing() {
     assert!(
         teed.contains("first") && teed.contains("second"),
         "tee sink must receive both lines: {teed:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess"]
+async fn stderr_buffered_tee_flushes_while_capturing() {
+    let sink = SharedSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let command = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo err 1>&2"])
+    } else {
+        Command::new("sh").args(["-c", "echo err 1>&2"])
+    };
+    let result = command
+        .stderr_tee(tokio::io::BufWriter::with_capacity(4096, sink.clone()))
+        .output_string()
+        .await
+        .expect("a stderr_tee run completes");
+
+    assert!(
+        result.stderr().contains("err"),
+        "capture must still see stderr: {:?}",
+        result.stderr()
+    );
+    let teed = String::from_utf8(sink.0.lock().expect("sink mutex").clone()).expect("tee is utf-8");
+    assert!(
+        teed.contains("err"),
+        "tee sink must receive stderr: {teed:?}"
     );
 }
 

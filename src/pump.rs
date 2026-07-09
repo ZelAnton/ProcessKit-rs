@@ -1965,6 +1965,30 @@ mod tests {
         Arc::new(tokio::sync::Mutex::new(Box::new(sink)))
     }
 
+    async fn assert_buffered_tee_flushes_after_read_error(stream: &str) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let buffered = tokio::io::BufWriter::with_capacity(1024, VecSink(buf.clone()));
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            ChunkedReader::erroring([b"complete\npartial".to_vec()]),
+            StreamConfig {
+                encoding: encoding_rs::UTF_8,
+                handler: None,
+                tee: Some(tee_of(buffered)),
+                terminator: LineTerminator::Newline,
+            },
+            sink.clone(),
+        )
+        .await;
+
+        assert_eq!(sink.drain(), vec!["complete", "partial"]);
+        assert_eq!(
+            &*buf.lock().unwrap(),
+            b"complete\npartial\n",
+            "{stream} tee must flush through its buffering writer after a read error"
+        );
+    }
+
     #[tokio::test]
     async fn tee_writes_each_decoded_line_plus_newline_to_the_async_sink() {
         // The async tee receives every decoded line followed by '\n', while
@@ -2029,6 +2053,60 @@ mod tests {
             sink.drain(),
             vec!["a", "b", "c"],
             "capture survives a tee write error"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdout_buffered_tee_flushes_after_read_error() {
+        assert_buffered_tee_flushes_after_read_error("stdout").await;
+    }
+
+    #[tokio::test]
+    async fn stderr_buffered_tee_flushes_after_read_error() {
+        assert_buffered_tee_flushes_after_read_error("stderr").await;
+    }
+
+    #[tokio::test]
+    async fn tee_flush_error_is_isolated_and_capture_completes() {
+        struct FlushErrSink;
+        impl tokio::io::AsyncWrite for FlushErrSink {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("nope")))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"a\nb\n"[..],
+            StreamConfig {
+                encoding: encoding_rs::UTF_8,
+                handler: None,
+                tee: Some(tee_of(FlushErrSink)),
+                terminator: LineTerminator::Newline,
+            },
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            sink.drain(),
+            vec!["a", "b"],
+            "capture survives a tee flush error"
         );
     }
 
