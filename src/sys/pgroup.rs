@@ -1213,6 +1213,12 @@ mod tests {
             unsafe { libc::kill(-pid, 0) } == 0,
             "the child must lead its own group"
         );
+        // Let the shell finish executing `trap '' TERM` before we signal it —
+        // without this settle window a SIGTERM can race the trap installation
+        // and kill the child under its still-default disposition, exactly as
+        // `escalate_false_does_not_kill_survivors` above already guards against
+        // for the same spawn pattern.
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Real capture: `track` reads the live leader's identity itself.
         tracked.track(pid, true);
