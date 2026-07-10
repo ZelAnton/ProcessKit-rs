@@ -316,6 +316,22 @@ impl RunningProcess {
                 });
             }
         }
+        // A first OS read error on either pipe means an incomplete capture:
+        // surface it as `Error::Io` rather than a silently-short "success". Unlike
+        // the overflow check above (skipped for a bare finish's discarded stdout,
+        // which the caller never asked to capture), a read error is an OS-level
+        // failure of the child's pipe, so it is surfaced for the streamed and the
+        // bare-finish (discarded) stdout alike — matching `wait`. A broken-pipe
+        // read was already folded into a clean EOF by the pump, so a normal
+        // writer-closed stream never trips this.
+        for sink in [self.stdout_sink.as_ref(), self.stderr_sink.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(source) = sink.take_read_error() {
+                return Err(crate::Error::Io(source));
+            }
+        }
         // `dropped()` = lines the buffer policy discarded from the background
         // stderr drain, not lines this call itself failed to observe — matches
         // the same signal `output_string`/`output_bytes` derive `truncated` from.
@@ -707,6 +723,35 @@ mod tests {
     use super::*;
     use crate::buffer::OutputBufferPolicy;
     use tokio_stream::StreamExt;
+
+    /// T-087: after a streamed stdout hit an OS read error mid-stream, the
+    /// streaming consumer wakes and ends (the sink closes), and the consuming
+    /// `finish` reports the cause as `Error::Io` — not a silently-short success.
+    /// The recorded error stands in for one a real pump would set (the pump seam
+    /// is covered in `pump.rs`).
+    #[tokio::test]
+    async fn finish_surfaces_a_recorded_stream_read_error_as_io() {
+        use crate::command::Command;
+        use crate::doubles::{Reply, ScriptedRunner};
+        use crate::runner::ProcessRunner;
+
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok(""))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+        // Stream stdout (takes the reader, installs the stdout sink) then drop the
+        // consumer, as `first_line`-style code does once the stream ends.
+        drop(run.stdout_lines().expect("stdout_lines"));
+        run.stdout_sink
+            .as_ref()
+            .expect("streaming installed the stdout sink")
+            .set_read_error(std::io::Error::other("stream read boom"));
+        match run.finish().await {
+            Err(crate::Error::Io(e)) => assert_eq!(e.to_string(), "stream read boom"),
+            other => panic!("expected Err(Io) for an incomplete streamed capture, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn output_events_interleaves_fairly_between_two_ready_streams() {

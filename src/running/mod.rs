@@ -23,7 +23,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
 
-use crate::buffer::{OutputBufferPolicy, clamp_dropoldest_tail, push_capped_bytes};
+use crate::buffer::{OutputBufferPolicy, OverflowMode, clamp_dropoldest_tail, push_capped_bytes};
 use crate::error::Error;
 use crate::error::Result;
 use crate::group::ProcessGroup;
@@ -610,44 +610,26 @@ impl RunningProcess {
         // bounded teardown below can read them even if it has to abort the task.
         let stdout_cap = self.buffer.max_bytes;
         let stdout_mode = self.buffer.overflow;
-        let stdout_seen = Arc::new(AtomicUsize::new(0));
-        let stdout_overflowed = Arc::new(AtomicBool::new(false));
-        let stdout_truncated = Arc::new(AtomicBool::new(false));
-        let mut stdout_pipe = self.backend.take_stdout_reader();
+        // Shared signals the raw drain writes and the bounded teardown reads even if
+        // it has to abort the task — including the first non-broken-pipe OS read
+        // error, so an incomplete byte capture surfaces as `Error::Io` below rather
+        // than a silently-truncated `Ok(ProcessResult)` prefix.
+        let signals = RawStdoutSignals {
+            seen: Arc::new(AtomicUsize::new(0)),
+            overflowed: Arc::new(AtomicBool::new(false)),
+            truncated: Arc::new(AtomicBool::new(false)),
+            read_error: Arc::new(std::sync::Mutex::new(None)),
+        };
+        let stdout_pipe = self.backend.take_stdout_reader();
         let out_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-        self.stdout_pump = Some({
-            let out_buf = out_buf.clone();
-            let stdout_seen = stdout_seen.clone();
-            let stdout_overflowed = stdout_overflowed.clone();
-            let stdout_truncated = stdout_truncated.clone();
-            tokio::spawn(async move {
-                if let Some(pipe) = &mut stdout_pipe {
-                    let mut chunk = [0u8; 8 * 1024];
-                    loop {
-                        match pipe.read(&mut chunk).await {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                stdout_seen.fetch_add(n, Ordering::Relaxed);
-                                let mut guard = out_buf.lock().expect("stdout buffer poisoned");
-                                push_capped_bytes(
-                                    &mut guard,
-                                    &chunk[..n],
-                                    stdout_cap,
-                                    stdout_mode,
-                                    &stdout_overflowed,
-                                    &stdout_truncated,
-                                );
-                            }
-                            Err(_e) => {
-                                // Read error: keep partial capture, surface via tracing.
-                                #[cfg(feature = "tracing")]
-                                tracing::warn!(target: "processkit", error = %_e, "stdout read error; ending byte capture early");
-                                break;
-                            }
-                        }
-                    }
-                }
-            })
+        self.stdout_pump = stdout_pipe.map(|pipe| {
+            tokio::spawn(pump_raw_bytes(
+                pipe,
+                out_buf.clone(),
+                stdout_cap,
+                stdout_mode,
+                signals.clone(),
+            ))
         });
 
         let outcome = self.drive_to_exit().await?;
@@ -678,13 +660,13 @@ impl RunningProcess {
         // A raw-stdout fail-loud (Error mode) byte overflow surfaces first, like
         // the stderr line ceiling below. Raw stdout has no lines, so report only
         // the byte ceiling that actually fired (`max_lines: None`).
-        if stdout_overflowed.load(Ordering::Relaxed) {
+        if signals.overflowed.load(Ordering::Relaxed) {
             return Err(crate::Error::OutputTooLarge {
                 program: self.program.clone(),
                 max_lines: None,
                 max_bytes: self.buffer.max_bytes,
                 total_lines: 0,
-                total_bytes: stdout_seen.load(Ordering::Relaxed),
+                total_bytes: signals.seen.load(Ordering::Relaxed),
             });
         }
         if stderr_sink.overflowed() {
@@ -697,8 +679,27 @@ impl RunningProcess {
             });
         }
 
+        // An incomplete capture from a first OS read error on either stream
+        // surfaces as `Error::Io` — a short raw-stdout prefix (or a truncated
+        // stderr) is not a full success. Checked after the overflow ceilings (the
+        // more specific signal if both fire) and after `checked_outcome`
+        // (cancellation wins). A timeout closes the pipe with a *clean* EOF, not a
+        // read error, so the documented best-effort-prefix-on-timeout contract is
+        // unaffected; on the teardown-abort path the signal is best-effort.
+        if let Some(source) = signals
+            .read_error
+            .lock()
+            .expect("stdout read-error slot poisoned")
+            .take()
+        {
+            return Err(Error::Io(source));
+        }
+        if let Some(source) = stderr_sink.take_read_error() {
+            return Err(Error::Io(source));
+        }
+
         let stderr_lines = stderr_sink.drain();
-        let truncated = stdout_truncated.load(Ordering::Relaxed) || stderr_sink.dropped() > 0;
+        let truncated = signals.truncated.load(Ordering::Relaxed) || stderr_sink.dropped() > 0;
         let duration = self.started.elapsed();
         Ok(ProcessResult::new(
             self.program.clone(),
@@ -711,7 +712,8 @@ impl RunningProcess {
         .with_truncated(truncated)
         .with_overflow_totals(
             stderr_sink.count(),
-            stdout_seen
+            signals
+                .seen
                 .load(Ordering::Relaxed)
                 .saturating_add(stderr_sink.seen_bytes()),
         )
@@ -1027,6 +1029,20 @@ impl RunningProcess {
                         total_bytes: sink.seen_bytes(),
                     });
                 }
+            }
+        }
+
+        // A first OS read error on either pipe means the capture is incomplete:
+        // surface it as `Error::Io` for the capturing (`output_string`) and the
+        // discard (`wait`/`profile`) paths alike, rather than reporting a
+        // silently-short read as a full success. Checked after the fail-loud
+        // overflow ceiling (the more specific signal if both fire) and after
+        // `checked_outcome` (so cancellation/stdin priority is preserved); a
+        // broken-pipe read was already folded into a clean EOF by the pump, so a
+        // normal writer-closed stream never trips this.
+        for sink in [&stdout_sink, &stderr_sink] {
+            if let Some(source) = sink.take_read_error() {
+                return Err(Error::Io(source));
             }
         }
 
@@ -1641,10 +1657,13 @@ impl Drop for RunningProcess {
     }
 }
 
-/// Whether `e` is the routine pipe-closed write error — `BrokenPipe`, plus the
-/// raw Windows encodings (`ERROR_BROKEN_PIPE` = 109, `ERROR_NO_DATA` = 232)
-/// that don't always map to the kind.
-fn is_broken_pipe(e: &std::io::Error) -> bool {
+/// Whether `e` is the routine pipe-closed error — `BrokenPipe`, plus the raw
+/// Windows encodings (`ERROR_BROKEN_PIPE` = 109, `ERROR_NO_DATA` = 232) that
+/// don't always map to the kind. Used on the stdin *write* side (a child that
+/// closed stdin early is not a failure) and on the stdout/stderr *read* side (a
+/// writer-closed read is the normal end of a stream, not an incomplete capture),
+/// so it is shared with [`crate::pump`].
+pub(crate) fn is_broken_pipe(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::BrokenPipe || matches!(e.raw_os_error(), Some(109 | 232))
 }
 
@@ -1698,6 +1717,76 @@ async fn gated_reap(
 async fn gated_reap_and_retire(gate: Arc<PidGate>, mut child: Child) {
     let _ = gated_reap(&gate, &mut child).await;
     gate.retire();
+}
+
+/// The shared signals the raw stdout byte drain ([`pump_raw_bytes`]) writes and
+/// [`RunningProcess::output_bytes`] reads after teardown — bytes seen, the two
+/// byte-cap overflow flags, and the first OS read error. Bundled (all `Arc`) so
+/// the detached drain task and the finisher share one set (and so the seam stays
+/// within a sane argument count).
+#[derive(Clone)]
+struct RawStdoutSignals {
+    /// Cumulative bytes read, including any dropped past a byte cap.
+    seen: Arc<AtomicUsize>,
+    /// Set when an [`OverflowMode::Error`] byte ceiling is breached.
+    overflowed: Arc<AtomicBool>,
+    /// Set when a drop-mode byte cap discarded bytes (the truncation signal).
+    truncated: Arc<AtomicBool>,
+    /// The first non-broken-pipe OS read error, surfaced as [`Error::Io`].
+    read_error: Arc<std::sync::Mutex<Option<std::io::Error>>>,
+}
+
+/// Drain a child's **raw** stdout bytes into `out_buf`, honoring the byte
+/// ceiling (`cap`/`mode`) and updating the shared `signals` (bytes seen, the two
+/// overflow flags, and the first non-broken-pipe OS read error) so
+/// [`RunningProcess::output_bytes`] can surface an incomplete capture as
+/// [`Error::Io`] instead of a silently-short prefix. The raw (non-line) analogue
+/// of [`pump_lines_core`](crate::pump)'s read loop, extracted as a seam so the
+/// read-error / broken-pipe / clean-EOF classification is unit-testable without a
+/// live child. A broken-pipe read (the writer closing) is the normal end of a
+/// stream and ends the drain cleanly, recording no error.
+async fn pump_raw_bytes<R>(
+    mut reader: R,
+    out_buf: Arc<std::sync::Mutex<Vec<u8>>>,
+    cap: Option<usize>,
+    mode: OverflowMode,
+    signals: RawStdoutSignals,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                signals.seen.fetch_add(n, Ordering::Relaxed);
+                let mut guard = out_buf.lock().expect("stdout buffer poisoned");
+                push_capped_bytes(
+                    &mut guard,
+                    &chunk[..n],
+                    cap,
+                    mode,
+                    &signals.overflowed,
+                    &signals.truncated,
+                );
+            }
+            // Broken pipe = the writer end closed = the normal end of a child
+            // stream (std already maps it to `Ok(0)`; this is a defensive net):
+            // end cleanly, recording no error.
+            Err(e) if is_broken_pipe(&e) => break,
+            Err(e) => {
+                // Keep the partial prefix already captured, but record the error so
+                // the consuming finisher reports the incomplete capture.
+                #[cfg(feature = "tracing")]
+                tracing::warn!(target: "processkit", error = %e, "stdout read error; ending byte capture early");
+                *signals
+                    .read_error
+                    .lock()
+                    .expect("stdout read-error slot poisoned") = Some(e);
+                break;
+            }
+        }
+    }
 }
 
 /// Await the output pumps, bounded by [`PUMP_TEARDOWN`]; abort stragglers.
@@ -2312,5 +2401,147 @@ mod tests {
             run.wait().await.is_ok(),
             "discard verbs do not require a piped stdout"
         );
+    }
+
+    // --- T-087: raw `output_bytes` read-error seam --------------------------
+
+    /// A reader that yields predefined byte chunks one `poll_read` at a time, then
+    /// either EOFs or returns one IO error — the raw-bytes analogue of `pump.rs`'s
+    /// `ChunkedReader`, exercising [`pump_raw_bytes`]'s read-error / clean-EOF /
+    /// broken-pipe classification deterministically without a live child.
+    struct RawChunkedReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        err_at_end: Option<std::io::Error>,
+    }
+
+    impl RawChunkedReader {
+        fn new(
+            chunks: impl IntoIterator<Item = Vec<u8>>,
+            err_at_end: Option<std::io::Error>,
+        ) -> Self {
+            Self {
+                chunks: chunks.into_iter().collect(),
+                err_at_end,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for RawChunkedReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if let Some(chunk) = self.chunks.pop_front() {
+                let n = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..n]);
+                if n < chunk.len() {
+                    self.chunks.push_front(chunk[n..].to_vec());
+                }
+                std::task::Poll::Ready(Ok(()))
+            } else if let Some(err) = self.err_at_end.take() {
+                std::task::Poll::Ready(Err(err))
+            } else {
+                std::task::Poll::Ready(Ok(())) // 0 bytes filled == EOF
+            }
+        }
+    }
+
+    /// Drive [`pump_raw_bytes`] over `reader` under the default unbounded policy,
+    /// returning `(captured_bytes, recorded_read_error)`.
+    async fn drive_pump_raw_bytes(reader: RawChunkedReader) -> (Vec<u8>, Option<std::io::Error>) {
+        let out_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let signals = RawStdoutSignals {
+            seen: Arc::new(AtomicUsize::new(0)),
+            overflowed: Arc::new(AtomicBool::new(false)),
+            truncated: Arc::new(AtomicBool::new(false)),
+            read_error: Arc::new(std::sync::Mutex::new(None)),
+        };
+        pump_raw_bytes(
+            reader,
+            out_buf.clone(),
+            None,
+            OverflowMode::DropOldest,
+            signals.clone(),
+        )
+        .await;
+        let bytes = std::mem::take(&mut *out_buf.lock().unwrap());
+        let err = signals.read_error.lock().unwrap().take();
+        (bytes, err)
+    }
+
+    #[tokio::test]
+    async fn pump_raw_bytes_records_a_mid_stream_error_and_keeps_the_prefix() {
+        let (bytes, err) = drive_pump_raw_bytes(RawChunkedReader::new(
+            [b"partial".to_vec()],
+            Some(std::io::Error::other("boom")),
+        ))
+        .await;
+        assert_eq!(
+            bytes, b"partial",
+            "the prefix read before the error is kept"
+        );
+        assert!(
+            err.is_some(),
+            "the raw stdout OS read error is recorded for output_bytes to surface as Error::Io"
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_raw_bytes_clean_eof_records_no_error() {
+        let (bytes, err) = drive_pump_raw_bytes(RawChunkedReader::new(
+            [b"all".to_vec(), b"good".to_vec()],
+            None,
+        ))
+        .await;
+        assert_eq!(bytes, b"allgood");
+        assert!(err.is_none(), "a clean EOF is a complete capture");
+    }
+
+    #[tokio::test]
+    async fn pump_raw_bytes_treats_a_broken_pipe_read_as_clean_eof() {
+        let (bytes, err) = drive_pump_raw_bytes(RawChunkedReader::new(
+            [b"done".to_vec()],
+            Some(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        ))
+        .await;
+        assert_eq!(bytes, b"done", "the prefix is kept");
+        assert!(
+            err.is_none(),
+            "a broken-pipe read is the normal writer-closed end, not an incomplete capture"
+        );
+    }
+
+    // --- T-087: consuming finishers surface a recorded read error -----------
+
+    /// The capturing line finisher (`output_string`, via `finish_lines`) surfaces
+    /// a recorded stdout read error as `Error::Io` rather than a silently-short
+    /// `Ok(ProcessResult)`. The sink stands in for one a pump populated (the pump
+    /// seam is covered in `pump.rs`); a clean-EOF sink carries no error, so a
+    /// normal run is unaffected — the other tests here exercise that path.
+    #[tokio::test]
+    async fn output_string_surfaces_a_recorded_read_error_as_io() {
+        let mut run = scripted_handle(&[0]).await; // Reply::ok("") -> empty, exit 0
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        sink.set_read_error(std::io::Error::other("stdout read boom"));
+        run.stdout_sink = Some(sink);
+        match run.output_string().await {
+            Err(Error::Io(e)) => assert_eq!(e.to_string(), "stdout read boom"),
+            other => panic!("expected Err(Io) for an incomplete capture, got {other:?}"),
+        }
+    }
+
+    /// The discard finisher (`wait`, also via `finish_lines`) likewise classifies
+    /// an incomplete stderr capture as `Error::Io`, not a silent success.
+    #[tokio::test]
+    async fn wait_surfaces_a_recorded_read_error_as_io() {
+        let mut run = scripted_handle(&[0]).await;
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        sink.set_read_error(std::io::Error::other("stderr read boom"));
+        run.stderr_sink = Some(sink);
+        match run.wait().await {
+            Err(Error::Io(e)) => assert_eq!(e.to_string(), "stderr read boom"),
+            other => panic!("expected Err(Io) for an incomplete capture, got {other:?}"),
+        }
     }
 }

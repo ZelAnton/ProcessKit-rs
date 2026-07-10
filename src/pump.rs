@@ -32,6 +32,16 @@ pub(crate) struct SharedLines {
     /// under an unbounded policy, so `output_string` after partial streaming is
     /// not falsely reported as truncated.
     dropped: AtomicUsize,
+    /// The first OS read error the pump hit while draining this stream, if any.
+    /// Set once by [`pump_lines_core`] just before it closes the sink; a clean
+    /// EOF (or a broken-pipe read, treated as EOF) leaves it `None`. A consuming
+    /// finisher reads it (via [`take_read_error`](Self::take_read_error)) after
+    /// the pump joins and surfaces an incomplete capture as
+    /// [`Error::Io`](crate::Error::Io) instead of a silent short read reported as
+    /// a full, successful capture. Its own `Mutex` (not `Inner`'s) so the hot
+    /// `push` path is untouched; poison is recovered rather than propagated,
+    /// matching [`close`](Self::close).
+    read_error: Mutex<Option<std::io::Error>>,
 }
 
 struct Inner {
@@ -120,6 +130,7 @@ impl SharedLines {
             notify: Notify::new(),
             count: AtomicUsize::new(0),
             dropped: AtomicUsize::new(0),
+            read_error: Mutex::new(None),
         })
     }
 
@@ -286,6 +297,31 @@ impl SharedLines {
         self.dropped.load(Ordering::Relaxed)
     }
 
+    /// Record the first OS read error the pump hit while draining the stream —
+    /// the incomplete-capture signal a consuming finisher turns into
+    /// [`Error::Io`](crate::Error::Io). Only the *first* error is kept (a later
+    /// one is ignored); a clean EOF, or a broken-pipe read treated as EOF, records
+    /// nothing. Poison-tolerant, like [`close`](Self::close), because it runs on
+    /// the pump task's normal *and* unwind exit paths.
+    pub(crate) fn set_read_error(&self, err: std::io::Error) {
+        let mut slot = self.read_error.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_none() {
+            *slot = Some(err);
+        }
+    }
+
+    /// Take the recorded OS read error, if any. Consumes it (by value — a
+    /// `std::io::Error` is not `Clone`), so a consuming finisher calls it once
+    /// after the pump has joined and wraps a `Some` in
+    /// [`Error::Io`](crate::Error::Io); `None` means the stream drained to a clean
+    /// EOF and the capture is complete.
+    pub(crate) fn take_read_error(&self) -> Option<std::io::Error> {
+        self.read_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+    }
+
     /// Whether the `OverflowMode::Error` ceiling was hit during pumping.
     /// Always `false` for `DropOldest`/`DropNewest` buffers.
     pub(crate) fn overflowed(&self) -> bool {
@@ -431,8 +467,13 @@ pub(crate) async fn pump_lines_term<R>(
 
 /// Drain `reader` into `sink` line by line, decoding text with `encoding`,
 /// invoking `handler` (if any) and writing each line to `tee` (if any). Always
-/// reads to EOF so the child never blocks on a full pipe; on an IO error it
-/// flushes what it has and closes the sink.
+/// reads to EOF so the child never blocks on a full pipe; on an OS read error it
+/// flushes what it has, **records the error on the sink**
+/// ([`set_read_error`](SharedLines::set_read_error)) so a consuming finisher can
+/// surface the incomplete capture as [`Error::Io`](crate::Error::Io) rather than
+/// a silent short read, and closes the sink. A broken-pipe read (the writer end
+/// closing) is the normal end of a stream and is treated as a clean EOF, not an
+/// error.
 ///
 /// A **panicking handler does not poison the run**: the panic is caught, the
 /// handler is disabled for the rest of the run (and the fact surfaced as a
@@ -640,12 +681,21 @@ where
         // pump, but only a clean EOF signals the decoder's end-of-stream flush. On
         // an error we pass `last = false` so a trailing *incomplete* multibyte
         // sequence (truncated by the error) is dropped, not fabricated into a
-        // phantom replacement char / final line.
-        let (n, eof, errored) = match reader.read(&mut chunk).await {
-            Ok(0) => (0, true, false),
-            Ok(n) => (n, false, false),
-            Err(_) => (0, true, true),
+        // phantom replacement char / final line — and the error itself is recorded
+        // on the sink at stream end (below) so a consuming finisher surfaces the
+        // incomplete capture instead of a silent short read.
+        let (n, eof, read_err) = match reader.read(&mut chunk).await {
+            Ok(0) => (0, true, None),
+            Ok(n) => (n, false, None),
+            // A broken-pipe read means the writer end closed — the normal end of a
+            // child stream. Rust's std already maps this to `Ok(0)` on both Unix
+            // (EOF) and Windows (`ERROR_BROKEN_PIPE`), so this arm is a defensive
+            // net for any reader that ever surfaces it as an error: treat it
+            // exactly like a clean EOF, never an incomplete-capture error.
+            Err(e) if crate::running::is_broken_pipe(&e) => (0, true, None),
+            Err(e) => (0, true, Some(e)),
         };
+        let errored = read_err.is_some();
         let last = eof && !errored;
         // Reserve the decoder's worst-case output up front so `decode_to_string`
         // (which uses the `String`'s spare capacity as its output limit, never
@@ -756,6 +806,13 @@ where
                 use tokio::io::AsyncWriteExt;
                 let _ = t.lock().await.flush().await;
             }
+            if let Some(e) = read_err {
+                // Record the OS read error AFTER flushing the partial tail (so the
+                // already-decoded prefix is still delivered) and before the sink
+                // closes, so a finisher that joins this pump surfaces the
+                // incomplete capture as `Error::Io`.
+                sink.0.set_read_error(e);
+            }
             break;
         }
     }
@@ -770,7 +827,9 @@ where
 #[cfg(any(test, fuzzing))]
 struct ChunkedReader {
     chunks: VecDeque<Vec<u8>>,
-    err_at_end: bool,
+    /// One-shot error emitted once the chunks drain (`take`n on first hit), then
+    /// the reader EOFs like `new`. `None` = drain straight to a clean EOF.
+    err_at_end: Option<std::io::Error>,
 }
 
 #[cfg(any(test, fuzzing))]
@@ -778,15 +837,23 @@ impl ChunkedReader {
     fn new(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
         Self {
             chunks: chunks.into_iter().collect(),
-            err_at_end: false,
+            err_at_end: None,
         }
     }
 
     #[allow(dead_code, reason = "only exercised by the hand-written unit tests")]
     fn erroring(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        Self::erroring_with(chunks, std::io::Error::other("boom"))
+    }
+
+    /// Like [`erroring`](Self::erroring) but with a caller-chosen error, so a test
+    /// can drive a specific `ErrorKind` (e.g. `BrokenPipe`, to prove the pump
+    /// treats a writer-closed read as a clean EOF, not an incomplete capture).
+    #[allow(dead_code, reason = "only exercised by the hand-written unit tests")]
+    fn erroring_with(chunks: impl IntoIterator<Item = Vec<u8>>, err: std::io::Error) -> Self {
         Self {
             chunks: chunks.into_iter().collect(),
-            err_at_end: true,
+            err_at_end: Some(err),
         }
     }
 }
@@ -805,9 +872,8 @@ impl AsyncRead for ChunkedReader {
                 self.chunks.push_front(chunk[n..].to_vec());
             }
             std::task::Poll::Ready(Ok(()))
-        } else if self.err_at_end {
-            self.err_at_end = false;
-            std::task::Poll::Ready(Err(std::io::Error::other("boom")))
+        } else if let Some(err) = self.err_at_end.take() {
+            std::task::Poll::Ready(Err(err))
         } else {
             std::task::Poll::Ready(Ok(())) // 0 bytes filled == EOF
         }
@@ -1253,6 +1319,10 @@ mod tests {
         pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
         assert_eq!(sink.count(), 2, "the partial tail still counts");
         assert_eq!(sink.drain(), vec!["done", "part"]);
+        assert!(
+            sink.take_read_error().is_some(),
+            "the OS read error is recorded on the sink for a consuming finisher"
+        );
     }
 
     #[tokio::test]
@@ -1632,6 +1702,100 @@ mod tests {
             "the truncated lead byte produces no phantom line"
         );
         assert_eq!(sink.count(), 1);
+        assert!(
+            sink.take_read_error().is_some(),
+            "the read error is recorded even though the truncated multibyte tail is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_eof_records_no_read_error() {
+        // A stream that drains to a normal EOF is a complete capture: the sink must
+        // carry no read error, so a finisher reports success rather than
+        // `Error::Io` — the non-regression guard against a false-positive read error.
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(&b"a\nb\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(sink.drain(), vec!["a", "b"]);
+        assert!(
+            sink.take_read_error().is_none(),
+            "a clean EOF is a complete capture, not an incomplete one"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_error_on_a_line_boundary_keeps_the_line_and_records_the_error() {
+        // The error lands exactly on a line boundary (a complete "done\n", no
+        // partial tail): the completed line is retained AND the read error is
+        // recorded — a boundary-aligned error is still an incomplete capture, since
+        // lines past it may have been lost.
+        let reader = ChunkedReader::erroring([b"done\n".to_vec()]);
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(sink.drain(), vec!["done"], "the completed line is retained");
+        assert!(
+            sink.take_read_error().is_some(),
+            "even a boundary-aligned read error is recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn broken_pipe_read_is_treated_as_clean_eof_not_an_incomplete_capture() {
+        // A `BrokenPipe` read (the writer end closing) is the normal end of a child
+        // stream — std maps it to `Ok(0)` already, but the pump also defensively
+        // folds it into a clean EOF: the buffered line is delivered and NO read
+        // error is recorded, so a normal writer-closed stream never spuriously
+        // reports `Error::Io`.
+        let reader = ChunkedReader::erroring_with(
+            [b"tail\n".to_vec()],
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+        );
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(sink.drain(), vec!["tail"]);
+        assert!(
+            sink.take_read_error().is_none(),
+            "a broken-pipe read is the normal end of a stream, not an incomplete capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_read_errors_on_both_streams_are_each_recorded() {
+        // A read error on one stream must not stop the other from draining and
+        // recording its own: two pumps run concurrently, each errors, and each sink
+        // independently flushes its tail, records its error, and closes — no
+        // deadlock, no cross-contamination (the "simultaneous error on the second
+        // stream" case).
+        let out_sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        let err_sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        let out = tokio::spawn(pump_lines(
+            ChunkedReader::erroring([b"o1\no2".to_vec()]),
+            encoding_rs::UTF_8,
+            None,
+            out_sink.clone(),
+        ));
+        let err = tokio::spawn(pump_lines(
+            ChunkedReader::erroring([b"e1\ne2".to_vec()]),
+            encoding_rs::UTF_8,
+            None,
+            err_sink.clone(),
+        ));
+        out.await.expect("stdout pump");
+        err.await.expect("stderr pump");
+        assert_eq!(out_sink.drain(), vec!["o1", "o2"]);
+        assert_eq!(err_sink.drain(), vec!["e1", "e2"]);
+        assert!(
+            out_sink.take_read_error().is_some(),
+            "stdout error recorded"
+        );
+        assert!(
+            err_sink.take_read_error().is_some(),
+            "stderr error recorded"
+        );
+        assert!(
+            matches!(out_sink.try_pop(), Popped::Closed),
+            "each sink still closes so a streaming consumer ends"
+        );
+        assert!(matches!(err_sink.try_pop(), Popped::Closed));
     }
 
     // --- `\r`-aware (CarriageReturn) line-terminator mode --------------------
