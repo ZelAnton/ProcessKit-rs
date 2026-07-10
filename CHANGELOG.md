@@ -20,6 +20,12 @@ to a dated version section.
 ### Fixed
 -
 
+## [2.2.3] - 2026-07-10
+
+### Changed
+
+- Settle the trap before signalling in matching_identity_group_is_kept_and_signalled
+
 ## [2.2.2] - 2026-07-10
 
 ### Added
@@ -2153,7 +2159,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.2...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.3...HEAD
+[2.2.3]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.2...v2.2.3
 [2.2.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.1...v2.2.2
 [2.2.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.1.1...v2.2.0
