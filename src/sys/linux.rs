@@ -285,47 +285,7 @@ impl Job {
     #[cfg(feature = "stats")]
     pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
         match &self.backend {
-            Backend::Cgroup(cg) => {
-                // Our cgroup has no controllers enabled (so `cgroup.kill` works
-                // without the "no internal processes" rule), so cpu/memory aren't
-                // available from the cgroup itself — sum per-process /proc
-                // counters of the live members instead.
-                //
-                // Note: `cgroup.procs` lists only *live* members — a process
-                // leaves it on **exit**, before it is reaped, so an unreaped zombie
-                // never appears there (per the kernel's cgroup-v2 docs: "a zombie
-                // process does not appear in cgroup.procs"). The count and the
-                // summed `/proc` counters therefore reflect live processes, not
-                // dead ones. A member can still exit in the TOCTOU window between
-                // reading `cgroup.procs` and reading its `/proc/<pid>/stat`, in
-                // which case that pid's stat is either gone (skipped) or a brief
-                // zombie snapshot — a momentary, self-correcting skew, not a
-                // persistent zombie over-count.
-                let pids = cg.members()?;
-                let active = pids.len();
-                let mut cpu = Duration::ZERO;
-                let mut have_cpu = false;
-                let mut mem = 0u64;
-                let mut have_mem = false;
-                for pid in pids {
-                    let m = process_metrics(pid as u32);
-                    if let Some(c) = m.cpu_time {
-                        // Saturating: summing many members' CPU time could in
-                        // principle overflow `Duration`; clamp rather than panic.
-                        cpu = cpu.saturating_add(c);
-                        have_cpu = true;
-                    }
-                    if let Some(p) = m.peak_memory_bytes {
-                        mem = mem.saturating_add(p);
-                        have_mem = true;
-                    }
-                }
-                Ok(ProcessGroupStats {
-                    active_process_count: active,
-                    total_cpu_time: have_cpu.then_some(cpu),
-                    peak_memory_bytes: have_mem.then_some(mem),
-                })
-            }
+            Backend::Cgroup(cg) => cg.stats(),
             Backend::ProcessGroup(pg) => pg.stats(),
         }
     }
@@ -406,12 +366,12 @@ impl Drop for Job {
                     // loop usually exits on the first check. Accepted cost of a
                     // synchronous leak-safe teardown.
                     for _ in 0..50 {
-                        match cg.is_empty() {
-                            Ok(true) => break,
-                            // An unreadable member list is unknown, not empty.
-                            // Keep waiting best-effort; Drop must not panic.
-                            Ok(false) | Err(_) => {}
+                        if let Ok(true) = cg.is_empty() {
+                            break;
                         }
+                        // `Ok(false)` or `Err(_)`: an unreadable member list is
+                        // unknown, not empty. Keep waiting best-effort; Drop
+                        // must not panic.
                         std::thread::sleep(Duration::from_millis(2));
                     }
                 }
@@ -614,7 +574,13 @@ impl Cgroup {
         self.members_with(|path| std::fs::read_to_string(path))
     }
 
-    fn members_with(&self, read: impl FnOnce(&Path) -> io::Result<String>) -> io::Result<Vec<i32>> {
+    /// `members()` parametrized over the `cgroup.procs` reader — the injectable
+    /// seam that lets tests exercise the success/`NotFound`/`PermissionDenied`/I/O
+    /// error mapping below, and that every other fail-safe decision in this type
+    /// (`is_empty`, `signal`, `kill`, `stats`) is threaded through so *their* tests
+    /// can drive the same error paths without a real cgroup filesystem. `Fn` (not
+    /// `FnOnce`): the legacy kill sweep below calls this in a bounded retry loop.
+    fn members_with(&self, read: impl Fn(&Path) -> io::Result<String>) -> io::Result<Vec<i32>> {
         match read(&self.path.join("cgroup.procs")) {
             Ok(procs) => Ok(procs
                 .lines()
@@ -635,8 +601,69 @@ impl Cgroup {
         }
     }
 
+    /// `is_drained` (the [`GracefulTarget`](super::graceful::GracefulTarget) impl
+    /// below) maps a read failure here to "not drained" (`unwrap_or(false)`), and
+    /// `Job::drop`'s bounded wait treats it the same way — neither can take an
+    /// injected reader (both signatures are fixed), so both are exercised
+    /// directly against a real, permission-denied temporary directory in
+    /// `fail_safe_tests` below rather than through the `_with` seam.
     fn is_empty(&self) -> io::Result<bool> {
         Ok(self.members()?.is_empty())
+    }
+
+    /// Sum per-process `/proc` counters (cpu time, peak memory) over the live
+    /// members. Our cgroup has no controllers enabled (so `cgroup.kill` works
+    /// without the "no internal processes" rule), so cpu/memory aren't available
+    /// from the cgroup itself.
+    ///
+    /// Note: `cgroup.procs` lists only *live* members — a process leaves it on
+    /// **exit**, before it is reaped, so an unreaped zombie never appears there
+    /// (per the kernel's cgroup-v2 docs: "a zombie process does not appear in
+    /// cgroup.procs"). The count and the summed `/proc` counters therefore reflect
+    /// live processes, not dead ones. A member can still exit in the TOCTOU window
+    /// between reading `cgroup.procs` and reading its `/proc/<pid>/stat`, in which
+    /// case that pid's stat is either gone (skipped) or a brief zombie snapshot —
+    /// a momentary, self-correcting skew, not a persistent zombie over-count.
+    ///
+    /// A `cgroup.procs` read failure (EACCES/EIO/…) propagates as `Err` here
+    /// (via `?`) rather than being reported as an empty/zero-active group — an
+    /// unreadable member list is unknown, not "no processes".
+    #[cfg(feature = "stats")]
+    fn stats(&self) -> io::Result<ProcessGroupStats> {
+        self.stats_with(|path| std::fs::read_to_string(path))
+    }
+
+    /// `stats()` parametrized over the `cgroup.procs` reader — see
+    /// [`members_with`](Self::members_with).
+    #[cfg(feature = "stats")]
+    fn stats_with(
+        &self,
+        read: impl Fn(&Path) -> io::Result<String>,
+    ) -> io::Result<ProcessGroupStats> {
+        let pids = self.members_with(read)?;
+        let active = pids.len();
+        let mut cpu = Duration::ZERO;
+        let mut have_cpu = false;
+        let mut mem = 0u64;
+        let mut have_mem = false;
+        for pid in pids {
+            let m = process_metrics(pid as u32);
+            if let Some(c) = m.cpu_time {
+                // Saturating: summing many members' CPU time could in principle
+                // overflow `Duration`; clamp rather than panic.
+                cpu = cpu.saturating_add(c);
+                have_cpu = true;
+            }
+            if let Some(p) = m.peak_memory_bytes {
+                mem = mem.saturating_add(p);
+                have_mem = true;
+            }
+        }
+        Ok(ProcessGroupStats {
+            active_process_count: active,
+            total_cpu_time: have_cpu.then_some(cpu),
+            peak_memory_bytes: have_mem.then_some(mem),
+        })
     }
 
     /// Send `sig` to every current member (the graceful SIGTERM tier and the
@@ -652,8 +679,16 @@ impl Cgroup {
     /// suspend/resume, preferred by [`freeze`](Self::freeze)) are race-free.
     /// SIGKILL teardown therefore goes through `cgroup.kill`, not this path.
     fn signal(&self, sig: i32) -> io::Result<()> {
+        self.signal_with(sig, |path| std::fs::read_to_string(path))
+    }
+
+    /// `signal()` parametrized over the `cgroup.procs` reader — see
+    /// [`members_with`](Self::members_with). A member-list read failure returns
+    /// `Err` (via `?`) *before* the per-pid loop below runs, so no signal is ever
+    /// sent when the membership is unknown.
+    fn signal_with(&self, sig: i32, read: impl Fn(&Path) -> io::Result<String>) -> io::Result<()> {
         let mut last_err = None;
-        for pid in self.members()? {
+        for pid in self.members_with(read)? {
             // SAFETY: a plain signal to a pid read from cgroup.procs.
             let rc = unsafe { libc::kill(pid, sig) };
             if rc != 0 {
@@ -699,6 +734,15 @@ impl Cgroup {
     }
 
     fn kill(&self) -> io::Result<()> {
+        self.kill_with(|path| std::fs::read_to_string(path))
+    }
+
+    /// `kill()` parametrized over the `cgroup.procs` reader used by the legacy
+    /// (pre-5.14) SIGKILL-sweep fallback below — see [`members_with`](Self::members_with).
+    /// A persistent read error keeps the bounded sweep from ever observing an
+    /// empty member list, so it runs to the deadline and the final drain check
+    /// below propagates that error instead of a false `Ok(())`.
+    fn kill_with(&self, read: impl Fn(&Path) -> io::Result<String>) -> io::Result<()> {
         // `cgroup.kill` (kernel ≥ 5.14): write "1" to SIGKILL the whole subtree
         // atomically.
         //
@@ -760,22 +804,19 @@ impl Cgroup {
         // under load.
         let _ = std::fs::write(self.path.join("cgroup.freeze"), b"1");
         for _ in 0..50 {
-            match self.members() {
-                Ok(members) => {
-                    if members.is_empty() {
-                        break;
-                    }
-                    for pid in members {
-                        // SAFETY: see signal.
-                        unsafe {
-                            libc::kill(pid, libc::SIGKILL);
-                        }
+            if let Ok(members) = self.members_with(&read) {
+                if members.is_empty() {
+                    break;
+                }
+                for pid in members {
+                    // SAFETY: see signal.
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
                     }
                 }
-                // Unknown state must not look drained. Continue the bounded
-                // fallback in case the read failure is transient.
-                Err(_) => {}
             }
+            // `Err(_)`: unknown state must not look drained. Continue the
+            // bounded fallback in case the read failure is transient.
             std::thread::sleep(Duration::from_millis(2));
         }
         // Thaw (best-effort): the freeze only halted forking DURING the sweep.
@@ -789,7 +830,7 @@ impl Cgroup {
         // Report a real drain failure instead of a false success, so the caller
         // knows the tree may still be alive — a fork bomb still out-spawning, or
         // un-reapable zombies (a D-state task ignores SIGKILL until it unblocks).
-        match self.members() {
+        match self.members_with(&read) {
             Ok(members) if members.is_empty() => Ok(()),
             Ok(_) => Err(io::Error::other(
                 "cgroup did not drain after the bounded SIGKILL sweep (kernel < 5.14 fallback)",
@@ -929,9 +970,16 @@ fn write_self_pid(path: &CStr) -> io::Result<()> {
     }
 }
 
+/// Unit tests for the `_with`-suffixed read-seam methods (`members_with`,
+/// `signal_with`, `kill_with`, `stats_with`): each takes an injectable
+/// `cgroup.procs` reader so the success/`NotFound`/`PermissionDenied`/I/O-error
+/// mapping — and the fail-safe decision each caller builds on it — can be driven
+/// deterministically without a real cgroup v2 mount. See `fail_safe_tests` below
+/// for the two paths whose signature can't take an injected reader
+/// (`GracefulTarget::is_drained`, `Job::drop`'s drain wait), which are instead
+/// exercised against a real temporary directory.
 #[cfg(test)]
-#[cfg(test)]
-mod member_read_tests {
+mod cgroup_read_seam_tests {
     use std::io;
     use std::path::{Path, PathBuf};
 
@@ -980,6 +1028,163 @@ mod member_read_tests {
             .expect_err("an I/O failure must not look empty");
 
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn signal_with_propagates_read_error_without_reaching_the_per_pid_loop() {
+        // `signal_with` resolves the member list with `?` before the per-pid
+        // `libc::kill` loop, so a read failure returns `Err` and no signal is
+        // ever sent — the fail-safe this test locks in.
+        let err = cgroup()
+            .signal_with(libc::SIGTERM, |_| {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            })
+            .expect_err("an unreadable member list must not look like a successful no-op signal");
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn signal_with_empty_member_list_is_a_no_op_success() {
+        cgroup()
+            .signal_with(libc::SIGTERM, |_| Ok(String::new()))
+            .expect("no members to signal is trivially successful");
+    }
+
+    #[test]
+    fn kill_with_persistent_read_error_reports_a_real_drain_failure() {
+        // The mock path has no real `cgroup.kill` file, so this always falls
+        // into the legacy per-pid SIGKILL sweep; a `cgroup.procs` that never
+        // becomes readable must make the sweep propagate that error instead of
+        // a false `Ok(())` (a regression here would look like `Err(_) => Ok(())`
+        // in the final drain check).
+        let err = cgroup()
+            .kill_with(|_| Err(io::Error::from_raw_os_error(libc::EIO)))
+            .expect_err("a cgroup.procs that never becomes readable must not report as drained");
+
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn kill_with_empty_member_list_drains_immediately() {
+        cgroup()
+            .kill_with(|_| Ok(String::new()))
+            .expect("an already-empty cgroup is reported as drained by the fallback sweep");
+    }
+
+    #[cfg(feature = "stats")]
+    #[test]
+    fn stats_with_read_error_is_not_reported_as_zero_active_processes() {
+        let err = cgroup()
+            .stats_with(|_| Err(io::Error::from(io::ErrorKind::PermissionDenied)))
+            .expect_err("an unreadable member list must not look like an empty (0-process) group");
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(feature = "stats")]
+    #[test]
+    fn stats_with_empty_member_list_reports_zero_active_processes() {
+        let stats = cgroup()
+            .stats_with(|_| Ok(String::new()))
+            .expect("an empty member list is a legitimate zero-active-process stats snapshot");
+
+        assert_eq!(stats.active_process_count, 0);
+    }
+}
+
+/// Fail-safe coverage for the two paths that read `cgroup.procs` through the
+/// **real** filesystem rather than the `_with` seam above:
+/// `GracefulTarget::is_drained` (whose signature is fixed by the trait, so no
+/// reader can be injected) and `Job`'s `Drop` drain wait (which calls the
+/// zero-arg `Cgroup::is_empty` directly, for the same reason — `Drop::drop`
+/// can't take a parameter either). Both build a real temporary "cgroup"
+/// directory with an unreadable `cgroup.procs` (`chmod 000`) to reproduce an
+/// EACCES read failure without a real cgroup v2 mount, and skip (rather than
+/// false-fail) when the environment can read past the permission bits (e.g.
+/// running as root).
+#[cfg(test)]
+mod fail_safe_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::{Backend, Cgroup, Job};
+    use crate::sys::SkipDropKill;
+    use crate::sys::graceful::GracefulTarget;
+
+    /// A throwaway directory standing in for a cgroup, with an unreadable
+    /// `cgroup.procs`. Returns `None` (rather than panicking) when this
+    /// environment can read past `chmod 000` (e.g. running as root), since the
+    /// fail-safe behaviour under test is not reachable there.
+    fn unreadable_procs_cgroup() -> Option<(Cgroup, PathBuf)> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-failsafe-test-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp cgroup dir");
+        let procs = dir.join("cgroup.procs");
+        std::fs::write(&procs, b"").expect("create cgroup.procs");
+        std::fs::set_permissions(&procs, std::fs::Permissions::from_mode(0o000))
+            .expect("revoke read permission on cgroup.procs");
+
+        let cg = Cgroup { path: dir.clone() };
+        if cg.is_empty().is_ok() {
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!(
+                "skipping: this environment can read past chmod 000 (likely running as root) \
+                 — the fail-safe path under test is not reachable here"
+            );
+            return None;
+        }
+        Some((cg, dir))
+    }
+
+    #[test]
+    fn is_drained_treats_unreadable_procs_as_not_drained() {
+        let Some((cg, dir)) = unreadable_procs_cgroup() else {
+            return;
+        };
+
+        assert!(
+            !cg.is_drained(),
+            "an unreadable member list is unknown, not drained — GracefulTarget::is_drained \
+             must not treat it as an empty cgroup (doing so would cancel the escalation)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drop_keeps_waiting_out_the_bounded_drain_when_procs_is_unreadable() {
+        let Some((cg, dir)) = unreadable_procs_cgroup() else {
+            return;
+        };
+
+        // Armed (default `SkipDropKill::new()`): `Drop` must run its ~100ms
+        // bounded drain wait, not skip it.
+        let job = Job {
+            backend: Backend::Cgroup(cg),
+            skip_drop_kill: SkipDropKill::new(),
+        };
+        let start = Instant::now();
+        drop(job);
+        let elapsed = start.elapsed();
+
+        // The wait is 50 iterations * 2ms = ~100ms; an unreadable `cgroup.procs`
+        // must not be mistaken for "drained" (`Ok(true)`) and short-circuit it —
+        // a regression here would look like `Ok(false) | Err(_) => break`.
+        assert!(
+            elapsed >= Duration::from_millis(90),
+            "Job::drop exited its drain wait early ({elapsed:?}) — an unreadable member \
+             list must not be treated as an empty (drained) cgroup"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
