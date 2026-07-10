@@ -1627,51 +1627,74 @@ impl Drop for RunningProcess {
                 // flag the watchdog would set concurrently). An own-group handle tears
                 // its whole tree down on drop and arms no detached pid-killer; a
                 // shared handle without a graceful timeout never spawns one either, so
-                // neither needs this. Also skipped once the gate is retired (a
-                // consuming reap ran, so no detached killer survives) or when no
-                // runtime is current (nothing detached can be running to endanger a
-                // pid). When the deadline had not actually fired the handed-off reaper
-                // is merely a harmless deterministic replacement for the orphan reap.
+                // neither needs this hand-off — they fall through to the `else` and
+                // retire the gate synchronously instead (see below).
+                //
+                // The hand-off ALSO needs two *dynamic* conditions, and the `else`
+                // now covers every case where one of them fails (this is what closes
+                // the T-093 no-runtime window): a live (un-retired) gate — a consuming
+                // reap already retires it, leaving no detached killer to survive — and
+                // a *current* tokio runtime to spawn the reaper on. `try_current()` is
+                // checked BEFORE `real.child.take()` on purpose: when no runtime is
+                // current the chain short-circuits WITHOUT taking the child, so the
+                // child is still owned by `real` when the `else` retires the gate,
+                // preserving the "retire before the pid is freed" ordering (the child's
+                // pid is freed only as `real` drops at the end of this `drop()`, after
+                // the retire — never before it). When the deadline had not actually
+                // fired the handed-off reaper is merely a harmless deterministic
+                // replacement for the orphan reap.
                 if real.own_group.is_none()
                     && self.timeout.is_some()
                     && self.timeout_grace.is_some()
                     && !self.pid_gate.is_retired()
-                    && let Some(child) = real.child.take()
                     && let Ok(handle) = tokio::runtime::Handle::try_current()
+                    && let Some(child) = real.child.take()
                 {
                     let gate = self.pid_gate.clone();
                     handle.spawn(gated_reap_and_retire(gate, child));
-                } else if real.own_group.is_some()
-                    || self.timeout.is_none()
-                    || self.timeout_grace.is_none()
-                {
-                    // Every OTHER Real shape reaches here — the exact negation of
-                    // the handoff branch's static preconditions above. The child is
-                    // handed to no detached reaper: the owned `Child` drops at the
-                    // end of this `drop()`, and its pid is freed either by tokio's
-                    // orphan reaper (a shared-group handle — the caller-owned group
+                } else {
+                    // Every OTHER Real drop reaches here: an own-group handle, a
+                    // shared group without a graceful window, OR a shared-group+grace
+                    // handle whose hand-off could not run (no current runtime, an
+                    // already-retired gate, or an already-taken child). None of these
+                    // leaves a detached grace kill-and-reap that a retire could strand:
+                    //
+                    //   * own-group / shared-without-grace never arm that detached task
+                    //     at all — it needs `own_group.is_none() && timeout.is_some()
+                    //     && timeout_grace.is_some()`, precisely the config we are NOT
+                    //     in on those shapes;
+                    //   * a shared-group+grace handle dropped with NO runtime current
+                    //     never armed it *from a live path here* either — the grace
+                    //     kill-and-reap is spawned by the streaming deadline watchdog,
+                    //     which itself needs a runtime, so with none current the
+                    //     hand-off is simply unavailable and retiring is the only way
+                    //     to close the window (a deadline/cancel watchdog mid-poll on
+                    //     another worker/runtime could otherwise outlive an un-retired
+                    //     gate onto a recycled pid — the T-093 gap this branch closes);
+                    //   * an already-retired gate means a consuming reap already ran.
+                    //
+                    // `PidGate::retire` is idempotent, so retiring an already-retired
+                    // gate is a safe no-op (the same idempotence `abort_watchdogs`
+                    // relies on). The child, when not handed off, is freed only as the
+                    // owned `Child` drops at the end of this `drop()` — by tokio's
+                    // orphan reaper for a shared-group handle (the caller-owned group
                     // still tears the child's tree down on ITS own drop, per
                     // shared-group semantics) or as the owned group tears the whole
-                    // tree down (an own-group handle). None of these shapes ever
-                    // armed the detached shared-group graceful kill-and-reap — that
-                    // needs `own_group.is_none() && timeout.is_some() &&
-                    // timeout_grace.is_some()`, precisely the handoff config we are
-                    // NOT in here — so retiring the gate now strands no final
-                    // grace-SIGKILL (the regression the handoff branch guards).
+                    // tree down (an own-group handle).
                     //
-                    // What it DOES close is the window the non-synchronous
+                    // Retiring the gate NOW closes the window the non-synchronous
                     // `abort()`s at the top of `drop()` leave open: a deadline/cancel
                     // watchdog still mid-poll on another worker thread can reach its
                     // gated raw `force_kill`/`kill_via_weak` (both routed through
                     // `PidGate::with_live_pid`) after the structural drop above frees
-                    // — and lets the OS recycle — the pid. Retiring the gate NOW,
-                    // synchronously and before `drop()` returns (so before that
-                    // structural free), linearizes any such raw kill to either land
-                    // entirely before the retire (the child is still un-reaped — a
-                    // legitimate kill) or be skipped once retired (a safe no-op),
-                    // never a SIGKILL/TerminateProcess on a recycled pid. This is the
-                    // same "retire before the pid is freed" discipline `kill_tree`
-                    // and `teardown_on_timeout` already follow; `abort()`, which only
+                    // — and lets the OS recycle — the pid. Retiring synchronously and
+                    // before `drop()` returns (so before that structural free)
+                    // linearizes any such raw kill to either land entirely before the
+                    // retire (the child is still un-reaped — a legitimate kill) or be
+                    // skipped once retired (a safe no-op), never a
+                    // SIGKILL/TerminateProcess on a recycled pid. This is the same
+                    // "retire before the pid is freed" discipline `kill_tree` and
+                    // `teardown_on_timeout` already follow; `abort()`, which only
                     // schedules cancellation, is never relied on alone. The teardown
                     // scope is untouched: an own-group tree still dies with its group
                     // and a shared-group child is still left to the caller's group —
@@ -2493,6 +2516,78 @@ mod tests {
             gate.is_retired(),
             "the own-group Drop branch must retire the gate too"
         );
+    }
+
+    /// T-093: the **no-runtime** Drop of a shared-group + grace handle. Its static
+    /// shape (`own_group.is_none() && timeout.is_some() && timeout_grace.is_some()`)
+    /// is exactly the detached-handoff branch's, but that branch also needs a
+    /// *current* tokio runtime to spawn its reaper on. Dropping such a handle with
+    /// NO runtime current — `Handle::try_current()` is `Err`, so the hand-off cannot
+    /// run — must STILL retire the `PidGate` synchronously (via the `else`), or a
+    /// deadline/cancel watchdog aborted mid-poll could outlive an un-retired gate and
+    /// land a raw kill on the freed (and possibly OS-recycled) pid.
+    ///
+    /// Deterministic, no timing: the handle is built *inside* a runtime (spawning a
+    /// child needs one) but dropped only AFTER `block_on` returns, when this thread
+    /// provably holds no runtime context — asserted directly via `try_current()` —
+    /// so the drop takes the no-runtime path every run. A long-lived sleeper keeps
+    /// the child alive across the drop, so the assertion turns on the gate's
+    /// synchronous live→retired transition, never on the child exiting. Like the two
+    /// T-092 Drop cases above this spawns a real subprocess, hence `#[ignore]` (run
+    /// in CI via `--include-ignored`); a scripted double is pid-less and takes the
+    /// `Scripted` Drop arm, so it cannot exercise the `Backend::Real` branch. The
+    /// gate's linearizability once retired is proven hermetically in
+    /// `sys::pid_gate::tests`; this proves the no-runtime Drop *reaches* the retired
+    /// state before the pid can be freed.
+    #[test] // NOT `#[tokio::test]`: the drop must happen with no current runtime.
+    #[ignore = "spawns a real subprocess (no-runtime shared-group+grace Drop gate retirement)"]
+    fn dropping_a_shared_group_grace_handle_with_no_runtime_retires_the_gate() {
+        let rt = tokio::runtime::Runtime::new().expect("a test runtime");
+        let group = crate::group::ProcessGroup::new().expect("a shared process group");
+        // Build the handoff-SHAPE handle inside the runtime: a shared group (no owned
+        // group, via `launch`) with BOTH a timeout and a grace window — the exact
+        // static preconditions of the detached-handoff branch.
+        let (run, gate) = rt.block_on(async {
+            let cmd = sleeper_cmd()
+                .timeout(Duration::from_secs(30))
+                .timeout_grace(Duration::from_secs(5));
+            let run = crate::runner::launch(&group, &cmd)
+                .await
+                .expect("launch into the shared group");
+            let gate = run.pid_gate.clone();
+            (run, gate)
+        });
+        // The handle matches the handoff branch's static preconditions...
+        assert!(
+            !run.kills_tree_on_drop(),
+            "a shared-group handle owns no tree — its group does (own_group is None)"
+        );
+        assert!(
+            run.timeout.is_some() && run.timeout_grace.is_some(),
+            "the shape under test has both a timeout and a graceful window"
+        );
+        assert!(
+            !gate.is_retired(),
+            "a fresh live handle's gate is not retired"
+        );
+        // ...but the drop below happens OUTSIDE any runtime: `block_on` has returned,
+        // so this thread holds no runtime context and the hand-off cannot be spawned.
+        // Asserting this makes the no-runtime scenario deterministic, not incidental.
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the drop below must run with no current runtime — the scenario under test"
+        );
+        drop(run); // exercises Drop's shared-group+grace shape with NO runtime current
+        assert!(
+            gate.is_retired(),
+            "Drop must retire the gate even with no runtime current, so a watchdog \
+             aborted mid-poll can't land a raw kill on the freed/recycled pid"
+        );
+        // The shared group still owns the child's teardown; dropping it tears the
+        // child down (job-close / SIGKILL, synchronous and runtime-free) so the test
+        // leaves no live subprocess. `rt` is dropped last, after the child is gone.
+        drop(group);
+        drop(rt);
     }
 
     /// `wait_exit` applies `classify_timed_out` so the `stdout_lines` → `wait_any`
