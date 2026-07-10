@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -535,42 +535,74 @@ fn is_zero_u64(n: &u64) -> bool {
 /// there); **restrict the containing directory** (or use a per-user temp dir,
 /// not a world-writable shared one) if the fixture can carry secrets.
 fn write_cassette(path: &Path, json: &str) -> std::io::Result<()> {
-    // Write to a sibling temp file, then atomically `rename` it over the target,
-    // so a crash / interrupted write can never truncate or destroy an existing
-    // good cassette — the old file survives intact until the rename swaps in the
-    // fully-written new one. The temp shares the target's directory so the rename
-    // stays on one filesystem (a cross-device rename is not atomic).
-    // Defense-in-depth alert: refuse a symlinked cassette path (`O_NOFOLLOW` on
-    // the temp can't see the target). The rename below is safe regardless — it
-    // replaces the link, never writes *through* it to the secret-bearing target —
-    // but a symlink at a cassette path is suspicious, so fail loud (`ELOOP`).
+    // Durability + concurrency contract (documented on `RecordReplayRunner::save`):
+    //   1. Refuse a symlinked cassette path (`O_NOFOLLOW`, unix) — fail loud
+    //      (`ELOOP`) rather than write the secret-bearing content through a
+    //      planted link. The rename below is safe regardless (it replaces the
+    //      link, never writes *through* it), but a symlink here is suspicious.
+    //   2. Serialize every writer to this one target behind an advisory lock
+    //      (`acquire_save_lock`): a concurrent thread/process is refused with an
+    //      explicit, transient `WouldBlock` conflict rather than a silent
+    //      last-writer-wins clobber of another recorder's records.
+    //   3. Write a *uniquely* named sibling temp with `O_EXCL` (never the old
+    //      fixed `target + pid` name), so two in-flight saves can't stomp one
+    //      temp, and a stale temp left by a crashed writer is a harmless orphan
+    //      we neither collide with nor delete (it could be a live writer's temp).
+    //   4. fsync the temp (in `write_new_file`), atomically `rename` it over the
+    //      target (single-filesystem, so the rename is atomic), then fsync the
+    //      parent directory so the rename itself is durable across a power loss on
+    //      supporting unix filesystems.
+    // Any fsync/rename failure propagates as `Err`; the previous cassette (if any)
+    // survives intact until the rename swaps in the fully written new one.
     #[cfg(unix)]
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(std::io::Error::from_raw_os_error(libc::ELOOP));
     }
-    let tmp = tmp_sibling(path);
-    // Clear a stale temp left by a prior crashed run (a recycled pid could leave
-    // one behind) so `create_new` below doesn't spuriously fail; removing a
-    // symlink here drops the link, not its target.
-    let _ = std::fs::remove_file(&tmp);
-    let written = write_new_file(&tmp, json);
-    match written.and_then(|()| std::fs::rename(&tmp, path)) {
+    // Held for the whole temp-write → rename → dir-fsync critical section; the
+    // guard drops (releasing the lock) when this function returns.
+    let _lock = acquire_save_lock(path)?;
+    // A fresh unique temp, created with `O_EXCL`. The name collision that trips
+    // `create_new` is astronomically unlikely (pid + a per-process counter +
+    // nanos), but on the off chance a recycled pid left an identically named
+    // orphan, retry with a new name rather than delete a file that might be
+    // another writer's in-flight temp.
+    let mut tmp = tmp_sibling(path);
+    let mut attempts = 0u32;
+    loop {
+        match write_new_file(&tmp, json) {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 16 => {
+                attempts += 1;
+                tmp = tmp_sibling(path);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    match std::fs::rename(&tmp, path).and_then(|()| sync_parent_dir(path)) {
         Ok(()) => Ok(()),
         Err(e) => {
-            // Best-effort cleanup of the temp file; the original cassette (if any)
-            // is untouched.
+            // Best-effort cleanup of the temp *we* created; the original cassette
+            // (if any) is untouched. We only ever remove a temp we made.
             let _ = std::fs::remove_file(&tmp);
             Err(e)
         }
     }
 }
 
-/// A sibling temp path in the same directory as `path` (so a later `rename` is
-/// same-filesystem/atomic). The pid disambiguates one process's temp from
-/// another's; concurrent recorders to *one* cassette are still unsupported.
+/// A *uniquely* named sibling temp path in the same directory as `path` (so a
+/// later `rename` is same-filesystem/atomic). Uniqueness — pid + a process-wide
+/// monotonic counter + wall-clock nanos — is what lets several in-flight saves
+/// (two recorder instances in one process, or two processes) coexist without
+/// stomping one another's temp: each save creates its own file with `O_EXCL` and
+/// never touches, nor deletes, a name it did not create.
 fn tmp_sibling(path: &Path) -> std::path::PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     let mut name = path.as_os_str().to_owned();
-    name.push(format!(".{}.tmp", std::process::id()));
+    name.push(format!(".{}.{}.{}.tmp", std::process::id(), seq, nanos));
     std::path::PathBuf::from(name)
 }
 
@@ -606,6 +638,130 @@ fn write_new_file(path: &Path, json: &str) -> std::io::Result<()> {
             .open(path)?;
         file.write_all(json.as_bytes())?;
         file.sync_all()?;
+        Ok(())
+    }
+}
+
+/// A sibling advisory-lock path (`<path>.lock`) coordinating concurrent saves to
+/// one cassette across threads and processes (see [`acquire_save_lock`]).
+fn lock_sibling(path: &Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    std::path::PathBuf::from(name)
+}
+
+/// The `Err` raised when another writer is saving the same cassette right now.
+/// Its [`WouldBlock`](std::io::ErrorKind::WouldBlock) kind makes the wrapping
+/// [`Error::Io`] satisfy [`Error::is_transient`](crate::Error::is_transient) — so
+/// the loser can simply retry once the winner's save completes, and the last
+/// confirmed-good cassette is preserved rather than silently overwritten.
+fn concurrent_save_conflict() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "another writer is saving this cassette concurrently — concurrent saves to \
+         one cassette path are serialized by an advisory lock and the loser is \
+         refused (a transient, retryable error) rather than silently overwriting \
+         the last good cassette",
+    )
+}
+
+/// An advisory exclusive lock over concurrent saves to one cassette path, held
+/// for the temp-write → rename → dir-fsync critical section. Releasing the lock
+/// is dropping the held handle — which also happens on process death, so a
+/// crashed writer never wedges future saves.
+struct SaveLock {
+    /// Held purely so its `Drop` (closing the handle) releases the OS lock; the
+    /// value itself is never read after construction.
+    #[allow(dead_code)]
+    file: std::fs::File,
+}
+
+/// Acquire the per-target advisory save lock, **non-blocking**. On success the
+/// returned guard holds the lock until dropped; if another thread or process
+/// holds it, returns [`concurrent_save_conflict`] rather than blocking or
+/// silently proceeding.
+///
+/// Cross-process **and** cross-thread on both platforms:
+/// - **Unix**: a `flock(LOCK_EX | LOCK_NB)` on a sibling `<path>.lock`. A
+///   separate `open` per save gives each save its own open-file-description, so
+///   two threads of one process contend here just like two processes do. The
+///   lock is deliberately never `unlink`ed (unlinking a `flock`'d file races a
+///   fresh create+lock of the same name); a leftover 0-byte `<path>.lock` is the
+///   intended, harmless artifact.
+/// - **Windows**: a deny-all `share_mode(0)` open of the same file — a
+///   concurrent open (thread or process) fails with a sharing violation.
+#[cfg(unix)]
+fn acquire_save_lock(path: &Path) -> std::io::Result<SaveLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    // Owner-only, and refuse a symlinked lock path (`O_NOFOLLOW`) for the same
+    // defense-in-depth reason the cassette write does. `create` (not
+    // `create_new`) so an existing lock file from a prior run is reused — the
+    // `flock` below, not the file's existence, is the arbiter.
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        // Never truncate: the lock file is a 0-byte rendezvous, and truncating it
+        // would needlessly touch an inode another holder may be `flock`ing.
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(lock_sibling(path))?;
+    // SAFETY: `flock` on a valid fd we own; the fd outlives the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = std::io::Error::last_os_error();
+        // std maps both `EWOULDBLOCK` and `EAGAIN` (the errnos `LOCK_NB`
+        // contention raises) to `WouldBlock`.
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(concurrent_save_conflict());
+        }
+        return Err(err);
+    }
+    Ok(SaveLock { file })
+}
+
+#[cfg(windows)]
+fn acquire_save_lock(path: &Path) -> std::io::Result<SaveLock> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Another handle already holds the deny-all lock (thread or process).
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        // Never truncate: the lock file is a 0-byte rendezvous held only for its
+        // deny-share handle, not its contents.
+        .truncate(false)
+        .write(true)
+        .share_mode(0)
+        .open(lock_sibling(path))
+    {
+        Ok(file) => Ok(SaveLock { file }),
+        Err(err) if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+            Err(concurrent_save_conflict())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// fsync the directory containing `path` so a preceding `rename` into it is
+/// durable across a power loss. The file's own contents are already fsync'd in
+/// [`write_new_file`], but the directory-entry swap `rename` performs is a
+/// separate metadata write that must itself be flushed. Unix-only: Windows has
+/// no portable directory-fsync, and NTFS metadata journaling plus the file's
+/// `FlushFileBuffers` and the atomic `MoveFileEx` replace already provide the
+/// durable-replacement guarantee there.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        // A bare filename (`cassette.json`) has an empty parent — sync `.`.
+        let dir = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(parent) => std::fs::File::open(parent)?,
+            None => std::fs::File::open(".")?,
+        };
+        dir.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
         Ok(())
     }
 }
@@ -1033,11 +1189,43 @@ impl<R: ProcessRunner> RecordReplayRunner<R> {
     /// a save are still covered: the drop-time flush fires whenever anything
     /// was recorded since the last successful save.
     ///
+    /// # Durability
+    ///
+    /// The write is crash-atomic: the full cassette is written to a uniquely
+    /// named sibling temp, fsync'd, then `rename`d over the target (an atomic
+    /// replacement on a single filesystem), after which the **parent directory is
+    /// fsync'd on Unix** so the rename itself survives a power loss. An
+    /// interrupted or crashed save therefore never truncates or corrupts an
+    /// existing good cassette — the old file stays intact until the rename swaps
+    /// in the fully written new one. `rename`/fsync failures surface as `Err`
+    /// (see below); the best-effort drop-time flush ignores them, and `Drop`
+    /// never panics.
+    ///
+    /// # Concurrency
+    ///
+    /// Concurrent saves to **one** cassette path — two recorder instances in a
+    /// process, or separate processes — are serialized by an advisory lock on a
+    /// sibling `<path>.lock` (a `flock` on Unix, a deny-share open on Windows;
+    /// both released on drop, including on process death). Each save uses its own
+    /// `O_EXCL` temp, so writers never stomp one temp or delete another's (a
+    /// stale temp from a crashed writer is a harmless orphan). The lock is taken
+    /// **non-blocking**: if another writer holds it at that instant, the save is
+    /// refused with a *transient* [`Error::Io`]
+    /// ([`WouldBlock`](std::io::ErrorKind::WouldBlock), so
+    /// [`is_transient`](crate::Error::is_transient) is `true` — retry once the
+    /// other save completes) rather than silently overwriting it. This trades the
+    /// old silent last-writer-wins data loss for an explicit, retryable conflict
+    /// that always preserves the last confirmed-good cassette. A single recorder
+    /// never conflicts with itself: its own saves are internally serialized.
+    ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the recorded entries cannot be serialized to JSON, or if
-    /// writing the cassette file fails. In replay mode there is nothing to write,
-    /// so it returns `Ok(())`.
+    /// [`Error::Io`] if the recorded entries cannot be serialized to JSON; if
+    /// another writer holds the save lock (a transient
+    /// [`WouldBlock`](std::io::ErrorKind::WouldBlock) conflict — see
+    /// *Concurrency*); or if writing, renaming, or fsync'ing the cassette (or its
+    /// parent directory) fails. In replay mode there is nothing to write, so it
+    /// returns `Ok(())`.
     ///
     /// # Panics
     ///
@@ -2222,6 +2410,187 @@ mod tests {
             .await
             .expect("the post-save run was flushed by drop");
         assert_eq!(result.code(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn concurrent_saves_to_one_path_never_corrupt_the_cassette() {
+        // Unique-temp + advisory-lock + crash-atomic write, exercised together:
+        // eight *distinct* recorder instances (as two independent recorders in one
+        // process would be) all save to ONE path simultaneously. No save may
+        // corrupt the file or panic; every save either wins or is refused with the
+        // explicit transient conflict; and the survivor must reopen as a whole,
+        // valid cassette.
+        let (_dir, path) = temp_cassette();
+        let mut recorders = Vec::new();
+        for _ in 0..8 {
+            let r = RecordReplayRunner::record(
+                &path,
+                ScriptedRunner::new().on(["tool", "ping"], Reply::ok("pong")),
+            );
+            let _ = r
+                .output_string(&Command::new("tool").arg("ping"))
+                .await
+                .expect("record ping");
+            recorders.push(r);
+        }
+        // Fire every save at once, each on its own thread.
+        let results: Vec<Result<()>> = std::thread::scope(|s| {
+            let handles: Vec<_> = recorders.iter().map(|r| s.spawn(|| r.save())).collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("a save thread must not panic"))
+                .collect()
+        });
+        // A losing save is *only ever* the transient WouldBlock conflict — never a
+        // corrupt/partial-write error of some other kind.
+        for res in &results {
+            if let Err(err) = res {
+                assert!(
+                    err.is_transient(),
+                    "a losing concurrent save must be the transient WouldBlock \
+                     conflict, got {err:?}"
+                );
+            }
+        }
+        assert!(
+            results.iter().any(|r| r.is_ok()),
+            "at least one concurrent save must win"
+        );
+        // The final cassette reopens and replays the recorded run — proof the
+        // winner wrote a whole, valid cassette, not a torn or interleaved one.
+        let replayer = RecordReplayRunner::replay(&path).expect("reopen after concurrent writes");
+        let out = replayer
+            .output_string(&Command::new("tool").arg("ping"))
+            .await
+            .expect("replay the surviving entry");
+        assert_eq!(out.stdout(), "pong");
+    }
+
+    #[tokio::test]
+    async fn a_save_racing_a_held_lock_is_refused_not_a_silent_clobber() {
+        // The cross-process boundary: a competing writer (another process, or
+        // another thread) is modeled by holding the very OS advisory lock `save`
+        // takes — that lock *is* the cross-process coordination. A save that races
+        // it must be refused with the transient conflict and must NOT overwrite
+        // the last confirmed-good cassette.
+        let (_dir, path) = temp_cassette();
+
+        // A first recorder writes a known-good cassette.
+        let winner = RecordReplayRunner::record(
+            &path,
+            ScriptedRunner::new().on(["tool", "keep"], Reply::ok("kept")),
+        );
+        let _ = winner
+            .output_string(&Command::new("tool").arg("keep"))
+            .await
+            .expect("record the good run");
+        winner.save().expect("the first save wins the free lock");
+
+        // Now a competitor holds the lock, exactly as a rival process would.
+        let held = acquire_save_lock(&path).expect("model a competing writer holding the lock");
+
+        // A second, different recorder tries to save the same path while it is held.
+        let loser = RecordReplayRunner::record(
+            &path,
+            ScriptedRunner::new().on(["tool", "clobber"], Reply::ok("clobbered\n")),
+        );
+        let _ = loser
+            .output_string(&Command::new("tool").arg("clobber"))
+            .await
+            .expect("record the clobbering run");
+        let err = loser
+            .save()
+            .expect_err("a save racing a held lock must be refused, not silently applied");
+        assert!(
+            err.is_transient(),
+            "the conflict must be the transient WouldBlock error, got {err:?}"
+        );
+
+        drop(held); // release the competitor's lock
+
+        // The last confirmed-good cassette survived untouched: `keep` still
+        // replays, and the refused save's run never reached the file.
+        let replayer = RecordReplayRunner::replay(&path).expect("reopen the preserved cassette");
+        assert_eq!(
+            replayer
+                .output_string(&Command::new("tool").arg("keep"))
+                .await
+                .expect("the good run is still there")
+                .stdout(),
+            "kept"
+        );
+        let miss = replayer
+            .output_string(&Command::new("tool").arg("clobber"))
+            .await
+            .expect_err("the refused save's run must be absent");
+        assert!(
+            matches!(miss, Error::CassetteMiss { .. }),
+            "the clobbering entry must be absent (a miss), got {miss:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_temp_from_a_crashed_writer_is_left_untouched_and_does_not_block() {
+        // A leftover temp from a prior crashed/interrupted writer must neither
+        // block a fresh save (the new temp is uniquely named + `O_EXCL`) nor be
+        // deleted (it is indistinguishable from another *live* writer's in-flight
+        // temp, so removing it would be the very bug this change removes).
+        let (_dir, path) = temp_cassette();
+        let stale = {
+            let mut name = path.as_os_str().to_owned();
+            // Shaped like a real temp but with a pid/seq this run will never mint.
+            name.push(".4294967295.0.0.tmp");
+            PathBuf::from(name)
+        };
+        std::fs::write(&stale, "garbage from a crashed writer").expect("seed stale temp");
+
+        let recorder = RecordReplayRunner::record(&path, scripted());
+        let _ = recorder
+            .output_string(&Command::new("tool").arg("--version"))
+            .await
+            .expect("record");
+        recorder
+            .save()
+            .expect("save must succeed despite the stale temp");
+
+        assert!(
+            stale.exists(),
+            "a stale temp (possibly another writer's live temp) must be left untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&stale).expect("read stale temp"),
+            "garbage from a crashed writer",
+            "the stale temp's contents must not be disturbed"
+        );
+        RecordReplayRunner::replay(&path).expect("the cassette is valid and reopens");
+    }
+
+    #[tokio::test]
+    async fn a_write_failure_surfaces_as_err_and_drop_stays_non_panic() {
+        // A failure in the temp→target replacement must propagate out of `save`
+        // (never a silent success), and a subsequent best-effort drop-flush over
+        // the same failure must not panic. We occupy the target path with a
+        // *directory* so the atomic `rename` cannot succeed — cross-platform, and
+        // independent of filesystem permissions or the test process's uid.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("cassette.json");
+        std::fs::create_dir(&path).expect("occupy the target path with a directory");
+
+        let recorder = RecordReplayRunner::record(&path, scripted());
+        let _ = recorder
+            .output_string(&Command::new("tool").arg("--version"))
+            .await
+            .expect("record (now dirty)");
+        let err = recorder
+            .save()
+            .expect_err("renaming the temp over a directory must fail, not silently succeed");
+        assert!(
+            matches!(err, Error::Io(_)),
+            "a write/rename failure is an Io error, got {err:?}"
+        );
+        // The recorder is still dirty; dropping it re-runs the best-effort flush,
+        // which fails the same way and must swallow it without panicking.
+        drop(recorder);
     }
 
     #[tokio::test]
