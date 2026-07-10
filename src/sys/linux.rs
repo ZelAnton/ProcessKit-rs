@@ -6,6 +6,7 @@
 
 use std::ffi::{CStr, CString};
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -667,17 +668,23 @@ impl Cgroup {
     }
 
     /// Send `sig` to every current member (the graceful SIGTERM tier and the
-    /// public signal broadcast). Best-effort: an empty cgroup is trivially
-    /// signalled, and a member that exits mid-loop just yields `ESRCH`.
+    /// public signal broadcast). Best-effort in *aggregate*: an empty cgroup is
+    /// trivially signalled, and a member that exits mid-broadcast is a benign
+    /// no-op — but each individual delivery is **identity-safe** against pid
+    /// recycling (see [`signal_with`](Self::signal_with) and
+    /// [`deliver_identity_safe`]).
     ///
-    /// This per-pid path is inherently best-effort against pid recycling: in the
-    /// window between reading `cgroup.procs` and `kill(pid, sig)`, a member can
-    /// exit and its pid be reused by an unrelated process, which would then
-    /// receive `sig`. The window is tiny, but the kernel offers no atomic
-    /// per-pid-within-cgroup signal — only `cgroup.kill` (whole-subtree SIGKILL,
-    /// used by [`kill`](Self::kill)) and `cgroup.freeze` (whole-subtree
-    /// suspend/resume, preferred by [`freeze`](Self::freeze)) are race-free.
-    /// SIGKILL teardown therefore goes through `cgroup.kill`, not this path.
+    /// The old raw `kill(pid, sig)` had a destructive TOCTOU window: between
+    /// reading `cgroup.procs` and the `kill`, a member could exit, be reaped, and
+    /// its pid be recycled by an unrelated process *outside* the cgroup, which then
+    /// received `sig`. That is now closed by pinning each pid with a pidfd
+    /// (`pidfd_open`) and delivering through `pidfd_send_signal`, which can only
+    /// ever reach the pinned task — never a recycled pid — after reconfirming the
+    /// pid is still a cgroup member. `cgroup.kill` (whole-subtree SIGKILL, used by
+    /// [`kill`](Self::kill)) stays the path for SIGKILL teardown because a
+    /// broadcast — however identity-safe per pid — can still miss a process forked
+    /// after the membership snapshot; only the atomic whole-subtree operation
+    /// covers that.
     fn signal(&self, sig: i32) -> io::Result<()> {
         self.signal_with(sig, |path| std::fs::read_to_string(path))
     }
@@ -686,21 +693,33 @@ impl Cgroup {
     /// [`members_with`](Self::members_with). A member-list read failure returns
     /// `Err` (via `?`) *before* the per-pid loop below runs, so no signal is ever
     /// sent when the membership is unknown.
+    ///
+    /// Each member is delivered through [`deliver_identity_safe`] with the real
+    /// pidfd syscalls: pin the pid with `pidfd_open`, reconfirm it is still a
+    /// member (a second read through the same seam), then `pidfd_send_signal`. The
+    /// reconfirm uses the *same* injected `read`, so a seam test can drive the
+    /// "member exited + pid recycled before send" race deterministically. A
+    /// kernel without pidfd (< 5.3) makes each delivery fail safe with an honest
+    /// error rather than silently downgrading to a racy raw kill.
     fn signal_with(&self, sig: i32, read: impl Fn(&Path) -> io::Result<String>) -> io::Result<()> {
+        // Reconfirm membership *after* the pidfd pins the identity: re-reads
+        // `cgroup.procs` through the same seam and asks whether the pinned pid is
+        // still listed. If it left, the pidfd may now point at a process outside
+        // the cgroup that recycled the number, so the primitive refuses to send.
+        let still_member =
+            |pid: i32| -> io::Result<bool> { Ok(self.members_with(&read)?.contains(&pid)) };
         let mut last_err = None;
-        for pid in self.members_with(read)? {
-            // SAFETY: a plain signal to a pid read from cgroup.procs.
-            let rc = unsafe { libc::kill(pid, sig) };
-            if rc != 0 {
-                let err = io::Error::last_os_error();
-                // A race where the pid already exited (ESRCH) is benign — the
-                // member is gone, the intended end state. Any other failure
-                // (notably EPERM — a member that changed uid, or a seccomp /
-                // container restriction) is a real delivery failure and must not
-                // read as success: surface the last one.
-                if err.raw_os_error() != Some(libc::ESRCH) {
-                    last_err = Some(err);
-                }
+        for pid in self.members_with(&read)? {
+            // `still_member` captures only shared references, so it is `Copy` —
+            // passing it by value copies it each iteration rather than moving it.
+            match deliver_identity_safe(pid, sig, pidfd_open, still_member, pidfd_send_signal) {
+                // Delivered to the confirmed member, or a benign race (the pinned
+                // target exited, or the pid left the cgroup before we could send —
+                // never a signal to a recycled pid). Nothing to surface.
+                Delivery::Delivered | Delivery::Skipped => {}
+                // A real delivery failure (EPERM, an unreadable membership, or a
+                // kernel lacking pidfd): keep the last one so it is not lost.
+                Delivery::Failed(err) => last_err = Some(err),
             }
         }
         match last_err {
@@ -716,6 +735,14 @@ impl Cgroup {
     /// write returns) and needs no controllers — the same family as the
     /// `cgroup.kill` file used for teardown. On kernels without it, fall back to
     /// per-pid `SIGSTOP`/`SIGCONT`, mirroring the `cgroup.kill` fallback idiom.
+    ///
+    /// The fallback routes through [`signal`](Self::signal), so it inherits the
+    /// same identity-safe pidfd delivery — a recycled pid outside the cgroup is
+    /// never `SIGSTOP`/`SIGCONT`'d, exactly as for `SIGTERM`. The only kernels that
+    /// need this fallback (< 5.2, no `cgroup.freeze`) also lack `pidfd_open`
+    /// (< 5.3), so there the primitive fails safe with an honest error rather than
+    /// a racy raw kill — suspend/resume via the per-pid tier is unavailable on such
+    /// ancient kernels, by design.
     #[cfg(feature = "process-control")]
     fn freeze(&self, frozen: bool) -> io::Result<()> {
         let val: &[u8] = if frozen { b"1" } else { b"0" };
@@ -856,6 +883,143 @@ impl super::graceful::GracefulTarget for Cgroup {
     }
 }
 
+/// The classified outcome of one identity-safe per-member delivery attempt (see
+/// [`deliver_identity_safe`]). Not a bare `io::Result`: "the member is gone" and
+/// "the pid left the cgroup, so it was deliberately skipped" are both success for
+/// the broadcast, yet must be distinguishable from a real delivery failure that
+/// has to surface.
+enum Delivery {
+    /// The signal reached the confirmed member, or a benign exit race made it a
+    /// no-op — either the target exited before we could pin it, or the *pinned*
+    /// task exited before the send (an ESRCH that pidfd guarantees is our target's
+    /// own exit, never a signal leaked to a recycled pid). The intended end state
+    /// holds; nothing to surface.
+    Delivered,
+    /// The pinned pid was no longer a member when we reconfirmed: its number may
+    /// have been recycled by a process *outside* the cgroup, so we refused to
+    /// signal it. No signal was sent.
+    Skipped,
+    /// A real failure to surface: `EPERM` (a member that changed uid, or a
+    /// seccomp/container policy), an unreadable membership (fail-safe: never signal
+    /// when we cannot confirm the target still belongs), or a kernel lacking pidfd
+    /// (fail-safe: refuse to downgrade to a racy raw kill).
+    Failed(io::Error),
+}
+
+/// The identity-safe per-member signal primitive, factored over its syscall seam
+/// so the pid-reuse race is testable without real pidfd syscalls. Three steps,
+/// in this order — the order is what makes it race-free:
+///
+/// 1. `open(pid)` **pins** the exact task currently running as `pid` (a pidfd in
+///    production). From here the delivery in step 3 can only ever reach *this*
+///    task — never a later process that recycles the number.
+/// 2. `still_member(pid)` **reconfirms** membership, read *after* the pin. If the
+///    pin captured a process that had already recycled `pid` (the original member
+///    exited in the snapshot→pin window), that impostor is not a member of our
+///    cgroup, so this reports `false` and we skip without sending.
+/// 3. `send(handle, sig)` delivers through the pinned handle.
+///
+/// Why this never signals a *live* process outside the cgroup: a delivery reaches
+/// a live process only if the pinned task is still alive at step 3, in which case
+/// it has held `pid` continuously since the pin (a live process keeps its pid),
+/// so it *is* the process that step 2 read at `pid` — and step 2 only let us
+/// proceed if that process was a member. If the pinned task instead exited, the
+/// send is a benign `ESRCH`, never a hit on whoever recycled the number.
+fn deliver_identity_safe<H>(
+    pid: i32,
+    sig: i32,
+    open: impl Fn(i32) -> io::Result<H>,
+    still_member: impl Fn(i32) -> io::Result<bool>,
+    send: impl Fn(&H, i32) -> io::Result<()>,
+) -> Delivery {
+    // 1. Pin the exact task currently at `pid`.
+    let handle = match open(pid) {
+        Ok(handle) => handle,
+        // Already gone before we could pin it — the member is the intended end
+        // state (gone). Benign, exactly like an `ESRCH` from the old raw `kill`.
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Delivery::Delivered,
+        // No pidfd on this kernel (< 5.3) or a seccomp filter blocks the syscall:
+        // fail safe with an honest error instead of a racy raw-kill downgrade.
+        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+            return Delivery::Failed(pidfd_unsupported());
+        }
+        Err(e) => return Delivery::Failed(e),
+    };
+    // 2. Reconfirm membership *after* pinning.
+    match still_member(pid) {
+        Ok(true) => {}
+        // The pinned pid left the cgroup — its number may have been recycled by a
+        // process outside our tree. Refuse to signal it.
+        Ok(false) => return Delivery::Skipped,
+        // Membership unknown (an unreadable `cgroup.procs`): never signal when we
+        // cannot confirm the target still belongs to the cgroup.
+        Err(e) => return Delivery::Failed(e),
+    }
+    // 3. Deliver through the pinned handle — the pinned task or nothing.
+    match send(&handle, sig) {
+        Ok(()) => Delivery::Delivered,
+        // The pinned target exited between the reconfirm and the send. pidfd
+        // guarantees this `ESRCH` is *our* target's exit, never a signal that
+        // leaked to a recycled pid — so it is benign.
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Delivery::Delivered,
+        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => Delivery::Failed(pidfd_unsupported()),
+        // A real delivery failure (EPERM, …): surface it, never read as success.
+        Err(e) => Delivery::Failed(e),
+    }
+}
+
+/// The honest error returned when the kernel lacks pidfd support, so per-member
+/// signalling refuses to fall back to a racy `kill(pid, …)`.
+fn pidfd_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "identity-safe per-member signalling needs pidfd (pidfd_open/pidfd_send_signal, \
+         Linux >= 5.3); this kernel lacks it, so processkit refuses to fall back to a racy \
+         kill(pid, ...) that could hit a pid recycled by a process outside the cgroup — use \
+         SIGKILL teardown (atomic cgroup.kill) or run on a >= 5.3 kernel",
+    )
+}
+
+/// `pidfd_open(2)` (Linux >= 5.3): return an owned fd that pins the *exact* task
+/// currently running as `pid`. Unlike the bare pid, this fd never refers to a
+/// later process that recycles the number — the identity anchor the per-member
+/// signal path relies on. A kernel without the syscall answers `ENOSYS`, which
+/// the caller turns into an honest error rather than a racy raw-kill fallback.
+fn pidfd_open(pid: i32) -> io::Result<OwnedFd> {
+    // SAFETY: pidfd_open takes (pid, flags) by value and shares no memory with the
+    // kernel; on success it returns a fresh file descriptor this process owns.
+    let rc = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `rc` is a fresh fd we exclusively own; wrap it so it is closed on drop.
+    Ok(unsafe { OwnedFd::from_raw_fd(rc as RawFd) })
+}
+
+/// `pidfd_send_signal(2)` (Linux >= 5.1): deliver `sig` to the task pinned by
+/// `fd`. Because the fd names a specific task, the signal can only ever reach
+/// that task — never a process that later reused its pid — which is what makes
+/// per-member signalling race-free against pid recycling. A null `siginfo` and
+/// zero flags ask the kernel to behave exactly like `kill(2)`.
+fn pidfd_send_signal(fd: &OwnedFd, sig: i32) -> io::Result<()> {
+    // SAFETY: `fd` is a live pidfd we own; a null siginfo pointer with 0 flags is
+    // the documented "behave like kill(2)" form and shares no memory with the
+    // kernel.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            sig,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Which of the `needed` cgroup controllers are not already present in a
 /// `cgroup.subtree_control` value (a space-separated list of enabled controller
 /// names). Returns the ones that still need enabling — so the caller writes
@@ -980,10 +1144,11 @@ fn write_self_pid(path: &CStr) -> io::Result<()> {
 /// exercised against a real temporary directory.
 #[cfg(test)]
 mod cgroup_read_seam_tests {
+    use std::cell::Cell;
     use std::io;
     use std::path::{Path, PathBuf};
 
-    use super::Cgroup;
+    use super::{Cgroup, Delivery, deliver_identity_safe};
 
     fn cgroup() -> Cgroup {
         Cgroup {
@@ -1090,6 +1255,162 @@ mod cgroup_read_seam_tests {
             .expect("an empty member list is a legitimate zero-active-process stats snapshot");
 
         assert_eq!(stats.active_process_count, 0);
+    }
+
+    // ---- identity-safe per-member delivery (`deliver_identity_safe`) ----
+    //
+    // These drive the pin → reconfirm-membership → send decision logic through
+    // injected syscall closures, so the pid-reuse race is exercised
+    // deterministically without a real pidfd or cgroup. The production
+    // `signal_with` wires the same logic to the real `pidfd_open`/
+    // `pidfd_send_signal`; `pidfd_integration_tests` covers that live path.
+
+    /// A zero-cost stand-in for a pidfd — `deliver_identity_safe` is generic over
+    /// the pin handle, so tests pin with a token instead of a real fd.
+    struct FakeHandle;
+
+    #[test]
+    fn reused_pid_outside_cgroup_is_never_signalled() {
+        // The pin succeeds, but by the time membership is reconfirmed the original
+        // member has exited and its pid was recycled by a process OUTSIDE the
+        // cgroup, so `still_member` reports false. The primitive must skip and
+        // never call `send` — the core PID-reuse safety this task adds.
+        let sent = Cell::new(false);
+        let outcome = deliver_identity_safe(
+            1234,
+            libc::SIGTERM,
+            |_| Ok(FakeHandle),
+            |_| Ok(false),
+            |_: &FakeHandle, _| {
+                sent.set(true);
+                Ok(())
+            },
+        );
+        assert!(matches!(outcome, Delivery::Skipped));
+        assert!(
+            !sent.get(),
+            "a pid recycled outside the cgroup must never be signalled"
+        );
+    }
+
+    #[test]
+    fn confirmed_member_is_signalled_with_the_requested_signal() {
+        let sent = Cell::new(None);
+        let outcome = deliver_identity_safe(
+            42,
+            libc::SIGTERM,
+            |_| Ok(FakeHandle),
+            |_| Ok(true),
+            |_: &FakeHandle, sig| {
+                sent.set(Some(sig));
+                Ok(())
+            },
+        );
+        assert!(matches!(outcome, Delivery::Delivered));
+        assert_eq!(
+            sent.get(),
+            Some(libc::SIGTERM),
+            "the requested signal reaches a confirmed member"
+        );
+    }
+
+    #[test]
+    fn member_gone_before_pin_is_a_benign_no_op() {
+        // `open` (pidfd_open) fails ESRCH: the member exited before we could pin
+        // it. Benign — the intended end state (gone) already holds — and no send;
+        // membership is not even consulted.
+        let sent = Cell::new(false);
+        let outcome = deliver_identity_safe(
+            7,
+            libc::SIGTERM,
+            |_| Err::<FakeHandle, _>(io::Error::from_raw_os_error(libc::ESRCH)),
+            |_| -> io::Result<bool> {
+                panic!("membership must not be checked once the pin fails ESRCH")
+            },
+            |_: &FakeHandle, _| {
+                sent.set(true);
+                Ok(())
+            },
+        );
+        assert!(matches!(outcome, Delivery::Delivered));
+        assert!(!sent.get());
+    }
+
+    #[test]
+    fn no_pidfd_support_fails_safe_instead_of_raw_kill() {
+        // `open` fails ENOSYS (kernel < 5.3 / seccomp): the primitive must surface
+        // an honest Unsupported error, NOT silently fall back to a racy raw kill.
+        let sent = Cell::new(false);
+        let outcome = deliver_identity_safe(
+            7,
+            libc::SIGTERM,
+            |_| Err::<FakeHandle, _>(io::Error::from_raw_os_error(libc::ENOSYS)),
+            |_| Ok(true),
+            |_: &FakeHandle, _| {
+                sent.set(true);
+                Ok(())
+            },
+        );
+        match outcome {
+            Delivery::Failed(e) => assert_eq!(e.kind(), io::ErrorKind::Unsupported),
+            _ => panic!("a kernel without pidfd must fail safe, not signal"),
+        }
+        assert!(!sent.get(), "fail-safe must not send any signal");
+    }
+
+    #[test]
+    fn unreadable_membership_after_pin_fails_safe_without_sending() {
+        // Reconfirming membership fails (EACCES): unknown membership must not be
+        // signalled — fail safe, surface the error, no send.
+        let sent = Cell::new(false);
+        let outcome = deliver_identity_safe(
+            7,
+            libc::SIGTERM,
+            |_| Ok(FakeHandle),
+            |_| Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            |_: &FakeHandle, _| {
+                sent.set(true);
+                Ok(())
+            },
+        );
+        match outcome {
+            Delivery::Failed(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+            _ => panic!("an unreadable membership must fail safe"),
+        }
+        assert!(!sent.get());
+    }
+
+    #[test]
+    fn pinned_target_exiting_before_send_is_a_benign_esrch() {
+        // Membership is confirmed, but the pinned task exits before the send, so
+        // `send` returns ESRCH. pidfd guarantees that ESRCH is our own target's
+        // exit (never a recycled pid), so it is benign — reported Delivered.
+        let outcome = deliver_identity_safe(
+            7,
+            libc::SIGTERM,
+            |_| Ok(FakeHandle),
+            |_| Ok(true),
+            |_: &FakeHandle, _| Err(io::Error::from_raw_os_error(libc::ESRCH)),
+        );
+        assert!(matches!(outcome, Delivery::Delivered));
+    }
+
+    #[test]
+    fn eperm_on_send_is_a_real_failure_that_surfaces() {
+        // A confirmed member that changed uid (or a seccomp/container policy)
+        // rejects the signal with EPERM — a real delivery failure that must not
+        // read as success.
+        let outcome = deliver_identity_safe(
+            7,
+            libc::SIGTERM,
+            |_| Ok(FakeHandle),
+            |_| Ok(true),
+            |_: &FakeHandle, _| Err(io::Error::from_raw_os_error(libc::EPERM)),
+        );
+        match outcome {
+            Delivery::Failed(e) => assert_eq!(e.raw_os_error(), Some(libc::EPERM)),
+            _ => panic!("EPERM is a real delivery failure and must surface"),
+        }
     }
 }
 
@@ -1275,6 +1596,117 @@ mod rearm_race_tests {
             "a child that joined the cgroup mid-shutdown must keep its Drop-kill \
              backstop — the stale request must not re-spare it (Job::drop then \
              cgroup.kill's the tree)"
+        );
+    }
+}
+
+/// Linux integration coverage for the real pidfd mechanism behind the
+/// identity-safe per-member signal path ([`deliver_identity_safe`]). These drive
+/// the *actual* `pidfd_open`/`pidfd_send_signal` syscalls against real child
+/// processes (no cgroup mount needed), and skip — rather than fail — when the
+/// kernel lacks pidfd (< 5.3) or a seccomp filter blocks it, since the mechanism
+/// under test is then unreachable. Complements the deterministic decision-logic
+/// tests in `cgroup_read_seam_tests`, which use injected syscall seams.
+#[cfg(test)]
+mod pidfd_integration_tests {
+    use super::{Delivery, deliver_identity_safe, pidfd_open, pidfd_send_signal};
+
+    /// Whether this kernel/sandbox exposes `pidfd_open` — probed against our own
+    /// pid. `ENOSYS`/`EPERM` (old kernel, seccomp) ⇒ the mechanism is unreachable
+    /// and these tests skip instead of false-failing.
+    fn pidfd_available() -> bool {
+        pidfd_open(std::process::id() as i32).is_ok()
+    }
+
+    /// Spawn a real, long-lived child to pin. `sleep` is POSIX-standard on any
+    /// Linux host; it does not trap `SIGTERM`, so a delivered `SIGTERM` kills it.
+    fn spawn_sleeper() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn `sleep 30`")
+    }
+
+    #[test]
+    fn pidfd_pins_identity_and_reports_exit_via_esrch() {
+        if !pidfd_available() {
+            eprintln!("skipping: pidfd_open unavailable on this kernel/sandbox");
+            return;
+        }
+        let mut child = spawn_sleeper();
+        let pid = child.id() as i32;
+        let fd = pidfd_open(pid).expect("pin the live child");
+        // Signal 0 is a pure existence/permission probe: the child is alive, so Ok.
+        pidfd_send_signal(&fd, 0).expect("null-signal a live pinned child");
+        // Kill and reap, then the pinned fd must report the task gone (ESRCH). It
+        // can NEVER be revived by a process that later recycles `pid` — the whole
+        // point of pinning by pidfd rather than by number.
+        child.kill().expect("kill child");
+        child.wait().expect("reap child");
+        let err =
+            pidfd_send_signal(&fd, 0).expect_err("a reaped, pinned task must not be signallable");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ESRCH),
+            "a pinned task that exited must report ESRCH, never signal a recycled pid"
+        );
+    }
+
+    #[test]
+    fn a_live_non_member_is_skipped_by_the_real_primitive() {
+        if !pidfd_available() {
+            eprintln!("skipping: pidfd_open unavailable on this kernel/sandbox");
+            return;
+        }
+        let mut child = spawn_sleeper();
+        let pid = child.id() as i32;
+        // Real `pidfd_open`/`pidfd_send_signal`, but the membership reconfirm
+        // reports "not a member" (modelling a pid recycled by a process outside
+        // the cgroup). The primitive must skip: the would-be-fatal SIGKILL is never
+        // sent, so the child stays alive.
+        let outcome = deliver_identity_safe(
+            pid,
+            libc::SIGKILL,
+            pidfd_open,
+            |_| Ok(false),
+            pidfd_send_signal,
+        );
+        assert!(matches!(outcome, Delivery::Skipped));
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "a non-member must receive no signal — the live child is untouched"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn a_confirmed_live_member_is_delivered_to() {
+        use std::os::unix::process::ExitStatusExt;
+
+        if !pidfd_available() {
+            eprintln!("skipping: pidfd_open unavailable on this kernel/sandbox");
+            return;
+        }
+        let mut child = spawn_sleeper();
+        let pid = child.id() as i32;
+        // Confirmed member + real syscalls: SIGTERM is delivered and the sleeper,
+        // which does not trap SIGTERM, exits. Proves the real pidfd send path works
+        // end to end, not just the fail-safe branches.
+        let outcome = deliver_identity_safe(
+            pid,
+            libc::SIGTERM,
+            pidfd_open,
+            |_| Ok(true),
+            pidfd_send_signal,
+        );
+        assert!(matches!(outcome, Delivery::Delivered));
+        // `wait` blocks until the child dies, so the SIGTERM has taken effect.
+        let status = child.wait().expect("reap the signalled child");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "the child exited on the SIGTERM we delivered through the pidfd"
         );
     }
 }
