@@ -276,7 +276,13 @@ pub(crate) struct ProcMetrics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProcIdentity(u64);
 
+// Constructed and read only by the Linux (`/proc` starttime) and Windows
+// (creation `FILETIME`) backends; the POSIX fallback (macOS/BSD, `unix.rs`)
+// reports no identity and ignores the anchor, leaving both associated items
+// unused there — allow it on exactly that target rather than deleting methods
+// the other two backends need (mirrors the `SpawnOptions` field pattern above).
 #[cfg(feature = "stats")]
+#[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
 impl ProcIdentity {
     /// Wrap a platform-specific raw start-time token (constructed only by the
     /// platform backend that knows its units).
