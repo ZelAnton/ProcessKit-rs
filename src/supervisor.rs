@@ -466,6 +466,19 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// `Error::Cancelled` immediately, regardless of policy or budget — the
     /// token stays cancelled, so a restart would only be cancelled again.
     pub async fn run(self) -> Result<SupervisionOutcome> {
+        // Reject up front a configuration that could genuinely need a second
+        // incarnation but only has a one-shot stdin source to feed it: the
+        // first incarnation would consume the source, and every restart after
+        // it would fail to launch at all (`Error::Io`, "already consumed" —
+        // see `runner::take_stdin_for_run`), which under the default OnCrash
+        // policy spins forever as a rapid crash-restart-backoff loop instead
+        // of ever making progress. Caught here, before the first run even
+        // starts, so the failure is immediate and typed rather than an
+        // eventual runtime symptom.
+        if self.may_restart() && self.has_unusable_one_shot_stdin() {
+            return Err(self.one_shot_restart_err());
+        }
+
         let factor = if self.backoff_factor.is_finite() {
             self.backoff_factor.max(1.0)
         } else {
@@ -592,6 +605,57 @@ impl<R: ProcessRunner> Supervisor<R> {
         crate::Error::Cancelled {
             program: command.program_name(),
         }
+    }
+
+    /// Whether this supervisor's configuration could genuinely need more than
+    /// one run. [`RestartPolicy::Never`] never restarts, and an explicit
+    /// [`max_restarts(0)`](Self::max_restarts) budget caps supervision at the
+    /// first run regardless of policy — both mean a second incarnation can
+    /// never happen, so a one-shot stdin source is perfectly safe for either.
+    /// Every other policy/budget combination *could* restart (whether it
+    /// actually does depends on the run's outcome, which isn't known yet).
+    fn may_restart(&self) -> bool {
+        !matches!(self.policy, RestartPolicy::Never) && self.max_restarts != Some(0)
+    }
+
+    /// Whether `self.command`'s stdin source is one that only feeds a single
+    /// run and can't be replayed into a restart — a one-shot streaming source
+    /// ([`Stdin::from_reader`](crate::Stdin::from_reader)/
+    /// [`Stdin::from_lines`](crate::Stdin::from_lines)), and only when it is
+    /// actually going to be fed to the child at all
+    /// ([`keep_stdin_open`](Command::keep_stdin_open) hands the pipe to the
+    /// caller instead, ignoring any configured source). Mirrors the
+    /// equivalent check `runner::retrying` uses to skip retrying a one-shot
+    /// command.
+    fn has_unusable_one_shot_stdin(&self) -> bool {
+        !self.command.keeps_stdin_open()
+            && self
+                .command
+                .stdin_source()
+                .is_some_and(crate::Stdin::is_one_shot)
+    }
+
+    /// The typed, early error for [`may_restart`](Self::may_restart) +
+    /// [`has_unusable_one_shot_stdin`](Self::has_unusable_one_shot_stdin) both
+    /// holding: the same `Error::Io`/`InvalidInput` shape
+    /// `runner::take_stdin_for_run` raises when a later incarnation actually
+    /// hits the consumed source, but reported before any incarnation runs at
+    /// all instead of after a wasted (and then endlessly repeated) attempt.
+    fn one_shot_restart_err(&self) -> crate::Error {
+        crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "`{}`: this supervisor's restart policy ({:?}, max_restarts: {:?}) may run \
+                 the command more than once, but its stdin source is one-shot \
+                 (Stdin::from_reader/from_lines) and only feeds a single incarnation — use \
+                 Stdin::from_bytes/from_string/from_file/from_iter_lines (re-runnable stdin), \
+                 or restrict this supervisor to RestartPolicy::Never/max_restarts(0) for a \
+                 single run",
+                self.command.program_name(),
+                self.policy,
+                self.max_restarts,
+            ),
+        ))
     }
 
     /// Sleep `delay`, waking early (returning `true`) if the supervised command's
@@ -736,6 +800,7 @@ fn jitter_factor() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Stdin;
     use crate::result::Outcome;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -817,6 +882,15 @@ mod tests {
 
     fn supervise(runner: SeqRunner) -> Supervisor<SeqRunner> {
         Supervisor::new(Command::new("fake"))
+            .with_runner(runner)
+            .backoff(Duration::ZERO, 1.0)
+            .jitter(false)
+    }
+
+    /// Like [`supervise`], but with `stdin` configured on the underlying
+    /// `Command` — for the one-shot-stdin-vs-restart guard tests below.
+    fn supervise_with_stdin(runner: SeqRunner, stdin: crate::Stdin) -> Supervisor<SeqRunner> {
+        Supervisor::new(Command::new("fake").stdin(stdin))
             .with_runner(runner)
             .backoff(Duration::ZERO, 1.0)
             .jitter(false)
@@ -1481,5 +1555,146 @@ mod tests {
         assert_eq!(apply_jitter(Duration::ZERO, true), Duration::ZERO);
         let normal = apply_jitter(Duration::from_secs(10), true);
         assert!(normal >= Duration::from_secs(5) && normal < Duration::from_secs(15));
+    }
+
+    // --- One-shot stdin vs. a restart-capable policy (T-086) ---------------
+
+    #[tokio::test(start_paused = true)]
+    async fn one_shot_stdin_blocks_an_unlimited_oncrash_supervisor_before_any_run() {
+        // OnCrash + unlimited restarts could always need a second incarnation.
+        // An empty SeqRunner guarantees a panic if the guard ever lets a run
+        // through.
+        let start = tokio::time::Instant::now();
+        let err = supervise_with_stdin(SeqRunner::new(vec![]), Stdin::from_reader(&b"x"[..]))
+            .run()
+            .await
+            .expect_err("an unlimited OnCrash policy could need a second incarnation");
+        assert!(matches!(err, crate::Error::Io(_)), "got {err:?}");
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "must fail before the first run/backoff, not after one"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_shot_stdin_blocks_an_always_supervisor_before_any_run() {
+        // Always restarts even a clean run, so a one-shot source is just as
+        // unusable here as under OnCrash.
+        let start = tokio::time::Instant::now();
+        let err = supervise_with_stdin(
+            SeqRunner::new(vec![]),
+            Stdin::from_lines(tokio_stream::iter(vec!["x".to_owned()])),
+        )
+        .restart(RestartPolicy::Always)
+        .run()
+        .await
+        .expect_err("Always could always need a second incarnation");
+        assert!(matches!(err, crate::Error::Io(_)), "got {err:?}");
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_shot_stdin_blocks_a_finite_restart_budget_before_any_run() {
+        // A finite but nonzero budget still allows a second incarnation. The
+        // scripted (would-be) spawn error is never consumed, proving the
+        // guard fires ahead of the first attempt regardless of what that
+        // attempt would have reported.
+        let start = tokio::time::Instant::now();
+        let err = supervise_with_stdin(
+            SeqRunner::new(vec![spawn_err()]),
+            Stdin::from_reader(&b"x"[..]),
+        )
+        .max_restarts(2)
+        .run()
+        .await
+        .expect_err("max_restarts(2) could still need a second incarnation");
+        assert!(matches!(err, crate::Error::Io(_)), "got {err:?}");
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_shot_stdin_is_allowed_under_restart_policy_never() {
+        // Never runs at most once, so a one-shot source is fine — the guard
+        // must not fire, and the single scripted run must actually execute.
+        let outcome =
+            supervise_with_stdin(SeqRunner::new(vec![fail(3)]), Stdin::from_reader(&b"x"[..]))
+                .restart(RestartPolicy::Never)
+                .run()
+                .await
+                .expect("a single permitted run with one-shot stdin must succeed");
+        assert_eq!(outcome.restarts, 0);
+        assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
+        assert_eq!(outcome.final_result.code(), Some(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_shot_stdin_is_allowed_under_a_zero_restart_budget() {
+        // max_restarts(0) also caps supervision at a single run under the
+        // default OnCrash policy — same allowance as RestartPolicy::Never.
+        let outcome =
+            supervise_with_stdin(SeqRunner::new(vec![fail(1)]), Stdin::from_reader(&b"x"[..]))
+                .max_restarts(0)
+                .run()
+                .await
+                .expect("a single permitted run with one-shot stdin must succeed");
+        assert_eq!(outcome.restarts, 0);
+        assert_eq!(outcome.stopped, StopReason::RestartsExhausted);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keep_stdin_open_ignores_a_configured_one_shot_source() {
+        // keep_stdin_open() hands the pipe to the caller and never feeds the
+        // configured Stdin source to the child at all, so it can't be
+        // "consumed" by an incarnation — the guard must not fire, and
+        // restarts proceed exactly as they would with no stdin configured.
+        let outcome = Supervisor::new(
+            Command::new("fake")
+                .stdin(Stdin::from_reader(&b"x"[..]))
+                .keep_stdin_open(),
+        )
+        .with_runner(SeqRunner::new(vec![fail(1), ok()]))
+        .backoff(Duration::ZERO, 1.0)
+        .jitter(false)
+        .run()
+        .await
+        .expect("keep_stdin_open bypasses the one-shot guard");
+        assert_eq!(outcome.restarts, 1);
+        assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reusable_stdin_sources_still_restart_under_unlimited_oncrash() {
+        // Bytes/string/file/iter-lines sources are replayable, so an
+        // unlimited restart-capable policy must keep working exactly as it
+        // did before this guard existed.
+        for stdin in [
+            Stdin::from_bytes(b"x".to_vec()),
+            Stdin::from_string("x"),
+            Stdin::from_iter_lines(["a", "b"]),
+        ] {
+            let outcome = supervise_with_stdin(SeqRunner::new(vec![fail(1), fail(1), ok()]), stdin)
+                .run()
+                .await
+                .expect("a reusable stdin source must not trip the one-shot guard");
+            assert_eq!(outcome.restarts, 2);
+            assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
+        }
+    }
+
+    #[test]
+    fn one_shot_restart_err_names_the_program_and_is_understandable() {
+        let sv = Supervisor::new(Command::new("fake").stdin(Stdin::from_reader(&b"x"[..])))
+            .with_runner(SeqRunner::new(vec![]));
+        let err = sv.one_shot_restart_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fake"),
+            "message should name the program: {msg}"
+        );
+        assert!(
+            msg.contains("one-shot"),
+            "message should explain the actual problem: {msg}"
+        );
     }
 }

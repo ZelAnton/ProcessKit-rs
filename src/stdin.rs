@@ -4,29 +4,50 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::io::{AsyncRead, AsyncWriteExt};
-use tokio::sync::Mutex as AsyncMutex;
 use tokio_stream::{Stream, StreamExt};
 
 /// A boxed async reader, shared so [`Stdin`] stays `Clone` (one-shot: consumed
-/// on first use).
-type SharedReader = Arc<AsyncMutex<Option<Pin<Box<dyn AsyncRead + Send>>>>>;
+/// on first use). A plain [`Mutex`], not an async one: the only critical
+/// sections — reserving the payload out of the cell, and restoring it on a
+/// rolled-back reservation — are instant `Option::take`/store steps that never
+/// span an `.await`, and a synchronous lock is what lets a dropped, uncommitted
+/// reservation put the payload back from `Drop` (which cannot `.await`).
+type SharedReader = Arc<Mutex<Option<Pin<Box<dyn AsyncRead + Send>>>>>;
 /// A boxed async line stream, shared the same way.
-type SharedLines = Arc<AsyncMutex<Option<Pin<Box<dyn Stream<Item = String> + Send>>>>>;
+type SharedLines = Arc<Mutex<Option<Pin<Box<dyn Stream<Item = String> + Send>>>>>;
+
+/// Lock a shared one-shot cell, tolerating a poisoned mutex. The critical
+/// section never panics while holding the lock (it only `take`s/stores an
+/// `Option`), so poisoning cannot arise from this module — recovering the guard
+/// rather than unwrapping keeps a rollback in `Drop` from turning an unrelated
+/// panic into a double panic.
+fn lock_cell<T>(cell: &Arc<Mutex<T>>) -> MutexGuard<'_, T> {
+    cell.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// What to feed a child process on standard input.
 ///
 /// When a command has no `Stdin` (or
 /// [`Stdin::empty`]), stdin is closed at start so the child reads EOF
 /// immediately. The streaming sources ([`from_reader`](Self::from_reader),
-/// [`from_lines`](Self::from_lines)) are one-shot — their payload is consumed by
-/// the first run. Re-running or retrying a [`Command`](crate::Command) that
-/// reuses a consumed one-shot source **fails loud** (an
-/// [`Error::Io`](crate::Error::Io) at launch) rather than silently feeding
-/// the next run empty stdin; use a reusable source
+/// [`from_lines`](Self::from_lines)) are one-shot — their payload feeds the
+/// first run that actually **starts a child** and is consumed then. Re-running
+/// or retrying a [`Command`](crate::Command) that reuses a consumed one-shot
+/// source **fails loud** (an [`Error::Io`](crate::Error::Io) at launch) rather
+/// than silently feeding the next run empty stdin; use a reusable source
 /// (`from_string`/`from_bytes`/`from_file`/`from_iter_lines`) to re-run.
+///
+/// Reservation is transactional: a launch that fails **before** a child exists
+/// (program not found, a spawn error, an already-raised cancellation) leaves the
+/// payload untouched, so the very same `Command` can be launched again and will
+/// feed that child normally. Only the launch that reaches a live child consumes
+/// the source — and it stays consumed even if the subsequent write to the
+/// child's stdin fails (e.g. the child closed its read end early). Two concurrent
+/// launches of one cloned source never both feed a child: exactly one reserves
+/// the payload; the other fails loud.
 #[derive(Clone)]
 pub struct Stdin(Source);
 
@@ -88,9 +109,7 @@ impl Stdin {
     where
         R: AsyncRead + Send + 'static,
     {
-        Stdin(Source::Reader(Arc::new(AsyncMutex::new(Some(Box::pin(
-            reader,
-        ))))))
+        Stdin(Source::Reader(Arc::new(Mutex::new(Some(Box::pin(reader))))))
     }
 
     /// Write each item of an async string stream as a `\n`-terminated line.
@@ -99,9 +118,7 @@ impl Stdin {
     where
         S: Stream<Item = String> + Send + 'static,
     {
-        Stdin(Source::Lines(Arc::new(AsyncMutex::new(Some(Box::pin(
-            lines,
-        ))))))
+        Stdin(Source::Lines(Arc::new(Mutex::new(Some(Box::pin(lines))))))
     }
 
     /// Whether this source closes stdin without writing anything.
@@ -113,8 +130,9 @@ impl Stdin {
     /// ([`from_reader`](Self::from_reader) / [`from_lines`](Self::from_lines)) —
     /// its payload feeds a *single* run and cannot be replayed. The retry path
     /// uses this to refuse retrying such a command (a retry could not re-feed the
-    /// input), and the launch path takes the payload atomically (see
-    /// [`take_for_run`](Self::take_for_run)).
+    /// input), and the launch path reserves the payload transactionally (see
+    /// [`take_for_run`](Self::take_for_run)), committing it only once a child
+    /// exists.
     pub(crate) fn is_one_shot(&self) -> bool {
         matches!(self.0, Source::Reader(_) | Source::Lines(_))
     }
@@ -159,44 +177,123 @@ impl Stdin {
         }
     }
 
-    /// Take this source's payload for a single run, or report a one-shot
-    /// source already consumed by a previous run.
+    /// Reserve this source's payload for a single run, or report a one-shot
+    /// source already consumed (or currently reserved) by another run.
     ///
     /// One-shot sources ([`from_reader`](Self::from_reader)/
     /// [`from_lines`](Self::from_lines)) are removed from their shared cell here —
-    /// **atomically**, under the async lock — so the take and the "already
-    /// consumed?" decision are a single step. This closes the TOCTOU where two
-    /// concurrent runs of the same cloned source could each pass a separate
+    /// **atomically**, under the lock — so the take and the "already consumed?"
+    /// decision are a single step. This closes the TOCTOU where two concurrent
+    /// runs of the same cloned source could each pass a separate
     /// `is_consumed`-style check and then have one silently feed the child empty
-    /// stdin: a concurrent second run now observes the source taken and fails
-    /// loud at launch. Re-runnable sources (bytes/file/empty) clone their
-    /// replayable payload. Call once per run, at launch.
-    pub(crate) async fn take_for_run(&self) -> Result<TakenStdin, OneShotConsumed> {
-        Ok(match &self.0 {
-            Source::Empty => TakenStdin::Empty,
-            Source::Bytes(bytes) => TakenStdin::Bytes(bytes.clone()),
-            Source::File(path) => TakenStdin::File(path.clone()),
-            Source::Reader(reader) => match reader.lock().await.take() {
-                Some(r) => TakenStdin::Reader(r),
+    /// stdin: a concurrent second run observes the source taken and fails loud at
+    /// launch. Re-runnable sources (bytes/file/empty) reserve a fresh clone of
+    /// their replayable payload.
+    ///
+    /// The take is a *reservation*, not yet a commitment. The returned
+    /// [`StdinReservation`] holds the payload out of the cell for the duration of
+    /// the launch. On success the caller [`commit`](StdinReservation::commit)s it
+    /// (yielding the payload to feed the child and leaving a one-shot cell empty
+    /// forever); if the launch fails before a child exists, dropping the
+    /// reservation without committing returns the payload to the cell, so the same
+    /// [`Command`](crate::Command) can be launched again. Call once per run, at
+    /// launch.
+    pub(crate) fn take_for_run(&self) -> Result<StdinReservation, OneShotConsumed> {
+        let reserved = match &self.0 {
+            Source::Empty => Reserved::Reusable(TakenStdin::Empty),
+            Source::Bytes(bytes) => Reserved::Reusable(TakenStdin::Bytes(bytes.clone())),
+            Source::File(path) => Reserved::Reusable(TakenStdin::File(path.clone())),
+            Source::Reader(reader) => match lock_cell(reader).take() {
+                Some(r) => Reserved::OneShotReader(r, Arc::clone(reader)),
                 None => return Err(OneShotConsumed),
             },
-            Source::Lines(lines) => match lines.lock().await.take() {
-                Some(s) => TakenStdin::Lines(s),
+            Source::Lines(lines) => match lock_cell(lines).take() {
+                Some(s) => Reserved::OneShotLines(s, Arc::clone(lines)),
                 None => return Err(OneShotConsumed),
             },
-        })
+        };
+        Ok(StdinReservation(Some(reserved)))
     }
 }
 
 /// A one-shot streaming stdin source ([`Stdin::from_reader`]/
-/// [`Stdin::from_lines`]) whose payload was already consumed by a previous run —
-/// returned by [`Stdin::take_for_run`] so the launch path can fail loud.
+/// [`Stdin::from_lines`]) whose payload was already consumed (or is currently
+/// reserved) by another run — returned by [`Stdin::take_for_run`] so the launch
+/// path can fail loud.
 #[derive(Debug)]
 pub(crate) struct OneShotConsumed;
 
-/// A stdin payload taken for one run by [`Stdin::take_for_run`]. It owns its
-/// content (a one-shot source has been removed from its shared cell), so writing
-/// it is a plain move — there is no second take and so no empty-stdin footgun.
+/// A payload reserved for one run by [`Stdin::take_for_run`], held across the
+/// launch's spawn attempt so the take can be **committed or rolled back**.
+///
+/// This is what makes one-shot reservation transactional. Reserving a one-shot
+/// source removes its payload from the shared cell up front, so a concurrent
+/// second run observes it taken and fails loud (never spawning a duplicate
+/// child). Then:
+///
+/// - the launch reaches a live child → [`commit`](Self::commit): the payload is
+///   yielded to feed the child and a one-shot cell is left empty for good, so the
+///   source stays consumed even if the later write to the child's stdin fails;
+/// - the launch fails first (program not found, spawn error, raised cancel) →
+///   the reservation is dropped **without** committing, and its [`Drop`] returns
+///   the payload to the cell so the same command can be launched again.
+///
+/// Re-runnable sources (bytes/file/empty) reserve a fresh clone and roll back to
+/// nothing — commit and drop are equivalent for them.
+pub(crate) struct StdinReservation(Option<Reserved>);
+
+/// The reserved payload inside a [`StdinReservation`] — `None` once committed or
+/// rolled back. The one-shot variants also carry a clone of their shared cell so
+/// a drop-without-commit can restore the payload there.
+enum Reserved {
+    /// A re-runnable payload (bytes/file/empty): nothing to restore on rollback.
+    Reusable(TakenStdin),
+    /// A one-shot reader taken out of its cell; rollback puts it back.
+    OneShotReader(Pin<Box<dyn AsyncRead + Send>>, SharedReader),
+    /// A one-shot line stream taken out of its cell; rollback puts it back.
+    OneShotLines(Pin<Box<dyn Stream<Item = String> + Send>>, SharedLines),
+}
+
+impl StdinReservation {
+    /// Commit the reservation now that a child exists: yield the payload to write
+    /// to the child and leave any one-shot cell permanently empty (the source is
+    /// consumed). Consumes the reservation, so its [`Drop`] can no longer roll
+    /// back — the source stays consumed even if writing the payload then fails.
+    pub(crate) fn commit(mut self) -> TakenStdin {
+        match self
+            .0
+            .take()
+            .expect("a StdinReservation is committed at most once")
+        {
+            Reserved::Reusable(payload) => payload,
+            // Drop the cell handle without restoring: the source is now consumed.
+            Reserved::OneShotReader(reader, _cell) => TakenStdin::Reader(reader),
+            Reserved::OneShotLines(lines, _cell) => TakenStdin::Lines(lines),
+        }
+    }
+}
+
+impl Drop for StdinReservation {
+    fn drop(&mut self) {
+        // An uncommitted one-shot reservation returns its payload to the source's
+        // cell, so a later launch of the same command can take it again. A
+        // re-runnable (or already-committed) reservation has nothing to restore.
+        match self.0.take() {
+            Some(Reserved::OneShotReader(reader, cell)) => {
+                *lock_cell(&cell) = Some(reader);
+            }
+            Some(Reserved::OneShotLines(lines, cell)) => {
+                *lock_cell(&cell) = Some(lines);
+            }
+            Some(Reserved::Reusable(_)) | None => {}
+        }
+    }
+}
+
+/// A stdin payload committed to one run — obtained from
+/// [`StdinReservation::commit`] once a child exists. It owns its content (a
+/// one-shot source has been removed from its shared cell for good), so writing it
+/// is a plain move — there is no second take and so no empty-stdin footgun.
 pub(crate) enum TakenStdin {
     Empty,
     Bytes(Vec<u8>),
@@ -393,14 +490,15 @@ impl fmt::Debug for ProcessStdin {
 mod tests {
     use super::*;
 
-    /// Take the source for one run and drive its payload into an in-memory sink,
-    /// returning what was written (panics if the one-shot source was consumed).
+    /// Reserve the source for one run, commit it (as a successful launch would),
+    /// and drive its payload into an in-memory sink, returning what was written
+    /// (panics if the one-shot source was already consumed).
     async fn written(stdin: &Stdin) -> Vec<u8> {
         let mut sink = Vec::new();
         stdin
             .take_for_run()
-            .await
             .unwrap_or_else(|_| panic!("source already consumed"))
+            .commit()
             .write_to(&mut sink)
             .await
             .expect("write_to");
@@ -414,7 +512,7 @@ mod tests {
         let stdin = Stdin::from_reader(&b"payload"[..]);
         assert_eq!(written(&stdin).await, b"payload");
         assert!(
-            stdin.take_for_run().await.is_err(),
+            stdin.take_for_run().is_err(),
             "a consumed one-shot reader reports OneShotConsumed, not empty"
         );
     }
@@ -438,7 +536,7 @@ mod tests {
         ]));
         assert_eq!(written(&stdin).await, b"first\nsecond\n");
         assert!(
-            stdin.take_for_run().await.is_err(),
+            stdin.take_for_run().is_err(),
             "the stream was consumed by the first run"
         );
     }
@@ -475,8 +573,8 @@ mod tests {
         let mut sink = Vec::new();
         let err = stdin
             .take_for_run()
-            .await
             .unwrap_or_else(|_| panic!("file source is re-runnable"))
+            .commit()
             .write_to(&mut sink)
             .await
             .expect_err("a missing stdin file must error, not feed silence");
@@ -488,35 +586,78 @@ mod tests {
         assert!(written(&Stdin::empty()).await.is_empty());
     }
 
-    #[tokio::test]
-    async fn concurrent_reuse_of_a_one_shot_source_fails_the_loser_atomically() {
-        // The take is atomic: when two runs of the same (cloned) one-shot source
-        // race, exactly one wins the payload and the other observes it consumed —
-        // no window where both pass a check and one then feeds empty stdin. The
-        // slow copy no longer holds the source lock, so the loser returns promptly.
-        use std::time::Duration;
-
-        let (_tx, rx) = tokio::io::duplex(64);
-        let stdin = Stdin::from_reader(rx);
+    #[test]
+    fn a_reservation_holds_the_source_taken_until_it_is_committed() {
+        // Reserving a one-shot source removes its payload up front, so a second
+        // (concurrent) take observes it already reserved and fails loud — no
+        // window where both reservations succeed and one then feeds empty stdin.
+        // This models two concurrent launches racing one cloned source: exactly
+        // one reserves the payload; the other errors instead of spawning a
+        // duplicate child. The take is synchronous and instant, so the loser is
+        // never blocked on the winner.
+        let stdin = Stdin::from_reader(&b"payload"[..]);
         let stdin2 = stdin.clone();
 
-        // Run 1 wins the take and parks in the copy (no data, no EOF).
-        let run1 = tokio::spawn(async move {
-            let taken = stdin.take_for_run().await.expect("run 1 wins the take");
-            let mut sink = Vec::new();
-            let _ = taken.write_to(&mut sink).await;
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Run 2 must observe the consumed source and finish quickly with an error.
-        let second = tokio::time::timeout(Duration::from_secs(2), stdin2.take_for_run()).await;
-        let second = second.expect("the loser must not block on the slow winner's copy");
+        let reservation = stdin.take_for_run().expect("the first reservation wins");
         assert!(
-            second.is_err(),
-            "the losing concurrent run sees the one-shot source already taken"
+            stdin2.take_for_run().is_err(),
+            "a second concurrent take sees the source already reserved"
         );
+        // Committing (a live child now exists) keeps it consumed for good.
+        let _committed = reservation.commit();
+        assert!(
+            stdin.take_for_run().is_err(),
+            "a committed one-shot source stays consumed"
+        );
+    }
 
-        run1.abort();
+    #[tokio::test]
+    async fn dropping_a_reservation_without_committing_returns_the_payload() {
+        // A launch that fails before a child exists drops its reservation
+        // uncommitted; that rolls the payload back into the shared cell, so the
+        // same source can be reserved and fed by a later run.
+        let stdin = Stdin::from_reader(&b"payload"[..]);
+        {
+            let _reservation = stdin.take_for_run().expect("first reservation");
+            assert!(
+                stdin.take_for_run().is_err(),
+                "while a reservation is outstanding the source is taken"
+            );
+            // `_reservation` drops here uncommitted → the payload is restored.
+        }
+        // The rolled-back payload feeds a later run exactly as if untouched.
+        assert_eq!(written(&stdin).await, b"payload");
+        // That later run committed the source, so it is now finally consumed.
+        assert!(
+            stdin.take_for_run().is_err(),
+            "the committed re-run consumes the one-shot source"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_lines_reservation_also_rolls_back() {
+        // The rollback path applies to `from_lines` as much as `from_reader`.
+        let stdin = Stdin::from_lines(tokio_stream::iter(vec!["a".to_owned(), "b".to_owned()]));
+        drop(stdin.take_for_run().expect("reserve the line stream"));
+        assert_eq!(written(&stdin).await, b"a\nb\n");
+        assert!(
+            stdin.take_for_run().is_err(),
+            "the committed re-run consumes the line stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reusable_source_survives_reserve_commit_and_rollback() {
+        // Re-runnable sources clone their payload per reservation, so neither a
+        // rollback nor a commit ever consumes them.
+        let stdin = Stdin::from_bytes(b"abc".to_vec());
+        drop(stdin.take_for_run().expect("reserve")); // rollback: no-op for a clone
+        assert_eq!(written(&stdin).await, b"abc"); // commit
+        assert_eq!(
+            written(&stdin).await,
+            b"abc",
+            "a re-runnable source replays on every run"
+        );
     }
 
     #[test]

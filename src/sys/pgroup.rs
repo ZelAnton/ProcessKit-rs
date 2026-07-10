@@ -24,7 +24,98 @@ use tokio::process::{Child, Command};
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
 
-/// One tracked id (a group leader pid or a solo pid) plus its liveness latch.
+/// Best-effort read of `pid`'s OS **start-time identity token** — a value that
+/// changes when the same pid/pgid *number* is reused for a different process, so
+/// a recycled number can be told apart from the original process a tracked
+/// [`Entry`] was bound to. Captured once at track time and re-read on every
+/// probe; a live number whose current token differs from the captured one is a
+/// *stranger* that recycled the number, and is treated as gone (never signalled).
+///
+/// `None` means "identity unknown" and is *never* treated as proof of anything —
+/// a target or a read that can't produce a token degrades to the number-only
+/// liveness behavior with no weakening. Availability by platform:
+///
+/// - **Linux / Android** — `/proc/<pid>/stat` field 22 (process start time in
+///   clock ticks since boot; set at creation, stable across `exec`).
+/// - **macOS / the other Apple targets** — `proc_pidinfo(PROC_PIDTBSDINFO)`'s
+///   `pbi_start_tvsec`/`pbi_start_tvusec` (process creation time).
+/// - **the BSDs** — *not wired up*: the start time lives in `kinfo_proc`, reached
+///   only through per-OS `sysctl(KERN_PROC)` MIBs with divergent layouts
+///   (FreeBSD/DragonFly `kp_start`, NetBSD's separate `kinfo_proc2`, OpenBSD's
+///   element-size/count MIB) and no hosted CI runner to verify any of them.
+///   Shipping an unverifiable reader whose silent miscompute would *break*
+///   kill-on-drop is worse than not having one, so identity reads return `None`
+///   here and every entry keeps the pre-existing number-only `group_seen`
+///   behavior. The residual recycled-number window this leaves is exactly the
+///   one that existed before identity tracking — no BSD regression.
+///
+/// Residual even where available: start-time granularity (a clock tick on Linux,
+/// a microsecond on macOS) makes two processes that occupy the same number within
+/// one tick indistinguishable — astronomically unlikely for a group leader (its
+/// pgid is reserved by POSIX until the whole group drains, so reuse requires the
+/// group to fully die first) and negligible for a solo pid.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_identity(pid: i32) -> Option<u64> {
+    // `/proc/<pid>/stat` field 22 is the start time in clock ticks since boot.
+    // The comm field (2) may contain spaces/parens, so read after the last ')'
+    // (matching the `process_metrics` parser in `sys/linux.rs`): after it, the
+    // whitespace-split index 0 is field 3 (state), so field 22 is index 19.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit_once(')')?.1;
+    after.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+/// The Apple reader — see the identity-token doc above the Linux `read_identity`.
+#[cfg(target_vendor = "apple")]
+fn read_identity(pid: i32) -> Option<u64> {
+    // `proc_pidinfo(PROC_PIDTBSDINFO)` fills a `proc_bsdinfo` whose
+    // `pbi_start_tvsec`/`pbi_start_tvusec` is the process creation time (stable
+    // across `exec`, distinct for a recycled pid). Fold it into microseconds.
+    // SAFETY: `proc_bsdinfo` is plain-old-data (integers and byte arrays), for
+    // which an all-zero bit pattern is a valid initialized value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let want = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `proc_pidinfo` writes at most `want` bytes into `info`; a valid
+    // pointer and a matching buffer size are its only preconditions.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast::<libc::c_void>(),
+            want,
+        )
+    };
+    // A full-size fill is success; 0 / -1 (gone, EPERM) or a short read is not a
+    // usable identity — report `None` so the caller defers to the liveness probe.
+    if got != want {
+        return None;
+    }
+    Some(
+        info.pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec),
+    )
+}
+
+/// The BSDs (and any other unix): no wired-up reader, so identity is always
+/// unknown — see the identity-token doc above the Linux `read_identity`.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn read_identity(_pid: i32) -> Option<u64> {
+    None
+}
+
+/// Positive proof that the number behind a tracked entry was recycled: the
+/// identity captured at track time and the one read now are *both* known and
+/// they *differ*. A `None` on either side is never proof — the caller then
+/// defers to the liveness probe, so a target without an identity reader (the
+/// BSDs) is not weakened.
+fn is_recycled(tracked: Option<u64>, current: Option<u64>) -> bool {
+    matches!((tracked, current), (Some(a), Some(b)) if a != b)
+}
+
+/// One tracked id (a group leader pid or a solo pid), its liveness latch, and the
+/// start-time identity captured when it was first tracked (see `read_identity`).
 struct Entry {
     id: i32,
     /// Latched `true` once the group probe (`kill(-id, 0)`) has succeeded — the
@@ -35,6 +126,14 @@ struct Entry {
     /// `Drop`/`kill_all` SIGKILL an unrelated process that recycled the pid.
     /// Unused for solo (non-group) sets, whose probe is always a direct pid.
     group_seen: bool,
+    /// Start-time identity of the tracked process captured at track time (see
+    /// `read_identity`). Re-read on every probe: a live number whose current
+    /// identity differs is a recycled *stranger* and is reported gone — the
+    /// fail-safe that stops a signal reaching an unrelated process/group that
+    /// reused the pid/pgid *without* an intervening `ESRCH` for the `group_seen`
+    /// latch to catch. `None` (the BSDs, or a failed read) defers to the
+    /// number-only liveness behavior, so no platform is weakened.
+    identity: Option<u64>,
 }
 
 /// One tracked id-set with its probe/signal primitives — either process
@@ -49,6 +148,15 @@ struct Entry {
 /// pid — any reuse aliases it (likelier on macOS's small pid space). The
 /// mitigations are uniform for both kinds:
 ///
+/// - bind each entry to the tracked process's start-time identity (see
+///   `read_identity`) captured at track time and re-checked on every probe: a
+///   live number whose current identity differs was recycled by a *stranger*, so
+///   it is reported gone and never signalled ([`probe_entry`](Self::probe_entry)).
+///   This is the load-bearing fail-safe — it catches a reuse even when no
+///   intervening `ESRCH` was ever observed (the case the `group_seen` latch alone
+///   misses: a drained group whose pgid a new leader takes, or a solo pid reused,
+///   between two sweeps). Where identity is unreadable (the BSDs) the entry falls
+///   back to the number-only checks below with no weakening;
 /// - probe existence immediately before signalling, so the in-sweep window is
 ///   a few instructions wide;
 /// - prune on `ESRCH` and never re-add a pruned id — an empty group can never
@@ -114,10 +222,41 @@ impl Tracked {
         (false, group_seen)
     }
 
-    /// Probe a stored entry, updating its [`group_seen`](Entry::group_seen) latch.
+    /// Probe a stored entry, updating its [`group_seen`](Entry::group_seen) latch
+    /// and gating the liveness verdict through the entry's start-time identity.
+    ///
+    /// The identity gate is the fail-safe that closes the recycled-number hazard
+    /// the `group_seen` latch alone cannot: the latch only catches a reuse the
+    /// code observed an `ESRCH` for *before* the number was recycled, but a group
+    /// that drained and whose pgid an unrelated new leader then took (or a solo
+    /// pid recycled to any process) between two sweeps still probes alive.
+    /// Re-reading the identity and comparing it to the one captured at track time
+    /// detects that positively — a live number with a *different* identity is a
+    /// stranger, so we report it gone and it is pruned (never signalled). Only a
+    /// positive mismatch prunes; an unknown identity on either side (the BSDs, or
+    /// a group whose leader was reaped while its descendants live and keep the
+    /// group — and its pgid — alive) defers to the liveness verdict, preserving
+    /// descendant containment and not weakening any platform.
+    ///
+    /// Placed here, at the single probe choke point every sweep funnels through
+    /// (`track` / `signal_all` / `any_alive` / `live_snapshot` / `count_alive`),
+    /// the check runs a few instructions before the matching `kill`/`killpg` in
+    /// `signal_all`, so cross-sweep reuse is closed and only the irreducible
+    /// in-sweep instruction window remains (POSIX offers no atomic
+    /// probe-and-signal for a whole *group*; that narrow window is unchanged from
+    /// before this hardening).
     fn probe_entry(&self, entry: &mut Entry) -> bool {
         let (alive, group_seen) = self.probe_raw(entry.id, entry.group_seen);
         entry.group_seen = group_seen;
+        if alive && entry.identity.is_some() && is_recycled(entry.identity, read_identity(entry.id))
+        {
+            // Positively recycled: the number is alive but names a different
+            // process than the one tracked — fail-safe, report gone so it is
+            // pruned and never signalled. (The `is_some` guard skips the identity
+            // read entirely when there is no captured token to compare against —
+            // the BSDs, or a track-time read that failed.)
+            return false;
+        }
         alive
     }
 
@@ -147,11 +286,28 @@ impl Tracked {
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
         ids.retain_mut(|e| self.probe_entry(e));
         if !ids.iter().any(|e| e.id == id) {
-            ids.push(Entry { id, group_seen });
+            // Capture the start-time identity now, while `id` is freshly live, so
+            // a later probe can tell the tracked process apart from any process
+            // that recycles the number. A de-dup (re-adopt of an id still present
+            // above) keeps the existing entry's identity untouched; had the number
+            // been recycled since, `probe_entry` would already have pruned the
+            // stale entry in the `retain` above, so this pushes a fresh entry
+            // carrying the new identity.
+            ids.push(Entry {
+                id,
+                group_seen,
+                identity: read_identity(id),
+            });
         }
     }
 
     /// Send `sig` to every still-existing entry, pruning the drained ones.
+    ///
+    /// Each entry is identity-gated by [`probe_entry`](Self::probe_entry) a few
+    /// instructions before its `kill`/`killpg`, so a number recycled by a stranger
+    /// since it was tracked is pruned here rather than signalled — the delivery
+    /// only ever reaches an id whose identity was just re-verified (or, on a
+    /// target/path without a readable identity, whose bare liveness was).
     ///
     /// Best-effort: delivery failures are **not** surfaced. On the process-group
     /// mechanism's own platforms (macOS/BSD) `EPERM` is ambiguous — it is returned
@@ -901,5 +1057,187 @@ mod tests {
         let _ = unsafe { libc::killpg(pid, libc::SIGKILL) };
         let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
         let _ = kept.wait().await;
+    }
+
+    /// Reuse of a group's pgid **without** an intervening `ESRCH` — the hazard the
+    /// `group_seen` latch alone misses. A tracked group drains, its pgid number is
+    /// freed, and a *different* leader takes it before the next sweep: `kill(-id,0)`
+    /// reports the stranger group alive, so without the identity gate a teardown
+    /// sweep would `killpg` an unrelated group. The gate must instead prune the
+    /// entry (its captured identity no longer matches the number's current one)
+    /// and signal nothing.
+    ///
+    /// Deterministic on a real subprocess: a genuinely-alive group leader stands
+    /// in for the stranger that recycled the number, and the entry is tracked with
+    /// a deliberately *stale* identity (as if captured from the original,
+    /// since-reaped leader). Pruning inside `signal_all`'s sweep — before any
+    /// `killpg` for that entry — is the load-bearing outcome: it is structurally
+    /// impossible for the stranger to have been signalled.
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn group_pgid_reuse_without_esrch_is_not_signalled() {
+        use std::os::unix::process::CommandExt as _;
+
+        let tracked = Tracked::new(true);
+
+        // A real child that leads its own group, so `kill(-pid, 0)` succeeds — the
+        // stranger group that reused our old pgid number. It traps TERM so an
+        // (erroneous) signal would not even reap it, keeping the test orphan-free;
+        // the load-bearing assertion is the prune, not liveness.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("trap '' TERM; while :; do :; done");
+        cmd.kill_on_drop(true);
+        cmd.as_std_mut().process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id().unwrap() as i32;
+        assert!(
+            unsafe { libc::kill(-pid, 0) } == 0,
+            "the stand-in must lead its own group"
+        );
+
+        let Some(real) = read_identity(pid) else {
+            // No identity reader on this target (the BSDs): the strengthening
+            // degrades to the documented number-only behavior — nothing to assert.
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = child.wait().await;
+            return;
+        };
+
+        // Track the *number* with a stale identity (`real ^ 1` ≠ `real`) and
+        // `group_seen = true`: the original group was seen alive before it drained,
+        // so absent the identity check the sweep would happily `killpg` the
+        // stranger that now holds the pgid.
+        {
+            let mut ids = tracked.ids.lock().unwrap_or_else(|e| e.into_inner());
+            ids.push(Entry {
+                id: pid,
+                group_seen: true,
+                identity: Some(real ^ 1),
+            });
+        }
+
+        tracked.signal_all(libc::SIGTERM);
+
+        let still_tracked = {
+            let ids = tracked.ids.lock().unwrap_or_else(|e| e.into_inner());
+            ids.iter().any(|e| e.id == pid)
+        };
+
+        let _ = unsafe { libc::killpg(pid, libc::SIGKILL) };
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait().await;
+
+        assert!(
+            !still_tracked,
+            "a recycled-pgid entry (identity mismatch, no intervening ESRCH) must \
+             be pruned by the sweep, so the stranger group is never signalled"
+        );
+    }
+
+    /// The solo counterpart of `group_pgid_reuse_without_esrch_is_not_signalled`:
+    /// an adopted (solo) pid recycled to an unrelated process between two sweeps.
+    /// A solo entry is a bare pid — `kill(pid, 0)` reports the recycled stranger
+    /// alive — so its protection must be no weaker than a group's: the identity
+    /// gate must prune the entry and signal nothing.
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn solo_pid_reuse_without_esrch_is_not_signalled() {
+        let tracked = Tracked::new(false); // solo: direct-pid probe/signal
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; while :; do :; done")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap() as i32;
+        assert!(
+            unsafe { libc::kill(pid, 0) } == 0,
+            "the stand-in solo pid must be alive"
+        );
+
+        let Some(real) = read_identity(pid) else {
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = child.wait().await;
+            return;
+        };
+
+        // Track the number with a stale identity: the original adopted child was
+        // reaped and the pid recycled to this unrelated process.
+        {
+            let mut ids = tracked.ids.lock().unwrap_or_else(|e| e.into_inner());
+            ids.push(Entry {
+                id: pid,
+                group_seen: false,
+                identity: Some(real ^ 1),
+            });
+        }
+
+        tracked.signal_all(libc::SIGTERM);
+
+        let still_tracked = {
+            let ids = tracked.ids.lock().unwrap_or_else(|e| e.into_inner());
+            ids.iter().any(|e| e.id == pid)
+        };
+
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait().await;
+
+        assert!(
+            !still_tracked,
+            "a recycled solo pid (identity mismatch) must be pruned by the sweep, \
+             so the stranger process is never signalled"
+        );
+    }
+
+    /// The identity gate must not over-prune: a genuinely-alive entry whose
+    /// captured identity still *matches* the number's current one is kept and
+    /// signalled, so a normal spawn/adopt/Drop does not regress. `track` captures
+    /// the real identity here, exercising the actual capture-then-match path (on
+    /// every platform, including the BSDs where both sides are `None` and the gate
+    /// is a no-op).
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn matching_identity_group_is_kept_and_signalled() {
+        use std::os::unix::process::CommandExt as _;
+
+        let tracked = Tracked::new(true);
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("trap '' TERM; while :; do :; done");
+        cmd.kill_on_drop(true);
+        cmd.as_std_mut().process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id().unwrap() as i32;
+        assert!(
+            unsafe { libc::kill(-pid, 0) } == 0,
+            "the child must lead its own group"
+        );
+
+        // Real capture: `track` reads the live leader's identity itself.
+        tracked.track(pid, true);
+        // Traps TERM, so a delivered SIGTERM does not reap it — we assert it stayed
+        // tracked (kept) and alive (signalled, not lost to the gate).
+        tracked.signal_all(libc::SIGTERM);
+
+        let still_tracked = {
+            let ids = tracked.ids.lock().unwrap_or_else(|e| e.into_inner());
+            ids.iter().any(|e| e.id == pid)
+        };
+        let alive = unsafe { libc::kill(-pid, 0) } == 0;
+
+        let _ = unsafe { libc::killpg(pid, libc::SIGKILL) };
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait().await;
+
+        assert!(
+            still_tracked,
+            "a live, identity-matching group must be kept by the sweep"
+        );
+        assert!(
+            alive,
+            "a matching-identity group must be signalled (trapped TERM) — the gate \
+             must not prune it"
+        );
     }
 }
