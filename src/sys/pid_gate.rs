@@ -109,14 +109,17 @@ impl PidGate {
     /// critical section — so the pid-freeing reap and the retire are atomic and no
     /// gated kill can slip between them. Returns whether the probe reaped.
     ///
-    /// This is the fully-linearized reap path for a synchronous reaper (a
-    /// `try_wait` exit probe): because the reap that frees the pid happens under
+    /// This is the fully-linearized reap path for any reaper whose pid-freeing step
+    /// is a synchronous, non-blocking call. Two shapes use it: a direct `try_wait`
+    /// exit probe (the readiness-probe path), and a **single poll of
+    /// `Child::wait()`** — tokio frees the pid via that same `try_wait` *inside* the
+    /// poll, so polling it through this closure runs the pid-free under the lock too
+    /// (the `backend_wait` backstop and the detached Drop reaper drive their
+    /// `Child::wait()` this way). Because the reap that frees the pid happens under
     /// the same lock a watchdog's kill must take, a kill can never observe the pid
-    /// as live after this reap freed it. An *async* reaper (`Child::wait().await`)
-    /// cannot hold the lock across its `.await`; it frees the pid first and then
-    /// [`retire`](Self::retire)s, leaving a bounded reap→retire residual that the
-    /// gate still keeps a raw kill from *completing* against a freed pid on the
-    /// owner-driven paths (which retire before that reap).
+    /// as live after this reap freed it. `reap` must therefore stay bounded and
+    /// non-blocking — a `try_wait`/liveness syscall or one leaf-future poll — and
+    /// must never block on I/O.
     pub(crate) fn reap_under_lock(&self, reap: impl FnOnce() -> bool) -> bool {
         let mut guard = self.lock();
         let reaped = reap();
@@ -226,6 +229,57 @@ mod tests {
         let mut fired = false;
         gate.with_live_pid((), |_| fired = true);
         assert!(!fired, "no kill runs after reap_under_lock retired the pid");
+    }
+
+    /// Models the **poll-driven** reap the `backend_wait` backstop and the
+    /// detached Drop reaper drive `Child::wait()` through: a run of non-reaping
+    /// polls (the child is still alive, `Child::wait()` `Pending`) must leave the
+    /// gate live and killable so a genuine timeout can still tear the child down,
+    /// and only the poll that finally reaps — freeing the pid, exactly as tokio's
+    /// `try_wait` does *inside* `Child::wait()`'s poll — retires the gate, in the
+    /// *same* critical section, so no gated kill can land on the freed pid.
+    /// Deterministic: it steps the poll sequence explicitly (no threads, no timing).
+    #[test]
+    fn a_poll_driven_reap_retires_only_when_the_poll_reaps() {
+        let gate = PidGate::new(Some(4321));
+        // Two non-reaping polls (`Child::wait()` still `Pending`): the gate stays
+        // live and a watchdog can still fire, matching a live child.
+        for _ in 0..2 {
+            assert!(
+                !gate.reap_under_lock(|| false),
+                "a Pending poll does not reap"
+            );
+            assert!(
+                !gate.is_retired(),
+                "an un-reaped child leaves the gate live"
+            );
+            let mut fired = false;
+            gate.with_live_pid((), |_| fired = true);
+            assert!(fired, "a live child stays killable between reap polls");
+        }
+        // The reaping poll (`Child::wait()` `Ready`) frees the pid; the retire
+        // happens in the same locked step, never a beat later.
+        let freed = AtomicBool::new(false);
+        let reaped = gate.reap_under_lock(|| {
+            freed.store(true, Ordering::SeqCst); // stands in for tokio's `try_wait`
+            true
+        });
+        assert!(
+            reaped && freed.load(Ordering::SeqCst),
+            "the reaping poll reaps"
+        );
+        assert!(
+            gate.is_retired(),
+            "the reaping poll retires the gate atomically"
+        );
+        // No kill runs now: the closure never fires once retired, so a raw kill can
+        // never touch the freed (possibly OS-recycled) pid.
+        let mut fired_after = false;
+        gate.with_live_pid((), |_| fired_after = true);
+        assert!(
+            !fired_after,
+            "no kill runs after the reaping poll freed the pid"
+        );
     }
 
     /// A probe that does not reap (child still running) leaves the gate live, so

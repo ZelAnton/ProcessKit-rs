@@ -744,6 +744,18 @@ impl ScriptedRunner {
     }
 }
 
+/// Commit a stdin reservation on a scripted run that "starts a child": the fake
+/// consumes the one-shot source exactly once, dropping the yielded payload (there
+/// is no real child to feed). A `None` reservation (no stdin source, or
+/// keep-stdin-open) is a no-op. Dropping the reservation *without* calling this
+/// instead rolls the payload back — the fake's mirror of a live pre-child failure
+/// (a canned `NotFound`/`Spawn`) leaving a one-shot source intact.
+fn commit_stdin_reservation(reservation: Option<crate::stdin::StdinReservation>) {
+    if let Some(reservation) = reservation {
+        let _consumed = reservation.commit();
+    }
+}
+
 /// Replay `stdout`/`stderr` text through the command's `on_stdout_line` /
 /// `on_stderr_line` handlers (panic-isolated), so a wrapper's
 /// progress-reporting path is exercised hermetically on the bulk `output_string` verb
@@ -796,23 +808,32 @@ impl ProcessRunner for ScriptedRunner {
         {
             return Err(crate::error::Error::Cancelled { program });
         }
-        // Consume a one-shot streaming stdin source exactly like the live launch
-        // path: a second run of a command whose stdin was `from_reader`/`from_lines`
+        // Reserve a one-shot streaming stdin source exactly like the live launch
+        // path, and hold the reservation until we know this scripted run "starts a
+        // child": a second run of a command whose stdin was `from_reader`/`from_lines`
         // must fail loud here too, not pass silently on the fake and only blow up
         // live. Checked before `matched_reply` so this never advances an
-        // `on_sequence` rule's reply cursor either.
-        crate::runner::take_stdin_for_run(command).await?;
+        // `on_sequence` rule's reply cursor either. A canned spawn error (below)
+        // returns before committing, so — like a live pre-child failure — it does
+        // NOT consume the source.
+        let reservation = crate::runner::take_stdin_for_run(command)?;
         // Honor the non-piped-stdout contract: a capture verb on
         // `stdout(Inherit/Null)` errors rather than handing back output it could
         // never have captured. Checked before `matched_reply` so this config error
-        // never advances an `on_sequence` rule's reply cursor.
+        // never advances an `on_sequence` rule's reply cursor. A pre-"spawn" config
+        // error, so the reservation drops uncommitted and the source is not eaten.
         if !command.stdout_is_piped() {
             return Err(crate::error::stdout_not_piped_error(&program));
         }
         let reply = self.matched_reply(command, &program)?;
         if let Some(err) = reply.spawn_error_for(program.clone()) {
+            // A spawn-side failure: no child ever ran, so leave the one-shot stdin
+            // intact — dropping `reservation` here rolls its payload back.
             return Err(err);
         }
+        // From here a child would exist: commit so the one-shot source is consumed
+        // exactly once, even if the run then cancels, times out, or fails.
+        commit_stdin_reservation(reservation);
         if reply.pending {
             return park_until_cancelled(command, program).await;
         }
@@ -839,13 +860,18 @@ impl ProcessRunner for ScriptedRunner {
             return Err(crate::error::Error::Cancelled { program });
         }
         // See the matching comment in `output_string`: a one-shot streaming stdin
-        // source is consumed here too, so a second scripted `start` of the same
-        // command fails loud exactly as a second live spawn would.
-        crate::runner::take_stdin_for_run(command).await?;
+        // source is reserved here too, then committed once we know a scripted child
+        // exists — so a second scripted `start` of the same command fails loud
+        // exactly as a second live spawn would, while a canned spawn error leaves
+        // the source intact.
+        let reservation = crate::runner::take_stdin_for_run(command)?;
         let reply = self.matched_reply(command, &program)?;
         if let Some(err) = reply.spawn_error_for(program) {
+            // No child ran → roll the reservation back (drop it uncommitted).
             return Err(err);
         }
+        // A scripted child now exists → consume the one-shot source exactly once.
+        commit_stdin_reservation(reservation);
         // A plain scripted reply carries no recorded truncation/duration — the
         // handle derives them from its own (instant) run, as a live child would.
         Ok(reply.clone().into_running(command, None))
@@ -2829,5 +2855,132 @@ mod tests {
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner.only_command()));
         assert!(result.is_err(), "zero calls must panic, not default");
+    }
+
+    // T-084: transactional one-shot stdin on the scripted seam. A canned
+    // spawn-side failure (`NotFound`/`Spawn`) must leave a `from_reader`/`from_lines`
+    // source intact — no child ever ran — exactly as a live pre-child failure now
+    // rolls its reservation back; only a scripted run that "starts a child"
+    // consumes the source, and does so exactly once.
+
+    #[tokio::test]
+    async fn scripted_canned_not_found_does_not_consume_one_shot_stdin() {
+        // One cloned one-shot source shared by a failing and a succeeding command.
+        let source = crate::Stdin::from_reader(&b"payload"[..]);
+        let runner = ScriptedRunner::new()
+            .on(["missing"], Reply::not_found())
+            .on(["present"], Reply::ok("out\n"));
+
+        // A canned NotFound: the source must survive (rolled back).
+        let miss = Command::new("missing").stdin(source.clone());
+        let err = runner
+            .output_string(&miss)
+            .await
+            .expect_err("a canned not_found is an error");
+        assert!(err.is_not_found(), "expected NotFound, got {err:?}");
+
+        // The rolled-back source now feeds a successful run…
+        let hit = Command::new("present").stdin(source.clone());
+        let out = runner
+            .output_string(&hit)
+            .await
+            .expect("the one-shot source was preserved, so this run succeeds");
+        assert!(out.is_success(), "the preserved source fed a run: {out:?}");
+
+        // …and is consumed exactly once: a second success fails loud.
+        let hit_again = Command::new("present").stdin(source.clone());
+        let err = runner
+            .output_string(&hit_again)
+            .await
+            .expect_err("the one-shot source is now consumed");
+        assert!(
+            matches!(err, crate::Error::Io(_)),
+            "expected Io, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_canned_spawn_error_does_not_consume_one_shot_stdin() {
+        let source = crate::Stdin::from_lines(tokio_stream::iter(vec!["a".to_owned()]));
+        let runner = ScriptedRunner::new()
+            .on(
+                ["denied"],
+                Reply::spawn_error(std::io::ErrorKind::PermissionDenied, "no"),
+            )
+            .on(["present"], Reply::ok("out\n"));
+
+        let denied = Command::new("denied").stdin(source.clone());
+        let err = runner
+            .output_string(&denied)
+            .await
+            .expect_err("a canned spawn_error is an error");
+        assert!(
+            matches!(err, crate::Error::Spawn { .. }),
+            "expected Spawn, got {err:?}"
+        );
+
+        // The source was not eaten by the spawn error.
+        let hit = Command::new("present").stdin(source);
+        let out = runner
+            .output_string(&hit)
+            .await
+            .expect("the spawn error left the one-shot source intact");
+        assert!(out.is_success(), "got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn scripted_start_consumes_one_shot_stdin_only_on_success() {
+        // The streaming `start` verb shares the same reserve-then-commit logic.
+        let source = crate::Stdin::from_reader(&b"payload"[..]);
+        let runner = ScriptedRunner::new()
+            .on(["missing"], Reply::not_found())
+            .on(["present"], Reply::ok("out\n"));
+
+        // A canned NotFound on `start`: source intact.
+        let miss = Command::new("missing").stdin(source.clone());
+        assert!(
+            runner.start(&miss).await.is_err(),
+            "a canned not_found on start is an error"
+        );
+
+        // A successful start consumes the source once.
+        let hit = Command::new("present").stdin(source.clone());
+        runner
+            .start(&hit)
+            .await
+            .expect("start succeeds; the source was preserved");
+        let hit_again = Command::new("present").stdin(source);
+        assert!(
+            runner.start(&hit_again).await.is_err(),
+            "the one-shot source is consumed by the successful start"
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_precancelled_token_does_not_consume_one_shot_stdin() {
+        // Cancellation before the (scripted) spawn short-circuits before the source
+        // is even reserved, so the one-shot payload survives for a later run.
+        let source = crate::Stdin::from_reader(&b"payload"[..]);
+        let runner = ScriptedRunner::new().on(["tool"], Reply::ok("out\n"));
+
+        let token = crate::CancellationToken::new();
+        token.cancel();
+        let cancelled = Command::new("tool").stdin(source.clone()).cancel_on(token);
+        let err = runner
+            .output_string(&cancelled)
+            .await
+            .expect_err("a pre-cancelled token short-circuits");
+        assert!(
+            matches!(err, crate::Error::Cancelled { .. }),
+            "expected Cancelled, got {err:?}"
+        );
+
+        // Cancel happened before the reserve, so the source is untouched.
+        let ok = Command::new("tool").stdin(source);
+        let out = runner
+            .output_string(&ok)
+            .await
+            .expect("cancel-before-reserve left the one-shot source intact");
+        assert!(out.is_success(), "got {out:?}");
     }
 }
