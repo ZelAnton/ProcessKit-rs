@@ -168,6 +168,48 @@ async fn pipeline_failure_tears_down_a_quiet_upstream_immediately() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a pipeline with a quiet upstream and a per-stage-cancelled downstream"]
+async fn pipeline_failure_tears_down_a_quiet_upstream_on_a_raw_stage_error_too() {
+    // T-085: distinct from `pipeline_failure_tears_down_a_quiet_upstream_immediately`
+    // above — that test's failure is a *checked* `Outcome` (a plain non-zero
+    // exit), which already fired proactive teardown before this fix landed.
+    // This one's failure is a *raw* `Err` (`Error::Cancelled`, via a per-stage
+    // `Command::cancel_on` on just the LAST stage — deliberately not the
+    // whole-chain `Pipeline::cancel_on`, so the quiet upstream carries no
+    // token of its own) surfacing straight out of a stage's task, past the
+    // checked-failure attribution logic entirely — before the fix, that path
+    // never touched `teardown`, so a quiet upstream (which never writes, and
+    // so never dies of a broken pipe) held the chain open until its own
+    // unrelated ~30s deadline elapsed instead.
+    use tokio_util::sync::CancellationToken;
+
+    let quiet_upstream = sleeper();
+    let token = CancellationToken::new();
+    let cancels_soon = sleep_secs(30).cancel_on(token.clone());
+    let fired = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        fired.cancel();
+    });
+
+    let start = Instant::now();
+    let err = quiet_upstream
+        .pipe(cancels_soon)
+        .output_string()
+        .await
+        .expect_err("a per-stage-cancelled last stage must surface as Err");
+    assert!(
+        matches!(err, processkit::Error::Cancelled { .. }),
+        "expected Cancelled, got {err:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(15),
+        "a quiet upstream must not hold a raw-Err chain open (took {:?})",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a real producer|head pipeline killed by the closing pipe"]
 async fn unchecked_producer_forgives_the_head_pattern() {
     // The motivating case for `unchecked_in_pipe()`: the consumer takes one line and

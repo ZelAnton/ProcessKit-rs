@@ -599,29 +599,37 @@ impl ProcessRunner for ProcessGroup {
     }
 }
 
-/// Take `command`'s stdin source for one run, exactly as the live launch path
-/// does: atomically consuming a one-shot source
+/// Reserve `command`'s stdin source for one run, exactly as the live launch path
+/// does: atomically taking a one-shot source
 /// ([`Stdin::from_reader`](crate::Stdin::from_reader)/
-/// [`Stdin::from_lines`](crate::Stdin::from_lines)) so a concurrent or later
-/// re-run observes it exhausted and fails loud, instead of silently feeding
-/// the next run empty stdin. Returns `Ok(None)` when the command keeps stdin
-/// open ([`Command::keep_stdin_open`](crate::Command::keep_stdin_open)) or has
-/// no stdin source configured at all — neither case takes anything.
+/// [`Stdin::from_lines`](crate::Stdin::from_lines)) out of its shared cell so a
+/// concurrent or later re-run observes it taken and fails loud, instead of
+/// silently feeding the next run empty stdin. Returns `Ok(None)` when the command
+/// keeps stdin open ([`Command::keep_stdin_open`](crate::Command::keep_stdin_open))
+/// or has no stdin source configured at all — neither case reserves anything.
 ///
-/// Shared by [`launch`] (which drives the taken payload into the child's pipe)
-/// and [`ScriptedRunner`](crate::testing::ScriptedRunner) (which only needs the
-/// same fail-loud consumption side effect — a repeated run of a one-shot-stdin
-/// command must fail on the fake exactly as it does live — not the payload
-/// itself), so the two call sites can never drift on the error's wording.
-pub(crate) async fn take_stdin_for_run(
+/// The reservation is *transactional*: the returned
+/// [`StdinReservation`](crate::stdin::StdinReservation) must be
+/// [`commit`](crate::stdin::StdinReservation::commit)ted once a child exists, or
+/// dropped uncommitted to roll the payload back (so a failed launch does not eat
+/// a one-shot source). See [`launch`] and
+/// [`ScriptedRunner`](crate::testing::ScriptedRunner).
+///
+/// Shared by [`launch`] (which commits and drives the payload into the child's
+/// pipe) and `ScriptedRunner` (which needs the same reserve-then-commit-or-roll-back
+/// consumption side effect — a canned spawn error must leave a one-shot source
+/// intact, while a scripted successful start must consume it exactly once, just
+/// like live), so the two call sites can never drift on the semantics or the
+/// error's wording.
+pub(crate) fn take_stdin_for_run(
     command: &Command,
-) -> Result<Option<crate::stdin::TakenStdin>> {
+) -> Result<Option<crate::stdin::StdinReservation>> {
     if command.keeps_stdin_open() {
         return Ok(None);
     }
     match command.stdin_source() {
-        Some(source) => match source.take_for_run().await {
-            Ok(taken) => Ok(Some(taken)),
+        Some(source) => match source.take_for_run() {
+            Ok(reservation) => Ok(Some(reservation)),
             Err(crate::stdin::OneShotConsumed) => Err(crate::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
@@ -701,10 +709,13 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         });
     }
 
-    // Take stdin atomically so a concurrent second run of a one-shot source sees
-    // it consumed and fails loud. Taken before the spawn so a failed spawn never
-    // leaves a child to feed.
-    let taken_stdin = take_stdin_for_run(command).await?;
+    // Reserve stdin before the spawn: a concurrent second run of a one-shot
+    // source sees it taken and fails loud, and a spawn failure below rolls the
+    // reservation back (via its Drop) rather than eating the payload — so the
+    // same command can be launched again. The reservation is committed only once
+    // a child exists (see below), after which the source stays consumed even if
+    // the stdin write then fails.
+    let stdin_reservation = take_stdin_for_run(command)?;
 
     let mut tokio_cmd = command.build_tokio();
     let opts = crate::sys::SpawnOptions {
@@ -776,6 +787,12 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         }
         Err(other) => return Err(other),
     };
+    // A child now exists: commit the reservation so a one-shot source is consumed
+    // for good. Every failure path above returned before this point, dropping the
+    // reservation uncommitted and rolling its payload back. The commit precedes
+    // the stdin write below, so the source stays consumed even if that write ends
+    // in BrokenPipe (the child closed its read end) or any other error.
+    let taken_stdin = stdin_reservation.map(crate::stdin::StdinReservation::commit);
     let pid = child.id();
     #[cfg(feature = "tracing")]
     tracing::debug!(
@@ -1191,5 +1208,149 @@ mod tests {
             .await
             .expect("a natural no-match end with an unfired timeout is Ok(None)");
         assert_eq!(found, None);
+    }
+
+    // ---- T-084: live one-shot stdin transactionality (real spawn path) ----
+    //
+    // These exercise the real `JobRunner` launch path end to end, so — like the
+    // rest of the crate's real-subprocess coverage — they are `#[ignore]`d and run
+    // explicitly (`cargo test -- --ignored`). The always-on hermetic coverage lives
+    // in `stdin.rs` (the reservation state machine) and `doubles.rs` (the scripted
+    // seam sharing the same `take_stdin_for_run` reserve/commit/rollback).
+
+    /// A program that echoes its stdin to stdout: `cat` on Unix, `cmd /c sort` on
+    /// Windows (`sort` reads stdin). A single-line payload passes through unchanged.
+    fn stdin_echo(source: crate::Stdin) -> Command {
+        if cfg!(windows) {
+            Command::new("cmd").args(["/c", "sort"]).stdin(source)
+        } else {
+            Command::new("cat").stdin(source)
+        }
+    }
+
+    /// A program that exits immediately without reading its stdin.
+    fn exits_zero(source: crate::Stdin) -> Command {
+        if cfg!(windows) {
+            Command::new("cmd").args(["/c", "exit", "0"]).stdin(source)
+        } else {
+            Command::new("sh").args(["-c", "exit 0"]).stdin(source)
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "exercises the real spawn path (creates a process group and a child)"]
+    async fn one_shot_stdin_is_returned_after_a_spawn_error_and_reused_live() {
+        // A launch that fails before a child exists returns the payload, so the
+        // same one-shot source feeds a later successful run — which consumes it.
+        let source = crate::Stdin::from_reader(&b"hello stdin\n"[..]);
+        let runner = JobRunner::new();
+
+        // A missing program: NotFound *after* the reservation but *before* a child.
+        let missing =
+            Command::new("processkit-definitely-missing-T084-stdin").stdin(source.clone());
+        let err = runner
+            .output_string(&missing)
+            .await
+            .expect_err("a missing program must error");
+        assert!(
+            matches!(err, Error::NotFound { .. } | Error::Spawn { .. }),
+            "expected a pre-child launch failure, got {err:?}"
+        );
+
+        // The rolled-back payload now feeds a real child.
+        let result = runner
+            .output_string(&stdin_echo(source.clone()))
+            .await
+            .expect("the preserved one-shot stdin feeds the echo program");
+        assert!(result.is_success(), "result: {result:?}");
+        assert!(
+            result.stdout().contains("hello stdin"),
+            "the child should have received the preserved stdin: {result:?}"
+        );
+
+        // Consumed exactly once: a re-run of the now-spent source fails loud.
+        let err = runner
+            .output_string(&stdin_echo(source))
+            .await
+            .expect_err("the one-shot source is consumed after the successful run");
+        assert!(matches!(err, Error::Io(_)), "expected Io, got {err:?}");
+    }
+
+    #[tokio::test]
+    #[ignore = "exercises the real spawn path with two concurrent children"]
+    async fn two_concurrent_live_launches_let_only_one_feed_a_child() {
+        // Two concurrent launches of one cloned one-shot source never both spawn a
+        // child: exactly one reserves the payload; the other fails loud.
+        let source = crate::Stdin::from_reader(&b"data\n"[..]);
+        let runner = JobRunner::new();
+
+        let first = stdin_echo(source.clone());
+        let second = stdin_echo(source.clone());
+        let (r1, r2) = tokio::join!(runner.output_string(&first), runner.output_string(&second));
+
+        let successes = usize::from(r1.is_ok()) + usize::from(r2.is_ok());
+        assert_eq!(
+            successes, 1,
+            "exactly one concurrent launch feeds a child; r1={r1:?} r2={r2:?}"
+        );
+        // The loser fails loud on the taken source, not silently with empty stdin.
+        let loser = if r1.is_err() { r1 } else { r2 };
+        assert!(
+            matches!(loser.unwrap_err(), Error::Io(_)),
+            "the losing concurrent launch must fail loud"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "exercises the real spawn path (creates a process group)"]
+    async fn one_shot_stdin_survives_cancellation_before_spawn_live() {
+        // A launch cancelled before it spawns must not eat the one-shot source —
+        // the cancel short-circuits ahead of the reservation.
+        let source = crate::Stdin::from_reader(&b"data\n"[..]);
+        let runner = JobRunner::new();
+
+        let token = crate::CancellationToken::new();
+        token.cancel();
+        let cancelled = stdin_echo(source.clone()).cancel_on(token);
+        let err = runner
+            .output_string(&cancelled)
+            .await
+            .expect_err("a pre-cancelled launch errors");
+        assert!(
+            matches!(err, Error::Cancelled { .. }),
+            "expected Cancelled, got {err:?}"
+        );
+
+        // The source was never reserved, so it still feeds a run.
+        let result = runner
+            .output_string(&stdin_echo(source))
+            .await
+            .expect("cancel-before-spawn left the one-shot source intact");
+        assert!(result.is_success(), "result: {result:?}");
+    }
+
+    #[tokio::test]
+    #[ignore = "exercises the real spawn path; the child ignores a large stdin then exits"]
+    async fn one_shot_stdin_stays_consumed_after_a_stdin_writer_error_live() {
+        // Once a child exists the source is consumed for good, even if the stdin
+        // write then fails (the child exited without reading — a broken pipe).
+        use tokio::io::AsyncReadExt;
+        // A megabyte of stdin fed to a child that exits immediately forces the
+        // writer to hit BrokenPipe partway through.
+        let source = crate::Stdin::from_reader(tokio::io::repeat(b'x').take(1 << 20));
+        let runner = JobRunner::new();
+
+        let result = runner
+            .output_string(&exits_zero(source.clone()))
+            .await
+            .expect("a broken-pipe stdin writer must not fail an otherwise-successful run");
+        assert!(result.is_success(), "result: {result:?}");
+
+        // The successful spawn consumed the source despite the write failing.
+        let err = runner
+            .output_string(&exits_zero(source))
+            .await
+            .expect_err("the one-shot source stays consumed after a successful spawn");
+        assert!(matches!(err, Error::Io(_)), "expected Io, got {err:?}");
     }
 }
