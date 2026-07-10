@@ -23,18 +23,6 @@ use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::result::{Outcome, ProcessResult};
 use crate::running::Finished;
-use tokio::task::AbortHandle;
-
-/// Abort in-flight drain tasks on early exit so they don't linger until killed children close their pipes.
-struct AbortTasksOnDrop(Vec<AbortHandle>);
-
-impl Drop for AbortTasksOnDrop {
-    fn drop(&mut self) {
-        for handle in &self.0 {
-            handle.abort();
-        }
-    }
-}
 
 /// A chain of [`Command`]s connected stdout→stdin — built with
 /// [`Command::pipe`], extended with [`pipe`](Self::pipe), driven with the same
@@ -113,6 +101,20 @@ struct StageOutcome {
     /// this stage is the one pipefail blames, so an inner stage's clipped
     /// diagnostics are visible even when it isn't the last stage.
     stderr_truncated: bool,
+}
+
+/// One stage task's outcome, tagged with enough to fold it back into position
+/// after the stages complete in **unordered** (true completion) order — see
+/// the comment on `capture`'s task-driving `JoinSet` for why unordered
+/// completion, rather than left-to-right positional awaiting, is what keeps
+/// the chain live.
+enum Joined<T> {
+    /// An inner (non-last) stage, tagged with its original index so the fold
+    /// can rebuild `stages` in left-to-right order once every task is in.
+    Inner(usize, StageOutcome),
+    /// The last stage: its captured output (`capture_last`'s result) plus
+    /// whether the chain's teardown had already fired when it finished.
+    Last(ProcessResult<T>, bool),
 }
 
 impl Pipeline {
@@ -293,13 +295,24 @@ impl Pipeline {
             .expect("a pipeline has at least two stages");
         let last_ok_codes = last_stage.ok_codes_vec();
         let last_timeout = last_stage.configured_timeout();
-        let mut inner_tasks = Vec::with_capacity(running.len());
-        for ((process, unchecked), stage) in running.into_iter().zip(self.stages.iter()) {
+        // Drive every stage's task through one `JoinSet`, drained by
+        // `drain_unordered` below: a stage's raw `Err` (`Cancelled` / `Stdin` /
+        // `Io` / `OutputTooLarge`) or a task panic never reaches the
+        // `is_checked_failure` check, so it can't fire `teardown` itself the
+        // way a checked failure does — `drain_unordered` fires it centrally
+        // for *every* bad completion, in true completion order rather than
+        // stage position, so a later stage's ready error can't sit behind an
+        // earlier, still-quiet stage forever.
+        let inner_count = running.len();
+        let mut tasks: tokio::task::JoinSet<Result<Joined<T>>> = tokio::task::JoinSet::new();
+        for (index, ((process, unchecked), stage)) in
+            running.into_iter().zip(self.stages.iter()).enumerate()
+        {
             let program = process.program_name().to_owned();
             let ok_codes = stage.ok_codes_vec();
             let timeout = stage.configured_timeout();
             let teardown = teardown.clone();
-            inner_tasks.push(tokio::spawn(async move {
+            tasks.spawn(async move {
                 let Finished {
                     outcome,
                     stderr,
@@ -312,26 +325,29 @@ impl Pipeline {
                 if !torn_down && is_checked_failure(outcome, &ok_codes, unchecked) {
                     teardown.cancel();
                 }
-                Ok::<_, crate::Error>(StageOutcome {
-                    program,
-                    outcome,
-                    stderr,
-                    unchecked,
-                    ok_codes,
-                    timeout,
-                    torn_down,
-                    stderr_truncated,
-                })
-            }));
+                Ok(Joined::Inner(
+                    index,
+                    StageOutcome {
+                        program,
+                        outcome,
+                        stderr,
+                        unchecked,
+                        ok_codes,
+                        timeout,
+                        torn_down,
+                        stderr_truncated,
+                    },
+                ))
+            });
         }
         // Call `capture_last` here (not inside the spawned future): it yields a
         // `Send` future `F`, whereas the closure `C` itself is not `Send` and must
         // not be captured across the `tokio::spawn` boundary.
         let last_future = capture_last(last);
-        let last_task = tokio::spawn({
+        {
             let teardown = teardown.clone();
             let last_ok_codes = last_ok_codes.clone();
-            async move {
+            tasks.spawn(async move {
                 let result = last_future.await?;
                 // The last stage triggers teardown too (a failing last stage should
                 // not wait on a quiet upstream either); torn if a sibling already did.
@@ -341,29 +357,35 @@ impl Pipeline {
                 {
                     teardown.cancel();
                 }
-                Ok::<_, crate::Error>((result, torn_down))
-            }
-        });
-
-        let _abort_guard = AbortTasksOnDrop(
-            inner_tasks
-                .iter()
-                .map(|t| t.abort_handle())
-                .chain(std::iter::once(last_task.abort_handle()))
-                .collect(),
-        );
+                Ok(Joined::Last(result, torn_down))
+            });
+        }
 
         let collect = async {
-            // Ordered gather (leftmost-first) — the success path is byte-for-byte
-            // the old behavior. On failure the killer arm below wakes and tears
-            // every stage's sub-group down, unblocking whichever ordered await was
-            // stalled on a quiet sibling; the gather then completes and wins the `select!`.
+            // On a bad completion `drain_unordered` fires `teardown` itself; the
+            // killer arm below wakes and tears every stage's sub-group down,
+            // unblocking whichever task was stalled on a quiet sibling, so
+            // `gather` (however long the drain takes to notice) still finishes
+            // and wins the `select!` rather than hanging next to a pending kill.
             let gather = async {
-                let mut outcomes = Vec::with_capacity(inner_tasks.len() + 1);
-                for task in inner_tasks {
-                    outcomes.push(task.await.map_err(join_error)??);
+                let joined = drain_unordered(tasks, &teardown).await?;
+                let mut inner_outcomes: Vec<Option<StageOutcome>> =
+                    (0..inner_count).map(|_| None).collect();
+                let mut last_slot: Option<(ProcessResult<T>, bool)> = None;
+                for item in joined {
+                    match item {
+                        Joined::Inner(index, outcome) => inner_outcomes[index] = Some(outcome),
+                        Joined::Last(result, torn_down) => last_slot = Some((result, torn_down)),
+                    }
                 }
-                let (last_result, last_torn_down) = last_task.await.map_err(join_error)??;
+                let outcomes: Vec<StageOutcome> = inner_outcomes
+                    .into_iter()
+                    .map(|outcome| {
+                        outcome.expect("every inner stage slot is filled when every task succeeded")
+                    })
+                    .collect();
+                let (last_result, last_torn_down) =
+                    last_slot.expect("last slot is filled when every task succeeded");
                 Ok::<_, crate::Error>((outcomes, last_result, last_torn_down))
             };
             tokio::select! {
@@ -383,7 +405,11 @@ impl Pipeline {
             Some(limit) => match tokio::time::timeout(limit, collect).await {
                 Ok(collected) => collected?,
                 Err(_elapsed) => {
-                    // Kill every stage's subtree; `_abort_guard` reaps the drain tasks as this returns.
+                    // Kill every stage's subtree; `tasks` was moved into `gather`
+                    // (via `drain_unordered`), which `collect` (and so this
+                    // `tokio::time::timeout`) just dropped — the `JoinSet`'s own
+                    // drop aborts every drain task still in flight, the same
+                    // guarantee the old explicit abort-on-drop guard gave.
                     kill_all_stage_groups(&stage_groups);
                     return Ok(ProcessResult::new(
                         self.pipeline_name(),
@@ -742,6 +768,57 @@ fn join_error(err: tokio::task::JoinError) -> crate::Error {
     crate::Error::Io(std::io::Error::other(format!(
         "pipeline stage task failed: {err}"
     )))
+}
+
+/// Drain every task in `tasks` to completion in **true completion order**
+/// (`JoinSet::join_next`, not a left-to-right positional await), firing
+/// `teardown` the instant *any* task ends badly — a raw `Err` (a stage's own
+/// [`Error::Cancelled`](crate::Error::Cancelled) /
+/// [`Error::Stdin`](crate::Error::Stdin) / [`Error::Io`](crate::Error::Io) /
+/// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge)) or a task panic
+/// (surfaced here as a `JoinError`).
+///
+/// This is `capture`'s liveness fix, factored out so it's testable without
+/// spawning a single real process: a positional `for task in tasks { task
+/// .await?? }` gather stalls forever on an earlier, still-quiet task once a
+/// *later* task is already sitting on a ready `Err` — that `Err` never got a
+/// chance to fire `teardown` either, since it happened on a path (`?`) that
+/// skips the checked-failure attribution logic entirely. Draining in
+/// completion order instead means whichever task is ready first — quiet or
+/// not, wherever it sits — is the one examined first, so a bad completion is
+/// never stuck behind a pending one.
+///
+/// A task that resolves to a *checked* failure (an `Outcome` `pipefail`
+/// treats as unclean) already fires `teardown` itself, from inside the task
+/// — see the spawn bodies in `capture` — since that decision needs
+/// domain knowledge (the stage's `ok_codes`/`unchecked` flag) this function
+/// doesn't have; this function only has to backstop the paths those spawn
+/// bodies *can't* self-report: a raw `Err` return (still inside the task,
+/// but past `is_checked_failure`) and a panic (never returns at all).
+///
+/// On success, every task's `Ok` payload is returned — in **completion**
+/// order, not submission order; a payload that must be rebuilt in original
+/// stage order (as `capture` does) needs to carry its own position, the way
+/// [`Joined::Inner`]'s index does.
+async fn drain_unordered<Item: 'static>(
+    mut tasks: tokio::task::JoinSet<Result<Item>>,
+    teardown: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<Item>> {
+    let mut collected = Vec::with_capacity(tasks.len());
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(item)) => collected.push(item),
+            Ok(Err(err)) => {
+                teardown.cancel();
+                return Err(err);
+            }
+            Err(join_err) => {
+                teardown.cancel();
+                return Err(join_error(join_err));
+            }
+        }
+    }
+    Ok(collected)
 }
 
 #[cfg(test)]
@@ -1186,5 +1263,133 @@ mod tests {
             }
             other => panic!("expected Error::Signalled, got {other:?}"),
         }
+    }
+
+    // T-085: `drain_unordered` regression coverage. These are hermetic — no
+    // real process is spawned — and exercise the exact liveness bug: a raw
+    // `Err` (or a task panic) on one task must fire `teardown` and let the
+    // whole drain finish, even while a *sibling* task is deliberately still
+    // pending. The quiet sibling below is a "controlled future": it can only
+    // resolve once `teardown` actually fires, so if `drain_unordered`
+    // regressed to a positional (left-to-right) gather that stalls on a
+    // still-pending earlier task, these tests hang instead of failing fast —
+    // wrapped in `tokio::time::timeout` so a regression is reported as a
+    // failure rather than a wedged test run.
+
+    /// A task that can only ever resolve once `teardown` fires — the
+    /// hermetic stand-in for a quiet upstream stage that never writes and so
+    /// never dies on its own; only the chain's proactive teardown ends it.
+    async fn quiet_until_teardown(
+        teardown: tokio_util::sync::CancellationToken,
+        item: &'static str,
+    ) -> Result<&'static str> {
+        teardown.cancelled().await;
+        Ok(item)
+    }
+
+    #[tokio::test]
+    async fn drain_unordered_wakes_a_quiet_task_when_a_later_task_returns_a_raw_error() {
+        let teardown = tokio_util::sync::CancellationToken::new();
+        let mut tasks: tokio::task::JoinSet<Result<&'static str>> = tokio::task::JoinSet::new();
+        // Spawned first (the "earlier, leftmost" stage in `capture`'s terms) —
+        // a positional gather would await this one to completion before ever
+        // looking at the task below, and it never completes on its own.
+        tasks.spawn(quiet_until_teardown(teardown.clone(), "quiet-upstream"));
+        // Spawned second (the "later" stage) but ready immediately — the raw
+        // `Err` a checked-failure path never produces, so nothing but the
+        // centralized `drain_unordered` firing `teardown` on its behalf can
+        // wake the sibling above.
+        tasks.spawn(async { Err(crate::Error::Io(std::io::Error::other("downstream boom"))) });
+
+        let drained =
+            tokio::time::timeout(Duration::from_secs(5), drain_unordered(tasks, &teardown))
+                .await
+                .expect(
+                    "drain_unordered must not hang on the still-pending quiet task \
+             once the sibling's raw error has fired teardown",
+                );
+
+        match drained {
+            Err(crate::Error::Io(err)) => {
+                assert_eq!(err.to_string(), "downstream boom");
+            }
+            other => panic!("expected the downstream stage's own Io error, got {other:?}"),
+        }
+        assert!(
+            teardown.is_cancelled(),
+            "a raw Err must fire teardown so a quiet sibling is unblocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_unordered_fires_teardown_on_a_task_panic_so_a_quiet_sibling_still_resolves() {
+        let teardown = tokio_util::sync::CancellationToken::new();
+        // Synchronizes the two tasks so the panic only happens once the quiet
+        // task has genuinely started waiting on `teardown` — proving this is
+        // a real concurrent-blocking scenario, not a fluke of scheduling
+        // order where the quiet task happened to run (and finish) first.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let mut tasks: tokio::task::JoinSet<Result<&'static str>> = tokio::task::JoinSet::new();
+        tasks.spawn({
+            let teardown = teardown.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                quiet_until_teardown(teardown, "quiet-upstream").await
+            }
+        });
+        tasks.spawn(async move {
+            barrier.wait().await;
+            panic!("downstream stage task panicked");
+        });
+
+        let drained =
+            tokio::time::timeout(Duration::from_secs(5), drain_unordered(tasks, &teardown))
+                .await
+                .expect(
+                    "drain_unordered must not hang on the still-pending quiet task \
+             once the sibling's panic has fired teardown",
+                );
+
+        match drained {
+            Err(crate::Error::Io(err)) => {
+                assert!(
+                    err.to_string().contains("pipeline stage task failed"),
+                    "expected the wrapped JoinError, got {err}"
+                );
+            }
+            other => panic!("expected a wrapped JoinError, got {other:?}"),
+        }
+        assert!(
+            teardown.is_cancelled(),
+            "a task panic must fire teardown so a quiet sibling is unblocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_unordered_returns_every_item_when_the_whole_set_finishes_clean() {
+        let teardown = tokio_util::sync::CancellationToken::new();
+        let mut tasks: tokio::task::JoinSet<Result<u32>> = tokio::task::JoinSet::new();
+        for item in [1u32, 2, 3] {
+            tasks.spawn(async move {
+                tokio::task::yield_now().await;
+                Ok(item)
+            });
+        }
+
+        let mut drained = drain_unordered(tasks, &teardown)
+            .await
+            .expect("every task succeeded");
+        drained.sort_unstable();
+        assert_eq!(
+            drained,
+            vec![1, 2, 3],
+            "every task's payload survives the drain, completion order aside"
+        );
+        assert!(
+            !teardown.is_cancelled(),
+            "an all-clean drain must never fire teardown"
+        );
     }
 }
