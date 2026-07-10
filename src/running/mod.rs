@@ -129,6 +129,15 @@ pub struct RunningProcess {
     timeout_grace: Option<Duration>,
     timeout_signal: i32,
     pid: Option<u32>,
+    // The child's OS start-time identity, captured once at spawn (while the child
+    // is provably alive). The metrics sampler and the `cpu_time`/`peak_memory_bytes`
+    // accessors pass it to `process_metrics` so a reading taken against a pid the OS
+    // recycled for an unrelated process — after `Child::wait` freed the number but
+    // before the sampler observes `reaped` — is rejected rather than folded in.
+    // `None` where the platform can't report a start identity (macOS/BSD) or the
+    // capture raced the child's exit; both degrade to the number-only behavior.
+    #[cfg(feature = "stats")]
+    proc_identity: Option<crate::sys::ProcIdentity>,
     // Per-stream pump config (encoding/handler/tee/terminator) threaded whole into
     // every pump this handle spawns — one value per stream.
     stdout_config: StreamConfig,
@@ -267,6 +276,10 @@ impl RunningProcess {
             timeout_grace: s.timeout_grace,
             timeout_signal: s.timeout_signal,
             pid: s.pid,
+            // Capture the identity anchor now, while the freshly-spawned child is
+            // provably alive, so a later sample can prove the pid still names it.
+            #[cfg(feature = "stats")]
+            proc_identity: s.pid.and_then(crate::sys::process_identity),
             stdout_config: s.stdout_config,
             stderr_config: s.stderr_config,
             buffer: s.buffer,
@@ -391,14 +404,14 @@ impl RunningProcess {
     #[cfg(feature = "stats")]
     pub fn cpu_time(&self) -> Option<Duration> {
         self.pid
-            .and_then(|pid| crate::sys::process_metrics(pid).cpu_time)
+            .and_then(|pid| crate::sys::process_metrics(pid, self.proc_identity).cpu_time)
     }
 
     /// Peak resident memory in bytes, if the platform can report it.
     #[cfg(feature = "stats")]
     pub fn peak_memory_bytes(&self) -> Option<u64> {
         self.pid
-            .and_then(|pid| crate::sys::process_metrics(pid).peak_memory_bytes)
+            .and_then(|pid| crate::sys::process_metrics(pid, self.proc_identity).peak_memory_bytes)
     }
 
     /// A clone of the timeout arbiter, so a consumer that has moved the handle
@@ -854,54 +867,27 @@ impl RunningProcess {
     pub async fn profile(mut self, every: Duration) -> Result<crate::stats::RunProfile> {
         use std::sync::{Arc, Mutex};
 
-        #[derive(Default)]
-        struct Acc {
-            cpu_time: Option<Duration>,
-            peak_memory_bytes: Option<u64>,
-            samples: usize,
-        }
-
         // tokio panics on a zero interval period; clamp rather than panic a
         // detached sampling task on a legal-looking input.
         let every = every.max(Duration::from_millis(1));
         let started = self.started;
-        let acc = Arc::new(Mutex::new(Acc::default()));
-        // Set by `on_exit` once the child is reaped, so the sampler stops folding
-        // readings taken against a pid the OS may have freed for reuse (which would
-        // corrupt the numbers). Checked before the read and before the fold. This
-        // narrows but does not fully close the recycled-pid window — the real reap
-        // happens a few frames earlier in `backend_wait` — bounding it to at most
-        // one stale sample, the same scheduler-quantum residual the watchdogs take.
+        let acc = Arc::new(Mutex::new(ProfileAcc::default()));
+        // Set by `on_exit` once the child is reaped so the sampler stops early — an
+        // optimization, not the load-bearing guard. The real protection is the
+        // identity gate: each sample calls `process_metrics(pid, identity)`, which
+        // returns the all-`None` default if the pid was recycled for an unrelated
+        // process, so even a sample that slips past this flag (the reap lands a few
+        // frames earlier in `backend_wait`, and the pump drain can run for
+        // PUMP_TEARDOWN on a leaked pipe) can never fold a stranger's counters.
         let reaped = Arc::new(AtomicBool::new(false));
+        let identity = self.proc_identity;
         let sampler = self.pid.map(|pid| {
             let acc = Arc::clone(&acc);
             let reaped = Arc::clone(&reaped);
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(every);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    ticker.tick().await;
-                    // Check before and after the read: avoids folding a reading
-                    // taken against a recycled pid (reap can land mid-flight).
-                    if reaped.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let metrics = crate::sys::process_metrics(pid);
-                    if reaped.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if let Ok(mut acc) = acc.lock() {
-                        acc.samples += 1;
-                        if let Some(cpu) = metrics.cpu_time {
-                            acc.cpu_time = Some(cpu);
-                        }
-                        if let Some(peak) = metrics.peak_memory_bytes {
-                            acc.peak_memory_bytes =
-                                Some(acc.peak_memory_bytes.map_or(peak, |prev| prev.max(peak)));
-                        }
-                    }
-                }
-            })
+            // The identity captured at spawn binds every reading to *this* child.
+            tokio::spawn(run_profile_sampler(every, reaped, acc, move || {
+                crate::sys::process_metrics(pid, identity)
+            }))
         });
 
         // Abort the sampler if the `profile()` future is dropped before it returns
@@ -915,9 +901,10 @@ impl RunningProcess {
         }
         let _sampler_guard = sampler.as_ref().map(|h| AbortOnDrop(h.abort_handle()));
 
-        // `reaped` flag does the real work: the sampler checks it before folding.
-        // `abort` is async and the pump drain can run for PUMP_TEARDOWN on a
-        // leaked pipe — long enough for a recycled pid to be read without the flag.
+        // Stop the sampler as the reap is observed: set the flag (its next tick
+        // breaks) and abort the task. `abort` is async and the pump drain can run for
+        // PUMP_TEARDOWN on a leaked pipe, so a late tick can still fire — but the
+        // identity gate (see the `reaped` comment above) makes any such reading harmless.
         let outcome = self
             .finish_lines(CaptureMode::Discard, /* expose_counts */ false, || {
                 reaped.store(true, Ordering::Release);
@@ -1674,6 +1661,67 @@ pub(crate) fn is_broken_pipe(e: &std::io::Error) -> bool {
 /// in-flight buffer grow without limit).
 fn discard_sink_policy() -> OutputBufferPolicy {
     OutputBufferPolicy::bounded(0).with_max_bytes(DISCARD_INFLIGHT_CAP)
+}
+
+/// The running accumulator behind [`RunningProcess::profile`]: the latest CPU
+/// reading, the peak memory across samples, and how many ticks ran.
+#[cfg(feature = "stats")]
+#[derive(Default)]
+struct ProfileAcc {
+    cpu_time: Option<Duration>,
+    peak_memory_bytes: Option<u64>,
+    samples: usize,
+}
+
+#[cfg(feature = "stats")]
+impl ProfileAcc {
+    /// Fold one metrics reading into the accumulator. A reading whose fields are
+    /// all `None` — the shape `process_metrics` returns for a pid whose identity no
+    /// longer matches (recycled) or a gone process — still counts as a tick but
+    /// contributes no CPU/memory, so a sample taken against a stranger can never
+    /// corrupt the numbers.
+    fn fold(&mut self, metrics: crate::sys::ProcMetrics) {
+        self.samples += 1;
+        if let Some(cpu) = metrics.cpu_time {
+            self.cpu_time = Some(cpu);
+        }
+        if let Some(peak) = metrics.peak_memory_bytes {
+            self.peak_memory_bytes =
+                Some(self.peak_memory_bytes.map_or(peak, |prev| prev.max(peak)));
+        }
+    }
+}
+
+/// The [`RunningProcess::profile`] sampler loop, factored over its `source` of
+/// metrics so a test can drive the PID-reuse window with a substitutable source
+/// (no real OS process). Ticks every `every`, folding each reading into `acc`, and
+/// stops as soon as `reaped` is set — checked BOTH before the read and before the
+/// fold, so a reap landing mid-read short-circuits before a sample the recycled pid
+/// could have produced is folded. The `source` is expected to be identity-gated
+/// (production passes `move || process_metrics(pid, identity)`), so even a reading
+/// that slips past the flag folds a stranger's data as the all-`None` default.
+#[cfg(feature = "stats")]
+async fn run_profile_sampler(
+    every: Duration,
+    reaped: Arc<AtomicBool>,
+    acc: Arc<std::sync::Mutex<ProfileAcc>>,
+    mut source: impl FnMut() -> crate::sys::ProcMetrics,
+) {
+    let mut ticker = tokio::time::interval(every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        if reaped.load(Ordering::Acquire) {
+            break;
+        }
+        let metrics = source();
+        if reaped.load(Ordering::Acquire) {
+            break;
+        }
+        if let Ok(mut acc) = acc.lock() {
+            acc.fold(metrics);
+        }
+    }
 }
 
 /// Reap `child` to exit **inside the gate lock**: poll `Child::wait()` within
@@ -2543,5 +2591,102 @@ mod tests {
             Err(Error::Io(e)) => assert_eq!(e.to_string(), "stderr read boom"),
             other => panic!("expected Err(Io) for an incomplete capture, got {other:?}"),
         }
+    }
+}
+
+/// T-090: the `profile` sampler must fold only readings taken against the child's
+/// own identity. The fold logic and the sampler loop are exercised with a
+/// substitutable metrics `source`, reproducing PID reuse in the sampler window
+/// deterministically — no real OS process, no reliance on a live child's timing.
+#[cfg(all(test, feature = "stats"))]
+mod profile_sampler_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::{ProfileAcc, run_profile_sampler};
+    use crate::sys::ProcMetrics;
+
+    fn metrics(cpu_ms: u64, mem: u64) -> ProcMetrics {
+        ProcMetrics {
+            cpu_time: Some(Duration::from_millis(cpu_ms)),
+            peak_memory_bytes: Some(mem),
+        }
+    }
+
+    #[test]
+    fn fold_ignores_all_none_readings() {
+        // The shape `process_metrics` returns for a recycled or gone pid: it counts
+        // as a tick but contributes no CPU/memory, so it can never overwrite a real
+        // reading nor reset the running peak.
+        let mut acc = ProfileAcc::default();
+        acc.fold(metrics(100, 8192)); // a real reading
+        acc.fold(ProcMetrics::default()); // a recycled-pid / gone reading
+        acc.fold(metrics(200, 4096)); // a later real reading
+        assert_eq!(acc.samples, 3, "every tick is counted, even empty ones");
+        assert_eq!(
+            acc.cpu_time,
+            Some(Duration::from_millis(200)),
+            "CPU tracks the latest real reading, not the empty one"
+        );
+        assert_eq!(
+            acc.peak_memory_bytes,
+            Some(8192),
+            "peak is the max across real readings; an empty reading never lowers it"
+        );
+    }
+
+    /// The sampler folds identity-matched readings and drops the stranger's default
+    /// after the pid is "recycled". Under `start_paused` the runtime auto-advances
+    /// the clock while the sampler awaits its interval, so this is deterministic:
+    /// the fake `source` returns two real readings, then all-`None` defaults (what
+    /// the identity gate yields once the pid is reused), and latches `reaped` after
+    /// enough ticks so the loop terminates.
+    #[tokio::test(start_paused = true)]
+    async fn sampler_folds_only_identity_matched_readings() {
+        let reaped = Arc::new(AtomicBool::new(false));
+        let acc = Arc::new(std::sync::Mutex::new(ProfileAcc::default()));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let reaped_src = Arc::clone(&reaped);
+        let calls_src = Arc::clone(&calls);
+        let source = move || {
+            let n = calls_src.fetch_add(1, Ordering::Relaxed);
+            // Latch reaped after several ticks so the loop breaks (the sampler's
+            // post-read reaped check stops before folding this call).
+            if n >= 4 {
+                reaped_src.store(true, Ordering::Release);
+            }
+            match n {
+                0 => metrics(100, 8192), // real: identity matches
+                1 => metrics(200, 4096), // real: identity matches
+                // pid recycled → identity mismatch → process_metrics default
+                _ => ProcMetrics::default(),
+            }
+        };
+
+        run_profile_sampler(
+            Duration::from_millis(5),
+            Arc::clone(&reaped),
+            Arc::clone(&acc),
+            source,
+        )
+        .await;
+
+        let acc = acc.lock().expect("acc mutex");
+        assert_eq!(
+            acc.cpu_time,
+            Some(Duration::from_millis(200)),
+            "the last identity-matched CPU reading is kept; the stranger's default is ignored"
+        );
+        assert_eq!(
+            acc.peak_memory_bytes,
+            Some(8192),
+            "peak reflects only identity-matched readings — the recycled pid never enters it"
+        );
+        assert!(
+            acc.samples >= 2,
+            "at least the two real readings were sampled"
+        );
     }
 }

@@ -262,11 +262,56 @@ pub(crate) struct ProcMetrics {
     pub peak_memory_bytes: Option<u64>,
 }
 
-/// Sample CPU time and peak memory for a single process by pid. Returns
-/// defaults (all `None`) if the process is gone or the platform can't report.
+/// An opaque snapshot of a process's OS-reported **start identity** — a start
+/// timestamp captured once so a later metrics read can prove a pid still names the
+/// *same* process instance, not one that recycled the number after the original
+/// was reaped. Only ever compared for equality, never interpreted: the units are
+/// platform-specific — Windows uses the process-creation `FILETIME` (100 ns units)
+/// and Linux uses `/proc/<pid>/stat` field 22 (`starttime`, clock ticks since
+/// boot); the POSIX fallback (macOS/BSD) reports none. This is the per-process
+/// analogue of the pgroup backend's start-time identity token (see
+/// [`pgroup::read_identity`](crate::sys::pgroup)); it exists to keep a pid-reuse
+/// race from folding an unrelated process's CPU/memory into a sample.
 #[cfg(feature = "stats")]
-pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
-    imp::process_metrics(pid)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcIdentity(u64);
+
+#[cfg(feature = "stats")]
+impl ProcIdentity {
+    /// Wrap a platform-specific raw start-time token (constructed only by the
+    /// platform backend that knows its units).
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The raw token, for a platform backend's own read-time equality re-check.
+    pub(crate) fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// Sample CPU time and peak memory for a single process by pid, but only when its
+/// current OS identity still matches `expected` (see [`ProcIdentity`]). If the pid
+/// was recycled by an unrelated process — its start identity no longer matching —
+/// the read yields defaults (all `None`) rather than that stranger's counters, so
+/// a sample can never be misattributed after PID reuse. `expected == None` skips
+/// the check (no identity was captured, or the platform can't report one),
+/// preserving the number-only behavior with no weakening. Returns defaults if the
+/// process is gone or the platform can't report.
+#[cfg(feature = "stats")]
+pub(crate) fn process_metrics(pid: u32, expected: Option<ProcIdentity>) -> ProcMetrics {
+    imp::process_metrics(pid, expected)
+}
+
+/// Capture the OS start-time identity anchor of the *live* process at `pid`, or
+/// `None` if the platform can't report one (macOS/BSD) or the process is already
+/// gone. Captured once — at spawn for the per-process sampler, or when a cgroup
+/// member is first read for a group-stats fold — and handed back to
+/// [`process_metrics`] so a later reading taken against a recycled pid is
+/// rejected rather than folded in.
+#[cfg(feature = "stats")]
+pub(crate) fn process_identity(pid: u32) -> Option<ProcIdentity> {
+    imp::process_identity(pid)
 }
 
 // Shared POSIX process-group backend for both the Linux fallback and macOS/BSD.

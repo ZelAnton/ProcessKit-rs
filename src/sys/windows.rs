@@ -59,7 +59,7 @@ use crate::limits::ResourceLimits;
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
 #[cfg(feature = "stats")]
-use crate::sys::ProcMetrics;
+use crate::sys::{ProcIdentity, ProcMetrics};
 
 pub(crate) struct Job {
     /// The job handle — deliberately non-inheritable and never duplicated:
@@ -749,11 +749,18 @@ fn job_member_pids(handle: HANDLE) -> io::Result<Vec<u32>> {
     }
 }
 
+/// A FILETIME as its raw 64-bit 100-ns unit count (high/low halves combined).
+/// The process-creation FILETIME serves as the [`ProcIdentity`] anchor, compared
+/// directly in these units; [`filetime_nanos`] scales the CPU-time FILETIMEs to ns.
+#[cfg(feature = "stats")]
+fn filetime_units(ft: FILETIME) -> u64 {
+    ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
+}
+
 /// Combine a FILETIME (100-ns units) into nanoseconds.
 #[cfg(feature = "stats")]
 fn filetime_nanos(ft: FILETIME) -> u64 {
-    let units = ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
-    units.saturating_mul(100)
+    filetime_units(ft).saturating_mul(100)
 }
 
 /// Convert a per-core CPU quota into a Job Object hard-cap `CpuRate`: 1/100 of a
@@ -769,8 +776,34 @@ fn cpu_hard_cap_rate(cores: f64, cpus: f64) -> u32 {
     rate.clamp(1.0, 10_000.0) as u32
 }
 
+/// The process-creation `FILETIME` of the process at `pid`, as its raw
+/// [`ProcIdentity`] token, or `None` if the process is gone / unqueryable. The
+/// creation time is fixed at spawn and never reused within a boot, so it tells a
+/// recycled pid apart from the original process (the Windows analogue of Linux's
+/// `/proc/<pid>/stat` starttime).
 #[cfg(feature = "stats")]
-pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
+pub(crate) fn process_identity(pid: u32) -> Option<ProcIdentity> {
+    // SAFETY: limited-information access; returns null on failure (e.g. gone).
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    // SAFETY: valid handle; all four out params are owned locals.
+    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    // SAFETY: handle came from OpenProcess and is closed exactly once.
+    unsafe { CloseHandle(handle) };
+    (ok != 0).then(|| ProcIdentity::from_raw(filetime_units(creation)))
+}
+
+#[cfg(feature = "stats")]
+pub(crate) fn process_metrics(pid: u32, expected: Option<ProcIdentity>) -> ProcMetrics {
     let mut metrics = ProcMetrics::default();
     // SAFETY: limited-information access; returns null on failure (e.g. gone).
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -787,6 +820,23 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
     let mut user = creation;
     // SAFETY: valid handle; all four out params are owned locals.
     let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+
+    // Identity gate. `OpenProcess(pid)` resolves the number to *whatever process
+    // holds it now* — possibly one that recycled it after our child was reaped —
+    // and the handle then pins that process. Comparing the pinned process's
+    // creation time (read via the same handle) against the captured identity proves
+    // it is our process before we trust ANY reading from this handle, memory
+    // included. If the times read failed we can't verify identity, so when one was
+    // demanded that counts as a mismatch: return defaults and touch nothing else.
+    if let Some(expected) = expected {
+        let confirmed = ok != 0 && filetime_units(creation) == expected.raw();
+        if !confirmed {
+            // SAFETY: handle came from OpenProcess and is closed exactly once.
+            unsafe { CloseHandle(handle) };
+            return ProcMetrics::default();
+        }
+    }
+
     if ok != 0 {
         metrics.cpu_time = Some(Duration::from_nanos(
             filetime_nanos(kernel).saturating_add(filetime_nanos(user)),
@@ -795,7 +845,9 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
 
     let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
     counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-    // SAFETY: valid handle; `counters` sized via its `cb` field.
+    // SAFETY: valid handle; `counters` sized via its `cb` field. Reading through the
+    // same identity-confirmed handle keeps the memory figure bound to our process,
+    // never a recycled stranger's.
     let ok = unsafe { K32GetProcessMemoryInfo(handle, &mut counters, counters.cb) };
     if ok != 0 {
         metrics.peak_memory_bytes = Some(counters.PeakWorkingSetSize as u64);
@@ -1066,6 +1118,63 @@ mod rearm_race_tests {
             !job.skip_drop_kill.is_set(),
             "a child assigned to the job mid-shutdown must keep its kill-on-close \
              backstop — the stale request must not re-spare it"
+        );
+    }
+}
+
+// The per-process identity gate (T-090): a metrics read that names a pid whose
+// current OS start identity does not match the captured one must yield defaults,
+// never the stranger's counters — the fail-safe that stops a recycled pid from
+// corrupting a `profile`/`cpu_time`/`peak_memory_bytes` sample. Driven against our
+// OWN live process (`GetCurrentProcessId`), which is guaranteed present and has a
+// stable creation time, so a wrong identity deterministically stands in for a
+// reused pid — no second process or reuse simulation needed.
+#[cfg(all(test, feature = "stats"))]
+mod metrics_identity_tests {
+    use super::{ProcIdentity, process_identity, process_metrics};
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+
+    #[test]
+    fn identity_is_captured_and_matches_a_same_process_read() {
+        // SAFETY: a plain read of our own pid.
+        let me = unsafe { GetCurrentProcessId() };
+        let id = process_identity(me).expect("our own live process has a creation time");
+
+        // The captured identity matches on a re-read (a live process keeps its
+        // creation time), so the gated read returns real counters.
+        let gated = process_metrics(me, Some(id));
+        assert!(
+            gated.cpu_time.is_some(),
+            "an identity-matched read of our own process reports CPU time"
+        );
+        assert!(
+            gated.peak_memory_bytes.is_some(),
+            "an identity-matched read of our own process reports peak memory"
+        );
+    }
+
+    #[test]
+    fn a_mismatched_identity_yields_defaults_not_the_live_process_counters() {
+        // SAFETY: a plain read of our own pid.
+        let me = unsafe { GetCurrentProcessId() };
+        let real = process_identity(me).expect("our own live process has a creation time");
+
+        // A wrong identity models a pid recycled by a different process: even though
+        // the pid is very much alive (it is us), the gate must refuse to fold ANY of
+        // this process's counters, returning the all-`None` default.
+        let bogus = ProcIdentity::from_raw(real.raw().wrapping_add(1));
+        let gated = process_metrics(me, Some(bogus));
+        assert!(
+            gated.cpu_time.is_none() && gated.peak_memory_bytes.is_none(),
+            "a mismatched identity must yield defaults, never the live process's \
+             CPU/memory — the recycled-pid fail-safe"
+        );
+
+        // Without a demanded identity the number-only behavior is preserved.
+        let ungated = process_metrics(me, None);
+        assert!(
+            ungated.cpu_time.is_some(),
+            "an unchecked read (identity None) still reports metrics"
         );
     }
 }

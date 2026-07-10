@@ -22,9 +22,9 @@ use crate::Signal;
 use crate::limits::ResourceLimits;
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
-#[cfg(feature = "stats")]
-use crate::sys::ProcMetrics;
 use crate::sys::pgroup::ProcessGroup;
+#[cfg(feature = "stats")]
+use crate::sys::{ProcIdentity, ProcMetrics};
 
 /// Process-wide counter so concurrent jobs get distinct cgroup names.
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -299,16 +299,57 @@ impl Job {
     }
 }
 
+/// Parse `/proc/<pid>/stat` field 22 (`starttime`, clock ticks since boot) — the
+/// process's start-time identity anchor. `starttime` is fixed at process creation
+/// and distinct for a pid recycled by a later process, so it tells a reused number
+/// apart from the original. The comm field (2) may contain spaces/parens, so parse
+/// after the last ')': its whitespace-split index 0 is field 3 (state), so field 22
+/// is index 19 (matching `read_identity` in `sys/pgroup.rs` and the cpu parser in
+/// [`process_metrics`]). `None` if the process is gone or the stat is unparsable.
 #[cfg(feature = "stats")]
-pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
+fn read_proc_starttime(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit_once(')')?.1;
+    after.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+/// Capture the `/proc/<pid>/stat` starttime of the live process at `pid` as its
+/// [`ProcIdentity`] token, or `None` if it is gone / unreadable.
+#[cfg(feature = "stats")]
+pub(crate) fn process_identity(pid: u32) -> Option<ProcIdentity> {
+    read_proc_starttime(pid).map(ProcIdentity::from_raw)
+}
+
+#[cfg(feature = "stats")]
+pub(crate) fn process_metrics(pid: u32, expected: Option<ProcIdentity>) -> ProcMetrics {
     let mut metrics = ProcMetrics::default();
 
-    // CPU: /proc/<pid>/stat fields utime (14) + stime (15), in clock ticks.
-    // The comm field (2) may contain spaces/parens, so parse after the last ')'.
-    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        && let Some(idx) = stat.rfind(')')
-    {
-        let fields: Vec<&str> = stat[idx + 1..].split_whitespace().collect();
+    // CPU *and* the identity anchor both come from /proc/<pid>/stat. The comm field
+    // (2) may contain spaces/parens, so parse after the last ')': its
+    // whitespace-split index 0 is field 3 (state).
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+    let fields: Option<Vec<&str>> = stat.as_deref().and_then(|s| {
+        let idx = s.rfind(')')?;
+        Some(s[idx + 1..].split_whitespace().collect())
+    });
+
+    // Identity gate: field 22 (`starttime`) is index 19 after ')'. If the caller
+    // captured an identity and this read's starttime differs — or the stat could
+    // not be read/parsed at all — the pid names a *different* process (recycled) or
+    // is gone: return the all-`None` default and do NOT fall through to the memory
+    // read, which would otherwise fold a stranger's RSS. Without a demanded identity
+    // (`None`), every read is best-effort as before, with no weakening.
+    if let Some(expected) = expected {
+        let current = fields
+            .as_ref()
+            .and_then(|f| f.get(19))
+            .and_then(|s| s.parse::<u64>().ok());
+        if current != Some(expected.raw()) {
+            return ProcMetrics::default();
+        }
+    }
+
+    if let Some(fields) = &fields {
         // After ')', index 0 is field 3 (state); utime=field14→idx11, stime→idx12.
         if fields.len() > 12
             && let (Ok(utime), Ok(stime)) = (fields[11].parse::<u64>(), fields[12].parse::<u64>())
@@ -326,7 +367,9 @@ pub(crate) fn process_metrics(pid: u32) -> ProcMetrics {
         }
     }
 
-    // Peak memory: /proc/<pid>/status VmHWM (high-water resident set, in kB).
+    // Peak memory: /proc/<pid>/status VmHWM (high-water resident set, in kB). Only
+    // reached once the identity gate above confirmed the pid (or none was demanded),
+    // so this read is bound to the same process the starttime identified.
     if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("VmHWM:") {
@@ -613,52 +656,85 @@ impl Cgroup {
     }
 
     /// Sum per-process `/proc` counters (cpu time, peak memory) over the live
-    /// members. Our cgroup has no controllers enabled (so `cgroup.kill` works
-    /// without the "no internal processes" rule), so cpu/memory aren't available
-    /// from the cgroup itself.
+    /// members, **identity-safe against pid recycling**. Our cgroup has no
+    /// controllers enabled (so `cgroup.kill` works without the "no internal
+    /// processes" rule), so cpu/memory aren't available from the cgroup itself.
     ///
     /// Note: `cgroup.procs` lists only *live* members — a process leaves it on
     /// **exit**, before it is reaped, so an unreaped zombie never appears there
     /// (per the kernel's cgroup-v2 docs: "a zombie process does not appear in
     /// cgroup.procs"). The count and the summed `/proc` counters therefore reflect
-    /// live processes, not dead ones. A member can still exit in the TOCTOU window
-    /// between reading `cgroup.procs` and reading its `/proc/<pid>/stat`, in which
-    /// case that pid's stat is either gone (skipped) or a brief zombie snapshot —
-    /// a momentary, self-correcting skew, not a persistent zombie over-count.
+    /// live processes, not dead ones.
     ///
-    /// A `cgroup.procs` read failure (EACCES/EIO/…) propagates as `Err` here
-    /// (via `?`) rather than being reported as an empty/zero-active group — an
-    /// unreadable member list is unknown, not "no processes".
+    /// The dangerous TOCTOU window is between reading `cgroup.procs` and reading a
+    /// member's `/proc/<pid>/stat`: the member can exit, be reaped, and its pid be
+    /// recycled by a process *outside* the cgroup, whose CPU/RSS would then be
+    /// folded into the group snapshot. Each member is therefore folded through
+    /// [`sample_member_identity_safe`], which pins the pid's start-time identity,
+    /// reconfirms it is *still* a cgroup member, and reads the counters gated on
+    /// that identity — so only data for members whose original identity **and**
+    /// current membership are both confirmed at read time is summed. A member that
+    /// merely exits (no recycle) is skipped cleanly, not folded as a stale value.
+    ///
+    /// A `cgroup.procs` read failure (EACCES/EIO/…) propagates as `Err` here — the
+    /// initial member-list read via `?`, and a per-member membership reconfirm read
+    /// via `MemberSample::Failed` — rather than being reported as an empty/partial
+    /// group; an unreadable member list is unknown, not "no processes".
     #[cfg(feature = "stats")]
     fn stats(&self) -> io::Result<ProcessGroupStats> {
         self.stats_with(|path| std::fs::read_to_string(path))
     }
 
     /// `stats()` parametrized over the `cgroup.procs` reader — see
-    /// [`members_with`](Self::members_with).
+    /// [`members_with`](Self::members_with). The per-member membership reconfirm in
+    /// the identity-safe fold re-reads through the *same* seam, so a seam test can
+    /// drive the "member exited + pid recycled before the metrics read" race
+    /// deterministically.
     #[cfg(feature = "stats")]
     fn stats_with(
         &self,
         read: impl Fn(&Path) -> io::Result<String>,
     ) -> io::Result<ProcessGroupStats> {
-        let pids = self.members_with(read)?;
+        let pids = self.members_with(&read)?;
         let active = pids.len();
         let mut cpu = Duration::ZERO;
         let mut have_cpu = false;
         let mut mem = 0u64;
         let mut have_mem = false;
+        let mut last_err = None;
         for pid in pids {
-            let m = process_metrics(pid as u32);
-            if let Some(c) = m.cpu_time {
-                // Saturating: summing many members' CPU time could in principle
-                // overflow `Duration`; clamp rather than panic.
-                cpu = cpu.saturating_add(c);
-                have_cpu = true;
+            // Pin identity → reconfirm membership → read gated on identity. The
+            // membership reconfirm re-reads `cgroup.procs` through the same seam.
+            let sample = sample_member_identity_safe(
+                pid,
+                |p| process_identity(p as u32),
+                |p| Ok(self.members_with(&read)?.contains(&p)),
+                |p, id| process_metrics(p as u32, Some(id)),
+            );
+            match sample {
+                MemberSample::Folded(m) => {
+                    if let Some(c) = m.cpu_time {
+                        // Saturating: summing many members' CPU time could in
+                        // principle overflow `Duration`; clamp rather than panic.
+                        cpu = cpu.saturating_add(c);
+                        have_cpu = true;
+                    }
+                    if let Some(p) = m.peak_memory_bytes {
+                        mem = mem.saturating_add(p);
+                        have_mem = true;
+                    }
+                }
+                // Gone, or its pid left the cgroup (possibly recycled outside) —
+                // contributes nothing, but is not a failure.
+                MemberSample::Skipped => {}
+                // A membership reconfirm read failed: the snapshot is unreliable.
+                MemberSample::Failed(e) => last_err = Some(e),
             }
-            if let Some(p) = m.peak_memory_bytes {
-                mem = mem.saturating_add(p);
-                have_mem = true;
-            }
+        }
+        // Surface an unreadable membership rather than a silently-short sum, mirroring
+        // `signal_with` and the initial `members_with(&read)?` above.
+        if let Some(e) = last_err {
+            return Err(e);
         }
         Ok(ProcessGroupStats {
             active_process_count: active,
@@ -966,6 +1042,74 @@ fn deliver_identity_safe<H>(
         // A real delivery failure (EPERM, …): surface it, never read as success.
         Err(e) => Delivery::Failed(e),
     }
+}
+
+/// The classified outcome of one identity-safe per-member metrics fold (see
+/// [`sample_member_identity_safe`]) — the stats analogue of [`Delivery`]. "The
+/// member is gone / its pid left the cgroup" is a benign skip that contributes
+/// nothing to the sum, distinct from a real membership-read failure that must
+/// surface rather than silently shorten the aggregate.
+#[cfg(feature = "stats")]
+enum MemberSample {
+    /// The pinned member was confirmed still present in the cgroup as the same
+    /// process; fold these counters (themselves possibly all-`None` for a member
+    /// whose `/proc` counters could not be read).
+    Folded(ProcMetrics),
+    /// The member was gone, or its pid left the cgroup (possibly recycled by a
+    /// process *outside* the tree) — no counters folded, but not a failure.
+    Skipped,
+    /// A membership reconfirm read failed: never fold when the membership is
+    /// unknown; surface it so the snapshot is not a silently-short sum.
+    Failed(io::Error),
+}
+
+/// The identity-safe per-member metrics fold, factored over its identity /
+/// membership / metrics seams so the pid-reuse race is testable without a real
+/// `/proc` or cgroup — the stats analogue of [`deliver_identity_safe`]. Three
+/// steps, in this order (the order is what makes it race-free):
+///
+/// 1. `capture_identity(pid)` **pins** the start-time identity of whoever holds
+///    `pid` now (a `/proc/<pid>/stat` starttime in production). `None` (gone /
+///    unreadable) is a benign skip — there is nobody we can vouch for.
+/// 2. `still_member(pid)` **reconfirms** membership, read *after* the pin. If the
+///    original member exited and the number was reused by a process *outside* the
+///    cgroup, that impostor is not a member, so this reports `false` and we skip
+///    without folding its counters.
+/// 3. `read_metrics(pid, id)` reads the counters **gated on the pinned identity**:
+///    a recycle *after* the reconfirm makes the identity no longer match, so
+///    `process_metrics` returns the all-`None` default (contributing nothing)
+///    rather than a stranger's CPU/RSS.
+///
+/// Why this never folds a live process outside the cgroup: the folded counters
+/// come from step 3, which only returns non-default values while the pid still
+/// carries the identity pinned in step 1 — i.e. the same process that step 2
+/// confirmed was a member. If instead the pinned process exited (recycled or not),
+/// step 3 sees a different-or-absent identity and folds nothing.
+#[cfg(feature = "stats")]
+fn sample_member_identity_safe(
+    pid: i32,
+    capture_identity: impl Fn(i32) -> Option<ProcIdentity>,
+    still_member: impl Fn(i32) -> io::Result<bool>,
+    read_metrics: impl Fn(i32, ProcIdentity) -> ProcMetrics,
+) -> MemberSample {
+    // 1. Pin the identity of the process currently at `pid`.
+    let Some(id) = capture_identity(pid) else {
+        // Gone (or no readable identity) before we could pin it — the counters
+        // would belong to nobody we can vouch for. Benign skip.
+        return MemberSample::Skipped;
+    };
+    // 2. Reconfirm membership *after* pinning.
+    match still_member(pid) {
+        Ok(true) => {}
+        // Left the cgroup — its number may have been recycled by a process outside
+        // the tree; refuse to fold its counters.
+        Ok(false) => return MemberSample::Skipped,
+        // Membership unknown (an unreadable `cgroup.procs`): never fold when we
+        // cannot confirm the target still belongs to the cgroup.
+        Err(e) => return MemberSample::Failed(e),
+    }
+    // 3. Read the counters gated on the pinned identity.
+    MemberSample::Folded(read_metrics(pid, id))
 }
 
 /// The honest error returned when the kernel lacks pidfd support, so per-member
@@ -1707,6 +1851,175 @@ mod pidfd_integration_tests {
             status.signal(),
             Some(libc::SIGTERM),
             "the child exited on the SIGTERM we delivered through the pidfd"
+        );
+    }
+}
+
+/// Identity-safe group-stats fold (T-090). These drive the pin → reconfirm
+/// membership → read-gated-on-identity decision logic of
+/// [`sample_member_identity_safe`] through injected seams, so the pid-reuse race in
+/// the `Cgroup::stats` window is reproduced deterministically without a real
+/// `/proc` or cgroup — the stats analogue of `cgroup_read_seam_tests`'
+/// `deliver_identity_safe` coverage. A second group exercises the real
+/// `process_identity`/`process_metrics` identity gate against this process itself
+/// (a live pid whose start-time is stable), where a deliberately-wrong identity
+/// stands in for a recycled pid.
+#[cfg(all(test, feature = "stats"))]
+mod member_sample_tests {
+    use std::cell::Cell;
+    use std::io;
+    use std::time::Duration;
+
+    use super::{
+        MemberSample, ProcIdentity, process_identity, process_metrics, read_proc_starttime,
+        sample_member_identity_safe,
+    };
+    use crate::sys::ProcMetrics;
+
+    /// A non-empty reading, so a fold that reaches it is observable.
+    fn some_metrics() -> ProcMetrics {
+        ProcMetrics {
+            cpu_time: Some(Duration::from_millis(10)),
+            peak_memory_bytes: Some(2048),
+        }
+    }
+
+    #[test]
+    fn reused_pid_outside_cgroup_is_never_folded() {
+        // The identity pins, but by reconfirm time the original member has exited
+        // and its pid was recycled by a process OUTSIDE the cgroup, so
+        // `still_member` reports false. The fold must skip and never read counters —
+        // the core group-stats PID-reuse safety.
+        let read = Cell::new(false);
+        let outcome = sample_member_identity_safe(
+            1234,
+            |_| Some(ProcIdentity::from_raw(42)),
+            |_| Ok(false),
+            |_, _| {
+                read.set(true);
+                some_metrics()
+            },
+        );
+        assert!(matches!(outcome, MemberSample::Skipped));
+        assert!(
+            !read.get(),
+            "a pid recycled outside the cgroup must never have its counters folded"
+        );
+    }
+
+    #[test]
+    fn confirmed_member_is_folded_with_its_counters() {
+        let outcome = sample_member_identity_safe(
+            42,
+            |_| Some(ProcIdentity::from_raw(7)),
+            |_| Ok(true),
+            |_, _| some_metrics(),
+        );
+        match outcome {
+            MemberSample::Folded(m) => {
+                assert_eq!(m.cpu_time, Some(Duration::from_millis(10)));
+                assert_eq!(m.peak_memory_bytes, Some(2048));
+            }
+            _ => panic!("a confirmed member must be folded"),
+        }
+    }
+
+    #[test]
+    fn member_gone_before_pin_is_a_benign_skip() {
+        // `capture_identity` fails: the member exited before we could pin it.
+        // Benign — membership is not even consulted and no counters are read.
+        let read = Cell::new(false);
+        let outcome = sample_member_identity_safe(
+            7,
+            |_| None,
+            |_| -> io::Result<bool> { panic!("membership must not be checked once the pin fails") },
+            |_, _| {
+                read.set(true);
+                some_metrics()
+            },
+        );
+        assert!(matches!(outcome, MemberSample::Skipped));
+        assert!(!read.get(), "a gone member's counters must not be read");
+    }
+
+    #[test]
+    fn unreadable_membership_fails_safe_without_reading_counters() {
+        // Reconfirming membership fails (EACCES): unknown membership must not be
+        // folded — fail safe, surface the error, read nothing.
+        let read = Cell::new(false);
+        let outcome = sample_member_identity_safe(
+            7,
+            |_| Some(ProcIdentity::from_raw(1)),
+            |_| Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            |_, _| {
+                read.set(true);
+                some_metrics()
+            },
+        );
+        match outcome {
+            MemberSample::Failed(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+            _ => panic!("an unreadable membership must fail safe"),
+        }
+        assert!(!read.get(), "fail-safe must not read any counters");
+    }
+
+    #[test]
+    fn recycle_after_reconfirm_folds_nothing() {
+        // Membership is confirmed, but the pid is recycled between the reconfirm and
+        // the metrics read: `process_metrics(pid, Some(id))` then sees a mismatching
+        // identity and returns the all-`None` default. The fold reaches step 3 but
+        // sums nothing, so a stranger's counters never enter the aggregate.
+        let outcome = sample_member_identity_safe(
+            7,
+            |_| Some(ProcIdentity::from_raw(1)),
+            |_| Ok(true),
+            |_, _| ProcMetrics::default(),
+        );
+        match outcome {
+            MemberSample::Folded(m) => {
+                assert!(
+                    m.cpu_time.is_none() && m.peak_memory_bytes.is_none(),
+                    "a recycle caught by the identity-gated read contributes nothing"
+                );
+            }
+            _ => panic!("a confirmed member is folded (with an all-None reading here)"),
+        }
+    }
+
+    // ---- the real /proc identity gate, driven against our own live process ----
+
+    #[test]
+    fn process_identity_matches_a_same_process_metrics_read() {
+        let me = std::process::id();
+        assert!(
+            read_proc_starttime(me).is_some(),
+            "our own /proc/<pid>/stat starttime must be readable"
+        );
+        let id = process_identity(me).expect("our own live process has a start identity");
+        let gated = process_metrics(me, Some(id));
+        assert!(
+            gated.cpu_time.is_some(),
+            "an identity-matched read of our own process reports CPU time"
+        );
+    }
+
+    #[test]
+    fn a_mismatched_identity_yields_defaults_not_the_live_process_counters() {
+        let me = std::process::id();
+        let real = process_identity(me).expect("our own live process has a start identity");
+        // A wrong starttime models a pid recycled by a different process: even though
+        // the pid is alive (it is us), the gate must return the all-`None` default.
+        let bogus = ProcIdentity::from_raw(real.raw().wrapping_add(1));
+        let gated = process_metrics(me, Some(bogus));
+        assert!(
+            gated.cpu_time.is_none() && gated.peak_memory_bytes.is_none(),
+            "a mismatched identity must yield defaults, never the live process's \
+             CPU/memory — the recycled-pid fail-safe"
+        );
+        // Without a demanded identity the number-only behavior is preserved.
+        assert!(
+            process_metrics(me, None).cpu_time.is_some(),
+            "an unchecked read (identity None) still reports metrics"
         );
     }
 }

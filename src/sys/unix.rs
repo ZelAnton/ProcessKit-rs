@@ -19,9 +19,9 @@ use crate::Signal;
 use crate::limits::ResourceLimits;
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
-#[cfg(feature = "stats")]
-use crate::sys::ProcMetrics;
 use crate::sys::pgroup::ProcessGroup;
+#[cfg(feature = "stats")]
+use crate::sys::{ProcIdentity, ProcMetrics};
 
 pub(crate) struct Job {
     group: ProcessGroup,
@@ -108,12 +108,25 @@ impl Job {
 }
 
 #[cfg(feature = "stats")]
-pub(crate) fn process_metrics(_pid: u32) -> ProcMetrics {
+pub(crate) fn process_metrics(_pid: u32, _expected: Option<ProcIdentity>) -> ProcMetrics {
     // Not *implemented* on these targets (returns the empty default), rather than
     // impossible: macOS/BSD have no `/proc`, so the Linux `/proc/<pid>/stat` path
     // doesn't apply, but per-process CPU/memory IS obtainable here via
     // `libproc`/`proc_pidinfo` (macOS) or `kvm`/`sysctl` (BSD) — just not wired up
     // (C12). Group-level `stats()` is likewise unavailable on the process-group
-    // mechanism; the count is all it can report.
+    // mechanism; the count is all it can report. The `expected` identity is
+    // irrelevant while no metrics are reported — an all-`None` default can never
+    // misattribute a recycled pid's counters, so it is honestly ignored.
     ProcMetrics::default()
+}
+
+#[cfg(feature = "stats")]
+pub(crate) fn process_identity(_pid: u32) -> Option<ProcIdentity> {
+    // No wired-up per-process metrics here (see `process_metrics`), so there is no
+    // reading to identity-gate and thus no anchor to capture. Honest `None` — never
+    // a fabricated token — degrades callers to the number-only path, which on this
+    // backend already reports no metrics. (The pgroup backend that actually tracks
+    // liveness DOES read a start-time identity where the platform allows it — see
+    // `pgroup::read_identity`; this is only the metrics-side stub.)
+    None
 }

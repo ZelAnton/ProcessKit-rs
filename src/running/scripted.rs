@@ -285,6 +285,10 @@ impl RunningProcess {
             timeout_grace: command.configured_timeout_grace(),
             timeout_signal: command.timeout_signal_raw(),
             pid: None,
+            // A scripted double owns no OS process, so there is no start identity to
+            // capture — metrics are never sampled against it.
+            #[cfg(feature = "stats")]
+            proc_identity: None,
             // Feeder writes UTF-8 (the canned String's bytes); force UTF-8 decode
             // so the caller sees the exact canned text regardless of the command's
             // configured encoding (see the doc above), while keeping the command's
