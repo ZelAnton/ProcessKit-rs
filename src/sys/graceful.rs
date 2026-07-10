@@ -130,9 +130,12 @@ pub(crate) trait PidTarget {
 /// `JoinHandle` untracked) so `RunningProcess::Drop` aborting the deadline
 /// watchdog cannot cancel the kill mid-grace; and the shared-group child carries
 /// no `kill_on_drop`, so this `SIGKILL` never races a Drop-triggered kill+reap
-/// of a recycled pid. The reap itself is the runtime's: dropping the child's
-/// `tokio::process::Child` hands it to tokio's orphan reaper, which collects it
-/// once this kill lands.
+/// of a recycled pid. The reap that frees the pid is owned by whoever owns the
+/// `Child` — a consuming finisher, or (when the consumer dropped its handle) the
+/// detached gated reaper `RunningProcess::Drop` hands the child to — and *that*
+/// reap retires the shared `PidGate` atomically, standing this driver down before
+/// its `SIGKILL`/liveness probe could touch the freed pid. The reap is never left
+/// to tokio's orphan reaper, which would free the pid without retiring the gate.
 ///
 /// When the child instead exits *on* the signal, [`is_alive`](PidTarget::is_alive)
 /// flips to `false` and the driver returns **without** the hard kill: the reap
@@ -580,6 +583,66 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "a retired target ends the grace immediately, before any hard kill"
+        );
+    }
+
+    // T-082 (Window 2): the detached shared-group graceful kill-and-reap must stand
+    // down the instant the pid's owner reaps — including when that reap is the
+    // detached Drop reaper landing *mid-grace* (the streaming consumer dropped its
+    // handle, so `RunningProcess::Drop` handed the child to a gated reaper that
+    // reaps under the gate and retires). Modelled deterministically: a target that
+    // retires the shared gate right after the driver's first liveness poll (standing
+    // in for that mid-grace reap). The very next poll must report "gone", so the
+    // driver returns WITHOUT its final `SIGKILL` — never signalling a pid the OS may
+    // have recycled. We probe our own (unquestionably live) pid, so a regression
+    // that kept polling/killing would either ride out the whole grace (tripping the
+    // timing bound) or fire a real, gate-guarded — hence no-op — hard kill (tripping
+    // the count). Under the paused clock, standing down burns no virtual time.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_reap_landing_mid_grace_stands_the_detached_kill_down() {
+        struct RetireAfterFirstPoll {
+            inner: UnixChild,
+            gate: std::sync::Arc<PidGate>,
+            polls: AtomicUsize,
+            hard_kills: AtomicUsize,
+        }
+        impl PidTarget for RetireAfterFirstPoll {
+            fn signal(&self, signal: i32) {
+                self.inner.signal(signal);
+            }
+            fn is_alive(&self) -> bool {
+                let alive = self.inner.is_alive();
+                // After the first live poll, the pid's owner reaps and retires the
+                // gate (the Drop reaper), so the next poll must see "gone".
+                if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.gate.retire();
+                }
+                alive
+            }
+            fn hard_kill(&self) {
+                self.hard_kills.fetch_add(1, Ordering::SeqCst);
+                self.inner.hard_kill();
+            }
+        }
+
+        let gate = std::sync::Arc::new(PidGate::new(Some(std::process::id())));
+        let target = RetireAfterFirstPoll {
+            inner: UnixChild::new(gate.clone()),
+            gate,
+            polls: AtomicUsize::new(0),
+            hard_kills: AtomicUsize::new(0),
+        };
+        let start = Instant::now();
+        run_pid(&target, 15, Duration::from_secs(10)).await;
+        assert_eq!(
+            target.hard_kills.load(Ordering::SeqCst),
+            0,
+            "a reap landing mid-grace must suppress the final SIGKILL (no recycled-pid kill)"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "the driver stands down on the next poll, not after riding out the grace"
         );
     }
 }
