@@ -18,6 +18,17 @@ to a dated version section.
 -
 
 ### Fixed
+-
+
+## [2.2.2] - 2026-07-10
+
+### Added
+-
+
+### Changed
+-
+
+### Fixed
 - Close a re-arm race between a non-escalating `ProcessGroup::shutdown`/
   `shutdown_ref` (`escalate_to_kill = false`) and a concurrent `start`/`adopt`.
   A child spawned or adopted into the group while the shutdown was still in
@@ -2142,7 +2153,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.1...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.2...HEAD
+[2.2.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.1...v2.2.2
 [2.2.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.1.1...v2.2.0
 [2.1.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.1.0...v2.1.1
