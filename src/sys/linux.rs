@@ -255,7 +255,7 @@ impl Job {
     pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
         let pids = match &self.backend {
             // Whole tree: every pid in cgroup.procs.
-            Backend::Cgroup(cg) => cg.members(),
+            Backend::Cgroup(cg) => cg.members()?,
             // Fallback tracks group leaders only.
             Backend::ProcessGroup(pg) => pg.members(),
         };
@@ -301,7 +301,7 @@ impl Job {
                 // which case that pid's stat is either gone (skipped) or a brief
                 // zombie snapshot — a momentary, self-correcting skew, not a
                 // persistent zombie over-count.
-                let pids = cg.members();
+                let pids = cg.members()?;
                 let active = pids.len();
                 let mut cpu = Duration::ZERO;
                 let mut have_cpu = false;
@@ -406,8 +406,11 @@ impl Drop for Job {
                     // loop usually exits on the first check. Accepted cost of a
                     // synchronous leak-safe teardown.
                     for _ in 0..50 {
-                        if cg.is_empty() {
-                            break;
+                        match cg.is_empty() {
+                            Ok(true) => break,
+                            // An unreadable member list is unknown, not empty.
+                            // Keep waiting best-effort; Drop must not panic.
+                            Ok(false) | Err(_) => {}
                         }
                         std::thread::sleep(Duration::from_millis(2));
                     }
@@ -605,10 +608,15 @@ impl Cgroup {
         Ok(())
     }
 
-    /// Read the live member pids (empty if the file is gone).
-    fn members(&self) -> Vec<i32> {
-        match std::fs::read_to_string(self.path.join("cgroup.procs")) {
-            Ok(procs) => procs
+    /// Read the live member pids. A removed cgroup is empty; other read failures
+    /// leave its state unknown and are surfaced to the caller.
+    fn members(&self) -> io::Result<Vec<i32>> {
+        self.members_with(|path| std::fs::read_to_string(path))
+    }
+
+    fn members_with(&self, read: impl FnOnce(&Path) -> io::Result<String>) -> io::Result<Vec<i32>> {
+        match read(&self.path.join("cgroup.procs")) {
+            Ok(procs) => Ok(procs
                 .lines()
                 // Keep only real pids: a `0`/negative line would otherwise reach
                 // `kill(pid, …)` as "the caller's whole process group" (0) or "a
@@ -621,13 +629,14 @@ impl Cgroup {
                 // pid visibility, still reaps it.
                 .filter_map(|l| l.trim().parse::<i32>().ok())
                 .filter(|&pid| pid > 0)
-                .collect(),
-            Err(_) => Vec::new(),
+                .collect()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.members().is_empty()
+    fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.members()?.is_empty())
     }
 
     /// Send `sig` to every current member (the graceful SIGTERM tier and the
@@ -644,7 +653,7 @@ impl Cgroup {
     /// SIGKILL teardown therefore goes through `cgroup.kill`, not this path.
     fn signal(&self, sig: i32) -> io::Result<()> {
         let mut last_err = None;
-        for pid in self.members() {
+        for pid in self.members()? {
             // SAFETY: a plain signal to a pid read from cgroup.procs.
             let rc = unsafe { libc::kill(pid, sig) };
             if rc != 0 {
@@ -751,15 +760,21 @@ impl Cgroup {
         // under load.
         let _ = std::fs::write(self.path.join("cgroup.freeze"), b"1");
         for _ in 0..50 {
-            let members = self.members();
-            if members.is_empty() {
-                break;
-            }
-            for pid in members {
-                // SAFETY: see `signal`.
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
+            match self.members() {
+                Ok(members) => {
+                    if members.is_empty() {
+                        break;
+                    }
+                    for pid in members {
+                        // SAFETY: see signal.
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
+                    }
                 }
+                // Unknown state must not look drained. Continue the bounded
+                // fallback in case the read failure is transient.
+                Err(_) => {}
             }
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -774,12 +789,12 @@ impl Cgroup {
         // Report a real drain failure instead of a false success, so the caller
         // knows the tree may still be alive — a fork bomb still out-spawning, or
         // un-reapable zombies (a D-state task ignores SIGKILL until it unblocks).
-        if self.members().is_empty() {
-            Ok(())
-        } else {
-            Err(io::Error::other(
+        match self.members() {
+            Ok(members) if members.is_empty() => Ok(()),
+            Ok(_) => Err(io::Error::other(
                 "cgroup did not drain after the bounded SIGKILL sweep (kernel < 5.14 fallback)",
-            ))
+            )),
+            Err(e) => Err(e),
         }
     }
 }
@@ -792,7 +807,7 @@ impl super::graceful::GracefulTarget for Cgroup {
     }
 
     fn is_drained(&self) -> bool {
-        self.is_empty()
+        self.is_empty().unwrap_or(false)
     }
 
     fn hard_kill(&self) -> io::Result<()> {
@@ -911,6 +926,60 @@ fn write_self_pid(path: &CStr) -> io::Result<()> {
             return Err(io::Error::from(io::ErrorKind::WriteZero));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod member_read_tests {
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    use super::Cgroup;
+
+    fn cgroup() -> Cgroup {
+        Cgroup {
+            path: PathBuf::from("/mock/processkit"),
+        }
+    }
+
+    #[test]
+    fn members_parses_readable_procs() {
+        let members = cgroup()
+            .members_with(|path| {
+                assert_eq!(path, Path::new("/mock/processkit/cgroup.procs"));
+                Ok("12\n0\ninvalid\n-3\n42\n".to_owned())
+            })
+            .expect("readable member list");
+
+        assert_eq!(members, [12, 42]);
+    }
+
+    #[test]
+    fn missing_procs_means_empty_cgroup() {
+        let members = cgroup()
+            .members_with(|_| Err(io::Error::from(io::ErrorKind::NotFound)))
+            .expect("a removed cgroup has no members");
+
+        assert!(members.is_empty());
+    }
+
+    #[test]
+    fn permission_denied_procs_is_unknown() {
+        let err = cgroup()
+            .members_with(|_| Err(io::Error::from(io::ErrorKind::PermissionDenied)))
+            .expect_err("an unreadable cgroup must not look empty");
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn io_error_procs_is_unknown() {
+        let err = cgroup()
+            .members_with(|_| Err(io::Error::from_raw_os_error(libc::EIO)))
+            .expect_err("an I/O failure must not look empty");
+
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
     }
 }
 
