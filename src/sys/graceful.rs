@@ -597,19 +597,32 @@ mod tests {
     // have recycled. We probe our own (unquestionably live) pid, so a regression
     // that kept polling/killing would either ride out the whole grace (tripping the
     // timing bound) or fire a real, gate-guarded — hence no-op — hard kill (tripping
-    // the count). Under the paused clock, standing down burns no virtual time.
+    // the count). Under the paused clock, standing down burns no virtual time. The
+    // model's `signal` is a counting no-op (see the method) so the up-front graceful
+    // signal — issued before the first poll retires the gate — never lands on our own
+    // still-live pid and terminates the runner.
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn a_reap_landing_mid_grace_stands_the_detached_kill_down() {
         struct RetireAfterFirstPoll {
             inner: UnixChild,
             gate: std::sync::Arc<PidGate>,
+            signals: AtomicUsize,
             polls: AtomicUsize,
             hard_kills: AtomicUsize,
         }
         impl PidTarget for RetireAfterFirstPoll {
-            fn signal(&self, signal: i32) {
-                self.inner.signal(signal);
+            fn signal(&self, _signal: i32) {
+                // A counting no-op — deliberately NOT delegating to
+                // `self.inner.signal`. `run_pid` issues the graceful signal up
+                // front, *before* the first liveness poll retires the gate (the
+                // retire fires only inside `is_alive`). At that instant the gate is
+                // still live and its pid is our own (`std::process::id()`), so a real
+                // `UnixChild::signal` would `kill(getpid(), SIGTERM)` and terminate
+                // the un-retired test runner. What this test exercises is the gate's
+                // liveness/hard-kill behaviour, not signal delivery, so we merely
+                // record that the driver issued the graceful signal.
+                self.signals.fetch_add(1, Ordering::SeqCst);
             }
             fn is_alive(&self) -> bool {
                 let alive = self.inner.is_alive();
@@ -630,11 +643,17 @@ mod tests {
         let target = RetireAfterFirstPoll {
             inner: UnixChild::new(gate.clone()),
             gate,
+            signals: AtomicUsize::new(0),
             polls: AtomicUsize::new(0),
             hard_kills: AtomicUsize::new(0),
         };
         let start = Instant::now();
         run_pid(&target, 15, Duration::from_secs(10)).await;
+        assert_eq!(
+            target.signals.load(Ordering::SeqCst),
+            1,
+            "the driver issues the graceful signal once, up front, before it polls"
+        );
         assert_eq!(
             target.hard_kills.load(Ordering::SeqCst),
             0,
