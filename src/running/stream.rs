@@ -459,14 +459,18 @@ pub(crate) async fn graceful_kill_pid(gate: Arc<PidGate>, grace: std::time::Dura
 /// shared group itself is dropped. Detaching it here severs that abort: the task
 /// runs to completion independently, delivering the guaranteed `SIGKILL`. The
 /// shared-group child carries no `kill_on_drop`, so this kill never races a
-/// Drop-triggered kill+reap of a recycled pid; the reap is the runtime's — the
-/// dropped `tokio::process::Child` is collected by tokio's orphan reaper once
-/// the kill lands.
+/// Drop-triggered kill+reap of a recycled pid.
 ///
-/// The shared [`PidGate`] rides along as the [`graceful_kill_pid`] stand-down: if
-/// a consuming finisher reclaims teardown mid-grace (it retires the gate and
-/// reaps through the owned `Child`), this detached task's liveness poll stops and
-/// its `SIGKILL` is suppressed, so it can't fire on the recycled pid.
+/// The reap that frees the pid is **never** left to tokio's orphan reaper (which
+/// would free it without retiring the gate, leaving this task free to probe or
+/// SIGKILL whatever recycled it). It is owned by whoever owns the `Child`: a
+/// consuming finisher (which retires the gate and reaps through the owned
+/// `Child`), or — when the streaming consumer instead drops its handle mid-grace —
+/// the detached gated reaper `RunningProcess::Drop` hands the child to
+/// (`gated_reap_and_retire`), which reaps it under the gate and retires
+/// atomically. Either way the shared [`PidGate`] is the [`graceful_kill_pid`]
+/// stand-down: once the pid's owner retires it, this task's liveness poll reports
+/// "gone", its `SIGKILL` is suppressed, and it can never fire on a recycled pid.
 fn spawn_graceful_kill_and_reap(gate: Arc<PidGate>, grace: std::time::Duration, signal: i32) {
     // Detached on purpose: dropping the handle lets it outlive the (abortable)
     // deadline watchdog that spawned it.
