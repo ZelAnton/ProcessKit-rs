@@ -1032,8 +1032,8 @@ impl core::marker::Send for processkit::Stdin
 impl core::marker::Sync for processkit::Stdin
 impl core::marker::Unpin for processkit::Stdin
 impl core::marker::UnsafeUnpin for processkit::Stdin
-impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Stdin
-impl !core::panic::unwind_safe::UnwindSafe for processkit::Stdin
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::Stdin
+impl core::panic::unwind_safe::UnwindSafe for processkit::Stdin
 pub struct processkit::StdoutLines
 impl core::fmt::Debug for processkit::StdoutLines
 pub fn processkit::StdoutLines::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
