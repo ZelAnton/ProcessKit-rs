@@ -353,4 +353,74 @@ mod tests {
             );
         }
     }
+
+    /// T-092: the **structural-drop** discipline `RunningProcess::drop` uses on the
+    /// branches that hand the child to no detached reaper (an own-group handle, or a
+    /// shared group without a grace window). There the owner does NOT fuse the reap
+    /// and the retire the way [`reap_under_lock`](PidGate::reap_under_lock) does:
+    /// `drop()` calls [`retire`](PidGate::retire) synchronously, and only *afterwards*
+    /// — as a **separate** later step — does the owned `Child` drop and the pid get
+    /// freed (by tokio's orphan reaper, or as the owned group tears the tree down).
+    /// This proves that split is still race-free: because the `retire` fully precedes
+    /// the free in program order AND both contend on the same lock a watchdog's kill
+    /// must take, an aborted-but-mid-poll watchdog's gated raw kill can only ever
+    /// observe the pid *un-freed*.
+    ///
+    /// A barrier releases the "drop" thread (retire, then a beat later mark the pid
+    /// freed) and a "watchdog" thread (kill through the gate) at the same instant to
+    /// maximize contention. Whichever wins the lock, the killer's closure never runs
+    /// after the free: it either linearizes before the retire (pid still valid) or is
+    /// skipped once retired. Deterministic (a barrier + a hard assertion, no sleeps or
+    /// timing guesses) and platform-agnostic — the exact reaper-vs-watchdog race the
+    /// two structural-drop Drop branches reduce to.
+    #[test]
+    fn a_retire_before_a_separate_pid_free_still_bars_a_racing_kill() {
+        for _ in 0..2_000 {
+            let gate = Arc::new(PidGate::new(Some(4321)));
+            let freed = Arc::new(AtomicBool::new(false));
+            let killed_after_free = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(2));
+
+            // The Drop path: retire the gate, THEN (strictly afterwards, a separate
+            // step) free the pid — exactly as the owned `Child` is dropped only once
+            // `drop()` has already retired the gate.
+            let dropper = {
+                let gate = gate.clone();
+                let freed = freed.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    gate.retire();
+                    freed.store(true, Ordering::SeqCst);
+                })
+            };
+            // A deadline/cancel watchdog aborted mid-poll that still reaches its
+            // gated raw kill.
+            let killer = {
+                let gate = gate.clone();
+                let freed = freed.clone();
+                let killed_after_free = killed_after_free.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    gate.with_live_pid((), |_pid| {
+                        // Runs only under the lock and only while not retired. A
+                        // closure that runs here must have won the lock *before* the
+                        // dropper's `retire` — hence before the free that follows it —
+                        // so `freed` is never observed set.
+                        if freed.load(Ordering::SeqCst) {
+                            killed_after_free.fetch_add(1, Ordering::SeqCst);
+                        }
+                    });
+                })
+            };
+            dropper.join().expect("dropper thread");
+            killer.join().expect("killer thread");
+            assert_eq!(
+                killed_after_free.load(Ordering::SeqCst),
+                0,
+                "a raw kill must never run after the structural drop freed the pid"
+            );
+        }
+    }
 }
