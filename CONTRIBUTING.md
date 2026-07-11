@@ -40,8 +40,11 @@ repository root: `just check` for the fast everyday gate (fmt, clippy,
 workflow (fmt, clippy and tests in all three feature configurations, the
 `cargo-hack` feature-powerset build, and the doc builds). `just ci` needs
 `cargo-hack` installed (`cargo install cargo-hack`); run `just --list` to see
-the optional recipes (`just ci-nightly`, `just msrv`, `just public-api-diff`)
-that mirror the remaining CI jobs but need a nightly toolchain or extra tools.
+the optional recipes (`just ci-nightly`, `just msrv`, `just public-api-diff`,
+`just test-musl`) that mirror the remaining CI jobs but need a nightly
+toolchain or extra tools (`test-musl` needs Docker — it runs the
+real-subprocess suite inside a real Alpine/musl container, mirroring the CI
+`test-musl` job; see [platform-support.md](docs/platform-support.md#ci-coverage)).
 
 ## Releasing
 

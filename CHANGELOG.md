@@ -26,6 +26,9 @@ to a dated version section.
   existing one-shot-source refusal — rather than silently letting one setting
   win. The rejection is enforced on the shared launch seam, so the hermetic test
   doubles (`ScriptedRunner`) reject the same conflict a live run does.
+- CI now runs the real-subprocess test suite inside a real Alpine/musl
+  container (`test-musl` job), in addition to the existing glibc/Windows/macOS
+  legs; reproduce locally with `just test-musl` (requires Docker)
 
 ### Changed
 -
