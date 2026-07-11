@@ -276,12 +276,12 @@ where
 /// up on `PATH` honoring PATHEXT on Windows and the execute bit on Unix; a
 /// path-form `program` is probed directly — so a `which` hit is exactly what a
 /// real run would spawn, and a `which` miss is exactly the
-/// [`Error::NotFound`](crate::Error::NotFound) that run would raise. Synchronous
+/// [`Error::NotFound`] that run would raise. Synchronous
 /// and cheap (a few `stat`s); no async runtime is required.
 ///
 /// # Errors
 ///
-/// [`Error::NotFound`](crate::Error::NotFound) when the program can't be located
+/// [`Error::NotFound`] when the program can't be located
 /// — not installed, not on `PATH`, or a path that doesn't resolve to an
 /// executable. Its `searched` field names the directories checked for a
 /// bare-name lookup, and [`is_not_found`](crate::Error::is_not_found) classifies
