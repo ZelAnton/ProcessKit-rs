@@ -47,7 +47,9 @@ via the job's (and the `just test-musl` recipe's) `--init` and
   `kill(pid, 0)`. That silently breaks every test that asserts a forked
   grandchild is actually gone after teardown. `--init` runs
   [tini](https://github.com/krallin/tini) as PID 1, a real subreaper, which
-  is what a properly configured container host provides.
+  is what a properly configured container host provides. Any container's own
+  PID 1 has the identical gap for its own orphaned grandchildren — see
+  [Running in containers → PID 1](containers.md#pid-1-signals-zombies-and-whats-contained).
 - **`CAP_SYS_NICE` dropped by default.** Docker excludes it from the default
   capability set even for a root container user, so *raising* scheduling
   priority fails `EPERM` regardless of uid (lowering it never needs the
@@ -169,7 +171,12 @@ is therefore Unix-only.
 **Linux cgroup delegation.** Creating the per-group cgroup needs write access
 to the cgroup v2 hierarchy. Dev boxes typically lack it → the pgroup fallback.
 CI inside containers usually has it. Check `mechanism()` when behavior must
-not silently degrade.
+not silently degrade. For the container-specific version of this — what a
+plain `docker run` actually gets, and why resource limits stay unenforceable
+even under `--privileged` — see
+[Running in containers → mechanism](containers.md#which-containment-mechanism-you-get)
+and
+[Running in containers → resource limits](containers.md#container-resource-limits-vs-the-crates-limits).
 
 **`uid()`/`gid()` × the cgroup mechanism.** The OS applies the uid drop
 *before* `pre_exec` hooks, and the cgroup join runs in `pre_exec` — as the
@@ -216,7 +223,10 @@ before starting new work; details in
 **Frozen trees and graceful shutdown.** Hard kills penetrate a frozen tree
 (SIGKILL / `cgroup.kill` / job terminate), but a graceful `shutdown` leads
 with a `SIGTERM` the frozen processes can't handle — it waits out the full
-grace. Resume first.
+grace. Resume first. For the orchestrator's own `SIGTERM` to your
+container's PID 1 (a related but distinct signal from the one `shutdown`
+sends to the tree it manages), see
+[Running in containers → graceful shutdown](containers.md#graceful-shutdown-on-the-orchestrators-sigterm).
 
 **pgroup backends: leaders, zombies, pid reuse.** `members()` lists tracked
 group leaders only; an exited-but-unreaped child (zombie) still probes as
@@ -228,5 +238,5 @@ to keep the window minimal.
 ---
 
 Next: [Process groups](process-groups.md) ·
-[Running commands](commands.md) ·
+[Running in containers](containers.md) ·
 [docs index](README.md)

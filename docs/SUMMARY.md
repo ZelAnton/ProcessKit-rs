@@ -12,5 +12,6 @@
 - [Supervision](supervision.md)
 - [Testing your code](testing.md)
 - [Platform support](platform-support.md)
+- [Running in containers](containers.md)
 - [Upgrading](upgrading.md)
 - [What's next](whats-next.md)

@@ -82,6 +82,11 @@ mod docs_process_groups {}
 #[doc = include_str!("../docs/platform-support.md")]
 mod docs_platform_support {}
 
+/// `docs/containers.md`.
+#[doc(hidden)]
+#[doc = include_str!("../docs/containers.md")]
+mod docs_containers {}
+
 /// `docs/upgrading.md`.
 #[doc(hidden)]
 #[doc = include_str!("../docs/upgrading.md")]
