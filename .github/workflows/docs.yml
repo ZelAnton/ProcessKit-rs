@@ -1,0 +1,65 @@
+name: docs
+
+# Builds the mdBook documentation site (docs/**, theme/**, book.toml -- see
+# the mdBook scaffolding under those paths and the source config `src =
+# "docs"` in book.toml) and publishes it via the official GitHub Pages
+# deployment mechanism (`actions/upload-pages-artifact` +
+# `actions/deploy-pages`), not `peaceiris/actions-gh-pages` / a `gh-pages`
+# branch. Requires the repository's Pages source to be set to "GitHub
+# Actions" (Settings > Pages) -- a repo setting, not something this workflow
+# can configure.
+#
+# Scoped to the docs sources only (paths below) so it never runs on
+# unrelated application-code changes, and named/filed distinctly from the
+# other workflow tiers (ci.yml, release.yml, bench.yml, fuzz.yml,
+# mutants.yml, stress.yml) so there's no name or trigger overlap with them.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'theme/**'
+      - 'book.toml'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+# Only one Pages deployment can be in flight at a time; queue behind the
+# latest push rather than letting two runs race to publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    name: build (mdBook)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Pinned to the same mdBook version used by the Pages-repository
+      # workflow that renders this site, so both builds produce the same
+      # output for identical sources.
+      - name: Install mdBook
+        run: |
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C /usr/local/bin
+      - run: mdbook build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: book
+
+  deploy:
+    name: deploy (GitHub Pages)
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

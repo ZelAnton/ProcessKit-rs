@@ -42,6 +42,11 @@ to a dated version section.
 - CI now runs the real-subprocess test suite inside a real Alpine/musl
   container (`test-musl` job), in addition to the existing glibc/Windows/macOS
   legs; reproduce locally with `just test-musl` (requires Docker)
+- CI now also runs the `test` and `clippy` matrices on a native `ubuntu-24.04-arm`
+  (Linux aarch64) runner, in addition to the existing x86_64 Linux/Windows/macOS
+  (and Darwin arm64) legs, giving the native Linux syscall/signal/cgroup layer in
+  `src/sys/{linux,pgroup,unix,pid_gate}.rs` real Linux/aarch64 test coverage
+  instead of only Darwin-arm64 `cargo check`
 
 ### Changed
 -
