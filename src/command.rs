@@ -1799,6 +1799,88 @@ impl Command {
         // lives in one place and stays exercisable with any runner.
         JobRunner::new().first_line(self, predicate).await
     }
+
+    /// Resolve this command's `program` to a concrete executable path **without
+    /// launching it** — a spawn-free preflight, for a *doctor* / early-diagnosis
+    /// check ("is `git` installed?") that must have **no** side effects. Unlike
+    /// [`probe`](Self::probe) (which actually runs the tool), this only *locates*
+    /// it — no process is ever started.
+    ///
+    /// Resolution is byte-for-byte the same as the one the real launch performs,
+    /// because it reuses the *same* internal logic — not a second copy: a bare
+    /// name is resolved against this command's [`prefer_local`](Self::prefer_local)
+    /// directories first (in priority order), then the `PATH`, honoring PATHEXT on
+    /// Windows and the execute bit on Unix; a path-form `program` (absolute, or
+    /// relative with a separator) is probed directly, exactly as the OS receives
+    /// it. When the command has **relocated** the child's `PATH`
+    /// ([`env`](Self::env)/[`env_remove`](Self::env_remove) of `PATH`,
+    /// [`env_clear`](Self::env_clear), or [`inherit_env`](Self::inherit_env)),
+    /// the lookup runs against that *effective child* `PATH`, so preflight never
+    /// disagrees with what the spawn would actually find.
+    ///
+    /// On success returns the resolved **absolute** path. This is a synchronous,
+    /// cheap filesystem probe (a few `stat`s) — no async runtime is required.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`](crate::Error::NotFound) when the program can't be
+    /// located — not installed, not on `PATH`, or a path that doesn't resolve to
+    /// an executable. Its `searched` field lists the directories that were
+    /// checked (`prefer_local` first, then `PATH`) for a bare-name lookup, and is
+    /// `None` for a path-form program; [`is_not_found`](crate::Error::is_not_found)
+    /// classifies it, exactly as it would for the same missing program on a real
+    /// run.
+    pub fn resolve_program(&self) -> Result<PathBuf> {
+        let path = if self.customizes_path() {
+            // The command moves the child's `PATH` away from the process `PATH`,
+            // so resolve against the value the child will actually receive.
+            PathSource::Explicit(self.effective_path_value())
+        } else {
+            // The child inherits the process `PATH`; searching it (via the same
+            // `find_in_path` the launch models with) is exact.
+            PathSource::ProcessPath
+        };
+        match resolve_program(self.program.as_os_str(), &self.prefer_local, path) {
+            ProgramResolution::Found(found) => Ok(found),
+            ProgramResolution::NotFound { searched } => Err(Error::NotFound {
+                program: self.program_name(),
+                searched,
+            }),
+        }
+    }
+
+    /// The value of the child's `PATH` after this command's env ops — the exact
+    /// `PATH` the OS would search at spawn, for [`resolve_program`](Self::resolve_program)
+    /// to resolve against when the command has relocated it. Mirrors
+    /// [`build_tokio`](Self::build_tokio)'s env application for the single `PATH`
+    /// key: start from the inherited base (empty under
+    /// [`env_clear`](Self::env_clear)/[`inherit_env`](Self::inherit_env), else the
+    /// process env), let an `inherit_env` allow-list reintroduce the parent
+    /// `PATH`, then apply the per-command [`env`](Self::env)/[`env_remove`](Self::env_remove)
+    /// ops in order (last write wins). Case-insensitive `PATH` matching on Windows.
+    fn effective_path_value(&self) -> Option<OsString> {
+        let path_key = OsStr::new("PATH");
+        // Base: what the child inherits before per-command env ops. `env_clear`
+        // and `inherit_env` both start the child from a clean slate; only an
+        // `inherit_env` allow-list that names `PATH` reintroduces it from the
+        // parent (build_tokio copies each listed var from the parent env).
+        let mut value: Option<OsString> = if self.env_clear || self.inherit_env.is_some() {
+            self.inherit_env
+                .as_deref()
+                .filter(|names| names.iter().any(|n| env_key_eq(n, path_key)))
+                .and_then(|_| std::env::var_os("PATH"))
+        } else {
+            std::env::var_os("PATH")
+        };
+        // Per-command env ops win, in registration order (a later op supersedes
+        // an earlier one for the same key).
+        for (key, v) in &self.envs {
+            if env_key_eq(key, path_key) {
+                value = v.clone();
+            }
+        }
+        value
+    }
 }
 
 impl fmt::Debug for Command {
@@ -1981,23 +2063,165 @@ pub(crate) fn is_bare_name(program: &OsStr) -> bool {
     matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
 }
 
-/// Search `PATH` for an executable named `program` (bare name, no separators).
+/// Search the process's own `PATH` for an executable named `program` (bare
+/// name, no separators) — the process-`PATH` specialization of
+/// [`find_in_path_in`].
 ///
 /// Returns `(found, searched)`:
 /// - `found` — the resolved absolute path when the program is on `PATH`.
 /// - `searched` — the raw `PATH` value (for the error message when not found).
 pub(crate) fn find_in_path(program: &OsStr) -> (Option<std::path::PathBuf>, String) {
-    let path_var = match std::env::var_os("PATH") {
+    find_in_path_in(program, std::env::var_os("PATH").as_deref())
+}
+
+/// Search a specific `PATH` **value** for an executable named `program` (bare
+/// name, no separators). The single `PATH`/PATHEXT/execute-bit search shared by
+/// [`find_in_path`] (which passes the process `PATH`) and the spawn-free
+/// preflight (which passes a command's *effective child* `PATH` when it has
+/// relocated it) — so both resolve a bare name through exactly the same
+/// [`probe_dir`] logic, never a second copy.
+///
+/// An absent or empty `PATH` value yields `(None, String::new())` — no
+/// directories to search or to name — matching the process-`PATH` behavior.
+pub(crate) fn find_in_path_in(
+    program: &OsStr,
+    path_value: Option<&OsStr>,
+) -> (Option<std::path::PathBuf>, String) {
+    let path_var = match path_value {
         Some(p) if !p.is_empty() => p,
         _ => return (None, String::new()),
     };
     let searched = path_var.to_string_lossy().into_owned();
-    for dir in std::env::split_paths(&path_var) {
+    for dir in std::env::split_paths(path_var) {
         if let Some(found) = probe_dir(&dir, program) {
             return (Some(found), searched);
         }
     }
     (None, searched)
+}
+
+/// Which `PATH` a [`resolve_program`] call searches for a bare name — the one
+/// knob that lets the spawn-free preflight resolve against the *same* `PATH` the
+/// launch will, without a second search implementation.
+pub(crate) enum PathSource {
+    /// Search the process's own `PATH` (via [`find_in_path`]) — the child `PATH`
+    /// when the command hasn't relocated it, so it faithfully models the launch.
+    ProcessPath,
+    /// Search this explicit `PATH` value — a command's computed *effective
+    /// child* `PATH` (see [`Command::effective_path_value`]), used by preflight
+    /// when the command relocates `PATH` (`env`/`env_remove`/`env_clear`/
+    /// `inherit_env`) so the process `PATH` would be the wrong list.
+    Explicit(Option<OsString>),
+    /// Do **not** search a `PATH` — report only the `prefer_local` directories
+    /// in `searched`. Used by the launch-path `NotFound` enrichment for a
+    /// command that relocated its child `PATH`: the OS already searched the
+    /// child `PATH` and came up empty, and the *process* `PATH` (all
+    /// [`find_in_path`] can read) is the wrong list to name here.
+    Skip,
+}
+
+/// The outcome of resolving a command's `program` to a concrete executable path
+/// **without spawning it** — the single decision the live launch path's
+/// [`Error::NotFound`](crate::Error::NotFound) enrichment (in `runner.rs`) and
+/// the spawn-free [`which`](crate::which) / [`Command::resolve_program`]
+/// preflight both derive from, so the two can never disagree about whether a
+/// program is available.
+pub(crate) enum ProgramResolution {
+    /// Resolved to this absolute path — a `prefer_local` match, a `PATH`/PATHEXT
+    /// hit, or (for a path-form program) the path itself. The launch spawns a
+    /// `prefer_local` match via this exact path and lets the OS resolve a bare
+    /// name the same way [`find_in_path_in`] models; preflight returns it.
+    Found(PathBuf),
+    /// Not resolvable. `searched` is the directory list for
+    /// [`Error::NotFound`](crate::Error::NotFound)'s field: `Some` for a
+    /// bare-name `PATH` lookup (the searched dirs, `prefer_local` first),
+    /// `None` for a path-form program (no `PATH` search applied).
+    NotFound { searched: Option<String> },
+}
+
+/// Resolve `program` to a concrete executable path without spawning, composing
+/// the *same* primitives the live launch uses — [`probe_prefer_local`] (the
+/// exact resolution `build_tokio` spawns a `prefer_local` match through),
+/// [`find_in_path_in`]/[`probe_dir`] (the `PATH`/PATHEXT/execute-bit probe), and
+/// [`probe_path_form`] for a path-form program. There is no second copy of the
+/// resolution logic, so the spawn-free preflight built on this can never diverge
+/// from the actual launch.
+///
+/// A **bare name** is looked up `prefer_local` directories first (in priority
+/// order), then the `PATH` per `path`. A **path-form** program (absolute, or
+/// relative with a separator) is never looked up on `PATH` — it is probed
+/// directly, mirroring how the OS receives it verbatim at spawn.
+pub(crate) fn resolve_program(
+    program: &OsStr,
+    prefer_local: &[PathBuf],
+    path: PathSource,
+) -> ProgramResolution {
+    if !is_bare_name(program) {
+        return match probe_path_form(program) {
+            Some(found) => ProgramResolution::Found(found),
+            None => ProgramResolution::NotFound { searched: None },
+        };
+    }
+    // A bare name: `prefer_local` directories are parent-side plain filesystem
+    // probes, independent of the child's environment, so they always apply —
+    // even under a relocated child `PATH`.
+    if let Some(found) = probe_prefer_local(prefer_local, program) {
+        return ProgramResolution::Found(found);
+    }
+    let (found, path_searched) = match path {
+        PathSource::Skip => {
+            // No `PATH` search: only the `prefer_local` directories are safe to
+            // name (the process `PATH` would be the wrong list for a relocated
+            // child `PATH`).
+            let prefer = prepend_prefer_local_to_searched(prefer_local, "");
+            let searched = if prefer.is_empty() {
+                None
+            } else {
+                Some(prefer)
+            };
+            return ProgramResolution::NotFound { searched };
+        }
+        PathSource::ProcessPath => find_in_path(program),
+        PathSource::Explicit(value) => find_in_path_in(program, value.as_deref()),
+    };
+    if let Some(found) = found {
+        return ProgramResolution::Found(found);
+    }
+    let searched = prepend_prefer_local_to_searched(prefer_local, &path_searched);
+    ProgramResolution::NotFound {
+        searched: Some(searched),
+    }
+}
+
+/// Resolve a **path-form** program (absolute, or relative with a separator) to
+/// an absolute executable path without spawning — the path-form companion to the
+/// bare-name [`find_in_path_in`]/[`probe_prefer_local`] lookups. The launch
+/// hands such a program to the OS verbatim (no `PATH` search), so this probes the
+/// path itself with the very same per-file executability predicate
+/// [`probe_dir`] applies (execute-bit on Unix, PATHEXT-aware on Windows) and
+/// absolutizes a relative match against the process's current directory
+/// (mirroring [`probe_prefer_local`]), so the returned path is absolute and
+/// can't later be reinterpreted.
+fn probe_path_form(program: &OsStr) -> Option<PathBuf> {
+    // A trailing separator names a directory, never an executable file.
+    let bytes = program.as_encoded_bytes();
+    if matches!(bytes.last(), Some(b'/') | Some(b'\\')) {
+        return None;
+    }
+    let path = Path::new(program);
+    // Absolutize a relative path against the process cwd so the match is
+    // absolute (and thus can't be reinterpreted against a child's `current_dir`
+    // later), exactly as `probe_prefer_local` does for a relative directory.
+    let absolute: PathBuf = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    let parent = absolute.parent()?;
+    let file = absolute.file_name()?;
+    probe_dir(parent, file)
 }
 
 /// Probe `dirs` in order for `program` (a bare name), reusing [`probe_dir`] —
@@ -2764,6 +2988,182 @@ mod tests {
             super::prepend_prefer_local_to_searched(&dirs, ""),
             format!("/opt/a{sep}/opt/b")
         );
+    }
+
+    // ── spawn-free program resolution (which / Command::resolve_program) ──────
+
+    // T-101: a bare name found under a `prefer_local` directory resolves to its
+    // absolute path — the same `probe_prefer_local` the launch spawns through,
+    // so preflight can't disagree with a real run.
+    #[test]
+    fn resolve_program_finds_a_bare_name_under_prefer_local() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let expected = write_executable(dir.path(), "pk-resolve-tool");
+
+        let resolved = Command::new("pk-resolve-tool")
+            .prefer_local(dir.path())
+            .resolve_program()
+            .expect("prefer_local match must resolve without spawning");
+        assert!(resolved.is_absolute(), "resolved path must be absolute");
+        // Windows PATHEXT casing follows the env var, so compare case-insensitively
+        // (same reason as the `probe_prefer_local` tests).
+        assert!(
+            resolved
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&expected.to_string_lossy()),
+            "expected {expected:?}, got {resolved:?}"
+        );
+    }
+
+    // T-101: a bare name that resolves nowhere yields `Error::NotFound` whose
+    // `searched` names the `prefer_local` directories (first) — the same typed
+    // error the launch raises, reusing `Error::NotFound` rather than a parallel.
+    #[test]
+    fn resolve_program_missing_bare_name_is_not_found_with_searched() {
+        let dir = tempfile::tempdir().expect("temp dir"); // deliberately empty
+        let err = Command::new("pk-definitely-absent-tool-101")
+            .prefer_local(dir.path())
+            .resolve_program()
+            .expect_err("an absent program must not resolve");
+        assert!(err.is_not_found(), "must classify as not-found: {err:?}");
+        match err {
+            crate::Error::NotFound { searched, .. } => {
+                let searched = searched.expect("a bare-name lookup reports searched dirs");
+                assert!(
+                    searched.contains(&dir.path().to_string_lossy().into_owned()),
+                    "searched must include the prefer_local directory: {searched}"
+                );
+            }
+            other => panic!("expected Error::NotFound, got {other:?}"),
+        }
+    }
+
+    // T-101: a path-form program is probed directly (no PATH search) — found when
+    // it is an executable file, `NotFound { searched: None }` otherwise, matching
+    // how the launch hands such a program to the OS verbatim.
+    #[test]
+    fn resolve_program_handles_a_path_form_program() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = write_executable(dir.path(), "pk-path-form");
+
+        // The absolute path to the real executable resolves to itself.
+        let resolved = Command::new(&exe)
+            .resolve_program()
+            .expect("an existing path-form executable resolves");
+        assert!(
+            resolved
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&exe.to_string_lossy()),
+            "expected {exe:?}, got {resolved:?}"
+        );
+
+        // A path-form program that doesn't exist → NotFound with no searched dirs
+        // (no PATH lookup applies to a path-form program).
+        let missing = dir.path().join("pk-path-form-missing");
+        let err = Command::new(&missing)
+            .resolve_program()
+            .expect_err("a missing path-form program must not resolve");
+        match err {
+            crate::Error::NotFound { searched, .. } => assert_eq!(
+                searched, None,
+                "a path-form lookup applies no PATH search, so searched is None"
+            ),
+            other => panic!("expected Error::NotFound, got {other:?}"),
+        }
+    }
+
+    // T-101: `probe_path_form` rejects a trailing-separator name — it designates a
+    // directory, never an executable file, so it must not falsely resolve a
+    // same-named sibling.
+    #[test]
+    fn probe_path_form_rejects_a_trailing_separator() {
+        assert_eq!(super::probe_path_form(OsStr::new("tool/")), None);
+        #[cfg(windows)]
+        assert_eq!(super::probe_path_form(OsStr::new("tool\\")), None);
+    }
+
+    // T-101: the effective child `PATH` — what preflight resolves against when a
+    // command relocates `PATH` — mirrors `build_tokio`'s env application.
+    #[test]
+    fn effective_path_value_mirrors_the_child_env() {
+        use std::ffi::OsString;
+
+        let process_path = std::env::var_os("PATH");
+
+        // A plain command inherits the process PATH.
+        assert_eq!(Command::new("x").effective_path_value(), process_path);
+
+        // An explicit `env("PATH", …)` override wins (last write, too).
+        assert_eq!(
+            Command::new("x")
+                .env("PATH", "/one")
+                .env("PATH", "/two")
+                .effective_path_value(),
+            Some(OsString::from("/two"))
+        );
+
+        // `env_remove("PATH")` leaves the child with no PATH.
+        assert_eq!(
+            Command::new("x").env_remove("PATH").effective_path_value(),
+            None
+        );
+
+        // `env_clear` clears everything (no PATH) unless one is set back.
+        assert_eq!(Command::new("x").env_clear().effective_path_value(), None);
+        assert_eq!(
+            Command::new("x")
+                .env_clear()
+                .env("PATH", "/only")
+                .effective_path_value(),
+            Some(OsString::from("/only"))
+        );
+
+        // `inherit_env` without PATH → cleared (no PATH); with PATH → the parent's.
+        assert_eq!(
+            Command::new("x")
+                .inherit_env(["HOME"])
+                .effective_path_value(),
+            None
+        );
+        assert_eq!(
+            Command::new("x")
+                .inherit_env(["PATH"])
+                .effective_path_value(),
+            process_path
+        );
+    }
+
+    // T-101 (anti-drift): for a command that explicitly sets or removes `PATH`,
+    // `effective_path_value` must equal exactly what `build_tokio` hands the
+    // child — so the preflight can never resolve against a different PATH than
+    // the spawn does.
+    #[test]
+    fn effective_path_value_agrees_with_build_tokio_for_explicit_path_ops() {
+        use std::ffi::OsString;
+
+        // The PATH the built tokio command carries: `Some(Some(v))` set to `v`,
+        // `Some(None)` explicitly removed, `None` not mentioned (inherited).
+        fn tokio_path_env(cmd: &Command) -> Option<Option<OsString>> {
+            cmd.build_tokio()
+                .as_std()
+                .get_envs()
+                .find(|(k, _)| super::env_key_eq(k, OsStr::new("PATH")))
+                .map(|(_, v)| v.map(|v| v.to_os_string()))
+        }
+
+        let set = Command::new("x").env("PATH", "/custom/bin");
+        assert_eq!(
+            tokio_path_env(&set),
+            Some(Some(OsString::from("/custom/bin")))
+        );
+        assert_eq!(
+            set.effective_path_value(),
+            Some(OsString::from("/custom/bin"))
+        );
+
+        let removed = Command::new("x").env_remove("PATH");
+        assert_eq!(tokio_path_env(&removed), Some(None));
+        assert_eq!(removed.effective_path_value(), None);
     }
 
     #[test]

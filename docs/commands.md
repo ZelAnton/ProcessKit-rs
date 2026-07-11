@@ -132,6 +132,58 @@ above).
 priority order, ahead of the `PATH` directories — so the diagnostic never
 hides that they were checked.
 
+## Preflight: resolve a program without running it
+
+Sometimes you want to know whether an external tool is *available* before you
+run it — a **doctor** check at startup, a friendly "is `git` installed?" error
+up front — with **no** side effects. `resolve_program` locates a command's
+program and returns its absolute path **without spawning** anything:
+
+```rust,no_run
+use processkit::Command;
+
+fn main() -> processkit::Result<()> {
+    // `which` is the crate-level shortcut for a bare tool.
+    let git = processkit::which("git")?;   // Ok(/usr/bin/git) or Err(NotFound)
+    println!("git lives at {}", git.display());
+
+    // On a builder it honors that command's own `prefer_local` and env, so it
+    // resolves exactly what a real run of that command would launch.
+    let eslint = Command::new("eslint")
+        .prefer_local("./node_modules/.bin")
+        .resolve_program()?;
+    println!("eslint lives at {}", eslint.display());
+    Ok(())
+}
+```
+
+**No divergence from a real run.** Resolution reuses the crate's *own*
+launch-path logic — the same `PATH`/PATHEXT/execute-bit resolution and
+`prefer_local` handling a spawn performs, not a second copy — so a
+`resolve_program` hit is exactly the executable a run would launch, and a miss
+is exactly the `Error::NotFound` (with the same `searched` diagnostic and
+`is_not_found()` classification) a run would raise. A command that relocates the
+child's `PATH` (`env`/`env_remove` of `PATH`, `env_clear`, `inherit_env`) is
+resolved against that *effective child* `PATH`, so preflight still matches the
+spawn.
+
+It is a **synchronous**, cheap filesystem probe (a few `stat`s) — no async
+runtime is required, and no process is ever started. Contrast `probe()`, which
+*runs* the tool to read its exit code; `resolve_program` only *locates* it.
+
+```rust,no_run
+fn main() {
+    match processkit::which("definitely-not-installed") {
+        Ok(path) => println!("found: {}", path.display()),
+        Err(e) if e.is_not_found() => eprintln!("tool not installed"),
+        Err(e) => eprintln!("resolution error: {e}"),
+    }
+}
+```
+
+For a tool wrapped behind a `CliClient`, `CliClient::resolve_program()` does the
+same for the client's program, honoring its env defaults.
+
 ## Environment
 
 Four builders compose, applied in a fixed order at spawn:

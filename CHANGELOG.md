@@ -12,6 +12,19 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- Spawn-free program resolution (a *doctor* / preflight check): the crate-level
+  `processkit::which(program)`, `Command::resolve_program()`, and
+  `CliClient::resolve_program()` resolve a program to its absolute path **without
+  launching it** (no side effects), returning the typed `Error::NotFound`
+  (`is_not_found()`, `searched` diagnostic) when it can't be located — the same
+  error a real run would raise. Resolution reuses the crate's own launch-path
+  logic — the same `PATH`/PATHEXT/execute-bit resolution and `prefer_local`
+  handling a spawn performs, not a separate copy — so preflight never disagrees
+  with the actual launch (a command that relocates the child's `PATH` via
+  `env`/`env_clear`/`inherit_env` is resolved against that effective child
+  `PATH`). Synchronous and cheap (a few `stat`s); no async runtime required. For
+  early, friendly "is this tool installed?" diagnostics in wrapper apps without
+  starting a process.
 - `Command::inherit_stdin()` — give the child the parent's own standard input
   (`Stdio::inherit`), so it reads directly from the parent's terminal/file/pipe
   instead of a crate-managed pipe. The stdin counterpart of

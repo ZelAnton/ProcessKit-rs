@@ -355,6 +355,33 @@ impl<R: ProcessRunner> CliClient<R> {
         self.apply_defaults(Command::new(&self.program).current_dir(dir).args(args))
     }
 
+    /// Resolve this client's `program` to a concrete executable path **without
+    /// spawning it** — the client-level preflight, for a *doctor* /
+    /// early-diagnosis check ("is this tool installed?") before running any
+    /// command, with **no** side effects (no process is started).
+    ///
+    /// Builds a command for the client's program with the client's defaults
+    /// applied — so a [`default_env`](Self::default_env) that relocates `PATH`
+    /// (or a [`default_env_fn`](Self::default_env_fn) that does) is honored
+    /// exactly as it would be at launch — then resolves it via
+    /// [`Command::resolve_program`](crate::Command::resolve_program), reusing the
+    /// **same** internal PATH/PATHEXT/execute-bit resolution the real spawn uses.
+    /// The preflight therefore never disagrees with what an actual run of this
+    /// client would find.
+    ///
+    /// Returns the resolved **absolute** path on success. A synchronous, cheap
+    /// filesystem probe — no async runtime is required.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`](crate::Error::NotFound) when the program can't be
+    /// located — see [`Command::resolve_program`] for the full contract
+    /// (`searched` diagnostic, [`is_not_found`](crate::Error::is_not_found)
+    /// classification).
+    pub fn resolve_program(&self) -> Result<std::path::PathBuf> {
+        self.command(std::iter::empty::<&OsStr>()).resolve_program()
+    }
+
     /// Fill the client's defaults into `command`, but only where the command has
     /// not set them itself — so a fresh [`command()`](Self::command) (no settings)
     /// gets every default, while a caller-supplied [`Command`] passed straight to
@@ -1361,6 +1388,48 @@ mod tests {
             false
         });
         assert!(demo.head(Path::new(".")).await.is_err());
+    }
+
+    #[test]
+    fn resolve_program_locates_the_clients_program_or_reports_not_found() {
+        // A path-form program that exists (an executable temp file) resolves to
+        // its own path, without spawning — the client-level preflight delegating
+        // to `Command::resolve_program`.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let p = dir.path().join("pk-client-doctor");
+                std::fs::write(&p, b"#!/bin/sh\nexit 0\n").expect("write stub");
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod +x");
+                p
+            }
+            #[cfg(not(unix))]
+            {
+                let p = dir.path().join("pk-client-doctor.exe");
+                std::fs::write(&p, b"stub").expect("write stub");
+                p
+            }
+        };
+        let resolved = CliClient::new(&exe)
+            .resolve_program()
+            .expect("an existing program resolves via the client preflight");
+        assert!(
+            resolved
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&exe.to_string_lossy()),
+            "expected {exe:?}, got {resolved:?}"
+        );
+
+        // A missing bare program surfaces the typed NotFound, attributed to the
+        // client's program.
+        let err = CliClient::new("pk-client-absent-tool-101")
+            .resolve_program()
+            .expect_err("a missing program must not resolve");
+        assert!(err.is_not_found(), "must classify as not-found: {err:?}");
+        assert_eq!(err.program(), Some("pk-client-absent-tool-101"));
     }
 
     #[test]

@@ -264,6 +264,32 @@ where
     Command::new(program).args(args).output_string().await
 }
 
+/// Resolve `program` to a concrete executable path **without launching it** — a
+/// spawn-free preflight for a *doctor* / early-diagnosis check ("is `git`
+/// installed?") that must have **no** side effects. A thin shim over
+/// [`Command::new(program).resolve_program()`](Command::resolve_program); use the
+/// builder form when you need `prefer_local` directories or a relocated `PATH`
+/// honored (the client-level [`CliClient::resolve_program`] does the same for a
+/// wrapped tool).
+///
+/// Resolution reuses the crate's *own* launch-path logic — a bare name is looked
+/// up on `PATH` honoring PATHEXT on Windows and the execute bit on Unix; a
+/// path-form `program` is probed directly — so a `which` hit is exactly what a
+/// real run would spawn, and a `which` miss is exactly the
+/// [`Error::NotFound`](crate::Error::NotFound) that run would raise. Synchronous
+/// and cheap (a few `stat`s); no async runtime is required.
+///
+/// # Errors
+///
+/// [`Error::NotFound`](crate::Error::NotFound) when the program can't be located
+/// — not installed, not on `PATH`, or a path that doesn't resolve to an
+/// executable. Its `searched` field names the directories checked for a
+/// bare-name lookup, and [`is_not_found`](crate::Error::is_not_found) classifies
+/// it — the same error, with the same classification, a real run would give.
+pub fn which(program: impl AsRef<OsStr>) -> Result<std::path::PathBuf> {
+    Command::new(program).resolve_program()
+}
+
 /// Wait for whichever of several running processes exits **first**, returning
 /// its index in `processes` and its [`Outcome`] (matching
 /// [`RunningProcess::wait`]).

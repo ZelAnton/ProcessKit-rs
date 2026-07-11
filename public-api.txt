@@ -535,6 +535,7 @@ pub async fn processkit::CliClient<R>::output_bytes(&self, impl processkit::Into
 pub async fn processkit::CliClient<R>::output_string(&self, impl processkit::IntoCommand<R>) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
 pub async fn processkit::CliClient<R>::parse<T, F>(&self, impl processkit::IntoCommand<R>, F) -> processkit::Result<T> where T: core::marker::Send, F: core::ops::function::FnOnce(&str) -> T + core::marker::Send
 pub async fn processkit::CliClient<R>::probe(&self, impl processkit::IntoCommand<R>) -> processkit::Result<bool>
+pub fn processkit::CliClient<R>::resolve_program(&self) -> processkit::Result<std::path::PathBuf>
 pub async fn processkit::CliClient<R>::run(&self, impl processkit::IntoCommand<R>) -> processkit::Result<alloc::string::String>
 pub async fn processkit::CliClient<R>::run_unit(&self, impl processkit::IntoCommand<R>) -> processkit::Result<()>
 pub fn processkit::CliClient<R>::runner(&self) -> &R
@@ -592,6 +593,7 @@ pub fn processkit::Command::prefer_local(self, impl core::convert::Into<std::pat
 pub fn processkit::Command::priority(self, processkit::Priority) -> Self
 pub async fn processkit::Command::probe(&self) -> processkit::Result<bool>
 pub fn processkit::Command::program(&self) -> &std::ffi::os_str::OsStr
+pub fn processkit::Command::resolve_program(&self) -> processkit::Result<std::path::PathBuf>
 pub fn processkit::Command::retry(self, u32, core::time::Duration, impl core::ops::function::Fn(&processkit::Error) -> bool + core::marker::Send + core::marker::Sync + 'static) -> Self
 pub fn processkit::Command::retry_never(self) -> Self
 pub fn processkit::Command::retry_with(self, processkit::RetryPolicy, impl core::ops::function::Fn(&processkit::Error) -> bool + core::marker::Send + core::marker::Sync + 'static) -> Self
@@ -1168,4 +1170,5 @@ pub async fn processkit::output_string<I, S>(impl core::convert::AsRef<std::ffi:
 pub async fn processkit::run<I, S>(impl core::convert::AsRef<std::ffi::os_str::OsStr>, I) -> processkit::Result<alloc::string::String> where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub async fn processkit::wait_all(&mut [&mut processkit::RunningProcess]) -> processkit::Result<alloc::vec::Vec<processkit::Outcome>>
 pub async fn processkit::wait_any(&mut [&mut processkit::RunningProcess]) -> processkit::Result<(usize, processkit::Outcome)>
+pub fn processkit::which(impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> processkit::Result<std::path::PathBuf>
 pub type processkit::Result<T> = core::result::Result<T, processkit::Error>

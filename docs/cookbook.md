@@ -13,6 +13,7 @@ runtime and `use processkit::Command;` unless shown otherwise.
 - [Bound a run with a timeout](#bound-a-run-with-a-timeout)
 - [Let a tool clean up on timeout](#let-a-tool-clean-up-on-timeout)
 - [Show a useful error message](#show-a-useful-error-message)
+- [Check a tool is installed without running it](#check-a-tool-is-installed-without-running-it)
 - [Feed the child's stdin](#feed-the-childs-stdin)
 - [Stream output as it arrives](#stream-output-as-it-arrives)
 - [Talk to an interactive child](#talk-to-an-interactive-child)
@@ -176,6 +177,38 @@ async fn main() -> processkit::Result<()> {
 `Error::diagnostic()` picks the most explanatory captured text — stderr,
 falling back to stdout (git writes `CONFLICT …` there) — so callers don't
 re-implement the same heuristic.
+
+## Check a tool is installed without running it
+
+```rust,no_run
+use processkit::Command;
+
+fn main() {
+    // The crate-level shortcut for a bare tool:
+    match processkit::which("git") {
+        Ok(path) => println!("git is at {}", path.display()),
+        Err(e) if e.is_not_found() => eprintln!("git is not installed"),
+        Err(e) => eprintln!("could not resolve git: {e}"),
+    }
+
+    // On a builder it honors that command's `prefer_local` / env, resolving
+    // exactly what a real run would launch:
+    let _ = Command::new("eslint")
+        .prefer_local("./node_modules/.bin")
+        .resolve_program();
+}
+```
+
+`which` / `Command::resolve_program()` locate a program **without spawning it**
+— a side-effect-free *doctor* / preflight check ("is the tool installed?") for a
+friendly up-front error. Resolution reuses the crate's own launch-path logic
+(the same PATH/PATHEXT/execute-bit and `prefer_local` handling a real run uses),
+so a hit is exactly what would be launched and a miss is exactly the
+`Error::NotFound` (`is_not_found()`) a run would raise. It is synchronous — no
+tokio runtime needed. A wrapped tool's client offers the same via
+`CliClient::resolve_program()`.
+
+*Fine print: [Running commands → preflight](commands.md).*
 
 ## Feed the child's stdin
 

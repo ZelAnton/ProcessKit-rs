@@ -226,6 +226,121 @@ async fn missing_program_not_found_searched_includes_prefer_local_dirs_even_with
     }
 }
 
+// T-101: the spawn-free preflight (`which` / `Command::resolve_program` /
+// `CliClient::resolve_program`) must agree with the ACTUAL launch on the same
+// inputs — a preflight that "finds" a program the spawn can't locate (or the
+// reverse) would lie about availability. Covers a bare name on PATH, a
+// `prefer_local` hit (PATHEXT on Windows / the execute bit on Unix through the
+// same resolution), a non-executable file (found by neither), and a genuinely
+// missing program (NotFound from both).
+#[tokio::test]
+#[ignore = "exercises the real spawn path (creates a process group)"]
+async fn preflight_resolution_agrees_with_the_actual_spawn() {
+    // Whether a real spawn LOCATED the program: `Ok`, or any error that isn't
+    // `NotFound` (e.g. a non-zero exit), means the launch found and ran it;
+    // only `Error::NotFound` means it couldn't be located.
+    async fn spawn_located(cmd: Command) -> bool {
+        match cmd.output_string().await {
+            Ok(_) => true,
+            Err(e) => !e.is_not_found(),
+        }
+    }
+
+    // (1) A bare name that IS on PATH (`cargo`, present in this workspace):
+    // `which` resolves it to an existing absolute path, and the spawn locates it.
+    let resolved = processkit::which("cargo").expect("cargo resolves on PATH");
+    assert!(
+        resolved.is_absolute() && resolved.exists(),
+        "which must resolve to an existing absolute path: {resolved:?}"
+    );
+    assert!(
+        spawn_located(Command::new("cargo").arg("--version")).await,
+        "the spawn must also locate cargo"
+    );
+
+    // (2) A genuinely missing bare name: preflight AND spawn must both report
+    // NotFound (never a false "found").
+    let missing = "pk-preflight-agree-absent-9x8y7";
+    let preflight_missing = Command::new(missing).resolve_program();
+    assert!(
+        preflight_missing
+            .as_ref()
+            .is_err_and(processkit::Error::is_not_found),
+        "preflight must report NotFound: {preflight_missing:?}"
+    );
+    assert!(
+        !spawn_located(Command::new(missing)).await,
+        "the spawn must also report NotFound for the same missing program"
+    );
+
+    // (3) A program present ONLY in a `prefer_local` directory (not on PATH):
+    // preflight resolves it to a path under that directory, and the spawn runs
+    // it — exercising PATHEXT (Windows) / the execute bit (Unix) via the SAME
+    // resolution both paths share.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let unique = "pk_preflight_prefer_local_stub";
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.path().join(unique);
+        std::fs::write(&p, b"#!/bin/sh\nexit 0\n").expect("write stub");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod +x");
+    }
+    #[cfg(windows)]
+    {
+        std::fs::copy(
+            r"C:\Windows\System32\where.exe",
+            dir.path().join(format!("{unique}.exe")),
+        )
+        .expect("copy where.exe");
+    }
+    let make = || {
+        let c = Command::new(unique).prefer_local(dir.path());
+        if cfg!(windows) { c.arg("/?") } else { c }
+    };
+    let resolved = make()
+        .resolve_program()
+        .expect("prefer_local must resolve without spawning");
+    assert!(
+        resolved.starts_with(dir.path()),
+        "resolved path must live under the prefer_local dir: {resolved:?}"
+    );
+    assert!(
+        spawn_located(make()).await,
+        "the spawn must locate the same prefer_local program"
+    );
+
+    // (4) A file in a `prefer_local` directory that is NOT directly executable
+    // (no execute bit on Unix / no PATHEXT-recognized extension on Windows) must
+    // be located by NEITHER: preflight falls through to PATH (a miss) and so
+    // does the spawn — they agree it is unavailable.
+    let noexec = tempfile::tempdir().expect("temp dir");
+    let noexec_name = "pk_preflight_noexec_9182";
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let p = noexec.path().join(noexec_name);
+        std::fs::write(&p, b"#!/bin/sh\nexit 0\n").expect("write");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).expect("chmod -x");
+    }
+    #[cfg(windows)]
+    {
+        std::fs::write(noexec.path().join(noexec_name), b"not an exe").expect("write");
+    }
+    let noexec_cmd = || Command::new(noexec_name).prefer_local(noexec.path());
+    let preflight_noexec = noexec_cmd().resolve_program();
+    assert!(
+        preflight_noexec
+            .as_ref()
+            .is_err_and(processkit::Error::is_not_found),
+        "a non-executable prefer_local file must not resolve: {preflight_noexec:?}"
+    );
+    assert!(
+        !spawn_located(noexec_cmd()).await,
+        "the spawn must likewise not locate a non-executable prefer_local file"
+    );
+}
+
 #[tokio::test]
 #[ignore = "spawns a real subprocess"]
 async fn output_string_captures_stdout() {
