@@ -1,0 +1,11 @@
+[book]
+title = "ProcessKit"
+description = "Async child-process management — Rust · Go · F# · Kotlin"
+src = "docs"
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/ZelAnton/ProcessKit-rs"
+edit-url-template = "https://github.com/ZelAnton/ProcessKit-rs/edit/main/docs/{path}"
+site-url = "/ProcessKit-rs/"
+additional-css = ["theme/custom.css"]

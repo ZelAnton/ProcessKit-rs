@@ -43,6 +43,15 @@ exclude = [
   # 3.5 MB README banner — rendered from its absolute raw.githubusercontent URL,
   # so it never needs to ship inside the published crate.
   "cover.png",
+  # mdBook config + theme + nav index for the GitHub Pages docs site — only
+  # matters for building that site, not for a consumer of the published crate.
+  "book.toml",
+  "theme/",
+  "docs/SUMMARY.md",
+  "docs/.nojekyll",
+  # ~4.5 MB docs-site cover images (same reasoning as cover.png above).
+  "docs/processkit-cover.png",
+  "docs/processkit-cover-social.jpg",
 ]
 # Minimum Supported Rust Version. 1.88 is required for `let`-chains
 # (`if let … && let …`), used in the unix process-group/cgroup code. The `msrv`
