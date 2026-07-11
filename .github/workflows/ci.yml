@@ -89,8 +89,8 @@ jobs:
       # (the guides collectively exercise every optional feature). Note
       # `--include-ignored` still *compiles* an `ignore`-tagged doc block (only
       # `no_run` skips running it, and only a non-`rust` fence like `text` skips
-      # compiling it) — see `docs/upgrading.md` / `docs/migrating-1.2-to-2.1.md`
-      # for the historical-API snippets that use `text` for exactly that reason.
+      # compiling it) — see `docs/upgrading.md` for the historical-API snippets
+      # that use `text` for exactly that reason.
       - run: cargo test --all-features -- --include-ignored
       # Also exercise the default configuration (process-control only — stats and
       # limits off) at runtime: it takes the `limits`-free `Job::new()` path — the
