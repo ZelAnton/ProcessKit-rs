@@ -143,7 +143,7 @@ async fn main() -> processkit::Result<()> {
 This README is the quick tour. The **[`docs/` guide set](docs/README.md)**
 goes deeper on every capability, with more examples and the platform fine
 print collected in one place — browse it as a published site at
-**https://zelanton.github.io/ProcessKit-rs/**, built from this repository's
+**<https://zelanton.github.io/ProcessKit-rs/>**, built from this repository's
 `docs/` sources by the `docs` GitHub Actions workflow
 (`.github/workflows/docs.yml`). This repository is the sole source of the
 documentation site; it does not consume or publish to any other repository.

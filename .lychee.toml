@@ -17,6 +17,12 @@
 exclude = [
   "/ideas($|/)",
   "/decisions($|/)",
+  # The docs GitHub Actions workflow (.github/workflows/docs.yml) publishes this
+  # site, but GitHub Pages hasn't been switched to Source = "GitHub Actions" in
+  # the repo settings yet (Settings -> Pages), so the deploy job 404s and the
+  # site isn't live. Remove this line once that one-time repo setting is made
+  # and the site resolves — README.md links to it deliberately (T-097/T-096).
+  "^https://zelanton\\.github\\.io/ProcessKit-rs/$",
 ]
 
 # Retry transient failures (rate limiting, flaky hosts) instead of flaking the
