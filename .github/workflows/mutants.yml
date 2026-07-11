@@ -3,10 +3,51 @@ name: mutants
 # cargo-mutants exhaustively mutates the examined modules (scope defined in
 # .cargo/mutants.toml, which cargo-mutants auto-loads from the workspace root)
 # and re-runs the whole test suite for every mutant, which is far too slow and
-# noisy to gate a PR — even over a small,
-# hermetic scope a full sweep can take tens of minutes. Like the stress and
-# fuzz tiers, it stays OUTSIDE the PR matrix: nightly on a schedule and
-# on-demand via the Actions tab.
+# noisy to gate a PR — even over a small, hermetic scope a full sweep can take
+# tens of minutes. Like the stress and fuzz tiers, it stays OUTSIDE the PR
+# matrix: nightly on a schedule and on-demand via the Actions tab.
+#
+# Why this tier is sharded (T-103)
+# --------------------------------
+# The hermetic scope currently yields ~400 mutants. A single un-parameterized
+# `cargo mutants` job processed only ~60 of them in ~59 min (43 MISSED, 19
+# TIMEOUT) before the hosted runner was reclaimed ("runner has received a
+# shutdown signal") — an end-to-end rate of ~1 min/mutant. That rate bundles the
+# per-mutant incremental build + full test run, plus the ~27 s auto-timeout that
+# each hang-inducing mutant (~1 in 3 here) burns in full. Sweeping all 400 at
+# ~1 min each needs several hours, so the single job never reached a verdict: it
+# blew past both `timeout-minutes: 90` and the wall-clock the runner actually
+# grants, and every scheduled run 2026-07-08..2026-07-11 ended cancelled/failed
+# mid-sweep (run 29144347707 was the latest).
+#
+# Fix: split the mutant list across an 8-way matrix using cargo-mutants' native
+# `--shard k/8`. Sharding deterministically partitions the SAME ~400 mutants
+# (same .cargo/mutants.toml scope, same auto-timeout) into 8 disjoint subsets of
+# ~50 — it does NOT narrow the scope and does NOT shrink the per-mutant timeout,
+# so total mutation coverage is unchanged and no real MISSED mutant can be
+# hidden by this change. Only the parallelism changes.
+#
+# Budget per shard (observed ~1 min/mutant end-to-end, applied pessimistically):
+#
+#     one unmutated baseline build + test, paid once per shard runner
+#         ~2 min warm cache … ~10 min cold cache (first sharded run)
+#   + ~50 mutants × ~1 min                                       ≈ 50 min
+#   ------------------------------------------------------------------------
+#     ≈ 52 min warm  …  ≈ 60 min cold, worst case, per shard
+#
+# i.e. ~52–60 min against the per-job `timeout-minutes: 90` below — a ~30–38 min
+# (≈1.5–1.7×) headroom that absorbs runner variance, versus the old single job
+# that could not finish at all. If the scope in .cargo/mutants.toml grows enough
+# that ~400 mutants climbs and erodes this headroom, raise the shard count in the
+# matrix below (keep the `--shard k/N` denominator in step).
+#
+# Single overall verdict: `fail-fast: false` runs every shard to its own verdict;
+# any shard that finds a MISSED mutant, hits a per-mutant TIMEOUT, or overruns
+# its `timeout-minutes` exits non-zero and reds the whole workflow run. There is
+# deliberately no `continue-on-error`, so a failure/hang in any shard stays
+# visible. (A completed sweep is currently expected to report `failure` on
+# substance — there are real MISSED/TIMEOUT mutants — closing those is a separate
+# follow-up task; this change only makes the tier reach that verdict predictably.)
 on:
   schedule:
     # 05:29 UTC daily — staggered from stress.yml (03:17) and fuzz.yml (04:07).
@@ -18,15 +59,26 @@ env:
 
 jobs:
   mutants:
-    name: mutants
+    name: mutants (shard ${{ matrix.shard }}/8)
     runs-on: ubuntu-latest
+    # Generous per-shard ceiling: each shard is estimated at ~52–60 min (see the
+    # budget note above), so 90 min is a ~1.5× backstop that still hard-fails a
+    # pathologically slow shard instead of letting it hang the whole tier.
     timeout-minutes: 90
+    strategy:
+      # Run every shard to its own verdict; one red shard already reds the run.
+      fail-fast: false
+      matrix:
+        # 8-way split of the ~400-mutant scope (see the header note). Grow this
+        # list — and the `--shard k/N` denominator below — together if the mutant
+        # count rises enough to erode the per-shard headroom.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-mutants
-      # Scope, exclusions and `--all-features` all come from
-      # .cargo/mutants.toml (auto-loaded by cargo-mutants), so the CLI
-      # invocation itself stays a plain, un-parameterized run.
-      - run: cargo mutants
+      # Scope, exclusions and `--all-features` all come from .cargo/mutants.toml
+      # (auto-loaded by cargo-mutants); `--shard k/8` is the only CLI parameter,
+      # selecting this job's disjoint subset of that fixed scope.
+      - run: cargo mutants --shard ${{ matrix.shard }}/8
