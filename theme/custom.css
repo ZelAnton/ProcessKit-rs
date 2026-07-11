@@ -1,0 +1,79 @@
+/* ── Top bar title ──────────────────────────────────────────────────────── */
+
+.menu-title {
+    font-size: 1.8em;
+    font-weight: bold;
+    letter-spacing: 0.01em;
+    color: #ffffff;
+}
+
+.light .menu-title,
+.rust .menu-title {
+    color: #333333;
+}
+
+/* ── Sidebar navigation ─────────────────────────────────────────────────── */
+
+/* No horizontal overflow */
+.sidebar,
+.sidebar-scrollbox {
+    overflow-x: hidden;
+}
+
+.sidebar .chapter {
+    font-size: 1.6rem;
+    font-weight: bold;
+}
+
+/* Left-border track on every item */
+.sidebar .chapter li.chapter-item > a {
+    display: block;
+    padding: 0.38em 1em 0.38em 1.1em;
+    border-left: 3px solid transparent;
+    border-radius: 0 4px 4px 0;
+    font-size: 0.97em;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    transition: background 0.13s ease, border-color 0.13s ease;
+}
+
+/* Hover */
+.sidebar .chapter li.chapter-item > a:hover {
+    background: rgba(128, 128, 128, 0.12);
+    border-left-color: rgba(128, 128, 128, 0.45);
+    text-decoration: none;
+}
+
+/* Active page — accent bar + slight highlight */
+.sidebar .chapter li.chapter-item.active > a {
+    border-left-color: var(--links);
+    font-weight: 600;
+    background: rgba(128, 128, 128, 0.09);
+}
+
+/* Section divider (--- in SUMMARY.md) */
+.sidebar .chapter li.spacer {
+    height: 1px;
+    margin: 0.55em 0.9em;
+    background: rgba(128, 128, 128, 0.22);
+    list-style: none;
+}
+
+/* ── Wide tables ────────────────────────────────────────────────────────── */
+
+/* Tables that are wider than the content area scroll instead of clipping */
+.content table {
+    display: block;
+    overflow-x: auto;
+    width: max-content;
+    max-width: 100%;
+}
+
+/* Pinned title ("Overview") above the divider */
+.sidebar .chapter li:not(.chapter-item):not(.spacer) > a {
+    font-size: 0.88em;
+    opacity: 0.75;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    padding-left: 1.1em;
+}
