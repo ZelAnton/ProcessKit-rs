@@ -19,9 +19,13 @@ matrices and fine print in one place.
 ## CI coverage
 
 `.github/workflows/ci.yml`'s `test` job runs the full real-subprocess suite
-(`--include-ignored`, so kill-on-drop is actually exercised) on glibc
-(`ubuntu-latest`), Windows and macOS. A separate `test-musl` job runs the same
-suite a fourth time inside a real `rust:alpine` container — musl libc and a
+(`--include-ignored`, so kill-on-drop is actually exercised) on glibc x86_64
+(`ubuntu-latest`), glibc aarch64 (`ubuntu-24.04-arm`), Windows and macOS. The
+aarch64 leg is the only place the native Linux syscall/layout code
+(`sys/{linux,pgroup,unix,pid_gate}.rs`) actually runs on Linux/glibc-aarch64 —
+elsewhere aarch64 is only `cargo check`-compiled against `aarch64-apple-darwin`
+(Darwin, in the `msrv` job), never executed. A separate `test-musl` job runs the
+full suite a further time inside a real `rust:alpine` container — musl libc and a
 busybox userland, not merely a cross-compiled `x86_64-unknown-linux-musl`
 binary executed by glibc userland tools — because musl/Alpine is the de-facto
 standard for the container images this crate actually runs in, and its libc,

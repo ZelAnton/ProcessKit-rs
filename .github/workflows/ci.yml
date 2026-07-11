@@ -32,9 +32,9 @@ jobs:
       # Lint on every OS so each platform module is actually checked: cgroup /
       # process-group (Linux), Job Object (Windows) and the macOS/BSD process
       # group (macOS). Linting only on Linux would leave windows.rs and unix.rs
-      # unchecked.
+      # unchecked. `ubuntu-24.04-arm` lints the same Linux module on aarch64.
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -72,8 +72,12 @@ jobs:
       fail-fast: false
       # macOS exercises the POSIX process-group containment path (unix.rs); the
       # BSDs use the same path but have no hosted runner, so macOS stands in.
+      # `ubuntu-24.04-arm`: the only leg that actually runs the native Linux
+      # syscall/layout code (sys/{linux,pgroup,unix,pid_gate}.rs) on aarch64 —
+      # the msrv job only `cargo check`s aarch64-apple-darwin, which is Darwin
+      # and never executes on real Linux/glibc-aarch64.
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
