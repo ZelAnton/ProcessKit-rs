@@ -142,9 +142,14 @@ async fn main() -> processkit::Result<()> {
 
 This README is the quick tour. The **[`docs/` guide set](docs/README.md)**
 goes deeper on every capability, with more examples and the platform fine
-print collected in one place. New here? Skim the [Cookbook](docs/cookbook.md)
-first — it maps "I want to …" tasks to working snippets — then read
-[Running commands](docs/commands.md) end to end:
+print collected in one place — browse it as a published site at
+**https://zelanton.github.io/ProcessKit-rs/**, built from this repository's
+`docs/` sources by the `docs` GitHub Actions workflow
+(`.github/workflows/docs.yml`). This repository is the sole source of the
+documentation site; it does not consume or publish to any other repository.
+New here? Skim the [Cookbook](docs/cookbook.md) first — it maps "I want to …"
+tasks to working snippets — then read [Running commands](docs/commands.md)
+end to end:
 
 | Guide | Covers |
 |---|---|
