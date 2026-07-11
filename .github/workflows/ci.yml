@@ -101,6 +101,61 @@ jobs:
       # cfg-gated arms in the suite) against bit-rot.
       - run: cargo test --no-default-features -- --include-ignored
 
+  test-musl:
+    name: test (musl/Alpine)
+    runs-on: ubuntu-latest
+    # `rust:alpine` is real Alpine Linux — musl libc and a busybox userland —
+    # with Rust preinstalled via rustup for the musl target. Every leg above
+    # exercises only glibc (`ubuntu-latest`) or a non-Linux OS; musl is the
+    # de-facto standard for the container images this crate will actually run
+    # in, and its libc/signal/userland details genuinely differ from glibc's.
+    # Running inside the container (rather than merely cross-compiling to the
+    # `x86_64-unknown-linux-musl` target on an ubuntu runner) is deliberate:
+    # it exercises the real busybox `sh`/coreutils the real-subprocess tests
+    # spawn, not just musl-linked object code executed by glibc userland tools.
+    container:
+      image: rust:alpine
+      # `--init`: a plain container has no subreaper as PID 1 (PID 1 here is
+      # just this job's own entry process) — a killed process's orphaned
+      # grandchildren become unreaped zombies that still probe alive via
+      # `kill(pid, 0)`, which falsely fails every containment test that forks
+      # grandchildren (`unix_fork_storm_is_swept_by_group_broadcast`,
+      # `per_stage_timeout_reaps_a_forking_stages_grandchild`,
+      # `unix_setsid_child_forks_grandchild_still_contained` — confirmed by
+      # running the suite locally with and without this flag). `--init` runs
+      # tini as PID 1, a real subreaper, matching how a properly configured
+      # container host behaves.
+      # `--cap-add=SYS_NICE`: Docker drops CAP_SYS_NICE from the default
+      # capability set even for a root container user, so raising scheduling
+      # priority fails EPERM regardless of uid.
+      # `priority_high_with_uid_drop_and_no_groups_succeeds` raises priority
+      # (`Priority::High` -> negative nice) — confirmed to need exactly this
+      # capability locally. Restored explicitly rather than skipping the test:
+      # it is a narrow, low-blast-radius capability (only lets a process raise
+      # its own/children's scheduling priority), unlike e.g. `SYS_ADMIN`.
+      options: --init --cap-add=SYS_NICE
+    steps:
+      # The image has neither `git` (actions/checkout needs it) nor a `ps`
+      # that supports `-p PID` (busybox's `ps` only takes a fixed `-o` column
+      # list, no `-p` filter; `priority_and_umask_apply_before_exec` needs
+      # that filter) — installed via `procps` (procps-ng), which apk swaps in
+      # over the busybox applet. Everything else the suite spawns (`sh`,
+      # `cat`, `sleep`, `yes`, `head`, `grep`, `sort`, `id`, `printf`, `env`,
+      # `seq`) is already covered by Alpine's busybox — confirmed by running
+      # the full suite locally against this image with only these two
+      # packages added. `gcc`/`musl-dev` (needed to link) already ship in the
+      # base image.
+      - name: Install git and procps (ps -p support)
+        run: apk add --no-cache git procps
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-targets --all-features
+      # Same three feature configurations as the `test` job above, each with
+      # `--include-ignored` so the real-subprocess/kill-on-drop tests run.
+      - run: cargo test --all-features -- --include-ignored
+      - run: cargo test -- --include-ignored
+      - run: cargo test --no-default-features -- --include-ignored
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest

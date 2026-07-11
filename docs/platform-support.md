@@ -11,9 +11,48 @@ implemented, *honestly partial* (documented and typed), or refused with
 `Error::Unsupported` — never silently skipped. This page collects all the
 matrices and fine print in one place.
 
+- [CI coverage](#ci-coverage)
 - [Containment mechanisms](#containment-mechanisms)
 - [Capability matrices](#capability-matrices)
 - [Caveats](#caveats)
+
+## CI coverage
+
+`.github/workflows/ci.yml`'s `test` job runs the full real-subprocess suite
+(`--include-ignored`, so kill-on-drop is actually exercised) on glibc
+(`ubuntu-latest`), Windows and macOS. A separate `test-musl` job runs the same
+suite a fourth time inside a real `rust:alpine` container — musl libc and a
+busybox userland, not merely a cross-compiled `x86_64-unknown-linux-musl`
+binary executed by glibc userland tools — because musl/Alpine is the de-facto
+standard for the container images this crate actually runs in, and its libc,
+signal, and userland-utility details genuinely differ from glibc's. Alpine's
+busybox already covers every external utility the suite spawns (`sh`, `cat`,
+`sleep`, `yes`, `head`, `grep`, `sort`, `id`, `printf`, `env`, `seq`) except
+one: its `ps` applet has no `-p PID` filter, so the job installs `procps`
+(`procps-ng`) to get one that does. `gcc`/`musl-dev` (needed to link) already
+ship in the base image.
+
+Two container-runtime quirks — unrelated to musl/Alpine itself, but specific
+to running *any* test suite inside a plain container — need working around,
+via the job's (and the `just test-musl` recipe's) `--init` and
+`--cap-add=SYS_NICE` options:
+
+- **No subreaper.** A plain container's PID 1 is just the job's own entry
+  process, not a real init — so a killed process's orphaned grandchildren
+  become zombies that are never reaped and still probe alive via
+  `kill(pid, 0)`. That silently breaks every test that asserts a forked
+  grandchild is actually gone after teardown. `--init` runs
+  [tini](https://github.com/krallin/tini) as PID 1, a real subreaper, which
+  is what a properly configured container host provides.
+- **`CAP_SYS_NICE` dropped by default.** Docker excludes it from the default
+  capability set even for a root container user, so *raising* scheduling
+  priority fails `EPERM` regardless of uid (lowering it never needs the
+  capability). One test exercises `Priority::High` (a negative `nice`) together
+  with a privilege drop; `--cap-add=SYS_NICE` restores just that one narrow,
+  low-blast-radius capability rather than skipping the test.
+
+Run the same job locally with `just test-musl` (requires Docker); see the
+recipe in `justfile` for details.
 
 ## Containment mechanisms
 

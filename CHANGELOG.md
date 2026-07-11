@@ -12,7 +12,9 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- CI now runs the real-subprocess test suite inside a real Alpine/musl
+  container (`test-musl` job), in addition to the existing glibc/Windows/macOS
+  legs; reproduce locally with `just test-musl` (requires Docker)
 
 ### Changed
 -

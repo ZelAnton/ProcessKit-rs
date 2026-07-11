@@ -83,6 +83,31 @@ msrv:
     cargo +1.88 check --target x86_64-pc-windows-msvc --lib --bins --all-features
     cargo +1.88 check --target aarch64-apple-darwin --lib --bins --all-features
 
+# Mirrors the CI `test-musl` job locally: builds and runs the full suite
+# (same three feature configurations, each with `--include-ignored`) inside a
+# real Alpine/musl container — busybox userland, musl libc — not merely a
+# cross-compiled musl-target binary run under glibc userland tools. Requires
+# Docker. `--init` supplies a real subreaper and `--cap-add=SYS_NICE` restores
+# a capability Docker drops by default; see the CI job's comments in
+# `.github/workflows/ci.yml` for why both are needed. `procps` swaps in a
+# `ps` that supports `-p PID` (busybox's does not), which one test needs.
+# The build output goes to a named Docker volume, not `./target`, so this
+# never mixes musl-linked artifacts into your native `target/` directory.
+# `MSYS_NO_PATHCONV=1` is a no-op outside Git Bash on Windows; there it stops
+# Git Bash from mangling the `/work`-style container paths below.
+test-musl:
+    MSYS_NO_PATHCONV=1 docker run --rm --init --cap-add=SYS_NICE \
+        -v "{{justfile_directory()}}:/work" \
+        -v processkit-musl-target:/musl-target \
+        -w /work \
+        -e CARGO_TARGET_DIR=/musl-target \
+        rust:alpine sh -c ' \
+            apk add --no-cache procps >/dev/null && \
+            cargo build --all-targets --all-features && \
+            cargo test --all-features -- --include-ignored && \
+            cargo test -- --include-ignored && \
+            cargo test --no-default-features -- --include-ignored'
+
 # Optional: mirrors the CI `public-api` job. Requires a nightly toolchain and
 # `cargo-public-api` (`cargo install cargo-public-api --locked`); compares the
 # crate's current public surface against the committed `public-api.txt`
