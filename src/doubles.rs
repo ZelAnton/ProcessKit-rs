@@ -2547,6 +2547,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fake_rejects_inherit_stdin_conflicts_like_a_live_run() {
+        // The fake routes stdin through the same `runner::take_stdin_for_run` seam
+        // the live launch does, so an incompatible `inherit_stdin` combination is
+        // rejected on the double exactly as it would be live — never a silent
+        // divergence where the fake accepts a setup a real spawn refuses.
+        let runner = ScriptedRunner::new().fallback(Reply::ok("done"));
+
+        let with_keep_open = Command::new("tool").inherit_stdin().keep_stdin_open();
+        let with_source = Command::new("tool")
+            .inherit_stdin()
+            .stdin(crate::Stdin::from_string("payload"));
+        for bad in [with_keep_open, with_source] {
+            match runner.output_string(&bad).await {
+                Err(crate::error::Error::Io(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                }
+                other => panic!("expected Io(InvalidInput) from the fake, got {other:?}"),
+            }
+            // Parity on the streaming verb too.
+            assert!(
+                runner.start(&bad).await.is_err(),
+                "the scripted `start` verb rejects the same conflict"
+            );
+        }
+
+        // A plain `inherit_stdin` (no conflict) runs on the fake like any other
+        // command — the child would read the parent's stdin, which the double has
+        // no content to route, so it just returns its canned reply.
+        let ok = Command::new("tool").inherit_stdin();
+        let result = runner
+            .output_string(&ok)
+            .await
+            .expect("a plain inherit_stdin command runs on the fake");
+        assert_eq!(result.stdout(), "done");
+    }
+
+    #[tokio::test]
     async fn reusable_stdin_sources_are_not_consumed_by_the_fake() {
         // Control: a re-runnable source (`from_bytes`/`from_string`/…) must NOT
         // be affected by the new consumption check — every existing test that

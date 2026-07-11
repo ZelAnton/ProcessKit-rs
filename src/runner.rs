@@ -621,9 +621,36 @@ impl ProcessRunner for ProcessGroup {
 /// intact, while a scripted successful start must consume it exactly once, just
 /// like live), so the two call sites can never drift on the semantics or the
 /// error's wording.
+///
+/// It also enforces [`Command::inherit_stdin`](crate::Command::inherit_stdin)'s
+/// mutual exclusion with a mediated stdin (see below), so every runner rejects an
+/// incompatible stdin setup identically.
 pub(crate) fn take_stdin_for_run(
     command: &Command,
 ) -> Result<Option<crate::stdin::StdinReservation>> {
+    if command.inherits_stdin() {
+        // `inherit_stdin` hands the child the parent's own stdin fd, so the crate
+        // neither drives nor closes stdin. That is a contradiction with either way
+        // the crate *would* mediate stdin — an interactive `keep_stdin_open` pipe,
+        // or a configured `stdin(Stdin::…)` source (including an explicit
+        // `Stdin::empty()`). Reject the conflict here, at the shared launch
+        // boundary every runner routes through (live launch, the scripted/fake
+        // doubles, and cassette record via `JobRunner`), as a typed
+        // `Error::Io(InvalidInput)` — the same failure mode as the one-shot-consumed
+        // guard below — rather than silently letting one setting win.
+        if command.keeps_stdin_open() {
+            return Err(inherit_stdin_conflict(command, "keep_stdin_open()"));
+        }
+        if command.stdin_source().is_some() {
+            return Err(inherit_stdin_conflict(
+                command,
+                "a stdin source set via stdin(Stdin::…)",
+            ));
+        }
+        // Nothing to feed: the child reads the parent's stdin directly (wired as
+        // `Stdio::inherit()` in `Command::build_tokio`).
+        return Ok(None);
+    }
     if command.keeps_stdin_open() {
         return Ok(None);
     }
@@ -643,6 +670,23 @@ pub(crate) fn take_stdin_for_run(
         },
         None => Ok(None),
     }
+}
+
+/// The typed error raised when [`Command::inherit_stdin`](crate::Command::inherit_stdin)
+/// is combined with another stdin knob that would drive/close stdin (`other`
+/// names it). An `Error::Io(InvalidInput)` — mirroring the crate's other
+/// stdin-misconfiguration refusal (a consumed one-shot source) — so a caller
+/// gets one uniform "bad stdin setup" failure mode to match on.
+fn inherit_stdin_conflict(command: &Command, other: &str) -> crate::Error {
+    crate::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "`{}`: inherit_stdin() cannot be combined with {other} — a child either \
+             inherits the parent's stdin or has its stdin mediated by the crate, not \
+             both; drop one of the two",
+            command.program_name()
+        ),
+    ))
 }
 
 /// Build the OS command, spawn it into `group`, wire stdin, and wrap everything
@@ -884,6 +928,62 @@ mod tests {
         Flaky {
             calls: AtomicU32::new(0),
             fail_times,
+        }
+    }
+
+    /// A plain `inherit_stdin()` (no conflicting knob) reserves nothing to feed —
+    /// the child reads the parent's stdin directly, so there is no payload and no
+    /// error.
+    #[test]
+    fn inherit_stdin_alone_reserves_no_payload() {
+        let command = Command::new("child").inherit_stdin();
+        let reservation = take_stdin_for_run(&command).expect("plain inherit is valid");
+        assert!(
+            reservation.is_none(),
+            "inherit_stdin feeds no payload — nothing to reserve"
+        );
+    }
+
+    /// `inherit_stdin()` + `keep_stdin_open()` is a contradiction (share the
+    /// parent's stdin AND be handed an interactive pipe) and is rejected at the
+    /// launch boundary with a typed `Error::Io(InvalidInput)`, not a silent
+    /// last-write-wins.
+    #[test]
+    fn inherit_stdin_conflicts_with_keep_stdin_open() {
+        // `Ok` carries a `StdinReservation`, which is intentionally not `Debug`
+        // (it guards a live payload), so assert on the error via `match`, not
+        // `expect_err`.
+        let command = Command::new("child").inherit_stdin().keep_stdin_open();
+        match take_stdin_for_run(&command) {
+            Err(Error::Io(io)) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput),
+            Err(other) => panic!("expected Error::Io(InvalidInput), got {other:?}"),
+            Ok(_) => panic!("inherit_stdin + keep_stdin_open must be rejected"),
+        }
+        // Order-independent: the conflict is rejected regardless of builder order.
+        let reversed = Command::new("child").keep_stdin_open().inherit_stdin();
+        assert!(
+            take_stdin_for_run(&reversed).is_err(),
+            "the conflict holds whichever knob was set last"
+        );
+    }
+
+    /// `inherit_stdin()` + a configured `stdin(Stdin::…)` source (a re-runnable
+    /// payload, a one-shot stream, or even an explicit `Stdin::empty()`) is
+    /// rejected the same way — you cannot both feed the child a source and let it
+    /// read the parent's stdin.
+    #[test]
+    fn inherit_stdin_conflicts_with_a_configured_source() {
+        for source in [
+            crate::Stdin::from_string("payload"),
+            crate::Stdin::empty(),
+            crate::Stdin::from_reader(&b"stream"[..]),
+        ] {
+            let command = Command::new("child").stdin(source).inherit_stdin();
+            match take_stdin_for_run(&command) {
+                Err(Error::Io(io)) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput),
+                Err(other) => panic!("expected Error::Io(InvalidInput), got {other:?}"),
+                Ok(_) => panic!("inherit_stdin + a stdin source must be rejected"),
+            }
         }
     }
 

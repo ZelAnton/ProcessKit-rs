@@ -35,5 +35,6 @@ mod readiness;
 mod shutdown;
 #[cfg(feature = "stats")]
 mod stats;
+mod stdin_inherit;
 mod streaming;
 mod supervision;

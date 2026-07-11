@@ -205,6 +205,55 @@ For conversational, request/response stdin — write a line, read the answer,
 repeat — use `keep_stdin_open()` and the streaming API instead: see
 [Streaming & interactive I/O](streaming.md#interactive-stdin).
 
+### Inheriting the parent's stdin: `inherit_stdin()`
+
+`inherit_stdin()` hands the child the parent's **own** standard input — it reads
+directly from whatever this process's stdin is (a terminal, a file, a pipe)
+rather than from a crate-managed pipe. It is the stdin counterpart of
+`stdout(StdioMode::Inherit)` / `stderr(StdioMode::Inherit)`: the child *shares*
+the parent stream instead of the crate mediating it.
+
+```rust,no_run
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    // `git commit` opens $EDITOR on the parent's terminal; the child talks to the
+    // real tty directly. stdout/stderr are still captured as usual.
+    Command::new("git").arg("commit").inherit_stdin().run().await?;
+    Ok(())
+}
+```
+
+Reach for it when a child must talk to the real terminal — `git commit` opening
+`$EDITOR`, a tool prompting for a password or a yes/no — or to forward the
+parent's piped stdin straight through. Until a pseudo-terminal exists (a future
+direction, not yet provided) this covers the common non-tty-negotiating
+interactive cases without the crate having to pump bytes. Because the child reads
+the parent's stdin directly, the crate neither feeds nor captures that input, and
+`take_stdin()` returns `None` (as for a non-`keep_stdin_open` run). Capturing and
+streaming the child's *output* is unaffected.
+
+**Why a dedicated verb rather than a `Stdin::Inherit` source or a mode enum.**
+For stdout/stderr the three `StdioMode` variants map cleanly onto one setter, but
+stdin's "piped" case is not modeless — it *needs a payload* (which source? what
+bytes?), already expressed by `stdin(Stdin::…)`, and its "null" case is
+`Stdin::empty()`. Folding inheritance into that same `stdin(Stdin)` field would
+make "inherit **and** a source" collapse to silent last-write-wins, impossible to
+flag. A separate `inherit_stdin()` keeps the two intents in distinct fields so an
+incompatible pairing is a **detectable, rejectable** error instead.
+
+Accordingly, `inherit_stdin()` is **mutually exclusive** with either way the crate
+would otherwise drive stdin — a configured `stdin(Stdin::…)` source (including an
+explicit `Stdin::empty()`) or `keep_stdin_open()`'s interactive pipe. Setting
+`inherit_stdin()` together with one of those is a contradiction (feed the child a
+source *and* let it read the terminal?), so it is refused at the launch boundary
+with a typed `Error::Io` (`InvalidInput`) — the same failure mode as re-running a
+consumed one-shot source — rather than silently letting one win. Drop the other
+stdin knob to resolve it. The refusal is enforced on the same launch seam the
+hermetic test doubles route through, so a `ScriptedRunner` rejects the conflict
+exactly as a live run does.
+
 ## Output handling
 
 ### Encodings

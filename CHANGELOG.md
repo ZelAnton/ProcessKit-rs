@@ -12,7 +12,20 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- `Command::inherit_stdin()` — give the child the parent's own standard input
+  (`Stdio::inherit`), so it reads directly from the parent's terminal/file/pipe
+  instead of a crate-managed pipe. The stdin counterpart of
+  `stdout(StdioMode::Inherit)`, for children that must talk to the real tty
+  (`git commit` opening `$EDITOR`, a tool prompting for input) or to forward the
+  parent's piped stdin straight through. Portable across Linux, macOS, and
+  Windows. It is a dedicated verb (not a `Stdin` source or a mode enum) so that
+  its incompatibility with a mediated stdin is representable and enforced:
+  combining `inherit_stdin()` with `keep_stdin_open()` or a configured
+  `stdin(Stdin::…)` source (including `Stdin::empty()`) is refused at the launch
+  boundary with a typed `Error::Io` (`InvalidInput`) — mirroring the crate's
+  existing one-shot-source refusal — rather than silently letting one setting
+  win. The rejection is enforced on the shared launch seam, so the hermetic test
+  doubles (`ScriptedRunner`) reject the same conflict a live run does.
 
 ### Changed
 -

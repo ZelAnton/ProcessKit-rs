@@ -70,6 +70,12 @@ pub struct Command {
     env_clear: bool,
     stdin: Option<Stdin>,
     keep_stdin_open: bool,
+    /// Hand the child the parent's own standard input (`Stdio::inherit`) instead
+    /// of a pipe — see [`Self::inherit_stdin`]. Mutually exclusive with
+    /// [`keep_stdin_open`](Self::keep_stdin_open) and a configured
+    /// [`stdin`](Self::stdin) source; the conflict is rejected at the launch
+    /// boundary (see `runner::take_stdin_for_run`).
+    stdin_inherit: bool,
     /// Exempt this stage from pipefail attribution (see [`Self::unchecked_in_pipe`]).
     unchecked: bool,
     /// The timeout state — unset, explicitly unbounded, or a deadline (see
@@ -137,6 +143,7 @@ impl Command {
             env_clear: false,
             stdin: None,
             keep_stdin_open: false,
+            stdin_inherit: false,
             unchecked: false,
             timeout: Timeout::Unset,
             timeout_grace: None,
@@ -544,6 +551,9 @@ impl Command {
     {
         self.stdin = Some(Stdin::from_reader(reader));
         self.keep_stdin_open = false;
+        // An inner pipeline stage reads the previous stage's stdout, never the
+        // parent's stdin — clear any inherit so the wired pipe unconditionally wins.
+        self.stdin_inherit = false;
     }
 
     /// Kill the run if it exceeds `timeout`.
@@ -797,8 +807,51 @@ impl Command {
     /// equivalent to not setting it. A writer the caller *did* take is
     /// unaffected and keeps the pipe until dropped or
     /// [`finish`](crate::ProcessStdin::finish)ed.
+    ///
+    /// Mutually exclusive with [`inherit_stdin`](Self::inherit_stdin) — a child
+    /// cannot both be handed an interactive stdin pipe and share the parent's
+    /// stdin; setting both is rejected at launch (see `inherit_stdin`).
     pub fn keep_stdin_open(mut self) -> Self {
         self.keep_stdin_open = true;
+        self
+    }
+
+    /// Give the child the parent's **own** standard input — it reads directly
+    /// from whatever this process's stdin is connected to (a terminal, a file,
+    /// a pipe) rather than from a crate-managed pipe.
+    ///
+    /// This is the stdin counterpart of
+    /// [`stdout(StdioMode::Inherit)`](Self::stdout) /
+    /// [`stderr(StdioMode::Inherit)`](Self::stderr): the child *shares* the
+    /// parent stream instead of the crate mediating it. Reach for it when a
+    /// child must talk to the real terminal — `git commit` opening `$EDITOR`, a
+    /// tool prompting the user for a password or a yes/no, or simply forwarding
+    /// the parent's piped stdin straight through to the child. Until a
+    /// pseudo-terminal exists (a future direction, not yet provided) this covers
+    /// the common non-tty-negotiating interactive cases without the crate having
+    /// to pump bytes.
+    ///
+    /// Because the child reads the parent's stdin directly, the crate neither
+    /// feeds nor captures that input, and there is no writer to
+    /// [`take_stdin`](crate::RunningProcess::take_stdin) (it returns `None`, as
+    /// for a non-`keep_stdin_open` run). stdout/stderr are unaffected — capture
+    /// and streaming of the child's output keep working exactly as before.
+    ///
+    /// # Mutually exclusive with a mediated stdin
+    ///
+    /// Inheriting the parent's stdin cannot be combined with either way the crate
+    /// would otherwise *drive* stdin — a configured [`stdin`](Self::stdin) source
+    /// (`Stdin::from_string`/`from_bytes`/`from_file`/`from_reader`/`from_lines`,
+    /// or an explicit `Stdin::empty()`) or [`keep_stdin_open`](Self::keep_stdin_open)'s
+    /// interactive pipe. Setting `inherit_stdin` **and** one of those is a
+    /// contradiction (feed the child a source *and* let it read the terminal?),
+    /// so it is rejected at the launch boundary with a typed
+    /// [`Error::Io`](crate::Error::Io) (`InvalidInput`) — the same failure mode
+    /// as the other stdin misconfiguration the crate refuses (re-running a
+    /// consumed one-shot source) — rather than silently letting one win. Drop the
+    /// other stdin knob to resolve it.
+    pub fn inherit_stdin(mut self) -> Self {
+        self.stdin_inherit = true;
         self
     }
 
@@ -1035,6 +1088,12 @@ impl Command {
 
     pub(crate) fn keeps_stdin_open(&self) -> bool {
         self.keep_stdin_open
+    }
+
+    /// Whether the child should read the parent's own stdin
+    /// ([`inherit_stdin`](Self::inherit_stdin)).
+    pub(crate) fn inherits_stdin(&self) -> bool {
+        self.stdin_inherit
     }
 
     /// A clone with the per-line push side-effects — the
@@ -1505,6 +1564,15 @@ impl Command {
         });
         if self.keep_stdin_open {
             cmd.stdin(Stdio::piped());
+        } else if self.stdin_inherit {
+            // Share the parent's own stdin fd — one portable primitive that
+            // behaves the same across unix/linux/windows (the sys spawn paths only
+            // add group/job containment and never re-wire stdio). The
+            // mutual-exclusion with keep_stdin_open / a configured source is
+            // enforced at the launch boundary (`runner::take_stdin_for_run`); the
+            // ordering here is only the tie-break for the raw `to_tokio_command`
+            // escape hatch, which bypasses that check.
+            cmd.stdin(Stdio::inherit());
         } else {
             match &self.stdin {
                 Some(src) => {
@@ -1747,6 +1815,7 @@ impl fmt::Debug for Command {
             .field("env_clear", &self.env_clear)
             .field("stdin", &self.stdin)
             .field("keep_stdin_open", &self.keep_stdin_open)
+            .field("stdin_inherit", &self.stdin_inherit)
             .field("unchecked", &self.unchecked)
             .field("timeout", &self.timeout)
             .field("timeout_grace", &self.timeout_grace)

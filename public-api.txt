@@ -574,6 +574,7 @@ pub async fn processkit::Command::first_line<F>(&self, F) -> processkit::Result<
 pub fn processkit::Command::gid(self, u32) -> Self
 pub fn processkit::Command::groups(self, impl core::convert::AsRef<[u32]>) -> Self
 pub fn processkit::Command::inherit_env<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
+pub fn processkit::Command::inherit_stdin(self) -> Self
 pub fn processkit::Command::keep_stdin_open(self) -> Self
 pub fn processkit::Command::kill_on_parent_death(self) -> Self
 pub fn processkit::Command::line_terminator(self, processkit::LineTerminator) -> Self
