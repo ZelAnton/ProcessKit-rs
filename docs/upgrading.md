@@ -22,10 +22,6 @@ the full record; this page is the "I depend on it, what do I do" view.
 > break lands in a major as intended. There is nothing extra to do for the skip;
 > the migration from a `1.2.x` dependency is exactly the notes here.
 
-> **Doing the bump in a project?** [Migrating 1.2 → 2.1](migrating-1.2-to-2.1.md)
-> is the mechanical checklist companion to this section — detection greps, a
-> find→replace table, and a verify step, written for an agent applying the edits.
-
 Mostly mechanical renames — **caught by the compiler** — plus two
 `#[non_exhaustive]` tightenings on `Error` (also compiler-caught, once you stop
 destructuring the affected variants field-exhaustively) and one genuine

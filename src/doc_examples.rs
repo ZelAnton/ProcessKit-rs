@@ -82,12 +82,12 @@ mod docs_process_groups {}
 #[doc = include_str!("../docs/platform-support.md")]
 mod docs_platform_support {}
 
-/// `docs/migrating-1.2-to-2.1.md`.
-#[doc(hidden)]
-#[doc = include_str!("../docs/migrating-1.2-to-2.1.md")]
-mod docs_migrating_1_2_to_2_1 {}
-
 /// `docs/upgrading.md`.
 #[doc(hidden)]
 #[doc = include_str!("../docs/upgrading.md")]
 mod docs_upgrading {}
+
+/// `docs/whats-next.md`.
+#[doc(hidden)]
+#[doc = include_str!("../docs/whats-next.md")]
+mod docs_whats_next {}

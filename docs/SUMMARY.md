@@ -13,4 +13,4 @@
 - [Testing your code](testing.md)
 - [Platform support](platform-support.md)
 - [Upgrading](upgrading.md)
-- [Migrating 1.2 → 2.1](migrating-1.2-to-2.1.md)
+- [What's next](whats-next.md)
