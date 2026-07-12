@@ -1,8 +1,12 @@
 # Summary
 
+[Rust version]()
+[Python wrapper]()
+[.NET version]()
+
+---
+
 [Overview](README.md)
-[Python wrapper](python-wrapper.md)
-[.NET version](dotnet-version.md)
 
 ---
 
