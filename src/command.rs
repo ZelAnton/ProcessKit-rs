@@ -1171,7 +1171,7 @@ impl Command {
             || self
                 .envs
                 .iter()
-                .any(|(k, _)| k.to_str().is_some_and(|k| k.eq_ignore_ascii_case("PATH")))
+                .any(|(key, _)| env_key_eq(key, OsStr::new("PATH")))
     }
 
     /// Whether [`setsid`](Self::setsid) was requested (read by the spawn seam).
@@ -2768,11 +2768,19 @@ mod tests {
                 .env("PATH", "/opt/bin")
                 .customizes_path()
         );
+        #[cfg(windows)]
         assert!(
             Command::new("git")
                 .env("path", "/opt/bin")
                 .customizes_path(),
-            "PATH match is case-insensitive (Windows uses `Path`)"
+            "Windows environment keys are case-insensitive"
+        );
+        #[cfg(unix)]
+        assert!(
+            !Command::new("git")
+                .env("path", "/opt/bin")
+                .customizes_path(),
+            "Unix `path` is distinct from `PATH`"
         );
         assert!(Command::new("git").env_remove("PATH").customizes_path());
         assert!(Command::new("git").env_clear().customizes_path());

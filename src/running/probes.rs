@@ -5,7 +5,15 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// `tokio::time::Instant` (not `std::time::Instant`) for the poll deadlines
+// below: they are slept out on tokio's timer (`tokio::time::sleep` /
+// `tokio::time::timeout`), so a deadline computed from `Instant::now() + within`
+// must track the same (possibly paused) virtual clock — otherwise a probe under
+// a paused runtime would misjudge its remaining budget. Same shared-clock
+// rationale as `running::deadline` and `sys::graceful`.
+use tokio::time::Instant;
 
 use tokio::net::TcpStream;
 
