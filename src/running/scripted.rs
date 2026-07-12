@@ -312,6 +312,12 @@ impl RunningProcess {
             cancel_task: None,
             cancel_at_exit: None,
             started: Instant::now(),
+            // Same spawn instant as `started`, on tokio's clock: the deadline
+            // anchor a scripted stream's watchdog (`arm_scripted_deadline`) and a
+            // consuming `drive_to_exit_inner` measure the timeout budget from —
+            // the crux of a hermetic paused-clock run, where `started` (real
+            // clock) barely moves while virtual time advances.
+            deadline_anchor: tokio::time::Instant::now(),
             start_time: SystemTime::now(),
             scripted_result: recorded,
         }
@@ -328,8 +334,11 @@ impl RunningProcess {
         let (Some(limit), Some(kill)) = (self.timeout, self.backend.scripted_kill()) else {
             return;
         };
-        // Anchor to spawn time so a late stream call can't re-grant the full limit.
-        let started = self.started;
+        // Anchor to spawn time so a late stream call can't re-grant the full
+        // limit — on `deadline_anchor` (tokio's clock), the crux under a paused
+        // runtime: virtual time already burned (e.g. by a `wait_for_line` probe)
+        // is charged against the limit, matching a live child's real clock.
+        let started = self.deadline_anchor;
         let timeout_state = self.timeout_state.clone();
         self.deadline_task = Some(tokio::spawn(async move {
             if !super::deadline::wait_deadline_and_claim(started, limit, &timeout_state).await {

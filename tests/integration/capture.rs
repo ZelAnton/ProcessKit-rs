@@ -165,6 +165,32 @@ async fn prefer_local_miss_falls_back_to_the_system_path() {
     );
 }
 
+// T-110: Unix environment keys are case-sensitive, so a lowercase `path`
+// must not suppress the process-PATH diagnostic for a missing program.
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "exercises the real spawn path (creates a process group)"]
+async fn lowercase_path_env_keeps_the_not_found_searched_path() {
+    let system_path = std::env::var_os("PATH")
+        .expect("test environment must provide PATH")
+        .to_string_lossy()
+        .into_owned();
+    let err = Command::new("processkit-definitely-not-installed-t110")
+        .env("path", "/opt/bin")
+        .output_string()
+        .await
+        .expect_err("an unknown program must error");
+
+    match err {
+        processkit::Error::NotFound { searched, .. } => assert_eq!(
+            searched,
+            Some(system_path),
+            "lowercase `path` must not replace the process PATH on Unix"
+        ),
+        other => panic!("expected Error::NotFound, got {other:?}"),
+    }
+}
+
 // T-054: when resolution fails everywhere, `Error::NotFound`'s `searched`
 // diagnostic must include the `prefer_local` directories too — not just PATH
 // — so the caller can tell they were checked.

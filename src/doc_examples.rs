@@ -13,86 +13,170 @@
 // on a private, hidden module purely so rustdoc's doctest extractor walks its
 // fenced blocks — the text itself is never published anywhere.
 //
-// Gated on all six optional features, including the default
-// `process-control`, so it only builds under `cargo test --all-features`
-// (the guides collectively demonstrate the `process-control`/`stats`/
-// `limits`/`mock`/`tracing`/`record` surfaces); the default and
-// `--no-default-features` CI legs never see this module at all.
+// The doctest registrations are gated on all six optional features, including
+// the default `process-control`, because the guides collectively demonstrate
+// the `process-control`/`stats`/`limits`/`mock`/`tracing`/`record` surfaces.
+// The test below stays available to ordinary `cargo test`: it makes a new
+// guide fail CI until it is explicitly registered here.
 #![allow(dead_code)]
 
-/// `README.md` (crate root) — kept **out** of the rendered crate doc
-/// (see `decisions/readme-crate-doc-sourcing.md`); included here only so its
-/// fenced Rust blocks run as doctests.
-#[doc(hidden)]
-#[doc = include_str!("../README.md")]
-mod readme {}
+#[cfg(all(
+    feature = "process-control",
+    feature = "stats",
+    feature = "limits",
+    feature = "mock",
+    feature = "tracing",
+    feature = "record"
+))]
+mod guides {
+    /// `README.md` (crate root) — kept **out** of the rendered crate doc
+    /// (see `decisions/readme-crate-doc-sourcing.md`); included here only so its
+    /// fenced Rust blocks run as doctests.
+    #[doc(hidden)]
+    #[doc = include_str!("../README.md")]
+    mod readme {}
 
-/// `docs/README.md` — the guide-set index.
-#[doc(hidden)]
-#[doc = include_str!("../docs/README.md")]
-mod docs_readme {}
+    /// `docs/README.md` — the guide-set index.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/README.md")]
+    mod docs_readme {}
 
-/// `docs/commands.md`.
-#[doc(hidden)]
-#[doc = include_str!("../docs/commands.md")]
-mod docs_commands {}
+    /// `docs/commands.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/commands.md")]
+    mod docs_commands {}
 
-/// `docs/cookbook.md`.
-#[doc(hidden)]
-#[doc = include_str!("../docs/cookbook.md")]
-mod docs_cookbook {}
+    /// `docs/cookbook.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/cookbook.md")]
+    mod docs_cookbook {}
 
-/// `docs/streaming.md`.
-#[doc(hidden)]
-#[doc = include_str!("../docs/streaming.md")]
-mod docs_streaming {}
+    /// `docs/streaming.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/streaming.md")]
+    mod docs_streaming {}
 
-/// `docs/pipelines.md`.
-#[doc(hidden)]
-#[doc = include_str!("../docs/pipelines.md")]
-mod docs_pipelines {}
+    /// `docs/pipelines.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/pipelines.md")]
+    mod docs_pipelines {}
 
-/// `docs/supervision.md`.
-#[doc(hidden)]
-#[doc = include_str!("../docs/supervision.md")]
-mod docs_supervision {}
+    /// `docs/supervision.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/supervision.md")]
+    mod docs_supervision {}
 
-/// `docs/testing.md`.
-#[doc(hidden)]
-#[doc = include_str!("../docs/testing.md")]
-mod docs_testing {}
+    /// `docs/testing.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/testing.md")]
+    mod docs_testing {}
 
-/// `docs/timeouts-and-cancellation.md`.
-#[doc(hidden)]
-#[doc = include_str!("../docs/timeouts-and-cancellation.md")]
-mod docs_timeouts_and_cancellation {}
+    /// `docs/timeouts-and-cancellation.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/timeouts-and-cancellation.md")]
+    mod docs_timeouts_and_cancellation {}
 
-/// `docs/errors.md`.
-#[doc(hidden)]
-#[doc = include_str!("../docs/errors.md")]
-mod docs_errors {}
+    /// `docs/errors.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/errors.md")]
+    mod docs_errors {}
 
-/// `docs/process-groups.md`.
-#[doc(hidden)]
-#[doc = include_str!("../docs/process-groups.md")]
-mod docs_process_groups {}
+    /// `docs/process-groups.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/process-groups.md")]
+    mod docs_process_groups {}
 
-/// `docs/platform-support.md`.
-#[doc(hidden)]
-#[doc = include_str!("../docs/platform-support.md")]
-mod docs_platform_support {}
+    /// `docs/platform-support.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/platform-support.md")]
+    mod docs_platform_support {}
 
-/// `docs/containers.md`.
-#[doc(hidden)]
-#[doc = include_str!("../docs/containers.md")]
-mod docs_containers {}
+    /// `docs/containers.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/containers.md")]
+    mod docs_containers {}
 
-/// `docs/upgrading.md`.
-#[doc(hidden)]
-#[doc = include_str!("../docs/upgrading.md")]
-mod docs_upgrading {}
+    /// `docs/upgrading.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/upgrading.md")]
+    mod docs_upgrading {}
 
-/// `docs/whats-next.md`.
-#[doc(hidden)]
-#[doc = include_str!("../docs/whats-next.md")]
-mod docs_whats_next {}
+    /// `docs/whats-next.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/whats-next.md")]
+    mod docs_whats_next {}
+
+    /// `docs/dotnet-version.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/dotnet-version.md")]
+    mod docs_dotnet_version {}
+
+    /// `docs/python-wrapper.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/python-wrapper.md")]
+    mod docs_python_wrapper {}
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::Path;
+
+    const NON_CHAPTERS: &[&str] = &["SUMMARY.md"];
+
+    fn narrative_guides(docs_dir: &Path) -> BTreeSet<String> {
+        fs::read_dir(docs_dir)
+            .expect("read docs directory")
+            .map(|entry| entry.expect("read docs directory entry").file_name())
+            .filter_map(|name| name.into_string().ok())
+            .filter(|name| name.ends_with(".md") && !NON_CHAPTERS.contains(&name.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn every_narrative_guide_is_registered_for_doctests() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = fs::read_to_string(manifest_dir.join("src/doc_examples.rs"))
+            .expect("read doc_examples harness source");
+
+        let included_guides = source
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix(r#"#[doc = include_str!("../docs/"#)
+                    .and_then(|path| path.strip_suffix(r#"")]"#))
+                    .map(str::to_owned)
+            })
+            .collect::<BTreeSet<_>>();
+        let guide_files = narrative_guides(&manifest_dir.join("docs"));
+
+        assert_eq!(
+            included_guides, guide_files,
+            "docs/*.md and doc_examples.rs registrations diverged; add each new narrative guide with #[doc = include_str!(...)] (or list a known non-chapter in NON_CHAPTERS)"
+        );
+
+        let registered_modules = source
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("mod docs_")
+                    .and_then(|name| name.strip_suffix(" {}"))
+                    .map(str::to_owned)
+            })
+            .collect::<BTreeSet<_>>();
+        let expected_modules = guide_files
+            .iter()
+            .map(|file| {
+                file.trim_end_matches(".md")
+                    .replace('-', "_")
+                    .to_lowercase()
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            registered_modules, expected_modules,
+            "every narrative docs/*.md include must have a matching mod docs_* declaration"
+        );
+    }
+}
