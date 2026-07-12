@@ -1799,7 +1799,11 @@ mod cgroup_read_seam_tests {
             vec![1001, 1003],
             "the pid missing from the single reconfirm snapshot is skipped; the rest are signalled"
         );
-        assert_eq!(reads.get(), 2, "still exactly two reads for the whole batch");
+        assert_eq!(
+            reads.get(),
+            2,
+            "still exactly two reads for the whole batch"
+        );
     }
 }
 
