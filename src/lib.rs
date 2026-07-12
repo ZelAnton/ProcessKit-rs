@@ -156,13 +156,16 @@ mod command;
 // (see the module's own doc comment). Only under `--all-features` — the
 // guides collectively use every optional feature, and the default /
 // `--no-default-features` CI legs don't need a second copy of this check.
-#[cfg(all(
-    feature = "process-control",
-    feature = "stats",
-    feature = "limits",
-    feature = "mock",
-    feature = "tracing",
-    feature = "record"
+#[cfg(any(
+    test,
+    all(
+        feature = "process-control",
+        feature = "stats",
+        feature = "limits",
+        feature = "mock",
+        feature = "tracing",
+        feature = "record"
+    )
 ))]
 mod doc_examples;
 mod doubles;
