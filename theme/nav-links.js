@@ -5,14 +5,12 @@
 // makes the build fail ("failed to read chapter https://..."). The three
 // implementation entries are therefore carried in SUMMARY.md as *draft prefix
 // chapters* (bare `[Title]()` links, no chapter files) pinned above
-// `[Overview](README.md)` in the same un-numbered prefix block. mdBook v0.5.4
-// renders them as
-// <li class="chapter-item expanded "><span class="chapter-link-wrapper"><span>...</span></span></li>
-// (verified against this repo's own `mdbook build` output — the draft title
-// sits in a plain <span> nested inside .chapter-link-wrapper; this differs
-// from the bare <div> shape the ProcessKit-fSharp reference documents for its
-// own mdBook version, so the selector below is this repo's own, not a copy of
-// the reference's).
+// `[Overview](README.md)` in the same un-numbered prefix block. Production is
+// built with mdBook v0.4.40, pinned in `.github/workflows/docs.yml`; that exact
+// version renders them as
+// <li class="chapter-item expanded affix "><div>...</div></li>.
+// The selector below deliberately targets this bare <div> output, which is the
+// same version-specific shape used by the ProcessKit-fSharp reference.
 // This script upgrades the two external entries to live links and marks the
 // local implementation as a non-clickable indicator:
 //
@@ -32,17 +30,16 @@
   };
 
   function apply() {
-    // mdBook v0.5.4 renders draft prefix chapters as:
-    // <li class="chapter-item expanded "><span class="chapter-link-wrapper"><span>Rust version</span></span></li>
-    // (verified against this repo's own `mdbook build` output; no leading "N."
-    // since prefix chapters are never numbered — the digit-stripping regex
-    // below is just defensive)
+    // Production's pinned mdBook v0.4.40 renders draft prefix chapters as:
+    // <li class="chapter-item expanded affix "><div>Rust version</div></li>
+    // (verified with that exact binary; no leading "N." since prefix chapters
+    // are never numbered — the digit-stripping regex below is defensive).
     var drafts = document.querySelectorAll(
-      ".sidebar .chapter .chapter-link-wrapper > span"
+      ".sidebar .chapter li.chapter-item > div"
     );
 
-    Array.prototype.forEach.call(drafts, function (spanEntry) {
-      var textContent = spanEntry.textContent || "";
+    Array.prototype.forEach.call(drafts, function (draftEntry) {
+      var textContent = draftEntry.textContent || "";
       var title = textContent.replace(/^\s*\d+\.\s*/, "").trim();
       var spec = ENTRIES[title];
       if (!spec) {
@@ -53,14 +50,14 @@
         var link = document.createElement("a");
         link.href = spec.href;
         link.rel = "noopener";
-        while (spanEntry.firstChild) {
-          link.appendChild(spanEntry.firstChild);
+        while (draftEntry.firstChild) {
+          link.appendChild(draftEntry.firstChild);
         }
-        spanEntry.replaceWith(link);
+        draftEntry.replaceWith(link);
       } else if (spec.placeholder) {
-        spanEntry.classList.add("current-implementation");
-        spanEntry.title = spec.placeholder;
-        spanEntry.setAttribute("aria-label", title + " — " + spec.placeholder);
+        draftEntry.classList.add("current-implementation");
+        draftEntry.title = spec.placeholder;
+        draftEntry.setAttribute("aria-label", title + " — " + spec.placeholder);
       }
     });
   }

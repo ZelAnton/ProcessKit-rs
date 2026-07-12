@@ -51,12 +51,11 @@
     background: rgba(128, 128, 128, 0.09);
 }
 
-/* Current implementation marker (not a navigation target). Selector targets
-   the DOM mdBook v0.5.4 actually renders here for a draft prefix chapter —
-   a plain <span> nested inside .chapter-link-wrapper, not a bare <div> as in
-   the ProcessKit-fSharp reference's (older mdBook version's) markup —
-   verified against this repo's own `mdbook build` output. */
-.sidebar .chapter li.chapter-item > .chapter-link-wrapper > .current-implementation {
+/* Current implementation marker (not a navigation target). Production and
+   the ProcessKit-fSharp reference both pin mdBook v0.4.40 in CI; its verified
+   draft-prefix markup is a bare direct-child <div>, so this selector must
+   target that output rather than v0.5.4's chapter-link-wrapper markup. */
+.sidebar .chapter li.chapter-item > div.current-implementation {
     display: block;
     padding: 0.38em 1em 0.38em 1.1em;
     border-left: 3px solid var(--links);

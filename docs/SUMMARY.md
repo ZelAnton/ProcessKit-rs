@@ -7,7 +7,9 @@
      bullet list) with no chapter files, in the same un-numbered prefix block as
      Overview itself. theme/nav-links.js upgrades "Python wrapper" and ".NET
      version" into live external links; "Rust version" remains a labelled,
-     non-clickable indicator for this current implementation. -->
+     non-clickable indicator for this current implementation. Production and
+     the ProcessKit-fSharp reference both pin mdBook v0.4.40 in CI, whose
+     draft entries are bare <div> elements targeted by the theme. -->
 [Rust version]()
 [Python wrapper]()
 [.NET version]()

@@ -9,7 +9,8 @@ git-repository-url = "https://github.com/ZelAnton/ProcessKit-rs"
 edit-url-template = "https://github.com/ZelAnton/ProcessKit-rs/edit/main/docs/{path}"
 site-url = "/ProcessKit-rs/"
 additional-css = ["theme/custom.css"]
-# nav-links.js upgrades the Python/.NET reserved draft chapters immediately after
-# Overview into external links and marks the Rust entry as the current implementation.
+# nav-links.js upgrades the Python/.NET reserved draft chapters above Overview
+# into external links and marks the Rust entry as the current implementation.
+# CI pins mdBook v0.4.40, whose bare draft-entry <div>s the theme targets;
 # mdBook has no native way to point a sidebar entry at an external URL.
 additional-js = ["theme/nav-links.js"]
