@@ -686,53 +686,103 @@ impl Cgroup {
     }
 
     /// `stats()` parametrized over the `cgroup.procs` reader — see
-    /// [`members_with`](Self::members_with). The per-member membership reconfirm in
-    /// the identity-safe fold re-reads through the *same* seam, so a seam test can
-    /// drive the "member exited + pid recycled before the metrics read" race
-    /// deterministically.
+    /// [`members_with`](Self::members_with) — wired to the real `/proc` identity
+    /// and metrics reads. The fold logic lives in
+    /// [`stats_with_seams`](Self::stats_with_seams) so a seam test can drive the
+    /// whole batch (pin → reconfirm → read) with injected identity/metrics seams
+    /// instead of a real `/proc`.
     #[cfg(feature = "stats")]
     fn stats_with(
         &self,
         read: impl Fn(&Path) -> io::Result<String>,
     ) -> io::Result<ProcessGroupStats> {
+        self.stats_with_seams(
+            read,
+            |p| process_identity(p as u32),
+            |p, id| process_metrics(p as u32, Some(id)),
+        )
+    }
+
+    /// The batched identity-safe stats fold, factored over *all* its seams (the
+    /// `cgroup.procs` reader, the identity capture, the metrics read) so a seam
+    /// test can drive the full pin → reconfirm → read path — and count reads —
+    /// without a real `/proc` or cgroup.
+    ///
+    /// Batched exactly like [`signal_with_seams`](Self::signal_with_seams): pin
+    /// (capture the start-time identity of) **every** member first, then read
+    /// `cgroup.procs` exactly **once**, then reconfirm each pinned member against
+    /// that single snapshot and read its counters gated on the pinned identity
+    /// (`sample_pinned`). The lone reconfirm read lands after every capture, so it
+    /// is after *each* member's pin — the same race-freedom order the per-member
+    /// [`sample_member_identity_safe`] enforces, now at O(1) reads of an
+    /// O(n)-line file instead of O(n).
+    ///
+    /// `active_process_count` reflects the *initial* member list, as before: a
+    /// member that later turns out gone/recycled still counted as live at snapshot
+    /// time. An unreadable membership — the initial read (via `?`) or the single
+    /// reconfirm read — surfaces as `Err` rather than a silently-short sum.
+    #[cfg(feature = "stats")]
+    fn stats_with_seams(
+        &self,
+        read: impl Fn(&Path) -> io::Result<String>,
+        capture_identity: impl Fn(i32) -> Option<ProcIdentity>,
+        read_metrics: impl Fn(i32, ProcIdentity) -> ProcMetrics,
+    ) -> io::Result<ProcessGroupStats> {
         let pids = self.members_with(&read)?;
         let active = pids.len();
+        // 1. Pin (capture the start-time identity of) each member before the
+        //    reconfirm read. A member gone/unreadable before its pin (None) is a
+        //    benign skip that contributes nothing.
+        let mut pinned: Vec<(i32, ProcIdentity)> = Vec::new();
+        for pid in pids {
+            if let Some(id) = capture_identity(pid) {
+                pinned.push((pid, id));
+            }
+        }
         let mut cpu = Duration::ZERO;
         let mut have_cpu = false;
         let mut mem = 0u64;
         let mut have_mem = false;
         let mut last_err = None;
-        for pid in pids {
-            // Pin identity → reconfirm membership → read gated on identity. The
-            // membership reconfirm re-reads `cgroup.procs` through the same seam.
-            let sample = sample_member_identity_safe(
-                pid,
-                |p| process_identity(p as u32),
-                |p| Ok(self.members_with(&read)?.contains(&p)),
-                |p, id| process_metrics(p as u32, Some(id)),
-            );
-            match sample {
-                MemberSample::Folded(m) => {
-                    if let Some(c) = m.cpu_time {
-                        // Saturating: summing many members' CPU time could in
-                        // principle overflow `Duration`; clamp rather than panic.
-                        cpu = cpu.saturating_add(c);
-                        have_cpu = true;
-                    }
-                    if let Some(p) = m.peak_memory_bytes {
-                        mem = mem.saturating_add(p);
-                        have_mem = true;
+        // 2. One reconfirm read for the whole fold — O(1), not O(n) — taken after
+        //    every capture above. Skipped when nothing was pinned (an all-gone or
+        //    empty group), matching the old per-member path.
+        if !pinned.is_empty() {
+            match self.members_with(&read) {
+                Ok(snapshot) => {
+                    let snapshot: std::collections::HashSet<i32> = snapshot.into_iter().collect();
+                    // 3. Reconfirm each pinned member against the single snapshot,
+                    //    then read its counters gated on the pinned identity.
+                    for (pid, id) in pinned {
+                        match sample_pinned(pid, id, |p| Ok(snapshot.contains(&p)), &read_metrics) {
+                            MemberSample::Folded(m) => {
+                                if let Some(c) = m.cpu_time {
+                                    // Saturating: summing many members' CPU time
+                                    // could in principle overflow `Duration`; clamp
+                                    // rather than panic.
+                                    cpu = cpu.saturating_add(c);
+                                    have_cpu = true;
+                                }
+                                if let Some(p) = m.peak_memory_bytes {
+                                    mem = mem.saturating_add(p);
+                                    have_mem = true;
+                                }
+                            }
+                            // Gone, or its pid left the cgroup (possibly recycled
+                            // outside) — contributes nothing, but is not a failure.
+                            MemberSample::Skipped => {}
+                            // A membership reconfirm read failed: the snapshot is
+                            // unreliable. (Infallible against the in-memory snapshot
+                            // here; the reconfirm-read failure is caught below.)
+                            MemberSample::Failed(e) => last_err = Some(e),
+                        }
                     }
                 }
-                // Gone, or its pid left the cgroup (possibly recycled outside) —
-                // contributes nothing, but is not a failure.
-                MemberSample::Skipped => {}
-                // A membership reconfirm read failed: the snapshot is unreliable.
-                MemberSample::Failed(e) => last_err = Some(e),
+                // Reconfirm membership unknown: surface it rather than a
+                // silently-short sum, mirroring the initial `members_with(&read)?`.
+                Err(e) => last_err = Some(e),
             }
         }
-        // Surface an unreadable membership rather than a silently-short sum, mirroring
-        // `signal_with` and the initial `members_with(&read)?` above.
         if let Some(e) = last_err {
             return Err(e);
         }
@@ -766,36 +816,88 @@ impl Cgroup {
     }
 
     /// `signal()` parametrized over the `cgroup.procs` reader — see
-    /// [`members_with`](Self::members_with). A member-list read failure returns
-    /// `Err` (via `?`) *before* the per-pid loop below runs, so no signal is ever
-    /// sent when the membership is unknown.
-    ///
-    /// Each member is delivered through [`deliver_identity_safe`] with the real
-    /// pidfd syscalls: pin the pid with `pidfd_open`, reconfirm it is still a
-    /// member (a second read through the same seam), then `pidfd_send_signal`. The
-    /// reconfirm uses the *same* injected `read`, so a seam test can drive the
-    /// "member exited + pid recycled before send" race deterministically. A
-    /// kernel without pidfd (< 5.3) makes each delivery fail safe with an honest
-    /// error rather than silently downgrading to a racy raw kill.
+    /// [`members_with`](Self::members_with) — wired to the real pidfd syscalls.
+    /// The delivery logic lives in [`signal_with_seams`](Self::signal_with_seams)
+    /// so a seam test can drive the whole batch (pin → reconfirm → send) with
+    /// injected `pidfd_open`/`pidfd_send_signal` instead of touching real
+    /// processes.
     fn signal_with(&self, sig: i32, read: impl Fn(&Path) -> io::Result<String>) -> io::Result<()> {
-        // Reconfirm membership *after* the pidfd pins the identity: re-reads
-        // `cgroup.procs` through the same seam and asks whether the pinned pid is
-        // still listed. If it left, the pidfd may now point at a process outside
-        // the cgroup that recycled the number, so the primitive refuses to send.
-        let still_member =
-            |pid: i32| -> io::Result<bool> { Ok(self.members_with(&read)?.contains(&pid)) };
+        self.signal_with_seams(sig, read, pidfd_open, pidfd_send_signal)
+    }
+
+    /// The batched identity-safe broadcast, factored over *all three* seams (the
+    /// `cgroup.procs` reader plus the pidfd `open`/`send` syscalls) so tests can
+    /// exercise the full pin → reconfirm → send path — and count reads — without a
+    /// real pidfd or cgroup. A member-list read failure returns `Err` (via `?`)
+    /// *before* anything is pinned, so no signal is ever sent when the initial
+    /// membership is unknown.
+    ///
+    /// **Why one read for the whole batch, not one per pid.** The identity-safe
+    /// argument (see [`deliver_identity_safe`]) needs only that each pid's
+    /// membership reconfirm happens *after* that pid was pinned — not that every
+    /// pid gets its own fresh read. So this pins **every** current member first
+    /// (`pin_member`/`pidfd_open`), then reads `cgroup.procs` exactly **once**, and
+    /// reconfirms each pinned pid against that single snapshot before sending
+    /// (`deliver_pinned`/`pidfd_send_signal`). The lone reconfirm read lands strictly
+    /// after every pin, so it is after *each* pid's pin — the race-freedom order is
+    /// preserved verbatim, at O(1) reads of an O(n)-line file instead of O(n).
+    ///
+    /// Holding all N pidfds open across the single read (rather than one at a time)
+    /// is the deliberate cost of that ordering: a recycled pid must not be pinnable
+    /// between the read and the send, so the pin has to precede the shared read.
+    /// A process tree's N is bounded by `pids.max`, well under `RLIMIT_NOFILE`.
+    ///
+    /// A kernel without pidfd (< 5.3) makes `pin_member` fail safe with an honest
+    /// error rather than silently downgrading to a racy raw kill.
+    fn signal_with_seams<H>(
+        &self,
+        sig: i32,
+        read: impl Fn(&Path) -> io::Result<String>,
+        open: impl Fn(i32) -> io::Result<H>,
+        send: impl Fn(&H, i32) -> io::Result<()>,
+    ) -> io::Result<()> {
         let mut last_err = None;
+        // 1. Pin every current member *before* the reconfirm read below, so that
+        //    read lands after each pid's pin (the race-freedom order). A pin that
+        //    races the member's exit (ESRCH) is a benign no-op; a kernel without
+        //    pidfd (ENOSYS) or another error is surfaced.
+        let mut pinned: Vec<(i32, H)> = Vec::new();
         for pid in self.members_with(&read)? {
-            // `still_member` captures only shared references, so it is `Copy` —
-            // passing it by value copies it each iteration rather than moving it.
-            match deliver_identity_safe(pid, sig, pidfd_open, still_member, pidfd_send_signal) {
-                // Delivered to the confirmed member, or a benign race (the pinned
-                // target exited, or the pid left the cgroup before we could send —
-                // never a signal to a recycled pid). Nothing to surface.
-                Delivery::Delivered | Delivery::Skipped => {}
-                // A real delivery failure (EPERM, an unreadable membership, or a
-                // kernel lacking pidfd): keep the last one so it is not lost.
-                Delivery::Failed(err) => last_err = Some(err),
+            match pin_member(pid, &open) {
+                Pinned::Handle(handle) => pinned.push((pid, handle)),
+                Pinned::Gone => {}
+                Pinned::Failed(err) => last_err = Some(err),
+            }
+        }
+        // 2. One reconfirm read of `cgroup.procs` for the whole batch — O(1), not
+        //    O(n) — taken after every pin above. Skipped when nothing was pinned
+        //    (an all-gone or empty group), matching the old per-pid path, which
+        //    only re-read once it had a live pin to reconfirm.
+        if !pinned.is_empty() {
+            match self.members_with(&read) {
+                Ok(snapshot) => {
+                    let snapshot: std::collections::HashSet<i32> = snapshot.into_iter().collect();
+                    // 3. Reconfirm each pinned pid against the single snapshot, then
+                    //    send through its pinned handle. A pid absent from the
+                    //    snapshot left the cgroup (possibly recycled outside) and is
+                    //    skipped without a send.
+                    for (pid, handle) in pinned {
+                        match deliver_pinned(
+                            pid,
+                            sig,
+                            &handle,
+                            |p| Ok(snapshot.contains(&p)),
+                            &send,
+                        ) {
+                            Delivery::Delivered | Delivery::Skipped => {}
+                            Delivery::Failed(err) => last_err = Some(err),
+                        }
+                    }
+                }
+                // Reconfirm membership unknown (an unreadable `cgroup.procs`): fail
+                // safe — never send when we cannot confirm the pinned pids still
+                // belong — and surface the error rather than a false success.
+                Err(err) => last_err = Some(err),
             }
         }
         match last_err {
@@ -982,45 +1084,60 @@ enum Delivery {
     Failed(io::Error),
 }
 
-/// The identity-safe per-member signal primitive, factored over its syscall seam
-/// so the pid-reuse race is testable without real pidfd syscalls. Three steps,
-/// in this order — the order is what makes it race-free:
+/// The outcome of pinning a single member with [`pin_member`] — step 1 of the
+/// identity-safe delivery, split out so the batched broadcast
+/// ([`signal_with_seams`](Cgroup::signal_with_seams)) can pin **every** member
+/// *before* the one shared reconfirm read.
+enum Pinned<H> {
+    /// The exact task currently at `pid` was pinned; its handle drives the send.
+    Handle(H),
+    /// The member was already gone before we could pin it (an `ESRCH` from
+    /// `open`/`pidfd_open`) — the intended end state (gone) already holds, benign,
+    /// exactly like an `ESRCH` from the old raw `kill`. No send, and membership is
+    /// not even consulted.
+    Gone,
+    /// A real pin failure to surface: no pidfd on this kernel (< 5.3) or a seccomp
+    /// filter blocking the syscall (`ENOSYS` → the honest [`pidfd_unsupported`]
+    /// error rather than a racy raw-kill downgrade), or any other `open` error.
+    Failed(io::Error),
+}
+
+/// Step 1 of the identity-safe delivery: **pin** the exact task currently running
+/// as `pid` (a pidfd in production). From here a later send through the returned
+/// handle can only ever reach *this* task — never a process that recycles the
+/// number. Split from the reconfirm+send ([`deliver_pinned`]) so the batched
+/// broadcast pins all members first and then reads `cgroup.procs` once, keeping
+/// the race-freedom order (each reconfirm strictly after that pid's pin) at O(1)
+/// reads instead of O(n).
+fn pin_member<H>(pid: i32, open: impl Fn(i32) -> io::Result<H>) -> Pinned<H> {
+    match open(pid) {
+        Ok(handle) => Pinned::Handle(handle),
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Pinned::Gone,
+        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => Pinned::Failed(pidfd_unsupported()),
+        Err(e) => Pinned::Failed(e),
+    }
+}
+
+/// Steps 2–3 of the identity-safe delivery, against a pid already pinned by
+/// [`pin_member`]: **reconfirm** membership (read *after* the pin — the caller
+/// guarantees that order, whether one read per pid or one shared read for a whole
+/// batch), then **send** through the pinned `handle`.
 ///
-/// 1. `open(pid)` **pins** the exact task currently running as `pid` (a pidfd in
-///    production). From here the delivery in step 3 can only ever reach *this*
-///    task — never a later process that recycles the number.
-/// 2. `still_member(pid)` **reconfirms** membership, read *after* the pin. If the
-///    pin captured a process that had already recycled `pid` (the original member
-///    exited in the snapshot→pin window), that impostor is not a member of our
-///    cgroup, so this reports `false` and we skip without sending.
-/// 3. `send(handle, sig)` delivers through the pinned handle.
-///
-/// Why this never signals a *live* process outside the cgroup: a delivery reaches
-/// a live process only if the pinned task is still alive at step 3, in which case
-/// it has held `pid` continuously since the pin (a live process keeps its pid),
-/// so it *is* the process that step 2 read at `pid` — and step 2 only let us
+/// If the pin captured a process that had already recycled `pid` (the original
+/// member exited in the snapshot→pin window), that impostor is not a member of our
+/// cgroup, so `still_member` reports `false` and we skip without sending. A send
+/// reaches a live process only if the pinned task is still alive, in which case it
+/// has held `pid` continuously since the pin (a live process keeps its pid), so it
+/// *is* the process the reconfirm read at `pid` — and the reconfirm only let us
 /// proceed if that process was a member. If the pinned task instead exited, the
 /// send is a benign `ESRCH`, never a hit on whoever recycled the number.
-fn deliver_identity_safe<H>(
+fn deliver_pinned<H>(
     pid: i32,
     sig: i32,
-    open: impl Fn(i32) -> io::Result<H>,
+    handle: &H,
     still_member: impl Fn(i32) -> io::Result<bool>,
     send: impl Fn(&H, i32) -> io::Result<()>,
 ) -> Delivery {
-    // 1. Pin the exact task currently at `pid`.
-    let handle = match open(pid) {
-        Ok(handle) => handle,
-        // Already gone before we could pin it — the member is the intended end
-        // state (gone). Benign, exactly like an `ESRCH` from the old raw `kill`.
-        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Delivery::Delivered,
-        // No pidfd on this kernel (< 5.3) or a seccomp filter blocks the syscall:
-        // fail safe with an honest error instead of a racy raw-kill downgrade.
-        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
-            return Delivery::Failed(pidfd_unsupported());
-        }
-        Err(e) => return Delivery::Failed(e),
-    };
     // 2. Reconfirm membership *after* pinning.
     match still_member(pid) {
         Ok(true) => {}
@@ -1032,7 +1149,7 @@ fn deliver_identity_safe<H>(
         Err(e) => return Delivery::Failed(e),
     }
     // 3. Deliver through the pinned handle — the pinned task or nothing.
-    match send(&handle, sig) {
+    match send(handle, sig) {
         Ok(()) => Delivery::Delivered,
         // The pinned target exited between the reconfirm and the send. pidfd
         // guarantees this `ESRCH` is *our* target's exit, never a signal that
@@ -1042,6 +1159,31 @@ fn deliver_identity_safe<H>(
         // A real delivery failure (EPERM, …): surface it, never read as success.
         Err(e) => Delivery::Failed(e),
     }
+}
+
+/// The identity-safe per-member signal primitive: pin → reconfirm → send for a
+/// *single* pid, the composition of [`pin_member`] and [`deliver_pinned`]. The
+/// order is what makes it race-free; see those two for the full argument. The
+/// production broadcast batches the pins ahead of one shared reconfirm read
+/// ([`signal_with_seams`](Cgroup::signal_with_seams)); this single-pid composition
+/// keeps the race-freedom logic exercised end-to-end by the seam tests — its only
+/// caller — so it carries `allow(dead_code)` outside `cfg(test)`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn deliver_identity_safe<H>(
+    pid: i32,
+    sig: i32,
+    open: impl Fn(i32) -> io::Result<H>,
+    still_member: impl Fn(i32) -> io::Result<bool>,
+    send: impl Fn(&H, i32) -> io::Result<()>,
+) -> Delivery {
+    // 1. Pin the exact task currently at `pid`.
+    let handle = match pin_member(pid, open) {
+        Pinned::Handle(handle) => handle,
+        Pinned::Gone => return Delivery::Delivered,
+        Pinned::Failed(e) => return Delivery::Failed(e),
+    };
+    // 2–3. Reconfirm membership *after* the pin, then send.
+    deliver_pinned(pid, sig, &handle, still_member, send)
 }
 
 /// The classified outcome of one identity-safe per-member metrics fold (see
@@ -1063,41 +1205,26 @@ enum MemberSample {
     Failed(io::Error),
 }
 
-/// The identity-safe per-member metrics fold, factored over its identity /
-/// membership / metrics seams so the pid-reuse race is testable without a real
-/// `/proc` or cgroup — the stats analogue of [`deliver_identity_safe`]. Three
-/// steps, in this order (the order is what makes it race-free):
+/// Steps 2–3 of the identity-safe fold, against a pid whose start-time identity
+/// `id` was already pinned by `capture_identity`: **reconfirm** membership (read
+/// *after* the pin — the caller guarantees that order, whether one read per pid or
+/// one shared read for a whole batch), then read the counters **gated on the
+/// pinned identity**. The stats analogue of [`deliver_pinned`], split out so the
+/// batched fold ([`stats_with_seams`](Cgroup::stats_with_seams)) can capture every
+/// member's identity *before* the one shared reconfirm read.
 ///
-/// 1. `capture_identity(pid)` **pins** the start-time identity of whoever holds
-///    `pid` now (a `/proc/<pid>/stat` starttime in production). `None` (gone /
-///    unreadable) is a benign skip — there is nobody we can vouch for.
-/// 2. `still_member(pid)` **reconfirms** membership, read *after* the pin. If the
-///    original member exited and the number was reused by a process *outside* the
-///    cgroup, that impostor is not a member, so this reports `false` and we skip
-///    without folding its counters.
-/// 3. `read_metrics(pid, id)` reads the counters **gated on the pinned identity**:
-///    a recycle *after* the reconfirm makes the identity no longer match, so
-///    `process_metrics` returns the all-`None` default (contributing nothing)
-///    rather than a stranger's CPU/RSS.
-///
-/// Why this never folds a live process outside the cgroup: the folded counters
-/// come from step 3, which only returns non-default values while the pid still
-/// carries the identity pinned in step 1 — i.e. the same process that step 2
-/// confirmed was a member. If instead the pinned process exited (recycled or not),
-/// step 3 sees a different-or-absent identity and folds nothing.
+/// A recycle *after* the reconfirm makes the identity no longer match, so
+/// `read_metrics` (production `process_metrics`) returns the all-`None` default
+/// (contributing nothing) rather than a stranger's CPU/RSS. The folded counters
+/// therefore only carry non-default values while the pid still carries the pinned
+/// identity — i.e. the same process the reconfirm confirmed was a member.
 #[cfg(feature = "stats")]
-fn sample_member_identity_safe(
+fn sample_pinned(
     pid: i32,
-    capture_identity: impl Fn(i32) -> Option<ProcIdentity>,
+    id: ProcIdentity,
     still_member: impl Fn(i32) -> io::Result<bool>,
     read_metrics: impl Fn(i32, ProcIdentity) -> ProcMetrics,
 ) -> MemberSample {
-    // 1. Pin the identity of the process currently at `pid`.
-    let Some(id) = capture_identity(pid) else {
-        // Gone (or no readable identity) before we could pin it — the counters
-        // would belong to nobody we can vouch for. Benign skip.
-        return MemberSample::Skipped;
-    };
     // 2. Reconfirm membership *after* pinning.
     match still_member(pid) {
         Ok(true) => {}
@@ -1110,6 +1237,38 @@ fn sample_member_identity_safe(
     }
     // 3. Read the counters gated on the pinned identity.
     MemberSample::Folded(read_metrics(pid, id))
+}
+
+/// The identity-safe per-member metrics fold: pin → reconfirm → read for a
+/// *single* member, the composition of an identity capture and [`sample_pinned`].
+/// The order is what makes it race-free; see [`sample_pinned`] for the argument.
+/// The stats analogue of [`deliver_identity_safe`]. The production fold batches
+/// the identity captures ahead of one shared reconfirm read
+/// ([`stats_with_seams`](Cgroup::stats_with_seams)); this single-member
+/// composition keeps the race-freedom logic exercised end-to-end by the seam
+/// tests.
+///
+/// `capture_identity(pid)` pins the start-time identity of whoever holds `pid` now
+/// (a `/proc/<pid>/stat` starttime in production); `None` (gone / unreadable) is a
+/// benign skip — there is nobody we can vouch for, and membership is not consulted.
+/// The seam tests are its only caller, so it carries `allow(dead_code)` outside
+/// `cfg(test)`.
+#[cfg(feature = "stats")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn sample_member_identity_safe(
+    pid: i32,
+    capture_identity: impl Fn(i32) -> Option<ProcIdentity>,
+    still_member: impl Fn(i32) -> io::Result<bool>,
+    read_metrics: impl Fn(i32, ProcIdentity) -> ProcMetrics,
+) -> MemberSample {
+    // 1. Pin the identity of the process currently at `pid`.
+    let Some(id) = capture_identity(pid) else {
+        // Gone (or no readable identity) before we could pin it — the counters
+        // would belong to nobody we can vouch for. Benign skip.
+        return MemberSample::Skipped;
+    };
+    // 2–3. Reconfirm membership *after* the pin, then read gated on the identity.
+    sample_pinned(pid, id, still_member, read_metrics)
 }
 
 /// The honest error returned when the kernel lacks pidfd support, so per-member
@@ -1556,6 +1715,92 @@ mod cgroup_read_seam_tests {
             _ => panic!("EPERM is a real delivery failure and must surface"),
         }
     }
+
+    // ---- batched broadcast (`signal_with_seams`): one read for the whole tree ----
+    //
+    // The production broadcast pins every member first, reads `cgroup.procs`
+    // exactly once, then reconfirms each pinned pid against that single snapshot.
+    // These drive it through all three injected seams (counting reader + fake
+    // pidfd open/send) so both the O(1) read cost and the pid-reuse skip are
+    // observable without real processes — the anti-regression for this task's
+    // O(n^2)→O(n) change, and proof the single shared snapshot keeps the
+    // per-pid `deliver_identity_safe` safety above.
+
+    #[test]
+    fn signal_with_reads_cgroup_procs_a_constant_number_of_times_for_a_whole_tree() {
+        // A tree of 100 members must still cost a constant number of `cgroup.procs`
+        // reads, not one read per pid: the old per-pid reconfirm made this 1 + n
+        // (101) reads of an n-line file — the O(n^2) work this task removes.
+        let members = (1000..1100)
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reads = Cell::new(0usize);
+        let sends = Cell::new(0usize);
+        cgroup()
+            .signal_with_seams(
+                libc::SIGTERM,
+                |_| {
+                    reads.set(reads.get() + 1);
+                    Ok(members.clone())
+                },
+                |_| Ok(FakeHandle),
+                |_: &FakeHandle, _| {
+                    sends.set(sends.get() + 1);
+                    Ok(())
+                },
+            )
+            .expect("every confirmed member is signalled");
+        assert_eq!(
+            reads.get(),
+            2,
+            "one read for the initial member list + one shared reconfirm read, \
+             independent of the 100 members (was 1 + n before this task)"
+        );
+        assert_eq!(
+            sends.get(),
+            100,
+            "each confirmed member is still signalled exactly once"
+        );
+    }
+
+    #[test]
+    fn signal_with_skips_a_pid_recycled_outside_the_cgroup_via_the_single_snapshot() {
+        // Pid 1002 is pinned from the initial list but has left the cgroup by the
+        // one reconfirm snapshot (recycled by a process outside the tree). The
+        // batched path must skip exactly that pid — never signal it — while still
+        // signalling the rest, so the single shared snapshot preserves the
+        // pin→reconfirm→send pid-reuse safety.
+        struct Handle(i32);
+        let reads = Cell::new(0usize);
+        let signalled = std::cell::RefCell::new(Vec::new());
+        cgroup()
+            .signal_with_seams(
+                libc::SIGTERM,
+                |_| {
+                    reads.set(reads.get() + 1);
+                    // 1st read: initial member list. 2nd read: reconfirm snapshot,
+                    // with 1002 already gone.
+                    Ok(if reads.get() == 1 {
+                        "1001\n1002\n1003\n".to_owned()
+                    } else {
+                        "1001\n1003\n".to_owned()
+                    })
+                },
+                |pid| Ok(Handle(pid)),
+                |h: &Handle, _| {
+                    signalled.borrow_mut().push(h.0);
+                    Ok(())
+                },
+            )
+            .expect("a benign recycle race is not a broadcast failure");
+        assert_eq!(
+            *signalled.borrow(),
+            vec![1001, 1003],
+            "the pid missing from the single reconfirm snapshot is skipped; the rest are signalled"
+        );
+        assert_eq!(reads.get(), 2, "still exactly two reads for the whole batch");
+    }
 }
 
 /// Fail-safe coverage for the two paths that read `cgroup.procs` through the
@@ -1871,10 +2116,18 @@ mod member_sample_tests {
     use std::time::Duration;
 
     use super::{
-        MemberSample, ProcIdentity, process_identity, process_metrics, read_proc_starttime,
+        Cgroup, MemberSample, ProcIdentity, process_identity, process_metrics, read_proc_starttime,
         sample_member_identity_safe,
     };
     use crate::sys::ProcMetrics;
+
+    /// A mock cgroup whose `cgroup.procs` reads come from an injected seam, so the
+    /// batched `stats_with_seams` fold can be driven without a real cgroup mount.
+    fn cgroup() -> Cgroup {
+        Cgroup {
+            path: std::path::PathBuf::from("/mock/processkit"),
+        }
+    }
 
     /// A non-empty reading, so a fold that reaches it is observable.
     fn some_metrics() -> ProcMetrics {
@@ -1984,6 +2237,99 @@ mod member_sample_tests {
             }
             _ => panic!("a confirmed member is folded (with an all-None reading here)"),
         }
+    }
+
+    // ---- batched fold (`stats_with_seams`): one read for the whole tree ----
+    //
+    // The production fold pins (captures the identity of) every member first,
+    // reads `cgroup.procs` exactly once, then reconfirms each pinned member
+    // against that single snapshot. These drive it through all three injected
+    // seams (counting reader + fake identity/metrics) so both the O(1) read cost
+    // and the pid-reuse skip are observable — the stats analogue of
+    // `cgroup_read_seam_tests`' batched-broadcast coverage.
+
+    #[test]
+    fn stats_reads_cgroup_procs_a_constant_number_of_times_for_a_whole_tree() {
+        // A tree of 100 members must still cost a constant number of `cgroup.procs`
+        // reads, not one per pid: the old per-member reconfirm made this 1 + n
+        // (101) reads of an n-line file — the O(n^2) work this task removes.
+        let members = (1000..1100)
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reads = Cell::new(0usize);
+        let stats = cgroup()
+            .stats_with_seams(
+                |_| {
+                    reads.set(reads.get() + 1);
+                    Ok(members.clone())
+                },
+                |_| Some(ProcIdentity::from_raw(1)),
+                |_, _| some_metrics(),
+            )
+            .expect("a fully-confirmed tree folds cleanly");
+        assert_eq!(
+            reads.get(),
+            2,
+            "one read for the initial member list + one shared reconfirm read, \
+             independent of the 100 members (was 1 + n before this task)"
+        );
+        assert_eq!(stats.active_process_count, 100);
+        assert_eq!(
+            stats.total_cpu_time,
+            Some(Duration::from_millis(1000)),
+            "100 members × 10ms folded once each"
+        );
+        assert_eq!(
+            stats.peak_memory_bytes,
+            Some(204_800),
+            "100 members × 2048 bytes folded once each"
+        );
+    }
+
+    #[test]
+    fn stats_skips_a_pid_recycled_outside_the_cgroup_via_the_single_snapshot() {
+        // Pid 1002 is pinned from the initial list but has left the cgroup by the
+        // one reconfirm snapshot (recycled outside). Its counters must not be
+        // folded, while the rest are — the single shared snapshot preserving the
+        // pin→reconfirm→read pid-reuse safety of `sample_member_identity_safe`.
+        let reads = Cell::new(0usize);
+        let folded = std::cell::RefCell::new(Vec::new());
+        let stats = cgroup()
+            .stats_with_seams(
+                |_| {
+                    reads.set(reads.get() + 1);
+                    // 1st read: initial member list. 2nd read: reconfirm snapshot,
+                    // with 1002 already gone.
+                    Ok(if reads.get() == 1 {
+                        "1001\n1002\n1003\n".to_owned()
+                    } else {
+                        "1001\n1003\n".to_owned()
+                    })
+                },
+                |_| Some(ProcIdentity::from_raw(1)),
+                |pid, _| {
+                    folded.borrow_mut().push(pid);
+                    some_metrics()
+                },
+            )
+            .expect("a benign recycle race is not a fold failure");
+        assert_eq!(
+            *folded.borrow(),
+            vec![1001, 1003],
+            "only members present in the single reconfirm snapshot have their counters read"
+        );
+        assert_eq!(
+            stats.active_process_count, 3,
+            "active count reflects the initial member list, before the recycle"
+        );
+        assert_eq!(reads.get(), 2, "still exactly two reads for the whole fold");
+        assert_eq!(
+            stats.total_cpu_time,
+            Some(Duration::from_millis(20)),
+            "only the two confirmed members (1001, 1003) are folded"
+        );
+        assert_eq!(stats.peak_memory_bytes, Some(4096));
     }
 
     // ---- the real /proc identity gate, driven against our own live process ----
