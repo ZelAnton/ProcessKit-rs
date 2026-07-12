@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [2.2.4] - 2026-07-12
+
+### Added
 - Spawn-free program resolution (a *doctor* / preflight check): the crate-level
   `processkit::which(program)`, `Command::resolve_program()`, and
   `CliClient::resolve_program()` resolve a program to its absolute path **without
@@ -2193,7 +2204,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.3...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.4...HEAD
+[2.2.4]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.3...v2.2.4
 [2.2.3]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.2...v2.2.3
 [2.2.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.1...v2.2.2
 [2.2.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.0...v2.2.1
