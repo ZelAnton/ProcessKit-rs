@@ -157,8 +157,10 @@ impl RunningProcess {
             if own_group.is_some() || pid.is_some() {
                 let grace = self.timeout_grace;
                 let signal = self.timeout_signal;
-                // Anchor to spawn time so a late stream call can't re-grant the full limit.
-                let started = self.started;
+                // Anchor to spawn time so a late stream call can't re-grant the
+                // full limit — on `deadline_anchor` (tokio's clock), so virtual
+                // time a prior probe burned is charged against the limit here too.
+                let started = self.deadline_anchor;
                 // Claim the timeout via the shared arbiter so the finisher
                 // classifies `TimedOut` even if the child exits cleanly within the
                 // grace. But winning that CAS is NOT proof the pid is still

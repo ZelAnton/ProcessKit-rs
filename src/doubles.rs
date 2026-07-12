@@ -1856,6 +1856,62 @@ mod tests {
         );
     }
 
+    /// T-109: the handle deadline is anchored on the SAME (tokio) clock the
+    /// watchdog sleeps on, so virtual time a readiness probe already burned is
+    /// charged against the timeout — a late-armed deadline can't re-grant the
+    /// full limit.
+    ///
+    /// A `wait_for_line` probe (which never arms the command timeout) burns 10
+    /// virtual seconds against a 5s timeout, so the deadline is ALREADY past when
+    /// `finish` finally arms it. With the anchor on `std::time::Instant` the
+    /// remaining budget was `limit - started.elapsed()` measured on the *real*
+    /// clock — which barely moves under a paused runtime — so `finish` would sleep
+    /// another full 5 virtual seconds before firing, diverging from a live child
+    /// (whose real clock would have it time out at once). Anchored on
+    /// `tokio::time::Instant`, the 10s the probe burned is visible, the remaining
+    /// budget is zero, and `finish` times out immediately — the hermetic run
+    /// matches the live one. The child is paced far past every deadline so the run
+    /// can end ONLY via the timeout, isolating the anchor's arithmetic from a
+    /// natural reap; the two anchors would agree on the outcome (`TimedOut`), so
+    /// the regression is caught by the *timing* rather than the classification.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_burning_virtual_time_is_charged_against_a_later_armed_deadline() {
+        let runner = ScriptedRunner::new().fallback(
+            // Lines paced 30s apart (60s total) — well past every deadline below,
+            // so the scripted child never exits on its own.
+            Reply::lines(["working", "working"])
+                .with_line_delay(std::time::Duration::from_secs(30)),
+        );
+        let cmd = Command::new("hang").timeout(std::time::Duration::from_secs(5));
+        let mut run = runner.start(&cmd).await.expect("scripted start");
+
+        // Burn 10 virtual seconds in the probe (its full `within`, since no line
+        // ever matches) WITHOUT arming the command timeout.
+        let err = run
+            .wait_for_line(|_| false, std::time::Duration::from_secs(10))
+            .await
+            .expect_err("nothing matches within 10s");
+        assert!(matches!(err, crate::Error::NotReady { .. }), "got {err:?}");
+
+        // With 10 virtual seconds already burned against a 5s timeout, the
+        // deadline is past: `finish` must time out AT ONCE (advancing no further
+        // virtual time), not re-grant a fresh 5s budget measured on the real clock.
+        let armed_at = tokio::time::Instant::now();
+        let finish = run.finish().await.expect("finish");
+        let waited = armed_at.elapsed();
+
+        assert_eq!(
+            finish.outcome,
+            Outcome::TimedOut,
+            "the run can only end via its timeout — the child is paced past every deadline"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "a deadline the probe already overran must fire immediately, not re-grant \
+             a full 5s limit on the real clock: finish burned {waited:?} of virtual time"
+        );
+    }
+
     #[tokio::test]
     async fn scripted_timeout_reply_surfaces_through_start() {
         let runner = ScriptedRunner::new().fallback(Reply::timeout());

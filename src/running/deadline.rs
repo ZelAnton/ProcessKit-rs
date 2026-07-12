@@ -7,7 +7,17 @@
 //! each call site — that part is genuinely different per site.
 
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// `tokio::time::Instant` (not `std::time::Instant`): the remaining budget is
+// computed as `limit - started.elapsed()` and slept out via `tokio::time::sleep`
+// below, so the anchor must share tokio's clock. Otherwise, under a paused
+// runtime, virtual time already burned (e.g. by a readiness probe that advanced
+// the clock without arming this watchdog) would not count against the limit, and
+// a late arm would silently re-grant the full budget — diverging from the live
+// clock the hermetic tests are meant to mirror. `sys::graceful` anchors its own
+// deadline on the same clock for the same reason.
+use tokio::time::Instant;
 
 use super::{TS_PENDING, TS_TIMED_OUT};
 
@@ -15,7 +25,9 @@ use super::{TS_PENDING, TS_TIMED_OUT};
 /// timeout arbiter by CASing `flag` from `TS_PENDING` to `TS_TIMED_OUT`.
 ///
 /// Anchored to `started` (not "now") so a late arm can't re-grant the full
-/// limit. Returns `true` when this call won the race and now owns the
+/// limit. `started` is a [`tokio::time::Instant`] so that remaining-budget
+/// arithmetic shares the clock the `sleep` below runs on (see the import note).
+/// Returns `true` when this call won the race and now owns the
 /// "timed out vs exited" decision (the caller may proceed to kill/teardown
 /// and publish `TimedOut`); `false` when a natural reap already claimed the
 /// arbiter first — the caller must not kill the child or publish its own
