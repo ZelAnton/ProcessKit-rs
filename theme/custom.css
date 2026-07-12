@@ -37,19 +37,6 @@
     transition: background 0.13s ease, border-color 0.13s ease;
 }
 
-/* The local implementation is an indicator, not a navigation destination. */
-.sidebar .chapter .chapter-link-wrapper > .current-implementation {
-    display: block;
-    padding: 0.38em 1em 0.38em 1.1em;
-    border-left: 3px solid var(--links);
-    border-radius: 0 4px 4px 0;
-    background: rgba(128, 128, 128, 0.09);
-    color: var(--sidebar-fg);
-    cursor: default;
-    font-size: 0.97em;
-    font-weight: 600;
-    letter-spacing: 0.01em;
-}
 /* Hover */
 .sidebar .chapter li.chapter-item > a:hover {
     background: rgba(128, 128, 128, 0.12);
@@ -62,6 +49,23 @@
     border-left-color: var(--links);
     font-weight: 600;
     background: rgba(128, 128, 128, 0.09);
+}
+
+/* Current implementation marker (not a navigation target). Selector targets
+   the DOM mdBook v0.5.4 actually renders here for a draft prefix chapter —
+   a plain <span> nested inside .chapter-link-wrapper, not a bare <div> as in
+   the ProcessKit-fSharp reference's (older mdBook version's) markup —
+   verified against this repo's own `mdbook build` output. */
+.sidebar .chapter li.chapter-item > .chapter-link-wrapper > .current-implementation {
+    display: block;
+    padding: 0.38em 1em 0.38em 1.1em;
+    border-left: 3px solid var(--links);
+    border-radius: 0 4px 4px 0;
+    color: var(--links);
+    cursor: default;
+    font-size: 0.97em;
+    font-weight: 600;
+    letter-spacing: 0.01em;
 }
 
 /* Section divider (--- in SUMMARY.md) */
