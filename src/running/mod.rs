@@ -186,7 +186,23 @@ pub struct RunningProcess {
     // Cancel disposition snapshotted at first reap (first-observation wins);
     // `None` = not yet snapshotted.
     cancel_at_exit: Option<bool>,
+    // Wall-clock anchor (real `std::time::Instant`), captured at spawn. Backs the
+    // wall-clock reports ONLY — `elapsed()`, and the `duration()` every capture
+    // verb derives — so those keep reflecting real elapsed time, never tokio's
+    // virtual clock. Deadline arithmetic deliberately does NOT read this; it
+    // reads `deadline_anchor` below.
     started: Instant,
+    // Deadline anchor (`tokio::time::Instant`), captured at spawn alongside
+    // `started`. Every handle-level deadline measures its remaining budget from
+    // HERE — the stream/scripted watchdogs (`arm_stream_deadline` /
+    // `arm_scripted_deadline`), `drive_to_exit_inner`, and `shutdown`'s "already
+    // elapsed?" check — so the `limit - anchor.elapsed()` arithmetic shares the
+    // clock those deadlines `tokio::time::sleep` on. Under a paused runtime this
+    // makes virtual time a readiness probe already burned count against the
+    // limit; anchoring deadlines on `started` (the real clock) would let a late
+    // arm silently re-grant the full limit — the exact hermetic-vs-live drift
+    // `sys::graceful` avoids by the same deliberate split.
+    deadline_anchor: tokio::time::Instant,
     start_time: SystemTime,
     // Recorded truncation/overflow/duration a cassette `start`-replay carries, so
     // a consumed replay reports them instead of the values the re-pumped canned
@@ -301,6 +317,10 @@ impl RunningProcess {
             cancel_task: None,
             cancel_at_exit: None,
             started: Instant::now(),
+            // Captured next to `started` so the two anchors agree at spawn; they
+            // diverge only later, under a paused runtime, where `deadline_anchor`
+            // tracks tokio's virtual clock and `started` the real one.
+            deadline_anchor: tokio::time::Instant::now(),
             start_time: SystemTime::now(),
             scripted_result: None,
         }
@@ -794,8 +814,11 @@ impl RunningProcess {
         // Disable the concurrent `wait()`'s deadline arm to avoid two overlapping
         // graceful teardowns. A timeout that already elapsed still classifies
         // as `TimedOut` — claim the arbiter before nulling `self.timeout`.
+        // Measured off `deadline_anchor` (tokio's clock), not `started`, so this
+        // "already elapsed?" check agrees with `wait_deadline_and_claim` under a
+        // paused runtime instead of reading the real clock the deadline never slept on.
         if let Some(limit) = self.timeout
-            && self.started.elapsed() >= limit
+            && self.deadline_anchor.elapsed() >= limit
         {
             let _ = self.timeout_state.compare_exchange(
                 TS_PENDING,
@@ -1348,7 +1371,10 @@ impl RunningProcess {
         // only `self.backend_wait()` does, keeping the select! borrows disjoint.
         let limit = self.timeout;
         let token = self.cancel_token.clone();
-        let started = self.started;
+        // The deadline anchor is on tokio's clock (see the field docs) so the
+        // `limit - started.elapsed()` in `wait_deadline_and_claim` counts virtual
+        // time already burned before this consuming call armed the deadline.
+        let started = self.deadline_anchor;
         let cancelled = async {
             match &token {
                 Some(token) => token.cancelled().await,
