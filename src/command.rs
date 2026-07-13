@@ -1336,6 +1336,17 @@ impl Command {
         self.stdin.as_ref()
     }
 
+    /// The configured stdin source that will actually be passed to the child.
+    ///
+    /// [`keep_stdin_open`](Self::keep_stdin_open) takes precedence over a source
+    /// set with [`stdin`](Self::stdin); this mirrors the shared
+    /// [`crate::runner::take_stdin_for_run`] launch boundary.
+    pub(crate) fn effective_stdin_source(&self) -> Option<&Stdin> {
+        (!self.keeps_stdin_open())
+            .then_some(())
+            .and(self.stdin_source())
+    }
+
     /// The configured deadline, if any — `Some(d)` for a
     /// [`timeout(d)`](Self::timeout), `None` for both an unset timeout and an
     /// explicitly [`no_timeout`](Self::no_timeout) (neither imposes a deadline).
@@ -2347,6 +2358,25 @@ mod tests {
     use crate::buffer::LineTerminator;
     use std::ffi::OsStr;
     use std::path::PathBuf;
+
+    #[test]
+    fn effective_stdin_source_respects_keep_stdin_open() {
+        let absent = Command::new("tool");
+        assert!(absent.effective_stdin_source().is_none());
+
+        let configured = Command::new("tool").stdin(crate::Stdin::from_string("input"));
+        assert!(configured.stdin_source().is_some());
+        assert!(configured.effective_stdin_source().is_some());
+
+        let open_without_source = Command::new("tool").keep_stdin_open();
+        assert!(open_without_source.effective_stdin_source().is_none());
+
+        let open_with_source = Command::new("tool")
+            .stdin(crate::Stdin::from_string("ignored"))
+            .keep_stdin_open();
+        assert!(open_with_source.stdin_source().is_some());
+        assert!(open_with_source.effective_stdin_source().is_none());
+    }
 
     #[test]
     fn line_terminator_defaults_to_newline_and_setters_target_the_right_streams() {
