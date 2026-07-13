@@ -20,6 +20,28 @@ to a dated version section.
 ### Fixed
 -
 
+## [2.2.5] - 2026-07-13
+
+### Added
+
+- Add Command::effective_stdin_source to unify what stdin the child gets
+
+
+### Changed
+
+- Deduplicate FNV-1a hashing behind cassette match keys
+- Consolidate line-handler panic isolation into a shared helper
+- Deduplicate /proc/<pid>/stat starttime parsing into sys::procfs
+- Align rustdoc for stdout_lines/wait_for/wait_for_port with actual retention
+- Only treat backslash as a path separator in is_bare_name on Windows
+- 
+- Only treat backslash as a path separator in is_bare_name on Unix
+- Align rustdoc for stdout_lines/wait_for/wait_for_port with actual retention
+- Deduplicate /proc/<pid>/stat starttime parsing into sys::procfs
+- Consolidate line-handler panic isolation into a shared helper
+- Deduplicate FNV-1a hashing behind cassette match keys
+- Unify effective stdin source across command, doubles, and cassette
+
 ## [2.2.4] - 2026-07-12
 
 ### Added
@@ -2204,7 +2226,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.4...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.5...HEAD
+[2.2.5]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.4...v2.2.5
 [2.2.4]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.3...v2.2.4
 [2.2.3]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.2...v2.2.3
 [2.2.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.1...v2.2.2
