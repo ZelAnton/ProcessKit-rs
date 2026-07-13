@@ -16,6 +16,22 @@ use crate::buffer::{LineTerminator, OutputBufferPolicy, OverflowMode};
 /// A push-style per-line callback (e.g. tee each line to a log).
 pub(crate) type LineHandler = Arc<dyn Fn(&str) + Send + Sync>;
 
+pub(crate) fn invoke_handler_isolated(handler: &mut Option<LineHandler>, line: &str) {
+    if let Some(h) = handler {
+        // AssertUnwindSafe is sound: the handler is `Fn` (no `&mut` state to
+        // observe torn) and is dropped right after a panic.
+        let invoked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(line)));
+        if invoked.is_err() {
+            *handler = None;
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                target: "processkit",
+                "line handler panicked; disabled for the rest of the run"
+            );
+        }
+    }
+}
+
 /// A shared, bounded line buffer written by a [`pump_lines`] task and read by
 /// the bulk collectors (drain) or the streaming consumer (`next_line`).
 ///
@@ -541,19 +557,7 @@ where
         sink: &SharedLines,
         line: String,
     ) {
-        if let Some(h) = handler {
-            // AssertUnwindSafe is sound: the handler is `Fn` (no `&mut` state to
-            // observe torn) and is dropped right after a panic.
-            let invoked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(&line)));
-            if invoked.is_err() {
-                *handler = None;
-                #[cfg(feature = "tracing")]
-                tracing::warn!(
-                    target: "processkit",
-                    "line handler panicked; disabled for the rest of the run"
-                );
-            }
-        }
+        invoke_handler_isolated(handler, &line);
         if let Some(t) = tee {
             use tokio::io::AsyncWriteExt;
             let mut w = t.lock().await;
