@@ -324,6 +324,16 @@ pub(crate) fn process_identity(pid: u32) -> Option<ProcIdentity> {
 #[cfg(unix)]
 pub(crate) mod pgroup;
 
+// Shared `/proc/<pid>/stat` parser for the Linux/Android backends. The pgroup
+// liveness identity token (`pgroup::read_identity`) and the Linux per-process
+// metrics sampler (`imp::process_metrics` / `process_identity`) all pull the same
+// start-time field from the same file with the same "skip past the comm's last
+// ')', then field 22 = whitespace index 19" convention; centralizing it here keeps
+// that convention from drifting between them and silently weakening the
+// anti-pid-reuse identity gate.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) mod procfs;
+
 // Shared graceful-shutdown escalation driver for both unix backends. Windows'
 // atomic Job kill has no graceful tier, so it is unix-only. `pub(crate)` so the
 // shared-group single-child kill-and-reap primitive ([`graceful::run_pid`]) is

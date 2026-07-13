@@ -784,17 +784,7 @@ pub(crate) fn replay_line_handlers(command: &Command, stdout: &str, stderr: &str
 /// and replay continues. The scripted bulk path must not diverge from the live
 /// path on the very contract the doubles exist to exercise.
 fn invoke_isolated(handler: &mut Option<crate::pump::LineHandler>, line: &str) {
-    if let Some(h) = handler {
-        let invoked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(line)));
-        if invoked.is_err() {
-            *handler = None;
-            #[cfg(feature = "tracing")]
-            tracing::warn!(
-                target: "processkit",
-                "line handler panicked; disabled for the rest of the run"
-            );
-        }
-    }
+    crate::pump::invoke_handler_isolated(handler, line);
 }
 
 #[async_trait::async_trait]

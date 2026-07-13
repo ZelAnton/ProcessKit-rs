@@ -56,13 +56,12 @@ use crate::stats::ProcessGroupStats;
 /// group to fully die first) and negligible for a solo pid.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn read_identity(pid: i32) -> Option<u64> {
-    // `/proc/<pid>/stat` field 22 is the start time in clock ticks since boot.
-    // The comm field (2) may contain spaces/parens, so read after the last ')'
-    // (matching the `process_metrics` parser in `sys/linux.rs`): after it, the
-    // whitespace-split index 0 is field 3 (state), so field 22 is index 19.
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after = stat.rsplit_once(')')?.1;
-    after.split_whitespace().nth(19)?.parse::<u64>().ok()
+    // `/proc/<pid>/stat` field 22 is the start time in clock ticks since boot. The
+    // parse (skip past the comm's last ')', then field 22 = whitespace index 19)
+    // lives in `sys::procfs`, shared with the `process_metrics` identity gate in
+    // `sys/linux.rs` so the two can never disagree. Pids are always positive here,
+    // so the `as u32` cast is value-preserving.
+    super::procfs::read_starttime(pid as u32)
 }
 
 /// The Apple reader — see the identity-token doc above the Linux `read_identity`.

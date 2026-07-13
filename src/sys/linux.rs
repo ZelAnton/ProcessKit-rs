@@ -299,18 +299,15 @@ impl Job {
     }
 }
 
-/// Parse `/proc/<pid>/stat` field 22 (`starttime`, clock ticks since boot) — the
-/// process's start-time identity anchor. `starttime` is fixed at process creation
-/// and distinct for a pid recycled by a later process, so it tells a reused number
-/// apart from the original. The comm field (2) may contain spaces/parens, so parse
-/// after the last ')': its whitespace-split index 0 is field 3 (state), so field 22
-/// is index 19 (matching `read_identity` in `sys/pgroup.rs` and the cpu parser in
-/// [`process_metrics`]). `None` if the process is gone or the stat is unparsable.
+/// Read `/proc/<pid>/stat`'s `starttime` (field 22) — the process's start-time
+/// identity anchor. `starttime` is fixed at process creation and distinct for a pid
+/// recycled by a later process, so it tells a reused number apart from the original.
+/// Thin Linux-side alias for the shared parser (`crate::sys::procfs::read_starttime`)
+/// so this metrics path and the pgroup liveness path (`sys/pgroup.rs::read_identity`)
+/// stay bit-identical. `None` if the process is gone or the stat is unparsable.
 #[cfg(feature = "stats")]
 fn read_proc_starttime(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after = stat.rsplit_once(')')?.1;
-    after.split_whitespace().nth(19)?.parse::<u64>().ok()
+    crate::sys::procfs::read_starttime(pid)
 }
 
 /// Capture the `/proc/<pid>/stat` starttime of the live process at `pid` as its
@@ -324,30 +321,36 @@ pub(crate) fn process_identity(pid: u32) -> Option<ProcIdentity> {
 pub(crate) fn process_metrics(pid: u32, expected: Option<ProcIdentity>) -> ProcMetrics {
     let mut metrics = ProcMetrics::default();
 
-    // CPU *and* the identity anchor both come from /proc/<pid>/stat. The comm field
-    // (2) may contain spaces/parens, so parse after the last ')': its
-    // whitespace-split index 0 is field 3 (state).
+    // CPU *and* the identity anchor both come from a *single* /proc/<pid>/stat read
+    // — one read so the identity gate and the CPU sample describe the same instant
+    // (a second read could straddle a pid recycle). Every field access goes through
+    // the shared `sys::procfs` parser (skip past the comm's last ')', then
+    // whitespace index 0 is field 3), so this parse cannot drift from the pgroup
+    // liveness path in `sys/pgroup.rs::read_identity` that shares it.
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
-    let fields: Option<Vec<&str>> = stat.as_deref().and_then(|s| {
-        let idx = s.rfind(')')?;
-        Some(s[idx + 1..].split_whitespace().collect())
-    });
 
-    // Identity gate: field 22 (`starttime`) is index 19 after ')'. If the caller
-    // captured an identity and this read's starttime differs — or the stat could
-    // not be read/parsed at all — the pid names a *different* process (recycled) or
-    // is gone: return the all-`None` default and do NOT fall through to the memory
-    // read, which would otherwise fold a stranger's RSS. Without a demanded identity
-    // (`None`), every read is best-effort as before, with no weakening.
+    // Identity gate: compare the captured identity against this read's `starttime`
+    // (field 22) via the shared parser. If the caller captured an identity and this
+    // read's starttime differs — or the stat could not be read/parsed at all — the
+    // pid names a *different* process (recycled) or is gone: return the all-`None`
+    // default and do NOT fall through to the memory read, which would otherwise fold
+    // a stranger's RSS. Without a demanded identity (`None`), every read is
+    // best-effort as before, with no weakening.
     if let Some(expected) = expected {
-        let current = fields
-            .as_ref()
-            .and_then(|f| f.get(19))
-            .and_then(|s| s.parse::<u64>().ok());
+        let current = stat
+            .as_deref()
+            .and_then(crate::sys::procfs::starttime_from_stat);
         if current != Some(expected.raw()) {
             return ProcMetrics::default();
         }
     }
+
+    // The whitespace fields after the comm feed the CPU sample below; the shared
+    // `after_comm` cut is the same one the identity gate used above.
+    let fields: Option<Vec<&str>> = stat
+        .as_deref()
+        .and_then(crate::sys::procfs::after_comm)
+        .map(|after| after.split_whitespace().collect());
 
     if let Some(fields) = &fields {
         // After ')', index 0 is field 3 (state); utime=field14→idx11, stime→idx12.
