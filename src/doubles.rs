@@ -969,7 +969,7 @@ impl Invocation {
             cwd: command.working_dir().map(std::path::Path::to_path_buf),
             envs: command.env_overrides().to_vec(),
             has_stdin: command
-                .stdin_source()
+                .effective_stdin_source()
                 .is_some_and(|stdin| !stdin.is_empty()),
         }
     }
@@ -1298,6 +1298,30 @@ impl ProcessRunner for DryRunRunner {
 mod tests {
     use super::*;
     use crate::runner::ProcessRunnerExt;
+
+    #[test]
+    fn invocation_omits_sources_ignored_by_keep_stdin_open() {
+        let commands = [
+            Command::new("tool")
+                .stdin(crate::Stdin::from_string("replayable"))
+                .keep_stdin_open(),
+            Command::new("tool")
+                .stdin(crate::Stdin::from_reader(&b"reader"[..]))
+                .keep_stdin_open(),
+            Command::new("tool")
+                .stdin(crate::Stdin::from_lines(tokio_stream::iter(vec![
+                    "line".to_owned(),
+                ])))
+                .keep_stdin_open(),
+        ];
+
+        for command in commands {
+            assert!(
+                !Invocation::from_command(&command).has_stdin,
+                "keep_stdin_open must hide its ignored source from recorded invocations"
+            );
+        }
+    }
 
     #[test]
     fn invocation_env_assertions() {

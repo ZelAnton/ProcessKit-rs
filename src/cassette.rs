@@ -925,7 +925,7 @@ type Key = (String, Vec<String>, bool, Option<u64>, Option<u64>);
 /// bytes hash their content, a `from_file` source hashes its path.
 fn stdin_digest_of(command: &Command) -> Option<u64> {
     command
-        .stdin_source()
+        .effective_stdin_source()
         .filter(|s| !s.is_empty())
         .map(|s| s.content_digest())
 }
@@ -939,7 +939,10 @@ fn stdin_digest_of(command: &Command) -> Option<u64> {
 /// (`from_bytes`/`from_string`/`from_file`) for a recordable invocation. Applies
 /// to both verbs, `output_string` and `start`.
 fn reject_unrecordable_stdin(command: &Command) -> Result<()> {
-    if command.stdin_source().is_some_and(|s| s.is_one_shot()) {
+    if command
+        .effective_stdin_source()
+        .is_some_and(|s| s.is_one_shot())
+    {
         return Err(Error::Unsupported {
             operation: "cassette record/replay with one-shot streaming stdin \
                         (from_reader/from_lines); use from_bytes/from_string/from_file"
@@ -2068,6 +2071,47 @@ mod tests {
             .await
             .expect_err("replay must reject a one-shot streaming stdin");
         assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn keep_stdin_open_omits_ignored_sources_from_the_digest() {
+        let replayable = Command::new("tool")
+            .stdin(crate::Stdin::from_string("first"))
+            .keep_stdin_open();
+        let one_shot = Command::new("tool")
+            .stdin(crate::Stdin::from_reader(&b"second"[..]))
+            .keep_stdin_open();
+
+        assert_eq!(stdin_digest_of(&replayable), None);
+        assert_eq!(stdin_digest_of(&one_shot), None);
+    }
+
+    #[tokio::test]
+    async fn keep_stdin_open_allows_ignored_one_shot_stdin_in_record_and_replay() {
+        let (_dir, path) = temp_cassette();
+        let recorder =
+            RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::ok("out\n")));
+        let recorded = Command::new("tool")
+            .stdin(crate::Stdin::from_reader(&b"recorded"[..]))
+            .keep_stdin_open();
+        let result = recorder
+            .output_string(&recorded)
+            .await
+            .expect("record accepts an ignored one-shot source");
+        assert_eq!(result.stdout(), "out");
+        recorder.save().expect("save");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load");
+        let replayed = Command::new("tool")
+            .stdin(crate::Stdin::from_lines(tokio_stream::iter(vec![
+                "replayed".to_owned(),
+            ])))
+            .keep_stdin_open();
+        let result = replayer
+            .output_string(&replayed)
+            .await
+            .expect("replay accepts and ignores a different one-shot source");
+        assert_eq!(result.stdout(), "out");
     }
 
     #[tokio::test]
