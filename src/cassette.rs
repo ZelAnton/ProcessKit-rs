@@ -465,44 +465,38 @@ impl MatchPolicy {
         if self.is_empty() {
             return None;
         }
-        // FNV-1a, matching `Stdin::content_digest`'s constants so the two digests
-        // reason alike (stable across releases).
-        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const PRIME: u64 = 0x0000_0100_0000_01b3;
-        fn mix(mut h: u64, bytes: &[u8]) -> u64 {
-            for &b in bytes {
-                h ^= u64::from(b);
-                h = h.wrapping_mul(PRIME);
-            }
-            h
-        }
-        let mut h = OFFSET;
+        // FNV-1a via the shared `digest::Fnv1a` helper — the single home of the
+        // constants + mix loop, shared with `Stdin::content_digest` so the two
+        // cassette-key digests reason alike (a constant changed in only one place
+        // would silently invalidate recorded cassettes). Stable across releases,
+        // unlike `DefaultHasher`.
+        let mut h = crate::digest::Fnv1a::new();
         if self.match_cwd {
             // Tag the field so an empty-cwd policy can't alias a same-length env
             // digest; `cwd` is lossless bytes (also stored verbatim on the entry).
-            h = mix(h, b"cwd\0");
+            h.mix(b"cwd\0");
             match &invocation.cwd {
                 Some(cwd) => {
-                    h = mix(h, &[1]);
-                    h = mix(h, cwd.as_os_str().as_encoded_bytes());
+                    h.mix(&[1]);
+                    h.mix(cwd.as_os_str().as_encoded_bytes());
                 }
-                None => h = mix(h, &[0]),
+                None => h.mix(&[0]),
             }
         }
         for name in &self.env_names {
-            h = mix(h, b"env\0");
-            h = mix(h, name.as_bytes());
-            h = mix(h, &[0]); // name/value boundary
+            h.mix(b"env\0");
+            h.mix(name.as_bytes());
+            h.mix(&[0]); // name/value boundary
             match invocation.env(name) {
                 Some(Some(value)) => {
-                    h = mix(h, &[1]); // set to a value
-                    h = mix(h, value.as_encoded_bytes());
+                    h.mix(&[1]); // set to a value
+                    h.mix(value.as_encoded_bytes());
                 }
-                Some(None) => h = mix(h, &[2]), // explicitly removed
-                None => h = mix(h, &[0]),       // untouched / inherited
+                Some(None) => h.mix(&[2]), // explicitly removed
+                None => h.mix(&[0]),       // untouched / inherited
             }
         }
-        Some(h)
+        Some(h.finish())
     }
 }
 
@@ -3208,5 +3202,45 @@ mod tests {
             .await
             .expect("policy name order must not affect the key");
         assert_eq!(out, "ok");
+    }
+
+    #[test]
+    fn digest_of_is_stable_byte_for_byte() {
+        // Pin the exact FNV-1a output of `MatchPolicy::digest_of` for fixed
+        // policies + invocations. The expected values are computed independently (a
+        // standalone FNV-1a-64 over the exact byte sequence the method folds), NOT
+        // copied out of the code — so they catch any drift in the constants, the
+        // mix loop, or the field-tag order, which would silently invalidate every
+        // already-recorded cassette (a baffling `CassetteMiss`, not a build error).
+
+        // Env policy with the var set: folds b"env\0" ++ b"MODE" ++ [0] ++ [1] ++
+        // b"fast" onto the offset basis.
+        let env_policy = MatchPolicy {
+            match_cwd: false,
+            env_names: vec!["MODE".to_owned()],
+        };
+        let set = Invocation::from_command(&Command::new("tool").env("MODE", "fast"));
+        assert_eq!(
+            env_policy.digest_of(&set),
+            Some(0xb9f4_ba02_d660_e742),
+            "env-value digest changed — invalidates every recorded cassette"
+        );
+
+        // cwd policy with an ASCII cwd (identical OsStr bytes on every platform):
+        // folds b"cwd\0" ++ [1] ++ b"/work/a".
+        let cwd_policy = MatchPolicy {
+            match_cwd: true,
+            env_names: Vec::new(),
+        };
+        let in_dir = Invocation::from_command(&Command::new("tool").current_dir("/work/a"));
+        assert_eq!(
+            cwd_policy.digest_of(&in_dir),
+            Some(0x1926_ae14_ca39_bd8e),
+            "cwd digest changed — invalidates every recorded cassette"
+        );
+
+        // An empty policy keys to `None` (no `match_digest` on the entry) — the
+        // portable default is unchanged by the refactor.
+        assert_eq!(MatchPolicy::default().digest_of(&set), None);
     }
 }

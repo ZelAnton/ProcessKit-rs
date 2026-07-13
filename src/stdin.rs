@@ -149,22 +149,20 @@ impl Stdin {
     /// that discriminant would collide distinct payloads.
     #[cfg(feature = "record")]
     pub(crate) fn content_digest(&self) -> u64 {
-        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const PRIME: u64 = 0x0000_0100_0000_01b3;
-        fn mix(mut h: u64, bytes: &[u8]) -> u64 {
-            for &b in bytes {
-                h ^= b as u64;
-                h = h.wrapping_mul(PRIME);
-            }
-            h
-        }
         let (tag, payload): (u8, &[u8]) = match &self.0 {
             Source::Empty => (0, &[]),
             Source::Bytes(b) => (1, b),
             Source::File(p) => (2, p.as_os_str().as_encoded_bytes()),
             Source::Reader(_) | Source::Lines(_) => (3, b"<stream>"),
         };
-        mix(mix(OFFSET, &[tag]), payload)
+        // FNV-1a via the shared `digest::Fnv1a` helper — the single home of the
+        // constants + mix loop, shared with `MatchPolicy::digest_of` so the two
+        // cassette-key digests reason alike and can't drift apart. A leading tag
+        // byte keeps distinct source kinds from colliding.
+        let mut h = crate::digest::Fnv1a::new();
+        h.mix(&[tag]);
+        h.mix(payload);
+        h.finish()
     }
 
     /// The [`Stdio`] to configure on the spawn: `null` for [`Self::empty`] (EOF
@@ -657,6 +655,41 @@ mod tests {
             written(&stdin).await,
             b"abc",
             "a re-runnable source replays on every run"
+        );
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn content_digest_is_stable_byte_for_byte() {
+        // Pin the exact FNV-1a output of `content_digest` for every source kind.
+        // The expected values are computed independently (a standalone FNV-1a-64
+        // over the `[tag] ++ payload` bytes the method folds), NOT read back from
+        // the code — so any drift in the shared constants/mix loop that would
+        // silently invalidate recorded cassettes fails here as a test error rather
+        // than a baffling `CassetteMiss` at replay.
+        assert_eq!(Stdin::empty().content_digest(), 0xaf63_bd4c_8601_b7df);
+        // A byte source and a string source with identical content hash alike.
+        assert_eq!(
+            Stdin::from_bytes(b"processkit".to_vec()).content_digest(),
+            0xdc0e_2747_f7ea_4273
+        );
+        assert_eq!(
+            Stdin::from_string("processkit").content_digest(),
+            0xdc0e_2747_f7ea_4273
+        );
+        // A file source hashes its *path* bytes (ASCII → identical on every OS).
+        assert_eq!(
+            Stdin::from_file("config.txt").content_digest(),
+            0xad5c_44ea_a11d_2661
+        );
+        // Both one-shot streaming kinds hash the same `<stream>` discriminant.
+        assert_eq!(
+            Stdin::from_reader(&b"whatever"[..]).content_digest(),
+            0x5d5d_73d4_4a22_6b64
+        );
+        assert_eq!(
+            Stdin::from_lines(tokio_stream::iter(vec!["x".to_owned()])).content_digest(),
+            0x5d5d_73d4_4a22_6b64
         );
     }
 

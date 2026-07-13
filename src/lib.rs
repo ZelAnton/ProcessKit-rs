@@ -152,6 +152,11 @@ mod buffer;
 mod cassette;
 mod client;
 mod command;
+// FNV-1a helper shared by the two cassette-key digests (`Stdin::content_digest`
+// and `MatchPolicy::digest_of`), so their constants + mix loop have one home and
+// can't drift apart. Both call sites live under `record`, so the helper does too.
+#[cfg(feature = "record")]
+mod digest;
 // Compiles docs/*.md + README.md's fenced Rust blocks as doctests under
 // `--all-features` (see the module's own doc comment). Under `cfg(test)`, the
 // sanity test stays available to ordinary `cargo test` with any feature
