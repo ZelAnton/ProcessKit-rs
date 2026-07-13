@@ -881,6 +881,23 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_unix_backslash_name_reports_path_search() {
+        let command = Command::new(r"processkit-definitely-missing\backslash-T113");
+        let err = JobRunner::new()
+            .start(&command)
+            .await
+            .expect_err("the deliberately absent program must not launch");
+
+        match err {
+            Error::NotFound {
+                searched: Some(_), ..
+            } => {}
+            other => panic!("a Unix backslash name must be enriched as bare: {other:?}"),
+        }
+    }
+
     /// A fake runner that reports a non-zero exit for its first `fail_times`
     /// calls, then a success — and counts total calls. No real process.
     struct Flaky {
