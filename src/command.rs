@@ -2056,7 +2056,11 @@ pub(crate) fn is_bare_name(program: &OsStr) -> bool {
     // components() normalizes trailing separators away ("git/" → Normal("git")),
     // so check raw bytes first: any separator makes it path-ish.
     let bytes = program.as_encoded_bytes();
-    if bytes.contains(&b'/') || bytes.contains(&b'\\') {
+    if bytes.contains(&b'/') {
+        return false;
+    }
+    #[cfg(windows)]
+    if bytes.contains(&b'\\') {
         return false;
     }
     let mut comps = Path::new(program).components();
@@ -2205,7 +2209,11 @@ pub(crate) fn resolve_program(
 fn probe_path_form(program: &OsStr) -> Option<PathBuf> {
     // A trailing separator names a directory, never an executable file.
     let bytes = program.as_encoded_bytes();
-    if matches!(bytes.last(), Some(b'/') | Some(b'\\')) {
+    if matches!(bytes.last(), Some(b'/')) {
+        return None;
+    }
+    #[cfg(windows)]
+    if matches!(bytes.last(), Some(b'\\')) {
         return None;
     }
     let path = Path::new(program);
@@ -2592,7 +2600,10 @@ mod tests {
         assert!(!is_bare_name(OsStr::new("C:\\git.exe")));
         // A trailing separator is path-ish (Path normalizes it away).
         assert!(!is_bare_name(OsStr::new("git/")));
+        #[cfg(windows)]
         assert!(!is_bare_name(OsStr::new("git\\")));
+        #[cfg(not(windows))]
+        assert!(is_bare_name(OsStr::new("git\\")));
     }
 
     #[cfg(not(unix))]
@@ -2877,6 +2888,39 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn backslash_program_name_resolves_as_bare_across_preflight_and_build() {
+        let program = r"we\ird";
+        let dir = tempfile::tempdir().expect("temp dir");
+        let expected = write_executable(dir.path(), program);
+        let path = std::env::join_paths([dir.path()]).expect("single PATH entry");
+
+        assert!(
+            super::is_bare_name(OsStr::new(program)),
+            "a backslash is an ordinary filename character on Unix"
+        );
+
+        let resolved = Command::new(program)
+            .env("PATH", &path)
+            .resolve_program()
+            .expect("Command preflight must search PATH for a backslash name");
+        assert_eq!(resolved, expected);
+
+        let client_resolved = crate::CliClient::new(program)
+            .default_env("PATH", &path)
+            .resolve_program()
+            .expect("CliClient preflight must search PATH for a backslash name");
+        assert_eq!(client_resolved, expected);
+
+        let built = Command::new(program).prefer_local(dir.path()).build_tokio();
+        assert_eq!(
+            built.as_std().get_program(),
+            expected.as_os_str(),
+            "prefer_local must substitute a Unix backslash name before spawn"
+        );
+    }
+
     // R-01: a relative `prefer_local` directory (the form used throughout the
     // docs, e.g. `"./node_modules/.bin"`) must resolve to an *absolute* program
     // path — one that a later `.current_dir(other)` on the same command cannot
@@ -3088,6 +3132,19 @@ mod tests {
         assert_eq!(super::probe_path_form(OsStr::new("tool/")), None);
         #[cfg(windows)]
         assert_eq!(super::probe_path_form(OsStr::new("tool\\")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_path_form_accepts_a_trailing_backslash_in_a_unix_filename() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let expected = write_executable(dir.path(), "tool\\");
+
+        assert_eq!(
+            super::probe_path_form(expected.as_os_str()),
+            Some(expected),
+            "a trailing backslash is not a directory marker on Unix"
+        );
     }
 
     // T-101: the effective child `PATH` — what preflight resolves against when a
