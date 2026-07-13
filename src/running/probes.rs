@@ -103,12 +103,16 @@ impl RunningProcess {
     ///
     /// The check is any async predicate — an HTTP health endpoint, a file
     /// appearing, a database accepting connections. Piped stdout/stderr are
-    /// background-drained (and discarded) for the duration of the poll — like
-    /// [`wait_for_line`](Self::wait_for_line), but the caller never sees the
-    /// lines — so a child with a large startup burst can't stall in `write()`
-    /// on a full OS pipe buffer (~64 KiB on Linux) while this probe is
-    /// polling. It still composes with any later consumption
-    /// ([`wait`](Self::wait), [`output_string`](Self::output_string), …), which
+    /// background-drained and retained under the caller's
+    /// [`OutputBufferPolicy`](crate::OutputBufferPolicy) for the duration of the
+    /// poll — like [`wait_for_line`](Self::wait_for_line), but the caller never
+    /// sees the lines during the probe — so a child with a large startup burst
+    /// can't stall in `write()` on a full OS pipe buffer (~64 KiB on Linux).
+    /// Retention lets later consumption such as
+    /// [`output_string`](Self::output_string) collect the same drained output;
+    /// an existing [`stdout_lines`](Self::stdout_lines) /
+    /// [`output_events`](Self::output_events) consumer also reads that sink. It
+    /// still composes with [`wait`](Self::wait) and other later consumers that
     /// pick up the same background-drained sink — but *not* with
     /// [`output_bytes`](Self::output_bytes) or a fresh
     /// [`stdout_lines`](Self::stdout_lines) / [`output_events`](Self::output_events)
@@ -146,10 +150,11 @@ impl RunningProcess {
     ///
     /// One connect attempt per ~50 ms tick (each attempt itself bounded so a
     /// stalled connect can't overrun the deadline); the probe connection is
-    /// dropped as soon as it succeeds. Piped stdout/stderr are
-    /// background-drained (and discarded) for the duration of the poll, like
-    /// [`wait_for`](Self::wait_for) — see its doc for what that does and
-    /// doesn't compose with. A failed probe does not kill the child.
+    /// dropped as soon as it succeeds. Piped stdout/stderr are background-drained
+    /// and retained under the caller's
+    /// [`OutputBufferPolicy`](crate::OutputBufferPolicy), like
+    /// [`wait_for`](Self::wait_for) — see its documentation for the same retention
+    /// and composition semantics. A failed probe does not kill the child.
     ///
     /// # Errors
     ///

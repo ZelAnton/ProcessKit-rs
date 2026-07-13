@@ -63,10 +63,14 @@ pub struct Finished {
 impl RunningProcess {
     /// Stream the child's standard output line by line. Call this **once**.
     ///
-    /// Standard error is drained in the background and discarded — use
-    /// [`output_string`](Self::output_string) when you need both. The command's
-    /// [`timeout`](crate::Command::timeout) bounds the stream: at the deadline the
-    /// process tree is killed, pipes close, and a following
+    /// Standard error is drained in the background under the caller's
+    /// [`OutputBufferPolicy`](crate::OutputBufferPolicy) (unbounded by default)
+    /// and retained in [`Finished::stderr`] for inspection after
+    /// [`finish`](Self::finish). With the default policy, stderr from a long-lived
+    /// or chatty process grows in memory until `finish`; configure a bounded policy
+    /// when that is a concern. The command's [`timeout`](crate::Command::timeout)
+    /// bounds the stream: at the deadline the process tree is killed, pipes close,
+    /// and a following
     /// [`finish`](Self::finish) reports [`Outcome::TimedOut`](crate::Outcome::TimedOut)
     /// even if the child caught the signal and exited cleanly within the grace.
     ///
