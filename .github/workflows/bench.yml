@@ -56,7 +56,7 @@ jobs:
       # job log alone -- upload it so a regression can be inspected visually,
       # not just read off the printed percentage change.
       - name: Upload criterion report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: criterion-pump-report
           path: target/criterion
