@@ -41,7 +41,7 @@ jobs:
       # actions/cache then always saves the freshly written baseline at the
       # end of the job, and the next run picks it up via `restore-keys`,
       # keeping the entry rolling forward run over run.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: target/criterion
           key: criterion-pump-${{ github.run_id }}
