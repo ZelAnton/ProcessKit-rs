@@ -622,17 +622,12 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// run and can't be replayed into a restart — a one-shot streaming source
     /// ([`Stdin::from_reader`](crate::Stdin::from_reader)/
     /// [`Stdin::from_lines`](crate::Stdin::from_lines)), and only when it is
-    /// actually going to be fed to the child at all
-    /// ([`keep_stdin_open`](Command::keep_stdin_open) hands the pipe to the
-    /// caller instead, ignoring any configured source). Mirrors the
-    /// equivalent check `runner::retrying` uses to skip retrying a one-shot
-    /// command.
+    /// actually going to be fed to the child at all, as determined by
+    /// [`effective_stdin_source`](Command::effective_stdin_source).
     fn has_unusable_one_shot_stdin(&self) -> bool {
-        !self.command.keeps_stdin_open()
-            && self
-                .command
-                .stdin_source()
-                .is_some_and(crate::Stdin::is_one_shot)
+        self.command
+            .effective_stdin_source()
+            .is_some_and(crate::Stdin::is_one_shot)
     }
 
     /// The typed, early error for [`may_restart`](Self::may_restart) +

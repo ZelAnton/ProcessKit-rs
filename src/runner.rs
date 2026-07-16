@@ -449,10 +449,9 @@ where
 {
     let config = command.retry_config();
     // A one-shot streaming stdin is consumed by the first attempt; run once.
-    let one_shot_stdin = !command.keeps_stdin_open()
-        && command
-            .stdin_source()
-            .is_some_and(crate::Stdin::is_one_shot);
+    let one_shot_stdin = command
+        .effective_stdin_source()
+        .is_some_and(crate::Stdin::is_one_shot);
     let mut tries = 0u32;
     loop {
         tries += 1;
