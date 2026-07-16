@@ -367,3 +367,325 @@ pub(crate) fn clamp_dropoldest_tail(buf: &mut Vec<u8>, cap: Option<usize>, mode:
         buf.drain(..excess);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flags() -> (AtomicBool, AtomicBool) {
+        (AtomicBool::new(false), AtomicBool::new(false))
+    }
+
+    // ---- OverflowMode::Error: `buf.len() + chunk.len() > cap`, `room = cap.saturating_sub(buf.len())` ----
+
+    #[test]
+    fn error_mode_under_cap_does_not_overflow() {
+        let (overflowed, truncated) = flags();
+        let mut buf = Vec::new();
+        push_capped_bytes(
+            &mut buf,
+            b"abcd",
+            Some(5),
+            OverflowMode::Error,
+            &overflowed,
+            &truncated,
+        );
+        assert_eq!(buf, b"abcd", "cap-1 input must fit whole");
+        assert!(!overflowed.load(Ordering::Relaxed));
+        assert!(!truncated.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn error_mode_exactly_at_cap_does_not_overflow() {
+        let (overflowed, truncated) = flags();
+        let mut buf = Vec::new();
+        push_capped_bytes(
+            &mut buf,
+            b"abcde",
+            Some(5),
+            OverflowMode::Error,
+            &overflowed,
+            &truncated,
+        );
+        assert_eq!(buf, b"abcde");
+        assert!(
+            !overflowed.load(Ordering::Relaxed),
+            "buf.len() + chunk.len() == cap must not overflow"
+        );
+        assert!(!truncated.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn error_mode_one_over_cap_overflows_and_writes_partial_room() {
+        let (overflowed, truncated) = flags();
+        let mut buf = Vec::new();
+        push_capped_bytes(
+            &mut buf,
+            b"abcdef",
+            Some(5),
+            OverflowMode::Error,
+            &overflowed,
+            &truncated,
+        );
+        assert_eq!(
+            buf, b"abcde",
+            "only room = cap - buf.len() bytes are retained"
+        );
+        assert!(overflowed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn error_mode_partial_room_when_buffer_already_holds_some_bytes() {
+        let (overflowed, truncated) = flags();
+        let mut buf = b"ab".to_vec();
+        push_capped_bytes(
+            &mut buf,
+            b"cdefgh",
+            Some(5),
+            OverflowMode::Error,
+            &overflowed,
+            &truncated,
+        );
+        // room = cap.saturating_sub(buf.len()) = 5 - 2 = 3
+        assert_eq!(buf, b"abcde");
+        assert!(overflowed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn error_mode_zero_room_appends_nothing_further() {
+        let (overflowed, truncated) = flags();
+        let mut buf = b"abcde".to_vec();
+        push_capped_bytes(
+            &mut buf,
+            b"f",
+            Some(5),
+            OverflowMode::Error,
+            &overflowed,
+            &truncated,
+        );
+        assert_eq!(buf, b"abcde", "room is 0 once already at cap");
+        assert!(overflowed.load(Ordering::Relaxed));
+    }
+
+    // ---- OverflowMode::DropNewest: `take < chunk.len()` drives `truncated` ----
+
+    #[test]
+    fn drop_newest_under_cap_does_not_truncate() {
+        let (overflowed, truncated) = flags();
+        let mut buf = Vec::new();
+        push_capped_bytes(
+            &mut buf,
+            b"abcd",
+            Some(5),
+            OverflowMode::DropNewest,
+            &overflowed,
+            &truncated,
+        );
+        assert_eq!(buf, b"abcd");
+        assert!(!truncated.load(Ordering::Relaxed));
+        assert!(!overflowed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn drop_newest_exact_fit_does_not_truncate() {
+        let (overflowed, truncated) = flags();
+        let mut buf = Vec::new();
+        push_capped_bytes(
+            &mut buf,
+            b"abcde",
+            Some(5),
+            OverflowMode::DropNewest,
+            &overflowed,
+            &truncated,
+        );
+        assert_eq!(buf, b"abcde");
+        assert!(
+            !truncated.load(Ordering::Relaxed),
+            "take == chunk.len() must not truncate"
+        );
+    }
+
+    #[test]
+    fn drop_newest_one_over_cap_truncates_and_keeps_head() {
+        let (overflowed, truncated) = flags();
+        let mut buf = Vec::new();
+        push_capped_bytes(
+            &mut buf,
+            b"abcdef",
+            Some(5),
+            OverflowMode::DropNewest,
+            &overflowed,
+            &truncated,
+        );
+        assert_eq!(buf, b"abcde");
+        assert!(
+            truncated.load(Ordering::Relaxed),
+            "take < chunk.len() must truncate"
+        );
+    }
+
+    #[test]
+    fn drop_newest_zero_room_still_truncates() {
+        let (overflowed, truncated) = flags();
+        let mut buf = b"abcde".to_vec();
+        push_capped_bytes(
+            &mut buf,
+            b"f",
+            Some(5),
+            OverflowMode::DropNewest,
+            &overflowed,
+            &truncated,
+        );
+        assert_eq!(buf, b"abcde");
+        assert!(truncated.load(Ordering::Relaxed));
+    }
+
+    // ---- OverflowMode::DropOldest: `buf.len() > cap`, amortized compaction at
+    // `buf.len() > cap.saturating_mul(2)`, exact `excess = buf.len() - cap` ----
+
+    #[test]
+    fn drop_oldest_under_cap_does_not_truncate() {
+        let (overflowed, truncated) = flags();
+        let mut buf = Vec::new();
+        push_capped_bytes(
+            &mut buf,
+            b"abcd",
+            Some(5),
+            OverflowMode::DropOldest,
+            &overflowed,
+            &truncated,
+        );
+        assert_eq!(buf, b"abcd");
+        assert!(!truncated.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn drop_oldest_exactly_at_cap_does_not_truncate() {
+        let (overflowed, truncated) = flags();
+        let mut buf = Vec::new();
+        push_capped_bytes(
+            &mut buf,
+            b"abcde",
+            Some(5),
+            OverflowMode::DropOldest,
+            &overflowed,
+            &truncated,
+        );
+        assert_eq!(buf, b"abcde");
+        assert!(
+            !truncated.load(Ordering::Relaxed),
+            "buf.len() == cap must not truncate"
+        );
+    }
+
+    #[test]
+    fn drop_oldest_one_over_cap_truncates_without_compacting() {
+        let (overflowed, truncated) = flags();
+        let mut buf = Vec::new();
+        push_capped_bytes(
+            &mut buf,
+            b"abcdef",
+            Some(5),
+            OverflowMode::DropOldest,
+            &overflowed,
+            &truncated,
+        );
+        assert_eq!(
+            buf, b"abcdef",
+            "below the 2*cap compaction threshold, the tail is left as-is"
+        );
+        assert!(truncated.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn drop_oldest_exactly_at_double_cap_does_not_compact() {
+        let (overflowed, truncated) = flags();
+        let mut buf = Vec::new();
+        push_capped_bytes(
+            &mut buf,
+            b"0123456789",
+            Some(5),
+            OverflowMode::DropOldest,
+            &overflowed,
+            &truncated,
+        );
+        assert_eq!(
+            buf, b"0123456789",
+            "buf.len() == 2*cap must not trigger compaction"
+        );
+        assert!(truncated.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn drop_oldest_one_over_double_cap_compacts_to_exact_excess() {
+        let (overflowed, truncated) = flags();
+        let mut buf = Vec::new();
+        push_capped_bytes(
+            &mut buf,
+            b"abcdefghijk",
+            Some(5),
+            OverflowMode::DropOldest,
+            &overflowed,
+            &truncated,
+        );
+        // excess = 11 - 5 = 6; the first 6 bytes are drained, leaving the last 5.
+        assert_eq!(buf, b"ghijk");
+        assert!(truncated.load(Ordering::Relaxed));
+    }
+
+    // ---- clamp_dropoldest_tail: `buf.len() > cap`, exact `excess = buf.len() - cap` ----
+
+    #[test]
+    fn clamp_dropoldest_tail_under_cap_is_unchanged() {
+        let mut buf = b"abcd".to_vec();
+        clamp_dropoldest_tail(&mut buf, Some(5), OverflowMode::DropOldest);
+        assert_eq!(buf, b"abcd");
+    }
+
+    #[test]
+    fn clamp_dropoldest_tail_exactly_at_cap_is_unchanged() {
+        let mut buf = b"abcde".to_vec();
+        clamp_dropoldest_tail(&mut buf, Some(5), OverflowMode::DropOldest);
+        assert_eq!(buf, b"abcde", "buf.len() == cap must not be clamped");
+    }
+
+    #[test]
+    fn clamp_dropoldest_tail_one_over_cap_drops_exact_excess() {
+        let mut buf = b"abcdef".to_vec();
+        clamp_dropoldest_tail(&mut buf, Some(5), OverflowMode::DropOldest);
+        assert_eq!(
+            buf, b"bcdef",
+            "excess = 6 - 5 = 1 byte dropped from the front"
+        );
+    }
+
+    #[test]
+    fn clamp_dropoldest_tail_at_double_cap_drops_exact_excess() {
+        let mut buf = b"0123456789".to_vec();
+        clamp_dropoldest_tail(&mut buf, Some(5), OverflowMode::DropOldest);
+        // excess = 10 - 5 = 5
+        assert_eq!(buf, b"56789");
+    }
+
+    #[test]
+    fn clamp_dropoldest_tail_well_over_cap_drops_exact_excess() {
+        let mut buf = b"abcdefghijk".to_vec();
+        clamp_dropoldest_tail(&mut buf, Some(5), OverflowMode::DropOldest);
+        // excess = 11 - 5 = 6
+        assert_eq!(buf, b"ghijk");
+    }
+
+    #[test]
+    fn clamp_dropoldest_tail_ignores_other_modes() {
+        let mut buf = b"abcdefghijk".to_vec();
+        clamp_dropoldest_tail(&mut buf, Some(5), OverflowMode::DropNewest);
+        assert_eq!(buf, b"abcdefghijk", "only DropOldest is clamped");
+    }
+
+    #[test]
+    fn clamp_dropoldest_tail_no_cap_is_a_no_op() {
+        let mut buf = b"abcdefghijk".to_vec();
+        clamp_dropoldest_tail(&mut buf, None, OverflowMode::DropOldest);
+        assert_eq!(buf, b"abcdefghijk");
+    }
+}

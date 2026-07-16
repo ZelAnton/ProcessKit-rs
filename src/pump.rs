@@ -2306,6 +2306,299 @@ mod tests {
         );
     }
 
+    // --- Capacity-ceiling boundary pins (T-120) ------------------------------
+    //
+    // These pin the exact `>`/`<`/`+`/`<=` boundaries in the retention logic
+    // (`Inner::over_backlog`, `Inner::would_fit`, the `SharedLines::push`
+    // `OverflowMode::Error` branch) and the pump's over-cap skip accounting
+    // (`skip_over_cap_len`, the enter-skip guard, the byte-cursor arithmetic)
+    // plus the `ChunkedReader` partial-read path — cases the coarse-grained
+    // tests above pass either side of the boundary and so left unpinned.
+
+    #[tokio::test]
+    async fn over_backlog_byte_ceiling_retains_at_cap_and_evicts_past_it() {
+        // DropOldest with a byte cap and no line cap: a retained byte sum sitting
+        // *exactly* on `max_bytes` is within budget (not "over"), so nothing is
+        // evicted; one byte past it evicts the oldest to fit. Pins the byte
+        // comparison at the boundary — a `>=`/`==` there would wrongly evict at
+        // the cap, a `<` would never evict.
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(4));
+        sink.push("aa".into()); // 2 bytes
+        sink.push("bb".into()); // 2 bytes -> exactly 4, sitting on the cap
+        assert_eq!(
+            sink.dropped(),
+            0,
+            "a backlog exactly at the byte cap is not over"
+        );
+        // A third line pushes the sum to 6 > 4, so the oldest is evicted to fit.
+        sink.push("cc".into());
+        assert_eq!(
+            sink.dropped(),
+            1,
+            "one byte past the cap evicts exactly one line"
+        );
+        assert_eq!(
+            sink.drain(),
+            vec!["bb", "cc"],
+            "only the newest two fit the 4-byte cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_backlog_derived_line_ceiling_bounds_empty_lines() {
+        // Empty lines add 0 content bytes, so only the derived per-line bound
+        // (`self.lines.len() > b`) can bound them under a byte cap. Exactly `b`
+        // empty lines sit on the bound (retained); the (b+1)-th trips it.
+        let at = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(3));
+        at.push(String::new());
+        at.push(String::new());
+        at.push(String::new());
+        assert_eq!(
+            at.dropped(),
+            0,
+            "three empty lines sit exactly on the derived cap of 3"
+        );
+        assert_eq!(
+            at.drain(),
+            vec!["", "", ""],
+            "all three at-bound empty lines are retained"
+        );
+
+        let over = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(3));
+        for _ in 0..4 {
+            over.push(String::new());
+        }
+        assert_eq!(over.dropped(), 1, "the 4th empty line evicts the oldest");
+        assert_eq!(
+            over.drain().len(),
+            3,
+            "the empty-line backlog stays bounded at 3"
+        );
+    }
+
+    #[tokio::test]
+    async fn would_fit_byte_sum_governs_dropnewest_at_the_boundary() {
+        // DropNewest keeps the head: a line fits only if the retained byte sum
+        // PLUS its own length still fits `max_bytes`. Pins the `self.bytes + len`
+        // sum and the `<= b` boundary — a `*`/`-` on the sum, or a `>` on the
+        // comparison, changes which lines are judged to fit.
+        let policy = OutputBufferPolicy::unbounded()
+            .with_overflow(OverflowMode::DropNewest)
+            .with_max_bytes(2);
+        let sink = SharedLines::new(&policy);
+        sink.push("aa".into()); // 2 bytes -> exactly fills the 2-byte cap
+        sink.push("b".into()); // 2 + 1 = 3 > 2 -> cannot fit, dropped
+        assert_eq!(
+            sink.dropped(),
+            1,
+            "the over-budget line is dropped, not retained"
+        );
+        assert_eq!(
+            sink.drain(),
+            vec!["aa"],
+            "only the head that fills the cap is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn would_fit_derived_line_ceiling_bounds_empty_lines_dropnewest() {
+        // Under DropNewest a byte cap must still bound a flood of empty lines via
+        // the derived `self.lines.len() < b` count bound (empty lines add 0
+        // bytes). Exactly `b` empty lines fit; the (b+1)-th does not.
+        let policy = OutputBufferPolicy::unbounded()
+            .with_overflow(OverflowMode::DropNewest)
+            .with_max_bytes(2);
+        let sink = SharedLines::new(&policy);
+        sink.push(String::new());
+        sink.push(String::new());
+        sink.push(String::new()); // lines.len() is already 2, not < 2 -> dropped
+        assert_eq!(
+            sink.dropped(),
+            1,
+            "the 3rd empty line cannot fit the derived 2-line bound"
+        );
+        assert_eq!(
+            sink.drain(),
+            vec!["", ""],
+            "two empty lines fit the derived bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_mode_byte_ceiling_retains_at_cap_and_trips_past_it() {
+        // OverflowMode::Error with a byte cap fires on the cumulative seen-byte
+        // total. A total sitting exactly on `max_bytes` is within budget
+        // (retained, not overflowed); one byte past it trips the fail-loud
+        // ceiling. Pins `inner.seen_bytes > b` at the boundary.
+        let at = SharedLines::new(
+            &OutputBufferPolicy::unbounded()
+                .with_overflow(OverflowMode::Error)
+                .with_max_bytes(4),
+        );
+        at.push("ab".into()); // seen 2
+        at.push("cd".into()); // seen 4 -> exactly on the cap
+        assert!(
+            !at.overflowed(),
+            "a cumulative total exactly at the byte cap does not trip"
+        );
+        assert_eq!(
+            at.drain(),
+            vec!["ab", "cd"],
+            "both at-cap lines are retained"
+        );
+
+        let over = SharedLines::new(
+            &OutputBufferPolicy::unbounded()
+                .with_overflow(OverflowMode::Error)
+                .with_max_bytes(4),
+        );
+        over.push("ab".into()); // seen 2
+        over.push("cde".into()); // seen 5 > 4 -> trips
+        assert!(
+            over.overflowed(),
+            "one byte past the cap trips the fail-loud ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_mode_derived_line_ceiling_trips_on_empty_lines() {
+        // Empty lines add 0 to seen_bytes, so only the derived `total_lines > b`
+        // bound can trip OverflowMode::Error under a byte cap. Exactly `b` empty
+        // lines are within budget; the (b+1)-th trips it.
+        let at = SharedLines::new(
+            &OutputBufferPolicy::unbounded()
+                .with_overflow(OverflowMode::Error)
+                .with_max_bytes(3),
+        );
+        at.push(String::new());
+        at.push(String::new());
+        at.push(String::new());
+        assert!(
+            !at.overflowed(),
+            "three empty lines sit exactly on the derived 3-line bound"
+        );
+        assert_eq!(
+            at.drain(),
+            vec!["", "", ""],
+            "the at-bound empty lines are retained"
+        );
+
+        let over = SharedLines::new(
+            &OutputBufferPolicy::unbounded()
+                .with_overflow(OverflowMode::Error)
+                .with_max_bytes(3),
+        );
+        for _ in 0..4 {
+            over.push(String::new());
+        }
+        assert!(
+            over.overflowed(),
+            "a 4th empty line trips the derived line ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_mode_retained_byte_sum_accumulates_exactly() {
+        // Under OverflowMode::Error each retained line adds its own byte length
+        // to the retained byte sum. That sum never changes an observable verdict
+        // on its own (Error mode never consults `over_backlog`/`would_fit`) and
+        // has no public getter, so this pins the `inner.bytes += line.len()`
+        // accounting by reading the private field directly (same-crate test
+        // access) — a `*=`/`-=` there leaves it at 0 (or underflow-panics).
+        let sink = SharedLines::new(
+            &OutputBufferPolicy::unbounded()
+                .with_overflow(OverflowMode::Error)
+                .with_max_bytes(100),
+        );
+        sink.push("abc".into()); // +3
+        sink.push("de".into()); // +2
+        let retained_bytes = sink.inner.lock().expect("SharedLines poisoned").bytes;
+        assert_eq!(
+            retained_bytes, 5,
+            "the retained byte sum is the exact total of kept lines"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_partial_read_preserves_the_full_remainder() {
+        // A chunk larger than the pump's 8 KiB read buffer is delivered across
+        // several `poll_read` calls: the tail beyond `buf.remaining()` must be put
+        // back at the front of the queue (`n < chunk.len()`), never dropped. A
+        // 10 000-byte line proves every byte survives the partial reads.
+        let reader = ChunkedReader::new([vec![b'a'; 10_000], b"\n".to_vec()]);
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(sink.count(), 1, "one line total");
+        let lines = sink.drain();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].len(),
+            10_000,
+            "every byte of the oversized chunk survives the partial reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_cap_multibyte_line_skipped_across_reads_stays_on_char_boundaries() {
+        // An over-cap line of multibyte UTF-8, arriving split across reads, must
+        // be skipped by whole `sub`-length steps that land on character
+        // boundaries and account for every content byte — advancing by a fixed
+        // 1 byte would slice mid-codepoint and panic, and a broken cursor
+        // (`*=`/`-=`) would mis-count. '€' is 3 bytes; five of them (15 bytes)
+        // over a 4-byte cap, delivered across three reads so the skip
+        // continuation runs.
+        let reader = ChunkedReader::new([
+            "\u{20ac}\u{20ac}".as_bytes().to_vec(), // "€€" (6 bytes), no terminator
+            "\u{20ac}\u{20ac}".as_bytes().to_vec(), // "€€" (6 bytes), still skipping
+            "\u{20ac}\n".as_bytes().to_vec(),       // "€\n" -> terminator
+        ]);
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(4));
+        pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(sink.count(), 1, "the over-cap line is counted once");
+        assert!(
+            sink.drain().is_empty(),
+            "the over-cap multibyte line is dropped whole"
+        );
+        assert_eq!(
+            sink.seen_bytes(),
+            15,
+            "all 15 content bytes are accounted for"
+        );
+    }
+
+    #[tokio::test]
+    async fn byte_cap_under_cap_line_split_across_reads_is_retained() {
+        // A line whose content is UNDER the byte cap but which arrives split
+        // across reads (no terminator in the first chunk) must be retained once
+        // completed — the over-cap skip guard must not fire for an under-cap
+        // line. "abc" (3 bytes) under a 5-byte cap, split as ["ab", "c\n"].
+        let reader = ChunkedReader::new([b"ab".to_vec(), b"c\n".to_vec()]);
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(5));
+        pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(
+            sink.drain(),
+            vec!["abc"],
+            "an under-cap line split across reads is retained"
+        );
+        assert_eq!(sink.dropped(), 0, "nothing was over cap");
+    }
+
+    #[tokio::test]
+    async fn unterminated_tail_exactly_at_byte_cap_is_retained_at_eof() {
+        // An unterminated final line whose length is EXACTLY the byte cap fits
+        // and must be emitted at EOF, not dropped as over-cap. Pins the EOF tail
+        // check `line.len() > c` at the boundary — a `>=`/`==` there wrongly
+        // drops the at-cap tail.
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(2));
+        pump_lines(&b"ab"[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(
+            sink.drain(),
+            vec!["ab"],
+            "an unterminated tail exactly at the cap is kept"
+        );
+        assert_eq!(sink.dropped(), 0, "the at-cap tail is not a truncation");
+    }
+
     /// Property tests over the pump + decoder for arbitrary input, chunked at
     /// arbitrary read boundaries: the hand-written cases above pin known
     /// tricky shapes (Shift-JIS, lone lead bytes, CRLF-at-a-boundary), while
