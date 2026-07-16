@@ -1518,6 +1518,59 @@ mod tests {
     }
 
     #[test]
+    fn stream_preview_truncates_on_char_boundary() {
+        // Byte 200 is the second byte of `é`; the preview must back up to the
+        // preceding character boundary and report every omitted byte.
+        let stream = format!("{}éz", "a".repeat(DIAG_CAP - 1));
+        let cut = DIAG_CAP - 1;
+
+        assert_eq!(
+            format!("{:?}", StreamPreview(&stream)),
+            format!("{:?}… (+{} bytes)", &stream[..cut], stream.len() - cut)
+        );
+    }
+
+    #[test]
+    fn searched_redaction_filters_empty_path_segments() {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+
+        assert_eq!(
+            format!("{:?}", SearchedRedaction(&format!("first{sep}second{sep}"))),
+            "<2 directories>"
+        );
+        assert_eq!(
+            format!("{:?}", SearchedRedaction(&format!("first{sep}{sep}second"))),
+            "<2 directories>"
+        );
+    }
+
+    #[test]
+    fn push_sanitized_capped_respects_byte_boundaries() {
+        let mut out = String::new();
+        push_sanitized_capped(&mut out, "abcd", 4);
+        assert_eq!(out, "abcd");
+
+        let mut out = String::new();
+        push_sanitized_capped(&mut out, "abc", 4);
+        assert_eq!(out, "abc");
+
+        let mut out = String::new();
+        push_sanitized_capped(&mut out, "abcde", 4);
+        assert_eq!(out, "abcd…");
+
+        let mut out = String::new();
+        push_sanitized_capped(&mut out, "abé", 3);
+        assert_eq!(out, "ab…");
+
+        let mut out = String::new();
+        push_sanitized_capped(&mut out, "\x1b", 3);
+        assert_eq!(out, "\u{FFFD}");
+
+        let mut out = String::new();
+        push_sanitized_capped(&mut out, "\x1ba", 3);
+        assert_eq!(out, "\u{FFFD}…");
+    }
+    #[test]
     fn debug_bounds_stdout_bytes_to_a_length_summary() {
         // `stdout_bytes` may carry the same multi-MiB payload as `stdout` (just
         // pre-decode) — Debug must summarize its length, never dump the bytes.
