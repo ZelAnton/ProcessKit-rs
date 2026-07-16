@@ -37,8 +37,10 @@
 //!   [`wait_for_port`](RunningProcess::wait_for_port) /
 //!   [`wait_for`](RunningProcess::wait_for)) wait until a started child is
 //!   actually *ready* instead of sleeping. A [`Pipeline`]
-//!   ([`Command::pipe`]) chains commands stdout→stdin without a shell — one
-//!   shared group, pipefail outcome. [`Command::cancel_on`] ties a run to a
+//!   ([`Command::pipe`]) chains commands stdout→stdin without a shell — each
+//!   stage spawns into its own kill-on-drop `ProcessGroup` sub-group, with
+//!   chain-wide teardown fanning the kill across every sub-group, pipefail
+//!   outcome. [`Command::cancel_on`] ties a run to a
 //!   [`CancellationToken`]: cancelling it kills the tree and every consuming
 //!   path resolves to [`Error::Cancelled`]. Spawn-time sandboxing knobs:
 //!   [`Command::inherit_env`] (env allow-list), [`Command::uid`] /
