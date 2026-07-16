@@ -244,19 +244,29 @@ impl SharedLines {
     /// Record a line whose own byte length exceeds `max_bytes`: it is counted
     /// and added to the seen-byte total, but never retained (it cannot fit the
     /// cap). Under [`OverflowMode::Error`] it trips the fail-loud ceiling; under
-    /// the drop modes it sets the truncation signal. Mirrors the "cannot fit"
-    /// accounting in [`push`](Self::push) for a line the pump never buffered (so
-    /// it is also not delivered to the per-line handler or tee).
+    /// the drop modes it sets the truncation signal. A discarding sink instead
+    /// only counts the line and its bytes, skipping all retention and overflow
+    /// bookkeeping like [`push`](Self::push). Mirrors the "cannot fit" accounting
+    /// in [`push`](Self::push) for a line the pump never buffered (so it is also
+    /// not delivered to the per-line handler or tee).
     pub(crate) fn record_oversized_line(&self, byte_len: usize) {
         self.count.fetch_add(1, Ordering::Relaxed);
+        let mut policy_dropped = false;
         {
             let mut inner = self.inner.lock().expect("SharedLines poisoned");
             inner.seen_bytes = inner.seen_bytes.saturating_add(byte_len);
-            if matches!(inner.mode, OverflowMode::Error) {
-                inner.overflowed = true;
+            // A discarded streaming consumer retains nothing and skips all
+            // overflow bookkeeping, even for an over-cap line the pump skipped.
+            if !inner.discarding {
+                if matches!(inner.mode, OverflowMode::Error) {
+                    inner.overflowed = true;
+                }
+                policy_dropped = true;
             }
         }
-        self.dropped.fetch_add(1, Ordering::Relaxed);
+        if policy_dropped {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
         self.notify.notify_one();
     }
 
@@ -1120,6 +1130,21 @@ mod tests {
             "lines pushed after discarding are not retained"
         );
         assert_eq!(sink.count(), 3, "every line is still counted");
+    }
+
+    #[test]
+    fn discarding_oversized_line_skips_overflow_bookkeeping() {
+        let policy = OutputBufferPolicy::fail_loud(10).with_max_bytes(3);
+        let sink = SharedLines::new(&policy);
+        sink.start_discarding();
+        sink.record_oversized_line(4);
+
+        assert_eq!(sink.count(), 1, "the oversized line is still counted");
+        assert_eq!(sink.dropped(), 0, "discarding skips truncation bookkeeping");
+        assert!(
+            !sink.overflowed(),
+            "discarding skips fail-loud bookkeeping for oversized lines"
+        );
     }
 
     #[tokio::test]
