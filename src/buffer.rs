@@ -359,6 +359,14 @@ pub(crate) fn push_capped_bytes(
 /// Trim an [`OverflowMode::DropOldest`] raw-byte capture back to exactly the
 /// last `cap` bytes. [`push_capped_bytes`] lets the tail run up to `2 * cap`
 /// during streaming to amortize compaction; this clamps the retained result.
+///
+/// `#[mutants::skip]`: `buf.len() > cap` mutated to `>=` is an equivalent
+/// mutant at the one point they diverge — `buf.len() == cap` — since `excess`
+/// becomes `0` and `buf.drain(..0)` is a no-op, leaving `buf` unchanged either
+/// way. (The attribute is function-scoped, so it also silences the `&&`/`||`
+/// and `==`/`<` mutants this tiny function's other unit tests already catch;
+/// see the tests below for that coverage.)
+#[mutants::skip]
 pub(crate) fn clamp_dropoldest_tail(buf: &mut Vec<u8>, cap: Option<usize>, mode: OverflowMode) {
     if let (OverflowMode::DropOldest, Some(cap)) = (mode, cap)
         && buf.len() > cap

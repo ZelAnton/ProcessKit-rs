@@ -675,6 +675,23 @@ where
         }
     }
 
+    // The single bulk memmove for a chunk: drop exactly the consumed prefix,
+    // leaving `pending` holding only the unconsumed remainder for the next
+    // read to append to (same invariant the per-line drains used to maintain
+    // one line at a time). `start == 0` (nothing consumed this read) is
+    // guarded out purely as a micro-optimization: `String::drain(..0)` is
+    // already a no-op (an empty range, always a valid char boundary), so a
+    // `start > 0` mutated to `start >= 0` behaves identically — a `#[mutants::
+    // skip]`-worthy equivalent mutant, hence skipped here rather than chased
+    // with an unkillable test. (`#[mutants::skip]` only attaches to functions,
+    // not to an inline `if`, hence this extraction.)
+    #[mutants::skip]
+    fn drain_consumed_prefix(pending: &mut String, start: usize) {
+        if start > 0 {
+            pending.drain(..start);
+        }
+    }
+
     // The OS read size.
     const CHUNK: usize = 8192;
     // The retained-byte ceiling, read once. When set it bounds the *in-flight*
@@ -782,13 +799,7 @@ where
                 }
             }
         }
-        if start > 0 {
-            // The single bulk memmove for this chunk: drop exactly the
-            // consumed prefix, leaving `pending` holding only the unconsumed
-            // remainder for the next read to append to (same invariant the
-            // per-line drains used to maintain one line at a time).
-            pending.drain(..start);
-        }
+        drain_consumed_prefix(&mut pending, start);
 
         if eof {
             // Finalize a final line (or an un-terminated over-cap tail). At EOF the
@@ -2588,6 +2599,96 @@ mod tests {
             sink.seen_bytes(),
             15,
             "all 15 content bytes are accounted for"
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_over_cap_len_actually_advances_past_the_discarded_prefix() {
+        // `skip_over_cap_len`'s *recorded length* (via `record_oversized_line`)
+        // is unchanged by how much of `sub` it reports skippable: whatever is not
+        // advanced past simply stays in `pending` and is re-counted once the
+        // terminator is finally found, so a byte-total/`seen_bytes` assertion
+        // alone cannot tell a `0` body apart from the real one — both report the
+        // exact right total (the un-drained tail is simply re-summed later).
+        // What a `0` body actually breaks is its *sole purpose*: bounding the
+        // in-flight buffer (see the function's doc comment and the `cap + CHUNK`
+        // note above `pump_lines_core`'s main loop) so a newline-free flood
+        // cannot OOM the parent. Never advancing means `pending` is never
+        // drained while skipping — it keeps the WHOLE oversized line in memory
+        // and re-scans it from byte 0 for a terminator on every single read,
+        // turning O(chunks) work into O(chunks²).
+        //
+        // Pin the actual guarantee instead: pump a long, newline-free, deeply
+        // over-cap stream split across many small reads and require it to finish
+        // within a generous, machine-speed-scaling-only bound. With the real
+        // `skip_over_cap_len` (draining down to ~`cap + CHUNK` every read) this
+        // takes tens of milliseconds locally; a `0` body measured ~100x slower
+        // (multiple seconds) — the quadratic blowup from re-scanning an
+        // ever-growing, never-drained buffer. The bound below leaves large
+        // headroom on both sides (the real path is comfortably under it even on
+        // a much slower CI host; the O(n^2) path comfortably exceeds it) rather
+        // than depending on exact timing.
+        let chunks: Vec<Vec<u8>> = std::iter::repeat_with(|| vec![b'a'; 8000])
+            .take(2500)
+            .collect();
+        let reader = ChunkedReader::new(chunks);
+        // A 1-byte cap forces the very first chunk into the skip path, so every
+        // one of the 2500 reads that follow stays in it (no terminator anywhere).
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(1));
+        let start = std::time::Instant::now();
+        pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "skipping a 20MB over-cap line across 2500 reads must stay near-linear \
+             (took {:?}) — a `skip_over_cap_len` that fails to advance would instead \
+             re-scan the whole never-drained buffer on every read",
+            start.elapsed()
+        );
+        assert!(
+            sink.drain().is_empty(),
+            "the over-cap line is never retained"
+        );
+        assert!(sink.dropped() >= 1, "the over-cap line is a truncation");
+    }
+
+    #[tokio::test]
+    async fn memory_bound_guard_engages_the_skip_path_for_a_newline_free_flood() {
+        // The memory-bound guard (`cap.is_some_and(|c| sub.len() - ... > c)`)
+        // is what *enters* the over-cap skip path in the first place. Like
+        // `skip_over_cap_len` above, disabling it (`with false`) is invisible to
+        // a final byte-total assertion: without it, the line is simply never
+        // flagged as oversized *during* streaming, so `pending` keeps
+        // accumulating unbounded — but once a terminator (or EOF) eventually
+        // shows up, the ordinary over-cap checks (`len <= c` at the terminator,
+        // `line.len() > c` at EOF) still correctly classify and drop it via
+        // `record_oversized_line`, reporting the exact right total. A disabled
+        // guard is instead an OOM guard that never engages: every read re-scans
+        // the whole never-drained buffer from scratch for a terminator that
+        // never comes, the same O(chunks²) blowup `skip_over_cap_len` guards
+        // against — so it is caught by the same near-linear-time requirement,
+        // with independently chosen chunk counts/sizes so this test does not
+        // merely piggyback on the one above.
+        let chunks: Vec<Vec<u8>> = std::iter::repeat_with(|| vec![b'x'; 8000])
+            .take(3500)
+            .collect();
+        let reader = ChunkedReader::new(chunks);
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(8));
+        let start = std::time::Instant::now();
+        pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "a newline-free flood far over the byte cap must engage the skip path \
+             and stay near-linear (took {:?}) — a disabled guard never engages it \
+             and instead re-scans the whole never-drained buffer on every read",
+            start.elapsed()
+        );
+        assert!(
+            sink.drain().is_empty(),
+            "the over-cap flood is never retained"
+        );
+        assert!(
+            sink.dropped() >= 1,
+            "the over-cap flood is recorded as a truncation via record_oversized_line"
         );
     }
 
