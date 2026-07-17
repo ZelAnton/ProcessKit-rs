@@ -367,6 +367,73 @@ async fn preflight_resolution_agrees_with_the_actual_spawn() {
     );
 }
 
+// T-125: the parity above (case 1) covers a bare name that resolves through a
+// `.exe` on PATH — the case the OS's own `.exe`-only bare-name search already
+// agrees with. This closes the gap the earlier test deliberately side-stepped:
+// a bare name that exists on PATH ONLY via a non-`.exe` PATHEXT extension (the
+// typical `yarn.cmd`/`npx.cmd` npm/scoop shim). Preflight resolves it (its
+// PATHEXT model finds the `.cmd`), and — now that `build_tokio` substitutes the
+// resolved absolute path for such a match — the ACTUAL spawn succeeds too,
+// instead of failing (before the fix the OS's bare-name search appended only
+// `.exe`, missed the `.cmd`, and the launch raised `Error::Spawn`). A plain
+// `spawn_located` check wouldn't prove the fix — the pre-fix failure was a
+// non-`NotFound` `Spawn` error, which `spawn_located` counts as "located" — so
+// this asserts a genuinely successful run.
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "exercises the real spawn path (creates a process group); writes a temp .cmd"]
+async fn preflight_and_spawn_agree_on_a_non_exe_pathext_program_on_path() {
+    // A directory holding ONLY `<unique>.cmd` — no `.exe` — prepended to the
+    // command's `PATH`. `env("PATH", …)` relocates the child `PATH`, so both the
+    // preflight and `build_tokio` resolve against this exact list (its effective
+    // child `PATH`), keeping them in lockstep.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let unique = "pk_pathext_cmd_shim_t125";
+    let cmd_path = dir.path().join(format!("{unique}.cmd"));
+    // A trivial batch that exits cleanly. `@echo off` keeps stdout quiet; the
+    // exit code (0) is what `is_success()` checks.
+    std::fs::write(&cmd_path, "@echo off\r\nexit /b 0\r\n").expect("write .cmd shim");
+
+    let base_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut new_path = std::ffi::OsString::from(dir.path());
+    new_path.push(";");
+    new_path.push(&base_path);
+
+    // (a) Preflight resolves the bare name to the `.cmd` under our directory —
+    // its PATHEXT model finds a non-`.exe` match the OS's own search would not.
+    let resolved = Command::new(unique)
+        .env("PATH", &new_path)
+        .resolve_program()
+        .expect("a bare name present on PATH only as a .cmd must resolve via PATHEXT");
+    assert!(
+        resolved.starts_with(dir.path()),
+        "resolved path must live under our PATH directory: {resolved:?}"
+    );
+    assert!(
+        resolved
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("cmd")),
+        "the match must be the non-.exe PATHEXT extension (.cmd): {resolved:?}"
+    );
+
+    // (b) The ACTUAL launch now spawns it successfully — not the pre-fix
+    // `Error::Spawn` from the OS's `.exe`-only bare-name search missing the
+    // `.cmd`. `.expect(...)` here is the load-bearing assertion: it fails on the
+    // pre-fix behavior and passes only once the resolved absolute path is
+    // substituted at spawn.
+    let result = Command::new(unique)
+        .env("PATH", &new_path)
+        .output_string()
+        .await
+        .expect("a bare name resolvable only via a non-.exe PATHEXT match must now spawn");
+    assert!(
+        result.is_success(),
+        "the resolved .cmd must run and exit 0; got {:?}",
+        result.code()
+    );
+}
+
 #[tokio::test]
 #[ignore = "spawns a real subprocess"]
 async fn output_string_captures_stdout() {

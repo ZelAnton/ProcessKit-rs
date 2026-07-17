@@ -365,9 +365,15 @@ impl<R: ProcessRunner> CliClient<R> {
     /// (or a [`default_env_fn`](Self::default_env_fn) that does) is honored
     /// exactly as it would be at launch — then resolves it via
     /// [`Command::resolve_program`](crate::Command::resolve_program), reusing the
-    /// **same** internal PATH/PATHEXT/execute-bit resolution the real spawn uses.
-    /// The preflight therefore never disagrees with what an actual run of this
-    /// client would find.
+    /// **same** internal PATH/PATHEXT/execute-bit resolution the real spawn uses —
+    /// so a preflight **hit** is exactly what a run of this client would spawn,
+    /// including a bare name reachable only via a non-`.exe` PATHEXT extension on
+    /// Windows (`yarn.cmd`/`npx.cmd` shims), which the launch spawns via its
+    /// resolved path. The one residual gap is a Windows preflight **miss**: the OS
+    /// can still find a bare name through the application/current/system
+    /// directories this `PATH`-based model doesn't cover — see
+    /// [`Command::resolve_program`](crate::Command::resolve_program) for the full
+    /// parity contract.
     ///
     /// Returns the resolved **absolute** path on success. A synchronous, cheap
     /// filesystem probe — no async runtime is required.

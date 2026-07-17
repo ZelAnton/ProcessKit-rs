@@ -1393,17 +1393,16 @@ impl Command {
     /// Build the `tokio` command with stdio wired for capture. Containment
     /// (cgroup/job/process-group) is added by the group's `spawn`.
     pub(crate) fn build_tokio(&self) -> tokio::process::Command {
-        // A bare-name program checks `prefer_local` directories first (in
-        // priority order); a match is spawned via its resolved absolute path,
-        // so the OS never has to search anything for it. No match (or a
-        // path-form program, or no `prefer_local` at all) leaves the program
-        // untouched — the OS still resolves it against the child's own `PATH`,
-        // exactly as before this builder existed.
-        let program = if !self.prefer_local.is_empty() && is_bare_name(self.program.as_os_str()) {
-            probe_prefer_local(&self.prefer_local, &self.program)
-        } else {
-            None
-        };
+        // A bare-name `program` may be spawned via a resolved absolute path so
+        // the OS launches *exactly* what the spawn-free preflight
+        // (`resolve_program`) reports it would: a `prefer_local` match (always),
+        // or — on Windows — a `PATH` match whose PATHEXT extension is not `.exe`
+        // (`.cmd`/`.bat`/`.com`/…), which the OS's own `.exe`-only bare-name
+        // `PATH` search would never find. Everything else (a `.exe` `PATH`
+        // match, a path-form program, no match) is left untouched — the OS still
+        // resolves it against the child's own `PATH`, exactly as before this
+        // builder existed. See `spawn_program_override` for the full rationale.
+        let program = self.spawn_program_override();
         let mut cmd = match program {
             Some(resolved) => tokio::process::Command::new(resolved),
             None => tokio::process::Command::new(&self.program),
@@ -1595,6 +1594,87 @@ impl Command {
             }
         }
         cmd
+    }
+
+    /// The absolute program path [`build_tokio`](Self::build_tokio) substitutes
+    /// for a bare-name `program`, or `None` to hand the OS the name verbatim.
+    ///
+    /// Two kinds of bare name are rewritten so the OS spawns *exactly* what the
+    /// spawn-free preflight ([`resolve_program`](Self::resolve_program))
+    /// resolved — closing the gap where `which` promised a program the launch
+    /// then couldn't reach:
+    /// - a [`prefer_local`](Self::prefer_local) match — its resolved absolute
+    ///   path, always, independent of extension (the OS never searches for it);
+    /// - on Windows, a `PATH` match whose PATHEXT extension is **not** `.exe`
+    ///   (`.cmd`/`.bat`/`.com`/…). The OS's own bare-name `PATH` search appends
+    ///   only `.exe`, so it would never launch such a program by bare name — yet
+    ///   the crate's PATHEXT-aware resolution (the *same* one `which` uses) found
+    ///   it. Handing the OS the resolved absolute path closes that divergence
+    ///   (std then routes a `.cmd`/`.bat` through `cmd.exe` with BatBadBut-safe
+    ///   quoting, exactly as it already does for a `prefer_local` `.cmd`).
+    ///
+    /// A `.exe` `PATH` match is deliberately left as the bare name: the OS
+    /// resolves it — and, on Windows, may prefer the application/current/system
+    /// directories this `PATH`-only model doesn't touch — exactly as before, so
+    /// that richer OS search is never overridden. A path-form program is never
+    /// rewritten here (the OS receives it verbatim).
+    ///
+    /// Inert on non-Windows: the `PATH`-rewrite branch is `#[cfg(windows)]`
+    /// (Unix has no PATHEXT), so a Unix bare name yields only a `prefer_local`
+    /// match or `None`, byte-for-byte as before.
+    fn spawn_program_override(&self) -> Option<PathBuf> {
+        let program = self.program.as_os_str();
+        if !is_bare_name(program) {
+            return None;
+        }
+        // A `prefer_local` match is spawned via its resolved absolute path,
+        // always — independent of extension and of the child's `PATH`. The
+        // emptiness guard skips `probe_prefer_local`'s `current_dir` read on the
+        // common no-`prefer_local` path.
+        if !self.prefer_local.is_empty()
+            && let Some(found) = probe_prefer_local(&self.prefer_local, program)
+        {
+            return Some(found);
+        }
+        // Windows-only: rescue a bare name whose only `PATH` match carries a
+        // non-`.exe` PATHEXT extension — the OS's `.exe`-only bare-name search
+        // would miss it. Resolve against the *same* `resolve_program` the
+        // preflight uses (same `prefer_local`, same effective-child-`PATH`
+        // source), so a rewrite can never disagree with what `which` reports.
+        // `prefer_local` already missed above, so a `Found` here is a `PATH`
+        // match; only substitute it when it is not the `.exe` the OS would find
+        // on its own.
+        #[cfg(windows)]
+        {
+            if let ProgramResolution::Found(found) =
+                resolve_program(program, &self.prefer_local, self.resolution_path_source())
+                && !has_exe_extension(&found)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// The [`PathSource`] this command's bare-name `program` resolves against —
+    /// its *effective child* `PATH` when the command relocates `PATH`
+    /// ([`env`](Self::env)/[`env_remove`](Self::env_remove) of `PATH`,
+    /// [`env_clear`](Self::env_clear), or [`inherit_env`](Self::inherit_env)),
+    /// otherwise the process `PATH`. Shared by the spawn-free preflight
+    /// ([`resolve_program`](Self::resolve_program)) and the live-launch
+    /// [`build_tokio`](Self::build_tokio) rewrite, so both resolve a bare name
+    /// against the identical `PATH` list — the single source of the parity
+    /// between what `which` reports and what a run actually spawns.
+    fn resolution_path_source(&self) -> PathSource {
+        if self.customizes_path() {
+            // The command moves the child's `PATH` away from the process `PATH`,
+            // so resolve against the value the child will actually receive.
+            PathSource::Explicit(self.effective_path_value())
+        } else {
+            // The child inherits the process `PATH`; searching it (via the same
+            // `find_in_path` the launch models with) is exact.
+            PathSource::ProcessPath
+        }
     }
 
     // --- Live handle (private one-shot group) ------------------------------
@@ -1827,7 +1907,18 @@ impl Command {
     /// ([`env`](Self::env)/[`env_remove`](Self::env_remove) of `PATH`,
     /// [`env_clear`](Self::env_clear), or [`inherit_env`](Self::inherit_env)),
     /// the lookup runs against that *effective child* `PATH`, so preflight never
-    /// disagrees with what the spawn would actually find.
+    /// disagrees with which list the spawn searches.
+    ///
+    /// A resolved **hit** is exactly what a run spawns, at that same path — on
+    /// Windows including a bare name found only through a non-`.exe` PATHEXT
+    /// extension (`.cmd`/`.bat`/`.com`/…): the launch substitutes the resolved
+    /// absolute path (the OS's own bare-name search appends only `.exe`), so such
+    /// a hit spawns instead of raising [`Error::Spawn`]. The one residual
+    /// asymmetry is a preflight **miss** on Windows: the OS can still locate a
+    /// bare name through the application directory, the current directory, or the
+    /// system directories — routes this `PATH`-based model doesn't cover — so a
+    /// miss there is not proof a run couldn't launch it. Unix (`execvp`,
+    /// `PATH`-only) has no such gap.
     ///
     /// On success returns the resolved **absolute** path. This is a synchronous,
     /// cheap filesystem probe (a few `stat`s) — no async runtime is required.
@@ -1842,15 +1933,10 @@ impl Command {
     /// classifies it, exactly as it would for the same missing program on a real
     /// run.
     pub fn resolve_program(&self) -> Result<PathBuf> {
-        let path = if self.customizes_path() {
-            // The command moves the child's `PATH` away from the process `PATH`,
-            // so resolve against the value the child will actually receive.
-            PathSource::Explicit(self.effective_path_value())
-        } else {
-            // The child inherits the process `PATH`; searching it (via the same
-            // `find_in_path` the launch models with) is exact.
-            PathSource::ProcessPath
-        };
+        // Resolve against the same `PATH` source the live launch's
+        // `build_tokio` rewrite uses (`resolution_path_source`), so preflight
+        // and spawn can never disagree about which list a bare name is found in.
+        let path = self.resolution_path_source();
         match resolve_program(self.program.as_os_str(), &self.prefer_local, path) {
             ProgramResolution::Found(found) => Ok(found),
             ProgramResolution::NotFound { searched } => Err(Error::NotFound {
@@ -2350,6 +2436,20 @@ fn probe_dir(dir: &std::path::Path, program: &OsStr) -> Option<std::path::PathBu
         }
     }
     None
+}
+
+/// Whether `path`'s extension is `.exe` (ASCII case-insensitive) — the single
+/// extension the OS's own bare-name `PATH` search appends. A `.exe` `PATH` match
+/// therefore needs no rewrite at spawn (the OS locates it by bare name); every
+/// other executable extension a PATHEXT probe can return (`.cmd`/`.bat`/`.com`/…)
+/// does, since the OS would never reach it by bare name — see
+/// [`Command::spawn_program_override`]. Windows-only: Unix has no PATHEXT and
+/// never calls this.
+#[cfg(windows)]
+fn has_exe_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
 }
 
 #[cfg(test)]
@@ -3027,6 +3127,67 @@ mod tests {
             tokio_cmd.as_std().get_program(),
             OsStr::new("not-in-prefer-local"),
             "a prefer_local miss must leave the bare name for the OS's own PATH search"
+        );
+    }
+
+    // T-125: a bare name that exists on `PATH` ONLY via a non-`.exe` PATHEXT
+    // extension (`yarn.cmd`/`npx.cmd` npm/scoop shims) must be spawned via its
+    // resolved absolute path — the OS's own bare-name search appends only
+    // `.exe`, so it would never launch such a program by bare name, breaking the
+    // documented `which`/spawn parity. This is the PATH-side analogue of the
+    // `prefer_local` substitution above.
+    #[cfg(windows)]
+    #[test]
+    fn build_tokio_substitutes_a_non_exe_pathext_path_match() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let unique = "pk_build_tokio_cmd_shim";
+        let cmd_path = dir.path().join(format!("{unique}.cmd"));
+        std::fs::write(&cmd_path, "@echo off\r\nexit /b 0\r\n").expect("write .cmd shim");
+
+        // `env("PATH", …)` relocates the child PATH, so both build_tokio and the
+        // preflight resolve against this single directory (its effective child
+        // PATH) — the substitution and `resolve_program` must land on one path.
+        let cmd = Command::new(unique).env("PATH", dir.path());
+        let tokio_cmd = cmd.build_tokio();
+        assert!(
+            tokio_cmd
+                .as_std()
+                .get_program()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&cmd_path.to_string_lossy()),
+            "a non-.exe PATHEXT PATH match must be spawned via its resolved \
+             absolute path; got {:?}, expected {cmd_path:?}",
+            tokio_cmd.as_std().get_program()
+        );
+        let resolved = cmd
+            .resolve_program()
+            .expect("preflight must resolve the same .cmd");
+        assert!(
+            resolved
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&cmd_path.to_string_lossy()),
+            "preflight and build_tokio must resolve the identical path; got {resolved:?}"
+        );
+    }
+
+    // T-125: the complement — a `.exe` match on `PATH` is exactly what the OS's
+    // own bare-name search already finds, so build_tokio must NOT substitute it.
+    // Leaving the bare name preserves the OS's richer search order (application
+    // directory / current directory / System32) that this `PATH`-only model
+    // deliberately doesn't touch — the pre-existing, unchanged `.exe` behavior.
+    #[cfg(windows)]
+    #[test]
+    fn build_tokio_leaves_a_bare_name_with_an_exe_path_match_for_the_os() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let unique = "pk_build_tokio_exe_on_path";
+        write_executable(dir.path(), unique); // writes `<unique>.exe`
+
+        let cmd = Command::new(unique).env("PATH", dir.path());
+        let tokio_cmd = cmd.build_tokio();
+        assert_eq!(
+            tokio_cmd.as_std().get_program(),
+            OsStr::new(unique),
+            "an .exe PATH match must be left as the bare name for the OS's own search"
         );
     }
 

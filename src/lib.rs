@@ -285,9 +285,19 @@ where
 /// Resolution reuses the crate's *own* launch-path logic — a bare name is looked
 /// up on `PATH` honoring PATHEXT on Windows and the execute bit on Unix; a
 /// path-form `program` is probed directly — so a `which` hit is exactly what a
-/// real run would spawn, and a `which` miss is exactly the
-/// [`Error::NotFound`] that run would raise. Synchronous
-/// and cheap (a few `stat`s); no async runtime is required.
+/// real run would spawn, at that same absolute path. On Windows this includes a
+/// bare name reachable only through a non-`.exe` PATHEXT extension
+/// (`yarn.cmd`/`npx.cmd` and similar shims): the launch substitutes the resolved
+/// path, so such a hit spawns rather than failing. Synchronous and cheap (a few
+/// `stat`s); no async runtime is required.
+///
+/// **The reverse holds on Unix, not fully on Windows.** A `which` miss is the
+/// exact [`Error::NotFound`] a run would raise on Unix, where `execvp` searches
+/// `PATH` only. On Windows the OS *also* locates a bare name through routes this
+/// `PATH`-based preflight deliberately doesn't model — the application directory,
+/// the current directory, and the system directories — so a Windows `which` miss
+/// is not a guarantee a run couldn't still launch the program by one of those
+/// routes.
 ///
 /// # Errors
 ///
