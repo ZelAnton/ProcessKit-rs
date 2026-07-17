@@ -41,13 +41,39 @@ name: mutants
 # that ~400 mutants climbs and erodes this headroom, raise the shard count in the
 # matrix below (keep the `--shard k/N` denominator in step).
 #
-# Single overall verdict: `fail-fast: false` runs every shard to its own verdict;
-# any shard that finds a MISSED mutant, hits a per-mutant TIMEOUT, or overruns
-# its `timeout-minutes` exits non-zero and reds the whole workflow run. There is
-# deliberately no `continue-on-error`, so a failure/hang in any shard stays
-# visible. (A completed sweep is currently expected to report `failure` on
-# substance — there are real MISSED/TIMEOUT mutants — closing those is a separate
-# follow-up task; this change only makes the tier reach that verdict predictably.)
+# Single overall verdict, and what "green" means (T-129)
+# ------------------------------------------------------
+# `fail-fast: false` runs every shard to its own verdict. A shard is green iff
+# cargo-mutants reports ZERO MISSED mutants for its subset. TIMEOUT mutants are
+# tolerated and do NOT red the shard: a TIMEOUT means the mutation made the code
+# hang (e.g. breaks the pump's loop-advance / termination signal — offset
+# arithmetic in `next_terminator`, `start += term.resume`,
+# `SharedLines::{close,close_now,changed}`, `pump_lines_core -> ()`, and similar)
+# rather than fail a test. Such a mutant cannot be "caught" — it hangs by
+# construction — so cargo-mutants' ~27 s auto-timeout, not a real test failure,
+# is what flags it, and treating that as a red is not a useful signal.
+#
+# The run step below decides success/failure from cargo-mutants' actual output
+# files (`mutants.out/missed.txt` / `timeout.txt`), NOT from its exit code:
+# exit 3 can mean "some MISSED and some TIMEOUT" simultaneously (observed: shard
+# 4/8, 2 missed + 12 timeouts, exit 3), so naively treating exit 3 as tolerable
+# would hide real MISSED mutants. TIMEOUT-ed mutants stay visible (logged and
+# added to the job summary), never silently dropped. There is deliberately no
+# YAML-level `continue-on-error`; the step itself captures cargo-mutants' exit
+# code and only tolerates the "some TIMEOUT, zero MISSED" case — any other
+# non-zero exit (build/setup failure, unexpected cargo-mutants error) still reds
+# the shard, so a failure/hang stays visible.
+#
+# Trade-off (deliberate, accepted): tolerating TIMEOUT could in principle mask a
+# real coverage gap if the test that WOULD have caught a mutant is itself slow
+# enough to time out instead of failing outright. Mitigation: keep the
+# auto-timeout generous — do not aggressively shrink `--timeout`/
+# `--timeout-multiplier` in .cargo/mutants.toml — so a genuine test failure has
+# room to fire before the auto-timeout does; the current ~27 s auto-timeout
+# against the per-shard budget above (≤90 min) leaves ample headroom for that.
+#
+# Full mutation coverage (closing the real MISSED gaps observed on this scope)
+# is a separate follow-up; this change only fixes what counts as a false alarm.
 on:
   schedule:
     # 05:29 UTC daily — staggered from stress.yml (03:17) and fuzz.yml (04:07).
@@ -81,4 +107,54 @@ jobs:
       # Scope, exclusions and `--all-features` all come from .cargo/mutants.toml
       # (auto-loaded by cargo-mutants); `--shard k/8` is the only CLI parameter,
       # selecting this job's disjoint subset of that fixed scope.
-      - run: cargo mutants --shard ${{ matrix.shard }}/8
+      #
+      # Verdict is decided from mutants.out/{missed,timeout}.txt, not from
+      # cargo-mutants' exit code (see the header comment for why): a non-empty
+      # missed.txt is a real coverage gap and reds the shard; a non-empty
+      # timeout.txt alone is tolerated but still surfaced in the log and job
+      # summary. Any exit code other than the recognised "clean" (0) or
+      # "missed/timeout accounted for" (2/3) cases reds the shard too, so an
+      # unrelated cargo-mutants/setup failure can't slip through silently.
+      - name: Run mutants shard
+        run: |
+          set +e
+          cargo mutants --shard ${{ matrix.shard }}/8
+          status=$?
+          set -e
+
+          missed_file="mutants.out/missed.txt"
+          timeout_file="mutants.out/timeout.txt"
+
+          if [ -s "$timeout_file" ]; then
+            count=$(wc -l < "$timeout_file" | tr -d ' ')
+            echo "::warning::${count} mutant(s) timed out in shard ${{ matrix.shard }}/8 (tolerated — hang-by-construction, not a MISSED signal; see workflow header)"
+            echo "--- timeout.txt (shard ${{ matrix.shard }}/8, tolerated) ---"
+            cat "$timeout_file"
+            {
+              echo "### TIMEOUT mutants (tolerated) — shard ${{ matrix.shard }}/8"
+              echo '```'
+              cat "$timeout_file"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -s "$missed_file" ]; then
+            count=$(wc -l < "$missed_file" | tr -d ' ')
+            echo "::error::${count} mutant(s) MISSED in shard ${{ matrix.shard }}/8 — real coverage gap"
+            echo "--- missed.txt (shard ${{ matrix.shard }}/8) ---"
+            cat "$missed_file"
+            {
+              echo "### MISSED mutants — shard ${{ matrix.shard }}/8"
+              echo '```'
+              cat "$missed_file"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "$status" -ne 0 ] && [ "$status" -ne 2 ] && [ "$status" -ne 3 ]; then
+            echo "::error::cargo-mutants exited ${status} in shard ${{ matrix.shard }}/8 for a reason other than mutant outcomes (no MISSED, mutants.out/missed.txt empty/absent) — treating as a hard failure, not tolerating"
+            exit "$status"
+          fi
+
+          echo "Shard ${{ matrix.shard }}/8: no MISSED mutants (cargo-mutants exit code was ${status}; TIMEOUT-only outcomes are tolerated per policy — see workflow header)."
