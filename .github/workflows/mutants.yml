@@ -13,8 +13,9 @@ name: mutants
 # `cargo mutants` job processed only ~60 of them in ~59 min (43 MISSED, 19
 # TIMEOUT) before the hosted runner was reclaimed ("runner has received a
 # shutdown signal") — an end-to-end rate of ~1 min/mutant. That rate bundles the
-# per-mutant incremental build + full test run, plus the ~27 s auto-timeout that
-# each hang-inducing mutant (~1 in 3 here) burns in full. Sweeping all 400 at
+# per-mutant incremental build + full test run, plus the configured auto-timeout
+# (at least 30 s, and 6x the baseline test time) that each hang-inducing mutant
+# (~1 in 3 here) burns in full. Sweeping all 400 at
 # ~1 min each needs several hours, so the single job never reached a verdict: it
 # blew past both `timeout-minutes: 90` and the wall-clock the runner actually
 # grants, and every scheduled run 2026-07-08..2026-07-11 ended cancelled/failed
@@ -50,7 +51,8 @@ name: mutants
 # arithmetic in `next_terminator`, `start += term.resume`,
 # `SharedLines::{close,close_now,changed}`, `pump_lines_core -> ()`, and similar)
 # rather than fail a test. Such a mutant cannot be "caught" — it hangs by
-# construction — so cargo-mutants' ~27 s auto-timeout, not a real test failure,
+# construction — so cargo-mutants' configured auto-timeout (at least 30 s, and
+# 6x the baseline test time), not a real test failure,
 # is what flags it, and treating that as a red is not a useful signal.
 #
 # The run step below decides success/failure from cargo-mutants' actual output
@@ -66,11 +68,12 @@ name: mutants
 #
 # Trade-off (deliberate, accepted): tolerating TIMEOUT could in principle mask a
 # real coverage gap if the test that WOULD have caught a mutant is itself slow
-# enough to time out instead of failing outright. Mitigation: keep the
-# auto-timeout generous — do not aggressively shrink `--timeout`/
-# `--timeout-multiplier` in .cargo/mutants.toml — so a genuine test failure has
-# room to fire before the auto-timeout does; the current ~27 s auto-timeout
-# against the per-shard budget above (≤90 min) leaves ample headroom for that.
+# enough to time out instead of failing outright. Mitigation: .cargo/mutants.toml
+# explicitly sets `timeout_multiplier = 6` and `minimum_test_timeout = 30`, so
+# cargo-mutants allows the greater of 6x the measured baseline test time or 30 s
+# before declaring TIMEOUT. That leaves a genuine test failure room to fire
+# before the auto-timeout, while the per-shard budget above (≤90 min) retains
+# ample headroom.
 #
 # Full mutation coverage (closing the real MISSED gaps observed on this scope)
 # is a separate follow-up; this change only fixes what counts as a false alarm.
@@ -124,6 +127,18 @@ jobs:
 
           missed_file="mutants.out/missed.txt"
           timeout_file="mutants.out/timeout.txt"
+
+          # Exit 2/3 are mutant-outcome verdicts only when cargo-mutants wrote
+          # the matching files. A crash or interrupted run must stay red.
+          if [ "$status" -eq 3 ] && [ ! -s "$timeout_file" ]; then
+            echo "::error::cargo-mutants exited 3 in shard ${{ matrix.shard }}/8 without a non-empty timeout.txt — treating incomplete output as a hard failure"
+            exit 1
+          fi
+
+          if [ "$status" -eq 2 ] && [ ! -s "$missed_file" ] && [ ! -s "$timeout_file" ]; then
+            echo "::error::cargo-mutants exited 2 in shard ${{ matrix.shard }}/8 without a non-empty missed.txt or timeout.txt — treating incomplete output as a hard failure"
+            exit 1
+          fi
 
           if [ -s "$timeout_file" ]; then
             count=$(wc -l < "$timeout_file" | tr -d ' ')
