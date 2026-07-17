@@ -1131,16 +1131,18 @@ type InvocationCallback = Box<dyn Fn(&str) + Send + Sync>;
 /// A [`ProcessRunner`] that never spawns a process: it renders each command
 /// via [`Command::command_line`] — reusing the crate's own display quoting,
 /// not a hand-rolled shell-escaper — and returns a synthetic successful
-/// result for every verb. The seam behind a tool's own `--dry-run`/`--echo`
-/// mode: production code keeps calling the same [`ProcessRunner`], just wired
-/// to this double instead of [`JobRunner`](crate::JobRunner).
+/// result for every valid verb. It still validates stdin through the shared
+/// runner path, so an incompatible stdin setup is rejected before its line is
+/// rendered. The seam behind a tool's own `--dry-run`/`--echo` mode: production
+/// code keeps calling the same [`ProcessRunner`], just wired to this double
+/// instead of [`JobRunner`](crate::JobRunner).
 ///
 /// Unlike [`ScriptedRunner`], there is nothing to script — a dry run has no
-/// real output to fake, only a command line to show — so every call
-/// unconditionally succeeds: empty stdout/stderr, and an exit code drawn
-/// from the command's own [`ok_codes`](Command::ok_codes) (`0` by default)
-/// so `is_success()`/the Ext verbs agree it succeeded even for a command
-/// whose `ok_codes` excludes `0`. Rendered lines are available two ways,
+/// real output to fake, only a command line to show — so every valid call
+/// succeeds with empty stdout/stderr and an exit code drawn from the command's
+/// own [`ok_codes`](Command::ok_codes) (`0` by default) so
+/// `is_success()`/the Ext verbs agree it succeeded even for a command whose
+/// `ok_codes` excludes `0`. Rendered lines are available two ways,
 /// usable together or alone:
 ///
 /// - a collected snapshot, in the style of [`RecordingRunner::calls`] —
@@ -1267,8 +1269,13 @@ fn synthetic_success_code(command: &Command) -> i32 {
 #[async_trait::async_trait]
 impl ProcessRunner for DryRunRunner {
     /// Record `command`'s rendered line and return a synthetic successful
-    /// result — no process spawned, no output to fake.
+    /// result — no process spawned, no output to fake. Invalid stdin
+    /// configurations are rejected before recording.
     async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+        // Validate through the same launch boundary as live and scripted runs.
+        // Dropping this uncommitted reservation leaves a one-shot source available
+        // for a later real run.
+        let _stdin_reservation = crate::runner::take_stdin_for_run(command)?;
         self.record(command);
         Ok(ProcessResult::new(
             command.program().to_string_lossy().into_owned(),
@@ -1284,7 +1291,11 @@ impl ProcessRunner for DryRunRunner {
     /// live handle whose (empty) output flows through the same pump
     /// machinery a scripted [`start`](ScriptedRunner::start) uses, so
     /// `stdout_lines`/`finish` behave consistently with the rest of the seam.
+    /// Invalid stdin configurations are rejected before recording.
     async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
+        // Keep validation identical to `output_string`; the reservation drops
+        // uncommitted because a dry run never starts a child.
+        let _stdin_reservation = crate::runner::take_stdin_for_run(command)?;
         self.record(command);
         let reply = Reply {
             code: synthetic_success_code(command),
@@ -2857,18 +2868,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dry_run_never_spawns_and_always_synthesizes_success() {
-        // No rule to miss, no fallback to configure — every command
-        // unconditionally succeeds, unlike `ScriptedRunner`.
+    async fn dry_run_synthesizes_success_for_valid_commands() {
+        // No rule to miss, no fallback to configure — every valid command
+        // succeeds, unlike `ScriptedRunner`.
         let runner = DryRunRunner::new();
         for program in ["rm", "curl", "anything-at-all"] {
             let out = runner
                 .output_string(&Command::new(program).arg("--flag"))
                 .await
-                .unwrap_or_else(|e| panic!("dry run of `{program}` must never fail: {e}"));
+                .unwrap_or_else(|e| panic!("dry run of `{program}` must succeed: {e}"));
             assert!(out.is_success());
         }
         assert_eq!(runner.commands().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn dry_run_rejects_inherit_stdin_with_configured_source() {
+        let runner = DryRunRunner::new();
+        let command = Command::new("tool")
+            .inherit_stdin()
+            .stdin(crate::Stdin::from_string("payload"));
+
+        let error = runner
+            .output_string(&command)
+            .await
+            .expect_err("inherit_stdin with a configured source must be rejected");
+        match error {
+            crate::Error::Io(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(
+                    error.to_string().contains("inherit_stdin()"),
+                    "expected inherit_stdin context, got: {error}"
+                );
+            }
+            other => panic!("expected Error::Io(InvalidInput), got {other:?}"),
+        }
+        assert!(
+            runner.commands().is_empty(),
+            "validation must fail before the command is rendered"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_validates_one_shot_stdin_without_consuming_it() {
+        let runner = DryRunRunner::new();
+        let command = Command::new("tool").stdin(crate::Stdin::from_reader(&b"content"[..]));
+
+        assert!(
+            runner
+                .output_string(&command)
+                .await
+                .expect("dry-run validation succeeds")
+                .is_success()
+        );
+        assert!(
+            runner
+                .output_string(&command)
+                .await
+                .expect("dropping the reservation keeps the one-shot source available")
+                .is_success()
+        );
+        assert_eq!(runner.commands().len(), 2);
     }
 
     #[tokio::test]
