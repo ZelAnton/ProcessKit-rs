@@ -1338,11 +1338,15 @@ impl Command {
 
     /// The configured stdin source that will actually be passed to the child.
     ///
-    /// [`keep_stdin_open`](Self::keep_stdin_open) takes precedence over a source
-    /// set with [`stdin`](Self::stdin); this mirrors the shared
-    /// [`crate::runner::take_stdin_for_run`] launch boundary.
+    /// [`keep_stdin_open`](Self::keep_stdin_open) and
+    /// [`inherit_stdin`](Self::inherit_stdin) both take precedence over a
+    /// source set with [`stdin`](Self::stdin); this mirrors the shared
+    /// [`crate::runner::take_stdin_for_run`] launch boundary, which never
+    /// reserves a source for an inherit-stdin command (the conflict between
+    /// `inherit_stdin` and a configured source is rejected at the launch
+    /// boundary before any reservation happens).
     pub(crate) fn effective_stdin_source(&self) -> Option<&Stdin> {
-        (!self.keeps_stdin_open())
+        (!self.keeps_stdin_open() && !self.inherits_stdin())
             .then_some(())
             .and(self.stdin_source())
     }
@@ -2476,6 +2480,36 @@ mod tests {
             .keep_stdin_open();
         assert!(open_with_source.stdin_source().is_some());
         assert!(open_with_source.effective_stdin_source().is_none());
+    }
+
+    #[test]
+    fn effective_stdin_source_ignores_configured_source_when_inheriting_stdin() {
+        let inherit_with_bytes_source = Command::new("tool")
+            .stdin(crate::Stdin::from_bytes(b"ignored".to_vec()))
+            .inherit_stdin();
+        assert!(inherit_with_bytes_source.stdin_source().is_some());
+        assert!(inherit_with_bytes_source.effective_stdin_source().is_none());
+
+        let inherit_with_string_source = Command::new("tool")
+            .stdin(crate::Stdin::from_string("ignored"))
+            .inherit_stdin();
+        assert!(inherit_with_string_source.stdin_source().is_some());
+        assert!(
+            inherit_with_string_source
+                .effective_stdin_source()
+                .is_none()
+        );
+
+        // Same result regardless of whether `keep_stdin_open` is also set.
+        let inherit_with_source_and_keep_open = Command::new("tool")
+            .stdin(crate::Stdin::from_string("ignored"))
+            .keep_stdin_open()
+            .inherit_stdin();
+        assert!(
+            inherit_with_source_and_keep_open
+                .effective_stdin_source()
+                .is_none()
+        );
     }
 
     #[test]
