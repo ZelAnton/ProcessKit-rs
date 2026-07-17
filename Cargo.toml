@@ -157,6 +157,13 @@ tokio-util = { version = "0.7", default-features = false }
 # human-diffable on-disk format. Never in production builds without `record`.
 serde = { version = "1.0.166", features = ["derive"], optional = true }
 serde_json = { version = "1.0.100", optional = true }
+# `#[mutants::skip]`, marking a handful of genuinely equivalent-mutant helpers
+# (`buffer::clamp_dropoldest_tail`, `pump::drain_consumed_prefix`) as out of
+# scope for the `mutants` CI tier (.cargo/mutants.toml). A tiny, no-op-at-
+# compile-time attribute macro (see its own doc comment) — the annotated
+# functions aren't feature-gated, so this is a plain, unconditional dependency
+# rather than optional.
+mutants = "0.0.4"
 
 [features]
 # Feature flags are *visibility* gates: additive, hiding API without changing the
