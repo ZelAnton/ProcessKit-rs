@@ -13,6 +13,61 @@ use tokio::sync::Notify;
 
 use crate::buffer::{LineTerminator, OutputBufferPolicy, OverflowMode};
 
+// The oversized-line paths deliberately discard decoded text before it can
+// accumulate. Unit tests need to observe that internal bound without making it
+// part of the production pump contract; task-local storage keeps parallel tests
+// isolated and compiles out of non-test builds.
+#[cfg(test)]
+#[derive(Default)]
+struct PumpTestProbe {
+    max_pending_bytes: AtomicUsize,
+    skip_calls: AtomicUsize,
+    guard_entries: AtomicUsize,
+}
+
+#[cfg(test)]
+impl PumpTestProbe {
+    fn max_pending_bytes(&self) -> usize {
+        self.max_pending_bytes.load(Ordering::Relaxed)
+    }
+
+    fn skip_calls(&self) -> usize {
+        self.skip_calls.load(Ordering::Relaxed)
+    }
+
+    fn guard_entries(&self) -> usize {
+        self.guard_entries.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static PUMP_TEST_PROBE: Arc<PumpTestProbe>;
+}
+
+#[cfg(test)]
+fn observe_pending(pending: &str) {
+    let _ = PUMP_TEST_PROBE.try_with(|probe| {
+        probe
+            .max_pending_bytes
+            .fetch_max(pending.len(), Ordering::Relaxed);
+    });
+}
+
+#[cfg(test)]
+fn observe_skip_call() {
+    let _ = PUMP_TEST_PROBE.try_with(|probe| {
+        probe.skip_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[cfg(test)]
+fn observe_guard_entry() {
+    let _ = PUMP_TEST_PROBE.try_with(|probe| {
+        probe.guard_entries.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
 /// A push-style per-line callback (e.g. tee each line to a log).
 pub(crate) type LineHandler = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -735,6 +790,8 @@ where
             pending.reserve(need);
         }
         let _ = decoder.decode_to_string(&chunk[..n], &mut pending, last);
+        #[cfg(test)]
+        observe_pending(&pending);
 
         // Split out every complete line decoded so far, bounding memory by
         // `cap`. `start` is a byte cursor into `pending`: instead of draining
@@ -757,6 +814,8 @@ where
                         sink.0.record_oversized_line(line_len);
                     }
                     None => {
+                        #[cfg(test)]
+                        observe_skip_call();
                         let advance = skip_over_cap_len(sub);
                         start += advance;
                         oversized = Some(skipped.saturating_add(advance));
@@ -790,6 +849,10 @@ where
                     None if cap
                         .is_some_and(|c| sub.len() - usize::from(sub.ends_with('\r')) > c) =>
                     {
+                        #[cfg(test)]
+                        observe_guard_entry();
+                        #[cfg(test)]
+                        observe_skip_call();
                         let advance = skip_over_cap_len(sub);
                         start += advance;
                         oversized = Some(advance);
@@ -2604,30 +2667,11 @@ mod tests {
 
     #[tokio::test]
     async fn skip_over_cap_len_actually_advances_past_the_discarded_prefix() {
-        // `skip_over_cap_len`'s *recorded length* (via `record_oversized_line`)
-        // is unchanged by how much of `sub` it reports skippable: whatever is not
-        // advanced past simply stays in `pending` and is re-counted once the
-        // terminator is finally found, so a byte-total/`seen_bytes` assertion
-        // alone cannot tell a `0` body apart from the real one — both report the
-        // exact right total (the un-drained tail is simply re-summed later).
-        // What a `0` body actually breaks is its *sole purpose*: bounding the
-        // in-flight buffer (see the function's doc comment and the `cap + CHUNK`
-        // note above `pump_lines_core`'s main loop) so a newline-free flood
-        // cannot OOM the parent. Never advancing means `pending` is never
-        // drained while skipping — it keeps the WHOLE oversized line in memory
-        // and re-scans it from byte 0 for a terminator on every single read,
-        // turning O(chunks) work into O(chunks²).
-        //
-        // Pin the actual guarantee instead: pump a long, newline-free, deeply
-        // over-cap stream split across many small reads and require it to finish
-        // within a generous, machine-speed-scaling-only bound. With the real
-        // `skip_over_cap_len` (draining down to ~`cap + CHUNK` every read) this
-        // takes tens of milliseconds locally; a `0` body measured ~100x slower
-        // (multiple seconds) — the quadratic blowup from re-scanning an
-        // ever-growing, never-drained buffer. The bound below leaves large
-        // headroom on both sides (the real path is comfortably under it even on
-        // a much slower CI host; the O(n^2) path comfortably exceeds it) rather
-        // than depending on exact timing.
+        // `seen_bytes` proves that the skipped prefix and final tail are charged
+        // exactly once. The task-local probe additionally pins the reason this
+        // helper exists: every skipped chunk must be drained from `pending`, so
+        // its high-water mark remains one input chunk. A `0` return value leaves
+        // the whole 20 MB line in `pending` and fails this deterministically.
         let chunks: Vec<Vec<u8>> = std::iter::repeat_with(|| vec![b'a'; 8000])
             .take(2500)
             .collect();
@@ -2635,52 +2679,65 @@ mod tests {
         // A 1-byte cap forces the very first chunk into the skip path, so every
         // one of the 2500 reads that follow stays in it (no terminator anywhere).
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(1));
-        let start = std::time::Instant::now();
-        pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
+        let probe = Arc::new(PumpTestProbe::default());
+        PUMP_TEST_PROBE
+            .scope(
+                probe.clone(),
+                pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()),
+            )
+            .await;
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(1),
-            "skipping a 20MB over-cap line across 2500 reads must stay near-linear \
-             (took {:?}) — a `skip_over_cap_len` that fails to advance would instead \
-             re-scan the whole never-drained buffer on every read",
-            start.elapsed()
+            probe.max_pending_bytes() <= 8000,
+            "skipping each 8 KB chunk must keep pending bounded (high-water: {} bytes)",
+            probe.max_pending_bytes()
+        );
+        assert!(
+            probe.skip_calls() >= 2500,
+            "every chunk must invoke skip_over_cap_len while discarding the flood"
         );
         assert!(
             sink.drain().is_empty(),
             "the over-cap line is never retained"
         );
         assert!(sink.dropped() >= 1, "the over-cap line is a truncation");
+        assert_eq!(
+            sink.seen_bytes(),
+            20_000_000,
+            "all 20M bytes are accounted for"
+        );
     }
 
     #[tokio::test]
     async fn memory_bound_guard_engages_the_skip_path_for_a_newline_free_flood() {
         // The memory-bound guard (`cap.is_some_and(|c| sub.len() - ... > c)`)
-        // is what *enters* the over-cap skip path in the first place. Like
-        // `skip_over_cap_len` above, disabling it (`with false`) is invisible to
-        // a final byte-total assertion: without it, the line is simply never
-        // flagged as oversized *during* streaming, so `pending` keeps
-        // accumulating unbounded — but once a terminator (or EOF) eventually
-        // shows up, the ordinary over-cap checks (`len <= c` at the terminator,
-        // `line.len() > c` at EOF) still correctly classify and drop it via
-        // `record_oversized_line`, reporting the exact right total. A disabled
-        // guard is instead an OOM guard that never engages: every read re-scans
-        // the whole never-drained buffer from scratch for a terminator that
-        // never comes, the same O(chunks²) blowup `skip_over_cap_len` guards
-        // against — so it is caught by the same near-linear-time requirement,
-        // with independently chosen chunk counts/sizes so this test does not
-        // merely piggyback on the one above.
+        // is what enters the over-cap skip path in the first place. Pin both the
+        // observed guard entry and the bounded pending buffer: replacing it with
+        // `false` records no entry and retains the whole newline-free flood.
         let chunks: Vec<Vec<u8>> = std::iter::repeat_with(|| vec![b'x'; 8000])
             .take(3500)
             .collect();
         let reader = ChunkedReader::new(chunks);
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(8));
-        let start = std::time::Instant::now();
-        pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
+        let probe = Arc::new(PumpTestProbe::default());
+        PUMP_TEST_PROBE
+            .scope(
+                probe.clone(),
+                pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()),
+            )
+            .await;
+        assert_eq!(
+            probe.guard_entries(),
+            1,
+            "the first over-cap chunk must engage the memory-bound guard"
+        );
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(1),
-            "a newline-free flood far over the byte cap must engage the skip path \
-             and stay near-linear (took {:?}) — a disabled guard never engages it \
-             and instead re-scans the whole never-drained buffer on every read",
-            start.elapsed()
+            probe.skip_calls() >= 3500,
+            "guard engagement must move the flood into the skip path"
+        );
+        assert!(
+            probe.max_pending_bytes() <= 8000,
+            "the guard must keep pending bounded (high-water: {} bytes)",
+            probe.max_pending_bytes()
         );
         assert!(
             sink.drain().is_empty(),
@@ -2689,6 +2746,11 @@ mod tests {
         assert!(
             sink.dropped() >= 1,
             "the over-cap flood is recorded as a truncation via record_oversized_line"
+        );
+        assert_eq!(
+            sink.seen_bytes(),
+            28_000_000,
+            "all 28M bytes are accounted for"
         );
     }
 
