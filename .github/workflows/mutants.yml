@@ -77,6 +77,74 @@ name: mutants
 #
 # Full mutation coverage (closing the real MISSED gaps observed on this scope)
 # is a separate follow-up; this change only fixes what counts as a false alarm.
+#
+# A shard whose runner is reclaimed mid-sweep (T-130)
+# ---------------------------------------------------
+# Separately from the MISSED/TIMEOUT verdict logic above, one shard (observed:
+# 5/8, on 3 independent runs 2026-07-17..2026-07-18, each interrupted ~6 min in —
+# far inside timeout-minutes: 90 and inside cargo-mutants' own ~30-38 s per-mutant
+# auto-timeout) does not reach a verdict at all: its GitHub-hosted runner is
+# reclaimed out from under a well-behaved process —
+#
+#     ERROR interrupted
+#     ##[error]The runner has received a shutdown signal. ...
+#     ##[error]The operation was canceled.
+#
+# This is an INFRASTRUCTURE-level reclaim, a failure class distinct from a red
+# shard. GitHub cancels the reclaimed job, so its conclusion is `cancelled`, NOT
+# the `failure` that the verdict step below produces via `exit 1` on a real
+# MISSED. That `cancelled` vs `failure` split is the entire basis of the safe
+# auto-retry (see the mitigation note below).
+#
+# Root cause (investigated; a pre-existing instability, not a regression):
+#   * The first of the three runs predates T-128/T-129 entirely (it used the old
+#     exit-code step) and hit the identical shard-5/8 pattern — so neither task
+#     introduced it.
+#   * NOT timeout-minutes (dies ~6 min; budget is 90) and NOT cargo-mutants'
+#     per-mutant auto-timeout (the message is a hosted-runner reclaim, not a
+#     cargo-mutants TIMEOUT verdict; TIMEOUT handling stays correct in the other
+#     7 shards).
+#   * The tempting "a mutated Linux process-lifecycle function (sys::imp /
+#     running) leaks orphan child processes and destabilises the runner"
+#     hypothesis is ruled OUT by the actual mutation scope. .cargo/mutants.toml
+#     limits examine_globs to five hermetic pure-logic modules (pump/buffer/
+#     retry/result/error) AND exclude_globs `src/sys/**`, `src/running/**`,
+#     `src/supervisor.rs`, so NO mutant is ever generated in the process-spawning
+#     layer. `cargo mutants --list --shard 5/8` confirms it: every mutant in that
+#     shard is in those five files, none under sys/running. (The benign
+#     `WARN referent of mod not found mod_name=imp` in the log is cargo-mutants
+#     parsing the `mod imp;` declaration in src/sys/mod.rs, not mutating sys::imp
+#     — see KB K-009.) There is therefore no in-scope code defect to fix here.
+#   * What remains is a transient hosted-runner reclaim (an infra flake and/or
+#     resource churn from the full test suite that cargo-mutants re-runs per
+#     mutant, which does spawn real subprocesses). Pinning the exact trigger
+#     would need a multi-hour sweep on the CI-pinned Linux toolchain (K-006/
+#     K-009) — out of scope on a Windows host, and moot: the reclaim happens
+#     before any verdict, so there is no coverage gap to repair, only a lost job
+#     to re-run.
+#
+# Mitigation (accepted interim): a companion controller, the workflow
+# .github/workflows/mutants-retry.yml, watches this workflow's completion and
+# re-runs — from a clean checkout on a fresh runner — ONLY shard jobs whose
+# conclusion is `cancelled`, never `failure`. A step-level retry here (a bash
+# loop / retry-action inside the shard step) cannot help: the runner itself is
+# being torn down, so the retry code would die with it — only a fresh job on a
+# fresh runner recovers. Because a real MISSED verdict is `failure`, it is
+# structurally impossible for this retry to paper over a coverage gap: the
+# retried shard either reaches a genuine verdict (green, or a real MISSED red
+# that stays red) or is reclaimed again and, after a small bounded number of
+# attempts, stays visibly unresolved. Retrying is safe precisely because the
+# failure happens before cargo-mutants reaches any verdict — there is nothing to
+# hide.
+#
+# Trade-off (deliberate, accepted): a runner genuinely lost to a transient infra
+# event is retried automatically (the goal), at the cost of also retrying a shard
+# cancelled for some other reason while its siblings still reached verdicts. The
+# controller therefore refuses to retry when the WHOLE run is cancelled (the
+# manual-/whole-run-cancel shape) and caps attempts to avoid re-run loops. This
+# only auto-retries; it cannot by itself PROVE the reclaim is gone — that is
+# confirmed by observing a later schedule/workflow_dispatch run reach a verdict
+# on the affected shard (the T-130 follow-up observation point).
 on:
   schedule:
     # 05:29 UTC daily — staggered from stress.yml (03:17) and fuzz.yml (04:07).

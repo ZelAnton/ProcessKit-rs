@@ -1,0 +1,108 @@
+name: mutants-retry
+
+# Companion auto-retry controller for the `mutants` tier (see
+# .github/workflows/mutants.yml). It exists to handle ONE specific, pre-existing
+# failure class documented under "A shard whose runner is reclaimed mid-sweep
+# (T-130)" in that file: a shard whose GitHub-hosted runner is reclaimed out from
+# under a well-behaved process mid-sweep —
+#
+#     ##[error]The runner has received a shutdown signal. ...
+#     ##[error]The operation was canceled.
+#
+# That is an INFRASTRUCTURE-level reclaim, distinct from a red shard. GitHub
+# cancels the reclaimed job, so its conclusion is `cancelled`. A real coverage
+# gap, by contrast, makes the `Run mutants shard` step `exit 1`, so that job's
+# conclusion is `failure`. This controller keys off exactly that difference and
+# re-runs ONLY `cancelled` shard jobs — never `failure` — from a clean checkout
+# on a fresh runner (a step-level retry inside mutants.yml cannot help here: the
+# runner itself is being torn down, so the retry code would die with it; only a
+# fresh job on a fresh runner recovers).
+#
+# Why this can never mask a real MISSED verdict
+# ---------------------------------------------
+#   * A shard with MISSED mutants concludes `failure` (T-129 gating: `exit 1`).
+#     `failure` is NEVER in the retry set, so a genuine coverage gap always stays
+#     red no matter how many times the reclaim retry fires.
+#   * The reclaim happens BEFORE cargo-mutants reaches any verdict at all, so
+#     there is nothing for a retry to hide: the retried shard either reaches a
+#     genuine verdict (green, or a real MISSED red that stays red) or is
+#     reclaimed again and, once the bounded attempt budget is spent, stays
+#     visibly unresolved (a `cancelled` run is not green).
+#
+# Guards (deliberate, to avoid fighting non-infra cancels and re-run loops):
+#   * run_attempt cap in the job `if:` bounds total attempts (no infinite loop:
+#     each single-job re-run bumps run_attempt and fires this workflow again).
+#   * Only acts when SOME job in the run reached a real verdict (success/failure)
+#     — if EVERY job is `cancelled`, that is the shape of a manual/whole-run
+#     cancel (or a broad infra event), not a per-shard reclaim, so it is left
+#     alone.
+#   * Only reacts to the mutants tier's own triggers (schedule/workflow_dispatch).
+#
+# This controller only auto-retries; it does not by itself PROVE the reclaim is
+# gone. That is confirmed by observing a later schedule/workflow_dispatch run
+# reach a verdict on the affected shard (the T-130 follow-up observation point).
+
+on:
+  workflow_run:
+    workflows: ["mutants"]
+    types: [completed]
+
+permissions:
+  contents: read
+  # Required for `gh run rerun` against the triggering mutants run.
+  actions: write
+
+jobs:
+  retry-reclaimed-shards:
+    name: retry runner-reclaimed shards
+    # Skip clean runs, cap attempts to avoid re-run loops, and only react to the
+    # mutants tier's own triggers. Each `--job` re-run increments run_attempt and
+    # re-fires this workflow, so `< 3` allows a reclaimed shard to be retried at
+    # most twice before it is left visibly unresolved.
+    if: >-
+      ${{ github.event.workflow_run.conclusion != 'success'
+          && github.event.workflow_run.run_attempt < 3
+          && (github.event.workflow_run.event == 'schedule'
+              || github.event.workflow_run.event == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Re-run only shards cancelled by a runner reclaim (never MISSED reds)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          # Enumerate the jobs of the completed mutants run. The mutants matrix is
+          # 8 shards (well under one page); this controller job lives in a
+          # different workflow, so it is not in that list.
+          gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs?per_page=100" > jobs.json
+
+          # `cancelled` == runner reclaim (the only thing we retry).
+          cancelled_ids="$(jq -r '.jobs[] | select(.conclusion == "cancelled") | .id' jobs.json)"
+          # `success`/`failure` == a shard that actually reached a verdict.
+          reached_verdict="$(jq -r '[.jobs[] | select(.conclusion == "success" or .conclusion == "failure")] | length' jobs.json)"
+
+          if [ -z "$cancelled_ids" ]; then
+            echo "No shard job was reclaimed (no 'cancelled' conclusion) — nothing to retry."
+            echo "A MISSED shard concludes 'failure', which is intentionally never retried."
+            exit 0
+          fi
+
+          if [ "$reached_verdict" -eq 0 ]; then
+            echo "Every job is 'cancelled' — this is the shape of a manual/whole-run cancel or a broad infra event, not a per-shard runner reclaim. Not retrying."
+            exit 0
+          fi
+
+          # Re-run reclaimed shard job(s) on a fresh runner, by job id, so a real
+          # MISSED red ('failure') is never in the retry set. Re-running one job
+          # puts the run back in progress and re-fires this workflow on the new
+          # attempt, so any still-'cancelled' shard is picked up on the next cycle
+          # (bounded by the run_attempt guard above). The observed symptom is a
+          # single reclaimed shard, so one per cycle is sufficient in practice.
+          echo "Reclaimed shard job id(s): $(printf '%s ' $cancelled_ids)"
+          target_id="$(printf '%s\n' $cancelled_ids | head -n1)"
+          echo "Re-running job ${target_id} from a clean checkout on a fresh runner."
+          gh run rerun --job "${target_id}"
