@@ -20,6 +20,55 @@ to a dated version section.
 ### Fixed
 -
 
+## [2.3.0] - 2026-07-19
+
+### Added
+
+- Add hermetic tests for pump oversized-line skip/guard paths, mark equivalent mutants
+- Add scoped retry controller for mutants shard runner reclaims
+- Add auto-retry controller for mutants-shard runner reclaims
+
+
+### Changed
+
+- Consolidate one-shot-stdin predicate on Command::effective_stdin_source
+- Pin surviving mutation-test boundaries in error.rs redaction/truncation
+- Pin surviving capacity-boundary mutants in pump.rs with boundary tests
+- Pin surviving capacity-boundary mutants in buffer.rs with boundary tests
+- Initialize integration workspace for batch B-20260716T110651Z
+- Pin surviving capacity-boundary mutants in buffer.rs with boundary tests
+- Pin surviving capacity-boundary mutants in pump.rs with boundary tests
+- Pin surviving mutation-test boundaries in error.rs redaction/truncation
+- Consolidate one-shot-stdin predicate on Command::effective_stdin_source
+- Align record_oversized_line with discarding-contract of SharedLines::push
+- Initialize integration workspace for batch B-20260716T223538Z
+- Align record_oversized_line with the discarding contract of SharedLines::push
+- Substitute resolved path for non-.exe PATHEXT bare-name matches on Windows
+- Route DryRunRunner stdin validation through take_stdin_for_run
+- 
+- Reject invalid stdin configs in DryRunRunner via take_stdin_for_run
+- Substitute resolved path for non-.exe PATHEXT bare-name matches on Windows
+- Mirror stdin_inherit into Command::effective_stdin_source
+- Initialize integration workspace for batch B-20260717T012348Z
+- Mirror stdin_inherit into Command::effective_stdin_source
+- Gate mutants CI on missed.txt content instead of cargo-mutants exit code
+- Validate outcome files before tolerating exit codes 2/3, enforce generous timeouts
+- Replace timing-based mutant proofs with deterministic assertions
+- ci(deps): bump actions/deploy-pages from 4 to 5 (#15)
+- ci(deps): bump actions/cache from 4 to 6
+- ci(deps): bump actions/upload-artifact from 4 to 7
+- ci(deps): bump actions/upload-pages-artifact from 3 to 5
+- Initialize integration workspace for batch B-20260717T123847Z (re-anchored on updated main)
+- Close remaining MISSED mutants in pump.rs/buffer.rs mutation scope
+- Gate mutants CI on MISSED only, tolerate TIMEOUT
+- Start integration branch for batch B-20260718T103516Z
+
+
+### Fixed
+
+- Fix outdated Pipeline crate-doc: per-stage sub-groups, not one shared group
+- Fix outdated Pipeline crate-doc: per-stage sub-groups, not one shared group
+
 ## [2.2.5] - 2026-07-13
 
 ### Added
@@ -2226,7 +2275,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.5...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.5...v2.3.0
 [2.2.5]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.4...v2.2.5
 [2.2.4]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.3...v2.2.4
 [2.2.3]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.2...v2.2.3
