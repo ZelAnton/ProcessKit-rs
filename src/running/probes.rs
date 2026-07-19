@@ -192,17 +192,24 @@ impl RunningProcess {
         F: FnMut() -> Fut,
         Fut: Future<Output = bool>,
     {
-        // Background-drain stdout (and, via the same call, stderr) so a child
-        // that writes a large startup burst before becoming ready can't stall in
+        // Background-drain stderr and (when streamable) stdout so a child that
+        // writes a large startup burst before becoming ready can't stall in
         // `write()` on a full OS pipe buffer (~64 KiB on Linux) while we poll —
-        // the same pump `wait_for_line` uses, just without a foreground search:
+        // the same pumps `wait_for_line` uses, just without a foreground search:
         // nothing here ever pops a line back out, but `pump_lines_core` drains
-        // the pipe into the sink regardless of whether anyone reads the sink, so
-        // setting the pump up once is enough. Not arming the `Command::timeout`
-        // watchdog matches every other probe. Errors are not this probe's
-        // concern — stdout not piped, or already drained by an earlier
-        // streaming call — either way there's nothing left to do here.
-        let _ = self.drain_stdout_lines();
+        // the pipe into the sink regardless of whether anyone reads it, so
+        // setting the pumps up once is enough. Not arming the `Command::timeout`
+        // watchdog matches every other probe.
+        //
+        // Crucially the stderr drain is armed *independently* of stdout: piped
+        // stderr (the default) must keep flowing even when stdout is not piped
+        // (`Inherit`/`Null`), where a plain `drain_stdout_lines` would bail on
+        // `ensure_stdout_streamable` before ever reaching the stderr pump and
+        // strand a chatty child mid-`write()`. A non-piped or already-consumed
+        // stdout is not this probe's concern — `ensure_background_drains` skips
+        // its stdout pump for that case (it never hands stdout back), leaving the
+        // `stdout_lines` / `wait_for_line` contract untouched.
+        self.ensure_background_drains();
 
         // Clamp so a `Duration::MAX`-ish `within` can't overflow the deadline.
         let deadline = Instant::now() + within.min(crate::MAX_DEADLINE);
@@ -246,4 +253,113 @@ fn probe_futures_are_send(rp: &mut RunningProcess) {
     assert_send(&rp.wait_for(|| async { true }, Duration::ZERO));
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
     assert_send(&rp.wait_for_port(addr, Duration::ZERO));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::command::Command;
+    use crate::doubles::{Reply, ScriptedRunner};
+    use crate::runner::ProcessRunner;
+
+    /// T-134: a readiness probe must background-drain piped stderr even when
+    /// stdout is not piped (`StdioMode::Null`/`Inherit`). The scripted backend
+    /// can't reproduce a real `write()` block on a full OS pipe buffer (the
+    /// `#[ignore]` real-subprocess test
+    /// `wait_for_drains_stderr_so_a_large_startup_burst_does_not_block_readiness`
+    /// covers that liveness), but it deterministically pins the state that used to
+    /// be wrong: `poll_until` armed its drains through `drain_stdout_lines`, which
+    /// bailed on `ensure_stdout_streamable` for a non-piped stdout *before* ever
+    /// reaching the stderr pump — so the probe left piped stderr un-drained and a
+    /// chatty child stranded in `write()`.
+    #[tokio::test]
+    async fn probe_background_drains_stderr_when_stdout_is_not_piped() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok("").with_stderr("warn-1\nwarn-2\n"))
+            .start(&Command::new("tool").stdout(crate::StdioMode::Null))
+            .await
+            .expect("scripted start");
+
+        // A check that passes on the first tick still must have armed the stderr
+        // drain before returning.
+        run.wait_for(|| async { true }, Duration::from_millis(50))
+            .await
+            .expect("an always-true check passes immediately");
+
+        assert!(
+            run.stderr_sink.is_some(),
+            "the probe must background-drain piped stderr even with a non-piped stdout"
+        );
+
+        // The stderr drained during the probe is retained for a later consuming
+        // `finish` — matching the documented retention contract.
+        let finished = run.finish().await.expect("finish the scripted run");
+        assert_eq!(
+            finished.stderr, "warn-1\nwarn-2",
+            "the stderr the probe drained is handed back by finish"
+        );
+    }
+
+    /// `wait_for_port` shares `poll_until` (and thus `ensure_background_drains`)
+    /// with `wait_for`, so it too must arm the stderr drain with a non-piped
+    /// stdout. There is no scripted seam for the TCP connect, so bind a real
+    /// localhost listener: the very first connect tick then succeeds, and the
+    /// probe still must have armed the stderr drain before returning.
+    #[tokio::test]
+    async fn wait_for_port_probe_also_drains_stderr_when_stdout_is_not_piped() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok("").with_stderr("boom\n"))
+            .start(&Command::new("tool").stdout(crate::StdioMode::Null))
+            .await
+            .expect("scripted start");
+
+        run.wait_for_port(addr, Duration::from_secs(1))
+            .await
+            .expect("the bound port is immediately ready");
+
+        assert!(
+            run.stderr_sink.is_some(),
+            "wait_for_port must background-drain piped stderr even with a non-piped stdout"
+        );
+    }
+
+    /// Neighboring case the fix must not regress: once an earlier streaming verb
+    /// consumed stdout and armed the background stderr pump, a probe must reuse
+    /// those exact drains, not re-install them. Re-taking the stderr reader or
+    /// overwriting the sink would strand the running pump or drop already-drained
+    /// stderr — `ensure_background_drains` is idempotent here (stderr is guarded by
+    /// `stderr_sink.is_none()`, and `drain_stdout_lines` errors out on
+    /// already-consumed stdout, which the probe ignores).
+    #[tokio::test]
+    async fn probe_after_streaming_does_not_reinstall_the_drains() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok("out-1\n").with_stderr("err-1\n"))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+
+        // An earlier streaming verb takes stdout and arms the background stderr pump.
+        let _stream = run.stdout_lines().expect("stream stdout");
+        let stderr_before =
+            std::sync::Arc::clone(run.stderr_sink.as_ref().expect("streaming armed stderr"));
+
+        // A probe now must reuse the exact same stderr sink, not build a new one.
+        run.wait_for(|| async { true }, Duration::from_millis(50))
+            .await
+            .expect("an always-true check passes immediately");
+
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &stderr_before,
+                run.stderr_sink.as_ref().expect("stderr still armed"),
+            ),
+            "the probe must not replace the stderr sink an earlier stream installed"
+        );
+    }
 }
