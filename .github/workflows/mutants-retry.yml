@@ -70,6 +70,7 @@ jobs:
       - name: Re-run only shards cancelled by a runner reclaim (never MISSED reds)
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
