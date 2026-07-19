@@ -80,10 +80,13 @@ pub(crate) async fn run(
     // Clamp so a `Duration::MAX`-ish timeout can't overflow the `Instant` add.
     let deadline = Instant::now() + timeout.min(crate::MAX_DEADLINE);
     while !target.is_drained() {
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             break;
         }
-        sleep(POLL_INTERVAL).await;
+        // Never oversleep past the deadline, however large `POLL_INTERVAL` is
+        // relative to the remaining grace.
+        sleep(POLL_INTERVAL.min(deadline - now)).await;
     }
     if escalate && !target.is_drained() {
         target.hard_kill()?;
