@@ -98,19 +98,9 @@ impl RunningProcess {
     pub(super) fn drain_stdout_lines(&mut self) -> Result<StdoutLines> {
         self.ensure_stdout_streamable()?;
         // Background-drain stderr; keep the handle so `finish` can await the last
-        // line. Set up once — a second call must not overwrite the first sink/pump,
-        // or `finish` would return empty stderr.
-        if self.stderr_sink.is_none() {
-            let stderr_sink = SharedLines::new(&self.buffer);
-            if let Some(pipe) = self.backend.take_stderr_reader() {
-                self.stderr_pump = Some(tokio::spawn(pump_lines_core(
-                    pipe,
-                    self.stderr_config.clone(),
-                    stderr_sink.clone(),
-                )));
-            }
-            self.stderr_sink = Some(stderr_sink);
-        }
+        // line. Idempotent, so a second call never overwrites the first sink/pump
+        // (which would leave `finish` with empty stderr).
+        self.ensure_stderr_drain();
 
         let stdout_sink = SharedLines::new(&self.buffer);
         match self.backend.take_stdout_reader() {
@@ -135,6 +125,59 @@ impl RunningProcess {
             sink: stdout_sink,
             wait: None,
         })
+    }
+
+    /// Background-drain stderr under the caller's
+    /// [`OutputBufferPolicy`](crate::OutputBufferPolicy) when it is piped and not
+    /// already draining, retaining the sink/pump so [`finish`](Self::finish) can
+    /// await the last line and return the collected stderr.
+    ///
+    /// Deliberately **independent of stdout**: it never consults stdout's
+    /// streamability, so a readiness probe can keep stderr flowing even when
+    /// stdout is `Inherit`/`Null` (and so has no drain of its own). Idempotent —
+    /// a second call is a no-op, because overwriting the first sink/pump would
+    /// discard already-drained stderr (and its overflow flag), leaving `finish`
+    /// with empty stderr. A non-piped stderr installs an empty sink with no pump,
+    /// matching what `finish` expects (empty stderr).
+    fn ensure_stderr_drain(&mut self) {
+        if self.stderr_sink.is_none() {
+            let stderr_sink = SharedLines::new(&self.buffer);
+            if let Some(pipe) = self.backend.take_stderr_reader() {
+                self.stderr_pump = Some(tokio::spawn(pump_lines_core(
+                    pipe,
+                    self.stderr_config.clone(),
+                    stderr_sink.clone(),
+                )));
+            }
+            self.stderr_sink = Some(stderr_sink);
+        }
+    }
+
+    /// Set up the background output drains a readiness probe needs, regardless of
+    /// whether stdout is streamable.
+    ///
+    /// The stderr drain is the liveness-critical part and is armed
+    /// unconditionally via `ensure_stderr_drain`: a child that writes a large
+    /// startup burst to piped stderr before becoming ready must not stall in
+    /// `write()` on a full OS pipe buffer (~64 KiB on Linux), and it must not do
+    /// so even when stdout is `Inherit`/`Null`. The stdout drain is best-effort —
+    /// `drain_stdout_lines` sets it up only for piped, not-yet-consumed stdout,
+    /// and otherwise returns an `Err` that is deliberately ignored here: unlike
+    /// `wait_for_line`, a probe never hands stdout back, so a non-streamable
+    /// stdout is not its concern. This leaves the `stdout_lines` / `wait_for_line`
+    /// contract untouched — neither changes behavior; only the probe now drains
+    /// stderr independently of stdout.
+    pub(super) fn ensure_background_drains(&mut self) {
+        // stderr first and on its own, so it can't hinge on stdout being
+        // streamable: the bug this fixes was `drain_stdout_lines` bailing on a
+        // non-piped stdout (via `ensure_stdout_streamable`) before ever reaching
+        // the stderr pump.
+        self.ensure_stderr_drain();
+        // stdout is best-effort: only piped, not-yet-consumed stdout gets a pump;
+        // the `Err` for a non-piped/consumed stdout is not this probe's concern
+        // (`ensure_stderr_drain` above already made stderr's drain idempotent, so
+        // the redundant call inside `drain_stdout_lines` is a no-op).
+        let _ = self.drain_stdout_lines();
     }
 
     /// Arm the deadline watchdog for a live stream. At the timeout, claim it via

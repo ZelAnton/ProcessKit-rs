@@ -176,6 +176,34 @@ pub(crate) fn big_stdout_then_marker(bytes: usize, marker: &std::path::Path) -> 
     }
 }
 
+/// A child that writes `bytes` bytes to **stderr** in one burst, then creates an
+/// empty marker file at `marker` and exits 0, per platform — the stderr analogue
+/// of [`big_stdout_then_marker`]. `bytes` should be well past the OS pipe buffer
+/// (~64 KiB on Linux, similarly small elsewhere): if nothing drains piped stderr
+/// while the child writes, it stalls in `write()` and never reaches (creates) the
+/// marker. Pair it with `stdout(StdioMode::Null)` to reproduce the readiness-probe
+/// case where stdout is not piped and only stderr needs a background drain.
+pub(crate) fn big_stderr_then_marker(bytes: usize, marker: &std::path::Path) -> Command {
+    let marker = marker.display();
+    if cfg!(windows) {
+        Command::new("powershell").args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "[Console]::Error.Write(('x' * {bytes})); \
+                 New-Item -ItemType File -Path '{marker}' -Force | Out-Null"
+            ),
+        ])
+    } else {
+        // `1>&2` sends head's byte burst to stderr; the marker follows only once
+        // that write completes.
+        Command::new("sh").args([
+            "-c",
+            &format!("yes | head -c {bytes} 1>&2; touch '{marker}'"),
+        ])
+    }
+}
+
 /// A child that prints its whole environment, per platform.
 pub(crate) fn print_env() -> Command {
     if cfg!(windows) {

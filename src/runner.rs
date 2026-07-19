@@ -438,6 +438,38 @@ pub trait ProcessRunnerExt: ProcessRunner {
     }
 }
 
+/// Whether `err` is a launch failure **guaranteed to have occurred before any
+/// child process was spawned** — the program was never located
+/// ([`Error::NotFound`](crate::Error::NotFound)), the spawn attempt itself
+/// failed ([`Error::Spawn`](crate::Error::Spawn) — including a transient
+/// `ETXTBSY` that [`Error::is_transient`](crate::Error::is_transient) accepts),
+/// or a required platform primitive was refused up front
+/// ([`Error::Unsupported`](crate::Error::Unsupported)). In each of these no live
+/// child ever existed.
+///
+/// This is what lets [`retrying`] safely re-run a command carrying a **one-shot**
+/// stdin source: [`launch`] reserves that payload transactionally and commits it
+/// only once a child exists (see [`take_stdin_for_run`] and
+/// [`StdinReservation`](crate::stdin::StdinReservation)), so a pre-child failure
+/// rolls the reservation back and leaves the payload intact for the retried
+/// attempt. Every other error may have reached a live child that already
+/// consumed the source, so it is **not** treated as pre-child — including the
+/// ambiguous [`Error::Io`](crate::Error::Io), which arises both before a child
+/// (a process group that could not be created, a source already consumed by an
+/// *earlier* run) and after one (driving or tearing down a live child).
+///
+/// A conservative `matches!`, not an exhaustive match: the safe default for the
+/// retry gate is "not pre-child" (do not retry), so a future error variant is
+/// correctly refused a one-shot retry until it is deliberately added here.
+fn is_pre_child_launch_failure(err: &crate::Error) -> bool {
+    matches!(
+        err,
+        crate::Error::NotFound { .. }
+            | crate::Error::Spawn { .. }
+            | crate::Error::Unsupported { .. }
+    )
+}
+
 /// Run `attempt` once, or up to the policy's `max_attempts` when the command
 /// carries a retry config, sleeping the policy's per-retry delay (capped
 /// exponential backoff, optionally jittered) between retries while the error is
@@ -448,7 +480,9 @@ where
     Fut: core::future::Future<Output = Result<T>>,
 {
     let config = command.retry_config();
-    // A one-shot streaming stdin is consumed by the first attempt; run once.
+    // A one-shot streaming stdin feeds a single run, so a retry may re-feed it
+    // only when the failed attempt is guaranteed not to have consumed it — see
+    // the gate on `is_pre_child_launch_failure` below.
     let one_shot_stdin = command
         .effective_stdin_source()
         .is_some_and(crate::Stdin::is_one_shot);
@@ -463,7 +497,16 @@ where
                 if err.is_cancelled() {
                     return Err(err);
                 }
-                if one_shot_stdin {
+                // A one-shot streaming stdin (from_reader/from_lines) feeds a
+                // single run. Only a failure guaranteed to precede a live child
+                // (NotFound/Spawn/Unsupported) rolled the transactional stdin
+                // reservation back (see `launch`), leaving the payload intact for
+                // a safe retry. Any other error may have spawned a child that
+                // consumed the source (Exit/Timeout/Signalled/Stdin/
+                // OutputTooLarge, or the ambiguous Io), so retrying could only
+                // replay empty stdin or spuriously re-classify the re-consume —
+                // return the first error as-is.
+                if one_shot_stdin && !is_pre_child_launch_failure(&err) {
                     return Err(err);
                 }
                 match &config {
@@ -1082,7 +1125,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_shot_stdin_command_is_not_retried() {
+    async fn one_shot_stdin_is_not_retried_on_a_post_child_error() {
+        // `flaky` reports a non-zero exit — a *post-child* `Error::Exit`: a child
+        // ran, so a one-shot source would have been consumed. The gate refuses to
+        // retry it (contrast the pre-child launch failure covered below), while a
+        // re-runnable source still retries to the cap.
         let runner = flaky(10);
         let cmd = Command::new("x")
             .stdin(crate::Stdin::from_reader(&b"once"[..]))
@@ -1091,7 +1138,7 @@ mod tests {
         assert_eq!(
             runner.calls.load(Ordering::SeqCst),
             1,
-            "a one-shot stdin command is attempted once, not retried"
+            "a one-shot stdin command is not retried after a post-child error"
         );
 
         let runner = flaky(10);
@@ -1103,6 +1150,147 @@ mod tests {
             runner.calls.load(Ordering::SeqCst),
             3,
             "a re-runnable stdin source retries up to the cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_shot_stdin_is_retried_after_a_pre_child_launch_failure() {
+        // A launch failure guaranteed to precede a live child (a transient
+        // `Spawn`/ETXTBSY, or `NotFound`) rolls the one-shot stdin reservation
+        // back, so the command IS retried and the eventual successful attempt
+        // feeds the untouched payload — the canonical transient-spawn retry that
+        // the old blanket refusal wrongly denied.
+
+        /// Mimics the live launch's transactional stdin handling: reserves the
+        /// command's stdin exactly as `launch` does, fails *before a child
+        /// exists* for its first `fail_times` calls (dropping the reservation
+        /// uncommitted, so a one-shot payload rolls back intact), then commits
+        /// the reservation and echoes the payload it read.
+        struct PreChildThenEcho {
+            calls: AtomicU32,
+            fail_times: u32,
+            make_err: fn(String) -> Error,
+        }
+
+        #[async_trait::async_trait]
+        impl ProcessRunner for PreChildThenEcho {
+            async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+                let reservation = take_stdin_for_run(command)?;
+                let program = command.program().to_string_lossy().into_owned();
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n < self.fail_times {
+                    // Fail before a child exists: dropping the reservation
+                    // uncommitted rolls a one-shot payload back into its cell.
+                    drop(reservation);
+                    return Err((self.make_err)(program));
+                }
+                // A child would now exist: commit and drive the payload into a
+                // sink to prove the retried attempt saw the real, untouched bytes.
+                let mut sink = Vec::new();
+                if let Some(reservation) = reservation {
+                    reservation
+                        .commit()
+                        .write_to(&mut sink)
+                        .await
+                        .expect("write the reserved one-shot payload");
+                }
+                Ok(ProcessResult::new(
+                    program,
+                    String::from_utf8(sink).expect("utf8 stdin"),
+                    String::new(),
+                    Outcome::Exited(0),
+                    None,
+                ))
+            }
+        }
+
+        let transient_spawn: fn(String) -> Error = |p| {
+            Error::spawn(
+                p,
+                std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy),
+            )
+        };
+        let not_found: fn(String) -> Error = |p| Error::not_found(p, None);
+
+        for make_err in [transient_spawn, not_found] {
+            let runner = PreChildThenEcho {
+                calls: AtomicU32::new(0),
+                fail_times: 2,
+                make_err,
+            };
+            let cmd = Command::new("x")
+                .stdin(crate::Stdin::from_reader(&b"hello"[..]))
+                // Accept both a transient spawn error and a not-found, so it is
+                // the pre-child gate — not the classifier — that this exercises.
+                .retry(5, Duration::from_millis(0), |e| {
+                    e.is_transient() || e.is_not_found()
+                });
+            let out = runner
+                .run(&cmd)
+                .await
+                .expect("a pre-child launch failure is retried");
+            assert_eq!(
+                out, "hello",
+                "the retried attempt fed the untouched one-shot payload"
+            );
+            assert_eq!(
+                runner.calls.load(Ordering::SeqCst),
+                3,
+                "two pre-child failures then a success"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_shot_stdin_post_child_error_is_returned_as_is_not_reclassified() {
+        // A post-child failure (here a `Timeout`) means a child ran and
+        // committed — consumed — the one-shot source. The gate returns that first
+        // error unchanged; it never retries into the spent source and so never
+        // reclassifies it as an `Io` "already consumed" failure.
+
+        /// Commits the reservation on every call (a live child existed), then
+        /// reports a `Timeout` — a post-child error over a consumed one-shot
+        /// source. A retry would re-reserve and hit the "already consumed" `Io`;
+        /// the test asserts that never happens.
+        struct SpawnThenTimeout {
+            calls: AtomicU32,
+        }
+
+        #[async_trait::async_trait]
+        impl ProcessRunner for SpawnThenTimeout {
+            async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+                let reservation = take_stdin_for_run(command)?;
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                // A child existed and consumed the one-shot source (commit),
+                // exactly as `launch` does on a successful spawn.
+                let _consumed = reservation.map(crate::stdin::StdinReservation::commit);
+                Err(Error::timeout(
+                    command.program().to_string_lossy().into_owned(),
+                    Duration::from_secs(1),
+                    "",
+                    "",
+                ))
+            }
+        }
+
+        let runner = SpawnThenTimeout {
+            calls: AtomicU32::new(0),
+        };
+        let cmd = Command::new("x")
+            .stdin(crate::Stdin::from_reader(&b"once"[..]))
+            .retry(5, Duration::from_millis(0), |_| true);
+        let err = runner
+            .run(&cmd)
+            .await
+            .expect_err("a post-child timeout on a one-shot command errors");
+        assert!(
+            matches!(err, Error::Timeout { .. }),
+            "the first post-child error is returned as-is, got {err:?}"
+        );
+        assert_eq!(
+            runner.calls.load(Ordering::SeqCst),
+            1,
+            "a post-child error on a one-shot stdin command is not retried"
         );
     }
 

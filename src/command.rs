@@ -717,17 +717,31 @@ impl Command {
     /// ≈ `attempts × timeout` + the sum of the backoffs). Bound the total with
     /// [`cancel_on`](Self::cancel_on) (a `Cancelled` is terminal — never retried).
     ///
-    /// Because the command is replayed from scratch, a **one-shot** stdin source
+    /// A **one-shot** stdin source
     /// ([`Stdin::from_reader`](crate::Stdin::from_reader) /
-    /// [`from_lines`](crate::Stdin::from_lines)) can't survive a retry: its
-    /// payload is consumed by the first attempt and can't be re-fed. So such a
-    /// command is **not retried at all** — the first attempt's error is returned
-    /// as-is (retrying would either replay empty stdin or spuriously classify the
-    /// re-consume), and the retry policy is inert for it. Use a reusable source
-    /// (`from_string`/`from_bytes`/`from_file`/`from_iter_lines`) when retrying.
-    /// (A one-shot source *re-run* outside this retry loop — a `Supervisor`
-    /// incarnation, a pipeline re-run — does fail loud with
-    /// [`Error::Io`](crate::Error::Io) `InvalidInput` at launch instead.)
+    /// [`from_lines`](crate::Stdin::from_lines)) feeds a single run, so a retry
+    /// re-feeds it only when the failed attempt is **guaranteed not to have
+    /// consumed it**. The launch reserves that payload *transactionally* and
+    /// commits it only once a child exists, so a failure **before any child was
+    /// spawned** — [`NotFound`](crate::Error::NotFound),
+    /// [`Spawn`](crate::Error::Spawn) (e.g. a transient `ETXTBSY` that
+    /// [`is_transient`](crate::Error::is_transient) accepts), or
+    /// [`Unsupported`](crate::Error::Unsupported) — rolls the reservation back
+    /// and leaves the payload intact: such a command **is** retried (subject to
+    /// the classifier) and the next attempt feeds the untouched source. Any
+    /// other error may have reached a live child that already consumed the
+    /// source — a non-zero [`Exit`](crate::Error::Exit),
+    /// [`Timeout`](crate::Error::Timeout), [`Signalled`](crate::Error::Signalled),
+    /// a stdin-write [`Stdin`](crate::Error::Stdin) failure,
+    /// [`OutputTooLarge`](crate::Error::OutputTooLarge), or the ambiguous
+    /// [`Io`](crate::Error::Io) (which arises both before and after a child) — so
+    /// the first attempt's error is returned as-is, **not** retried (a retry
+    /// would either replay empty stdin or spuriously classify the re-consume).
+    /// Use a reusable source (`from_string`/`from_bytes`/`from_file`/
+    /// `from_iter_lines`) to retry unconditionally. (A one-shot source *re-run*
+    /// outside this retry loop — a `Supervisor` incarnation, a pipeline re-run —
+    /// does fail loud with [`Error::Io`](crate::Error::Io) `InvalidInput` at
+    /// launch instead.)
     ///
     /// **Inert outside the success-checking verbs.** A `retry` policy is
     /// honored only by the verbs listed above. It is **ignored** by:
