@@ -97,9 +97,13 @@ impl RunningProcess {
     /// running).
     pub(super) fn drain_stdout_lines(&mut self) -> Result<StdoutLines> {
         self.ensure_stdout_streamable()?;
-        // Background-drain stderr; keep the handle so `finish` can await the last
-        // line. Idempotent, so a second call never overwrites the first sink/pump
-        // (which would leave `finish` with empty stderr).
+        debug_assert!(
+            self.stdout_sink.is_none(),
+            "ensure_stdout_streamable rejects a previously consumed stdout stream"
+        );
+        // Background-drain stderr; `ensure_stderr_drain` is idempotent, retaining
+        // its first sink/pump so `finish` can await the last line and return the
+        // collected stderr.
         self.ensure_stderr_drain();
 
         let stdout_sink = SharedLines::new(&self.buffer);
@@ -115,11 +119,7 @@ impl RunningProcess {
             // close the sink rather than hang if an internal caller reaches here.
             None => stdout_sink.close_now(),
         }
-        // Store only on the first call — overwriting would discard the first pump's
-        // overflow flag and count.
-        if self.stdout_sink.is_none() {
-            self.stdout_sink = Some(stdout_sink.clone());
-        }
+        self.stdout_sink = Some(stdout_sink.clone());
 
         Ok(StdoutLines {
             sink: stdout_sink,
@@ -413,6 +413,14 @@ impl RunningProcess {
     /// would silently be empty.
     pub fn output_events(&mut self) -> Result<OutputEvents> {
         self.ensure_stdout_streamable()?;
+        debug_assert!(
+            self.stdout_sink.is_none(),
+            "ensure_stdout_streamable rejects a previously consumed stdout stream"
+        );
+        debug_assert!(
+            self.stderr_sink.is_none(),
+            "a public output stream consumes stdout before it can arm stderr"
+        );
         let stdout_sink = SharedLines::new(&self.buffer);
         match self.backend.take_stdout_reader() {
             Some(pipe) => {
@@ -424,32 +432,19 @@ impl RunningProcess {
             }
             None => stdout_sink.close_now(),
         }
-        // Store only on the first call — overwriting would discard the first pump's
-        // overflow flag and count.
-        if self.stdout_sink.is_none() {
-            self.stdout_sink = Some(stdout_sink.clone());
-        }
+        self.stdout_sink = Some(stdout_sink.clone());
 
-        // Set up stderr on the first call only. A repeat call gets its own closed
-        // sink — a shared sink's notify_one on close wakes only one waiter.
-        let stderr_sink = if self.stderr_sink.is_none() {
-            let sink = SharedLines::new(&self.buffer);
-            if let Some(pipe) = self.backend.take_stderr_reader() {
-                self.stderr_pump = Some(tokio::spawn(pump_lines_core(
-                    pipe,
-                    self.stderr_config.clone(),
-                    sink.clone(),
-                )));
-            } else {
-                sink.close_now();
-            }
-            self.stderr_sink = Some(sink.clone());
-            sink
+        let stderr_sink = SharedLines::new(&self.buffer);
+        if let Some(pipe) = self.backend.take_stderr_reader() {
+            self.stderr_pump = Some(tokio::spawn(pump_lines_core(
+                pipe,
+                self.stderr_config.clone(),
+                stderr_sink.clone(),
+            )));
         } else {
-            let closed = SharedLines::new(&self.buffer);
-            closed.close_now();
-            closed
-        };
+            stderr_sink.close_now();
+        }
+        self.stderr_sink = Some(stderr_sink.clone());
 
         self.arm_stream_deadline();
 
