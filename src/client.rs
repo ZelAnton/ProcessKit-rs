@@ -639,6 +639,7 @@ macro_rules! cli_client {
             }
 
             /// Apply a default timeout to every command this client builds.
+            #[must_use]
             pub fn default_timeout(mut self, timeout: ::core::time::Duration) -> Self {
                 self.core = self.core.default_timeout(timeout);
                 self
@@ -646,6 +647,7 @@ macro_rules! cli_client {
 
             /// Set an environment variable on every command this client builds
             /// (e.g. `GIT_TERMINAL_PROMPT=0`).
+            #[must_use]
             pub fn default_env(
                 mut self,
                 key: impl ::core::convert::AsRef<::std::ffi::OsStr>,
@@ -657,6 +659,7 @@ macro_rules! cli_client {
 
             /// Remove an inherited environment variable on every command this
             /// client builds.
+            #[must_use]
             pub fn default_env_remove(
                 mut self,
                 key: impl ::core::convert::AsRef<::std::ffi::OsStr>,
@@ -667,6 +670,7 @@ macro_rules! cli_client {
 
             /// Set an env variable on every command to a value computed per built
             /// command (see `CliClient::default_env_fn`).
+            #[must_use]
             pub fn default_env_fn<V, F>(
                 mut self,
                 key: impl ::core::convert::AsRef<::std::ffi::OsStr>,
@@ -688,6 +692,7 @@ macro_rules! cli_client {
             /// Cancel every command this client builds when `token` fires (a
             /// per-command `cancel_on` replaces the default — see
             /// `CliClient::default_cancel_on`).
+            #[must_use]
             pub fn default_cancel_on(mut self, token: $crate::CancellationToken) -> Self {
                 self.core = self.core.default_cancel_on(token);
                 self
@@ -695,6 +700,7 @@ macro_rules! cli_client {
 
             /// Retry every verb on a shared `RetryPolicy` + classifier
             /// (see `CliClient::default_retry`).
+            #[must_use]
             pub fn default_retry(
                 mut self,
                 policy: $crate::RetryPolicy,
