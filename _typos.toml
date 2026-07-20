@@ -1,0 +1,31 @@
+# Configuration for the `typos` spell-checker (https://github.com/crate-ci/typos).
+# Run locally with `just typos`; enforced in CI by the `typos` job.
+#
+# Entries below are words `typos` flags as misspellings that are actually
+# correct in this repository's context (a deliberate spelling variant, a
+# fragment of a hyphenated compound split at the hyphen, or a regex/anchor
+# artifact) — added by hand as they turned up in the first CI-mirroring run,
+# not pre-emptively.
+
+[default.extend-words]
+# `clonable` is a recognized, if less common, spelling of `cloneable` and is
+# used deliberately in doc comments (`src/running/scripted.rs`).
+clonable = "clonable"
+# `typos` tokenizes hyphenated compounds like `mis-count`/`mis-parse`/
+# `mis-reported`/`mis-applied` at the hyphen, flagging the `mis` fragment on
+# its own as a misspelling of `miss`/`mist`. The full compounds are correct.
+mis = "mis"
+# GitHub Markdown auto-generates heading anchors by stripping punctuation, so
+# "Feed the child's stdin" becomes `#feed-the-childs-stdin`
+# (`docs/cookbook.md`) — the anchor text itself, not a misspelling of
+# `children`.
+childs = "childs"
+# "look-alikes" (plural of "look-alike") is correct; `typos` only recognizes
+# the singular `alike`/`likes`.
+alikes = "alikes"
+
+[default.extend-identifiers]
+# `cliff.toml`'s commit-parser regex `^[Rr]elease v?\d` is flagged because the
+# character class `[Rr]elease` isn't recognized as the word `Release`/`release`
+# split across a bracket group; it's a regex fragment, not a misspelling.
+elease = "elease"

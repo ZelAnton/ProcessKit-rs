@@ -17,11 +17,12 @@ check:
 # the three feature configurations the CI matrix checks, the feature-powerset
 # build via cargo-hack, tests in the three configurations (with
 # `--include-ignored` so the real-subprocess tests run), and the two stable
-# doc builds. Does not cover the nightly-only CI jobs (docsrs doc,
-# minimal-versions, msrv) or the jobs needing external services/tokens
-# (coverage/coveralls, cargo-deny, public-api diff, semver-checks) — see the
-# optional recipes below for the ones that can still run locally.
-ci: fmt-check clippy-all hack test-all doc-all
+# doc builds, and the typos spell check. Does not cover the nightly-only CI
+# jobs (docsrs doc, minimal-versions, msrv) or the jobs needing external
+# services/tokens (coverage/coveralls, cargo-deny, public-api diff,
+# semver-checks) — see the optional recipes below for the ones that can still
+# run locally.
+ci: fmt-check clippy-all hack test-all doc-all typos
 
 # Mirrors the CI `fmt` job.
 fmt-check:
@@ -107,6 +108,12 @@ test-musl:
             cargo test --all-features -- --include-ignored && \
             cargo test -- --include-ignored && \
             cargo test --no-default-features -- --include-ignored'
+
+# Mirrors the CI `typos` job. Requires the `typos` CLI
+# (`cargo install typos-cli`). Config/allow-list is `_typos.toml`.
+typos:
+    @typos --version >/dev/null 2>&1 || (echo "typos is not installed; run: cargo install typos-cli" && exit 1)
+    typos
 
 # Optional: mirrors the CI `public-api` job. Requires a nightly toolchain and
 # `cargo-public-api` (`cargo install cargo-public-api --locked`); compares the

@@ -221,6 +221,17 @@ jobs:
         env:
           RUSTDOCFLAGS: --cfg docsrs -D warnings
 
+  typos:
+    name: spell check (typos)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Catches common typos across README/docs/rustdoc before they reach
+      # docs.rs or the published mdBook site; lychee above only checks that
+      # links resolve, it doesn't check spelling. Config/allow-list lives in
+      # `_typos.toml`; `just typos` runs the same check locally.
+      - uses: crate-ci/typos@v1
+
   linkcheck:
     name: markdown links (lychee)
     runs-on: ubuntu-latest
