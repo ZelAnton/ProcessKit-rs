@@ -20,6 +20,69 @@ to a dated version section.
 ### Fixed
 -
 
+## [2.3.1] - 2026-07-20
+
+### Added
+
+- Add #[must_use] to cli_client! macro-generated builder methods
+- Add #[must_use] to cli_client! macro-generated builder methods
+- Add nested Job Object containment integration test
+- Add typos spell-checker to CI and justfile
+- Add "Running many at once" batch fan-out guide
+- Add fuzz targets for cassette parsing and replay
+- Add opt-in liveness health checks to Supervisor
+- Add spawn-time stdout/stderr file redirect to Command
+- Add opt-in Windows graceful shutdown via console CTRL_BREAK
+- Add opt-in Windows graceful shutdown via console CTRL_BREAK
+- Add spawn-time stdout/stderr file redirect to Command
+- Add opt-in liveness health checks to Supervisor
+- Add fuzz targets for cassette parsing and replay
+- Add "Running many at once" batch fan-out guide
+- Add typos spell-checker to CI and justfile
+- Add nested Job Object containment integration test
+- Add loom model-checking tier for pid_gate/deadline/SkipDropKill
+- Add proptest suite for OutputBufferPolicy invariants
+- Add proptest suite for OutputBufferPolicy invariants
+- Add loom model-checking tier for pid_gate/deadline/SkipDropKill
+- Add ProcessGroup::members_info() enriched member snapshot
+- Add ProcessGroup::members_info() enriched member snapshot
+
+
+### Changed
+
+- Start integration branch for batch B-20260719T111659Z
+- Give gh run rerun explicit repo context in mutants-retry
+- Clamp graceful::run poll sleep to remaining deadline
+- Drain stderr in poll_until independently of stdout streamability
+- Narrow one-shot stdin retry gate to pre-child launch failures
+- Start integration branch for batch B-20260719T213134Z
+- Narrow one-shot stdin retry gate to pre-child launch failures
+- Drain stderr in poll_until independently of stdout streamability
+- Clamp graceful::run poll sleep to remaining deadline
+- Start integration branch for batch B-20260719T230600Z
+- Document composite pipeline name in ProcessResult::program rustdoc
+- Start integration branch for batch B-20260720T081656Z
+- Document composite pipeline name in ProcessResult::program rustdoc
+- Raise honest EPERM for live pgroup members on SIGKILL teardown
+- Extract shared probe() 0/1 exit-code helper on ProcessResult<String>
+- Start integration branch for batch B-20260720T192446Z
+- Extract shared probe() 0/1 exit-code helper on ProcessResult<String>
+- Raise honest EPERM for live pgroup members on SIGKILL teardown
+- Start integration branch for batch B-20260720T211640Z
+
+
+### Fixed
+
+- Fix mutants-retry gh run rerun missing repo context
+- Fix broken rustdoc intra-doc links under --no-default-features
+- Fix rustfmt formatting in sys::pgroup live/zombie state check
+
+
+### Removed
+
+- Remove unreachable stdout/stderr sink guards, document invariant with debug_assert
+- Remove unreachable stdout/stderr sink guards, document invariant with debug_assert
+
 ## [2.3.0] - 2026-07-19
 
 ### Added
@@ -2275,7 +2338,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.3.1...HEAD
+[2.3.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.5...v2.3.0
 [2.2.5]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.4...v2.2.5
 [2.2.4]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.3...v2.2.4
