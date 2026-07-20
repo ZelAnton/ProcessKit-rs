@@ -17,7 +17,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::buffer::OutputBufferPolicy;
 use crate::command::Command;
@@ -372,12 +372,11 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// either (including [`unbounded`](OutputBufferPolicy::unbounded) if you truly
     /// want every line).
     ///
-    /// This caps *retention*, not the stdio mode: supervision captures each
-    /// incarnation's output (to evaluate [`stop_when`](Self::stop_when) and the
-    /// final result), so the command's `stdout` must stay
-    /// [`Piped`](crate::StdioMode::Piped) (the default). A command with a
-    /// non-piped `stdout` (`Inherit`/`Null`) errors every incarnation and
-    /// would just spin the restart loop.
+    /// This caps *retention*, not the stdio mode. A piped stdout is retained so
+    /// [`stop_when`](Self::stop_when) can inspect it; a non-piped stdout
+    /// (`Inherit`/`Null`/a file redirect) is discarded and its final result has
+    /// an empty stdout. File redirects therefore remain suitable for a service
+    /// whose restart incarnations append to one child-owned log.
     #[must_use]
     pub fn capture(mut self, policy: OutputBufferPolicy) -> Self {
         self.capture = policy;
@@ -851,16 +850,17 @@ impl<R: ProcessRunner> Supervisor<R> {
     }
 
     /// Run one incarnation. Without a [`health_check`](Self::health_check) this
-    /// is exactly `runner.output_string` (the pre-feature fast path — no extra
-    /// task, timer, or `select!`). With one, race the run against the liveness
-    /// watcher: whichever resolves first wins, `biased` toward a genuine
-    /// exit/crash so a child that dies on its own the same instant a probe would
-    /// have tripped is reported as its real result, not a liveness kill. When the
-    /// watcher wins, dropping the losing `output_string` future ends the wedged
+    /// is exactly [`run_to_result`](Self::run_to_result) (the pre-feature fast
+    /// path — no extra task, timer, or `select!`). With one, race the run
+    /// against the liveness watcher: whichever resolves first wins, `biased`
+    /// toward a genuine exit/crash so a child that dies on its own the same
+    /// instant a probe would have tripped is reported as its real result, not a
+    /// liveness kill. When the watcher wins, dropping the losing
+    /// [`run_to_result`](Self::run_to_result) future ends the wedged
     /// incarnation (killed on drop under the default [`JobRunner`]).
     async fn run_incarnation(&self, command: &Command) -> Incarnation {
         let Some(health) = &self.health_check else {
-            return Incarnation::Ran(self.runner.output_string(command).await);
+            return Incarnation::Ran(self.run_to_result(command).await);
         };
         // Anchor uptime on tokio's clock (not `std::time::Instant`) so it shares
         // the timer the liveness sleeps and any paused-runtime test run on — the
@@ -868,7 +868,7 @@ impl<R: ProcessRunner> Supervisor<R> {
         let started = tokio::time::Instant::now();
         tokio::select! {
             biased;
-            result = self.runner.output_string(command) => Incarnation::Ran(result),
+            result = self.run_to_result(command) => Incarnation::Ran(result),
             () = health.watch(self.health_check_failures) => {
                 Incarnation::LivenessFailed { uptime: started.elapsed() }
             }
@@ -958,6 +958,37 @@ impl<R: ProcessRunner> Supervisor<R> {
             storm_pauses: storm.pauses,
             liveness_kills,
         }
+    }
+
+    /// Run one incarnation through the only owning launch choice and produce
+    /// its [`ProcessResult`]. A file, inherited, or null stdout has no
+    /// parent-readable pipe, so it cannot use the capture verb; finish drains
+    /// only any independently-piped stderr and preserves the exit outcome for
+    /// the restart policy. The sole callee of [`run_incarnation`](Self::run_incarnation),
+    /// which additionally races this against the liveness watcher when a
+    /// [`health_check`](Self::health_check) is set.
+    async fn run_to_result(&self, command: &Command) -> Result<ProcessResult<String>> {
+        if command.stdout_is_piped() {
+            return self.runner.output_string(command).await;
+        }
+
+        let started = Instant::now();
+        let finished = self.runner.start(command).await?.finish().await?;
+        let crate::Finished {
+            outcome,
+            stderr,
+            stderr_truncated,
+        } = finished;
+        Ok(ProcessResult::new(
+            command.program_name(),
+            String::new(),
+            stderr,
+            outcome,
+            command.configured_timeout(),
+        )
+        .with_duration(started.elapsed())
+        .with_truncated(stderr_truncated)
+        .with_ok_codes(command.ok_codes_vec()))
     }
 
     /// The terminal `Cancelled` error for supervision cut short by a cancel token
@@ -1251,6 +1282,21 @@ mod tests {
             .with_runner(runner)
             .backoff(Duration::ZERO, 1.0)
             .jitter(false)
+    }
+
+    #[tokio::test]
+    async fn redirected_stdout_is_discarded_but_still_supervised() {
+        let path = std::env::temp_dir().join("processkit-supervisor-file-redirect.log");
+        let outcome = Supervisor::new(Command::new("server").stdout_file(path))
+            .restart(RestartPolicy::Never)
+            .with_runner(ScriptedRunner::new().fallback(Reply::ok("hidden").with_stderr("warn")))
+            .run()
+            .await
+            .expect("a redirected service is supervised through start/finish");
+
+        assert_eq!(outcome.final_result.stdout(), "");
+        assert_eq!(outcome.final_result.stderr(), "warn");
+        assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
     }
 
     #[test]

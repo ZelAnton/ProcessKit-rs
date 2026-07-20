@@ -619,6 +619,7 @@ pub async fn processkit::Command::try_parse<T, F>(&self, F) -> processkit::Resul
 pub fn processkit::Command::uid(self, u32) -> Self
 pub fn processkit::Command::umask(self, u32) -> Self
 pub fn processkit::Command::unchecked_in_pipe(self) -> Self
+pub fn processkit::Command::windows_graceful_ctrl_break(self) -> Self
 pub fn processkit::Command::working_dir(&self) -> core::option::Option<&std::path::Path>
 impl core::clone::Clone for processkit::Command
 pub fn processkit::Command::clone(&self) -> processkit::Command

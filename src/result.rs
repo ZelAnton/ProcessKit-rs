@@ -218,9 +218,11 @@ impl<T> ProcessResult<T> {
 
     /// The program this result is attributed to (lossy UTF-8 of the program
     /// name) — the same value the error variants carry. For a
-    /// [`Pipeline`](crate::Pipeline) outcome this is the pipefail-attributed
-    /// stage: the first stage that didn't exit cleanly, or the last stage
-    /// when every stage succeeded.
+    /// [`Pipeline`](crate::Pipeline) outcome this is usually the
+    /// pipefail-attributed stage: the first stage that didn't exit cleanly, or
+    /// the last stage when every stage succeeded. If the pipeline's chain-wide
+    /// [`Pipeline::timeout`](crate::Pipeline::timeout) elapses instead, this is
+    /// the composite pipeline name: all stage names joined by `" | "`.
     pub fn program(&self) -> &str {
         &self.program
     }

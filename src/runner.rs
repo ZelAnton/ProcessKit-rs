@@ -801,11 +801,12 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     // the stdin write then fails.
     let stdin_reservation = take_stdin_for_run(command)?;
 
-    let mut tokio_cmd = command.build_tokio();
+    let mut tokio_cmd = command.build_tokio()?;
     let opts = crate::sys::SpawnOptions {
         setsid: command.wants_setsid(),
         creation_flags: command.extra_creation_flags(),
         kill_on_parent_death: command.wants_kill_on_parent_death(),
+        windows_new_process_group: command.wants_windows_graceful_ctrl_break(),
     };
     // Translate the OS's opaque NotFound into `Error::NotFound` after the spawn
     // attempt, so the OS stays the source of truth. The cwd was validated above,

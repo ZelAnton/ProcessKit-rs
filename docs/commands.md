@@ -12,6 +12,7 @@ future can never leak a process tree.
 - [Resolving a locally-installed tool: `prefer_local`](#resolving-a-locally-installed-tool-prefer_local)
 - [Environment](#environment)
 - [Standard input](#standard-input)
+- [Redirecting output directly to a file](#redirecting-output-directly-to-a-file)
 - [Output handling](#output-handling)
 - [Timeouts and retries](#timeouts-and-retries)
 - [Privileges and spawn flags](#privileges-and-spawn-flags)
@@ -305,6 +306,43 @@ consumed one-shot source — rather than silently letting one win. Drop the othe
 stdin knob to resolve it. The refusal is enforced on the same launch seam the
 hermetic test doubles route through, so a `ScriptedRunner` rejects the conflict
 exactly as a live run does.
+
+## Redirecting output directly to a file
+
+`stdout_file(path)` and `stderr_file(path)` give the child a file descriptor at
+spawn (`Stdio::from(File)`). They do **not** tee through a parent task: no output
+is line-pumped, decoded, or retained in memory, and the child can keep writing if
+the parent exits suddenly.
+
+The plain builder creates the file when needed and **truncates** it for that
+spawn. Use the explicit `*_file_truncate` spelling when choosing a mode in a
+conditional expression, or `*_file_append` to preserve existing contents and
+append each new child incarnation:
+
+```rust,no_run
+use processkit::{Command, Supervisor};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let service = Command::new("my-service")
+        .stdout_file_append("service.log") // every Supervisor incarnation shares this log
+        .stderr_file_append("service.log");
+
+    Supervisor::new(service).run().await?;
+    Ok(())
+}
+```
+
+This is the low-overhead choice for a service under `Supervisor` that writes its
+own log: append mode accumulates every restart in one file, while truncate mode
+starts a fresh log for each spawn. The command's `stdout(StdioMode::…)` /
+`stderr(StdioMode::…)` setters are last-wins and clear a prior file destination.
+
+A redirected stdout is deliberately **not piped**. `output_string`,
+`output_bytes`, `stdout_lines`, and `output_events` therefore reject it just as
+they reject `Inherit`/`Null`; call `start().await?.wait().await?` (or supervise
+the command) when only its exit outcome matters. Stderr may be redirected
+independently; it does not prevent stdout capture.
 
 ## Output handling
 
