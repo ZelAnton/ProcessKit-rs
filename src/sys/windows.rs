@@ -11,12 +11,15 @@ use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 #[cfg(feature = "process-control")]
 use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_MORE_DATA};
+use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
-#[cfg(feature = "process-control")]
+// Ungated: the opt-in console-CTRL graceful teardown is compiled on every
+// Windows feature config, and its drain check (`QueryInformationJobObject` on
+// the accounting info) and per-leader recycle guard (`IsProcessInJob`) can't be
+// gated behind `process-control`/`stats`.
 use windows_sys::Win32::System::JobObjects::IsProcessInJob;
-#[cfg(any(feature = "process-control", feature = "stats"))]
 use windows_sys::Win32::System::JobObjects::QueryInformationJobObject;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -29,7 +32,6 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JobObjectCpuRateControlInformation,
 };
-#[cfg(feature = "stats")]
 use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
 };
@@ -42,13 +44,12 @@ use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS
 #[cfg(feature = "stats")]
 use windows_sys::Win32::System::Threading::GetProcessTimes;
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
 };
 #[cfg(feature = "process-control")]
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessIdOfThread, SuspendThread, THREAD_QUERY_LIMITED_INFORMATION,
 };
-#[cfg(any(feature = "process-control", feature = "stats"))]
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
 use crate::Mechanism;
@@ -86,6 +87,16 @@ pub(crate) struct Job {
     /// Set by `graceful_shutdown(escalate=false)` so `Drop` clears
     /// `KILL_ON_JOB_CLOSE` before closing the handle, leaving survivors alive.
     skip_drop_kill: super::SkipDropKill,
+    /// Pids of direct children spawned `CREATE_NEW_PROCESS_GROUP` for the opt-in
+    /// console-CTRL graceful path (via
+    /// [`Command::windows_graceful_ctrl_break`](crate::Command::windows_graceful_ctrl_break)).
+    /// Empty unless a child opted in: `graceful_shutdown` takes the CTRL_BREAK →
+    /// grace → `TerminateJobObject` path **iff** this is non-empty, so the default
+    /// atomic-kill behavior is untouched for every other job. Each pid is a console
+    /// **process-group id** (equal to the leader's pid) addressable by
+    /// `GenerateConsoleCtrlEvent`; a per-leader `IsProcessInJob` re-check at signal
+    /// time keeps a recycled pid from diverting the event onto a stranger's group.
+    ctrl_break_leaders: std::sync::Mutex<Vec<u32>>,
 }
 
 // The handle is owned solely by this struct and every Win32 job API used here is
@@ -104,6 +115,7 @@ impl Job {
             handle,
             suspend_lock: std::sync::Mutex::new(()),
             skip_drop_kill: super::SkipDropKill::new(),
+            ctrl_break_leaders: std::sync::Mutex::new(Vec::new()),
         };
 
         // Kill every process in the job once the last handle closes — i.e. when
@@ -179,9 +191,18 @@ impl Job {
         // which a fast-forking child could have escaped the job. Win32 exposes
         // no flag getter, so this overwrite is also where the Command-carried
         // extras (e.g. CREATE_NO_WINDOW) are OR'd back in.
+        //
+        // Opt-in graceful CTRL path: OR in CREATE_NEW_PROCESS_GROUP so the direct
+        // child becomes its own console process group, addressable by its pid via
+        // `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` at graceful teardown.
+        // A side effect is that CTRL_C is disabled for the new group by default —
+        // CTRL_BREAK, which the teardown sends, is unaffected.
         use std::os::windows::process::CommandExt;
-        cmd.as_std_mut()
-            .creation_flags(CREATE_SUSPENDED | opts.creation_flags);
+        let mut flags = CREATE_SUSPENDED | opts.creation_flags;
+        if opts.windows_new_process_group {
+            flags |= CREATE_NEW_PROCESS_GROUP;
+        }
+        cmd.as_std_mut().creation_flags(flags);
 
         // Arm a reaper for the window between spawn and containment: the child is
         // suspended and not yet in the job, so until `AssignProcessToJobObject`
@@ -230,6 +251,16 @@ impl Job {
         // Drop. Done after successful containment so a failed spawn leaves the
         // spared survivors alone.
         self.skip_drop_kill.clear();
+        // Opt-in: record this direct child as a console-CTRL leader so a later
+        // graceful_shutdown addresses it with GenerateConsoleCtrlEvent. Recorded
+        // only after successful containment (so a failed spawn tracks nothing) and
+        // only when the child was actually spawned into its own process group.
+        if opts.windows_new_process_group {
+            self.ctrl_break_leaders
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(pid);
+        }
         Ok(guard.disarm())
     }
 
@@ -366,25 +397,43 @@ impl Job {
 
     pub(crate) async fn graceful_shutdown(
         &self,
-        _signal: i32,
-        _timeout: Duration,
+        signal: i32,
+        timeout: Duration,
         escalate: bool,
     ) -> io::Result<()> {
-        // A Job Object has no graceful tier: there is no Windows equivalent of
-        // SIGTERM, and the kill is atomic. When `escalate=true`, kill the tree
-        // immediately. When `escalate=false`, skip the kill and let survivors
-        // run; `Drop` will clear `KILL_ON_JOB_CLOSE` before closing the handle
-        // so the tree is not implicitly killed then either.
+        // Opt-in console-CTRL path: a direct child was spawned into its own
+        // process group (`windows_graceful_ctrl_break`), so there IS a way to
+        // *trigger* a soft exit — `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)`.
+        // Drive the SAME shared escalation loop the unix backends use: signal the
+        // leaders, poll the job's active-process count up to `timeout`, then
+        // `TerminateJobObject` survivors (escalate) or spare them (!escalate). The
+        // driver owns the `begin_shutdown`/`request` epoch handshake, so the
+        // re-arm race is handled there, exactly as on unix.
+        let leaders = self
+            .ctrl_break_leaders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if !leaders.is_empty() {
+            let target = CtrlBreakTarget { job: self, leaders };
+            return super::graceful::run(&target, &self.skip_drop_kill, signal, timeout, escalate)
+                .await;
+        }
+
+        // Default path — no opt-in leaders. A Job Object has no graceful tier: no
+        // Windows equivalent of SIGTERM, and the kill is atomic. When
+        // `escalate=true`, kill the tree immediately. When `escalate=false`, skip
+        // the kill and let survivors run; `Drop` will clear `KILL_ON_JOB_CLOSE`
+        // before closing the handle so the tree is not implicitly killed then
+        // either.
         //
-        // The `timeout` is deliberately NOT used as a drain window (C6): Windows
-        // can't *trigger* a graceful exit (no soft signal), so polling for a
-        // natural exit up to `timeout` would, for the common case of a child that
+        // The `timeout` is deliberately NOT used as a drain window (C6): without a
+        // soft signal there is nothing to *trigger* a graceful exit, so polling for
+        // a natural exit up to `timeout` would, for the common case of a child that
         // ignores the (absent) signal, only delay the inevitable kill by the whole
         // grace — a data-losing 30 s stall, not a graceful drain. Prompt hard-kill
         // at the deadline is the honest behavior; the grace/soft-signal tiers are
-        // Unix-only. (A tree that wants a real shutdown handshake on Windows must
-        // be signaled out-of-band — a console CTRL event, a named-pipe stop —
-        // before this call.)
+        // Unix-only (or the opt-in CTRL path above).
         //
         // Snapshot the re-arm generation up front — before the branch — so a
         // `spawn`/`adopt` that re-arms the backstop concurrently with this shutdown
@@ -451,6 +500,88 @@ impl Job {
     pub(crate) fn mechanism(&self) -> Mechanism {
         Mechanism::JobObject
     }
+}
+
+/// The Job-backed [`GracefulTarget`](crate::sys::graceful::GracefulTarget) for the
+/// opt-in console-CTRL graceful teardown. It plugs the Job Object into the *same*
+/// signal → poll → escalate loop the unix backends drive
+/// ([`graceful::run`](crate::sys::graceful::run)):
+///
+/// - `signal_all` sends `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` to each
+///   recorded process-group leader (best-effort);
+/// - `is_drained` reads the job's active-process count;
+/// - `hard_kill` is `TerminateJobObject` (the escalation fallback).
+///
+/// It borrows the `Job` (already `Sync`) and a snapshot of the leader pids, so it
+/// is automatically `Send + Sync` — no raw handle is carried across the driver's
+/// `.await`s.
+struct CtrlBreakTarget<'a> {
+    job: &'a Job,
+    /// Snapshot of the console process-group leader pids at shutdown time.
+    leaders: Vec<u32>,
+}
+
+impl super::graceful::GracefulTarget for CtrlBreakTarget<'_> {
+    fn signal_all(&self, _signal: i32) {
+        // Windows delivers a console CTRL_BREAK, not a POSIX signal — the raw
+        // `signal` number (SIGTERM/`timeout_signal`) is meaningless here and
+        // ignored. CTRL_BREAK is chosen over CTRL_C deliberately: a process can
+        // disable CTRL_C for its group (and CREATE_NEW_PROCESS_GROUP does so by
+        // default), but CTRL_BREAK is always deliverable.
+        for &pid in &self.leaders {
+            // Never pass 0: `GenerateConsoleCtrlEvent(_, 0)` targets EVERY process
+            // sharing this console — including us. A recorded leader is always a
+            // real, nonzero pid, but guard defensively.
+            if pid == 0 {
+                continue;
+            }
+            // Recycle guard (mirrors the suspend/resume C13 discipline): only
+            // signal a leader that is STILL a live member of THIS job. A leader
+            // that already exited may have had its pid reused as an unrelated
+            // process's group id sharing our console; `IsProcessInJob` fails safe
+            // (a gone/denied pid reads as "not a member"), so the event is never
+            // diverted onto a stranger's group.
+            if !process_is_in_job(pid, self.job.handle) {
+                continue;
+            }
+            // SAFETY: a console control event to a process group id; a delivery
+            // failure (no shared console, the leader just exited) is swallowed —
+            // the poll below observes the drain, and the `hard_kill` fallback
+            // covers a child that never received it.
+            unsafe {
+                GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
+            }
+        }
+    }
+
+    fn is_drained(&self) -> bool {
+        job_is_drained(self.job.handle)
+    }
+
+    fn hard_kill(&self) -> io::Result<()> {
+        self.job.kill_all()
+    }
+}
+
+/// Whether the job has fully drained — no process is still active in it.
+///
+/// Best-effort: a failed query (a torn-down handle, a transient error) reports
+/// "not drained" so the driver keeps waiting and then takes its escalation
+/// (`TerminateJobObject`) / spare decision at the deadline, never a premature
+/// "drained" that would skip the fallback kill.
+fn job_is_drained(handle: HANDLE) -> bool {
+    let mut acct: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: out param matches the accounting info class and its size.
+    let ok = unsafe {
+        QueryInformationJobObject(
+            handle,
+            JobObjectBasicAccountingInformation,
+            std::ptr::from_mut(&mut acct).cast(),
+            std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    ok != 0 && acct.ActiveProcesses == 0
 }
 
 /// Whether the process behind `handle` has already exited —
@@ -666,14 +797,15 @@ fn suspend_or_resume_thread(
 }
 
 /// Whether the process named by `pid` is currently a member of `job` — the
-/// per-thread pid-recycle guard (C13) for the suspend/resume walk.
+/// pid-recycle guard (C13) shared by the process-control suspend/resume walk and
+/// the opt-in console-CTRL teardown's per-leader signal check.
 ///
 /// Fail-safe by construction: a failure to open the process (gone, denied) or to
 /// query membership yields `false`, i.e. "treat as NOT our member". A false
-/// negative merely skips a suspend/resume for one thread (best-effort, already
-/// the walk's contract), whereas a false positive would freeze a foreign
-/// process — so uncertainty must resolve to "leave it alone".
-#[cfg(feature = "process-control")]
+/// negative merely skips a suspend/resume for one thread, or a CTRL_BREAK for one
+/// leader (both best-effort, with a `TerminateJobObject` backstop), whereas a
+/// false positive would freeze a foreign process or divert a console event onto a
+/// stranger's group — so uncertainty must resolve to "leave it alone".
 fn process_is_in_job(pid: u32, job: HANDLE) -> bool {
     // Least-privilege: `IsProcessInJob` only needs query access.
     // SAFETY: opens the process by id; returns null on failure (e.g. exited).
@@ -1118,6 +1250,107 @@ mod rearm_race_tests {
             !job.skip_drop_kill.is_set(),
             "a child assigned to the job mid-shutdown must keep its kill-on-close \
              backstop — the stale request must not re-spare it"
+        );
+    }
+}
+
+// T-139: the opt-in console-CTRL graceful path. Un-gated (the leader tracking,
+// routing and drain check are core, not feature-gated) so the default
+// `cargo test` exercises them — no subprocess needed, driven against an empty job
+// and our own (non-member) pid as a stand-in leader.
+#[cfg(test)]
+mod ctrl_break_tests {
+    use std::time::Duration;
+
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+
+    /// Build a bare `Job`, papering over the `limits`-feature gate on `Job::new`.
+    fn new_job() -> super::Job {
+        #[cfg(feature = "limits")]
+        {
+            super::Job::new(&crate::limits::ResourceLimits::default()).expect("create a test job")
+        }
+        #[cfg(not(feature = "limits"))]
+        {
+            super::Job::new().expect("create a test job")
+        }
+    }
+
+    /// The drain check reports a fresh, empty job as drained (no active member),
+    /// so the CTRL driver's poll ends immediately rather than riding the grace.
+    #[test]
+    fn an_empty_job_reports_drained() {
+        let job = new_job();
+        assert!(
+            super::job_is_drained(job.handle),
+            "an empty job has zero active processes, so it is drained"
+        );
+    }
+
+    /// With a recorded leader, `graceful_shutdown` takes the CTRL_BREAK path
+    /// (`graceful::run`), not the atomic branch. The recorded leader here is our
+    /// OWN pid, which is NOT a member of this job — so the per-leader
+    /// `IsProcessInJob` recycle guard must skip it, never delivering a CTRL_BREAK
+    /// that would terminate the (handler-less) test runner. The job being empty,
+    /// the driver's first drain check returns "drained" and it returns Ok promptly
+    /// without a hard kill. The test process surviving to its assertions is the
+    /// proof the membership gate held.
+    #[tokio::test]
+    async fn a_recorded_non_member_leader_is_never_signalled() {
+        let job = new_job();
+        // SAFETY: a plain read of our own pid.
+        let me = unsafe { GetCurrentProcessId() };
+        job.ctrl_break_leaders
+            .lock()
+            .expect("lock leaders")
+            .push(me);
+
+        let start = std::time::Instant::now();
+        job.graceful_shutdown(crate::sys::SIGTERM_RAW, Duration::from_secs(30), true)
+            .await
+            .expect("ctrl-break graceful shutdown of an empty job");
+        // The empty job is drained on the first poll, so the driver never waits
+        // out the 30s grace; a bug that signalled/killed us would not get here.
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a drained job ends the CTRL grace immediately (took {:?})",
+            start.elapsed()
+        );
+        assert!(
+            job.ctrl_break_leaders.lock().expect("lock leaders").len() == 1,
+            "the recorded leader is retained across a shutdown"
+        );
+    }
+
+    /// The CTRL path honors `escalate = false` sparing exactly as the atomic path
+    /// and the unix backends do: with a leader recorded but the job already
+    /// drained, a non-escalating shutdown latches `skip_drop_kill` so `Drop`
+    /// clears `KILL_ON_JOB_CLOSE`. Reuses the shared `graceful::run` epoch
+    /// handshake, so the documented spawn/adopt re-arm race stays covered by the
+    /// `SkipDropKill` unit tests.
+    #[tokio::test]
+    async fn the_ctrl_path_spares_survivors_when_not_escalating() {
+        let job = new_job();
+        // SAFETY: a plain read of our own pid — a non-member leader (skipped by
+        // the recycle guard), so no CTRL_BREAK reaches the test runner.
+        let me = unsafe { GetCurrentProcessId() };
+        job.ctrl_break_leaders
+            .lock()
+            .expect("lock leaders")
+            .push(me);
+
+        job.graceful_shutdown(crate::sys::SIGTERM_RAW, Duration::ZERO, false)
+            .await
+            .expect("non-escalating ctrl-break shutdown");
+        assert!(
+            job.skip_drop_kill.is_set(),
+            "a non-escalating CTRL shutdown spares survivors: Drop clears KILL_ON_JOB_CLOSE"
+        );
+        // A subsequent spawn/adopt re-arms it, as on every backend.
+        job.skip_drop_kill.clear();
+        assert!(
+            !job.skip_drop_kill.is_set(),
+            "a reused job re-arms the backstop"
         );
     }
 }
