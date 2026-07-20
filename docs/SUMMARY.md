@@ -22,6 +22,7 @@
 
 - [Cookbook](cookbook.md)
 - [Running commands](commands.md)
+- [Running many at once](batch.md)
 - [Process groups](process-groups.md)
 - [Streaming & interactive I/O](streaming.md)
 - [Pipelines](pipelines.md)
