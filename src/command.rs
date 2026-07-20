@@ -572,11 +572,11 @@ impl Command {
     ///   service parent with no console of its own can't deliver the event either.
     /// - **`CTRL_BREAK`, not `CTRL_C`.** `CREATE_NEW_PROCESS_GROUP` disables
     ///   `CTRL_C` for the new group by default; `CTRL_BREAK` is always deliverable,
-    ///   which is why it is the event sent. [`timeout_signal`](Self::timeout_signal)
+    ///   which is why it is the event sent. `timeout_signal`
     ///   (Unix's signal choice) does not apply — Windows always sends `CTRL_BREAK`.
     /// - **Direct child only.** Only the process launched by this run is a group
     ///   leader; its own descendants receive the event via the shared console and
-    ///   group, but an [`adopt`](crate::ProcessGroup::adopt)ed child (not spawned
+    ///   group, but an `adopt`ed child (not spawned
     ///   here) is not addressed and falls back to the hard kill.
     /// - **No-op off Windows.** On Unix the graceful tier already sends a real
     ///   signal, so this builder does nothing there.
