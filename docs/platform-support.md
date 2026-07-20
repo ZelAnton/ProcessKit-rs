@@ -95,13 +95,31 @@ otherwise rejected the request.
 | Capability | Windows JobObject | Linux cgroup | Linux pgroup | macOS/BSD |
 |---|---|---|---|---|
 | Kill-on-drop, whole tree | ✅ | ✅ | ✅ groups-based | ✅ groups-based |
-| Graceful `shutdown` (TERM → grace → KILL) | 🟡 atomic kill only | ✅ | ✅ | ✅ |
+| Graceful `shutdown` (TERM → grace → KILL) | 🟡 atomic kill (opt-in `CTRL_BREAK` soft tier) | ✅ | ✅ | ✅ |
 | `adopt` an external child | ✅ (future forks contained) | ✅ (future forks contained) | 🟡 exec'd child tracked individually | 🟡 same |
 
-Windows has no signal tier, so a graceful `shutdown` collapses to the atomic Job
-kill — but it still honors `escalate_to_kill`: `false` **spares** the survivors
-(closes the Job handle without `KILL_ON_JOB_CLOSE`) rather than killing them, so
-the Windows column is "atomic kill *when it kills*", not an unconditional kill.
+By default Windows has no signal tier, so a graceful `shutdown` collapses to the
+atomic Job kill — but it still honors `escalate_to_kill`: `false` **spares** the
+survivors (closes the Job handle without `KILL_ON_JOB_CLOSE`) rather than killing
+them, so the Windows column is "atomic kill *when it kills*", not an
+unconditional kill.
+
+**Opt-in soft tier (Windows).**
+[`Command::windows_graceful_ctrl_break()`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.windows_graceful_ctrl_break)
+gives Windows a real soft-shutdown trigger: the direct child is spawned in its
+own console process group (`CREATE_NEW_PROCESS_GROUP`), and at graceful teardown
+it is sent `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` before the grace
+window — driven through the *same* signal → wait → escalate loop the unix
+backends use. A console child that handles `CTRL_BREAK` (many CLIs, Node,
+Python, Go services do) can flush and exit within the grace; any survivor is then
+`TerminateJobObject`'d, the same hard fallback as before, so containment is never
+weakened. **Boundaries:** it works only for children that share this process's
+console — a child spawned `create_no_window` / `DETACHED_PROCESS` (or a GUI /
+service parent with no console) never receives the event and simply rides the
+grace to the fallback kill; the event is `CTRL_BREAK` (not `CTRL_C`, which a new
+process group disables); and only the direct child is addressed (an `adopt`ed
+child is not). Off Windows the builder is a no-op — the graceful ladder already
+sends a real signal.
 
 **Signals & freezing**
 

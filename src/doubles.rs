@@ -1276,6 +1276,11 @@ impl ProcessRunner for DryRunRunner {
         // Dropping this uncommitted reservation leaves a one-shot source available
         // for a later real run.
         let _stdin_reservation = crate::runner::take_stdin_for_run(command)?;
+        if !command.stdout_is_piped() {
+            return Err(crate::error::stdout_not_piped_error(
+                &command.program_name(),
+            ));
+        }
         self.record(command);
         Ok(ProcessResult::new(
             command.program().to_string_lossy().into_owned(),
@@ -2018,6 +2023,34 @@ mod tests {
             }
             other => panic!("expected Io(InvalidInput), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn file_redirect_is_non_piped_for_scripted_and_dry_runs() {
+        let path = std::env::temp_dir().join("processkit-file-redirect-double.log");
+        let command = Command::new("x").stdout_file(&path);
+
+        let scripted = ScriptedRunner::new().fallback(Reply::ok("canned"));
+        let err = scripted
+            .output_string(&command)
+            .await
+            .expect_err("a scripted capture cannot read the child-owned file");
+        assert!(
+            matches!(err, crate::error::Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput)
+        );
+
+        let dry_run = DryRunRunner::new();
+        let err = dry_run
+            .output_string(&command)
+            .await
+            .expect_err("a dry-run capture cannot pretend to read the file");
+        assert!(
+            matches!(err, crate::error::Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput)
+        );
+        assert!(
+            dry_run.commands().is_empty(),
+            "invalid capture was not recorded"
+        );
     }
 
     #[tokio::test]

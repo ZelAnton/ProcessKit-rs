@@ -155,6 +155,7 @@ end to end:
 |---|---|
 | [Cookbook](docs/cookbook.md) | Task → snippet recipes for everything below; the fastest way in |
 | [Running commands](docs/commands.md) | The full `Command` builder and every consuming verb, with error semantics |
+| [Running many at once](docs/batch.md) | Bounded `output_all` / `output_all_bytes` fan-out, containment choices, and `wait_any` / `wait_all` races and joins |
 | [Process groups](docs/process-groups.md) | Containment, teardown, signals, suspend/resume, members, limits, stats |
 | [Streaming & interactive I/O](docs/streaming.md) | Line streaming, conversational stdin, readiness probes, `wait_any`, profiling |
 | [Pipelines](docs/pipelines.md) | Shell-free `a \| b \| c`, pipefail attribution, chain timeouts |

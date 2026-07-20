@@ -82,7 +82,7 @@ Things to know:
 
 - **Call `stdout_lines()` once.** It is fallible: a second `stdout_lines` /
   `output_events` call (stdout is consumed once), or a non-piped stdout
-  (`StdioMode::Inherit`/`Null`), returns `Err` rather than a silently-empty
+  (`StdioMode::Inherit`/`Null` or `Command::stdout_file*`), returns `Err` rather than a silently-empty
   stream.
 - **The command's `timeout` bounds the stream**: at the deadline the tree
   (own-group handle) or the direct child (shared-group handle) is killed, the

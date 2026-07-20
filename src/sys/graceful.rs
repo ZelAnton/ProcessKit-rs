@@ -1,16 +1,20 @@
-//! The shared unix graceful-shutdown driver.
+//! The shared graceful-shutdown driver.
 //!
-//! Both unix containment backends — the Linux cgroup and the POSIX
-//! process-group fallback — escalate teardown the same way: send a graceful
+//! Every containment backend escalates teardown the same way: send a graceful
 //! signal to the whole tree, poll until it drains or a deadline passes, then
 //! either hard-kill the survivors (`escalate`) or leave them running and tell
 //! `Drop` to keep its hands off (`!escalate`). Only the mechanics differ
-//! (a cgroup signals and kills through the cgroup file API; a process group via
-//! `killpg`), so each backend supplies those primitives through
+//! (a Linux cgroup signals and kills through the cgroup file API; a POSIX
+//! process group via `killpg`; a Windows Job Object via a console CTRL_BREAK and
+//! `TerminateJobObject`), so each backend supplies those primitives through
 //! [`GracefulTarget`] and they share the escalation algorithm in [`run`].
 //!
-//! Windows has no graceful tier — its Job Object kill is atomic — so it does
-//! not use this module.
+//! Windows has no *soft signal* tier by default — its Job Object kill is atomic —
+//! but the opt-in `windows_graceful_ctrl_break` path (a direct child spawned
+//! `CREATE_NEW_PROCESS_GROUP`) does drive [`run`] with a Job-backed
+//! `GracefulTarget`, so [`run`] and [`GracefulTarget`] are cross-platform. The
+//! single-child kill-and-reap primitives below ([`PidTarget`]/[`run_pid`]/
+//! [`UnixChild`]) lean on `PidGate`/`libc` and stay unix-only.
 
 use std::io;
 use std::time::Duration;
@@ -106,6 +110,10 @@ pub(crate) async fn run(
 /// (a cgroup or a POSIX process group): a **shared-group** run does not own its
 /// group, so its teardown reaches only its own direct child, by pid — the
 /// child's own descendants are the documented shared-group teardown gap.
+///
+/// Unix-only: it is signal/`PidGate`-based, and the shared-group streaming
+/// timeout on Windows force-kills through the gate instead (no soft-signal tier).
+#[cfg(unix)]
 pub(crate) trait PidTarget {
     /// Best-effort graceful signal to the child. A delivery failure (the child
     /// already exited, `EPERM`) is swallowed — the driver proceeds to poll.
@@ -147,6 +155,7 @@ pub(crate) trait PidTarget {
 ///
 /// `grace` is clamped to [`crate::MAX_DEADLINE`] so a `Duration::MAX`-ish value
 /// can't overflow `Instant + Duration` and panic mid-teardown.
+#[cfg(unix)]
 pub(crate) async fn run_pid(target: &impl PidTarget, signal: i32, grace: Duration) {
     // Best-effort: the driver proceeds to polling regardless of delivery.
     target.signal(signal);
@@ -450,6 +459,7 @@ mod tests {
     /// A scriptable [`PidTarget`] for the single-child driver: records the
     /// graceful signal and hard kills, and reports "alive" for the first
     /// `alive_polls` liveness checks, then "gone".
+    #[cfg(unix)]
     struct FakePid {
         signals: AtomicUsize,
         last_signal: std::sync::atomic::AtomicI32,
@@ -457,6 +467,7 @@ mod tests {
         alive_polls: AtomicUsize,
     }
 
+    #[cfg(unix)]
     impl FakePid {
         /// Reports alive for `alive_polls` liveness checks, then gone forever.
         /// `usize::MAX` models a child that catches the signal and keeps running
@@ -471,6 +482,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl PidTarget for FakePid {
         fn signal(&self, signal: i32) {
             self.signals.fetch_add(1, Ordering::Relaxed);
@@ -491,6 +503,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn pid_child_that_catches_the_signal_is_still_hard_killed() {
         // The child stays alive the whole grace (caught the signal, closed
@@ -511,6 +524,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn pid_child_that_exits_within_grace_skips_the_hard_kill() {
         // Alive for two polls, then gone — the child exited on the signal within
@@ -525,6 +539,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn pid_saturating_grace_does_not_panic() {
         // Duration::MAX must be clamped before the `Instant + Duration` add.
