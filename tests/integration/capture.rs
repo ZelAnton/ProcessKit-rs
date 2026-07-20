@@ -509,6 +509,98 @@ async fn stdout_null_makes_capture_verbs_error_but_discard_verbs_run() {
     );
 }
 
+#[tokio::test]
+#[ignore = "spawns real subprocesses that write directly to temp files"]
+async fn file_redirection_truncates_or_appends_without_a_stdout_pipe() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let stdout_path = dir.path().join("service.log");
+    std::fs::write(&stdout_path, "stale\n").expect("seed stale log");
+
+    let first = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo first"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'first\\n'"])
+    };
+    first
+        .stdout_file(&stdout_path)
+        .start()
+        .await
+        .expect("start with redirected stdout")
+        .wait()
+        .await
+        .expect("first child exits");
+    let first_log = std::fs::read_to_string(&stdout_path).expect("read truncated log");
+    assert!(first_log.contains("first"), "log: {first_log:?}");
+    assert!(
+        !first_log.contains("stale"),
+        "log was not truncated: {first_log:?}"
+    );
+
+    let second = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo second"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'second\\n'"])
+    };
+    second
+        .stdout_file_append(&stdout_path)
+        .start()
+        .await
+        .expect("start with appended stdout")
+        .wait()
+        .await
+        .expect("second child exits");
+    let appended_log = std::fs::read_to_string(&stdout_path).expect("read appended log");
+    assert!(appended_log.contains("first") && appended_log.contains("second"));
+
+    let stderr_path = dir.path().join("service.err");
+    let stderr_writer = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo warning 1>&2"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'warning\\n' >&2"])
+    };
+    stderr_writer
+        .stderr_file(&stderr_path)
+        .start()
+        .await
+        .expect("start with redirected stderr")
+        .wait()
+        .await
+        .expect("stderr writer exits");
+    assert!(
+        std::fs::read_to_string(stderr_path)
+            .expect("read stderr log")
+            .contains("warning")
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess to verify the file-redirect capture gate"]
+async fn file_redirect_rejects_capture_and_streaming_verbs() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("out.log");
+
+    let err = two_line_echo()
+        .stdout_file(&path)
+        .output_string()
+        .await
+        .expect_err("a file is not a capture pipe");
+    match err {
+        processkit::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        other => panic!("expected Io(InvalidInput), got {other:?}"),
+    }
+
+    let mut run = two_line_echo()
+        .stdout_file(&path)
+        .start()
+        .await
+        .expect("start redirected child");
+    assert!(
+        run.stdout_lines().is_err(),
+        "stdout_lines must reject a file redirect"
+    );
+    run.wait().await.expect("redirected child still exits");
+}
+
 #[derive(Clone)]
 struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 

@@ -13,9 +13,15 @@ cargo-fuzz = true
 # encoding independently of the payload bytes.
 arbitrary = { version = "1", features = ["derive"] }
 libfuzzer-sys = "0.4"
+# Build valid cassette fixtures from structured arbitrary data, leaving the
+# target to exercise processkit's real parser and replay state machine.
+serde_json = "1"
 
 [dependencies.processkit]
 path = ".."
+# Cassettes are an opt-in crate surface, so fuzz targets enable the same
+# feature explicitly instead of changing the parent crate's default build.
+features = ["record"]
 
 # Isolate this crate's dependency resolution (and Cargo.lock) from the parent
 # crate: fuzz targets are dev tooling, never part of the published/workspace
@@ -25,6 +31,21 @@ path = ".."
 [[bin]]
 name = "decode_pump_lines"
 path = "fuzz_targets/decode_pump_lines.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "fuzz_cassette_parse"
+path = "fuzz_targets/fuzz_cassette_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_cassette_replay"
+path = "fuzz_targets/fuzz_cassette_replay.rs"
 test = false
 doc = false
 bench = false

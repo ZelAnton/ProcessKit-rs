@@ -222,6 +222,10 @@ pub use priority::Priority;
 // fuzzing`) surface, and thus never touches `public-api.txt`.
 #[cfg(fuzzing)]
 pub use pump::fuzz_decode_pump_lines;
+// Fuzzing-only cassette seams keep the ordinary API file-based while letting
+// cargo-fuzz exercise parser and replay state directly from in-memory input.
+#[cfg(all(fuzzing, feature = "record"))]
+pub use cassette::{fuzz_cassette_parse, fuzz_cassette_replay};
 pub use result::{Outcome, ProcessResult};
 pub use retry::RetryPolicy;
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
