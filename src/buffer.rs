@@ -698,4 +698,155 @@ mod tests {
         clamp_dropoldest_tail(&mut buf, None, OverflowMode::DropOldest);
         assert_eq!(buf, b"abcdefghijk");
     }
+
+    mod proptests {
+        use super::*;
+        use crate::pump::SharedLines;
+        use proptest::prelude::*;
+
+        #[derive(Default)]
+        struct ExpectedLines {
+            lines: Vec<String>,
+            count: usize,
+            seen_bytes: usize,
+            dropped: usize,
+            overflowed: bool,
+        }
+
+        impl ExpectedLines {
+            fn push(&mut self, line: String, policy: OutputBufferPolicy) {
+                self.count += 1;
+                self.seen_bytes += line.len();
+                match policy.overflow {
+                    OverflowMode::Error => {
+                        let over = match (policy.max_lines, policy.max_bytes) {
+                            (None, None) => true,
+                            (max_lines, max_bytes) => {
+                                max_lines.is_some_and(|cap| self.count > cap)
+                                    || max_bytes.is_some_and(|cap| {
+                                        self.seen_bytes > cap || self.count > cap
+                                    })
+                            }
+                        };
+                        if over {
+                            self.overflowed = true;
+                            self.dropped += 1;
+                        } else {
+                            self.lines.push(line);
+                        }
+                    }
+                    OverflowMode::DropOldest => {
+                        self.lines.push(line);
+                        let mut dropped = false;
+                        while policy.max_lines.is_some_and(|cap| self.lines.len() > cap)
+                            || policy.max_bytes.is_some_and(|cap| {
+                                self.lines.iter().map(String::len).sum::<usize>() > cap
+                                    || self.lines.len() > cap
+                            })
+                        {
+                            self.lines.remove(0);
+                            dropped = true;
+                        }
+                        if dropped {
+                            self.dropped += 1;
+                        }
+                    }
+                    OverflowMode::DropNewest => {
+                        let bytes: usize = self.lines.iter().map(String::len).sum();
+                        let fits = policy.max_lines.is_none_or(|cap| self.lines.len() < cap)
+                            && policy.max_bytes.is_none_or(|cap| {
+                                bytes + line.len() <= cap && self.lines.len() < cap
+                            });
+                        if fits {
+                            self.lines.push(line);
+                        } else {
+                            self.dropped += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        fn arb_line() -> impl Strategy<Value = String> {
+            prop::collection::vec(any::<char>(), 0..16)
+                .prop_map(|chars| chars.into_iter().collect())
+        }
+
+        fn arb_cap(limit: usize) -> impl Strategy<Value = Option<usize>> {
+            prop_oneof![Just(None), (0usize..=limit).prop_map(Some)]
+        }
+
+        fn arb_overflow_mode() -> impl Strategy<Value = OverflowMode> {
+            prop_oneof![
+                Just(OverflowMode::DropOldest),
+                Just(OverflowMode::DropNewest),
+                Just(OverflowMode::Error),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(100))]
+
+            #[test]
+            fn line_buffer_policy_matches_its_model(
+                input in prop::collection::vec(arb_line(), 0..24),
+                max_lines in arb_cap(12), max_bytes in arb_cap(96), overflow in arb_overflow_mode(),
+            ) {
+                let policy = OutputBufferPolicy { max_lines, max_bytes, overflow };
+                let sink = SharedLines::new(&policy);
+                let mut expected = ExpectedLines::default();
+                for line in input {
+                    expected.push(line.clone(), policy);
+                    sink.push(line);
+                    prop_assert_eq!(sink.count(), expected.count);
+                    prop_assert_eq!(sink.seen_bytes(), expected.seen_bytes);
+                    prop_assert_eq!(sink.dropped(), expected.dropped);
+                    prop_assert_eq!(sink.overflowed(), expected.overflowed);
+                }
+                let retained = sink.drain();
+                let retained_bytes: usize = retained.iter().map(String::len).sum();
+                if let Some(cap) = policy.max_lines { prop_assert!(retained.len() <= cap); }
+                if let Some(cap) = policy.max_bytes {
+                    prop_assert!(retained_bytes <= cap);
+                    prop_assert!(retained.len() <= cap);
+                }
+                prop_assert_eq!(retained, expected.lines);
+                prop_assert_eq!(sink.dropped() > 0, expected.dropped > 0);
+            }
+
+            #[test]
+            fn raw_byte_buffer_policy_matches_its_model(
+                chunks in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..80), 0..24),
+                max_lines in arb_cap(12), max_bytes in arb_cap(96), overflow in arb_overflow_mode(),
+            ) {
+                let policy = OutputBufferPolicy { max_lines, max_bytes, overflow };
+                let input: Vec<u8> = chunks.iter().flatten().copied().collect();
+                let (overflowed, truncated) = (AtomicBool::new(false), AtomicBool::new(false));
+                let mut actual = Vec::new();
+                for chunk in &chunks {
+                    let was_overflowed = overflowed.load(Ordering::Relaxed);
+                    let was_truncated = truncated.load(Ordering::Relaxed);
+                    push_capped_bytes(&mut actual, chunk, policy.max_bytes, policy.overflow, &overflowed, &truncated);
+                    prop_assert!(!was_overflowed || overflowed.load(Ordering::Relaxed));
+                    prop_assert!(!was_truncated || truncated.load(Ordering::Relaxed));
+                }
+                clamp_dropoldest_tail(&mut actual, policy.max_bytes, policy.overflow);
+                let (expected, expected_overflowed, expected_truncated) = match policy.max_bytes {
+                    None => (input, false, false),
+                    Some(cap) => match policy.overflow {
+                        OverflowMode::DropOldest => {
+                            let start = input.len().saturating_sub(cap);
+                            (input[start..].to_vec(), false, input.len() > cap)
+                        }
+                        OverflowMode::DropNewest => (input[..input.len().min(cap)].to_vec(), false, input.len() > cap),
+                        OverflowMode::Error => (input[..input.len().min(cap)].to_vec(), input.len() > cap, false),
+                    },
+                };
+                if let Some(cap) = policy.max_bytes { prop_assert!(actual.len() <= cap); }
+                prop_assert_eq!(actual, expected);
+                prop_assert_eq!(overflowed.load(Ordering::Relaxed), expected_overflowed);
+                prop_assert_eq!(truncated.load(Ordering::Relaxed), expected_truncated);
+            }
+        }
+    }
 }

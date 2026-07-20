@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f536a89c3311d00e4fb961b4622bd0830bfcc0cafc1876991d653c017c7d1bb4 # shrinks to input = ["", "A¡aAA𐀀\0ࠀA", "A𐀀aࠀA𐀀𐀀𐀀0𐀀𐀀 𐀀A"], max_lines = None, max_bytes = Some(1), overflow = DropOldest
