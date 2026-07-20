@@ -92,7 +92,16 @@ async fn main() -> processkit::Result<()> {
 
 `timed_out()` is `true` regardless of whether the child exited on the signal or was
 `SIGKILL`ed after the grace — the deadline is what fired. **Windows** has no signal
-tier: `timeout_grace` is accepted but the deadline kills the job atomically.
+tier by default: `timeout_grace` is accepted but the deadline kills the job
+atomically. To get a real soft-shutdown window there, add
+[`windows_graceful_ctrl_break()`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.windows_graceful_ctrl_break):
+the direct child is spawned in its own console process group and, at the deadline,
+sent a console `CTRL_BREAK` before the grace window, then `TerminateJobObject`'d if
+it hasn't exited — the same `timeout_grace` window now actually meaning something on
+Windows. It works only for a child that shares this process's console (a
+`create_no_window` / `DETACHED_PROCESS` child never receives the event and rides
+the grace to the hard kill), and sends `CTRL_BREAK` rather than the Unix
+`timeout_signal`. See [Process groups → Windows opt-in](process-groups.md#windows-opt-into-a-graceful-ctrl_break-soft-tier).
 
 The explicit [`RunningProcess::shutdown(grace)`](streaming.md) verb (stop a started
 handle on demand) composes with a `Command::timeout`: its own SIGTERM → grace →

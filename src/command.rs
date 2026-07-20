@@ -124,6 +124,11 @@ pub struct Command {
     /// Extra Windows process-creation flags (e.g. `CREATE_NO_WINDOW`), OR'd
     /// into the spawn by the Command-driven launch paths.
     creation_flags_extra: u32,
+    /// Opt in to the Windows graceful-teardown console-CTRL path (see
+    /// [`Self::windows_graceful_ctrl_break`]): spawn the direct child
+    /// `CREATE_NEW_PROCESS_GROUP` and send it `CTRL_BREAK` before the grace
+    /// window. A no-op off Windows (Unix already has a real signal tier).
+    windows_graceful_ctrl_break: bool,
     /// When cancelled, the run's tree is killed and every consuming path
     /// resolves to `Error::Cancelled`. Cheap to clone (internally `Arc`'d), so
     /// a `Command` clone — including each `Pipeline` stage and each
@@ -165,6 +170,7 @@ impl Command {
             umask: None,
             kill_on_parent_death: false,
             creation_flags_extra: 0,
+            windows_graceful_ctrl_break: false,
             cancel_token: None,
         }
     }
@@ -496,6 +502,53 @@ impl Command {
     pub fn create_no_window(mut self) -> Self {
         // CREATE_NO_WINDOW, as a literal so the field exists on every platform.
         self.creation_flags_extra |= 0x0800_0000;
+        self
+    }
+
+    /// Opt in to a **graceful Windows teardown** via a console `CTRL_BREAK`
+    /// event, giving a console child a chance to shut down cleanly instead of
+    /// being hard-killed at once.
+    ///
+    /// By default Windows has no soft-signal tier, so a graceful timeout
+    /// ([`timeout_grace`](Self::timeout_grace)) or a group
+    /// [`shutdown`](crate::ProcessGroup::shutdown) collapses to an *atomic* Job
+    /// Object kill — there is nothing to *trigger* a clean exit. With this opt-in
+    /// the direct child is spawned in its own console process group
+    /// (`CREATE_NEW_PROCESS_GROUP`), and at graceful teardown it is sent
+    /// `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` before the grace window:
+    /// a child that installs a `CTRL_BREAK` handler (as many CLIs, Node, Python,
+    /// and Go services do) can flush and exit within the grace. Any survivor still
+    /// running when the grace elapses is then `TerminateJobObject`'d — the same
+    /// hard-kill fallback as before, so containment is never weakened.
+    ///
+    /// # Boundaries (read these)
+    ///
+    /// - **Console-only.** The event is delivered through the console this process
+    ///   shares with the child. A child spawned
+    ///   [`create_no_window`](Self::create_no_window) (or `DETACHED_PROCESS`) does
+    ///   **not** share that console, so it never receives the `CTRL_BREAK` and
+    ///   simply rides the grace to the `TerminateJobObject` fallback. A GUI /
+    ///   service parent with no console of its own can't deliver the event either.
+    /// - **`CTRL_BREAK`, not `CTRL_C`.** `CREATE_NEW_PROCESS_GROUP` disables
+    ///   `CTRL_C` for the new group by default; `CTRL_BREAK` is always deliverable,
+    ///   which is why it is the event sent. [`timeout_signal`](Self::timeout_signal)
+    ///   (Unix's signal choice) does not apply — Windows always sends `CTRL_BREAK`.
+    /// - **Direct child only.** Only the process launched by this run is a group
+    ///   leader; its own descendants receive the event via the shared console and
+    ///   group, but an [`adopt`](crate::ProcessGroup::adopt)ed child (not spawned
+    ///   here) is not addressed and falls back to the hard kill.
+    /// - **No-op off Windows.** On Unix the graceful tier already sends a real
+    ///   signal, so this builder does nothing there.
+    ///
+    /// Honored by the `Command`-driven launch paths (run helpers,
+    /// [`start`](crate::ProcessGroup::start), the run-level graceful
+    /// [`timeout_grace`](Self::timeout_grace), and a shared
+    /// [`ProcessGroup`](crate::ProcessGroup)'s
+    /// [`shutdown`](crate::ProcessGroup::shutdown)); the raw
+    /// [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) escape hatch, which
+    /// overwrites creation flags wholesale, does not participate.
+    pub fn windows_graceful_ctrl_break(mut self) -> Self {
+        self.windows_graceful_ctrl_break = true;
         self
     }
 
@@ -1273,6 +1326,15 @@ impl Command {
         }
     }
 
+    /// Whether this command opted into the Windows graceful console-CTRL teardown
+    /// ([`windows_graceful_ctrl_break`](Self::windows_graceful_ctrl_break)). Read
+    /// by the launch seam to set
+    /// [`SpawnOptions::windows_new_process_group`](crate::sys::SpawnOptions); a
+    /// documented no-op off Windows.
+    pub(crate) fn wants_windows_graceful_ctrl_break(&self) -> bool {
+        self.windows_graceful_ctrl_break
+    }
+
     /// The requested privilege-drop uid — read only by the non-Unix
     /// unsupported gate (Unix consumes the field directly in `build_tokio`).
     #[cfg(not(unix))]
@@ -2038,7 +2100,11 @@ impl fmt::Debug for Command {
             .field("priority", &self.priority)
             .field("umask", &self.umask)
             .field("kill_on_parent_death", &self.kill_on_parent_death)
-            .field("creation_flags_extra", &self.creation_flags_extra);
+            .field("creation_flags_extra", &self.creation_flags_extra)
+            .field(
+                "windows_graceful_ctrl_break",
+                &self.windows_graceful_ctrl_break,
+            );
         #[cfg(feature = "process-control")]
         d.field("timeout_signal", &self.timeout_signal);
         d.field("has_cancel_token", &self.cancel_token.is_some());
@@ -2700,6 +2766,24 @@ mod tests {
         let cmd = Command::new("x").create_no_window();
         assert_eq!(cmd.extra_creation_flags(), 0x0800_0000);
         assert_eq!(Command::new("x").extra_creation_flags(), 0);
+    }
+
+    #[test]
+    fn windows_graceful_ctrl_break_records_the_opt_in() {
+        assert!(
+            Command::new("x")
+                .windows_graceful_ctrl_break()
+                .wants_windows_graceful_ctrl_break(),
+            "the builder opts the command into the Windows console-CTRL teardown"
+        );
+        // Off by default — every existing command keeps the atomic-kill behavior.
+        assert!(!Command::new("x").wants_windows_graceful_ctrl_break());
+        // Composes with create_no_window (both are independent spawn knobs).
+        let combined = Command::new("x")
+            .windows_graceful_ctrl_break()
+            .create_no_window();
+        assert!(combined.wants_windows_graceful_ctrl_break());
+        assert_eq!(combined.extra_creation_flags(), 0x0800_0000);
     }
 
     #[test]
