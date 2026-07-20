@@ -225,6 +225,11 @@ windows-sys = { version = "0.61", features = [
   # suspended child's primary thread for ResumeThread — std/tokio expose only
   # the process handle, not the PROCESS_INFORMATION thread handle.
   "Win32_System_Diagnostics_ToolHelp",
+  # GenerateConsoleCtrlEvent + CTRL_BREAK_EVENT for the opt-in graceful
+  # teardown: a direct child spawned CREATE_NEW_PROCESS_GROUP is sent a console
+  # CTRL_BREAK before the grace window, so a console child can shut down softly
+  # (Command::windows_graceful_ctrl_break). See src/sys/windows.rs.
+  "Win32_System_Console",
 ] }
 
 [target.'cfg(unix)'.dependencies]
@@ -264,9 +269,13 @@ harness = false
 [target.'cfg(windows)'.dev-dependencies]
 # Liveness probe (OpenProcess) in the integration tests that prove a grandchild is
 # reaped with its job — integration tests can't see the non-dev windows-sys.
+# `Win32_System_Console` (AllocConsole) lets the CTRL_BREAK graceful test attach
+# a console when the harness was launched without one, so the console event the
+# mechanism relies on has somewhere to route.
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_System_Threading",
+  "Win32_System_Console",
   # The nested-jobs integration test (groups.rs `mod nested_job`) drives Job
   # Objects from the test itself, mirroring src/sys/windows.rs at the user level:
   # CreateJobObjectW + SetInformationJobObject (JOBOBJECT_EXTENDED_LIMIT_INFORMATION

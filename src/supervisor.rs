@@ -15,12 +15,14 @@
 //! [`with_runner(&group)`](Supervisor::with_runner) runs every incarnation
 //! inside one shared kill-on-drop [`ProcessGroup`](crate::ProcessGroup).
 
-use std::time::Duration;
+use std::future::Future;
+use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use crate::buffer::OutputBufferPolicy;
 use crate::command::Command;
 use crate::error::Result;
-use crate::result::ProcessResult;
+use crate::result::{Outcome, ProcessResult};
 use crate::runner::{JobRunner, ProcessRunner};
 
 /// Default per-incarnation capture tail for a supervised command whose own
@@ -28,6 +30,95 @@ use crate::runner::{JobRunner, ProcessRunner};
 /// capturing its *entire* output risks unbounded heap — keep a bounded tail (the
 /// most recent lines, the ones that matter for a crash) by default instead.
 const DEFAULT_SUPERVISION_TAIL: usize = 1000;
+
+/// Default number of *consecutive* failed liveness checks tolerated before the
+/// supervisor force-restarts the current incarnation (see
+/// [`Supervisor::health_check`] / [`Supervisor::health_check_failures`]).
+/// Mirrors the Kubernetes container liveness-probe `failureThreshold` default of
+/// `3`: a single blip (a slow tick, a momentarily-busy endpoint) is forgiven, a
+/// genuinely wedged child is not. No effect unless
+/// [`health_check`](Supervisor::health_check) is enabled.
+const DEFAULT_HEALTH_FAILURES: u32 = 3;
+
+/// A boxed async liveness probe: called with no arguments (like
+/// [`RunningProcess::wait_for`](crate::RunningProcess::wait_for)'s `check`) and
+/// resolving to `true` when the child is healthy. Boxed — probe *and* its future
+/// — so the [`Supervisor`] can store an arbitrary closure/endpoint check as one
+/// opaque field, the async twin of the boxed `stop_when`/`give_up_when`
+/// predicates.
+type HealthProbe = Box<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+
+/// A liveness health check: an async probe re-run on a fixed cadence for the
+/// life of the current incarnation. Configured by
+/// [`Supervisor::health_check`]; the consecutive-failure threshold lives
+/// separately on the supervisor ([`health_check_failures`](Supervisor::health_check_failures))
+/// so it can be set in either order.
+struct HealthCheck {
+    probe: HealthProbe,
+    interval: Duration,
+}
+
+impl HealthCheck {
+    /// Poll the probe on the configured cadence until it fails
+    /// `failures_before_unhealthy` times **in a row** — then resolve, signalling
+    /// that the incarnation is wedged and must be force-restarted. Any healthy
+    /// probe resets the streak, so only a *sustained* failure trips it.
+    ///
+    /// The first probe fires one `interval` *after* the incarnation starts (not
+    /// immediately, unlike the one-shot readiness [`wait_for`](crate::RunningProcess::wait_for)),
+    /// giving a booting child that grace before liveness is judged; a healthy
+    /// service then loops here for its whole lifetime and this future never
+    /// resolves. A slow probe stretches the effective cadence (the period is
+    /// `interval` *plus* the probe's own runtime) rather than overlapping checks.
+    async fn watch(&self, failures_before_unhealthy: u32) {
+        // A zero threshold would never trip (`consecutive >= 0` can't be the
+        // *strict* streak we want); clamp to "one failed probe kills".
+        let threshold = failures_before_unhealthy.max(1);
+        let mut consecutive: u32 = 0;
+        loop {
+            tokio::time::sleep(self.interval).await;
+            if (self.probe)().await {
+                consecutive = 0;
+            } else {
+                consecutive = consecutive.saturating_add(1);
+                if consecutive >= threshold {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// One incarnation's end, as seen by [`Supervisor::run_incarnation`]: either it
+/// ran to a natural conclusion (exit / crash / spawn failure — a
+/// [`ProcessResult`] or an [`Error`](crate::Error)), or a liveness
+/// [`health_check`](Supervisor::health_check) judged it wedged and forced it
+/// down.
+enum Incarnation {
+    /// The runner produced a completed result or a spawn/IO error.
+    Ran(Result<ProcessResult<String>>),
+    /// A liveness check tripped; the in-flight run was abandoned (killed on drop
+    /// under the default [`JobRunner`]). Carries the incarnation's uptime so the
+    /// backoff escalation can treat a long-lived-then-wedged child as healthy.
+    LivenessFailed { uptime: Duration },
+}
+
+/// What the supervision loop should do after a restart-eligible incarnation
+/// (a real crash, a clean `Always` restart, or a liveness kill), decided by
+/// [`Supervisor::gate_restart`].
+enum GateOutcome {
+    /// Restart — the backoff (and any storm pause) has already been awaited.
+    Restart,
+    /// [`give_up_when`](Supervisor::give_up_when) classified the crash as
+    /// permanent — stop with [`StopReason::GaveUp`].
+    GaveUp,
+    /// The [`max_restarts`](Supervisor::max_restarts) budget is spent — stop
+    /// with [`StopReason::RestartsExhausted`].
+    Exhausted,
+    /// A cancel token fired during the backoff/storm pause — end supervision
+    /// with `Error::Cancelled`.
+    Cancelled,
+}
 
 /// The capture policy to apply to each incarnation: respect an explicit
 /// bounded/fail-loud command policy, but bound an unbounded line count to a
@@ -85,6 +176,17 @@ pub enum StopReason {
     /// The [`max_restarts`](Supervisor::max_restarts) budget ran out while the
     /// policy still wanted another restart.
     RestartsExhausted,
+    /// A liveness [`health_check`](Supervisor::health_check) judged the
+    /// incarnation unresponsive and forced it down, and the [`RestartPolicy`]
+    /// did not call for a restart ([`Never`](RestartPolicy::Never)) — so that
+    /// force-killed run is the final one. Under a *restart-wanting* policy a
+    /// failed liveness check instead counts as a crash and restarts, surfacing
+    /// (if it then ends supervision at all) as the usual
+    /// [`GaveUp`](Self::GaveUp) / [`RestartsExhausted`](Self::RestartsExhausted);
+    /// either way the number of liveness force-kills is reported in
+    /// [`SupervisionOutcome::liveness_kills`], and the final run's
+    /// [`ProcessResult`] carries [`Outcome::Signalled`](crate::Outcome::Signalled).
+    Unhealthy,
 }
 
 /// What the [`give_up_when`](Supervisor::give_up_when) classifier inspects: a
@@ -124,6 +226,12 @@ pub struct SupervisionOutcome {
     /// How many times the failure-storm guard paused restarts (always `0`
     /// unless [`storm_pause`](Supervisor::storm_pause) is set).
     pub storm_pauses: u32,
+    /// How many incarnations a liveness [`health_check`](Supervisor::health_check)
+    /// force-killed for being unresponsive (always `0` unless a health check is
+    /// enabled). Each such kill is treated as a crash for the
+    /// [`RestartPolicy`]/backoff/storm guard, so it is *also* reflected in
+    /// [`restarts`](Self::restarts) when the policy restarted it.
+    pub liveness_kills: u32,
 }
 
 /// Keeps a [`Command`] alive: runs it, classifies every exit against the
@@ -160,6 +268,15 @@ pub struct Supervisor<R: ProcessRunner = JobRunner> {
     /// bounded tail (see [`default_supervision_capture`]); override with
     /// [`capture`](Self::capture).
     capture: OutputBufferPolicy,
+    /// The opt-in liveness probe + cadence; `None` (the default) leaves the
+    /// supervisor's behavior exactly as it was before health-checking existed.
+    /// Enabled by [`health_check`](Self::health_check).
+    health_check: Option<HealthCheck>,
+    /// Consecutive failed liveness checks tolerated before the incarnation is
+    /// force-restarted (default [`DEFAULT_HEALTH_FAILURES`]). No effect unless
+    /// [`health_check`](Self::health_check) is set; tunable via
+    /// [`health_check_failures`](Self::health_check_failures).
+    health_check_failures: u32,
 }
 
 // Manual: runner type parameter and boxed predicate are opaque.
@@ -178,6 +295,8 @@ impl<R: ProcessRunner> std::fmt::Debug for Supervisor<R> {
             .field("has_stop_when", &self.stop_when.is_some())
             .field("has_give_up_when", &self.give_up_when.is_some())
             .field("capture", &self.capture)
+            .field("has_health_check", &self.health_check.is_some())
+            .field("health_check_failures", &self.health_check_failures)
             .finish_non_exhaustive()
     }
 }
@@ -202,6 +321,8 @@ impl Supervisor<JobRunner> {
             stop_when: None,
             give_up_when: None,
             capture,
+            health_check: None,
+            health_check_failures: DEFAULT_HEALTH_FAILURES,
         }
     }
 }
@@ -233,6 +354,8 @@ impl<R: ProcessRunner> Supervisor<R> {
             stop_when: self.stop_when,
             give_up_when: self.give_up_when,
             capture: self.capture,
+            health_check: self.health_check,
+            health_check_failures: self.health_check_failures,
         }
     }
 
@@ -249,12 +372,11 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// either (including [`unbounded`](OutputBufferPolicy::unbounded) if you truly
     /// want every line).
     ///
-    /// This caps *retention*, not the stdio mode: supervision captures each
-    /// incarnation's output (to evaluate [`stop_when`](Self::stop_when) and the
-    /// final result), so the command's `stdout` must stay
-    /// [`Piped`](crate::StdioMode::Piped) (the default). A command with a
-    /// non-piped `stdout` (`Inherit`/`Null`) errors every incarnation and
-    /// would just spin the restart loop.
+    /// This caps *retention*, not the stdio mode. A piped stdout is retained so
+    /// [`stop_when`](Self::stop_when) can inspect it; a non-piped stdout
+    /// (`Inherit`/`Null`/a file redirect) is discarded and its final result has
+    /// an empty stdout. File redirects therefore remain suitable for a service
+    /// whose restart incarnations append to one child-owned log.
     #[must_use]
     pub fn capture(mut self, policy: OutputBufferPolicy) -> Self {
         self.capture = policy;
@@ -427,6 +549,86 @@ impl<R: ProcessRunner> Supervisor<R> {
         self
     }
 
+    /// Enable **liveness health-checking** (opt-in; off by default): re-run the
+    /// async `probe` every `interval` for the life of each incarnation, and when
+    /// it fails a threshold of consecutive checks
+    /// ([`health_check_failures`](Self::health_check_failures), default
+    /// `3`) **force-restart** the child. This detects the
+    /// blind spot a plain [`RestartPolicy`] can't see: a process that is still
+    /// *alive* but *wedged* — a deadlocked server, a stuck event loop — which
+    /// never exits, so the exit-driven policy would keep it "running" forever.
+    /// The analogue of systemd's `WatchdogSec` and a container liveness probe.
+    ///
+    /// `probe` is any async predicate returning `true` for *healthy* — a TCP
+    /// connect, an HTTP `/healthz` request, a file/heartbeat check, a custom
+    /// closure — in the same shape as
+    /// [`RunningProcess::wait_for`](crate::RunningProcess::wait_for)'s readiness
+    /// check (it takes no handle, so it observes the child out-of-band). The
+    /// first probe fires one `interval` after the incarnation starts (startup
+    /// grace); a healthy child is then never disturbed.
+    ///
+    /// A failed liveness check is treated **exactly like a crash**: the wedged
+    /// incarnation is dropped (killed on drop under the default [`JobRunner`] —
+    /// see [`run`](Self::run)'s cancellation note for the shared-group caveat)
+    /// and flows through the [`RestartPolicy`], [`backoff`](Self::backoff), the
+    /// [failure-storm guard](Self::storm_pause) and [`max_restarts`](Self::max_restarts)
+    /// just as a real crash would — but it does **not** consult
+    /// [`stop_when`](Self::stop_when) (there is no cleanly-completed run to
+    /// evaluate). Under [`Never`](RestartPolicy::Never) the single force-killed
+    /// run is reported with [`StopReason::Unhealthy`]. Each force-kill is counted
+    /// in [`SupervisionOutcome::liveness_kills`]; the synthetic final result
+    /// carries [`Outcome::Signalled`](crate::Outcome).
+    ///
+    /// A liveness-killed incarnation counts toward the backoff escalation as any
+    /// crash does, using how long it actually stayed up before wedging — so a
+    /// service that runs healthy for a long while and only occasionally wedges
+    /// isn't pinned at the [`max_backoff`](Self::max_backoff) ceiling, while one
+    /// that wedges promptly after each restart self-throttles (same uptime floor
+    /// as [`backoff`](Self::backoff)).
+    ///
+    /// ```
+    /// use processkit::{Command, Supervisor};
+    /// use std::time::Duration;
+    ///
+    /// # async fn f() -> processkit::Result<()> {
+    /// let outcome = Supervisor::new(Command::new("my-server"))
+    ///     .health_check(
+    ///         || async { tokio::net::TcpStream::connect("127.0.0.1:8080").await.is_ok() },
+    ///         Duration::from_secs(5),
+    ///     )
+    ///     .max_restarts(10)
+    ///     .run()
+    ///     .await?;
+    /// println!("liveness kills: {}", outcome.liveness_kills);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn health_check<F, Fut>(mut self, probe: F, interval: Duration) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = bool> + Send + 'static,
+    {
+        self.health_check = Some(HealthCheck {
+            probe: Box::new(move || Box::pin(probe())),
+            interval,
+        });
+        self
+    }
+
+    /// How many *consecutive* failed liveness checks to tolerate before a
+    /// [`health_check`](Self::health_check) force-restarts the incarnation
+    /// (default `3`). One healthy probe resets the
+    /// streak, so this forgives transient blips; combined with the probe
+    /// `interval` it sets the effective grace window (≈ `interval × n`) before a
+    /// wedged child is killed. A value of `0` is treated as `1`. No effect unless
+    /// [`health_check`](Self::health_check) is set — settable in either order.
+    #[must_use]
+    pub fn health_check_failures(mut self, n: u32) -> Self {
+        self.health_check_failures = n;
+        self
+    }
+
     /// Supervise until the policy, the predicate, or the restart budget ends
     /// it, and report the [`SupervisionOutcome`].
     ///
@@ -465,6 +667,11 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// is **terminal**: supervision returns that
     /// `Error::Cancelled` immediately, regardless of policy or budget — the
     /// token stays cancelled, so a restart would only be cancelled again.
+    ///
+    /// A [`health_check`](Self::health_check) force-kill relies on this same
+    /// drop-kills semantics to end the wedged incarnation, so the shared-group
+    /// caveat above applies to it too (a shared-group child is only reliably
+    /// stopped when the group is torn down).
     pub async fn run(self) -> Result<SupervisionOutcome> {
         // Reject up front a configuration that could genuinely need a second
         // incarnation but only has a one-shot stdin source to feed it: the
@@ -494,14 +701,23 @@ impl<R: ProcessRunner> Supervisor<R> {
         // long-lived service that exits/crashes occasionally would climb to the
         // `max_backoff` ceiling and restart at it forever.
         let mut backoff_restarts: u32 = 0;
+        // Lifetime count of incarnations a liveness check force-killed (reported
+        // in `SupervisionOutcome::liveness_kills`); always 0 without a health check.
+        let mut liveness_kills: u32 = 0;
         let mut storm = StormState::new();
         loop {
-            match self.runner.output_string(&command).await {
-                Ok(result) => {
+            match self.run_incarnation(&command).await {
+                Incarnation::Ran(Ok(result)) => {
                     if let Some(predicate) = &self.stop_when
                         && predicate(&result)
                     {
-                        return Ok(self.outcome(result, restarts, &storm, StopReason::Predicate));
+                        return Ok(self.outcome(
+                            result,
+                            restarts,
+                            liveness_kills,
+                            &storm,
+                            StopReason::Predicate,
+                        ));
                     }
                     let crashed = !result.is_success();
                     let wants_restart = match self.policy {
@@ -513,47 +729,96 @@ impl<R: ProcessRunner> Supervisor<R> {
                         return Ok(self.outcome(
                             result,
                             restarts,
+                            liveness_kills,
                             &storm,
                             StopReason::PolicySatisfied,
                         ));
                     }
-                    if crashed
-                        && let Some(classifier) = &self.give_up_when
-                        && classifier(&GiveUpAttempt::Crashed(&result))
+                    match self
+                        .gate_restart(
+                            &result,
+                            crashed,
+                            &mut restarts,
+                            &mut backoff_restarts,
+                            &mut storm,
+                            factor,
+                        )
+                        .await
                     {
-                        return Ok(self.outcome(result, restarts, &storm, StopReason::GaveUp));
+                        GateOutcome::GaveUp => {
+                            return Ok(self.outcome(
+                                result,
+                                restarts,
+                                liveness_kills,
+                                &storm,
+                                StopReason::GaveUp,
+                            ));
+                        }
+                        GateOutcome::Exhausted => {
+                            return Ok(self.outcome(
+                                result,
+                                restarts,
+                                liveness_kills,
+                                &storm,
+                                StopReason::RestartsExhausted,
+                            ));
+                        }
+                        GateOutcome::Cancelled => return Err(self.cancelled_err(&command)),
+                        GateOutcome::Restart => {}
                     }
-                    if self.max_restarts.is_some_and(|max| restarts >= max) {
+                }
+                Incarnation::LivenessFailed { uptime } => {
+                    // A failed liveness check is a crash the supervisor induced:
+                    // the wedged incarnation was already dropped (killed on drop),
+                    // and now flows through the same crash machinery — but skips
+                    // `stop_when` (no cleanly-completed run to judge). The stamped
+                    // uptime lets the E3 escalation reset for a long-lived child.
+                    liveness_kills = liveness_kills.saturating_add(1);
+                    let result = self.liveness_kill_result(uptime);
+                    if matches!(self.policy, RestartPolicy::Never) {
+                        // Never won't restart — report the single force-killed run.
                         return Ok(self.outcome(
                             result,
                             restarts,
+                            liveness_kills,
                             &storm,
-                            StopReason::RestartsExhausted,
+                            StopReason::Unhealthy,
                         ));
                     }
-                    // E3: a run is "healthy" only if it stayed up at least as long
-                    // as the backoff ceiling — a clear "it's stable now" signal —
-                    // whether it then exited cleanly or crashed. Resetting the
-                    // escalation there keeps a long-lived service off the ceiling,
-                    // while a tight loop (clean OR crashing, each incarnation shorter
-                    // than max_backoff) keeps climbing and self-throttles. A uniform
-                    // uptime floor — rather than "any clean exit resets" — avoids a
-                    // footgun: under Always, an instantly-exiting `exit 0` loop would
-                    // otherwise reset every iteration and spin at the base delay.
-                    let healthy = result.duration() >= self.max_backoff;
-                    if healthy {
-                        backoff_restarts = 0;
+                    match self
+                        .gate_restart(
+                            &result,
+                            /* crashed */ true,
+                            &mut restarts,
+                            &mut backoff_restarts,
+                            &mut storm,
+                            factor,
+                        )
+                        .await
+                    {
+                        GateOutcome::GaveUp => {
+                            return Ok(self.outcome(
+                                result,
+                                restarts,
+                                liveness_kills,
+                                &storm,
+                                StopReason::GaveUp,
+                            ));
+                        }
+                        GateOutcome::Exhausted => {
+                            return Ok(self.outcome(
+                                result,
+                                restarts,
+                                liveness_kills,
+                                &storm,
+                                StopReason::RestartsExhausted,
+                            ));
+                        }
+                        GateOutcome::Cancelled => return Err(self.cancelled_err(&command)),
+                        GateOutcome::Restart => {}
                     }
-                    if crashed && self.storm_gate(&mut storm).await {
-                        return Err(self.cancelled_err(&command));
-                    }
-                    if self.sleep_backoff(backoff_restarts, factor).await {
-                        return Err(self.cancelled_err(&command));
-                    }
-                    restarts = restarts.saturating_add(1);
-                    backoff_restarts = backoff_restarts.saturating_add(1);
                 }
-                Err(err) => {
+                Incarnation::Ran(Err(err)) => {
                     if err.is_cancelled() {
                         return Err(err);
                     }
@@ -584,10 +849,105 @@ impl<R: ProcessRunner> Supervisor<R> {
         }
     }
 
+    /// Run one incarnation. Without a [`health_check`](Self::health_check) this
+    /// is exactly [`run_to_result`](Self::run_to_result) (the pre-feature fast
+    /// path — no extra task, timer, or `select!`). With one, race the run
+    /// against the liveness watcher: whichever resolves first wins, `biased`
+    /// toward a genuine exit/crash so a child that dies on its own the same
+    /// instant a probe would have tripped is reported as its real result, not a
+    /// liveness kill. When the watcher wins, dropping the losing
+    /// [`run_to_result`](Self::run_to_result) future ends the wedged
+    /// incarnation (killed on drop under the default [`JobRunner`]).
+    async fn run_incarnation(&self, command: &Command) -> Incarnation {
+        let Some(health) = &self.health_check else {
+            return Incarnation::Ran(self.run_to_result(command).await);
+        };
+        // Anchor uptime on tokio's clock (not `std::time::Instant`) so it shares
+        // the timer the liveness sleeps and any paused-runtime test run on — the
+        // same clock split `sleep_or_cancel`/probes use.
+        let started = tokio::time::Instant::now();
+        tokio::select! {
+            biased;
+            result = self.run_to_result(command) => Incarnation::Ran(result),
+            () = health.watch(self.health_check_failures) => {
+                Incarnation::LivenessFailed { uptime: started.elapsed() }
+            }
+        }
+    }
+
+    /// The shared restart gate reached by a restart-eligible incarnation — a real
+    /// crash, a clean run restarted under [`Always`](RestartPolicy::Always), or a
+    /// liveness kill (`crashed == true`). Consults, in order:
+    /// [`give_up_when`](Self::give_up_when) (crashes only),
+    /// [`max_restarts`](Self::max_restarts), the E3 healthy-uptime reset, the
+    /// [failure-storm guard](Self::storm_pause) (crashes only), and the backoff
+    /// sleep; then advances the restart counters. Factoring it here keeps the
+    /// `Ran(Ok)` and `LivenessFailed` arms from drifting apart.
+    async fn gate_restart(
+        &self,
+        result: &ProcessResult<String>,
+        crashed: bool,
+        restarts: &mut u32,
+        backoff_restarts: &mut u32,
+        storm: &mut StormState,
+        factor: f64,
+    ) -> GateOutcome {
+        if crashed
+            && let Some(classifier) = &self.give_up_when
+            && classifier(&GiveUpAttempt::Crashed(result))
+        {
+            return GateOutcome::GaveUp;
+        }
+        if self.max_restarts.is_some_and(|max| *restarts >= max) {
+            return GateOutcome::Exhausted;
+        }
+        // E3: a run is "healthy" only if it stayed up at least as long as the
+        // backoff ceiling — a clear "it's stable now" signal — whether it then
+        // exited cleanly, crashed, or was liveness-killed. Resetting the
+        // escalation there keeps a long-lived service off the ceiling, while a
+        // tight loop (clean OR crashing OR promptly-wedging, each incarnation
+        // shorter than max_backoff) keeps climbing and self-throttles. A uniform
+        // uptime floor — rather than "any clean exit resets" — avoids a footgun:
+        // under Always, an instantly-exiting `exit 0` loop would otherwise reset
+        // every iteration and spin at the base delay.
+        let healthy = result.duration() >= self.max_backoff;
+        if healthy {
+            *backoff_restarts = 0;
+        }
+        if crashed && self.storm_gate(storm).await {
+            return GateOutcome::Cancelled;
+        }
+        if self.sleep_backoff(*backoff_restarts, factor).await {
+            return GateOutcome::Cancelled;
+        }
+        *restarts = restarts.saturating_add(1);
+        *backoff_restarts = backoff_restarts.saturating_add(1);
+        GateOutcome::Restart
+    }
+
+    /// The synthetic [`ProcessResult`] for an incarnation a liveness check
+    /// force-killed: a non-success [`Signalled`](crate::Outcome::Signalled)
+    /// outcome (we killed it) stamped with how long it stayed up before wedging,
+    /// so it is a *crash* for `is_success`/policy purposes and drives the E3
+    /// backoff reset off its real uptime. Empty stdout/stderr — the wedged run's
+    /// captured output was abandoned with the dropped incarnation.
+    fn liveness_kill_result(&self, uptime: Duration) -> ProcessResult<String> {
+        ProcessResult::new(
+            self.command.program_name(),
+            String::new(),
+            String::new(),
+            Outcome::Signalled(None),
+            None,
+        )
+        .with_duration(uptime)
+        .with_ok_codes(self.command.ok_codes_vec())
+    }
+
     fn outcome(
         &self,
         final_result: ProcessResult<String>,
         restarts: u32,
+        liveness_kills: u32,
         storm: &StormState,
         stopped: StopReason,
     ) -> SupervisionOutcome {
@@ -596,7 +956,39 @@ impl<R: ProcessRunner> Supervisor<R> {
             restarts,
             stopped,
             storm_pauses: storm.pauses,
+            liveness_kills,
         }
+    }
+
+    /// Run one incarnation through the only owning launch choice and produce
+    /// its [`ProcessResult`]. A file, inherited, or null stdout has no
+    /// parent-readable pipe, so it cannot use the capture verb; finish drains
+    /// only any independently-piped stderr and preserves the exit outcome for
+    /// the restart policy. The sole callee of [`run_incarnation`](Self::run_incarnation),
+    /// which additionally races this against the liveness watcher when a
+    /// [`health_check`](Self::health_check) is set.
+    async fn run_to_result(&self, command: &Command) -> Result<ProcessResult<String>> {
+        if command.stdout_is_piped() {
+            return self.runner.output_string(command).await;
+        }
+
+        let started = Instant::now();
+        let finished = self.runner.start(command).await?.finish().await?;
+        let crate::Finished {
+            outcome,
+            stderr,
+            stderr_truncated,
+        } = finished;
+        Ok(ProcessResult::new(
+            command.program_name(),
+            String::new(),
+            stderr,
+            outcome,
+            command.configured_timeout(),
+        )
+        .with_duration(started.elapsed())
+        .with_truncated(stderr_truncated)
+        .with_ok_codes(command.ok_codes_vec()))
     }
 
     /// The terminal `Cancelled` error for supervision cut short by a cancel token
@@ -796,6 +1188,7 @@ fn jitter_factor() -> f64 {
 mod tests {
     use super::*;
     use crate::Stdin;
+    use crate::doubles::{Reply, ScriptedRunner};
     use crate::result::Outcome;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -889,6 +1282,21 @@ mod tests {
             .with_runner(runner)
             .backoff(Duration::ZERO, 1.0)
             .jitter(false)
+    }
+
+    #[tokio::test]
+    async fn redirected_stdout_is_discarded_but_still_supervised() {
+        let path = std::env::temp_dir().join("processkit-supervisor-file-redirect.log");
+        let outcome = Supervisor::new(Command::new("server").stdout_file(path))
+            .restart(RestartPolicy::Never)
+            .with_runner(ScriptedRunner::new().fallback(Reply::ok("hidden").with_stderr("warn")))
+            .run()
+            .await
+            .expect("a redirected service is supervised through start/finish");
+
+        assert_eq!(outcome.final_result.stdout(), "");
+        assert_eq!(outcome.final_result.stderr(), "warn");
+        assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
     }
 
     #[test]
@@ -1691,5 +2099,254 @@ mod tests {
             msg.contains("one-shot"),
             "message should explain the actual problem: {msg}"
         );
+    }
+
+    // --- Liveness health checks (T-141) ------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn health_watch_trips_after_the_consecutive_failure_threshold() {
+        let hc = HealthCheck {
+            probe: Box::new(|| Box::pin(async { false })),
+            interval: Duration::from_millis(100),
+        };
+        let start = tokio::time::Instant::now();
+        hc.watch(3).await;
+        // First probe fires one interval in (100ms); the third consecutive
+        // failure (300ms) trips the watch.
+        assert_eq!(start.elapsed(), Duration::from_millis(300));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_watch_resets_the_streak_on_a_healthy_probe() {
+        let calls = AtomicU32::new(0);
+        let hc = HealthCheck {
+            probe: Box::new(move || {
+                // Healthy only on the 3rd probe; unhealthy otherwise.
+                let healthy = calls.fetch_add(1, Ordering::SeqCst) == 2;
+                Box::pin(async move { healthy })
+            }),
+            interval: Duration::from_millis(100),
+        };
+        let start = tokio::time::Instant::now();
+        hc.watch(3).await;
+        // Probes: 1(fail) 2(fail) 3(healthy→reset) 4(fail) 5(fail) 6(fail→trip)
+        // — a single healthy check in the middle forbids an early trip.
+        assert_eq!(start.elapsed(), Duration::from_millis(600));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_watch_zero_threshold_is_clamped_to_one() {
+        let hc = HealthCheck {
+            probe: Box::new(|| Box::pin(async { false })),
+            interval: Duration::from_millis(100),
+        };
+        let start = tokio::time::Instant::now();
+        hc.watch(0).await; // 0 is meaningless — treated as "one failed probe kills".
+        assert_eq!(start.elapsed(), Duration::from_millis(100));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_failure_force_restarts_a_hung_but_alive_child() {
+        // The task's headline path. First incarnation: `Reply::pending` → the
+        // scripted `output_string` parks forever (a hung-but-alive child that
+        // never exits and no token cancels). An always-unhealthy probe trips
+        // after one failed check, dropping that pending run (the force-kill —
+        // killed on drop under a real JobRunner) and restarting it as a crash
+        // under the default OnCrash policy; the second incarnation exits cleanly.
+        let runner =
+            ScriptedRunner::new().on_sequence(["server"], [Reply::pending(), Reply::ok("up")]);
+        let outcome = Supervisor::new(Command::new("server"))
+            .with_runner(runner)
+            .health_check(|| async { false }, Duration::from_millis(50))
+            .health_check_failures(1)
+            .backoff(Duration::ZERO, 1.0)
+            .jitter(false)
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(
+            outcome.restarts, 1,
+            "the wedged incarnation was restarted once"
+        );
+        assert_eq!(
+            outcome.liveness_kills, 1,
+            "exactly one incarnation was force-killed by a failed liveness check"
+        );
+        assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
+        assert!(
+            outcome.final_result.is_success(),
+            "the restarted incarnation exited cleanly"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_kill_under_never_reports_unhealthy() {
+        // Never won't restart, but a health check still bounds a single run: a
+        // hung child is force-killed and reported as Unhealthy rather than
+        // parking forever.
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let outcome = Supervisor::new(Command::new("server"))
+            .with_runner(runner)
+            .restart(RestartPolicy::Never)
+            .health_check(|| async { false }, Duration::from_millis(50))
+            .health_check_failures(1)
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.restarts, 0);
+        assert_eq!(outcome.liveness_kills, 1);
+        assert_eq!(outcome.stopped, StopReason::Unhealthy);
+        assert!(!outcome.final_result.is_success());
+        assert_eq!(
+            outcome.final_result.code(),
+            None,
+            "a liveness kill surfaces as a Signalled(None) crash, no exit code"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_healthy_probe_never_force_restarts_a_long_running_child() {
+        // A child that stays up (pending) until its own 250ms timeout, with a
+        // probe that always reports healthy: liveness must never trip, so the run
+        // ends on its own terms (a timeout) and no incarnation is force-killed.
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let outcome = Supervisor::new(Command::new("server").timeout(Duration::from_millis(250)))
+            .with_runner(runner)
+            .restart(RestartPolicy::Never)
+            .health_check(|| async { true }, Duration::from_millis(100))
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(
+            outcome.liveness_kills, 0,
+            "a healthy child is never force-killed"
+        );
+        assert_eq!(outcome.restarts, 0);
+        assert!(
+            outcome.final_result.outcome().timed_out(),
+            "the run ended on its own timeout, not a liveness kill"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_kill_respects_give_up_when() {
+        // The synthetic liveness-kill result is a Signalled(None) crash, so
+        // give_up_when sees it as `Crashed` and can classify it permanent —
+        // stopping without a restart.
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let outcome = Supervisor::new(Command::new("server"))
+            .with_runner(runner)
+            .health_check(|| async { false }, Duration::from_millis(50))
+            .health_check_failures(1)
+            .give_up_when(
+                |attempt| matches!(attempt, GiveUpAttempt::Crashed(res) if res.code().is_none()),
+            )
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(
+            outcome.restarts, 0,
+            "give_up_when stops the liveness-killed run before any restart"
+        );
+        assert_eq!(outcome.liveness_kills, 1);
+        assert_eq!(outcome.stopped, StopReason::GaveUp);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_kills_can_exhaust_the_restart_budget() {
+        // Every incarnation wedges (fallback pending + always-unhealthy probe),
+        // so the budget is spent entirely on liveness-driven restarts.
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let outcome = Supervisor::new(Command::new("server"))
+            .with_runner(runner)
+            .health_check(|| async { false }, Duration::from_millis(50))
+            .health_check_failures(1)
+            .max_restarts(1)
+            .backoff(Duration::ZERO, 1.0)
+            .jitter(false)
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.restarts, 1);
+        assert_eq!(
+            outcome.liveness_kills, 2,
+            "the original and its one restart both wedged"
+        );
+        assert_eq!(outcome.stopped, StopReason::RestartsExhausted);
+        assert_eq!(
+            outcome.final_result.code(),
+            None,
+            "the final result is the Signalled liveness kill"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_kills_feed_the_storm_guard() {
+        // A liveness kill is a crash, so it feeds the failure-storm score exactly
+        // like a real crash. Scores 1, 2, 3 across the first three kills; the
+        // third crosses the 2.5 threshold → one collective pause.
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let outcome = Supervisor::new(Command::new("server"))
+            .with_runner(runner)
+            .health_check(|| async { false }, Duration::from_millis(1))
+            .health_check_failures(1)
+            .max_restarts(3)
+            .backoff(Duration::ZERO, 1.0)
+            .jitter(false)
+            .storm_pause(Duration::from_secs(1))
+            .failure_threshold(2.5)
+            .failure_decay(Duration::from_secs(1000))
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.liveness_kills, 4);
+        assert_eq!(outcome.restarts, 3);
+        assert_eq!(outcome.storm_pauses, 1);
+        assert_eq!(outcome.stopped, StopReason::RestartsExhausted);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_lived_then_wedged_incarnation_resets_the_backoff_escalation() {
+        // The E3 uptime floor applies to liveness kills via the stamped uptime:
+        // each incarnation stays "up" (pending) for 31s before the probe trips —
+        // longer than the 30s max_backoff — so every kill counts as healthy and
+        // resets the escalation. 5 restarts at base 1s: with the reset the backoff
+        // total is ≈5s; without it the delays would climb 1+2+4+8+16 = 31s. The
+        // 31s-per-incarnation uptime is virtual under a paused clock.
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let start = tokio::time::Instant::now();
+        let outcome = Supervisor::new(Command::new("server"))
+            .with_runner(runner)
+            .health_check(|| async { false }, Duration::from_secs(31))
+            .health_check_failures(1)
+            .max_restarts(5)
+            .backoff(Duration::from_secs(1), 2.0)
+            .max_backoff(Duration::from_secs(30))
+            .jitter(false)
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.liveness_kills, 6);
+        assert_eq!(outcome.restarts, 5);
+        let total = start.elapsed();
+        let uptime_total = Duration::from_secs(31 * 6);
+        assert!(
+            total < uptime_total + Duration::from_secs(10),
+            "healthy-uptime liveness kills must reset the backoff (≈5s), not escalate (31s); \
+             total {total:?}, uptime {uptime_total:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_health_check_liveness_kills_stays_zero() {
+        // The pre-feature fast path: no health check means no force-kills and the
+        // new counter stays 0.
+        let outcome = supervise(SeqRunner::new(vec![fail(1), ok()]))
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.liveness_kills, 0);
+        assert_eq!(outcome.restarts, 1);
+        assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
     }
 }

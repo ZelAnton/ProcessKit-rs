@@ -38,3 +38,5 @@ mod stats;
 mod stdin_inherit;
 mod streaming;
 mod supervision;
+#[cfg(windows)]
+mod windows_graceful;

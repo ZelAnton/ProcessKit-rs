@@ -102,7 +102,7 @@ edges worth knowing:
 |---|---|---|
 | `drop(group)` | Immediate **hard kill** of the whole tree (kill-on-close) | The safety net — always on |
 | `group.kill_all()` | The same hard kill, group stays usable (cgroup-`kill` / Job Object / process-group backends). On a **pre-5.14 Linux kernel** lacking `cgroup.kill`, the per-pid `SIGKILL` fallback returns `Err` if the tree doesn't drain (a fork bomb still out-spawning, or `D`-state zombies) | Explicit teardown mid-flight; idempotent |
-| `group.shutdown().await` | Unix: `SIGTERM` → wait `shutdown_timeout` → `SIGKILL` survivors (if `escalate_to_kill`); Windows: atomic job kill when `escalate_to_kill`, else the survivors are **spared** (handle closed without kill-on-close). Consumes the group (`shutdown_ref(&self)` is the same teardown, borrowing — for a group held behind an `Arc`/supervisor) | Graceful service stop |
+| `group.shutdown().await` | Unix: `SIGTERM` → wait `shutdown_timeout` → `SIGKILL` survivors (if `escalate_to_kill`); Windows: atomic job kill when `escalate_to_kill`, else the survivors are **spared** (handle closed without kill-on-close) — unless a child opted into `windows_graceful_ctrl_break` (see below), which gives Windows a real `CTRL_BREAK` → wait → kill tier. Consumes the group (`shutdown_ref(&self)` is the same teardown, borrowing — for a group held behind an `Arc`/supervisor) | Graceful service stop |
 
 ```rust,no_run
 use processkit::{Command, ProcessGroup, ProcessGroupOptions};
@@ -130,6 +130,44 @@ process-group backends, so keep `wait()`ing your handles concurrently if you
 want the early return. `Drop` can't `await`, which is why the graceful tier
 lives in this async method — dropping without calling it performs only the
 hard kill.
+
+### Windows: opt into a graceful `CTRL_BREAK` (soft) tier
+
+By default a Windows `shutdown` is an *atomic* Job Object kill — there is no
+`SIGTERM` to trigger a clean exit. Opt in per child with
+[`Command::windows_graceful_ctrl_break()`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.windows_graceful_ctrl_break):
+the direct child is spawned in its own console process group
+(`CREATE_NEW_PROCESS_GROUP`), and `shutdown` then sends it
+`GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)`, waits the `shutdown_timeout`,
+and `TerminateJobObject`s any survivor — the very same signal → wait → escalate
+ladder as Unix, so a console child that handles `CTRL_BREAK` shuts down softly.
+
+```rust,no_run
+use processkit::{Command, ProcessGroup, ProcessGroupOptions};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default().shutdown_timeout(Duration::from_secs(5)),
+    )?;
+    // CTRL_BREAK is sent on shutdown; a console child gets 5s to exit, else kill.
+    let _service = group
+        .start(&Command::new("my-service").windows_graceful_ctrl_break())
+        .await?;
+    group.shutdown().await?;
+    Ok(())
+}
+```
+
+It is **console-only**: a child spawned
+[`create_no_window`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.create_no_window)
+or `DETACHED_PROCESS` does not share this process's console, so it never receives
+the event and rides the grace to the `TerminateJobObject` fallback (as does a
+GUI/service parent with no console). Only the *direct* child is addressed — an
+[`adopt`](https://docs.rs/processkit/latest/processkit/struct.ProcessGroup.html#method.adopt)ed
+child is not — and the event is `CTRL_BREAK`, not `CTRL_C` (a new process group
+disables `CTRL_C`). Off Windows the builder is a no-op.
 
 ## Signalling the whole tree
 

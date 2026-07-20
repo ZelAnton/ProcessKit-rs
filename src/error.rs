@@ -1048,7 +1048,8 @@ fn display_not_found(program: &str, searched: &Option<String>) -> String {
 }
 
 /// Builds the [`Error::Io`] raised when a capture verb is called on a command
-/// whose stdout was not piped (`Command::stdout` set to `Inherit`/`Null`). The
+/// whose stdout was not piped (`Command::stdout` set to `Inherit`/`Null`, or
+/// redirected to a file). The
 /// live runner (`RunningProcess::ensure_stdout_capturable`) and both test
 /// doubles (`ScriptedRunner::output_string`, the `RecordReplayRunner` replay
 /// branch) must reject this identically, so they all route through this one
@@ -1058,7 +1059,7 @@ pub(crate) fn stdout_not_piped_error(program: &str) -> Error {
         std::io::ErrorKind::InvalidInput,
         format!(
             "`{program}`: stdout is not piped (Command::stdout was set to \
-             Inherit/Null), so the capture verbs have nothing to read — \
+             Inherit/Null or stdout_file), so the capture verbs have nothing to read — \
              use StdioMode::Piped to capture it"
         ),
     ))

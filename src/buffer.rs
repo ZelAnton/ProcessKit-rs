@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 ///
 /// Set per-stream on [`Command`](crate::Command) via
 /// [`Command::stdout`](crate::Command::stdout) /
-/// [`Command::stderr`](crate::Command::stderr). The default is
+/// [`Command::stderr`](crate::Command::stderr). For a child-owned file
+/// descriptor, use `stdout_file*` / `stderr_file*` instead; paths remain on
+/// `Command` so this enum can stay `Copy`. The default is
 /// [`Piped`](StdioMode::Piped), matching the crate's pre-1.0 behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]

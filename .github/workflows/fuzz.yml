@@ -16,9 +16,13 @@ env:
 
 jobs:
   fuzz:
-    name: fuzz (decode_pump_lines)
+    name: fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [decode_pump_lines, fuzz_cassette_parse, fuzz_cassette_replay]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -27,8 +31,8 @@ jobs:
           workspaces: "fuzz -> target"
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
-      - run: cargo +nightly fuzz build
+      - run: cargo +nightly fuzz build ${{ matrix.target }}
       # Bounded wall-clock budget (10 minutes): enough to catch regressions on
       # a schedule without an open-ended job. Run longer locally for a deeper
-      # sweep: `cargo +nightly fuzz run decode_pump_lines`.
-      - run: cargo +nightly fuzz run decode_pump_lines -- -max_total_time=600
+      # sweep: `cargo +nightly fuzz run <target>`.
+      - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600

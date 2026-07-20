@@ -13,6 +13,7 @@ keeper, platform-agnostic because it sits entirely on the
 - [Policies: what counts as a crash](#policies-what-counts-as-a-crash)
 - [Backoff and jitter](#backoff-and-jitter)
 - [Failure storms](#failure-storms)
+- [Liveness health checks](#liveness-health-checks)
 - [Stopping](#stopping)
 - [Giving up on permanent failures](#giving-up-on-permanent-failures)
 - [Outcomes](#outcomes)
@@ -137,6 +138,65 @@ the per-restart backoff, and the `max_restarts` budget is checked first, so a
 storm pause never extends an exhausted budget. Pauses taken are reported in
 `SupervisionOutcome::storm_pauses`.
 
+## Liveness health checks
+
+A `RestartPolicy` only ever reacts to a child that **exits**. It is blind to a
+child that is still *alive* but *wedged* — a deadlocked server, a stuck event
+loop, a process that stopped serving but never dies. From the policy's view that
+child is "running", so it is never restarted. The opt-in **health check** adds
+the missing dimension — the analogue of systemd's `WatchdogSec` and a container
+liveness probe:
+
+```rust,no_run
+use processkit::{Command, Supervisor};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let outcome = Supervisor::new(Command::new("my-server").args(["--port", "8080"]))
+        .health_check(
+            // Any async predicate: `true` = healthy. A port connect here; an
+            // HTTP `/healthz` request, a heartbeat file, a custom check elsewhere.
+            || async { tokio::net::TcpStream::connect("127.0.0.1:8080").await.is_ok() },
+            Duration::from_secs(5),       // probe cadence
+        )
+        .health_check_failures(3)         // consecutive misses tolerated (default 3)
+        .max_restarts(10)
+        .run()
+        .await?;
+
+    println!("liveness kills: {}", outcome.liveness_kills);
+    Ok(())
+}
+```
+
+The probe re-runs every `interval` for the life of each incarnation, in the same
+shape as the readiness [`wait_for`](testing.md#the-processrunner-seam) check (it
+takes no handle — it observes the child out-of-band, over a port/endpoint/file).
+The first probe fires one `interval` *after* the incarnation starts, so a booting
+child gets that long before liveness is judged; a healthy child then loops here
+untouched for its whole lifetime.
+
+When the probe fails `health_check_failures` times **in a row** (any healthy
+probe resets the streak, so a single blip is forgiven), the wedged incarnation is
+**force-killed** — dropped, which kills it on drop under the default `JobRunner`
+(the shared-group caveat from [Errors and cancellation](#errors-and-cancellation)
+applies) — and treated as a **crash**: it flows through the `RestartPolicy`,
+backoff, the storm guard and `max_restarts` exactly like a real crash, and its
+synthetic final result carries `Outcome::Signalled`. It does **not** consult
+`stop_when` (there is no cleanly-completed run to evaluate). The effective grace
+before a kill is roughly `interval × health_check_failures`.
+
+A liveness kill counts toward the backoff escalation using how long the
+incarnation actually stayed up before wedging — so a service that runs healthy
+for a long stretch and only occasionally wedges restarts near `base`, while one
+that wedges promptly after each restart self-throttles (the same uptime floor as
+[Backoff and jitter](#backoff-and-jitter)). Force-kills are counted in
+`SupervisionOutcome::liveness_kills`. Under `RestartPolicy::Never` — a single
+"run once, but kill it if it goes unresponsive" bound — the force-killed run ends
+supervision with `StopReason::Unhealthy`. Left unset (the default), a supervisor
+behaves exactly as it did before health-checking existed.
+
 ## Stopping
 
 Four gates, checked in this order after every completed run:
@@ -158,6 +218,10 @@ Four gates, checked in this order after every completed run:
 crash reports the more specific `GaveUp` even when the budget hasn't run out
 yet — and before the [failure-storm guard](#failure-storms), so giving up
 never pays for a storm pause it was going to end anyway.
+
+A [liveness kill](#liveness-health-checks) is not a completed run, so it skips
+gate 1 (`stop_when`) but still runs through the policy and gates 3–4 as a crash;
+under `RestartPolicy::Never` it ends supervision with `StopReason::Unhealthy`.
 
 ## Giving up on permanent failures
 
@@ -214,10 +278,11 @@ use processkit::{Command, Supervisor};
 async fn main() -> processkit::Result<()> {
     let outcome = Supervisor::new(Command::new("job")).run().await?;
 
-    outcome.final_result; // ProcessResult<String> of the LAST run
-    outcome.restarts;     // how many restarts happened (not counting run #1)
-    outcome.stopped;      // StopReason::{Predicate, PolicySatisfied, GaveUp, RestartsExhausted}
-    outcome.storm_pauses; // failure-storm pauses taken (0 unless storm_pause is set)
+    outcome.final_result;  // ProcessResult<String> of the LAST run
+    outcome.restarts;      // how many restarts happened (not counting run #1)
+    outcome.stopped;       // StopReason::{Predicate, PolicySatisfied, GaveUp, RestartsExhausted, Unhealthy}
+    outcome.storm_pauses;  // failure-storm pauses taken (0 unless storm_pause is set)
+    outcome.liveness_kills; // incarnations force-killed by a health check (0 unless health_check is set)
     Ok(())
 }
 ```
