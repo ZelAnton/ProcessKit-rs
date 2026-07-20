@@ -686,6 +686,27 @@ impl core::marker::Unpin for processkit::JobRunner
 impl core::marker::UnsafeUnpin for processkit::JobRunner
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::JobRunner
 impl core::panic::unwind_safe::UnwindSafe for processkit::JobRunner
+#[non_exhaustive] pub struct processkit::MemberInfo
+impl processkit::MemberInfo
+pub fn processkit::MemberInfo::exe_name(&self) -> core::option::Option<&str>
+pub fn processkit::MemberInfo::pid(&self) -> u32
+pub fn processkit::MemberInfo::ppid(&self) -> core::option::Option<u32>
+pub fn processkit::MemberInfo::start_time(&self) -> core::option::Option<u64>
+impl core::clone::Clone for processkit::MemberInfo
+pub fn processkit::MemberInfo::clone(&self) -> processkit::MemberInfo
+impl core::cmp::Eq for processkit::MemberInfo
+impl core::cmp::PartialEq for processkit::MemberInfo
+pub fn processkit::MemberInfo::eq(&self, &processkit::MemberInfo) -> bool
+impl core::fmt::Debug for processkit::MemberInfo
+pub fn processkit::MemberInfo::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for processkit::MemberInfo
+impl core::marker::Freeze for processkit::MemberInfo
+impl core::marker::Send for processkit::MemberInfo
+impl core::marker::Sync for processkit::MemberInfo
+impl core::marker::Unpin for processkit::MemberInfo
+impl core::marker::UnsafeUnpin for processkit::MemberInfo
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::MemberInfo
+impl core::panic::unwind_safe::UnwindSafe for processkit::MemberInfo
 #[non_exhaustive] pub struct processkit::OutputBufferPolicy
 pub processkit::OutputBufferPolicy::max_bytes: core::option::Option<usize>
 pub processkit::OutputBufferPolicy::max_lines: core::option::Option<usize>
@@ -780,6 +801,7 @@ pub fn processkit::ProcessGroup::adopt(&self, &tokio::process::Child) -> process
 pub fn processkit::ProcessGroup::kill_all(&self) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::mechanism(&self) -> processkit::Mechanism
 pub fn processkit::ProcessGroup::members(&self) -> processkit::Result<alloc::vec::Vec<u32>>
+pub fn processkit::ProcessGroup::members_info(&self) -> processkit::Result<alloc::vec::Vec<processkit::MemberInfo>>
 pub fn processkit::ProcessGroup::new() -> processkit::Result<Self>
 pub fn processkit::ProcessGroup::resume(&self) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::sample_stats(&self, core::time::Duration) -> processkit::StatsSampler<'_>

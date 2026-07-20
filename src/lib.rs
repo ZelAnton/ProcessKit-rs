@@ -114,7 +114,8 @@
 //!   pull an extra crate are `mock` → `mockall`, `tracing` → `tracing`, and
 //!   `record` → `serde`/`serde_json`.)
 //! - **`process-control`** *(default)* — tree control beyond contain+kill:
-//!   `Signal` and `ProcessGroup::{signal, suspend, resume, members, adopt}`.
+//!   `Signal` and `ProcessGroup::{signal, suspend, resume, members,
+//!   members_info, adopt}`, plus the enriched `MemberInfo` member snapshot.
 //! - **`limits`** — whole-tree resource caps: `ResourceLimits`, the
 //!   `max_memory`/`max_processes`/`cpu_quota` builders on
 //!   [`ProcessGroupOptions`], and `Error::ResourceLimit`. Implies `stats`.
@@ -181,6 +182,10 @@ mod group;
 #[cfg(feature = "limits")]
 mod limits;
 mod mechanism;
+// `MemberInfo` — the enriched member snapshot returned by
+// `ProcessGroup::members_info`. Gated with the method it exists for.
+#[cfg(feature = "process-control")]
+mod member;
 mod pipeline;
 mod priority;
 mod pump;
@@ -217,6 +222,8 @@ pub use group::{ProcessGroup, ProcessGroupOptions};
 #[cfg(feature = "limits")]
 pub use limits::{LimitKind, LimitReason, ResourceLimits};
 pub use mechanism::Mechanism;
+#[cfg(feature = "process-control")]
+pub use member::MemberInfo;
 pub use pipeline::Pipeline;
 pub use priority::Priority;
 // Fuzzing-only entry point for `fuzz/fuzz_targets/decode_pump_lines.rs` (see

@@ -9,6 +9,8 @@ use crate::error::{Error, Result};
 use crate::limits::{LimitKind, LimitReason, ResourceLimits};
 use crate::mechanism::Mechanism;
 #[cfg(feature = "process-control")]
+use crate::member::MemberInfo;
+#[cfg(feature = "process-control")]
 use crate::signal::Signal;
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
@@ -489,6 +491,59 @@ impl ProcessGroup {
     pub fn members(&self) -> Result<Vec<u32>> {
         let pids = self.job.members().map_err(Error::Io)?;
         Ok(pids)
+    }
+
+    /// An enriched, point-in-time snapshot of the group's members — the same set
+    /// as [`members`](Self::members), but each pid carried in a [`MemberInfo`]
+    /// alongside best-effort parent pid, image name, and start time.
+    ///
+    /// The metadata-carrying companion to [`members`](Self::members): use it for
+    /// diagnostics that want more than bare pids (a `members_snapshot` event, a
+    /// process tree view). *Which* processes appear is identical to
+    /// [`members`](Self::members) — see its platform matrix — and each enriching
+    /// field is `None` wherever the platform can't report it, never a fabricated
+    /// value (full per-field matrix on [`MemberInfo`]).
+    ///
+    /// # Platform support
+    ///
+    /// - **Windows** — the whole tree (every pid in the Job Object); ppid and image
+    ///   name from one `Toolhelp32` process snapshot, start time (creation
+    ///   `FILETIME`) per pid.
+    /// - **Linux cgroup** — the whole tree (`cgroup.procs`); ppid, `comm` image
+    ///   name, and start time from one `/proc/<pid>/stat` read each.
+    /// - **Linux process-group fallback** — the tracked group **leaders** (as
+    ///   [`members`](Self::members)), enriched from `/proc` the same way.
+    /// - **macOS** — the tracked leaders; ppid / image name / start time via
+    ///   `proc_pidinfo`.
+    /// - **the BSDs** — the tracked leaders with every enriching field `None` (no
+    ///   wired-up per-process reader — see [`MemberInfo::start_time`]); the pid is
+    ///   still reported, which is a correct result, not an error.
+    ///
+    /// # Racing a member that exits
+    ///
+    /// A point-in-time snapshot taken per pid: if a member exits **between** its
+    /// pid being enumerated and its metadata being read, that pid is **skipped**
+    /// (omitted from the `Vec`) rather than reported with fabricated fields — one
+    /// vanished member never fails the whole call. A member that is still present
+    /// but for which only some finer field can't be read (e.g. its start-time
+    /// handle just closed) is kept, with that field `None`.
+    ///
+    /// # No command line
+    ///
+    /// The raw argv / environment is **deliberately never** included, on any
+    /// platform — a command line routinely carries secrets, and redaction is the
+    /// consumer's policy to own (the crate's standing "never argv/env" stance).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] only if the group's membership cannot be read (the same
+    /// failure as [`members`](Self::members) — a failed `cgroup.procs` read or Job
+    /// Object query) or, on Windows, if the process-metadata snapshot cannot be
+    /// created at all. A single member vanishing is not an error (it is skipped).
+    #[cfg(feature = "process-control")]
+    pub fn members_info(&self) -> Result<Vec<MemberInfo>> {
+        let infos = self.job.members_info().map_err(Error::Io)?;
+        Ok(infos)
     }
 
     /// Gracefully tear the group down, consuming it.

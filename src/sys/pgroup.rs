@@ -21,6 +21,8 @@ use std::time::Duration;
 
 use tokio::process::{Child, Command};
 
+#[cfg(feature = "process-control")]
+use crate::member::MemberInfo;
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
 
@@ -188,6 +190,94 @@ fn is_live_non_zombie(pid: i32) -> bool {
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 fn is_live_non_zombie(_pid: i32) -> bool {
     false
+}
+
+/// Best-effort enriching metadata for one tracked leader `pid` — its ppid, short
+/// image name, and start-time token — for [`ProcessGroup::members_info`]. `None`
+/// means the process is gone (skip the record, never fabricate one); a `Some`
+/// carries whatever fields the platform can report (each independently `Option`).
+/// Availability mirrors [`read_identity`]/[`is_live_non_zombie`].
+///
+/// **Linux / Android** — one `/proc/<pid>/stat` read via the shared `sys::procfs`
+/// parser (ppid = field 4, `comm` = field 2, start time = field 22), so the
+/// fallback backend reports the *same* fields the cgroup backend does.
+#[cfg(all(
+    feature = "process-control",
+    any(target_os = "linux", target_os = "android")
+))]
+fn read_member_info(pid: i32) -> Option<MemberInfo> {
+    // Pids are positive here, so the `as u32` cast is value-preserving. `None` (the
+    // stat read failed) means the leader is gone — skipped by the caller.
+    let m = super::procfs::read_stat_meta(pid as u32)?;
+    Some(MemberInfo::new(pid as u32, m.ppid, m.comm, m.starttime))
+}
+
+/// The Apple reader — see the doc above the Linux `read_member_info`.
+///
+/// **macOS / the other Apple targets** — one `proc_pidinfo(PROC_PIDTBSDINFO)` fill
+/// (the same `proc_bsdinfo` `read_identity`/`is_live_non_zombie` read): `pbi_ppid`,
+/// the short `pbi_comm` image name, and the creation time folded to microseconds
+/// since the Unix epoch. A short/failed fill means the pid is gone/unreadable.
+#[cfg(all(feature = "process-control", target_vendor = "apple"))]
+fn read_member_info(pid: i32) -> Option<MemberInfo> {
+    // SAFETY: `proc_bsdinfo` is plain-old-data (integers and byte arrays), for
+    // which an all-zero bit pattern is a valid initialized value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let want = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `proc_pidinfo` writes at most `want` bytes into `info`; a valid
+    // pointer and a matching buffer size are its only preconditions.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast::<libc::c_void>(),
+            want,
+        )
+    };
+    if got != want {
+        return None;
+    }
+    let start_time = info
+        .pbi_start_tvsec
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbi_start_tvusec);
+    Some(MemberInfo::new(
+        pid as u32,
+        Some(info.pbi_ppid),
+        comm_to_string(&info.pbi_comm),
+        Some(start_time),
+    ))
+}
+
+/// Decode a NUL-terminated `c_char` `comm` array (`proc_bsdinfo::pbi_comm`) into a
+/// `String`, or `None` when it is empty. The kernel truncates `comm`, so this is a
+/// short image name, not a path.
+#[cfg(all(feature = "process-control", target_vendor = "apple"))]
+fn comm_to_string(comm: &[libc::c_char]) -> Option<String> {
+    let bytes: Vec<u8> = comm
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+/// The BSDs (and any other unix): no wired-up per-process reader (the same per-OS
+/// `sysctl(KERN_PROC)` divergence that blocks [`read_identity`] there), so the
+/// leader — just probed live by [`Tracked::live_snapshot`] — is reported with the
+/// pid known and every enriching field honestly `None`. That is a correct
+/// best-effort result on a bare BSD, not an error, and never drops a live member.
+#[cfg(all(
+    feature = "process-control",
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn read_member_info(pid: i32) -> Option<MemberInfo> {
+    Some(MemberInfo::new(pid as u32, None, None, None))
 }
 
 /// One tracked id (a group leader pid or a solo pid), its liveness latch, and the
@@ -677,6 +767,20 @@ impl ProcessGroup {
         let mut members = self.groups.live_snapshot();
         members.extend_from_slice(&self.solos.live_snapshot());
         members
+    }
+
+    /// The tracked leaders (plus solo-adopted pids) of [`members`](Self::members),
+    /// enriched with best-effort per-platform metadata via [`read_member_info`]. A
+    /// leader that vanished between the live probe and its metadata read is skipped
+    /// where the platform can tell (Linux `/proc`, Apple `proc_pidinfo`); on the
+    /// bare BSDs — no reader wired up — each live leader is reported with the pid
+    /// known and every enriching field `None`.
+    #[cfg(feature = "process-control")]
+    pub(crate) fn members_info(&self) -> Vec<MemberInfo> {
+        self.members()
+            .into_iter()
+            .filter_map(read_member_info)
+            .collect()
     }
 
     pub(crate) async fn graceful_shutdown(

@@ -20,6 +20,8 @@ use crate::Mechanism;
 use crate::Signal;
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
+#[cfg(feature = "process-control")]
+use crate::member::MemberInfo;
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
 use crate::sys::pgroup::ProcessGroup;
@@ -261,6 +263,21 @@ impl Job {
             Backend::ProcessGroup(pg) => pg.members(),
         };
         Ok(pids.into_iter().map(|pid| pid as u32).collect())
+    }
+
+    /// The same members as [`members`](Self::members), enriched from `/proc`.
+    ///
+    /// The cgroup arm reads the whole tree (`cgroup.procs`); the fallback arm the
+    /// tracked group leaders. Either way each pid's ppid / `comm` / start time come
+    /// from a single `/proc/<pid>/stat` read, and a pid gone before that read is
+    /// skipped (never a fabricated record).
+    #[cfg(feature = "process-control")]
+    pub(crate) fn members_info(&self) -> io::Result<Vec<MemberInfo>> {
+        match &self.backend {
+            Backend::Cgroup(cg) => cg.members_info(),
+            // The pgroup enumeration is an in-memory tracked list — infallible.
+            Backend::ProcessGroup(pg) => Ok(pg.members_info()),
+        }
     }
 
     pub(crate) async fn graceful_shutdown(
@@ -646,6 +663,34 @@ impl Cgroup {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e),
         }
+    }
+
+    /// The live members enriched with ppid / `comm` / start time, each read from a
+    /// single `/proc/<pid>/stat` (see [`crate::sys::procfs::read_stat_meta`]) so
+    /// the three fields describe one consistent instant. A member gone before its
+    /// stat read is skipped — a vanished process is omitted, not a fabricated
+    /// record, and never fails the whole snapshot. The `cgroup.procs` read failing
+    /// still propagates as `Err` (via [`members`](Self::members)): an unreadable
+    /// membership is unknown, not "no processes".
+    ///
+    /// Unlike the identity-safe [`stats`](Self::stats) fold — which pins and
+    /// reconfirms each pid against a re-read of `cgroup.procs` before folding its
+    /// *numeric* counters, so a recycled pid's CPU/RSS is never misattributed —
+    /// this snapshot follows the point-in-time contract of
+    /// [`members`](Self::members): the ppid/comm/start-time it reports are advisory
+    /// metadata, and a pid recycled between the `cgroup.procs` read and its stat
+    /// read carries the same best-effort exposure `members` already has. The single
+    /// atomic stat read keeps the *three fields of one pid* internally consistent.
+    #[cfg(feature = "process-control")]
+    fn members_info(&self) -> io::Result<Vec<MemberInfo>> {
+        let pids = self.members()?;
+        Ok(pids
+            .into_iter()
+            .filter_map(|pid| {
+                crate::sys::procfs::read_stat_meta(pid as u32)
+                    .map(|m| MemberInfo::new(pid as u32, m.ppid, m.comm, m.starttime))
+            })
+            .collect())
     }
 
     /// `is_drained` (the [`GracefulTarget`](super::graceful::GracefulTarget) impl

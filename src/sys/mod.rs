@@ -25,6 +25,8 @@ use crate::Mechanism;
 use crate::Signal;
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
+#[cfg(feature = "process-control")]
+use crate::member::MemberInfo;
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
 
@@ -264,6 +266,14 @@ impl Job {
     #[cfg(feature = "process-control")]
     pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
         self.0.members()
+    }
+
+    /// Snapshot the live members enriched with ppid / image name / start time
+    /// (same member set as [`members`](Self::members); honest `Option` where a
+    /// field is unavailable, vanished members skipped).
+    #[cfg(feature = "process-control")]
+    pub(crate) fn members_info(&self) -> io::Result<Vec<MemberInfo>> {
+        self.0.members_info()
     }
 
     /// Ask the tree to exit, then escalate.

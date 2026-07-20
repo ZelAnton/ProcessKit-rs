@@ -339,6 +339,55 @@ async fn members_on_empty_group_is_empty() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real subprocess and reads its enriched member snapshot"]
+async fn members_info_enriches_a_live_child() {
+    let group = ProcessGroup::new().expect("create group");
+    let child = group.start(&sleeper()).await.expect("start sleeper");
+    let child_pid = child.pid().expect("child pid");
+
+    let infos = group.members_info().expect("members_info");
+    assert!(!infos.is_empty(), "members_info empty for a live child");
+
+    // The started child's real pid must be among the enriched records — proof the
+    // snapshot reports genuine member pids (whole tree on Windows/cgroup, the group
+    // leader on the pgroup backends, and the direct child is that leader).
+    let mine = infos
+        .iter()
+        .find(|m| m.pid() == child_pid)
+        .unwrap_or_else(|| panic!("child pid {child_pid} not in members_info {infos:?}"));
+
+    // Every field this platform declares available (see `MemberInfo`'s matrix) must
+    // actually be filled for that live member — not silently `None`.
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    {
+        assert!(
+            mine.ppid().is_some(),
+            "ppid should be reported here: {mine:?}"
+        );
+        assert!(
+            mine.exe_name().is_some(),
+            "exe_name should be reported here: {mine:?}"
+        );
+        assert!(
+            mine.start_time().is_some(),
+            "start_time should be reported here: {mine:?}"
+        );
+    }
+    // On the bare BSDs the enriching fields are honestly `None`; the pid being
+    // present is the whole guarantee there.
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    let _ = mine;
+}
+
+#[tokio::test]
+#[ignore = "creates an OS job/cgroup"]
+async fn members_info_on_empty_group_is_empty() {
+    let group = ProcessGroup::new().expect("create group");
+    let infos = group.members_info().expect("members_info");
+    assert!(infos.is_empty(), "fresh group has members: {infos:?}");
+}
+
+#[tokio::test]
 #[ignore = "spawns a short subprocess and adopts it after reaping"]
 async fn adopt_of_a_reaped_child_errors_instead_of_tracking_nothing() {
     let group = ProcessGroup::new().expect("create group");

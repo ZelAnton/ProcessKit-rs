@@ -17,6 +17,8 @@ use crate::Mechanism;
 use crate::Signal;
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
+#[cfg(feature = "process-control")]
+use crate::member::MemberInfo;
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
 use crate::sys::pgroup::ProcessGroup;
@@ -84,6 +86,15 @@ impl Job {
             .into_iter()
             .map(|pid| pid as u32)
             .collect())
+    }
+
+    /// Tracked group leaders enriched with best-effort metadata — see the pgroup
+    /// backend. Infallible enumeration (an in-memory tracked list), so always
+    /// `Ok`; on macOS the fields are read via `proc_pidinfo`, on the bare BSDs they
+    /// are honestly `None`.
+    #[cfg(feature = "process-control")]
+    pub(crate) fn members_info(&self) -> io::Result<Vec<MemberInfo>> {
+        Ok(self.group.members_info())
     }
 
     pub(crate) async fn graceful_shutdown(

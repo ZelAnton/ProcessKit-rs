@@ -6,7 +6,10 @@ use std::io;
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
-#[cfg(feature = "stats")]
+// The process-creation `FILETIME` is both the `stats` identity anchor and the
+// `process-control` member-snapshot start time, so it (and `GetProcessTimes`
+// below) is needed under either feature.
+#[cfg(any(feature = "stats", feature = "process-control"))]
 use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 #[cfg(feature = "process-control")]
@@ -14,6 +17,12 @@ use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_MORE_DATA};
 use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
+// System-wide process snapshot for `members_info`'s per-member ppid + image name
+// (no per-pid Win32 API yields the parent pid without ntdll).
+#[cfg(feature = "process-control")]
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 // Ungated: the opt-in console-CTRL graceful teardown is compiled on every
 // Windows feature config, and its drain check (`QueryInformationJobObject` on
@@ -41,7 +50,7 @@ use windows_sys::Win32::System::JobObjects::{
 };
 #[cfg(feature = "stats")]
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-#[cfg(feature = "stats")]
+#[cfg(any(feature = "stats", feature = "process-control"))]
 use windows_sys::Win32::System::Threading::GetProcessTimes;
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
@@ -57,6 +66,8 @@ use crate::Mechanism;
 use crate::Signal;
 #[cfg(feature = "limits")]
 use crate::limits::ResourceLimits;
+#[cfg(feature = "process-control")]
+use crate::member::MemberInfo;
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
 #[cfg(feature = "stats")]
@@ -325,6 +336,43 @@ impl Job {
     #[cfg(feature = "process-control")]
     pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
         job_member_pids(self.handle)
+    }
+
+    /// The whole tree's members enriched with ppid / image name / start time.
+    ///
+    /// The member set is the same whole-tree pid list as [`members`](Self::members).
+    /// Parent pid and image name come from a single system-wide `Toolhelp32`
+    /// process snapshot; the start time (creation `FILETIME`) from a per-pid
+    /// handle. A member the snapshot doesn't list exited between the job
+    /// enumeration and the snapshot and is skipped (a vanished member, never a
+    /// fabricated record). `Err` only if the job membership can't be read *or* the
+    /// metadata snapshot can't be created (a total inability to read metadata,
+    /// distinct from one pid vanishing).
+    #[cfg(feature = "process-control")]
+    pub(crate) fn members_info(&self) -> io::Result<Vec<MemberInfo>> {
+        let pids = job_member_pids(self.handle)?;
+        let meta = snapshot_process_metadata()?;
+        let mut out = Vec::with_capacity(pids.len());
+        for pid in pids {
+            // A member absent from the snapshot exited between the job
+            // enumeration and the snapshot — skip it (the documented race), never
+            // fabricating ppid/exe for a pid we couldn't observe alive.
+            let Some((ppid, exe)) = meta.get(&pid) else {
+                continue;
+            };
+            // Start time via a per-pid handle. `None` if the process vanished in
+            // this even-later window: the ppid/exe captured while it was alive
+            // still stand, so the record is kept (only the finer start-time anchor
+            // is missing), matching the honest-`Option` contract.
+            let start_time = process_start_time(pid);
+            out.push(MemberInfo::new(
+                pid,
+                Some(*ppid),
+                Some(exe.clone()),
+                start_time,
+            ));
+        }
+        Ok(out)
     }
 
     /// Suspend or resume every thread of every process currently in the job.
@@ -881,10 +929,82 @@ fn job_member_pids(handle: HANDLE) -> io::Result<Vec<u32>> {
     }
 }
 
+/// A system-wide `pid -> (ppid, image name)` map from one `Toolhelp32` process
+/// snapshot — the source of [`members_info`](Job::members_info)'s parent-pid and
+/// executable-name fields (neither is obtainable per-pid without ntdll, so one
+/// snapshot is both cheaper and the only way to get the parent pid).
+///
+/// Best-effort, like the thread walk in [`for_each_member_thread`](Job::for_each_member_thread):
+/// a process created or reaped during the walk may be briefly present or missing.
+/// `Err` only when the snapshot itself can't be created — a genuine inability to
+/// read any metadata, which the caller surfaces rather than reporting a populated
+/// job as empty.
+#[cfg(feature = "process-control")]
+fn snapshot_process_metadata() -> io::Result<std::collections::HashMap<u32, (u32, String)>> {
+    // SAFETY: TH32CS_SNAPPROCESS snapshots all processes system-wide; returns
+    // INVALID_HANDLE_VALUE on failure.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+    let mut map = std::collections::HashMap::new();
+    // SAFETY: valid snapshot; `entry` is sized via its `dwSize` field.
+    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) };
+    while ok != 0 {
+        // `szExeFile` is a NUL-terminated UTF-16 array; decode up to the NUL.
+        let len = entry
+            .szExeFile
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let exe = String::from_utf16_lossy(&entry.szExeFile[..len]);
+        map.insert(entry.th32ProcessID, (entry.th32ParentProcessID, exe));
+        // SAFETY: same valid snapshot and entry.
+        ok = unsafe { Process32NextW(snapshot, &mut entry) };
+    }
+    // SAFETY: handle came from CreateToolhelp32Snapshot; closed exactly once.
+    unsafe { CloseHandle(snapshot) };
+    Ok(map)
+}
+
+/// The process-creation `FILETIME` of `pid` as its raw
+/// [`MemberInfo`](crate::MemberInfo) start-time token (100-ns units since
+/// 1601-01-01 UTC), or `None` if the process is gone / unqueryable. Fixed at spawn
+/// and never reused within a boot, so it tells a recycled pid apart from the
+/// original. (The `stats`-gated [`process_identity`] wraps the same read in a
+/// `ProcIdentity`; this returns the bare token for the `process-control` snapshot,
+/// which has no `stats` dependency.)
+#[cfg(feature = "process-control")]
+fn process_start_time(pid: u32) -> Option<u64> {
+    // SAFETY: limited-information access; returns null on failure (e.g. gone).
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    // SAFETY: valid handle; all four out params are owned locals.
+    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    // SAFETY: handle came from OpenProcess and is closed exactly once.
+    unsafe { CloseHandle(handle) };
+    (ok != 0).then(|| filetime_units(creation))
+}
+
 /// A FILETIME as its raw 64-bit 100-ns unit count (high/low halves combined).
-/// The process-creation FILETIME serves as the [`ProcIdentity`] anchor, compared
-/// directly in these units; [`filetime_nanos`] scales the CPU-time FILETIMEs to ns.
-#[cfg(feature = "stats")]
+/// The process-creation FILETIME serves as the [`ProcIdentity`] anchor (the
+/// `stats` metrics gate) and as the [`MemberInfo`](crate::MemberInfo) start-time
+/// token (the `process-control` snapshot), compared directly in these units;
+/// [`filetime_nanos`] scales the CPU-time FILETIMEs to ns.
+#[cfg(any(feature = "stats", feature = "process-control"))]
 fn filetime_units(ft: FILETIME) -> u64 {
     ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
 }

@@ -273,6 +273,49 @@ races it.
 To *wait* on members rather than list them, race the handles with
 [`wait_any`](streaming.md#racing-children-with-wait_any).
 
+### Enriched snapshot: `members_info`
+
+When bare pids aren't enough — a diagnostic `members_snapshot` event, a
+process-tree view — `members_info` returns the same member set as `members`,
+but each pid comes wrapped in a `MemberInfo` carrying best-effort **parent
+pid**, **image name**, and **start time**:
+
+```rust,no_run
+use processkit::{Command, ProcessGroup};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::new()?;
+    let _a = group.start(&Command::new("worker-a")).await?;
+
+    for m in group.members_info()? {
+        println!(
+            "pid={} ppid={:?} exe={:?} start={:?}",
+            m.pid(),
+            m.ppid(),
+            m.exe_name(),
+            m.start_time(),
+        );
+    }
+    Ok(())
+}
+```
+
+The fields are read where the platform can report them and are `None`
+otherwise — never a fabricated value. Windows and Linux (both the cgroup and
+`/proc` fallback paths) and macOS fill all four; on the bare BSDs only the pid
+is reported and the rest are `None`. `start_time` is an **opaque** identity
+anchor (its unit and epoch differ per platform), not a wall-clock timestamp —
+its use is pairing with the pid to tell a recycled number apart from the
+original process, not display. The raw command line is **deliberately never**
+included on any platform: it routinely carries secrets, and redaction is the
+consumer's policy to own.
+
+Same point-in-time contract as `members`, with one addition: if a member exits
+between its pid being enumerated and its metadata being read, that pid is
+**skipped** rather than reported with fabricated fields — a single vanished
+member never fails the whole call.
+
 ## Resource limits
 
 Requires the **`limits`** feature. Caps are a property of the group, set once

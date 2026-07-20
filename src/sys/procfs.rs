@@ -53,6 +53,68 @@ pub(crate) fn read_starttime(pid: u32) -> Option<u64> {
     starttime_from_stat(&stat)
 }
 
+/// Parse the `ppid` (field 4, parent process id) out of a `/proc/<pid>/stat`
+/// line. It is the 2nd whitespace field after the comm ([`after_comm`]): index 0
+/// is field 3 (state), so field 4 is index 1. `None` if the line has no `)`, has
+/// fewer than 2 fields after the comm, or that field is not a number.
+#[cfg(feature = "process-control")]
+pub(crate) fn ppid_from_stat(stat: &str) -> Option<u32> {
+    after_comm(stat)?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u32>()
+        .ok()
+}
+
+/// Extract the `comm` (field 2, the process's short image name) out of a
+/// `/proc/<pid>/stat` line — the text between the *first* `(` and the *last* `)`.
+///
+/// The comm is parenthesized and may itself contain spaces or `)` (the very shape
+/// [`after_comm`] exists to survive), so the whole span between the first `(` and
+/// the last `)` is the name; taking the last `)` mirrors the cut every numeric
+/// field is read past. The kernel truncates `comm` to 15 bytes and a process can
+/// rewrite it via `prctl(PR_SET_NAME)`, so it is the *current* name, not a
+/// canonical path. `None` if the line has no `(` / `)` pair or the span is empty.
+#[cfg(feature = "process-control")]
+pub(crate) fn comm_from_stat(stat: &str) -> Option<String> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    // Guard a malformed line whose `)` precedes (or abuts) its `(` — an empty or
+    // reversed span is no name.
+    let name = stat.get(open + 1..close)?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Best-effort enriching metadata for `pid` from a **single** `/proc/<pid>/stat`
+/// read — parent pid (field 4), image name (`comm`, field 2), and the start-time
+/// identity anchor (`starttime`, field 22) — so the three describe one consistent
+/// instant rather than straddling a pid recycle across separate reads. `None` when
+/// the process is gone (the read fails); each field is independently `Option` (a
+/// parse miss on one leaves the others intact).
+#[cfg(feature = "process-control")]
+pub(crate) fn read_stat_meta(pid: u32) -> Option<StatMeta> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    Some(StatMeta {
+        ppid: ppid_from_stat(&stat),
+        comm: comm_from_stat(&stat),
+        starttime: starttime_from_stat(&stat),
+    })
+}
+
+/// The trio of enriching fields [`read_stat_meta`] pulls from one `/proc/<pid>/stat`
+/// read. Each is independently `Option` — an unparsable field is `None`, never a
+/// fabricated value.
+#[cfg(feature = "process-control")]
+pub(crate) struct StatMeta {
+    pub ppid: Option<u32>,
+    pub comm: Option<String>,
+    pub starttime: Option<u64>,
+}
+
 /// Parse the **state** char (field 3) out of a `/proc/<pid>/stat` line.
 ///
 /// State is the first whitespace token after the comm ([`after_comm`]): `R`/`S`/
@@ -73,6 +135,60 @@ pub(crate) fn state_from_stat(stat: &str) -> Option<char> {
 pub(crate) fn read_state(pid: u32) -> Option<char> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     state_from_stat(&stat)
+}
+
+#[cfg(all(test, feature = "process-control"))]
+mod meta_tests {
+    use super::{comm_from_stat, ppid_from_stat};
+
+    // The same tricky `/proc/<pid>/stat` shape the identity tests use: a comm that
+    // itself contains a `)` and spaces, so a naive "split on first `)`" or plain
+    // field-split mis-parses. Field 3 (state) is `S`, field 4 (ppid) is `1` — the
+    // first two whitespace tokens after the comm's *last* `)`.
+    const TRICKY_COMM: &str = "1234 (weird ) proc :) S 1 1234 1234 0 -1 4194304 100 0 0 0 50 25 0 0 20 0 1 0 987654321 1000 2000";
+
+    #[test]
+    fn ppid_reads_field_4_past_a_tricky_comm() {
+        // Field 4 (ppid) is whitespace index 1 after the comm's last ')': for the
+        // tricky line above that is `1`. A shifted cut (e.g. a split on the first
+        // ')') would read a comm fragment instead.
+        assert_eq!(ppid_from_stat(TRICKY_COMM), Some(1));
+    }
+
+    #[test]
+    fn ppid_yields_none_when_absent_or_unparsable() {
+        // No `)` at all — unparsable.
+        assert_eq!(ppid_from_stat("1234 no-paren S 1"), None);
+        // Only the state field after the comm — index 1 (ppid) is absent.
+        assert_eq!(ppid_from_stat("1234 (proc) S"), None);
+        // A non-numeric ppid field.
+        assert_eq!(ppid_from_stat("1234 (proc) S not_a_pid"), None);
+    }
+
+    #[test]
+    fn comm_keeps_a_name_with_inner_parens_and_spaces() {
+        // The whole span between the first '(' and the last ')' is the name, so an
+        // inner ')' and spaces survive intact — the point of taking the last ')'.
+        assert_eq!(
+            comm_from_stat(TRICKY_COMM).as_deref(),
+            Some("weird ) proc :")
+        );
+        // A plain comm.
+        assert_eq!(
+            comm_from_stat("1234 (worker) S 1").as_deref(),
+            Some("worker")
+        );
+    }
+
+    #[test]
+    fn comm_yields_none_without_a_paren_pair_or_when_empty() {
+        // No parentheses at all.
+        assert_eq!(comm_from_stat("1234 no-paren S 1"), None);
+        // An empty comm span `()`.
+        assert_eq!(comm_from_stat("1234 () S 1"), None);
+        // A `)` before the `(` — reversed/malformed span.
+        assert_eq!(comm_from_stat("1234 )weird( S 1"), None);
+    }
 }
 
 #[cfg(test)]
