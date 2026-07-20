@@ -801,7 +801,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     // the stdin write then fails.
     let stdin_reservation = take_stdin_for_run(command)?;
 
-    let mut tokio_cmd = command.build_tokio();
+    let mut tokio_cmd = command.build_tokio()?;
     let opts = crate::sys::SpawnOptions {
         setsid: command.wants_setsid(),
         creation_flags: command.extra_creation_flags(),

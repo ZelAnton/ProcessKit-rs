@@ -2,6 +2,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -36,6 +37,40 @@ enum Timeout {
     Unbounded,
     /// A deadline of this duration ([`Command::timeout`]).
     After(Duration),
+}
+
+/// A child-owned stdout/stderr file destination. This is deliberately separate
+/// from [`StdioMode`]: paths make the connection state non-`Copy`, while the
+/// mode enum is a small, copyable choice used throughout the streaming API.
+#[derive(Clone, Debug)]
+struct FileRedirect {
+    path: PathBuf,
+    append: bool,
+}
+
+impl FileRedirect {
+    fn truncate(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+            append: false,
+        }
+    }
+
+    fn append(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+            append: true,
+        }
+    }
+
+    fn open(&self) -> std::io::Result<File> {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(self.append)
+            .truncate(!self.append)
+            .open(&self.path)
+    }
 }
 
 impl Timeout {
@@ -100,6 +135,10 @@ pub struct Command {
     stderr_config: StreamConfig,
     stdout_mode: StdioMode,
     stderr_mode: StdioMode,
+    /// Child-owned file destinations stay separate from `StdioMode` so that
+    /// enum remains `Copy`; their paths are opened only at the launch boundary.
+    stdout_file: Option<FileRedirect>,
+    stderr_file: Option<FileRedirect>,
     output_buffer: OutputBufferPolicy,
     retry: Option<RetryConfig>,
     /// `Some` once `inherit_env` was called (even with an empty list): clear
@@ -154,6 +193,8 @@ impl Command {
             stderr_config: StreamConfig::new(),
             stdout_mode: StdioMode::Piped,
             stderr_mode: StdioMode::Piped,
+            stdout_file: None,
+            stderr_file: None,
             output_buffer: OutputBufferPolicy::unbounded(),
             retry: None,
             inherit_env: None,
@@ -933,9 +974,11 @@ impl Command {
     /// verbs (`output_string`/`output_bytes`) **error** rather than return
     /// silently-empty output, and the streaming verbs (`stdout_lines`/
     /// `output_events`) yield an empty stream. Use a discard verb (`wait`) to run
-    /// a command whose stdout you don't want to capture.
+    /// a command whose stdout you don't want to capture. Calling this after
+    /// [`stdout_file`](Self::stdout_file) restores a normal stdio mode.
     pub fn stdout(mut self, mode: crate::StdioMode) -> Self {
         self.stdout_mode = mode;
+        self.stdout_file = None;
         self
     }
 
@@ -946,7 +989,61 @@ impl Command {
     /// `Inherit` passes through, `Null` suppresses.
     pub fn stderr(mut self, mode: crate::StdioMode) -> Self {
         self.stderr_mode = mode;
+        self.stderr_file = None;
         self
+    }
+
+    /// Redirect stdout directly to `path`, creating or truncating the file at
+    /// spawn time. The child owns the descriptor, so no parent-side pump or
+    /// output buffer is involved.
+    ///
+    /// Capture and streaming verbs require a pipe and therefore reject this
+    /// configuration; use [`wait`](crate::RunningProcess::wait) or another
+    /// discard verb. For a shared supervisor log across restarts, use
+    /// [`stdout_file_append`](Self::stdout_file_append).
+    pub fn stdout_file(mut self, path: impl AsRef<Path>) -> Self {
+        self.stdout_mode = StdioMode::Piped;
+        self.stdout_file = Some(FileRedirect::truncate(path));
+        self
+    }
+
+    /// Redirect stdout directly to `path`, creating it when absent and appending
+    /// on every spawn. This is useful for a [`Supervisor`](crate::Supervisor)
+    /// whose incarnations should share one log file.
+    pub fn stdout_file_append(mut self, path: impl AsRef<Path>) -> Self {
+        self.stdout_mode = StdioMode::Piped;
+        self.stdout_file = Some(FileRedirect::append(path));
+        self
+    }
+
+    /// Explicit spelling of [`stdout_file`](Self::stdout_file), for code that
+    /// selects append versus truncate at the call site.
+    pub fn stdout_file_truncate(self, path: impl AsRef<Path>) -> Self {
+        self.stdout_file(path)
+    }
+
+    /// Redirect stderr directly to `path`, creating or truncating the file at
+    /// spawn time. The child owns the descriptor, so no parent-side pump or
+    /// output buffer is involved.
+    pub fn stderr_file(mut self, path: impl AsRef<Path>) -> Self {
+        self.stderr_mode = StdioMode::Piped;
+        self.stderr_file = Some(FileRedirect::truncate(path));
+        self
+    }
+
+    /// Redirect stderr directly to `path`, creating it when absent and appending
+    /// on every spawn. See [`stdout_file_append`](Self::stdout_file_append) for
+    /// the restart-log use case.
+    pub fn stderr_file_append(mut self, path: impl AsRef<Path>) -> Self {
+        self.stderr_mode = StdioMode::Piped;
+        self.stderr_file = Some(FileRedirect::append(path));
+        self
+    }
+
+    /// Explicit spelling of [`stderr_file`](Self::stderr_file), for code that
+    /// selects append versus truncate at the call site.
+    pub fn stderr_file_truncate(self, path: impl AsRef<Path>) -> Self {
+        self.stderr_file(path)
     }
 
     /// Tee every decoded stdout line to `writer` as it is produced — capture
@@ -1149,11 +1246,11 @@ impl Command {
         self.retry.clone()
     }
 
-    /// Whether stdout is captured into a pipe (vs `Inherit`/`Null`). The bulk
+    /// Whether stdout is captured into a pipe (vs `Inherit`/`Null`/a file). The bulk
     /// capture verbs use this to fail loudly instead of returning silently-empty
     /// output when stdout wasn't piped.
     pub(crate) fn stdout_is_piped(&self) -> bool {
-        matches!(self.stdout_mode, StdioMode::Piped)
+        matches!(self.stdout_mode, StdioMode::Piped) && self.stdout_file.is_none()
     }
 
     pub(crate) fn program_name(&self) -> String {
@@ -1404,13 +1501,13 @@ impl Command {
     /// [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) escape hatch.
     /// Not part of the advertised surface; prefer the `start`/`output_string`/`run` verbs.
     #[doc(hidden)]
-    pub fn to_tokio_command(&self) -> tokio::process::Command {
+    pub fn to_tokio_command(&self) -> Result<tokio::process::Command> {
         self.build_tokio()
     }
 
     /// Build the `tokio` command with stdio wired for capture. Containment
     /// (cgroup/job/process-group) is added by the group's `spawn`.
-    pub(crate) fn build_tokio(&self) -> tokio::process::Command {
+    pub(crate) fn build_tokio(&self) -> Result<tokio::process::Command> {
         // A bare-name `program` may be spawned via a resolved absolute path so
         // the OS launches *exactly* what the spawn-free preflight
         // (`resolve_program`) reports it would: a `prefer_local` match (always),
@@ -1580,15 +1677,21 @@ impl Command {
                 cmd.as_std_mut().creation_flags(flags);
             }
         }
-        cmd.stdout(match self.stdout_mode {
-            StdioMode::Piped => Stdio::piped(),
-            StdioMode::Inherit => Stdio::inherit(),
-            StdioMode::Null => Stdio::null(),
+        cmd.stdout(match &self.stdout_file {
+            Some(file) => Stdio::from(file.open().map_err(Error::Io)?),
+            None => match self.stdout_mode {
+                StdioMode::Piped => Stdio::piped(),
+                StdioMode::Inherit => Stdio::inherit(),
+                StdioMode::Null => Stdio::null(),
+            },
         });
-        cmd.stderr(match self.stderr_mode {
-            StdioMode::Piped => Stdio::piped(),
-            StdioMode::Inherit => Stdio::inherit(),
-            StdioMode::Null => Stdio::null(),
+        cmd.stderr(match &self.stderr_file {
+            Some(file) => Stdio::from(file.open().map_err(Error::Io)?),
+            None => match self.stderr_mode {
+                StdioMode::Piped => Stdio::piped(),
+                StdioMode::Inherit => Stdio::inherit(),
+                StdioMode::Null => Stdio::null(),
+            },
         });
         if self.keep_stdin_open {
             cmd.stdin(Stdio::piped());
@@ -1611,7 +1714,7 @@ impl Command {
                 }
             }
         }
-        cmd
+        Ok(cmd)
     }
 
     /// The absolute program path [`build_tokio`](Self::build_tokio) substitutes
@@ -2019,6 +2122,8 @@ impl fmt::Debug for Command {
             .field("ok_codes", &self.ok_codes)
             .field("stdout_mode", &self.stdout_mode)
             .field("stderr_mode", &self.stderr_mode)
+            .field("stdout_file", &self.stdout_file)
+            .field("stderr_file", &self.stderr_file)
             .field("has_stdout_handler", &self.stdout_config.handler.is_some())
             .field("has_stderr_handler", &self.stderr_config.handler.is_some())
             .field("has_stdout_tee", &self.stdout_config.tee.is_some())
@@ -2605,6 +2710,7 @@ mod tests {
     /// (key, Some(value)|None-for-remove) pairs.
     fn built_envs(cmd: &Command) -> Vec<(String, Option<String>)> {
         cmd.build_tokio()
+            .expect("build tokio command")
             .as_std()
             .get_envs()
             .map(|(k, v)| {
@@ -2621,7 +2727,7 @@ mod tests {
         // PATH exists in every test environment — no global env mutation.
         let parent_path = std::env::var_os("PATH").expect("PATH set in tests");
         let cmd = Command::new("x").inherit_env(["PATH"]);
-        let built = cmd.build_tokio();
+        let built = cmd.build_tokio().expect("build tokio command");
         assert!(
             built
                 .as_std()
@@ -3052,7 +3158,7 @@ mod tests {
         let expected = write_executable(dir.path(), "prefer-local-tool");
 
         let cmd = Command::new("prefer-local-tool").prefer_local(dir.path());
-        let tokio_cmd = cmd.build_tokio();
+        let tokio_cmd = cmd.build_tokio().expect("build tokio command");
         // Case-insensitive for the same PATHEXT-casing reason as above.
         assert!(
             tokio_cmd
@@ -3091,7 +3197,10 @@ mod tests {
             .expect("CliClient preflight must search PATH for a backslash name");
         assert_eq!(client_resolved, expected);
 
-        let built = Command::new(program).prefer_local(dir.path()).build_tokio();
+        let built = Command::new(program)
+            .prefer_local(dir.path())
+            .build_tokio()
+            .expect("build tokio command");
         assert_eq!(
             built.as_std().get_program(),
             expected.as_os_str(),
@@ -3142,7 +3251,7 @@ mod tests {
         let cmd = Command::new("relative-prefer-local-tool")
             .prefer_local("./bin")
             .current_dir(other_cwd.path());
-        let tokio_cmd = cmd.build_tokio();
+        let tokio_cmd = cmd.build_tokio().expect("build tokio command");
         let resolved = tokio_cmd.as_std().get_program();
 
         assert!(
@@ -3170,12 +3279,37 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir"); // no matching file inside
 
         let cmd = Command::new("not-in-prefer-local").prefer_local(dir.path());
-        let tokio_cmd = cmd.build_tokio();
+        let tokio_cmd = cmd.build_tokio().expect("build tokio command");
         assert_eq!(
             tokio_cmd.as_std().get_program(),
             OsStr::new("not-in-prefer-local"),
             "a prefer_local miss must leave the bare name for the OS's own PATH search"
         );
+    }
+
+    #[test]
+    fn file_redirect_is_separate_from_the_copyable_stdio_mode() {
+        let mode = crate::StdioMode::Piped;
+        let mode_copy = mode;
+        assert_eq!(mode, mode_copy, "StdioMode stays Copy");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("service.log");
+        let command = Command::new("tool").stdout_file(&path);
+        assert!(
+            !command.stdout_is_piped(),
+            "a file destination must take the capture gate even though StdioMode remains Piped"
+        );
+        command
+            .build_tokio()
+            .expect("the launch mapper opens a creatable file");
+
+        let missing_parent = dir.path().join("missing").join("service.log");
+        let err = Command::new("tool")
+            .stdout_file(missing_parent)
+            .build_tokio()
+            .expect_err("file opening fails at the launch boundary");
+        assert!(matches!(err, crate::Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound));
     }
 
     // T-125: a bare name that exists on `PATH` ONLY via a non-`.exe` PATHEXT
@@ -3196,7 +3330,7 @@ mod tests {
         // preflight resolve against this single directory (its effective child
         // PATH) — the substitution and `resolve_program` must land on one path.
         let cmd = Command::new(unique).env("PATH", dir.path());
-        let tokio_cmd = cmd.build_tokio();
+        let tokio_cmd = cmd.build_tokio().expect("build tokio command");
         assert!(
             tokio_cmd
                 .as_std()
@@ -3231,7 +3365,7 @@ mod tests {
         write_executable(dir.path(), unique); // writes `<unique>.exe`
 
         let cmd = Command::new(unique).env("PATH", dir.path());
-        let tokio_cmd = cmd.build_tokio();
+        let tokio_cmd = cmd.build_tokio().expect("build tokio command");
         assert_eq!(
             tokio_cmd.as_std().get_program(),
             OsStr::new(unique),
@@ -3248,7 +3382,7 @@ mod tests {
         let path_program = "./tool";
 
         let cmd = Command::new(path_program).prefer_local(dir.path());
-        let tokio_cmd = cmd.build_tokio();
+        let tokio_cmd = cmd.build_tokio().expect("build tokio command");
         assert_eq!(
             tokio_cmd.as_std().get_program(),
             OsStr::new(path_program),
@@ -3449,6 +3583,7 @@ mod tests {
         // `Some(None)` explicitly removed, `None` not mentioned (inherited).
         fn tokio_path_env(cmd: &Command) -> Option<Option<OsString>> {
             cmd.build_tokio()
+                .expect("build tokio command")
                 .as_std()
                 .get_envs()
                 .find(|(k, _)| super::env_key_eq(k, OsStr::new("PATH")))
