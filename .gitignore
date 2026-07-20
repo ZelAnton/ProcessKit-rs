@@ -1,5 +1,10 @@
 /target
 
+# cargo-mutants writes disposable reports and build sandboxes here by default.
+# Keep both the current and rotated run out of git and jj auto-snapshots.
+/mutants.out/
+/mutants.out.old/
+
 # Rust
 **/*.rs.bk
 *.pdb

@@ -46,6 +46,32 @@ toolchain or extra tools (`test-musl` needs Docker — it runs the
 real-subprocess suite inside a real Alpine/musl container, mirroring the CI
 `test-musl` job; see [platform-support.md](docs/platform-support.md#ci-coverage)).
 
+### Mutation testing
+
+The scheduled CI workflow runs the sharded mutation tier and reads
+`mutants.out/missed.txt` and `mutants.out/timeout.txt` before the runner is
+discarded. For a local run, keep cargo-mutants' potentially large scratch tree
+outside the checkout:
+
+```bash
+scratch="${TMPDIR:-/tmp}/processkit-mutants-$$"
+cargo mutants --output "$scratch"
+rm -rf "$scratch"                 # also safe after an interrupted run
+```
+
+PowerShell equivalent:
+
+```powershell
+$scratch = Join-Path ([IO.Path]::GetTempPath()) "processkit-mutants-$PID"
+cargo mutants --output $scratch
+Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+```
+
+The default in-tree `mutants.out/` and its rotated `mutants.out.old/` are ignored as a
+safety net, including in Orchestra task worktrees, so an interrupted/default run cannot
+be absorbed by a later `jj describe` or `jj new`. They remain disposable; inspect any
+`outcomes.json`, `missed.txt`, or `timeout.txt` you need before deleting them.
+
 ## Releasing
 
 Maintainer-only, via the **Release** GitHub Actions workflow (manual
