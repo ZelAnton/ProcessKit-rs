@@ -195,20 +195,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
     async fn probe(&self, command: &Command) -> Result<bool> {
         retrying(command, || async {
             let result = self.output_string(command).await?;
-            match result.code() {
-                Some(0) => Ok(true),
-                Some(1) => Ok(false),
-                // Any other code (or no code: timeout / signal) is not a yes/no
-                // answer — reuse ensure_success to build the faithful error.
-                // Reset `ok_codes` to the default {0} first: `probe` keeps its
-                // strict 0/1 contract regardless of a command's `ok_codes`, and
-                // an *accepted* non-{0,1} code would otherwise make
-                // `ensure_success` return `Ok` and panic the `expect_err`.
-                _ => Err(result
-                    .with_ok_codes(vec![0])
-                    .ensure_success()
-                    .expect_err("a non-{0,1} exit code is never success")),
-            }
+            result.probe_bool()
         })
         .await
     }

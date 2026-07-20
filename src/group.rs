@@ -311,23 +311,28 @@ impl ProcessGroup {
     /// rather than a false success; the atomic backends (`cgroup.kill`, Windows
     /// Job Object) don't need to.
     ///
-    /// **Limitation (process-group mechanism only).** On macOS/BSD and the Linux
-    /// process-group fallback, a member that changed its real/saved uid (a
-    /// `sudo`/setuid child) can reject `SIGKILL` with `EPERM` and survive; this is
-    /// **not** surfaced as an `Err` here, because on those platforms `EPERM` is
-    /// indistinguishable from a `killpg` against an unreaped zombie (a normal,
-    /// harmless case), and reporting it would falsely fail an ordinary teardown.
-    /// A privileged child under the process-group mechanism can therefore outlive
-    /// `kill_all` — the atomic mechanisms (`cgroup.kill`, Job Object) have no such
-    /// gap.
+    /// **Process-group mechanism (macOS/BSD, Linux process-group fallback).** A
+    /// member that changed its real/saved uid (a `sudo`/setuid child) and rejects
+    /// `SIGKILL` with `EPERM` while still **alive** is surfaced as an `Err` — the
+    /// containment gap is reported, not hidden. The one `EPERM` that is *not*
+    /// surfaced is the harmless one: on those platforms `killpg` also returns
+    /// `EPERM` for a group whose only member is an unreaped **zombie** (dead), and
+    /// the two are indistinguishable from the errno alone, so the target's actual
+    /// run state is checked after the `EPERM` (`proc_pidinfo` on macOS, the
+    /// `/proc/<pid>/stat` state field on the Linux fallback) and only a
+    /// genuinely-alive, non-zombie member fails the call. On the **BSDs**, where no
+    /// process-state reader is wired up, a delivery `EPERM` stays swallowed
+    /// (best-effort), so a privileged child can still outlive `kill_all` there — the
+    /// atomic mechanisms (`cgroup.kill`, Job Object) have no such gap.
     ///
     /// # Errors
     ///
-    /// [`Error::Io`], only on the legacy per-pid kill fallback (a pre-5.14 Linux
-    /// kernel without `cgroup.kill`), when the tree won't drain within the
-    /// bounded sweep. The atomic backends (`cgroup.kill`, Windows Job Object)
-    /// never fail here, and a setuid member that rejects `SIGKILL` under the
-    /// process-group mechanism is deliberately *not* reported (see above).
+    /// [`Error::Io`] in two cases, both on the non-atomic Unix backends: the legacy
+    /// per-pid kill fallback (a pre-5.14 Linux kernel without `cgroup.kill`) when
+    /// the tree won't drain within the bounded sweep, and the process-group
+    /// mechanism (macOS/Linux fallback) when a live, non-zombie member rejects
+    /// `SIGKILL` with `EPERM` (a uid-changed child — see above). The atomic backends
+    /// (`cgroup.kill`, Windows Job Object) never fail here.
     pub fn kill_all(&self) -> Result<()> {
         #[cfg(feature = "tracing")]
         tracing::debug!(
@@ -359,11 +364,13 @@ impl ProcessGroup {
     ///
     /// **Limitation (process-group mechanism only).** On macOS/BSD and the Linux
     /// process-group fallback, delivery failures such as `EPERM` are not surfaced:
-    /// signalling is best-effort and returns `Ok`. As with
-    /// [`kill_all`](Self::kill_all), `EPERM` cannot be distinguished from signalling
-    /// an unreaped zombie, so reporting it would falsely fail a normal operation.
-    /// The Linux cgroup mechanism does surface delivery failures for signals other
-    /// than `SIGKILL`.
+    /// this arbitrary-signal broadcast is best-effort and returns `Ok`. Unlike
+    /// [`kill_all`](Self::kill_all) — which checks the target's run state to report
+    /// a live, non-zombie member that rejects `SIGKILL` — `signal` makes no such
+    /// live/zombie discrimination and always returns `Ok` on this mechanism, even
+    /// for [`Signal::Kill`]; reach for [`kill_all`](Self::kill_all) if you need a
+    /// rejected hard kill surfaced. The Linux cgroup mechanism does surface delivery
+    /// failures for signals other than `SIGKILL`.
     ///
     /// # Errors
     ///
@@ -505,8 +512,11 @@ impl ProcessGroup {
     /// leaves `cgroup.procs` / the job on *exit*, before reaping).
     ///
     /// When `escalate_to_kill` is set, the final hard kill can surface the same
-    /// undrained-tree `Err` as [`kill_all`](Self::kill_all) on the legacy pre-5.14
-    /// per-pid fallback.
+    /// errors as [`kill_all`](Self::kill_all): the undrained-tree `Err` on the
+    /// legacy pre-5.14 per-pid fallback, and — on the process-group mechanism — a
+    /// live, non-zombie member that rejects `SIGKILL` with `EPERM` (a uid-changed
+    /// child). A harmless zombie-only group is not reported (see
+    /// [`kill_all`](Self::kill_all)).
     ///
     /// Holding the group behind a shared handle (an `Arc`, a long-lived
     /// supervisor) that can't be moved out by value? Use the borrowing twin
@@ -514,10 +524,11 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the graceful teardown fails — including the same
-    /// undrained-tree failure as [`kill_all`](Self::kill_all) on the legacy
-    /// pre-5.14 per-pid fallback, when `escalate_to_kill` performs the final hard
-    /// kill.
+    /// [`Error::Io`] if the graceful teardown fails — including, when
+    /// `escalate_to_kill` performs the final hard kill, the same failures as
+    /// [`kill_all`](Self::kill_all): the undrained-tree failure on the legacy
+    /// pre-5.14 per-pid fallback, and a process-group member that rejects `SIGKILL`
+    /// with `EPERM` while still alive.
     pub async fn shutdown(self) -> Result<()> {
         self.shutdown_ref().await
     }
@@ -549,8 +560,9 @@ impl ProcessGroup {
     /// # Errors
     ///
     /// [`Error::Io`] if the graceful teardown fails (see
-    /// [`shutdown`](Self::shutdown) — the same undrained-tree failure on the
-    /// legacy per-pid fallback applies).
+    /// [`shutdown`](Self::shutdown) — the same undrained-tree failure on the legacy
+    /// per-pid fallback and the process-group live-`EPERM` on the final hard kill
+    /// apply).
     pub async fn shutdown_ref(&self) -> Result<()> {
         #[cfg(feature = "tracing")]
         tracing::debug!(

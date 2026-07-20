@@ -113,6 +113,79 @@ fn is_recycled(tracked: Option<u64>, current: Option<u64>) -> bool {
     matches!((tracked, current), (Some(a), Some(b)) if a != b)
 }
 
+/// Positive proof that `pid` names a **live, non-zombie** process — the sole state
+/// for which a delivery `EPERM` in [`signal_all`](Tracked::signal_all) is surfaced
+/// as a genuine "couldn't kill a live tree" failure rather than swallowed.
+///
+/// This discrimination is what lets the process-group teardown raise `EPERM`
+/// *honestly*: on macOS/BSD `killpg` returns `EPERM` **both** for a genuinely-alive
+/// uid-changed member (a `sudo`/setuid child that rejects the signal — a real
+/// containment gap worth reporting) *and* for a group whose only member is an
+/// unreaped **zombie** (dead, harmless — the false positive that reverted the first
+/// attempt at this fix, breaking a normal shutdown of a group with unreaped
+/// children). The errno alone cannot tell them apart, so we check the target's
+/// actual run state after the `EPERM`. Only a *positive* live/non-zombie answer
+/// surfaces the error; a zombie, a since-reaped/gone pid, or a target without a
+/// state reader all report `false`, so a normal teardown is never falsely failed.
+///
+/// Availability mirrors [`read_identity`]:
+/// - **Linux / Android** — `/proc/<pid>/stat` field 3 (state); live is any state
+///   other than `Z` (zombie) or `X`/`x` (dead).
+/// - **macOS / the other Apple targets** — `proc_pidinfo(PROC_PIDTBSDINFO)`'s
+///   `pbi_status`; live is `SIDL`/`SRUN`/`SSLEEP`/`SSTOP`, never `SZOMB`.
+/// - **the BSDs (and any other unix)** — no wired-up state reader (the same
+///   per-OS `sysctl(KERN_PROC)` divergence that blocks `read_identity` there), so
+///   the answer is always `false`: delivery `EPERM` keeps its pre-existing
+///   swallowed behavior on those targets, exactly as before this change — no
+///   regression and, crucially, no new false positive.
+///
+/// It classifies the tracked id itself (a group *leader* pid, or a solo pid). A
+/// live uid-changed *descendant* hidden behind an already-reaped/zombie leader is
+/// therefore not detected — the fail-safe direction (a missed report, never a
+/// false one); the common case the first attempt tripped over — the tracked leader
+/// *being* the zombie — is what this closes.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn is_live_non_zombie(pid: i32) -> bool {
+    // `/proc/<pid>/stat` field 3 is the state char. A successful read that is
+    // neither a zombie (`Z`) nor dead (`X`/`x`) is a live process; a failed read
+    // (the pid is gone) yields `None` → `false`. Pids are positive here, so the
+    // `as u32` cast is value-preserving.
+    super::procfs::read_state(pid as u32).is_some_and(|s| !matches!(s, 'Z' | 'X' | 'x'))
+}
+
+/// The Apple reader — see the doc above the Linux `is_live_non_zombie`.
+#[cfg(target_vendor = "apple")]
+fn is_live_non_zombie(pid: i32) -> bool {
+    // `proc_pidinfo(PROC_PIDTBSDINFO)` fills a `proc_bsdinfo` whose `pbi_status` is
+    // the BSD run state. A full-size fill whose status is a live value
+    // (SIDL/SRUN/SSLEEP/SSTOP — never SZOMB) is a genuinely-alive process; a
+    // short/failed read (the pid is gone or unreadable) or SZOMB reports `false`.
+    // SAFETY: `proc_bsdinfo` is plain-old-data (integers and byte arrays), for
+    // which an all-zero bit pattern is a valid initialized value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let want = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `proc_pidinfo` writes at most `want` bytes into `info`; a valid
+    // pointer and a matching buffer size are its only preconditions.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast::<libc::c_void>(),
+            want,
+        )
+    };
+    got == want && matches!(info.pbi_status, libc::SIDL | libc::SRUN | libc::SSLEEP | libc::SSTOP)
+}
+
+/// The BSDs (and any other unix): no wired-up state reader, so a delivery `EPERM`
+/// is never classified as a live containment gap — see the doc above the Linux
+/// `is_live_non_zombie`.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn is_live_non_zombie(_pid: i32) -> bool {
+    false
+}
+
 /// One tracked id (a group leader pid or a solo pid), its liveness latch, and the
 /// start-time identity captured when it was first tracked (see `read_identity`).
 struct Entry {
@@ -308,16 +381,26 @@ impl Tracked {
     /// only ever reaches an id whose identity was just re-verified (or, on a
     /// target/path without a readable identity, whose bare liveness was).
     ///
-    /// Best-effort: delivery failures are **not** surfaced. On the process-group
-    /// mechanism's own platforms (macOS/BSD) `EPERM` is ambiguous — it is returned
-    /// both for a genuinely-alive tree that changed uid (a `sudo`/setuid child, a
-    /// real "couldn't kill" case) *and* for a `killpg` against a group whose only
-    /// member is an unreaped **zombie** (dead, harmless). We can't tell them apart
-    /// from the errno alone, so surfacing `EPERM` here would falsely fail a
-    /// perfectly normal `kill_all`/`shutdown` of a group with unreaped children.
-    /// The uid-changed limitation is documented on `ProcessGroup::kill_all`.
-    fn signal_all(&self, sig: i32) {
+    /// Returns `Err` **only** when a delivery `EPERM` hit a positively **live,
+    /// non-zombie** member ([`is_live_non_zombie`]) — the genuine containment gap
+    /// (a `sudo`/setuid child that rejects the signal). Every other outcome is
+    /// `Ok`, including the ambiguous `EPERM` this backend used to swallow wholesale:
+    /// on macOS/BSD `killpg` returns `EPERM` for a group whose only member is an
+    /// unreaped **zombie** (dead, harmless) too, and surfacing *that* is what
+    /// reverted the first attempt at this fix (it falsely failed a normal
+    /// `kill_all`/`shutdown` of a group with unreaped children). By checking the
+    /// target's run state after the `EPERM`, the harmless zombie case — and a
+    /// since-reaped pid, and every target without a state reader (the BSDs) — stays
+    /// `Ok`, while a genuinely-alive rejecting member is reported. The sweep always
+    /// visits every entry before returning, so one member's live-`EPERM` never
+    /// skips signalling the rest of the tree. Callers that must stay best-effort
+    /// (`Drop`, the graceful soft-signal, `signal`/`suspend`/`resume`) discard the
+    /// result; `kill_all`/`hard_kill` propagate it.
+    fn signal_all(&self, sig: i32) -> io::Result<()> {
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
+        // The first live-non-zombie `EPERM` seen this sweep, surfaced after every
+        // entry has been signalled (a partial failure must not skip the rest).
+        let mut live_eperm: Option<io::Error> = None;
         ids.retain_mut(|e| {
             if !self.probe_entry(e) {
                 return false; // gone — forget it.
@@ -325,7 +408,7 @@ impl Tracked {
             let id = e.id;
             // SAFETY: killpg/kill to a probed-existing id; an exit between the
             // probe and here just yields ESRCH and the sweep continues.
-            unsafe {
+            let delivery = unsafe {
                 if self.group {
                     // killpg reaches the leader and every descendant. While the
                     // group has never been seen alive (a forked-but-not-yet-
@@ -334,18 +417,46 @@ impl Tracked {
                     // latched (`probe_entry` set it above), an ESRCH means the
                     // group is genuinely gone — do NOT direct-signal, or that
                     // would SIGKILL a process that recycled the pid.
-                    if libc::killpg(id, sig) == -1
-                        && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-                        && !e.group_seen
-                    {
-                        libc::kill(id, sig);
+                    if libc::killpg(id, sig) == -1 {
+                        let err = io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::ESRCH) && !e.group_seen {
+                            // Direct-pid fallback: report its own failure, if any.
+                            if libc::kill(id, sig) == -1 {
+                                Some(io::Error::last_os_error())
+                            } else {
+                                None
+                            }
+                        } else {
+                            Some(err)
+                        }
+                    } else {
+                        None
                     }
+                } else if libc::kill(id, sig) == -1 {
+                    Some(io::Error::last_os_error())
                 } else {
-                    libc::kill(id, sig);
+                    None
                 }
+            };
+            // Surface a delivery `EPERM` only when the target is positively a live,
+            // non-zombie process (the real "couldn't kill it" case). A zombie-only
+            // group's `killpg` `EPERM`, an `EPERM` against a since-reaped pid, or a
+            // target without a state reader (the BSDs) all classify as not-live and
+            // are swallowed — the fail-safe that keeps a normal teardown succeeding.
+            // The `is_live_non_zombie` probe runs only on the rare `EPERM` path.
+            if let Some(err) = delivery
+                && live_eperm.is_none()
+                && err.raw_os_error() == Some(libc::EPERM)
+                && is_live_non_zombie(id)
+            {
+                live_eperm = Some(err);
             }
             true
         });
+        match live_eperm {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// Whether any tracked entry still exists.
@@ -504,38 +615,49 @@ impl ProcessGroup {
         }
     }
 
+    /// Hard-kill every tracked group and solo child. Surfaces a genuine delivery
+    /// `EPERM` against a live, non-zombie member (a `sudo`/setuid child that
+    /// rejects `SIGKILL`) — see [`Tracked::signal_all`] — while a harmless
+    /// zombie-only group's `EPERM` stays `Ok`.
     pub(crate) fn kill_all(&self) -> io::Result<()> {
-        self.broadcast(libc::SIGKILL);
-        Ok(())
+        self.broadcast(libc::SIGKILL)
     }
 
     /// Broadcast `sig` to every tracked process group and solo-adopted child.
-    /// Best-effort: entries that already drained are skipped (and pruned); an
-    /// empty set is a no-op.
+    /// Best-effort by contract: entries that already drained are skipped (and
+    /// pruned), an empty set is a no-op, and a delivery `EPERM` is **not** surfaced
+    /// — unlike `kill_all`/`hard_kill` this makes no live/zombie discrimination.
     #[cfg(feature = "process-control")]
     pub(crate) fn signal(&self, sig: i32) -> io::Result<()> {
-        self.broadcast(sig);
+        // Documented best-effort (see `ProcessGroup::signal`): swallow any
+        // live-`EPERM` the sweep detected.
+        let _ = self.broadcast(sig);
         Ok(())
     }
 
     /// Freeze every tracked group (`SIGSTOP` — unblockable, idempotent).
     #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {
-        self.broadcast(libc::SIGSTOP);
+        let _ = self.broadcast(libc::SIGSTOP);
         Ok(())
     }
 
     /// Thaw every tracked group (`SIGCONT`).
     #[cfg(feature = "process-control")]
     pub(crate) fn resume(&self) -> io::Result<()> {
-        self.broadcast(libc::SIGCONT);
+        let _ = self.broadcast(libc::SIGCONT);
         Ok(())
     }
 
-    /// One signal sweep over both tracking sets.
-    fn broadcast(&self, sig: i32) {
-        self.groups.signal_all(sig);
-        self.solos.signal_all(sig);
+    /// One signal sweep over both tracking sets. Both sets are always signalled;
+    /// the first live-non-zombie `EPERM` surfaced by either is returned (see
+    /// [`Tracked::signal_all`]). Best-effort callers discard the result.
+    fn broadcast(&self, sig: i32) -> io::Result<()> {
+        let groups = self.groups.signal_all(sig);
+        let solos = self.solos.signal_all(sig);
+        // `and` keeps the groups error if present, else the solos one — both sweeps
+        // ran regardless, so no set is skipped by the other's failure.
+        groups.and(solos)
     }
 
     /// Whether anything tracked is still alive.
@@ -577,7 +699,10 @@ impl ProcessGroup {
 
 impl super::graceful::GracefulTarget for ProcessGroup {
     fn signal_all(&self, signal: i32) {
-        self.broadcast(signal);
+        // The graceful soft signal is best-effort by trait contract (the driver
+        // polls regardless), so a delivery `EPERM` here is swallowed — the genuine
+        // live-`EPERM` is reported from `hard_kill` at escalation instead.
+        let _ = self.broadcast(signal);
     }
 
     fn is_drained(&self) -> bool {
@@ -585,20 +710,23 @@ impl super::graceful::GracefulTarget for ProcessGroup {
     }
 
     fn hard_kill(&self) -> io::Result<()> {
-        // Best-effort `SIGKILL` sweep. A delivery `EPERM` is not surfaced: on
-        // macOS/BSD it is indistinguishable from a `killpg` against an unreaped
-        // zombie, so surfacing it would falsely fail a normal shutdown (see
-        // `Tracked::signal_all`). The uid-changed limitation is documented on
-        // `ProcessGroup::kill_all`.
-        self.broadcast(libc::SIGKILL);
-        Ok(())
+        // `SIGKILL` sweep. A delivery `EPERM` against a live, non-zombie member (a
+        // `sudo`/setuid child that rejects the signal) is surfaced as the genuine
+        // containment gap; a harmless zombie-only group's `EPERM` — the false
+        // positive that reverted the first attempt — stays `Ok` because the sweep
+        // checks the target's run state first (see `Tracked::signal_all`). The
+        // contract is documented on `ProcessGroup::kill_all`.
+        self.broadcast(libc::SIGKILL)
     }
 }
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if !self.skip_drop_kill.is_set() {
-            self.broadcast(libc::SIGKILL);
+            // Best-effort backstop; `Drop` cannot surface a result, so a
+            // live-`EPERM` here is swallowed (the same tree would have surfaced it
+            // from an explicit `kill_all`/`shutdown` had the caller made one).
+            let _ = self.broadcast(libc::SIGKILL);
         }
     }
 }
@@ -963,7 +1091,7 @@ mod tests {
         // Seed exactly as a spawn does now: a group entry with the latch `false`.
         tracked.track(pid, false);
         // A teardown sweep must keep and signal it via the direct-pid fallback.
-        tracked.signal_all(libc::SIGTERM);
+        let _ = tracked.signal_all(libc::SIGTERM);
 
         let still_tracked = {
             let ids = tracked.ids.lock().unwrap_or_else(|e| e.into_inner());
@@ -1115,7 +1243,7 @@ mod tests {
             });
         }
 
-        tracked.signal_all(libc::SIGTERM);
+        let _ = tracked.signal_all(libc::SIGTERM);
 
         let still_tracked = {
             let ids = tracked.ids.lock().unwrap_or_else(|e| e.into_inner());
@@ -1172,7 +1300,7 @@ mod tests {
             });
         }
 
-        tracked.signal_all(libc::SIGTERM);
+        let _ = tracked.signal_all(libc::SIGTERM);
 
         let still_tracked = {
             let ids = tracked.ids.lock().unwrap_or_else(|e| e.into_inner());
@@ -1223,7 +1351,7 @@ mod tests {
         tracked.track(pid, true);
         // Traps TERM, so a delivered SIGTERM does not reap it — we assert it stayed
         // tracked (kept) and alive (signalled, not lost to the gate).
-        tracked.signal_all(libc::SIGTERM);
+        let _ = tracked.signal_all(libc::SIGTERM);
 
         let still_tracked = {
             let ids = tracked.ids.lock().unwrap_or_else(|e| e.into_inner());
@@ -1243,6 +1371,109 @@ mod tests {
             alive,
             "a matching-identity group must be signalled (trapped TERM) — the gate \
              must not prune it"
+        );
+    }
+
+    /// `is_live_non_zombie` positively confirms a genuinely-running process — the
+    /// only state for which a delivery `EPERM` is surfaced as a real containment
+    /// gap. A running sleeper must classify as live wherever a state reader exists
+    /// (Linux/Android `/proc`, Apple `proc_pidinfo`); on the BSDs there is no
+    /// reader, so the answer is always `false` and the assertion is skipped — the
+    /// same "defer where the platform can't read it" shape the identity tests use.
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn is_live_non_zombie_is_true_for_a_running_process() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap() as i32;
+
+        let verdict = is_live_non_zombie(pid);
+
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait().await;
+
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        assert!(
+            verdict,
+            "a running child must classify as live/non-zombie (the state that \
+             surfaces a genuine SIGKILL EPERM)"
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        assert!(
+            !verdict,
+            "targets without a state reader (the BSDs) always classify as not-live, \
+             so a delivery EPERM stays swallowed there"
+        );
+    }
+
+    /// THE regression test for the reverted first attempt (macOS/BSD zombie-EPERM
+    /// false positive): a process **group** whose only member is an unreaped
+    /// **zombie** must NOT surface an error from a `signal_all(SIGKILL)` teardown.
+    /// On macOS `killpg` returns `EPERM` for such a group — the exact false positive
+    /// that broke a normal shutdown of a group with unreaped children before — and
+    /// the run-state check must classify the zombie leader as not-live and swallow
+    /// it, so the sweep returns `Ok`. On Linux `killpg` to a zombie group returns
+    /// `0`, so this also guards that the invariant holds identically there.
+    ///
+    /// Gated to the targets that have a state reader: on the BSDs the discrimination
+    /// degrades to the documented "swallow every EPERM" behavior (no zombie/live
+    /// telling-apart), so there is nothing platform-specific to exercise, and the
+    /// zombie oracle this test uses (`is_live_non_zombie` flipping to `false`) is
+    /// unavailable there.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess and leaves it an unreaped zombie"]
+    async fn zombie_only_group_teardown_reports_success() {
+        use std::os::unix::process::CommandExt as _;
+
+        let tracked = Tracked::new(true);
+        // A child that exits at once, in its own process group so `killpg`
+        // addresses exactly it. `kill_on_drop` reaps it on any early panic path.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("exit 0");
+        cmd.kill_on_drop(true);
+        cmd.as_std_mut().process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id().unwrap() as i32;
+
+        // Let the child exit into an unreaped zombie. We deliberately do NOT `wait`
+        // it — the tokio `Child` handle is held and unpolled, so nothing reaps it and
+        // the exited process lingers as a zombie the group still tracks. Poll until
+        // its state reads not-live: since nothing here reaps it, that flip can only
+        // mean "exited into a zombie" (never "gone"), a deterministic oracle that
+        // needs no fixed sleep.
+        let mut became_zombie = false;
+        for _ in 0..500 {
+            if !is_live_non_zombie(pid) {
+                became_zombie = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(became_zombie, "the child never became an observable zombie");
+        // It is a zombie, not already gone: a zombie still answers signal 0.
+        // SAFETY: signal 0 is a sound liveness probe.
+        assert!(
+            unsafe { libc::kill(pid, 0) } == 0,
+            "the exited-but-unreaped child must still exist as a zombie"
+        );
+
+        // Track the zombie leader and tear the group down. The identity captured
+        // here still matches the zombie's (its proc entry lingers), so the entry is
+        // not pruned by the recycle gate — the `killpg` really fires.
+        tracked.track(pid, true);
+        let outcome = tracked.signal_all(libc::SIGKILL);
+
+        // Reap the zombie regardless of the assertion below.
+        let _ = child.wait().await;
+
+        outcome.expect(
+            "a zombie-only group's killpg EPERM must be swallowed, not surfaced — \
+             surfacing it is the false positive that reverted the first attempt",
         );
     }
 }

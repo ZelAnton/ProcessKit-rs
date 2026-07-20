@@ -53,9 +53,31 @@ pub(crate) fn read_starttime(pid: u32) -> Option<u64> {
     starttime_from_stat(&stat)
 }
 
+/// Parse the **state** char (field 3) out of a `/proc/<pid>/stat` line.
+///
+/// State is the first whitespace token after the comm ([`after_comm`]): `R`/`S`/
+/// `D`/`T`/`I`/… for a live process, `Z` for a zombie, `X`/`x` for a fully-dead
+/// one. This is what tells a genuinely-alive member (whose `SIGKILL` `EPERM` is a
+/// real containment gap) apart from a harmless unreaped zombie whose group
+/// `killpg` also reports `EPERM` — see
+/// [`pgroup::is_live_non_zombie`](super::pgroup). `None` if the line has no `)`,
+/// has no token after the comm, or that token is empty.
+pub(crate) fn state_from_stat(stat: &str) -> Option<char> {
+    after_comm(stat)?.split_whitespace().next()?.chars().next()
+}
+
+/// Best-effort read of `pid`'s process-state char: read `/proc/<pid>/stat` and
+/// pull field 3 via [`state_from_stat`]. `None` if the process is gone (the read
+/// fails) or the stat is unparsable — a caller treats an unknown state as *not*
+/// positively live, so a vanished pid is never reported as a live containment gap.
+pub(crate) fn read_state(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    state_from_stat(&stat)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{after_comm, starttime_from_stat};
+    use super::{after_comm, starttime_from_stat, state_from_stat};
 
     // A synthetic `/proc/<pid>/stat` line whose comm contains BOTH a `)` and spaces
     // — the exact shape a naive "split on the first `)`" or a plain field-split
@@ -103,5 +125,28 @@ mod tests {
         // 20 fields after the comm, but field 22 (index 19) is non-numeric.
         let stat = "1 (p) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 not_a_number";
         assert_eq!(starttime_from_stat(stat), None);
+    }
+
+    #[test]
+    fn state_reads_field_3_past_a_tricky_comm() {
+        // Field 3 (state) is the first token after the comm's last ')': for the
+        // tricky comm above that is `S`. A shifted cut point (e.g. a split on the
+        // first ')') would read a comm fragment instead of the state.
+        assert_eq!(state_from_stat(TRICKY_COMM), Some('S'));
+    }
+
+    #[test]
+    fn state_reads_a_zombie() {
+        // The exact shape the live/zombie discrimination hinges on: a `Z` state is
+        // an unreaped zombie, whose group `killpg` `EPERM` must stay swallowed.
+        assert_eq!(state_from_stat("1234 (proc) Z 1 1234 1234 0 -1"), Some('Z'));
+    }
+
+    #[test]
+    fn state_yields_none_without_a_closing_paren_or_a_field() {
+        // No `)` at all — unparsable.
+        assert_eq!(state_from_stat("1234 no-paren R 1"), None);
+        // A trailing `)` with nothing after it — no state token.
+        assert_eq!(state_from_stat("1234 (proc)"), None);
     }
 }

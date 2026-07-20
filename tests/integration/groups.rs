@@ -277,6 +277,69 @@ async fn kill_all_is_idempotent() {
         .expect("child reaped");
 }
 
+/// Regression: tearing down a process group whose only member is an unreaped
+/// **zombie** must report success, not a false `EPERM`. On the process-group
+/// mechanism (macOS/BSD, and the Linux pgroup fallback) `killpg` against such a
+/// group returns `EPERM` on macOS/BSD — indistinguishable, from the errno alone,
+/// from a genuinely-alive uid-changed child that rejects the signal. A first
+/// attempt to surface that `EPERM` was reverted precisely because it falsely failed
+/// this normal case; `kill_all` now checks the leader's run state and swallows the
+/// harmless zombie `EPERM`, so this teardown must be `Ok`.
+///
+/// The raw [`ProcessGroup::spawn`](processkit::ProcessGroup::spawn) path hands back
+/// the tokio `Child`, so the test owns reaping: the child exits at once but is never
+/// `wait`ed until after the teardown, so it lingers as the unreaped zombie the group
+/// still tracks. `kill_all` returns `Ok` on every backend here (a zombie is already
+/// dead), so the assertion cannot flake — it fails only if the reverted false `EPERM`
+/// returns.
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a fast-exiting child and tears the group down while it is a zombie"]
+async fn kill_all_on_a_zombie_only_group_reports_success() {
+    use std::process::Stdio;
+
+    use processkit::ProcessGroup;
+    use tokio::io::AsyncReadExt as _;
+    use tokio::process::Command as TokioCommand;
+
+    let group = ProcessGroup::new().expect("create group");
+    let mut cmd = TokioCommand::new("sh");
+    cmd.arg("-c").arg("exit 0");
+    // A piped stdout gives a deterministic exit oracle (EOF on close) without
+    // reaping; silence stderr so a failing shell can't spam the harness.
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::null());
+    let mut child = group.spawn(cmd).expect("spawn fast-exiting child");
+    let pid = child.id().expect("child pid") as i32;
+
+    // Wait for the child to exit WITHOUT reaping it: its stdout pipe closes on
+    // exit, so a read to EOF proves it is gone-but-unreaped (a zombie the group
+    // still tracks). We never `wait` it before the teardown, so nothing reaps it.
+    let mut out = child.stdout.take().expect("piped stdout handle");
+    let mut sink = Vec::new();
+    completes_within(
+        Duration::from_secs(10),
+        "child exit (stdout EOF)",
+        out.read_to_end(&mut sink),
+    )
+    .await
+    .expect("read child stdout to EOF");
+    // Still present as an unreaped zombie (a zombie answers signal 0), not gone.
+    // SAFETY: signal 0 is a sound liveness probe.
+    assert!(
+        unsafe { libc::kill(pid, 0) } == 0,
+        "the exited child must still exist as an unreaped zombie"
+    );
+
+    // The load-bearing assertion: a zombie-only group's teardown reports success.
+    group
+        .kill_all()
+        .expect("kill_all of a zombie-only group must succeed, not raise a false EPERM");
+
+    // Reap the zombie so the test leaves nothing behind.
+    let _ = completes_within(Duration::from_secs(10), "zombie reap", child.wait()).await;
+}
+
 /// Nested Job Objects (Windows): a crate `ProcessGroup` built by a process that is
 /// **itself** already inside another Job Object. This pins the real
 /// agent-orchestrator topology — Windows Terminal, CI runners and IDE agents all
