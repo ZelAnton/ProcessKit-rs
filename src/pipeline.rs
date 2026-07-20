@@ -556,16 +556,7 @@ impl Pipeline {
     /// [`Error::Cancelled`](crate::Error::Cancelled), atop any launch failure.
     pub async fn probe(&self) -> Result<bool> {
         let result = self.output_string().await?;
-        match result.code() {
-            Some(0) => Ok(true),
-            Some(1) => Ok(false),
-            // Reset ok_codes to {0}: probe's contract is strict 0/1 regardless of
-            // any stage's ok_codes; ensure_success builds the faithful error.
-            _ => Err(result
-                .with_ok_codes(vec![0])
-                .ensure_success()
-                .expect_err("a non-{0,1} exit code is never success")),
-        }
+        result.probe_bool()
     }
 
     /// Run the chain (requiring a clean pipefail outcome) and feed the last
