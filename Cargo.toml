@@ -40,6 +40,11 @@ exclude = [
   # the fuzzing-only entry point it drives, `pump::fuzz_decode_pump_lines`
   # (`cfg(fuzzing)`, src/pump.rs).
   "fuzz/",
+  # loom model-check harness (its own Cargo.toml/Cargo.lock, built only by the
+  # `loom` CI job under `--cfg loom`) — dev tooling that `#[path]`-includes the
+  # PID-lifecycle cores from `src/`; never ships in the published crate. See
+  # loom/README.md.
+  "loom/",
   # 3.5 MB README banner — rendered from its absolute raw.githubusercontent URL,
   # so it never needs to ship inside the published crate.
   "cover.png",
@@ -76,14 +81,23 @@ missing_debug_implementations = "warn"
 # forgets to keep that discipline. (`missing_docs` is enforced lib-scoped in
 # `src/lib.rs` so it doesn't burden examples/tests.)
 unsafe_op_in_unsafe_fn = "deny"
-# `cfg(fuzzing)` is not a Cargo feature: `cargo fuzz build` sets it
-# automatically (via `RUSTFLAGS`) for every crate in the dependency graph, so
-# `fuzz/fuzz_targets/*.rs` can call into a fuzzing-only entry point (see
-# `src/pump.rs`'s `fuzz_decode_pump_lines`) without that entry point ever
-# appearing in an ordinary build's public API. Declare it so rustc's
-# `unexpected_cfgs` lint (which `-D warnings` would otherwise turn into a
-# build failure on every normal `cargo build`/`clippy`) does not fire on it.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+# Neither `cfg(fuzzing)` nor `cfg(loom)` is a Cargo feature; both are set via
+# `RUSTFLAGS` for a whole build and gate testing-only code paths:
+#   * `cfg(fuzzing)` — `cargo fuzz build` sets it for every crate in the graph so
+#     `fuzz/fuzz_targets/*.rs` can call a fuzzing-only entry point (see
+#     `src/pump.rs`'s `fuzz_decode_pump_lines`) without it ever appearing in an
+#     ordinary build's public API.
+#   * `cfg(loom)` — the PID-lifecycle lock-free cores (`sys/pid_gate.rs`,
+#     `running/deadline.rs`, `sys/skip_drop_kill.rs`, and the `src/sync.rs` layer)
+#     carry `cfg(loom)`/`cfg(all(test, loom))` gates so the standalone loom harness
+#     (`loom/`, run by the `loom` CI job with `RUSTFLAGS=--cfg loom`) can pull those
+#     files in via `#[path]` and model-check them against loom's atomics/mutex — none
+#     of which is set in an ordinary build of this crate, but the gates are compiled
+#     (as `not(loom)`) here regardless. Declaring the cfg keeps `unexpected_cfgs`
+#     (which `-D warnings` would turn into a build failure on every normal
+#     `cargo build`/`clippy`) from firing on them.
+# Declare both so rustc's `unexpected_cfgs` lint does not fire.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(loom)"] }
 
 # The most valuable pedantic-clippy slice for an error-rich crate (Rust API
 # Guidelines C-FAILURE): every public fallible method must document its error

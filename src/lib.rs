@@ -194,6 +194,10 @@ mod signal;
 mod stats;
 mod stdin;
 mod supervisor;
+// The `cfg(loom)`-swappable sync layer (std::sync in ordinary builds, loom models
+// under `--cfg loom` test builds) that the PID-lifecycle lock-free protocols build
+// on. See `sync.rs` for why it gates on `all(loom, test)`.
+mod sync;
 mod sys;
 
 /// Clamp ceiling for `Instant + Duration` deadline math: a timeout, grace,

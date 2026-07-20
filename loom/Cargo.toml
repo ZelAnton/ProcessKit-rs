@@ -1,0 +1,23 @@
+[package]
+name = "processkit-loom"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# The `#[path]`-included cores carry `cfg(loom)` gates; declare the cfg (as the
+# parent crate's Cargo.toml does) so rustc's `unexpected_cfgs` lint stays quiet.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+[dev-dependencies]
+# The model checker. This harness exists solely to run loom over the three pure
+# PID-lifecycle lock-free cores it `#[path]`-includes from the parent crate's
+# `src/`; it never depends on `processkit` itself (that would pull in tokio, which
+# strips `tokio::process` under `--cfg loom`). Only the `#[cfg(test)]` loom suites
+# reference loom, so it is a dev-dependency. Pinned to loom's current major.
+loom = "0.7"
+
+# Isolate this crate's dependency resolution (and Cargo.lock) from the parent
+# crate: this is dev tooling, never part of the published/workspace build, and must
+# not be swept into a workspace the root crate might grow later (mirrors `fuzz/`).
+[workspace]

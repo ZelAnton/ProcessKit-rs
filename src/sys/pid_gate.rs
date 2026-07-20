@@ -32,7 +32,11 @@
 //! kill syscall behind [`force_kill`] differs (SIGKILL on unix, `OpenProcess` +
 //! `TerminateProcess` on Windows).
 
-use std::sync::{Mutex, MutexGuard};
+// The mutex comes from the crate's `cfg(loom)`-swappable sync layer: `std::sync`
+// in ordinary builds (byte-for-byte the same gate), loom's model under a
+// `--cfg loom` test build so the `loom_model` suite below can permute the
+// reaper-vs-watchdog interleavings this gate linearizes. See `crate::sync`.
+use crate::sync::{Mutex, MutexGuard};
 
 /// A gate around a direct child's raw pid that linearizes raw kills against the
 /// reap that retires the pid. Shared (`Arc`) between the owning handle's reap
@@ -145,6 +149,12 @@ impl PidGate {
 /// This is the single choke point every teardown watchdog funnels its raw
 /// direct-child kill through, so routing it through [`PidGate::with_live_pid`]
 /// guarantees the kill can never land after the owner retired the pid.
+///
+/// `cfg(not(loom))`: this is the only impure part of the gate (a raw `libc` /
+/// `windows-sys` syscall), and it is never exercised by the loom models — they
+/// drive the gate's *state machine* directly. Gating it out lets the standalone
+/// loom harness (`loom/`) `#[path]`-include this file without libc/windows-sys.
+#[cfg(not(loom))]
 pub(crate) fn force_kill(gate: &PidGate) {
     gate.with_live_pid((), raw_force_kill);
 }
@@ -152,6 +162,7 @@ pub(crate) fn force_kill(gate: &PidGate) {
 /// The raw force-kill syscall for one pid. Called only from
 /// [`force_kill`] under the gate lock (never directly), so it never runs on a
 /// retired/recycled pid.
+#[cfg(not(loom))]
 fn raw_force_kill(pid: u32) {
     #[cfg(unix)]
     // SAFETY: SIGKILL to a pid; `ESRCH` (already exited/reaped) is ignored. The
@@ -175,7 +186,11 @@ fn raw_force_kill(pid: u32) {
     }
 }
 
-#[cfg(test)]
+// These deterministic real-thread tests construct a `PidGate` and drive it
+// directly; under `--cfg loom` the gate's mutex is a loom model that may only be
+// used inside `loom::model`, so this suite is compiled out there and the
+// exhaustive-interleaving equivalents live in `loom_model` below.
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -422,5 +437,136 @@ mod tests {
                 "a raw kill must never run after the structural drop freed the pid"
             );
         }
+    }
+}
+
+/// Loom model-checking suite for the [`PidGate`] linearization (run under
+/// `--cfg loom`; see [`crate::sync`]).
+///
+/// Where the `tests` module above pins the invariants with real threads and a
+/// barrier — which exercises *some* interleavings but can never prove it hit the
+/// racy one — loom **exhaustively** permutes every thread interleaving and every
+/// permitted memory ordering of the reaper-vs-watchdog race and fails if any one
+/// violates the gate's contract: a gated raw kill never runs after the pid is
+/// freed (no use of a freed/recycled pid slot), yet a still-live child stays
+/// killable (no missed kill). These are the exact races the cancellation
+/// watchdog, the streaming deadline watchdog, and the graceful pid-timeout
+/// teardown (whose detached final SIGKILL stands down only through this gate) all
+/// reduce to.
+#[cfg(all(test, loom))]
+mod loom_model {
+    use super::PidGate;
+    use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicBool, Ordering};
+
+    /// The core linearizability invariant, checked over every interleaving: a
+    /// reaper frees the pid and retires it in one critical section
+    /// ([`reap_under_lock`](PidGate::reap_under_lock)) while a watchdog kills
+    /// through the gate ([`with_live_pid`](PidGate::with_live_pid)). The kill
+    /// closure runs only under the lock and only while un-retired, so it must
+    /// never observe the pid freed — no gated kill lands on a freed (possibly
+    /// OS-recycled) pid.
+    #[test]
+    fn a_gated_kill_never_lands_after_a_fused_reap_freed_the_pid() {
+        loom::model(|| {
+            let gate = Arc::new(PidGate::new(Some(4321)));
+            let freed = Arc::new(AtomicBool::new(false));
+
+            let reaper = {
+                let gate = gate.clone();
+                let freed = freed.clone();
+                loom::thread::spawn(move || {
+                    // "Reap": free the pid and retire it in one critical section.
+                    gate.reap_under_lock(|| {
+                        freed.store(true, Ordering::SeqCst);
+                        true
+                    });
+                })
+            };
+
+            // The watchdog kills on the model's main thread. If the closure runs
+            // at all, the gate held the lock un-retired — so the fused reap has
+            // not run, and `freed` must be false.
+            gate.with_live_pid((), |_pid| {
+                assert!(
+                    !freed.load(Ordering::SeqCst),
+                    "a gated kill ran after the fused reap freed the pid"
+                );
+            });
+
+            reaper.join().unwrap();
+            // Once the fused reap has run, the gate is retired for good — the
+            // `is_retired` early-out a watchdog reads before even the group kill
+            // now reports "stood down" on every interleaving.
+            assert!(
+                gate.is_retired(),
+                "a fused reap must leave the gate retired"
+            );
+        });
+    }
+
+    /// The T-092 structural-drop discipline: the owner
+    /// [`retire`](PidGate::retire)s the gate and only *afterwards*, as a separate
+    /// step, frees the pid. Loom proves that split is still race-free across every
+    /// interleaving — a racing gated kill either linearizes before the retire (pid
+    /// valid) or is skipped, never after the free.
+    #[test]
+    fn a_retire_before_a_separate_free_still_bars_a_racing_kill() {
+        loom::model(|| {
+            let gate = Arc::new(PidGate::new(Some(4321)));
+            let freed = Arc::new(AtomicBool::new(false));
+
+            let dropper = {
+                let gate = gate.clone();
+                let freed = freed.clone();
+                loom::thread::spawn(move || {
+                    // Retire first (takes the lock), THEN — strictly afterwards, a
+                    // separate step — free the pid.
+                    gate.retire();
+                    freed.store(true, Ordering::SeqCst);
+                })
+            };
+
+            gate.with_live_pid((), |_pid| {
+                assert!(
+                    !freed.load(Ordering::SeqCst),
+                    "a gated kill ran after the structural drop freed the pid"
+                );
+            });
+
+            dropper.join().unwrap();
+        });
+    }
+
+    /// The other half of the contract — no *missed* kill: a non-reaping poll
+    /// ([`reap_under_lock`] returning `false`, the child still alive) never
+    /// retires the gate, so a genuinely-live child stays killable on every
+    /// interleaving. This is what keeps a real streaming/deadline timeout from
+    /// being silently swallowed.
+    #[test]
+    fn a_live_child_stays_killable_across_a_non_reaping_poll() {
+        loom::model(|| {
+            let gate = Arc::new(PidGate::new(Some(4321)));
+            let killed = Arc::new(AtomicBool::new(false));
+
+            let poller = {
+                let gate = gate.clone();
+                loom::thread::spawn(move || {
+                    // A `Pending` poll: the child is still running, so this does
+                    // not reap and must not retire the gate.
+                    assert!(!gate.reap_under_lock(|| false), "a Pending poll reaped");
+                })
+            };
+
+            gate.with_live_pid((), |_pid| {
+                killed.store(true, Ordering::SeqCst);
+            });
+
+            poller.join().unwrap();
+            assert!(
+                killed.load(Ordering::SeqCst),
+                "a live child was left un-killable — the watchdog's kill was dropped"
+            );
+        });
     }
 }

@@ -6,8 +6,13 @@
 //! [`split_pump_lines`], and [`RunningProcess::from_scripted`]).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
+
+// The shared timeout arbiter is built from the crate's `cfg(loom)`-swappable sync
+// layer so its type matches `RunningProcess::timeout_state` under `--cfg loom`
+// (`std::sync::atomic::AtomicU8` otherwise). See `crate::sync`.
+use crate::sync::atomic::AtomicU8;
 
 use tokio::sync::Notify;
 use tokio::task::AbortHandle;

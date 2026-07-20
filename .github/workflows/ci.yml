@@ -160,6 +160,37 @@ jobs:
       - run: cargo test -- --include-ignored
       - run: cargo test --no-default-features -- --include-ignored
 
+  loom:
+    name: loom (model check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The harness has its own manifest/lockfile under `loom/`.
+          workspaces: loom
+      # Exhaustively model-check the three historically race-prone PID-lifecycle
+      # lock-free protocols — the `pid_gate` linearization, the deadline
+      # `PENDING -> TIMED_OUT`/`EXITED` arbiter CAS, and the `SkipDropKill` re-arm
+      # latch (archive: T-064/066/078/079/082/092/093). This runs in the standalone
+      # `loom/` harness, which depends only on loom and `#[path]`-includes the three
+      # pure cores from `src/`: the parent crate itself can't build under `--cfg loom`
+      # because tokio strips `tokio::process` there (loom can't model real I/O).
+      # `--cfg loom` flips `src/sync.rs` to loom's atomics/mutex and selects each
+      # core's `#[cfg(all(test, loom))]` suite; the tokio/libc parts are
+      # `#[cfg(not(loom))]`-gated out. `--release` keeps loom's interleaving search
+      # fast. One Linux leg suffices — the modeled protocols are platform-agnostic.
+      # `--lib`: run only the harness's unit tests (the loom suites). It carries no
+      # doctests, and `cargo test`'s doctest phase drives rustdoc, which doesn't get
+      # `RUSTFLAGS` — so it would rebuild the cores in their `not(loom)` shape and
+      # fail on the tokio/libc parts. `--lib` skips that phase cleanly.
+      - name: Model-check with loom
+        working-directory: loom
+        run: cargo test --release --lib -- --nocapture
+        env:
+          RUSTFLAGS: --cfg loom
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest

@@ -16,8 +16,14 @@ pub use stream::{Finished, OutputEvent, OutputEvents, OutputLine, StdoutLines};
 pub(crate) use scripted::{ScriptedProc, ScriptedResultInfo, split_pump_lines};
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
+
+// The timeout arbiter (`timeout_state`) is built from the crate's
+// `cfg(loom)`-swappable sync layer so its `PENDING → TIMED_OUT`/`EXITED` CAS
+// protocol — funnelled through `deadline::claim_timed_out`/`claim_exited` — can be
+// loom-modeled; `std::sync::atomic::AtomicU8` in ordinary builds. See `crate::sync`.
+use crate::sync::atomic::AtomicU8;
 
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
@@ -820,12 +826,7 @@ impl RunningProcess {
         if let Some(limit) = self.timeout
             && self.deadline_anchor.elapsed() >= limit
         {
-            let _ = self.timeout_state.compare_exchange(
-                TS_PENDING,
-                TS_TIMED_OUT,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            );
+            let _ = deadline::claim_timed_out(&self.timeout_state);
         }
         self.timeout = None;
         if let Some(task) = self.deadline_task.take() {
@@ -1336,12 +1337,7 @@ impl RunningProcess {
         self.pid_gate.retire();
         // Claim natural reap. If a deadline already won (`TS_TIMED_OUT`), this
         // CAS fails and the run stays `TimedOut`.
-        let _ = self.timeout_state.compare_exchange(
-            TS_PENDING,
-            TS_EXITED,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
+        let _ = deadline::claim_exited(&self.timeout_state);
         Ok(outcome)
     }
 
@@ -1549,12 +1545,7 @@ impl RunningProcess {
             // Claim the arbiter: a deadline watchdog racing on another thread could
             // win `PENDING -> TIMED_OUT` before `abort_watchdogs` stops it,
             // misclassifying a clean exit. Claiming `EXITED` closes that window.
-            let _ = self.timeout_state.compare_exchange(
-                TS_PENDING,
-                TS_EXITED,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            );
+            let _ = deadline::claim_exited(&self.timeout_state);
             self.abort_watchdogs();
             // Snapshot the cancel disposition at the moment this probe observes
             // the reap, first-observation-wins. This is *observation-time*
