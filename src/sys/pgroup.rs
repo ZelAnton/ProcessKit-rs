@@ -175,7 +175,11 @@ fn is_live_non_zombie(pid: i32) -> bool {
             want,
         )
     };
-    got == want && matches!(info.pbi_status, libc::SIDL | libc::SRUN | libc::SSLEEP | libc::SSTOP)
+    got == want
+        && matches!(
+            info.pbi_status,
+            libc::SIDL | libc::SRUN | libc::SSLEEP | libc::SSTOP
+        )
 }
 
 /// The BSDs (and any other unix): no wired-up state reader, so a delivery `EPERM`
