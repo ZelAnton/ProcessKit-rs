@@ -262,9 +262,22 @@ name = "pump"
 harness = false
 
 [target.'cfg(windows)'.dev-dependencies]
-# Liveness probe (OpenProcess) in the integration test that proves a grandchild
-# is reaped with its job — integration tests can't see the non-dev windows-sys.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+# Liveness probe (OpenProcess) in the integration tests that prove a grandchild is
+# reaped with its job — integration tests can't see the non-dev windows-sys.
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Threading",
+  # The nested-jobs integration test (groups.rs `mod nested_job`) drives Job
+  # Objects from the test itself, mirroring src/sys/windows.rs at the user level:
+  # CreateJobObjectW + SetInformationJobObject (JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+  # with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) build the *outer* job,
+  # AssignProcessToJobObject nests the helper process into it, and IsProcessInJob
+  # is the helper's "am I actually inside a job?" sanity check.
+  "Win32_System_JobObjects",
+  # CreateJobObjectW's signature references SECURITY_ATTRIBUTES — same reason the
+  # non-dev windows-sys enables this above.
+  "Win32_Security",
+] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # Liveness probe (kill(pid, 0)) and the root gate (geteuid) in the setsid /

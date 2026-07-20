@@ -276,3 +276,622 @@ async fn kill_all_is_idempotent() {
         .await
         .expect("child reaped");
 }
+
+/// Nested Job Objects (Windows): a crate `ProcessGroup` built by a process that is
+/// **itself** already inside another Job Object. This pins the real
+/// agent-orchestrator topology — Windows Terminal, CI runners and IDE agents all
+/// put the parent process in a job — where a silently-degraded
+/// `AssignProcessToJobObject` (the historical pre-Windows-8 / hostile-outer-job
+/// failure) would leave the crate's containment broken with nobody noticing.
+/// Covers scenario 7 of the Orchestra containment request.
+///
+/// Shape (self-re-exec helper, the same trick `stdin_inherit.rs` uses). The
+/// harness creates an **outer** job — `KILL_ON_JOB_CLOSE`, and deliberately *no*
+/// breakaway flag — then re-executes this very integration-test binary in
+/// "helper mode" (an env-gated `#[ignore]` test), assigns that fresh helper
+/// process into the outer job, and only then releases it. Now nested, the helper
+/// builds the crate's own `ProcessGroup` (an **inner** job), starts a child that
+/// launches a grandchild, and publishes their PIDs through files — the pidfile +
+/// poll pattern of [`windows_grandchild_is_contained`], never a fixed sleep. The
+/// helper is a real child process distinct from the harness, so tearing the outer
+/// job down with kill-on-close (scenario (c)) never reaches the harness itself.
+#[cfg(windows)]
+mod nested_job {
+    use std::os::windows::io::AsRawHandle;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    use processkit::{Command, Mechanism, ProcessGroup};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    use crate::common::{poll_until, windows_pid_alive};
+
+    /// Marker env var: when set, this binary runs as the re-exec'd helper below
+    /// instead of an ordinary test. Unset in a normal `--include-ignored` suite
+    /// run, so `job_helper_process` is then just an immediate no-op pass.
+    const HELPER_FLAG: &str = "PK_NESTED_JOB_HELPER";
+    /// Temp dir + unique tag handed to the helper so both sides derive the exact
+    /// same coordination-file paths without passing one env var per file.
+    const HELPER_DIR: &str = "PK_NESTED_JOB_DIR";
+    const HELPER_TAG: &str = "PK_NESTED_JOB_TAG";
+    /// The libtest name the harness re-execs (positional filter + `--exact`). Keep
+    /// in sync with the module path and `fn job_helper_process` below — a mismatch
+    /// surfaces loudly as `wait_ready` timing out with no ready/error file.
+    const HELPER_TEST: &str = "groups::nested_job::job_helper_process";
+
+    /// Every coordination-file path, derived identically on the harness and the
+    /// re-exec'd helper from a shared temp dir + unique tag.
+    struct Paths {
+        dir: PathBuf,
+        tag: String,
+        /// Harness → helper: written *after* the helper is inside the outer job, so
+        /// the helper begins its in-the-nesting work only once contained.
+        go: PathBuf,
+        /// Helper → harness: `helper_pid`/`child_pid`/`grandchild_pid`/`mechanism`.
+        ready: PathBuf,
+        /// Helper → harness: a hard-failure message (loud, not a silent degrade).
+        error: PathBuf,
+        /// Harness → helper: tear your own inner group down with `kill_all`.
+        kill: PathBuf,
+        /// Helper → harness: `kill_all` returned.
+        killed: PathBuf,
+        /// Harness → helper: you may exit cleanly now.
+        exit: PathBuf,
+        /// Grandchild → everyone: its own PID (written by the grandchild script).
+        gc_pidfile: PathBuf,
+        gc_ps1: PathBuf,
+        parent_ps1: PathBuf,
+    }
+
+    impl Paths {
+        fn new(dir: &Path, tag: &str) -> Self {
+            let at = |name: &str| dir.join(format!("processkit_nested_{tag}_{name}"));
+            Self {
+                dir: dir.to_path_buf(),
+                tag: tag.to_string(),
+                go: at("go"),
+                ready: at("ready"),
+                error: at("error"),
+                kill: at("kill"),
+                killed: at("killed"),
+                exit: at("exit"),
+                gc_pidfile: at("gc.pid"),
+                gc_ps1: at("gc.ps1"),
+                parent_ps1: at("parent.ps1"),
+            }
+        }
+
+        fn cleanup(&self) {
+            for p in [
+                &self.go,
+                &self.ready,
+                &self.error,
+                &self.kill,
+                &self.killed,
+                &self.exit,
+                &self.gc_pidfile,
+                &self.gc_ps1,
+                &self.parent_ps1,
+            ] {
+                let _ = std::fs::remove_file(p);
+            }
+            // The `ready` atomic-write temp, if a crash ever left one behind.
+            let _ = std::fs::remove_file(self.ready.with_extension("tmp"));
+        }
+    }
+
+    /// A RAII **outer** Job Object: `KILL_ON_JOB_CLOSE`, no breakaway. Dropping it
+    /// closes the last handle, so kill-on-close reaps every member — both the
+    /// cleanup backstop on any panic path and the exact mechanism scenario (c)
+    /// exercises.
+    struct OuterJob {
+        handle: HANDLE,
+    }
+
+    // Sound: the guard is the sole owner of the handle and every Win32 job API is
+    // thread-safe (mirrors the `unsafe impl Send for Job` in src/sys/windows.rs).
+    unsafe impl Send for OuterJob {}
+
+    impl OuterJob {
+        fn create() -> OuterJob {
+            // SAFETY: null name/attributes request an unnamed job with defaults.
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            assert!(
+                !handle.is_null(),
+                "CreateJobObjectW failed: {}",
+                std::io::Error::last_os_error()
+            );
+            // Kill-on-close with *no* breakaway flag: members (and their nested
+            // children) die when this last handle closes and cannot escape — the
+            // hostile outer job an orchestrator's parent process already lives in.
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: fully-initialised struct matching the info class; size passed
+            // explicitly. On failure the guard is not built, so no handle leaks
+            // (we close it here before panicking).
+            let ok = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_ref(&info).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if ok == 0 {
+                let err = std::io::Error::last_os_error();
+                // SAFETY: handle came from CreateJobObjectW; closed exactly once.
+                unsafe { CloseHandle(handle) };
+                panic!("SetInformationJobObject failed: {err}");
+            }
+            OuterJob { handle }
+        }
+
+        /// Assign an already-running process into this job (the documented `adopt`
+        /// shape). `false` on failure — the caller reports the OS error loudly.
+        fn assign(&self, process: HANDLE) -> bool {
+            // SAFETY: both handles are valid for the duration of the call.
+            unsafe { AssignProcessToJobObject(self.handle, process) != 0 }
+        }
+    }
+
+    impl Drop for OuterJob {
+        fn drop(&mut self) {
+            // Closing the last handle triggers KILL_ON_JOB_CLOSE, reaping every
+            // member: the panic-path backstop and scenario (c)'s teardown.
+            // SAFETY: handle came from CreateJobObjectW; closed exactly once.
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+
+    /// Whether the current process is inside *any* Job Object — the nesting
+    /// premise the helper must confirm before its result means anything.
+    fn current_process_in_a_job() -> bool {
+        let mut in_job: i32 = 0;
+        // SAFETY: GetCurrentProcess returns a pseudo-handle; a null job argument
+        // asks "in ANY job?"; `in_job` is a valid BOOL out-param.
+        let ok = unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) };
+        ok != 0 && in_job != 0
+    }
+
+    /// The PIDs the helper publishes once its nested tree is up.
+    struct Ready {
+        helper_pid: u32,
+        child_pid: u32,
+        grandchild_pid: u32,
+    }
+
+    impl Ready {
+        fn parse(text: &str) -> Option<Ready> {
+            let mut helper_pid = None;
+            let mut child_pid = None;
+            let mut grandchild_pid = None;
+            for line in text.lines() {
+                let Some((key, val)) = line.split_once('=') else {
+                    continue;
+                };
+                let val = val.trim();
+                match key.trim() {
+                    "helper_pid" => helper_pid = val.parse().ok(),
+                    "child_pid" => child_pid = val.parse().ok(),
+                    "grandchild_pid" => grandchild_pid = val.parse().ok(),
+                    _ => {}
+                }
+            }
+            Some(Ready {
+                helper_pid: helper_pid?,
+                child_pid: child_pid?,
+                grandchild_pid: grandchild_pid?,
+            })
+        }
+    }
+
+    static TAG_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A per-run unique tag so the two harness tests (which libtest may run in
+    /// parallel) never collide on coordination files.
+    fn unique_tag(kind: &str) -> String {
+        format!(
+            "{}_{kind}_{}",
+            std::process::id(),
+            TAG_COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// Re-exec this test binary as the nested-job helper (raw `std` spawn: we need
+    /// the process handle to assign it into the outer job ourselves, and it must
+    /// *not* be wrapped in any crate group).
+    fn spawn_helper(paths: &Paths) -> std::process::Child {
+        let exe = std::env::current_exe().expect("locate the integration-test binary");
+        std::process::Command::new(exe)
+            .args([HELPER_TEST, "--exact", "--ignored"])
+            .env(HELPER_FLAG, "1")
+            .env(HELPER_DIR, &paths.dir)
+            .env(HELPER_TAG, &paths.tag)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("re-exec this test binary in nested-job helper mode")
+    }
+
+    /// Create the outer job, spawn the helper, nest it into the outer job, release
+    /// it, and wait for it to publish its PIDs. Returns the still-open outer job
+    /// (as a guard) and the published PIDs.
+    async fn setup_nested(kind: &str) -> (Paths, OuterJob, Ready) {
+        let paths = Paths::new(&std::env::temp_dir(), &unique_tag(kind));
+        paths.cleanup();
+
+        let outer = OuterJob::create();
+
+        let child = spawn_helper(&paths);
+        // Assign the (idling) helper into the outer job *before* releasing it, so
+        // every process it later creates nests inside the outer job too.
+        let raw = child.as_raw_handle() as HANDLE;
+        assert!(
+            outer.assign(raw),
+            "AssignProcessToJobObject(outer job, helper) failed: {} — nested Job \
+             Objects appear unsupported on this host (pre-Windows 8, or a \
+             breakaway-forbidding outer job that rejects re-nesting)",
+            std::io::Error::last_os_error()
+        );
+        // Release the helper now that it is contained, then drop our handle to it:
+        // a later OpenProcess-by-pid liveness probe must see the process gone once
+        // it dies, not kept openable by a handle we still hold.
+        std::fs::write(&paths.go, b"1").expect("write the go signal");
+        drop(child);
+
+        let ready = wait_ready(&paths, Duration::from_secs(40)).await;
+        (paths, outer, ready)
+    }
+
+    /// Wait for the helper's `ready` file (or fail loudly on its `error` file /
+    /// timeout).
+    async fn wait_ready(paths: &Paths, timeout: Duration) -> Ready {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(err) = std::fs::read_to_string(&paths.error) {
+                let err = err.trim();
+                if !err.is_empty() {
+                    panic!("nested-job helper reported a hard failure: {err}");
+                }
+            }
+            if let Ok(text) = std::fs::read_to_string(&paths.ready)
+                && let Some(ready) = Ready::parse(&text)
+            {
+                return ready;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "nested-job helper never became ready within {timeout:?} (no ready/error \
+                 file — the re-exec filter may not have matched `{HELPER_TEST}`)"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    // --- Harness tests -----------------------------------------------------
+
+    /// (a)+(b): from inside the outer job the helper establishes the crate's
+    /// containment (`mechanism == JobObject`) and a live child+grandchild, then a
+    /// `kill_all` on its own inner group reaps that child and grandchild while
+    /// leaving the helper itself — not a member of its own job — alive.
+    #[tokio::test]
+    #[ignore = "re-execs a helper inside an outer job; proves nested spawn/assign + kill_all"]
+    async fn windows_nested_job_assign_and_kill_all() {
+        let (paths, outer, ready) = setup_nested("kill").await;
+
+        // (a) The helper got past `group.start` from inside the outer job (assign
+        //     did not fail) — otherwise it would have failed loudly and `wait_ready`
+        //     would have panicked with that message instead of returning here.
+        assert!(
+            windows_pid_alive(ready.helper_pid),
+            "helper should be alive after publishing"
+        );
+        assert!(
+            windows_pid_alive(ready.child_pid),
+            "child should be alive before kill_all"
+        );
+        assert!(
+            windows_pid_alive(ready.grandchild_pid),
+            "grandchild should be alive before kill_all"
+        );
+
+        // (b) Ask the helper to `kill_all` its inner group.
+        std::fs::write(&paths.kill, b"1").expect("write the kill signal");
+        poll_until(
+            Duration::from_secs(20),
+            Duration::from_millis(100),
+            "helper never confirmed kill_all",
+            || paths.killed.exists(),
+        )
+        .await;
+
+        poll_until(
+            Duration::from_secs(15),
+            Duration::from_millis(100),
+            "child outlived kill_all — inner-job containment leaked",
+            || !windows_pid_alive(ready.child_pid),
+        )
+        .await;
+        poll_until(
+            Duration::from_secs(15),
+            Duration::from_millis(100),
+            "grandchild outlived kill_all — nested containment did not reach it",
+            || !windows_pid_alive(ready.grandchild_pid),
+        )
+        .await;
+
+        assert!(
+            windows_pid_alive(ready.helper_pid),
+            "kill_all on the inner group must not reap the helper itself (it is not a \
+             member of its own job)"
+        );
+
+        // Let the helper exit cleanly — it stayed alive to the end of the scenario.
+        std::fs::write(&paths.exit, b"1").expect("write the exit signal");
+        poll_until(
+            Duration::from_secs(15),
+            Duration::from_millis(100),
+            "helper did not exit after the exit signal",
+            || !windows_pid_alive(ready.helper_pid),
+        )
+        .await;
+
+        drop(outer); // close the outer job (cleanup; nothing left to reap)
+        paths.cleanup();
+    }
+
+    /// (c): closing the outer job's last handle must cascade `KILL_ON_JOB_CLOSE`
+    /// through the nesting and reap the helper **and** its whole subtree. The
+    /// helper does not touch its own group here — the entire tree rides on the
+    /// outer job.
+    #[tokio::test]
+    #[ignore = "re-execs a helper subtree inside an outer job; proves closing the job reaps it all"]
+    async fn windows_nested_job_outer_close_reaps_tree() {
+        let (paths, outer, ready) = setup_nested("close").await;
+
+        assert!(
+            windows_pid_alive(ready.helper_pid),
+            "helper should be alive before the close"
+        );
+        assert!(
+            windows_pid_alive(ready.child_pid),
+            "child should be alive before the close"
+        );
+        assert!(
+            windows_pid_alive(ready.grandchild_pid),
+            "grandchild should be alive before the close"
+        );
+
+        drop(outer); // close the outer job's last handle → kill-on-close cascades
+
+        poll_until(
+            Duration::from_secs(20),
+            Duration::from_millis(100),
+            "helper outlived the outer-job close — kill-on-close did not reach it through the nesting",
+            || !windows_pid_alive(ready.helper_pid),
+        )
+        .await;
+        poll_until(
+            Duration::from_secs(20),
+            Duration::from_millis(100),
+            "child outlived the outer-job close",
+            || !windows_pid_alive(ready.child_pid),
+        )
+        .await;
+        poll_until(
+            Duration::from_secs(20),
+            Duration::from_millis(100),
+            "grandchild outlived the outer-job close",
+            || !windows_pid_alive(ready.grandchild_pid),
+        )
+        .await;
+
+        // This harness process is not a member of the outer job, so it is untouched.
+        paths.cleanup();
+    }
+
+    // --- Helper (re-exec'd) ------------------------------------------------
+
+    /// The re-exec'd helper. Env-gated: unset in an ordinary suite run, so this is
+    /// then an immediate no-op pass; only the harness tests above re-exec the
+    /// binary with `PK_NESTED_JOB_HELPER` set, at which point it runs the
+    /// in-the-nesting workload.
+    #[tokio::test]
+    #[ignore = "re-exec target: runs its workload only when the harness sets PK_NESTED_JOB_HELPER"]
+    async fn job_helper_process() {
+        if std::env::var_os(HELPER_FLAG).is_none() {
+            return;
+        }
+        let dir = PathBuf::from(std::env::var(HELPER_DIR).expect("helper dir env"));
+        let tag = std::env::var(HELPER_TAG).expect("helper tag env");
+        let paths = Paths::new(&dir, &tag);
+        if let Err(msg) = run_helper(&paths).await {
+            // Publish the failure so the harness surfaces it loudly, then fail this
+            // process too (a silent degrade is exactly what this test guards against).
+            let _ = std::fs::write(&paths.error, &msg);
+            panic!("nested-job helper failed: {msg}");
+        }
+    }
+
+    async fn run_helper(paths: &Paths) -> Result<(), String> {
+        // 1. Wait until the harness has nested us into the outer job.
+        wait_for_file(
+            &paths.go,
+            Duration::from_secs(30),
+            "outer-job assignment (go signal)",
+        )
+        .await?;
+
+        // 2. Confirm the nesting premise actually holds.
+        if !current_process_in_a_job() {
+            return Err(
+                "helper is not inside any Job Object after the harness assign — \
+                        the nesting premise is unmet, so this would not test nesting"
+                    .into(),
+            );
+        }
+
+        // 3. Build the crate's ProcessGroup *inside* the outer job (a nested job).
+        let group = ProcessGroup::new()
+            .map_err(|e| format!("ProcessGroup::new failed inside the outer job: {e}"))?;
+        let mechanism = group.mechanism();
+        if mechanism != Mechanism::JobObject {
+            return Err(format!(
+                "expected the JobObject mechanism inside the nesting, got {mechanism:?} — \
+                 containment silently degraded"
+            ));
+        }
+
+        // 4. Scripts: a child that launches a detached grandchild; both record their
+        //    PID and idle ~120s (well past the harness's death-detection windows), so
+        //    kill_all / job-close always has live members to reap.
+        std::fs::write(
+            &paths.gc_ps1,
+            format!(
+                "$PID | Set-Content -Encoding ascii '{}'\nStart-Sleep -Seconds 120\n",
+                paths.gc_pidfile.display()
+            ),
+        )
+        .map_err(|e| format!("write grandchild script: {e}"))?;
+        std::fs::write(
+            &paths.parent_ps1,
+            format!(
+                "Start-Process -WindowStyle Hidden -FilePath powershell \
+                 -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'\n\
+                 Start-Sleep -Seconds 120\n",
+                paths.gc_ps1.display()
+            ),
+        )
+        .map_err(|e| format!("write parent script: {e}"))?;
+
+        // 5. (a) spawn + AssignProcessToJobObject into the INNER job must not fail —
+        //    this is the crate establishing containment from inside the outer job.
+        let run = group
+            .start(&Command::new("powershell").args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                &paths.parent_ps1.to_string_lossy(),
+            ]))
+            .await
+            .map_err(|e| {
+                format!(
+                    "group.start (spawn + AssignProcessToJobObject) failed inside the outer \
+                     job — nested containment could not be established: {e}"
+                )
+            })?;
+        let child_pid = run
+            .pid()
+            .ok_or("the child reported no pid right after spawn")?;
+
+        // 6. The grandchild publishes its PID.
+        let grandchild_pid =
+            wait_for_pid(&paths.gc_pidfile, Duration::from_secs(30), "grandchild pid").await?;
+
+        // 7. Publish everything for the harness (atomic: temp + rename, so a
+        //    concurrent read never sees a half-written file).
+        let helper_pid = std::process::id();
+        write_atomic(
+            &paths.ready,
+            format!(
+                "helper_pid={helper_pid}\nchild_pid={child_pid}\n\
+                 grandchild_pid={grandchild_pid}\nmechanism={mechanism:?}\n"
+            ),
+        )
+        .map_err(|e| format!("publish ready file: {e}"))?;
+
+        // 8. The harness's next move:
+        //    - (b) a `kill` signal → tear our own inner group down with kill_all
+        //      (reaps child+grandchild, not us — we never joined our own job), mark
+        //      it done, then idle until the harness lets us exit cleanly;
+        //    - (c) no signal → the harness closes the outer job and kill-on-close
+        //      terminates us mid-wait. The generous deadline (>> the harness's death
+        //      windows) is only a safety net so a harness bug can't strand the helper
+        //      *and* can't be mistaken for the job close having worked.
+        if wait_for_file_opt(&paths.kill, Duration::from_secs(90)).await {
+            group
+                .kill_all()
+                .map_err(|e| format!("group.kill_all failed: {e}"))?;
+            std::fs::write(&paths.killed, b"1").map_err(|e| format!("write killed marker: {e}"))?;
+            // Release the now-terminated child's handle so its pid stops being
+            // openable and the harness's OpenProcess-by-pid probe reports it dead —
+            // an open handle we still held would keep the process object (and thus
+            // its pid) alive. (The grandchild has no handle held here, so it frees
+            // on its own once reaped.)
+            drop(run);
+            wait_for_file_opt(&paths.exit, Duration::from_secs(90)).await;
+        } else {
+            // Scenario (c): held `run` alive so the inner job kept a live member
+            // right up to the outer-job close that terminates us mid-wait; this
+            // else is only the safety-net fall-through.
+            drop(run);
+        }
+
+        // `group` is intentionally held until here; it drops at end of scope. The
+        // helper never joined its own inner job, so holding it does not keep the
+        // helper's pid alive for the harness's probe.
+        drop(group);
+        Ok(())
+    }
+
+    async fn wait_for_file(path: &Path, timeout: Duration, what: &str) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if path.exists() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("{what} did not arrive within {timeout:?}"));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Like [`wait_for_file`] but returns whether the file appeared, rather than
+    /// failing — for the optional `kill`/`exit` triggers.
+    async fn wait_for_file_opt(path: &Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if path.exists() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn wait_for_pid(path: &Path, timeout: Duration, what: &str) -> Result<u32, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                return Ok(pid);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("{what} was not published within {timeout:?}"));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Write `content` to `path` atomically (temp file + rename) so a concurrent
+    /// reader never observes a partially written file.
+    fn write_atomic(path: &Path, content: String) -> std::io::Result<()> {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, content)?;
+        std::fs::rename(&tmp, path)
+    }
+}
