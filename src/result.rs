@@ -452,6 +452,25 @@ impl ProcessResult<String> {
         combine_streams(self.stdout(), self.stderr())
     }
 
+    /// The shared `probe` contract — exit `0` → `Ok(true)`, exit `1` →
+    /// `Ok(false)`, anything else → `Err` — reused by
+    /// [`ProcessRunnerExt::probe`](crate::ProcessRunnerExt::probe) and
+    /// [`Pipeline::probe`](crate::Pipeline::probe) so the classification lives in
+    /// exactly one place. Resets `ok_codes` to the default `{0}` first: `probe`
+    /// keeps its strict 0/1 contract regardless of a command's/stage's
+    /// `ok_codes`, and an *accepted* non-{0,1} code would otherwise make
+    /// `ensure_success` return `Ok` and panic the `expect_err`.
+    pub(crate) fn probe_bool(self) -> Result<bool, Error> {
+        match self.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(self
+                .with_ok_codes(vec![0])
+                .ensure_success()
+                .expect_err("a non-{0,1} exit code is never success")),
+        }
+    }
+
     /// Whether **either** captured stream contains any of `needles`, matched
     /// **case-insensitively** (ASCII). For the lenient "a specific non-zero exit
     /// is benign when a known stderr/stdout marker is present" idiom — e.g. `gh`'s
