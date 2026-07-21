@@ -162,6 +162,7 @@ than swallowing it — consistent with the "never silently skipped" philosophy; 
 | `setsid` | ❌ `Unsupported` | ✅ |
 | `create_no_window` | ✅ | no-op |
 | `kill_on_parent_death` | ✅ always on (kernel) | Linux: direct child; macOS/BSD: no-op |
+| `kill_on_parent_death_scope()` (abrupt-death reach) | `WholeTree` | Linux: `DirectChildOnly`; macOS/BSD: `Unsupported` |
 | `priority` | ✅ (priority class) | ✅ (`nice`/`setpriority`) |
 | `umask` | ❌ `Unsupported` | ✅ |
 
@@ -216,6 +217,16 @@ the cgroup/pgroup down, so grandchildren survive. The
 parent-died-before-arming race is closed by re-checking `getppid()` in the
 child against the spawner's pid captured before the fork — which stays
 correct when the spawner itself is PID 1 (a container entrypoint).
+
+**The reach of `kill_on_parent_death()` on *abrupt* owner death is reported
+honestly, not overpromised.** There is no portable Unix primitive that kills a
+whole process tree when its creator dies — only Windows Job Objects give it for
+free. So `Command::kill_on_parent_death_scope()` returns a `ParentDeathCleanup`
+capability report — `WholeTree` on Windows, `DirectChildOnly` on Linux,
+`Unsupported` on macOS/BSD — letting a wrapper (e.g. a CLI) state the *actual*
+scope instead of guaranteeing a whole-tree cleanup the kernel cannot deliver.
+This describes only the abrupt-death path (a SIGKILL of the owner, where `Drop`
+never runs); ordinary graceful teardown still kills the whole tree everywhere.
 
 **Windows: the suspended-spawn handshake.** Children are created
 `CREATE_SUSPENDED`, assigned to the job, then resumed — closing the classic

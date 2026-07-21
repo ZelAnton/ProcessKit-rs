@@ -82,6 +82,16 @@ Neither duty is something `processkit` does for you, and neither needs to be:
   reparents to PID 1, "someone" has to be PID 1 itself — and an ordinary
   process, `processkit`-managed or not, doesn't indiscriminately reap
   processes it never spawned.
+- **If *your own* process dies abruptly (SIGKILL), its `Drop` never runs**, so
+  the cgroup/pgroup teardown that normally reaps the tree does not fire. The
+  opt-in [`kill_on_parent_death()`](commands.md#privileges-and-spawn-flags)
+  hardens this case, but its reach is platform-limited and reported honestly by
+  `Command::kill_on_parent_death_scope()` — `WholeTree` on Windows,
+  `DirectChildOnly` on Linux (the direct child dies; a surviving cgroup keeps
+  grandchildren alive), `Unsupported` on macOS/BSD. There is no portable Unix
+  kernel primitive that tears a whole tree down on its creator's abrupt death;
+  when that guarantee matters, keep an outer container/cgroup (or a subreaper)
+  that owns the tree independently of your process.
 
 This is exactly the gap [Platform support's CI section](platform-support.md#ci-coverage)
 documents and works around with `--init` for the crate's *own* test suite —

@@ -12,6 +12,7 @@ use encoding_rs::Encoding;
 
 use crate::buffer::{LineTerminator, OutputBufferPolicy, StdioMode};
 use crate::error::{Error, Result};
+use crate::parent_death::ParentDeathCleanup;
 use crate::pump::StreamConfig;
 use crate::result::ProcessResult;
 use crate::retry::{RetryConfig, RetryPolicy};
@@ -511,6 +512,15 @@ impl Command {
     /// | Linux | `prctl(PR_SET_PDEATHSIG, SIGKILL)` on the **direct child only** — grandchildren are not covered (with the parent gone, nothing tears the cgroup/pgroup down). |
     /// | macOS / BSD / other | No `pdeathsig` equivalent — does nothing (the graceful-exit guarantee via `Drop` still holds). |
     ///
+    /// The reach of this hardening on the current platform is reported honestly
+    /// by [`kill_on_parent_death_scope`](Self::kill_on_parent_death_scope) as a
+    /// [`ParentDeathCleanup`] — [`WholeTree`](ParentDeathCleanup::WholeTree) on
+    /// Windows, [`DirectChildOnly`](ParentDeathCleanup::DirectChildOnly) on
+    /// Linux, [`Unsupported`](ParentDeathCleanup::Unsupported) on macOS/BSD — so
+    /// a caller can surface the real scope instead of overpromising a whole-tree
+    /// guarantee. This is best-effort hardening for **abrupt** owner death only;
+    /// ordinary graceful teardown (`Drop`) still kills the whole tree everywhere.
+    ///
     /// Two honest Linux caveats:
     /// - The death signal fires when the spawning **thread** dies, not only the
     ///   process — on a multi-threaded tokio runtime, a worker thread retired
@@ -530,6 +540,42 @@ impl Command {
     pub fn kill_on_parent_death(mut self) -> Self {
         self.kill_on_parent_death = true;
         self
+    }
+
+    /// The scope of whole-tree cleanup [`kill_on_parent_death`] actually
+    /// achieves on this build's target platform when the owner dies
+    /// **abruptly** — a [`ParentDeathCleanup`] capability report, so a caller
+    /// can state the real reach of the hardening rather than overpromising a
+    /// whole-tree guarantee the OS cannot keep.
+    ///
+    /// [`WholeTree`](ParentDeathCleanup::WholeTree) on Windows (the kernel
+    /// closes the Job Object handle on owner death and kill-on-close reaps the
+    /// whole tree), [`DirectChildOnly`](ParentDeathCleanup::DirectChildOnly) on
+    /// Linux (`PR_SET_PDEATHSIG` reaches only the direct child; grandchildren
+    /// survive), and [`Unsupported`](ParentDeathCleanup::Unsupported) on macOS /
+    /// the BSDs (no `pdeathsig` equivalent). Fixed per target at build time — it
+    /// does not depend on whether [`kill_on_parent_death`] was called or on any
+    /// runtime state — so it is an associated function, not a method on a built
+    /// command. See [`ParentDeathCleanup`] for the full contract; note it
+    /// describes only the abrupt-death path, since ordinary graceful teardown
+    /// (owner exits/panics, so `Drop` runs) kills the whole tree everywhere.
+    ///
+    /// [`kill_on_parent_death`]: Self::kill_on_parent_death
+    #[must_use]
+    pub const fn kill_on_parent_death_scope() -> ParentDeathCleanup {
+        if cfg!(windows) {
+            // Job Object kill-on-close: the kernel reaps the whole tree when the
+            // owner's last job handle closes on death.
+            ParentDeathCleanup::WholeTree
+        } else if cfg!(target_os = "linux") {
+            // PR_SET_PDEATHSIG(SIGKILL) fires on the direct child only; nothing
+            // tears the surviving cgroup/pgroup down once the owner is gone.
+            ParentDeathCleanup::DirectChildOnly
+        } else {
+            // macOS / the BSDs (and any other unix): no pdeathsig equivalent, so
+            // an abrupt owner death triggers no cleanup at all.
+            ParentDeathCleanup::Unsupported
+        }
     }
 
     /// Spawn without a console window (Windows `CREATE_NO_WINDOW`) — for a
@@ -2865,6 +2911,21 @@ mod tests {
                 .wants_kill_on_parent_death()
         );
         assert!(!Command::new("x").wants_kill_on_parent_death());
+    }
+
+    #[test]
+    fn kill_on_parent_death_scope_reports_the_platform_capability() {
+        use crate::ParentDeathCleanup;
+        // The honest per-platform capability report backing the CLI's
+        // direct_child_only/none decision — fixed at build time for this target,
+        // never overpromising a whole-tree guarantee the OS can't keep.
+        let scope = Command::kill_on_parent_death_scope();
+        #[cfg(windows)]
+        assert_eq!(scope, ParentDeathCleanup::WholeTree);
+        #[cfg(target_os = "linux")]
+        assert_eq!(scope, ParentDeathCleanup::DirectChildOnly);
+        #[cfg(all(unix, not(target_os = "linux")))]
+        assert_eq!(scope, ParentDeathCleanup::Unsupported);
     }
 
     #[test]

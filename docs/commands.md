@@ -536,7 +536,24 @@ leaves the child holding the parent's (often root's) supplementary groups.
 `kill_on_parent_death` is best-effort by design: guaranteed on Windows
 (regardless of the knob), direct-child-only on Linux, unavailable on
 macOS/BSD — the graceful-exit guarantee via `Drop` holds everywhere either
-way. Containment is preserved in every combination; the platform fine print
+way. When the owner dies *abruptly* the kernel has no portable Unix way to take
+the whole tree down, so `Command::kill_on_parent_death_scope()` reports the
+honest reach as a `ParentDeathCleanup` — `WholeTree` (Windows),
+`DirectChildOnly` (Linux), or `Unsupported` (macOS/BSD). A wrapper can surface
+that scope instead of overpromising a whole-tree cleanup:
+
+```rust,no_run
+use processkit::{Command, ParentDeathCleanup};
+
+match Command::kill_on_parent_death_scope() {
+    ParentDeathCleanup::WholeTree => { /* the whole tree dies with the owner */ }
+    ParentDeathCleanup::DirectChildOnly => { /* only the direct child; grandchildren survive */ }
+    ParentDeathCleanup::Unsupported => { /* no abrupt-death cleanup on this platform */ }
+    _ => {}
+}
+```
+
+Containment is preserved in every combination; the platform fine print
 (the Linux cgroup × `uid` interaction, `setsid` × process-group coordination,
 the pdeathsig thread caveat) is collected in
 [Platform support](platform-support.md#caveats).

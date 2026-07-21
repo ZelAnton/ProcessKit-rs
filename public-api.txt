@@ -404,6 +404,26 @@ impl core::marker::Unpin for processkit::OverflowMode
 impl core::marker::UnsafeUnpin for processkit::OverflowMode
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::OverflowMode
 impl core::panic::unwind_safe::UnwindSafe for processkit::OverflowMode
+#[non_exhaustive] pub enum processkit::ParentDeathCleanup
+pub processkit::ParentDeathCleanup::DirectChildOnly
+pub processkit::ParentDeathCleanup::Unsupported
+pub processkit::ParentDeathCleanup::WholeTree
+impl core::clone::Clone for processkit::ParentDeathCleanup
+pub fn processkit::ParentDeathCleanup::clone(&self) -> processkit::ParentDeathCleanup
+impl core::cmp::Eq for processkit::ParentDeathCleanup
+impl core::cmp::PartialEq for processkit::ParentDeathCleanup
+pub fn processkit::ParentDeathCleanup::eq(&self, &processkit::ParentDeathCleanup) -> bool
+impl core::fmt::Debug for processkit::ParentDeathCleanup
+pub fn processkit::ParentDeathCleanup::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for processkit::ParentDeathCleanup
+impl core::marker::StructuralPartialEq for processkit::ParentDeathCleanup
+impl core::marker::Freeze for processkit::ParentDeathCleanup
+impl core::marker::Send for processkit::ParentDeathCleanup
+impl core::marker::Sync for processkit::ParentDeathCleanup
+impl core::marker::Unpin for processkit::ParentDeathCleanup
+impl core::marker::UnsafeUnpin for processkit::ParentDeathCleanup
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::ParentDeathCleanup
+impl core::panic::unwind_safe::UnwindSafe for processkit::ParentDeathCleanup
 #[non_exhaustive] pub enum processkit::Priority
 pub processkit::Priority::AboveNormal
 pub processkit::Priority::BelowNormal
@@ -579,6 +599,7 @@ pub fn processkit::Command::inherit_env<I, S>(self, I) -> Self where I: core::it
 pub fn processkit::Command::inherit_stdin(self) -> Self
 pub fn processkit::Command::keep_stdin_open(self) -> Self
 pub fn processkit::Command::kill_on_parent_death(self) -> Self
+pub const fn processkit::Command::kill_on_parent_death_scope() -> processkit::ParentDeathCleanup
 pub fn processkit::Command::line_terminator(self, processkit::LineTerminator) -> Self
 pub fn processkit::Command::new(impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
 pub fn processkit::Command::no_timeout(self) -> Self
