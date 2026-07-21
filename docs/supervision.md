@@ -175,7 +175,10 @@ shape as the readiness [`wait_for`](testing.md#the-processrunner-seam) check (it
 takes no handle — it observes the child out-of-band, over a port/endpoint/file).
 The first probe fires one `interval` *after* the incarnation starts, so a booting
 child gets that long before liveness is judged; a healthy child then loops here
-untouched for its whole lifetime.
+untouched for its whole lifetime. A zero (or otherwise degenerate) `interval` is
+clamped to a small safe minimum rather than passed through as-is — it neither
+panics nor turns the probe loop into a busy-spin, and the startup-grace promise
+above still holds.
 
 When the probe fails `health_check_failures` times **in a row** (any healthy
 probe resets the streak, so a single blip is forgiven), the wedged incarnation is
