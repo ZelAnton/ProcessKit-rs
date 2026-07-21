@@ -40,6 +40,15 @@ const DEFAULT_SUPERVISION_TAIL: usize = 1000;
 /// [`health_check`](Supervisor::health_check) is enabled.
 const DEFAULT_HEALTH_FAILURES: u32 = 3;
 
+/// Floor for a [`health_check`](Supervisor::health_check) probe `interval`.
+/// `tokio::time::sleep(Duration::ZERO)` resolves immediately, so a zero (or
+/// otherwise degenerate) interval would turn `HealthCheck::watch`'s loop into a
+/// busy `sleep(0) -> probe()` hot-loop and silently void the documented
+/// startup-grace promise (first probe one `interval` after the incarnation
+/// starts). Clamp rather than make [`health_check`](Supervisor::health_check)
+/// fallible — mirrors `StatsSampler::new`'s clamp in `src/stats.rs`.
+const MIN_HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(1);
+
 /// A boxed async liveness probe: called with no arguments (like
 /// [`RunningProcess::wait_for`](crate::RunningProcess::wait_for)'s `check`) and
 /// resolving to `true` when the child is healthy. Boxed — probe *and* its future
@@ -70,6 +79,10 @@ impl HealthCheck {
     /// service then loops here for its whole lifetime and this future never
     /// resolves. A slow probe stretches the effective cadence (the period is
     /// `interval` *plus* the probe's own runtime) rather than overlapping checks.
+    /// `self.interval` is already clamped to a safe minimum by the
+    /// [`health_check`](Supervisor::health_check) builder, so this loop never
+    /// degenerates into a `sleep(0)` busy-spin even for a caller-supplied zero
+    /// interval.
     async fn watch(&self, failures_before_unhealthy: u32) {
         // A zero threshold would never trip (`consecutive >= 0` can't be the
         // *strict* streak we want); clamp to "one failed probe kills".
@@ -565,7 +578,9 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// [`RunningProcess::wait_for`](crate::RunningProcess::wait_for)'s readiness
     /// check (it takes no handle, so it observes the child out-of-band). The
     /// first probe fires one `interval` after the incarnation starts (startup
-    /// grace); a healthy child is then never disturbed.
+    /// grace); a healthy child is then never disturbed. A zero (or otherwise
+    /// degenerate) `interval` is clamped to a small safe minimum rather than
+    /// causing a busy-spin loop or dropping the startup grace.
     ///
     /// A failed liveness check is treated **exactly like a crash**: the wedged
     /// incarnation is dropped (killed on drop under the default [`JobRunner`] —
@@ -611,7 +626,12 @@ impl<R: ProcessRunner> Supervisor<R> {
     {
         self.health_check = Some(HealthCheck {
             probe: Box::new(move || Box::pin(probe())),
-            interval,
+            // A degenerate (e.g. zero) interval is clamped to a safe minimum
+            // rather than passed through as-is, so `watch`'s loop can't
+            // degenerate into a busy-spin and the startup-grace promise below
+            // stays true even for a zero `interval` (see the clamp constant's
+            // doc comment for the full rationale).
+            interval: interval.max(MIN_HEALTH_CHECK_INTERVAL),
         });
         self
     }
@@ -2143,6 +2163,74 @@ mod tests {
         let start = tokio::time::Instant::now();
         hc.watch(0).await; // 0 is meaningless — treated as "one failed probe kills".
         assert_eq!(start.elapsed(), Duration::from_millis(100));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_check_clamps_a_zero_interval_to_the_safe_minimum() {
+        let supervisor =
+            Supervisor::new(Command::new("server")).health_check(|| async { true }, Duration::ZERO);
+        let interval = supervisor
+            .health_check
+            .as_ref()
+            .expect("health check set")
+            .interval;
+        assert_eq!(
+            interval, MIN_HEALTH_CHECK_INTERVAL,
+            "a zero interval must be clamped, not passed through as-is \
+             (mirrors StatsSampler::new's clamp in src/stats.rs)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_watch_zero_interval_does_not_busy_loop() {
+        // A zero interval clamped to `MIN_HEALTH_CHECK_INTERVAL` costs exactly
+        // that much virtual time *per probe*; an unclamped zero interval would
+        // instead let the whole loop resolve in zero virtual time (the busy-spin
+        // hazard this test guards against).
+        let calls = AtomicU32::new(0);
+        let hc = Supervisor::new(Command::new("server"))
+            .health_check(
+                move || {
+                    // Healthy for the first 4 probes, unhealthy on the 5th.
+                    let healthy = calls.fetch_add(1, Ordering::SeqCst) < 4;
+                    async move { healthy }
+                },
+                Duration::ZERO,
+            )
+            .health_check
+            .expect("health check set");
+        let start = tokio::time::Instant::now();
+        hc.watch(1).await; // threshold 1: the first failed probe trips it.
+        assert_eq!(
+            start.elapsed(),
+            MIN_HEALTH_CHECK_INTERVAL * 5,
+            "5 clamped-interval sleeps (4 healthy + 1 failing probe), not an \
+             instant busy-spin"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_kill_with_a_zero_interval_still_grants_startup_grace() {
+        // A zero interval is clamped rather than voiding the documented
+        // startup-grace promise: the wedged child is force-killed only after the
+        // clamped interval elapses, never instantly.
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let start = tokio::time::Instant::now();
+        let outcome = Supervisor::new(Command::new("server"))
+            .with_runner(runner)
+            .restart(RestartPolicy::Never)
+            .health_check(|| async { false }, Duration::ZERO)
+            .health_check_failures(1)
+            .run()
+            .await
+            .expect("supervision");
+        assert_eq!(outcome.liveness_kills, 1);
+        assert_eq!(
+            start.elapsed(),
+            MIN_HEALTH_CHECK_INTERVAL,
+            "the first probe must fire one (clamped) interval after the \
+             incarnation starts, not instantly"
+        );
     }
 
     #[tokio::test(start_paused = true)]
