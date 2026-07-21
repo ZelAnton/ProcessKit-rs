@@ -8,7 +8,7 @@ like wasm. Building for such a target fails at compile time (a `compile_error!`
 guard, or earlier in tokio's own dependencies). Within the supported set, it
 treats platform support as first-class: every capability is either fully
 implemented, *honestly partial* (documented and typed), or refused with
-`Error::Unsupported` — never silently skipped. This page collects all the
+`ErrorKind::Unsupported` — never silently skipped. This page collects all the
 matrices and fine print in one place.
 
 - [CI coverage](#ci-coverage)
@@ -81,7 +81,7 @@ session/scope/service. The crate does not migrate your process into a sub-cgroup
 to work around it, so in practice limits apply only at a minimal non-systemd init
 sitting at the real root. Without a usable cgroup it quietly falls back to `ProcessGroup` —
 unless you requested [resource limits](#capability-matrices), which fail fast
-instead (`Error::ResourceLimit`), because an unapplied cap is no protection. The
+instead (`ErrorKind::ResourceLimit`), because an unapplied cap is no protection. The
 error's `reason` distinguishes the two ways this happens: `LimitReason::Unsupported`
 when no cgroup v2 is mounted at all (or on macOS/BSD, which has no whole-tree
 container of any kind), `LimitReason::Unenforceable` when cgroup v2 exists but this
@@ -205,7 +205,7 @@ surfaces as `Exited(-1073741510)` (`STATUS_CONTROL_C_EXIT` as a signed `i32`).
 The crate reports the platform truth rather than fabricating a `Signalled` from
 an NTSTATUS code (that mapping would be a lossy guess). When you need to *know*
 the run was killed, use a `ProcessGroup` deadline or a cancellation token (which
-surface as `TimedOut` / `Error::Cancelled` on every platform). `Outcome::Signalled`
+surface as `TimedOut` / `ErrorKind::Cancelled` on every platform). `Outcome::Signalled`
 is therefore Unix-only.
 
 **Linux cgroup delegation.** Creating the per-group cgroup needs write access

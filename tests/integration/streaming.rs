@@ -334,10 +334,11 @@ async fn second_stdout_lines_call_is_a_loud_error() {
     // not a silently-empty stream.
     let err = process
         .stdout_lines()
-        .expect_err("a second stdout_lines must be a loud error");
+        .expect_err("a second stdout_lines must be a loud error")
+        .into_kind();
     assert!(
-        matches!(err, processkit::Error::Io(_)),
-        "expected Error::Io, got {err:?}"
+        matches!(err, processkit::ErrorKind::Io(_)),
+        "expected ErrorKind::Io, got {err:?}"
     );
 
     let _ = process.finish().await;

@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use processkit::Command;
+use processkit::{Command, ErrorKind};
 
 use crate::common::*;
 
@@ -53,7 +53,7 @@ async fn working_directory_that_is_a_file_errors_as_not_a_directory() {
 #[tokio::test]
 #[ignore = "exercises the real spawn path (creates a process group)"]
 async fn missing_program_surfaces_not_found_with_searched_path() {
-    // A bare program name that isn't on PATH must produce Error::NotFound
+    // A bare program name that isn't on PATH must produce ErrorKind::NotFound
     // with a message that names the searched directories — not the opaque
     // OS ENOENT that would otherwise be indistinguishable from a missing cwd.
     let err = Command::new("processkit-definitely-not-installed-424242")
@@ -61,8 +61,8 @@ async fn missing_program_surfaces_not_found_with_searched_path() {
         .await
         .expect_err("an unknown program must error");
     assert!(
-        matches!(err, processkit::Error::NotFound { .. }),
-        "expected Error::NotFound, got {err:?}"
+        matches!(err.kind(), ErrorKind::NotFound { .. }),
+        "expected ErrorKind::NotFound, got {err:?}"
     );
     assert!(err.is_not_found(), "is_not_found() must be true: {err:?}");
     let msg = err.to_string();
@@ -181,17 +181,17 @@ async fn lowercase_path_env_keeps_the_not_found_searched_path() {
         .await
         .expect_err("an unknown program must error");
 
-    match err {
-        processkit::Error::NotFound { searched, .. } => assert_eq!(
-            searched,
-            Some(system_path),
+    match err.kind() {
+        processkit::ErrorKind::NotFound { searched, .. } => assert_eq!(
+            searched.as_ref(),
+            Some(&system_path),
             "lowercase `path` must not replace the process PATH on Unix"
         ),
-        other => panic!("expected Error::NotFound, got {other:?}"),
+        other => panic!("expected ErrorKind::NotFound, got {other:?}"),
     }
 }
 
-// T-054: when resolution fails everywhere, `Error::NotFound`'s `searched`
+// T-054: when resolution fails everywhere, `ErrorKind::NotFound`'s `searched`
 // diagnostic must include the `prefer_local` directories too — not just PATH
 // — so the caller can tell they were checked.
 #[tokio::test]
@@ -203,22 +203,23 @@ async fn missing_program_not_found_searched_includes_prefer_local_dirs() {
         .prefer_local(dir.path())
         .output_string()
         .await
-        .expect_err("an unknown program must error");
+        .expect_err("an unknown program must error")
+        .into_kind();
     match err {
-        processkit::Error::NotFound { searched, .. } => {
+        processkit::ErrorKind::NotFound { searched, .. } => {
             let searched = searched.expect("a bare-name lookup must report searched dirs");
             assert!(
                 searched.contains(&dir.path().to_string_lossy().into_owned()),
                 "searched must include the prefer_local directory: {searched}"
             );
         }
-        other => panic!("expected Error::NotFound, got {other:?}"),
+        other => panic!("expected ErrorKind::NotFound, got {other:?}"),
     }
 }
 
 // R-01 (secondary observation): `prefer_local` resolution is parent-side
 // (plain filesystem probes under caller-named directories) and independent
-// of the child's own environment, so `Error::NotFound`'s `searched` must
+// of the child's own environment, so `ErrorKind::NotFound`'s `searched` must
 // still name the `prefer_local` directories even when the command also
 // customizes the child's `PATH` (here via `inherit_env`, which clears the
 // inherited set) — only the process-`PATH` portion of the diagnostic is
@@ -235,9 +236,10 @@ async fn missing_program_not_found_searched_includes_prefer_local_dirs_even_with
         .inherit_env(["HOME"]) // customizes_path(): true
         .output_string()
         .await
-        .expect_err("an unknown program must error");
+        .expect_err("an unknown program must error")
+        .into_kind();
     match err {
-        processkit::Error::NotFound { searched, .. } => {
+        processkit::ErrorKind::NotFound { searched, .. } => {
             let searched = searched.expect(
                 "a prefer_local directory was probed even though PATH itself is customized",
             );
@@ -248,7 +250,7 @@ async fn missing_program_not_found_searched_includes_prefer_local_dirs_even_with
                  entries, since those don't apply to the customized child env"
             );
         }
-        other => panic!("expected Error::NotFound, got {other:?}"),
+        other => panic!("expected ErrorKind::NotFound, got {other:?}"),
     }
 }
 
@@ -264,7 +266,7 @@ async fn missing_program_not_found_searched_includes_prefer_local_dirs_even_with
 async fn preflight_resolution_agrees_with_the_actual_spawn() {
     // Whether a real spawn LOCATED the program: `Ok`, or any error that isn't
     // `NotFound` (e.g. a non-zero exit), means the launch found and ran it;
-    // only `Error::NotFound` means it couldn't be located.
+    // only `ErrorKind::NotFound` means it couldn't be located.
     async fn spawn_located(cmd: Command) -> bool {
         match cmd.output_string().await {
             Ok(_) => true,
@@ -375,7 +377,7 @@ async fn preflight_resolution_agrees_with_the_actual_spawn() {
 // PATHEXT model finds the `.cmd`), and — now that `build_tokio` substitutes the
 // resolved absolute path for such a match — the ACTUAL spawn succeeds too,
 // instead of failing (before the fix the OS's bare-name search appended only
-// `.exe`, missed the `.cmd`, and the launch raised `Error::Spawn`). A plain
+// `.exe`, missed the `.cmd`, and the launch raised `ErrorKind::Spawn`). A plain
 // `spawn_located` check wouldn't prove the fix — the pre-fix failure was a
 // non-`NotFound` `Spawn` error, which `spawn_located` counts as "located" — so
 // this asserts a genuinely successful run.
@@ -418,7 +420,7 @@ async fn preflight_and_spawn_agree_on_a_non_exe_pathext_program_on_path() {
     );
 
     // (b) The ACTUAL launch now spawns it successfully — not the pre-fix
-    // `Error::Spawn` from the OS's `.exe`-only bare-name search missing the
+    // `ErrorKind::Spawn` from the OS's `.exe`-only bare-name search missing the
     // `.cmd`. `.expect(...)` here is the load-bearing assertion: it fails on the
     // pre-fix behavior and passes only once the resolved absolute path is
     // substituted at spawn.
@@ -487,8 +489,8 @@ async fn stdout_null_makes_capture_verbs_error_but_discard_verbs_run() {
         .output_string()
         .await
         .expect_err("output_string on a non-piped stdout must error (D5)");
-    match err {
-        processkit::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+    match err.kind() {
+        processkit::ErrorKind::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
         other => panic!("expected Io(InvalidInput), got {other:?}"),
     }
 
@@ -584,8 +586,8 @@ async fn file_redirect_rejects_capture_and_streaming_verbs() {
         .output_string()
         .await
         .expect_err("a file is not a capture pipe");
-    match err {
-        processkit::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+    match err.kind() {
+        processkit::ErrorKind::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
         other => panic!("expected Io(InvalidInput), got {other:?}"),
     }
 
@@ -757,7 +759,6 @@ async fn untaken_keep_stdin_open_pipe_is_closed_by_bulk_verbs() {
 #[tokio::test]
 #[ignore = "spawns a real subprocess fed a failing stdin source"]
 async fn failing_stdin_source_surfaces_as_error_stdin_on_a_successful_run() {
-    use processkit::Error;
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
@@ -781,19 +782,21 @@ async fn failing_stdin_source_surfaces_as_error_stdin_on_a_successful_run() {
     };
     // B3 (Decision 2): the child sees EOF (the sink is dropped on the writer's
     // error) and exits 0 — a success — so the stashed non-broken-pipe stdin
-    // failure now surfaces as `Error::Stdin` instead of being swallowed.
+    // failure now surfaces as `ErrorKind::Stdin` instead of being swallowed.
     let err = reads_stdin
         .stdin(processkit::Stdin::from_reader(FailingReader))
         .output_string()
         .await
-        .expect_err("a failed stdin writer on a successful run must surface as Error::Stdin");
-    assert!(matches!(err, Error::Stdin { .. }), "got: {err:?}");
+        .expect_err("a failed stdin writer on a successful run must surface as ErrorKind::Stdin");
+    assert!(
+        matches!(err.kind(), ErrorKind::Stdin { .. }),
+        "got: {err:?}"
+    );
 }
 
 #[tokio::test]
 #[ignore = "spawns a real subprocess fed a panicking stdin source"]
 async fn panicking_stdin_source_surfaces_as_error_stdin_not_silent_success() {
-    use processkit::Error;
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
@@ -815,14 +818,15 @@ async fn panicking_stdin_source_surfaces_as_error_stdin_not_silent_success() {
         Command::new("cat")
     };
     // L1: the writer task panics; its `JoinError` must be surfaced as
-    // `Error::Stdin` on an otherwise-successful run, not swallowed into a clean
+    // `ErrorKind::Stdin` on an otherwise-successful run, not swallowed into a clean
     // success (a panicking source is a real failure the caller must see).
     let err = reads_stdin
         .stdin(processkit::Stdin::from_reader(PanickingReader))
         .output_string()
         .await
-        .expect_err("a panicking stdin writer on a successful run must surface as Error::Stdin");
-    assert!(matches!(err, Error::Stdin { .. }), "got: {err:?}");
+        .expect_err("a panicking stdin writer on a successful run must surface as ErrorKind::Stdin")
+        .into_kind();
+    assert!(matches!(err, ErrorKind::Stdin { .. }), "got: {err:?}");
 }
 
 #[tokio::test]
@@ -858,7 +862,7 @@ async fn nonzero_exit_wins_over_a_failing_stdin_source() {
     };
     // B3 (Decision 2): exit 1 is outside `ok_codes`, so the run is NOT a success
     // — the stdin failure is dropped, not surfaced. `output_string` returns the
-    // result carrying the real exit code rather than `Err(Error::Stdin)`.
+    // result carrying the real exit code rather than `Err(ErrorKind::Stdin)`.
     let result = nonzero
         .stdin(processkit::Stdin::from_reader(OneLineThenFail(false)))
         .output_string()
@@ -875,7 +879,6 @@ async fn nonzero_exit_wins_over_a_failing_stdin_source() {
 #[tokio::test]
 #[ignore = "spawns a real subprocess whose stdin source fails during pump teardown"]
 async fn stdin_source_failing_during_pump_teardown_still_surfaces_as_error_stdin() {
-    use processkit::Error;
     use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -912,7 +915,7 @@ async fn stdin_source_failing_during_pump_teardown_still_surfaces_as_error_stdin
 
     // `echo` prints a line and exits 0 *without* consuming stdin, so the run
     // succeeds while the parked writer is still in flight — a child success plus
-    // a swallowed stdin failure is precisely the `Error::Stdin` case. Its stdout
+    // a swallowed stdin failure is precisely the `ErrorKind::Stdin` case. Its stdout
     // line gives the pumps something to drain during teardown.
     let outputs_and_exits = if cfg!(windows) {
         Command::new("cmd").args(["/c", "echo hello"])
@@ -931,9 +934,10 @@ async fn stdin_source_failing_during_pump_teardown_still_surfaces_as_error_stdin
         .await
         .expect_err(
             "a stdin writer that fails during the join_pumps window must still surface as \
-             Error::Stdin, not a silent success",
-        );
-    assert!(matches!(err, Error::Stdin { .. }), "got: {err:?}");
+             ErrorKind::Stdin, not a silent success",
+        )
+        .into_kind();
+    assert!(matches!(err, ErrorKind::Stdin { .. }), "got: {err:?}");
 }
 
 #[tokio::test]
@@ -1011,16 +1015,17 @@ async fn timeout_kills_and_flags() {
 #[tokio::test]
 #[ignore = "spawns a real subprocess and waits for the timeout"]
 async fn exit_code_surfaces_timeout_as_error() {
-    // `Command::exit_code` must report a timeout as `Error::Timeout`, not the
+    // `Command::exit_code` must report a timeout as `ErrorKind::Timeout`, not the
     // synthetic `-1` — consistent with the runner/CliClient code paths.
     let err = sleeper()
         .timeout(Duration::from_millis(300))
         .exit_code()
         .await
-        .expect_err("a timed-out run has no meaningful exit code");
+        .expect_err("a timed-out run has no meaningful exit code")
+        .into_kind();
     assert!(
-        matches!(err, processkit::Error::Timeout { .. }),
-        "expected Error::Timeout, got {err:?}"
+        matches!(err, processkit::ErrorKind::Timeout { .. }),
+        "expected ErrorKind::Timeout, got {err:?}"
     );
 }
 
@@ -1029,7 +1034,7 @@ async fn exit_code_surfaces_timeout_as_error() {
 async fn first_line_honors_timeout_instead_of_hanging() {
     // A long-running command that emits NO stdout: without a timeout `first_line`
     // would block forever waiting for a line. With a deadline it must give up and
-    // surface `Error::Timeout` promptly — never hang.
+    // surface `ErrorKind::Timeout` promptly — never hang.
     let silent = if cfg!(windows) {
         Command::new("powershell").args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
     } else {
@@ -1040,10 +1045,11 @@ async fn first_line_honors_timeout_instead_of_hanging() {
         .timeout(Duration::from_millis(300))
         .first_line(|_| true)
         .await
-        .expect_err("a stalled run should time out, not return Ok(None)");
+        .expect_err("a stalled run should time out, not return Ok(None)")
+        .into_kind();
     assert!(
-        matches!(err, processkit::Error::Timeout { .. }),
-        "expected Error::Timeout, got {err:?}"
+        matches!(err, processkit::ErrorKind::Timeout { .. }),
+        "expected ErrorKind::Timeout, got {err:?}"
     );
     // Generous anti-hang bound (the sleeper runs ~30s if the timeout is
     // broken): under full-suite load PowerShell's cold start alone has been
@@ -1062,7 +1068,7 @@ async fn shared_group_first_line_honors_timeout_and_tears_down() {
     use processkit::{ProcessGroup, ProcessRunnerExt};
 
     // A2: a first_line probe on a SHARED group must honor the command timeout —
-    // surface Error::Timeout AND tear the child down (the shared-group deadline
+    // surface ErrorKind::Timeout AND tear the child down (the shared-group deadline
     // watchdog now reaches the direct child by pid). A single-process idle emits
     // no matching line and outlives the deadline.
     let group = ProcessGroup::new().expect("group");
@@ -1080,10 +1086,11 @@ async fn shared_group_first_line_honors_timeout_and_tears_down() {
         group.first_line(&silent, |_| false),
     )
     .await
-    .expect_err("a stalled shared-group probe must time out, not hang or return Ok(None)");
+    .expect_err("a stalled shared-group probe must time out, not hang or return Ok(None)")
+    .into_kind();
     assert!(
-        matches!(err, processkit::Error::Timeout { .. }),
-        "expected Error::Timeout, got {err:?}"
+        matches!(err, processkit::ErrorKind::Timeout { .. }),
+        "expected ErrorKind::Timeout, got {err:?}"
     );
     assert!(
         start.elapsed() < Duration::from_secs(15),
@@ -1199,7 +1206,7 @@ async fn ok_codes_widens_success_through_output_string_and_bytes() {
 #[ignore = "spawns a real subprocess that overflows a fail-loud buffer"]
 async fn fail_loud_buffer_surfaces_output_too_large() {
     // A child that prints more lines than a fail-loud ceiling must surface
-    // Error::OutputTooLarge through the real spawn+pump path — the fail-loud
+    // ErrorKind::OutputTooLarge through the real spawn+pump path — the fail-loud
     // DoS guard, end-to-end. `five_lines` prints 5 lines; the cap is 2, so the
     // run errors even though the child exited 0. (The pipe is still drained, so
     // the child never blocks.)
@@ -1209,20 +1216,20 @@ async fn fail_loud_buffer_surfaces_output_too_large() {
         .output_string()
         .await
         .expect_err("5 lines over a 2-line fail-loud cap must error");
-    match err {
-        processkit::Error::OutputTooLarge {
+    match err.kind() {
+        processkit::ErrorKind::OutputTooLarge {
             max_lines,
             total_lines,
             ..
         } => {
             assert_eq!(
-                max_lines,
+                *max_lines,
                 Some(2),
                 "the configured line cap is reported: {err:?}"
             );
-            assert!(total_lines >= 5, "every line is counted: {total_lines}");
+            assert!(*total_lines >= 5, "every line is counted: {total_lines}");
         }
-        other => panic!("expected Error::OutputTooLarge, got {other:?}"),
+        other => panic!("expected ErrorKind::OutputTooLarge, got {other:?}"),
     }
 
     // A run that stays under the cap must NOT error (control case).
@@ -1254,9 +1261,10 @@ async fn output_bytes_honors_the_byte_cap() {
         )
         .output_bytes()
         .await
-        .expect_err("raw stdout over a 4-byte fail-loud cap must error");
+        .expect_err("raw stdout over a 4-byte fail-loud cap must error")
+        .into_kind();
     match err {
-        processkit::Error::OutputTooLarge {
+        processkit::ErrorKind::OutputTooLarge {
             max_bytes,
             max_lines,
             total_bytes,
@@ -1272,7 +1280,7 @@ async fn output_bytes_honors_the_byte_cap() {
                 "every byte seen is counted: {total_bytes}"
             );
         }
-        other => panic!("expected Error::OutputTooLarge, got {other:?}"),
+        other => panic!("expected ErrorKind::OutputTooLarge, got {other:?}"),
     }
 
     // Drop mode (the policy default overflow): the retained bytes are bounded
@@ -1322,11 +1330,12 @@ async fn checking_verbs_reject_truncated_output_e2e() {
         .output_buffer(OutputBufferPolicy::bounded(2))
         .run()
         .await
-        .expect_err("run must reject truncated stdout (B12)");
+        .expect_err("run must reject truncated stdout (B12)")
+        .into_kind();
     assert!(
         matches!(
             err,
-            processkit::Error::OutputTooLarge {
+            processkit::ErrorKind::OutputTooLarge {
                 max_lines: Some(2),
                 ..
             }

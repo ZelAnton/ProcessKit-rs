@@ -22,7 +22,7 @@ use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 
 use super::RunningProcess;
 
@@ -37,7 +37,7 @@ const CONNECT_ATTEMPT_CAP: Duration = Duration::from_secs(1);
 
 impl RunningProcess {
     /// Wait until a stdout line matches `predicate` (returning that line), or
-    /// fail with [`Error::NotReady`] when `within` elapses — or immediately
+    /// fail with [`ErrorKind::NotReady`] when `within` elapses — or immediately
     /// when stdout closes before a match (e.g. the child exited and no
     /// descendant kept the pipe open), since no further line can arrive. A
     /// child that exits while a descendant still holds its stdout keeps the
@@ -68,11 +68,11 @@ impl RunningProcess {
     ///
     /// # Errors
     ///
-    /// - [`Error::NotReady`] when `within` elapses with no matching line, or
+    /// - [`ErrorKind::NotReady`] when `within` elapses with no matching line, or
     ///   immediately when stdout closes first (no further line can arrive). This
-    ///   is a *probe* deadline — distinct from [`Error::Timeout`], and a failed
+    ///   is a *probe* deadline — distinct from [`ErrorKind::Timeout`], and a failed
     ///   probe neither kills the child nor flips its outcome to `TimedOut`.
-    /// - [`Error::Io`] when stdout was not piped, or a prior streaming verb
+    /// - [`ErrorKind::Io`] when stdout was not piped, or a prior streaming verb
     ///   already consumed it (so no line stream can be drained).
     pub async fn wait_for_line(
         &mut self,
@@ -102,7 +102,7 @@ impl RunningProcess {
     }
 
     /// Wait until `check` (re-invoked every ~50 ms, first attempt immediate)
-    /// returns `true`, or fail with [`Error::NotReady`] when `within` elapses —
+    /// returns `true`, or fail with [`ErrorKind::NotReady`] when `within` elapses —
     /// or immediately when the child exits first (a dead process never becomes
     /// ready).
     ///
@@ -137,9 +137,9 @@ impl RunningProcess {
     ///
     /// # Errors
     ///
-    /// [`Error::NotReady`] when `within` elapses before `check` returns `true`,
+    /// [`ErrorKind::NotReady`] when `within` elapses before `check` returns `true`,
     /// or immediately when the child exits first (a dead process never becomes
-    /// ready). This is a *probe* deadline — distinct from [`Error::Timeout`]: a
+    /// ready). This is a *probe* deadline — distinct from [`ErrorKind::Timeout`]: a
     /// failed probe does not kill the child or touch its outcome.
     pub async fn wait_for<F, Fut>(&mut self, check: F, within: Duration) -> Result<()>
     where
@@ -150,7 +150,7 @@ impl RunningProcess {
     }
 
     /// Wait until a TCP connection to `addr` is accepted, or fail with
-    /// [`Error::NotReady`] when `within` elapses — or immediately when the
+    /// [`ErrorKind::NotReady`] when `within` elapses — or immediately when the
     /// child exits first.
     ///
     /// One connect attempt per ~50 ms tick (each attempt itself bounded so a
@@ -163,9 +163,9 @@ impl RunningProcess {
     ///
     /// # Errors
     ///
-    /// [`Error::NotReady`] when `within` elapses before a connection to `addr` is
+    /// [`ErrorKind::NotReady`] when `within` elapses before a connection to `addr` is
     /// accepted, or immediately when the child exits first. This is a *probe*
-    /// deadline — distinct from [`Error::Timeout`]: a failed probe does not kill
+    /// deadline — distinct from [`ErrorKind::Timeout`]: a failed probe does not kill
     /// the child or touch its outcome.
     pub async fn wait_for_port(&mut self, addr: SocketAddr, within: Duration) -> Result<()> {
         // Clamp so a `Duration::MAX`-ish `within` can't overflow the deadline.
@@ -298,10 +298,11 @@ impl RunningProcess {
     }
 
     fn not_ready(&self, within: Duration) -> Error {
-        Error::NotReady {
+        ErrorKind::NotReady {
             program: self.program.clone(),
             timeout: within,
         }
+        .into()
     }
 }
 

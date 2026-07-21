@@ -207,8 +207,8 @@ fn windows_signal_non_kill_is_unsupported() {
             .signal(sig)
             .expect_err("a non-Kill signal with no soft-close target must be rejected on Windows");
         assert!(
-            matches!(err, processkit::Error::Unsupported { .. }),
-            "expected Error::Unsupported for {sig:?}, got {err:?}"
+            matches!(err, processkit::ErrorKind::Unsupported { .. }),
+            "expected ErrorKind::Unsupported for {sig:?}, got {err:?}"
         );
     }
 }
@@ -413,9 +413,10 @@ async fn adopt_of_a_reaped_child_errors_instead_of_tracking_nothing() {
     // rather than silently tracking nothing.
     let err = group
         .adopt(&child)
-        .expect_err("adopting a reaped child must error");
+        .expect_err("adopting a reaped child must error")
+        .into_kind();
     assert!(
-        matches!(err, processkit::Error::Io(_)),
+        matches!(err, processkit::ErrorKind::Io(_)),
         "expected the no-pid Io error, got {err:?}"
     );
 }
@@ -474,9 +475,10 @@ async fn empty_group_accepts_lifecycle_calls() {
         // signal to fall back on.
         let err = group
             .signal(Signal::Term)
-            .expect_err("Term on an empty Windows group has no soft-close target");
+            .expect_err("Term on an empty Windows group has no soft-close target")
+            .into_kind();
         assert!(
-            matches!(err, processkit::Error::Unsupported { .. }),
+            matches!(err, processkit::ErrorKind::Unsupported { .. }),
             "expected Unsupported, got {err:?}"
         );
     } else {

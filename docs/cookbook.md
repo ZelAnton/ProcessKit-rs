@@ -132,7 +132,7 @@ async fn main() -> processkit::Result<()> {
 
 At the deadline the whole tree is killed. On the capture verbs the timeout is
 *captured* (`timed_out()`, partial output kept); on the success-checking verbs
-(`run`, `exit_code`) it surfaces as `Error::Timeout`.
+(`run`, `exit_code`) it surfaces as `ErrorKind::Timeout`.
 
 ## Let a tool clean up on timeout
 
@@ -204,7 +204,7 @@ fn main() {
 friendly up-front error. Resolution reuses the crate's own launch-path logic
 (the same PATH/PATHEXT/execute-bit and `prefer_local` handling a real run uses),
 so a hit is exactly what would be launched and a miss is exactly the
-`Error::NotFound` (`is_not_found()`) a run would raise. It is synchronous — no
+`ErrorKind::NotFound` (`is_not_found()`) a run would raise. It is synchronous — no
 tokio runtime needed. A wrapped tool's client offers the same via
 `CliClient::resolve_program()`.
 
@@ -233,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 One-shot sources (`from_reader`/`from_lines`) feed a single run; re-running the
-same `Command` afterwards **fails loud** (an `Error::Io` at launch, D10) instead
+same `Command` afterwards **fails loud** (an `ErrorKind::Io` at launch, D10) instead
 of silently seeing empty stdin. For a conversation, see the next recipe but one.
 
 *Fine print: [Running commands → standard input](commands.md).*
@@ -289,7 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 `keep_stdin_open()` hands you an async writer instead of closing stdin at
 spawn; interleave writes with reads for request/response tools. Its writer
 methods return `std::io::Result` (idiomatic for a writer) — convert with
-`.map_err(processkit::Error::Io)?` in a `processkit::Result` function, or use
+`.map_err(processkit::ErrorKind::Io)?` in a `processkit::Result` function, or use
 `Box<dyn std::error::Error>`.
 
 *Fine print: [Streaming & interactive I/O → interactive stdin](streaming.md).*
@@ -357,7 +357,7 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-A probe that can't succeed fails fast with `Error::NotReady` and never kills
+A probe that can't succeed fails fast with `ErrorKind::NotReady` and never kills
 the child — you decide what happens next. No more `sleep(2)` and hoping.
 
 *Fine print: [Streaming & interactive I/O → readiness probes](streaming.md).*
@@ -436,7 +436,7 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-Unenforceable limits are a hard `Error::ResourceLimit`, never a silently
+Unenforceable limits are a hard `ErrorKind::ResourceLimit`, never a silently
 unbounded group. On Unix, add `.uid(…)`/`.gid(…)` to drop privileges (note the
 cgroup-mechanism caveat in the guide).
 
@@ -480,7 +480,7 @@ being the same case.
 
 ```rust,no_run
 use processkit::Command;
-use processkit::Error;
+use processkit::ErrorKind;
 use std::time::Duration;
 
 #[tokio::main]
@@ -489,7 +489,7 @@ async fn main() -> processkit::Result<()> {
         .args(["fetch", "--quiet"])
         .timeout(Duration::from_secs(10))
         .retry(3, Duration::from_millis(200), |e| {
-            matches!(e, Error::Timeout { .. })
+            matches!(e.kind(), ErrorKind::Timeout { .. })
                 || e.diagnostic().is_some_and(|m| m.contains("Could not resolve host"))
         })
         .run()
@@ -520,8 +520,8 @@ async fn main() -> processkit::Result<()> {
     });
 
     // On Ctrl-C / shutdown signal / sibling failure:
-    token.cancel(); // kills the tree; the run resolves to Error::Cancelled
-    let outcome = job.await; // Err(Error::Cancelled { .. }) inside
+    token.cancel(); // kills the tree; the run resolves to ErrorKind::Cancelled
+    let outcome = job.await; // Err(ErrorKind::Cancelled { .. }) inside
     Ok(())
 }
 ```
@@ -569,7 +569,7 @@ cgroup); elsewhere you still get process counts.
 ## Contain a process you didn't spawn
 
 ```rust,no_run
-use processkit::{Error, ProcessGroup};
+use processkit::{ErrorKind, ProcessGroup};
 
 fn main() -> processkit::Result<()> {
     // `tokio`/`std` calls return `io::Error`, which the crate does NOT auto-convert
@@ -578,7 +578,7 @@ fn main() -> processkit::Result<()> {
     // your own code so both error types `?` freely.
     let child = tokio::process::Command::new("legacy-launcher")
         .spawn()
-        .map_err(Error::Io)?;
+        .map_err(ErrorKind::Io)?;
 
     let group = ProcessGroup::new()?; // `adopt` is part of `process-control` (default-on)
     group.adopt(&child)?;            // from now on the group's teardown covers it

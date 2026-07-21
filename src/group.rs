@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio::process::{Child, Command};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 #[cfg(feature = "limits")]
 use crate::limits::{LimitKind, LimitReason, ResourceLimits};
 use crate::mechanism::Mechanism;
@@ -138,7 +138,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the OS rejects creating the group's containment primitive
+    /// [`ErrorKind::Io`] if the OS rejects creating the group's containment primitive
     /// (a Job Object on Windows, a cgroup on Linux). The default options set no
     /// resource caps, so no limit-enforcement failure can arise.
     pub fn new() -> Result<Self> {
@@ -149,7 +149,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the OS rejects creating the group's containment primitive.
+    /// [`ErrorKind::Io`] if the OS rejects creating the group's containment primitive.
     #[cfg_attr(
         feature = "limits",
         doc = "",
@@ -157,7 +157,7 @@ impl ProcessGroup {
         doc = "now. When the active mechanism can't honor a requested limit (no",
         doc = "cgroup/Job Object, or a Linux cgroup whose controllers can't be enabled —",
         doc = "see [`ResourceLimits`] for the cgroup-v2 real-root requirement) this",
-        doc = "returns [`Error::ResourceLimit`] — rather than handing back an unbounded",
+        doc = "returns [`ErrorKind::ResourceLimit`] — rather than handing back an unbounded",
         doc = "group — and an invalid cap value returns it too, with",
         doc = "[`LimitReason::Invalid`](crate::LimitReason::Invalid)."
     )]
@@ -168,7 +168,7 @@ impl ProcessGroup {
             Job::new(&options.limits).map_err(|source| {
                 if options.limits.any() {
                     // A real signal from the backend, not a guess: every
-                    // backend reports `ErrorKind::Unsupported` exactly when no
+                    // backend reports `io::ErrorKind::Unsupported` exactly when no
                     // whole-tree container mechanism exists at all on this
                     // platform (macOS/BSD's POSIX-only fallback, a Linux host
                     // with no cgroup v2 mounted) — the same convention
@@ -182,18 +182,18 @@ impl ProcessGroup {
                     } else {
                         LimitReason::Unenforceable
                     };
-                    Error::ResourceLimit {
+                    ErrorKind::ResourceLimit {
                         kind: first_requested_kind(&options.limits),
                         reason,
                         detail: source.to_string(),
                     }
                 } else {
-                    Error::Io(source)
+                    ErrorKind::Io(source)
                 }
             })?
         };
         #[cfg(not(feature = "limits"))]
-        let job = Job::new().map_err(Error::Io)?;
+        let job = Job::new().map_err(ErrorKind::Io)?;
         Ok(Self { job, options })
     }
 
@@ -228,10 +228,10 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::Spawn`] if the OS refuses to start `cmd` — the working directory
+    /// [`ErrorKind::Spawn`] if the OS refuses to start `cmd` — the working directory
     /// is bad, permission is denied, and so on. (This raw path reports every
-    /// launch failure as [`Error::Spawn`]; the `Command`-driven run helpers, by
-    /// contrast, translate a not-found program into [`Error::NotFound`].)
+    /// launch failure as [`ErrorKind::Spawn`]; the `Command`-driven run helpers, by
+    /// contrast, translate a not-found program into [`ErrorKind::NotFound`].)
     pub fn spawn(&self, mut cmd: Command) -> Result<Child> {
         self.spawn_with_options(&mut cmd, &crate::sys::SpawnOptions::default())
     }
@@ -244,10 +244,13 @@ impl ProcessGroup {
         cmd: &mut Command,
         opts: &crate::sys::SpawnOptions,
     ) -> Result<Child> {
-        let child = self.job.spawn(cmd, opts).map_err(|source| Error::Spawn {
-            program: program_name(cmd),
-            source,
-        })?;
+        let child = self
+            .job
+            .spawn(cmd, opts)
+            .map_err(|source| ErrorKind::Spawn {
+                program: program_name(cmd),
+                source,
+            })?;
         Ok(child)
     }
 
@@ -282,12 +285,12 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if `child` has already been reaped (awaited), leaving no
+    /// [`ErrorKind::Io`] if `child` has already been reaped (awaited), leaving no
     /// live handle/pid to reference. Adopting an exited-but-unreaped child is a
     /// successful no-op.
     #[cfg(feature = "process-control")]
     pub fn adopt(&self, child: &Child) -> Result<()> {
-        self.job.adopt(child).map_err(Error::Io)?;
+        self.job.adopt(child).map_err(ErrorKind::Io)?;
         #[cfg(feature = "tracing")]
         tracing::trace!(
             target: "processkit",
@@ -329,7 +332,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] in two cases, both on the non-atomic Unix backends: the legacy
+    /// [`ErrorKind::Io`] in two cases, both on the non-atomic Unix backends: the legacy
     /// per-pid kill fallback (a pre-5.14 Linux kernel without `cgroup.kill`) when
     /// the tree won't drain within the bounded sweep, and the process-group
     /// mechanism (macOS/Linux fallback) when a live, non-zombie member rejects
@@ -342,7 +345,7 @@ impl ProcessGroup {
             mechanism = ?self.mechanism(),
             "hard-killing every process in the group"
         );
-        self.job.kill_all().map_err(Error::Io)?;
+        self.job.kill_all().map_err(ErrorKind::Io)?;
         Ok(())
     }
 
@@ -361,11 +364,11 @@ impl ProcessGroup {
     ///   [`Command::windows_graceful_ctrl_break`](crate::Command::windows_graceful_ctrl_break),
     ///   plus `WM_CLOSE` to every top-level window owned by a live member (an
     ///   Electron app, a desktop tool, a windowed service). This TRIGGERS a clean
-    ///   exit without waiting or escalating. It returns [`Error::Unsupported`] only
+    ///   exit without waiting or escalating. It returns [`ErrorKind::Unsupported`] only
     ///   when the group has **neither** a console-CTRL leader **nor** a windowed
     ///   member (nothing a soft close could reach); every other signal
     ///   ([`Signal::Hup`], [`Signal::Quit`], [`Signal::Usr1`], [`Signal::Usr2`],
-    ///   [`Signal::Other`]) is always [`Error::Unsupported`].
+    ///   [`Signal::Other`]) is always [`ErrorKind::Unsupported`].
     ///
     /// `SIGKILL` ([`Signal::Kill`], or `Other(libc::SIGKILL)`) is routed through
     /// the same whole-tree hard kill as [`kill_all`](Self::kill_all)
@@ -385,7 +388,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] on Windows for [`Signal::Int`] / [`Signal::Term`]
+    /// [`ErrorKind::Unsupported`] on Windows for [`Signal::Int`] / [`Signal::Term`]
     /// only when the group has no console-CTRL leader and no windowed member (see
     /// Platform support above), and for every other non-[`Kill`](Signal::Kill)
     /// signal unconditionally (a Job Object has no POSIX signals). On the Linux
@@ -452,8 +455,8 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] if the active mechanism cannot freeze the tree;
-    /// otherwise [`Error::Io`] if the OS rejects the freeze / `SIGSTOP`.
+    /// [`ErrorKind::Unsupported`] if the active mechanism cannot freeze the tree;
+    /// otherwise [`ErrorKind::Io`] if the OS rejects the freeze / `SIGSTOP`.
     #[cfg(feature = "process-control")]
     pub fn suspend(&self) -> Result<()> {
         self.job
@@ -468,8 +471,8 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] if the active mechanism cannot thaw the tree;
-    /// otherwise [`Error::Io`] if the OS rejects the resume / `SIGCONT`.
+    /// [`ErrorKind::Unsupported`] if the active mechanism cannot thaw the tree;
+    /// otherwise [`ErrorKind::Io`] if the OS rejects the resume / `SIGCONT`.
     #[cfg(feature = "process-control")]
     pub fn resume(&self) -> Result<()> {
         self.job
@@ -497,11 +500,11 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the group's membership cannot be read (e.g. a failed
+    /// [`ErrorKind::Io`] if the group's membership cannot be read (e.g. a failed
     /// `cgroup.procs` read or Job Object query).
     #[cfg(feature = "process-control")]
     pub fn members(&self) -> Result<Vec<u32>> {
-        let pids = self.job.members().map_err(Error::Io)?;
+        let pids = self.job.members().map_err(ErrorKind::Io)?;
         Ok(pids)
     }
 
@@ -548,13 +551,13 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] only if the group's membership cannot be read (the same
+    /// [`ErrorKind::Io`] only if the group's membership cannot be read (the same
     /// failure as [`members`](Self::members) — a failed `cgroup.procs` read or Job
     /// Object query) or, on Windows, if the process-metadata snapshot cannot be
     /// created at all. A single member vanishing is not an error (it is skipped).
     #[cfg(feature = "process-control")]
     pub fn members_info(&self) -> Result<Vec<MemberInfo>> {
-        let infos = self.job.members_info().map_err(Error::Io)?;
+        let infos = self.job.members_info().map_err(ErrorKind::Io)?;
         Ok(infos)
     }
 
@@ -591,7 +594,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the graceful teardown fails — including, when
+    /// [`ErrorKind::Io`] if the graceful teardown fails — including, when
     /// `escalate_to_kill` performs the final hard kill, the same failures as
     /// [`kill_all`](Self::kill_all): the undrained-tree failure on the legacy
     /// pre-5.14 per-pid fallback, and a process-group member that rejects `SIGKILL`
@@ -626,7 +629,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the graceful teardown fails (see
+    /// [`ErrorKind::Io`] if the graceful teardown fails (see
     /// [`shutdown`](Self::shutdown) — the same undrained-tree failure on the legacy
     /// per-pid fallback and the process-group live-`EPERM` on the final hard kill
     /// apply).
@@ -646,7 +649,7 @@ impl ProcessGroup {
                 self.options.escalate_to_kill,
             )
             .await
-            .map_err(Error::Io)?;
+            .map_err(ErrorKind::Io)?;
         Ok(())
     }
 
@@ -659,7 +662,7 @@ impl ProcessGroup {
         self.job
             .graceful_shutdown(signal, grace, true)
             .await
-            .map_err(Error::Io)?;
+            .map_err(ErrorKind::Io)?;
         Ok(())
     }
 
@@ -669,10 +672,10 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the platform's resource query fails.
+    /// [`ErrorKind::Io`] if the platform's resource query fails.
     #[cfg(feature = "stats")]
     pub fn stats(&self) -> Result<ProcessGroupStats> {
-        let stats = self.job.stats().map_err(Error::Io)?;
+        let stats = self.job.stats().map_err(ErrorKind::Io)?;
         Ok(stats)
     }
 
@@ -707,7 +710,7 @@ impl ProcessGroup {
     /// written back to `max`). On the **POSIX process-group** mechanism (macOS, the
     /// BSDs, and the Linux fallback with no usable cgroup) there is no whole-tree
     /// cap primitive, so a request carrying **any** cap is refused with
-    /// [`Error::ResourceLimit`] — never silently dropped — while an all-`None`
+    /// [`ErrorKind::ResourceLimit`] — never silently dropped — while an all-`None`
     /// request (lift every cap) is a trivial success, since the tree is already
     /// unbounded there.
     ///
@@ -723,7 +726,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::ResourceLimit`] — with [`LimitReason::Invalid`] for a nonsensical
+    /// [`ErrorKind::ResourceLimit`] — with [`LimitReason::Invalid`] for a nonsensical
     /// value (rejected by the shared `validate_limits` before the OS is touched,
     /// exactly as at creation), [`LimitReason::Unsupported`] when the active
     /// mechanism has no whole-tree accounting at all (a process-group mechanism),
@@ -775,48 +778,52 @@ fn program_name(cmd: &Command) -> String {
     cmd.as_std().get_program().to_string_lossy().into_owned()
 }
 
-/// Map a backend `ErrorKind::Unsupported` to the typed [`Error::Unsupported`],
+/// Map a backend `io::ErrorKind::Unsupported` to the typed [`ErrorKind::Unsupported`],
 /// passing every other IO failure through unchanged. Unambiguous here: on the
 /// signal/suspend/resume paths the only producer of `Unsupported` is the
 /// backends' own "this platform can't do that" reporting.
 #[cfg(feature = "process-control")]
 fn map_unsupported(source: std::io::Error, operation: impl Into<String>) -> Error {
     if source.kind() == std::io::ErrorKind::Unsupported {
-        Error::Unsupported {
+        ErrorKind::Unsupported {
             operation: operation.into(),
         }
+        .into()
     } else {
-        Error::Io(source)
+        ErrorKind::Io(source).into()
     }
 }
 
 /// Reject nonsensical limit values before touching the OS, so a typo surfaces as a
-/// clear [`Error::ResourceLimit`] (`reason: Invalid`) rather than an opaque
+/// clear [`ErrorKind::ResourceLimit`] (`reason: Invalid`) rather than an opaque
 /// kernel error.
 #[cfg(feature = "limits")]
 fn validate_limits(limits: &ResourceLimits) -> Result<()> {
     if limits.max_memory == Some(0) {
-        return Err(Error::ResourceLimit {
+        return Err(ErrorKind::ResourceLimit {
             kind: LimitKind::Memory,
             reason: LimitReason::Invalid,
             detail: "max_memory must be greater than 0".into(),
-        });
+        }
+        .into());
     }
     if limits.max_processes == Some(0) {
-        return Err(Error::ResourceLimit {
+        return Err(ErrorKind::ResourceLimit {
             kind: LimitKind::Processes,
             reason: LimitReason::Invalid,
             detail: "max_processes must be greater than 0".into(),
-        });
+        }
+        .into());
     }
     if let Some(cores) = limits.cpu_quota
         && !(cores.is_finite() && cores > 0.0)
     {
-        return Err(Error::ResourceLimit {
+        return Err(ErrorKind::ResourceLimit {
             kind: LimitKind::Cpu,
             reason: LimitReason::Invalid,
             detail: "cpu_quota must be a finite value greater than 0".into(),
-        });
+        }
+        .into());
     }
     Ok(())
 }
@@ -890,15 +897,15 @@ mod tests {
         ] {
             // `validate_limits` classifies as `Invalid` with the specific
             // field that failed — never a guess, and never touching the OS.
-            match validate_limits(&opts.limits) {
-                Err(Error::ResourceLimit { kind, reason, .. }) => {
+            match validate_limits(&opts.limits).map_err(Error::into_kind) {
+                Err(ErrorKind::ResourceLimit { kind, reason, .. }) => {
                     assert_eq!(kind, expected_kind);
                     assert_eq!(reason, LimitReason::Invalid);
                 }
                 other => panic!("expected ResourceLimit, got {other:?}"),
             }
-            match ProcessGroup::with_options(opts) {
-                Err(Error::ResourceLimit { kind, reason, .. }) => {
+            match ProcessGroup::with_options(opts).map_err(Error::into_kind) {
+                Err(ErrorKind::ResourceLimit { kind, reason, .. }) => {
                     assert_eq!(kind, expected_kind);
                     assert_eq!(reason, LimitReason::Invalid);
                 }

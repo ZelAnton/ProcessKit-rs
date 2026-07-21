@@ -183,7 +183,7 @@ async fn priority_high_with_uid_drop_and_no_groups_succeeds() {
     // only the pre-drop (root) process has. Before the fix, the `None`
     // branch let std's own `.uid()`/`.gid()` builder methods perform the drop
     // — those apply *before* any user pre_exec hook, including the priority
-    // hook — so this exact combination failed with `Error::Spawn` (EPERM from
+    // hook — so this exact combination failed with `ErrorKind::Spawn` (EPERM from
     // setpriority under the already-dropped uid). It must now succeed,
     // identically to the `groups`-present path.
     // SAFETY: geteuid is a pure query.
@@ -344,7 +344,7 @@ async fn windows_unix_only_builders_are_unsupported() {
             .await
             .expect_err("a privilege request must not be silently skipped");
         assert!(
-            matches!(err, processkit::Error::Unsupported { .. }),
+            matches!(err, processkit::ErrorKind::Unsupported { .. }),
             "expected Unsupported for {what}, got {err:?}"
         );
     }

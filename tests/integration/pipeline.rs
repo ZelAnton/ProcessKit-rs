@@ -124,9 +124,10 @@ async fn pipeline_pipefail_attributes_the_first_failure() {
         .pipe(sort_stage())
         .run()
         .await
-        .expect_err("a failing stage must fail run()");
+        .expect_err("a failing stage must fail run()")
+        .into_kind();
     assert!(
-        matches!(err, processkit::Error::Exit { code: 3, .. }),
+        matches!(err, processkit::ErrorKind::Exit { code: 3, .. }),
         "expected Exit with code 3, got {err:?}"
     );
 }
@@ -173,7 +174,7 @@ async fn pipeline_failure_tears_down_a_quiet_upstream_on_a_raw_stage_error_too()
     // T-085: distinct from `pipeline_failure_tears_down_a_quiet_upstream_immediately`
     // above — that test's failure is a *checked* `Outcome` (a plain non-zero
     // exit), which already fired proactive teardown before this fix landed.
-    // This one's failure is a *raw* `Err` (`Error::Cancelled`, via a per-stage
+    // This one's failure is a *raw* `Err` (`ErrorKind::Cancelled`, via a per-stage
     // `Command::cancel_on` on just the LAST stage — deliberately not the
     // whole-chain `Pipeline::cancel_on`, so the quiet upstream carries no
     // token of its own) surfacing straight out of a stage's task, past the
@@ -197,9 +198,10 @@ async fn pipeline_failure_tears_down_a_quiet_upstream_on_a_raw_stage_error_too()
         .pipe(cancels_soon)
         .output_string()
         .await
-        .expect_err("a per-stage-cancelled last stage must surface as Err");
+        .expect_err("a per-stage-cancelled last stage must surface as Err")
+        .into_kind();
     assert!(
-        matches!(err, processkit::Error::Cancelled { .. }),
+        matches!(err, processkit::ErrorKind::Cancelled { .. }),
         "expected Cancelled, got {err:?}"
     );
     assert!(
@@ -608,9 +610,10 @@ async fn pipeline_parse_fails_loud_on_a_truncated_last_stage() {
         .pipe(sort_stage().output_buffer(OutputBufferPolicy::bounded(2)))
         .parse(|s| s.to_owned())
         .await
-        .expect_err("a truncated last stage must fail loud");
+        .expect_err("a truncated last stage must fail loud")
+        .into_kind();
     assert!(
-        matches!(err, processkit::Error::OutputTooLarge { .. }),
+        matches!(err, processkit::ErrorKind::OutputTooLarge { .. }),
         "got {err:?}"
     );
 }
@@ -631,9 +634,10 @@ async fn pipeline_run_fails_loud_on_a_truncated_last_stage() {
         .pipe(sort_stage().output_buffer(OutputBufferPolicy::bounded(2)))
         .run()
         .await
-        .expect_err("a truncated last stage must fail loud on run()");
+        .expect_err("a truncated last stage must fail loud on run()")
+        .into_kind();
     assert!(
-        matches!(err, processkit::Error::OutputTooLarge { .. }),
+        matches!(err, processkit::ErrorKind::OutputTooLarge { .. }),
         "got {err:?}"
     );
 }
@@ -642,7 +646,7 @@ async fn pipeline_run_fails_loud_on_a_truncated_last_stage() {
 #[ignore = "spawns a real long-running pipeline and cancels it"]
 async fn pipeline_cancel_on_tears_the_whole_chain_down() {
     // S-1: a token fired mid-run cancels every stage; the run resolves to
-    // Error::Cancelled rather than hanging on the endless producer.
+    // ErrorKind::Cancelled rather than hanging on the endless producer.
     use tokio_util::sync::CancellationToken;
     let token = CancellationToken::new();
     let chain = endless_yes()
@@ -658,9 +662,10 @@ async fn pipeline_cancel_on_tears_the_whole_chain_down() {
     let err = chain
         .output_string()
         .await
-        .expect_err("a cancelled chain errors");
+        .expect_err("a cancelled chain errors")
+        .into_kind();
     assert!(
-        matches!(err, processkit::Error::Cancelled { .. }),
+        matches!(err, processkit::ErrorKind::Cancelled { .. }),
         "expected Cancelled, got {err:?}"
     );
     assert!(

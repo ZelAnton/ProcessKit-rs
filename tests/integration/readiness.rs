@@ -41,9 +41,10 @@ async fn wait_for_line_not_ready_when_silent() {
     let err = process
         .wait_for_line(|_| true, Duration::from_millis(300))
         .await
-        .expect_err("a silent child never becomes ready");
+        .expect_err("a silent child never becomes ready")
+        .into_kind();
     assert!(
-        matches!(err, processkit::Error::NotReady { .. }),
+        matches!(err, processkit::ErrorKind::NotReady { .. }),
         "expected NotReady, got {err:?}"
     );
     assert!(
@@ -64,9 +65,10 @@ async fn wait_for_line_not_ready_fast_when_child_exits_silently() {
     let err = process
         .wait_for_line(|l| l.contains("never-printed"), Duration::from_secs(30))
         .await
-        .expect_err("the banner never appears");
+        .expect_err("the banner never appears")
+        .into_kind();
     assert!(
-        matches!(err, processkit::Error::NotReady { .. }),
+        matches!(err, processkit::ErrorKind::NotReady { .. }),
         "expected NotReady, got {err:?}"
     );
     assert!(
@@ -134,9 +136,10 @@ async fn wait_for_port_gives_up_after_the_listener_closes_mid_retry() {
     )
     .await
     .expect("probe finished in time")
-    .expect_err("the closed listener never becomes ready again");
+    .expect_err("the closed listener never becomes ready again")
+    .into_kind();
     assert!(
-        matches!(err, processkit::Error::NotReady { .. }),
+        matches!(err, processkit::ErrorKind::NotReady { .. }),
         "expected NotReady, got {err:?}"
     );
     assert!(
@@ -260,9 +263,10 @@ async fn wait_for_fails_fast_when_child_exits() {
     let err = process
         .wait_for(|| async { false }, Duration::from_secs(30))
         .await
-        .expect_err("an exited child never becomes ready");
+        .expect_err("an exited child never becomes ready")
+        .into_kind();
     assert!(
-        matches!(err, processkit::Error::NotReady { .. }),
+        matches!(err, processkit::ErrorKind::NotReady { .. }),
         "expected NotReady, got {err:?}"
     );
     assert!(

@@ -96,7 +96,7 @@ Things to know:
   pipes close, and the stream ends — a
   streamed run can't hang past its deadline. A `cancel_on` token ends it the
   same way; the following
-  `finish` then reports `Error::Cancelled`. Details in
+  `finish` then reports `ErrorKind::Cancelled`. Details in
   [Timeouts & cancellation](timeouts-and-cancellation.md).
 - Line counters tick live: `run.stdout_line_count()` / `stderr_line_count()`
   are cheap progress gauges even while you stream.
@@ -169,7 +169,7 @@ use processkit::prelude::StreamExt;
 use processkit::{Command, Finished, Outcome};
 
 // `ProcessStdin`'s writer methods return `std::io::Result`; `Box<dyn Error>`
-// mixes them with the crate's `Result` (or `.map_err(processkit::Error::Io)?`).
+// mixes them with the crate's `Result` (or `.map_err(processkit::ErrorKind::Io)?`).
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `bc` evaluates each stdin line and prints the result.
@@ -250,8 +250,8 @@ async fn main() -> processkit::Result<()> {
 
 Probe semantics, deliberately uniform:
 
-- A probe that can't pass within its deadline fails with **`Error::NotReady`**
-  — distinct from `Error::Timeout`, which is the run's own deadline.
+- A probe that can't pass within its deadline fails with **`ErrorKind::NotReady`**
+  — distinct from `ErrorKind::Timeout`, which is the run's own deadline.
 - A probe also fails *fast* once readiness can no longer happen: the child
   exits, or (for `wait_for_line`) its stdout closes — no waiting out a 30s
   deadline on a dead server.

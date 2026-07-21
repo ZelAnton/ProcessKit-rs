@@ -202,7 +202,7 @@ async fn main() -> processkit::Result<()> {
 | Platform | Deliverable signals |
 |---|---|
 | Linux (cgroup or pgroup), macOS/BSD | Any — `Term`, `Kill`, `Int`, `Hup`, `Quit`, `Usr1`, `Usr2`, `Other(n)` |
-| Windows | `Kill` (Job Object terminate); `Int`/`Term` as a best-effort soft close (`CTRL_BREAK` to console leaders + `WM_CLOSE` to windowed members) — `Error::Unsupported` only when neither exists; every other signal → `Error::Unsupported` |
+| Windows | `Kill` (Job Object terminate); `Int`/`Term` as a best-effort soft close (`CTRL_BREAK` to console leaders + `WM_CLOSE` to windowed members) — `ErrorKind::Unsupported` only when neither exists; every other signal → `ErrorKind::Unsupported` |
 
 `Signal::Kill` always takes the same *atomic* whole-tree kill path as
 `kill_all` (`cgroup.kill` / `killpg` / job terminate), so it cannot miss
@@ -361,7 +361,7 @@ async fn main() -> processkit::Result<()> {
 `cpu_quota` is a fraction of a **single** core (`2.0` = two cores). Limits
 need a real container; when a requested cap can't be enforced — no Job
 Object/cgroup, or a Linux cgroup whose controllers can't be enabled —
-`with_options` returns `Error::ResourceLimit { kind, reason, detail }` instead
+`with_options` returns `ErrorKind::ResourceLimit { kind, reason, detail }` instead
 of handing back a silently-unbounded group: `kind` names the limit
 (`max_memory`/`max_processes`/`cpu_quota`), `reason` says whether the value was
 simply invalid, the platform has no whole-tree mechanism at all

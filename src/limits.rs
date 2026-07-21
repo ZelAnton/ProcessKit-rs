@@ -24,7 +24,7 @@
 /// cgroup v2**. On macOS/the BSDs and the Linux process-group fallback there is
 /// no whole-tree limit primitive, so
 /// requesting *any* limit there fails fast with
-/// [`Error::ResourceLimit`](crate::Error::ResourceLimit) rather than silently
+/// [`ErrorKind::ResourceLimit`](crate::ErrorKind::ResourceLimit) rather than silently
 /// leaving the tree unbounded.
 ///
 /// **Linux (cgroup v2): limits need this process at the *real* cgroup root.**
@@ -40,7 +40,7 @@
 /// real hierarchy root (a minimal init not managed by systemd) — **not** under any
 /// systemd session/scope/service, and **not** in an ordinary container. When the
 /// controllers can't be enabled, group creation **fails fast**
-/// ([`Error::ResourceLimit`](crate::Error::ResourceLimit)) rather than silently
+/// ([`ErrorKind::ResourceLimit`](crate::ErrorKind::ResourceLimit)) rather than silently
 /// leaving the tree unbounded — an unenforced limit is no protection. The crate
 /// deliberately does **not** migrate your process into a sub-cgroup to make limits
 /// work elsewhere (the create-leaf→migrate-self→enable dance); do that externally
@@ -89,7 +89,7 @@ impl ResourceLimits {
 }
 
 /// Which [`ResourceLimits`] field an
-/// [`Error::ResourceLimit`](crate::Error::ResourceLimit) failure is about —
+/// [`ErrorKind::ResourceLimit`](crate::ErrorKind::ResourceLimit) failure is about —
 /// [`Memory`](Self::Memory) for [`max_memory`](ResourceLimits::max_memory),
 /// [`Processes`](Self::Processes) for
 /// [`max_processes`](ResourceLimits::max_processes), [`Cpu`](Self::Cpu) for
@@ -112,7 +112,7 @@ pub enum LimitKind {
 }
 
 /// Why a requested resource limit could not be applied — the classification an
-/// [`Error::ResourceLimit`](crate::Error::ResourceLimit) failure carries so a
+/// [`ErrorKind::ResourceLimit`](crate::ErrorKind::ResourceLimit) failure carries so a
 /// caller (e.g. the `processkit-py` binding) can branch on the *kind* of failure
 /// without parsing the English `detail` text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

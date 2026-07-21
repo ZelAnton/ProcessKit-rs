@@ -14,7 +14,7 @@
 //! call site used to define its own copy; a constant edited in one but not the
 //! other would silently invalidate every already-recorded cassette (the recomputed
 //! digest stops matching the stored one), surfacing not as a build error but as a
-//! baffling [`CassetteMiss`](crate::Error::CassetteMiss) at replay. Centralising
+//! baffling [`CassetteMiss`](crate::ErrorKind::CassetteMiss) at replay. Centralising
 //! them here makes that drift impossible: there is one definition to change, and
 //! changing it is — by definition — a cassette-format break.
 

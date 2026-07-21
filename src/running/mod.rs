@@ -30,7 +30,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
 
 use crate::buffer::{OutputBufferPolicy, OverflowMode, clamp_dropoldest_tail, push_capped_bytes};
-use crate::error::Error;
+use crate::error::ErrorKind;
 use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::pump::{SharedLines, StreamConfig, pump_lines_core};
@@ -160,7 +160,7 @@ pub struct RunningProcess {
     stdout_pump: Option<JoinHandle<()>>,
     stderr_pump: Option<JoinHandle<()>>,
     // Non-broken-pipe stdin failure stashed by `observe_stdin_task`; surfaced as
-    // `Error::Stdin` by `checked_outcome` only when the run otherwise succeeded.
+    // `ErrorKind::Stdin` by `checked_outcome` only when the run otherwise succeeded.
     stdin_error: Option<std::io::Error>,
     // Bulk capture verbs fail loudly on non-piped stdout rather than returning empty.
     stdout_piped: bool,
@@ -507,14 +507,15 @@ impl RunningProcess {
     fn ensure_stdout_streamable(&self) -> Result<()> {
         self.ensure_stdout_capturable()?; // (a) non-piped stdout
         if self.stdout_sink.is_some() {
-            return Err(Error::Io(std::io::Error::new(
+            return Err(ErrorKind::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "`{}`: stdout was already consumed by an earlier stdout_lines/output_events \
                      call — stream it once (a second call would yield an empty stream)",
                     self.program
                 ),
-            )));
+            ))
+            .into());
         }
         Ok(())
     }
@@ -535,16 +536,16 @@ impl RunningProcess {
     /// [`ensure_success`](ProcessResult::ensure_success) to turn a non-zero,
     /// timed-out, or signalled outcome into an error. The `Err` cases are:
     ///
-    /// - [`Error::Cancelled`] — the run was cancelled via
+    /// - [`ErrorKind::Cancelled`] — the run was cancelled via
     ///   [`Command::cancel_on`](crate::Command::cancel_on). Unlike a timeout,
     ///   cancellation is *always* raised (and discards any captured output).
-    /// - [`Error::OutputTooLarge`] — the
+    /// - [`ErrorKind::OutputTooLarge`] — the
     ///   [`OutputBufferPolicy`](crate::OutputBufferPolicy) is fail-loud
     ///   ([`OverflowMode::Error`](crate::OverflowMode)) and the captured output
     ///   exceeded its line or byte ceiling.
-    /// - [`Error::Stdin`] — a configured stdin source failed for a reason other
+    /// - [`ErrorKind::Stdin`] — a configured stdin source failed for a reason other
     ///   than a broken pipe, on an *otherwise-successful* run.
-    /// - [`Error::Io`] — stdout is not piped, a prior streaming call already
+    /// - [`ErrorKind::Io`] — stdout is not piped, a prior streaming call already
     ///   consumed it as decoded lines, or waiting on the child failed.
     pub async fn output_string(mut self) -> Result<ProcessResult<String>> {
         let finished = self
@@ -592,13 +593,13 @@ impl RunningProcess {
     /// (stderr captured as text). On **timeout** the bytes read before the
     /// deadline are returned as a best-effort prefix (the outcome is
     /// [`Outcome::TimedOut`]); a **cancelled** run instead errors with
-    /// [`Error::Cancelled`] and no bytes — cancellation via
+    /// [`ErrorKind::Cancelled`] and no bytes — cancellation via
     /// [`Command::cancel_on`](crate::Command::cancel_on) is always terminal.
     ///
     /// A byte ceiling on the [`OutputBufferPolicy`] bounds the raw stdout capture
     /// (its `max_lines` does not — raw bytes have no lines): with
     /// [`OverflowMode::Error`](crate::OverflowMode) a flood past the cap errors
-    /// with [`Error::OutputTooLarge`], while the drop modes keep a bounded
+    /// with [`ErrorKind::OutputTooLarge`], while the drop modes keep a bounded
     /// head/tail and set [`ProcessResult::truncated`]. With no byte cap the
     /// capture is unbounded — bound a flooding child with
     /// [`with_max_bytes`](crate::OutputBufferPolicy::with_max_bytes) or a
@@ -606,12 +607,12 @@ impl RunningProcess {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io(InvalidInput)`](std::io::ErrorKind::InvalidInput) if
+    /// Returns [`ErrorKind::Io(InvalidInput)`](std::io::ErrorKind::InvalidInput) if
     /// stdout is not piped, or if a prior streaming call already consumed stdout
     /// as decoded lines (the raw bytes cannot be reconstructed). Returns
-    /// [`Error::OutputTooLarge`] if the byte ceiling is set to
+    /// [`ErrorKind::OutputTooLarge`] if the byte ceiling is set to
     /// [`OverflowMode::Error`](crate::OverflowMode) and the raw stdout exceeds it.
-    /// (A cancelled run is [`Error::Cancelled`]; a non-zero exit, a timeout, or a
+    /// (A cancelled run is [`ErrorKind::Cancelled`]; a non-zero exit, a timeout, or a
     /// signal-kill is *captured* in the returned [`ProcessResult`]'s
     /// [`outcome`](ProcessResult::outcome), not raised.)
     ///
@@ -623,7 +624,7 @@ impl RunningProcess {
     pub async fn output_bytes(mut self) -> Result<ProcessResult<Vec<u8>>> {
         self.ensure_stdout_capturable()?;
         if self.stdout_sink.is_some() || self.stderr_sink.is_some() {
-            return Err(Error::Io(std::io::Error::new(
+            return Err(ErrorKind::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "`{}`: output_bytes cannot follow a streaming call (stdout was already \
@@ -631,7 +632,8 @@ impl RunningProcess {
                      call output_bytes without streaming first",
                     self.program
                 ),
-            )));
+            ))
+            .into());
         }
         let stderr_sink = SharedLines::new(&self.buffer);
         self.stderr_pump = self.backend.take_stderr_reader().map(|pipe| {
@@ -659,7 +661,7 @@ impl RunningProcess {
         let stdout_mode = self.buffer.overflow;
         // Shared signals the raw drain writes and the bounded teardown reads even if
         // it has to abort the task — including the first non-broken-pipe OS read
-        // error, so an incomplete byte capture surfaces as `Error::Io` below rather
+        // error, so an incomplete byte capture surfaces as `ErrorKind::Io` below rather
         // than a silently-truncated `Ok(ProcessResult)` prefix.
         let signals = RawStdoutSignals {
             seen: Arc::new(AtomicUsize::new(0)),
@@ -708,26 +710,28 @@ impl RunningProcess {
         // the stderr line ceiling below. Raw stdout has no lines, so report only
         // the byte ceiling that actually fired (`max_lines: None`).
         if signals.overflowed.load(Ordering::Relaxed) {
-            return Err(crate::Error::OutputTooLarge {
+            return Err(crate::ErrorKind::OutputTooLarge {
                 program: self.program.clone(),
                 max_lines: None,
                 max_bytes: self.buffer.max_bytes,
                 total_lines: 0,
                 total_bytes: signals.seen.load(Ordering::Relaxed),
-            });
+            }
+            .into());
         }
         if stderr_sink.overflowed() {
-            return Err(crate::Error::OutputTooLarge {
+            return Err(crate::ErrorKind::OutputTooLarge {
                 program: self.program.clone(),
                 max_lines: self.buffer.max_lines,
                 max_bytes: self.buffer.max_bytes,
                 total_lines: stderr_sink.count(),
                 total_bytes: stderr_sink.seen_bytes(),
-            });
+            }
+            .into());
         }
 
         // An incomplete capture from a first OS read error on either stream
-        // surfaces as `Error::Io` — a short raw-stdout prefix (or a truncated
+        // surfaces as `ErrorKind::Io` — a short raw-stdout prefix (or a truncated
         // stderr) is not a full success. Checked after the overflow ceilings (the
         // more specific signal if both fire) and after `checked_outcome`
         // (cancellation wins). A timeout closes the pipe with a *clean* EOF, not a
@@ -739,10 +743,10 @@ impl RunningProcess {
             .expect("stdout read-error slot poisoned")
             .take()
         {
-            return Err(Error::Io(source));
+            return Err(ErrorKind::Io(source).into());
         }
         if let Some(source) = stderr_sink.take_read_error() {
-            return Err(Error::Io(source));
+            return Err(ErrorKind::Io(source).into());
         }
 
         let stderr_lines = stderr_sink.drain();
@@ -772,15 +776,15 @@ impl RunningProcess {
     ///
     /// Reports the raw outcome — timeout and signals are not raised as errors
     /// here. Exception: cancellation via `Command::cancel_on` always errors with
-    /// `Error::Cancelled`.
+    /// `ErrorKind::Cancelled`.
     ///
     /// # Errors
     ///
     /// A timeout or signal-kill is *captured* in the returned [`Outcome`], not
-    /// raised. The `Err` cases are [`Error::Cancelled`] (the run was cancelled
+    /// raised. The `Err` cases are [`ErrorKind::Cancelled`] (the run was cancelled
     /// via [`Command::cancel_on`](crate::Command::cancel_on) — always raised),
-    /// [`Error::Stdin`] (a non-broken-pipe stdin-source failure on an
-    /// otherwise-successful run), or [`Error::Io`] (waiting on the child failed).
+    /// [`ErrorKind::Stdin`] (a non-broken-pipe stdin-source failure on an
+    /// otherwise-successful run), or [`ErrorKind::Io`] (waiting on the child failed).
     pub async fn wait(mut self) -> Result<Outcome> {
         Ok(self
             .finish_lines(CaptureMode::Discard, /* expose_counts */ false, || {})
@@ -793,7 +797,7 @@ impl RunningProcess {
     /// awaited.
     ///
     /// Only an **own-group** handle can be shut down here — a **shared-group**
-    /// handle returns [`Error::Unsupported`](crate::Error::Unsupported) because
+    /// handle returns [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) because
     /// shutting it down would tear down the caller's other children too.
     ///
     /// If the configured timeout deadline already elapsed when `shutdown` is
@@ -801,25 +805,26 @@ impl RunningProcess {
     ///
     /// # Errors
     ///
-    /// - [`Error::Unsupported`] — this is a **shared-group** handle, which does
+    /// - [`ErrorKind::Unsupported`] — this is a **shared-group** handle, which does
     ///   not own its group (tearing it down would kill the caller's other
     ///   children); use [`ProcessGroup::shutdown`](crate::ProcessGroup::shutdown)
     ///   or [`start_kill`](Self::start_kill) instead.
-    /// - [`Error::Cancelled`] — the run was cancelled via
+    /// - [`ErrorKind::Cancelled`] — the run was cancelled via
     ///   [`Command::cancel_on`](crate::Command::cancel_on).
-    /// - [`Error::Stdin`] — a non-broken-pipe stdin-source failure on an
+    /// - [`ErrorKind::Stdin`] — a non-broken-pipe stdin-source failure on an
     ///   otherwise-successful run.
-    /// - [`Error::Io`] — the graceful teardown or the exit wait failed.
+    /// - [`ErrorKind::Io`] — the graceful teardown or the exit wait failed.
     ///
     /// A timeout or signal-kill is *captured* in the returned [`Outcome`], not
     /// raised.
     pub async fn shutdown(mut self, grace: std::time::Duration) -> Result<Outcome> {
         let Some(group) = self.backend.own_group().cloned() else {
-            return Err(Error::Unsupported {
+            return Err(ErrorKind::Unsupported {
                 operation: "shutdown (a shared-group handle does not own its group — \
                             use ProcessGroup::shutdown, or start_kill for just this child)"
                     .into(),
-            });
+            }
+            .into());
         };
         // Disable the concurrent `wait()`'s deadline arm to avoid two overlapping
         // graceful teardowns. A timeout that already elapsed still classifies
@@ -891,10 +896,10 @@ impl RunningProcess {
     ///
     /// The same surface as [`wait`](Self::wait): a timeout or signal-kill is
     /// *captured* in the returned [`RunProfile`](crate::stats::RunProfile)'s
-    /// outcome, not raised. The `Err` cases are [`Error::Cancelled`] (cancelled
-    /// via [`Command::cancel_on`](crate::Command::cancel_on)), [`Error::Stdin`]
+    /// outcome, not raised. The `Err` cases are [`ErrorKind::Cancelled`] (cancelled
+    /// via [`Command::cancel_on`](crate::Command::cancel_on)), [`ErrorKind::Stdin`]
     /// (a non-broken-pipe stdin-source failure on an otherwise-successful run),
-    /// or [`Error::Io`] (waiting on the child failed).
+    /// or [`ErrorKind::Io`] (waiting on the child failed).
     #[cfg(feature = "stats")]
     pub async fn profile(mut self, every: Duration) -> Result<crate::stats::RunProfile> {
         use std::sync::{Arc, Mutex};
@@ -1040,19 +1045,20 @@ impl RunningProcess {
         if matches!(capture, CaptureMode::Lines) {
             for sink in [&stdout_sink, &stderr_sink] {
                 if sink.overflowed() {
-                    return Err(crate::Error::OutputTooLarge {
+                    return Err(crate::ErrorKind::OutputTooLarge {
                         program: self.program.clone(),
                         max_lines: self.buffer.max_lines,
                         max_bytes: self.buffer.max_bytes,
                         total_lines: sink.count(),
                         total_bytes: sink.seen_bytes(),
-                    });
+                    }
+                    .into());
                 }
             }
         }
 
         // A first OS read error on either pipe means the capture is incomplete:
-        // surface it as `Error::Io` for the capturing (`output_string`) and the
+        // surface it as `ErrorKind::Io` for the capturing (`output_string`) and the
         // discard (`wait`/`profile`) paths alike, rather than reporting a
         // silently-short read as a full success. Checked after the fail-loud
         // overflow ceiling (the more specific signal if both fire) and after
@@ -1061,7 +1067,7 @@ impl RunningProcess {
         // normal writer-closed stream never trips this.
         for sink in [&stdout_sink, &stderr_sink] {
             if let Some(source) = sink.take_read_error() {
-                return Err(Error::Io(source));
+                return Err(ErrorKind::Io(source).into());
             }
         }
 
@@ -1104,16 +1110,18 @@ impl RunningProcess {
         // discarding real output. `unwrap_or(false)` — `None` is not yet
         // snapshotted; treat conservatively as "not cancelled".
         if self.cancel_at_exit.unwrap_or(false) {
-            return Err(Error::Cancelled {
+            return Err(ErrorKind::Cancelled {
                 program: self.program.clone(),
-            });
+            }
+            .into());
         }
         let succeeded = matches!(outcome, Outcome::Exited(code) if self.ok_codes.contains(&code));
         if succeeded && let Some(source) = self.stdin_error.take() {
-            return Err(Error::Stdin {
+            return Err(ErrorKind::Stdin {
                 program: self.program.clone(),
                 source,
-            });
+            }
+            .into());
         }
         Ok(outcome)
     }
@@ -1153,7 +1161,7 @@ impl RunningProcess {
     /// `from_reader`/`from_file` source that erred while the pumps were still
     /// draining the child's output — was re-parked and would otherwise never
     /// reach `self.stdin_error`, letting an otherwise-successful run report a
-    /// silent success (exactly the case `Error::Stdin` exists to diagnose).
+    /// silent success (exactly the case `ErrorKind::Stdin` exists to diagnose).
     ///
     /// This waits for that writer, but only *bounded* by [`PUMP_TEARDOWN`]: a
     /// writer still blocked on a genuinely hung source is aborted and left
@@ -1315,7 +1323,7 @@ impl RunningProcess {
                 // polling — no reap, gate untouched — so losers stay usable.
                 let status = gated_reap(&gate, real.child_mut())
                     .await
-                    .map_err(Error::Io)?;
+                    .map_err(ErrorKind::Io)?;
                 match status.code() {
                     Some(code) => Outcome::Exited(code),
                     None => {
@@ -1584,7 +1592,7 @@ impl RunningProcess {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the OS rejects the kill for a reason other than the
+    /// [`ErrorKind::Io`] if the OS rejects the kill for a reason other than the
     /// child having already been reaped (which is treated as a no-op success).
     pub fn start_kill(&mut self) -> Result<()> {
         match &mut self.backend {
@@ -1593,7 +1601,7 @@ impl RunningProcess {
                 // tokio/std currently return `Ok` for a reaped child; treat
                 // `InvalidInput` as the same no-op in case that ever changes.
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
-                Err(e) => return Err(Error::Io(e)),
+                Err(e) => return Err(ErrorKind::Io(e).into()),
             },
             Backend::Scripted(s) => s.kill(),
         }
@@ -1864,7 +1872,7 @@ struct RawStdoutSignals {
     overflowed: Arc<AtomicBool>,
     /// Set when a drop-mode byte cap discarded bytes (the truncation signal).
     truncated: Arc<AtomicBool>,
-    /// The first non-broken-pipe OS read error, surfaced as [`Error::Io`].
+    /// The first non-broken-pipe OS read error, surfaced as [`ErrorKind::Io`].
     read_error: Arc<std::sync::Mutex<Option<std::io::Error>>>,
 }
 
@@ -1872,7 +1880,7 @@ struct RawStdoutSignals {
 /// ceiling (`cap`/`mode`) and updating the shared `signals` (bytes seen, the two
 /// overflow flags, and the first non-broken-pipe OS read error) so
 /// [`RunningProcess::output_bytes`] can surface an incomplete capture as
-/// [`Error::Io`] instead of a silently-short prefix. The raw (non-line) analogue
+/// [`ErrorKind::Io`] instead of a silently-short prefix. The raw (non-line) analogue
 /// of [`pump_lines_core`](crate::pump)'s read loop, extracted as a seam so the
 /// read-error / broken-pipe / clean-EOF classification is unit-testable without a
 /// live child. A broken-pipe read (the writer closing) is the normal end of a
@@ -1973,19 +1981,22 @@ mod tests {
             .expect("scripted start")
     }
 
-    /// A stashed non-broken-pipe stdin failure surfaces as `Error::Stdin` only on
+    /// A stashed non-broken-pipe stdin failure surfaces as `ErrorKind::Stdin` only on
     /// an otherwise-successful outcome; a non-zero exit or a signal is the "realer"
     /// failure and wins (outcome passed through).
     #[tokio::test]
     async fn stdin_error_surfaces_only_on_a_successful_outcome() {
         let mut run = scripted_handle(&[0]).await;
         run.stdin_error = Some(std::io::Error::other("boom"));
-        match run.checked_outcome(Outcome::Exited(0)) {
-            Err(Error::Stdin { program, source }) => {
+        match run
+            .checked_outcome(Outcome::Exited(0))
+            .map_err(crate::Error::into_kind)
+        {
+            Err(ErrorKind::Stdin { program, source }) => {
                 assert_eq!(program, "tool");
                 assert_eq!(source.to_string(), "boom");
             }
-            other => panic!("expected Error::Stdin, got {other:?}"),
+            other => panic!("expected ErrorKind::Stdin, got {other:?}"),
         }
 
         // Non-zero exit wins: outcome returned for the caller's classifier.
@@ -2012,8 +2023,8 @@ mod tests {
         let mut run = scripted_handle(&[0, 3]).await;
         run.stdin_error = Some(std::io::Error::other("boom"));
         assert!(matches!(
-            run.checked_outcome(Outcome::Exited(3)),
-            Err(Error::Stdin { .. })
+            &run.checked_outcome(Outcome::Exited(3)),
+            Err(e) if matches!(e.kind(), ErrorKind::Stdin { .. })
         ));
     }
 
@@ -2071,8 +2082,8 @@ mod tests {
             .output_bytes()
             .await
             .expect_err("output_bytes after streaming must error, not return empty");
-        match err {
-            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        match err.kind() {
+            ErrorKind::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
             other => panic!("expected Io(InvalidInput), got {other:?}"),
         }
     }
@@ -2258,7 +2269,7 @@ mod tests {
         run.timeout_state.store(TS_TIMED_OUT, Ordering::Release);
         token.cancel();
         match run.wait().await {
-            Err(Error::Cancelled { .. }) => {}
+            Err(e) if matches!(e.kind(), ErrorKind::Cancelled { .. }) => {}
             other => panic!("expected Err(Cancelled), got {other:?}"),
         }
     }
@@ -2304,7 +2315,7 @@ mod tests {
             .wait_for(|| async { false }, Duration::from_secs(5))
             .await
         {
-            Err(Error::NotReady { .. }) => {}
+            Err(e) if matches!(e.kind(), ErrorKind::NotReady { .. }) => {}
             other => panic!("expected Err(NotReady), got {other:?}"),
         }
         // Cancel only now, after the probe already observed the exit: the frozen
@@ -2340,13 +2351,13 @@ mod tests {
             .wait_for(|| async { false }, Duration::from_secs(5))
             .await
         {
-            Err(Error::NotReady { .. }) => {}
+            Err(e) if matches!(e.kind(), ErrorKind::NotReady { .. }) => {}
             other => panic!("expected Err(NotReady), got {other:?}"),
         }
         // The cancel active at observation is preserved: the finisher reports it,
         // never a silent `Ok` for a run the cancel really tore down.
         match run.wait().await {
-            Err(Error::Cancelled { .. }) => {}
+            Err(e) if matches!(e.kind(), ErrorKind::Cancelled { .. }) => {}
             other => panic!("expected Err(Cancelled), got {other:?}"),
         }
     }
@@ -2673,8 +2684,8 @@ mod tests {
             .start(&Command::new("tool").stdout(crate::StdioMode::Null))
             .await
             .unwrap();
-        match run.output_string().await {
-            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        match run.output_string().await.map_err(crate::Error::into_kind) {
+            Err(ErrorKind::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
             other => panic!("expected Io(InvalidInput), got {other:?}"),
         }
 
@@ -2683,7 +2694,10 @@ mod tests {
             .start(&Command::new("tool").stdout(crate::StdioMode::Inherit))
             .await
             .unwrap();
-        assert!(matches!(run.output_bytes().await, Err(Error::Io(_))));
+        assert!(matches!(
+            &run.output_bytes().await,
+            Err(e) if matches!(e.kind(), ErrorKind::Io(_))
+        ));
 
         let run = ScriptedRunner::new()
             .fallback(Reply::ok("hi"))
@@ -2782,7 +2796,7 @@ mod tests {
         );
         assert!(
             err.is_some(),
-            "the raw stdout OS read error is recorded for output_bytes to surface as Error::Io"
+            "the raw stdout OS read error is recorded for output_bytes to surface as ErrorKind::Io"
         );
     }
 
@@ -2814,7 +2828,7 @@ mod tests {
     // --- T-087: consuming finishers surface a recorded read error -----------
 
     /// The capturing line finisher (`output_string`, via `finish_lines`) surfaces
-    /// a recorded stdout read error as `Error::Io` rather than a silently-short
+    /// a recorded stdout read error as `ErrorKind::Io` rather than a silently-short
     /// `Ok(ProcessResult)`. The sink stands in for one a pump populated (the pump
     /// seam is covered in `pump.rs`); a clean-EOF sink carries no error, so a
     /// normal run is unaffected — the other tests here exercise that path.
@@ -2824,22 +2838,22 @@ mod tests {
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
         sink.set_read_error(std::io::Error::other("stdout read boom"));
         run.stdout_sink = Some(sink);
-        match run.output_string().await {
-            Err(Error::Io(e)) => assert_eq!(e.to_string(), "stdout read boom"),
+        match run.output_string().await.map_err(crate::Error::into_kind) {
+            Err(ErrorKind::Io(e)) => assert_eq!(e.to_string(), "stdout read boom"),
             other => panic!("expected Err(Io) for an incomplete capture, got {other:?}"),
         }
     }
 
     /// The discard finisher (`wait`, also via `finish_lines`) likewise classifies
-    /// an incomplete stderr capture as `Error::Io`, not a silent success.
+    /// an incomplete stderr capture as `ErrorKind::Io`, not a silent success.
     #[tokio::test]
     async fn wait_surfaces_a_recorded_read_error_as_io() {
         let mut run = scripted_handle(&[0]).await;
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
         sink.set_read_error(std::io::Error::other("stderr read boom"));
         run.stderr_sink = Some(sink);
-        match run.wait().await {
-            Err(Error::Io(e)) => assert_eq!(e.to_string(), "stderr read boom"),
+        match run.wait().await.map_err(crate::Error::into_kind) {
+            Err(ErrorKind::Io(e)) => assert_eq!(e.to_string(), "stderr read boom"),
             other => panic!("expected Err(Io) for an incomplete capture, got {other:?}"),
         }
     }

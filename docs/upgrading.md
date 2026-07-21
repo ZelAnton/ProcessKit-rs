@@ -70,10 +70,10 @@ After — add `..` to the pattern (or, better, use the existing accessors instea
 of destructuring at all):
 
 ```rust,no_run
-use processkit::Error;
+use processkit::{Error, ErrorKind};
 fn handle(err: Error) {
-match &err {
-    Error::Exit { program, code, stdout, stderr, .. } => { let _ = (program, code, stdout, stderr); }
+match err.kind() {
+    ErrorKind::Exit { program, code, stdout, stderr, .. } => { let _ = (program, code, stdout, stderr); }
     _ => {}
 }
 

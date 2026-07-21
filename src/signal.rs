@@ -11,7 +11,7 @@
 /// a console `CTRL_BREAK` to a child opted into
 /// [`Command::windows_graceful_ctrl_break`](crate::Command::windows_graceful_ctrl_break),
 /// plus `WM_CLOSE` to every top-level window a live member owns. Those two yield
-/// [`Error::Unsupported`](crate::Error::Unsupported) only when the group has no such
+/// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) only when the group has no such
 /// target; every other variant is always unsupported on Windows.
 ///
 /// [`Other`](Signal::Other) is an escape hatch carrying a raw signal number on

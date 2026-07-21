@@ -130,13 +130,13 @@ async fn output_all_collects_a_failing_command_as_data() {
 #[tokio::test]
 #[ignore = "spawns a real subprocess fed a failing stdin source, observed via wait_all"]
 async fn failing_stdin_source_surfaces_as_error_stdin_via_wait_all() {
-    use processkit::{Error, Stdin};
+    use processkit::{ErrorKind, Stdin};
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
     // E8: the wait_any/wait_all path (wait_exit) must observe a finished stdin
     // writer that failed for a non-broken-pipe reason and surface it as
-    // Error::Stdin on an otherwise-successful run, matching the bulk verbs' B3
+    // ErrorKind::Stdin on an otherwise-successful run, matching the bulk verbs' B3
     // contract — previously this path never called observe_stdin_task, so the
     // failure was silently lost and the join reported a clean Outcome.
     //
@@ -175,6 +175,7 @@ async fn failing_stdin_source_surfaces_as_error_stdin_via_wait_all() {
     let err = tokio::time::timeout(Duration::from_secs(15), wait_all(&mut [&mut child]))
         .await
         .expect("wait_all must not hang")
-        .expect_err("a failed stdin writer on a successful run must surface as Error::Stdin");
-    assert!(matches!(err, Error::Stdin { .. }), "got: {err:?}");
+        .expect_err("a failed stdin writer on a successful run must surface as ErrorKind::Stdin")
+        .into_kind();
+    assert!(matches!(err, ErrorKind::Stdin { .. }), "got: {err:?}");
 }

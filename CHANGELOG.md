@@ -39,6 +39,12 @@ to a dated version section.
 
 ### Changed
 
+- **Breaking:** `Error` is now an opaque struct wrapping `Box<ErrorKind>`.
+  `size_of::<Error>()` had grown to over 100 bytes, bloating every `Result<T>`
+  and triggering clippy lints (see [issue #21](https://github.com/ZelAnton/ProcessKit-rs/issues/21)).
+  All previous `Error` variants are available in the new, `#[non_exhaustive]`
+  `ErrorKind` accessible through `err.kind()` or `err.into_kind()`.
+  The `is_*` classifiers are available on both `Error` and `ErrorKind`.
 - Release publishing now uses crates.io Trusted Publishing — a short-lived token
   minted over GitHub OIDC per run — instead of a stored long-lived
   `CRATES_IO_TOKEN` secret

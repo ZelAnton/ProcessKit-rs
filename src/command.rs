@@ -11,7 +11,7 @@ use std::time::Duration;
 use encoding_rs::Encoding;
 
 use crate::buffer::{LineTerminator, OutputBufferPolicy, StdioMode};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 use crate::parent_death::ParentDeathCleanup;
 use crate::pump::StreamConfig;
 use crate::result::ProcessResult;
@@ -170,7 +170,7 @@ pub struct Command {
     /// window. A no-op off Windows (Unix already has a real signal tier).
     windows_graceful_ctrl_break: bool,
     /// When cancelled, the run's tree is killed and every consuming path
-    /// resolves to `Error::Cancelled`. Cheap to clone (internally `Arc`'d), so
+    /// resolves to `ErrorKind::Cancelled`. Cheap to clone (internally `Arc`'d), so
     /// a `Command` clone — including each `Pipeline` stage and each
     /// `Supervisor` incarnation — shares the same cancel state.
     cancel_token: Option<tokio_util::sync::CancellationToken>,
@@ -285,7 +285,7 @@ impl Command {
     /// the child's own working directory once [`current_dir`](Self::current_dir)
     /// is also set.
     ///
-    /// If resolution fails everywhere, [`Error::NotFound`](crate::Error::NotFound)'s
+    /// If resolution fails everywhere, [`ErrorKind::NotFound`](crate::ErrorKind::NotFound)'s
     /// `searched` includes these directories — first, in priority order — ahead
     /// of the `PATH` directories, so the diagnostic doesn't hide that they were
     /// checked too.
@@ -400,7 +400,7 @@ impl Command {
     /// [`gid`](Self::gid) — the group id is set **before** the user id (once
     /// the uid drops, changing gid is no longer permitted), an ordering the
     /// standard library guarantees. On non-Unix targets the run fails with
-    /// [`Error::Unsupported`](crate::Error::Unsupported) — a requested
+    /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) — a requested
     /// privilege drop is never silently skipped.
     ///
     /// **Linux cgroup caveat:** under the cgroup v2 mechanism
@@ -436,7 +436,7 @@ impl Command {
     /// Ordering is handled for you: the OS applies `setgroups` → `setgid` →
     /// `setuid` (groups and gid must be set while still privileged, before the
     /// uid drops). On non-Unix targets the run fails with
-    /// [`Error::Unsupported`](crate::Error::Unsupported) — never silently
+    /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) — never silently
     /// skipped. The Linux cgroup-v2 caveat from [`uid`](Self::uid) applies
     /// unchanged.
     pub fn groups(mut self, gids: impl AsRef<[u32]>) -> Self {
@@ -450,7 +450,7 @@ impl Command {
     /// Containment is preserved: the group tracks the new session's process
     /// group (whose id is the child's pid), so kill-on-drop and the teardown
     /// verbs still reach it. On non-Unix targets the run fails with
-    /// [`Error::Unsupported`](crate::Error::Unsupported).
+    /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
     ///
     /// Honored by the `Command`-driven launch paths (`run`/`output_*`/
     /// `start`, [`ProcessGroup::start`](crate::ProcessGroup::start),
@@ -472,7 +472,7 @@ impl Command {
     /// a priority-class flag OR'd into `creation_flags`, the same seam as
     /// [`create_no_window`](Self::create_no_window). Unlike the privilege
     /// builders this never yields
-    /// [`Error::Unsupported`](crate::Error::Unsupported) — see
+    /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) — see
     /// [`Priority`](crate::Priority) for why both platforms cover every
     /// variant, and the Unix caveat that lowering `nice` below its inherited
     /// value — [`Priority::AboveNormal`](crate::Priority::AboveNormal)/
@@ -492,7 +492,7 @@ impl Command {
     /// Applied via `pre_exec`, alongside [`setsid`](Self::setsid)/
     /// [`groups`](Self::groups) — another knob on that same seam. On
     /// non-Unix targets the run fails with
-    /// [`Error::Unsupported`](crate::Error::Unsupported) rather than
+    /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) rather than
     /// silently ignoring the requested mask. Only the low permission bits are
     /// meaningful (as with the `umask(2)` syscall itself); pass the value you
     /// would give the `umask` shell builtin, e.g. `0o022`.
@@ -805,7 +805,7 @@ impl Command {
     /// Tie this run to `token`: cancelling it kills the process tree and makes
     /// every consuming path (`run`/`output_string`/`output_bytes`/`wait`/
     /// `exit_code`/`probe`/`profile`/`finish` and the streamed
-    /// finishers) resolve to [`Error::Cancelled`](crate::Error::Cancelled).
+    /// finishers) resolve to [`ErrorKind::Cancelled`](crate::ErrorKind::Cancelled).
     /// In a [`Pipeline`](crate::Pipeline), a token on any stage cancels that
     /// stage and the cancellation errors the whole pipeline (the private
     /// pipeline group tears the other stages down).
@@ -826,12 +826,12 @@ impl Command {
     /// pre-spawn short-circuit. A mid-run cancel during
     /// [`wait_for_line`](crate::RunningProcess::wait_for_line), by contrast,
     /// closes the stream and surfaces as that probe's
-    /// [`Error::NotReady`](crate::Error::NotReady), not `Cancelled` — the
+    /// [`ErrorKind::NotReady`](crate::ErrorKind::NotReady), not `Cancelled` — the
     /// consuming finisher afterwards still reports `Cancelled`.
     ///
     /// A cancelled run is never retried: [`retry`](Self::retry) policies and
     /// [`Supervisor`](crate::Supervisor) restarts both treat
-    /// `Error::Cancelled` as terminal — the token stays cancelled forever, so
+    /// `ErrorKind::Cancelled` as terminal — the token stays cancelled forever, so
     /// another attempt could only fail the same way.
     ///
     /// On a `Command` this **replaces** any previously set token (last write
@@ -853,14 +853,14 @@ impl Command {
     /// [`Command`](Self::run), on [`ProcessRunnerExt`](crate::ProcessRunnerExt),
     /// and on [`CliClient`](crate::CliClient): the ones that surface failure as an
     /// [`Error`] the classifier can inspect (e.g. a transient network failure in
-    /// `stderr`, or [`Error::Timeout`](crate::Error::Timeout)). The non-erroring
+    /// `stderr`, or [`ErrorKind::Timeout`](crate::ErrorKind::Timeout)). The non-erroring
     /// `output_string`/`output_bytes` paths don't retry.
     ///
     /// Each attempt **re-executes the whole command** — a fresh process. Only
     /// retry operations that are safe to repeat: a side effect that already landed
     /// before the failure (a `git push` that reached the server, then dropped the
     /// connection) will be replayed. Prefer to gate retries on a classifier that
-    /// matches *pre-effect* failures (DNS/connection errors, [`Error::Timeout`]
+    /// matches *pre-effect* failures (DNS/connection errors, [`ErrorKind::Timeout`]
     /// while still connecting) rather than any non-zero exit.
     ///
     /// A [`timeout`](Self::timeout) bounds **each attempt**, not the whole retried
@@ -874,24 +874,24 @@ impl Command {
     /// re-feeds it only when the failed attempt is **guaranteed not to have
     /// consumed it**. The launch reserves that payload *transactionally* and
     /// commits it only once a child exists, so a failure **before any child was
-    /// spawned** — [`NotFound`](crate::Error::NotFound),
-    /// [`Spawn`](crate::Error::Spawn) (e.g. a transient `ETXTBSY` that
+    /// spawned** — [`NotFound`](crate::ErrorKind::NotFound),
+    /// [`Spawn`](crate::ErrorKind::Spawn) (e.g. a transient `ETXTBSY` that
     /// [`is_transient`](crate::Error::is_transient) accepts), or
-    /// [`Unsupported`](crate::Error::Unsupported) — rolls the reservation back
+    /// [`Unsupported`](crate::ErrorKind::Unsupported) — rolls the reservation back
     /// and leaves the payload intact: such a command **is** retried (subject to
     /// the classifier) and the next attempt feeds the untouched source. Any
     /// other error may have reached a live child that already consumed the
-    /// source — a non-zero [`Exit`](crate::Error::Exit),
-    /// [`Timeout`](crate::Error::Timeout), [`Signalled`](crate::Error::Signalled),
-    /// a stdin-write [`Stdin`](crate::Error::Stdin) failure,
-    /// [`OutputTooLarge`](crate::Error::OutputTooLarge), or the ambiguous
-    /// [`Io`](crate::Error::Io) (which arises both before and after a child) — so
+    /// source — a non-zero [`Exit`](crate::ErrorKind::Exit),
+    /// [`Timeout`](crate::ErrorKind::Timeout), [`Signalled`](crate::ErrorKind::Signalled),
+    /// a stdin-write [`Stdin`](crate::ErrorKind::Stdin) failure,
+    /// [`OutputTooLarge`](crate::ErrorKind::OutputTooLarge), or the ambiguous
+    /// [`Io`](crate::ErrorKind::Io) (which arises both before and after a child) — so
     /// the first attempt's error is returned as-is, **not** retried (a retry
     /// would either replay empty stdin or spuriously classify the re-consume).
     /// Use a reusable source (`from_string`/`from_bytes`/`from_file`/
     /// `from_iter_lines`) to retry unconditionally. (A one-shot source *re-run*
     /// outside this retry loop — a `Supervisor` incarnation, a pipeline re-run —
-    /// does fail loud with [`Error::Io`](crate::Error::Io) `InvalidInput` at
+    /// does fail loud with [`ErrorKind::Io`](crate::ErrorKind::Io) `InvalidInput` at
     /// launch instead.)
     ///
     /// **Inert outside the success-checking verbs.** A `retry` policy is
@@ -915,7 +915,7 @@ impl Command {
     /// a `RetryPolicy` counts `max_retries` (the runs *after* the first), so
     /// `retry(3, …)` corresponds to `RetryPolicy::new().max_retries(2)`.
     ///
-    /// [`Error::Timeout`]: crate::Error::Timeout
+    /// [`ErrorKind::Timeout`]: crate::ErrorKind::Timeout
     pub fn retry(
         mut self,
         max_attempts: u32,
@@ -1011,7 +1011,7 @@ impl Command {
     /// interactive pipe. Setting `inherit_stdin` **and** one of those is a
     /// contradiction (feed the child a source *and* let it read the terminal?),
     /// so it is rejected at the launch boundary with a typed
-    /// [`Error::Io`](crate::Error::Io) (`InvalidInput`) — the same failure mode
+    /// [`ErrorKind::Io`](crate::ErrorKind::Io) (`InvalidInput`) — the same failure mode
     /// as the other stdin misconfiguration the crate refuses (re-running a
     /// consumed one-shot source) — rather than silently letting one win. Drop the
     /// other stdin knob to resolve it.
@@ -1368,7 +1368,7 @@ impl Command {
     }
 
     /// The [`prefer_local`](Self::prefer_local) directories, in priority order
-    /// (read by the `Error::NotFound` diagnostic enrichment in `runner.rs`).
+    /// (read by the `ErrorKind::NotFound` diagnostic enrichment in `runner.rs`).
     pub(crate) fn prefer_local_dirs(&self) -> &[PathBuf] {
         &self.prefer_local
     }
@@ -1377,13 +1377,13 @@ impl Command {
     /// `PATH` away from the process `PATH` — an explicit `PATH` override/removal,
     /// [`env_clear`](Self::env_clear), or [`inherit_env`](Self::inherit_env)
     /// (which clears the inherited set). When true, the *`PATH`*-directory
-    /// naming in [`Error::NotFound`](crate::Error::NotFound) is skipped:
+    /// naming in [`ErrorKind::NotFound`](crate::ErrorKind::NotFound) is skipped:
     /// `find_in_path` reads the *process* `PATH`, so against a custom child
     /// `PATH` that list would be wrong. [`prefer_local`](Self::prefer_local)
     /// directories are unaffected by this gate and still get named — they're
     /// resolved by plain filesystem probes on the parent side, independent of
     /// the child's environment. A missing program still surfaces as
-    /// `Error::NotFound` (so [`is_not_found`](crate::Error::is_not_found)
+    /// `ErrorKind::NotFound` (so [`is_not_found`](crate::Error::is_not_found)
     /// holds), with `searched: None` only when there are no `prefer_local`
     /// directories to name either.
     pub(crate) fn customizes_path(&self) -> bool {
@@ -1797,7 +1797,7 @@ impl Command {
             }
         }
         cmd.stdout(match &self.stdout_file {
-            Some(file) => Stdio::from(file.open().map_err(Error::Io)?),
+            Some(file) => Stdio::from(file.open().map_err(ErrorKind::Io)?),
             None => match self.stdout_mode {
                 StdioMode::Piped => Stdio::piped(),
                 StdioMode::Inherit => Stdio::inherit(),
@@ -1805,7 +1805,7 @@ impl Command {
             },
         });
         cmd.stderr(match &self.stderr_file {
-            Some(file) => Stdio::from(file.open().map_err(Error::Io)?),
+            Some(file) => Stdio::from(file.open().map_err(ErrorKind::Io)?),
             None => match self.stderr_mode {
                 StdioMode::Piped => Stdio::piped(),
                 StdioMode::Inherit => Stdio::inherit(),
@@ -1928,24 +1928,24 @@ impl Command {
     ///
     /// The launch surface shared by every run verb on `Command`:
     ///
-    /// - [`Error::NotFound`] — the program could not be located (not installed,
+    /// - [`ErrorKind::NotFound`] — the program could not be located (not installed,
     ///   not on `PATH`, or the given path does not resolve to an executable).
-    /// - [`Error::Spawn`] — the program was located but the OS refused to start
+    /// - [`ErrorKind::Spawn`] — the program was located but the OS refused to start
     ///   it (permission denied, a missing or non-directory working directory, a
     ///   Windows `.cmd`/`.bat` that needs `cmd.exe`, …).
-    /// - [`Error::Unsupported`] — a requested POSIX-only primitive (running as
+    /// - [`ErrorKind::Unsupported`] — a requested POSIX-only primitive (running as
     ///   another user/group, a new session via `setsid`, or a `umask`) is not
     ///   available on this platform.
-    /// - [`Error::Cancelled`] — the [`cancel_on`](Self::cancel_on) token was
+    /// - [`ErrorKind::Cancelled`] — the [`cancel_on`](Self::cancel_on) token was
     ///   already cancelled before the spawn.
-    /// - [`Error::Io`] — the private [`ProcessGroup`](crate::ProcessGroup) backing
+    /// - [`ErrorKind::Io`] — the private [`ProcessGroup`](crate::ProcessGroup) backing
     ///   the run could not be created, or a one-shot streaming stdin source
     ///   ([`Stdin::from_reader`](crate::Stdin::from_reader) /
     ///   [`Stdin::from_lines`](crate::Stdin::from_lines)) was already consumed by
     ///   a previous run.
     #[cfg_attr(
         feature = "limits",
-        doc = "- [`Error::ResourceLimit`](crate::Error::ResourceLimit) — a resource cap configured on the run's group could not be enforced."
+        doc = "- [`ErrorKind::ResourceLimit`](crate::ErrorKind::ResourceLimit) — a resource cap configured on the run's group could not be enforced."
     )]
     pub async fn start(&self) -> Result<RunningProcess> {
         JobRunner::new().start(self).await
@@ -1963,10 +1963,10 @@ impl Command {
     /// timeout, and a signal-kill are *captured* in the returned
     /// [`ProcessResult`] rather than raised (call
     /// [`ensure_success`](crate::ProcessResult::ensure_success) to promote them);
-    /// beyond launch, only [`Error::Cancelled`] (a cancellation is always
-    /// raised), [`Error::OutputTooLarge`] (a fail-loud buffer overflowed),
-    /// [`Error::Stdin`] (a non-broken-pipe stdin failure on an
-    /// otherwise-successful run), and [`Error::Io`] surface.
+    /// beyond launch, only [`ErrorKind::Cancelled`] (a cancellation is always
+    /// raised), [`ErrorKind::OutputTooLarge`] (a fail-loud buffer overflowed),
+    /// [`ErrorKind::Stdin`] (a non-broken-pipe stdin failure on an
+    /// otherwise-successful run), and [`ErrorKind::Io`] surface.
     pub async fn output_string(&self) -> Result<ProcessResult<String>> {
         JobRunner::new().start(self).await?.output_string().await
     }
@@ -1977,7 +1977,7 @@ impl Command {
     ///
     /// Identical to [`output_string`](Self::output_string) — a non-zero exit, a
     /// timeout, or a signal-kill is captured in the [`ProcessResult`], not raised
-    /// — except that a fail-loud [`Error::OutputTooLarge`] applies to the raw
+    /// — except that a fail-loud [`ErrorKind::OutputTooLarge`] applies to the raw
     /// stdout *byte* ceiling.
     pub async fn output_bytes(&self) -> Result<ProcessResult<Vec<u8>>> {
         JobRunner::new().start(self).await?.output_bytes().await
@@ -1985,16 +1985,16 @@ impl Command {
 
     /// Run to completion and return just the exit code (output is discarded). A
     /// run that yields no code surfaces as an error — a timeout as
-    /// [`Error::Timeout`](crate::Error::Timeout), a signal-kill as
-    /// [`Error::Signalled`](crate::Error::Signalled) — consistent with
+    /// [`ErrorKind::Timeout`](crate::ErrorKind::Timeout), a signal-kill as
+    /// [`ErrorKind::Signalled`](crate::ErrorKind::Signalled) — consistent with
     /// [`ProcessRunnerExt::exit_code`](crate::ProcessRunnerExt::exit_code) and
     /// [`CliClient::exit_code`](crate::CliClient::exit_code).
     ///
     /// # Errors
     ///
     /// The launch failures listed on [`start`](Self::start), plus — when the run
-    /// produced no code — [`Error::Timeout`] (the deadline elapsed),
-    /// [`Error::Signalled`] (killed by a signal), or [`Error::Cancelled`]. A
+    /// produced no code — [`ErrorKind::Timeout`] (the deadline elapsed),
+    /// [`ErrorKind::Signalled`] (killed by a signal), or [`ErrorKind::Cancelled`]. A
     /// non-zero exit is returned as the code, not raised.
     pub async fn exit_code(&self) -> Result<i32> {
         JobRunner::new().exit_code(self).await
@@ -2002,17 +2002,17 @@ impl Command {
 
     /// Run to completion, requiring an **accepted** exit (`0` by default, widened
     /// by [`ok_codes`](Self::ok_codes)), and return trimmed stdout. Any other
-    /// code is [`Error::Exit`](crate::Error::Exit).
+    /// code is [`ErrorKind::Exit`](crate::ErrorKind::Exit).
     ///
     /// # Errors
     ///
     /// The launch failures listed on [`start`](Self::start), plus the
-    /// success-checking failures: [`Error::Exit`] (a non-accepted exit code),
-    /// [`Error::Signalled`] (a signal-kill), [`Error::Timeout`] (the deadline
+    /// success-checking failures: [`ErrorKind::Exit`] (a non-accepted exit code),
+    /// [`ErrorKind::Signalled`] (a signal-kill), [`ErrorKind::Timeout`] (the deadline
     /// elapsed — *raised* here, unlike on
-    /// [`output_string`](Self::output_string)), [`Error::Cancelled`],
-    /// [`Error::OutputTooLarge`] (a fail-loud buffer truncated the presented
-    /// stdout), and [`Error::Stdin`] (a non-broken-pipe stdin failure on an
+    /// [`output_string`](Self::output_string)), [`ErrorKind::Cancelled`],
+    /// [`ErrorKind::OutputTooLarge`] (a fail-loud buffer truncated the presented
+    /// stdout), and [`ErrorKind::Stdin`] (a non-broken-pipe stdin failure on an
     /// otherwise-successful run).
     pub async fn run(&self) -> Result<String> {
         JobRunner::new().run(self).await
@@ -2028,12 +2028,12 @@ impl Command {
     /// # Errors
     ///
     /// The same success-checking surface as [`run`](Self::run) —
-    /// [`Error::Exit`] / [`Error::Signalled`] / [`Error::Timeout`] /
-    /// [`Error::Cancelled`] / [`Error::Stdin`], atop the launch failures on
+    /// [`ErrorKind::Exit`] / [`ErrorKind::Signalled`] / [`ErrorKind::Timeout`] /
+    /// [`ErrorKind::Cancelled`] / [`ErrorKind::Stdin`], atop the launch failures on
     /// [`start`](Self::start) — except that, as the lenient building block,
     /// `checked` does **not** fail loud on a bounded-buffer truncation (inspect
     /// [`ProcessResult::truncated`](crate::ProcessResult::truncated) yourself), so
-    /// it never returns [`Error::OutputTooLarge`].
+    /// it never returns [`ErrorKind::OutputTooLarge`].
     pub async fn checked(&self) -> Result<ProcessResult<String>> {
         JobRunner::new().checked(self).await
     }
@@ -2046,8 +2046,8 @@ impl Command {
     /// # Errors
     ///
     /// The same surface as [`checked`](Self::checked) (the launch failures on
-    /// [`start`](Self::start) plus [`Error::Exit`] / [`Error::Signalled`] /
-    /// [`Error::Timeout`] / [`Error::Cancelled`] / [`Error::Stdin`]); only the
+    /// [`start`](Self::start) plus [`ErrorKind::Exit`] / [`ErrorKind::Signalled`] /
+    /// [`ErrorKind::Timeout`] / [`ErrorKind::Cancelled`] / [`ErrorKind::Stdin`]); only the
     /// captured output is discarded.
     pub async fn run_unit(&self) -> Result<()> {
         JobRunner::new().run_unit(self).await
@@ -2055,17 +2055,17 @@ impl Command {
 
     /// Run a predicate command and read its exit code as a boolean: exit `0` →
     /// `Ok(true)`, exit `1` → `Ok(false)`, anything else → `Err` (any other code
-    /// as [`Error::Exit`], a timeout as [`Error::Timeout`](crate::Error::Timeout),
-    /// a signal-kill as [`Error::Signalled`](crate::Error::Signalled)). For tools
+    /// as [`ErrorKind::Exit`], a timeout as [`ErrorKind::Timeout`](crate::ErrorKind::Timeout),
+    /// a signal-kill as [`ErrorKind::Signalled`](crate::ErrorKind::Signalled)). For tools
     /// whose exit code *is* the answer —
     /// `git diff --quiet`, `git show-ref --verify --quiet`, `grep -q`, …
     ///
     /// # Errors
     ///
-    /// Any exit code other than `0`/`1` becomes [`Error::Exit`], and — atop the
+    /// Any exit code other than `0`/`1` becomes [`ErrorKind::Exit`], and — atop the
     /// launch failures on [`start`](Self::start) — a run that produced no code
-    /// errors as [`Error::Timeout`], [`Error::Signalled`], or
-    /// [`Error::Cancelled`]. The strict `0`/`1` contract holds regardless of the
+    /// errors as [`ErrorKind::Timeout`], [`ErrorKind::Signalled`], or
+    /// [`ErrorKind::Cancelled`]. The strict `0`/`1` contract holds regardless of the
     /// command's [`ok_codes`](Self::ok_codes).
     pub async fn probe(&self) -> Result<bool> {
         JobRunner::new().probe(self).await
@@ -2080,9 +2080,9 @@ impl Command {
     /// # Errors
     ///
     /// The success-checking surface of [`run`](Self::run) (the launch failures on
-    /// [`start`](Self::start), plus [`Error::Exit`] / [`Error::Signalled`] /
-    /// [`Error::Timeout`] / [`Error::Cancelled`] / [`Error::Stdin`]), plus
-    /// [`Error::OutputTooLarge`] when a fail-loud buffer truncated the stdout the
+    /// [`start`](Self::start), plus [`ErrorKind::Exit`] / [`ErrorKind::Signalled`] /
+    /// [`ErrorKind::Timeout`] / [`ErrorKind::Cancelled`] / [`ErrorKind::Stdin`]), plus
+    /// [`ErrorKind::OutputTooLarge`] when a fail-loud buffer truncated the stdout the
     /// parser would see. The `parse` closure is infallible, so it adds no error.
     pub async fn parse<T, F>(&self, parse: F) -> Result<T>
     where
@@ -2094,7 +2094,7 @@ impl Command {
 
     /// Run (requiring an **accepted** exit) and feed stdout to a *fallible*
     /// `parse` closure (the JSON-deserialization shape; a failure becomes
-    /// [`Error::Parse`](crate::Error::Parse) or whatever the closure returns).
+    /// [`ErrorKind::Parse`](crate::ErrorKind::Parse) or whatever the closure returns).
     /// Fails loud on truncation. Consistent with
     /// [`ProcessRunnerExt::try_parse`](crate::ProcessRunnerExt::try_parse) and
     /// [`CliClient::try_parse`](crate::CliClient::try_parse).
@@ -2103,7 +2103,7 @@ impl Command {
     ///
     /// Everything [`parse`](Self::parse) can return, plus whatever the fallible
     /// `parse` closure yields on malformed output — typically
-    /// [`Error::Parse`](crate::Error::Parse).
+    /// [`ErrorKind::Parse`](crate::ErrorKind::Parse).
     pub async fn try_parse<T, F>(&self, parse: F) -> Result<T>
     where
         T: Send,
@@ -2118,9 +2118,9 @@ impl Command {
     /// # Errors
     ///
     /// The launch failures listed on [`start`](Self::start), plus
-    /// [`Error::Timeout`] when a [`timeout`](Self::timeout) is set and its
+    /// [`ErrorKind::Timeout`] when a [`timeout`](Self::timeout) is set and its
     /// deadline elapses mid-stream (which tears the process down),
-    /// [`Error::Cancelled`], or [`Error::Io`] while streaming. A stream that ends
+    /// [`ErrorKind::Cancelled`], or [`ErrorKind::Io`] while streaming. A stream that ends
     /// with no match is `Ok(None)`, not an error.
     pub async fn first_line<F>(&self, predicate: F) -> Result<Option<String>>
     where
@@ -2153,7 +2153,7 @@ impl Command {
     /// Windows including a bare name found only through a non-`.exe` PATHEXT
     /// extension (`.cmd`/`.bat`/`.com`/…): the launch substitutes the resolved
     /// absolute path (the OS's own bare-name search appends only `.exe`), so such
-    /// a hit spawns instead of raising [`Error::Spawn`]. The one residual
+    /// a hit spawns instead of raising [`ErrorKind::Spawn`]. The one residual
     /// asymmetry is a preflight **miss** on Windows: the OS can still locate a
     /// bare name through the application directory, the current directory, or the
     /// system directories — routes this `PATH`-based model doesn't cover — so a
@@ -2165,7 +2165,7 @@ impl Command {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`](crate::Error::NotFound) when the program can't be
+    /// [`ErrorKind::NotFound`](crate::ErrorKind::NotFound) when the program can't be
     /// located — not installed, not on `PATH`, or a path that doesn't resolve to
     /// an executable. Its `searched` field lists the directories that were
     /// checked (`prefer_local` first, then `PATH`) for a bare-name lookup, and is
@@ -2179,10 +2179,11 @@ impl Command {
         let path = self.resolution_path_source();
         match resolve_program(self.program.as_os_str(), &self.prefer_local, path) {
             ProgramResolution::Found(found) => Ok(found),
-            ProgramResolution::NotFound { searched } => Err(Error::NotFound {
+            ProgramResolution::NotFound { searched } => Err(ErrorKind::NotFound {
                 program: self.program_name(),
                 searched,
-            }),
+            }
+            .into()),
         }
     }
 
@@ -2469,7 +2470,7 @@ pub(crate) enum PathSource {
 
 /// The outcome of resolving a command's `program` to a concrete executable path
 /// **without spawning it** — the single decision the live launch path's
-/// [`Error::NotFound`](crate::Error::NotFound) enrichment (in `runner.rs`) and
+/// [`ErrorKind::NotFound`](crate::ErrorKind::NotFound) enrichment (in `runner.rs`) and
 /// the spawn-free [`which`](crate::which) / [`Command::resolve_program`]
 /// preflight both derive from, so the two can never disagree about whether a
 /// program is available.
@@ -2480,7 +2481,7 @@ pub(crate) enum ProgramResolution {
     /// name the same way [`find_in_path_in`] models; preflight returns it.
     Found(PathBuf),
     /// Not resolvable. `searched` is the directory list for
-    /// [`Error::NotFound`](crate::Error::NotFound)'s field: `Some` for a
+    /// [`ErrorKind::NotFound`](crate::ErrorKind::NotFound)'s field: `Some` for a
     /// bare-name `PATH` lookup (the searched dirs, `prefer_local` first),
     /// `None` for a path-form program (no `PATH` search applied).
     NotFound { searched: Option<String> },
@@ -2610,7 +2611,7 @@ pub(crate) fn probe_prefer_local(dirs: &[PathBuf], program: &OsStr) -> Option<Pa
 }
 
 /// Build the combined `searched` diagnostic for
-/// [`Error::NotFound`](crate::Error::NotFound): the [`Command::prefer_local`]
+/// [`ErrorKind::NotFound`](crate::ErrorKind::NotFound): the [`Command::prefer_local`]
 /// directories (first, in priority order) followed by the `PATH` directories
 /// (`path_searched`, as returned by [`find_in_path`]) — joined by the
 /// platform's `PATH`-list separator (`:` on Unix, `;` on Windows), matching
@@ -3465,7 +3466,9 @@ mod tests {
             .stdout_file(missing_parent)
             .build_tokio()
             .expect_err("file opening fails at the launch boundary");
-        assert!(matches!(err, crate::Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound));
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
+        );
     }
 
     // T-125: a bare name that exists on `PATH` ONLY via a non-`.exe` PATHEXT
@@ -3596,9 +3599,9 @@ mod tests {
         );
     }
 
-    // T-101: a bare name that resolves nowhere yields `Error::NotFound` whose
+    // T-101: a bare name that resolves nowhere yields `ErrorKind::NotFound` whose
     // `searched` names the `prefer_local` directories (first) — the same typed
-    // error the launch raises, reusing `Error::NotFound` rather than a parallel.
+    // error the launch raises, reusing `ErrorKind::NotFound` rather than a parallel.
     #[test]
     fn resolve_program_missing_bare_name_is_not_found_with_searched() {
         let dir = tempfile::tempdir().expect("temp dir"); // deliberately empty
@@ -3607,15 +3610,17 @@ mod tests {
             .resolve_program()
             .expect_err("an absent program must not resolve");
         assert!(err.is_not_found(), "must classify as not-found: {err:?}");
-        match err {
-            crate::Error::NotFound { searched, .. } => {
-                let searched = searched.expect("a bare-name lookup reports searched dirs");
+        match err.kind() {
+            crate::ErrorKind::NotFound { searched, .. } => {
+                let searched = searched
+                    .as_ref()
+                    .expect("a bare-name lookup reports searched dirs");
                 assert!(
                     searched.contains(&dir.path().to_string_lossy().into_owned()),
                     "searched must include the prefer_local directory: {searched}"
                 );
             }
-            other => panic!("expected Error::NotFound, got {other:?}"),
+            other => panic!("expected ErrorKind::NotFound, got {other:?}"),
         }
     }
 
@@ -3644,12 +3649,12 @@ mod tests {
         let err = Command::new(&missing)
             .resolve_program()
             .expect_err("a missing path-form program must not resolve");
-        match err {
-            crate::Error::NotFound { searched, .. } => assert_eq!(
-                searched, None,
+        match err.kind() {
+            crate::ErrorKind::NotFound { searched, .. } => assert_eq!(
+                *searched, None,
                 "a path-form lookup applies no PATH search, so searched is None"
             ),
-            other => panic!("expected Error::NotFound, got {other:?}"),
+            other => panic!("expected ErrorKind::NotFound, got {other:?}"),
         }
     }
 
@@ -3843,7 +3848,7 @@ mod tests {
     // not make `probe_dir` report a match — otherwise `find_in_path` returns
     // `found == Some(..)` for a file that Windows cannot actually run, and the
     // error-enrichment branch in `runner::launch` turns a genuinely missing
-    // `git.exe` into `Error::Spawn` instead of `Error::NotFound`, breaking
+    // `git.exe` into `ErrorKind::Spawn` instead of `ErrorKind::NotFound`, breaking
     // `is_not_found()` for callers.
     #[cfg(windows)]
     #[test]

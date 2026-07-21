@@ -44,7 +44,7 @@ async fn main() -> processkit::Result<()> {
         .run()
         .await
         .unwrap_err();
-    assert!(matches!(err, processkit::Error::Timeout { .. }));
+    assert!(matches!(err.kind(), processkit::ErrorKind::Timeout { .. }));
     Ok(())
 }
 ```
@@ -54,17 +54,17 @@ Where each verb lands:
 | Verb | Deadline expiry becomes |
 |---|---|
 | `output_string()` / `output_bytes()` | `Ok` result with `timed_out() == true`, `code() == None`, partial output kept |
-| `run()` / `exit_code()` / `probe()` / `checked()` | `Error::Timeout { program, timeout, stdout, stderr }` — the partial output captured before the kill is attached (`err.diagnostic()` surfaces a hung tool's last words) |
-| `first_line(pred)` | `Error::Timeout` (the line never arrived in time) |
+| `run()` / `exit_code()` / `probe()` / `checked()` | `ErrorKind::Timeout { program, timeout, stdout, stderr }` — the partial output captured before the kill is attached (`err.diagnostic()` surfaces a hung tool's last words) |
+| `first_line(pred)` | `ErrorKind::Timeout` (the line never arrived in time) |
 | `start()` + streaming | the stream **ends** at the deadline (tree killed, pipes closed); `finish` then reports the kill (`outcome == Outcome::TimedOut`) |
-| `ensure_success()` on a captured result | `Error::Timeout`, checked *before* the exit code |
+| `ensure_success()` on a captured result | `ErrorKind::Timeout`, checked *before* the exit code |
 | [`Pipeline`](pipelines.md#timeouts) | chain deadline → `timed_out` result; per-stage deadlines fold into pipefail |
 
 Two distinct deadline families to keep apart:
 
 - `Command::timeout` — the run's own contract, this section.
 - The [readiness probes](streaming.md#readiness-probes)' `within` parameter —
-  gives `Error::NotReady` and **never kills the child**.
+  gives `ErrorKind::NotReady` and **never kills the child**.
 
 ### Graceful timeout
 
@@ -117,7 +117,7 @@ teardown timing.
 only while the classifier accepts the error:
 
 ```rust,no_run
-use processkit::{Command, Error};
+use processkit::{Command, ErrorKind};
 use std::time::Duration;
 
 #[tokio::main]
@@ -127,8 +127,8 @@ async fn main() -> processkit::Result<()> {
         .timeout(Duration::from_secs(10))
         .retry(3, Duration::from_millis(250), |e| {
             // transient: network timeouts and curl's "couldn't connect" (7)
-            matches!(e, Error::Timeout { .. })
-                || matches!(e, Error::Exit { code: 7, .. })
+            matches!(e.kind(), ErrorKind::Timeout { .. })
+                || matches!(e.kind(), ErrorKind::Exit { code: 7, .. })
         })
         .run()
         .await?;
@@ -150,7 +150,7 @@ Ground rules:
   as-is, since a second attempt could only replay empty stdin. Use a reusable
   stdin source if a stdin-bearing command must retry. (A one-shot source re-run
   *outside* the retry loop — a `Supervisor` incarnation, a pipeline re-run —
-  instead fails loud with an `Error::Io` (`InvalidInput`) at launch.)
+  instead fails loud with an `ErrorKind::Io` (`InvalidInput`) at launch.)
 - A `Cancelled` error is **never retried**, classifier or not — the token
   stays cancelled forever, so another attempt could only fail the same way.
 
@@ -162,7 +162,7 @@ backoff shape, different loop condition.
 
 Hand any command a `CancellationToken` (re-exported at the crate root);
 cancelling the token kills the run's tree and makes every consuming path
-report `Error::Cancelled`:
+report `ErrorKind::Cancelled`:
 
 ```rust,no_run
 use processkit::{CancellationToken, Command};
@@ -183,8 +183,8 @@ async fn main() -> processkit::Result<()> {
     shutdown.cancel();
 
     assert!(matches!(
-        job.await.unwrap(),
-        Err(processkit::Error::Cancelled { .. })
+        job.await.unwrap().map_err(processkit::Error::into_kind),
+        Err(processkit::ErrorKind::Cancelled { .. })
     ));
     Ok(())
 }
@@ -194,15 +194,15 @@ The contract, path by path:
 
 | Situation | Behavior |
 |---|---|
-| Cancel during `run` / `output_string` / `output_bytes` / `wait` / `profile` / `exit_code` / `probe` | tree killed, `Error::Cancelled { program }` |
-| Cancel during streaming (`stdout_lines`) | the stream **ends**; the following `finish` reports `Error::Cancelled` |
+| Cancel during `run` / `output_string` / `output_bytes` / `wait` / `profile` / `exit_code` / `probe` | tree killed, `ErrorKind::Cancelled { program }` |
+| Cancel during streaming (`stdout_lines`) | the stream **ends**; the following `finish` reports `ErrorKind::Cancelled` |
 | Token already cancelled before the run | short-circuits **before spawning** — no process is ever created |
 | Cancel on a shared-`ProcessGroup` handle | kills the child itself, leaves the group's siblings alone (same scope as a timeout) |
 | A `Pipeline` stage's token cancels | that stage dies; the cancellation errors the whole pipeline and the private group reaps the other stages |
 | Under `retry` | terminal — never retried, whatever the classifier says |
 | Under a [`Supervisor`](supervision.md) | terminal — supervision returns `Err(Cancelled)` instead of restarting into a still-cancelled token |
 | `wait_any` mid-run | surfaces `Err(Cancelled)` — each racer's wait path resolves to `Cancelled` when its token fires, the same as a bulk verb (a *pre-cancelled* token still hits the pre-spawn short-circuit) |
-| `first_line` mid-run | surfaces `Error::Cancelled` once the token fires — a cancelled stream that closes without a match is reported as cancellation, not `Ok(None)` |
+| `first_line` mid-run | surfaces `ErrorKind::Cancelled` once the token fires — a cancelled stream that closes without a match is reported as cancellation, not `Ok(None)` |
 
 ### Client-level default
 
@@ -217,7 +217,7 @@ use processkit::{CancellationToken, CliClient};
 let token = CancellationToken::new();
 let gh = CliClient::new("gh").default_cancel_on(token.child_token());
 // ... controller cancels `token` → every in-flight command of THIS client
-// dies (whole tree), surfacing Error::Cancelled to the awaiting call.
+// dies (whole tree), surfacing ErrorKind::Cancelled to the awaiting call.
 ```
 
 Clients are cheap — scope cancellation by building **one client per
@@ -254,7 +254,7 @@ async fn main() -> processkit::Result<()> {
         .run()
         .await
         .unwrap_err();
-    assert!(matches!(err, processkit::Error::Cancelled { .. }));
+    assert!(matches!(err.kind(), processkit::ErrorKind::Cancelled { .. }));
     Ok(())
 }
 ```

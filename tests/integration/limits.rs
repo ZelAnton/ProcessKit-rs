@@ -4,14 +4,14 @@
 #[cfg(windows)]
 use processkit::Command;
 use processkit::{
-    Error, LimitKind, LimitReason, Mechanism, ProcessGroup, ProcessGroupOptions, ResourceLimits,
+    Error, ErrorKind, LimitKind, LimitReason, Mechanism, ProcessGroup, ProcessGroupOptions, ResourceLimits,
 };
 
 #[tokio::test]
 #[ignore = "creates an OS job/cgroup with a resource limit"]
 async fn limits_are_enforced_or_rejected_per_platform() {
     // Setting a limit must either be honored by a real container (Windows Job
-    // Object / Linux cgroup) or fail fast with `Error::ResourceLimit` — never
+    // Object / Linux cgroup) or fail fast with `ErrorKind::ResourceLimit` — never
     // silently hand back an unbounded group.
     let res =
         ProcessGroup::with_options(ProcessGroupOptions::default().max_memory(64 * 1024 * 1024));
@@ -19,13 +19,13 @@ async fn limits_are_enforced_or_rejected_per_platform() {
         let group = res.expect("Windows Job Objects enforce a memory cap");
         assert!(matches!(group.mechanism(), Mechanism::JobObject));
     } else if cfg!(target_os = "linux") {
-        match res {
+        match res.map_err(Error::into_kind) {
             Ok(group) => assert!(matches!(group.mechanism(), Mechanism::CgroupV2)),
             // Common on dev boxes / CI without cgroup delegation — the fail-fast
             // path. A capable mechanism (cgroup v2 is mounted) exists here; this
             // *specific* request just couldn't be applied — `Unenforceable`, not
             // `Unsupported`.
-            Err(Error::ResourceLimit { kind, reason, .. }) => {
+            Err(ErrorKind::ResourceLimit { kind, reason, .. }) => {
                 assert_eq!(kind, LimitKind::Memory);
                 assert_eq!(reason, LimitReason::Unenforceable);
                 eprintln!("skipping cgroup enforcement: controller delegation unavailable");
@@ -35,8 +35,8 @@ async fn limits_are_enforced_or_rejected_per_platform() {
     } else {
         // macOS/BSD have no whole-tree cap at all — `Unsupported`, not
         // `Unenforceable` (no mechanism exists to even attempt this against).
-        match res {
-            Err(Error::ResourceLimit { kind, reason, .. }) => {
+        match res.map_err(Error::into_kind) {
+            Err(ErrorKind::ResourceLimit { kind, reason, .. }) => {
                 assert_eq!(kind, LimitKind::Memory);
                 assert_eq!(reason, LimitReason::Unsupported);
             }

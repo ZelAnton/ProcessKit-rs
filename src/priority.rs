@@ -11,7 +11,7 @@
 /// platform families — `setpriority` is plain POSIX (Linux, macOS, the BSDs
 /// alike) and every Windows edition has all five priority classes — so
 /// [`Command::priority`](crate::Command::priority) never yields
-/// [`Error::Unsupported`](crate::Error::Unsupported).
+/// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Priority {
@@ -30,7 +30,7 @@ pub enum Priority {
     /// the kernel to *lower* the child's `nice` back to `0` — the same kind
     /// of decrease as [`AboveNormal`](Priority::AboveNormal)/[`High`](Priority::High),
     /// and subject to the same `CAP_SYS_NICE`/root requirement and
-    /// [`Error::Spawn`](crate::Error::Spawn) failure mode described there.
+    /// [`ErrorKind::Spawn`](crate::ErrorKind::Spawn) failure mode described there.
     /// Windows is unaffected: `NORMAL_PRIORITY_CLASS` never needs a privilege
     /// check.
     Normal,
@@ -40,7 +40,7 @@ pub enum Priority {
     /// **Unix caveat:** same privilege requirement as
     /// [`High`](Priority::High) — lowering `nice` below its inherited value
     /// needs `CAP_SYS_NICE`/root, and without it the spawn fails as
-    /// [`Error::Spawn`](crate::Error::Spawn) rather than silently applying a
+    /// [`ErrorKind::Spawn`](crate::ErrorKind::Spawn) rather than silently applying a
     /// smaller increase.
     AboveNormal,
     /// Highest ordinary (non-real-time) priority.
@@ -48,7 +48,7 @@ pub enum Priority {
     /// **Unix caveat:** lowering `nice` below its inherited value needs
     /// `CAP_SYS_NICE` (Linux) or an equivalent privilege elsewhere; without it
     /// the OS refuses the change and the spawn fails as
-    /// [`Error::Spawn`](crate::Error::Spawn), exactly like any other rejected
+    /// [`ErrorKind::Spawn`](crate::ErrorKind::Spawn), exactly like any other rejected
     /// `pre_exec` hook — it is never silently downgraded to a lower priority.
     /// Windows needs no special privilege for `HIGH_PRIORITY_CLASS`.
     /// Unix: `nice(-10)`. Windows: `HIGH_PRIORITY_CLASS`.

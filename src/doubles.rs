@@ -36,7 +36,7 @@
 //! [`Reply::pending`]: it parks the call (or never
 //! "exits", on `start`) until the command's token — per-command or
 //! [`CliClient::default_cancel_on`](crate::CliClient::default_cancel_on) —
-//! cancels, then resolves with `Err(Error::Cancelled { .. })`, mirroring the
+//! cancels, then resolves with `Err(ErrorKind::Cancelled { .. })`, mirroring the
 //! live contract. A pending call is likewise bounded by the command's
 //! [`Command::timeout`](crate::Command::timeout): with a deadline set it resolves
 //! timed-out (`Outcome::TimedOut`) rather than parking, on the bulk verbs and
@@ -84,10 +84,10 @@ pub struct Reply {
 /// run with a failing exit code.
 #[derive(Debug, Clone)]
 enum SpawnError {
-    /// Drives [`Error::NotFound`](crate::Error::NotFound) (`is_not_found() ==
+    /// Drives [`ErrorKind::NotFound`](crate::ErrorKind::NotFound) (`is_not_found() ==
     /// true`).
     NotFound,
-    /// Drives [`Error::Spawn`](crate::Error::Spawn) carrying the given
+    /// Drives [`ErrorKind::Spawn`](crate::ErrorKind::Spawn) carrying the given
     /// [`std::io::ErrorKind`] and message.
     Spawn {
         kind: std::io::ErrorKind,
@@ -131,7 +131,7 @@ impl Reply {
     }
 
     /// A timed-out reply — drives the timeout path so a test can assert that a
-    /// command which exceeds its deadline surfaces as [`Error::Timeout`](crate::Error::Timeout).
+    /// command which exceeds its deadline surfaces as [`ErrorKind::Timeout`](crate::ErrorKind::Timeout).
     ///
     /// On both the bulk verbs (`output_string` and friends) and a scripted
     /// [`start`](crate::ProcessRunner::start) this resolves **immediately** as
@@ -180,7 +180,7 @@ impl Reply {
     /// for overrunning its deadline, for testing that an orchestration genuinely
     /// cancels (and cleans up) or bounds a hang, not just that it formats a canned
     /// error. A firing token resolves with
-    /// [`Error::Cancelled`](crate::Error::Cancelled) naming the program; a firing
+    /// [`ErrorKind::Cancelled`](crate::ErrorKind::Cancelled) naming the program; a firing
     /// deadline resolves as a timed-out run (`Outcome::TimedOut`), exactly as a
     /// [`timeout`](Self::timeout) reply would.
     ///
@@ -240,7 +240,7 @@ impl Reply {
 
     /// Attach stdout to a reply — e.g. the `CONFLICT …` text `git merge` writes
     /// to stdout on a failing reply, so a test can exercise
-    /// [`Error::Exit`](crate::Error::Exit)'s stdout field /
+    /// [`ErrorKind::Exit`](crate::ErrorKind::Exit)'s stdout field /
     /// [`ProcessResult::diagnostic`](crate::ProcessResult::diagnostic).
     pub fn with_stdout(mut self, stdout: impl Into<String>) -> Self {
         self.stdout = stdout.into();
@@ -258,10 +258,10 @@ impl Reply {
 
     /// A reply that fails as if the program could not be located at all — not
     /// installed, not on `PATH`, or the given path doesn't resolve — driving
-    /// [`Error::NotFound`](crate::Error::NotFound)
+    /// [`ErrorKind::NotFound`](crate::ErrorKind::NotFound)
     /// (`is_not_found() == true`), the hermetic mirror of a live spawn hitting a
     /// missing binary. A rule miss on the real runner instead lands on
-    /// [`Error::Spawn`](crate::Error::Spawn) (`is_not_found() == false` — a
+    /// [`ErrorKind::Spawn`](crate::ErrorKind::Spawn) (`is_not_found() == false` — a
     /// double-specific "no rule matched" config error, not a modeled spawn
     /// failure), so script this reply explicitly to test a "tool not installed →
     /// fallback" branch: `.on(["rg", …], Reply::not_found())` (or
@@ -276,7 +276,7 @@ impl Reply {
     /// A reply that fails at spawn time with a generic OS-level error —
     /// permission denied, a busy executable, and so on — as opposed to
     /// [`not_found`](Self::not_found)'s "the program doesn't exist at all".
-    /// Drives [`Error::Spawn`](crate::Error::Spawn) with an `io::Error` of the
+    /// Drives [`ErrorKind::Spawn`](crate::ErrorKind::Spawn) with an `io::Error` of the
     /// given `kind` and `message`, so classifiers built on it
     /// (e.g. [`Error::is_permission_denied`](crate::Error::is_permission_denied))
     /// answer on the fake exactly as they would for a live spawn failure.
@@ -296,14 +296,20 @@ impl Reply {
     /// all.
     fn spawn_error_for(&self, program: String) -> Option<crate::error::Error> {
         match &self.spawn_error {
-            Some(SpawnError::NotFound) => Some(crate::error::Error::NotFound {
-                program,
-                searched: None,
-            }),
-            Some(SpawnError::Spawn { kind, message }) => Some(crate::error::Error::Spawn {
-                program,
-                source: std::io::Error::new(*kind, message.clone()),
-            }),
+            Some(SpawnError::NotFound) => Some(
+                crate::error::ErrorKind::NotFound {
+                    program,
+                    searched: None,
+                }
+                .into(),
+            ),
+            Some(SpawnError::Spawn { kind, message }) => Some(
+                crate::error::ErrorKind::Spawn {
+                    program,
+                    source: std::io::Error::new(*kind, message.clone()),
+                }
+                .into(),
+            ),
             None => None,
         }
     }
@@ -406,7 +412,7 @@ impl Reply {
     /// and the bulk and `start` verbs agree on one double.
     fn into_result(self, program: String, command: &Command) -> ProcessResult<String> {
         // Carry the command's configured timeout so a timed-out reply surfaces as
-        // `Error::Timeout` with the real deadline, not a zero duration.
+        // `ErrorKind::Timeout` with the real deadline, not a zero duration.
         let timeout = command.configured_timeout();
         let outcome = if self.timed_out {
             Outcome::TimedOut
@@ -732,15 +738,16 @@ impl ScriptedRunner {
                 return Ok(&entry.replies[i.min(entry.replies.len() - 1)]);
             }
         }
-        self.fallback
-            .as_ref()
-            .ok_or_else(|| crate::error::Error::Spawn {
+        self.fallback.as_ref().ok_or_else(|| {
+            crate::error::ErrorKind::Spawn {
                 program: program.to_owned(),
                 source: std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "ScriptedRunner: no rule matched and no fallback set",
                 ),
-            })
+            }
+            .into()
+        })
     }
 }
 
@@ -796,7 +803,7 @@ impl ProcessRunner for ScriptedRunner {
         if let Some(token) = command.cancel_token()
             && token.is_cancelled()
         {
-            return Err(crate::error::Error::Cancelled { program });
+            return Err(crate::error::ErrorKind::Cancelled { program }.into());
         }
         // Reserve a one-shot streaming stdin source exactly like the live launch
         // path, and hold the reservation until we know this scripted run "starts a
@@ -847,7 +854,7 @@ impl ProcessRunner for ScriptedRunner {
         if let Some(token) = command.cancel_token()
             && token.is_cancelled()
         {
-            return Err(crate::error::Error::Cancelled { program });
+            return Err(crate::error::ErrorKind::Cancelled { program }.into());
         }
         // See the matching comment in `output_string`: a one-shot streaming stdin
         // source is reserved here too, then committed once we know a scripted child
@@ -873,7 +880,7 @@ impl ProcessRunner for ScriptedRunner {
 /// [`timeout`](crate::Command::timeout) and resolve exactly as the live bulk
 /// path would for a genuinely hung child.
 ///
-/// - the token fires first → `Err(Error::Cancelled)`, the mirror of cancelling
+/// - the token fires first → `Err(ErrorKind::Cancelled)`, the mirror of cancelling
 ///   (and cleaning up) a live long-runner;
 /// - the `Command::timeout` deadline fires first → a synthesized timed-out
 ///   [`ProcessResult`] (`Outcome::TimedOut`, empty output — the same shape a
@@ -906,7 +913,7 @@ async fn park_until_cancelled(command: &Command, program: String) -> Result<Proc
     };
     tokio::select! {
         biased;
-        () = cancelled => Err(crate::error::Error::Cancelled { program }),
+        () = cancelled => Err(crate::error::ErrorKind::Cancelled { program }.into()),
         // The same construction the bulk verb applies to a `Reply::timeout()`, so a
         // pending-then-timeout result is byte-for-byte a canned timeout on this verb.
         () = deadline => Ok(Reply::timeout()
@@ -1115,7 +1122,7 @@ impl<R: ProcessRunner> ProcessRunner for RecordingRunner<R> {
     async fn output_bytes(&self, command: &Command) -> Result<ProcessResult<Vec<u8>>> {
         // Don't fall through to the `start`-based default: a runner whose
         // `output_bytes` override behaves differently (e.g. rejects with
-        // `Error::Unsupported` instead of lossily re-encoding) must be honored,
+        // `ErrorKind::Unsupported` instead of lossily re-encoding) must be honored,
         // not silently replayed through `start`.
         self.calls
             .lock()
@@ -1455,7 +1462,7 @@ mod tests {
     #[tokio::test]
     async fn first_line_reports_cancellation_not_a_missing_line() {
         // When the command's cancel token has fired, a `first_line` whose
-        // predicate never matched must surface `Error::Cancelled` — not `Ok(None)`,
+        // predicate never matched must surface `ErrorKind::Cancelled` — not `Ok(None)`,
         // which a readiness probe would misread as "the line never appeared".
         use crate::runner::ProcessRunnerExt;
         use tokio_util::sync::CancellationToken;
@@ -1468,7 +1475,7 @@ mod tests {
             .cancel_on(token.child_token());
         let result = runner.first_line(&cmd, |l| l.contains("ready")).await;
         assert!(
-            matches!(result, Err(crate::Error::Cancelled { .. })),
+            matches!(&result, Err(e) if matches!(e.kind(), crate::ErrorKind::Cancelled { .. })),
             "a cancelled probe must report Cancelled, got {result:?}"
         );
 
@@ -1852,7 +1859,10 @@ mod tests {
             .expect_err("the line never arrives, so the probe is NotReady");
         let waited = start.elapsed();
 
-        assert!(matches!(err, crate::Error::NotReady { .. }), "got {err:?}");
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::NotReady { .. }),
+            "got {err:?}"
+        );
         assert!(
             waited >= std::time::Duration::from_secs(9),
             "the probe must wait its full `within` (10s), not be cut short by the \
@@ -1876,7 +1886,10 @@ mod tests {
             .wait_for_line(|_| false, std::time::Duration::from_secs(1))
             .await
             .expect_err("nothing matches within 1s");
-        assert!(matches!(err, crate::Error::NotReady { .. }), "got {err:?}");
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::NotReady { .. }),
+            "got {err:?}"
+        );
 
         let finish = run.finish().await.expect("finish");
         assert_eq!(
@@ -1921,7 +1934,10 @@ mod tests {
             .wait_for_line(|_| false, std::time::Duration::from_secs(10))
             .await
             .expect_err("nothing matches within 10s");
-        assert!(matches!(err, crate::Error::NotReady { .. }), "got {err:?}");
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::NotReady { .. }),
+            "got {err:?}"
+        );
 
         // With 10 virtual seconds already burned against a 5s timeout, the
         // deadline is past: `finish` must time out AT ONCE (advancing no further
@@ -2017,8 +2033,8 @@ mod tests {
             .output_string(&cmd)
             .await
             .expect_err("a non-piped stdout must error on a capture verb");
-        match err {
-            crate::error::Error::Io(e) => {
+        match err.kind() {
+            crate::error::ErrorKind::Io(e) => {
                 assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput)
             }
             other => panic!("expected Io(InvalidInput), got {other:?}"),
@@ -2036,7 +2052,7 @@ mod tests {
             .await
             .expect_err("a scripted capture cannot read the child-owned file");
         assert!(
-            matches!(err, crate::error::Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput)
+            matches!(err.kind(), crate::error::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput)
         );
 
         let dry_run = DryRunRunner::new();
@@ -2045,7 +2061,7 @@ mod tests {
             .await
             .expect_err("a dry-run capture cannot pretend to read the file");
         assert!(
-            matches!(err, crate::error::Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput)
+            matches!(err.kind(), crate::error::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput)
         );
         assert!(
             dry_run.commands().is_empty(),
@@ -2066,7 +2082,7 @@ mod tests {
             .await
             .expect_err("a pre-cancelled token short-circuits");
         assert!(
-            matches!(err, crate::error::Error::Cancelled { .. }),
+            matches!(err.kind(), crate::error::ErrorKind::Cancelled { .. }),
             "got {err:?}"
         );
     }
@@ -2085,7 +2101,7 @@ mod tests {
             .await
             .expect_err("a pre-cancelled token short-circuits start");
         assert!(
-            matches!(err, crate::error::Error::Cancelled { .. }),
+            matches!(err.kind(), crate::error::ErrorKind::Cancelled { .. }),
             "got {err:?}"
         );
     }
@@ -2161,9 +2177,10 @@ mod tests {
         }
 
         async fn output_bytes(&self, _command: &Command) -> Result<ProcessResult<Vec<u8>>> {
-            Err(crate::error::Error::Unsupported {
+            Err(crate::error::ErrorKind::Unsupported {
                 operation: "output_bytes".into(),
-            })
+            }
+            .into())
         }
     }
 
@@ -2178,7 +2195,7 @@ mod tests {
             .await
             .expect_err("inner's Unsupported must be forwarded, not masked");
         assert!(
-            matches!(err, crate::error::Error::Unsupported { .. }),
+            matches!(err.kind(), crate::error::ErrorKind::Unsupported { .. }),
             "got {err:?}"
         );
         assert_eq!(rec.only_call().args_str(), ["cat-file", "blob", "HEAD"]);
@@ -2204,7 +2221,7 @@ mod tests {
             .expect("the token resolves the run")
             .expect_err("cancellation is always an error");
         assert!(
-            matches!(err, crate::error::Error::Cancelled { .. }),
+            matches!(err.kind(), crate::error::ErrorKind::Cancelled { .. }),
             "got {err:?}"
         );
     }
@@ -2250,7 +2267,7 @@ mod tests {
             .expect("the token resolves the race")
             .expect_err("a cancelled run surfaces as an error");
         assert!(
-            matches!(err, crate::error::Error::Cancelled { .. }),
+            matches!(err.kind(), crate::error::ErrorKind::Cancelled { .. }),
             "got {err:?}"
         );
     }
@@ -2298,12 +2315,12 @@ mod tests {
             .output_string(&Command::new("git").arg("log"))
             .await
             .expect_err("an unmatched command with no fallback must error");
-        match err {
-            crate::error::Error::Spawn { program, source } => {
+        match err.kind() {
+            crate::error::ErrorKind::Spawn { program, source } => {
                 assert_eq!(program, "git");
                 assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
             }
-            other => panic!("expected Error::Spawn, got {other:?}"),
+            other => panic!("expected ErrorKind::Spawn, got {other:?}"),
         }
     }
 
@@ -2382,26 +2399,30 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_reply_surfaces_as_timeout_error() {
-        use crate::error::Error;
+        use crate::error::ErrorKind;
         let runner = ScriptedRunner::new().fallback(Reply::timeout());
         // capture/output exposes the flag without erroring …
         let out = runner.output_string(&Command::new("git")).await.unwrap();
         assert!(out.timed_out());
         // … but the success-checking helpers raise a distinct Timeout.
         assert!(matches!(
-            runner.run(&Command::new("git")).await.unwrap_err(),
-            Error::Timeout { .. }
+            runner.run(&Command::new("git")).await.unwrap_err().kind(),
+            ErrorKind::Timeout { .. }
         ));
         assert!(matches!(
-            runner.exit_code(&Command::new("git")).await.unwrap_err(),
-            Error::Timeout { .. }
+            runner
+                .exit_code(&Command::new("git"))
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Timeout { .. }
         ));
         // The reply carries the command's *real* configured deadline, matching the
         // live runner — not a zero duration.
         let cmd = Command::new("git").timeout(std::time::Duration::from_secs(7));
-        match runner.run(&cmd).await.unwrap_err() {
-            Error::Timeout { timeout, .. } => {
-                assert_eq!(timeout, std::time::Duration::from_secs(7))
+        match runner.run(&cmd).await.unwrap_err().kind() {
+            ErrorKind::Timeout { timeout, .. } => {
+                assert_eq!(*timeout, std::time::Duration::from_secs(7))
             }
             other => panic!("expected Timeout, got {other:?}"),
         }
@@ -2439,13 +2460,13 @@ mod tests {
 
     #[tokio::test]
     async fn signalled_reply_carries_signal_number() {
-        use crate::error::Error;
+        use crate::error::ErrorKind;
         let runner = ScriptedRunner::new().fallback(Reply::signalled(Some(9)));
         let result = runner.output_string(&Command::new("tool")).await.unwrap();
         assert_eq!(result.outcome(), crate::Outcome::Signalled(Some(9)));
         assert!(matches!(
-            runner.run(&Command::new("tool")).await.unwrap_err(),
-            Error::Signalled {
+            runner.run(&Command::new("tool")).await.unwrap_err().kind(),
+            ErrorKind::Signalled {
                 signal: Some(9),
                 ..
             }
@@ -2454,19 +2475,19 @@ mod tests {
 
     #[tokio::test]
     async fn signalled_reply_without_a_number_is_signalled_none() {
-        use crate::error::Error;
+        use crate::error::ErrorKind;
         let runner = ScriptedRunner::new().fallback(Reply::signalled(None));
         let result = runner.output_string(&Command::new("tool")).await.unwrap();
         assert_eq!(result.outcome(), crate::Outcome::Signalled(None));
         assert!(matches!(
-            runner.run(&Command::new("tool")).await.unwrap_err(),
-            Error::Signalled { signal: None, .. }
+            runner.run(&Command::new("tool")).await.unwrap_err().kind(),
+            ErrorKind::Signalled { signal: None, .. }
         ));
     }
 
     #[tokio::test(start_paused = true)]
     async fn pending_parks_until_the_token_fires_then_cancels() {
-        use crate::error::Error;
+        use crate::error::ErrorKind;
         let token = crate::CancellationToken::new();
         let runner = ScriptedRunner::new().on(["gh", "run", "watch"], Reply::pending());
         let cmd = Command::new("gh")
@@ -2482,9 +2503,9 @@ mod tests {
             "a pending reply must not resolve before cancellation"
         );
         token.cancel();
-        match call.await {
-            Err(Error::Cancelled { program }) => assert_eq!(program, "gh"),
-            other => panic!("expected Error::Cancelled, got {other:?}"),
+        match call.await.map_err(crate::error::Error::into_kind) {
+            Err(ErrorKind::Cancelled { program }) => assert_eq!(program, "gh"),
+            other => panic!("expected ErrorKind::Cancelled, got {other:?}"),
         }
     }
 
@@ -2509,7 +2530,7 @@ mod tests {
         // bounded by the command's `timeout` just like the live bulk path and the
         // scripted `start` path. With no cancel token but a deadline set, the call
         // must resolve `TimedOut` at the deadline instead of parking forever.
-        use crate::error::Error;
+        use crate::error::ErrorKind;
         use crate::runner::ProcessRunnerExt;
         let runner = ScriptedRunner::new().fallback(Reply::pending());
         let cmd = Command::new("hang").timeout(std::time::Duration::from_secs(3));
@@ -2522,13 +2543,13 @@ mod tests {
         assert_eq!(result.outcome(), Outcome::TimedOut);
         assert!(result.timed_out());
 
-        // …and the checking verbs raise `Error::Timeout` carrying the command's
+        // …and the checking verbs raise `ErrorKind::Timeout` carrying the command's
         // real configured deadline — byte-for-byte a `Reply::timeout` on this verb.
-        match runner.run(&cmd).await.unwrap_err() {
-            Error::Timeout { timeout, .. } => {
-                assert_eq!(timeout, std::time::Duration::from_secs(3))
+        match runner.run(&cmd).await.unwrap_err().kind() {
+            ErrorKind::Timeout { timeout, .. } => {
+                assert_eq!(*timeout, std::time::Duration::from_secs(3))
             }
-            other => panic!("expected Error::Timeout, got {other:?}"),
+            other => panic!("expected ErrorKind::Timeout, got {other:?}"),
         }
     }
 
@@ -2537,7 +2558,7 @@ mod tests {
         // When both a token and a timeout bound a pending bulk call, the one that
         // fires first wins — here the token cancels well before the (long) deadline,
         // so the call reports `Cancelled`, not `TimedOut`.
-        use crate::error::Error;
+        use crate::error::ErrorKind;
         let token = crate::CancellationToken::new();
         let runner = ScriptedRunner::new().fallback(Reply::pending());
         let cmd = Command::new("watch")
@@ -2554,15 +2575,15 @@ mod tests {
             "the call must not resolve before either knob fires"
         );
         token.cancel();
-        match call.await {
-            Err(Error::Cancelled { program }) => assert_eq!(program, "watch"),
-            other => panic!("expected Error::Cancelled, got {other:?}"),
+        match call.await.map_err(crate::error::Error::into_kind) {
+            Err(ErrorKind::Cancelled { program }) => assert_eq!(program, "watch"),
+            other => panic!("expected ErrorKind::Cancelled, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn probe_reads_exit_code_as_bool() {
-        use crate::error::Error;
+        use crate::error::ErrorKind;
         let runner = ScriptedRunner::new()
             .on(["t", "yes"], Reply::ok(""))
             .on(["t", "no"], Reply::fail(1, ""))
@@ -2576,15 +2597,17 @@ mod tests {
             runner
                 .probe(&Command::new("t").arg("boom"))
                 .await
-                .unwrap_err(),
-            Error::Exit { code: 2, .. }
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Exit { code: 2, .. }
         ));
         assert!(matches!(
             runner
                 .probe(&Command::new("t").arg("other"))
                 .await
-                .unwrap_err(),
-            Error::Timeout { .. }
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Timeout { .. }
         ));
     }
 
@@ -2630,8 +2653,10 @@ mod tests {
             .output_string(&cmd)
             .await
             .expect_err("a re-run of a consumed one-shot stdin source must fail loud");
-        match second {
-            crate::error::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        match second.kind() {
+            crate::error::ErrorKind::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput)
+            }
             other => panic!("expected Io(InvalidInput), got {other:?}"),
         }
     }
@@ -2654,8 +2679,10 @@ mod tests {
             .start(&cmd)
             .await
             .expect_err("a re-run of a consumed one-shot stdin source must fail loud");
-        match second {
-            crate::error::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        match second.kind() {
+            crate::error::ErrorKind::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput)
+            }
             other => panic!("expected Io(InvalidInput), got {other:?}"),
         }
     }
@@ -2673,8 +2700,12 @@ mod tests {
             .inherit_stdin()
             .stdin(crate::Stdin::from_string("payload"));
         for bad in [with_keep_open, with_source] {
-            match runner.output_string(&bad).await {
-                Err(crate::error::Error::Io(e)) => {
+            match runner
+                .output_string(&bad)
+                .await
+                .map_err(crate::error::Error::into_kind)
+            {
+                Err(crate::error::ErrorKind::Io(e)) => {
                     assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
                 }
                 other => panic!("expected Io(InvalidInput) from the fake, got {other:?}"),
@@ -2717,16 +2748,16 @@ mod tests {
         // `Reply::not_found()` fails as a spawn-side "the program doesn't
         // exist", not a completed run with a failing exit code — the fake's
         // analogue of a live spawn hitting a missing binary (D8).
-        use crate::error::Error;
+        use crate::error::ErrorKind;
         let runner = ScriptedRunner::new().on(["rg", "--version"], Reply::not_found());
         let err = runner
             .output_string(&Command::new("rg").arg("--version"))
             .await
             .expect_err("a not_found reply must error, not return a canned exit code");
         assert!(err.is_not_found(), "expected is_not_found(), got {err:?}");
-        match err {
-            Error::NotFound { program, .. } => assert_eq!(program, "rg"),
-            other => panic!("expected Error::NotFound, got {other:?}"),
+        match err.kind() {
+            ErrorKind::NotFound { program, .. } => assert_eq!(program, "rg"),
+            other => panic!("expected ErrorKind::NotFound, got {other:?}"),
         }
     }
 
@@ -2767,9 +2798,9 @@ mod tests {
     async fn spawn_error_reply_carries_the_io_kind() {
         // A generic OS-level spawn failure (as opposed to `not_found`'s "the
         // program doesn't exist at all") — e.g. permission denied — so
-        // classifiers built on `Error::Spawn`'s io kind answer on the fake
+        // classifiers built on `ErrorKind::Spawn`'s io kind answer on the fake
         // exactly as they would live.
-        use crate::error::Error;
+        use crate::error::ErrorKind;
         let runner = ScriptedRunner::new().fallback(Reply::spawn_error(
             std::io::ErrorKind::PermissionDenied,
             "eacces",
@@ -2786,13 +2817,13 @@ mod tests {
             !err.is_not_found(),
             "a generic spawn error is not is_not_found()"
         );
-        match err {
-            Error::Spawn { program, source } => {
+        match err.kind() {
+            ErrorKind::Spawn { program, source } => {
                 assert_eq!(program, "locked-tool");
                 assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
                 assert_eq!(source.to_string(), "eacces");
             }
-            other => panic!("expected Error::Spawn, got {other:?}"),
+            other => panic!("expected ErrorKind::Spawn, got {other:?}"),
         }
     }
 
@@ -2926,15 +2957,15 @@ mod tests {
             .output_string(&command)
             .await
             .expect_err("inherit_stdin with a configured source must be rejected");
-        match error {
-            crate::Error::Io(error) => {
+        match error.kind() {
+            crate::ErrorKind::Io(error) => {
                 assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
                 assert!(
                     error.to_string().contains("inherit_stdin()"),
                     "expected inherit_stdin context, got: {error}"
                 );
             }
-            other => panic!("expected Error::Io(InvalidInput), got {other:?}"),
+            other => panic!("expected ErrorKind::Io(InvalidInput), got {other:?}"),
         }
         assert!(
             runner.commands().is_empty(),
@@ -3021,7 +3052,7 @@ mod tests {
         assert_eq!(finish.outcome, Outcome::Exited(2));
 
         // The Ext verb `run()` goes through `checked` → `ensure_success`; it
-        // must succeed rather than surface `Error::Exit` for this command.
+        // must succeed rather than surface `ErrorKind::Exit` for this command.
         use crate::runner::ProcessRunnerExt;
         runner
             .run(&command)
@@ -3094,7 +3125,7 @@ mod tests {
             .await
             .expect_err("the one-shot source is now consumed");
         assert!(
-            matches!(err, crate::Error::Io(_)),
+            matches!(err.kind(), crate::ErrorKind::Io(_)),
             "expected Io, got {err:?}"
         );
     }
@@ -3115,7 +3146,7 @@ mod tests {
             .await
             .expect_err("a canned spawn_error is an error");
         assert!(
-            matches!(err, crate::Error::Spawn { .. }),
+            matches!(err.kind(), crate::ErrorKind::Spawn { .. }),
             "expected Spawn, got {err:?}"
         );
 
@@ -3171,7 +3202,7 @@ mod tests {
             .await
             .expect_err("a pre-cancelled token short-circuits");
         assert!(
-            matches!(err, crate::Error::Cancelled { .. }),
+            matches!(err.kind(), crate::ErrorKind::Cancelled { .. }),
             "expected Cancelled, got {err:?}"
         );
 

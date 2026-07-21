@@ -29,7 +29,9 @@ mod interleave;
 
 use std::time::Duration;
 
-use processkit::{Command, JobRunner, ProcessGroup, RunningProcess, output_all, wait_all};
+use processkit::{
+    Command, ErrorKind, JobRunner, ProcessGroup, RunningProcess, output_all, wait_all,
+};
 
 use crate::common::*;
 
@@ -227,7 +229,7 @@ async fn concurrent_kill_reaps_every_handle() {
 }
 
 /// 6. A cancellation storm: fire many tokens at once and assert every in-flight
-///    run resolves to `Error::Cancelled` (and its tree is torn down).
+///    run resolves to `ErrorKind::Cancelled` (and its tree is torn down).
 #[tokio::test]
 async fn cancellation_storm_resolves_every_call() {
     use processkit::{CancellationToken, Error};
@@ -255,10 +257,11 @@ async fn cancellation_storm_resolves_every_call() {
         let result = tokio::time::timeout(Duration::from_secs(15), task)
             .await
             .expect("cancelled run resolves in time")
-            .expect("task did not panic");
+            .expect("task did not panic")
+            .map_err(Error::into_kind);
         assert!(
-            matches!(result, Err(Error::Cancelled { .. })),
-            "every cancelled run resolves to Error::Cancelled, got {result:?}"
+            matches!(result, Err(ErrorKind::Cancelled { .. })),
+            "every cancelled run resolves to ErrorKind::Cancelled, got {result:?}"
         );
     }
 }

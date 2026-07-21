@@ -48,12 +48,12 @@ The verbs mirror `Command`'s, each operating on the pipefail outcome:
 |---|---|---|
 | `output_string()` | `ProcessResult<String>` | …reported in the result (code/stderr/program of the first unclean stage) |
 | `output_bytes()` | `ProcessResult<Vec<u8>>` | …same, with the last stage's stdout captured raw (binary pipes) |
-| `run()` | trimmed final stdout | …raised as that stage's `Error::Exit`; fails loud on a truncated capture |
-| `checked()` | full `ProcessResult<String>` | …raised as `Error::Exit` (untrimmed stdout) |
-| `run_unit()` | `()` | …raised as `Error::Exit` (output discarded) |
-| `exit_code()` | `i32` | …its attributed code (no code → `Error::Timeout`/`Signalled`) |
+| `run()` | trimmed final stdout | …raised as that stage's `ErrorKind::Exit`; fails loud on a truncated capture |
+| `checked()` | full `ProcessResult<String>` | …raised as `ErrorKind::Exit` (untrimmed stdout) |
+| `run_unit()` | `()` | …raised as `ErrorKind::Exit` (output discarded) |
+| `exit_code()` | `i32` | …its attributed code (no code → `ErrorKind::Timeout`/`Signalled`) |
 | `probe()` | `bool` | `0` → `true`, `1` → `false`, else `Err` |
-| `parse(\|s\| …)` / `try_parse(\|s\| …)` | `T` | …raised as `Error::Exit`; fails loud on a truncated capture |
+| `parse(\|s\| …)` / `try_parse(\|s\| …)` | `T` | …raised as `ErrorKind::Exit`; fails loud on a truncated capture |
 
 `Err` from `output_string` itself means a stage couldn't be *started or
 driven* at all (spawn failure, broken plumbing) — never a mere non-zero exit.
@@ -226,13 +226,13 @@ async fn main() -> processkit::Result<()> {
   own sub-group, grandchildren of a forking `sh -c …` included, not just its
   direct child. Every stage is evaluated by the same pipefail rule (D14): a
   stage that hit its own deadline — inner *or* last — surfaces on `run()` as
-  that stage's `Error::Timeout`, reporting **that stage's own deadline** (not
+  that stage's `ErrorKind::Timeout`, reporting **that stage's own deadline** (not
   the chain's, and never `0ns`).
 
 Cancellation has two forms. **`Pipeline::cancel_on(token)`** is the chain-level
 control: the token **gap-fills** into every stage that doesn't already carry its
 own `Command::cancel_on` (an explicit per-stage token is left intact), so firing
-it tears the whole chain down and the run resolves to `Error::Cancelled`. (A
+it tears the whole chain down and the run resolves to `ErrorKind::Cancelled`. (A
 `cancel_on` token on an individual stage `Command` also cancels that stage and
 errors the pipeline, but
 the pipeline-level builder is the clearer authority.) See
@@ -306,7 +306,7 @@ the session regardless of which stage is slow.
 A `Pipeline` is `Clone` and re-runnable — stages are re-cloned per run. The
 one caveat is inherited from `Command`: a **one-shot** stdin source on the
 first stage (`Stdin::from_reader` / `from_lines`) is consumed by the first run;
-re-running then **fails loud** (an `Error::Io` at launch, D10) rather than
+re-running then **fails loud** (an `ErrorKind::Io` at launch, D10) rather than
 silently feeding empty stdin. Use the reusable sources
 (`from_string` / `from_bytes` / `from_iter_lines` / `from_file`) when a chain
 runs more than once.

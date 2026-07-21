@@ -608,7 +608,7 @@ async fn shutdown_reports_timed_out_when_the_deadline_already_elapsed() {
 }
 
 // D4: a shared-group handle (ProcessGroup::start) does not own its group, so
-// `shutdown` refuses with Error::Unsupported — the caller tears the group down
+// `shutdown` refuses with ErrorKind::Unsupported — the caller tears the group down
 // via ProcessGroup::shutdown instead.
 #[tokio::test]
 #[ignore = "spawns a real subprocess; D4 shutdown is unsupported on a shared-group handle"]
@@ -621,9 +621,10 @@ async fn shutdown_is_unsupported_on_a_shared_group_handle() {
     let err = run
         .shutdown(Duration::from_secs(1))
         .await
-        .expect_err("a shared-group handle cannot be gracefully shut down");
+        .expect_err("a shared-group handle cannot be gracefully shut down")
+        .into_kind();
     assert!(
-        matches!(err, processkit::Error::Unsupported { .. }),
+        matches!(err, processkit::ErrorKind::Unsupported { .. }),
         "expected Unsupported, got {err:?}"
     );
     // The child survived (shared-group Drop doesn't kill); tear it down here.
