@@ -66,7 +66,7 @@ use crate::runner::{JobRunner, ProcessRunner};
 /// `cwd` to a path relative to a `record_root` (preserves cwd distinctions, but
 /// needs a "root" concept the runner doesn't otherwise have, and no in-tree
 /// consumer has ever needed two recorded runs to be told apart *only* by their
-/// cwd — see `ideas/later-cassette-cwd-portability.md`).
+/// cwd).
 ///
 /// Bumped to `4`: an entry may now carry an optional `match_digest` (see
 /// [`MatchPolicy`]) — the FNV-1a digest that an **opt-in** match policy
@@ -1069,8 +1069,8 @@ enum Mode<R> {
 ///   a [`ScriptedRunner`](crate::testing::ScriptedRunner) rule keyed on a
 ///   predicate that inspects [`Command::env_overrides`] directly. (Env-keying via
 ///   `match_on_env` keys on a **digest** of the selected values, never the raw
-///   values — see `ideas/v2-breaking-changes.md`, D10 for the deferred
-///   always-on alternative.)
+///   values — a broader always-on env-keying alternative was considered and
+///   deferred.)
 /// - **Duplicates** replay in capture order, then the last entry repeats.
 /// - **A miss is [`Error::CassetteMiss`]** (not `is_not_found()`): never a
 ///   surprise subprocess. A **recorded `Err`** replays as that same `Error`

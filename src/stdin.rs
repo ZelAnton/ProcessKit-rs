@@ -441,9 +441,9 @@ impl ProcessStdin {
     /// end-of-input). A child that doesn't inspect its stdin for control bytes
     /// will not be interrupted or signaled by this call. Real terminal-signal
     /// semantics (the kernel actually delivering `SIGINT` etc. to the child)
-    /// require a pseudo-terminal, which this crate does not yet provide — see
-    /// the (git-untracked) design note `ideas/later-pty-support.md` for that
-    /// direction.
+    /// require a pseudo-terminal, which this crate does not yet provide; a
+    /// real PTY would let the OS deliver an actual signal to the child instead
+    /// of relying on it to recognize a control byte in its input stream.
     ///
     /// # Errors
     ///
