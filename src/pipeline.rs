@@ -406,8 +406,7 @@ impl Pipeline {
         let chain_state = Arc::new(AtomicU8::new(crate::running::TS_PENDING));
         let deadline_task = self.timeout.map(|limit| {
             let state = chain_state.clone();
-            let groups: Vec<Weak<ProcessGroup>> =
-                stage_groups.iter().map(Arc::downgrade).collect();
+            let groups: Vec<Weak<ProcessGroup>> = stage_groups.iter().map(Arc::downgrade).collect();
             let anchor = tokio::time::Instant::now();
             tokio::spawn(async move {
                 if crate::running::deadline::wait_deadline_and_claim(anchor, limit, &state).await {
@@ -530,9 +529,10 @@ impl Pipeline {
                 // `finish_inner_stage` is the shared classify-and-teardown body,
                 // reused by `start`'s streaming inner drains — so both paths blame
                 // a stage and fire proactive teardown identically.
-                let (index, outcome) =
-                    finish_inner_stage(process, index, program, ok_codes, timeout, unchecked, teardown)
-                        .await?;
+                let (index, outcome) = finish_inner_stage(
+                    process, index, program, ok_codes, timeout, unchecked, teardown,
+                )
+                .await?;
                 Ok(Joined::Inner(index, outcome))
             });
         }
@@ -1054,8 +1054,7 @@ impl PipelineSession {
         // `inner_count` items, each tagged with its unique launch index), then append
         // the last. Sorting by index needs no `expect` for a missing slot.
         inner.sort_by_key(|(index, _)| *index);
-        let mut stages: Vec<StageOutcome> =
-            inner.into_iter().map(|(_, outcome)| outcome).collect();
+        let mut stages: Vec<StageOutcome> = inner.into_iter().map(|(_, outcome)| outcome).collect();
         stages.push(StageOutcome {
             program: self.last_program.clone(),
             outcome: last_finished.outcome,

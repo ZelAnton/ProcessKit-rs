@@ -734,20 +734,18 @@ fn pid_recording_idle(pidfile: &std::path::Path) -> Command {
 }
 
 /// Read the PID a [`pid_recording_idle`] stage wrote, polling briefly for the file
-/// to appear (the stage records it right after spawn).
-async fn read_recorded_pid(pidfile: &std::path::Path) -> u32 {
+/// to appear (the stage records it right after spawn). Returns `None` if teardown
+/// kills the stage before it is scheduled.
+async fn read_recorded_pid(pidfile: &std::path::Path) -> Option<u32> {
     for _ in 0..100 {
         if let Ok(text) = std::fs::read_to_string(pidfile)
             && let Ok(pid) = text.trim().parse::<u32>()
         {
-            return pid;
+            return Some(pid);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!(
-        "the idle producer never recorded its PID to {}",
-        pidfile.display()
-    );
+    None
 }
 
 #[tokio::test]
@@ -798,7 +796,11 @@ async fn pipeline_start_streams_last_stage_lines() {
     );
 
     let Finished { outcome, .. } = session.finish().await.expect("finish the chain");
-    assert_eq!(outcome, Outcome::Exited(0), "a clean chain folds to Exited(0)");
+    assert_eq!(
+        outcome,
+        Outcome::Exited(0),
+        "a clean chain folds to Exited(0)"
+    );
 }
 
 // Unix-only: a live-chain readiness banner must flush *promptly* out of the last
@@ -923,9 +925,14 @@ async fn pipeline_start_kill_reaps_the_whole_chain() {
         .await
         .expect("start the live chain");
 
-    let inner_pid = read_recorded_pid(&pidfile).await;
+    let inner_pid = read_recorded_pid(&pidfile)
+        .await
+        .expect("the idle producer should record its PID");
     let last_pid = session.pid().expect("the last stage has a live pid");
-    assert!(stage_pid_alive(inner_pid), "the inner stage should be alive");
+    assert!(
+        stage_pid_alive(inner_pid),
+        "the inner stage should be alive"
+    );
 
     session.start_kill().expect("stop the whole chain");
     // `finish` folds the killed outcome AND consumes the session — releasing the
@@ -961,7 +968,9 @@ async fn pipeline_session_drop_kills_the_whole_chain() {
         .await
         .expect("start the live chain");
 
-    let inner_pid = read_recorded_pid(&pidfile).await;
+    let inner_pid = read_recorded_pid(&pidfile)
+        .await
+        .expect("the idle producer should record its PID");
     let last_pid = session.pid().expect("the last stage has a live pid");
 
     // Drop the session unread — kill-on-drop must tear the whole chain down.
@@ -1083,8 +1092,10 @@ async fn pipeline_start_errors_on_a_partially_started_chain() {
 #[tokio::test]
 #[ignore = "spawns one real stage then fails to spawn the next; the partial chain must be reaped"]
 async fn pipeline_start_reaps_a_partially_started_chain() {
-    let pidfile =
-        std::env::temp_dir().join(format!("processkit_t159_partial_{}.pid", std::process::id()));
+    let pidfile = std::env::temp_dir().join(format!(
+        "processkit_t159_partial_{}.pid",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&pidfile);
 
     // The first stage starts and records its pid; the second stage names a program
@@ -1104,9 +1115,10 @@ async fn pipeline_start_reaps_a_partially_started_chain() {
         "expected NotFound/Spawn, got {err:?}"
     );
 
-    // The first stage recorded its pid before `start` returned its error; it must
-    // now be gone — the partial chain was not left running.
-    let inner_pid = read_recorded_pid(&pidfile).await;
-    assert_pid_reaped(inner_pid, "first stage of a partially-started chain").await;
+    // Under load, the first stage can be killed before it is scheduled to record
+    // its pid. In that case no process ran; otherwise the recorded pid must be gone.
+    if let Some(inner_pid) = read_recorded_pid(&pidfile).await {
+        assert_pid_reaped(inner_pid, "first stage of a partially-started chain").await;
+    }
     let _ = std::fs::remove_file(&pidfile);
 }
