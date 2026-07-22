@@ -12,7 +12,7 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- Add `RunningProcess::wait_for_socket` for Unix domain socket readiness probes
 
 ### Changed
 -

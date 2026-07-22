@@ -206,8 +206,8 @@ interactivity — give the command `Stdin::from_lines(stream)` /
 
 ## Readiness probes
 
-"Start a server, then use it" needs *ready*, not merely *started*. Three
-probes replace the arbitrary sleep, each bounded by its own deadline:
+"Start a server, then use it" needs *ready*, not merely *started*. Four probes
+replace the arbitrary sleep, each bounded by its own deadline:
 
 ```rust,no_run
 async fn health_check() -> bool { true }
@@ -227,7 +227,11 @@ async fn main() -> processkit::Result<()> {
     run.wait_for_port("127.0.0.1:8080".parse().unwrap(), Duration::from_secs(10))
         .await?;
 
-    // 3. Any async predicate (an HTTP /health endpoint, a file appearing, …):
+    // 3. A Unix domain socket accepting connections (Unix only):
+    run.wait_for_socket("/tmp/my-server.sock", Duration::from_secs(10))
+        .await?;
+
+    // 4. Any async predicate (an HTTP /health endpoint, a file appearing, …):
     run.wait_for(|| async { health_check().await }, Duration::from_secs(10))
         .await?;
 
@@ -246,15 +250,18 @@ Probe semantics, deliberately uniform:
   deadline on a dead server.
 - A failed probe **never kills the child.** You decide: retry, log and
   continue, or tear down.
-- All three probes background-drain stdout/stderr while they poll, so a
+- All four probes background-drain stdout/stderr while they poll, so a
   child with a large startup burst can't stall in `write()` on a full OS pipe
   buffer. `wait_for_line` consumes stdout up to (and including) the match —
-  continue with `finish`. `wait_for_port` / `wait_for`
+  continue with `finish`. `wait_for_port` / `wait_for_socket` / `wait_for`
   drain the same way but never hand any of it back mid-probe; `wait` /
   `output_string` afterward still see the full captured output, but
   `output_bytes` or a fresh `stdout_lines` / `output_events` call do not
-  compose with any of the three probes (same as calling `wait_for_line`
+  compose with any of the four probes (same as calling `wait_for_line`
   first).
+- `wait_for_socket` uses a real connection attempt, not just a socket-file
+  existence check, and returns `Error::Unsupported` immediately on platforms
+  without AF_UNIX (including Windows).
 
 ## Racing children with `wait_any`
 
