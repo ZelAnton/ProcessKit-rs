@@ -7,6 +7,13 @@ For long-running or conversational children, `Command::start()` returns a live
 `RunningProcess` you drive yourself: stream stdout as it arrives, write stdin
 incrementally, probe for readiness, race several children, or profile a run.
 
+The same live-handle model extends to **multi-stage chains**:
+`Pipeline::start()` returns a `PipelineSession` — the multi-stage analogue of
+`RunningProcess` — that streams the last stage's stdout, waits for a readiness
+line, and folds the pipefail outcome at `finish()`, all while the whole chain is
+bounded and torn down as a unit. See
+[Pipelines → streaming a live chain](pipelines.md#streaming-a-live-chain).
+
 - [Lifecycle](#lifecycle)
 - [Streaming stdout](#streaming-stdout)
 - [Interactive stdin](#interactive-stdin)

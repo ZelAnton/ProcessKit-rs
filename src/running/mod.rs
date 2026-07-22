@@ -5,7 +5,7 @@
 //! [`probes`] holds the non-consuming readiness probes; [`stream`] holds the
 //! incremental stdout streaming surface.
 
-mod deadline;
+pub(crate) mod deadline;
 mod probes;
 mod scripted;
 mod stream;
@@ -59,7 +59,11 @@ const DISCARD_INFLIGHT_CAP: usize = 64 << 20;
 // first `compare_exchange`s from `PENDING` wins — a single CAS arbiter that
 // keeps "timed out vs exited" race-free even when the child exits within a
 // scheduler quantum of the deadline.
-const TS_PENDING: u8 = 0;
+// `pub(crate)` so `Pipeline::start`'s chain-wide deadline arbiter (a live
+// streaming session, `src/pipeline.rs`) can initialize its own arbiter word to
+// the same `PENDING` start state — it reuses the shared `deadline` claim helpers
+// rather than duplicating the CAS protocol (see K-034).
+pub(crate) const TS_PENDING: u8 = 0;
 const TS_EXITED: u8 = 1;
 // `pub(crate)` so `first_line` (in `crate::runner`) can classify a timed-out
 // streamed run: the deadline watchdog stores `TS_TIMED_OUT` *before* it kills, so
