@@ -586,6 +586,29 @@ impl SessionShared {
     }
 }
 
+/// Releases the published live child ([`SessionShared::current`]) when
+/// [`run_to_result`](Supervisor::run_to_result) leaves by **any** path — a
+/// normal return *or* the future being dropped mid-run, which is exactly what a
+/// liveness [`health_check`](Supervisor::health_check) kill does (the losing
+/// `run_to_result` in [`run_incarnation`](Supervisor::run_incarnation)'s
+/// `select!` is dropped, so a plain `clear_current()` at the end is never
+/// reached). Dropping `current` releases the [`ChildStopper`]'s clone of the
+/// incarnation's `Arc<ProcessGroup>`; together with the abandoned
+/// [`RunningProcess`](crate::RunningProcess)'s own reference dropping in the same
+/// unwind, that lets the group's kill-on-drop backstop fire (and tear the wedged
+/// child down) *immediately* on the kill — not linger until the next
+/// `publish_current` overwrites it, which would keep the force-killed child alive
+/// and its now-stale pid observable through the whole restart backoff.
+struct CurrentGuard<'a> {
+    shared: &'a SessionShared,
+}
+
+impl Drop for CurrentGuard<'_> {
+    fn drop(&mut self) {
+        self.shared.clear_current();
+    }
+}
+
 /// Why a backoff / storm sleep (or an incarnation) stopped waiting — the shared
 /// return of [`Supervisor::sleep_or_cancel`] and its callers.
 enum Wake {
@@ -1566,8 +1589,18 @@ impl<R: ProcessRunner> Supervisor<R> {
             // loop ends with `Stopped`.
             tokio::spawn(async move { stopper.graceful_stop(grace).await });
         }
+        // Release the published live child on *every* exit from here — a normal
+        // return below, but crucially also this future being dropped mid-`await`
+        // when a liveness kill wins `run_incarnation`'s `select!`. Without it the
+        // dropped incarnation's `current` (and the `Arc<ProcessGroup>` clone its
+        // `ChildStopper` holds) would outlive the force-kill until the next
+        // `publish_current`, pinning the wedged child's group alive — and its
+        // stale pid observable — across the whole restart backoff.
+        let _current_guard = CurrentGuard { shared };
 
-        let result = if command.stdout_is_piped() {
+        // Returned directly: `_current_guard` above still drops (clearing
+        // `current`) as this function unwinds, after the value below is produced.
+        if command.stdout_is_piped() {
             handle.output_string().await
         } else {
             match handle.finish().await {
@@ -1587,9 +1620,7 @@ impl<R: ProcessRunner> Supervisor<R> {
                 .with_ok_codes(command.ok_codes_vec())),
                 Err(err) => Err(err),
             }
-        };
-        shared.clear_current();
-        result
+        }
     }
 
     /// The classic capture path, unchanged: a piped stdout uses the bulk
@@ -3230,6 +3261,85 @@ mod tests {
             start.elapsed() < Duration::from_secs(60),
             "the backoff sleep must be cut short by the stop, not waited out: {:?}",
             start.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_liveness_kill_clears_the_live_child_before_the_backoff() {
+        // R-01 regression. A liveness `health_check` force-kills a wedged
+        // incarnation by *dropping* the in-flight `run_to_result` future (via
+        // `run_incarnation`'s `select!`). That drop must release the published
+        // live child (`shared.current`) right then — not leave it holding the
+        // killed incarnation's start time / pid (and, under a real JobRunner, a
+        // clone of its `Arc<ProcessGroup>`, which would defer the group's
+        // kill-on-drop teardown) until the *next* `publish_current` overwrites it
+        // after the whole restart backoff.
+        //
+        // A scripted double exposes no OS pid or real group, so this asserts the
+        // observable bookkeeping — `started_at()` (Some for a live scripted
+        // incarnation) must go back to None the moment the kill drops the run,
+        // all through the backoff. Before the fix it stayed Some for the entire
+        // backoff window, this test spinning forever waiting for the clear.
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let session = Supervisor::new(Command::new("server"))
+            .with_runner(runner)
+            // First probe one interval after the incarnation starts; one failure
+            // trips it, so the live child is force-killed at ~50ms.
+            .health_check(|| async { false }, Duration::from_millis(50))
+            .health_check_failures(1)
+            // A long backoff keeps the loop parked *between* incarnations so the
+            // just-killed child's bookkeeping is observable there.
+            .backoff(Duration::from_secs(60), 1.0)
+            .jitter(false)
+            .start();
+
+        // Let the (paused) clock auto-advance while this task parks: the first
+        // incarnation goes live (`current` published), the ~50ms probe then
+        // force-kills it, and the loop parks in the 60s backoff. A short real
+        // wait spans the ~50ms kill without reaching the 60s restart.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let in_backoff = session.status();
+        assert!(
+            in_backoff.is_active(),
+            "supervision is still running, parked in the backoff after the kill"
+        );
+        assert_eq!(
+            in_backoff.restarts(),
+            0,
+            "still before the restart — the loop is in the backoff, not a new incarnation"
+        );
+        assert!(
+            in_backoff.started_at().is_none(),
+            "the force-killed incarnation's live-child state must be cleared on the \
+             kill, not linger through the backoff"
+        );
+        assert!(
+            in_backoff.pid().is_none(),
+            "no live pid is reported during the backoff after a liveness kill"
+        );
+
+        // The cleared state is stable, not a momentary blip: the frozen clock
+        // keeps the loop parked in the backoff across these yields.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            session.status().started_at().is_none(),
+            "the live child stays cleared for the whole backoff window"
+        );
+
+        // Stop from the backoff so the paused-clock test doesn't park forever;
+        // the outcome confirms exactly one liveness kill and no further restart.
+        let outcome = session
+            .stop(Duration::ZERO)
+            .await
+            .expect("a graceful stop yields an outcome");
+        assert_eq!(outcome.stopped, StopReason::Stopped);
+        assert_eq!(outcome.restarts, 0, "no further incarnation was launched");
+        assert_eq!(
+            outcome.liveness_kills, 1,
+            "the wedged first incarnation was force-killed exactly once"
         );
     }
 
