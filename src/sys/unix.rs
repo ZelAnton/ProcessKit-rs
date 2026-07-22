@@ -62,6 +62,24 @@ impl Job {
         self.group.kill_all()
     }
 
+    /// A POSIX process group has no resource accounting, so a request carrying any
+    /// cap is refused with `ErrorKind::Unsupported` — the exact typed refusal
+    /// creation gives ([`Job::new`](Self::new) rejects a limited group the same
+    /// way). An empty set (all `None`) is a trivially-satisfiable no-op: the tree is
+    /// already unbounded here, so "remove all limits" needs nothing done and must
+    /// not spuriously fail.
+    #[cfg(feature = "limits")]
+    pub(crate) fn update_limits(&self, limits: &ResourceLimits) -> io::Result<()> {
+        if limits.any() {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "resource limits require a cgroup or Job Object; unavailable on this target",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     #[cfg(feature = "process-control")]
     pub(crate) fn signal(&self, sig: Signal) -> io::Result<()> {
         self.group.signal(sig.raw())
