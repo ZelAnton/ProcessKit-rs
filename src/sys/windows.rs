@@ -11,7 +11,7 @@ use tokio::process::{Child, Command};
 // below) is needed under either feature.
 #[cfg(any(feature = "stats", feature = "process-control"))]
 use windows_sys::Win32::Foundation::FILETIME;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM};
 #[cfg(feature = "process-control")]
 use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_MORE_DATA};
 use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
@@ -60,6 +60,15 @@ use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessIdOfThread, SuspendThread, THREAD_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+// EnumWindows + PostMessageW(WM_CLOSE) for the best-effort GUI-graceful tier: a
+// windowed member (Electron/desktop tool/windowed service) receives no console
+// CTRL event, so WM_CLOSE is the only soft "please close" it can act on before the
+// TerminateJobObject fallback. Un-gated (the WM_CLOSE tier is core to graceful
+// shutdown, not feature-gated).
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
+};
+use windows_sys::core::BOOL;
 
 use crate::Mechanism;
 #[cfg(feature = "process-control")]
@@ -435,13 +444,45 @@ impl Job {
         Ok(())
     }
 
-    /// A Job Object has no POSIX signals: only `Kill` is deliverable (it maps
-    /// to the job terminate); everything else is reported as unsupported so the
-    /// caller never believes a reload/interrupt was delivered.
+    /// A Job Object has no POSIX signals, but two portable soft triggers exist:
+    /// `Kill` maps to the atomic job terminate; `Int`/`Term` get a best-effort
+    /// soft close — `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` to any console
+    /// process-group leader (`windows_graceful_ctrl_break`) plus `WM_CLOSE` to any
+    /// windowed member. This is the `signal`-verb analogue of the graceful-shutdown
+    /// soft tier, but a one-shot broadcast: it TRIGGERS a clean exit without waiting
+    /// or escalating. `Unsupported` is returned for `Int`/`Term` only when the group
+    /// has NEITHER a CTRL-capable leader NOR a windowed member (nothing a soft close
+    /// could reach); every other non-`Kill` signal stays unsupported so the caller
+    /// never believes a reload/interrupt was delivered.
     #[cfg(feature = "process-control")]
     pub(crate) fn signal(&self, sig: Signal) -> io::Result<()> {
         match sig {
             Signal::Kill => self.kill_all(),
+            Signal::Int | Signal::Term => {
+                // Best-effort soft close: CTRL_BREAK to live console leaders plus
+                // WM_CLOSE to windowed members. Neither waits — a `signal` is a
+                // one-shot broadcast, not a teardown (contrast `graceful_shutdown`,
+                // which then polls and escalates).
+                let leaders = self
+                    .ctrl_break_leaders
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let signalled = ctrl_break_live_leaders(&leaders, self.handle);
+                let closed = close_member_windows(self.handle);
+                // Unsupported ONLY when there was nothing to soft-close: no live
+                // console leader and no windowed member. A Job Object still has no
+                // way to deliver a POSIX Int/Term to such a group.
+                if signalled == 0 && closed == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!(
+                            "signal({sig:?}): no console-CTRL or windowed member to soft-close"
+                        ),
+                    ));
+                }
+                Ok(())
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("signal({other:?})"),
@@ -576,31 +617,39 @@ impl Job {
         timeout: Duration,
         escalate: bool,
     ) -> io::Result<()> {
-        // Opt-in console-CTRL path: a direct child was spawned into its own
-        // process group (`windows_graceful_ctrl_break`), so there IS a way to
-        // *trigger* a soft exit — `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)`.
-        // Drive the SAME shared escalation loop the unix backends use: signal the
-        // leaders, poll the job's active-process count up to `timeout`, then
-        // `TerminateJobObject` survivors (escalate) or spare them (!escalate). The
-        // driver owns the `begin_shutdown`/`request` epoch handshake, so the
-        // re-arm race is handled there, exactly as on unix.
+        // Soft-shutdown tier: a Windows Job Object has no POSIX SIGTERM, but there
+        // ARE two best-effort ways to *trigger* a clean exit before the atomic
+        // kill —
+        //   * a direct child spawned into its own console process group
+        //     (`windows_graceful_ctrl_break`), addressable by
+        //     `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)`; and
+        //   * ANY live member that owns a top-level window (an Electron app, a
+        //     desktop tool, a windowed service), addressable by `WM_CLOSE`.
+        // When either exists, drive the SAME shared escalation loop the unix
+        // backends use: soft-signal (CTRL_BREAK + WM_CLOSE), poll the job's
+        // active-process count up to `timeout`, then `TerminateJobObject` survivors
+        // (escalate) or spare them (!escalate). The driver owns the
+        // `begin_shutdown`/`request` epoch handshake, so the re-arm race is handled
+        // there, exactly as on unix. The WM_CLOSE broadcast itself is issued once,
+        // inside the target's `signal_all`, so the loop's soft-signal step stays the
+        // single source of the trigger.
         let leaders = self
             .ctrl_break_leaders
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        if !leaders.is_empty() {
-            let target = CtrlBreakTarget { job: self, leaders };
+        if !leaders.is_empty() || job_has_windowed_member(self.handle) {
+            let target = SoftShutdownTarget { job: self, leaders };
             return super::graceful::run(&target, &self.skip_drop_kill, signal, timeout, escalate)
                 .await;
         }
 
-        // Default path — no opt-in leaders. A Job Object has no graceful tier: no
-        // Windows equivalent of SIGTERM, and the kill is atomic. When
-        // `escalate=true`, kill the tree immediately. When `escalate=false`, skip
-        // the kill and let survivors run; `Drop` will clear `KILL_ON_JOB_CLOSE`
-        // before closing the handle so the tree is not implicitly killed then
-        // either.
+        // Default path — no console-CTRL leader and no windowed member, so nothing
+        // can *trigger* a soft exit. A Job Object has no graceful tier: no Windows
+        // equivalent of SIGTERM, and the kill is atomic. When `escalate=true`, kill
+        // the tree immediately. When `escalate=false`, skip the kill and let
+        // survivors run; `Drop` will clear `KILL_ON_JOB_CLOSE` before closing the
+        // handle so the tree is not implicitly killed then either.
         //
         // The `timeout` is deliberately NOT used as a drain window (C6): without a
         // soft signal there is nothing to *trigger* a graceful exit, so polling for
@@ -608,7 +657,9 @@ impl Job {
         // ignores the (absent) signal, only delay the inevitable kill by the whole
         // grace — a data-losing 30 s stall, not a graceful drain. Prompt hard-kill
         // at the deadline is the honest behavior; the grace/soft-signal tiers are
-        // Unix-only (or the opt-in CTRL path above).
+        // Unix-only (or the CTRL/WM_CLOSE paths above). Kill-on-drop and the current
+        // timings are therefore unchanged for a windowless tree with no CTRL leader:
+        // no extra wait is introduced here, exactly as before this WM_CLOSE tier.
         //
         // Snapshot the re-arm generation up front — before the branch — so a
         // `spawn`/`adopt` that re-arms the backstop concurrently with this shutdown
@@ -678,55 +729,36 @@ impl Job {
 }
 
 /// The Job-backed [`GracefulTarget`](crate::sys::graceful::GracefulTarget) for the
-/// opt-in console-CTRL graceful teardown. It plugs the Job Object into the *same*
+/// Windows soft-shutdown tier. It plugs the Job Object into the *same*
 /// signal → poll → escalate loop the unix backends drive
 /// ([`graceful::run`](crate::sys::graceful::run)):
 ///
-/// - `signal_all` sends `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` to each
-///   recorded process-group leader (best-effort);
+/// - `signal_all` fires both best-effort soft triggers —
+///   `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` to each recorded console
+///   process-group leader, and `WM_CLOSE` to every top-level window owned by a
+///   live job member (the GUI-graceful path);
 /// - `is_drained` reads the job's active-process count;
 /// - `hard_kill` is `TerminateJobObject` (the escalation fallback).
 ///
 /// It borrows the `Job` (already `Sync`) and a snapshot of the leader pids, so it
 /// is automatically `Send + Sync` — no raw handle is carried across the driver's
 /// `.await`s.
-struct CtrlBreakTarget<'a> {
+struct SoftShutdownTarget<'a> {
     job: &'a Job,
     /// Snapshot of the console process-group leader pids at shutdown time.
     leaders: Vec<u32>,
 }
 
-impl super::graceful::GracefulTarget for CtrlBreakTarget<'_> {
+impl super::graceful::GracefulTarget for SoftShutdownTarget<'_> {
     fn signal_all(&self, _signal: i32) {
-        // Windows delivers a console CTRL_BREAK, not a POSIX signal — the raw
-        // `signal` number (SIGTERM/`timeout_signal`) is meaningless here and
-        // ignored. CTRL_BREAK is chosen over CTRL_C deliberately: a process can
-        // disable CTRL_C for its group (and CREATE_NEW_PROCESS_GROUP does so by
-        // default), but CTRL_BREAK is always deliverable.
-        for &pid in &self.leaders {
-            // Never pass 0: `GenerateConsoleCtrlEvent(_, 0)` targets EVERY process
-            // sharing this console — including us. A recorded leader is always a
-            // real, nonzero pid, but guard defensively.
-            if pid == 0 {
-                continue;
-            }
-            // Recycle guard (mirrors the suspend/resume C13 discipline): only
-            // signal a leader that is STILL a live member of THIS job. A leader
-            // that already exited may have had its pid reused as an unrelated
-            // process's group id sharing our console; `IsProcessInJob` fails safe
-            // (a gone/denied pid reads as "not a member"), so the event is never
-            // diverted onto a stranger's group.
-            if !process_is_in_job(pid, self.job.handle) {
-                continue;
-            }
-            // SAFETY: a console control event to a process group id; a delivery
-            // failure (no shared console, the leader just exited) is swallowed —
-            // the poll below observes the drain, and the `hard_kill` fallback
-            // covers a child that never received it.
-            unsafe {
-                GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
-            }
-        }
+        // Windows delivers a console CTRL_BREAK / a window WM_CLOSE, not a POSIX
+        // signal — the raw `signal` number (SIGTERM/`timeout_signal`) is meaningless
+        // here and ignored. Both are best-effort soft triggers: a console-group
+        // leader gets CTRL_BREAK, a windowed member gets WM_CLOSE. Whatever ignores
+        // its trigger rides the grace to the `hard_kill` (TerminateJobObject)
+        // fallback.
+        ctrl_break_live_leaders(&self.leaders, self.job.handle);
+        close_member_windows(self.job.handle);
     }
 
     fn is_drained(&self) -> bool {
@@ -736,6 +768,138 @@ impl super::graceful::GracefulTarget for CtrlBreakTarget<'_> {
     fn hard_kill(&self) -> io::Result<()> {
         self.job.kill_all()
     }
+}
+
+/// Send `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` to each recorded console
+/// process-group leader that is STILL a live member of `job`, returning the number
+/// actually signalled.
+///
+/// CTRL_BREAK is chosen over CTRL_C deliberately: a process can disable CTRL_C for
+/// its group (and `CREATE_NEW_PROCESS_GROUP` does so by default), but CTRL_BREAK is
+/// always deliverable. Best-effort — a delivery failure is swallowed; the count is
+/// used only to tell whether the group HAD a CTRL-capable member (so a bare
+/// `signal(Int/Term)` can report `Unsupported` when it did not).
+fn ctrl_break_live_leaders(leaders: &[u32], job: HANDLE) -> usize {
+    let mut signalled = 0;
+    for &pid in leaders {
+        // Never pass 0: `GenerateConsoleCtrlEvent(_, 0)` targets EVERY process
+        // sharing this console — including us. A recorded leader is always a real,
+        // nonzero pid, but guard defensively.
+        if pid == 0 {
+            continue;
+        }
+        // Recycle guard (mirrors the suspend/resume C13 discipline): only signal a
+        // leader that is STILL a live member of THIS job. A leader that already
+        // exited may have had its pid reused as an unrelated process's group id
+        // sharing our console; `IsProcessInJob` fails safe (a gone/denied pid reads
+        // as "not a member"), so the event is never diverted onto a stranger's
+        // group.
+        if !process_is_in_job(pid, job) {
+            continue;
+        }
+        // SAFETY: a console control event to a process group id; a delivery failure
+        // (no shared console, the leader just exited) is swallowed — the poll
+        // observes the drain, and the `hard_kill` fallback covers a child that never
+        // received it.
+        unsafe {
+            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
+        }
+        signalled += 1;
+    }
+    signalled
+}
+
+/// Drives the [`EnumWindows`] top-level-window walk for the GUI-graceful tier: the
+/// job whose members' windows are the target, whether to actually POST `WM_CLOSE`
+/// (vs merely detect one), and a running count of matched member windows.
+struct MemberWindowScan {
+    job: HANDLE,
+    /// `true`: post `WM_CLOSE` to each matched member window. `false`: only count
+    /// (the side-effect-free "does a windowed member exist?" probe).
+    close: bool,
+    /// Number of top-level windows found owned by a live member of `job`.
+    matched: usize,
+}
+
+/// The [`EnumWindows`] callback: for one top-level window, post `WM_CLOSE` (or, in
+/// probe mode, just count) iff its owning process is a live member of the job
+/// carried in `lparam`. Always returns `TRUE` to visit every top-level window.
+///
+/// SAFETY: registered only by [`scan_member_windows`], which passes a valid
+/// `&mut MemberWindowScan` as `lparam` and drives the enumeration synchronously, so
+/// the pointer is live for every callback.
+unsafe extern "system" fn scan_member_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    // SAFETY: `lparam` is the `&mut MemberWindowScan` pointer `scan_member_windows`
+    // handed to `EnumWindows`; it stays borrowed for the whole synchronous
+    // enumeration, so the reference is valid for every callback.
+    let ctx = unsafe { &mut *(lparam as *mut MemberWindowScan) };
+    let mut pid: u32 = 0;
+    // SAFETY: `hwnd` is a valid top-level window handle supplied by `EnumWindows`;
+    // `pid` is an owned out-param.
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    // Recycle-safe, mirroring the CTRL_BREAK / suspend-resume C13 discipline: only
+    // touch a window whose owner is STILL a live member of THIS job. A window whose
+    // owner exited — its pid perhaps recycled by a stranger sharing our desktop —
+    // fails `process_is_in_job`, so a `WM_CLOSE` never lands on an unrelated app's
+    // window.
+    if pid != 0 && process_is_in_job(pid, ctx.job) {
+        ctx.matched += 1;
+        if ctx.close {
+            // SAFETY: POST (never Send) a close request to a valid window, so a hung
+            // window cannot block us. A delivery failure is swallowed — the grace
+            // poll observes the drain and the `TerminateJobObject` fallback covers a
+            // window that ignores the request.
+            unsafe {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+        }
+    }
+    // Continue the enumeration (TRUE) to the next top-level window.
+    1
+}
+
+/// Walk every top-level window on this desktop, applying [`scan_member_window`] to
+/// each. Returns the count of windows owned by a live member of `job`; in
+/// `close = true` mode each such window is also sent `WM_CLOSE`.
+fn scan_member_windows(job: HANDLE, close: bool) -> usize {
+    let mut ctx = MemberWindowScan {
+        job,
+        close,
+        matched: 0,
+    };
+    // SAFETY: `scan_member_window` is a valid `WNDENUMPROC`; `&mut ctx` is passed as
+    // the callback `lparam` and stays borrowed for the whole synchronous call. A 0
+    // return from `EnumWindows` (no windows, or an internal stop) is not an error
+    // here — `ctx.matched` is authoritative.
+    unsafe {
+        EnumWindows(
+            Some(scan_member_window),
+            std::ptr::from_mut(&mut ctx) as LPARAM,
+        );
+    }
+    ctx.matched
+}
+
+/// Post `WM_CLOSE` to every top-level window owned by a live member of `job`,
+/// returning the number of windows messaged.
+///
+/// Best-effort GUI-graceful trigger: a windowed child (Electron app, desktop tool,
+/// windowed service) receives no console CTRL event, so `WM_CLOSE` is the only soft
+/// "please close" it can act on before the `TerminateJobObject` fallback.
+/// `PostMessageW` (never `SendMessageW`) is used so a hung window can never block
+/// teardown. A return of 0 means the job has no windowed member right now — the
+/// caller keeps the prompt hard-kill behavior (no grace wait is introduced for a
+/// windowless tree).
+fn close_member_windows(job: HANDLE) -> usize {
+    scan_member_windows(job, true)
+}
+
+/// Whether any top-level window is owned by a live member of `job` — the
+/// side-effect-free probe [`Job::graceful_shutdown`](Job::graceful_shutdown) uses to
+/// decide whether a GUI-graceful drain is even possible (and thus whether to drive
+/// the grace loop) before its target's `signal_all` posts the actual `WM_CLOSE`.
+fn job_has_windowed_member(job: HANDLE) -> bool {
+    scan_member_windows(job, false) > 0
 }
 
 /// Whether the job has fully drained — no process is still active in it.
@@ -1535,6 +1699,70 @@ mod ctrl_break_tests {
             super::job_is_drained(job.handle),
             "an empty job has zero active processes, so it is drained"
         );
+    }
+
+    /// The GUI-graceful probe is membership-scoped: a fresh, empty job owns no
+    /// top-level window, so `job_has_windowed_member` is false and
+    /// `close_member_windows` posts nothing. This is the load-bearing safety
+    /// property — a `WM_CLOSE` is never posted onto an unrelated app's window (or
+    /// the test runner's own, which is not a member of this job), only onto a live
+    /// member's. It runs on every desktop (the enumeration visits all top-level
+    /// windows; none pass the `process_is_in_job` filter for this empty job).
+    #[test]
+    fn an_empty_job_has_no_windowed_member_and_closes_nothing() {
+        let job = new_job();
+        assert!(
+            !super::job_has_windowed_member(job.handle),
+            "an empty job owns no top-level window"
+        );
+        assert_eq!(
+            super::close_member_windows(job.handle),
+            0,
+            "no member window means no WM_CLOSE is posted — never onto an unrelated \
+             app's window or the test runner's own"
+        );
+    }
+
+    /// The narrowed `signal` contract: `Int`/`Term` on a group with neither a
+    /// console-CTRL leader nor a windowed member (a fresh empty job is both) still
+    /// reports `Unsupported` — a Job Object can't deliver a POSIX Int/Term when
+    /// there is nothing to soft-close.
+    #[cfg(feature = "process-control")]
+    #[test]
+    fn signal_int_or_term_without_a_soft_close_target_is_unsupported() {
+        let job = new_job();
+        for sig in [crate::Signal::Int, crate::Signal::Term] {
+            let err = job
+                .signal(sig)
+                .expect_err("no console/windowed target to reach");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::Unsupported,
+                "{sig:?} on a group with no console/windowed member is Unsupported"
+            );
+        }
+    }
+
+    /// The WM_CLOSE tier narrowed the contract for `Int`/`Term` ONLY: every other
+    /// curated non-`Kill` signal stays unconditionally `Unsupported` on Windows.
+    #[cfg(feature = "process-control")]
+    #[test]
+    fn signal_other_curated_variants_stay_unsupported() {
+        let job = new_job();
+        for sig in [
+            crate::Signal::Hup,
+            crate::Signal::Quit,
+            crate::Signal::Usr1,
+            crate::Signal::Usr2,
+            crate::Signal::Other(9),
+        ] {
+            let err = job.signal(sig).expect_err("not a soft-close signal");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::Unsupported,
+                "{sig:?} remains Unsupported on Windows"
+            );
+        }
     }
 
     /// With a recorded leader, `graceful_shutdown` takes the CTRL_BREAK path

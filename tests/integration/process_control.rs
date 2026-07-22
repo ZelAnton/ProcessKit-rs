@@ -196,13 +196,16 @@ async fn unix_fork_storm_is_swept_by_group_broadcast() {
 #[test]
 #[ignore = "creates an OS job"]
 fn windows_signal_non_kill_is_unsupported() {
-    // Job Objects have no POSIX signals: everything except Kill must surface as
-    // the typed Unsupported error, never a silent no-op.
+    // Job Objects have no POSIX signals. `Int`/`Term` get a best-effort soft close
+    // (console `CTRL_BREAK` + `WM_CLOSE` to windowed members), but this empty group
+    // has neither a console leader nor a windowed member, so they too surface the
+    // typed Unsupported error here — as does every other non-Kill signal
+    // unconditionally. Never a silent no-op.
     let group = ProcessGroup::new().expect("create group");
     for sig in [Signal::Term, Signal::Hup, Signal::Other(9)] {
         let err = group
             .signal(sig)
-            .expect_err("a non-Kill signal must be rejected on Windows");
+            .expect_err("a non-Kill signal with no soft-close target must be rejected on Windows");
         assert!(
             matches!(err, processkit::Error::Unsupported { .. }),
             "expected Error::Unsupported for {sig:?}, got {err:?}"
@@ -465,11 +468,13 @@ async fn empty_group_accepts_lifecycle_calls() {
     // Signalling, freezing, and thawing nobody must succeed trivially…
     group.signal(Signal::Kill).expect("Kill on an empty group");
     if cfg!(windows) {
-        // …except non-Kill signals on Windows, which are typed as unsupported
-        // (a Job Object has no POSIX signals) even with no members.
+        // …except `Term`/`Int` on Windows: they would soft-close a console or
+        // windowed member (`CTRL_BREAK` + `WM_CLOSE`), but an EMPTY group has
+        // neither, so they are typed Unsupported here — a Job Object has no POSIX
+        // signal to fall back on.
         let err = group
             .signal(Signal::Term)
-            .expect_err("only Kill is deliverable on Windows");
+            .expect_err("Term on an empty Windows group has no soft-close target");
         assert!(
             matches!(err, processkit::Error::Unsupported { .. }),
             "expected Unsupported, got {err:?}"

@@ -355,8 +355,17 @@ impl ProcessGroup {
     ///
     /// - **Linux (cgroup or process-group fallback), macOS/BSD** — any signal,
     ///   attempted for every live member of the tree.
-    /// - **Windows** — only [`Signal::Kill`]; any other signal — including
-    ///   [`Signal::Other`] — returns [`Error::Unsupported`].
+    /// - **Windows** — [`Signal::Kill`] (the atomic Job Object terminate) always;
+    ///   [`Signal::Int`] / [`Signal::Term`] as a best-effort **soft close** —
+    ///   `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` to any child spawned with
+    ///   [`Command::windows_graceful_ctrl_break`](crate::Command::windows_graceful_ctrl_break),
+    ///   plus `WM_CLOSE` to every top-level window owned by a live member (an
+    ///   Electron app, a desktop tool, a windowed service). This TRIGGERS a clean
+    ///   exit without waiting or escalating. It returns [`Error::Unsupported`] only
+    ///   when the group has **neither** a console-CTRL leader **nor** a windowed
+    ///   member (nothing a soft close could reach); every other signal
+    ///   ([`Signal::Hup`], [`Signal::Quit`], [`Signal::Usr1`], [`Signal::Usr2`],
+    ///   [`Signal::Other`]) is always [`Error::Unsupported`].
     ///
     /// `SIGKILL` ([`Signal::Kill`], or `Other(libc::SIGKILL)`) is routed through
     /// the same whole-tree hard kill as [`kill_all`](Self::kill_all)
@@ -376,11 +385,14 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] on Windows for any signal other than
-    /// [`Signal::Kill`] (Job Objects have no POSIX signals). On the Linux cgroup
-    /// mechanism, [`Error::Io`] if the OS rejects delivering the signal to a
+    /// [`Error::Unsupported`] on Windows for [`Signal::Int`] / [`Signal::Term`]
+    /// only when the group has no console-CTRL leader and no windowed member (see
+    /// Platform support above), and for every other non-[`Kill`](Signal::Kill)
+    /// signal unconditionally (a Job Object has no POSIX signals). On the Linux
+    /// cgroup mechanism, [`Error::Io`] if the OS rejects delivering the signal to a
     /// member. Delivery errors are deliberately not reported by the process-group
-    /// mechanism (see above).
+    /// mechanism (see above), and the Windows soft close is likewise best-effort
+    /// (an enumeration / post failure never fails a call that reached a target).
     #[cfg(feature = "process-control")]
     pub fn signal(&self, sig: Signal) -> Result<()> {
         self.job

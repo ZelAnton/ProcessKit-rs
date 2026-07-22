@@ -5,10 +5,14 @@
 /// [`signal`](crate::ProcessGroup::signal).
 ///
 /// The curated variants map to the POSIX signal of the same name on Unix. On
-/// Windows only [`Kill`](Signal::Kill) is deliverable (it maps to the Job
-/// Object terminate, the same hard kill as
-/// [`kill_all`](crate::ProcessGroup::kill_all)); every other variant
-/// yields [`Error::Unsupported`](crate::Error::Unsupported).
+/// Windows, [`Kill`](Signal::Kill) maps to the atomic Job Object terminate (the
+/// same hard kill as [`kill_all`](crate::ProcessGroup::kill_all)), and
+/// [`Int`](Signal::Int) / [`Term`](Signal::Term) are a best-effort **soft close**:
+/// a console `CTRL_BREAK` to a child opted into
+/// [`Command::windows_graceful_ctrl_break`](crate::Command::windows_graceful_ctrl_break),
+/// plus `WM_CLOSE` to every top-level window a live member owns. Those two yield
+/// [`Error::Unsupported`](crate::Error::Unsupported) only when the group has no such
+/// target; every other variant is always unsupported on Windows.
 ///
 /// [`Other`](Signal::Other) is an escape hatch carrying a raw signal number on
 /// Unix (e.g. `libc::SIGWINCH`); it is always unsupported on Windows.

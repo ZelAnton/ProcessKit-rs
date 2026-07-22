@@ -13,6 +13,12 @@ to a dated version section.
 
 ### Added
 
+- Windows graceful shutdown now posts `WM_CLOSE` (best-effort, *posted* not sent)
+  to every top-level window a live job member owns before the hard
+  `TerminateJobObject`, so a windowed child (Electron app, desktop tool, windowed
+  service) can close cleanly within the grace. Automatic — no opt-in; a windowless
+  tree with no `windows_graceful_ctrl_break` opt-in is still hard-killed promptly
+  at the deadline, so its timings are unchanged
 - Add a seeded randomized-interleaving stress harness for the process lifecycle
 - Add "Running untrusted children" hardening guide (`docs/untrusted-children.md`)
 - Add `Supervisor::start()` returning a live `SupervisionSession` (status
@@ -23,7 +29,12 @@ to a dated version section.
   process-group mechanism)
 
 ### Changed
--
+
+- `ProcessGroup::signal` for `Signal::Int` / `Signal::Term` on Windows now
+  best-effort soft-closes the tree (console `CTRL_BREAK` to
+  `windows_graceful_ctrl_break` leaders plus `WM_CLOSE` to windowed members)
+  instead of always returning `Error::Unsupported`; it returns `Unsupported` only
+  when the group has neither a console-CTRL leader nor a windowed member
 
 ### Fixed
 -

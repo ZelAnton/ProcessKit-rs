@@ -19,6 +19,12 @@
 //! the child, so the two delivery tests first ensure this process owns one (a
 //! harness launched headless has none). All are `#[ignore]`d real-subprocess
 //! tests, run on the Windows CI leg via `--include-ignored`.
+//!
+//! The **automatic** `WM_CLOSE` tier (no opt-in) is covered by two further tests:
+//! a real WinForms-windowed PowerShell child that exits (code 43) on `WM_CLOSE`
+//! within the grace, and a windowless `ping` child that has no window to close and
+//! so must be hard-killed *promptly* — proving the tier adds no grace wait for a
+//! windowless tree.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -228,5 +234,134 @@ async fn windows_ctrl_break_falls_back_to_terminate_for_an_off_console_child() {
     assert!(
         !matches!(outcome, Outcome::Exited(0)),
         "the off-console child was hard-killed by the fallback (got {outcome:?})"
+    );
+}
+
+/// A PowerShell script that creates a real WinForms top-level window, prints
+/// `ready` once the window is shown, then pumps its message loop. On `WM_CLOSE`
+/// (posted by the automatic graceful teardown) the `FormClosing` handler exits with
+/// the distinctive code 43 — positive proof the WM_CLOSE path ran the handler, not
+/// the `TerminateJobObject` fallback (which would exit 1).
+const PS_WINDOW_SCRIPT: &str = r#"Add-Type -AssemblyName System.Windows.Forms
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'processkit-wmclose-test'
+$form.Add_FormClosing({ [Environment]::Exit(43) })
+$form.Add_Shown({ [Console]::Out.WriteLine('ready'); [Console]::Out.Flush() })
+[System.Windows.Forms.Application]::Run($form)
+"#;
+
+/// Build a `Command` running the WinForms-windowed PowerShell child, plus the temp
+/// script path that must be kept alive for the child's lifetime. Deliberately NOT
+/// `windows_graceful_ctrl_break` — the WM_CLOSE tier is automatic for any windowed
+/// member. `-Sta` keeps the WinForms message pump on a single-threaded apartment
+/// (the default for Windows PowerShell, requested explicitly for robustness).
+fn wm_close_powershell() -> (Command, tempfile::TempPath) {
+    let mut f = tempfile::Builder::new()
+        .suffix(".ps1")
+        .tempfile()
+        .expect("create temp script");
+    f.write_all(PS_WINDOW_SCRIPT.as_bytes())
+        .expect("write temp script");
+    f.flush().expect("flush temp script");
+    // Close our handle before spawning — Windows blocks PowerShell from reading a
+    // file we still hold open — while keeping it on disk until the path drops.
+    let temp_path = f.into_temp_path();
+    let cmd = Command::new("powershell").args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Sta",
+        "-File",
+        &temp_path.to_string_lossy(),
+    ]);
+    (cmd, temp_path)
+}
+
+#[tokio::test]
+#[ignore = "spawns a real GUI subprocess; automatic graceful WM_CLOSE shutdown"]
+async fn windows_wm_close_lets_a_windowed_child_exit_within_the_grace() {
+    // A generous grace — the windowed child must exit *early* on the WM_CLOSE, so a
+    // regression that failed to post it would ride the full grace and trip the
+    // bound below. No `windows_graceful_ctrl_break()`: the WM_CLOSE tier is
+    // automatic for any windowed member.
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default().shutdown_timeout(Duration::from_secs(25)),
+    )
+    .expect("create group");
+
+    let (cmd, _script) = wm_close_powershell();
+    let mut run = group.start(&cmd).await.expect("start");
+    // Wait until the window is shown (Add-Type + the WinForms load take a few
+    // seconds on a cold runner) before signalling: a WM_CLOSE posted before the
+    // window exists would land on nothing and the child would ride the grace.
+    run.wait_for_line(|l| l.contains("ready"), Duration::from_secs(30))
+        .await
+        .expect("window shown");
+
+    let start = Instant::now();
+    completes_within(
+        Duration::from_secs(30),
+        "wm-close graceful shutdown",
+        group.shutdown(),
+    )
+    .await
+    .expect("shutdown ok");
+    assert!(
+        start.elapsed() < Duration::from_secs(12),
+        "a WM_CLOSE-handling windowed child must exit early, not ride the 25s grace (took {:?})",
+        start.elapsed()
+    );
+
+    let outcome = completes_within(Duration::from_secs(5), "reap", run.wait())
+        .await
+        .expect("wait");
+    assert_eq!(
+        outcome,
+        Outcome::Exited(43),
+        "the child exited via its WM_CLOSE FormClosing handler (code 43), not the hard-kill fallback"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real windowless console subprocess; WM_CLOSE tier must NOT delay its prompt hard kill"]
+async fn windows_windowless_child_is_hard_killed_promptly_not_after_the_grace() {
+    // A plain console `ping` owns no window and did not opt into
+    // `windows_graceful_ctrl_break`, so there is nothing to soft-close: the WM_CLOSE
+    // tier must leave its timings unchanged — a prompt atomic hard kill at the
+    // deadline, NOT a wait-out of the grace. A large grace makes a regression
+    // (driving the grace loop for a windowless tree) unmistakable.
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default().shutdown_timeout(Duration::from_secs(20)),
+    )
+    .expect("create group");
+
+    let run = group
+        .start(&Command::new("ping").args(["-n", "30", "127.0.0.1"]))
+        .await
+        .expect("start");
+    // Let it settle into its ~30s run so it is unambiguously still alive at shutdown.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let start = Instant::now();
+    completes_within(
+        Duration::from_secs(10),
+        "windowless prompt shutdown",
+        group.shutdown(),
+    )
+    .await
+    .expect("shutdown ok");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "a windowless child has no WM_CLOSE target, so it is hard-killed promptly — \
+         NOT after the 20s grace (took {:?})",
+        start.elapsed()
+    );
+
+    let outcome = completes_within(Duration::from_secs(5), "reap", run.wait())
+        .await
+        .expect("wait");
+    assert!(
+        !matches!(outcome, Outcome::Exited(0)),
+        "the windowless child was hard-killed by the atomic fallback (got {outcome:?})"
     );
 }

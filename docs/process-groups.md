@@ -131,10 +131,15 @@ want the early return. `Drop` can't `await`, which is why the graceful tier
 lives in this async method — dropping without calling it performs only the
 hard kill.
 
-### Windows: opt into a graceful `CTRL_BREAK` (soft) tier
+### Windows: the graceful soft tier (`WM_CLOSE`, opt-in `CTRL_BREAK`)
 
-By default a Windows `shutdown` is an *atomic* Job Object kill — there is no
-`SIGTERM` to trigger a clean exit. Opt in per child with
+A Windows `shutdown` has no POSIX `SIGTERM`, but it still tries to *trigger* a
+clean exit before the atomic Job Object kill. For a **windowed** child (Electron
+app, desktop tool, windowed service) this is automatic: `WM_CLOSE` is *posted*
+(never *sent*, so a hung window can't block us) to every top-level window a live
+member owns, then the *same* signal → wait → escalate ladder runs — the child
+gets the `shutdown_timeout` to flush and exit, else `TerminateJobObject`. A
+**console** child has no window, so opt in per child with
 [`Command::windows_graceful_ctrl_break()`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.windows_graceful_ctrl_break):
 the direct child is spawned in its own console process group
 (`CREATE_NEW_PROCESS_GROUP`), and `shutdown` then sends it
@@ -160,14 +165,18 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-It is **console-only**: a child spawned
+The `CTRL_BREAK` opt-in is **console-only**: a child spawned
 [`create_no_window`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.create_no_window)
 or `DETACHED_PROCESS` does not share this process's console, so it never receives
-the event and rides the grace to the `TerminateJobObject` fallback (as does a
-GUI/service parent with no console). Only the *direct* child is addressed — an
+the event and rides the grace to the `TerminateJobObject` fallback. Only the
+*direct* child is addressed by `CTRL_BREAK` — an
 [`adopt`](https://docs.rs/processkit/latest/processkit/struct.ProcessGroup.html#method.adopt)ed
 child is not — and the event is `CTRL_BREAK`, not `CTRL_C` (a new process group
-disables `CTRL_C`). Off Windows the builder is a no-op.
+disables `CTRL_C`). The automatic `WM_CLOSE` path is the complement: it reaches
+any live member that owns a top-level window (including forked descendants and
+adopted children), needs no console and no opt-in, but only a member that actually
+has a window. A member with neither a window nor the console opt-in is hard-killed
+promptly at the deadline. Off Windows the builder is a no-op.
 
 ## Signalling the whole tree
 
@@ -193,13 +202,17 @@ async fn main() -> processkit::Result<()> {
 | Platform | Deliverable signals |
 |---|---|
 | Linux (cgroup or pgroup), macOS/BSD | Any — `Term`, `Kill`, `Int`, `Hup`, `Quit`, `Usr1`, `Usr2`, `Other(n)` |
-| Windows | `Kill` only (maps to the Job Object terminate); anything else → `Error::Unsupported` |
+| Windows | `Kill` (Job Object terminate); `Int`/`Term` as a best-effort soft close (`CTRL_BREAK` to console leaders + `WM_CLOSE` to windowed members) — `Error::Unsupported` only when neither exists; every other signal → `Error::Unsupported` |
 
 `Signal::Kill` always takes the same *atomic* whole-tree kill path as
 `kill_all` (`cgroup.kill` / `killpg` / job terminate), so it cannot miss
 a process forked mid-broadcast. Other signals are a per-member broadcast —
-best-effort against a tree that is forking at that exact moment. An empty
-group accepts any deliverable signal trivially. On the **cgroup** mechanism a
+best-effort against a tree that is forking at that exact moment. On Windows,
+`Signal::Int`/`Signal::Term` do not wait or escalate (they only *trigger* a soft
+close — contrast the graceful `shutdown`, which then waits the grace and
+escalates). An empty group accepts any deliverable signal trivially — except
+Windows `Int`/`Term`, which report `Unsupported` on an empty group (no member,
+hence no console or windowed target to soft-close). On the **cgroup** mechanism a
 real per-member delivery failure (e.g. `EPERM` from a member that changed uid, or
 a seccomp/container restriction) is surfaced as an `Err` rather than swallowed —
 an `ESRCH` race (the member already exited) is still success; the pgroup
