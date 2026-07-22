@@ -13,6 +13,12 @@ to a dated version section.
 
 ### Added
 
+- Add `Pipeline::start()` returning a live `PipelineSession` — the multi-stage
+  analogue of `RunningProcess`: stream the last stage's stdout
+  (`stdout_lines`/`output_events`), wait for a readiness line (`wait_for_line`),
+  and `finish()` folds the same pipefail outcome (the culprit stage's outcome and
+  its own stderr) as the buffering verbs. Whole-chain `start_kill`, kill-on-drop,
+  and chain-wide `timeout`/`cancel_on` bound the live session
 - Add a seeded randomized-interleaving stress harness for the process lifecycle
 - Add "Running untrusted children" hardening guide (`docs/untrusted-children.md`)
 - Add `Supervisor::start()` returning a live `SupervisionSession` (status

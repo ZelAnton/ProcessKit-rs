@@ -228,7 +228,7 @@ pub use mechanism::Mechanism;
 #[cfg(feature = "process-control")]
 pub use member::MemberInfo;
 pub use parent_death::ParentDeathCleanup;
-pub use pipeline::Pipeline;
+pub use pipeline::{Pipeline, PipelineSession};
 pub use priority::Priority;
 // Fuzzing-only entry point for `fuzz/fuzz_targets/decode_pump_lines.rs` (see
 // `src/pump.rs`). `cfg(fuzzing)` is set automatically by `cargo fuzz build`

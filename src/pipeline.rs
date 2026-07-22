@@ -15,14 +15,17 @@
 //! whole chain still dies as a unit. The outcome is **pipefail**: the first stage
 //! without a clean exit decides the reported code/diagnostics.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
+
+use tokio::task::JoinHandle;
 
 use crate::command::Command;
 use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::result::{Outcome, ProcessResult};
-use crate::running::Finished;
+use crate::running::{Finished, OutputEvents, RunningProcess, StdoutLines};
+use crate::sync::atomic::{AtomicU8, Ordering};
 
 /// A chain of [`Command`]s connected stdout→stdin — built with
 /// [`Command::pipe`], extended with [`pipe`](Self::pipe), driven with the same
@@ -117,6 +120,34 @@ enum Joined<T> {
     Last(ProcessResult<T>, bool),
 }
 
+/// A launched chain, before the last stage is split off — the shared product of
+/// [`Pipeline::launch`], consumed by the buffering [`capture`](Pipeline::capture)
+/// path and the streaming [`start`](Pipeline::start) path alike. Holding it keeps
+/// every stage's kill-on-drop sub-group alive; dropping it (e.g. after a mid-chain
+/// spawn failure returned by `launch` via `?`) tears every already-started stage
+/// down, so a partially-launched chain never leaks.
+struct LaunchedChain {
+    /// A strong handle to every stage's kill-on-drop sub-group, so the chain-wide
+    /// teardown can fan a hard kill across all of them.
+    stage_groups: Vec<Arc<ProcessGroup>>,
+    /// Every stage's live handle paired with its `unchecked_in_pipe` flag, in
+    /// left-to-right order (the last stage is the final element).
+    running: Vec<(RunningProcess, bool)>,
+    /// Wall-clock start of the whole chain, captured before the first spawn.
+    started: std::time::Instant,
+}
+
+/// The last stage split off a launched chain by [`Pipeline::detach_last`]: the
+/// live streaming handle plus the pipefail metadata [`PipelineSession::finish`]
+/// folds it back into position with.
+struct DetachedLast {
+    handle: RunningProcess,
+    program: String,
+    ok_codes: Vec<i32>,
+    timeout: Option<Duration>,
+    unchecked: bool,
+}
+
 impl Pipeline {
     pub(crate) fn new(first: Command, second: Command) -> Self {
         Pipeline {
@@ -187,6 +218,221 @@ impl Pipeline {
         self
     }
 
+    /// Launch every stage of the chain — the shared start-up core reused by the
+    /// buffering [`capture`](Self::capture) verbs and the streaming
+    /// [`start`](Self::start) session, so a change to how a chain comes up (per-stage
+    /// sub-groups, the stdout→stdin relay, cancel-token gap-fill) lands on both.
+    ///
+    /// Each stage spawns into its **own** kill-on-drop sub-group, retained as a
+    /// strong handle so a per-stage [`Command::timeout`]/[`cancel_on`](Command::cancel_on)
+    /// tears down that stage's *whole* subtree (grandchildren of a forking `sh -c …`
+    /// included) and a chain-wide teardown can fan a kill across every one. The
+    /// pipeline [`cancel_on`](Self::cancel_on) token gap-fills onto every stage that
+    /// carries no token of its own.
+    ///
+    /// On a mid-chain spawn failure the `?` early-return drops the partially-built
+    /// vectors, so kill-on-drop reaps every already-started stage — a partial chain
+    /// never leaks (the "partially poured" teardown invariant).
+    async fn launch(&self) -> Result<LaunchedChain> {
+        // Wall-clock start of the whole chain, before the first spawn.
+        let started = std::time::Instant::now();
+
+        let mut stage_groups: Vec<Arc<ProcessGroup>> = Vec::with_capacity(self.stages.len());
+        let mut running = Vec::with_capacity(self.stages.len());
+        let mut upstream = None;
+        for (index, stage) in self.stages.iter().enumerate() {
+            let mut command = stage.clone();
+            // Gap-fill: apply the pipeline cancel token only where a stage has no token of its own.
+            if let Some(token) = &self.cancel_token
+                && command.cancel_token().is_none()
+            {
+                command = command.cancel_on(token.clone());
+            }
+            if let Some(reader) = upstream.take() {
+                command.set_pipe_stdin(reader);
+            }
+            // Spawn into a fresh per-stage group, then hand it to the stage handle
+            // (`attach_group` also upgrades the cancel watchdog to a group+pid kill)
+            // and keep a strong clone for the chain-wide teardown.
+            let group = ProcessGroup::new()?;
+            let mut process = group.start(&command).await?;
+            process.attach_group(group);
+            if let Some(handle) = process.own_group_handle() {
+                stage_groups.push(handle);
+            }
+            if index + 1 < self.stages.len() {
+                upstream = process.take_stdout_pipe();
+            }
+            // Bundle the unchecked flag with the handle; the last stage is split off by the caller.
+            running.push((process, stage.is_unchecked()));
+        }
+
+        Ok(LaunchedChain {
+            stage_groups,
+            running,
+            started,
+        })
+    }
+
+    /// Split the last stage off a launched chain's handles as the streaming
+    /// surface, paired with the pipefail metadata [`finish`](PipelineSession::finish)
+    /// folds it back with. Kept private so its infallible `pop`/`last` (a
+    /// `Pipeline` starts at and never drops below two stages, so `running` is never
+    /// empty and `self.stages` is never empty here) stays out of the public
+    /// [`start`](Self::start) — matching how the buffering verbs keep their
+    /// same-invariant `expect`s inside the private `capture`.
+    fn detach_last(&self, running: &mut Vec<(RunningProcess, bool)>) -> DetachedLast {
+        let (handle, unchecked) = running.pop().expect("a pipeline has at least two stages");
+        let stage = self
+            .stages
+            .last()
+            .expect("a pipeline has at least two stages");
+        DetachedLast {
+            program: handle.program_name().to_owned(),
+            ok_codes: stage.ok_codes_vec(),
+            timeout: stage.configured_timeout(),
+            unchecked,
+            handle,
+        }
+    }
+
+    /// Start the chain as a **live streaming session** — the multi-stage analogue
+    /// of [`Command::start`](crate::Command::start), returning a
+    /// [`PipelineSession`] you drive yourself instead of buffering the whole run.
+    /// It brings the streaming surface (`journalctl -f | grep …`, `tail -F | jq`,
+    /// any long-lived chain you read *from* rather than wait *out*) to pipelines.
+    ///
+    /// The session gives:
+    ///
+    /// - the **last** stage's stdout as it arrives —
+    ///   [`stdout_lines`](PipelineSession::stdout_lines) /
+    ///   [`output_events`](PipelineSession::output_events), with the same
+    ///   consume-once contract as [`RunningProcess`](crate::RunningProcess) (a
+    ///   second take is a loud `Err`, never a silently-empty stream);
+    /// - a readiness wait on that stream —
+    ///   [`wait_for_line`](PipelineSession::wait_for_line);
+    /// - a [`finish`](PipelineSession::finish) that folds the same **pipefail**
+    ///   outcome as the buffering verbs: the culprit stage's outcome and *its own*
+    ///   stderr, not just the last stage's;
+    /// - whole-chain teardown — [`start_kill`](PipelineSession::start_kill) and
+    ///   kill-on-drop — plus the chain-wide [`timeout`](Self::timeout) /
+    ///   [`cancel_on`](Self::cancel_on) still bounding the live session.
+    ///
+    /// # Errors
+    ///
+    /// A launch failure of any stage
+    /// ([`Error::NotFound`](crate::Error::NotFound) /
+    /// [`Error::Spawn`](crate::Error::Spawn) /
+    /// [`Error::Unsupported`](crate::Error::Unsupported)) or
+    /// [`Error::Stdin`](crate::Error::Stdin) at start-up — every already-started
+    /// stage is torn down before the error returns. A failing *stage* is not raised
+    /// here; it surfaces at [`finish`](PipelineSession::finish).
+    pub async fn start(&self) -> Result<PipelineSession> {
+        let LaunchedChain {
+            stage_groups,
+            mut running,
+            // A live session reports no duration (its `Finished` carries none — the
+            // caller times the stream itself), so the launch anchor is unused here.
+            started: _,
+        } = self.launch().await?;
+
+        // Split the last stage off as the live streaming surface; the caller drives
+        // it. Carry its pipefail metadata so `finish` can fold it into position.
+        // The infallible pop lives in `detach_last` (a `Pipeline` starts at and
+        // never drops below two stages), so this public method carries no panic path.
+        let DetachedLast {
+            handle: last,
+            program: last_program,
+            ok_codes: last_ok_codes,
+            timeout: last_timeout,
+            unchecked: last_unchecked,
+        } = self.detach_last(&mut running);
+
+        let inner_count = running.len();
+
+        // Proactive teardown token, exactly as in `capture`: an inner stage's first
+        // checked failure (or a raw error) fires it, and the standing killer below
+        // reacts by tearing the whole live chain down — so a quiet upstream can't
+        // hold a failed streaming chain open.
+        let teardown = tokio_util::sync::CancellationToken::new();
+
+        // Background-drain every inner stage while the caller streams the last. Each
+        // task reuses `finish_inner_stage` (the shared classify-and-teardown body)
+        // and *additionally* fires teardown on a raw `Err`, standing in for the
+        // central `drain_unordered` backstop the buffering path gets for free —
+        // here no central drain runs while the caller streams, so each task must
+        // self-report to keep the chain live behind a ready error.
+        let mut inner_tasks: tokio::task::JoinSet<Result<(usize, StageOutcome)>> =
+            tokio::task::JoinSet::new();
+        for (index, ((process, unchecked), stage)) in
+            running.into_iter().zip(self.stages.iter()).enumerate()
+        {
+            let program = process.program_name().to_owned();
+            let ok_codes = stage.ok_codes_vec();
+            let timeout = stage.configured_timeout();
+            let teardown = teardown.clone();
+            inner_tasks.spawn(async move {
+                let result = finish_inner_stage(
+                    process,
+                    index,
+                    program,
+                    ok_codes,
+                    timeout,
+                    unchecked,
+                    teardown.clone(),
+                )
+                .await;
+                if result.is_err() {
+                    teardown.cancel();
+                }
+                result
+            });
+        }
+
+        // Standing teardown killer: fans a hard kill across every stage's sub-group
+        // the instant `teardown` fires, so a failing inner stage tears the *whole*
+        // live chain down (last stage included) even while the caller is mid-stream.
+        // `Weak` handles so it never pins a group past a session drop; aborted on
+        // `finish`/drop.
+        let killer = spawn_group_killer(teardown.clone(), &stage_groups);
+
+        // Chain-wide `Pipeline::timeout` on the live session: a background watchdog
+        // reusing the shared deadline arbiter (no second implementation — K-034/K-007).
+        // At the deadline it claims a fresh chain arbiter and hard-kills every
+        // sub-group; `finish` reads the arbiter to report `Outcome::TimedOut`, exactly
+        // as the buffering path's `tokio::time::timeout` branch does. Anchored to a
+        // `tokio::time::Instant` (the deadline clock), captured now — after launch,
+        // matching where the buffering `tokio::time::timeout(limit, collect)` begins.
+        let chain_state = Arc::new(AtomicU8::new(crate::running::TS_PENDING));
+        let deadline_task = self.timeout.map(|limit| {
+            let state = chain_state.clone();
+            let groups: Vec<Weak<ProcessGroup>> =
+                stage_groups.iter().map(Arc::downgrade).collect();
+            let anchor = tokio::time::Instant::now();
+            tokio::spawn(async move {
+                if crate::running::deadline::wait_deadline_and_claim(anchor, limit, &state).await {
+                    kill_weak_stage_groups(&groups);
+                }
+            })
+        });
+
+        Ok(PipelineSession {
+            last: Some(last),
+            last_program,
+            last_ok_codes,
+            last_unchecked,
+            last_timeout,
+            inner_tasks: Some(inner_tasks),
+            inner_count,
+            stage_groups,
+            teardown,
+            timeout: self.timeout,
+            chain_state,
+            deadline_task,
+            killer: Some(killer),
+        })
+    }
+
     /// Run the chain to completion and capture the outcome (stdout as text). A
     /// failing stage is **not** an `Err` here — it is reported in the result
     /// (pipefail attribution, see the type docs); `Err` means a stage could not
@@ -233,48 +479,16 @@ impl Pipeline {
         C: FnOnce(crate::running::RunningProcess) -> F,
         F: std::future::Future<Output = Result<ProcessResult<T>>> + Send + 'static,
     {
-        // Wall-clock start of the whole chain — from here to the moment the final
-        // `ProcessResult` is assembled (success, pipefail failure, or chain-wide
-        // timeout), so `duration()` reflects the run, not just the last stage.
-        let started = std::time::Instant::now();
-
-        // Each stage gets its own kill-on-drop sub-group, retained here as a
-        // strong handle. A per-stage `Command::timeout`/`cancel_on` then tears
-        // down that stage's *whole* subtree (grandchildren of a forking `sh -c …`
-        // included) rather than only its direct child, and the chain-wide backstop
-        // below fans a kill across every sub-group. Holding the strong handles for
-        // the whole capture keeps the old lifetime — a stage's tree lives until the
-        // chain ends, then kill-on-drop reaps any straggler.
-        let mut stage_groups: Vec<Arc<ProcessGroup>> = Vec::with_capacity(self.stages.len());
-
-        let mut running = Vec::with_capacity(self.stages.len());
-        let mut upstream = None;
-        for (index, stage) in self.stages.iter().enumerate() {
-            let mut command = stage.clone();
-            // Gap-fill: apply the pipeline cancel token only where a stage has no token of its own.
-            if let Some(token) = &self.cancel_token
-                && command.cancel_token().is_none()
-            {
-                command = command.cancel_on(token.clone());
-            }
-            if let Some(reader) = upstream.take() {
-                command.set_pipe_stdin(reader);
-            }
-            // Spawn into a fresh per-stage group, then hand it to the stage handle
-            // (`attach_group` also upgrades the cancel watchdog to a group+pid kill)
-            // and keep a strong clone for the chain-wide teardown.
-            let group = ProcessGroup::new()?;
-            let mut process = group.start(&command).await?;
-            process.attach_group(group);
-            if let Some(handle) = process.own_group_handle() {
-                stage_groups.push(handle);
-            }
-            if index + 1 < self.stages.len() {
-                upstream = process.take_stdout_pipe();
-            }
-            // Bundle the unchecked flag with the handle; the last stage is popped below.
-            running.push((process, stage.is_unchecked()));
-        }
+        // Launch the whole chain (shared with `start`'s streaming path): every
+        // stage in its own kill-on-drop sub-group, stdout→stdin chained, strong
+        // sub-group handles retained for the chain-wide teardown fan. `started` is
+        // the wall-clock anchor from before the first spawn, so `duration()`
+        // reflects the run, not just the last stage.
+        let LaunchedChain {
+            stage_groups,
+            mut running,
+            started,
+        } = self.launch().await?;
 
         // Proactive teardown: the first stage to finish with a *checked failure*
         // fires this token; a concurrent killer then tears every stage's sub-group
@@ -313,31 +527,13 @@ impl Pipeline {
             let timeout = stage.configured_timeout();
             let teardown = teardown.clone();
             tasks.spawn(async move {
-                let Finished {
-                    outcome,
-                    stderr,
-                    stderr_truncated,
-                } = process.finish().await?;
-                // Snapshot *before* firing: a teardown already in flight when this
-                // stage ended marks it a victim; the first genuine failure sees no
-                // teardown yet, so it fires it and stays the (non-torn) culprit.
-                let torn_down = teardown.is_cancelled();
-                if !torn_down && is_checked_failure(outcome, &ok_codes, unchecked) {
-                    teardown.cancel();
-                }
-                Ok(Joined::Inner(
-                    index,
-                    StageOutcome {
-                        program,
-                        outcome,
-                        stderr,
-                        unchecked,
-                        ok_codes,
-                        timeout,
-                        torn_down,
-                        stderr_truncated,
-                    },
-                ))
+                // `finish_inner_stage` is the shared classify-and-teardown body,
+                // reused by `start`'s streaming inner drains — so both paths blame
+                // a stage and fire proactive teardown identically.
+                let (index, outcome) =
+                    finish_inner_stage(process, index, program, ok_codes, timeout, unchecked, teardown)
+                        .await?;
+                Ok(Joined::Inner(index, outcome))
             });
         }
         // Call `capture_last` here (not inside the spawned future): it yields a
@@ -625,6 +821,325 @@ impl Pipeline {
     }
 }
 
+/// A **live streaming session** over a running [`Pipeline`] — the multi-stage
+/// analogue of a [`RunningProcess`](crate::RunningProcess), returned by
+/// [`Pipeline::start`]. It streams the **last** stage's stdout as it arrives while
+/// every inner stage drains in the background, then folds the same **pipefail**
+/// outcome as the buffering verbs at [`finish`](Self::finish).
+///
+/// Drive it like a `RunningProcess`:
+///
+/// - [`stdout_lines`](Self::stdout_lines) / [`output_events`](Self::output_events)
+///   — the last stage's stdout, line by line or as interleaved events, with the
+///   same **consume-once** contract (a second take is a loud `Err`).
+/// - [`wait_for_line`](Self::wait_for_line) — wait for a readiness banner on that
+///   stream without tearing the chain down.
+/// - [`finish`](Self::finish) — fold the pipefail outcome (the culprit stage's
+///   outcome and *its own* stderr, not just the last stage's) into a
+///   [`Finished`].
+/// - [`start_kill`](Self::start_kill) — stop the whole chain now.
+///
+/// **Teardown is whole-chain.** A stage's checked failure proactively tears every
+/// stage's sub-group down (so a quiet upstream can't hold a failed live chain
+/// open), the chain-wide [`Pipeline::timeout`] / [`Pipeline::cancel_on`] still
+/// bound the session, and **dropping** the session hard-kills every stage's tree —
+/// the crate's no-orphan invariant holds for a live chain exactly as it does for a
+/// single [`RunningProcess`](crate::RunningProcess). A partially-started chain (one
+/// stage up, the next failing to spawn) is torn down before [`start`](Pipeline::start)
+/// even returns its error.
+#[must_use = "a PipelineSession streams a live chain; drop it and the whole chain is killed unread"]
+pub struct PipelineSession {
+    /// The last stage's live handle — the streaming surface the caller drives.
+    /// `Option` so [`finish`](Self::finish) can move it out without a partial move
+    /// (the session has a `Drop`); `None` only after `finish` consumed it.
+    last: Option<RunningProcess>,
+    /// The last stage's pipefail metadata, kept so `finish` can fold it into place.
+    last_program: String,
+    last_ok_codes: Vec<i32>,
+    last_unchecked: bool,
+    last_timeout: Option<Duration>,
+    /// Background drains of every inner (non-last) stage — each an index-tagged
+    /// [`StageOutcome`] once its stage exits, sorted back into left-to-right order
+    /// by `finish`. `Option`, taken by `finish`.
+    inner_tasks: Option<tokio::task::JoinSet<Result<(usize, StageOutcome)>>>,
+    /// How many inner stages there are — the `Debug` summary's stage count.
+    inner_count: usize,
+    /// Strong handles to every stage's sub-group, for [`start_kill`](Self::start_kill)
+    /// and the kill-on-drop backstop.
+    stage_groups: Vec<Arc<ProcessGroup>>,
+    /// Proactive teardown token, fired by an inner stage's checked/raw failure.
+    teardown: tokio_util::sync::CancellationToken,
+    /// The chain-wide [`Pipeline::timeout`], if any (gates the arbiter read).
+    timeout: Option<Duration>,
+    /// The chain-wide deadline arbiter (reusing the shared `running::deadline` CAS
+    /// protocol): the watchdog claims `TimedOut`, `finish` claims `Exited`.
+    chain_state: Arc<AtomicU8>,
+    /// The chain-wide timeout watchdog, aborted on `finish`/drop.
+    deadline_task: Option<JoinHandle<()>>,
+    /// The standing teardown killer, aborted on `finish`/drop.
+    killer: Option<JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for PipelineSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipelineSession")
+            .field("last", &self.last_program)
+            .field("inner_stages", &self.inner_count)
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PipelineSession {
+    /// Stream the **last** stage's standard output line by line, as the chain
+    /// produces it — the multi-stage analogue of
+    /// [`RunningProcess::stdout_lines`](crate::RunningProcess::stdout_lines). Call
+    /// this **once**. Every inner stage's stdout feeds the next stage's stdin (and
+    /// its stderr is drained in the background for pipefail diagnostics); only the
+    /// last stage's stdout reaches you.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`](crate::Error::Io) when the last stage's stdout was not piped,
+    /// or a prior streaming verb ([`stdout_lines`](Self::stdout_lines) /
+    /// [`output_events`](Self::output_events) / [`wait_for_line`](Self::wait_for_line))
+    /// already consumed it — returned instead of a silently-empty stream.
+    pub fn stdout_lines(&mut self) -> Result<StdoutLines> {
+        self.last_mut().stdout_lines()
+    }
+
+    /// Stream the **last** stage's stdout **and** stderr as one ordered sequence of
+    /// [`OutputEvent`](crate::OutputEvent)s — the multi-stage analogue of
+    /// [`RunningProcess::output_events`](crate::RunningProcess::output_events). Call
+    /// this **once**. Note this surfaces only the *last* stage's stderr as events;
+    /// inner stages' stderr still folds into the pipefail diagnostics at
+    /// [`finish`](Self::finish).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`](crate::Error::Io) when the last stage's stdout was not piped,
+    /// or a prior streaming verb already consumed it.
+    pub fn output_events(&mut self) -> Result<OutputEvents> {
+        self.last_mut().output_events()
+    }
+
+    /// Wait until a line on the **last** stage's stdout matches `predicate`
+    /// (returning that line), or fail with [`Error::NotReady`](crate::Error::NotReady)
+    /// when `within` elapses — the multi-stage analogue of
+    /// [`RunningProcess::wait_for_line`](crate::RunningProcess::wait_for_line). Like
+    /// there, a failed probe does **not** kill the chain and does not arm the
+    /// chain-wide timeout; continue with [`finish`](Self::finish) for the outcome.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotReady`](crate::Error::NotReady) when `within` elapses with no
+    /// matching line (or the last stage's stdout closes first), and
+    /// [`Error::Io`](crate::Error::Io) when that stdout was not piped or was already
+    /// consumed — the same surface as the single-process probe.
+    pub async fn wait_for_line(
+        &mut self,
+        predicate: impl Fn(&str) -> bool + Send,
+        within: Duration,
+    ) -> Result<String> {
+        self.last_mut().wait_for_line(predicate, within).await
+    }
+
+    /// The OS process id of the **last** stage, or `None` once it has been reaped —
+    /// the stage whose stdout you stream. The inner stages' pids are not surfaced;
+    /// the chain is driven and torn down as a unit.
+    pub fn pid(&self) -> Option<u32> {
+        self.last.as_ref().and_then(RunningProcess::pid)
+    }
+
+    /// Stop the **whole chain** now: fan a hard kill across every stage's sub-group.
+    /// Idempotent and best-effort (a per-group error is swallowed), mirroring
+    /// [`RunningProcess::start_kill`](crate::RunningProcess::start_kill) at chain
+    /// scope. After it, the last stage's stream ends and [`finish`](Self::finish)
+    /// reports the killed outcome via the usual pipefail fold.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible — returns `Ok(())`; the `Result` mirrors
+    /// [`RunningProcess::start_kill`](crate::RunningProcess::start_kill) and leaves
+    /// room for a future backend that can report a kill failure.
+    pub fn start_kill(&mut self) -> Result<()> {
+        kill_all_stage_groups(&self.stage_groups);
+        Ok(())
+    }
+
+    /// Finish the live chain and fold the **pipefail** outcome, the streaming
+    /// analogue of [`Pipeline::output_string`](Pipeline::output_string) /
+    /// [`RunningProcess::finish`](crate::RunningProcess::finish). The last stage's
+    /// stdout was already streamed to you, so — like [`Finished`] — none is
+    /// re-bundled here; what you get back is *how the chain ended*.
+    ///
+    /// The returned [`Finished`] carries the **pipefail-attributed** stage's
+    /// [`outcome`](Finished::outcome) and *its own* [`stderr`](Finished::stderr):
+    /// the culprit is chosen by the same rule as the buffering verbs — the leftmost
+    /// checked failure, preferring a genuine failure over a SIGPIPE/teardown victim,
+    /// or the last stage when every stage exited cleanly. A chain-wide
+    /// [`Pipeline::timeout`] that elapsed reports [`Outcome::TimedOut`](crate::Outcome::TimedOut)
+    /// regardless of how the individual stages were killed, exactly as the buffering
+    /// path's whole-chain timeout does.
+    ///
+    /// # Errors
+    ///
+    /// A failing stage (and a chain timeout) is *captured* in the returned
+    /// [`Finished`]'s [`outcome`](Finished::outcome), not raised. `Err` mirrors the
+    /// buffering verbs' non-outcome failures:
+    /// [`Error::Cancelled`](crate::Error::Cancelled) (the chain-wide
+    /// [`cancel_on`](Pipeline::cancel_on) token fired, or a stage carried one),
+    /// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge) (a fail-loud buffer
+    /// overflowed on a stage), [`Error::Stdin`](crate::Error::Stdin), or
+    /// [`Error::Io`](crate::Error::Io).
+    pub async fn finish(mut self) -> Result<Finished> {
+        // The consume-once `take`s live in `take_live_parts` (this method takes
+        // `self` by value, so they are always `Some` here), keeping the panic path
+        // out of the public `finish`.
+        let (last, inner_tasks) = self.take_live_parts();
+        let teardown = self.teardown.clone();
+        let last_ok_codes = self.last_ok_codes.clone();
+        let last_unchecked = self.last_unchecked;
+
+        // Drive the last stage to its `Finished` and drain the inner stages
+        // concurrently, with the standing killer + chain-deadline watchdog still
+        // armed. A failing/erroring last stage fires `teardown` too (mirroring the
+        // buffering path's failing-last-stage teardown), so a quiet upstream can't
+        // wedge the finalize; the killer then tears the chain down.
+        let last_fut = {
+            let teardown = teardown.clone();
+            async move {
+                let result = last.finish().await;
+                // Snapshot `torn_down` *before* the last stage might fire teardown —
+                // a teardown already in flight makes it a victim; a last stage that
+                // fails on its own fires teardown yet stays the (non-torn) culprit.
+                let torn_down = teardown.is_cancelled();
+                match &result {
+                    Ok(finished) => {
+                        if !torn_down
+                            && is_checked_failure(finished.outcome, &last_ok_codes, last_unchecked)
+                        {
+                            teardown.cancel();
+                        }
+                    }
+                    Err(_) if !torn_down => teardown.cancel(),
+                    Err(_) => {}
+                }
+                (result, torn_down)
+            }
+        };
+        let ((last_res, last_torn_down), inner_res) =
+            tokio::join!(last_fut, drain_unordered(inner_tasks, &teardown));
+
+        // Both sides settled — stop the background watchdogs.
+        self.abort_background();
+
+        // Chain-wide timeout wins over the stages' own (hard-killed) outcomes, just
+        // like the buffering path's `tokio::time::timeout` branch. Claiming the
+        // arbiter is race-free against the watchdog: whichever of `Exited`/`TimedOut`
+        // CASes from `PENDING` first decides.
+        if self.chain_timed_out() {
+            return Ok(Finished {
+                outcome: Outcome::TimedOut,
+                stderr: String::new(),
+                stderr_truncated: false,
+            });
+        }
+
+        // Surface a raw `Err` from either side (Cancelled / OutputTooLarge / Stdin / Io).
+        let last_finished = last_res?;
+        let mut inner = inner_res?;
+
+        // Rebuild the inner stages in left-to-right order (a clean drain returns all
+        // `inner_count` items, each tagged with its unique launch index), then append
+        // the last. Sorting by index needs no `expect` for a missing slot.
+        inner.sort_by_key(|(index, _)| *index);
+        let mut stages: Vec<StageOutcome> =
+            inner.into_iter().map(|(_, outcome)| outcome).collect();
+        stages.push(StageOutcome {
+            program: self.last_program.clone(),
+            outcome: last_finished.outcome,
+            stderr: last_finished.stderr,
+            unchecked: self.last_unchecked,
+            ok_codes: self.last_ok_codes.clone(),
+            timeout: self.last_timeout,
+            torn_down: last_torn_down,
+            stderr_truncated: last_finished.stderr_truncated,
+        });
+
+        // Reuse the exact pipefail attribution. The last stage's real stdout was
+        // already streamed to the caller, so fold with a unit payload and surface
+        // only the attributed stage's outcome + stderr as a `Finished`.
+        let folded = pipefail(stages, ());
+        Ok(Finished {
+            outcome: folded.outcome(),
+            stderr: folded.stderr().to_owned(),
+            stderr_truncated: folded.truncated(),
+        })
+    }
+
+    fn last_mut(&mut self) -> &mut RunningProcess {
+        self.last
+            .as_mut()
+            .expect("the last stage is live until finish consumes the session")
+    }
+
+    /// Take the last stage handle and the inner-stage drains out of the session for
+    /// [`finish`](Self::finish). Private so its consume-once `expect`s (both fields
+    /// are always `Some` until `finish` — which owns `self` — runs) stay out of the
+    /// public API's panic-doc surface.
+    #[allow(clippy::type_complexity)]
+    fn take_live_parts(
+        &mut self,
+    ) -> (
+        RunningProcess,
+        tokio::task::JoinSet<Result<(usize, StageOutcome)>>,
+    ) {
+        let last = self
+            .last
+            .take()
+            .expect("finish consumes the session exactly once");
+        let inner_tasks = self
+            .inner_tasks
+            .take()
+            .expect("finish consumes the session exactly once");
+        (last, inner_tasks)
+    }
+
+    /// Whether the chain-wide [`Pipeline::timeout`] elapsed: claim the arbiter for a
+    /// natural finish (`Exited`); if a fired deadline already claimed `TimedOut`,
+    /// report the timeout. Reuses the shared `running::deadline` claim protocol.
+    fn chain_timed_out(&self) -> bool {
+        self.timeout.is_some()
+            && !crate::running::deadline::claim_exited(&self.chain_state)
+            && self.chain_state.load(Ordering::Acquire) == crate::running::TS_TIMED_OUT
+    }
+
+    /// Abort the standing background watchdog tasks (deadline + teardown killer).
+    /// Idempotent — `finish` calls it once the chain has settled, and `Drop` calls
+    /// it for the drop-without-finish path.
+    fn abort_background(&mut self) {
+        if let Some(task) = self.deadline_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.killer.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for PipelineSession {
+    fn drop(&mut self) {
+        // Abort the detached watchdogs so a session dropped unfinished leaves no
+        // parked killer/deadline task behind. The chain itself is torn down by
+        // kill-on-drop as the fields fall: the last stage's `RunningProcess::drop`
+        // kills its own tree, every inner stage's handle (moved into the aborted
+        // `inner_tasks`) does the same as the `JoinSet` drops, and the retained
+        // `stage_groups` are the kill-on-drop backstop for any straggler.
+        self.abort_background();
+    }
+}
+
 /// Fan a hard kill across every stage's sub-group — the chain-wide backstop when
 /// a [`Pipeline::timeout`] elapses or a stage's failure triggers proactive
 /// teardown, now that each stage owns its own kill-on-drop group rather than
@@ -640,6 +1155,80 @@ fn kill_all_stage_groups(groups: &[Arc<ProcessGroup>]) {
     for group in groups {
         let _ = group.kill_all();
     }
+}
+
+/// The [`Weak`] analogue of [`kill_all_stage_groups`], for the detached watchdog
+/// tasks a live [`PipelineSession`] holds: `Weak` so a still-parked killer/deadline
+/// task can never keep a stage's sub-group (and its kill-on-drop backstop) alive
+/// past a session drop — a dropped-away group simply fails to upgrade and is
+/// skipped. Best-effort per group, exactly like the strong-handle version.
+fn kill_weak_stage_groups(groups: &[Weak<ProcessGroup>]) {
+    for group in groups {
+        if let Some(group) = group.upgrade() {
+            let _ = group.kill_all();
+        }
+    }
+}
+
+/// Spawn the standing teardown killer for [`Pipeline::start`]'s live session: it
+/// waits on `teardown` and, the instant it fires, fans a hard kill across every
+/// stage's sub-group (the last stage included) so a failing inner stage tears the
+/// *whole* live chain down even mid-stream. Holds [`Weak`] handles so it never
+/// pins the groups; the session aborts it on `finish`/drop.
+fn spawn_group_killer(
+    teardown: tokio_util::sync::CancellationToken,
+    stage_groups: &[Arc<ProcessGroup>],
+) -> JoinHandle<()> {
+    let groups: Vec<Weak<ProcessGroup>> = stage_groups.iter().map(Arc::downgrade).collect();
+    tokio::spawn(async move {
+        teardown.cancelled().await;
+        kill_weak_stage_groups(&groups);
+    })
+}
+
+/// Drive one already-launched **non-last** stage to its [`Finished`] and fold it
+/// into a positioned [`StageOutcome`], firing `teardown` on its first *checked*
+/// failure (the proactive-teardown trigger). The shared classify-and-teardown body
+/// of both the buffering [`capture`](Pipeline::capture) path and the streaming
+/// [`start`](Pipeline::start) session's inner drains, so both blame a stage — and
+/// decide whether it is a teardown victim — by exactly the same rule.
+///
+/// The `torn_down` snapshot is taken *before* this stage might fire `teardown`: a
+/// teardown already in flight when the stage ended marks it a victim (de-prioritized
+/// in the pipefail fold), while the first genuine failure sees no teardown yet, so
+/// it fires it and stays the (non-torn) culprit.
+#[allow(clippy::too_many_arguments)]
+async fn finish_inner_stage(
+    process: RunningProcess,
+    index: usize,
+    program: String,
+    ok_codes: Vec<i32>,
+    timeout: Option<Duration>,
+    unchecked: bool,
+    teardown: tokio_util::sync::CancellationToken,
+) -> Result<(usize, StageOutcome)> {
+    let Finished {
+        outcome,
+        stderr,
+        stderr_truncated,
+    } = process.finish().await?;
+    let torn_down = teardown.is_cancelled();
+    if !torn_down && is_checked_failure(outcome, &ok_codes, unchecked) {
+        teardown.cancel();
+    }
+    Ok((
+        index,
+        StageOutcome {
+            program,
+            outcome,
+            stderr,
+            unchecked,
+            ok_codes,
+            timeout,
+            torn_down,
+            stderr_truncated,
+        },
+    ))
 }
 
 /// True for SIGPIPE (Unix signal 13) — the usual victim symptom, not the culprit.

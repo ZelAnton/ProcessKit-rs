@@ -801,6 +801,7 @@ pub fn processkit::Pipeline::pipe(self, processkit::Command) -> Self
 pub async fn processkit::Pipeline::probe(&self) -> processkit::Result<bool>
 pub async fn processkit::Pipeline::run(&self) -> processkit::Result<alloc::string::String>
 pub async fn processkit::Pipeline::run_unit(&self) -> processkit::Result<()>
+pub async fn processkit::Pipeline::start(&self) -> processkit::Result<processkit::PipelineSession>
 pub fn processkit::Pipeline::timeout(self, core::time::Duration) -> Self
 pub async fn processkit::Pipeline::try_parse<T, F>(&self, F) -> processkit::Result<T> where F: core::ops::function::FnOnce(&str) -> processkit::Result<T>
 impl core::clone::Clone for processkit::Pipeline
@@ -817,6 +818,25 @@ impl core::marker::Unpin for processkit::Pipeline
 impl core::marker::UnsafeUnpin for processkit::Pipeline
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Pipeline
 impl !core::panic::unwind_safe::UnwindSafe for processkit::Pipeline
+pub struct processkit::PipelineSession
+impl processkit::PipelineSession
+pub async fn processkit::PipelineSession::finish(self) -> processkit::Result<processkit::Finished>
+pub fn processkit::PipelineSession::output_events(&mut self) -> processkit::Result<processkit::OutputEvents>
+pub fn processkit::PipelineSession::pid(&self) -> core::option::Option<u32>
+pub fn processkit::PipelineSession::start_kill(&mut self) -> processkit::Result<()>
+pub fn processkit::PipelineSession::stdout_lines(&mut self) -> processkit::Result<processkit::StdoutLines>
+pub async fn processkit::PipelineSession::wait_for_line(&mut self, impl core::ops::function::Fn(&str) -> bool + core::marker::Send, core::time::Duration) -> processkit::Result<alloc::string::String>
+impl core::fmt::Debug for processkit::PipelineSession
+pub fn processkit::PipelineSession::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::drop::Drop for processkit::PipelineSession
+pub fn processkit::PipelineSession::drop(&mut self)
+impl core::marker::Freeze for processkit::PipelineSession
+impl core::marker::Send for processkit::PipelineSession
+impl core::marker::Sync for processkit::PipelineSession
+impl core::marker::Unpin for processkit::PipelineSession
+impl core::marker::UnsafeUnpin for processkit::PipelineSession
+impl !core::panic::unwind_safe::RefUnwindSafe for processkit::PipelineSession
+impl !core::panic::unwind_safe::UnwindSafe for processkit::PipelineSession
 pub struct processkit::ProcessGroup
 impl processkit::ProcessGroup
 pub fn processkit::ProcessGroup::adopt(&self, &tokio::process::Child) -> processkit::Result<()>
