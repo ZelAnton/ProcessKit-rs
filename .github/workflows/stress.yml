@@ -28,6 +28,14 @@ jobs:
       # churn scenario (`/proc/self/fd` / `lsof` / `GetProcessHandleCount`) and,
       # on Linux, the direct verification that a group's cgroup directory is
       # actually removed on drop — see tests/stress/{main,common}.rs.
+      #
+      # This leg also carries the seeded randomized-interleaving harness
+      # (tests/stress/interleave.rs): per seed it generates concurrent
+      # combinations of the public lifecycle operations over a shared
+      # ProcessGroup and its children and checks the order-independent
+      # invariants (no panic / no impossible error, no survivors or zombies,
+      # descriptors and cgroup dirs released). A failure prints the seed;
+      # re-run just that plan with `PROCESSKIT_STRESS_SEED=<seed>`.
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:

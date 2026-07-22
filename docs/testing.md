@@ -28,6 +28,7 @@ whole CLI wrappers testable for free.
 - [Expectation-style: `MockRunner`](#expectation-style-mockrunner)
 - [Record/replay cassettes: `RecordReplayRunner`](#recordreplay-cassettes)
 - [Wrapping a CLI tool: `CliClient`](#wrapping-a-cli-tool)
+- [How the crate tests itself: the stress tier](#how-the-crate-tests-itself-the-stress-tier)
 
 ## The `ProcessRunner` seam
 
@@ -487,6 +488,41 @@ async fn head_is_trimmed() {
 
 …or with a [cassette](#recordreplay-cassettes) recorded against the real tool
 once.
+
+## How the crate tests itself: the stress tier
+
+The doubles above are for testing *your* code. The crate's own suite has an
+extra, non-functional layer you'll only meet if you hack on `processkit`
+itself: an opt-in **stress tier** (`tests/stress/`) that exercises behaviour at
+scale and under multiplicity — spawn bursts, cancel storms, mass teardown, and
+buffer floods. It is gated behind the `PROCESSKIT_STRESS` env var (so the normal
+PR matrix compiles it for free but pays nothing) and runs on its own scheduled /
+on-demand CI leg (`.github/workflows/stress.yml`), never in the fast PR run.
+
+Its most searching scenario is the **seeded randomized-interleaving harness**
+(`tests/stress/interleave.rs`). A seed deterministically generates a *random
+combination* of the public lifecycle operations — `wait` / `start_kill` /
+`take_stdin` / the streaming verbs / group `signal` / `suspend` / `shutdown` —
+over a shared [`ProcessGroup`](process-groups.md) and children of three shapes
+(short-lived, long-lived, stdout-flooding), then runs them concurrently so real
+thread scheduling explores the orderings. After every combination it checks the
+invariants that must hold under *any* interleaving:
+
+- no operation panics or returns an impossible `Error` (only the documented,
+  operational variants);
+- no live descendants or zombies survive (reusing the tier's reap helpers);
+- no background pump/drain/supervision task faulted unnoticed;
+- every descriptor and group is released (Job handle closed, cgroup directory
+  removed).
+
+The seed fixes the *plan*, not the scheduling: a re-run with the same seed
+replays the identical sequence of operations, so a failure is reproducible. The
+offending seed is printed on failure — re-run just that plan in a loop with
+`PROCESSKIT_STRESS_SEED=<seed>` while you debug. Run the tier locally with:
+
+```text
+PROCESSKIT_STRESS=1 cargo test --all-features --test stress -- --test-threads=1
+```
 
 ---
 

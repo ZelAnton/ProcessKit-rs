@@ -12,7 +12,7 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- Add a seeded randomized-interleaving stress harness for the process lifecycle
 
 ### Changed
 -

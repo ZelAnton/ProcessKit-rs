@@ -25,6 +25,7 @@
 //! dies, and is collected — never wall-clock numbers, which are inherently noisy.
 
 mod common;
+mod interleave;
 
 use std::time::Duration;
 
