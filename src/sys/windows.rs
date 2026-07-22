@@ -201,6 +201,101 @@ impl Job {
         Ok(job)
     }
 
+    /// Re-apply a fresh [`ResourceLimits`] set to the **live** Job Object — the
+    /// backend for [`ProcessGroup::update_limits`](crate::ProcessGroup::update_limits).
+    ///
+    /// Reissues the exact two `SetInformationJobObject` calls
+    /// [`new`](Self::new) makes at creation
+    /// (`JOBOBJECT_EXTENDED_LIMIT_INFORMATION` + `JOBOBJECT_CPU_RATE_CONTROL_INFORMATION`),
+    /// so the semantics are a **full replacement**: an axis left `None` clears its
+    /// limit flag and the job is unbounded on that axis again, exactly as if the
+    /// group had been created with that axis unset.
+    ///
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is deliberately OR'd back into
+    /// `LimitFlags`: the extended-limit struct carries *both* the containment flag
+    /// and the memory/process caps, and `SetInformationJobObject` overwrites the
+    /// whole `LimitFlags`, so re-writing it without kill-on-close would silently
+    /// strip the tree's kill-on-drop guarantee. The CPU-rate struct is written
+    /// unconditionally — `ControlFlags = 0` (no `ENABLE`) is how a previously-set
+    /// hard cap is cleared, so a removed `cpu_quota` reliably lifts the cap rather
+    /// than leaving a stale one in place.
+    #[cfg(feature = "limits")]
+    pub(crate) fn update_limits(&self, limits: &ResourceLimits) -> io::Result<()> {
+        // Rebuild the extended-limit struct from scratch, exactly as `new` does:
+        // kill-on-close is always present, and only the requested (Some) caps set
+        // their flags — a None axis is left with its flag clear, i.e. unbounded.
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Some(bytes) = limits.max_memory {
+            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+            info.JobMemoryLimit = usize::try_from(bytes).unwrap_or(usize::MAX);
+        }
+        if let Some(n) = limits.max_processes {
+            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+            info.BasicLimitInformation.ActiveProcessLimit = n;
+        }
+        // SAFETY: `info` is a fully-initialised struct matching the info class and
+        // its size is passed explicitly. The handle is valid for the lifetime of
+        // self.
+        let ok = unsafe {
+            SetInformationJobObject(
+                self.handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            let err = io::Error::last_os_error();
+            return Err(io::Error::new(
+                err.kind(),
+                format!("extended-limit reissue: {err}"),
+            ));
+        }
+
+        // CPU quota is a separate info class. Written unconditionally so a removed
+        // cap is actually cleared: `ControlFlags = 0` disables CPU rate control,
+        // while `Some(cores)` re-enables the hard cap at the converted rate — the
+        // same conversion `new` uses.
+        let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+        if let Some(cores) = limits.cpu_quota {
+            let cpus = std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64);
+            cpu.ControlFlags =
+                JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+            cpu.Anonymous.CpuRate = cpu_hard_cap_rate(cores, cpus);
+        }
+        // SAFETY: fully-initialised struct matching the CPU-rate info class; size
+        // passed explicitly. A zeroed struct (ControlFlags = 0) is the documented
+        // way to disable rate control.
+        let ok = unsafe {
+            SetInformationJobObject(
+                self.handle,
+                JobObjectCpuRateControlInformation,
+                std::ptr::from_ref(&cpu).cast(),
+                std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            let err = io::Error::last_os_error();
+            // Clearing a CPU cap (cpu_quota == None → ControlFlags = 0) on a job
+            // that never had rate control enabled is rejected with
+            // `ERROR_INVALID_PARAMETER` — there is nothing to disable. The desired
+            // state (no CPU cap) already holds, so that specific case is a success,
+            // not a failure. A real failure while *setting* a cap (cpu_quota
+            // Some), or any other error kind, still propagates.
+            let benign_clear = limits.cpu_quota.is_none()
+                && err.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32);
+            if !benign_clear {
+                return Err(io::Error::new(
+                    err.kind(),
+                    format!("cpu-rate reissue: {err}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn spawn(
         &self,
         cmd: &mut Command,

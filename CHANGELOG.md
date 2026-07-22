@@ -12,7 +12,11 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+
 - Add `RunningProcess::wait_for_socket` for Unix domain socket readiness probes
+- Add `ProcessGroup::update_limits` to re-apply `ResourceLimits` to a live group
+  (full replacement; Windows Job Object / Linux cgroup v2, typed refusal on the
+  process-group mechanism)
 
 ### Changed
 -

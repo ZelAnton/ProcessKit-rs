@@ -262,6 +262,12 @@ init on bare metal or a VM, not a container. `mechanism()`/kill-on-drop
 containment keep working either way; only the `limits` cap itself is
 unavailable.
 
+On a host where the crate's `limits` *do* apply, the caps are not frozen at
+creation: [`ProcessGroup::update_limits`](process-groups.md#updating-a-live-group)
+re-applies a fresh set to the live tree (a full replacement) for adaptive
+tightening or relaxing, and refuses — rather than silently drops — a cap on a
+mechanism that can't enforce it, exactly as creation does.
+
 ---
 
 Next: [Platform support](platform-support.md) ·

@@ -318,8 +318,10 @@ member never fails the whole call.
 
 ## Resource limits
 
-Requires the **`limits`** feature. Caps are a property of the group, set once
-at creation and enforced by the same kernel object that contains the tree:
+Requires the **`limits`** feature. Caps are a property of the group, set at
+creation (and adjustable later — see [Updating a live
+group](#updating-a-live-group)) and enforced by the same kernel object that
+contains the tree:
 
 ```rust,no_run
 use processkit::{Command, ProcessGroup, ProcessGroupOptions};
@@ -360,6 +362,40 @@ too), *not* under systemd — and the crate doesn't migrate your process. See th
 limits prerequisites in
 [Platform support](platform-support.md#containment-mechanisms). The `uid()`-drop
 interaction lives under its [Caveats](platform-support.md#caveats).
+
+### Updating a live group
+
+`ProcessGroup::update_limits(ResourceLimits)` re-applies a fresh set of caps to
+an **already-running** group — without recreating the container or restarting
+its children — for adaptive resource management (tighten a slumping batch's
+memory, widen a long-lived worker pool's CPU quota):
+
+```rust,no_run
+use processkit::{ProcessGroup, ResourceLimits};
+
+# fn main() -> processkit::Result<()> {
+let mut group = ProcessGroup::new()?;
+
+// Later, adapt the caps on the already-running group:
+let mut limits = ResourceLimits::default();
+limits.max_memory = Some(256 * 1024 * 1024); // tighten to 256 MiB
+limits.cpu_quota = Some(2.0);                 // widen CPU to two cores
+group.update_limits(limits)?; // max_processes left None → that cap is lifted
+# Ok(())
+# }
+```
+
+The new value is a **full replacement**, not a merge: an axis left `None` is
+lifted back to unbounded — it does *not* keep its previous cap — so always
+describe the complete desired state (start from `ResourceLimits::default()` and
+set the axes you want capped). On Windows the live Job Object's caps are
+reissued; on Linux cgroup v2 the `memory.max` / `pids.max` / `cpu.max` files are
+rewritten (a removed axis written back to `max`). It routes through the same
+live container the tree-control verbs use, so the same platform matrix and
+`Error::ResourceLimit { kind, reason, detail }` classification apply — a
+process-group mechanism (macOS/BSD, the Linux fallback) refuses any requested
+cap with `Unsupported` rather than silently dropping it, while lifting *all*
+caps there is a trivial success.
 
 ## Stats and sampling
 

@@ -673,6 +673,85 @@ impl ProcessGroup {
         crate::stats::StatsSampler::new(self, every)
     }
 
+    /// Replace the group's resource limits on the **live** container, without
+    /// recreating it or restarting its children — adaptive resource management
+    /// (tighten a slumping batch's memory, widen a long-lived worker pool's CPU
+    /// quota) after the group is already running.
+    ///
+    /// # Full replacement
+    ///
+    /// The new [`ResourceLimits`] **wholly replaces** the active set — it is not
+    /// merged with the old one. An axis left `None` becomes **unbounded again**
+    /// (its cap is lifted), exactly as if the group had been created with that axis
+    /// unset — *not* "keep the previous value". So `update_limits` always describes
+    /// the complete desired state of all three caps.
+    ///
+    /// # Platform support
+    ///
+    /// The same matrix as creation ([`with_options`](Self::with_options) — see
+    /// [`ResourceLimits`]): a real container is required. On **Windows** the live
+    /// Job Object's memory / process / CPU caps are reissued; on **Linux cgroup v2**
+    /// the `memory.max` / `pids.max` / `cpu.max` files are rewritten (a removed axis
+    /// written back to `max`). On the **POSIX process-group** mechanism (macOS, the
+    /// BSDs, and the Linux fallback with no usable cgroup) there is no whole-tree
+    /// cap primitive, so a request carrying **any** cap is refused with
+    /// [`Error::ResourceLimit`] — never silently dropped — while an all-`None`
+    /// request (lift every cap) is a trivial success, since the tree is already
+    /// unbounded there.
+    ///
+    /// This routes through the same live handle / cgroup the tree-control verbs
+    /// ([`kill_all`](Self::kill_all), [`signal`](Self::signal),
+    /// [`suspend`](Self::suspend)) use — it never re-derives the container — so once
+    /// the group is torn down by the consuming [`shutdown`](Self::shutdown) or
+    /// `Drop`, the group is gone by ownership and cannot be reconfigured at all.
+    ///
+    /// On success the group's stored options reflect the new set (observable via the
+    /// group's [`Debug`](std::fmt::Debug)); a failure leaves the previous caps in
+    /// force.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ResourceLimit`] — with [`LimitReason::Invalid`] for a nonsensical
+    /// value (rejected by the shared `validate_limits` before the OS is touched,
+    /// exactly as at creation), [`LimitReason::Unsupported`] when the active
+    /// mechanism has no whole-tree accounting at all (a process-group mechanism),
+    /// or [`LimitReason::Unenforceable`] when a capable mechanism exists but this
+    /// request could not be applied (a Linux cgroup whose controllers can't be
+    /// enabled off the real hierarchy root, or a Job Object call the OS rejected).
+    #[cfg(feature = "limits")]
+    pub fn update_limits(&mut self, limits: ResourceLimits) -> Result<()> {
+        // Same validation the creation path runs — an invalid value is rejected
+        // before the OS is touched, with the specific offending axis.
+        validate_limits(&limits)?;
+        self.job.update_limits(&limits).map_err(|source| {
+            if limits.any() {
+                // Mirror `with_options`'s classification exactly: the backends
+                // report `ErrorKind::Unsupported` precisely when no whole-tree
+                // container mechanism exists at all; every other failure means a
+                // capable mechanism exists but this request could not be applied.
+                let reason = if source.kind() == std::io::ErrorKind::Unsupported {
+                    LimitReason::Unsupported
+                } else {
+                    LimitReason::Unenforceable
+                };
+                Error::ResourceLimit {
+                    kind: first_requested_kind(&limits),
+                    reason,
+                    detail: source.to_string(),
+                }
+            } else {
+                // No cap requested (a pure "lift everything") that still failed —
+                // a plain I/O failure on the reset write, not a limit-capability
+                // problem.
+                Error::Io(source)
+            }
+        })?;
+        // Reflect the applied set so the group's public view (Debug, any future
+        // getter) stays honest.
+        self.options.limits = limits;
+        Ok(())
+    }
+
     /// The containment mechanism actually in effect (see [`Mechanism`]).
     pub fn mechanism(&self) -> Mechanism {
         self.job.mechanism()

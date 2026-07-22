@@ -8,6 +8,16 @@
 /// group. Every limit bounds the **whole tree**, not a single process, and is
 /// applied to the kernel container at creation time.
 ///
+/// # Updating a live group (full replacement)
+///
+/// [`ProcessGroup::update_limits`](crate::ProcessGroup::update_limits) applies a
+/// fresh `ResourceLimits` to an already-running group without recreating the
+/// container or restarting its children. Its semantics are a **full replacement**,
+/// not a merge: the value passed becomes the complete set of active caps, so an
+/// axis left `None` is lifted back to **unbounded** — it does *not* retain whatever
+/// value was previously in force. Build the whole desired state each time (e.g.
+/// start from [`ResourceLimits::default`] and set the axes you want capped).
+///
 /// # Platform support
 ///
 /// Enforcement needs a real container — a **Windows Job Object** or a **Linux

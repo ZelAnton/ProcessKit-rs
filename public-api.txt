@@ -832,6 +832,7 @@ pub fn processkit::ProcessGroup::signal(&self, processkit::Signal) -> processkit
 pub fn processkit::ProcessGroup::spawn(&self, tokio::process::Command) -> processkit::Result<tokio::process::Child>
 pub fn processkit::ProcessGroup::stats(&self) -> processkit::Result<processkit::ProcessGroupStats>
 pub fn processkit::ProcessGroup::suspend(&self) -> processkit::Result<()>
+pub fn processkit::ProcessGroup::update_limits(&mut self, processkit::ResourceLimits) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::with_options(processkit::ProcessGroupOptions) -> processkit::Result<Self>
 impl processkit::ProcessGroup
 pub async fn processkit::ProcessGroup::start(&self, &processkit::Command) -> processkit::Result<processkit::RunningProcess>
