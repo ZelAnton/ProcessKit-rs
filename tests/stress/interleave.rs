@@ -305,7 +305,9 @@ fn is_impossible_error(e: &Error) -> bool {
 fn check(result: Result<(), Error>, what: &str) -> Result<(), String> {
     match result {
         Ok(()) => Ok(()),
-        Err(e) if is_impossible_error(&e) => Err(format!("{what} returned impossible error: {e:?}")),
+        Err(e) if is_impossible_error(&e) => {
+            Err(format!("{what} returned impossible error: {e:?}"))
+        }
         Err(_) => Ok(()),
     }
 }

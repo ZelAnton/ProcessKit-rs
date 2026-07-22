@@ -220,7 +220,7 @@ async fn update_limits_reuses_validation_and_survives_teardown() {
     }
 
     // Lifting every cap (all-`None`) is a trivial success on every mechanism — the
-    // tree is unbounded either way, so "remove all limits" is always applyable.
+    // tree is unbounded either way, so "remove all limits" is always applicable.
     group
         .update_limits(ResourceLimits::default())
         .expect("lifting all caps must succeed on every mechanism");
