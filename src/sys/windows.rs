@@ -107,6 +107,16 @@ pub(crate) struct Job {
     /// **process-group id** (equal to the leader's pid) addressable by
     /// `GenerateConsoleCtrlEvent`; a per-leader `IsProcessInJob` re-check at signal
     /// time keeps a recycled pid from diverting the event onto a stranger's group.
+    ///
+    /// Bounded, not merely monotonic (T-154): `spawn` prunes exited/non-member
+    /// entries — via the same `process_is_in_job` recycle guard `signal_all`
+    /// uses at teardown — before recording each new leader, so a long-lived
+    /// shared `Job` that repeatedly spawns opt-in children does not grow this
+    /// list for the job's whole lifetime; it stays bounded by the count of
+    /// concurrently-live opt-in leaders. Between opt-in spawns a dead entry can
+    /// sit here until the *next* opt-in spawn prunes it — harmless, since a dead
+    /// pid is never a live job member and `signal_all`'s own guard already skips
+    /// it at signal time.
     ctrl_break_leaders: std::sync::Mutex<Vec<u32>>,
 }
 
@@ -267,10 +277,24 @@ impl Job {
         // only after successful containment (so a failed spawn tracks nothing) and
         // only when the child was actually spawned into its own process group.
         if opts.windows_new_process_group {
-            self.ctrl_break_leaders
+            let mut leaders = self
+                .ctrl_break_leaders
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(pid);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Prune stale entries before recording the new leader (T-154): without
+            // this, a long-lived shared `Job` that repeatedly spawns opt-in
+            // children grows this list for its whole lifetime, even though most
+            // entries are dead. Reuses the exact recycle-safe `process_is_in_job`
+            // check `CtrlBreakTarget::signal_all` applies at teardown time — a
+            // pid it drops here is by construction never a live job member, so
+            // pruning it can never cause a future `signal_all` to miss a leader
+            // it would otherwise have signalled. Chosen over pruning inside
+            // `graceful_shutdown`: it bounds the dominant long-lived-job growth
+            // pattern (repeated opt-in spawns) without adding an extra full
+            // `retain` walk (and its `IsProcessInJob` syscalls) to every
+            // teardown's hot path, on top of `signal_all`'s own per-leader check.
+            leaders.retain(|&leader| process_is_in_job(leader, self.handle));
+            leaders.push(pid);
         }
         Ok(guard.disarm())
     }
@@ -1376,8 +1400,11 @@ mod rearm_race_tests {
 
 // T-139: the opt-in console-CTRL graceful path. Un-gated (the leader tracking,
 // routing and drain check are core, not feature-gated) so the default
-// `cargo test` exercises them — no subprocess needed, driven against an empty job
-// and our own (non-member) pid as a stand-in leader.
+// `cargo test` exercises most of this module without a subprocess, driven
+// against an empty job and our own (non-member) pid as a stand-in leader. The
+// T-154 pruning regression test is the one exception — it drives the real
+// `Job::spawn` against real short-lived children and is `#[ignore]`d
+// accordingly (see K-028-adjacent convention in `guard_tests` above).
 #[cfg(test)]
 mod ctrl_break_tests {
     use std::time::Duration;
@@ -1472,6 +1499,98 @@ mod ctrl_break_tests {
             !job.skip_drop_kill.is_set(),
             "a reused job re-arms the backstop"
         );
+    }
+
+    /// T-154 regression: `ctrl_break_leaders` must stay bounded across a
+    /// long-lived shared job's lifetime, not grow by one per opt-in spawn
+    /// regardless of exits. Drives the real `Job::spawn` (unlike the other tests
+    /// in this module, which push a stand-in pid directly) across three
+    /// spawn+exit cycles of real, short-lived children and asserts each new
+    /// opt-in spawn prunes the previous cycle's now-dead leader before recording
+    /// itself — the list only ever holds the single currently-live leader, never
+    /// the whole spawn history.
+    ///
+    /// Between "exit" and "prune" the test polls `process_is_in_job` — the same
+    /// recycle guard `spawn`'s pruning uses — down to `false` rather than
+    /// asserting the very next instruction after `wait()`/`drop`: a just-exited
+    /// process's pid can stay openable, and its job association readable, for a
+    /// short OS-timed window past our own handle closing (some other observer —
+    /// AV/ETW/csrss bookkeeping — can transiently hold the last reference), so
+    /// asserting immediately would be a race against Windows process teardown
+    /// timing, not against this pruning logic.
+    #[tokio::test]
+    #[ignore = "spawns real subprocesses"]
+    async fn stale_leaders_are_pruned_across_spawn_and_exit_cycles() {
+        let job = new_job();
+        let opts = crate::sys::SpawnOptions {
+            windows_new_process_group: true,
+            ..Default::default()
+        };
+
+        fn short_lived_cmd() -> tokio::process::Command {
+            let mut cmd = tokio::process::Command::new("cmd");
+            cmd.args(["/C", "exit 0"]);
+            cmd
+        }
+
+        /// Waits (bounded) for `pid` to stop reading as a member of `job` via
+        /// the same `process_is_in_job` guard `spawn`'s pruning consults, so
+        /// the test's own assertions race the pruning logic, not the OS's
+        /// process-teardown timing.
+        async fn wait_until_pruneable(pid: u32, job: &super::Job) {
+            for _ in 0..500 {
+                if !super::process_is_in_job(pid, job.handle) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("pid {pid} still reads as a job member after 5s — can't test pruning");
+        }
+
+        // Cycle 1: spawn, then wait out and drop the child, and wait for its
+        // job membership to actually clear before treating it as prune-able.
+        let mut child1 = job
+            .spawn(&mut short_lived_cmd(), &opts)
+            .expect("spawn first opt-in child");
+        let pid1 = child1.id().expect("first child has a pid");
+        child1.wait().await.expect("first child exits");
+        drop(child1);
+        assert_eq!(
+            job.ctrl_break_leaders.lock().expect("lock leaders").clone(),
+            vec![pid1],
+            "the first leader is recorded right after its spawn"
+        );
+        wait_until_pruneable(pid1, &job).await;
+
+        // Cycle 2: a second opt-in spawn into the SAME job must prune the now-
+        // dead first leader before recording itself — the list must not simply
+        // grow to two entries.
+        let mut child2 = job
+            .spawn(&mut short_lived_cmd(), &opts)
+            .expect("spawn second opt-in child");
+        let pid2 = child2.id().expect("second child has a pid");
+        assert_eq!(
+            job.ctrl_break_leaders.lock().expect("lock leaders").clone(),
+            vec![pid2],
+            "spawn prunes the stale first leader and records only the live second one"
+        );
+        child2.wait().await.expect("second child exits");
+        drop(child2);
+        wait_until_pruneable(pid2, &job).await;
+
+        // Cycle 3: repeating the pattern proves the list stays bounded across
+        // more than one spawn+exit cycle, not just the first pruning.
+        let mut child3 = job
+            .spawn(&mut short_lived_cmd(), &opts)
+            .expect("spawn third opt-in child");
+        let pid3 = child3.id().expect("third child has a pid");
+        assert_eq!(
+            job.ctrl_break_leaders.lock().expect("lock leaders").clone(),
+            vec![pid3],
+            "the list stays bounded to the single live leader across a second \
+             spawn+exit cycle"
+        );
+        let _ = child3.kill().await;
     }
 }
 
