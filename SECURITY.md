@@ -36,3 +36,18 @@ Security fixes land on the **latest published version** on
 [crates.io](https://crates.io/crates/processkit); please reproduce on the latest
 release before reporting. Within the current `2.x` line, fixes ship as patch
 releases.
+
+## Release integrity and provenance
+
+Releases are published to [crates.io](https://crates.io/crates/processkit) with
+**Trusted Publishing**: the release workflow mints a short-lived token over
+GitHub OIDC for that run and never stores a long-lived crates.io API token. If
+the token cannot be minted, the release fails rather than silently falling back
+to a stored secret.
+
+Each release also carries a **build-provenance attestation** for the packaged
+`.crate` (and its `SHA256SUMS`), signed during the same run. This binds the
+artifact to this repository and its `release.yml` workflow, so you can confirm
+what you install was built here and not tampered with. See
+[Verifying provenance](README.md#verifying-provenance) in the README for the
+exact `gh attestation verify` command.

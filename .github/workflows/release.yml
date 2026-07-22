@@ -1,7 +1,11 @@
 name: Release
 
-# Manual release workflow. Needs the `CRATES_IO_TOKEN` repository secret to
-# publish to crates.io.
+# Manual release workflow. Publishes to crates.io via **Trusted Publishing**: a
+# short-lived token is minted per run over GitHub OIDC (no long-lived
+# `CRATES_IO_TOKEN` secret is stored or used), and build-provenance attestations
+# are issued for the released artifacts. The one-time crates.io trusted-publisher
+# this requires is documented in CONTRIBUTING.md "Releasing" (repository
+# `ZelAnton/ProcessKit-rs`, workflow `release.yml`, no environment).
 #
 # `workflow_dispatch`-only with no `push:`/tag trigger, so it never runs on its
 # own — you click "Run workflow" in the Actions UI and pick a bump type. It
@@ -16,9 +20,11 @@ name: Release
 #
 # Single-crate release: bump the version, auto-fill an empty `[Unreleased]` from
 # git history via git-cliff, promote the curated changelog, verify the crate
-# publishes (dry run), publish to crates.io, then tag `v<version>` and publish a
-# GitHub Release. Publishing comes BEFORE the tag, so a failed publish strands
-# nothing (just re-run). See AGENTS.md "Releasing and the changelog".
+# publishes (dry run), attest build provenance for the packaged `.crate` and its
+# checksums, publish to crates.io, then tag `v<version>` and publish a GitHub
+# Release (with the `.crate` + checksums attached). Publishing comes BEFORE the
+# tag, so a failed publish strands nothing (just re-run). See AGENTS.md
+# "Releasing and the changelog".
 
 on:
   workflow_dispatch:
@@ -39,7 +45,9 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write # push the version-bump commit + tag, and create the Release
+  contents: write     # push the version-bump commit + tag, and create the Release
+  id-token: write     # OIDC: mint the short-lived crates.io token + sign attestations
+  attestations: write # write build-provenance attestations for the release artifacts
 
 jobs:
   release:
@@ -87,16 +95,17 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Fail fast if the publish credential is missing, BEFORE any irreversible
-      # step (tag/push/GitHub Release). Otherwise a missing secret would only
-      # surface at the final `cargo publish`, stranding a tag + Release with no
-      # matching crates.io version.
-      - name: Preflight — require CRATES_IO_TOKEN
-        env:
-          TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+      # Fail fast, BEFORE any irreversible step, if this run cannot obtain a
+      # GitHub OIDC token — both crates.io Trusted Publishing (the publish
+      # credential) and the build-provenance attestations mint their short-lived
+      # credentials from it. This checks only that the capability is present;
+      # the actual crates.io token is minted right before publish so it stays
+      # fresh. A failure here means `permissions: id-token: write` is not in
+      # effect — there is NO fallback to a stored secret.
+      - name: Preflight — require OIDC (Trusted Publishing)
         run: |
-          if [ -z "${TOKEN}" ]; then
-            echo "::error::CRATES_IO_TOKEN secret is not set. Add it under repo Settings → Secrets and variables → Actions before releasing."
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::error::No GitHub OIDC token is available (ACTIONS_ID_TOKEN_REQUEST_URL is unset). This release uses crates.io Trusted Publishing, which requires 'permissions: id-token: write'. Refusing to release; there is no stored-token fallback."
             exit 1
           fi
 
@@ -387,6 +396,48 @@ jobs:
         # clean-tree check). cargo set-version already updated the lock.
         run: cargo publish --locked --dry-run
 
+      # Checksums over the packaged `.crate` the dry run just wrote to
+      # target/package/. These bytes are what the publish below uploads —
+      # `cargo package` is deterministic for the same source + locked deps, and
+      # nothing edits the tree between here and the publish. Written to
+      # $RUNNER_TEMP so it neither dirties the tree (which would abort `cargo
+      # publish`) nor lands in the packaged crate.
+      - name: Generate checksums for the packaged crate
+        env:
+          SUMS_FILE: ${{ runner.temp }}/SHA256SUMS
+        run: |
+          set -euo pipefail
+          # cd so the manifest records the bare `.crate` basename (portable for
+          # `sha256sum -c`), not a target/package/ path prefix.
+          cd target/package
+          sha256sum *.crate | tee "$SUMS_FILE"
+
+      # Build-provenance attestation over the release artifacts, issued BEFORE
+      # the irreversible publish: it binds the `.crate` (and its checksums) to
+      # this repository + workflow run so a consumer can verify origin with `gh
+      # attestation verify` (see SECURITY.md / README "Verifying provenance").
+      # Done pre-publish so a signing failure strands nothing; the attested
+      # bytes equal the uploaded bytes because packaging is deterministic. Uses
+      # its own OIDC exchange (independent of the crates.io token minted below).
+      - name: Attest build provenance for release artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            target/package/*.crate
+            ${{ runner.temp }}/SHA256SUMS
+
+      # Mint a short-lived crates.io token via Trusted Publishing (GitHub OIDC),
+      # immediately before the publish that consumes it, so it stays fresh. The
+      # token is scoped to this run and auto-revoked when the job ends — no
+      # long-lived `CRATES_IO_TOKEN` secret exists anymore. Requires a one-time
+      # trusted publisher configured on crates.io for this repo + `release.yml`
+      # (see CONTRIBUTING.md "Releasing"); if it is missing or OIDC fails this
+      # step fails and the release stops here — there is NO fallback to a stored
+      # secret.
+      - name: Authenticate to crates.io (Trusted Publishing)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
       # Publish FIRST — before the tag/push/Release. crates.io is the only
       # irreversible step (a version can never be re-published), so doing it
       # before anything is pushed means a failed publish leaves NO stranded tag:
@@ -397,9 +448,16 @@ jobs:
       # queues the rustdoc build for this exact published package.
       - name: Publish to crates.io
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           set -uo pipefail
+          # Fail closed: never publish without the OIDC-minted token. If the
+          # auth step above produced no token, stop — do NOT fall back to any
+          # stored credential.
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::No crates.io Trusted Publishing token was minted; refusing to publish (no fallback to a stored secret)."
+            exit 1
+          fi
           attempt=0
           max=3
           while :; do
@@ -451,19 +509,30 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
           NOTES_FILE: ${{ runner.temp }}/release-notes.md
+          SUMS_FILE: ${{ runner.temp }}/SHA256SUMS
         run: |
           set -uo pipefail
+          # Attach the packaged crate + its checksums so consumers can verify
+          # the build-provenance attestation issued above (see SECURITY.md).
+          CRATE_FILE=$(ls target/package/*.crate)
           attempt=0
           max=3
           while :; do
             attempt=$((attempt + 1))
             if gh release view "$TAG" >/dev/null 2>&1; then
-              gh release edit "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" && break
+              # A prior attempt created the Release; refresh notes and (re)upload
+              # the assets idempotently.
+              if gh release edit "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" \
+                && gh release upload "$TAG" "$CRATE_FILE" "$SUMS_FILE" --clobber; then
+                break
+              fi
             else
-              gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" && break
+              if gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" "$CRATE_FILE" "$SUMS_FILE"; then
+                break
+              fi
             fi
             if [ "$attempt" -ge "$max" ]; then
-              echo "::error::${TAG} is PUBLISHED to crates.io and the tag is pushed, but creating the GitHub Release failed. Finish it by hand: gh release create ${TAG} --notes-file <notes>. Do NOT re-run this workflow — it would bump to the next version and strand ${TAG}'s release."
+              echo "::error::${TAG} is PUBLISHED to crates.io and the tag is pushed, but creating the GitHub Release failed. Finish it by hand: gh release create ${TAG} --notes-file <notes> <crate> <sums>. Do NOT re-run this workflow — it would bump to the next version and strand ${TAG}'s release."
               exit 1
             fi
             echo "::warning::GitHub Release attempt ${attempt} failed; retrying in 15s..."

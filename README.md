@@ -86,6 +86,31 @@ cargo add processkit
 This crate requires a [tokio](https://tokio.rs/) runtime. Minimum Supported Rust
 Version: **1.88**.
 
+## Verifying provenance
+
+Every release is published to crates.io with **Trusted Publishing** (a
+short-lived token minted over GitHub OIDC — no long-lived API token) and ships a
+**build-provenance attestation** for the packaged crate. That lets you confirm a
+release was built by this repository's `release.yml` workflow and not tampered
+with.
+
+The `.crate` and a `SHA256SUMS` file are attached to each
+[GitHub Release](https://github.com/ZelAnton/ProcessKit-rs/releases). With the
+`gh` CLI (2.49+):
+
+```bash
+# Fetch the artifacts for the version you depend on (e.g. v2.3.2):
+gh release download v<version> --repo ZelAnton/ProcessKit-rs
+
+# Check the digests, then verify provenance against this repo + workflow:
+sha256sum -c SHA256SUMS
+gh attestation verify processkit-<version>.crate --repo ZelAnton/ProcessKit-rs
+```
+
+A successful `gh attestation verify` proves the `.crate` was produced by the
+`release.yml` workflow in `ZelAnton/ProcessKit-rs`. See
+[SECURITY.md](SECURITY.md) for the release-integrity model.
+
 ## Picking a verb
 
 Every run starts with the same builder; the verb you finish with decides what

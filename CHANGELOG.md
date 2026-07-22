@@ -21,9 +21,15 @@ to a dated version section.
 - Add `ProcessGroup::update_limits` to re-apply `ResourceLimits` to a live group
   (full replacement; Windows Job Object / Linux cgroup v2, typed refusal on the
   process-group mechanism)
+- Publish build-provenance attestations for release artifacts (the packaged
+  `.crate` and its `SHA256SUMS`, attached to each GitHub Release); see
+  "Verifying provenance" in README.md / SECURITY.md
 
 ### Changed
--
+
+- Release publishing now uses crates.io Trusted Publishing — a short-lived token
+  minted over GitHub OIDC per run — instead of a stored long-lived
+  `CRATES_IO_TOKEN` secret
 
 ### Fixed
 -

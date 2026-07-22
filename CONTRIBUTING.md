@@ -81,6 +81,35 @@ GitHub Release. The release commit is pushed to `main` with a dedicated **GitHub
 token, so it works under branch protection without a personal token (the App is in the
 ruleset's bypass list).
 
+### Publishing to crates.io (Trusted Publishing)
+
+The workflow publishes with **crates.io Trusted Publishing**: it mints a
+short-lived token over GitHub OIDC for that run and passes it to `cargo publish`.
+No long-lived `CRATES_IO_TOKEN` secret is stored or used — the token is scoped to
+the run and auto-revoked when it ends. If it cannot be minted (OIDC unavailable,
+or no trusted publisher configured on crates.io), the release **fails loudly**;
+it never falls back to a stored secret.
+
+One-time setup (repository owner). On crates.io, add a trusted publisher for the
+`processkit` crate under *Settings → Trusted Publishing → GitHub* with exactly:
+
+- Repository owner: `ZelAnton`
+- Repository name: `ProcessKit-rs`
+- Workflow filename: `release.yml`
+- Environment: *(leave empty — this workflow uses no GitHub Environment)*
+
+Post-migration step (repository owner). After the **first** successful release
+through this path, delete the now-unused `CRATES_IO_TOKEN` repository secret
+(*Settings → Secrets and variables → Actions*). It is intentionally kept until
+then so a first-release problem can be diagnosed without racing to restore a
+credential; the workflow no longer reads it.
+
+Each release also issues **build-provenance attestations** for the packaged
+`.crate` and its `SHA256SUMS` and attaches both files to the GitHub Release, so
+consumers can verify the artifacts were built by this repository and workflow —
+see [SECURITY.md](SECURITY.md) and the README's *Verifying provenance* section
+for the exact `gh attestation verify` command.
+
 The docs.rs API reference is published by that same crates.io release: after
 `cargo publish` uploads the crate, docs.rs builds
 `https://docs.rs/processkit/<version>/processkit/` from the published package.
