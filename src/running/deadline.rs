@@ -49,7 +49,7 @@ use super::{TS_EXITED, TS_PENDING, TS_TIMED_OUT};
 /// arbiter first — the caller must not kill the child or publish its own
 /// outcome.
 #[cfg(not(loom))]
-pub(super) async fn wait_deadline_and_claim(
+pub(crate) async fn wait_deadline_and_claim(
     started: Instant,
     limit: Duration,
     flag: &AtomicU8,
@@ -88,7 +88,7 @@ pub(super) fn claim_timed_out(flag: &AtomicU8) -> bool {
 /// [`claim_timed_out`]; the two race on the same word and exactly one can win.
 ///
 /// Same `AcqRel`/`Relaxed` ordering and rationale as [`claim_timed_out`].
-pub(super) fn claim_exited(flag: &AtomicU8) -> bool {
+pub(crate) fn claim_exited(flag: &AtomicU8) -> bool {
     flag.compare_exchange(TS_PENDING, TS_EXITED, Ordering::AcqRel, Ordering::Relaxed)
         .is_ok()
 }

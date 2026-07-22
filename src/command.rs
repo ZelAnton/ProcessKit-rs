@@ -593,13 +593,16 @@ impl Command {
     }
 
     /// Opt in to a **graceful Windows teardown** via a console `CTRL_BREAK`
-    /// event, giving a console child a chance to shut down cleanly instead of
+    /// event, giving a **console** child a chance to shut down cleanly instead of
     /// being hard-killed at once.
     ///
-    /// By default Windows has no soft-signal tier, so a graceful timeout
-    /// ([`timeout_grace`](Self::timeout_grace)) or a group
-    /// [`shutdown`](crate::ProcessGroup::shutdown) collapses to an *atomic* Job
-    /// Object kill — there is nothing to *trigger* a clean exit. With this opt-in
+    /// A graceful timeout ([`timeout_grace`](Self::timeout_grace)) or a group
+    /// [`shutdown`](crate::ProcessGroup::shutdown) already posts `WM_CLOSE` to any
+    /// top-level window a live member owns, so a **windowed** child (Electron app,
+    /// desktop tool, windowed service) drains cleanly with no opt-in. A **console**
+    /// child has no window, and Windows has no POSIX signal to reach it, so without
+    /// this opt-in its graceful teardown collapses to the *atomic* Job Object kill —
+    /// there is nothing to *trigger* a clean exit. With this opt-in
     /// the direct child is spawned in its own console process group
     /// (`CREATE_NEW_PROCESS_GROUP`), and at graceful teardown it is sent
     /// `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` before the grace window:
@@ -746,8 +749,16 @@ impl Command {
     /// Without it the deadline hard-kills at once. No effect unless
     /// [`timeout`](Self::timeout) is also set.
     ///
-    /// **Windows** has no signal tier: the deadline kills the job atomically
-    /// regardless of `grace`. Either way
+    /// **Windows** has no POSIX signal tier, but two best-effort soft triggers run
+    /// before the atomic kill when the tree can act on one: `WM_CLOSE` is posted to
+    /// every top-level window owned by a live member (a windowed child — Electron
+    /// app, desktop tool, windowed service — can then close and drain within
+    /// `grace`), and a child opted into
+    /// [`windows_graceful_ctrl_break`](Self::windows_graceful_ctrl_break) is sent a
+    /// console `CTRL_BREAK`. A tree with **neither** a window nor that opt-in has
+    /// nothing to trigger a soft exit, so the deadline hard-kills the job at once,
+    /// `grace` unused — timings unchanged from before this soft tier. Any survivor
+    /// still running when `grace` elapses is `TerminateJobObject`'d. Either way
     /// [`timed_out`](crate::ProcessResult::timed_out) stays `true` (the deadline
     /// was exceeded), graceful or not.
     pub fn timeout_grace(mut self, grace: Duration) -> Self {

@@ -293,28 +293,32 @@ impl Job {
     /// On Unix: send `signal` (typically `SIGTERM`), wait up to `timeout` for the
     /// members to leave, then `SIGKILL` survivors when `escalate` is set.
     ///
-    /// On Windows the default (no opt-in) job kill is atomic, so `signal` and
-    /// `timeout` are **both ignored**: `escalate = true` kills the tree immediately
-    /// (equivalent to [`kill_all`](Self::kill_all)), and `escalate = false` leaves
-    /// survivors alive (`Drop` then closes the handle without `KILL_ON_JOB_CLOSE`).
-    /// Without a soft signal there is no way to *trigger* a graceful exit, so it
-    /// does not wait out the grace `timeout` as a drain window either — doing so
-    /// would only delay the kill of a child that ignores the (absent) signal by the
-    /// whole grace.
+    /// On Windows a Job Object has no POSIX signal, so `signal` is ignored. The
+    /// grace `timeout` is used as a drain window **only** when there is a way to
+    /// *trigger* a soft exit — a windowed member (`WM_CLOSE`) or a console-CTRL
+    /// leader (see below). For a windowless tree with neither, the job kill is
+    /// atomic and `timeout` is ignored too: `escalate = true` kills the tree
+    /// immediately (equivalent to [`kill_all`](Self::kill_all)), and
+    /// `escalate = false` leaves survivors alive (`Drop` then closes the handle
+    /// without `KILL_ON_JOB_CLOSE`). It does not wait out the grace as a drain
+    /// window there, since polling for a natural exit nothing triggered would only
+    /// delay the kill of a child that ignores the (absent) signal by the whole
+    /// grace.
     ///
-    /// **Opt-in Windows path.** When a direct child was spawned with
-    /// [`SpawnOptions::windows_new_process_group`] (via
-    /// [`Command::windows_graceful_ctrl_break`](crate::Command::windows_graceful_ctrl_break)),
-    /// the Job records it as a console-CTRL leader and this drives the *same*
-    /// shared [`graceful::run`](crate::sys::graceful::run) loop the unix backends
-    /// use: `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` to each leader, poll
+    /// **Windows soft tier.** When a live member owns a top-level window, or a
+    /// direct child was spawned with [`SpawnOptions::windows_new_process_group`]
+    /// (via [`Command::windows_graceful_ctrl_break`](crate::Command::windows_graceful_ctrl_break)),
+    /// this drives the *same* shared [`graceful::run`](crate::sys::graceful::run)
+    /// loop the unix backends use: post `WM_CLOSE` to each member window **and**
+    /// `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` to each console leader, poll
     /// the job's active-process count up to `timeout`, then `TerminateJobObject`
     /// survivors when `escalate` is set (or spare them when not). `signal` is still
-    /// ignored — Windows delivers CTRL_BREAK, not a POSIX signal. The console event
-    /// only reaches children that share this process's console; a child spawned
+    /// ignored — Windows delivers `WM_CLOSE`/`CTRL_BREAK`, not a POSIX signal. The
+    /// console event only reaches children that share this process's console; a
+    /// child spawned
     /// [`create_no_window`](crate::Command::create_no_window)/`DETACHED_PROCESS`
-    /// cannot receive it and simply rides the grace to the `TerminateJobObject`
-    /// fallback.
+    /// cannot receive it, and a windowless member owns no window to close — either
+    /// simply rides the grace to the `TerminateJobObject` fallback.
     ///
     /// `escalate = false` survivor-sparing is **best-effort on Windows**: `Drop`
     /// clears `KILL_ON_JOB_CLOSE` before closing the handle, but if that

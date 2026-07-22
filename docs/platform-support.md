@@ -95,16 +95,26 @@ otherwise rejected the request.
 | Capability | Windows JobObject | Linux cgroup | Linux pgroup | macOS/BSD |
 |---|---|---|---|---|
 | Kill-on-drop, whole tree | ✅ | ✅ | ✅ groups-based | ✅ groups-based |
-| Graceful `shutdown` (TERM → grace → KILL) | 🟡 atomic kill (opt-in `CTRL_BREAK` soft tier) | ✅ | ✅ | ✅ |
+| Graceful `shutdown` (TERM → grace → KILL) | 🟡 auto `WM_CLOSE` soft tier for windowed children; opt-in `CTRL_BREAK` for console children; else atomic kill | ✅ | ✅ | ✅ |
 | `adopt` an external child | ✅ (future forks contained) | ✅ (future forks contained) | 🟡 exec'd child tracked individually | 🟡 same |
 
-By default Windows has no signal tier, so a graceful `shutdown` collapses to the
-atomic Job kill — but it still honors `escalate_to_kill`: `false` **spares** the
-survivors (closes the Job handle without `KILL_ON_JOB_CLOSE`) rather than killing
-them, so the Windows column is "atomic kill *when it kills*", not an
-unconditional kill.
+Windows has no POSIX signal tier, so for a **windowless** child with no opt-in a
+graceful `shutdown` collapses to the atomic Job kill — but it still honors
+`escalate_to_kill`: `false` **spares** the survivors (closes the Job handle
+without `KILL_ON_JOB_CLOSE`) rather than killing them, so the Windows column is
+"atomic kill *when it kills*", not an unconditional kill.
 
-**Opt-in soft tier (Windows).**
+**Automatic soft tier for windowed children (Windows).** Before the atomic kill,
+a graceful `shutdown` posts `WM_CLOSE` to every top-level window owned by a live
+member and then drives the *same* signal → wait → escalate loop the unix backends
+use. A windowed child (Electron app, desktop tool, windowed service) that handles
+`WM_CLOSE` can flush and exit within the grace; any survivor is then
+`TerminateJobObject`'d, the same hard fallback as before. This is automatic — no
+opt-in — and `WM_CLOSE` is *posted*, never *sent*, so a hung window can never
+block teardown. A windowless tree with no console opt-in still hard-kills promptly
+at the deadline (no grace wait is introduced for it), so its timings are unchanged.
+
+**Opt-in soft tier for console children (Windows).**
 [`Command::windows_graceful_ctrl_break()`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.windows_graceful_ctrl_break)
 gives Windows a real soft-shutdown trigger: the direct child is spawned in its
 own console process group (`CREATE_NEW_PROCESS_GROUP`), and at graceful teardown
@@ -125,7 +135,7 @@ sends a real signal.
 
 | Capability | Windows | Linux cgroup | Linux pgroup | macOS/BSD |
 |---|---|---|---|---|
-| Arbitrary signal (`Hup`, `Usr1`, `Other(n)`, …) | ❌ `Kill` only | ✅ | ✅ | ✅ |
+| Arbitrary signal (`Hup`, `Usr1`, `Other(n)`, …) | 🟡 `Kill`, plus `Int`/`Term` as a best-effort soft close (`CTRL_BREAK` + `WM_CLOSE`); others unsupported | ✅ | ✅ | ✅ |
 | `suspend` / `resume` | 🟡 per-thread counts | ✅ `cgroup.freeze` | ✅ `SIGSTOP`/`CONT` | ✅ `SIGSTOP`/`CONT` |
 
 On the cgroup mechanism, a non-`Kill` `signal` (and the `SIGSTOP`/`SIGCONT`

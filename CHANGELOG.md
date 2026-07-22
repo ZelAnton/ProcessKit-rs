@@ -13,6 +13,18 @@ to a dated version section.
 
 ### Added
 
+- Windows graceful shutdown now posts `WM_CLOSE` (best-effort, *posted* not sent)
+  to every top-level window a live job member owns before the hard
+  `TerminateJobObject`, so a windowed child (Electron app, desktop tool, windowed
+  service) can close cleanly within the grace. Automatic — no opt-in; a windowless
+  tree with no `windows_graceful_ctrl_break` opt-in is still hard-killed promptly
+  at the deadline, so its timings are unchanged
+- Add `Pipeline::start()` returning a live `PipelineSession` — the multi-stage
+  analogue of `RunningProcess`: stream the last stage's stdout
+  (`stdout_lines`/`output_events`), wait for a readiness line (`wait_for_line`),
+  and `finish()` folds the same pipefail outcome (the culprit stage's outcome and
+  its own stderr) as the buffering verbs. Whole-chain `start_kill`, kill-on-drop,
+  and chain-wide `timeout`/`cancel_on` bound the live session
 - Add a seeded randomized-interleaving stress harness for the process lifecycle
 - Add "Running untrusted children" hardening guide (`docs/untrusted-children.md`)
 - Add `Supervisor::start()` returning a live `SupervisionSession` (status
@@ -30,6 +42,11 @@ to a dated version section.
 - Release publishing now uses crates.io Trusted Publishing — a short-lived token
   minted over GitHub OIDC per run — instead of a stored long-lived
   `CRATES_IO_TOKEN` secret
+- `ProcessGroup::signal` for `Signal::Int` / `Signal::Term` on Windows now
+  best-effort soft-closes the tree (console `CTRL_BREAK` to
+  `windows_graceful_ctrl_break` leaders plus `WM_CLOSE` to windowed members)
+  instead of always returning `Error::Unsupported`; it returns `Unsupported` only
+  when the group has neither a console-CTRL leader nor a windowed member
 
 ### Fixed
 -

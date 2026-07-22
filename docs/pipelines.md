@@ -18,6 +18,7 @@ fails, rather than instantly via `SIGPIPE`.)
 - [Semantics: pipefail and the ends](#semantics-pipefail-and-the-ends)
 - [Unchecked stages](#unchecked-stages)
 - [Timeouts](#timeouts)
+- [Streaming a live chain](#streaming-a-live-chain)
 - [Re-running a pipeline](#re-running-a-pipeline)
 
 ## Building and running
@@ -57,13 +58,13 @@ The verbs mirror `Command`'s, each operating on the pipefail outcome:
 `Err` from `output_string` itself means a stage couldn't be *started or
 driven* at all (spawn failure, broken plumbing) — never a mere non-zero exit.
 
-The streaming `first_line` probe is deliberately not a pipeline verb: a chain
-consumes its last stage in full to fold the pipefail outcome. To *capture* the
-first matching line of a finished chain, add a `| head -n1` (Unix) / `grep -m1`
-/ `findstr` stage and capture. This does **not** cover a streaming readiness
-probe over a chain that must keep running (e.g. wait for a banner line, then
-leave the chain alive) — `| head` would tear it down; use a single `Command`
-with `first_line` for that.
+The `first_line` probe is deliberately not a *buffering* pipeline verb: those
+verbs consume the last stage in full to fold the pipefail outcome. To *capture*
+the first matching line of a finished chain, add a `| head -n1` (Unix) / `grep
+-m1` / `findstr` stage and capture. To instead **read a chain that keeps
+running** — wait for a banner line, then stream the rest — use
+[`Pipeline::start()`](#streaming-a-live-chain), which gives a chain the same live
+streaming surface a single `Command::start()` gives a process.
 
 The `|` operator is sugar for the same thing — `a | b | c` ≡
 `a.pipe(b).pipe(c)`. Parenthesize the chain before a terminal verb, since
@@ -236,6 +237,69 @@ it tears the whole chain down and the run resolves to `Error::Cancelled`. (A
 errors the pipeline, but
 the pipeline-level builder is the clearer authority.) See
 [Timeouts & cancellation](timeouts-and-cancellation.md).
+
+## Streaming a live chain
+
+The verbs above buffer the whole run. For a long-lived chain you read *from*
+rather than wait *out* — `journalctl -f | grep ERROR`, `tail -F access.log | jq`
+— `Pipeline::start()` returns a `PipelineSession`: the multi-stage analogue of
+the [`RunningProcess`](streaming.md) a single `Command::start()` gives you. It
+streams the **last** stage's stdout as it arrives while every inner stage drains
+in the background, then folds the same pipefail outcome at `finish()`.
+
+```rust,no_run
+use processkit::prelude::StreamExt;
+use processkit::{Command, Finished, Outcome};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    // journalctl -f | grep --line-buffered ERROR
+    let mut session = Command::new("journalctl").arg("-f")
+        .pipe(Command::new("grep").args(["--line-buffered", "ERROR"]))
+        .start()
+        .await?;
+
+    let mut lines = session.stdout_lines()?;   // the *last* stage's stdout, live
+    while let Some(line) = lines.next().await {
+        println!("error: {line}");
+        // …break out when you've seen enough, then tear the chain down…
+        break;
+    }
+    drop(lines);
+
+    // Fold the pipefail outcome. The last stage's stdout was already streamed,
+    // so — like RunningProcess::finish — none is re-bundled; `outcome` and
+    // `stderr` come from the pipefail-attributed (culprit) stage.
+    session.start_kill()?;                      // stop the whole chain now
+    let Finished { outcome, stderr, .. } = session.finish().await?;
+    if outcome != Outcome::Exited(0) {
+        eprintln!("chain ended {outcome:?}: {stderr}");
+    }
+    Ok(())
+}
+```
+
+The session mirrors `RunningProcess`:
+
+- **`stdout_lines()` / `output_events()`** — the last stage's stdout (lines) or
+  its stdout+stderr (interleaved events), each **consume-once** (a second take is
+  a loud `Err`, never a silently-empty stream).
+- **`wait_for_line(pred, within)`** — wait for a readiness banner on that stream
+  without tearing the chain down (an `Error::NotReady` on timeout, like the
+  single-process probe).
+- **`finish()`** — the streaming analogue of `output_string()`: the
+  pipefail-attributed stage's `outcome` and *its own* `stderr` in a `Finished`
+  (no stdout — you already streamed it). A chain-wide `Pipeline::timeout` that
+  elapsed reports `Outcome::TimedOut`; a `Pipeline::cancel_on` that fired surfaces
+  as `Error::Cancelled` — exactly as in the buffering verbs.
+- **`start_kill()`** and **kill-on-drop** — stop the whole chain now, or drop the
+  session and every stage's tree dies. The no-orphan invariant holds for a live
+  chain (including a partially-started one) just as it does for a single process.
+
+Whole-chain teardown still applies while streaming: an inner stage's checked
+failure proactively tears the chain down (so a quiet upstream can't hold a failed
+live chain open), and the chain-wide [timeout / cancellation](#timeouts) bounds
+the session regardless of which stage is slow.
 
 ## Re-running a pipeline
 
