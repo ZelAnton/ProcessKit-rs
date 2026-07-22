@@ -17,11 +17,17 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
+
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use crate::buffer::OutputBufferPolicy;
 use crate::command::Command;
 use crate::error::Result;
+use crate::group::ProcessGroup;
 use crate::result::{Outcome, ProcessResult};
 use crate::runner::{JobRunner, ProcessRunner};
 
@@ -131,6 +137,9 @@ enum GateOutcome {
     /// A cancel token fired during the backoff/storm pause — end supervision
     /// with `Error::Cancelled`.
     Cancelled,
+    /// A [`SupervisionSession::stop`] fired during the backoff/storm pause — end
+    /// supervision with [`StopReason::Stopped`], launching no further incarnation.
+    Stopped,
 }
 
 /// The capture policy to apply to each incarnation: respect an explicit
@@ -200,6 +209,15 @@ pub enum StopReason {
     /// [`SupervisionOutcome::liveness_kills`], and the final run's
     /// [`ProcessResult`] carries [`Outcome::Signalled`](crate::Outcome::Signalled).
     Unhealthy,
+    /// A caller asked the live [`SupervisionSession`] to stop
+    /// ([`SupervisionSession::stop`]): the current incarnation (if any) was
+    /// stopped through its graceful path and supervision ended deliberately —
+    /// distinct from a crash, an exhausted budget, a cancellation
+    /// ([`Error::Cancelled`](crate::Error::Cancelled)), or a
+    /// [`stop_when`](Supervisor::stop_when) match. Only produced by a session
+    /// stop; [`run`](Supervisor::run), which exposes no live handle, never
+    /// reports it.
+    Stopped,
 }
 
 /// What the [`give_up_when`](Supervisor::give_up_when) classifier inspects: a
@@ -245,6 +263,340 @@ pub struct SupervisionOutcome {
     /// [`RestartPolicy`]/backoff/storm guard, so it is *also* reflected in
     /// [`restarts`](Self::restarts) when the policy restarted it.
     pub liveness_kills: u32,
+}
+
+/// A consistent, point-in-time snapshot of a live [`SupervisionSession`]'s
+/// state — read atomically under the same lock the supervision loop publishes
+/// each change under, so every field agrees with the others (no torn read).
+/// Only non-secret facts appear here (activity, counts, the current child's
+/// pid / start time); argv and environment values never do.
+///
+/// Non-exhaustive: a read-only snapshot the crate produces — new fields can be
+/// added without a breaking change.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct SupervisionStatus {
+    active: bool,
+    restarts: u32,
+    storm_paused: bool,
+    pid: Option<u32>,
+    started_at: Option<SystemTime>,
+}
+
+impl SupervisionStatus {
+    /// Whether the supervision loop is still running: `true` from
+    /// [`start`](Supervisor::start) until supervision ends (on its own, via a
+    /// [`stop`](SupervisionSession::stop), or by a cancel-token cancellation),
+    /// `false` once the final [`SupervisionOutcome`] (or terminal error) has
+    /// been produced.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// How many times the child has been *re*-run so far, live — mirrors
+    /// [`SupervisionOutcome::restarts`] but updates as each restart happens
+    /// rather than only once supervision ends. The first run is not a restart,
+    /// so `0` while the first incarnation is alive.
+    #[must_use]
+    pub fn restarts(&self) -> u32 {
+        self.restarts
+    }
+
+    /// Whether restarts are currently paused by the failure-storm guard
+    /// ([`storm_pause`](Supervisor::storm_pause)) — `true` only while a storm
+    /// pause is being slept out. Always `false` when `storm_pause` is unset.
+    #[must_use]
+    pub fn is_storm_paused(&self) -> bool {
+        self.storm_paused
+    }
+
+    /// The OS process id of the current live incarnation, or `None` when no
+    /// child is alive right now (between incarnations, during a backoff / storm
+    /// pause, or once supervision has ended) or when the runner exposes no live
+    /// pid (a capture-only test double).
+    #[must_use]
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// When the current live incarnation started, or `None` when no child is
+    /// alive right now (see [`pid`](Self::pid)).
+    #[must_use]
+    pub fn started_at(&self) -> Option<SystemTime> {
+        self.started_at
+    }
+}
+
+/// A live handle to a running supervision, returned by
+/// [`Supervisor::start`]. Unlike [`run`](Supervisor::run) — which only reports
+/// its [`SupervisionOutcome`] at the very end — a session lets a caller watch
+/// supervision *while it runs* ([`status`](Self::status)), ask it to stop
+/// *gracefully* ([`stop`](Self::stop)), and await its eventual outcome
+/// ([`wait`](Self::wait)). This is the primitive for building daemons / process
+/// managers on top of the runner layer.
+///
+/// The live status is an **addition** to (never a replacement for) the exit-
+/// driven [`RestartPolicy`] and the crate's tracing instrumentation.
+///
+/// `Send`, like the crate's other handle types. Supervision runs on a detached
+/// task; **dropping** the session without [`wait`](Self::wait)/[`stop`](Self::stop)
+/// aborts that task (no orphaned supervision task), and under the default
+/// [`JobRunner`] the in-flight incarnation is killed on drop (its private group
+/// tears down), so no child is orphaned either.
+#[derive(Debug)]
+pub struct SupervisionSession {
+    shared: Arc<SessionShared>,
+    /// The final outcome, delivered once the loop task ends. `Option` so
+    /// [`wait`](Self::wait)/[`stop`](Self::stop) can take it out under
+    /// `&mut self` without moving a field out of a `Drop` type.
+    completion: Option<oneshot::Receiver<Result<SupervisionOutcome>>>,
+    /// Aborts the detached supervision task on [`Drop`] — no orphaned task.
+    abort: tokio::task::AbortHandle,
+}
+
+impl SupervisionSession {
+    /// A consistent live snapshot of this session's state (activity, restart
+    /// count, storm-pause flag, and the current live incarnation's pid / start
+    /// time). Cheap and lock-guarded — safe to poll at any time without racing
+    /// the supervision loop.
+    #[must_use]
+    pub fn status(&self) -> SupervisionStatus {
+        self.shared.snapshot()
+    }
+
+    /// Await the final [`SupervisionOutcome`] (or terminal error) — exactly
+    /// what [`Supervisor::run`] would have returned. Blocks until supervision
+    /// ends on its own, via [`stop`](Self::stop), or via a cancel-token
+    /// cancellation.
+    ///
+    /// # Errors
+    ///
+    /// The same surface as [`run`](Supervisor::run) (a terminating spawn/IO
+    /// failure, or a cancel-token [`Error::Cancelled`](crate::Error::Cancelled)).
+    pub async fn wait(mut self) -> Result<SupervisionOutcome> {
+        Self::await_completion(self.completion.take()).await
+    }
+
+    /// Ask supervision to stop gracefully with `grace` and await the final
+    /// outcome. Stops the current live incarnation through its graceful path
+    /// (honouring the `grace` window — `SIGTERM`, wait `grace`, then `SIGKILL`,
+    /// under the default own-group [`JobRunner`]) and ends the loop with
+    /// [`StopReason::Stopped`] — reported as a normal [`SupervisionOutcome`],
+    /// never a crash or a cancellation error. A stop taken *during a backoff /
+    /// storm pause* (no live child right now) interrupts that sleep and ends
+    /// supervision at once, launching no further incarnation. `Duration::ZERO`
+    /// escalates the child kill immediately.
+    ///
+    /// A caller who wants the outcome without stopping should
+    /// [`wait`](Self::wait) instead.
+    ///
+    /// # Errors
+    ///
+    /// The same surface as [`wait`](Self::wait); a graceful stop itself yields a
+    /// [`StopReason::Stopped`] outcome (`Ok`), not an error.
+    pub async fn stop(mut self, grace: Duration) -> Result<SupervisionOutcome> {
+        // Record the request and snapshot the current live child atomically
+        // (closing the stop-vs-spawn race, see `SessionShared::publish_current`),
+        // then interrupt any in-flight backoff / storm sleep so a between-
+        // incarnations stop also ends promptly.
+        let child = self.shared.request_stop(grace);
+        self.shared.stop.cancel();
+        if let Some(stopper) = child {
+            // Stop the live child through its graceful path; the in-flight
+            // capture then returns and the loop ends with `Stopped`.
+            stopper.graceful_stop(grace).await;
+        }
+        Self::await_completion(self.completion.take()).await
+    }
+
+    async fn await_completion(
+        completion: Option<oneshot::Receiver<Result<SupervisionOutcome>>>,
+    ) -> Result<SupervisionOutcome> {
+        match completion {
+            Some(rx) => rx.await.unwrap_or_else(|_| {
+                Err(crate::Error::Io(std::io::Error::other(
+                    "supervision task ended without reporting an outcome",
+                )))
+            }),
+            None => Err(crate::Error::Io(std::io::Error::other(
+                "supervision outcome already taken",
+            ))),
+        }
+    }
+}
+
+impl Drop for SupervisionSession {
+    fn drop(&mut self) {
+        // No orphaned supervision task: aborting drops the loop future, which
+        // drops the in-flight incarnation's handle (killed on drop under the
+        // default own-group `JobRunner`). A no-op once the task has finished.
+        self.abort.abort();
+    }
+}
+
+/// State shared between a [`SupervisionSession`] handle and its detached
+/// supervision loop: the observable snapshot fields (behind `state`) and the
+/// stop signal (`stop`) that interrupts an in-flight backoff / storm sleep.
+#[derive(Debug)]
+struct SessionShared {
+    state: Mutex<SessionState>,
+    /// Cancelled by [`SupervisionSession::stop`] to cut short a backoff / storm
+    /// sleep. Distinct from the command's [`cancel_on`](Command::cancel_on)
+    /// token (whose cancellation is an *error*): a stop is not an error.
+    stop: CancellationToken,
+}
+
+/// The loop-owned mirror fields republished into an atomic [`SupervisionStatus`]
+/// snapshot on every change; also the graceful-stop rendezvous.
+#[derive(Debug)]
+struct SessionState {
+    active: bool,
+    restarts: u32,
+    storm_paused: bool,
+    /// Set by [`SupervisionSession::stop`]; read by the loop to end with
+    /// [`StopReason::Stopped`] rather than start / restart another incarnation.
+    stopping: bool,
+    stop_grace: Duration,
+    /// The current live incarnation (pid, start time, and how to stop it), or
+    /// `None` between incarnations / for a capture-only runner.
+    current: Option<CurrentChild>,
+}
+
+/// Bookkeeping for the current live incarnation.
+#[derive(Debug)]
+struct CurrentChild {
+    pid: Option<u32>,
+    started_at: SystemTime,
+    stopper: ChildStopper,
+}
+
+/// How to stop the current live incarnation on a graceful session stop, without
+/// consuming the handle the incarnation's output verb is draining.
+#[derive(Debug, Clone)]
+struct ChildStopper {
+    /// The incarnation's own private group, when it owns one (the default
+    /// [`JobRunner`]): stopped with a real `SIGTERM` → grace → `SIGKILL`.
+    group: Option<Arc<ProcessGroup>>,
+    /// The incarnation command's cancel token: fired to stop a child with no
+    /// own group to shut down gracefully (a shared-group child — just that
+    /// child — or a capture-only double), the only stop lever there.
+    inc_cancel: CancellationToken,
+}
+
+impl ChildStopper {
+    /// Stop the current child. An own-group incarnation gets a graceful
+    /// `SIGTERM` → `grace` → `SIGKILL`; any other (shared-group or capture-only)
+    /// is stopped by firing its cancel token, the only available lever.
+    async fn graceful_stop(&self, grace: Duration) {
+        match &self.group {
+            Some(group) => {
+                let _ = group
+                    .graceful_terminate(grace, crate::sys::SIGTERM_RAW)
+                    .await;
+            }
+            None => self.inc_cancel.cancel(),
+        }
+    }
+}
+
+impl SessionShared {
+    fn new() -> Self {
+        SessionShared {
+            state: Mutex::new(SessionState {
+                active: true,
+                restarts: 0,
+                storm_paused: false,
+                stopping: false,
+                stop_grace: Duration::ZERO,
+                current: None,
+            }),
+            stop: CancellationToken::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SessionState> {
+        self.state.lock().expect("session state lock")
+    }
+
+    /// The atomic snapshot read by [`SupervisionSession::status`].
+    fn snapshot(&self) -> SupervisionStatus {
+        let state = self.lock();
+        SupervisionStatus {
+            active: state.active,
+            restarts: state.restarts,
+            storm_paused: state.storm_paused,
+            pid: state.current.as_ref().and_then(|c| c.pid),
+            started_at: state.current.as_ref().map(|c| c.started_at),
+        }
+    }
+
+    fn set_restarts(&self, restarts: u32) {
+        self.lock().restarts = restarts;
+    }
+
+    fn set_storm_paused(&self, paused: bool) {
+        self.lock().storm_paused = paused;
+    }
+
+    /// Publish a freshly-spawned child as current and, atomically, learn whether
+    /// a graceful stop is already pending — closing the stop-vs-spawn race:
+    /// whichever of publish / [`request_stop`](Self::request_stop) takes the
+    /// lock second sees the other's write, so the child is stopped exactly once
+    /// (here, if the stop landed first, or in `stop` if the publish did).
+    fn publish_current(
+        &self,
+        pid: Option<u32>,
+        started_at: SystemTime,
+        stopper: ChildStopper,
+    ) -> Option<Duration> {
+        let mut state = self.lock();
+        let grace = state.stop_grace;
+        let stopping = state.stopping;
+        state.current = Some(CurrentChild {
+            pid,
+            started_at,
+            stopper,
+        });
+        stopping.then_some(grace)
+    }
+
+    fn clear_current(&self) {
+        self.lock().current = None;
+    }
+
+    fn mark_inactive(&self) {
+        let mut state = self.lock();
+        state.active = false;
+        state.current = None;
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.lock().stopping
+    }
+
+    /// Record a graceful-stop request and snapshot the current live child (its
+    /// stopper), atomically — the [`publish_current`](Self::publish_current)
+    /// counterpart of the stop-vs-spawn race.
+    fn request_stop(&self, grace: Duration) -> Option<ChildStopper> {
+        let mut state = self.lock();
+        state.stopping = true;
+        state.stop_grace = grace;
+        state.current.as_ref().map(|c| c.stopper.clone())
+    }
+}
+
+/// Why a backoff / storm sleep (or an incarnation) stopped waiting — the shared
+/// return of [`Supervisor::sleep_or_cancel`] and its callers.
+enum Wake {
+    /// The delay elapsed normally.
+    Elapsed,
+    /// The command's [`cancel_on`](Command::cancel_on) token fired — a terminal
+    /// [`Error::Cancelled`](crate::Error::Cancelled).
+    Cancelled,
+    /// A [`SupervisionSession::stop`] was requested — end with
+    /// [`StopReason::Stopped`].
+    Stopped,
 }
 
 /// Keeps a [`Command`] alive: runs it, classifies every exit against the
@@ -692,7 +1044,34 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// drop-kills semantics to end the wedged incarnation, so the shared-group
     /// caveat above applies to it too (a shared-group child is only reliably
     /// stopped when the group is torn down).
+    ///
+    /// # Live status
+    ///
+    /// `run` reports its outcome only at the very end and exposes no handle
+    /// while it runs. For a live view — watch the restart count / current pid,
+    /// or ask supervision to stop gracefully mid-flight — use
+    /// [`start`](Self::start), which returns a [`SupervisionSession`]; `run` is a
+    /// thin wrapper over `start` + awaiting its outcome, so their behavior is
+    /// identical. (`run` therefore never reports [`StopReason::Stopped`], which
+    /// only a session stop produces.)
     pub async fn run(self) -> Result<SupervisionOutcome> {
+        // A thin wrapper over the shared supervision engine (`drive`), the same
+        // one `start`'s detached task runs — so `run` preserves the classic
+        // behavior verbatim (outcome classification, cancellation, tracing,
+        // liveness/storm accounting). It drives the engine inline rather than
+        // spawning, so — unlike `start` — it needs no `'static` runner and keeps
+        // working for a borrowed shared group (`with_runner(&group)`); the
+        // session status it publishes is simply never observed.
+        let shared = Arc::new(SessionShared::new());
+        self.drive(shared).await
+    }
+
+    /// The shared supervision engine behind [`run`](Self::run) and
+    /// [`start`](Self::start): one faithful copy of the classic supervision loop,
+    /// extended only with live-status publication and graceful-stop handling
+    /// (both no-ops for `run`, whose `shared` is never observed and whose stop is
+    /// never fired). Returns the final [`SupervisionOutcome`] exactly as before.
+    async fn drive(self, shared: Arc<SessionShared>) -> Result<SupervisionOutcome> {
         // Reject up front a configuration that could genuinely need a second
         // incarnation but only has a one-shot stdin source to feed it: the
         // first incarnation would consume the source, and every restart after
@@ -714,6 +1093,11 @@ impl<R: ProcessRunner> Supervisor<R> {
 
         // Apply the capture policy once; clone so `self` stays intact.
         let command = self.command.clone().output_buffer(self.capture);
+        // Latches false the first time the runner proves capture-only (its
+        // `start` returns `Unsupported`): the loop then drives incarnations
+        // through the capture verb — no live pid / graceful child-stop, but
+        // supervision itself is unaffected.
+        let spawn_capable = AtomicBool::new(true);
 
         let mut restarts: u32 = 0;
         // The backoff *exponent* — separate from the lifetime `restarts` count so a
@@ -725,9 +1109,52 @@ impl<R: ProcessRunner> Supervisor<R> {
         // in `SupervisionOutcome::liveness_kills`); always 0 without a health check.
         let mut liveness_kills: u32 = 0;
         let mut storm = StormState::new();
+        let mut last_result: Option<ProcessResult<String>> = None;
         loop {
-            match self.run_incarnation(&command).await {
+            // A graceful stop requested while between incarnations (a backoff /
+            // storm sleep was just interrupted): end now with the last result
+            // rather than start another incarnation.
+            if shared.is_stopping()
+                && let Some(last) = &last_result
+            {
+                return Ok(self.outcome(
+                    last.clone(),
+                    restarts,
+                    liveness_kills,
+                    &storm,
+                    StopReason::Stopped,
+                ));
+            }
+
+            // Each incarnation carries a fresh cancel token so a graceful stop
+            // can reach a shared-group / capture-only child (its only lever); it
+            // is a *child* of any caller `cancel_on` token, so caller cancellation
+            // still propagates and stays a terminal `Error::Cancelled`.
+            let inc_cancel = self
+                .command
+                .cancel_token()
+                .map_or_else(CancellationToken::new, |user| user.child_token());
+            let inc_command = command.clone().cancel_on(inc_cancel);
+
+            match self
+                .run_incarnation(&inc_command, &shared, &spawn_capable)
+                .await
+            {
                 Incarnation::Ran(Ok(result)) => {
+                    last_result = Some(result.clone());
+                    if shared.is_stopping() {
+                        // The current incarnation was gracefully stopped (or
+                        // completed while a stop was pending): end with its honest
+                        // result and `Stopped`, which wins over policy/predicate —
+                        // the caller explicitly asked to stop.
+                        return Ok(self.outcome(
+                            result,
+                            restarts,
+                            liveness_kills,
+                            &storm,
+                            StopReason::Stopped,
+                        ));
+                    }
                     if let Some(predicate) = &self.stop_when
                         && predicate(&result)
                     {
@@ -762,6 +1189,7 @@ impl<R: ProcessRunner> Supervisor<R> {
                             &mut backoff_restarts,
                             &mut storm,
                             factor,
+                            &shared,
                         )
                         .await
                     {
@@ -784,7 +1212,16 @@ impl<R: ProcessRunner> Supervisor<R> {
                             ));
                         }
                         GateOutcome::Cancelled => return Err(self.cancelled_err(&command)),
-                        GateOutcome::Restart => {}
+                        GateOutcome::Stopped => {
+                            return Ok(self.outcome(
+                                result,
+                                restarts,
+                                liveness_kills,
+                                &storm,
+                                StopReason::Stopped,
+                            ));
+                        }
+                        GateOutcome::Restart => shared.set_restarts(restarts),
                     }
                 }
                 Incarnation::LivenessFailed { uptime } => {
@@ -795,6 +1232,18 @@ impl<R: ProcessRunner> Supervisor<R> {
                     // uptime lets the E3 escalation reset for a long-lived child.
                     liveness_kills = liveness_kills.saturating_add(1);
                     let result = self.liveness_kill_result(uptime);
+                    last_result = Some(result.clone());
+                    if shared.is_stopping() {
+                        // A stop landed while this incarnation was being force-killed
+                        // for wedging — honor the stop over a restart.
+                        return Ok(self.outcome(
+                            result,
+                            restarts,
+                            liveness_kills,
+                            &storm,
+                            StopReason::Stopped,
+                        ));
+                    }
                     if matches!(self.policy, RestartPolicy::Never) {
                         // Never won't restart — report the single force-killed run.
                         return Ok(self.outcome(
@@ -813,6 +1262,7 @@ impl<R: ProcessRunner> Supervisor<R> {
                             &mut backoff_restarts,
                             &mut storm,
                             factor,
+                            &shared,
                         )
                         .await
                     {
@@ -835,11 +1285,39 @@ impl<R: ProcessRunner> Supervisor<R> {
                             ));
                         }
                         GateOutcome::Cancelled => return Err(self.cancelled_err(&command)),
-                        GateOutcome::Restart => {}
+                        GateOutcome::Stopped => {
+                            return Ok(self.outcome(
+                                result,
+                                restarts,
+                                liveness_kills,
+                                &storm,
+                                StopReason::Stopped,
+                            ));
+                        }
+                        GateOutcome::Restart => shared.set_restarts(restarts),
                     }
                 }
                 Incarnation::Ran(Err(err)) => {
                     if err.is_cancelled() {
+                        // A graceful stop of a shared-group / capture-only child
+                        // manifests as a `Cancelled` capture (its cancel token is
+                        // the only stop lever). Report the deliberate stop as
+                        // `Stopped`, not as a cancellation error.
+                        if shared.is_stopping() {
+                            return Ok(self.outcome(
+                                self.stopped_result(),
+                                restarts,
+                                liveness_kills,
+                                &storm,
+                                StopReason::Stopped,
+                            ));
+                        }
+                        return Err(err);
+                    }
+                    // A stop was requested but this attempt produced no result to
+                    // report — surface the honest terminal error (same shape as an
+                    // exhausted budget on this path).
+                    if shared.is_stopping() {
                         return Err(err);
                     }
                     let wants_restart = !matches!(self.policy, RestartPolicy::Never);
@@ -856,14 +1334,35 @@ impl<R: ProcessRunner> Supervisor<R> {
                     }
                     // A spawn-side failure carries no run duration, so it never
                     // counts as healthy — the escalation keeps climbing.
-                    if self.storm_gate(&mut storm).await {
-                        return Err(self.cancelled_err(&command));
+                    match self.storm_gate(&mut storm, &shared).await {
+                        Wake::Cancelled => return Err(self.cancelled_err(&command)),
+                        Wake::Stopped => {
+                            return Ok(self.outcome(
+                                self.stopped_result(),
+                                restarts,
+                                liveness_kills,
+                                &storm,
+                                StopReason::Stopped,
+                            ));
+                        }
+                        Wake::Elapsed => {}
                     }
-                    if self.sleep_backoff(backoff_restarts, factor).await {
-                        return Err(self.cancelled_err(&command));
+                    match self.sleep_backoff(backoff_restarts, factor, &shared).await {
+                        Wake::Cancelled => return Err(self.cancelled_err(&command)),
+                        Wake::Stopped => {
+                            return Ok(self.outcome(
+                                self.stopped_result(),
+                                restarts,
+                                liveness_kills,
+                                &storm,
+                                StopReason::Stopped,
+                            ));
+                        }
+                        Wake::Elapsed => {}
                     }
                     restarts = restarts.saturating_add(1);
                     backoff_restarts = backoff_restarts.saturating_add(1);
+                    shared.set_restarts(restarts);
                 }
             }
         }
@@ -878,9 +1377,14 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// liveness kill. When the watcher wins, dropping the losing
     /// [`run_to_result`](Self::run_to_result) future ends the wedged
     /// incarnation (killed on drop under the default [`JobRunner`]).
-    async fn run_incarnation(&self, command: &Command) -> Incarnation {
+    async fn run_incarnation(
+        &self,
+        command: &Command,
+        shared: &SessionShared,
+        spawn_capable: &AtomicBool,
+    ) -> Incarnation {
         let Some(health) = &self.health_check else {
-            return Incarnation::Ran(self.run_to_result(command).await);
+            return Incarnation::Ran(self.run_to_result(command, shared, spawn_capable).await);
         };
         // Anchor uptime on tokio's clock (not `std::time::Instant`) so it shares
         // the timer the liveness sleeps and any paused-runtime test run on — the
@@ -888,7 +1392,7 @@ impl<R: ProcessRunner> Supervisor<R> {
         let started = tokio::time::Instant::now();
         tokio::select! {
             biased;
-            result = self.run_to_result(command) => Incarnation::Ran(result),
+            result = self.run_to_result(command, shared, spawn_capable) => Incarnation::Ran(result),
             () = health.watch(self.health_check_failures) => {
                 Incarnation::LivenessFailed { uptime: started.elapsed() }
             }
@@ -903,6 +1407,7 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// [failure-storm guard](Self::storm_pause) (crashes only), and the backoff
     /// sleep; then advances the restart counters. Factoring it here keeps the
     /// `Ran(Ok)` and `LivenessFailed` arms from drifting apart.
+    #[allow(clippy::too_many_arguments)]
     async fn gate_restart(
         &self,
         result: &ProcessResult<String>,
@@ -911,6 +1416,7 @@ impl<R: ProcessRunner> Supervisor<R> {
         backoff_restarts: &mut u32,
         storm: &mut StormState,
         factor: f64,
+        shared: &SessionShared,
     ) -> GateOutcome {
         if crashed
             && let Some(classifier) = &self.give_up_when
@@ -934,11 +1440,17 @@ impl<R: ProcessRunner> Supervisor<R> {
         if healthy {
             *backoff_restarts = 0;
         }
-        if crashed && self.storm_gate(storm).await {
-            return GateOutcome::Cancelled;
+        if crashed {
+            match self.storm_gate(storm, shared).await {
+                Wake::Cancelled => return GateOutcome::Cancelled,
+                Wake::Stopped => return GateOutcome::Stopped,
+                Wake::Elapsed => {}
+            }
         }
-        if self.sleep_backoff(*backoff_restarts, factor).await {
-            return GateOutcome::Cancelled;
+        match self.sleep_backoff(*backoff_restarts, factor, shared).await {
+            Wake::Cancelled => return GateOutcome::Cancelled,
+            Wake::Stopped => return GateOutcome::Stopped,
+            Wake::Elapsed => {}
         }
         *restarts = restarts.saturating_add(1);
         *backoff_restarts = backoff_restarts.saturating_add(1);
@@ -963,6 +1475,24 @@ impl<R: ProcessRunner> Supervisor<R> {
         .with_ok_codes(self.command.ok_codes_vec())
     }
 
+    /// The synthetic [`ProcessResult`] reported as the final result when a
+    /// graceful session stop ended an incarnation that produced only a
+    /// `Cancelled` capture (a shared-group / capture-only child, whose only stop
+    /// lever is its cancel token, so it has no honest exit to report). A
+    /// non-success [`Signalled`](crate::Outcome::Signalled) — the child was
+    /// stopped, not a clean exit. (An own-group child stopped through its
+    /// graceful path *does* return an honest result, reported as-is.)
+    fn stopped_result(&self) -> ProcessResult<String> {
+        ProcessResult::new(
+            self.command.program_name(),
+            String::new(),
+            String::new(),
+            Outcome::Signalled(None),
+            None,
+        )
+        .with_ok_codes(self.command.ok_codes_vec())
+    }
+
     fn outcome(
         &self,
         final_result: ProcessResult<String>,
@@ -980,14 +1510,95 @@ impl<R: ProcessRunner> Supervisor<R> {
         }
     }
 
-    /// Run one incarnation through the only owning launch choice and produce
-    /// its [`ProcessResult`]. A file, inherited, or null stdout has no
-    /// parent-readable pipe, so it cannot use the capture verb; finish drains
-    /// only any independently-piped stderr and preserves the exit outcome for
-    /// the restart policy. The sole callee of [`run_incarnation`](Self::run_incarnation),
-    /// which additionally races this against the liveness watcher when a
-    /// [`health_check`](Self::health_check) is set.
-    async fn run_to_result(&self, command: &Command) -> Result<ProcessResult<String>> {
+    /// Run one incarnation and produce its [`ProcessResult`], publishing the
+    /// live child (pid / start time / how to stop it) into `shared` for the
+    /// duration so a [`SupervisionSession`] can observe and gracefully stop it.
+    ///
+    /// Obtains a live handle via [`start`](ProcessRunner::start) — the lever for
+    /// a live pid and a graceful child-stop — and captures its output exactly as
+    /// the classic path did: for a piped stdout the same [`output_string`] the
+    /// bulk capture verb runs, otherwise a [`finish`] that drains only any
+    /// independently-piped stderr and preserves the exit outcome. A **capture-only**
+    /// runner (whose `start` is [`Unsupported`](crate::Error::Unsupported)) latches
+    /// `spawn_capable` off and falls back to the plain capture verb — verbatim
+    /// classic behavior, minus the live pid / graceful stop. The sole callee of
+    /// [`run_incarnation`](Self::run_incarnation), which additionally races this
+    /// against the liveness watcher when a [`health_check`](Self::health_check) is
+    /// set.
+    ///
+    /// [`output_string`]: ProcessRunner::output_string
+    /// [`finish`]: crate::RunningProcess::finish
+    async fn run_to_result(
+        &self,
+        command: &Command,
+        shared: &SessionShared,
+        spawn_capable: &AtomicBool,
+    ) -> Result<ProcessResult<String>> {
+        if !spawn_capable.load(Ordering::Relaxed) {
+            return self.capture_only(command).await;
+        }
+        let started = Instant::now();
+        let handle = match self.runner.start(command).await {
+            Ok(handle) => handle,
+            Err(crate::Error::Unsupported { .. }) => {
+                // A capture-only runner: it exposes no live handle. Drive this and
+                // every later incarnation through the plain capture verb instead —
+                // no live pid / graceful stop, but supervision is unaffected.
+                spawn_capable.store(false, Ordering::Relaxed);
+                return self.capture_only(command).await;
+            }
+            Err(err) => return Err(err),
+        };
+
+        // Publish the live child and learn, atomically, whether a graceful stop
+        // already landed (the stop-vs-spawn race). Its cancel token is the only
+        // stop lever for a shared-group / capture-only child; an own-group child
+        // is stopped gracefully through its private group.
+        let stopper = ChildStopper {
+            group: handle.own_group_handle(),
+            inc_cancel: command.cancel_token().unwrap_or_default(),
+        };
+        if let Some(grace) =
+            shared.publish_current(handle.pid(), handle.start_time(), stopper.clone())
+        {
+            // A stop was pending before this child became current: stop it now,
+            // fire-and-forget — the output verb below observes the exit and the
+            // loop ends with `Stopped`.
+            tokio::spawn(async move { stopper.graceful_stop(grace).await });
+        }
+
+        let result = if command.stdout_is_piped() {
+            handle.output_string().await
+        } else {
+            match handle.finish().await {
+                Ok(crate::Finished {
+                    outcome,
+                    stderr,
+                    stderr_truncated,
+                }) => Ok(ProcessResult::new(
+                    command.program_name(),
+                    String::new(),
+                    stderr,
+                    outcome,
+                    command.configured_timeout(),
+                )
+                .with_duration(started.elapsed())
+                .with_truncated(stderr_truncated)
+                .with_ok_codes(command.ok_codes_vec())),
+                Err(err) => Err(err),
+            }
+        };
+        shared.clear_current();
+        result
+    }
+
+    /// The classic capture path, unchanged: a piped stdout uses the bulk
+    /// [`output_string`](ProcessRunner::output_string) verb; otherwise a
+    /// [`start`](ProcessRunner::start) + [`finish`](crate::RunningProcess::finish)
+    /// drains only any independently-piped stderr. Reached for a capture-only
+    /// runner (whose `start` is `Unsupported`), where no live handle — hence no
+    /// live pid or graceful child-stop — is available.
+    async fn capture_only(&self, command: &Command) -> Result<ProcessResult<String>> {
         if command.stdout_is_piped() {
             return self.runner.output_string(command).await;
         }
@@ -1065,30 +1676,38 @@ impl<R: ProcessRunner> Supervisor<R> {
         ))
     }
 
-    /// Sleep `delay`, waking early (returning `true`) if the supervised command's
-    /// [`cancel_on`](crate::Command::cancel_on) token fires — so a cancellation
-    /// during a backoff or storm pause ends supervision promptly with
-    /// `Error::Cancelled` instead of waiting out a (possibly long) delay. Without a
-    /// token, this just sleeps and returns `false`. A zero delay still observes an
-    /// already-cancelled token (returns `true`) so supervision ends promptly.
-    #[must_use = "the returned bool signals cancellation — supervision must end when true"]
-    async fn sleep_or_cancel(&self, delay: Duration) -> bool {
+    /// Sleep `delay`, waking early if the supervised command's
+    /// [`cancel_on`](crate::Command::cancel_on) token fires ([`Wake::Cancelled`])
+    /// or a [`SupervisionSession::stop`] is requested ([`Wake::Stopped`]) — so
+    /// either ends supervision promptly instead of waiting out a (possibly long)
+    /// delay. Cancellation takes precedence over a stop when both fire (a caller
+    /// cancel is a terminal error). Without either, this just sleeps and returns
+    /// [`Wake::Elapsed`]. A zero delay still observes an already-fired token so
+    /// supervision ends promptly. For [`run`](Self::run) the stop token is never
+    /// fired, so this reduces to the classic cancel-or-elapse behavior.
+    #[must_use = "the returned Wake signals cancellation/stop — supervision must end unless Elapsed"]
+    async fn sleep_or_cancel(&self, delay: Duration, shared: &SessionShared) -> Wake {
+        let user = self.command.cancel_token();
         if delay.is_zero() {
-            return self
-                .command
-                .cancel_token()
-                .is_some_and(|t| t.is_cancelled());
-        }
-        match self.command.cancel_token() {
-            Some(token) => tokio::select! {
-                biased;
-                () = token.cancelled() => true,
-                () = tokio::time::sleep(delay) => false,
-            },
-            None => {
-                tokio::time::sleep(delay).await;
-                false
+            if user.is_some_and(|t| t.is_cancelled()) {
+                return Wake::Cancelled;
             }
+            if shared.stop.is_cancelled() {
+                return Wake::Stopped;
+            }
+            return Wake::Elapsed;
+        }
+        let cancelled = async {
+            match &user {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            () = cancelled => Wake::Cancelled,
+            () = shared.stop.cancelled() => Wake::Stopped,
+            () = tokio::time::sleep(delay) => Wake::Elapsed,
         }
     }
 
@@ -1096,12 +1715,14 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// driven restart: fold the failure into the decaying score and, past the
     /// threshold, sleep out one jittered [`storm_pause`](Self::storm_pause)
     /// and reset the score (a fresh window — the pause itself must not count
-    /// as elapsed decay time for the *next* failure). Returns `true` if the
-    /// cancel token fired during the pause (supervision should end).
-    #[must_use = "the returned bool signals cancellation — supervision must end when true"]
-    async fn storm_gate(&self, storm: &mut StormState) -> bool {
+    /// as elapsed decay time for the *next* failure). Returns a non-[`Elapsed`](Wake::Elapsed)
+    /// [`Wake`] if a cancel token / session stop fired during the pause
+    /// (supervision should end). Brackets the pause window in the live status
+    /// [`is_storm_paused`](SupervisionStatus::is_storm_paused).
+    #[must_use = "the returned Wake signals cancellation/stop — supervision must end unless Elapsed"]
+    async fn storm_gate(&self, storm: &mut StormState, shared: &SessionShared) -> Wake {
         let Some(pause) = self.storm_pause else {
-            return false;
+            return Wake::Elapsed;
         };
         let now = tokio::time::Instant::now();
         let elapsed = storm
@@ -1112,7 +1733,7 @@ impl<R: ProcessRunner> Supervisor<R> {
         storm.score = decayed_failure_score(storm.score, elapsed, self.failure_decay);
         let tripped = storm.score > self.failure_threshold;
         if !tripped {
-            return false;
+            return Wake::Elapsed;
         }
         let pause = apply_jitter(pause, self.jitter);
         #[cfg(feature = "tracing")]
@@ -1121,19 +1742,25 @@ impl<R: ProcessRunner> Supervisor<R> {
             pause_ms = pause.as_millis() as u64,
             "supervisor failure storm — pausing restarts"
         );
-        if self.sleep_or_cancel(pause).await {
-            return true;
+        // Bracket exactly the pause window in the live status: paused while the
+        // jittered sleep runs, cleared the instant it returns (or is cut short).
+        shared.set_storm_paused(true);
+        let wake = self.sleep_or_cancel(pause, shared).await;
+        shared.set_storm_paused(false);
+        if !matches!(wake, Wake::Elapsed) {
+            return wake;
         }
         storm.score = 0.0;
         storm.last_failure_at = None;
         storm.pauses = storm.pauses.saturating_add(1);
-        false
+        Wake::Elapsed
     }
 
-    /// Sleep out the delay before the `restarts`-th (0-based) restart. Returns
-    /// `true` if the cancel token fired during the backoff.
-    #[must_use = "the returned bool signals cancellation — supervision must end when true"]
-    async fn sleep_backoff(&self, restarts: u32, factor: f64) -> bool {
+    /// Sleep out the delay before the `restarts`-th (0-based) restart. Returns a
+    /// non-[`Elapsed`](Wake::Elapsed) [`Wake`] if a cancel token / session stop
+    /// fired during the backoff.
+    #[must_use = "the returned Wake signals cancellation/stop — supervision must end unless Elapsed"]
+    async fn sleep_backoff(&self, restarts: u32, factor: f64, shared: &SessionShared) -> Wake {
         let delay = backoff_delay(self.backoff_base, factor, restarts, self.max_backoff);
         let delay = apply_jitter(delay, self.jitter);
         #[cfg(feature = "tracing")]
@@ -1143,7 +1770,50 @@ impl<R: ProcessRunner> Supervisor<R> {
             delay_ms = delay.as_millis() as u64,
             "supervisor restarting child"
         );
-        self.sleep_or_cancel(delay).await
+        self.sleep_or_cancel(delay, shared).await
+    }
+}
+
+impl<R: ProcessRunner + 'static> Supervisor<R> {
+    /// Start supervising in the background and return a live
+    /// [`SupervisionSession`] — the interactive counterpart to
+    /// [`run`](Self::run). Supervision runs on a detached task from the moment
+    /// this returns; poll the session's [`status`](SupervisionSession::status)
+    /// (restart count, storm-pause flag, the current child's pid / start time),
+    /// ask it to [`stop`](SupervisionSession::stop) gracefully, or
+    /// [`wait`](SupervisionSession::wait) for the final
+    /// [`SupervisionOutcome`] — exactly what [`run`](Self::run) would have
+    /// returned.
+    ///
+    /// The live status is an **addition** to the exit-driven
+    /// [`RestartPolicy`]/[`stop_when`](Self::stop_when)/tracing instrumentation,
+    /// never a replacement — supervision behaves identically to [`run`](Self::run).
+    ///
+    /// Requires a `'static` runner because supervision moves onto a spawned task;
+    /// the borrowed shared-group form (`with_runner(&group)`) is available only
+    /// through [`run`](Self::run). Own it — `with_runner(group)` by value, or an
+    /// `Arc<ProcessGroup>` runner — to supervise a shared group via a session.
+    ///
+    /// Must be called from within a Tokio runtime (it spawns the supervision
+    /// task).
+    #[must_use = "a dropped SupervisionSession aborts supervision immediately — hold it, then wait()/stop()"]
+    pub fn start(self) -> SupervisionSession {
+        let shared = Arc::new(SessionShared::new());
+        let (tx, rx) = oneshot::channel();
+        let task_shared = Arc::clone(&shared);
+        let handle = tokio::spawn(async move {
+            let outcome = self.drive(Arc::clone(&task_shared)).await;
+            // Flip the live status to inactive before the outcome becomes
+            // observable, so an awaiter that then reads `status()` never sees
+            // `is_active() == true` on a finished session.
+            task_shared.mark_inactive();
+            let _ = tx.send(outcome);
+        });
+        SupervisionSession {
+            shared,
+            completion: Some(rx),
+            abort: handle.abort_handle(),
+        }
     }
 }
 
@@ -2436,5 +3106,202 @@ mod tests {
         assert_eq!(outcome.liveness_kills, 0);
         assert_eq!(outcome.restarts, 1);
         assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
+    }
+
+    // --- Live supervision session (T-158) ----------------------------------
+
+    /// Poll `session.status()` until `pred` holds, yielding to let the detached
+    /// supervision loop make progress. Panics rather than spin forever.
+    async fn yield_until(
+        session: &SupervisionSession,
+        pred: impl Fn(&SupervisionStatus) -> bool,
+    ) -> SupervisionStatus {
+        for _ in 0..2000 {
+            let status = session.status();
+            if pred(&status) {
+                return status;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "session status condition never held: {:?}",
+            session.status()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_status_snapshots_a_live_incarnation() {
+        // A pending first incarnation stays live; the session exposes it while it
+        // runs — active, a start time, restarts still 0 (the first run is not a
+        // restart). The scripted double has no OS pid, so `pid()` is `None`.
+        let session = Supervisor::new(Command::new("server"))
+            .with_runner(ScriptedRunner::new().fallback(Reply::pending()))
+            .start();
+        let status = yield_until(&session, |s| s.started_at().is_some()).await;
+        assert!(status.is_active(), "supervision is running");
+        assert_eq!(
+            status.restarts(),
+            0,
+            "the first incarnation is not a restart"
+        );
+        assert!(!status.is_storm_paused());
+        assert!(
+            status.pid().is_none(),
+            "a scripted double exposes no live pid"
+        );
+
+        // A stop ends it cleanly so the paused-clock test doesn't park forever.
+        let outcome = session
+            .stop(Duration::ZERO)
+            .await
+            .expect("a graceful stop yields an outcome");
+        assert_eq!(outcome.stopped, StopReason::Stopped);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_status_tracks_restarts_live() {
+        // The first incarnation crashes and restarts; the second is a live
+        // pending run. The session's restart count updates as it happens, not
+        // only at the end.
+        let runner = ScriptedRunner::new()
+            .on_sequence(["server"], [Reply::fail(1, "boom"), Reply::pending()]);
+        let session = Supervisor::new(Command::new("server"))
+            .with_runner(runner)
+            .backoff(Duration::ZERO, 1.0)
+            .jitter(false)
+            .start();
+        let status = yield_until(&session, |s| s.restarts() == 1 && s.started_at().is_some()).await;
+        assert!(status.is_active());
+        assert_eq!(status.restarts(), 1, "one crash-restart so far, live");
+
+        let outcome = session
+            .stop(Duration::ZERO)
+            .await
+            .expect("a graceful stop yields an outcome");
+        assert_eq!(outcome.stopped, StopReason::Stopped);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_stop_during_a_live_child_reports_stopped() {
+        // Stopping while a child is alive ends supervision with `Stopped` — a
+        // deliberate, honest reason distinct from a crash, a cancellation, or a
+        // predicate/policy stop.
+        let session = Supervisor::new(Command::new("server"))
+            .with_runner(ScriptedRunner::new().fallback(Reply::pending()))
+            .restart(RestartPolicy::Always)
+            .start();
+        yield_until(&session, |s| s.started_at().is_some()).await;
+
+        let outcome = session
+            .stop(Duration::ZERO)
+            .await
+            .expect("a graceful stop yields an outcome");
+        assert_eq!(outcome.stopped, StopReason::Stopped);
+        assert_eq!(outcome.restarts, 0);
+        // A snapshot taken after supervision ended must not claim it is active.
+        assert!(!outcome.final_result.is_success());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_stop_during_backoff_does_not_wait_or_launch_another() {
+        // A stop taken while a backoff sleep is in flight interrupts the sleep and
+        // ends supervision at once — it must NOT wait the (60s) delay out nor
+        // start the next incarnation. The `SeqRunner` scripts exactly one reply,
+        // so a second incarnation would panic ("ran out of scripted replies").
+        let start = tokio::time::Instant::now();
+        let session = Supervisor::new(Command::new("fake"))
+            .with_runner(SeqRunner::new(vec![fail(1)]))
+            .backoff(Duration::from_secs(60), 1.0)
+            .jitter(false)
+            .start();
+        // Let the loop run the single crash and park in the 60s backoff sleep.
+        yield_until(&session, |s| s.restarts() == 0 && !s.is_storm_paused()).await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        let outcome = session
+            .stop(Duration::ZERO)
+            .await
+            .expect("a graceful stop yields an outcome");
+        assert_eq!(outcome.stopped, StopReason::Stopped);
+        assert_eq!(outcome.restarts, 0, "no further incarnation was launched");
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the backoff sleep must be cut short by the stop, not waited out: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_and_a_session_agree_on_the_outcome() {
+        // `run()` is a thin wrapper over `start()` + awaiting the outcome, so the
+        // two must produce an identical `SupervisionOutcome` for the same config.
+        let via_run = supervise(SeqRunner::new(vec![fail(1), fail(1), ok()]))
+            .run()
+            .await
+            .expect("run supervision");
+        let via_session = supervise(SeqRunner::new(vec![fail(1), fail(1), ok()]))
+            .start()
+            .wait()
+            .await
+            .expect("session supervision");
+        assert_eq!(
+            via_run, via_session,
+            "run() and start().wait() must agree on the outcome"
+        );
+        assert_eq!(via_run.restarts, 2);
+        assert_eq!(via_run.stopped, StopReason::PolicySatisfied);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_session_aborts_supervision_without_leaking_the_task() {
+        // A runner that carries a canary `Arc`: while the detached supervision
+        // task is alive it holds the runner (hence a clone of the canary). Dropping
+        // the session must abort that task — no orphaned supervision task — so the
+        // runner drops and the canary's strong count falls back to 1.
+        struct CanaryRunner {
+            inner: ScriptedRunner,
+            _canary: std::sync::Arc<()>,
+        }
+        #[async_trait::async_trait]
+        impl ProcessRunner for CanaryRunner {
+            async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+                self.inner.output_string(command).await
+            }
+            async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
+                self.inner.start(command).await
+            }
+        }
+
+        let canary = std::sync::Arc::new(());
+        let runner = CanaryRunner {
+            inner: ScriptedRunner::new().fallback(Reply::pending()),
+            _canary: std::sync::Arc::clone(&canary),
+        };
+        let session = Supervisor::new(Command::new("server"))
+            .with_runner(runner)
+            .start();
+        // Let the loop spawn the (pending) child so the task is genuinely running.
+        yield_until(&session, |s| s.started_at().is_some()).await;
+        assert_eq!(
+            std::sync::Arc::strong_count(&canary),
+            2,
+            "the live supervision task holds the runner"
+        );
+
+        drop(session);
+        // Let the runtime process the abort and drop the task's future (the runner).
+        for _ in 0..200 {
+            if std::sync::Arc::strong_count(&canary) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            std::sync::Arc::strong_count(&canary),
+            1,
+            "dropping the session must abort supervision — no orphaned task holding the runner"
+        );
     }
 }

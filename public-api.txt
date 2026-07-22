@@ -520,6 +520,7 @@ pub processkit::StopReason::GaveUp
 pub processkit::StopReason::PolicySatisfied
 pub processkit::StopReason::Predicate
 pub processkit::StopReason::RestartsExhausted
+pub processkit::StopReason::Stopped
 pub processkit::StopReason::Unhealthy
 impl core::clone::Clone for processkit::StopReason
 pub fn processkit::StopReason::clone(&self) -> processkit::StopReason
@@ -1122,9 +1123,45 @@ impl core::marker::Unpin for processkit::SupervisionOutcome
 impl core::marker::UnsafeUnpin for processkit::SupervisionOutcome
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::SupervisionOutcome
 impl core::panic::unwind_safe::UnwindSafe for processkit::SupervisionOutcome
+pub struct processkit::SupervisionSession
+impl processkit::SupervisionSession
+pub fn processkit::SupervisionSession::status(&self) -> processkit::SupervisionStatus
+pub async fn processkit::SupervisionSession::stop(self, core::time::Duration) -> processkit::Result<processkit::SupervisionOutcome>
+pub async fn processkit::SupervisionSession::wait(self) -> processkit::Result<processkit::SupervisionOutcome>
+impl core::fmt::Debug for processkit::SupervisionSession
+pub fn processkit::SupervisionSession::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::drop::Drop for processkit::SupervisionSession
+pub fn processkit::SupervisionSession::drop(&mut self)
+impl core::marker::Freeze for processkit::SupervisionSession
+impl core::marker::Send for processkit::SupervisionSession
+impl core::marker::Sync for processkit::SupervisionSession
+impl core::marker::Unpin for processkit::SupervisionSession
+impl core::marker::UnsafeUnpin for processkit::SupervisionSession
+impl !core::panic::unwind_safe::RefUnwindSafe for processkit::SupervisionSession
+impl !core::panic::unwind_safe::UnwindSafe for processkit::SupervisionSession
+#[non_exhaustive] pub struct processkit::SupervisionStatus
+impl processkit::SupervisionStatus
+pub fn processkit::SupervisionStatus::is_active(&self) -> bool
+pub fn processkit::SupervisionStatus::is_storm_paused(&self) -> bool
+pub fn processkit::SupervisionStatus::pid(&self) -> core::option::Option<u32>
+pub fn processkit::SupervisionStatus::restarts(&self) -> u32
+pub fn processkit::SupervisionStatus::started_at(&self) -> core::option::Option<std::time::SystemTime>
+impl core::clone::Clone for processkit::SupervisionStatus
+pub fn processkit::SupervisionStatus::clone(&self) -> processkit::SupervisionStatus
+impl core::fmt::Debug for processkit::SupervisionStatus
+pub fn processkit::SupervisionStatus::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for processkit::SupervisionStatus
+impl core::marker::Send for processkit::SupervisionStatus
+impl core::marker::Sync for processkit::SupervisionStatus
+impl core::marker::Unpin for processkit::SupervisionStatus
+impl core::marker::UnsafeUnpin for processkit::SupervisionStatus
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::SupervisionStatus
+impl core::panic::unwind_safe::UnwindSafe for processkit::SupervisionStatus
 pub struct processkit::Supervisor<R: processkit::ProcessRunner>
 impl processkit::Supervisor<processkit::JobRunner>
 pub fn processkit::Supervisor<processkit::JobRunner>::new(processkit::Command) -> Self
+impl<R: processkit::ProcessRunner + 'static> processkit::Supervisor<R>
+pub fn processkit::Supervisor<R>::start(self) -> processkit::SupervisionSession
 impl<R: processkit::ProcessRunner> processkit::Supervisor<R>
 pub fn processkit::Supervisor<R>::backoff(self, core::time::Duration, f64) -> Self
 pub fn processkit::Supervisor<R>::capture(self, processkit::OutputBufferPolicy) -> Self

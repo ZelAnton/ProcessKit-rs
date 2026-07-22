@@ -12,7 +12,8 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+
+- Add Supervisor::start() returning a live SupervisionSession (status snapshot, graceful stop, wait)
 
 ### Changed
 -

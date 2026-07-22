@@ -131,3 +131,48 @@ async fn supervisor_exhausts_restarts_on_a_crashing_child() {
     assert_eq!(outcome.stopped, StopReason::RestartsExhausted);
     assert_eq!(outcome.final_result.code(), Some(1));
 }
+
+#[tokio::test]
+#[ignore = "starts a real supervised child and stops it through a live session"]
+async fn session_gracefully_stops_a_real_supervised_child() {
+    use processkit::{RestartPolicy, StopReason, Supervisor};
+
+    // The live-session path against a REAL long-running child under the default
+    // own-group JobRunner: `status()` exposes the running incarnation's real pid,
+    // and `stop()` ends it through its group's graceful teardown, reporting a
+    // deliberate `StopReason::Stopped` (never a crash/exhaustion/cancellation).
+    let session = Supervisor::new(sleep_secs(30))
+        .restart(RestartPolicy::Always)
+        .start();
+
+    // Wait until the first incarnation is live, with a real OS pid published.
+    let mut live_pid = None;
+    for _ in 0..400 {
+        let status = session.status();
+        if status.is_active()
+            && let Some(pid) = status.pid()
+        {
+            live_pid = Some(pid);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        live_pid.is_some(),
+        "the supervised child should go live with a real pid"
+    );
+
+    let outcome = session
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("a graceful stop yields an outcome");
+    assert_eq!(
+        outcome.stopped,
+        StopReason::Stopped,
+        "a session stop ends supervision deliberately: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.restarts, 0,
+        "the first incarnation was stopped, not restarted"
+    );
+}
