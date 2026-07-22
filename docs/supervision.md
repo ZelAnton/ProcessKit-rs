@@ -17,6 +17,7 @@ keeper, platform-agnostic because it sits entirely on the
 - [Stopping](#stopping)
 - [Giving up on permanent failures](#giving-up-on-permanent-failures)
 - [Outcomes](#outcomes)
+- [Live sessions: `start()`](#live-sessions-start)
 - [Supervising inside a shared group](#supervising-inside-a-shared-group)
 - [Errors and cancellation](#errors-and-cancellation)
 
@@ -283,7 +284,7 @@ async fn main() -> processkit::Result<()> {
 
     outcome.final_result;  // ProcessResult<String> of the LAST run
     outcome.restarts;      // how many restarts happened (not counting run #1)
-    outcome.stopped;       // StopReason::{Predicate, PolicySatisfied, GaveUp, RestartsExhausted, Unhealthy}
+    outcome.stopped;       // StopReason::{Predicate, PolicySatisfied, GaveUp, RestartsExhausted, Unhealthy, Stopped}
     outcome.storm_pauses;  // failure-storm pauses taken (0 unless storm_pause is set)
     outcome.liveness_kills; // incarnations force-killed by a health check (0 unless health_check is set)
     Ok(())
@@ -293,6 +294,62 @@ async fn main() -> processkit::Result<()> {
 Note `run()` returning `Ok` does **not** mean the child succeeded — it means
 supervision *concluded*. Inspect `final_result` (or `ensure_success()` it) for
 the child's own verdict.
+
+## Live sessions: `start()`
+
+`run()` owns supervision from start to finish and only hands back a
+`SupervisionOutcome` at the very end — there is no handle to watch or steer it
+while it runs. For a daemon / process-manager that needs a *live* view, call
+`start()` instead of `run()`. It returns a `SupervisionSession`, a `Send` handle
+to supervision running on a background task:
+
+- **`status()`** — a consistent snapshot (`SupervisionStatus`): whether
+  supervision is still active, the live restart count, whether a failure-storm
+  pause is in effect right now, and the current incarnation's `pid` / start time
+  (both `None` between incarnations, during a backoff, or for a capture-only test
+  double). Poll it any time; it never races the loop.
+- **`stop(grace)`** — stop the current child *gracefully* (its normal
+  `SIGTERM` → wait `grace` → `SIGKILL` path, under the default own-group
+  runner) and end supervision with `StopReason::Stopped` — a deliberate,
+  honest reason distinct from a crash, an exhausted budget, a cancellation, or a
+  `stop_when` match. A stop taken *during a backoff* (no child alive right now)
+  cuts the sleep short and ends at once, launching no further incarnation.
+- **`wait()`** — await the final `SupervisionOutcome`, exactly what `run()`
+  would have returned.
+
+```rust,no_run
+use processkit::{Command, RestartPolicy, Supervisor};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let session = Supervisor::new(Command::new("my-server"))
+        .restart(RestartPolicy::Always)
+        .start(); // supervision runs in the background from here
+
+    // ... elsewhere: observe it live ...
+    let status = session.status();
+    println!("active={}, restarts={}", status.is_active(), status.restarts());
+
+    // ... on shutdown: stop gracefully and read the final outcome ...
+    let outcome = session.stop(Duration::from_secs(5)).await?;
+    println!("stopped: {:?}", outcome.stopped); // StopReason::Stopped
+    Ok(())
+}
+```
+
+The live status is an **addition** to the exit-driven policy and callbacks, not
+a replacement — supervision behaves identically to `run()` (which is itself a
+thin wrapper over `start()` + `wait()`). Only a session `stop()` produces
+`StopReason::Stopped`; `run()` never does.
+
+Two handle contracts round it out: **dropping** a `SupervisionSession` without
+`wait()`/`stop()` aborts the background task (no orphaned supervision task, and
+under the default `JobRunner` the in-flight incarnation is killed on drop), and
+`start()` needs a `'static` runner because supervision moves onto a spawned task
+— the borrowed shared-group form (`with_runner(&group)`) is available through
+`run()`; own the group (by value, or an `Arc<ProcessGroup>`) to drive a shared
+group from a session.
 
 ## Supervising inside a shared group
 
