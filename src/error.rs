@@ -201,9 +201,11 @@ pub enum Error {
 
     /// A readiness probe ([`RunningProcess::wait_for_line`],
     /// [`wait_for_port`](crate::RunningProcess::wait_for_port),
+    /// [`wait_for_socket`](crate::RunningProcess::wait_for_socket),
     /// [`wait_for`](crate::RunningProcess::wait_for)) did not pass within its
-    /// deadline — the line never appeared, the port never accepted, the check
-    /// never returned `true`, or the child exited before becoming ready.
+    /// deadline — the line never appeared, the port or Unix socket never
+    /// accepted, the check never returned `true`, or the child exited before
+    /// becoming ready.
     ///
     /// Distinct from [`Timeout`](Error::Timeout): a probe deadline is separate
     /// from the run's own [`Command::timeout`](crate::Command::timeout), and a

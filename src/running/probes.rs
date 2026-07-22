@@ -1,10 +1,12 @@
-//! Readiness probes: `wait_for_line` / `wait_for` / `wait_for_port` and their
-//! shared polling loop. All three background-drain stdout/stderr while they
+//! Readiness probes: `wait_for_line` / `wait_for` / `wait_for_port` /
+//! `wait_for_socket` and their
+//! shared polling loop. All four background-drain stdout/stderr while they
 //! poll, so a chatty child can't stall in `write()` on a full OS pipe buffer;
 //! only `wait_for_line` hands any of the drained stdout back to the caller.
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::Duration;
 
 // `tokio::time::Instant` (not `std::time::Instant`) for the poll deadlines
@@ -17,17 +19,20 @@ use tokio::time::Instant;
 
 use tokio::net::TcpStream;
 
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
 use crate::error::{Error, Result};
 
 use super::RunningProcess;
 
-/// How often [`RunningProcess::wait_for`] / [`wait_for_port`]
-/// (RunningProcess::wait_for_port) re-check readiness — responsive without
+/// How often [`RunningProcess::wait_for`] / [`wait_for_port`] /
+/// [`wait_for_socket`] re-check readiness — responsive without
 /// busy-spinning; matches the 50 ms liveness-poll cadence used elsewhere.
 const READINESS_POLL: Duration = Duration::from_millis(50);
 
-/// Cap on a single `wait_for_port` connect attempt (clamped to the remaining
-/// budget), so one stalled connect can't overrun the probe deadline.
+/// Cap on a single TCP or Unix-socket connect attempt (clamped to the
+/// remaining budget), so one stalled connect can't overrun the probe deadline.
 const CONNECT_ATTEMPT_CAP: Duration = Duration::from_secs(1);
 
 impl RunningProcess {
@@ -185,6 +190,67 @@ impl RunningProcess {
         .await
     }
 
+    /// Wait until a Unix domain socket at `path` accepts a connection, or fail
+    /// with [`Error::NotReady`] when `within` elapses — or immediately when the
+    /// child exits first. The successful connection is dropped immediately;
+    /// merely finding a socket file is not enough, so an orphaned socket from a
+    /// dead server does not count as ready.
+    ///
+    /// One connect attempt per ~50 ms tick (each attempt itself bounded so a
+    /// stalled connect cannot overrun the deadline). Piped stdout/stderr are
+    /// background-drained and retained under the caller's
+    /// [`OutputBufferPolicy`](crate::OutputBufferPolicy), like
+    /// [`wait_for_port`](Self::wait_for_port). Unix domain sockets are available
+    /// only on platforms with AF_UNIX; other targets return
+    /// [`Error::Unsupported`] immediately.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotReady`] when `within` elapses before a connection to `path` is
+    /// accepted, or immediately when the child exits first. This is a *probe*
+    /// deadline — distinct from [`Error::Timeout`]: a failed probe does not kill
+    /// the child or touch its outcome. [`Error::Unsupported`] is returned on
+    /// platforms without AF_UNIX support.
+    pub async fn wait_for_socket(
+        &mut self,
+        path: impl AsRef<Path>,
+        within: Duration,
+    ) -> Result<()> {
+        #[cfg(not(unix))]
+        {
+            let _ = (path, within);
+            Err(Error::Unsupported {
+                operation: "wait_for_socket".into(),
+            })
+        }
+
+        #[cfg(unix)]
+        {
+            let path = path.as_ref().to_owned();
+            // Clamp so a `Duration::MAX`-ish `within` can't overflow the deadline.
+            let deadline = Instant::now() + within.min(crate::MAX_DEADLINE);
+            self.poll_until(
+                move || {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let path = path.clone();
+                    async move {
+                        // Clamp the attempt to the remaining budget; floor at 1ms so
+                        // the final tick still makes a (brief) attempt.
+                        let cap = CONNECT_ATTEMPT_CAP
+                            .min(remaining)
+                            .max(Duration::from_millis(1));
+                        matches!(
+                            tokio::time::timeout(cap, UnixStream::connect(path)).await,
+                            Ok(Ok(_))
+                        )
+                    }
+                },
+                within,
+            )
+            .await
+        }
+    }
+
     /// Re-run `check` on the readiness cadence until it passes, the child
     /// exits, or the deadline elapses.
     async fn poll_until<F, Fut>(&mut self, mut check: F, within: Duration) -> Result<()>
@@ -253,6 +319,7 @@ fn probe_futures_are_send(rp: &mut RunningProcess) {
     assert_send(&rp.wait_for(|| async { true }, Duration::ZERO));
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
     assert_send(&rp.wait_for_port(addr, Duration::ZERO));
+    assert_send(&rp.wait_for_socket("socket", Duration::ZERO));
 }
 
 #[cfg(test)]
@@ -261,6 +328,7 @@ mod tests {
 
     use crate::command::Command;
     use crate::doubles::{Reply, ScriptedRunner};
+    use crate::error::Error;
     use crate::runner::ProcessRunner;
 
     /// T-134: a readiness probe must background-drain piped stderr even when
@@ -326,6 +394,111 @@ mod tests {
         assert!(
             run.stderr_sink.is_some(),
             "wait_for_port must background-drain piped stderr even with a non-piped stdout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_for_socket_succeeds_when_a_listener_accepts() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("ready.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind Unix listener");
+        let server = tokio::spawn(async move {
+            let (_stream, _address) = listener.accept().await.expect("accept probe connection");
+        });
+
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::pending().with_stderr("socket server\n"))
+            .start(&Command::new("tool").stdout(crate::StdioMode::Null))
+            .await
+            .expect("scripted start");
+
+        run.wait_for_socket(&path, Duration::from_secs(1))
+            .await
+            .expect("the listening Unix socket is ready");
+        assert!(
+            run.stderr_sink.is_some(),
+            "wait_for_socket must background-drain piped stderr"
+        );
+        server.await.expect("listener task");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_socket_returns_not_ready_when_timeout_expires() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("missing.sock");
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::pending())
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+
+        let error = run
+            .wait_for_socket(&path, Duration::from_millis(150))
+            .await
+            .expect_err("a missing listener must time out");
+        assert!(matches!(error, Error::NotReady { .. }), "got {error:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_socket_fails_fast_when_child_is_already_dead() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("missing.sock");
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok(""))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+
+        let error = run
+            .wait_for_socket(&path, Duration::from_secs(30))
+            .await
+            .expect_err("an exited child cannot become ready");
+        assert!(matches!(error, Error::NotReady { .. }), "got {error:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_socket_does_not_accept_an_orphaned_socket_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("orphan.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind Unix listener");
+        drop(listener);
+        assert!(
+            path.exists(),
+            "dropping a Unix listener leaves its socket file"
+        );
+
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::pending())
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+        let error = run
+            .wait_for_socket(&path, Duration::from_millis(150))
+            .await
+            .expect_err("an orphaned socket file has no accepting listener");
+        assert!(matches!(error, Error::NotReady { .. }), "got {error:?}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn wait_for_socket_is_unsupported_on_windows() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::pending())
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+
+        let error = run
+            .wait_for_socket("socket", Duration::from_secs(30))
+            .await
+            .expect_err("Windows has no AF_UNIX readiness probe");
+        assert!(
+            matches!(error, Error::Unsupported { ref operation } if operation == "wait_for_socket"),
+            "got {error:?}"
         );
     }
 
