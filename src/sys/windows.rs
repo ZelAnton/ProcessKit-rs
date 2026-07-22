@@ -294,7 +294,15 @@ impl Job {
             // `retain` walk (and its `IsProcessInJob` syscalls) to every
             // teardown's hot path, on top of `signal_all`'s own per-leader check.
             leaders.retain(|&leader| process_is_in_job(leader, self.handle));
-            leaders.push(pid);
+            // Dedup guard (T-154 R-3): `pid` is the child JUST assigned to this
+            // job above, so if the OS recycled a stale leader's freed pid for
+            // this very child, `retain` above already sees that stale entry as
+            // "live" (it now IS this child) and keeps it — pushing unconditionally
+            // would then record the same pid twice. Skip the push in that case;
+            // the retained entry already correctly identifies this child.
+            if !leaders.contains(&pid) {
+                leaders.push(pid);
+            }
         }
         Ok(guard.disarm())
     }
