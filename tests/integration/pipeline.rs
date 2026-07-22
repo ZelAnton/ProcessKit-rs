@@ -742,7 +742,7 @@ async fn read_recorded_pid(pidfile: &std::path::Path) -> u32 {
         {
             return pid;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!(
         "the idle producer never recorded its PID to {}",
@@ -802,19 +802,19 @@ async fn pipeline_start_streams_last_stage_lines() {
 }
 
 // Unix-only: a live-chain readiness banner must flush *promptly* out of the last
-// stage, which needs a line-buffered passthrough (`grep --line-buffered`). Windows
-// `findstr`/`more` block-buffer a piped stdout, so the single "ready" line would
-// sit unflushed — the same platform buffering the forking-stage tests dodge by
-// staying Unix-only. The `wait_for_line` delegation itself is platform-agnostic and
-// is covered cross-platform by the single-process readiness suite.
+// stage, which needs a passthrough (`cat`). Windows `findstr`/`more` block-buffer a
+// piped stdout, so the single "ready" line would sit unflushed — the same platform
+// buffering the forking-stage tests dodge by staying Unix-only. The `wait_for_line`
+// delegation itself is platform-agnostic and is covered cross-platform by the
+// single-process readiness suite.
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "spawns a real live chain and waits for a readiness banner on its last stage"]
 async fn pipeline_start_wait_for_line_on_a_live_chain() {
-    // The producer prints `ready` after ~0.5s then idles ~30s; a line-buffered
-    // filter passes that line through as the *last* stage's stdout, so
+    // The producer prints `ready` after ~0.5s then idles ~30s; a passthrough
+    // stage passes that line through as the *last* stage's stdout, so
     // `wait_for_line` on the session sees it without tearing the chain down.
-    let filter = Command::new("grep").args(["--line-buffered", "ready"]);
+    let filter = Command::new("cat");
 
     let mut session = banner_then_idle()
         .pipe(filter)
