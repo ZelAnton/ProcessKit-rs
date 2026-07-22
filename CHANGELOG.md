@@ -12,7 +12,7 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- Add "Running untrusted children" hardening guide (`docs/untrusted-children.md`)
 
 ### Changed
 -

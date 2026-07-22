@@ -262,8 +262,15 @@ init on bare metal or a VM, not a container. `mechanism()`/kill-on-drop
 containment keep working either way; only the `limits` cap itself is
 unavailable.
 
+Running something you don't trust inside that container? See [Running
+untrusted children](untrusted-children.md) for the full hardening checklist —
+containment, resource limits, privilege drop, env hygiene, output/wall-time
+bounds — with the platform caveats from this page and
+[Platform support](platform-support.md) folded in.
+
 ---
 
 Next: [Platform support](platform-support.md) ·
+[Running untrusted children](untrusted-children.md) ·
 [Process groups](process-groups.md) ·
 [docs index](README.md)

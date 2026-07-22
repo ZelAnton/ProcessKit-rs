@@ -32,5 +32,6 @@
 - [Testing your code](testing.md)
 - [Platform support](platform-support.md)
 - [Running in containers](containers.md)
+- [Running untrusted children](untrusted-children.md)
 - [Upgrading](upgrading.md)
 - [What's next](whats-next.md)

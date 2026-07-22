@@ -264,8 +264,13 @@ alive (keep `wait()`ing handles if you need prompt liveness, e.g. for
 best-effort against pid reuse — the crate prunes dead entries on every probe
 to keep the window minimal.
 
+Launching a program you don't trust? [Running untrusted children](untrusted-children.md)
+assembles the containment/limits/privilege-drop caveats above into a
+threat-aware checklist.
+
 ---
 
 Next: [Process groups](process-groups.md) ·
 [Running in containers](containers.md) ·
+[Running untrusted children](untrusted-children.md) ·
 [docs index](README.md)

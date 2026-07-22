@@ -23,6 +23,13 @@ paths can have safety or isolation consequences (a leaked subprocess, an incompl
 privilege drop, a containment escape), so they are treated as security issues, not
 just functional ones.
 
+If you're launching a program you don't trust, read
+[Running untrusted children](docs/untrusted-children.md) first: it lays out what
+this crate does and does not guarantee (it hardens process management, it is
+**not** a sandbox — seccomp/AppContainer/namespaces/a real OS container remain
+the caller's job) and the concrete checklist for containment, resource limits,
+privilege drop, and environment hygiene.
+
 ## Supported versions
 
 Security fixes land on the **latest published version** on
