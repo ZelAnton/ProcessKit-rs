@@ -520,6 +520,7 @@ pub processkit::StopReason::GaveUp
 pub processkit::StopReason::PolicySatisfied
 pub processkit::StopReason::Predicate
 pub processkit::StopReason::RestartsExhausted
+pub processkit::StopReason::Stopped
 pub processkit::StopReason::Unhealthy
 impl core::clone::Clone for processkit::StopReason
 pub fn processkit::StopReason::clone(&self) -> processkit::StopReason
@@ -832,6 +833,7 @@ pub fn processkit::ProcessGroup::signal(&self, processkit::Signal) -> processkit
 pub fn processkit::ProcessGroup::spawn(&self, tokio::process::Command) -> processkit::Result<tokio::process::Child>
 pub fn processkit::ProcessGroup::stats(&self) -> processkit::Result<processkit::ProcessGroupStats>
 pub fn processkit::ProcessGroup::suspend(&self) -> processkit::Result<()>
+pub fn processkit::ProcessGroup::update_limits(&mut self, processkit::ResourceLimits) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::with_options(processkit::ProcessGroupOptions) -> processkit::Result<Self>
 impl processkit::ProcessGroup
 pub async fn processkit::ProcessGroup::start(&self, &processkit::Command) -> processkit::Result<processkit::RunningProcess>
@@ -1044,6 +1046,7 @@ impl processkit::RunningProcess
 pub async fn processkit::RunningProcess::wait_for<F, Fut>(&mut self, F, core::time::Duration) -> processkit::Result<()> where F: core::ops::function::FnMut() -> Fut + core::marker::Send, Fut: core::future::future::Future<Output = bool> + core::marker::Send
 pub async fn processkit::RunningProcess::wait_for_line(&mut self, impl core::ops::function::Fn(&str) -> bool + core::marker::Send, core::time::Duration) -> processkit::Result<alloc::string::String>
 pub async fn processkit::RunningProcess::wait_for_port(&mut self, core::net::socket_addr::SocketAddr, core::time::Duration) -> processkit::Result<()>
+pub async fn processkit::RunningProcess::wait_for_socket(&mut self, impl core::convert::AsRef<std::path::Path>, core::time::Duration) -> processkit::Result<()>
 impl core::fmt::Debug for processkit::RunningProcess
 pub fn processkit::RunningProcess::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::ops::drop::Drop for processkit::RunningProcess
@@ -1122,9 +1125,45 @@ impl core::marker::Unpin for processkit::SupervisionOutcome
 impl core::marker::UnsafeUnpin for processkit::SupervisionOutcome
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::SupervisionOutcome
 impl core::panic::unwind_safe::UnwindSafe for processkit::SupervisionOutcome
+pub struct processkit::SupervisionSession
+impl processkit::SupervisionSession
+pub fn processkit::SupervisionSession::status(&self) -> processkit::SupervisionStatus
+pub async fn processkit::SupervisionSession::stop(self, core::time::Duration) -> processkit::Result<processkit::SupervisionOutcome>
+pub async fn processkit::SupervisionSession::wait(self) -> processkit::Result<processkit::SupervisionOutcome>
+impl core::fmt::Debug for processkit::SupervisionSession
+pub fn processkit::SupervisionSession::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::drop::Drop for processkit::SupervisionSession
+pub fn processkit::SupervisionSession::drop(&mut self)
+impl core::marker::Freeze for processkit::SupervisionSession
+impl core::marker::Send for processkit::SupervisionSession
+impl core::marker::Sync for processkit::SupervisionSession
+impl core::marker::Unpin for processkit::SupervisionSession
+impl core::marker::UnsafeUnpin for processkit::SupervisionSession
+impl !core::panic::unwind_safe::RefUnwindSafe for processkit::SupervisionSession
+impl !core::panic::unwind_safe::UnwindSafe for processkit::SupervisionSession
+#[non_exhaustive] pub struct processkit::SupervisionStatus
+impl processkit::SupervisionStatus
+pub fn processkit::SupervisionStatus::is_active(&self) -> bool
+pub fn processkit::SupervisionStatus::is_storm_paused(&self) -> bool
+pub fn processkit::SupervisionStatus::pid(&self) -> core::option::Option<u32>
+pub fn processkit::SupervisionStatus::restarts(&self) -> u32
+pub fn processkit::SupervisionStatus::started_at(&self) -> core::option::Option<std::time::SystemTime>
+impl core::clone::Clone for processkit::SupervisionStatus
+pub fn processkit::SupervisionStatus::clone(&self) -> processkit::SupervisionStatus
+impl core::fmt::Debug for processkit::SupervisionStatus
+pub fn processkit::SupervisionStatus::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for processkit::SupervisionStatus
+impl core::marker::Send for processkit::SupervisionStatus
+impl core::marker::Sync for processkit::SupervisionStatus
+impl core::marker::Unpin for processkit::SupervisionStatus
+impl core::marker::UnsafeUnpin for processkit::SupervisionStatus
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::SupervisionStatus
+impl core::panic::unwind_safe::UnwindSafe for processkit::SupervisionStatus
 pub struct processkit::Supervisor<R: processkit::ProcessRunner>
 impl processkit::Supervisor<processkit::JobRunner>
 pub fn processkit::Supervisor<processkit::JobRunner>::new(processkit::Command) -> Self
+impl<R: processkit::ProcessRunner + 'static> processkit::Supervisor<R>
+pub fn processkit::Supervisor<R>::start(self) -> processkit::SupervisionSession
 impl<R: processkit::ProcessRunner> processkit::Supervisor<R>
 pub fn processkit::Supervisor<R>::backoff(self, core::time::Duration, f64) -> Self
 pub fn processkit::Supervisor<R>::capture(self, processkit::OutputBufferPolicy) -> Self

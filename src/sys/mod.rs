@@ -219,6 +219,18 @@ impl Job {
         imp::Job::new().map(Job)
     }
 
+    /// Replace the live job's resource limits — a **full replacement**, so an axis
+    /// left `None` becomes unbounded again. Fails like [`new`](Self::new)'s limit
+    /// application: `ErrorKind::Unsupported` when the mechanism has no whole-tree
+    /// accounting at all (the POSIX process-group fallback), otherwise a
+    /// mechanism-specific failure to apply the request (a Linux cgroup whose
+    /// controllers can't be enabled, a Windows Job Object call rejected). Applies
+    /// to the same live handle/cgroup the tree-control verbs use.
+    #[cfg(feature = "limits")]
+    pub(crate) fn update_limits(&self, limits: &ResourceLimits) -> io::Result<()> {
+        self.0.update_limits(limits)
+    }
+
     /// Spawn `cmd` as a member of this job, honoring the per-spawn `opts`.
     ///
     /// The child — and any process it later spawns — belongs to the job and is

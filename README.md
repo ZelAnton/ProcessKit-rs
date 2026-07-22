@@ -164,6 +164,7 @@ end to end:
 | [Supervision](docs/supervision.md) | Restart policies, backoff & jitter, stop conditions, outcomes |
 | [Testing your code](docs/testing.md) | The `ProcessRunner` seam, scripted/recording/mock doubles, cassettes, `CliClient` |
 | [Platform support](docs/platform-support.md) | Mechanisms, all capability matrices, every caveat |
+| [Running untrusted children](docs/untrusted-children.md) | Hardening checklist for launching an untrusted program: containment, resource limits, privilege drop, env hygiene, output/wall-time bounds |
 | [Upgrading](docs/upgrading.md) | Per-version consumer upgrade notes — what changed on each release and how to migrate across a major bump |
 
 API reference: [docs.rs/processkit](https://docs.rs/processkit).

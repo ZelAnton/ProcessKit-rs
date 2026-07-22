@@ -119,6 +119,11 @@ mod guides {
     #[doc(hidden)]
     #[doc = include_str!("../docs/python-wrapper.md")]
     mod docs_python_wrapper {}
+
+    /// `docs/untrusted-children.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/untrusted-children.md")]
+    mod docs_untrusted_children {}
 }
 
 #[cfg(test)]

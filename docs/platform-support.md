@@ -153,6 +153,17 @@ than swallowing it — consistent with the "never silently skipped" philosophy; 
 | `max_processes` | ✅ | ✅ | ❌ | ❌ |
 | `cpu_quota` | 🟡 approximate | ✅ | ❌ | ❌ |
 
+**Readiness probes**
+
+| Capability | Windows | Unix |
+|---|---|---|
+| `wait_for_line`, `wait_for_port`, `wait_for` | ✅ | ✅ |
+| `wait_for_socket` (AF_UNIX) | ❌ `Unsupported` | ✅ |
+
+`wait_for_socket` attempts a real Unix domain socket connection, so an orphaned
+socket file does not count as ready. On Windows and any target without AF_UNIX,
+it returns `Error::Unsupported` immediately.
+
 **Spawn-time controls**
 
 | Capability | Windows | Unix (all) |
@@ -167,9 +178,9 @@ than swallowing it — consistent with the "never silently skipped" philosophy; 
 | `umask` | ❌ `Unsupported` | ✅ |
 
 Everything not listed — capture, streaming, interactive stdin, encodings,
-buffer policies, timeouts, retry, pipelines, supervision, readiness probes,
-the test doubles, cassettes, cancellation — is **platform-agnostic** and
-behaves identically everywhere.
+buffer policies, timeouts, retry, pipelines, supervision, the non-socket
+readiness probes, the test doubles, cassettes, cancellation — is
+**platform-agnostic** and behaves identically everywhere.
 
 ## Caveats
 
@@ -264,8 +275,13 @@ alive (keep `wait()`ing handles if you need prompt liveness, e.g. for
 best-effort against pid reuse — the crate prunes dead entries on every probe
 to keep the window minimal.
 
+Launching a program you don't trust? [Running untrusted children](untrusted-children.md)
+assembles the containment/limits/privilege-drop caveats above into a
+threat-aware checklist.
+
 ---
 
 Next: [Process groups](process-groups.md) ·
 [Running in containers](containers.md) ·
+[Running untrusted children](untrusted-children.md) ·
 [docs index](README.md)

@@ -226,6 +226,33 @@ impl Job {
         }
     }
 
+    /// Replace the live limits on the already-created container (full replacement).
+    ///
+    /// The cgroup arm rewrites the `*.max` files in the existing cgroup dir. The
+    /// process-group fallback has no whole-tree resource accounting, so a request
+    /// carrying any cap is refused with `ErrorKind::Unsupported` — the same typed
+    /// refusal creation gives (`Job::new` propagates the cgroup-create error, which
+    /// is `Unsupported` when there is no cgroup mechanism, when `limits.any()`).
+    /// An empty set (all `None`) is a trivially-satisfiable no-op there: the tree is
+    /// already unbounded on the fallback, so "remove all limits" needs nothing done.
+    #[cfg(feature = "limits")]
+    pub(crate) fn update_limits(&self, limits: &ResourceLimits) -> io::Result<()> {
+        match &self.backend {
+            Backend::Cgroup(cg) => cg.update_limits(limits),
+            Backend::ProcessGroup(_) => {
+                if limits.any() {
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "resource limits require a cgroup or Job Object; this group fell back to \
+                         a POSIX process group, which has no whole-tree resource accounting",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "process-control")]
     pub(crate) fn signal(&self, sig: Signal) -> io::Result<()> {
         match &self.backend {
@@ -563,18 +590,74 @@ impl Cgroup {
     /// from under unrelated trees. Enabled-but-unused controllers cost nothing.
     #[cfg(feature = "limits")]
     fn apply_limits(&self, parent: &Path, limits: &ResourceLimits) -> io::Result<()> {
-        // The controllers each requested limit needs.
-        let mut needed: Vec<&str> = Vec::new();
-        if limits.max_memory.is_some() {
-            needed.push("memory");
+        // Enable the controllers each requested limit needs (the "no internal
+        // processes" gate — fails fast off the real hierarchy root), then write the
+        // requested caps. At creation the limit files default to `max`, so only the
+        // Some axes are written; the None-axis reset lives in `update_limits`.
+        self.enable_controllers(parent, &needed_controllers(limits))?;
+        if let Some(bytes) = limits.max_memory {
+            std::fs::write(self.path.join("memory.max"), bytes.to_string())?;
         }
-        if limits.max_processes.is_some() {
-            needed.push("pids");
+        if let Some(n) = limits.max_processes {
+            std::fs::write(self.path.join("pids.max"), n.to_string())?;
         }
-        if limits.cpu_quota.is_some() {
-            needed.push("cpu");
+        if let Some(cores) = limits.cpu_quota {
+            std::fs::write(self.path.join("cpu.max"), cpu_max_value(cores))?;
         }
+        Ok(())
+    }
 
+    /// Apply a fresh [`ResourceLimits`] set to this **already-created** cgroup — the
+    /// backend for [`ProcessGroup::update_limits`](crate::ProcessGroup::update_limits).
+    ///
+    /// A **full replacement** of the live caps: each of `memory.max` / `pids.max` /
+    /// `cpu.max` is overwritten with the new value, and an axis left `None` is
+    /// written back to `max` (unbounded) — but only when its interface file exists.
+    /// A controller that was never enabled has no file and is already unbounded, so
+    /// there is nothing to reset; a newly-requested axis whose controller isn't yet
+    /// enabled enables it here first (and, off the real hierarchy root, fails fast
+    /// with the same honest error `apply_limits` raises at creation).
+    ///
+    /// `parent` is derived from this cgroup's own path — the dir it was created
+    /// under, i.e. this process's own cgroup — the same `parent` `create` computed,
+    /// so no `/proc/self/cgroup` re-derivation is needed and the write targets the
+    /// live cgroup rather than re-resolving a possibly-stale one.
+    #[cfg(feature = "limits")]
+    fn update_limits(&self, limits: &ResourceLimits) -> io::Result<()> {
+        let parent = self.path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "cgroup directory has no parent — cannot resolve subtree_control",
+            )
+        })?;
+        // Enable controllers for the newly-requested (Some) axes not already
+        // enabled — the same off-root fail-fast gate as creation. A None axis needs
+        // no controller (it is being cleared, not enforced).
+        self.enable_controllers(parent, &needed_controllers(limits))?;
+        // Full replacement: set each axis, or reset a removed one to `max`.
+        write_limit_reset(
+            &self.path.join("memory.max"),
+            limits.max_memory.map(|b| b.to_string()),
+        )?;
+        write_limit_reset(
+            &self.path.join("pids.max"),
+            limits.max_processes.map(|n| n.to_string()),
+        )?;
+        write_limit_reset(
+            &self.path.join("cpu.max"),
+            limits.cpu_quota.map(cpu_max_value),
+        )?;
+        Ok(())
+    }
+
+    /// Enable each controller in `needed` that is not already present in `parent`'s
+    /// `cgroup.subtree_control`, making the matching limit interface files
+    /// (`memory.max`, …) appear in this child cgroup. Shared by
+    /// [`apply_limits`](Self::apply_limits) (creation) and
+    /// [`update_limits`](Self::update_limits) (live update) so the "no internal
+    /// processes" gate and its honest off-root error stay identical on both paths.
+    #[cfg(feature = "limits")]
+    fn enable_controllers(&self, parent: &Path, needed: &[&str]) -> io::Result<()> {
         // Enable only the controllers not ALREADY in the parent's
         // `subtree_control`. When they are present (the parent is the *real*
         // cgroup-v2 hierarchy root — the one cgroup that may carry controllers
@@ -591,7 +674,7 @@ impl Cgroup {
         // loudly with an honest error.
         let enabled =
             std::fs::read_to_string(parent.join("cgroup.subtree_control")).unwrap_or_default();
-        let to_enable = controllers_to_enable(&needed, &enabled);
+        let to_enable = controllers_to_enable(needed, &enabled);
         if !to_enable.is_empty() {
             let spec = to_enable
                 .iter()
@@ -618,16 +701,6 @@ impl Cgroup {
                     ),
                 )
             })?;
-        }
-
-        if let Some(bytes) = limits.max_memory {
-            std::fs::write(self.path.join("memory.max"), bytes.to_string())?;
-        }
-        if let Some(n) = limits.max_processes {
-            std::fs::write(self.path.join("pids.max"), n.to_string())?;
-        }
-        if let Some(cores) = limits.cpu_quota {
-            std::fs::write(self.path.join("cpu.max"), cpu_max_value(cores))?;
         }
         Ok(())
     }
@@ -1394,6 +1467,40 @@ fn cpu_max_value(cores: f64) -> String {
     const PERIOD: u64 = 100_000;
     let quota = (cores * PERIOD as f64).round().max(1.0) as u64;
     format!("{quota} {PERIOD}")
+}
+
+/// The cgroup v2 controllers a limit set needs enabled — one per **requested**
+/// (`Some`) axis, in `memory` / `pids` / `cpu` order. A `None` axis needs no
+/// controller (it carries no cap to enforce). Shared by the creation
+/// (`apply_limits`) and live-update (`update_limits`) paths so both gate on the
+/// same controller set.
+#[cfg(feature = "limits")]
+fn needed_controllers(limits: &ResourceLimits) -> Vec<&'static str> {
+    let mut needed: Vec<&'static str> = Vec::new();
+    if limits.max_memory.is_some() {
+        needed.push("memory");
+    }
+    if limits.max_processes.is_some() {
+        needed.push("pids");
+    }
+    if limits.cpu_quota.is_some() {
+        needed.push("cpu");
+    }
+    needed
+}
+
+/// Write one cgroup limit interface file for the `update_limits` full replacement:
+/// `Some(v)` sets the axis to `v`; `None` resets it to `max` (unbounded) — but only
+/// when the file exists. A controller that was never enabled has no interface file
+/// and the axis is already unbounded, so a `None` reset there is a no-op success
+/// rather than a spurious `NotFound` write error.
+#[cfg(feature = "limits")]
+fn write_limit_reset(path: &Path, value: Option<String>) -> io::Result<()> {
+    match value {
+        Some(v) => std::fs::write(path, v),
+        None if path.exists() => std::fs::write(path, "max"),
+        None => Ok(()),
+    }
 }
 
 /// Arm `PR_SET_PDEATHSIG(SIGKILL)` so the kernel kills this child when the

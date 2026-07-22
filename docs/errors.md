@@ -175,8 +175,14 @@ completed-but-failing run. A recognized-permanent failure reports
 terminal here too — supervision returns `Err(Cancelled)` instead of
 restarting into a still-cancelled token, `give_up_when` or not.
 
+`Error::ResourceLimit` and `Error::Unsupported` specifically are how a
+sandboxing request fails loud instead of silently doing less than asked —
+see [Running untrusted children](untrusted-children.md) for the hardening
+checklist that relies on exactly that honesty.
+
 ---
 
 Next: [Running commands](commands.md) ·
 [Timeouts, retries & cancellation](timeouts-and-cancellation.md) ·
-[Supervision](supervision.md)
+[Supervision](supervision.md) ·
+[Running untrusted children](untrusted-children.md)

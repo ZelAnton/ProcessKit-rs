@@ -349,6 +349,7 @@ async fn main() -> processkit::Result<()> {
     // Pick the probe that matches how the server announces readiness:
     server.wait_for_line(|l| l.contains("listening"), Duration::from_secs(10)).await?;
     // server.wait_for_port("127.0.0.1:8080".parse().unwrap(), Duration::from_secs(10)).await?;
+    // server.wait_for_socket("/tmp/my-server.sock", Duration::from_secs(10)).await?; // Unix only
     // server.wait_for(|| async { http_health().await }, Duration::from_secs(10)).await?;
 
     // …use the server; dropping `server` kills its whole tree.
