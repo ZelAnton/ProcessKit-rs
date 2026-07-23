@@ -63,7 +63,7 @@ guarantee is unconditional in every configuration.
 | `process-control` | **on** | `Signal`, `ProcessGroup::{signal, suspend, resume, members, adopt}` | — |
 | `limits` | off | Whole-tree resource caps on `ProcessGroupOptions` (`max_memory` / `max_processes` / `cpu_quota`), `ErrorReason::ResourceLimit`; implies `stats` | — |
 | `mock` | off | A `mockall`-generated `MockRunner` for expectation-style tests (test-only; its `expect_*` surface is **semver-exempt**, tracking `mockall` — prefer `ScriptedRunner`/`RecordingRunner` for a stable double) | `mockall` |
-| `tracing` | off | Events on the `processkit` target: spawn/exit, timeout & cancel firing, group teardown, retries, supervisor storms, teardown anomalies (never argv/env) | `tracing` |
+| `tracing` | off | Events on the `processkit` target: spawn/exit, timeout & cancel firing, per-transition graceful teardown (`soft_signal` → `grace_started` → `drained`/`escalated`/`spared`), retries, supervisor storms, teardown anomalies (never argv/env) | `tracing` |
 | `record` | off | `RecordReplayRunner` JSON cassettes over the runner seam | `serde`, `serde_json` |
 
 ```toml

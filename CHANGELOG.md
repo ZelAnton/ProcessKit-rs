@@ -13,6 +13,23 @@ to a dated version section.
 
 ### Added
 
+- Narrate the **graceful-teardown transitions** on the `tracing` seam (feature
+  `tracing`): the shared teardown driver now emits a `debug` event per transition on
+  the `processkit` target — `soft_signal` (the SIGTERM / CTRL_BREAK was issued) →
+  `grace_started` (the grace window opened, with `grace_ms`) → one of `drained` (the
+  tree/child exited in time), `escalated` (the grace elapsed and the tree was
+  hard-killed), or `spared` (a non-escalating stop left survivors) — each in a stable
+  `phase` field, joining the existing spawn/exit events for one uniform, timestamped
+  lifecycle timeline. Emitted the same way for **every** graceful path
+  (`ProcessGroup::stop` / `shutdown` / `shutdown_ref`, a run-level
+  `Command::timeout_grace`, a `Supervisor`'s graceful stop, and the single-child
+  streaming teardown), so a consumer running its own end-of-run race can stamp each
+  transition the instant the layer that observed it crossed it — the **live**
+  counterpart of the after-the-fact facts on `ShutdownReport`. Observation only
+  (no way to influence the teardown), zero cost when the feature or a subscriber is
+  absent, and never carrying argv/env. No new public API (`public-api.txt`
+  unchanged); the typed, `select!`-able event *stream* stays deferred to the unified
+  output/lifecycle-stream design
 - Add `output_stream(commands, concurrency, runner)` / `output_stream_bytes(...)` — the
   **streaming** siblings of `output_all` / `output_all_bytes`. Same bounded fan-out, but
   each result is yielded the moment its command finishes (a `Stream` of `(input index,
