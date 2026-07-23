@@ -31,6 +31,11 @@ to a dated version section.
   `Command::kill_on_parent_death_scope()` reports, reused not recomputed; and
   `crate_version()`. The mechanism detection is lifted out of the group-creation path
   so the query and the real selection share one source of truth. Purely additive
+- Add `RunningProcess::stdout_bytes_seen()` and
+  `RunningProcess::stderr_bytes_seen()` live monotonic counters. They report
+  raw bytes read from each pipe before decoding, including bytes discarded by
+  buffer overflow or oversized-line handling, and report `0` for streams that
+  are not pumped.
 - Add `Command::stdout_raw_tee(writer)` / `stderr_raw_tee(writer)` — a
   **byte-accurate** tee that writes each chunk to `writer` *exactly as read from
   the child's pipe*, before any decoding or line splitting. Where
@@ -142,6 +147,34 @@ to a dated version section.
 
 ### Changed
 
+- `ErrorReason::OutputTooLarge.total_bytes` and the `OverflowMode::Error` plus
+  `max_bytes` ceiling now count raw bytes read from the output pipe, including
+  line terminators and invalid UTF-8 bytes, rather than decoded line-content
+  bytes
+- **Breaking:** `Error` is now a **pointer-sized wrapper** around a boxed
+  `ErrorReason` (`struct Error { .. }` holding a `Box<ErrorReason>`) instead of a
+  large enum, mirroring `std::io::Error` / `ErrorKind`. This shrinks `Error` from
+  100+ bytes to one pointer, so every `Result<T, Error>` on the run path — and any
+  enum that embeds one (e.g. a caller's `vcs_core::Error`) — stays small, and the
+  default `result_large_err` / `large_enum_variant` clippy lints no longer fire on
+  the crate's public path. The former enum, with **every variant and field
+  unchanged** (`Spawn`, `NotFound`, `CassetteMiss`, `Exit`, `Timeout`,
+  `OutputTooLarge`, `NotReady`, `Parse`, `ResourceLimit`, `Unsupported`,
+  `Cancelled`, `Signalled`, `Stdin`, `Io`), is now the re-exported `ErrorReason`,
+  reached via `err.reason() -> &ErrorReason` (or `err.into_reason() -> ErrorReason`
+  to take ownership). A `From<ErrorReason> for Error` is provided. All read
+  accessors (`code()`, `program()`, `stdout()`/`stderr()`/`stdout_bytes()`,
+  `diagnostic()`, `combined()`, `is_not_found()`/`is_timeout()`/`is_cancelled()`/
+  `is_signalled()`/`is_transient()`/`is_permission_denied()`, `signal()`,
+  `limit_kind()`/`limit_reason()`), `Display`, `Debug` (with its unchanged
+  200-byte stream previews, `PATH` redaction, and control-/bidi-sanitizing), and
+  `source()` work on `Error` directly as before — only a **direct variant match**
+  needs updating: `match err { Error::Exit { .. } => … }` becomes
+  `match err.reason() { ErrorReason::Exit { .. } => … }`. The `#[doc(hidden)]`
+  constructors (`Error::exit`/`timeout`/`signalled`/`spawn`/`not_found`/`stdin`)
+  and the public `Error::parse(..)` are unchanged and still return an `Error`. A
+  compile-time assertion pins `size_of::<Error>()` to a pointer. See
+  [Upgrading](docs/upgrading.md) (GitHub issue #21)
 - Release publishing now uses crates.io Trusted Publishing — a short-lived token
   minted over GitHub OIDC per run — instead of a stored long-lived
   `CRATES_IO_TOKEN` secret

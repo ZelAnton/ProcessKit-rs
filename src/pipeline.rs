@@ -185,7 +185,7 @@ impl Pipeline {
     /// Cancel the **whole chain** when `token` fires: the token reaches every
     /// stage (see gap-fill below), so each stage's run is cancelled and kills its
     /// own subtree, and the run resolves to
-    /// [`Error::Cancelled`](crate::Error::Cancelled). This is **proactive** —
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled). This is **proactive** —
     /// firing the token cancels the stages directly, it does not wait for them to
     /// notice a closed pipe.
     ///
@@ -321,10 +321,10 @@ impl Pipeline {
     /// # Errors
     ///
     /// A launch failure of any stage
-    /// ([`Error::NotFound`](crate::Error::NotFound) /
-    /// [`Error::Spawn`](crate::Error::Spawn) /
-    /// [`Error::Unsupported`](crate::Error::Unsupported)) or
-    /// [`Error::Stdin`](crate::Error::Stdin) at start-up — every already-started
+    /// ([`ErrorReason::NotFound`](crate::ErrorReason::NotFound) /
+    /// [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) /
+    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported)) or
+    /// [`ErrorReason::Stdin`](crate::ErrorReason::Stdin) at start-up — every already-started
     /// stage is torn down before the error returns. A failing *stage* is not raised
     /// here; it surfaces at [`finish`](PipelineSession::finish).
     pub async fn start(&self) -> Result<PipelineSession> {
@@ -442,13 +442,13 @@ impl Pipeline {
     /// A failing stage (and a timeout) is *captured* in the returned
     /// [`ProcessResult`] (pipefail attribution), not raised. `Err` means a stage
     /// could not be *started or driven*: a launch failure
-    /// ([`Error::NotFound`](crate::Error::NotFound) /
-    /// [`Error::Spawn`](crate::Error::Spawn) /
-    /// [`Error::Unsupported`](crate::Error::Unsupported)),
-    /// [`Error::Cancelled`](crate::Error::Cancelled),
-    /// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge) (a fail-loud
-    /// overflow of the last stage), [`Error::Stdin`](crate::Error::Stdin), or
-    /// [`Error::Io`](crate::Error::Io).
+    /// ([`ErrorReason::NotFound`](crate::ErrorReason::NotFound) /
+    /// [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) /
+    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported)),
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled),
+    /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) (a fail-loud
+    /// overflow of the last stage), [`ErrorReason::Stdin`](crate::ErrorReason::Stdin), or
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io).
     pub async fn output_string(&self) -> Result<ProcessResult<String>> {
         self.capture(|last| async move { last.output_string().await })
             .await
@@ -656,25 +656,25 @@ impl Pipeline {
 
     /// Run the chain, require **every** stage to exit cleanly, and return the
     /// last stage's trimmed stdout. A failure surfaces as the first failing
-    /// stage's [`Error::Exit`](crate::Error::Exit) (pipefail attribution;
+    /// stage's [`ErrorReason::Exit`](crate::ErrorReason::Exit) (pipefail attribution;
     /// [`unchecked_in_pipe`](Command::unchecked_in_pipe) stages are exempt, so a chain whose
     /// only failures are unchecked returns `Ok`).
-    /// [`Error::Timeout`](crate::Error::Timeout) is produced by the whole-chain
+    /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) is produced by the whole-chain
     /// [`timeout`](Self::timeout) or by **any** stage's own
     /// [`Command::timeout`] — the attributed stage's *own* deadline is reported,
     /// not the chain's.
     ///
     /// # Errors
     ///
-    /// The first failing stage's [`Error::Exit`](crate::Error::Exit) (pipefail
+    /// The first failing stage's [`ErrorReason::Exit`](crate::ErrorReason::Exit) (pipefail
     /// attribution; [`unchecked_in_pipe`](Command::unchecked_in_pipe) stages are
-    /// exempt), [`Error::Signalled`](crate::Error::Signalled),
-    /// [`Error::Timeout`](crate::Error::Timeout) (the whole-chain
+    /// exempt), [`ErrorReason::Signalled`](crate::ErrorReason::Signalled),
+    /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) (the whole-chain
     /// [`timeout`](Self::timeout) or any stage's own — the attributed stage's
-    /// deadline is reported), [`Error::Cancelled`](crate::Error::Cancelled),
-    /// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge) (a fail-loud
+    /// deadline is reported), [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled),
+    /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) (a fail-loud
     /// truncation of the last stage), plus any launch failure or
-    /// [`Error::Stdin`](crate::Error::Stdin).
+    /// [`ErrorReason::Stdin`](crate::ErrorReason::Stdin).
     pub async fn run(&self) -> Result<String> {
         let out = self.checked().await?;
         self.reject_if_last_truncated(&out)?;
@@ -690,11 +690,11 @@ impl Pipeline {
     /// # Errors
     ///
     /// The same pipefail surface as [`run`](Self::run) —
-    /// [`Error::Exit`](crate::Error::Exit) /
-    /// [`Error::Signalled`](crate::Error::Signalled) /
-    /// [`Error::Timeout`](crate::Error::Timeout) /
-    /// [`Error::Cancelled`](crate::Error::Cancelled), plus launch failures and
-    /// [`Error::Stdin`](crate::Error::Stdin) — but, as the lenient building block,
+    /// [`ErrorReason::Exit`](crate::ErrorReason::Exit) /
+    /// [`ErrorReason::Signalled`](crate::ErrorReason::Signalled) /
+    /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) /
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled), plus launch failures and
+    /// [`ErrorReason::Stdin`](crate::ErrorReason::Stdin) — but, as the lenient building block,
     /// it does not fail loud on a bounded-buffer truncation.
     pub async fn checked(&self) -> Result<ProcessResult<String>> {
         self.output_string().await?.ensure_success()
@@ -713,16 +713,16 @@ impl Pipeline {
 
     /// Run the chain and return the pipefail-attributed exit code. A chain that
     /// produced no code surfaces as an error — a whole-chain or stage timeout as
-    /// [`Error::Timeout`](crate::Error::Timeout), a signal-kill as
-    /// [`Error::Signalled`](crate::Error::Signalled) — mirroring
+    /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout), a signal-kill as
+    /// [`ErrorReason::Signalled`](crate::ErrorReason::Signalled) — mirroring
     /// [`Command::exit_code`](crate::Command::exit_code).
     ///
     /// # Errors
     ///
     /// A chain that produced no code errors as
-    /// [`Error::Timeout`](crate::Error::Timeout) (whole-chain or stage),
-    /// [`Error::Signalled`](crate::Error::Signalled), or
-    /// [`Error::Cancelled`](crate::Error::Cancelled), atop any launch failure. A
+    /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) (whole-chain or stage),
+    /// [`ErrorReason::Signalled`](crate::ErrorReason::Signalled), or
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled), atop any launch failure. A
     /// non-zero pipefail code is returned, not raised.
     pub async fn exit_code(&self) -> Result<i32> {
         self.output_string().await?.require_code()
@@ -730,9 +730,9 @@ impl Pipeline {
 
     /// Read the chain's pipefail-attributed exit code as a boolean: `0` →
     /// `Ok(true)`, `1` → `Ok(false)`, anything else → `Err` (other code as
-    /// [`Error::Exit`](crate::Error::Exit), a timeout as
-    /// [`Error::Timeout`](crate::Error::Timeout), a signal-kill as
-    /// [`Error::Signalled`](crate::Error::Signalled)). For a chain whose final
+    /// [`ErrorReason::Exit`](crate::ErrorReason::Exit), a timeout as
+    /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout), a signal-kill as
+    /// [`ErrorReason::Signalled`](crate::ErrorReason::Signalled)). For a chain whose final
     /// answer is a yes/no exit — `producer | grep -q pattern`. Mirrors
     /// [`Command::probe`](crate::Command::probe) and keeps its strict 0/1
     /// contract regardless of any stage's `ok_codes`.
@@ -746,10 +746,10 @@ impl Pipeline {
     /// # Errors
     ///
     /// A pipefail code other than `0`/`1` becomes
-    /// [`Error::Exit`](crate::Error::Exit); a chain with no code errors as
-    /// [`Error::Timeout`](crate::Error::Timeout),
-    /// [`Error::Signalled`](crate::Error::Signalled), or
-    /// [`Error::Cancelled`](crate::Error::Cancelled), atop any launch failure.
+    /// [`ErrorReason::Exit`](crate::ErrorReason::Exit); a chain with no code errors as
+    /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout),
+    /// [`ErrorReason::Signalled`](crate::ErrorReason::Signalled), or
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled), atop any launch failure.
     pub async fn probe(&self) -> Result<bool> {
         let result = self.output_string().await?;
         result.probe_bool()
@@ -766,12 +766,12 @@ impl Pipeline {
     /// # Errors
     ///
     /// The pipefail surface of [`run`](Self::run) (launch failures,
-    /// [`Error::Exit`](crate::Error::Exit) /
-    /// [`Error::Signalled`](crate::Error::Signalled) /
-    /// [`Error::Timeout`](crate::Error::Timeout) /
-    /// [`Error::Cancelled`](crate::Error::Cancelled) /
-    /// [`Error::Stdin`](crate::Error::Stdin)), plus
-    /// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge) when a fail-loud
+    /// [`ErrorReason::Exit`](crate::ErrorReason::Exit) /
+    /// [`ErrorReason::Signalled`](crate::ErrorReason::Signalled) /
+    /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) /
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) /
+    /// [`ErrorReason::Stdin`](crate::ErrorReason::Stdin)), plus
+    /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) when a fail-loud
     /// buffer truncated the last stage's stdout. The `parse` closure is
     /// infallible, so it adds no error.
     pub async fn parse<T, F>(&self, parse: F) -> Result<T>
@@ -785,7 +785,7 @@ impl Pipeline {
 
     /// Run the chain (requiring a clean pipefail outcome) and feed the last
     /// stage's stdout to a *fallible* `parse` closure (the JSON-deserialization
-    /// shape; a failure becomes [`Error::Parse`](crate::Error::Parse) or whatever
+    /// shape; a failure becomes [`ErrorReason::Parse`](crate::ErrorReason::Parse) or whatever
     /// the closure returns). Fails loud on truncation. Mirrors
     /// [`Command::try_parse`](crate::Command::try_parse).
     ///
@@ -793,7 +793,7 @@ impl Pipeline {
     ///
     /// Everything [`parse`](Self::parse) can return, plus whatever the fallible
     /// `parse` closure yields on malformed output — typically
-    /// [`Error::Parse`](crate::Error::Parse).
+    /// [`ErrorReason::Parse`](crate::ErrorReason::Parse).
     pub async fn try_parse<T, F>(&self, parse: F) -> Result<T>
     where
         F: FnOnce(&str) -> Result<T>,
@@ -900,7 +900,7 @@ impl PipelineSession {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`](crate::Error::Io) when the last stage's stdout was not piped,
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io) when the last stage's stdout was not piped,
     /// or a prior streaming verb ([`stdout_lines`](Self::stdout_lines) /
     /// [`output_events`](Self::output_events) / [`wait_for_line`](Self::wait_for_line))
     /// already consumed it — returned instead of a silently-empty stream.
@@ -917,14 +917,14 @@ impl PipelineSession {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`](crate::Error::Io) when the last stage's stdout was not piped,
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io) when the last stage's stdout was not piped,
     /// or a prior streaming verb already consumed it.
     pub fn output_events(&mut self) -> Result<OutputEvents> {
         self.last_mut().output_events()
     }
 
     /// Wait until a line on the **last** stage's stdout matches `predicate`
-    /// (returning that line), or fail with [`Error::NotReady`](crate::Error::NotReady)
+    /// (returning that line), or fail with [`ErrorReason::NotReady`](crate::ErrorReason::NotReady)
     /// when `within` elapses — the multi-stage analogue of
     /// [`RunningProcess::wait_for_line`](crate::RunningProcess::wait_for_line). Like
     /// there, a failed probe does **not** kill the chain and does not arm the
@@ -932,9 +932,9 @@ impl PipelineSession {
     ///
     /// # Errors
     ///
-    /// [`Error::NotReady`](crate::Error::NotReady) when `within` elapses with no
+    /// [`ErrorReason::NotReady`](crate::ErrorReason::NotReady) when `within` elapses with no
     /// matching line (or the last stage's stdout closes first), and
-    /// [`Error::Io`](crate::Error::Io) when that stdout was not piped or was already
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io) when that stdout was not piped or was already
     /// consumed — the same surface as the single-process probe.
     pub async fn wait_for_line(
         &mut self,
@@ -987,11 +987,11 @@ impl PipelineSession {
     /// A failing stage (and a chain timeout) is *captured* in the returned
     /// [`Finished`]'s [`outcome`](Finished::outcome), not raised. `Err` mirrors the
     /// buffering verbs' non-outcome failures:
-    /// [`Error::Cancelled`](crate::Error::Cancelled) (the chain-wide
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) (the chain-wide
     /// [`cancel_on`](Pipeline::cancel_on) token fired, or a stage carried one),
-    /// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge) (a fail-loud buffer
-    /// overflowed on a stage), [`Error::Stdin`](crate::Error::Stdin), or
-    /// [`Error::Io`](crate::Error::Io).
+    /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) (a fail-loud buffer
+    /// overflowed on a stage), [`ErrorReason::Stdin`](crate::ErrorReason::Stdin), or
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io).
     pub async fn finish(mut self) -> Result<Finished> {
         // The consume-once `take`s live in `take_live_parts` (this method takes
         // `self` by value, so they are always `Some` here), keeping the panic path
@@ -1344,7 +1344,7 @@ impl std::ops::BitOr<Command> for Pipeline {
 }
 
 fn join_error(err: tokio::task::JoinError) -> crate::Error {
-    crate::Error::Io(std::io::Error::other(format!(
+    crate::Error::io(std::io::Error::other(format!(
         "pipeline stage task failed: {err}"
     )))
 }
@@ -1352,9 +1352,9 @@ fn join_error(err: tokio::task::JoinError) -> crate::Error {
 /// Drain every task in `tasks` to completion in **true completion order**
 /// (`JoinSet::join_next`, not a left-to-right positional await), firing
 /// `teardown` the instant *any* task ends badly — a raw `Err` (a stage's own
-/// [`Error::Cancelled`](crate::Error::Cancelled) /
-/// [`Error::Stdin`](crate::Error::Stdin) / [`Error::Io`](crate::Error::Io) /
-/// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge)) or a task panic
+/// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) /
+/// [`ErrorReason::Stdin`](crate::ErrorReason::Stdin) / [`ErrorReason::Io`](crate::ErrorReason::Io) /
+/// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge)) or a task panic
 /// (surfaced here as a `JoinError`).
 ///
 /// This is `capture`'s liveness fix, factored out so it's testable without
@@ -1492,8 +1492,8 @@ mod tests {
             "stdout is what the chain produced — the last stage's"
         );
         assert!(!result.timed_out());
-        match result.ensure_success() {
-            Err(crate::Error::Exit {
+        match result.ensure_success().map_err(|e| e.into_reason()) {
+            Err(crate::ErrorReason::Exit {
                 program,
                 code,
                 stdout,
@@ -1505,7 +1505,7 @@ mod tests {
                 assert_eq!(stdout, "final");
                 assert_eq!(stderr, "b broke");
             }
-            other => panic!("expected Error::Exit, got {other:?}"),
+            other => panic!("expected ErrorReason::Exit, got {other:?}"),
         }
     }
 
@@ -1547,11 +1547,11 @@ mod tests {
         assert_eq!(result.program(), "a", "pipefail blames the FIRST failure");
         assert_eq!(result.code(), Some(1));
         assert_eq!(result.stderr(), "first");
-        match result.ensure_success() {
-            Err(crate::Error::Exit { program, .. }) => {
+        match result.ensure_success().map_err(|e| e.into_reason()) {
+            Err(crate::ErrorReason::Exit { program, .. }) => {
                 assert_eq!(program, "a", "...and so does the error surface");
             }
-            other => panic!("expected Error::Exit, got {other:?}"),
+            other => panic!("expected ErrorReason::Exit, got {other:?}"),
         }
     }
 
@@ -1696,8 +1696,8 @@ mod tests {
         let result = pf(vec![timed], last(Outcome::Exited(0), false), "out");
         assert_eq!(result.program(), "slow");
         assert!(result.timed_out());
-        match result.ensure_success() {
-            Err(crate::Error::Timeout {
+        match result.ensure_success().map_err(|e| e.into_reason()) {
+            Err(crate::ErrorReason::Timeout {
                 program, timeout, ..
             }) => {
                 assert_eq!(program, "slow");
@@ -1707,7 +1707,7 @@ mod tests {
                     "the stage's own deadline, not the chain's 0ns"
                 );
             }
-            other => panic!("expected Error::Timeout, got {other:?}"),
+            other => panic!("expected ErrorReason::Timeout, got {other:?}"),
         }
     }
 
@@ -1756,12 +1756,12 @@ mod tests {
             "the failure that triggered teardown wins, not a torn-down victim"
         );
         assert_eq!(result.code(), Some(3));
-        match result.ensure_success() {
-            Err(crate::Error::Exit { program, code, .. }) => {
+        match result.ensure_success().map_err(|e| e.into_reason()) {
+            Err(crate::ErrorReason::Exit { program, code, .. }) => {
                 assert_eq!(program, "downstream");
                 assert_eq!(code, 3);
             }
-            other => panic!("expected Error::Exit, got {other:?}"),
+            other => panic!("expected ErrorReason::Exit, got {other:?}"),
         }
     }
 
@@ -1833,14 +1833,14 @@ mod tests {
         assert_eq!(result.code(), None);
         assert_eq!(result.stderr(), "killed");
         assert!(!result.timed_out(), "a stage kill is not a chain timeout");
-        match result.ensure_success() {
-            Err(crate::Error::Signalled {
+        match result.ensure_success().map_err(|e| e.into_reason()) {
+            Err(crate::ErrorReason::Signalled {
                 program, signal, ..
             }) => {
                 assert_eq!(program, "a");
                 assert_eq!(signal, None);
             }
-            other => panic!("expected Error::Signalled, got {other:?}"),
+            other => panic!("expected ErrorReason::Signalled, got {other:?}"),
         }
     }
 
@@ -1878,7 +1878,7 @@ mod tests {
         // `Err` a checked-failure path never produces, so nothing but the
         // centralized `drain_unordered` firing `teardown` on its behalf can
         // wake the sibling above.
-        tasks.spawn(async { Err(crate::Error::Io(std::io::Error::other("downstream boom"))) });
+        tasks.spawn(async { Err(crate::Error::io(std::io::Error::other("downstream boom"))) });
 
         let drained =
             tokio::time::timeout(Duration::from_secs(5), drain_unordered(tasks, &teardown))
@@ -1888,8 +1888,8 @@ mod tests {
              once the sibling's raw error has fired teardown",
                 );
 
-        match drained {
-            Err(crate::Error::Io(err)) => {
+        match drained.map_err(|e| e.into_reason()) {
+            Err(crate::ErrorReason::Io(err)) => {
                 assert_eq!(err.to_string(), "downstream boom");
             }
             other => panic!("expected the downstream stage's own Io error, got {other:?}"),
@@ -1931,8 +1931,8 @@ mod tests {
              once the sibling's panic has fired teardown",
                 );
 
-        match drained {
-            Err(crate::Error::Io(err)) => {
+        match drained.map_err(|e| e.into_reason()) {
+            Err(crate::ErrorReason::Io(err)) => {
                 assert!(
                     err.to_string().contains("pipeline stage task failed"),
                     "expected the wrapped JoinError, got {err}"

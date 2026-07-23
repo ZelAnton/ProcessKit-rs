@@ -50,7 +50,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use processkit::{Command, Error, OutputBufferPolicy, ProcessGroup, RunningProcess};
+use processkit::{Command, Error, ErrorReason, OutputBufferPolicy, ProcessGroup, RunningProcess};
 
 use crate::common::*;
 
@@ -126,7 +126,7 @@ enum ChildClass {
 /// The consuming verb that ends a child's plan and reaps it. (Per-handle
 /// *graceful* stop — `RunningProcess::shutdown` — is deliberately absent: a
 /// `group.start()` child is a *shared-group* handle, for which that verb is
-/// documented to return `Error::Unsupported`; group-level graceful stop is
+/// documented to return `ErrorReason::Unsupported`; group-level graceful stop is
 /// exercised via [`GroupOp::ShutdownRef`] instead.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Terminal {
@@ -282,19 +282,19 @@ fn child_command(plan: &ChildPlan) -> Command {
 /// a legitimate outcome of a concurrent teardown and is allowed.
 fn is_impossible_error(e: &Error) -> bool {
     if matches!(
-        e,
-        Error::CassetteMiss { .. }
-            | Error::Parse { .. }
-            | Error::NotFound { .. }
-            | Error::Spawn { .. }
-            | Error::OutputTooLarge { .. }
+        e.reason(),
+        ErrorReason::CassetteMiss { .. }
+            | ErrorReason::Parse { .. }
+            | ErrorReason::NotFound { .. }
+            | ErrorReason::Spawn { .. }
+            | ErrorReason::OutputTooLarge { .. }
     ) {
         return true;
     }
     // `ResourceLimit` only exists (and can only fire) with the `limits` feature;
     // this harness sets no limits, so it too would be a defect.
     #[cfg(feature = "limits")]
-    if matches!(e, Error::ResourceLimit { .. }) {
+    if matches!(e.reason(), ErrorReason::ResourceLimit { .. }) {
         return true;
     }
     false

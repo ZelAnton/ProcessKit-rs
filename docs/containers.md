@@ -280,14 +280,14 @@ essentially never meets, privileged or not (see
 Confirmed by actually requesting a limit from inside a container:
 
 ```text
-plain docker run:       Error::ResourceLimit { kind: Memory, reason: Unenforceable,
+plain docker run:       ErrorReason::ResourceLimit { kind: Memory, reason: Unenforceable,
                            detail: "…Read-only file system…" }
-docker run --privileged: Error::ResourceLimit { kind: Memory, reason: Unenforceable,
+docker run --privileged: ErrorReason::ResourceLimit { kind: Memory, reason: Unenforceable,
                            detail: "…cgroup v2's 'no internal processes' rule…Resource busy…" }
 ```
 
 Both fail the *same* way the crate documents for any non-delegated host —
-`Error::ResourceLimit` with `reason: LimitReason::Unenforceable` — never a
+`ErrorReason::ResourceLimit` with `reason: LimitReason::Unenforceable` — never a
 silently-unbounded group (see
 [Errors → `ResourceLimit`](errors.md) and
 [Platform support → containment mechanisms](platform-support.md#containment-mechanisms)

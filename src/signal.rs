@@ -11,7 +11,7 @@
 /// a console `CTRL_BREAK` to a child opted into
 /// [`Command::windows_graceful_ctrl_break`](crate::Command::windows_graceful_ctrl_break),
 /// plus `WM_CLOSE` to every top-level window a live member owns. Those two yield
-/// [`Error::Unsupported`](crate::Error::Unsupported) only when the group has no such
+/// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) only when the group has no such
 /// target; every other variant is always unsupported on Windows.
 ///
 /// [`Other`](Signal::Other) is an escape hatch carrying a raw signal number on
@@ -53,7 +53,7 @@ pub enum Signal {
     ///   probe reached a signalable target", never "a signal was delivered".
     /// - An **out-of-range** number makes the underlying `kill`/`killpg` fail
     ///   `EINVAL`, and that failure is now surfaced as
-    ///   [`Error::Io`](crate::Error::Io) on **every** Unix backend — the Linux
+    ///   [`ErrorReason::Io`](crate::ErrorReason::Io) on **every** Unix backend — the Linux
     ///   **cgroup** mechanism and the **process-group** mechanism (macOS/BSD and the
     ///   Linux fallback) agree, so a bad number no longer silently "succeeds" on one
     ///   and fails on the other. Still, pass a real signal number rather than

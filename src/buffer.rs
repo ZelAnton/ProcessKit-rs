@@ -182,7 +182,7 @@ pub enum OverflowMode {
     /// [`DropOldest`](OverflowMode::DropOldest)).
     DropNewest,
     /// Fail-loud ceiling: once the buffer is full, the run errors with
-    /// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge) rather than
+    /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) rather than
     /// silently dropping lines. The pipe is still drained (so the child never
     /// blocks); excess lines are counted but not retained.
     ///
@@ -222,12 +222,14 @@ pub enum OverflowMode {
     /// *unbounded* buffer (no `max_lines` and no `max_bytes`) this mode is a
     /// misconfiguration — a fail-loud ceiling with no ceiling — so it is treated
     /// as **zero-tolerance**: the run errors on *any* line-pumped output
-    /// (`Error::OutputTooLarge`), rather than silently retaining everything. Use
+    /// (`ErrorReason::OutputTooLarge`), rather than silently retaining everything. Use
     /// `fail_loud(n)` when you want a real cap.
     ///
     /// **Counts the total, not the backlog.** The ceiling fires on the
-    /// *cumulative* output the pump has seen — total lines and total bytes — not
-    /// on how much is currently buffered. A streaming consumer
+    /// *cumulative* output the pump has seen — total lines and, for
+    /// `max_bytes`, raw bytes read from the pipe before decoding, including
+    /// line terminators and invalid UTF-8 bytes — not on how much is currently
+    /// buffered. A streaming consumer
     /// ([`stdout_lines`](crate::RunningProcess::stdout_lines)) draining lines as
     /// they arrive frees buffer space but does **not** reset the ceiling, so
     /// `fail_loud(100)` errors on the 101st line whether it is read through
@@ -368,7 +370,7 @@ impl OutputBufferPolicy {
     /// Retain at most `max_lines` and error when full — a fail-loud ceiling.
     ///
     /// Equivalent to `bounded(max_lines).with_overflow(OverflowMode::Error)`.
-    /// The run errors with [`Error::OutputTooLarge`](crate::Error::OutputTooLarge)
+    /// The run errors with [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge)
     /// once this limit is reached; excess lines are counted but not retained.
     pub fn fail_loud(max_lines: usize) -> Self {
         Self {
@@ -390,7 +392,12 @@ impl OutputBufferPolicy {
     /// `fail_loud(100).with_max_bytes(1 << 20)` errors on whichever ceiling — 100
     /// lines or 1 MiB — is reached first. Under the drop modes a single line
     /// larger than the cap is dropped whole (it cannot fit); under
-    /// [`OverflowMode::Error`] it trips the fail-loud ceiling.
+    /// [`OverflowMode::Error`] it trips the fail-loud ceiling. The accounting is
+    /// intentionally asymmetric: drop-mode retention remains bounded by decoded
+    /// line-content byte lengths, while the `Error` ceiling counts raw bytes read
+    /// from the pipe, including terminators and invalid UTF-8 bytes, before
+    /// decoding. Thus a line whose content exactly fits the cap can still trip
+    /// the `Error` ceiling when its terminator is read.
     ///
     /// **This affects every sink, not just the buffer:** a line longer than
     /// `max_bytes` is never assembled by the pump, so it is silently skipped
@@ -437,7 +444,7 @@ impl Default for OutputBufferPolicy {
 /// - No cap (`None`): retain everything (the default — byte-for-byte the old
 ///   behavior).
 /// - [`OverflowMode::Error`]: flag overflow and stop retaining past the cap; the
-///   caller drains the pipe to EOF and then raises `Error::OutputTooLarge`.
+///   caller drains the pipe to EOF and then raises `ErrorReason::OutputTooLarge`.
 /// - [`OverflowMode::DropNewest`]: keep the first `cap` bytes (head), flag
 ///   truncation.
 /// - [`OverflowMode::DropOldest`]: keep roughly the last `cap` bytes (tail). The
@@ -992,6 +999,10 @@ mod tests {
                 let mut expected = ExpectedLines::default();
                 for line in input {
                     expected.push(line.clone(), policy);
+                    // `SharedLines::push` is below the pipe-read seam in this
+                    // model test; simulate the raw bytes that pump_lines_core
+                    // accounts for before it calls push.
+                    sink.add_seen_bytes(line.len());
                     sink.push(line);
                     prop_assert_eq!(sink.count(), expected.count);
                     prop_assert_eq!(sink.seen_bytes(), expected.seen_bytes);
