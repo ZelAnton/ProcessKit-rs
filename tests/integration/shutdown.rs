@@ -701,7 +701,11 @@ async fn stop_reports_an_early_drain_without_spending_the_whole_grace() {
     );
 
     let outcome = waiter.await.expect("join").expect("wait");
-    assert_eq!(outcome, Outcome::Exited(0), "the child exited via its TERM trap");
+    assert_eq!(
+        outcome,
+        Outcome::Exited(0),
+        "the child exited via its TERM trap"
+    );
 
     // Call-after-teardown: a second `stop` on the now-drained group must return
     // promptly (a near no-op), not hang or panic.
@@ -712,7 +716,10 @@ async fn stop_reports_an_early_drain_without_spending_the_whole_grace() {
     .await
     .expect("a second stop on a drained group must not hang")
     .expect("second stop ok");
-    assert!(again.drained_within_grace(), "the empty group is trivially drained");
+    assert!(
+        again.drained_within_grace(),
+        "the empty group is trivially drained"
+    );
     assert!(!again.escalated(), "nothing to escalate on an empty group");
     assert_eq!(again.members_before(), Some(0), "no members remain");
     assert!(
@@ -792,13 +799,10 @@ async fn stop_with_zero_grace_kills_and_reports() {
         .expect("trap installed");
     let waiter = tokio::spawn(run.wait());
 
-    let report = tokio::time::timeout(
-        Duration::from_secs(10),
-        group.stop(Duration::ZERO, true),
-    )
-    .await
-    .expect("zero-grace stop is prompt")
-    .expect("stop ok");
+    let report = tokio::time::timeout(Duration::from_secs(10), group.stop(Duration::ZERO, true))
+        .await
+        .expect("zero-grace stop is prompt")
+        .expect("stop ok");
 
     assert!(
         !report.drained_within_grace(),
@@ -838,9 +842,16 @@ async fn stop_on_an_empty_group_reports_no_members() {
     .expect("stop bounded")
     .expect("stop ok");
 
-    assert_eq!(report.members_before(), Some(0), "an empty group has no members");
+    assert_eq!(
+        report.members_before(),
+        Some(0),
+        "an empty group has no members"
+    );
     assert_eq!(report.members_after(), Some(0), "still none afterwards");
-    assert!(report.drained_within_grace(), "an empty tree is trivially drained");
+    assert!(
+        report.drained_within_grace(),
+        "an empty tree is trivially drained"
+    );
     assert!(!report.escalated(), "nothing to escalate");
     assert_eq!(
         report.soft_signal(),

@@ -582,10 +582,18 @@ mod tests {
         let outcome = run(&target, &skip, 15, Duration::from_secs(30), true)
             .await
             .expect("graceful run");
-        assert_eq!(outcome.soft, SoftDelivery::Sent, "the soft signal was issued");
+        assert_eq!(
+            outcome.soft,
+            SoftDelivery::Sent,
+            "the soft signal was issued"
+        );
         assert!(outcome.drained, "the tree drained within the grace");
         assert!(!outcome.escalated, "an in-time drain needs no hard kill");
-        assert_eq!(outcome.members_before, Some(3), "three members before the signal");
+        assert_eq!(
+            outcome.members_before,
+            Some(3),
+            "three members before the signal"
+        );
         assert_eq!(outcome.members_after, Some(0), "none left after the drain");
         assert!(
             outcome.elapsed < Duration::from_secs(30),
@@ -623,7 +631,10 @@ mod tests {
             .await
             .expect("graceful run");
         assert!(!outcome.drained, "the tree was left running, not drained");
-        assert!(!outcome.escalated, "a non-escalating shutdown never hard-kills");
+        assert!(
+            !outcome.escalated,
+            "a non-escalating shutdown never hard-kills"
+        );
         assert_eq!(target.hard_kills.load(Ordering::Relaxed), 0, "no hard kill");
         assert!(skip.is_set(), "survivors are spared on Drop");
     }

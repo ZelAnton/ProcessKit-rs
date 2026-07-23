@@ -191,7 +191,7 @@ the tree is empty rather than always spend the whole grace, and to report the ti
 the kernel *observed* rather than what you *tried*. `ProcessGroup::stop(grace,
 escalate)` is that verb: the same `SIGTERM` / `CTRL_BREAK` / `WM_CLOSE` → wait →
 escalate ladder, taking `grace`/`escalate` explicitly and returning a
-[`ShutdownReport`](https://docs.rs/processkit/latest/processkit/struct.ShutdownReport.html).
+[`ShutdownReport`](https://github.com/ZelAnton/ProcessKit-rs/blob/main/src/shutdown_report.rs).
 
 ```rust,no_run
 use processkit::{Command, ProcessGroup};

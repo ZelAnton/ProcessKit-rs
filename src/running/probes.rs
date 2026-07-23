@@ -470,6 +470,12 @@ mod tests {
             path.exists(),
             "dropping a Unix listener leaves its socket file"
         );
+        #[cfg(target_os = "macos")]
+        {
+            // Darwin can briefly keep a just-closed pathname socket connectable;
+            // unlink the name so this test does not depend on that teardown window.
+            std::fs::remove_file(&path).expect("unlink orphaned socket path");
+        }
 
         let mut run = ScriptedRunner::new()
             .fallback(Reply::pending())
