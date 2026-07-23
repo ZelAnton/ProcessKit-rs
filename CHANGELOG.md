@@ -13,6 +13,36 @@ to a dated version section.
 
 ### Added
 
+- Add `Error::kind()` / `ErrorReason::kind()` returning a new `#[non_exhaustive]`
+  `ErrorKind` — a **total** classification of every failure into one coarse routing
+  bucket (`NotFound`, `Spawn`, `PermissionDenied`, `ResourceLimit` (`limits`),
+  `Unsupported`, `Timeout`, `Cancelled`, `Exit`, `Signalled`, `Other`). Where
+  `ErrorReason` is the structured failure mode, `ErrorKind` is what a consumer needs
+  when it maps failures onto its **own** shape — a CLI folding each disposition into a
+  distinct exit code, a cross-language binding raising a matching exception class, a
+  router picking a retry policy — instead of matching `NotFound`/`Spawn` by hand and
+  dumping everything else into one "backend failure" bucket, which just defers the same
+  catch-all past a `#[non_exhaustive]` match. The mapping is **derived** from each
+  variant's existing semantics (not invented) and is an exhaustive `match` inside the
+  crate with **no** catch-all, so a future `ErrorReason` variant cannot ship without a
+  deliberate kind. It stays consistent with the point classifiers (`is_not_found()` ⇔
+  `kind() == NotFound`, `is_permission_denied()` ⇔ `PermissionDenied`, `is_timeout()`
+  ⇔ `Timeout`, …), which keep their exact behavior. `ErrorKind::name()` gives a stable
+  `snake_case` machine identifier (`"not_found"`, `"permission_denied"`, …); like
+  `Outcome`, it is reported-only, with no `from_name` inverse
+- Add payload accessors that previously required destructuring the
+  `#[non_exhaustive]` variant by hand: `Error::timeout_duration()` /
+  `ErrorReason::timeout_duration()` (the run deadline of a `Timeout`; `None`
+  elsewhere, including `NotReady` whose probe deadline is a separate clock),
+  `Error::unsupported_operation()` / `ErrorReason::unsupported_operation()` (the
+  operation description of an `Unsupported`), and `Error::output_overflow()` /
+  `ErrorReason::output_overflow()` returning a new `#[non_exhaustive]` `OutputOverflow`
+  snapshot with `total_lines()` / `total_bytes()` / `max_lines()` / `max_bytes()`
+  accessors for an `OutputTooLarge` failure (a grouped snapshot rather than four scalar
+  `Option<usize>` accessors, so the two optional ceilings stay unambiguous). Each
+  follows the existing `code()` / `signal()` pattern — an exhaustive match, `None` for
+  irrelevant variants. Purely additive; no existing accessor or classifier changes
+  behavior
 - Add `output_stream(commands, concurrency, runner)` / `output_stream_bytes(...)` — the
   **streaming** siblings of `output_all` / `output_all_bytes`. Same bounded fan-out, but
   each result is yielded the moment its command finishes (a `Stream` of `(input index,

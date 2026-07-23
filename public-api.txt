@@ -165,6 +165,35 @@ impl core::marker::UnsafeUnpin for processkit::testing::ScriptedRunner
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::testing::ScriptedRunner
 impl !core::panic::unwind_safe::UnwindSafe for processkit::testing::ScriptedRunner
 pub macro processkit::cli_client!
+#[non_exhaustive] pub enum processkit::ErrorKind
+pub processkit::ErrorKind::Cancelled
+pub processkit::ErrorKind::Exit
+pub processkit::ErrorKind::NotFound
+pub processkit::ErrorKind::Other
+pub processkit::ErrorKind::PermissionDenied
+pub processkit::ErrorKind::ResourceLimit
+pub processkit::ErrorKind::Signalled
+pub processkit::ErrorKind::Spawn
+pub processkit::ErrorKind::Timeout
+pub processkit::ErrorKind::Unsupported
+impl processkit::ErrorKind
+pub fn processkit::ErrorKind::name(&self) -> &'static str
+impl core::clone::Clone for processkit::ErrorKind
+pub fn processkit::ErrorKind::clone(&self) -> processkit::ErrorKind
+impl core::cmp::Eq for processkit::ErrorKind
+impl core::cmp::PartialEq for processkit::ErrorKind
+pub fn processkit::ErrorKind::eq(&self, &processkit::ErrorKind) -> bool
+impl core::fmt::Debug for processkit::ErrorKind
+pub fn processkit::ErrorKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for processkit::ErrorKind
+impl core::marker::StructuralPartialEq for processkit::ErrorKind
+impl core::marker::Freeze for processkit::ErrorKind
+impl core::marker::Send for processkit::ErrorKind
+impl core::marker::Sync for processkit::ErrorKind
+impl core::marker::Unpin for processkit::ErrorKind
+impl core::marker::UnsafeUnpin for processkit::ErrorKind
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::ErrorKind
+impl core::panic::unwind_safe::UnwindSafe for processkit::ErrorKind
 #[non_exhaustive] pub enum processkit::ErrorReason
 pub processkit::ErrorReason::Cancelled
 pub processkit::ErrorReason::Cancelled::program: alloc::string::String
@@ -226,13 +255,17 @@ pub fn processkit::ErrorReason::is_permission_denied(&self) -> bool
 pub fn processkit::ErrorReason::is_signalled(&self) -> bool
 pub fn processkit::ErrorReason::is_timeout(&self) -> bool
 pub fn processkit::ErrorReason::is_transient(&self) -> bool
+pub fn processkit::ErrorReason::kind(&self) -> processkit::ErrorKind
 pub fn processkit::ErrorReason::limit_kind(&self) -> core::option::Option<processkit::LimitKind>
 pub fn processkit::ErrorReason::limit_reason(&self) -> core::option::Option<processkit::LimitReason>
+pub fn processkit::ErrorReason::output_overflow(&self) -> core::option::Option<processkit::OutputOverflow>
 pub fn processkit::ErrorReason::program(&self) -> core::option::Option<&str>
 pub fn processkit::ErrorReason::signal(&self) -> core::option::Option<i32>
 pub fn processkit::ErrorReason::stderr(&self) -> core::option::Option<&str>
 pub fn processkit::ErrorReason::stdout(&self) -> core::option::Option<&str>
 pub fn processkit::ErrorReason::stdout_bytes(&self) -> core::option::Option<&[u8]>
+pub fn processkit::ErrorReason::timeout_duration(&self) -> core::option::Option<core::time::Duration>
+pub fn processkit::ErrorReason::unsupported_operation(&self) -> core::option::Option<&str>
 impl core::convert::From<processkit::ErrorReason> for processkit::Error
 pub fn processkit::Error::from(processkit::ErrorReason) -> Self
 impl core::error::Error for processkit::ErrorReason
@@ -761,14 +794,18 @@ pub fn processkit::Error::is_permission_denied(&self) -> bool
 pub fn processkit::Error::is_signalled(&self) -> bool
 pub fn processkit::Error::is_timeout(&self) -> bool
 pub fn processkit::Error::is_transient(&self) -> bool
+pub fn processkit::Error::kind(&self) -> processkit::ErrorKind
 pub fn processkit::Error::limit_kind(&self) -> core::option::Option<processkit::LimitKind>
 pub fn processkit::Error::limit_reason(&self) -> core::option::Option<processkit::LimitReason>
+pub fn processkit::Error::output_overflow(&self) -> core::option::Option<processkit::OutputOverflow>
 pub fn processkit::Error::program(&self) -> core::option::Option<&str>
 pub fn processkit::Error::reason(&self) -> &processkit::ErrorReason
 pub fn processkit::Error::signal(&self) -> core::option::Option<i32>
 pub fn processkit::Error::stderr(&self) -> core::option::Option<&str>
 pub fn processkit::Error::stdout(&self) -> core::option::Option<&str>
 pub fn processkit::Error::stdout_bytes(&self) -> core::option::Option<&[u8]>
+pub fn processkit::Error::timeout_duration(&self) -> core::option::Option<core::time::Duration>
+pub fn processkit::Error::unsupported_operation(&self) -> core::option::Option<&str>
 impl processkit::Error
 pub fn processkit::Error::parse(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 impl core::convert::From<processkit::ErrorReason> for processkit::Error
@@ -928,6 +965,28 @@ impl core::marker::Unpin for processkit::OutputLine
 impl core::marker::UnsafeUnpin for processkit::OutputLine
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::OutputLine
 impl core::panic::unwind_safe::UnwindSafe for processkit::OutputLine
+#[non_exhaustive] pub struct processkit::OutputOverflow
+impl processkit::OutputOverflow
+pub fn processkit::OutputOverflow::max_bytes(&self) -> core::option::Option<usize>
+pub fn processkit::OutputOverflow::max_lines(&self) -> core::option::Option<usize>
+pub fn processkit::OutputOverflow::total_bytes(&self) -> usize
+pub fn processkit::OutputOverflow::total_lines(&self) -> usize
+impl core::clone::Clone for processkit::OutputOverflow
+pub fn processkit::OutputOverflow::clone(&self) -> processkit::OutputOverflow
+impl core::cmp::Eq for processkit::OutputOverflow
+impl core::cmp::PartialEq for processkit::OutputOverflow
+pub fn processkit::OutputOverflow::eq(&self, &processkit::OutputOverflow) -> bool
+impl core::fmt::Debug for processkit::OutputOverflow
+pub fn processkit::OutputOverflow::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for processkit::OutputOverflow
+impl core::marker::StructuralPartialEq for processkit::OutputOverflow
+impl core::marker::Freeze for processkit::OutputOverflow
+impl core::marker::Send for processkit::OutputOverflow
+impl core::marker::Sync for processkit::OutputOverflow
+impl core::marker::Unpin for processkit::OutputOverflow
+impl core::marker::UnsafeUnpin for processkit::OutputOverflow
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::OutputOverflow
+impl core::panic::unwind_safe::UnwindSafe for processkit::OutputOverflow
 pub struct processkit::Pipeline
 impl processkit::Pipeline
 pub fn processkit::Pipeline::cancel_on(self, tokio_util::sync::cancellation_token::CancellationToken) -> Self
