@@ -162,8 +162,31 @@ pub(crate) async fn run(
     // Best-effort: the graceful tier proceeds to polling regardless of the verdict,
     // which is recorded for the report only.
     let soft = target.signal_all(signal);
+    // The soft-signal transition — narrated live on the single `tracing` seam so a
+    // consumer can stamp it the instant it happens (the same facts `ShutdownReport`
+    // carries after the fact; see decisions/completion-phase-observability-2026-07).
+    // The `phase` field is a stable snake_case identifier (like `RestartPolicy::name`);
+    // argv/env never appear here, consistent with the crate's tracing redaction rule.
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        target: "processkit",
+        phase = "soft_signal",
+        signal,
+        delivery = ?soft,
+        members_before = ?members_before,
+        escalate,
+        "graceful teardown: soft signal issued"
+    );
     // Clamp so a `Duration::MAX`-ish timeout can't overflow the `Instant` add.
     let deadline = started + timeout.min(crate::MAX_DEADLINE);
+    // The grace window opens now — the driver will poll up to `timeout` for a drain.
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        target: "processkit",
+        phase = "grace_started",
+        grace_ms = timeout.min(crate::MAX_DEADLINE).as_millis() as u64,
+        "graceful teardown: grace window opened"
+    );
     while !target.is_drained() {
         let now = Instant::now();
         if now >= deadline {
@@ -195,6 +218,33 @@ pub(crate) async fn run(
     // kill so the report reflects the final state.
     let members_after = target.alive_count();
     let elapsed = started.elapsed();
+    // The terminal teardown transition, narrated live on the same seam: one of
+    // `drained` (exited within the grace), `escalated` (grace elapsed → hard kill),
+    // or `spared` (grace elapsed, a non-escalating stop left survivors alive). Reads
+    // the driver's own already-computed facts — no second source (single seam,
+    // K-032/K-054) — and holds no handle across an await (K-044 is not implicated:
+    // this is a plain synchronous emit at a discrete transition point, not in the
+    // poll loop). `elapsed`'s anchor is the tokio clock, like `ShutdownReport`'s
+    // (K-007 — a single-function reporting anchor).
+    #[cfg(feature = "tracing")]
+    {
+        let phase = if escalated {
+            "escalated"
+        } else if drained {
+            "drained"
+        } else {
+            "spared"
+        };
+        tracing::debug!(
+            target: "processkit",
+            phase,
+            drained,
+            escalated,
+            members_after = ?members_after,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "graceful teardown: grace window closed"
+        );
+    }
     kill_result.map(|()| GracefulOutcome {
         soft,
         members_before,
@@ -260,20 +310,51 @@ pub(crate) trait PidTarget {
 pub(crate) async fn run_pid(target: &impl PidTarget, signal: i32, grace: Duration) {
     // Best-effort: the driver proceeds to polling regardless of delivery.
     target.signal(signal);
+    // The single-child teardown transitions are narrated on the same `tracing` seam
+    // and share the whole-tree driver's stable `phase` vocabulary, so a consumer sees
+    // one uniform lifecycle timeline whichever teardown path drove it (see
+    // decisions/completion-phase-observability-2026-07).
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        target: "processkit",
+        phase = "soft_signal",
+        signal,
+        "graceful child teardown: soft signal issued"
+    );
     // Clamp so a `Duration::MAX`-ish grace can't overflow the `Instant` add.
     let deadline = Instant::now() + grace.min(crate::MAX_DEADLINE);
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        target: "processkit",
+        phase = "grace_started",
+        grace_ms = grace.min(crate::MAX_DEADLINE).as_millis() as u64,
+        "graceful child teardown: grace window opened"
+    );
     loop {
         let now = Instant::now();
         if now >= deadline {
             break; // grace elapsed with the child still around → hard kill below
         }
         if !target.is_alive() {
-            return; // exited (and reaped) within the grace → skip the SIGKILL
+            // exited (and reaped) within the grace → skip the SIGKILL
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                target: "processkit",
+                phase = "drained",
+                "graceful child teardown: child exited within grace"
+            );
+            return;
         }
         // Never oversleep past the deadline, however large `POLL_INTERVAL` is
         // relative to the remaining grace.
         sleep(POLL_INTERVAL.min(deadline - now)).await;
     }
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        target: "processkit",
+        phase = "escalated",
+        "graceful child teardown: grace elapsed, hard kill"
+    );
     target.hard_kill();
 }
 
@@ -863,6 +944,177 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "the driver stands down on the next poll, not after riding out the grace"
+        );
+    }
+
+    // --- Teardown transition narration (single `tracing` seam, T-176) ---------
+    //
+    // These pin that the shared driver narrates its teardown transitions, in order,
+    // on the `processkit` tracing target — the live, timestamped counterpart of the
+    // after-the-fact `ShutdownReport` (T-167), reading the driver's own facts (single
+    // seam, not a second source). A dependency-free capturing `Subscriber` records
+    // each event's stable `phase` field, so no `tracing-subscriber` dev-dep is pulled
+    // in (the crate carries zero other tracing-capture tests; `tracing` is a
+    // best-effort narration seam everywhere else). See
+    // decisions/completion-phase-observability-2026-07.md for the design pass.
+
+    /// A minimal [`tracing::Subscriber`] that records the `phase` field of every
+    /// event, in order — enough to assert the teardown driver's transition sequence
+    /// without depending on `tracing-subscriber`.
+    #[cfg(feature = "tracing")]
+    #[derive(Clone, Default)]
+    struct PhaseCapture {
+        phases: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[cfg(feature = "tracing")]
+    impl PhaseCapture {
+        fn phases(&self) -> Vec<String> {
+            self.phases.lock().expect("phase capture lock").clone()
+        }
+    }
+
+    /// Pulls the stable `phase` field (a `&str`) out of one event; ignores the rest.
+    #[cfg(feature = "tracing")]
+    struct PhaseVisitor<'a>(&'a mut Option<String>);
+
+    #[cfg(feature = "tracing")]
+    impl tracing::field::Visit for PhaseVisitor<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "phase" {
+                *self.0 = Some(value.to_owned());
+            }
+        }
+        // The other fields (signal, member counts, bools) are irrelevant to the
+        // sequence assertion — a no-op required by the trait.
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+    }
+
+    #[cfg(feature = "tracing")]
+    impl tracing::Subscriber for PhaseCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut phase = None;
+            event.record(&mut PhaseVisitor(&mut phase));
+            if let Some(phase) = phase {
+                self.phases.lock().expect("phase capture lock").push(phase);
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Install a fresh [`PhaseCapture`] as the thread-local default subscriber, drive
+    /// `body` to completion on a current-thread runtime (so every event lands on this
+    /// thread, where the capture is installed), and return the ordered `phase` values.
+    #[cfg(feature = "tracing")]
+    fn capture_teardown_phases<F, Fut>(body: F) -> Vec<String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let capture = PhaseCapture::default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("current-thread runtime");
+        tracing::subscriber::with_default(capture.clone(), || rt.block_on(body()));
+        capture.phases()
+    }
+
+    // The headline: a штатный graceful teardown narrates the FULL transition
+    // sequence live — soft signal → grace window → drained — in order.
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn teardown_narrates_the_full_transition_sequence_on_a_clean_drain() {
+        let phases = capture_teardown_phases(|| async {
+            let target = FakeTarget::new(0); // drained on the first check
+            let skip = crate::sys::SkipDropKill::new();
+            run(&target, &skip, 15, Duration::from_secs(10), true)
+                .await
+                .expect("graceful run");
+        });
+        assert_eq!(
+            phases,
+            vec!["soft_signal", "grace_started", "drained"],
+            "a clean graceful teardown narrates soft signal → grace → drain, in order"
+        );
+    }
+
+    // The escalation branch: a tree that rides out the grace narrates soft signal →
+    // grace window → escalated (to the hard kill).
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn teardown_narrates_the_escalation_branch() {
+        let phases = capture_teardown_phases(|| async {
+            let target = FakeTarget::new(usize::MAX); // never drains
+            let skip = crate::sys::SkipDropKill::new();
+            // Zero grace: the deadline passes on the first check (no sleep awaited).
+            run(&target, &skip, 15, Duration::ZERO, true)
+                .await
+                .expect("graceful run");
+        });
+        assert_eq!(
+            phases,
+            vec!["soft_signal", "grace_started", "escalated"],
+            "a tree that rides out the grace narrates the escalation to the hard kill"
+        );
+    }
+
+    // The distinct third terminal transition: a non-escalating stop that leaves
+    // survivors narrates them as spared, not drained or escalated.
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn teardown_narrates_survivors_spared_by_a_non_escalating_stop() {
+        let phases = capture_teardown_phases(|| async {
+            let target = FakeTarget::new(usize::MAX); // never drains
+            let skip = crate::sys::SkipDropKill::new();
+            run(&target, &skip, 15, Duration::ZERO, false)
+                .await
+                .expect("graceful run");
+        });
+        assert_eq!(
+            phases,
+            vec!["soft_signal", "grace_started", "spared"],
+            "a non-escalating stop that leaves survivors narrates them as spared"
+        );
+    }
+
+    // The single-child driver shares the whole-tree phase vocabulary: a child gone
+    // within the grace narrates the same soft signal → grace → drained sequence.
+    #[cfg(all(unix, feature = "tracing"))]
+    #[test]
+    fn pid_teardown_narrates_a_clean_exit_within_grace() {
+        let phases = capture_teardown_phases(|| async {
+            let target = FakePid::new(0); // gone on the first poll
+            run_pid(&target, 15, Duration::from_secs(10)).await;
+        });
+        assert_eq!(
+            phases,
+            vec!["soft_signal", "grace_started", "drained"],
+            "a child gone within the grace narrates the same drain transition"
+        );
+    }
+
+    // And the single-child escalation branch.
+    #[cfg(all(unix, feature = "tracing"))]
+    #[test]
+    fn pid_teardown_narrates_the_hard_kill_branch() {
+        let phases = capture_teardown_phases(|| async {
+            let target = FakePid::new(usize::MAX); // rides out the grace
+            run_pid(&target, 15, Duration::ZERO).await;
+        });
+        assert_eq!(
+            phases,
+            vec!["soft_signal", "grace_started", "escalated"],
+            "a child that survives the grace narrates the escalation to the hard kill"
         );
     }
 }

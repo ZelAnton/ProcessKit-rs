@@ -21,6 +21,7 @@ which variant fires from where, how to classify it, and what to do about it.
 - [Variant reference](#variant-reference)
 - [Variants that look alike but aren't](#variants-that-look-alike-but-arent)
 - [Classifiers](#classifiers)
+- [Total classification: `kind()`](#total-classification-kind)
 - [Stable machine identifiers](#stable-machine-identifiers)
 - [Matching under `#[non_exhaustive]`](#matching-under-non_exhaustive)
 - [Errors and retries](#errors-and-retries)
@@ -89,6 +90,71 @@ which variant fires from where, how to classify it, and what to do about it.
 | `program()` | Every variant that names one | `None` only for `Unsupported`, `Io`, and (`limits` feature) `ResourceLimit` — the ones with no single program to attribute. |
 | `limit_kind()` / `limit_reason()` (`limits` feature) | `ResourceLimit` only | Read structured fields instead of parsing `detail`'s English text. |
 | `diagnostic()` | `Exit` / `Timeout` / `Signalled` (`Some`) | Stderr if it carries text, else stdout (`git`/`jj` put decisive output there), else `None`. |
+| `timeout_duration()` | `Timeout` (`Some(dur)`) | The run deadline that elapsed. `None` everywhere else — including `NotReady`, whose probe deadline is a separate clock (matching `is_timeout()`'s scoping). |
+| `output_overflow()` | `OutputTooLarge` (`Some(OutputOverflow)`) | The overflow counters as one snapshot — `total_lines()` / `total_bytes()` / `max_lines()` / `max_bytes()` — instead of destructuring the `#[non_exhaustive]` variant. `None` for every other error. |
+| `unsupported_operation()` | `Unsupported` (`Some(&str)`) | The operation description (`"signal(Hup)"`, `"suspend"`). `None` for every other variant. |
+| `kind()` | Every error (total) | The one coarse **routing** bucket — see [Total classification](#total-classification-kind). Never `None`; every error has a kind. |
+
+## Total classification: `kind()`
+
+The classifiers above answer *one* question each. When you route **every**
+failure onto your own shape — a CLI folding each disposition into a distinct
+process exit code, a cross-language binding raising a matching exception class, a
+router picking a retry policy — you want one **total** classification instead of
+a chain of `is_*` checks ending in "everything else". `err.kind()` is that: a
+compact [`ErrorKind`](https://docs.rs/processkit/latest/processkit/enum.ErrorKind.html)
+with one bucket per operational disposition, **derived** from each variant's
+existing semantics (not invented), and covering every variant — present and
+future — through an exhaustive `match` inside the crate.
+
+| `ErrorKind` | Derived from `ErrorReason` | Machine name |
+|---|---|---|
+| `NotFound` | `NotFound` | `not_found` |
+| `Spawn` | `Spawn` whose `source` is **not** a permission denial | `spawn` |
+| `PermissionDenied` | the `PermissionDenied` subset of `Spawn` / `Io` | `permission_denied` |
+| `ResourceLimit` (`limits` feature) | `ResourceLimit` | `resource_limit` |
+| `Unsupported` | `Unsupported` | `unsupported` |
+| `Timeout` | `Timeout` | `timeout` |
+| `Cancelled` | `Cancelled` | `cancelled` |
+| `Exit` | `Exit` | `exit` |
+| `Signalled` | `Signalled` | `signalled` |
+| `Other` | `CassetteMiss`, `Parse`, `NotReady`, `OutputTooLarge`, `Stdin`, and a non-`PermissionDenied` `Io` | `other` |
+
+`kind()` is a **routing** answer, deliberately coarser than the variant — it is
+**not** a replacement for matching [`reason()`](processkit::Error::reason) when
+you need the details (the exit code, the captured streams, the timeout duration,
+which limit failed). It stays consistent with the point classifiers:
+`is_not_found()` ⇔ `kind() == NotFound`, `is_permission_denied()` ⇔
+`PermissionDenied`, `is_timeout()` ⇔ `Timeout`, and so on.
+
+`ErrorKind` mirrors [`std::io::ErrorKind`]: it is `#[non_exhaustive]` and carries
+an `Other` bucket, so a downstream `match` needs a catch-all arm — which is
+exactly what makes it forward-compatible.
+
+```rust
+use processkit::{Error, ErrorKind};
+
+// Fold every failure onto your own exit codes — one arm per kind you care
+// about, a catch-all for the rest (kinds are `#[non_exhaustive]`).
+fn exit_code(err: &Error) -> i32 {
+    match err.kind() {
+        ErrorKind::NotFound => 127,
+        ErrorKind::PermissionDenied => 126,
+        ErrorKind::Timeout => 124,
+        ErrorKind::Exit => 1,
+        // A future kind (or one behind a feature this build doesn't enable,
+        // e.g. ResourceLimit) routes here instead of breaking the build.
+        _ => 70,
+    }
+}
+
+let err = Error::parse("jq", "unexpected token");
+assert_eq!(err.kind(), ErrorKind::Other);
+assert_eq!(err.kind().name(), "other");
+assert_eq!(exit_code(&err), 70);
+```
+
+[`std::io::ErrorKind`]: https://doc.rust-lang.org/std/io/enum.ErrorKind.html
 
 ## Stable machine identifiers
 
@@ -100,9 +166,9 @@ enums carry that table for you:
 
 | Method | On | Direction |
 |---|---|---|
-| `name() -> &'static str` | `Mechanism`, `Outcome`, `ParentDeathCleanup`, `SoftStopScope`, `StopReason`, `LimitKind`, `LimitReason`, `StdioMode`, `LineTerminator`, `OverflowMode`, `Priority`, `RestartPolicy` | A short, lowercase `snake_case` identifier for the variant. |
+| `name() -> &'static str` | `Mechanism`, `Outcome`, `ErrorKind`, `ParentDeathCleanup`, `SoftStopScope`, `StopReason`, `LimitKind`, `LimitReason`, `StdioMode`, `LineTerminator`, `OverflowMode`, `Priority`, `RestartPolicy` | A short, lowercase `snake_case` identifier for the variant. |
 | `name() -> Option<&'static str>` | `Signal` | `Some(id)` for a curated signal; `None` for the raw-number `Signal::Other` (render its `i32` instead). |
-| `from_name(&str) -> Option<Self>` | every enum above **except** `Outcome` | Parse an identifier back into the value; `None` — not a default — for an unrecognized name. |
+| `from_name(&str) -> Option<Self>` | every enum above **except** `Outcome` and `ErrorKind` | Parse an identifier back into the value; `None` — not a default — for an unrecognized name. |
 
 The identifiers are a **compatibility surface**, held stable like the rest of
 the public API: a **new** variant gets a **new** identifier, and an existing
@@ -130,13 +196,17 @@ assert_eq!(Priority::from_name("below_normal"), Some(Priority::BelowNormal));
 assert_eq!(Priority::from_name("turbo"), None);
 ```
 
-Two enums are asymmetric on purpose. `Outcome::name()` reports the *disposition*
-only (`exited` / `signalled` / `timed_out`) and has **no** `from_name` — the
-name alone can't carry the exit code or signal number (read those from
+Two enums report a `name()` but take **no** `from_name`, because both are
+classifications the crate *reports* and never accepts back. `Outcome::name()`
+reports the *disposition* only (`exited` / `signalled` / `timed_out`) — the name
+alone can't carry the exit code or signal number (read those from
 [`code()`](https://docs.rs/processkit/latest/processkit/struct.ProcessResult.html#method.code)
-/ `signal()`), and an `Outcome` is always *reported* by the crate, never
-supplied to it. `Signal::name()` returns `Option` because the `Other(i32)`
-escape hatch has no curated name.
+/ `signal()`), and an `Outcome` is always reported, never supplied. `ErrorKind`
+is the same: a total failure classification the crate hands you via
+[`Error::kind()`](processkit::Error::kind), never one you supply back in. Read
+the fuller payload from the [`ErrorReason`] variant when a name isn't enough.
+`Signal::name()` returns `Option` because the `Other(i32)` escape hatch has no
+curated name (it still has a `from_name`).
 
 ## Matching under `#[non_exhaustive]`
 

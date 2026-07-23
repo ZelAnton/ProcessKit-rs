@@ -231,6 +231,15 @@ not at all) and reports what was still live — where bare `kill_all` returns as
 as the kill is *issued*. `shutdown`/`shutdown_ref` are unchanged; `stop` is purely
 additive.
 
+`ShutdownReport` is the teardown facts as a typed value *after* the teardown
+returns. For the same transitions **live** — stamped the instant each one happens —
+enable the `tracing` feature: the teardown driver narrates `soft_signal →
+grace_started → drained | escalated | spared` (each in a stable `phase` field) on
+the `processkit` target, for every graceful path (`stop`, `shutdown`, a run-level
+`timeout_grace`, a supervisor's graceful stop). The two are one seam read two ways
+(both derive from the same driver outcome); neither can influence the teardown, and
+neither carries argv/env.
+
 ## Signalling the whole tree
 
 > `signal`/`suspend`/`resume`/`members`/`adopt` — this section and the two

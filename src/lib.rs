@@ -263,7 +263,7 @@ pub use batch::{output_all, output_all_bytes, output_stream, output_stream_bytes
 pub use buffer::{LineTerminator, OutputBufferPolicy, OverflowMode, StdioMode};
 pub use client::{CliClient, IntoCommand};
 pub use command::Command;
-pub use error::{Error, ErrorReason, Result};
+pub use error::{Error, ErrorKind, ErrorReason, OutputOverflow, Result};
 pub use group::{ProcessGroup, ProcessGroupOptions};
 #[cfg(feature = "limits")]
 pub use limits::{LimitKind, LimitReason, ResourceLimits};

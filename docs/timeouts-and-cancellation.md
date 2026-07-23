@@ -110,6 +110,21 @@ teardown), and if the deadline has **already elapsed** when you call `shutdown`,
 the outcome is reported as `Outcome::TimedOut` — the `grace` you pass governs the
 teardown timing.
 
+#### Observing the grace window
+
+With the `tracing` feature on, the teardown driver narrates each grace-window
+transition **live** on the `processkit` target — `soft_signal` (the SIGTERM /
+CTRL_BREAK was issued), `grace_started` (the wait began, with `grace_ms`), and then
+one of `drained` (the tree exited in time), `escalated` (the grace elapsed and the
+tree was hard-killed), or `spared` (a non-escalating stop left survivors) — each
+carried in a stable `phase` field and stamped by your subscriber at the instant it
+happens. This is the same soft-signal → grace → drain/kill ladder every graceful
+path drives (`timeout_grace`, `RunningProcess::shutdown`, `ProcessGroup::stop`), so
+you get one uniform timeline whichever verb fired it. For the same facts *after* the
+teardown returns — as a typed value rather than log events — reach for
+[`ProcessGroup::stop`'s `ShutdownReport`](process-groups.md#observing-the-teardown-stop-and-shutdownreport).
+Neither is a control surface: both are observation only, and never carry argv/env.
+
 ## Retries
 
 `retry(max_attempts, backoff, classifier)` replays a failed run — up to

@@ -438,6 +438,20 @@ availability follows the platform: full CPU/memory on Windows and Linux,
 `None` where the kernel doesn't account per-process cheaply — see
 [Platform support](platform-support.md).
 
+### Lifecycle narration (`tracing`)
+
+With the opt-in **`tracing`** feature, a run narrates its lifecycle on the
+`processkit` target — `spawn` (pid, mechanism), the graceful-teardown transitions
+(`soft_signal` → `grace_started` → `drained` / `escalated` / `spared`, each in a
+stable `phase` field), and `exited` — so a subscriber can stamp each transition the
+instant the layer that observed it crossed it, and map it to an event of your own
+protocol. The teardown transitions are narrated the same way for a streaming
+handle's own `shutdown(grace)` as for a whole-group `ProcessGroup::stop`, so you get
+one uniform timeline. It is observation only (never a control surface) and never
+carries argv/env; for the same teardown facts as a typed *value* returned after the
+fact, see
+[`ShutdownReport`](process-groups.md#observing-the-teardown-stop-and-shutdownreport).
+
 ---
 
 Next: [Pipelines](pipelines.md) ·
