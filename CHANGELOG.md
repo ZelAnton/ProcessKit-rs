@@ -13,6 +13,26 @@ to a dated version section.
 
 ### Added
 
+- Add `output_stream(commands, concurrency, runner)` / `output_stream_bytes(...)` — the
+  **streaming** siblings of `output_all` / `output_all_bytes`. Same bounded fan-out, but
+  each result is yielded the moment its command finishes (a `Stream` of `(input index,
+  Result<ProcessResult<_>>)` pairs) instead of one `Vec` at the very end, so a fast
+  command never waits behind a slow one and you can act on the first finisher
+  immediately. Results arrive in **completion order**, each tagged with its input index
+  so it stays traceable to its source command; the fan-out never short-circuits (a
+  command's failure is just its own yielded item, never a cancellation of its siblings);
+  and the concurrency cap is honored exactly. Dropping the stream mid-fan-out tears down
+  every still-live process tree with no orphans (own-group runner) and drops every
+  command still waiting for a slot **without ever spawning it**, while every result
+  already handed to the consumer survives — closing `output_all`'s "no partial results
+  on cancellation" gap. Chosen as a borrowing `Stream` (not a channel + spawned task):
+  it keeps the same `&JobRunner` / `&ProcessGroup` runner ergonomics as `output_all`,
+  needs no `'static` bound, and makes "drop cancels the whole fan-out" fall out of
+  ownership rather than manual wiring. Strictly additive: `output_all` /
+  `output_all_bytes` keep their exact signatures and behavior — they are now literally
+  this same engine driven to exhaustion and reassembled into input order (one scheduler,
+  two presentations), so their concurrency and no-short-circuit semantics can no longer
+  drift from the streaming path
 - Add `Command::stdout_raw_tee(writer)` / `stderr_raw_tee(writer)` — a
   **byte-accurate** tee that writes each chunk to `writer` *exactly as read from
   the child's pipe*, before any decoding or line splitting. Where

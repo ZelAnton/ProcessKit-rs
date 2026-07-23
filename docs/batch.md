@@ -5,7 +5,9 @@
 The batch helpers cover two distinct shapes of concurrent process work:
 
 - `output_all` / `output_all_bytes` start a collection of `Command`s while
-  retaining a fixed number of live runs.
+  retaining a fixed number of live runs, then hand back every result **in input
+  order** once the whole batch finishes. `output_stream` / `output_stream_bytes`
+  run the same bounded fan-out but yield each result **the moment it finishes**.
 - `wait_any` / `wait_all` observe a fixed collection of `RunningProcess`
   handles that you started earlier.
 
@@ -14,6 +16,7 @@ Timeouts, retries, streaming, cancellation, and containment remain the normal
 `Command` and `ProcessGroup` primitives.
 
 - [Bounded fan-out](#bounded-fan-out)
+- [Results as they finish](#results-as-they-finish)
 - [Containment scope](#containment-scope)
 - [Racing and joining handles](#racing-and-joining-handles)
 - [Timeouts and output](#timeouts-and-output)
@@ -74,6 +77,63 @@ command's output. The vector appears only after the entire batch finishes;
 dropping its future returns no partial vector. See [Timeouts and
 cancellation](timeouts-and-cancellation.md) when cancellation is part of the
 design.
+
+## Results as they finish
+
+`output_stream(commands, concurrency, runner)` is the streaming sibling of
+`output_all`: the same bounded fan-out — the same concurrency cap, the same
+per-command error semantics, the same containment — but instead of one `Vec` at
+the very end it returns a `Stream` that yields each result **the instant that
+command finishes**. Each item is an `(input index, result)` pair, so a result is
+still traceable to the command that produced it even though items arrive in
+completion order rather than input order. Drive it with `StreamExt::next` (the
+crate re-exports `StreamExt` from `processkit::prelude`):
+
+```rust,no_run
+use processkit::{Command, JobRunner, output_stream};
+use processkit::prelude::StreamExt;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let conversions = (0..200)
+        .map(|n| Command::new("convert").args([format!("input-{n}.png"), format!("output-{n}.webp")]));
+    let runner = JobRunner;
+    let mut results = output_stream(conversions, 8, &runner);
+    while let Some((index, result)) = results.next().await {
+        // Handle each conversion as soon as it lands, without waiting for the
+        // slowest one in the batch.
+        match result {
+            Ok(output) if output.is_success() => {}
+            _ => eprintln!("conversion #{index} failed"),
+        }
+    }
+    Ok(())
+}
+```
+
+Reach for `output_stream` over `output_all` when either of these matters:
+
+- **First result early.** A fast command is handed back immediately instead of
+  waiting behind the slowest in the batch — useful for progress reporting, or to
+  start downstream work on the first artifact.
+- **Partial results survive cancellation.** Every result you have already pulled
+  from the stream is yours; dropping the stream mid-fan-out keeps them. This is
+  the gap `output_all` cannot cover — its `Vec` materializes only at the end, so
+  dropping its future discards even the commands that had already completed.
+
+Cancellation and containment work exactly as for `output_all`. Dropping the
+stream drops the in-flight command futures: with `&JobRunner` (an own group per
+run) that kills every still-live process tree with no orphans; with a shared
+`&group` those children live until you tear the group down. Commands still
+waiting for a concurrency slot are dropped **without ever being spawned** — a
+queued command runs nothing until it is scheduled, so cancelling the fan-out
+cancels them for free.
+
+`output_stream_bytes` is the raw-bytes twin (each `ProcessResult` carries
+`Vec<u8>` stdout), with identical scheduling, ordering, and cancellation — the
+streaming counterpart of `output_all_bytes`. In fact `output_all` is exactly
+`output_stream` collected back into input order: both are the same fan-out
+engine, so their concurrency and no-short-circuit guarantees cannot drift apart.
 
 ## Containment scope
 
