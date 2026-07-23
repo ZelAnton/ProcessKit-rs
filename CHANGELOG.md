@@ -13,6 +13,25 @@ to a dated version section.
 
 ### Added
 
+- Add `Command::stdout_raw_tee(writer)` / `stderr_raw_tee(writer)` — a
+  **byte-accurate** tee that writes each chunk to `writer` *exactly as read from
+  the child's pipe*, before any decoding or line splitting. Where
+  `stdout_tee`/`stderr_tee` write decoded lines (each plus a `\n`), the raw tee
+  preserves the child's bytes verbatim: non-UTF-8 output survives (no U+FFFD
+  replacement, so `git archive`/`tar -cz -`/`ffmpeg … -` are teed intact), CRLF
+  is not normalized, a missing final newline is not fabricated, an unterminated
+  prompt (`Password: `) reaches the sink the moment it is read rather than at EOF,
+  and even a line the buffer policy drops (past a `with_max_bytes` cap, or under
+  `DropOldest`/`DropNewest`/`Error`) is still teed whole. Strictly additive — the
+  decoded-line path (capture buffer, `on_*_line` handlers, `stdout_tee`,
+  truncation accounting) is unchanged, and both tees fire independently. The write
+  is awaited on the capture pump (the same backpressure seam as the line tee, so a
+  slow raw sink cannot grow unbounded in-flight memory), flushed at stream end, and
+  isolated on a write error. Fires from the line/streaming verbs (`output_string`,
+  `start` + `stdout_lines`/`output_events`, `wait`/`drain`); a no-op under
+  `Inherit`/`Null`/a file redirect (no capture pump) and under `output_bytes`
+  (whose own return value already is the raw stdout). Lets a transparent wrapper
+  forward a stream live *and* hash the exact bytes the child wrote
 - Add `RunningProcess::drain()` — a discard-style wait that **respects the
   configured `Command::output_buffer` byte cap**. It drains both pipes (the child
   never blocks on a full one), feeds every fitting line to the configured

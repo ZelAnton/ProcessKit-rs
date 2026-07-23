@@ -474,18 +474,32 @@ impl SharedLines {
 /// swallowed.
 pub(crate) type TeeSink = Arc<tokio::sync::Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>;
 
-/// The four per-stream pump knobs that differ between stdout and stderr — the
+/// A per-stream async **raw byte** tee sink: each chunk is written to it exactly
+/// as read from the child's pipe — *before* decoding and *before* line splitting,
+/// with no CRLF normalization, no terminator handling, and no per-line framing —
+/// [`Command::stdout_raw_tee`](crate::Command::stdout_raw_tee) /
+/// [`stderr_raw_tee`](crate::Command::stderr_raw_tee). Structurally the same
+/// `Arc<Mutex<…>>` boxed writer as [`TeeSink`]; a distinct alias because the
+/// contract differs — [`TeeSink`] receives *decoded lines* (each plus a `\n`),
+/// this one receives the child's *raw bytes* verbatim. The write is awaited on
+/// the pump task, so a slow sink applies the same backpressure as the line tee
+/// (the pump slows → the OS pipe fills → the child blocks on its next write)
+/// rather than buffering without bound.
+pub(crate) type RawTeeSink = TeeSink;
+
+/// The five per-stream pump knobs that differ between stdout and stderr — the
 /// decode [`encoding`](Self::encoding), an optional per-line
-/// [`handler`](Self::handler), an optional [`tee`](Self::tee) sink, and the line
+/// [`handler`](Self::handler), an optional decoded-line [`tee`](Self::tee) sink,
+/// an optional [`raw_tee`](Self::raw_tee) byte sink, and the line
 /// [`terminator`](Self::terminator) mode — carried as one value.
 ///
 /// Held one-per-stream by [`Command`](crate::Command),
 /// [`Spawned`](crate::running::Spawned), and
 /// [`RunningProcess`](crate::RunningProcess), and handed to [`pump_lines_core`]
-/// whole. Folding the four knobs into a single struct means a new per-stream knob
+/// whole. Folding the knobs into a single struct means a new per-stream knob
 /// is threaded through *this* type instead of duplicated across every field pair
-/// and pump call site. Cheap to clone: `handler`/`tee` are `Arc`s and the rest is
-/// `Copy`.
+/// and pump call site. Cheap to clone: `handler`/`tee`/`raw_tee` are `Arc`s and
+/// the rest is `Copy`.
 #[derive(Clone)]
 pub(crate) struct StreamConfig {
     /// Decode bytes with this encoding (default UTF-8).
@@ -494,6 +508,10 @@ pub(crate) struct StreamConfig {
     pub handler: Option<LineHandler>,
     /// Optional async sink each decoded line is also written to.
     pub tee: Option<TeeSink>,
+    /// Optional async sink each raw chunk is written to, verbatim and *before*
+    /// decoding — strictly additive to the decoded-line path (see
+    /// [`RawTeeSink`] and [`pump_lines_core`]).
+    pub raw_tee: Option<RawTeeSink>,
     /// Where the pump splits the stream into lines (default `\n`-only).
     pub terminator: LineTerminator,
 }
@@ -507,13 +525,14 @@ impl StreamConfig {
             encoding: UTF_8,
             handler: None,
             tee: None,
+            raw_tee: None,
             terminator: LineTerminator::Newline,
         }
     }
 
     /// This config with the decode `encoding` replaced. Used by the scripted
     /// feeder, which forces UTF-8 (it writes the canned `String`'s UTF-8 bytes)
-    /// while keeping the command's handler/tee/terminator.
+    /// while keeping the command's handler/tee/raw_tee/terminator.
     pub(crate) fn with_encoding(mut self, encoding: &'static Encoding) -> Self {
         self.encoding = encoding;
         self
@@ -538,6 +557,7 @@ pub(crate) async fn pump_lines<R>(
             encoding,
             handler,
             tee: None,
+            raw_tee: None,
             terminator: LineTerminator::Newline,
         },
         sink,
@@ -562,6 +582,7 @@ pub(crate) async fn pump_lines_term<R>(
             encoding,
             handler: None,
             tee: None,
+            raw_tee: None,
             terminator,
         },
         sink,
@@ -586,6 +607,20 @@ pub(crate) async fn pump_lines_term<R>(
 /// callback seam is handed to consumers' consumers, so "panic-free or else"
 /// is not a re-exportable contract. A `tee` write error is isolated the same
 /// way: the tee is disabled (with a `tracing` warn) and pumping continues.
+///
+/// **Raw byte tee (`raw_tee`):** strictly additive to everything above. When
+/// set, each chunk is written to it *exactly as read from the pipe* — the same
+/// `&chunk[..n]` the decoder is about to consume — **before** `decode_to_string`
+/// and independent of line splitting, the buffer policy, and the over-cap skip.
+/// So it observes every byte the child wrote, byte-for-byte and in FIFO order:
+/// no lossy decode (non-UTF-8 bytes survive), no CRLF normalization, no
+/// fabricated trailing newline, and no loss of a line the policy drops (an
+/// over-cap line skipped from every decoded sink still reaches the raw tee
+/// whole). A chunk with no line terminator reaches the raw tee immediately, not
+/// held until EOF. The write is awaited on the pump task — the same backpressure
+/// point as the line tee, so a slow raw sink can't grow memory without bound —
+/// flushed once at stream end, and a write error disables it (with a `tracing`
+/// warn) exactly like the line tee, leaving the decoded path untouched.
 ///
 /// **Decoding:** bytes are fed through a single persistent
 /// `encoding_rs::Decoder` and the *decoded* text is split into lines — correct
@@ -623,6 +658,7 @@ where
         encoding,
         handler,
         tee,
+        raw_tee,
         terminator,
     } = config;
     // Close the sink on *every* exit from this task: a panic out of this loop
@@ -636,6 +672,31 @@ where
     let sink = CloseOnDrop(sink);
     let mut handler = handler;
     let mut tee = tee;
+    let mut raw_tee = raw_tee;
+
+    // Write one raw chunk to the byte tee (`raw_tee`), disabling it on a write
+    // error the same way `emit` disables the line tee. Awaiting the write here is
+    // the backpressure point: a slow raw sink slows the pump, the OS pipe fills,
+    // and the child blocks on its next write — so a lagging consumer can never
+    // grow unbounded in-flight memory. Independent of decoding and line framing;
+    // the caller feeds it the exact `&chunk[..n]` just read, before the decoder
+    // sees it.
+    async fn tee_raw_chunk(raw_tee: &mut Option<RawTeeSink>, chunk: &[u8]) {
+        if let Some(t) = raw_tee {
+            use tokio::io::AsyncWriteExt;
+            let mut w = t.lock().await;
+            let wrote = w.write_all(chunk).await;
+            drop(w);
+            if wrote.is_err() {
+                *raw_tee = None;
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    target: "processkit",
+                    "raw tee writer errored; disabled for the rest of the run"
+                );
+            }
+        }
+    }
 
     // Emit one decoded line: run the (panic-isolated) handler, await the tee
     // (disabling it on a write error), then buffer the line.
@@ -806,6 +867,14 @@ where
         };
         let errored = read_err.is_some();
         let last = eof && !errored;
+        // Feed the raw byte tee the exact bytes just read, *before* decoding and
+        // any line framing — so it sees the child's output verbatim (non-UTF-8
+        // bytes, CRLF, an unterminated tail, an over-cap line the policy drops).
+        // A clean EOF / read error / broken pipe read yields `n == 0`, so nothing
+        // is written for them; only real data chunks reach the sink.
+        if n > 0 {
+            tee_raw_chunk(&mut raw_tee, &chunk[..n]).await;
+        }
         // Reserve the decoder's worst-case output up front so `decode_to_string`
         // (which uses the `String`'s spare capacity as its output limit, never
         // reallocating) consumes the whole chunk in one call.
@@ -914,6 +983,12 @@ where
             }
             // Flush the tee once at stream end (best-effort).
             if let Some(t) = &tee {
+                use tokio::io::AsyncWriteExt;
+                let _ = t.lock().await.flush().await;
+            }
+            // Flush the raw byte tee once at stream end too (best-effort), so a
+            // buffering raw sink (e.g. a `BufWriter`) commits its tail.
+            if let Some(t) = &raw_tee {
                 use tokio::io::AsyncWriteExt;
                 let _ = t.lock().await.flush().await;
             }
@@ -1053,6 +1128,7 @@ pub fn fuzz_decode_pump_lines(raw: &[u8], chunk_sizes: &[u8], encoding_idx: u8) 
             encoding,
             handler: None,
             tee: None,
+            raw_tee: None,
             terminator: LineTerminator::Newline,
         },
         sink.clone(),
@@ -2207,6 +2283,7 @@ mod tests {
                 encoding: encoding_rs::UTF_8,
                 handler: Some(handler),
                 tee: Some(tee_of(VecSink(buf.clone()))),
+                raw_tee: None,
                 terminator: LineTerminator::CarriageReturn,
             },
             sink.clone(),
@@ -2265,6 +2342,7 @@ mod tests {
                 encoding: encoding_rs::UTF_8,
                 handler: None,
                 tee: Some(tee_of(buffered)),
+                raw_tee: None,
                 terminator: LineTerminator::Newline,
             },
             sink.clone(),
@@ -2291,6 +2369,7 @@ mod tests {
                 encoding: encoding_rs::UTF_8,
                 handler: None,
                 tee: Some(tee_of(VecSink(buf.clone()))),
+                raw_tee: None,
                 terminator: LineTerminator::Newline,
             },
             sink.clone(),
@@ -2334,6 +2413,7 @@ mod tests {
                 encoding: encoding_rs::UTF_8,
                 handler: None,
                 tee: Some(tee_of(ErrSink)),
+                raw_tee: None,
                 terminator: LineTerminator::Newline,
             },
             sink.clone(),
@@ -2388,6 +2468,7 @@ mod tests {
                 encoding: encoding_rs::UTF_8,
                 handler: None,
                 tee: Some(tee_of(FlushErrSink)),
+                raw_tee: None,
                 terminator: LineTerminator::Newline,
             },
             sink.clone(),
@@ -2415,6 +2496,7 @@ mod tests {
                 encoding: encoding_rs::UTF_8,
                 handler: Some(handler),
                 tee: Some(tee_of(VecSink(buf.clone()))),
+                raw_tee: None,
                 terminator: LineTerminator::Newline,
             },
             sink.clone(),
@@ -2425,6 +2507,306 @@ mod tests {
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
             "x\ny\n",
             "tee fired"
+        );
+    }
+
+    // --- Raw byte tee (T-170) ------------------------------------------------
+    //
+    // The raw tee receives every chunk exactly as read from the pipe, before any
+    // decoding or line splitting: byte-for-byte identical to the child's output,
+    // including non-UTF-8 bytes, CRLF, a missing final newline, an unterminated
+    // prompt, and a line the buffer policy drops. Strictly additive — the
+    // decoded-line path (buffer/handler/line-tee) is unchanged by its presence.
+
+    /// A `StreamConfig` with only a raw tee wired (UTF-8 decode, `\n` framing,
+    /// no line handler or line tee) — the common shape for the raw-tee tests.
+    fn raw_only_config(raw_tee: RawTeeSink) -> StreamConfig {
+        StreamConfig {
+            encoding: encoding_rs::UTF_8,
+            handler: None,
+            tee: None,
+            raw_tee: Some(raw_tee),
+            terminator: LineTerminator::Newline,
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_tee_receives_non_utf8_bytes_verbatim() {
+        // Bytes that are not valid UTF-8 (`0x80 0x81`, lone continuation bytes)
+        // are lossily replaced on the *decoded* path (U+FFFD) but must reach the
+        // raw tee unchanged — the whole point of a byte-accurate transparent tee.
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &[0x80, 0x81, b'\n'][..],
+            raw_only_config(tee_of(VecSink(raw.clone()))),
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            &*raw.lock().unwrap(),
+            &[0x80, 0x81, b'\n'],
+            "the raw tee gets the exact bytes, non-UTF-8 and terminator included"
+        );
+        // The decoded path lossily replaced the two invalid bytes with U+FFFD,
+        // whose UTF-8 is 6 bytes — proving the tee is genuinely *pre-decode*: it
+        // delivered the original 2 invalid bytes, not the decoded text re-encoded.
+        let decoded = sink.drain();
+        assert_eq!(
+            decoded,
+            vec!["\u{FFFD}\u{FFFD}"],
+            "the decoded line is lossy replacement characters, not the raw bytes"
+        );
+        assert_ne!(
+            &raw.lock().unwrap()[..2],
+            decoded[0].as_bytes(),
+            "the raw bytes are not the decoded text's UTF-8 re-encoding"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_tee_preserves_crlf_and_unterminated_tail() {
+        // `a\r\nb` with no trailing newline: the decoded path strips the CRLF and
+        // emits `b` as an un-terminated final line (no fabricated `\n`). The raw
+        // tee must keep the CRLF un-normalized and lose no trailing byte.
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"a\r\nb"[..],
+            raw_only_config(tee_of(VecSink(raw.clone()))),
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            &*raw.lock().unwrap(),
+            b"a\r\nb",
+            "raw tee keeps CRLF and the un-terminated tail exactly"
+        );
+        assert_eq!(
+            sink.drain(),
+            vec!["a", "b"],
+            "the decoded line path still strips CRLF and emits the tail as a line"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_tee_gets_oversized_line_the_byte_cap_drops() {
+        // A line longer than the byte cap is skipped from every *decoded* sink
+        // (counted only via `dropped()`), but its bytes must still reach the raw
+        // tee whole — the raw sink is what a transparent wrapper hashes.
+        let policy = OutputBufferPolicy::unbounded().with_max_bytes(3);
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let sink = SharedLines::new(&policy);
+        pump_lines_core(
+            &b"toolongline\nok\n"[..],
+            raw_only_config(tee_of(VecSink(raw.clone()))),
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            &*raw.lock().unwrap(),
+            b"toolongline\nok\n",
+            "the raw tee gets the over-cap line whole plus the retained line"
+        );
+        assert_eq!(sink.count(), 2, "both lines are counted");
+        assert_eq!(
+            sink.dropped(),
+            1,
+            "the over-cap line was dropped from capture"
+        );
+        assert_eq!(sink.drain(), vec!["ok"], "only the in-cap line is retained");
+    }
+
+    #[tokio::test]
+    async fn raw_tee_gets_bytes_of_lines_dropped_by_dropnewest_seal() {
+        // Under `DropNewest` + a line cap of 1, the first line seals the head and
+        // every later line is dropped from the decoded path (K-054). The raw tee
+        // must still receive all of them — it does not fork the drop accounting,
+        // it is fed upstream of the policy entirely.
+        let policy = OutputBufferPolicy::bounded(1).with_overflow(OverflowMode::DropNewest);
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let sink = SharedLines::new(&policy);
+        pump_lines_core(
+            &b"a\nb\nc\n"[..],
+            raw_only_config(tee_of(VecSink(raw.clone()))),
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            &*raw.lock().unwrap(),
+            b"a\nb\nc\n",
+            "the raw tee gets every byte even for policy-sealed dropped lines"
+        );
+        assert_eq!(sink.drain(), vec!["a"], "DropNewest retains only the head");
+        assert_eq!(sink.dropped(), 2, "the two later lines were sealed off");
+    }
+
+    /// An in-memory `AsyncWrite` that records each `poll_write` call's bytes as a
+    /// separate entry, so a test can prove chunks are teed *per read* rather than
+    /// accumulated and written once at the end.
+    #[derive(Clone)]
+    struct RecordingSink(Arc<Mutex<Vec<Vec<u8>>>>);
+    impl tokio::io::AsyncWrite for RecordingSink {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.0.lock().unwrap().push(buf.to_vec());
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_tee_streams_each_read_without_waiting_for_a_newline() {
+        // Two newline-free chunks (`Passw` then `ord: `, an interactive prompt).
+        // Each is written to the raw tee as its own read completes — proving a
+        // chunk with no terminator reaches the sink immediately, not held in the
+        // decode buffer until EOF the way a decoded line is. The per-`poll_write`
+        // recording makes the "one write per read, in order" claim deterministic
+        // without any wall-clock timing (see K-017).
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            ChunkedReader::new([b"Passw".to_vec(), b"ord: ".to_vec()]),
+            raw_only_config(tee_of(RecordingSink(writes.clone()))),
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            &*writes.lock().unwrap(),
+            &[b"Passw".to_vec(), b"ord: ".to_vec()],
+            "each newline-free chunk is teed as its own write, in read order"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_tee_preserves_chunk_order_and_content_across_reads() {
+        // Split arbitrary bytes across several reads: the raw tee's concatenation
+        // is the exact original byte stream, FIFO — no reordering, no loss, no
+        // decoding artifact at a chunk boundary that splits a multibyte char.
+        let original: Vec<u8> = "αβγ\nδ".bytes().collect(); // multibyte UTF-8
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            ChunkedReader::new(to_chunks(&original, &[1, 2, 3])),
+            raw_only_config(tee_of(VecSink(raw.clone()))),
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            &*raw.lock().unwrap(),
+            &original,
+            "the raw tee reconstructs the exact byte stream in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_tee_and_decoded_sinks_fire_independently() {
+        // A raw tee and a decoded-line tee set together: each sees its own view of
+        // the same stream, and the buffer/line path is unchanged. Regression guard
+        // that the raw sink is strictly additive.
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"one\r\ntwo\n"[..],
+            StreamConfig {
+                encoding: encoding_rs::UTF_8,
+                handler: None,
+                tee: Some(tee_of(VecSink(lines.clone()))),
+                raw_tee: Some(tee_of(VecSink(raw.clone()))),
+                terminator: LineTerminator::Newline,
+            },
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            &*raw.lock().unwrap(),
+            b"one\r\ntwo\n",
+            "raw tee: verbatim bytes with CRLF intact"
+        );
+        assert_eq!(
+            String::from_utf8(lines.lock().unwrap().clone()).unwrap(),
+            "one\ntwo\n",
+            "line tee: decoded lines, CRLF normalized, each with a trailing \\n"
+        );
+        assert_eq!(
+            sink.drain(),
+            vec!["one", "two"],
+            "the capture buffer is unaffected by the raw tee"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_tee_write_error_is_isolated_and_capture_continues() {
+        // A raw sink that errors on write is disabled for the rest of the run and
+        // must not poison the decoded capture — mirrors the line tee's isolation.
+        struct ErrSink;
+        impl tokio::io::AsyncWrite for ErrSink {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("nope")))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"a\nb\nc\n"[..],
+            raw_only_config(tee_of(ErrSink)),
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            sink.drain(),
+            vec!["a", "b", "c"],
+            "the decoded capture survives a raw tee write error"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_tee_flushes_a_buffering_sink_at_stream_end() {
+        // A raw sink wrapped in a `BufWriter` only commits once flushed; the pump
+        // must flush the raw tee at stream end so a buffered tail is not lost.
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let buffered = tokio::io::BufWriter::with_capacity(1024, VecSink(raw.clone()));
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"no-newline-tail"[..],
+            raw_only_config(tee_of(buffered)),
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            &*raw.lock().unwrap(),
+            b"no-newline-tail",
+            "the raw tee is flushed through its buffering writer at stream end"
         );
     }
 

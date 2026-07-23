@@ -201,6 +201,57 @@ as it streams (never assembled whole) — rather than dropping the whole progres
 stream. Use `stdout_line_terminator` / `stderr_line_terminator` for one stream,
 or `line_terminator` for both.
 
+### Byte-accurate raw output (`stdout_raw_tee`)
+
+Every path above hands you **decoded** text: bytes go through `encoding_rs`,
+lines are split on the terminator, and CRLF is normalized. That is exactly right
+for text logic — but a **transparent wrapper** needs the child's bytes *unaltered*.
+Decoding mangles four things a passthrough must preserve: non-UTF-8 stdout (binary
+from `git archive`, `tar -cz -`, `ffmpeg … -`) becomes U+FFFD; CRLF is rewritten
+and a missing final newline is fabricated; an unterminated prompt (`Password: `)
+sits in the decode buffer until EOF and reads as a hang; and a line past the byte
+cap vanishes from the transcript entirely.
+
+`stdout_raw_tee(writer)` / `stderr_raw_tee(writer)` are the byte plane, orthogonal
+to `stdout_tee`. Each chunk is written to `writer` **exactly as read from the
+pipe** — before decoding, before line splitting — so it is byte-for-byte the
+child's output, in order: non-UTF-8 bytes survive, CRLF is untouched, the tail is
+never padded, an unterminated chunk arrives the instant it is read, and even a
+policy-dropped line is teed whole. It is **strictly additive** — the decoded line
+path (capture, `on_*_line`, `stdout_tee`, the buffer policy) is unchanged, and
+both tees can run at once, each seeing its own view. The write is awaited on the
+capture pump, so a slow raw sink applies the same backpressure as the line tee (no
+unbounded in-flight buffer), and it is flushed at stream end.
+
+```rust,no_run
+use processkit::Command;
+use tokio::fs::File;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Transparent passthrough: forward the child's *exact* stdout bytes to a file
+    // (binary-safe — no decoding, no CRLF rewrite, no lost tail), retaining
+    // nothing in memory. `drain` streams the bytes through to the tee and returns
+    // just the classified exit outcome.
+    let exact = File::create("archive.tar").await?;
+    let outcome = Command::new("git")
+        .args(["archive", "HEAD"]) // writes a binary tar to stdout
+        .stdout_raw_tee(exact)
+        .start()
+        .await?
+        .drain()
+        .await?;
+    println!("archive written: {outcome:?}");
+    Ok(())
+}
+```
+
+The raw tee fires from the line/streaming verbs (`output_string`, `start` +
+`stdout_lines` / `output_events`, `wait` / `drain`). It is a **no-op** under
+`stdout(Inherit)` / `stdout(Null)` / a `stdout_file` redirect — none run a capture
+pump — and under `output_bytes`, whose own return value already *is* the exact raw
+stdout. Reach for it when you need the raw bytes *alongside* decoded lines.
+
 ## Interactive stdin
 
 Conversational tools — write a request, read the response, repeat. Keep stdin

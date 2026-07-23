@@ -680,6 +680,102 @@ async fn stderr_buffered_tee_flushes_while_capturing() {
     );
 }
 
+// --- Raw byte tee (T-170) ------------------------------------------------
+
+// End to end, the raw tee must reproduce the child's *exact* stdout bytes — the
+// same bytes `output_bytes` (the raw-capture path) returns — whatever line
+// endings the platform's `echo` emits. Cross-platform, proving the raw tee is
+// wired through the builder and the capture pump.
+#[tokio::test]
+#[ignore = "spawns a real subprocess"]
+async fn stdout_raw_tee_reproduces_the_childs_exact_bytes() {
+    let expected = two_line_echo()
+        .output_bytes()
+        .await
+        .expect("output_bytes baseline")
+        .stdout()
+        .to_vec();
+
+    let sink = SharedSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let result = two_line_echo()
+        .stdout_raw_tee(sink.clone())
+        .output_string()
+        .await
+        .expect("a stdout_raw_tee run completes");
+
+    // The decoded capture still works alongside the raw tee (strictly additive).
+    assert!(result.stdout().contains("first") && result.stdout().contains("second"));
+    assert_eq!(
+        &*sink.0.lock().expect("sink mutex"),
+        &expected,
+        "the raw tee must reproduce the child's exact stdout bytes"
+    );
+}
+
+// The raw tee fires on the *streaming* path too (start + stdout_lines + finish),
+// not just bulk capture — proving the wiring reaches every pump call site.
+#[tokio::test]
+#[ignore = "spawns a real subprocess"]
+async fn stdout_raw_tee_feeds_the_streaming_path() {
+    use processkit::prelude::StreamExt;
+
+    let sink = SharedSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let mut run = two_line_echo()
+        .stdout_raw_tee(sink.clone())
+        .start()
+        .await
+        .expect("start a raw-tee streamed run");
+
+    let mut seen = Vec::new();
+    let mut lines = run.stdout_lines().expect("stream stdout lines");
+    while let Some(line) = lines.next().await {
+        seen.push(line);
+    }
+    drop(lines);
+    let done = run.finish().await.expect("finish the streamed run");
+    assert!(
+        matches!(done.outcome, processkit::Outcome::Exited(_)),
+        "the streamed child exited: {:?}",
+        done.outcome
+    );
+
+    assert!(
+        seen.iter().any(|l| l.contains("first")) && seen.iter().any(|l| l.contains("second")),
+        "the caller streamed both lines: {seen:?}"
+    );
+    let raw = String::from_utf8(sink.0.lock().expect("sink mutex").clone()).expect("raw is utf-8");
+    assert!(
+        raw.contains("first") && raw.contains("second"),
+        "the raw tee received the streamed stdout bytes: {raw:?}"
+    );
+}
+
+// The exacting end-to-end byte match: a real child writes CRLF, two non-UTF-8
+// bytes, and no final newline. The raw tee must reproduce every byte — no CRLF
+// normalization, no U+FFFD replacement, no fabricated trailing newline — while
+// the decoded capture is free to be lossy. Unix-only: emitting exact bytes needs
+// `printf` octal escapes (cmd.exe cannot).
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess"]
+async fn stdout_raw_tee_is_byte_exact_for_non_utf8_crlf_and_missing_newline() {
+    let sink = SharedSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let result = Command::new("sh")
+        .args(["-c", r"printf 'plain\r\n\377\376no-nl'"])
+        .stdout_raw_tee(sink.clone())
+        .output_string()
+        .await
+        .expect("a non-UTF-8 raw-tee run completes");
+
+    // The decoded capture kept the ASCII prefix (lossy on the invalid bytes).
+    assert!(result.stdout().contains("plain"));
+    assert_eq!(
+        &*sink.0.lock().expect("sink mutex"),
+        b"plain\r\n\xff\xfeno-nl",
+        "raw tee: CRLF un-normalized, non-UTF-8 bytes intact, no fabricated final newline"
+    );
+}
+
 #[tokio::test]
 #[ignore = "spawns a real subprocess"]
 async fn run_trims_and_requires_success() {

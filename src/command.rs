@@ -1235,6 +1235,113 @@ impl Command {
         self
     }
 
+    /// Tee the child's stdout to `writer` **byte for byte, before any decoding or
+    /// line splitting** — a transparent passthrough that hands the consumer the
+    /// child's exact bytes.
+    ///
+    /// Where [`stdout_tee`](Self::stdout_tee) writes *decoded lines* (each plus a
+    /// `\n`), this writes each chunk **exactly as read from the pipe**, ahead of
+    /// the decoder. That is the difference between a log tee and a faithful
+    /// wrapper: the raw tee neither loses nor invents a single byte, so a
+    /// consumer can forward the stream live *and* hash/capture the exact output.
+    /// Concretely, unlike the decoded tee it preserves:
+    ///
+    /// - **non-UTF-8 bytes** — a child writing binary to stdout (`git archive`,
+    ///   `tar -cz -`, `ffmpeg … -`) is teed verbatim, not mangled into U+FFFD
+    ///   replacement characters;
+    /// - **CRLF and lone `\r`** — no newline normalization, no line framing;
+    /// - **a missing final newline** — the last bytes are teed as-is, never
+    ///   given a fabricated `\n`;
+    /// - **an unterminated prompt** — `Password: ` (no newline) reaches the sink
+    ///   the moment it is read, rather than waiting in the decode buffer until
+    ///   EOF the way a decoded line does, so an interactive child does not read
+    ///   as hung;
+    /// - **a line the capture policy drops** — a line past a
+    ///   [`with_max_bytes`](crate::OutputBufferPolicy::with_max_bytes) byte cap is
+    ///   skipped from *every decoded sink* (the buffer, the handler, and
+    ///   [`stdout_tee`](Self::stdout_tee)), but its bytes still reach the raw tee
+    ///   **whole** — the digest a wrapper computes over the raw tee covers the
+    ///   child's actual output, not a truncated re-encoding.
+    ///
+    /// Chunks arrive in **FIFO** order within the stream. This is **strictly
+    /// additive**: the decoded-line path — capture buffer, its
+    /// [`OutputBufferPolicy`], the `dropped()` truncation accounting,
+    /// [`on_stdout_line`](Self::on_stdout_line), and
+    /// [`stdout_tee`](Self::stdout_tee) — is unchanged whether or not a raw tee is
+    /// set, and all configured sinks fire independently.
+    ///
+    /// # Backpressure and memory
+    ///
+    /// `writer` is an async [`tokio::io::AsyncWrite`]. Each raw write is **awaited
+    /// on the capture pump**, the same backpressure seam as
+    /// [`stdout_tee`](Self::stdout_tee): a slow sink slows the pump, the OS pipe
+    /// fills, and the child blocks on its next write. Nothing is buffered in the
+    /// crate between the pipe and the sink, so a lagging raw consumer **cannot**
+    /// grow unbounded in-flight memory — the bound is the OS pipe, not a heap
+    /// queue. A destination that blocks *forever* (not merely slow) stalls the
+    /// pump until teardown's grace aborts it, exactly as for the decoded tee. A
+    /// write error disables the raw tee for the rest of the run (a `tracing` warn
+    /// under the `tracing` feature, not silently swallowed); the decoded path is
+    /// unaffected. The sink is flushed once at stream end, so a buffering writer
+    /// (`BufWriter`, a file) commits its tail.
+    ///
+    /// **Shared across clones and attempts**, like [`stdout_tee`](Self::stdout_tee):
+    /// the sink is held in an `Arc<Mutex<…>>`, so cloned `Command`s (pipeline
+    /// stages, supervisor incarnations, retry attempts) share *one* sink —
+    /// concurrent clones interleave their bytes, sequential re-runs append. Tee to
+    /// distinct sinks for per-run separation. A second `stdout_raw_tee` replaces an
+    /// earlier one.
+    ///
+    /// # Requires a piped stdout; inert on the raw-capture verb
+    ///
+    /// The raw tee fires from the line **capture pump**, so — like
+    /// [`stdout_tee`](Self::stdout_tee) — it is a **no-op** under
+    /// [`stdout(Inherit)`](Self::stdout) / [`stdout(Null)`](Self::stdout) and a
+    /// [`stdout_file`](Self::stdout_file) redirect (all of which run no capture
+    /// pump); the builder accepts the combination but simply never invokes the
+    /// sink, rather than rejecting it. It is likewise inert under
+    /// [`output_bytes`](Self::output_bytes), whose *own* return value already **is**
+    /// the exact raw stdout (a separate raw drain, no line pump) — reach for the
+    /// raw tee with the line/streaming verbs (`output_string`, `start` +
+    /// `stdout_lines` / `output_events`, `wait` / `drain`) when you need the raw
+    /// bytes *alongside* decoded lines.
+    ///
+    /// # Record/replay caveat
+    ///
+    /// On a live run the tee is byte-exact. On a
+    /// [`ScriptedRunner`](crate::testing::ScriptedRunner) double or a cassette
+    /// replay there is no child: the scripted feeder writes the canned/recorded
+    /// text back as **UTF-8**, so the raw tee receives *those* bytes — byte-exact
+    /// only insofar as the recorded (already-decoded) text round-trips, the same
+    /// fidelity limit that makes [`output_bytes`](Self::output_bytes) unsupported
+    /// on a cassette. Rely on byte accuracy only against a real process.
+    pub fn stdout_raw_tee<W>(mut self, writer: W) -> Self
+    where
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let boxed: Box<dyn tokio::io::AsyncWrite + Send + Unpin> = Box::new(writer);
+        self.stdout_config.raw_tee = Some(Arc::new(tokio::sync::Mutex::new(boxed)));
+        self
+    }
+
+    /// Tee the child's stderr to `writer` **byte for byte, before any decoding or
+    /// line splitting**.
+    ///
+    /// Same contract as [`stdout_raw_tee`](Self::stdout_raw_tee) — verbatim bytes
+    /// (non-UTF-8, CRLF, missing final newline, and lines the buffer policy drops
+    /// all preserved), FIFO order, awaited on the pump (backpressure, bounded
+    /// memory), flushed at stream end, independent of
+    /// [`stderr_tee`](Self::stderr_tee)/[`on_stderr_line`](Self::on_stderr_line),
+    /// and requiring stderr to be [`Piped`](crate::StdioMode::Piped).
+    pub fn stderr_raw_tee<W>(mut self, writer: W) -> Self
+    where
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let boxed: Box<dyn tokio::io::AsyncWrite + Send + Unpin> = Box::new(writer);
+        self.stderr_config.raw_tee = Some(Arc::new(tokio::sync::Mutex::new(boxed)));
+        self
+    }
+
     /// Cap the in-memory backlog of captured output lines (see
     /// [`OutputBufferPolicy`]). The pump still drains the pipe; only retention is
     /// bounded.
@@ -1334,7 +1441,9 @@ impl Command {
 
     /// A clone with the per-line push side-effects — the
     /// [`on_stdout_line`](Self::on_stdout_line)/[`on_stderr_line`](Self::on_stderr_line)
-    /// handlers and the [`stdout_tee`](Self::stdout_tee)/[`stderr_tee`](Self::stderr_tee)
+    /// handlers, the [`stdout_tee`](Self::stdout_tee)/[`stderr_tee`](Self::stderr_tee)
+    /// sinks, and the
+    /// [`stdout_raw_tee`](Self::stdout_raw_tee)/[`stderr_raw_tee`](Self::stderr_raw_tee)
     /// sinks — removed. Used by the record/replay cassette's streaming `start`: its
     /// internal whole-run capture pass (`inner.output_string`) must stay silent,
     /// because the scripted handle it hands back fires the caller's handlers/tees
@@ -1347,6 +1456,8 @@ impl Command {
         clone.stderr_config.handler = None;
         clone.stdout_config.tee = None;
         clone.stderr_config.tee = None;
+        clone.stdout_config.raw_tee = None;
+        clone.stderr_config.raw_tee = None;
         clone
     }
 
@@ -2262,6 +2373,8 @@ impl fmt::Debug for Command {
             .field("has_stderr_handler", &self.stderr_config.handler.is_some())
             .field("has_stdout_tee", &self.stdout_config.tee.is_some())
             .field("has_stderr_tee", &self.stderr_config.tee.is_some())
+            .field("has_stdout_raw_tee", &self.stdout_config.raw_tee.is_some())
+            .field("has_stderr_raw_tee", &self.stderr_config.raw_tee.is_some())
             .field("output_buffer", &self.output_buffer)
             .field("stdout_encoding", &self.stdout_config.encoding.name())
             .field("stderr_encoding", &self.stderr_config.encoding.name())

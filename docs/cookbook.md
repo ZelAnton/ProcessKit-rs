@@ -265,6 +265,37 @@ while any capture verb drives the run.
 
 *Fine print: [Streaming & interactive I/O](streaming.md).*
 
+## Forward a child's exact bytes (binary passthrough)
+
+```rust,no_run
+use processkit::Command;
+use tokio::fs::File;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let exact = File::create("archive.tar").await?;
+    let outcome = Command::new("git")
+        .args(["archive", "HEAD"]) // binary tar on stdout
+        .stdout_raw_tee(exact)     // exact bytes, before any decoding
+        .start()
+        .await?
+        .drain()                   // stream through, retain nothing
+        .await?;
+    println!("done: {outcome:?}");
+    Ok(())
+}
+```
+
+`stdout_raw_tee` / `stderr_raw_tee` write each chunk **exactly as read from the
+pipe** — no decoding, no CRLF rewrite, no line splitting, no lost tail — so
+non-UTF-8 output (`git archive`, `tar -cz -`, `ffmpeg … -`) survives byte for
+byte. It runs *alongside* the decoded sinks (`stdout_lines`, `on_stdout_line`,
+`stdout_tee`), so you can forward the raw stream and react to decoded lines at
+once. For the whole output in memory instead of streamed through, `output_bytes()`
+returns the exact bytes directly.
+
+*Fine print: [Streaming → byte-accurate raw output](streaming.md).*
+
 ## Talk to an interactive child
 
 ```rust,no_run

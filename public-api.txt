@@ -684,6 +684,7 @@ pub fn processkit::Command::stderr_file(self, impl core::convert::AsRef<std::pat
 pub fn processkit::Command::stderr_file_append(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn processkit::Command::stderr_file_truncate(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn processkit::Command::stderr_line_terminator(self, processkit::LineTerminator) -> Self
+pub fn processkit::Command::stderr_raw_tee<W>(self, W) -> Self where W: tokio::io::async_write::AsyncWrite + core::marker::Send + core::marker::Unpin + 'static
 pub fn processkit::Command::stderr_tee<W>(self, W) -> Self where W: tokio::io::async_write::AsyncWrite + core::marker::Send + core::marker::Unpin + 'static
 pub fn processkit::Command::stdin(self, processkit::Stdin) -> Self
 pub fn processkit::Command::stdin_source(&self) -> core::option::Option<&processkit::Stdin>
@@ -693,6 +694,7 @@ pub fn processkit::Command::stdout_file(self, impl core::convert::AsRef<std::pat
 pub fn processkit::Command::stdout_file_append(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn processkit::Command::stdout_file_truncate(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn processkit::Command::stdout_line_terminator(self, processkit::LineTerminator) -> Self
+pub fn processkit::Command::stdout_raw_tee<W>(self, W) -> Self where W: tokio::io::async_write::AsyncWrite + core::marker::Send + core::marker::Unpin + 'static
 pub fn processkit::Command::stdout_tee<W>(self, W) -> Self where W: tokio::io::async_write::AsyncWrite + core::marker::Send + core::marker::Unpin + 'static
 pub fn processkit::Command::timeout(self, core::time::Duration) -> Self
 pub fn processkit::Command::timeout_grace(self, core::time::Duration) -> Self
