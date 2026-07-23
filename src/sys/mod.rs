@@ -112,6 +112,30 @@ pub(crate) fn process_identity(pid: u32) -> Option<ProcIdentity> {
     imp::process_identity(pid)
 }
 
+/// Identity + best-effort metadata for an **arbitrary** pid (not one tracked by
+/// any group) — the platform-dispatching core of the public
+/// [`process_info`](crate::process_info) query. Returns the same fields a
+/// [`MemberInfo`](crate::MemberInfo) carries for a group member, read through the
+/// **same** per-platform readers (`/proc/<pid>/stat` on Linux, `proc_pidinfo` on
+/// macOS, `Toolhelp32` + creation `FILETIME` on Windows, a `kill(pid, 0)` existence
+/// probe on the bare BSDs).
+///
+/// The three-way contract every backend upholds:
+/// - `Ok(Some(info))` — the process exists; each enriching field is honestly
+///   `Option` (`None` where the platform can't report it).
+/// - `Ok(None)` — the process definitively does **not** exist (an honest negative,
+///   never an error).
+/// - `Err` — the process may exist but couldn't be inspected (a permission denial
+///   or other OS error), so a caller never mistakes "not allowed to look" for
+///   "dead".
+///
+/// Reads no argv/environment on any platform — the crate's standing "never
+/// argv/env" rule.
+#[cfg(feature = "process-control")]
+pub(crate) fn process_info(pid: u32) -> io::Result<Option<crate::member::MemberInfo>> {
+    imp::process_info(pid)
+}
+
 // Shared POSIX process-group backend for both the Linux fallback and macOS/BSD.
 #[cfg(unix)]
 pub(crate) mod pgroup;

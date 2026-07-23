@@ -1364,6 +1364,22 @@ fn process_start_time(pid: u32) -> Option<u64> {
     if handle.is_null() {
         return None;
     }
+    let units = creation_time_units(handle);
+    // SAFETY: handle came from OpenProcess and is closed exactly once.
+    unsafe { CloseHandle(handle) };
+    units
+}
+
+/// Read a live process's creation `FILETIME` as its raw 100-ns identity token
+/// from an already-open query-limited `handle`. `None` if `GetProcessTimes` fails.
+///
+/// The single `GetProcessTimes` + [`filetime_units`] decode shared by
+/// [`process_start_time`] (which opens a fresh per-pid handle) and [`process_info`]
+/// (which reuses the handle it already opened as its existence oracle, avoiding a
+/// second `OpenProcess` and the recycle window between two opens), so the two can
+/// never decode the creation time differently.
+#[cfg(feature = "process-control")]
+fn creation_time_units(handle: HANDLE) -> Option<u64> {
     let mut creation = FILETIME {
         dwLowDateTime: 0,
         dwHighDateTime: 0,
@@ -1373,9 +1389,53 @@ fn process_start_time(pid: u32) -> Option<u64> {
     let mut user = creation;
     // SAFETY: valid handle; all four out params are owned locals.
     let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    (ok != 0).then(|| filetime_units(creation))
+}
+
+/// Identity + best-effort metadata for an **arbitrary** pid — the Windows backend
+/// of the standalone [`process_info`](crate::process_info) query.
+///
+/// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` is the existence-and-permission
+/// oracle: it is the least-privilege query right, grantable across sessions and
+/// integrity levels for ordinary processes, so a **null** handle means either the
+/// pid does not exist (`ERROR_INVALID_PARAMETER` → `Ok(None)`, an honest negative)
+/// or the caller may not query it — a protected / higher-integrity process such as
+/// an anti-malware PPL or the `System` process (any other failure, notably
+/// `ERROR_ACCESS_DENIED` → `Err`, never a false "dead"). A handle in hand means the
+/// process exists and is queryable; its creation `FILETIME` start-time token is
+/// read (via [`creation_time_units`]) while the handle is still held.
+///
+/// Parent pid and image name then come from one system-wide `Toolhelp32` snapshot
+/// (the same source [`members_info`](Job::members_info) uses — no per-pid Win32 API
+/// yields the parent pid without ntdll); a pid absent from that even-later snapshot
+/// vanished in the window and keeps those two fields `None`, while the start time —
+/// read above while the process was demonstrably alive — still stands (the honest
+/// per-field `Option` contract).
+#[cfg(feature = "process-control")]
+pub(crate) fn process_info(pid: u32) -> io::Result<Option<MemberInfo>> {
+    // SAFETY: opens by pid with the narrowest query right; null on failure.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        let err = io::Error::last_os_error();
+        // `ERROR_INVALID_PARAMETER` is the sole "no such pid" answer — a negative
+        // result, not an error. Every other failure (`ERROR_ACCESS_DENIED` on a
+        // protected process, …) leaves existence undetermined, so it surfaces as
+        // `Err` and is never read as "dead".
+        if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            return Ok(None);
+        }
+        return Err(err);
+    }
+    let start_time = creation_time_units(handle);
     // SAFETY: handle came from OpenProcess and is closed exactly once.
     unsafe { CloseHandle(handle) };
-    (ok != 0).then(|| filetime_units(creation))
+    // A member absent from the snapshot exited in this later window — keep the
+    // record (start time above still stands), with ppid/exe honestly `None`.
+    let (ppid, exe) = match snapshot_process_metadata()?.get(&pid) {
+        Some((ppid, exe)) => (Some(*ppid), Some(exe.clone())),
+        None => (None, None),
+    };
+    Ok(Some(MemberInfo::new(pid, ppid, exe, start_time)))
 }
 
 /// A FILETIME as its raw 64-bit 100-ns unit count (high/low halves combined).

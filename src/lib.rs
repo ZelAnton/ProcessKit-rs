@@ -137,7 +137,9 @@
 //!   `record` → `serde`/`serde_json`.)
 //! - **`process-control`** *(default)* — tree control beyond contain+kill:
 //!   `Signal` and `ProcessGroup::{signal, suspend, resume, members,
-//!   members_info, adopt}`, plus the enriched `MemberInfo` member snapshot.
+//!   members_info, adopt}`, the enriched `MemberInfo` member snapshot, and the
+//!   free-standing `process_info` / `process_is_alive` queries for a pid held
+//!   *outside* any group (reuse-safe liveness by the `(pid, start time)` pair).
 //! - **`limits`** — whole-tree resource caps: `ResourceLimits`, the
 //!   `max_memory`/`max_processes`/`cpu_quota` builders on
 //!   [`ProcessGroupOptions`], and `Error::ResourceLimit`. Implies `stats`.
@@ -203,9 +205,15 @@ mod error;
 mod group;
 #[cfg(feature = "limits")]
 mod limits;
+// `process_info` / `process_is_alive` — the free-standing identity & reuse-safe
+// liveness queries for an arbitrary pid held outside any group. Gated with the
+// `MemberInfo` they return and the `process-control` readers they reuse.
+#[cfg(feature = "process-control")]
+mod lookup;
 mod mechanism;
 // `MemberInfo` — the enriched member snapshot returned by
-// `ProcessGroup::members_info`. Gated with the method it exists for.
+// `ProcessGroup::members_info` and the free-standing `process_info` query. Gated
+// with the methods it exists for.
 #[cfg(feature = "process-control")]
 mod member;
 // `ParentDeathCleanup` — the honest per-platform capability report for
@@ -256,6 +264,8 @@ pub use error::{Error, Result};
 pub use group::{ProcessGroup, ProcessGroupOptions};
 #[cfg(feature = "limits")]
 pub use limits::{LimitKind, LimitReason, ResourceLimits};
+#[cfg(feature = "process-control")]
+pub use lookup::{process_info, process_is_alive};
 pub use mechanism::Mechanism;
 #[cfg(feature = "process-control")]
 pub use member::MemberInfo;

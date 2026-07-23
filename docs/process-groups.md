@@ -440,6 +440,79 @@ between its pid being enumerated and its metadata being read, that pid is
 **skipped** rather than reported with fabricated fields — a single vanished
 member never fails the whole call.
 
+### Identifying a process by pid (outside a group)
+
+Sometimes the pid you care about is **not** a member of any group you own — a pid
+saved to disk between runs, a launch registry checking whether the owner of a
+crash-surviving entry is still alive, an e2e probe watching a process from outside
+its container. For that, the crate publishes the *same* identity query as a
+free-standing function (needs `process-control`):
+
+```rust,no_run
+# fn main() -> processkit::Result<()> {
+let pid = 4321;
+
+// Look up an arbitrary pid — the standalone twin of `members_info`, returning the
+// same best-effort `MemberInfo` (parent pid, image name, start time).
+match processkit::process_info(pid)? {
+    Some(info) => println!(
+        "pid={} ppid={:?} exe={:?} start={:?}",
+        info.pid(), info.ppid(), info.exe_name(), info.start_time(),
+    ),
+    None => println!("pid {pid} is not running"),
+}
+# Ok(())
+# }
+```
+
+`process_info` returns **three** distinct outcomes, and the distinction is the
+point:
+
+- `Ok(Some(info))` — the process exists; fields are best-effort `Option` exactly as
+  in `members_info`.
+- `Ok(None)` — the pid names **no** process: an honest negative, the "it's gone"
+  answer a liveness check wants.
+- `Err` — the process may well exist, but you couldn't inspect it (no permission —
+  a Windows protected/`System` process, a Linux `hidepid` mount, a macOS restricted
+  process — or an OS read error). **Never read this as "dead."** That is the whole
+  reason it is an error rather than `Ok(None)`.
+
+It reads no argv/environment, on any platform — the same "never argv/env" stance
+`MemberInfo` documents.
+
+#### Reuse-safe liveness: `process_is_alive`
+
+Because the OS reuses pid *numbers*, "is pid N still alive?" is the wrong question
+for a saved pid: a stranger may have recycled the number after your process exited.
+Pair the pid with the **start-time token** and ask instead "is the *same* process
+still running?":
+
+```rust,no_run
+# fn main() -> processkit::Result<()> {
+// Earlier: record identity.
+let pid = 4321;
+let saved_start = processkit::process_info(pid)?.and_then(|i| i.start_time());
+
+// Later (perhaps after a restart): is that same process still alive?
+if processkit::process_is_alive(pid, saved_start)? {
+    println!("the original process {pid} is still alive");
+} else {
+    println!("process {pid} is gone (exited, or its number was recycled)");
+}
+# Ok(())
+# }
+```
+
+`process_is_alive` is `Ok(true)` only when the process exists **and** its current
+start time matches the saved one; a **different** start time on the same number
+(the number was recycled) reads as `Ok(false)`, and so does a nonexistent pid. A
+permission `Err` propagates just like `process_info` — again, never "dead". The
+start time is an opaque identity anchor (unit/epoch differ per platform), used only
+for this pairing, never displayed. Where the platform reports **no** start time
+(the bare BSDs, where `start_time()` is `None`), the check degrades to bare-pid
+liveness — exactly the number-only check you'd otherwise write by hand, no weaker,
+and never a false "dead".
+
 ## Resource limits
 
 Requires the **`limits`** feature. Caps are a property of the group, set at

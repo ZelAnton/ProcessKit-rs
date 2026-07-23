@@ -489,6 +489,189 @@ async fn members_info_on_empty_group_is_empty() {
     assert!(infos.is_empty(), "fresh group has members: {infos:?}");
 }
 
+// ── standalone process_info / process_is_alive (T-175) ───────────────────────
+
+// A live child is recognised by the free-standing pid query — outside any group —
+// with the same best-effort fields a group member carries, and its saved
+// (pid, start-time) pair reports it alive.
+#[tokio::test]
+#[ignore = "spawns a real subprocess and queries its identity by pid"]
+async fn process_info_identifies_a_live_child() {
+    let group = ProcessGroup::new().expect("create group");
+    let child = group.start(&sleeper()).await.expect("start sleeper");
+    let pid = child.pid().expect("child pid");
+
+    let info = processkit::process_info(pid)
+        .expect("process_info must not error on a live child we own")
+        .expect("a live child must be found by pid");
+    assert_eq!(info.pid(), pid, "process_info reported the wrong pid");
+
+    // Every field this platform declares available (see `MemberInfo`'s matrix) must
+    // actually be filled for a live process — exactly as `members_info` fills them,
+    // proof the standalone query reuses the same readers rather than a stub.
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    {
+        assert!(
+            info.ppid().is_some(),
+            "ppid should be reported here: {info:?}"
+        );
+        assert!(
+            info.exe_name().is_some(),
+            "exe_name should be reported here: {info:?}"
+        );
+        assert!(
+            info.start_time().is_some(),
+            "start_time should be reported here: {info:?}"
+        );
+    }
+
+    // The saved (pid, start-time) pair reports the same instance alive. On the bare
+    // BSDs `start_time()` is `None`, so this degrades to bare-pid liveness — still
+    // `true` for a live child.
+    assert!(
+        processkit::process_is_alive(pid, info.start_time())
+            .expect("liveness query must not error on a live child"),
+        "the live child must read as alive by its (pid, start-time) pair",
+    );
+}
+
+// Models a **recycled pid** without waiting for a real recycle: the pid is a live
+// process, but the saved start-time differs — as if a different process had
+// reclaimed the number after the original exited. A recycle-aware liveness check
+// must report the saved instance gone. Only meaningful where a start-time token is
+// reported (Windows / Linux / macOS); the bare BSDs report none and degrade to
+// number-only liveness by design.
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+#[ignore = "spawns a real subprocess to model a recycled pid without waiting for a real recycle"]
+async fn process_is_alive_rejects_a_recycled_number() {
+    let group = ProcessGroup::new().expect("create group");
+    let child = group.start(&sleeper()).await.expect("start sleeper");
+    let pid = child.pid().expect("child pid");
+
+    let start = processkit::process_info(pid)
+        .expect("process_info")
+        .and_then(|i| i.start_time())
+        .expect("a start-time token is reported on this platform");
+
+    // The genuine token: same instance, alive.
+    assert!(
+        processkit::process_is_alive(pid, Some(start)).expect("liveness with the real token"),
+        "the real (pid, start-time) pair must read as alive",
+    );
+
+    // A stale token on the *same live pid* stands in for the number having been
+    // recycled by a different process — the check must call the saved instance gone.
+    let stale = start ^ 0x5A5A_5A5A;
+    assert_ne!(
+        stale, start,
+        "the stale token must differ from the real one"
+    );
+    assert!(
+        !processkit::process_is_alive(pid, Some(stale))
+            .expect("liveness must not error on a live pid with a stale token"),
+        "a mismatched start-time must read as gone — the number was recycled",
+    );
+}
+
+// Once a child is torn down and reaped, the free-standing query reports its saved
+// (pid, start-time) pair gone — the "after it exits, an honest no" half of the
+// contract. Uses the same `OpenProcess`-by-pid liveness the group-teardown tests
+// rely on, polling to let the async reap complete (and, on Windows, the process
+// handle close).
+#[tokio::test]
+#[ignore = "spawns a real subprocess, tears it down, and confirms its pid reads as gone"]
+async fn process_is_alive_reports_gone_after_teardown() {
+    let group = ProcessGroup::new().expect("create group");
+    let child = group.start(&sleeper()).await.expect("start sleeper");
+    let pid = child.pid().expect("child pid");
+    let start = processkit::process_info(pid)
+        .expect("process_info")
+        .and_then(|i| i.start_time());
+
+    assert!(
+        processkit::process_is_alive(pid, start).expect("liveness while running"),
+        "the child must read alive before teardown",
+    );
+
+    group.kill_all().expect("terminate the tree");
+    let _ = child.wait().await.expect("reap the killed child");
+    drop(group);
+
+    // The pid must now read as gone. Poll: on the pgroup backends the reap frees the
+    // number a beat after the kill, and on Windows the last process handle closes as
+    // the child and job handles drop.
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        "the reaped child's pid still read as alive",
+        || {
+            !processkit::process_is_alive(pid, start)
+                .expect("liveness after teardown must not error")
+        },
+    )
+    .await;
+
+    // A fresh lookup is likewise a clean negative (or, if the number was already
+    // recycled by an unrelated process, a *different* instance — never the saved
+    // one, which `process_is_alive` above already proved gone).
+    match processkit::process_info(pid).expect("process_info after teardown must not error") {
+        None => {}
+        Some(info) => assert_ne!(
+            info.start_time(),
+            start,
+            "the saved instance is gone; any Some here is a recycled stranger",
+        ),
+    }
+}
+
+// A pid past any valid range names no process: a clean `Ok(None)`, never an error
+// or a panic, and never alive. The deterministic, subprocess-free negative.
+#[tokio::test]
+#[ignore = "queries a pid past any valid range"]
+async fn process_info_on_a_nonexistent_pid_is_a_clean_none() {
+    // ~2e9 is far above any OS's pid_max yet still fits `pid_t` (`i32`), so it
+    // exercises each backend's real "not found" path rather than a range guard.
+    let bogus = 2_000_000_000u32;
+    assert_eq!(
+        processkit::process_info(bogus).expect("a nonexistent pid is not an error"),
+        None,
+        "a nonexistent pid must be a clean None, not Some/Err",
+    );
+    assert!(
+        !processkit::process_is_alive(bogus, None).expect("liveness on a gone pid"),
+        "a nonexistent pid must read as not alive",
+    );
+    assert!(
+        !processkit::process_is_alive(bogus, Some(12_345)).expect("liveness on a gone pid"),
+        "a token cannot resurrect a nonexistent pid",
+    );
+}
+
+// A foreign **privileged** process must never be a false "gone": the documented and
+// verified behaviour is `Ok(Some)` when the caller may query it, else a permission
+// `Err` — but never `Ok(None)` (which would let a caller conclude a live process is
+// dead). Robust to whether the runner is elevated.
+#[tokio::test]
+#[ignore = "queries a known privileged system process by pid"]
+async fn process_info_on_a_privileged_process_is_never_a_false_gone() {
+    #[cfg(windows)]
+    let pid = 4; // the Windows `System` process — normally not query-openable.
+    #[cfg(not(windows))]
+    let pid = 1; // pid 1: init/systemd (Linux), launchd (macOS), the container init.
+
+    match processkit::process_info(pid) {
+        Ok(Some(info)) => assert_eq!(info.pid(), pid, "reported the wrong pid"),
+        Ok(None) => panic!(
+            "a live privileged process (pid {pid}) must never read as a nonexistent pid — \
+             'can't look' is not 'dead'"
+        ),
+        // A permission error is the honest "not allowed to look" — expected on the
+        // targets/rights where the query is denied, and explicitly not a false gone.
+        Err(_) => {}
+    }
+}
+
 #[tokio::test]
 #[ignore = "spawns a short subprocess and adopts it after reaping"]
 async fn adopt_of_a_reaped_child_errors_instead_of_tracking_nothing() {

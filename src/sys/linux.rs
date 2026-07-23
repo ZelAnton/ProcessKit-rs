@@ -354,6 +354,23 @@ impl Job {
     }
 }
 
+/// Identity + best-effort metadata for an **arbitrary** pid (not one tracked by a
+/// group) — the Linux backend of the standalone [`process_info`](crate::process_info)
+/// query. Reads the same single `/proc/<pid>/stat` line the group snapshot uses
+/// (ppid = field 4, `comm` = field 2, start time = field 22), through the shared
+/// `sys::procfs` parser, so it can't drift from the member-snapshot path.
+///
+/// `Ok(None)` when the pid is genuinely gone (`ENOENT`), `Err` when it can't be
+/// looked at (a permission denial, e.g. a `hidepid` mount — never mistaken for
+/// "dead"), `Ok(Some(_))` otherwise. `/proc/<pid>/stat` is world-readable for
+/// other users' processes on a default mount, so a foreign process is reported,
+/// not denied.
+#[cfg(feature = "process-control")]
+pub(crate) fn process_info(pid: u32) -> io::Result<Option<MemberInfo>> {
+    Ok(crate::sys::procfs::read_stat_meta_checked(pid)?
+        .map(|m| MemberInfo::new(pid, m.ppid, m.comm, m.starttime)))
+}
+
 /// Read `/proc/<pid>/stat`'s `starttime` (field 22) — the process's start-time
 /// identity anchor. `starttime` is fixed at process creation and distinct for a pid
 /// recycled by a later process, so it tells a reused number apart from the original.

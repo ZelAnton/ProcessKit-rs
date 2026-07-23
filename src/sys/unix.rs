@@ -159,6 +159,18 @@ pub(crate) fn process_metrics(_pid: u32, _expected: Option<ProcIdentity>) -> Pro
     ProcMetrics::default()
 }
 
+/// Identity + best-effort metadata for an **arbitrary** pid — the macOS/BSD
+/// backend of the standalone [`process_info`](crate::process_info) query.
+/// Delegates to the shared POSIX process-group module, which reuses the very
+/// `proc_pidinfo` reader (macOS) or `kill(pid, 0)` existence probe (the bare BSDs)
+/// the group tracking already relies on, and keeps its "no such process" (`Ok(None)`)
+/// vs "can't look" (`Err`) distinction. Works for any pid the caller holds, not
+/// only tracked group leaders.
+#[cfg(feature = "process-control")]
+pub(crate) fn process_info(pid: u32) -> io::Result<Option<MemberInfo>> {
+    crate::sys::pgroup::process_info(pid)
+}
+
 #[cfg(feature = "stats")]
 pub(crate) fn process_identity(_pid: u32) -> Option<ProcIdentity> {
     // No wired-up per-process metrics here (see `process_metrics`), so there is no
