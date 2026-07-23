@@ -191,6 +191,41 @@ impl RunProfile {
     pub fn timed_out(&self) -> bool {
         self.outcome.timed_out()
     }
+
+    /// Build a `RunProfile` from its fields — a `#[doc(hidden)]` insulated
+    /// constructor for a wrapper/serialization layer to reconstruct a value
+    /// directly, by the same "one insulated constructor instead of a struct
+    /// literal" rationale as [`Error::exit`](crate::Error::exit) —
+    /// `RunProfile`'s own `#[non_exhaustive]` already rejects a struct literal
+    /// from outside this crate even though every field is `pub` (see the
+    /// type's own doc for why). Off the documented surface, but `pub` so
+    /// downstream code can call it; semver-covered like any public item.
+    ///
+    /// Mirrors every field, so a value round-trips through this constructor and
+    /// reading the fields back (or the [`code`](Self::code) /
+    /// [`signal`](Self::signal) / [`timed_out`](Self::timed_out) /
+    /// [`avg_cpu_cores`](Self::avg_cpu_cores) accessors) byte-for-byte. No
+    /// combination of these fields can be internally contradictory: `outcome`
+    /// is this crate's own [`Outcome`], already mutually exclusive by
+    /// construction (an exit code and a signal can never both be present), and
+    /// every other field is independent telemetry with no cross-field
+    /// invariant to violate.
+    #[doc(hidden)]
+    pub fn from_parts(
+        outcome: Outcome,
+        duration: Duration,
+        cpu_time: Option<Duration>,
+        peak_memory_bytes: Option<u64>,
+        samples: usize,
+    ) -> Self {
+        RunProfile {
+            outcome,
+            duration,
+            cpu_time,
+            peak_memory_bytes,
+            samples,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -263,5 +298,34 @@ mod tests {
         assert_eq!(signalled.signal(), Some(9));
         // Both leave `code()` empty — only `outcome` separates them.
         assert_eq!(timed_out.code(), signalled.code());
+    }
+
+    /// T-179: a `RunProfile` built by the `#[doc(hidden)]` `from_parts`
+    /// constructor and read back through its (public) fields/accessors
+    /// reproduces the original, field for field.
+    #[test]
+    fn run_profile_from_parts_round_trips_every_field() {
+        let original = RunProfile::from_parts(
+            Outcome::Exited(0),
+            Duration::from_secs(2),
+            Some(Duration::from_secs(1)),
+            Some(4096),
+            8,
+        );
+        assert_eq!(original.outcome, Outcome::Exited(0));
+        assert_eq!(original.duration, Duration::from_secs(2));
+        assert_eq!(original.cpu_time, Some(Duration::from_secs(1)));
+        assert_eq!(original.peak_memory_bytes, Some(4096));
+        assert_eq!(original.samples, 8);
+        assert_eq!(original.avg_cpu_cores(), Some(0.5));
+
+        let rebuilt = RunProfile::from_parts(
+            original.outcome,
+            original.duration,
+            original.cpu_time,
+            original.peak_memory_bytes,
+            original.samples,
+        );
+        assert_eq!(original, rebuilt);
     }
 }

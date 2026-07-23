@@ -8,7 +8,7 @@ like wasm. Building for such a target fails at compile time (a `compile_error!`
 guard, or earlier in tokio's own dependencies). Within the supported set, it
 treats platform support as first-class: every capability is either fully
 implemented, *honestly partial* (documented and typed), or refused with
-`Error::Unsupported` — never silently skipped. This page collects all the
+`ErrorReason::Unsupported` — never silently skipped. This page collects all the
 matrices and fine print in one place.
 
 - [CI coverage](#ci-coverage)
@@ -70,6 +70,18 @@ recipe in `justfile` for details.
 | `CgroupV2` | Linux (with delegation) | A private cgroup; children join in `pre_exec`, before `exec`, so descendants can never escape; teardown is `cgroup.kill` |
 | `ProcessGroup` | macOS, BSDs, Linux fallback | POSIX process groups (`setpgid`); teardown is `killpg`; tracked per started/adopted child |
 
+To learn which mechanism you *would* get **without creating a group** — for a
+spawn-free preflight / host-check that must have no side effects — call
+`host_containment()`,
+which returns a `HostContainment` (`mechanism()`, plus `soft_stop_scope()`,
+`parent_death_cleanup()`, and `crate_version()`) from read-only checks that create
+no container and spawn no process (on Linux: no cgroup directory). The predicted
+mechanism matches a real `ProcessGroup::new` on the same host; the Linux cgroup
+answer is best-effort (it probes whether a cgroup *could* be created rather than
+creating one), so a live `ProcessGroup::mechanism()` remains the final word in the
+rare window where a writable-looking cgroup then rejects creation. See [Running in
+containers → Which containment mechanism you get](containers.md#which-containment-mechanism-you-get).
+
 On Linux the cgroup backend requires controller **delegation**, and resource
 limits specifically need this process to run at the **real cgroup-v2 root**. The
 crate creates the limit cgroup under this process's own cgroup and enables the
@@ -81,7 +93,7 @@ session/scope/service. The crate does not migrate your process into a sub-cgroup
 to work around it, so in practice limits apply only at a minimal non-systemd init
 sitting at the real root. Without a usable cgroup it quietly falls back to `ProcessGroup` —
 unless you requested [resource limits](#capability-matrices), which fail fast
-instead (`Error::ResourceLimit`), because an unapplied cap is no protection. The
+instead (`ErrorReason::ResourceLimit`), because an unapplied cap is no protection. The
 error's `reason` distinguishes the two ways this happens: `LimitReason::Unsupported`
 when no cgroup v2 is mounted at all (or on macOS/BSD, which has no whole-tree
 container of any kind), `LimitReason::Unenforceable` when cgroup v2 exists but this
@@ -155,12 +167,12 @@ same way.
 `soft_stop_scope()` answers, *before* you attempt a soft `Int`/`Term`, which
 members it would reach — a side-effect-free `SoftStopScope` capability report read
 from the group's live membership, so a caller cancelling on its own schedule can
-decide up front instead of firing a `signal` and parsing an `Error::Unsupported`
+decide up front instead of firing a `signal` and parsing an `ErrorReason::Unsupported`
 back. The Unix backends always reach the whole tree (`WholeTree`, never
 `Unsupported`); Windows reports `OptInMembers` when a live console-CTRL leader
 (`windows_graceful_ctrl_break`) or a windowed member exists, and `Unsupported`
 otherwise — exactly the split where `signal(Int/Term)` returns `Ok` versus
-`Error::Unsupported`. It is the group-axis sibling of
+`ErrorReason::Unsupported`. It is the group-axis sibling of
 `kill_on_parent_death_scope()` below, but read at runtime rather than fixed per
 platform. Gated on the **`process-control`** feature, like `signal`.
 
@@ -192,7 +204,7 @@ platform. Gated on the **`process-control`** feature, like `signal`.
 
 `wait_for_socket` attempts a real Unix domain socket connection, so an orphaned
 socket file does not count as ready. On Windows and any target without AF_UNIX,
-it returns `Error::Unsupported` immediately.
+it returns `ErrorReason::Unsupported` immediately.
 
 **Spawn-time controls**
 
@@ -225,7 +237,7 @@ surfaces as `Exited(-1073741510)` (`STATUS_CONTROL_C_EXIT` as a signed `i32`).
 The crate reports the platform truth rather than fabricating a `Signalled` from
 an NTSTATUS code (that mapping would be a lossy guess). When you need to *know*
 the run was killed, use a `ProcessGroup` deadline or a cancellation token (which
-surface as `TimedOut` / `Error::Cancelled` on every platform). `Outcome::Signalled`
+surface as `TimedOut` / `ErrorReason::Cancelled` on every platform). `Outcome::Signalled`
 is therefore Unix-only.
 
 **Linux cgroup delegation.** Creating the per-group cgroup needs write access

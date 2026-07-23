@@ -43,7 +43,7 @@ async fn wait_for_line_not_ready_when_silent() {
         .await
         .expect_err("a silent child never becomes ready");
     assert!(
-        matches!(err, processkit::Error::NotReady { .. }),
+        matches!(err.reason(), processkit::ErrorReason::NotReady { .. }),
         "expected NotReady, got {err:?}"
     );
     assert!(
@@ -66,7 +66,7 @@ async fn wait_for_line_not_ready_fast_when_child_exits_silently() {
         .await
         .expect_err("the banner never appears");
     assert!(
-        matches!(err, processkit::Error::NotReady { .. }),
+        matches!(err.reason(), processkit::ErrorReason::NotReady { .. }),
         "expected NotReady, got {err:?}"
     );
     assert!(
@@ -136,7 +136,7 @@ async fn wait_for_port_gives_up_after_the_listener_closes_mid_retry() {
     .expect("probe finished in time")
     .expect_err("the closed listener never becomes ready again");
     assert!(
-        matches!(err, processkit::Error::NotReady { .. }),
+        matches!(err.reason(), processkit::ErrorReason::NotReady { .. }),
         "expected NotReady, got {err:?}"
     );
     assert!(
@@ -262,7 +262,7 @@ async fn wait_for_fails_fast_when_child_exits() {
         .await
         .expect_err("an exited child never becomes ready");
     assert!(
-        matches!(err, processkit::Error::NotReady { .. }),
+        matches!(err.reason(), processkit::ErrorReason::NotReady { .. }),
         "expected NotReady, got {err:?}"
     );
     assert!(

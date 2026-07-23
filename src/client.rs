@@ -273,7 +273,7 @@ impl<R: ProcessRunner> CliClient<R> {
     /// Cancel every command this client builds when `token` fires: each built
     /// command gets [`cancel_on(token.clone())`](Command::cancel_on), so
     /// cancelling the token kills every in-flight run of **this client** (the
-    /// whole tree, surfacing [`Error::Cancelled`](crate::Error::Cancelled) on
+    /// whole tree, surfacing [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) on
     /// the awaiting call — same semantics as the per-command builder).
     ///
     /// **Precedence:** a per-command [`Command::cancel_on`] chained on a built
@@ -380,7 +380,7 @@ impl<R: ProcessRunner> CliClient<R> {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`](crate::Error::NotFound) when the program can't be
+    /// [`ErrorReason::NotFound`](crate::ErrorReason::NotFound) when the program can't be
     /// located — see [`Command::resolve_program`] for the full contract
     /// (`searched` diagnostic, [`is_not_found`](crate::Error::is_not_found)
     /// classification).
@@ -435,12 +435,12 @@ impl<R: ProcessRunner> CliClient<R> {
     /// # Errors
     ///
     /// The same surface as [`Command::run`](crate::Command::run): a launch
-    /// failure ([`Error::NotFound`] / [`Error::Spawn`] / [`Error::Unsupported`] /
-    /// [`Error::Io`], and — via the client's runner — [`Error::Cancelled`] on a
-    /// pre-cancelled token), a non-accepted exit ([`Error::Exit`]),
-    /// [`Error::Signalled`], [`Error::Timeout`], [`Error::Cancelled`],
-    /// [`Error::OutputTooLarge`] (a fail-loud buffer truncated the presented
-    /// stdout), or [`Error::Stdin`].
+    /// failure ([`ErrorReason::NotFound`](crate::ErrorReason::NotFound) / [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) / [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) /
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io), and — via the client's runner — [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) on a
+    /// pre-cancelled token), a non-accepted exit ([`ErrorReason::Exit`](crate::ErrorReason::Exit)),
+    /// [`ErrorReason::Signalled`](crate::ErrorReason::Signalled), [`ErrorReason::Timeout`](crate::ErrorReason::Timeout), [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled),
+    /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) (a fail-loud buffer truncated the presented
+    /// stdout), or [`ErrorReason::Stdin`](crate::ErrorReason::Stdin).
     pub async fn run(&self, call: impl IntoCommand<R>) -> Result<String> {
         self.runner.run(&call.into_command(self)).await
     }
@@ -453,10 +453,10 @@ impl<R: ProcessRunner> CliClient<R> {
     /// # Errors
     ///
     /// The same surface as [`Command::checked`](crate::Command::checked): the
-    /// launch failures, plus [`Error::Exit`] / [`Error::Signalled`] /
-    /// [`Error::Timeout`] / [`Error::Cancelled`] / [`Error::Stdin`]. Being the
+    /// launch failures, plus [`ErrorReason::Exit`](crate::ErrorReason::Exit) / [`ErrorReason::Signalled`](crate::ErrorReason::Signalled) /
+    /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) / [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) / [`ErrorReason::Stdin`](crate::ErrorReason::Stdin). Being the
     /// lenient building block, it does not fail loud on a bounded-buffer
-    /// truncation, so it never returns [`Error::OutputTooLarge`].
+    /// truncation, so it never returns [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge).
     pub async fn checked(&self, call: impl IntoCommand<R>) -> Result<ProcessResult<String>> {
         self.runner.checked(&call.into_command(self)).await
     }
@@ -470,8 +470,8 @@ impl<R: ProcessRunner> CliClient<R> {
     /// [`Command::output_string`](crate::Command::output_string): a non-zero
     /// exit, a timeout, and a signal-kill are *captured* in the returned
     /// [`ProcessResult`], not raised; beyond the launch failures, only
-    /// [`Error::Cancelled`], [`Error::OutputTooLarge`] (a fail-loud overflow),
-    /// [`Error::Stdin`], and [`Error::Io`] surface.
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled), [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) (a fail-loud overflow),
+    /// [`ErrorReason::Stdin`](crate::ErrorReason::Stdin), and [`ErrorReason::Io`](crate::ErrorReason::Io) surface.
     pub async fn output_string(&self, call: impl IntoCommand<R>) -> Result<ProcessResult<String>> {
         self.runner.output_string(&call.into_command(self)).await
     }
@@ -483,10 +483,10 @@ impl<R: ProcessRunner> CliClient<R> {
     /// # Errors
     ///
     /// Identical to [`output_string`](Self::output_string), except a fail-loud
-    /// [`Error::OutputTooLarge`] applies to the raw stdout *byte* ceiling. Note
+    /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) applies to the raw stdout *byte* ceiling. Note
     /// that a runner that only implements
     /// [`output_string`](crate::ProcessRunner::output_string) surfaces
-    /// [`Error::Unsupported`] here (byte capture routes through
+    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) here (byte capture routes through
     /// [`start`](crate::ProcessRunner::start)).
     pub async fn output_bytes(&self, call: impl IntoCommand<R>) -> Result<ProcessResult<Vec<u8>>> {
         self.runner.output_bytes(&call.into_command(self)).await
@@ -499,8 +499,8 @@ impl<R: ProcessRunner> CliClient<R> {
     /// # Errors
     ///
     /// The same surface as [`checked`](Self::checked) (launch failures plus
-    /// [`Error::Exit`] / [`Error::Signalled`] / [`Error::Timeout`] /
-    /// [`Error::Cancelled`] / [`Error::Stdin`]); only the output is discarded.
+    /// [`ErrorReason::Exit`](crate::ErrorReason::Exit) / [`ErrorReason::Signalled`](crate::ErrorReason::Signalled) / [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) /
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) / [`ErrorReason::Stdin`](crate::ErrorReason::Stdin)); only the output is discarded.
     pub async fn run_unit(&self, call: impl IntoCommand<R>) -> Result<()> {
         self.runner.run_unit(&call.into_command(self)).await
     }
@@ -512,7 +512,7 @@ impl<R: ProcessRunner> CliClient<R> {
     /// # Errors
     ///
     /// The launch failures, plus — when the run produced no code —
-    /// [`Error::Timeout`], [`Error::Signalled`], or [`Error::Cancelled`]. A
+    /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout), [`ErrorReason::Signalled`](crate::ErrorReason::Signalled), or [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled). A
     /// non-zero exit is returned as the code, not raised.
     pub async fn exit_code(&self, call: impl IntoCommand<R>) -> Result<i32> {
         self.runner.exit_code(&call.into_command(self)).await
@@ -526,9 +526,9 @@ impl<R: ProcessRunner> CliClient<R> {
     ///
     /// # Errors
     ///
-    /// Any exit code other than `0`/`1` becomes [`Error::Exit`], and — atop the
-    /// launch failures — a run with no code errors as [`Error::Timeout`],
-    /// [`Error::Signalled`], or [`Error::Cancelled`].
+    /// Any exit code other than `0`/`1` becomes [`ErrorReason::Exit`](crate::ErrorReason::Exit), and — atop the
+    /// launch failures — a run with no code errors as [`ErrorReason::Timeout`](crate::ErrorReason::Timeout),
+    /// [`ErrorReason::Signalled`](crate::ErrorReason::Signalled), or [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled).
     pub async fn probe(&self, call: impl IntoCommand<R>) -> Result<bool> {
         self.runner.probe(&call.into_command(self)).await
     }
@@ -540,10 +540,10 @@ impl<R: ProcessRunner> CliClient<R> {
     ///
     /// # Errors
     ///
-    /// The launch failures, plus [`Error::Timeout`] when a command
+    /// The launch failures, plus [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) when a command
     /// [`timeout`](crate::Command::timeout) is set and its deadline elapses
-    /// mid-stream (tearing the process down), [`Error::Cancelled`], or
-    /// [`Error::Io`] while streaming. A stream that ends with no match is
+    /// mid-stream (tearing the process down), [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled), or
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io) while streaming. A stream that ends with no match is
     /// `Ok(None)`, not an error.
     pub async fn first_line<F>(
         &self,
@@ -566,8 +566,8 @@ impl<R: ProcessRunner> CliClient<R> {
     /// # Errors
     ///
     /// The success-checking surface of [`run`](Self::run) (launch failures plus
-    /// [`Error::Exit`] / [`Error::Signalled`] / [`Error::Timeout`] /
-    /// [`Error::Cancelled`] / [`Error::Stdin`]), plus [`Error::OutputTooLarge`]
+    /// [`ErrorReason::Exit`](crate::ErrorReason::Exit) / [`ErrorReason::Signalled`](crate::ErrorReason::Signalled) / [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) /
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) / [`ErrorReason::Stdin`](crate::ErrorReason::Stdin)), plus [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge)
     /// when a fail-loud buffer truncated the stdout the parser would see. The
     /// `parse` closure is infallible, so it adds no error.
     pub async fn parse<T, F>(&self, call: impl IntoCommand<R>, parse: F) -> Result<T>
@@ -580,7 +580,7 @@ impl<R: ProcessRunner> CliClient<R> {
 
     /// Run (errors on a non-zero exit) and feed stdout to a *fallible* `parse` —
     /// the shape of JSON deserialization, where a parse failure becomes
-    /// [`Error::Parse`](crate::Error::Parse). Fails loud on a bounded-buffer
+    /// [`ErrorReason::Parse`](crate::ErrorReason::Parse). Fails loud on a bounded-buffer
     /// truncation. Delegates to
     /// [`ProcessRunnerExt::try_parse`](crate::ProcessRunnerExt::try_parse).
     ///
@@ -588,7 +588,7 @@ impl<R: ProcessRunner> CliClient<R> {
     ///
     /// Everything [`parse`](Self::parse) can return, plus whatever the fallible
     /// `parse` closure yields on malformed output — typically
-    /// [`Error::Parse`](crate::Error::Parse).
+    /// [`ErrorReason::Parse`](crate::ErrorReason::Parse).
     pub async fn try_parse<T, F>(&self, call: impl IntoCommand<R>, parse: F) -> Result<T>
     where
         T: Send,
@@ -722,8 +722,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::Error;
     use crate::testing::{RecordingRunner, Reply, ScriptedRunner};
+    use crate::{Error, ErrorReason};
 
     #[test]
     fn debug_redacts_default_env_values_keeping_names() {
@@ -816,14 +816,19 @@ mod tests {
         );
         let err = client
             .try_parse::<u32, _>(client.command(["x"]), |s| {
-                s.trim().parse::<u32>().map_err(|e| Error::Parse {
-                    program: "gh".into(),
-                    message: e.to_string(),
+                s.trim().parse::<u32>().map_err(|e| {
+                    Error::from(ErrorReason::Parse {
+                        program: "gh".into(),
+                        message: e.to_string(),
+                    })
                 })
             })
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::Parse { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -904,8 +909,9 @@ mod tests {
             client
                 .exit_code(client.command(["auth", "status"]))
                 .await
-                .unwrap_err(),
-            Error::Timeout { .. }
+                .unwrap_err()
+                .reason(),
+            ErrorReason::Timeout { .. }
         ));
     }
 
@@ -1178,7 +1184,10 @@ mod tests {
             .await
             .expect("the explicit token must resolve the call")
             .expect_err("explicit token cancels");
-        assert!(matches!(err, Error::Cancelled { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::Cancelled { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1202,9 +1211,10 @@ mod tests {
         match tokio::time::timeout(Duration::from_secs(3600), call)
             .await
             .expect("the cancelled token must resolve the call")
+            .map_err(|e| e.into_reason())
         {
-            Err(Error::Cancelled { program }) => assert_eq!(program, "gh"),
-            other => panic!("expected Error::Cancelled, got {other:?}"),
+            Err(ErrorReason::Cancelled { program }) => assert_eq!(program, "gh"),
+            other => panic!("expected ErrorReason::Cancelled, got {other:?}"),
         }
         assert_eq!(rec.only_call().args_str(), ["run", "watch", "123"]);
     }
@@ -1235,9 +1245,10 @@ mod tests {
         match tokio::time::timeout(Duration::from_secs(3600), call)
             .await
             .expect("cancelling the shared token must resolve the clone's call")
+            .map_err(|e| e.into_reason())
         {
-            Err(Error::Cancelled { program }) => assert_eq!(program, "gh"),
-            other => panic!("expected Error::Cancelled, got {other:?}"),
+            Err(ErrorReason::Cancelled { program }) => assert_eq!(program, "gh"),
+            other => panic!("expected ErrorReason::Cancelled, got {other:?}"),
         }
     }
 

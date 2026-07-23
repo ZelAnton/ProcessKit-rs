@@ -255,7 +255,7 @@ async fn main() -> processkit::Result<()> {
 | Platform | Deliverable signals |
 |---|---|
 | Linux (cgroup or pgroup), macOS/BSD | Any — `Term`, `Kill`, `Int`, `Hup`, `Quit`, `Usr1`, `Usr2`, `Other(n)` |
-| Windows | `Kill` (Job Object terminate); `Int`/`Term` as a best-effort soft close (`CTRL_BREAK` to console leaders + `WM_CLOSE` to windowed members) — `Error::Unsupported` only when neither exists; every other signal → `Error::Unsupported` |
+| Windows | `Kill` (Job Object terminate); `Int`/`Term` as a best-effort soft close (`CTRL_BREAK` to console leaders + `WM_CLOSE` to windowed members) — `ErrorReason::Unsupported` only when neither exists; every other signal → `ErrorReason::Unsupported` |
 
 `Signal::Kill` always takes the same *atomic* whole-tree kill path as
 `kill_all` (`cgroup.kill` / `killpg` / job terminate), so it cannot miss
@@ -284,7 +284,7 @@ the group whether one will actually reach anything — `soft_stop_scope()` retur
 `SoftStopScope` **capability report**, so a caller cancelling a run on *its own*
 schedule (a UI Cancel, a control-socket command, a timeout it owns) can decide up
 front whether to attempt a graceful stop and can tell its user the real reach,
-instead of firing a `signal`, catching `Error::Unsupported`, and reverse-engineering
+instead of firing a `signal`, catching `ErrorReason::Unsupported`, and reverse-engineering
 the scope. It is the group-axis sibling of
 `Command::kill_on_parent_death_scope() -> ParentDeathCleanup`, but read from the
 group's **live membership** (not fixed per platform) and **side-effect-free** — it
@@ -301,7 +301,7 @@ async fn main() -> processkit::Result<()> {
         .start(&Command::new("my-server").windows_graceful_ctrl_break())
         .await?;
 
-    // Decide BEFORE attempting — no Error::Unsupported to parse back.
+    // Decide BEFORE attempting — no ErrorReason::Unsupported to parse back.
     match group.soft_stop_scope() {
         SoftStopScope::WholeTree | SoftStopScope::OptInMembers => {
             group.signal(Signal::Term)?; // a soft stop will reach a member
@@ -319,7 +319,7 @@ async fn main() -> processkit::Result<()> {
 |---|---|---|
 | Linux cgroup v2, macOS/BSD, Linux pgroup fallback | `WholeTree` | `signal(Int/Term)` reaches every member of the tree (the cgroup, or every tracked process group via `killpg`); never `Unsupported` |
 | Windows, with a live console-CTRL leader (`windows_graceful_ctrl_break`) or a windowed member | `OptInMembers` | a soft close reaches only members it can *trigger* — a curated subset, not the whole tree |
-| Windows, with neither | `Unsupported` | a Job Object has no POSIX signal and there is nothing to soft-close, so `signal(Int/Term)` would return `Error::Unsupported` |
+| Windows, with neither | `Unsupported` | a Job Object has no POSIX signal and there is nothing to soft-close, so `signal(Int/Term)` would return `ErrorReason::Unsupported` |
 
 Consistent with `signal` by construction: it reads the very same live-membership
 primitives `signal(Int/Term)` acts on, so what it reports matches what a real soft
@@ -440,6 +440,79 @@ between its pid being enumerated and its metadata being read, that pid is
 **skipped** rather than reported with fabricated fields — a single vanished
 member never fails the whole call.
 
+### Identifying a process by pid (outside a group)
+
+Sometimes the pid you care about is **not** a member of any group you own — a pid
+saved to disk between runs, a launch registry checking whether the owner of a
+crash-surviving entry is still alive, an e2e probe watching a process from outside
+its container. For that, the crate publishes the *same* identity query as a
+free-standing function (needs `process-control`):
+
+```rust,no_run
+# fn main() -> processkit::Result<()> {
+let pid = 4321;
+
+// Look up an arbitrary pid — the standalone twin of `members_info`, returning the
+// same best-effort `MemberInfo` (parent pid, image name, start time).
+match processkit::process_info(pid)? {
+    Some(info) => println!(
+        "pid={} ppid={:?} exe={:?} start={:?}",
+        info.pid(), info.ppid(), info.exe_name(), info.start_time(),
+    ),
+    None => println!("pid {pid} is not running"),
+}
+# Ok(())
+# }
+```
+
+`process_info` returns **three** distinct outcomes, and the distinction is the
+point:
+
+- `Ok(Some(info))` — the process exists; fields are best-effort `Option` exactly as
+  in `members_info`.
+- `Ok(None)` — the pid names **no** process: an honest negative, the "it's gone"
+  answer a liveness check wants.
+- `Err` — the process may well exist, but you couldn't inspect it (no permission —
+  a Windows protected/`System` process, a Linux `hidepid` mount, a macOS restricted
+  process — or an OS read error). **Never read this as "dead."** That is the whole
+  reason it is an error rather than `Ok(None)`.
+
+It reads no argv/environment, on any platform — the same "never argv/env" stance
+`MemberInfo` documents.
+
+#### Reuse-safe liveness: `process_is_alive`
+
+Because the OS reuses pid *numbers*, "is pid N still alive?" is the wrong question
+for a saved pid: a stranger may have recycled the number after your process exited.
+Pair the pid with the **start-time token** and ask instead "is the *same* process
+still running?":
+
+```rust,no_run
+# fn main() -> processkit::Result<()> {
+// Earlier: record identity.
+let pid = 4321;
+let saved_start = processkit::process_info(pid)?.and_then(|i| i.start_time());
+
+// Later (perhaps after a restart): is that same process still alive?
+if processkit::process_is_alive(pid, saved_start)? {
+    println!("the original process {pid} is still alive");
+} else {
+    println!("process {pid} is gone (exited, or its number was recycled)");
+}
+# Ok(())
+# }
+```
+
+`process_is_alive` is `Ok(true)` only when the process exists **and** its current
+start time matches the saved one; a **different** start time on the same number
+(the number was recycled) reads as `Ok(false)`, and so does a nonexistent pid. A
+permission `Err` propagates just like `process_info` — again, never "dead". The
+start time is an opaque identity anchor (unit/epoch differ per platform), used only
+for this pairing, never displayed. Where the platform reports **no** start time
+(the bare BSDs, where `start_time()` is `None`), the check degrades to bare-pid
+liveness — exactly the number-only check you'd otherwise write by hand, no weaker,
+and never a false "dead".
+
 ## Resource limits
 
 Requires the **`limits`** feature. Caps are a property of the group, set at
@@ -472,7 +545,7 @@ async fn main() -> processkit::Result<()> {
 `cpu_quota` is a fraction of a **single** core (`2.0` = two cores). Limits
 need a real container; when a requested cap can't be enforced — no Job
 Object/cgroup, or a Linux cgroup whose controllers can't be enabled —
-`with_options` returns `Error::ResourceLimit { kind, reason, detail }` instead
+`with_options` returns `ErrorReason::ResourceLimit { kind, reason, detail }` instead
 of handing back a silently-unbounded group: `kind` names the limit
 (`max_memory`/`max_processes`/`cpu_quota`), `reason` says whether the value was
 simply invalid, the platform has no whole-tree mechanism at all
@@ -516,7 +589,7 @@ set the axes you want capped). On Windows the live Job Object's caps are
 reissued; on Linux cgroup v2 the `memory.max` / `pids.max` / `cpu.max` files are
 rewritten (a removed axis written back to `max`). It routes through the same
 live container the tree-control verbs use, so the same platform matrix and
-`Error::ResourceLimit { kind, reason, detail }` classification apply — a
+`ErrorReason::ResourceLimit { kind, reason, detail }` classification apply — a
 process-group mechanism (macOS/BSD, the Linux fallback) refuses any requested
 cap with `Unsupported` rather than silently dropping it, while lifting *all*
 caps there is a trivial success.

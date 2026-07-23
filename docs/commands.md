@@ -128,7 +128,7 @@ child's working directory once `current_dir` is set — unlike a relative-path
 footgun (see [Program, arguments, working directory](#program-arguments-working-directory)
 above).
 
-**Diagnostics.** If resolution fails everywhere, `Error::NotFound`'s
+**Diagnostics.** If resolution fails everywhere, `ErrorReason::NotFound`'s
 `searched` field includes the `prefer_local` directories too — first, in
 priority order, ahead of the `PATH` directories — so the diagnostic never
 hides that they were checked.
@@ -162,7 +162,7 @@ fn main() -> processkit::Result<()> {
 launch-path logic — the same `PATH`/PATHEXT/execute-bit resolution and
 `prefer_local` handling a spawn performs, not a second copy — so a
 `resolve_program` hit is exactly the executable a run would launch, and a miss
-is exactly the `Error::NotFound` (with the same `searched` diagnostic and
+is exactly the `ErrorReason::NotFound` (with the same `searched` diagnostic and
 `is_not_found()` classification) a run would raise. A command that relocates the
 child's `PATH` (`env`/`env_remove` of `PATH`, `env_clear`, `inherit_env`) is
 resolved against that *effective child* `PATH`, so preflight still matches the
@@ -250,7 +250,7 @@ The payload is written on a background task (so a large input can't deadlock
 against the child's output) and the pipe is dropped afterwards to signal EOF.
 The two *one-shot* sources are consumed by their first run: a retried or
 cloned command reusing them **fails loud** the second time — re-running a
-consumed `from_reader`/`from_lines` source is an `Error::Io` (`InvalidInput`)
+consumed `from_reader`/`from_lines` source is an `ErrorReason::Io` (`InvalidInput`)
 at launch (D10), not a silent empty stdin. Prefer the reusable sources when
 a command may run more than once.
 
@@ -301,7 +301,7 @@ would otherwise drive stdin — a configured `stdin(Stdin::…)` source (includi
 explicit `Stdin::empty()`) or `keep_stdin_open()`'s interactive pipe. Setting
 `inherit_stdin()` together with one of those is a contradiction (feed the child a
 source *and* let it read the terminal?), so it is refused at the launch boundary
-with a typed `Error::Io` (`InvalidInput`) — the same failure mode as re-running a
+with a typed `ErrorReason::Io` (`InvalidInput`) — the same failure mode as re-running a
 consumed one-shot source — rather than silently letting one win. Drop the other
 stdin knob to resolve it. The refusal is enforced on the same launch seam the
 hermetic test doubles route through, so a `ScriptedRunner` rejects the conflict
@@ -418,14 +418,14 @@ let strict = OutputBufferPolicy::fail_loud(10_000).with_max_bytes(8 << 20); // e
 ```
 
 `fail_loud` makes the ceiling **error** instead of dropping: the run fails with
-`Error::OutputTooLarge` once the cumulative output (lines *or* bytes) crosses the
+`ErrorReason::OutputTooLarge` once the cumulative output (lines *or* bytes) crosses the
 cap — even when a streaming consumer is draining lines as they arrive. It bounds
 memory, not wall-time, so pair it with `timeout` against a flooding child.
 
 Even under a *drop* policy (`DropOldest`/`DropNewest`), the checking verbs that
 hand back stdout as if complete — `run`, `parse`, `try_parse` — **refuse**
 silently-truncated output (B12): if the policy dropped lines they fail with
-`Error::OutputTooLarge` rather than feed a parser a truncated tail. The lenient
+`ErrorReason::OutputTooLarge` rather than feed a parser a truncated tail. The lenient
 capture verbs (`output_string` / `output_bytes`) are unaffected — they return
 the partial result with `truncated()` set for you to inspect.
 
@@ -478,7 +478,7 @@ fire per line.
 ## Timeouts and retries
 
 ```rust,no_run
-use processkit::{Command, Error};
+use processkit::{Command, ErrorReason};
 use std::time::Duration;
 
 #[tokio::main]
@@ -486,7 +486,7 @@ async fn main() -> processkit::Result<()> {
     let out = Command::new("flaky-network-tool")
         .timeout(Duration::from_secs(30))                 // kill the tree at the deadline
         .retry(3, Duration::from_millis(200), |e| {       // up to 3 attempts total
-            matches!(e, Error::Timeout { .. })            // …but only retry timeouts
+            matches!(e.reason(), ErrorReason::Timeout { .. })            // …but only retry timeouts
         })
         .run()
         .await?;
@@ -496,7 +496,7 @@ async fn main() -> processkit::Result<()> {
 
 - **`timeout`** kills the whole process tree at the deadline. On the capturing
   verbs the expiry is *captured* (`ProcessResult::timed_out`), on the
-  success-checking verbs it *raises* `Error::Timeout` — the full decision
+  success-checking verbs it *raises* `ErrorReason::Timeout` — the full decision
   table lives in [Timeouts, retries & cancellation](timeouts-and-cancellation.md).
 - **`retry`** applies to the success-checking verbs only — `run`, `run_unit`,
   `exit_code`, `probe`, `checked`, `parse`, and `try_parse` (seven in all; each
@@ -532,7 +532,7 @@ async fn main() -> processkit::Result<()> {
 ```
 
 `uid` / `gid` / `groups` / `setsid` are POSIX-only — on Windows the run
-fails with `Error::Unsupported` rather than silently skipping a privilege drop.
+fails with `ErrorReason::Unsupported` rather than silently skipping a privilege drop.
 A correct drop sets all three of `uid`/`gid`/`groups`: dropping the uid alone
 leaves the child holding the parent's (often root's) supplementary groups.
 `create_no_window` is a harmless no-op outside Windows.
@@ -587,15 +587,15 @@ async fn main() -> processkit::Result<()> {
 `priority` maps onto `nice`/`setpriority` on Unix and a priority class on
 Windows (`Idle`/`BelowNormal`/`Normal`/`AboveNormal`/`High`); unlike the
 privilege builders, **every variant is supported on both platforms**, so this
-knob never yields `Error::Unsupported`. One caveat: lowering `nice` below its
+knob never yields `ErrorReason::Unsupported`. One caveat: lowering `nice` below its
 inherited value on Unix — raising priority via `Priority::AboveNormal`/`High`,
 or even requesting `Priority::Normal` under a positively-niced parent (e.g. a
 `nice`d CI/batch launcher) — needs `CAP_SYS_NICE`/root; without it the OS
-rejects the change and the spawn fails loud (`Error::Spawn`), never silently
+rejects the change and the spawn fails loud (`ErrorReason::Spawn`), never silently
 downgrading to a lower priority.
 
 `umask` is Unix-only — like `setsid`/`groups`, requesting it on Windows fails
-with `Error::Unsupported` rather than being silently ignored.
+with `ErrorReason::Unsupported` rather than being silently ignored.
 
 **Interactive auth / TTY.** processkit wires **pipes**, not a pseudo-terminal,
 so a tool that *demands* a tty — an `ssh`/`sudo` **password** prompt, some
@@ -613,10 +613,10 @@ tools that read stdin without needing a tty already work today via
 |---|---|---|---|---|
 | `output_string()` | `ProcessResult<String>` | captured | captured (`timed_out`) | You want to inspect the outcome yourself |
 | `output_bytes()` | `ProcessResult<Vec<u8>>` | captured | captured | Binary stdout (images, archives, …) |
-| `run()` | trimmed stdout `String` | `Error::Exit` | `Error::Timeout` | "Give me the answer or fail" |
-| `exit_code()` | `i32` | the code, `Ok` | `Error::Timeout` | The code *is* the answer |
-| `probe()` | `bool` | `0`→`true`, `1`→`false`, else `Error::Exit` | `Error::Timeout` | Predicate commands: `git diff --quiet`, `grep -q` |
-| `first_line(pred)` | `Option<String>` | — (stream-based) | `Error::Timeout` | Grab one matching line, kill the rest |
+| `run()` | trimmed stdout `String` | `ErrorReason::Exit` | `ErrorReason::Timeout` | "Give me the answer or fail" |
+| `exit_code()` | `i32` | the code, `Ok` | `ErrorReason::Timeout` | The code *is* the answer |
+| `probe()` | `bool` | `0`→`true`, `1`→`false`, else `ErrorReason::Exit` | `ErrorReason::Timeout` | Predicate commands: `git diff --quiet`, `grep -q` |
+| `first_line(pred)` | `Option<String>` | — (stream-based) | `ErrorReason::Timeout` | Grab one matching line, kill the rest |
 | `start()` | live `RunningProcess` | — | bounds the stream | [Streaming, interactive I/O, probes](streaming.md) |
 
 ```rust,no_run
@@ -639,7 +639,7 @@ async fn main() -> processkit::Result<()> {
 `first_line` returns `Ok(None)` when stdout closes without a match, and kills
 the (private-group) child once it has its answer — you never wait out a long
 log for one line. A [`cancel_on`](timeouts-and-cancellation.md) token that fires
-while the search is still running surfaces as `Error::Cancelled`, so a readiness
+while the search is still running surfaces as `ErrorReason::Cancelled`, so a readiness
 probe with a shutdown token can't misread token-driven teardown as "the line
 never appeared" — while a run that genuinely ends with no match still reports
 `Ok(None)`, even if the token happens to fire an instant later.
@@ -665,6 +665,8 @@ async fn main() -> processkit::Result<()> {
     result.combined();     // stdout + stderr concatenated
     result.diagnostic();   // stderr if non-empty, else stdout — the human-facing line
                            // (git/jj put "CONFLICT …" on stdout!)
+    result.configured_timeout(); // Option<Duration> — the timeout this run was launched with
+    result.ok_codes();     // &[i32] — the accepted exit codes ({0} by default)
 
     // Opt into erroring whenever you're ready:
     let ok = result.ensure_success()?; // Exit / Timeout / Signalled (signal-kill) as typed errors
@@ -704,20 +706,20 @@ The error enum is structured and `#[non_exhaustive]`:
 
 | Variant | Meaning |
 |---|---|
-| `Error::Spawn { program, source }` | The program was located but the OS couldn't start it (permissions, a bad working directory, a Windows `.cmd`/`.bat` needing `cmd.exe`, …) — **not** `is_not_found()` |
-| `Error::NotFound { program, searched }` | The program couldn't be located (the single "not found" representation — `is_not_found()` is true); `searched` is `Some(dirs)` for a bare-name `PATH` lookup, `None` otherwise |
-| `Error::Exit { program, code, stdout, stderr, stdout_bytes }` | Non-zero exit, both streams attached in full (the `Display` message is bounded, but the fields carry the complete captured text for classification); `stdout_bytes` is `Some(exact bytes)` for a checking verb built over `output_bytes`, `None` on the text path — read via `Error::stdout_bytes()` (the variant is `#[non_exhaustive]`) |
-| `Error::Signalled { program, signal, stdout, stderr, stdout_bytes }` | The process was killed by a signal (no exit code); `signal` carries the number on Unix, `None` elsewhere; the partial streams captured before the kill are attached (reach them via `diagnostic()`); `stdout_bytes` as above |
-| `Error::OutputTooLarge { program, max_lines, max_bytes, total_lines, total_bytes }` | A `fail_loud` buffer's line or byte ceiling was exceeded |
-| `Error::Timeout { program, timeout, stdout, stderr, stdout_bytes }` | The run's own deadline killed it; whatever the run captured before the kill is attached — a hung tool's last stderr line tails the `Display` and is reachable via `diagnostic()`; `stdout_bytes` as above |
-| `Error::NotReady { program, timeout }` | A [readiness probe](streaming.md#readiness-probes) gave up |
-| `Error::Parse { program, message }` | A `try_parse` parser (on `Command`, `ProcessRunnerExt`, `CliClient`, or `Pipeline`) rejected the output (the `Display`/`Debug` of `message` is bounded to a 200-byte preview; the field carries the full text) |
-| `Error::Stdin { program, source }` | Feeding the child's stdin failed for a non-broken-pipe reason on an *otherwise-successful* run (a louder failure — exit/signal/timeout — wins instead); a routine broken pipe never surfaces |
-| `Error::CassetteMiss { program }` | (`record` feature) a cassette replay found no matching recording (stale/incomplete cassette) — kept distinct from a missing program, so `is_not_found()` is `false` |
-| `Error::Unsupported { operation }` | The platform can't do what was asked (and silently skipping would be wrong) |
-| `Error::Cancelled { program }` | the run's token was cancelled |
-| `Error::ResourceLimit { kind, reason, detail }` | (`limits` feature) a requested cap couldn't be enforced — `kind` (`LimitKind::Memory`/`Processes`/`Cpu`) says *which* limit, `reason` (`LimitReason::Invalid`/`Unsupported`/`Unenforceable`) says *why*, without parsing `detail`'s English text; read via `Error::limit_kind()`/`limit_reason()` (the variant is `#[non_exhaustive]`) |
-| `Error::Io(source)` | A low-level IO error from the crate's own machinery (driving a child, group control, cassette files) — never an arbitrary foreign `io::Error` (no blanket `From`, D13) |
+| `ErrorReason::Spawn { program, source }` | The program was located but the OS couldn't start it (permissions, a bad working directory, a Windows `.cmd`/`.bat` needing `cmd.exe`, …) — **not** `is_not_found()` |
+| `ErrorReason::NotFound { program, searched }` | The program couldn't be located (the single "not found" representation — `is_not_found()` is true); `searched` is `Some(dirs)` for a bare-name `PATH` lookup, `None` otherwise |
+| `ErrorReason::Exit { program, code, stdout, stderr, stdout_bytes }` | Non-zero exit, both streams attached in full (the `Display` message is bounded, but the fields carry the complete captured text for classification); `stdout_bytes` is `Some(exact bytes)` for a checking verb built over `output_bytes`, `None` on the text path — read via `Error::stdout_bytes()` (the variant is `#[non_exhaustive]`) |
+| `ErrorReason::Signalled { program, signal, stdout, stderr, stdout_bytes }` | The process was killed by a signal (no exit code); `signal` carries the number on Unix, `None` elsewhere; the partial streams captured before the kill are attached (reach them via `diagnostic()`); `stdout_bytes` as above |
+| `ErrorReason::OutputTooLarge { program, max_lines, max_bytes, total_lines, total_bytes }` | A `fail_loud` buffer's line or byte ceiling was exceeded |
+| `ErrorReason::Timeout { program, timeout, stdout, stderr, stdout_bytes }` | The run's own deadline killed it; whatever the run captured before the kill is attached — a hung tool's last stderr line tails the `Display` and is reachable via `diagnostic()`; `stdout_bytes` as above |
+| `ErrorReason::NotReady { program, timeout }` | A [readiness probe](streaming.md#readiness-probes) gave up |
+| `ErrorReason::Parse { program, message }` | A `try_parse` parser (on `Command`, `ProcessRunnerExt`, `CliClient`, or `Pipeline`) rejected the output (the `Display`/`Debug` of `message` is bounded to a 200-byte preview; the field carries the full text) |
+| `ErrorReason::Stdin { program, source }` | Feeding the child's stdin failed for a non-broken-pipe reason on an *otherwise-successful* run (a louder failure — exit/signal/timeout — wins instead); a routine broken pipe never surfaces |
+| `ErrorReason::CassetteMiss { program }` | (`record` feature) a cassette replay found no matching recording (stale/incomplete cassette) — kept distinct from a missing program, so `is_not_found()` is `false` |
+| `ErrorReason::Unsupported { operation }` | The platform can't do what was asked (and silently skipping would be wrong) |
+| `ErrorReason::Cancelled { program }` | the run's token was cancelled |
+| `ErrorReason::ResourceLimit { kind, reason, detail }` | (`limits` feature) a requested cap couldn't be enforced — `kind` (`LimitKind::Memory`/`Processes`/`Cpu`) says *which* limit, `reason` (`LimitReason::Invalid`/`Unsupported`/`Unenforceable`) says *why*, without parsing `detail`'s English text; read via `Error::limit_kind()`/`limit_reason()` (the variant is `#[non_exhaustive]`) |
+| `ErrorReason::Io(source)` | A low-level IO error from the crate's own machinery (driving a child, group control, cassette files) — never an arbitrary foreign `io::Error` (no blanket `From`, D13) |
 
 `Error::diagnostic()` returns the most useful human-facing line out of a
 failure that captured output — `Exit`, and (D12) `Timeout` / `Signalled` (the

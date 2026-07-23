@@ -138,10 +138,16 @@ Things to know:
   pipes close, and the stream ends — a
   streamed run can't hang past its deadline. A `cancel_on` token ends it the
   same way; the following
-  `finish` then reports `Error::Cancelled`. Details in
+  `finish` then reports `ErrorReason::Cancelled`. Details in
   [Timeouts & cancellation](timeouts-and-cancellation.md).
 - Line counters tick live: `run.stdout_line_count()` / `stderr_line_count()`
   are cheap progress gauges even while you stream.
+- Byte counters tick live: `run.stdout_bytes_seen()` /
+  `stderr_bytes_seen()` count raw bytes read from each pipe before decoding or
+  line splitting. They are monotonic and include bytes discarded by the
+  buffer policy, including oversized lines, and remain stable after the pump
+  completes. A stream that is not pumped (a file redirect or
+  `StdioMode::Null`/`Inherit`) reports `0` honestly.
 - The [buffer policy and line handlers](commands.md#output-handling) apply to
   streamed runs too — a handler sees each line on the pump, in addition to
   your loop.
@@ -262,7 +268,7 @@ use processkit::prelude::StreamExt;
 use processkit::{Command, Finished, Outcome};
 
 // `ProcessStdin`'s writer methods return `std::io::Result`; `Box<dyn Error>`
-// mixes them with the crate's `Result` (or `.map_err(processkit::Error::Io)?`).
+// mixes them with the crate's `Result` (or `.map_err(processkit::ErrorReason::Io)?`).
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `bc` evaluates each stdin line and prints the result.
@@ -343,8 +349,8 @@ async fn main() -> processkit::Result<()> {
 
 Probe semantics, deliberately uniform:
 
-- A probe that can't pass within its deadline fails with **`Error::NotReady`**
-  — distinct from `Error::Timeout`, which is the run's own deadline.
+- A probe that can't pass within its deadline fails with **`ErrorReason::NotReady`**
+  — distinct from `ErrorReason::Timeout`, which is the run's own deadline.
 - A probe also fails *fast* once readiness can no longer happen: the child
   exits, or (for `wait_for_line`) its stdout closes — no waiting out a 30s
   deadline on a dead server.
@@ -360,7 +366,7 @@ Probe semantics, deliberately uniform:
   compose with any of the four probes (same as calling `wait_for_line`
   first).
 - `wait_for_socket` uses a real connection attempt, not just a socket-file
-  existence check, and returns `Error::Unsupported` immediately on platforms
+  existence check, and returns `ErrorReason::Unsupported` immediately on platforms
   without AF_UNIX (including Windows).
 
 ## Racing children with `wait_any`

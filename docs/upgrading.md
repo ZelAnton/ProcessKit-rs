@@ -13,6 +13,56 @@ the full record; this page is the "I depend on it, what do I do" view.
 > major bump. (The `mock` feature's `mockall`-generated `expect_*` surface stays
 > semver-exempt — it tracks the `mockall` version.)
 
+## 3.0.0 (from 2.x)
+
+### `Error` is now a pointer-sized wrapper over `ErrorReason`
+
+`Error` changed from an enum into a thin `struct Error { .. }` holding a
+`Box<ErrorReason>`, so it is one pointer wide instead of ~100 bytes. This
+shrinks every `Result<T, Error>` on the run path (and any enum that embeds one)
+and silences the default `result_large_err` / `large_enum_variant` clippy lints.
+The former enum — with **all** its variants and fields unchanged — is now the
+re-exported [`ErrorReason`], reached through `err.reason()`.
+
+**Who it affects:** anyone that pattern-matches an `Error` by variant. The read
+accessors (`code()`, `program()`, `diagnostic()`, `is_timeout()`,
+`stdout_bytes()`, …), `Display`, `Debug`, and `source()` are **unchanged** and
+still work on `Error` directly — only direct variant matches need a fix.
+
+Fix: reach the variant through `reason()` (borrow) or `into_reason()` (own).
+
+Before:
+
+<!-- `text`, not `rust`: the pre-3.0 enum-variant match no longer compiles now
+     that `Error` is a struct — this crate's CI runs doctests, which would
+     reject it as `rust`. -->
+```text
+match err {
+    Error::Exit { code, .. } => eprintln!("exit {code}"),
+    Error::Timeout { .. } => eprintln!("timed out"),
+    _ => {}
+}
+```
+
+After:
+
+```rust,no_run
+use processkit::{Error, ErrorReason};
+fn handle(err: Error) {
+    match err.reason() {
+        ErrorReason::Exit { code, .. } => eprintln!("exit {code}"),
+        ErrorReason::Timeout { .. } => eprintln!("timed out"),
+        _ => {}
+    }
+    // To move a captured stream or the owned `io::Error` out of the reason,
+    // consume the wrapper instead: `match err.into_reason() { .. }`.
+}
+```
+
+The `#[doc(hidden)]` constructors (`Error::exit`/`timeout`/`signalled`/`spawn`/
+`not_found`/`stdin`) and the public `Error::parse(..)` are unchanged and still
+return an `Error`.
+
 ## 2.1.0 (from 1.2.x)
 
 > **2.0.0 and 1.3.0 were withdrawn — upgrade straight from 1.2.x to 2.1.0.**
@@ -70,10 +120,11 @@ After — add `..` to the pattern (or, better, use the existing accessors instea
 of destructuring at all):
 
 ```rust,no_run
-use processkit::Error;
+use processkit::{Error, ErrorReason};
 fn handle(err: Error) {
-match &err {
-    Error::Exit { program, code, stdout, stderr, .. } => { let _ = (program, code, stdout, stderr); }
+// Since 3.0 the variants live on `ErrorReason`, reached via `err.reason()`.
+match err.reason() {
+    ErrorReason::Exit { program, code, stdout, stderr, .. } => { let _ = (program, code, stdout, stderr); }
     _ => {}
 }
 

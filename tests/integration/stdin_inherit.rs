@@ -5,7 +5,7 @@
 use std::io::Write;
 use std::time::Duration;
 
-use processkit::{Command, Error, Stdin};
+use processkit::{Command, ErrorReason, Stdin};
 
 use crate::common::raw_stdin_echo;
 
@@ -94,7 +94,7 @@ async fn run_inner() {
 }
 
 /// `inherit_stdin()` + `keep_stdin_open()` is refused end-to-end through a public
-/// run verb, before any child is spawned, as a typed `Error::Io(InvalidInput)`.
+/// run verb, before any child is spawned, as a typed `ErrorReason::Io(InvalidInput)`.
 #[tokio::test]
 #[ignore = "drives the real launch path (though it rejects before spawning)"]
 async fn inherit_stdin_with_keep_stdin_open_is_rejected() {
@@ -105,13 +105,13 @@ async fn inherit_stdin_with_keep_stdin_open_is_rejected() {
         .await
         .expect_err("inherit_stdin + keep_stdin_open must be rejected at launch");
     assert!(
-        matches!(&err, Error::Io(io) if io.kind() == std::io::ErrorKind::InvalidInput),
-        "expected Error::Io(InvalidInput), got {err:?}"
+        matches!(err.reason(), ErrorReason::Io(io) if io.kind() == std::io::ErrorKind::InvalidInput),
+        "expected ErrorReason::Io(InvalidInput), got {err:?}"
     );
 }
 
 /// `inherit_stdin()` + a configured `stdin(Stdin::…)` source is likewise refused
-/// through a public run verb as a typed `Error::Io(InvalidInput)`.
+/// through a public run verb as a typed `ErrorReason::Io(InvalidInput)`.
 #[tokio::test]
 #[ignore = "drives the real launch path (though it rejects before spawning)"]
 async fn inherit_stdin_with_a_source_is_rejected() {
@@ -122,7 +122,7 @@ async fn inherit_stdin_with_a_source_is_rejected() {
         .await
         .expect_err("inherit_stdin + a stdin source must be rejected at launch");
     assert!(
-        matches!(&err, Error::Io(io) if io.kind() == std::io::ErrorKind::InvalidInput),
-        "expected Error::Io(InvalidInput), got {err:?}"
+        matches!(err.reason(), ErrorReason::Io(io) if io.kind() == std::io::ErrorKind::InvalidInput),
+        "expected ErrorReason::Io(InvalidInput), got {err:?}"
     );
 }
