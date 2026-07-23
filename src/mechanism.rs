@@ -93,9 +93,9 @@ impl Mechanism {
 /// **this** host — the answer to a consumer's preflight "what will I get here?"
 /// without paying to create a real [`ProcessGroup`](crate::ProcessGroup).
 ///
-/// Produced by [`host_containment`](crate::host_containment). A [`ProcessGroup`]
-/// exposes the same facts only *after* it exists ([`mechanism`](crate::ProcessGroup::mechanism),
-/// [`soft_stop_scope`](crate::ProcessGroup::soft_stop_scope)), which forces a
+/// Produced by [`host_containment`](crate::host_containment). A
+/// [`ProcessGroup`](crate::ProcessGroup) exposes the same facts only *after* it
+/// exists ([`mechanism`](crate::ProcessGroup::mechanism), `soft_stop_scope`), which forces a
 /// caller whose contract is "no side effects" (a doctor / host-check command that
 /// must not spawn a child, open a run registry, or create a container) to either
 /// skip the report or violate that contract. This type closes that gap: every field
@@ -105,21 +105,38 @@ impl Mechanism {
 /// # What each field means
 ///
 /// - [`mechanism`](Self::mechanism) — the [`Mechanism`] a group created here and now
-///   would use ([`Mechanism::detect`]). On Linux this is a **best-effort** read-only
+///   would use (`Mechanism::detect`). On Linux this is a **best-effort** read-only
 ///   probe of cgroup v2 availability/writability (it does not create the cgroup it
 ///   would use), so in a rare window it can differ from the mechanism a real
-///   `ProcessGroup::new` falls back to — see [`Mechanism::detect`].
-/// - [`soft_stop_scope`](Self::soft_stop_scope) *(needs `process-control`)* — how far
-///   a **soft stop** ([`ProcessGroup::signal`](crate::ProcessGroup::signal) with
-///   [`Signal::Term`](crate::Signal::Term) / [`Int`](crate::Signal::Int)) can reach
-///   on this host's mechanism: [`WholeTree`](crate::SoftStopScope::WholeTree) on the
-///   Unix backends, [`OptInMembers`](crate::SoftStopScope::OptInMembers) on Windows
-///   (a Job Object soft-stops only a console-CTRL leader or a windowed member). This
-///   is the **host-level maximum** the mechanism can achieve; a *specific* group's
-///   actual reach is still read per-group from
-///   [`ProcessGroup::soft_stop_scope`](crate::ProcessGroup::soft_stop_scope), which
-///   on Windows narrows to [`Unsupported`](crate::SoftStopScope::Unsupported) for a
-///   group holding no such member.
+///   `ProcessGroup::new` falls back to.
+// The `soft_stop_scope` bullet is split by feature: under `process-control` it keeps
+// the full intra-doc links; without it those items (`SoftStopScope`, `Signal`,
+// `ProcessGroup::signal`/`::soft_stop_scope`, `Self::soft_stop_scope`) are `cfg`-ed out
+// and linking to them would break `cargo doc --no-default-features` (K-026).
+#[cfg_attr(
+    feature = "process-control",
+    doc = "- [`soft_stop_scope`](Self::soft_stop_scope) *(needs `process-control`)* — how far",
+    doc = "  a **soft stop** ([`ProcessGroup::signal`](crate::ProcessGroup::signal) with",
+    doc = "  [`Signal::Term`](crate::Signal::Term) / [`Int`](crate::Signal::Int)) can reach",
+    doc = "  on this host's mechanism: [`WholeTree`](crate::SoftStopScope::WholeTree) on the",
+    doc = "  Unix backends, [`OptInMembers`](crate::SoftStopScope::OptInMembers) on Windows",
+    doc = "  (a Job Object soft-stops only a console-CTRL leader or a windowed member). This",
+    doc = "  is the **host-level maximum** the mechanism can achieve; a *specific* group's",
+    doc = "  actual reach is still read per-group from",
+    doc = "  [`ProcessGroup::soft_stop_scope`](crate::ProcessGroup::soft_stop_scope), which",
+    doc = "  on Windows narrows to [`Unsupported`](crate::SoftStopScope::Unsupported) for a",
+    doc = "  group holding no such member."
+)]
+#[cfg_attr(
+    not(feature = "process-control"),
+    doc = "- `soft_stop_scope` *(needs the `process-control` feature)* — how far a **soft",
+    doc = "  stop** (a `Term` / `Int` signal) can reach on this host's mechanism: the whole",
+    doc = "  tree on the Unix backends, only opt-in members on Windows (a Job Object",
+    doc = "  soft-stops only a console-CTRL leader or a windowed member). This is the",
+    doc = "  **host-level maximum** the mechanism can achieve; a *specific* group's actual",
+    doc = "  reach is still read per-group from its own `soft_stop_scope`, which on Windows",
+    doc = "  narrows to `Unsupported` for a group holding no such member."
+)]
 /// - [`parent_death_cleanup`](Self::parent_death_cleanup) — what the OS guarantees
 ///   when the **owner dies abruptly** (`SIGKILL`/crash, so `Drop` never runs): the
 ///   very same [`ParentDeathCleanup`] that
@@ -165,8 +182,9 @@ impl HostContainment {
     }
 
     /// The containment [`Mechanism`] a [`ProcessGroup`](crate::ProcessGroup) created
-    /// here and now would use — see [`Mechanism::detect`] for the per-platform detail
-    /// and the Linux best-effort caveat.
+    /// here and now would use — see the `mechanism` field note above (via the shared
+    /// `Mechanism::detect` probe) for the per-platform detail and the Linux
+    /// best-effort caveat.
     pub fn mechanism(&self) -> Mechanism {
         self.mechanism
     }

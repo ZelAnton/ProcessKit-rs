@@ -380,7 +380,7 @@ pub fn which(program: impl AsRef<OsStr>) -> Result<std::path::PathBuf> {
 ///
 /// See [`HostContainment`] for the full contract of each field. In particular the
 /// [`mechanism`](HostContainment::mechanism) is determined by a read-only probe
-/// (see [`Mechanism::detect`]) that on Linux is **best-effort**: it inspects whether
+/// (the shared `Mechanism::detect`) that on Linux is **best-effort**: it inspects whether
 /// a cgroup could be created rather than creating one, so in a rare window it can
 /// differ from the mechanism a real [`ProcessGroup::new`](ProcessGroup::new) falls
 /// back to. Like [`which`], no async runtime is required.
