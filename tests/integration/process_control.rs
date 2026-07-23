@@ -91,6 +91,45 @@ fn signal_on_empty_group_is_ok() {
 
 #[cfg(unix)]
 #[tokio::test]
+#[ignore = "spawns a real subprocess; cross-checks soft_stop_scope against signal"]
+async fn unix_soft_stop_scope_is_whole_tree_and_matches_signal() {
+    use processkit::SoftStopScope;
+
+    // The soft-stop capability report must agree with the real `signal` outcome
+    // on the SAME group (the honesty contract: what it advertises is what a soft
+    // stop actually reaches). On both Unix mechanisms — cgroup v2 and the POSIX
+    // process-group fallback — a soft `Int`/`Term` reaches the whole tree and
+    // never reports `Unsupported`, so the report is `WholeTree` and a real `Term`
+    // returns `Ok`.
+    let group = ProcessGroup::new().expect("create group");
+
+    // Before any member: whole-tree capability, and an empty group accepts a soft
+    // signal trivially.
+    assert_eq!(
+        group.soft_stop_scope(),
+        SoftStopScope::WholeTree,
+        "a Unix group always offers a whole-tree soft stop"
+    );
+    group
+        .signal(Signal::Term)
+        .expect("Term on an empty Unix group is Ok — matching the WholeTree report");
+
+    // With a live child: still whole tree, and a real soft `Term` still succeeds,
+    // so the report matches the observed signal outcome.
+    let cmd = Command::new("sh").args(["-c", "while :; do sleep 0.1; done"]);
+    let _run = group.start(&cmd).await.expect("start sleeper");
+    assert_eq!(
+        group.soft_stop_scope(),
+        SoftStopScope::WholeTree,
+        "the POSIX/cgroup soft stop reaches the whole tree with a live member too"
+    );
+    group
+        .signal(Signal::Term)
+        .expect("a real Term reaches the tree, matching the whole-tree report");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 #[ignore = "spawns a fork storm and broadcasts SIGKILL to the group"]
 async fn unix_fork_storm_is_swept_by_group_broadcast() {
     // Best-effort boundary of the pgroup mechanism under a fork storm. A group
@@ -211,6 +250,66 @@ fn windows_signal_non_kill_is_unsupported() {
             "expected Error::Unsupported for {sig:?}, got {err:?}"
         );
     }
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "creates an OS job"]
+fn windows_soft_stop_scope_on_empty_group_is_unsupported() {
+    use processkit::SoftStopScope;
+
+    // The soft-stop capability report agrees with the narrowed `signal` contract:
+    // a group with neither a console-CTRL leader nor a windowed member can soft-stop
+    // nothing, so the report is `Unsupported` and a real `signal(Term)` would return
+    // `Error::Unsupported` — the caller can decide up front without firing (and
+    // parsing back) the error. The probe is side-effect-free (no spawn, no signal).
+    let group = ProcessGroup::new().expect("create group");
+    assert_eq!(
+        group.soft_stop_scope(),
+        SoftStopScope::Unsupported,
+        "an empty Windows group has no soft-stop target"
+    );
+    let err = group
+        .signal(Signal::Term)
+        .expect_err("no soft-close target on an empty Windows group");
+    assert!(
+        matches!(err, processkit::Error::Unsupported { .. }),
+        "the report and the real signal outcome agree on Unsupported, got {err:?}"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns a real opt-in console child; probes soft-stop availability at the ProcessGroup API"]
+async fn windows_soft_stop_scope_reports_opt_in_members_for_a_live_child() {
+    use processkit::SoftStopScope;
+
+    // End-to-end through the public API (including the `windows_graceful_ctrl_break`
+    // → `SpawnOptions::windows_new_process_group` → recorded-leader wiring): a live
+    // opt-in console child makes a soft stop available, so the side-effect-free
+    // probe reports `OptInMembers` and a real `signal(Term)` then succeeds — the
+    // report matches the observed outcome. `ping` ignores CTRL_BREAK (it installs
+    // its own handler), so the child stays reapable for the explicit teardown.
+    let group = ProcessGroup::new().expect("create group");
+    let _run = group
+        .start(
+            &Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .windows_graceful_ctrl_break(),
+        )
+        .await
+        .expect("start opt-in console child");
+
+    assert_eq!(
+        group.soft_stop_scope(),
+        SoftStopScope::OptInMembers,
+        "a live opt-in console child makes a soft stop available"
+    );
+    group
+        .signal(Signal::Term)
+        .expect("a real Term reaches the live opt-in leader the probe reported");
+
+    group.kill_all().expect("tear the tree down");
 }
 
 #[cfg(windows)]

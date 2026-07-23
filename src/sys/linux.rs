@@ -265,6 +265,17 @@ impl Job {
         }
     }
 
+    /// Both Linux backends deliver a soft `Int`/`Term` to the **whole tree**,
+    /// matching `signal`'s reach: the cgroup backend writes the signal to every
+    /// member of the cgroup, and the process-group fallback `killpg`s every tracked
+    /// leader's group (see the pgroup backend). Neither has an opt-in subset or an
+    /// `Unsupported` case — `signal(Int/Term)` never returns `Unsupported` here —
+    /// so the scope is `WholeTree` for either backend.
+    #[cfg(feature = "process-control")]
+    pub(crate) fn soft_stop_scope(&self) -> crate::SoftStopScope {
+        crate::SoftStopScope::WholeTree
+    }
+
     #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {
         match &self.backend {

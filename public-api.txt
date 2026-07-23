@@ -541,6 +541,29 @@ impl core::marker::Unpin for processkit::SoftSignal
 impl core::marker::UnsafeUnpin for processkit::SoftSignal
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::SoftSignal
 impl core::panic::unwind_safe::UnwindSafe for processkit::SoftSignal
+#[non_exhaustive] pub enum processkit::SoftStopScope
+pub processkit::SoftStopScope::OptInMembers
+pub processkit::SoftStopScope::Unsupported
+pub processkit::SoftStopScope::WholeTree
+impl processkit::SoftStopScope
+pub fn processkit::SoftStopScope::from_name(&str) -> core::option::Option<Self>
+pub fn processkit::SoftStopScope::name(&self) -> &'static str
+impl core::clone::Clone for processkit::SoftStopScope
+pub fn processkit::SoftStopScope::clone(&self) -> processkit::SoftStopScope
+impl core::cmp::Eq for processkit::SoftStopScope
+impl core::cmp::PartialEq for processkit::SoftStopScope
+pub fn processkit::SoftStopScope::eq(&self, &processkit::SoftStopScope) -> bool
+impl core::fmt::Debug for processkit::SoftStopScope
+pub fn processkit::SoftStopScope::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for processkit::SoftStopScope
+impl core::marker::StructuralPartialEq for processkit::SoftStopScope
+impl core::marker::Freeze for processkit::SoftStopScope
+impl core::marker::Send for processkit::SoftStopScope
+impl core::marker::Sync for processkit::SoftStopScope
+impl core::marker::Unpin for processkit::SoftStopScope
+impl core::marker::UnsafeUnpin for processkit::SoftStopScope
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::SoftStopScope
+impl core::panic::unwind_safe::UnwindSafe for processkit::SoftStopScope
 #[non_exhaustive] pub enum processkit::StdioMode
 pub processkit::StdioMode::Inherit
 pub processkit::StdioMode::Null
@@ -904,6 +927,7 @@ pub fn processkit::ProcessGroup::sample_stats(&self, core::time::Duration) -> pr
 pub async fn processkit::ProcessGroup::shutdown(self) -> processkit::Result<()>
 pub async fn processkit::ProcessGroup::shutdown_ref(&self) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::signal(&self, processkit::Signal) -> processkit::Result<()>
+pub fn processkit::ProcessGroup::soft_stop_scope(&self) -> processkit::SoftStopScope
 pub fn processkit::ProcessGroup::spawn(&self, tokio::process::Command) -> processkit::Result<tokio::process::Child>
 pub fn processkit::ProcessGroup::stats(&self) -> processkit::Result<processkit::ProcessGroupStats>
 pub async fn processkit::ProcessGroup::stop(&self, core::time::Duration, bool) -> processkit::Result<processkit::ShutdownReport>

@@ -85,6 +85,16 @@ impl Job {
         self.group.signal(sig.raw())
     }
 
+    /// The POSIX process-group backend delivers a soft `Int`/`Term` to the whole
+    /// tracked tree (`killpg` over every tracked leader — see the pgroup backend),
+    /// matching `signal`'s reach. There is no opt-in subset or `Unsupported` case
+    /// here (`signal(Int/Term)` never returns `Unsupported` on this backend), so
+    /// the scope is always `WholeTree`.
+    #[cfg(feature = "process-control")]
+    pub(crate) fn soft_stop_scope(&self) -> crate::SoftStopScope {
+        crate::SoftStopScope::WholeTree
+    }
+
     #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {
         self.group.suspend()

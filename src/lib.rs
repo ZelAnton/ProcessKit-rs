@@ -64,8 +64,9 @@
 //! [`Mechanism`], [`Outcome`], [`ParentDeathCleanup`], [`StopReason`],
 //! [`StdioMode`], [`LineTerminator`], [`OverflowMode`], [`Priority`],
 //! [`RestartPolicy`], plus the feature-gated `LimitKind` / `LimitReason`
-//! (`limits`) and `Signal` (`process-control`), given as bare names here since
-//! this crate-root doc also builds with those features off — each
+//! (`limits`) and `Signal` / `SoftStopScope` (`process-control`), given as bare
+//! names here since this crate-root doc also builds with those features off —
+//! each
 //! expose a `name()` that returns a short, lowercase `snake_case` identifier
 //! for machine-readable output (a CLI's JSONL schema, a cross-language binding,
 //! a structured log field), so a consumer publishing a contract over these
@@ -224,6 +225,11 @@ mod running;
 mod shutdown_report;
 #[cfg(feature = "process-control")]
 mod signal;
+// `SoftStopScope` — the runtime, per-group reach of a soft stop on the group
+// axis, reported by `ProcessGroup::soft_stop_scope`. Gated with the `signal`
+// verb it precedes.
+#[cfg(feature = "process-control")]
+mod soft_stop;
 #[cfg(feature = "stats")]
 mod stats;
 mod stdin;
@@ -275,6 +281,8 @@ pub use running::{Finished, OutputEvent, OutputEvents, OutputLine, RunningProces
 pub use shutdown_report::{ShutdownReport, SoftSignal};
 #[cfg(feature = "process-control")]
 pub use signal::Signal;
+#[cfg(feature = "process-control")]
+pub use soft_stop::SoftStopScope;
 #[cfg(feature = "stats")]
 pub use stats::{ProcessGroupStats, RunProfile, StatsSampler};
 pub use stdin::{ProcessStdin, Stdin};

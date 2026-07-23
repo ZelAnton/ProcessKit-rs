@@ -261,6 +261,15 @@ impl Job {
         self.0.signal(sig)
     }
 
+    /// The reach of a soft `Int`/`Term` stop on this job right now, read
+    /// side-effect-free from live membership (whole tree on the Unix backends;
+    /// opt-in console/windowed members, or none, on the Windows Job Object). See
+    /// [`ProcessGroup::soft_stop_scope`](crate::ProcessGroup::soft_stop_scope).
+    #[cfg(feature = "process-control")]
+    pub(crate) fn soft_stop_scope(&self) -> crate::SoftStopScope {
+        self.0.soft_stop_scope()
+    }
+
     /// Freeze the whole tree (cgroup.freeze / SIGSTOP / per-thread suspend).
     #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {

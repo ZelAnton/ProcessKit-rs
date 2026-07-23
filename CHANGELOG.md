@@ -13,6 +13,24 @@ to a dated version section.
 
 ### Added
 
+- Add `ProcessGroup::soft_stop_scope() -> SoftStopScope` (needs `process-control`),
+  an honest, side-effect-free capability report of how far a **soft stop**
+  (`signal(Signal::Term)` / `Signal::Int`) reaches on *this* group — queried
+  **before** the attempt so a caller cancelling on its own schedule (a UI Cancel, a
+  control-socket command, its own timeout) can decide up front and state the real
+  reach, instead of firing a `signal`, catching `Error::Unsupported`, and
+  reverse-engineering the scope. The new `#[non_exhaustive]` `SoftStopScope` reports
+  `WholeTree` on the Unix backends (cgroup v2 and the POSIX process-group fallback
+  reach the whole tree), and on Windows `OptInMembers` when a live console-CTRL
+  leader (`windows_graceful_ctrl_break`) or a windowed member exists (a curated
+  subset) or `Unsupported` when neither does — exactly the split where
+  `signal(Int/Term)` returns `Ok` versus `Error::Unsupported`. It reads the same
+  live-membership primitives `signal` acts on (delivering no signal, posting no
+  `WM_CLOSE`, spawning nothing, mutating nothing), so its report is consistent with
+  the real soft-stop outcome by construction. Carries the usual stable machine
+  identifier (`name()` / `from_name()`: `whole_tree` / `opt_in_members` / `none`).
+  The group-axis sibling of `Command::kill_on_parent_death_scope()`, but read at
+  runtime rather than fixed per platform. Purely additive
 - Add `RunningProcess::drain()` — a discard-style wait that **respects the
   configured `Command::output_buffer` byte cap**. It drains both pipes (the child
   never blocks on a full one), feeds every fitting line to the configured
