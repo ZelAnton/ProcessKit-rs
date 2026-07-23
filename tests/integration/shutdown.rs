@@ -629,3 +629,227 @@ async fn shutdown_is_unsupported_on_a_shared_group_handle() {
     // The child survived (shared-group Drop doesn't kill); tear it down here.
     group.shutdown().await.expect("teardown the group");
 }
+
+// --- T-167: the observable graceful stop (`ProcessGroup::stop` → `ShutdownReport`) ---
+//
+// `stop(grace, escalate)` drives the SAME teardown as `shutdown_ref` but returns a
+// `ShutdownReport` of what the kernel actually observed. All `process-control`-gated
+// with the method (its `SoftSignal` carries a `Signal`).
+
+// The headline property: a TERM-handling child drains early and the report proves
+// it by *actual duration*, not a poll count — the whole 10s grace is NOT spent.
+// Also exercises the re-stop-after-teardown case at the end.
+#[cfg(feature = "process-control")]
+#[tokio::test]
+#[ignore = "spawns a real subprocess; T-167 stop() reports an early drain by actual duration"]
+async fn stop_reports_an_early_drain_without_spending_the_whole_grace() {
+    use processkit::{Signal, SoftSignal};
+
+    let group = ProcessGroup::new().expect("create group");
+    // Exits 0 on SIGTERM, parked on an interruptible `read` — zero forks (see the
+    // sibling `shutdown_lets_a_term_handling_child_end_the_grace_early`).
+    let mut run = group
+        .start(
+            &Command::new("sh")
+                .args(["-c", "trap 'exit 0' TERM; echo ready; read line"])
+                .keep_stdin_open(),
+        )
+        .await
+        .expect("start");
+    run.wait_for_line(|l| l.contains("ready"), Duration::from_secs(10))
+        .await
+        .expect("trap installed");
+    // Reap concurrently: the pgroup liveness probe reads a zombie as alive, so the
+    // child must actually be collected for the early drain (and `members_after == 0`).
+    let waiter = tokio::spawn(run.wait());
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(20),
+        group.stop(Duration::from_secs(10), true),
+    )
+    .await
+    .expect("stop bounded")
+    .expect("stop ok");
+
+    assert!(
+        report.drained_within_grace(),
+        "the TERM-handling child drained within the grace (report: {report:?})"
+    );
+    assert!(!report.escalated(), "an in-time drain needs no hard kill");
+    assert!(
+        report.elapsed() < Duration::from_secs(8),
+        "an early drain must NOT spend the whole 10s grace (report: {report:?})"
+    );
+    assert_eq!(
+        report.attempted_signal(),
+        Some(Signal::Term),
+        "the graceful soft signal is SIGTERM"
+    );
+    assert_eq!(
+        report.soft_signal(),
+        SoftSignal::Sent(Signal::Term),
+        "the soft signal was delivered"
+    );
+    assert!(
+        report.members_before().is_some_and(|n| n >= 1),
+        "at least the one child was alive before the signal (report: {report:?})"
+    );
+    assert_eq!(
+        report.members_after(),
+        Some(0),
+        "the tree is empty after the drain (report: {report:?})"
+    );
+
+    let outcome = waiter.await.expect("join").expect("wait");
+    assert_eq!(outcome, Outcome::Exited(0), "the child exited via its TERM trap");
+
+    // Call-after-teardown: a second `stop` on the now-drained group must return
+    // promptly (a near no-op), not hang or panic.
+    let again = tokio::time::timeout(
+        Duration::from_secs(5),
+        group.stop(Duration::from_secs(5), true),
+    )
+    .await
+    .expect("a second stop on a drained group must not hang")
+    .expect("second stop ok");
+    assert!(again.drained_within_grace(), "the empty group is trivially drained");
+    assert!(!again.escalated(), "nothing to escalate on an empty group");
+    assert_eq!(again.members_before(), Some(0), "no members remain");
+    assert!(
+        again.elapsed() < Duration::from_secs(2),
+        "a re-stop of a drained group is prompt (took {:?})",
+        again.elapsed()
+    );
+}
+
+// A TERM-ignoring child rides the grace and is hard-killed; the report says so
+// (`drained_within_grace == false`, `escalated == true`).
+#[cfg(feature = "process-control")]
+#[tokio::test]
+#[ignore = "spawns a TERM-ignoring subprocess; T-167 stop() reports escalation"]
+async fn stop_reports_escalation_of_a_term_ignoring_child() {
+    use processkit::{Signal, SoftSignal};
+
+    let group = ProcessGroup::new().expect("create group");
+    let mut run = group
+        .start(&Command::new("sh").args(["-c", "trap '' TERM; echo ready; while :; do :; done"]))
+        .await
+        .expect("start");
+    run.wait_for_line(|l| l.contains("ready"), Duration::from_secs(10))
+        .await
+        .expect("trap installed");
+    let waiter = tokio::spawn(run.wait());
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(15),
+        group.stop(Duration::from_millis(500), true),
+    )
+    .await
+    .expect("escalation keeps stop bounded")
+    .expect("stop ok");
+
+    assert!(
+        !report.drained_within_grace(),
+        "a TERM-ignoring child does not drain within the grace"
+    );
+    assert!(
+        report.escalated(),
+        "the undrained tree was escalated to a hard kill (report: {report:?})"
+    );
+    assert_eq!(
+        report.soft_signal(),
+        SoftSignal::Sent(Signal::Term),
+        "the SIGTERM was still delivered (the child ignored it)"
+    );
+    assert!(
+        report.elapsed() >= Duration::from_millis(300),
+        "the grace is waited out before escalating (report: {report:?})"
+    );
+
+    let outcome = waiter.await.expect("join").expect("wait");
+    assert!(
+        matches!(outcome, Outcome::Signalled(_)),
+        "SIGKILL surfaces as a signal kill, got {outcome:?}"
+    );
+}
+
+// The "kill and wait" path: `stop(Duration::ZERO, true)` kills the tree at once
+// (a zero grace elapses immediately) and reports what it observed — unlike bare
+// `kill_all`, which returns as soon as the kill is *issued* with no report.
+#[cfg(feature = "process-control")]
+#[tokio::test]
+#[ignore = "spawns a real subprocess; T-167 stop(ZERO, true) kills and reports"]
+async fn stop_with_zero_grace_kills_and_reports() {
+    use processkit::{Signal, SoftSignal};
+
+    let group = ProcessGroup::new().expect("create group");
+    let mut run = group
+        .start(&Command::new("sh").args(["-c", "trap '' TERM; echo ready; while :; do :; done"]))
+        .await
+        .expect("start");
+    run.wait_for_line(|l| l.contains("ready"), Duration::from_secs(10))
+        .await
+        .expect("trap installed");
+    let waiter = tokio::spawn(run.wait());
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(10),
+        group.stop(Duration::ZERO, true),
+    )
+    .await
+    .expect("zero-grace stop is prompt")
+    .expect("stop ok");
+
+    assert!(
+        !report.drained_within_grace(),
+        "a zero grace leaves no window to drain in"
+    );
+    assert!(
+        report.escalated(),
+        "the live tree is hard-killed at once (report: {report:?})"
+    );
+    assert_eq!(report.soft_signal(), SoftSignal::Sent(Signal::Term));
+    assert!(
+        report.members_before().is_some_and(|n| n >= 1),
+        "the child was alive before the kill (report: {report:?})"
+    );
+
+    let outcome = waiter.await.expect("join").expect("wait");
+    assert!(
+        matches!(outcome, Outcome::Signalled(_)),
+        "hard-killed, got {outcome:?}"
+    );
+}
+
+// Behavior on a group with NO live members: an empty group drains trivially and
+// reports zero members, no escalation, and an immediate return.
+#[cfg(feature = "process-control")]
+#[tokio::test]
+#[ignore = "creates a real process group; T-167 stop() on a group with no live members"]
+async fn stop_on_an_empty_group_reports_no_members() {
+    use processkit::{Signal, SoftSignal};
+
+    let group = ProcessGroup::new().expect("create group");
+    let report = tokio::time::timeout(
+        Duration::from_secs(5),
+        group.stop(Duration::from_millis(200), true),
+    )
+    .await
+    .expect("stop bounded")
+    .expect("stop ok");
+
+    assert_eq!(report.members_before(), Some(0), "an empty group has no members");
+    assert_eq!(report.members_after(), Some(0), "still none afterwards");
+    assert!(report.drained_within_grace(), "an empty tree is trivially drained");
+    assert!(!report.escalated(), "nothing to escalate");
+    assert_eq!(
+        report.soft_signal(),
+        SoftSignal::Sent(Signal::Term),
+        "a real SIGTERM tier exists on unix even over an empty group"
+    );
+    assert!(
+        report.elapsed() < Duration::from_secs(1),
+        "an empty group drains immediately, not after the grace (took {:?})",
+        report.elapsed()
+    );
+}

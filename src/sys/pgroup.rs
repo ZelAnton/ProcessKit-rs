@@ -583,10 +583,12 @@ impl Tracked {
         ids.iter().map(|e| e.id).collect()
     }
 
-    /// How many tracked entries still exist (probe-only; no pruning — stats
-    /// must not mutate the *set* of tracked ids, though it may refresh the
-    /// `group_seen` latch, which is a benign monotonic cache).
-    #[cfg(feature = "stats")]
+    /// How many tracked entries still exist (probe-only; no pruning — `stats` and
+    /// the graceful teardown report's before/after member counts must not mutate the
+    /// *set* of tracked ids, though it may refresh the `group_seen` latch, which is a
+    /// benign monotonic cache). Un-gated: the always-available graceful driver reads
+    /// it through [`ProcessGroup`]'s [`GracefulTarget::alive_count`] as well as the
+    /// `stats`-gated `stats()`.
     fn count_alive(&self) -> usize {
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
         let mut alive = 0;
@@ -810,7 +812,7 @@ impl ProcessGroup {
         signal: i32,
         timeout: Duration,
         escalate: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<super::graceful::GracefulOutcome> {
         super::graceful::run(self, &self.skip_drop_kill, signal, timeout, escalate).await
     }
 
@@ -828,15 +830,29 @@ impl ProcessGroup {
 }
 
 impl super::graceful::GracefulTarget for ProcessGroup {
-    fn signal_all(&self, signal: i32) {
+    fn signal_all(&self, signal: i32) -> super::graceful::SoftDelivery {
         // The graceful soft signal is best-effort by trait contract (the driver
-        // polls regardless), so a delivery `EPERM` here is swallowed — the genuine
-        // live-`EPERM` is reported from `hard_kill` at escalation instead.
-        let _ = self.broadcast(signal);
+        // polls regardless), so a delivery failure never stops the teardown — the
+        // genuine live-`EPERM` is still reported from `hard_kill` at escalation. The
+        // send verdict is recorded only for the report: an `Ok` sweep (including an
+        // empty group) is `Sent`; a surfaced send failure (an `EINVAL`, or a
+        // live-non-zombie `EPERM` a uid-changed member raised) is `Failed`.
+        match self.broadcast(signal) {
+            Ok(()) => super::graceful::SoftDelivery::Sent,
+            Err(_) => super::graceful::SoftDelivery::Failed,
+        }
     }
 
     fn is_drained(&self) -> bool {
         !self.any_alive()
+    }
+
+    fn alive_count(&self) -> Option<usize> {
+        // The tracked group leaders plus solo-adopted pids still alive — the same
+        // member set `members()` reports (descendants inside the groups are not
+        // enumerated). Probe-only (no pruning), and infallible for this in-memory
+        // tracked set, so always `Some`.
+        Some(self.groups.count_alive() + self.solos.count_alive())
     }
 
     fn hard_kill(&self) -> io::Result<()> {
@@ -991,7 +1007,9 @@ mod tests {
             polls: AtomicUsize,
         }
         impl crate::sys::graceful::GracefulTarget for RacingRearm<'_> {
-            fn signal_all(&self, _signal: i32) {}
+            fn signal_all(&self, _signal: i32) -> crate::sys::graceful::SoftDelivery {
+                crate::sys::graceful::SoftDelivery::Sent
+            }
             fn is_drained(&self) -> bool {
                 // Re-arm on the second poll (the concurrent spawn/adopt landing
                 // mid-shutdown), then keep reporting "not drained" so the driver
@@ -1000,6 +1018,9 @@ mod tests {
                     self.latch.clear();
                 }
                 false
+            }
+            fn alive_count(&self) -> Option<usize> {
+                None
             }
             fn hard_kill(&self) -> std::io::Result<()> {
                 Ok(())

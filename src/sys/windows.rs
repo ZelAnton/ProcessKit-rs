@@ -616,7 +616,7 @@ impl Job {
         signal: i32,
         timeout: Duration,
         escalate: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<super::graceful::GracefulOutcome> {
         // Soft-shutdown tier: a Windows Job Object has no POSIX SIGTERM, but there
         // ARE two best-effort ways to *trigger* a clean exit before the atomic
         // kill —
@@ -661,6 +661,12 @@ impl Job {
         // timings are therefore unchanged for a windowless tree with no CTRL leader:
         // no extra wait is introduced here, exactly as before this WM_CLOSE tier.
         //
+        // Report facts for the atomic branch, which bypasses the shared driver: no
+        // soft-signal tier exists here (`Unsupported`), the tree was never given a
+        // grace window to drain in, and the elapsed is just the synchronous
+        // kill/spare below.
+        let started = std::time::Instant::now();
+        let members_before = job_active_count(self.handle);
         // Snapshot the re-arm generation up front — before the branch — so a
         // `spawn`/`adopt` that re-arms the backstop concurrently with this shutdown
         // wins over the (stale) `request` below. This body does not poll, but the
@@ -669,8 +675,14 @@ impl Job {
         // the spare to the epoch makes that concurrent re-arm win (the fresh child
         // keeps its kill-on-close backstop), matching the unix backends.
         let epoch = self.skip_drop_kill.begin_shutdown();
-        if escalate {
-            self.kill_all()
+        // An already-empty tree "drained" trivially; otherwise the atomic branch
+        // never drains softly (there is no soft trigger), so a non-empty tree is
+        // either hard-killed (escalate) or spared (!escalate).
+        let already_empty = members_before == Some(0);
+        let (escalated, result) = if escalate {
+            // The immediate kill IS the escalation — unless the tree was already
+            // empty, in which case `kill_all` is a no-op and nothing was escalated.
+            (!already_empty, self.kill_all())
         } else {
             // Mark Drop to preserve survivors; the latch makes the flag visible
             // whichever thread drops the `Job` (it may differ from the one that
@@ -678,8 +690,17 @@ impl Job {
             // Keyed to `epoch`, so a concurrent spawn/adopt re-arm wins and this
             // spare no-ops — the fresh child is still killed on job-close.
             self.skip_drop_kill.request(epoch);
-            Ok(())
-        }
+            (false, Ok(()))
+        };
+        let members_after = job_active_count(self.handle);
+        result.map(|()| super::graceful::GracefulOutcome {
+            soft: super::graceful::SoftDelivery::Unsupported,
+            members_before,
+            members_after,
+            drained: already_empty,
+            escalated,
+            elapsed: started.elapsed(),
+        })
     }
 
     #[cfg(feature = "stats")]
@@ -750,19 +771,34 @@ struct SoftShutdownTarget<'a> {
 }
 
 impl super::graceful::GracefulTarget for SoftShutdownTarget<'_> {
-    fn signal_all(&self, _signal: i32) {
+    fn signal_all(&self, _signal: i32) -> super::graceful::SoftDelivery {
         // Windows delivers a console CTRL_BREAK / a window WM_CLOSE, not a POSIX
         // signal — the raw `signal` number (SIGTERM/`timeout_signal`) is meaningless
         // here and ignored. Both are best-effort soft triggers: a console-group
         // leader gets CTRL_BREAK, a windowed member gets WM_CLOSE. Whatever ignores
         // its trigger rides the grace to the `hard_kill` (TerminateJobObject)
-        // fallback.
-        ctrl_break_live_leaders(&self.leaders, self.job.handle);
-        close_member_windows(self.job.handle);
+        // fallback. Both fire (no short-circuit); the counts they return classify
+        // the delivery for the report — at least one live target reached is `Sent`,
+        // none reached (the leaders/windows vanished since the branch check) is
+        // `Failed`.
+        let ctrl = ctrl_break_live_leaders(&self.leaders, self.job.handle);
+        let windows = close_member_windows(self.job.handle);
+        if ctrl + windows > 0 {
+            super::graceful::SoftDelivery::Sent
+        } else {
+            super::graceful::SoftDelivery::Failed
+        }
     }
 
     fn is_drained(&self) -> bool {
         job_is_drained(self.job.handle)
+    }
+
+    fn alive_count(&self) -> Option<usize> {
+        // The whole tree's live members (the job's active-process count), matching
+        // `members()`; `None` if the accounting query fails, the same fail-safe
+        // `is_drained` applies (there mapped to "not drained").
+        job_active_count(self.job.handle)
     }
 
     fn hard_kill(&self) -> io::Result<()> {
@@ -902,13 +938,12 @@ fn job_has_windowed_member(job: HANDLE) -> bool {
     scan_member_windows(job, false) > 0
 }
 
-/// Whether the job has fully drained — no process is still active in it.
-///
-/// Best-effort: a failed query (a torn-down handle, a transient error) reports
-/// "not drained" so the driver keeps waiting and then takes its escalation
-/// (`TerminateJobObject`) / spare decision at the deadline, never a premature
-/// "drained" that would skip the fallback kill.
-fn job_is_drained(handle: HANDLE) -> bool {
+/// The job's live active-process count (the whole tree), or `None` if the
+/// accounting query fails (a torn-down handle, a transient error). The single
+/// membership primitive behind both [`job_is_drained`] (drained ⟺ `Some(0)`) and
+/// the graceful teardown report's before/after member counts — so the drain check
+/// and the reported counts always read the same `ActiveProcesses` field.
+fn job_active_count(handle: HANDLE) -> Option<usize> {
     let mut acct: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: out param matches the accounting info class and its size.
     let ok = unsafe {
@@ -920,7 +955,17 @@ fn job_is_drained(handle: HANDLE) -> bool {
             std::ptr::null_mut(),
         )
     };
-    ok != 0 && acct.ActiveProcesses == 0
+    (ok != 0).then_some(acct.ActiveProcesses as usize)
+}
+
+/// Whether the job has fully drained — no process is still active in it.
+///
+/// Best-effort: a failed query (a torn-down handle, a transient error) reports
+/// "not drained" so the driver keeps waiting and then takes its escalation
+/// (`TerminateJobObject`) / spare decision at the deadline, never a premature
+/// "drained" that would skip the fallback kill.
+fn job_is_drained(handle: HANDLE) -> bool {
+    job_active_count(handle) == Some(0)
 }
 
 /// Whether the process behind `handle` has already exited —
