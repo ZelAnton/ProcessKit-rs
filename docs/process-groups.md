@@ -212,11 +212,17 @@ best-effort against a tree that is forking at that exact moment. On Windows,
 close — contrast the graceful `shutdown`, which then waits the grace and
 escalates). An empty group accepts any deliverable signal trivially — except
 Windows `Int`/`Term`, which report `Unsupported` on an empty group (no member,
-hence no console or windowed target to soft-close). On the **cgroup** mechanism a
-real per-member delivery failure (e.g. `EPERM` from a member that changed uid, or
-a seccomp/container restriction) is surfaced as an `Err` rather than swallowed —
-an `ESRCH` race (the member already exited) is still success; the pgroup
-(macOS/BSD, Linux-without-cgroup) backend remains purely best-effort.
+hence no console or windowed target to soft-close). On **both** Unix mechanisms a
+real send failure is surfaced as an `Err` rather than swallowed — an `EINVAL` (an
+out-of-range `Other(n)`) always, and an `EPERM` against a **live, non-zombie**
+member (a `sudo`/setuid child that rejects the signal, or a seccomp/container
+restriction). The **process-group** mechanism (macOS/BSD, Linux-without-cgroup)
+reaches the same verdict as the cgroup one by checking the target's run state
+after an `EPERM`, so a harmless zombie-only `EPERM` — and, on the bare BSDs where
+no state reader exists, every `EPERM` — stays swallowed. An `ESRCH` race (the
+member already exited) is still success. `Signal::Other(0)` is the POSIX
+existence probe: it returns `Ok` having **delivered nothing** (a live target was
+reached, not signalled).
 
 ## Suspending and resuming
 

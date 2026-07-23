@@ -373,26 +373,44 @@ impl ProcessGroup {
     /// cannot miss a process forked mid-broadcast. Other signals are a per-member
     /// broadcast.
     ///
-    /// **Limitation (process-group mechanism only).** On macOS/BSD and the Linux
-    /// process-group fallback, delivery failures such as `EPERM` are not surfaced:
-    /// this arbitrary-signal broadcast is best-effort and returns `Ok`. Unlike
-    /// [`kill_all`](Self::kill_all) — which checks the target's run state to report
-    /// a live, non-zombie member that rejects `SIGKILL` — `signal` makes no such
-    /// live/zombie discrimination and always returns `Ok` on this mechanism, even
-    /// for [`Signal::Kill`]; reach for [`kill_all`](Self::kill_all) if you need a
-    /// rejected hard kill surfaced. The Linux cgroup mechanism does surface delivery
-    /// failures for signals other than `SIGKILL`.
+    /// **Honest send failures (every Unix backend).** A genuinely failed send is
+    /// reported as [`Error::Io`], not hidden behind a false `Ok`, and the two POSIX
+    /// mechanisms agree on which failures those are:
+    /// - an **`EINVAL`** (an out-of-range [`Signal::Other`] number) always surfaces;
+    /// - an **`EPERM`** surfaces when it hit a **live, non-zombie** member (a
+    ///   `sudo`/setuid child that rejects the signal — the genuine containment gap),
+    ///   on both the cgroup mechanism and the process-group mechanism (which checks
+    ///   the target's run state — `proc_pidinfo` on macOS, the `/proc/<pid>/stat`
+    ///   state field on the Linux fallback — after the `EPERM`, exactly as
+    ///   [`kill_all`](Self::kill_all) does). The one `EPERM` deliberately swallowed
+    ///   is the harmless zombie-only case;
+    /// - an **`ESRCH`** (the member already exited) is always a benign no-op success.
+    ///
+    /// On the **BSDs**, where no process-state reader is wired up, a delivery
+    /// `EPERM` stays swallowed (best-effort) — the same residual gap
+    /// [`kill_all`](Self::kill_all) documents. `SIGKILL` here goes through the same
+    /// whole-tree hard kill as [`kill_all`](Self::kill_all), so a rejected hard kill
+    /// surfaces identically whichever verb you call.
+    ///
+    /// **[`Signal::Other(0)`](Signal::Other) is an existence probe, not a delivery.**
+    /// Signal `0` checks whether targets exist and delivers nothing; a
+    /// `signal(Other(0))` over a group with live members therefore returns `Ok`
+    /// **having sent no signal** — the `Ok` means "a signalable target was reached",
+    /// not "a signal was delivered". It can still surface an `EPERM` against a live
+    /// target that rejects even the null signal, identically on both POSIX backends.
     ///
     /// # Errors
     ///
     /// [`Error::Unsupported`] on Windows for [`Signal::Int`] / [`Signal::Term`]
     /// only when the group has no console-CTRL leader and no windowed member (see
     /// Platform support above), and for every other non-[`Kill`](Signal::Kill)
-    /// signal unconditionally (a Job Object has no POSIX signals). On the Linux
-    /// cgroup mechanism, [`Error::Io`] if the OS rejects delivering the signal to a
-    /// member. Delivery errors are deliberately not reported by the process-group
-    /// mechanism (see above), and the Windows soft close is likewise best-effort
-    /// (an enumeration / post failure never fails a call that reached a target).
+    /// signal unconditionally (a Job Object has no POSIX signals). On **every** Unix
+    /// backend (cgroup and process-group alike), [`Error::Io`] if the OS honestly
+    /// rejects the send — an `EINVAL` (a bad [`Signal::Other`] number) or an `EPERM`
+    /// against a live, non-zombie member (see above); an `ESRCH` (member already
+    /// gone) and a harmless zombie-only `EPERM` are not errors. The Windows soft
+    /// close is likewise best-effort (an enumeration / post failure never fails a
+    /// call that reached a target).
     #[cfg(feature = "process-control")]
     pub fn signal(&self, sig: Signal) -> Result<()> {
         self.job

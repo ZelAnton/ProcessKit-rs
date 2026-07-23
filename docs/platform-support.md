@@ -138,11 +138,18 @@ sends a real signal.
 | Arbitrary signal (`Hup`, `Usr1`, `Other(n)`, …) | 🟡 `Kill`, plus `Int`/`Term` as a best-effort soft close (`CTRL_BREAK` + `WM_CLOSE`); others unsupported | ✅ | ✅ | ✅ |
 | `suspend` / `resume` | 🟡 per-thread counts | ✅ `cgroup.freeze` | ✅ `SIGSTOP`/`CONT` | ✅ `SIGSTOP`/`CONT` |
 
-On the cgroup mechanism, a non-`Kill` `signal` (and the `SIGSTOP`/`SIGCONT`
-fallback used for `suspend`/`resume` on pre-5.2 kernels without `cgroup.freeze`)
-surfaces a real per-member delivery failure (e.g. `EPERM`) as an `Err` rather
-than swallowing it — consistent with the "never silently skipped" philosophy; an
-`ESRCH` race (the member already exited) is still success.
+On **both** Unix mechanisms, a `signal` broadcast surfaces a real send failure as
+an `Err` rather than swallowing it — an `EINVAL` (an out-of-range `Other(n)`) and
+an `EPERM` against a **live, non-zombie** member (a uid-changed child, or a
+seccomp/container restriction) — consistent with the "never silently skipped"
+philosophy. The process-group backend (macOS/BSD, Linux fallback) matches the
+cgroup verdict by checking the target's run state after an `EPERM`, so a harmless
+zombie-only `EPERM` — and every `EPERM` on the bare BSDs (no state reader) —
+stays swallowed; an `ESRCH` race (the member already exited) is still success,
+and `Signal::Other(0)` returns `Ok` having delivered nothing (the POSIX existence
+probe). On the cgroup mechanism the `SIGSTOP`/`SIGCONT` fallback used for
+`suspend`/`resume` on pre-5.2 kernels (no `cgroup.freeze`) surfaces failures the
+same way.
 
 **Inspection & accounting**
 

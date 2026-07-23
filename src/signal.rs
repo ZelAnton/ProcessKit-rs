@@ -47,13 +47,17 @@ pub enum Signal {
     /// value:
     /// - **`Other(0)` is not an error.** Signal `0` is the POSIX *existence probe*
     ///   (`kill(pid, 0)` checks whether the target exists and delivers nothing), so
-    ///   it is a no-op "is it alive?" send, not `EINVAL`.
+    ///   it is a no-op "is it alive?" send, not `EINVAL`. On **both** POSIX backends
+    ///   a [`signal(Other(0))`](crate::ProcessGroup::signal) over a group with live
+    ///   members returns `Ok` **having delivered nothing** — the `Ok` reports "the
+    ///   probe reached a signalable target", never "a signal was delivered".
     /// - An **out-of-range** number makes the underlying `kill`/`killpg` fail
-    ///   `EINVAL`, but whether that **surfaces** is backend-dependent: the Linux
-    ///   **cgroup** mechanism propagates the send error, while the **process-group**
-    ///   mechanism (macOS/BSD and the Linux fallback) is best-effort and *swallows*
-    ///   it (the send appears to succeed, having delivered nothing). Pass a real
-    ///   signal number rather than relying on either behavior.
+    ///   `EINVAL`, and that failure is now surfaced as
+    ///   [`Error::Io`](crate::Error::Io) on **every** Unix backend — the Linux
+    ///   **cgroup** mechanism and the **process-group** mechanism (macOS/BSD and the
+    ///   Linux fallback) agree, so a bad number no longer silently "succeeds" on one
+    ///   and fails on the other. Still, pass a real signal number rather than
+    ///   leaning on the `EINVAL`.
     Other(i32),
 }
 

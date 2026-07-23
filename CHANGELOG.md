@@ -47,6 +47,16 @@ to a dated version section.
   `windows_graceful_ctrl_break` leaders plus `WM_CLOSE` to windowed members)
   instead of always returning `Error::Unsupported`; it returns `Unsupported` only
   when the group has neither a console-CTRL leader nor a windowed member
+- `ProcessGroup::signal` on the POSIX process-group mechanism (macOS/BSD and the
+  Linux process-group fallback) now reports a genuinely failed send as
+  `Error::Io` instead of swallowing every error behind a false `Ok`, matching the
+  cgroup mechanism: an `EINVAL` (an out-of-range `Signal::Other(n)`) and an
+  `EPERM` from a live, non-zombie member that rejects the signal now surface,
+  while an `ESRCH` (a member already exited) and a harmless zombie-only `EPERM`
+  stay swallowed. An empty group is still a trivial success, and
+  `Signal::Other(0)` remains the POSIX existence probe — it returns `Ok` having
+  delivered nothing. Signatures are unchanged; this only makes the error report
+  on these edge inputs truthful (not a breaking API change)
 
 ### Fixed
 -

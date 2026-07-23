@@ -475,10 +475,14 @@ impl Tracked {
     /// only ever reaches an id whose identity was just re-verified (or, on a
     /// target/path without a readable identity, whose bare liveness was).
     ///
-    /// Returns `Err` **only** when a delivery `EPERM` hit a positively **live,
-    /// non-zombie** member ([`is_live_non_zombie`]) — the genuine containment gap
-    /// (a `sudo`/setuid child that rejects the signal). Every other outcome is
-    /// `Ok`, including the ambiguous `EPERM` this backend used to swallow wholesale:
+    /// Returns `Err` when a send **honestly failed**: an `EINVAL` (a bad signal
+    /// number — the request itself is malformed, so it is surfaced whatever the
+    /// target's state; symmetric with the cgroup backend's `signal`) or a delivery
+    /// `EPERM` that hit a positively **live, non-zombie** member
+    /// ([`is_live_non_zombie`]) — the genuine containment gap (a `sudo`/setuid child
+    /// that rejects the signal). Every other outcome is `Ok`, including an `ESRCH`
+    /// (the target already exited) and the ambiguous `EPERM` this backend used to
+    /// swallow wholesale:
     /// on macOS/BSD `killpg` returns `EPERM` for a group whose only member is an
     /// unreaped **zombie** (dead, harmless) too, and surfacing *that* is what
     /// reverted the first attempt at this fix (it falsely failed a normal
@@ -492,9 +496,14 @@ impl Tracked {
     /// result; `kill_all`/`hard_kill` propagate it.
     fn signal_all(&self, sig: i32) -> io::Result<()> {
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
-        // The first live-non-zombie `EPERM` seen this sweep, surfaced after every
-        // entry has been signalled (a partial failure must not skip the rest).
-        let mut live_eperm: Option<io::Error> = None;
+        // The first *surfaceable* send error seen this sweep, returned after every
+        // entry has been signalled (a partial failure must not skip the rest): an
+        // `EINVAL` (a bad signal number — the request is malformed, so it surfaces
+        // whatever the target's state) or a live-non-zombie `EPERM` (a uid-changed
+        // member that genuinely rejects the signal). Every other outcome — `ESRCH`,
+        // a harmless zombie-only `EPERM`, a since-reaped pid, a target without a
+        // state reader (the BSDs) — stays swallowed.
+        let mut surfaced: Option<io::Error> = None;
         ids.retain_mut(|e| {
             if !self.probe_entry(e) {
                 return false; // gone — forget it.
@@ -532,22 +541,29 @@ impl Tracked {
                     None
                 }
             };
-            // Surface a delivery `EPERM` only when the target is positively a live,
-            // non-zombie process (the real "couldn't kill it" case). A zombie-only
-            // group's `killpg` `EPERM`, an `EPERM` against a since-reaped pid, or a
-            // target without a state reader (the BSDs) all classify as not-live and
-            // are swallowed — the fail-safe that keeps a normal teardown succeeding.
-            // The `is_live_non_zombie` probe runs only on the rare `EPERM` path.
+            // Surface a real send failure — an `EINVAL` (a malformed request: a bad
+            // signal number, which fails uniformly for every target) or an `EPERM`
+            // against a positively live, non-zombie process (the genuine "couldn't
+            // signal it" case). A zombie-only group's `killpg` `EPERM`, an `EPERM`
+            // against a since-reaped pid, or a target without a state reader (the
+            // BSDs) all classify as not-live and are swallowed — the fail-safe that
+            // keeps a normal teardown succeeding — and an `ESRCH` (the target is
+            // already gone) is likewise swallowed. The `is_live_non_zombie` probe
+            // runs only on the rare `EPERM` path (an `EINVAL` short-circuits before
+            // it).
             if let Some(err) = delivery
-                && live_eperm.is_none()
-                && err.raw_os_error() == Some(libc::EPERM)
-                && is_live_non_zombie(id)
+                && surfaced.is_none()
             {
-                live_eperm = Some(err);
+                let code = err.raw_os_error();
+                if code == Some(libc::EINVAL)
+                    || (code == Some(libc::EPERM) && is_live_non_zombie(id))
+                {
+                    surfaced = Some(err);
+                }
             }
             true
         });
-        match live_eperm {
+        match surfaced {
             Some(err) => Err(err),
             None => Ok(()),
         }
@@ -717,16 +733,20 @@ impl ProcessGroup {
         self.broadcast(libc::SIGKILL)
     }
 
-    /// Broadcast `sig` to every tracked process group and solo-adopted child.
-    /// Best-effort by contract: entries that already drained are skipped (and
-    /// pruned), an empty set is a no-op, and a delivery `EPERM` is **not** surfaced
-    /// — unlike `kill_all`/`hard_kill` this makes no live/zombie discrimination.
+    /// Broadcast `sig` to every tracked process group and solo-adopted child,
+    /// reporting an **honest** send failure — an `EINVAL` (a bad signal number) or
+    /// an `EPERM` against a live, non-zombie member that rejects it — as `Err`,
+    /// symmetric with the cgroup backend (see [`Tracked::signal_all`]). An entry
+    /// that already drained (`ESRCH`) is skipped and pruned, a harmless zombie-only
+    /// `EPERM` stays swallowed, and an empty / all-drained set is a no-op `Ok`.
+    ///
+    /// Signal `0` (`Signal::Other(0)`) is the POSIX existence probe: it delivers
+    /// **nothing**, so a returned `Ok` here means "the probe reached a signalable
+    /// live target", not "a signal was delivered". (See the honesty contract on
+    /// [`ProcessGroup::signal`](crate::ProcessGroup::signal).)
     #[cfg(feature = "process-control")]
     pub(crate) fn signal(&self, sig: i32) -> io::Result<()> {
-        // Documented best-effort (see `ProcessGroup::signal`): swallow any
-        // live-`EPERM` the sweep detected.
-        let _ = self.broadcast(sig);
-        Ok(())
+        self.broadcast(sig)
     }
 
     /// Freeze every tracked group (`SIGSTOP` — unblockable, idempotent).
@@ -744,8 +764,10 @@ impl ProcessGroup {
     }
 
     /// One signal sweep over both tracking sets. Both sets are always signalled;
-    /// the first live-non-zombie `EPERM` surfaced by either is returned (see
-    /// [`Tracked::signal_all`]). Best-effort callers discard the result.
+    /// the first surfaceable send error either raises — an `EINVAL` (a bad signal
+    /// number) or a live-non-zombie `EPERM` — is returned (see
+    /// [`Tracked::signal_all`]). Best-effort callers (`Drop`, the graceful
+    /// soft-signal, `suspend`/`resume`) discard the result.
     fn broadcast(&self, sig: i32) -> io::Result<()> {
         let groups = self.groups.signal_all(sig);
         let solos = self.solos.signal_all(sig);
@@ -912,6 +934,12 @@ mod tests {
     use tokio::process::Command;
 
     use super::*;
+
+    /// A signal number well past any real or real-time signal (`SIGRTMAX` is ~64 on
+    /// Linux, and macOS/BSD have no RT signals), so `kill`/`killpg` reject it with
+    /// `EINVAL` on every POSIX target — the malformed-request case the honesty fix
+    /// must surface rather than swallow.
+    const BOGUS_SIGNAL: i32 = 4096;
 
     /// `graceful_shutdown(escalate=false)` must not kill survivors — neither
     /// during the call nor when the `ProcessGroup` itself drops.
@@ -1583,5 +1611,110 @@ mod tests {
             "a zombie-only group's killpg EPERM must be swallowed, not surfaced — \
              surfacing it is the false positive that reverted the first attempt",
         );
+    }
+
+    /// The honesty fix: an out-of-range signal number (`EINVAL`) sent to a group
+    /// with a live member must now be **surfaced** as `Err`, symmetric with the
+    /// cgroup backend, instead of the old blanket swallow that returned a false
+    /// `Ok`. `EINVAL` is the malformed-request case, independent of the target's
+    /// run state, so it fires whatever the platform (no `is_live_non_zombie` gate,
+    /// hence no BSD carve-out — the assertion holds on every POSIX target).
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn signal_all_surfaces_einval_for_a_live_group() {
+        use std::os::unix::process::CommandExt as _;
+
+        let tracked = Tracked::new(true);
+        let mut cmd = Command::new("sh");
+        // Traps TERM so a stray real signal cannot reap it; the load-bearing check
+        // is the EINVAL return, and `BOGUS_SIGNAL` delivers nothing anyway.
+        cmd.arg("-c").arg("trap '' TERM; while :; do :; done");
+        cmd.kill_on_drop(true);
+        cmd.as_std_mut().process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id().unwrap() as i32;
+        assert!(
+            unsafe { libc::kill(-pid, 0) } == 0,
+            "the child must lead its own group"
+        );
+        // Real capture of the live leader's identity, then a bogus-signal sweep.
+        tracked.track(pid, true);
+
+        let outcome = tracked.signal_all(BOGUS_SIGNAL);
+
+        let _ = unsafe { libc::killpg(pid, libc::SIGKILL) };
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait().await;
+
+        let err = outcome.expect_err(
+            "an out-of-range signal number must surface EINVAL, not be swallowed as \
+             a false success",
+        );
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EINVAL),
+            "the surfaced error must be the EINVAL from the malformed send"
+        );
+    }
+
+    /// `Signal::Other(0)` maps to signal `0`, the POSIX existence probe: it delivers
+    /// **nothing**. A `signal_all(0)` over a group with a live member must return
+    /// `Ok` — but that `Ok` reports "a signalable target was reached", not "a signal
+    /// was delivered": the child must still be alive afterwards. This pins the
+    /// documented "success here does not mean delivery" contract of
+    /// `ProcessGroup::signal`.
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn other_zero_probes_without_delivering_and_returns_ok() {
+        use std::os::unix::process::CommandExt as _;
+
+        let tracked = Tracked::new(true);
+        let mut cmd = Command::new("sh");
+        // No signal handler needed: signal 0 is never delivered, so a plain idler
+        // that would die to any real signal proves nothing was delivered.
+        cmd.arg("-c").arg("while :; do :; done");
+        cmd.kill_on_drop(true);
+        cmd.as_std_mut().process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id().unwrap() as i32;
+        assert!(
+            unsafe { libc::kill(-pid, 0) } == 0,
+            "the child must lead its own group"
+        );
+        tracked.track(pid, true);
+
+        let outcome = tracked.signal_all(0);
+        // Nothing was delivered, so the group leader is untouched.
+        let alive = unsafe { libc::kill(-pid, 0) } == 0;
+
+        let _ = unsafe { libc::killpg(pid, libc::SIGKILL) };
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait().await;
+
+        outcome.expect(
+            "signal 0 is a probe over a live target — it returns Ok having delivered \
+             nothing, never an error",
+        );
+        assert!(
+            alive,
+            "signal 0 delivers nothing (POSIX existence probe), so the child must \
+             survive: an Ok here is not proof of delivery"
+        );
+    }
+
+    /// Regression for "nobody to signal": an empty tracked set is a trivial `Ok`
+    /// even for a bogus signal number, because there is no live member for the bad
+    /// number to reach a syscall against — the honesty fix must not turn an empty /
+    /// all-drained group into a new error. Matches the cgroup backend, whose
+    /// empty-membership broadcast is likewise a no-op `Ok`. Deterministic (no
+    /// subprocess), so it runs in CI on every POSIX target.
+    #[test]
+    fn signal_all_on_an_empty_set_is_ok_even_for_a_bogus_signal() {
+        Tracked::new(true)
+            .signal_all(BOGUS_SIGNAL)
+            .expect("an empty group signals nothing, so a bogus number is a no-op Ok");
+        Tracked::new(false)
+            .signal_all(BOGUS_SIGNAL)
+            .expect("an empty solo set signals nothing either — still a no-op Ok");
     }
 }
