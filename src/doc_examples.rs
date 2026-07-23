@@ -32,10 +32,17 @@
     feature = "record",
     feature = "pty"
 ))]
+// These hidden modules exist only to register fenced examples as doctests. Their
+// mdBook links are ordinary Markdown URLs (and often use downstream
+// `processkit::...` paths), not intra-doc links in this private module hierarchy.
+#[allow(rustdoc::broken_intra_doc_links)]
 mod guides {
     /// `README.md` (crate root) — kept **out** of the rendered crate doc
     /// (see `decisions/readme-crate-doc-sourcing.md`); included here only so its
     /// fenced Rust blocks run as doctests.
+    ///
+    /// README.md's relative file links (e.g. to `LICENSE`) aren't intra-doc
+    /// links; only `--document-private-items` builds check them.
     #[doc(hidden)]
     #[doc = include_str!("../README.md")]
     mod readme {}

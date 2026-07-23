@@ -1,5 +1,5 @@
 //! Implementation for unix targets without cgroups or Job Objects (macOS, the
-//! BSDs): a [`ProcessGroup`](super::pgroup::ProcessGroup) per the shared POSIX
+//! BSDs): a [`ProcessGroup`] per the shared POSIX
 //! backend. Every child leads its own process group, so dropping the job
 //! `killpg`s the whole tree — a real kill-on-close guarantee, weaker only
 //! against children that `setsid` away. Surfaced as [`Mechanism::ProcessGroup`].

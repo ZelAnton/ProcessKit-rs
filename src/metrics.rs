@@ -14,7 +14,7 @@
 //!
 //! Every label value emitted here comes from a **bounded, secret-free** source:
 //! the program *name* (never the full argv), the containment
-//! [`Mechanism`](crate::Mechanism)'s stable identifier, a fixed outcome-class
+//! [`Mechanism`]'s stable identifier, a fixed outcome-class
 //! token, an exit code, or a teardown-phase token. Command **argv** and
 //! **environment values** — which routinely carry secrets — are *never* passed
 //! into this module: the emission functions below do not even take the

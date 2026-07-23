@@ -351,7 +351,7 @@ impl<T> ProcessResult<T> {
     /// - [`ErrorReason::Timeout`] if the run was killed by its deadline (checked
     ///   *first*, so a run that both timed out and exited non-zero reports the
     ///   timeout).
-    /// - [`ErrorReason::Signalled`](crate::ErrorReason::Signalled) if it was terminated by a
+    /// - [`ErrorReason::Signalled`] if it was terminated by a
     ///   signal, with no exit code.
     /// - [`ErrorReason::Exit`] for an exit code outside the accepted set, carrying the
     ///   code and both captured streams in full (the

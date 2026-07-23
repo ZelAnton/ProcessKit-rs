@@ -1,4 +1,4 @@
-//! Diagnostic counters for a [`ProcessGroup`](crate::ProcessGroup), plus the
+//! Diagnostic counters for a [`ProcessGroup`], plus the
 //! time-series samplers ([`StatsSampler`] and its owning `'static` twin
 //! [`OwnedStatsSampler`]) and the per-run profile summary ([`RunProfile`]).
 
@@ -266,7 +266,7 @@ impl tokio_stream::Stream for OwnedStatsSampler {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunProfile {
-    /// How the run ended — the full [`Outcome`](crate::Outcome), so a profile can
+    /// How the run ended — the full [`Outcome`], so a profile can
     /// distinguish a clean exit from a signal kill from a timeout (all three of
     /// which leave [`code`](Self::code) `None`). Read it directly, or
     /// via the [`code`](Self::code) / [`signal`](Self::signal) /
@@ -303,7 +303,7 @@ impl RunProfile {
     /// [`outcome.code()`](crate::Outcome::code); the method form completes the
     /// `code()` / [`signal()`](Self::signal) / [`timed_out()`](Self::timed_out)
     /// accessor trio that mirrors [`ProcessResult`](crate::ProcessResult) and
-    /// [`Outcome`](crate::Outcome).
+    /// [`Outcome`].
     pub fn code(&self) -> Option<i32> {
         self.outcome.code()
     }

@@ -424,7 +424,7 @@ impl<R: ProcessRunner> CliClient<R> {
     /// Run, returning stdout (trailing whitespace trimmed) on success (errors on
     /// a non-zero exit) — the same verb, with the same semantics, as
     /// [`Command::run`](crate::Command::run) and
-    /// [`ProcessRunnerExt::run`](crate::ProcessRunnerExt::run). Trims with
+    /// [`ProcessRunnerExt::run`]. Trims with
     /// `trim_end`: the trailing newline is noise, but leading whitespace can be
     /// significant.
     ///
@@ -447,7 +447,7 @@ impl<R: ProcessRunner> CliClient<R> {
 
     /// Run, requiring an accepted exit, and return the full
     /// [`ProcessResult`] (untrimmed) — the [`CliClient`] analogue of
-    /// [`ProcessRunnerExt::checked`](crate::ProcessRunnerExt::checked); the
+    /// [`ProcessRunnerExt::checked`]; the
     /// building block when you need the whole result after success-checking.
     ///
     /// # Errors
@@ -494,7 +494,7 @@ impl<R: ProcessRunner> CliClient<R> {
 
     /// Run for the side effect, discarding stdout (errors on a non-zero exit) —
     /// the same verb as
-    /// [`ProcessRunnerExt::run_unit`](crate::ProcessRunnerExt::run_unit).
+    /// [`ProcessRunnerExt::run_unit`].
     ///
     /// # Errors
     ///
@@ -535,7 +535,7 @@ impl<R: ProcessRunner> CliClient<R> {
 
     /// Stream stdout and return the first line matching `predicate` (`None` if
     /// the stream ends first) — the [`CliClient`] analogue of
-    /// [`ProcessRunnerExt::first_line`](crate::ProcessRunnerExt::first_line),
+    /// [`ProcessRunnerExt::first_line`],
     /// bounded by the command's [`timeout`](crate::Command::timeout).
     ///
     /// # Errors
@@ -561,7 +561,7 @@ impl<R: ProcessRunner> CliClient<R> {
     /// Run (errors on a non-zero exit) and feed stdout to an infallible
     /// `parse` — the shape of git/jj struct-returning commands. Fails loud on a
     /// bounded-buffer truncation. Delegates to
-    /// [`ProcessRunnerExt::parse`](crate::ProcessRunnerExt::parse).
+    /// [`ProcessRunnerExt::parse`].
     ///
     /// # Errors
     ///
@@ -582,7 +582,7 @@ impl<R: ProcessRunner> CliClient<R> {
     /// the shape of JSON deserialization, where a parse failure becomes
     /// [`ErrorReason::Parse`](crate::ErrorReason::Parse). Fails loud on a bounded-buffer
     /// truncation. Delegates to
-    /// [`ProcessRunnerExt::try_parse`](crate::ProcessRunnerExt::try_parse).
+    /// [`ProcessRunnerExt::try_parse`].
     ///
     /// # Errors
     ///

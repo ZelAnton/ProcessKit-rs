@@ -277,7 +277,8 @@ fn skip_string_escape(bytes: &[u8], from: usize) -> usize {
 ///
 /// Returns [`Cow::Borrowed`] of the **input** line (never of some other `&str`)
 /// on its unchanged fast path, so the caller reuses the already-owned line with
-/// no re-allocation — and, unlike an arbitrary [`CapturePolicy`], that identity
+/// no re-allocation — and, unlike an arbitrary
+/// [`CapturePolicy`](crate::CapturePolicy), that identity
 /// is guaranteed by construction, so no pointer check is needed here (contrast
 /// [`apply_capture_policy`]'s [[K-065]] guard).
 fn strip_vt(line: &str) -> Cow<'_, str> {
@@ -328,7 +329,8 @@ fn strip_vt(line: &str) -> Cow<'_, str> {
 ///
 /// Like [`apply_capture_policy`], this shapes **only** what is retained: the
 /// pump runs it in `emit` *after* the raw-observing handler/tee (which keep
-/// seeing the un-sanitized decoded line, matching the [`CapturePolicy`] boundary,
+/// seeing the un-sanitized decoded line, matching the
+/// [`CapturePolicy`](crate::CapturePolicy) boundary,
 /// see [[K-066]]) and *before* the capture policy — so a secret-scrubbing policy
 /// matches on already-cleaned text, never one where a color escape could hide a
 /// token mid-word (`to\x1b[0mken`). It touches none of the `count`/`seen_bytes`/
@@ -349,7 +351,7 @@ fn apply_vt_sanitize(enabled: bool, line: String) -> String {
     }
 }
 
-/// A shared, bounded line buffer written by a [`pump_lines`] task and read by
+/// A shared, bounded line buffer written by a [`pump_lines_core`] task and read by
 /// the bulk collectors (drain) or the streaming consumer (`next_line`).
 ///
 /// The line counter increments on every line *before* the buffer write, so it

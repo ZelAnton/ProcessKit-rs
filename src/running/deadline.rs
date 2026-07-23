@@ -9,7 +9,7 @@
 //! Both sides of the single-word arbiter are funnelled through the two claim
 //! helpers here — [`claim_timed_out`] (a fired deadline) and [`claim_exited`] (a
 //! natural reap) — so the CAS from `TS_PENDING` and its memory ordering live in
-//! one place, and the [`loom_model`] suite can exhaustively check that the two
+//! one place, and the `loom_model` suite can exhaustively check that the two
 //! can never both win.
 
 // The arbiter atomic comes from the crate's `cfg(loom)`-swappable sync layer

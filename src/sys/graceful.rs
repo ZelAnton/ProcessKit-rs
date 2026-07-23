@@ -13,8 +13,8 @@
 //! but the opt-in `windows_graceful_ctrl_break` path (a direct child spawned
 //! `CREATE_NEW_PROCESS_GROUP`) does drive [`run`] with a Job-backed
 //! `GracefulTarget`, so [`run`] and [`GracefulTarget`] are cross-platform. The
-//! single-child kill-and-reap primitives below ([`PidTarget`]/[`run_pid`]/
-//! [`UnixChild`]) lean on `PidGate`/`libc` and stay unix-only.
+//! single-child kill-and-reap primitives below (`PidTarget`/`run_pid`/
+//! `UnixChild`) lean on `PidGate`/`libc` and stay unix-only.
 
 use std::io;
 use std::time::Duration;

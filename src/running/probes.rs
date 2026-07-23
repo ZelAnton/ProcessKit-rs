@@ -26,8 +26,8 @@ use crate::error::{Error, ErrorReason, Result};
 
 use super::RunningProcess;
 
-/// How often [`RunningProcess::wait_for`] / [`wait_for_port`] /
-/// [`wait_for_socket`] re-check readiness — responsive without
+/// How often [`RunningProcess::wait_for`] / [`RunningProcess::wait_for_port`] /
+/// [`RunningProcess::wait_for_socket`] re-check readiness — responsive without
 /// busy-spinning; matches the 50 ms liveness-poll cadence used elsewhere.
 const READINESS_POLL: Duration = Duration::from_millis(50);
 

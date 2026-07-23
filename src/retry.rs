@@ -27,7 +27,7 @@ use crate::error::Error;
 /// randomness is needed for backoff.
 ///
 /// Distinct from [`RestartPolicy`](crate::RestartPolicy): a `RetryPolicy` **replays
-/// a verb to success** (re-running on a classified [`Error`](crate::Error)), while a
+/// a verb to success** (re-running on a classified [`Error`]), while a
 /// `RestartPolicy` is the [`Supervisor`](crate::Supervisor)'s **keep-alive restart**
 /// schedule for a long-lived process — different subsystems, different intent.
 ///

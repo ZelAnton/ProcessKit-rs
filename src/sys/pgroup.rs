@@ -681,7 +681,9 @@ impl Tracked {
     /// the graceful teardown report's before/after member counts must not mutate the
     /// *set* of tracked ids, though it may refresh the `group_seen` latch, which is a
     /// benign monotonic cache). Un-gated: the always-available graceful driver reads
-    /// it through [`ProcessGroup`]'s [`GracefulTarget::alive_count`] as well as the
+    /// it through [`ProcessGroup`]'s
+    /// [`GracefulTarget::alive_count`](crate::sys::graceful::GracefulTarget::alive_count)
+    /// as well as the
     /// `stats`-gated `stats()`.
     fn count_alive(&self) -> usize {
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());

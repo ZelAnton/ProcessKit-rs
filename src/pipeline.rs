@@ -8,7 +8,7 @@
 //! (rather than instantly via SIGPIPE), and the relay's own I/O is plumbing — a
 //! closed sibling reads as EOF / writes as a broken pipe, neither reported as a
 //! stage's stdin failure. Each stage spawns into its **own** kill-on-drop
-//! [`ProcessGroup`](crate::ProcessGroup) sub-group, so a per-stage
+//! [`ProcessGroup`] sub-group, so a per-stage
 //! [`Command::timeout`] tears down that stage's *whole* subtree (grandchildren of
 //! a forking `sh -c …` included), while a chain-wide
 //! [`Pipeline::timeout`]/teardown fans the kill across every sub-group so the
@@ -307,7 +307,7 @@ impl Pipeline {
     /// - the **last** stage's stdout as it arrives —
     ///   [`stdout_lines`](PipelineSession::stdout_lines) /
     ///   [`events`](PipelineSession::events), with the same
-    ///   consume-once contract as [`RunningProcess`](crate::RunningProcess) (a
+    ///   consume-once contract as [`RunningProcess`] (a
     ///   second take is a loud `Err`, never a silently-empty stream);
     /// - a readiness wait on that stream —
     ///   [`wait_for_line`](PipelineSession::wait_for_line);
@@ -822,7 +822,7 @@ impl Pipeline {
 }
 
 /// A **live streaming session** over a running [`Pipeline`] — the multi-stage
-/// analogue of a [`RunningProcess`](crate::RunningProcess), returned by
+/// analogue of a [`RunningProcess`], returned by
 /// [`Pipeline::start`]. It streams the **last** stage's stdout as it arrives while
 /// every inner stage drains in the background, then folds the same **pipefail**
 /// outcome as the buffering verbs at [`finish`](Self::finish).
@@ -844,7 +844,7 @@ impl Pipeline {
 /// open), the chain-wide [`Pipeline::timeout`] / [`Pipeline::cancel_on`] still
 /// bound the session, and **dropping** the session hard-kills every stage's tree —
 /// the crate's no-orphan invariant holds for a live chain exactly as it does for a
-/// single [`RunningProcess`](crate::RunningProcess). A partially-started chain (one
+/// single [`RunningProcess`]. A partially-started chain (one
 /// stage up, the next failing to spawn) is torn down before [`start`](Pipeline::start)
 /// even returns its error.
 #[must_use = "a PipelineSession streams a live chain; drop it and the whole chain is killed unread"]
@@ -980,7 +980,7 @@ impl PipelineSession {
     /// the culprit is chosen by the same rule as the buffering verbs — the leftmost
     /// checked failure, preferring a genuine failure over a SIGPIPE/teardown victim,
     /// or the last stage when every stage exited cleanly. A chain-wide
-    /// [`Pipeline::timeout`] that elapsed reports [`Outcome::TimedOut`](crate::Outcome::TimedOut)
+    /// [`Pipeline::timeout`] that elapsed reports [`Outcome::TimedOut`]
     /// regardless of how the individual stages were killed, exactly as the buffering
     /// path's whole-chain timeout does.
     ///

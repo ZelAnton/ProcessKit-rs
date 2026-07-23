@@ -144,7 +144,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::Io`](crate::ErrorReason::Io) if the OS rejects creating the group's containment primitive
+    /// [`crate::ErrorReason::Io`] if the OS rejects creating the group's containment primitive
     /// (a Job Object on Windows, a cgroup on Linux). The default options set no
     /// resource caps, so no limit-enforcement failure can arise.
     pub fn new() -> Result<Self> {
@@ -155,7 +155,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::Io`](crate::ErrorReason::Io) if the OS rejects creating the group's containment primitive.
+    /// [`crate::ErrorReason::Io`] if the OS rejects creating the group's containment primitive.
     #[cfg_attr(
         feature = "limits",
         doc = "",
@@ -163,9 +163,9 @@ impl ProcessGroup {
         doc = "now. When the active mechanism can't honor a requested limit (no",
         doc = "cgroup/Job Object, or a Linux cgroup whose controllers can't be enabled —",
         doc = "see [`ResourceLimits`] for the cgroup-v2 real-root requirement) this",
-        doc = "returns [`ErrorReason::ResourceLimit`](crate::ErrorReason::ResourceLimit) — rather than handing back an unbounded",
+        doc = "returns [`crate::ErrorReason::ResourceLimit`] — rather than handing back an unbounded",
         doc = "group — and an invalid cap value returns it too, with",
-        doc = "[`LimitReason::Invalid`](crate::LimitReason::Invalid)."
+        doc = "[`LimitReason::Invalid`]."
     )]
     pub fn with_options(options: ProcessGroupOptions) -> Result<Self> {
         #[cfg(feature = "limits")]
@@ -236,10 +236,10 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) if the OS refuses to start `cmd` — the working directory
+    /// [`crate::ErrorReason::Spawn`] if the OS refuses to start `cmd` — the working directory
     /// is bad, permission is denied, and so on. (This raw path reports every
-    /// launch failure as [`ErrorReason::Spawn`](crate::ErrorReason::Spawn); the `Command`-driven run helpers, by
-    /// contrast, translate a not-found program into [`ErrorReason::NotFound`](crate::ErrorReason::NotFound).)
+    /// launch failure as [`crate::ErrorReason::Spawn`]; the `Command`-driven run helpers, by
+    /// contrast, translate a not-found program into [`crate::ErrorReason::NotFound`].)
     pub fn spawn(&self, mut cmd: Command) -> Result<Child> {
         self.spawn_with_options(&mut cmd, &crate::sys::SpawnOptions::default())
     }
@@ -307,7 +307,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::Io`](crate::ErrorReason::Io) if `child` has already been reaped (awaited), leaving no
+    /// [`crate::ErrorReason::Io`] if `child` has already been reaped (awaited), leaving no
     /// live handle/pid to reference. Adopting an exited-but-unreaped child is a
     /// successful no-op.
     #[cfg(feature = "process-control")]
@@ -354,7 +354,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::Io`](crate::ErrorReason::Io) in two cases, both on the non-atomic Unix backends: the legacy
+    /// [`crate::ErrorReason::Io`] in two cases, both on the non-atomic Unix backends: the legacy
     /// per-pid kill fallback (a pre-5.14 Linux kernel without `cgroup.kill`) when
     /// the tree won't drain within the bounded sweep, and the process-group
     /// mechanism (macOS/Linux fallback) when a live, non-zombie member rejects
@@ -386,11 +386,11 @@ impl ProcessGroup {
     ///   [`Command::windows_graceful_ctrl_break`](crate::Command::windows_graceful_ctrl_break),
     ///   plus `WM_CLOSE` to every top-level window owned by a live member (an
     ///   Electron app, a desktop tool, a windowed service). This TRIGGERS a clean
-    ///   exit without waiting or escalating. It returns [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) only
+    ///   exit without waiting or escalating. It returns [`crate::ErrorReason::Unsupported`] only
     ///   when the group has **neither** a console-CTRL leader **nor** a windowed
     ///   member (nothing a soft close could reach); every other signal
     ///   ([`Signal::Hup`], [`Signal::Quit`], [`Signal::Usr1`], [`Signal::Usr2`],
-    ///   [`Signal::Other`]) is always [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported).
+    ///   [`Signal::Other`]) is always [`crate::ErrorReason::Unsupported`].
     ///
     /// `SIGKILL` ([`Signal::Kill`], or `Other(libc::SIGKILL)`) is routed through
     /// the same whole-tree hard kill as [`kill_all`](Self::kill_all)
@@ -399,7 +399,7 @@ impl ProcessGroup {
     /// broadcast.
     ///
     /// **Honest send failures (every Unix backend).** A genuinely failed send is
-    /// reported as [`ErrorReason::Io`](crate::ErrorReason::Io), not hidden behind a false `Ok`, and the two POSIX
+    /// reported as [`crate::ErrorReason::Io`], not hidden behind a false `Ok`, and the two POSIX
     /// mechanisms agree on which failures those are:
     /// - an **`EINVAL`** (an out-of-range [`Signal::Other`] number) always surfaces;
     /// - an **`EPERM`** surfaces when it hit a **live, non-zombie** member (a
@@ -426,11 +426,11 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) on Windows for [`Signal::Int`] / [`Signal::Term`]
+    /// [`crate::ErrorReason::Unsupported`] on Windows for [`Signal::Int`] / [`Signal::Term`]
     /// only when the group has no console-CTRL leader and no windowed member (see
     /// Platform support above), and for every other non-[`Kill`](Signal::Kill)
     /// signal unconditionally (a Job Object has no POSIX signals). On **every** Unix
-    /// backend (cgroup and process-group alike), [`ErrorReason::Io`](crate::ErrorReason::Io) if the OS honestly
+    /// backend (cgroup and process-group alike), [`crate::ErrorReason::Io`] if the OS honestly
     /// rejects the send — an `EINVAL` (a bad [`Signal::Other`] number) or an `EPERM`
     /// against a live, non-zombie member (see above); an `ESRCH` (member already
     /// gone) and a harmless zombie-only `EPERM` are not errors. The Windows soft
@@ -445,10 +445,10 @@ impl ProcessGroup {
 
     /// The reach of a **soft stop** on this group *right now* — the honest
     /// capability answer to "if I ask this group to stop gracefully
-    /// ([`signal(Signal::Term)`](Self::signal) / [`Signal::Int`](crate::Signal::Int)),
+    /// ([`signal(Signal::Term)`](Self::signal) / [`Signal::Int`]),
     /// which of its members will actually receive it?" — queried **before** the
     /// attempt so a caller need not fire a `signal`, catch an
-    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported), and reverse-engineer the
+    /// [`crate::ErrorReason::Unsupported`], and reverse-engineer the
     /// scope.
     ///
     /// The group-axis analogue of
@@ -479,10 +479,10 @@ impl ProcessGroup {
     ///   [`SoftStopScope::Unsupported`] when it holds **neither** (an empty group,
     ///   or plain windowless children with no console opt-in), which is exactly
     ///   when [`signal(Signal::Term)`](Self::signal) would return
-    ///   [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported).
+    ///   [`crate::ErrorReason::Unsupported`].
     ///
     /// This describes the *soft* tier only: the unconditional hard kill
-    /// ([`Signal::Kill`](crate::Signal::Kill), [`kill_all`](Self::kill_all),
+    /// ([`Signal::Kill`], [`kill_all`](Self::kill_all),
     /// dropping the group) always tears the whole tree down regardless of this
     /// value.
     #[cfg(feature = "process-control")]
@@ -542,8 +542,8 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) if the active mechanism cannot freeze the tree;
-    /// otherwise [`ErrorReason::Io`](crate::ErrorReason::Io) if the OS rejects the freeze / `SIGSTOP`.
+    /// [`crate::ErrorReason::Unsupported`] if the active mechanism cannot freeze the tree;
+    /// otherwise [`crate::ErrorReason::Io`] if the OS rejects the freeze / `SIGSTOP`.
     #[cfg(feature = "process-control")]
     pub fn suspend(&self) -> Result<()> {
         self.job
@@ -558,8 +558,8 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) if the active mechanism cannot thaw the tree;
-    /// otherwise [`ErrorReason::Io`](crate::ErrorReason::Io) if the OS rejects the resume / `SIGCONT`.
+    /// [`crate::ErrorReason::Unsupported`] if the active mechanism cannot thaw the tree;
+    /// otherwise [`crate::ErrorReason::Io`] if the OS rejects the resume / `SIGCONT`.
     #[cfg(feature = "process-control")]
     pub fn resume(&self) -> Result<()> {
         self.job
@@ -587,7 +587,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::Io`](crate::ErrorReason::Io) if the group's membership cannot be read (e.g. a failed
+    /// [`crate::ErrorReason::Io`] if the group's membership cannot be read (e.g. a failed
     /// `cgroup.procs` read or Job Object query).
     #[cfg(feature = "process-control")]
     pub fn members(&self) -> Result<Vec<u32>> {
@@ -638,7 +638,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::Io`](crate::ErrorReason::Io) only if the group's membership cannot be read (the same
+    /// [`crate::ErrorReason::Io`] only if the group's membership cannot be read (the same
     /// failure as [`members`](Self::members) — a failed `cgroup.procs` read or Job
     /// Object query) or, on Windows, if the process-metadata snapshot cannot be
     /// created at all. A single member vanishing is not an error (it is skipped).
@@ -681,7 +681,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::Io`](crate::ErrorReason::Io) if the graceful teardown fails — including, when
+    /// [`crate::ErrorReason::Io`] if the graceful teardown fails — including, when
     /// `escalate_to_kill` performs the final hard kill, the same failures as
     /// [`kill_all`](Self::kill_all): the undrained-tree failure on the legacy
     /// pre-5.14 per-pid fallback, and a process-group member that rejects `SIGKILL`
@@ -716,7 +716,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::Io`](crate::ErrorReason::Io) if the graceful teardown fails (see
+    /// [`crate::ErrorReason::Io`] if the graceful teardown fails (see
     /// [`shutdown`](Self::shutdown) — the same undrained-tree failure on the legacy
     /// per-pid fallback and the process-group live-`EPERM` on the final hard kill
     /// apply).
@@ -796,7 +796,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::Io`](crate::ErrorReason::Io) if the teardown fails — the same surface as
+    /// [`crate::ErrorReason::Io`] if the teardown fails — the same surface as
     /// [`shutdown`](Self::shutdown): when `escalate` performs the final hard kill,
     /// the undrained-tree failure on the legacy pre-5.14 per-pid fallback and a
     /// process-group member that rejects `SIGKILL` with `EPERM` while still alive. A
@@ -840,7 +840,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::Io`](crate::ErrorReason::Io) if the platform's resource query fails.
+    /// [`crate::ErrorReason::Io`] if the platform's resource query fails.
     #[cfg(feature = "stats")]
     pub fn stats(&self) -> Result<ProcessGroupStats> {
         let stats = self.job.stats().map_err(Error::io)?;
@@ -878,7 +878,7 @@ impl ProcessGroup {
     /// written back to `max`). On the **POSIX process-group** mechanism (macOS, the
     /// BSDs, and the Linux fallback with no usable cgroup) there is no whole-tree
     /// cap primitive, so a request carrying **any** cap is refused with
-    /// [`ErrorReason::ResourceLimit`](crate::ErrorReason::ResourceLimit) — never silently dropped — while an all-`None`
+    /// [`crate::ErrorReason::ResourceLimit`] — never silently dropped — while an all-`None`
     /// request (lift every cap) is a trivial success, since the tree is already
     /// unbounded there.
     ///
@@ -894,7 +894,7 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::ResourceLimit`](crate::ErrorReason::ResourceLimit) — with [`LimitReason::Invalid`] for a nonsensical
+    /// [`crate::ErrorReason::ResourceLimit`] — with [`LimitReason::Invalid`] for a nonsensical
     /// value (rejected by the shared `validate_limits` before the OS is touched,
     /// exactly as at creation), [`LimitReason::Unsupported`] when the active
     /// mechanism has no whole-tree accounting at all (a process-group mechanism),
@@ -947,7 +947,7 @@ fn program_name(cmd: &Command) -> String {
     cmd.as_std().get_program().to_string_lossy().into_owned()
 }
 
-/// Map a backend `ErrorKind::Unsupported` to the typed [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported),
+/// Map a backend `ErrorKind::Unsupported` to the typed [`crate::ErrorReason::Unsupported`],
 /// passing every other IO failure through unchanged. Unambiguous here: on the
 /// signal/suspend/resume paths the only producer of `Unsupported` is the
 /// backends' own "this platform can't do that" reporting.
@@ -964,7 +964,7 @@ fn map_unsupported(source: std::io::Error, operation: impl Into<String>) -> Erro
 }
 
 /// Reject nonsensical limit values before touching the OS, so a typo surfaces as a
-/// clear [`ErrorReason::ResourceLimit`](crate::ErrorReason::ResourceLimit) (`reason: Invalid`) rather than an opaque
+/// clear [`crate::ErrorReason::ResourceLimit`] (`reason: Invalid`) rather than an opaque
 /// kernel error.
 #[cfg(feature = "limits")]
 fn validate_limits(limits: &ResourceLimits) -> Result<()> {

@@ -99,7 +99,7 @@ pub(crate) struct Job {
     /// covered by the "kernel kills the tree even on abrupt parent death" headline.
     handle: HANDLE,
     /// Serializes `spawn`'s create-suspended → assign → resume sequence against
-    /// the [`suspend`](Self::suspend)/[`resume`](Self::resume) member-thread
+    /// the `suspend`/`resume` member-thread
     /// walks. Without it, a walk landing between assign and `spawn`'s resume
     /// double-suspends the new child's primary thread (per-thread suspend
     /// *counts*), and `spawn`'s single resume leaves it suspended forever.
@@ -897,7 +897,7 @@ fn ctrl_break_live_leaders(leaders: &[u32], job: HANDLE) -> usize {
 /// Whether a recorded console-CTRL leader `pid` is STILL a live member of `job`
 /// — the recycle-safe predicate the soft-stop paths share so "which leader
 /// counts as reachable" never drifts between the side-effect-free capability
-/// probe ([`Job::soft_stop_scope`](Job::soft_stop_scope)) and the actual
+/// probe (`Job::soft_stop_scope`) and the actual
 /// `GenerateConsoleCtrlEvent` delivery ([`ctrl_break_live_leaders`]).
 ///
 /// A **zero** pid reads false: it is never a real recorded leader, and
@@ -1373,7 +1373,7 @@ fn snapshot_process_metadata() -> io::Result<std::collections::HashMap<u32, (u32
 }
 
 /// The process-creation `FILETIME` of `pid` as its raw
-/// [`MemberInfo`](crate::MemberInfo) start-time token (100-ns units since
+/// [`MemberInfo`] start-time token (100-ns units since
 /// 1601-01-01 UTC), or `None` if the process is gone / unqueryable. Fixed at spawn
 /// and never reused within a boot, so it tells a recycled pid apart from the
 /// original. (The `stats`-gated [`process_identity`] wraps the same read in a
@@ -1462,7 +1462,7 @@ pub(crate) fn process_info(pid: u32) -> io::Result<Option<MemberInfo>> {
 
 /// A FILETIME as its raw 64-bit 100-ns unit count (high/low halves combined).
 /// The process-creation FILETIME serves as the [`ProcIdentity`] anchor (the
-/// `stats` metrics gate) and as the [`MemberInfo`](crate::MemberInfo) start-time
+/// `stats` metrics gate) and as the [`MemberInfo`] start-time
 /// token (the `process-control` snapshot), compared directly in these units;
 /// [`filetime_nanos`] scales the CPU-time FILETIMEs to ns.
 #[cfg(any(feature = "stats", feature = "process-control"))]

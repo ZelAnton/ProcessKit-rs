@@ -7,7 +7,7 @@
 //! - **Linux** — a [cgroup v2] killed via `cgroup.kill`, falling back to a POSIX
 //!   process group when no writable cgroup is available.
 //! - **macOS / the BSDs** — a POSIX process group (`killpg` the tree on drop);
-//!   no cgroups or Job Objects exist there. See [`pgroup`].
+//!   no cgroups or Job Objects exist there. See `pgroup`.
 //!
 //! Only Unix and Windows are supported; other targets fail to compile (see the
 //! `compile_error!` below).
@@ -62,7 +62,7 @@ pub(crate) struct ProcMetrics {
 /// and Linux uses `/proc/<pid>/stat` field 22 (`starttime`, clock ticks since
 /// boot); the POSIX fallback (macOS/BSD) reports none. This is the per-process
 /// analogue of the pgroup backend's start-time identity token (see
-/// [`pgroup::read_identity`](crate::sys::pgroup)); it exists to keep a pid-reuse
+/// `pgroup::read_identity`); it exists to keep a pid-reuse
 /// race from folding an unrelated process's CPU/memory into a sample.
 #[cfg(feature = "stats")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +115,7 @@ pub(crate) fn process_identity(pid: u32) -> Option<ProcIdentity> {
 /// Identity + best-effort metadata for an **arbitrary** pid (not one tracked by
 /// any group) — the platform-dispatching core of the public
 /// [`process_info`](crate::process_info) query. Returns the same fields a
-/// [`MemberInfo`](crate::MemberInfo) carries for a group member, read through the
+/// [`MemberInfo`] carries for a group member, read through the
 /// **same** per-platform readers (`/proc/<pid>/stat` on Linux, `proc_pidinfo` on
 /// macOS, `Toolhelp32` + creation `FILETIME` on Windows, a `kill(pid, 0)` existence
 /// probe on the bare BSDs).
@@ -211,7 +211,7 @@ pub(crate) struct SpawnOptions {
     pub kill_on_parent_death: bool,
     /// Spawn the child under a pseudo-terminal instead of three independent
     /// pipes (`openpty` on Unix, `CreatePseudoConsole` ConPTY on Windows) — the
-    /// opt-in [`Command::use_pty`](crate::Command::use_pty) mode. Consulted only
+    /// opt-in `Command::use_pty` mode. Consulted only
     /// by the PTY spawn path (`crate::sys::pty`), which is compiled only with the
     /// `pty` feature; without the feature the field is always `false` and the
     /// spawn is byte-identical to the three-pipe path. Containment is unchanged —
@@ -220,8 +220,8 @@ pub(crate) struct SpawnOptions {
     #[cfg_attr(not(feature = "pty"), allow(dead_code))]
     pub use_pty: bool,
     /// The pseudo-terminal window size (`(cols, rows)`) for a `use_pty` spawn, or
-    /// `None` to fall back to the backend default ([`pty::DEFAULT_PTY_SIZE`]).
-    /// Set from [`Command::pty_size`](crate::Command::pty_size). Consulted only by
+    /// `None` to fall back to the backend default (`pty::DEFAULT_PTY_SIZE`).
+    /// Set from `Command::pty_size`. Consulted only by
     /// the PTY spawn path (`crate::sys::pty`, `pty`-feature only) — without
     /// `use_pty` the launch never routes there, so a size configured on a non-PTY
     /// command is a documented no-op (never applied to the three-pipe spawn).
@@ -385,7 +385,7 @@ impl Job {
     /// **Windows soft tier.** When a live member owns a top-level window, or a
     /// direct child was spawned with [`SpawnOptions::windows_new_process_group`]
     /// (via [`Command::windows_graceful_ctrl_break`](crate::Command::windows_graceful_ctrl_break)),
-    /// this drives the *same* shared [`graceful::run`](crate::sys::graceful::run)
+    /// this drives the *same* shared [`graceful::run`]
     /// loop the unix backends use: post `WM_CLOSE` to each member window **and**
     /// `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` to each console leader, poll
     /// the job's active-process count up to `timeout`, then `TerminateJobObject`

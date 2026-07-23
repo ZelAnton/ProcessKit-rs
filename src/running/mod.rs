@@ -691,7 +691,7 @@ impl RunningProcess {
     /// tree.
     ///
     /// `true` — owns a **private** process group; drop hard-kills the whole tree.
-    /// `false` — runs inside a **shared** [`ProcessGroup`](crate::ProcessGroup)
+    /// `false` — runs inside a **shared** [`ProcessGroup`]
     /// whose lifetime the group owns (drop does *not* kill the tree), or a
     /// scripted test double (no OS tree).
     pub fn kills_tree_on_drop(&self) -> bool {
@@ -715,7 +715,7 @@ impl RunningProcess {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported),
+    /// Returns [`ErrorReason::Unsupported`],
     /// never panicking and never silently ignoring, when the resize cannot apply:
     ///
     /// - the run is **not** a PTY run (no [`use_pty`](crate::Command::use_pty)),
@@ -723,7 +723,7 @@ impl RunningProcess {
     /// - the child has **already exited** — the pseudo-terminal is gone.
     ///
     /// A genuine OS failure of the resize syscall surfaces as
-    /// [`ErrorReason::Io`](crate::ErrorReason::Io).
+    /// [`ErrorReason::Io`].
     ///
     /// The PTY-variant scripted double ([`ScriptedRunner`](crate::testing::ScriptedRunner)
     /// with [`use_pty`](crate::Command::use_pty)) models this hermetically:
@@ -842,7 +842,7 @@ impl RunningProcess {
     ///   [`Command::cancel_on`](crate::Command::cancel_on). Unlike a timeout,
     ///   cancellation is *always* raised (and discards any captured output).
     /// - [`ErrorReason::OutputTooLarge`] — the
-    ///   [`OutputBufferPolicy`](crate::OutputBufferPolicy) is fail-loud
+    ///   [`OutputBufferPolicy`] is fail-loud
     ///   ([`OverflowMode::Error`](crate::OverflowMode)) and the captured output
     ///   exceeded its line or byte ceiling.
     /// - [`ErrorReason::Stdin`] — a configured stdin source failed for a reason other
@@ -1150,7 +1150,7 @@ impl RunningProcess {
     /// awaited.
     ///
     /// Only an **own-group** handle can be shut down here — a **shared-group**
-    /// handle returns [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) because
+    /// handle returns [`ErrorReason::Unsupported`] because
     /// shutting it down would tear down the caller's other children too.
     ///
     /// If the configured timeout deadline already elapsed when `shutdown` is

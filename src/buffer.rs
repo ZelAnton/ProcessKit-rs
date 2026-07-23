@@ -546,8 +546,8 @@ impl OutputStream {
 ///
 /// [`on_capture`](Self::on_capture) is a pure line **transform**: return the
 /// text to retain — the same line unchanged
-/// ([`Cow::Borrowed`](std::borrow::Cow::Borrowed)`(line)`), a redacted rewrite
-/// ([`Cow::Owned`](std::borrow::Cow::Owned)), or an empty string to elide the
+/// ([`Cow::Borrowed`]`(line)`), a redacted rewrite
+/// ([`Cow::Owned`]), or an empty string to elide the
 /// content while keeping the line's slot (and the exact line/byte counters).
 /// *How much* is retained and eviction on overflow stay
 /// [`OutputBufferPolicy`]'s job (the built-in [`OverflowMode`] fast path is
@@ -573,8 +573,8 @@ pub trait CapturePolicy: Send + Sync {
     /// Shape one decoded `line` from `stream` just before it enters the capture
     /// backlog, returning the text to retain.
     ///
-    /// Return [`Cow::Borrowed`](std::borrow::Cow::Borrowed)`(line)` to retain it
-    /// unchanged (no allocation), a [`Cow::Owned`](std::borrow::Cow::Owned) to
+    /// Return [`Cow::Borrowed`]`(line)` to retain it
+    /// unchanged (no allocation), a [`Cow::Owned`] to
     /// retain a rewritten/redacted line, or an empty string to blank it. The
     /// line has already had its terminator stripped (the shape
     /// [`stdout_lines`](crate::RunningProcess::stdout_lines) yields). Keep it
