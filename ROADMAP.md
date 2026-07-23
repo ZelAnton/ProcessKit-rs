@@ -196,3 +196,14 @@ line. Verified fmt/clippy/doc/test/cross-compile.
   flush knobs subsumed by PTY) → [`decisions/wont-do-2026-06.md`](decisions/wont-do-2026-06.md).
 - **Built-in shell mode, IPC/message-passing, detached-as-default, miri, object-mode
   streams** → [`decisions/wont-do-2026-06.md`](decisions/wont-do-2026-06.md) (unchanged).
+- **Reattach-to-container-by-identity** (the `processkit-cli` wishlist's last open
+  strand — a stable container id readable from a live group, reattached from a later
+  process to inspect or kill the leaked tree after abrupt owner death) →
+  [`decisions/container-reattach-identity.md`](decisions/container-reattach-identity.md).
+  Declined as out of crate scope: the safe-identity property it requires is
+  unachievable on either backend (Linux `cgroupfs` gives no contractual inode/birth-time
+  and no place for a marker; a Windows named/duplicated Job Object handle regresses the
+  free `KILL_ON_JOB_CLOSE` kill-on-owner-death and its name is reuse-unprotected), and
+  the residual honest need is already served by the T-151 `ParentDeathCleanup` report
+  plus the documented "keep an external owner (subreaper / `systemd` scope)" remedy.
+  Carries a bounded revisit condition for a read-only, inspection-only identifier getter.

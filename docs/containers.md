@@ -120,6 +120,24 @@ Neither duty is something `processkit` does for you, and neither needs to be:
   when that guarantee matters, keep an outer container/cgroup (or a subreaper)
   that owns the tree independently of your process.
 
+**Why there's no "reattach to the leaked tree by its id" escape hatch.** On Linux
+the surviving cgroup *could* in principle be reaped by a later process that knew
+its path (`cgroup.kill` acts on the whole subtree) — so it's natural to wish for a
+stable container identifier you could record and later reattach to. The crate
+deliberately does **not** expose one, because such an identifier cannot be made
+**identity-safe** across reuse: a cgroup path (or a Windows Job Object name) is
+freed when its container is torn down and can be handed to an *unrelated* later
+container, so acting on a recorded id risks killing an **innocent** tree. Nothing
+the crate can stamp on the container fixes this — a cgroup directory has nowhere to
+hold a crate-chosen marker, its pseudo-filesystem inode/birth-time are not a
+contractual identity, and giving a second process a live Windows job handle would
+itself defeat the `KILL_ON_JOB_CLOSE` kill-on-owner-death that makes the abrupt-death
+case *already* clean on Windows (the kernel reaps the whole tree there, so there is
+no leaked tree to reattach to in the first place). The honest remedy is the same one
+above: have an **external owner** — a subreaper, or a delegated `systemd` scope — own
+the tree independently of your process, so its death, not a fragile recorded id, is
+what triggers cleanup.
+
 This is exactly the gap [Platform support's CI section](platform-support.md#ci-coverage)
 documents and works around with `--init` for the crate's *own* test suite —
 and it reproduces identically for any container. Run a process that
