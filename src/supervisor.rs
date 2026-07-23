@@ -57,11 +57,35 @@ const MIN_HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(1);
 
 /// A boxed async liveness probe: called with no arguments (like
 /// [`RunningProcess::wait_for`](crate::RunningProcess::wait_for)'s `check`) and
-/// resolving to `true` when the child is healthy. Boxed — probe *and* its future
-/// — so the [`Supervisor`] can store an arbitrary closure/endpoint check as one
-/// opaque field, the async twin of the boxed `stop_when`/`give_up_when`
+/// resolving to `Ok(true)` when the child is healthy. Boxed — probe *and* its
+/// future — so the [`Supervisor`] can store an arbitrary closure/endpoint check
+/// as one opaque field, the async twin of the boxed `stop_when`/`give_up_when`
 /// predicates.
-type HealthProbe = Box<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+///
+/// The output is a `Result`: the infallible [`health_check`](Supervisor::health_check)
+/// builder wraps its `bool` probe as `Ok(bool)` (it can never resolve `Err`),
+/// while the fallible [`try_health_check`](Supervisor::try_health_check) twin
+/// stores a probe that may resolve `Err` to abort supervision with an
+/// [`ErrorReason::Predicate`](crate::ErrorReason::Predicate). One storage shape
+/// serves both so the drive loop consults a single probe field.
+type HealthProbe = Box<
+    dyn Fn() -> Pin<Box<dyn Future<Output = std::result::Result<bool, crate::error::PredicateError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Why a liveness [`watch`](HealthCheck::watch) resolved: the probe streak
+/// tripped (force-restart the wedged incarnation), or a fallible probe returned
+/// an error (abort supervision — the child is still torn down by the same
+/// dropped-future kill).
+enum WatchOutcome {
+    /// The probe failed `failures_before_unhealthy` times in a row — treat the
+    /// incarnation as wedged and force-restart it (a [`LivenessFailed`](Incarnation::LivenessFailed)).
+    Unhealthy,
+    /// A fallible probe returned `Err`: abort supervision with this error
+    /// (surfaced as an [`ErrorReason::Predicate`](crate::ErrorReason::Predicate)).
+    Failed(crate::error::PredicateError),
+}
 
 /// A liveness health check: an async probe re-run on a fixed cadence for the
 /// life of the current incarnation. Configured by
@@ -89,20 +113,27 @@ impl HealthCheck {
     /// [`health_check`](Supervisor::health_check) builder, so this loop never
     /// degenerates into a `sleep(0)` busy-spin even for a caller-supplied zero
     /// interval.
-    async fn watch(&self, failures_before_unhealthy: u32) {
+    async fn watch(&self, failures_before_unhealthy: u32) -> WatchOutcome {
         // A zero threshold would never trip (`consecutive >= 0` can't be the
         // *strict* streak we want); clamp to "one failed probe kills".
         let threshold = failures_before_unhealthy.max(1);
         let mut consecutive: u32 = 0;
         loop {
             tokio::time::sleep(self.interval).await;
-            if (self.probe)().await {
-                consecutive = 0;
-            } else {
-                consecutive = consecutive.saturating_add(1);
-                if consecutive >= threshold {
-                    return;
+            match (self.probe)().await {
+                // Healthy probe: reset the streak. (Always `Ok(_)` for the
+                // infallible builder, whose probe can't resolve `Err`.)
+                Ok(true) => consecutive = 0,
+                Ok(false) => {
+                    consecutive = consecutive.saturating_add(1);
+                    if consecutive >= threshold {
+                        return WatchOutcome::Unhealthy;
+                    }
                 }
+                // A fallible probe erred: abort *immediately*, distinct from an
+                // `Ok(false)` unhealthy vote that only trips after the streak —
+                // the predicate's error is terminal, not a health signal.
+                Err(source) => return WatchOutcome::Failed(source),
             }
         }
     }
@@ -120,6 +151,13 @@ enum Incarnation {
     /// under the default [`JobRunner`]). Carries the incarnation's uptime so the
     /// backoff escalation can treat a long-lived-then-wedged child as healthy.
     LivenessFailed { uptime: Duration },
+    /// A fallible [`try_health_check`](Supervisor::try_health_check) probe returned
+    /// an error. The in-flight run was abandoned by the **same** dropped-future
+    /// kill a [`LivenessFailed`](Incarnation::LivenessFailed) uses (the losing
+    /// `select!` branch drops `run_to_result`, releasing its `CurrentGuard` and
+    /// the child's kill-on-drop handle synchronously — no leak on this exit path),
+    /// but supervision **aborts** with this error rather than restarting.
+    LivenessError { source: crate::error::PredicateError },
 }
 
 /// What the supervision loop should do after a restart-eligible incarnation
@@ -140,6 +178,11 @@ enum GateOutcome {
     /// A [`SupervisionSession::stop`] fired during the backoff/storm pause — end
     /// supervision with [`StopReason::Stopped`], launching no further incarnation.
     Stopped,
+    /// A fallible [`try_give_up_when`](Supervisor::try_give_up_when) classifier
+    /// returned an error — abort supervision with an
+    /// [`ErrorReason::Predicate`](crate::ErrorReason::Predicate) rather than a
+    /// restart/give-up verdict.
+    PredicateError(crate::error::PredicateError),
 }
 
 /// The capture policy to apply to each incarnation: respect an explicit
@@ -771,12 +814,21 @@ pub struct Supervisor<R: ProcessRunner = JobRunner> {
     failure_decay: Duration,
     failure_threshold: f64,
     storm_pause: Option<Duration>,
+    /// The end-of-run predicate; see [`stop_when`](Self::stop_when) /
+    /// [`try_stop_when`](Self::try_stop_when). Stored in the **fallible** shape —
+    /// the infallible builder wraps its `bool` as `Ok(bool)` — so the drive loop
+    /// consults one field; an infallible predicate simply never resolves `Err`.
     #[allow(clippy::type_complexity)]
-    stop_when: Option<Box<dyn Fn(&ProcessResult<String>) -> bool + Send + Sync>>,
-    /// The permanent-failure classifier; see
-    /// [`give_up_when`](Self::give_up_when).
+    stop_when: Option<
+        Box<dyn Fn(&ProcessResult<String>) -> std::result::Result<bool, crate::error::PredicateError> + Send + Sync>,
+    >,
+    /// The permanent-failure classifier; see [`give_up_when`](Self::give_up_when) /
+    /// [`try_give_up_when`](Self::try_give_up_when). Stored fallible like
+    /// [`stop_when`](Self::stop_when).
     #[allow(clippy::type_complexity)]
-    give_up_when: Option<Box<dyn Fn(&GiveUpAttempt<'_>) -> bool + Send + Sync>>,
+    give_up_when: Option<
+        Box<dyn Fn(&GiveUpAttempt<'_>) -> std::result::Result<bool, crate::error::PredicateError> + Send + Sync>,
+    >,
     /// The output-capture policy applied to every incarnation. Defaults to a
     /// bounded tail (see [`default_supervision_capture`]); override with
     /// [`capture`](Self::capture).
@@ -1015,7 +1067,40 @@ impl<R: ProcessRunner> Supervisor<R> {
         mut self,
         predicate: impl Fn(&ProcessResult<String>) -> bool + Send + Sync + 'static,
     ) -> Self {
-        self.stop_when = Some(Box::new(predicate));
+        // Stored in the fallible shape (see the field) as an always-`Ok` closure:
+        // behavior is byte-identical to the pre-fallible path — the loop only ever
+        // observes `Ok(bool)` here.
+        self.stop_when = Some(Box::new(move |result| Ok(predicate(result))));
+        self
+    }
+
+    /// The **fallible twin** of [`stop_when`](Self::stop_when): end supervision
+    /// when `predicate` returns `Ok(true)`, but if it returns `Err`, **abort**
+    /// supervision and surface that error to the caller as an
+    /// [`ErrorReason::Predicate`](crate::ErrorReason::Predicate) — never a
+    /// fabricated stop verdict. `Ok(false)` behaves exactly as a non-matching
+    /// [`stop_when`](Self::stop_when) (supervision continues).
+    ///
+    /// For a wrapper over a language where any callback can throw (a
+    /// `processkit-py` binding, say): the predicate can propagate its own failure
+    /// out of supervision instead of being forced to swallow it or smuggle it
+    /// through the infallible `bool` channel. The error is carried **verbatim**
+    /// (`E: Into<Box<dyn Error + Send + Sync>>`), recoverable via
+    /// [`Error::reason`](crate::Error::reason) →
+    /// [`ErrorReason::Predicate`](crate::ErrorReason::Predicate)'s `source`.
+    ///
+    /// Additive: the infallible [`stop_when`](Self::stop_when) is unchanged.
+    /// Setting either replaces the other — a supervisor consults one end-of-run
+    /// predicate.
+    #[must_use]
+    pub fn try_stop_when<E>(
+        mut self,
+        predicate: impl Fn(&ProcessResult<String>) -> std::result::Result<bool, E> + Send + Sync + 'static,
+    ) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    {
+        self.stop_when = Some(Box::new(move |result| predicate(result).map_err(Into::into)));
         self
     }
 
@@ -1058,7 +1143,36 @@ impl<R: ProcessRunner> Supervisor<R> {
         mut self,
         classifier: impl Fn(&GiveUpAttempt<'_>) -> bool + Send + Sync + 'static,
     ) -> Self {
-        self.give_up_when = Some(Box::new(classifier));
+        // Stored fallible as an always-`Ok` closure — see `stop_when`.
+        self.give_up_when = Some(Box::new(move |attempt| Ok(classifier(attempt))));
+        self
+    }
+
+    /// The **fallible twin** of [`give_up_when`](Self::give_up_when): classify a
+    /// crash / spawn failure as permanent when `classifier` returns `Ok(true)`,
+    /// but if it returns `Err`, **abort** supervision and surface that error to
+    /// the caller as an [`ErrorReason::Predicate`](crate::ErrorReason::Predicate)
+    /// rather than a give-up or restart verdict. `Ok(false)` behaves exactly as a
+    /// non-matching [`give_up_when`](Self::give_up_when) (the failure is retried
+    /// per policy).
+    ///
+    /// The classifier twin of [`try_stop_when`](Self::try_stop_when): a wrapper
+    /// whose classification callback can throw propagates that failure out of
+    /// supervision, carried **verbatim**, instead of swallowing it. Consulted at
+    /// the same points as [`give_up_when`](Self::give_up_when) — before
+    /// [`max_restarts`](Self::max_restarts) and the storm guard.
+    ///
+    /// Additive: the infallible [`give_up_when`](Self::give_up_when) is unchanged.
+    /// Setting either replaces the other.
+    #[must_use]
+    pub fn try_give_up_when<E>(
+        mut self,
+        classifier: impl Fn(&GiveUpAttempt<'_>) -> std::result::Result<bool, E> + Send + Sync + 'static,
+    ) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    {
+        self.give_up_when = Some(Box::new(move |attempt| classifier(attempt).map_err(Into::into)));
         self
     }
 
@@ -1125,12 +1239,57 @@ impl<R: ProcessRunner> Supervisor<R> {
         Fut: Future<Output = bool> + Send + 'static,
     {
         self.health_check = Some(HealthCheck {
-            probe: Box::new(move || Box::pin(probe())),
+            // Stored in the fallible probe shape as an always-`Ok` future — see
+            // `HealthProbe` — so `watch` consults one probe; a `bool` probe can
+            // never resolve `Err`, keeping this path's behavior unchanged.
+            probe: Box::new(move || {
+                let fut = probe();
+                Box::pin(async move { Ok(fut.await) })
+            }),
             // A degenerate (e.g. zero) interval is clamped to a safe minimum
             // rather than passed through as-is, so `watch`'s loop can't
             // degenerate into a busy-spin and the startup-grace promise below
             // stays true even for a zero `interval` (see the clamp constant's
             // doc comment for the full rationale).
+            interval: interval.max(MIN_HEALTH_CHECK_INTERVAL),
+        });
+        self
+    }
+
+    /// The **fallible twin** of [`health_check`](Self::health_check): run the
+    /// async liveness `probe` on the same cadence, treating `Ok(false)` exactly
+    /// as an unhealthy vote (force-restart after the
+    /// [`health_check_failures`](Self::health_check_failures) streak) — but if the
+    /// probe resolves `Err`, **abort** supervision *immediately* and surface that
+    /// error to the caller as an
+    /// [`ErrorReason::Predicate`](crate::ErrorReason::Predicate), never a
+    /// fabricated liveness kill.
+    ///
+    /// A probe error is terminal, not a health signal: unlike a sustained
+    /// `Ok(false)` (which must fail the whole streak before it trips), a single
+    /// `Err` ends supervision at once. The wedged/live incarnation is still torn
+    /// down by the same drop-kill a liveness kill uses (the in-flight run future
+    /// is dropped, killing the child on drop under the default [`JobRunner`]), so
+    /// this abort leaks no child. The predicate's error is carried **verbatim**
+    /// (`E: Into<Box<dyn Error + Send + Sync>>`), for a wrapper whose async probe
+    /// can throw.
+    ///
+    /// Additive: the infallible [`health_check`](Self::health_check) is unchanged.
+    /// Setting either replaces the other; the
+    /// [`health_check_failures`](Self::health_check_failures) streak applies to
+    /// whichever is set.
+    #[must_use]
+    pub fn try_health_check<F, Fut, E>(mut self, probe: F, interval: Duration) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::result::Result<bool, E>> + Send + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    {
+        self.health_check = Some(HealthCheck {
+            probe: Box::new(move || {
+                let fut = probe();
+                Box::pin(async move { fut.await.map_err(Into::into) })
+            }),
             interval: interval.max(MIN_HEALTH_CHECK_INTERVAL),
         });
         self
@@ -1303,16 +1462,28 @@ impl<R: ProcessRunner> Supervisor<R> {
                             StopReason::Stopped,
                         ));
                     }
-                    if let Some(predicate) = &self.stop_when
-                        && predicate(&result)
-                    {
-                        return Ok(self.outcome(
-                            result,
-                            restarts,
-                            liveness_kills,
-                            &storm,
-                            StopReason::Predicate,
-                        ));
+                    if let Some(predicate) = &self.stop_when {
+                        match predicate(&result) {
+                            Ok(true) => {
+                                return Ok(self.outcome(
+                                    result,
+                                    restarts,
+                                    liveness_kills,
+                                    &storm,
+                                    StopReason::Predicate,
+                                ));
+                            }
+                            // Not a match — fall through to the policy, exactly as
+                            // an infallible `stop_when` returning `false` does.
+                            Ok(false) => {}
+                            // A fallible `try_stop_when` erred: abort supervision
+                            // with the predicate's own error, not a stop verdict.
+                            // The run already completed, so there is no live child
+                            // to release on this exit.
+                            Err(source) => {
+                                return Err(crate::Error::predicate("stop_when", source));
+                            }
+                        }
                     }
                     let crashed = !result.is_success();
                     let wants_restart = match self.policy {
@@ -1370,6 +1541,9 @@ impl<R: ProcessRunner> Supervisor<R> {
                             ));
                         }
                         GateOutcome::Restart => shared.set_restarts(restarts),
+                        GateOutcome::PredicateError(source) => {
+                            return Err(crate::Error::predicate("give_up_when", source));
+                        }
                     }
                 }
                 Incarnation::LivenessFailed { uptime } => {
@@ -1443,7 +1617,19 @@ impl<R: ProcessRunner> Supervisor<R> {
                             ));
                         }
                         GateOutcome::Restart => shared.set_restarts(restarts),
+                        GateOutcome::PredicateError(source) => {
+                            return Err(crate::Error::predicate("give_up_when", source));
+                        }
                     }
+                }
+                Incarnation::LivenessError { source } => {
+                    // A fallible `try_health_check` probe erred. The losing
+                    // `select!` branch already dropped the in-flight run (killing
+                    // the child on drop via `run_to_result`'s `CurrentGuard`) — the
+                    // same synchronous teardown a liveness kill uses, so no child
+                    // leaks on this new exit path. Abort supervision with the
+                    // probe's own error rather than a fabricated liveness kill.
+                    return Err(crate::Error::predicate("health_check", source));
                 }
                 Incarnation::Ran(Err(err)) => {
                     if err.is_cancelled() {
@@ -1472,10 +1658,19 @@ impl<R: ProcessRunner> Supervisor<R> {
                     if !wants_restart {
                         return Err(err);
                     }
-                    if let Some(classifier) = &self.give_up_when
-                        && classifier(&GiveUpAttempt::Failed(&err))
-                    {
-                        return Err(err);
+                    if let Some(classifier) = &self.give_up_when {
+                        match classifier(&GiveUpAttempt::Failed(&err)) {
+                            // Classified permanent: surface the spawn failure.
+                            Ok(true) => return Err(err),
+                            // Not permanent — retried below, exactly as an
+                            // infallible `give_up_when` returning `false` does.
+                            Ok(false) => {}
+                            // A fallible `try_give_up_when` erred: abort with the
+                            // predicate's own error instead of the spawn failure.
+                            Err(source) => {
+                                return Err(crate::Error::predicate("give_up_when", source));
+                            }
+                        }
                     }
                     if self.max_restarts.is_some_and(|max| restarts >= max) {
                         return Err(err);
@@ -1541,8 +1736,13 @@ impl<R: ProcessRunner> Supervisor<R> {
         tokio::select! {
             biased;
             result = self.run_to_result(command, shared, spawn_capable) => Incarnation::Ran(result),
-            () = health.watch(self.health_check_failures) => {
-                Incarnation::LivenessFailed { uptime: started.elapsed() }
+            watch = health.watch(self.health_check_failures) => match watch {
+                // The wedged incarnation: force-restart it. Dropping the losing
+                // `run_to_result` future above kills the child on drop.
+                WatchOutcome::Unhealthy => Incarnation::LivenessFailed { uptime: started.elapsed() },
+                // A fallible probe erred: same drop-kill of the in-flight run, but
+                // supervision aborts with the error (handled in the drive loop).
+                WatchOutcome::Failed(source) => Incarnation::LivenessError { source },
             }
         }
     }
@@ -1568,9 +1768,15 @@ impl<R: ProcessRunner> Supervisor<R> {
     ) -> GateOutcome {
         if crashed
             && let Some(classifier) = &self.give_up_when
-            && classifier(&GiveUpAttempt::Crashed(result))
         {
-            return GateOutcome::GaveUp;
+            match classifier(&GiveUpAttempt::Crashed(result)) {
+                Ok(true) => return GateOutcome::GaveUp,
+                // Not permanent — restart per policy, as infallible `false` does.
+                Ok(false) => {}
+                // A fallible `try_give_up_when` erred: abort supervision. The
+                // caller-facing `Error` is built where this outcome is handled.
+                Err(source) => return GateOutcome::PredicateError(source),
+            }
         }
         if self.max_restarts.is_some_and(|max| *restarts >= max) {
             return GateOutcome::Exhausted;
@@ -2460,6 +2666,160 @@ mod tests {
         assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
     }
 
+    // --- Fallible control predicates (T-178) --------------------------------
+
+    /// A caller predicate error carrying a distinctive tag so tests can recover it
+    /// by downcast — proving the predicate's own error reaches the caller
+    /// **verbatim**, not a value the crate fabricated.
+    #[derive(Debug)]
+    struct PredicateBoom(&'static str);
+    impl std::fmt::Display for PredicateBoom {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "predicate boom: {}", self.0)
+        }
+    }
+    impl std::error::Error for PredicateBoom {}
+
+    /// Assert `err` is a control-predicate error tagged `which`
+    /// ([`ErrorKind::Predicate`](crate::ErrorKind::Predicate)) carrying our
+    /// `PredicateBoom(tag)` verbatim as its source.
+    fn assert_predicate_error(err: &crate::Error, which: &str, tag: &str) {
+        assert_eq!(
+            err.kind(),
+            crate::ErrorKind::Predicate,
+            "a predicate error must classify as ErrorKind::Predicate, got {err:?}"
+        );
+        match err.reason() {
+            crate::ErrorReason::Predicate { predicate, source } => {
+                assert_eq!(*predicate, which, "wrong predicate identifier for {err:?}");
+                let boom = source
+                    .downcast_ref::<PredicateBoom>()
+                    .expect("the caller's own error is carried verbatim as the source");
+                assert_eq!(boom.0, tag, "the exact predicate error must be preserved");
+            }
+            other => panic!("expected ErrorReason::Predicate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_stop_when_error_aborts_supervision() {
+        // The error reaches the caller as a typed `Predicate` error, not a stop
+        // verdict — distinct from `try_stop_when_ok_true_stops_like_stop_when`.
+        let err = supervise(SeqRunner::new(vec![ok()]))
+            .try_stop_when(|_res| Err::<bool, _>(PredicateBoom("stop")))
+            .run()
+            .await
+            .expect_err("a fallible stop_when returning Err must abort supervision");
+        assert_predicate_error(&err, "stop_when", "stop");
+    }
+
+    #[tokio::test]
+    async fn try_stop_when_ok_true_stops_like_stop_when() {
+        // The benign path is indistinguishable from the infallible `stop_when`:
+        // Ok(true) ends supervision with StopReason::Predicate (a clean outcome),
+        // proving the error outcome above is genuinely distinct — no fabricated
+        // verdict either way.
+        let outcome = supervise(SeqRunner::new(vec![ok()]))
+            .restart(RestartPolicy::Always)
+            .try_stop_when(|res| Ok::<_, PredicateBoom>(res.code() == Some(0)))
+            .run()
+            .await
+            .expect("Ok(true) is a normal predicate stop, never an error");
+        assert_eq!(outcome.stopped, StopReason::Predicate);
+        assert_eq!(outcome.restarts, 0);
+    }
+
+    #[tokio::test]
+    async fn try_give_up_when_error_on_a_crash_aborts_supervision() {
+        let err = supervise(SeqRunner::new(vec![fail(1)]))
+            .try_give_up_when(|_attempt| Err::<bool, _>(PredicateBoom("classify-crash")))
+            .run()
+            .await
+            .expect_err("a fallible give_up_when erroring on a crash must abort supervision");
+        assert_predicate_error(&err, "give_up_when", "classify-crash");
+    }
+
+    #[tokio::test]
+    async fn try_give_up_when_error_on_a_spawn_failure_aborts_supervision() {
+        // The `Failed` (never-started) classifier path also carries the predicate
+        // error out — distinct from the spawn failure it was classifying.
+        let err = supervise(SeqRunner::new(vec![spawn_err()]))
+            .try_give_up_when(|attempt| match attempt {
+                GiveUpAttempt::Failed(_) => Err(PredicateBoom("classify-failed")),
+                GiveUpAttempt::Crashed(_) => Ok(false),
+            })
+            .run()
+            .await
+            .expect_err("a give_up_when error on the spawn-failure path must abort supervision");
+        assert_predicate_error(&err, "give_up_when", "classify-failed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn try_health_check_error_aborts_supervision() {
+        // A hung-but-alive first incarnation (pending) + a probe that errs on its
+        // first fire. The error aborts supervision *immediately* — note the streak
+        // threshold of 5 is irrelevant, an Err never waits out a streak — and the
+        // run returning at all (under a paused clock) proves the parked incarnation
+        // was dropped rather than left parked forever.
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let err = Supervisor::new(Command::new("server"))
+            .with_runner(runner)
+            .try_health_check(
+                || async { Err::<bool, _>(PredicateBoom("probe")) },
+                Duration::from_millis(50),
+            )
+            .health_check_failures(5)
+            .run()
+            .await
+            .expect_err("a fallible health-check probe erroring must abort supervision");
+        assert_predicate_error(&err, "health_check", "probe");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_liveness_probe_drops_the_live_incarnation() {
+        // The leak criterion (K-044): a probe *error* must tear the in-flight run
+        // down by the same `select!`-drop kill a liveness kill uses — releasing the
+        // child's kill-on-drop handle synchronously, not via a trailing post-await
+        // step the dropped future never reaches. A runner whose in-flight run holds
+        // an RAII drop-flag proves the run future (and, under a real JobRunner, its
+        // child) is dropped on the probe-error exit rather than leaked.
+        struct DropFlagRunner(Arc<AtomicBool>);
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        #[async_trait::async_trait]
+        impl ProcessRunner for DropFlagRunner {
+            async fn output_string(&self, _command: &Command) -> Result<ProcessResult<String>> {
+                let _flag = DropFlag(self.0.clone());
+                // Park forever: only being dropped (as the probe-error `select!`
+                // loser) ends this in-flight run.
+                std::future::pending::<()>().await;
+                unreachable!("the parked run only ends by being dropped")
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let err = Supervisor::new(Command::new("server"))
+            .with_runner(DropFlagRunner(dropped.clone()))
+            .try_health_check(
+                || async { Err::<bool, _>(PredicateBoom("probe")) },
+                Duration::from_millis(50),
+            )
+            .health_check_failures(1)
+            .run()
+            .await
+            .expect_err("the probe error aborts supervision");
+        assert_predicate_error(&err, "health_check", "probe");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the in-flight incarnation must be dropped (its child killed on drop) \
+             on the probe-error exit — no child leak on the new exit path"
+        );
+    }
+
     #[tokio::test]
     async fn a_timeout_counts_as_a_crash() {
         let outcome = supervise(SeqRunner::new(vec![timeout(), ok()]))
@@ -3070,7 +3430,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn health_watch_trips_after_the_consecutive_failure_threshold() {
         let hc = HealthCheck {
-            probe: Box::new(|| Box::pin(async { false })),
+            probe: Box::new(|| Box::pin(async { Ok(false) })),
             interval: Duration::from_millis(100),
         };
         let start = tokio::time::Instant::now();
@@ -3087,7 +3447,7 @@ mod tests {
             probe: Box::new(move || {
                 // Healthy only on the 3rd probe; unhealthy otherwise.
                 let healthy = calls.fetch_add(1, Ordering::SeqCst) == 2;
-                Box::pin(async move { healthy })
+                Box::pin(async move { Ok(healthy) })
             }),
             interval: Duration::from_millis(100),
         };
@@ -3101,7 +3461,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn health_watch_zero_threshold_is_clamped_to_one() {
         let hc = HealthCheck {
-            probe: Box::new(|| Box::pin(async { false })),
+            probe: Box::new(|| Box::pin(async { Ok(false) })),
             interval: Duration::from_millis(100),
         };
         let start = tokio::time::Instant::now();

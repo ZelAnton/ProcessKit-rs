@@ -3,6 +3,17 @@
 use std::fmt;
 use std::time::Duration;
 
+/// The boxed error a **fallible control predicate** may return — a
+/// [`Supervisor`](crate::Supervisor)'s `try_*` twin
+/// ([`try_stop_when`](crate::Supervisor::try_stop_when),
+/// [`try_give_up_when`](crate::Supervisor::try_give_up_when),
+/// [`try_health_check`](crate::Supervisor::try_health_check)) or a
+/// [`ScriptedRunner::try_when`](crate::testing::ScriptedRunner::try_when). Carried
+/// verbatim as the source of an [`ErrorReason::Predicate`]. Crate-internal alias;
+/// the public predicate setters accept any `E: Into<Box<dyn Error + Send + Sync>>`
+/// and box it into this shape.
+pub(crate) type PredicateError = Box<dyn std::error::Error + Send + Sync>;
+
 /// The structured failure mode behind an [`Error`] — the enum you reach through
 /// [`Error::reason`].
 ///
@@ -398,6 +409,41 @@ pub enum ErrorReason {
     /// `?` happened to route through here.
     #[error(transparent)]
     Io(std::io::Error),
+
+    /// A **fallible control predicate returned an error**, aborting the operation
+    /// instead of yielding a verdict.
+    ///
+    /// Produced by the `try_*` control-predicate twins — a
+    /// [`Supervisor`](crate::Supervisor)'s
+    /// [`try_stop_when`](crate::Supervisor::try_stop_when),
+    /// [`try_give_up_when`](crate::Supervisor::try_give_up_when), or
+    /// [`try_health_check`](crate::Supervisor::try_health_check), or a
+    /// [`ScriptedRunner::try_when`](crate::testing::ScriptedRunner::try_when) —
+    /// when the caller-supplied predicate returns `Err` rather than `Ok(bool)`.
+    /// The predicate's own error is carried **verbatim** as the [`source`], so a
+    /// wrapper (e.g. a language binding whose callback raised) recovers exactly
+    /// what its predicate produced rather than a fabricated stop/continue verdict.
+    ///
+    /// The outcome is deliberately **distinct** from a normal predicate-driven
+    /// stop: a predicate that returns `Ok(true)` ends supervision with a benign
+    /// [`SupervisionOutcome`](crate::SupervisionOutcome), whereas one that returns
+    /// `Err` surfaces this error to the caller. Classifies as
+    /// [`ErrorKind::Predicate`].
+    ///
+    /// [`source`]: std::error::Error::source
+    #[error("the `{predicate}` control predicate returned an error: {source}")]
+    #[non_exhaustive]
+    Predicate {
+        /// Which control predicate failed — a stable identifier: `"stop_when"`,
+        /// `"give_up_when"`, `"health_check"` (the [`Supervisor`](crate::Supervisor)
+        /// twins), or `"when"` (the [`ScriptedRunner`](crate::testing::ScriptedRunner)
+        /// twin). A diagnostic name for the message, not a value matched on —
+        /// route on [`kind`](Self::kind)/[`ErrorKind::Predicate`] instead.
+        predicate: &'static str,
+        /// The error the predicate returned, carried verbatim.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 /// The **kind** of an [`Error`] — a total, compact classification of the failure
@@ -462,6 +508,17 @@ pub enum ErrorKind {
     /// [`ErrorReason::Cancelled`]. The twin of [`Error::is_cancelled`]; a
     /// caller-initiated stop, never retried.
     Cancelled,
+    /// A fallible control predicate returned an error — from
+    /// [`ErrorReason::Predicate`]. Its own routing bucket, distinct from
+    /// [`Other`](ErrorKind::Other): the failure originated in the caller's own
+    /// `try_*` control predicate (a [`Supervisor`](crate::Supervisor) twin or
+    /// [`ScriptedRunner::try_when`](crate::testing::ScriptedRunner::try_when)), so
+    /// a wrapper routing failures onto its own shape (a language binding raising a
+    /// matching exception, say) can tell "the callback raised" apart from a
+    /// backend/IO failure without matching the reason variant. The predicate's
+    /// verbatim error is on the reason
+    /// ([`ErrorReason::Predicate::source`](std::error::Error::source)).
+    Predicate,
     /// The process ran to completion but exited non-zero — from
     /// [`ErrorReason::Exit`]. The exit code itself is on the reason
     /// ([`Error::code`]).
@@ -510,6 +567,7 @@ impl ErrorKind {
             ErrorKind::Unsupported => "unsupported",
             ErrorKind::Timeout => "timeout",
             ErrorKind::Cancelled => "cancelled",
+            ErrorKind::Predicate => "predicate",
             ErrorKind::Exit => "exit",
             ErrorKind::Signalled => "signalled",
             ErrorKind::Other => "other",
@@ -588,6 +646,7 @@ impl ErrorReason {
     ///   scope);
     /// - [`Timeout`](ErrorReason::Timeout) → [`ErrorKind::Timeout`],
     ///   [`Cancelled`](ErrorReason::Cancelled) → [`ErrorKind::Cancelled`],
+    ///   [`Predicate`](ErrorReason::Predicate) → [`ErrorKind::Predicate`],
     ///   [`Exit`](ErrorReason::Exit) → [`ErrorKind::Exit`],
     ///   [`Signalled`](ErrorReason::Signalled) → [`ErrorKind::Signalled`],
     ///   [`Unsupported`](ErrorReason::Unsupported) → [`ErrorKind::Unsupported`];
@@ -625,6 +684,7 @@ impl ErrorReason {
             }
             ErrorReason::Timeout { .. } => ErrorKind::Timeout,
             ErrorReason::Cancelled { .. } => ErrorKind::Cancelled,
+            ErrorReason::Predicate { .. } => ErrorKind::Predicate,
             ErrorReason::Exit { .. } => ErrorKind::Exit,
             ErrorReason::Signalled { .. } => ErrorKind::Signalled,
             ErrorReason::Unsupported { .. } => ErrorKind::Unsupported,
@@ -667,6 +727,7 @@ impl ErrorReason {
             | ErrorReason::Unsupported { .. }
             | ErrorReason::Cancelled { .. }
             | ErrorReason::Stdin { .. }
+            | ErrorReason::Predicate { .. }
             | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
             ErrorReason::ResourceLimit { .. } => None,
@@ -716,6 +777,7 @@ impl ErrorReason {
             | ErrorReason::Unsupported { .. }
             | ErrorReason::Cancelled { .. }
             | ErrorReason::Stdin { .. }
+            | ErrorReason::Predicate { .. }
             | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
             ErrorReason::ResourceLimit { .. } => None,
@@ -754,6 +816,7 @@ impl ErrorReason {
             | ErrorReason::Unsupported { .. }
             | ErrorReason::Cancelled { .. }
             | ErrorReason::Stdin { .. }
+            | ErrorReason::Predicate { .. }
             | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
             ErrorReason::ResourceLimit { .. } => None,
@@ -782,7 +845,8 @@ impl ErrorReason {
             | ErrorReason::Cancelled { program }
             | ErrorReason::Signalled { program, .. }
             | ErrorReason::Stdin { program, .. } => Some(program),
-            ErrorReason::Unsupported { .. } | ErrorReason::Io(_) => None,
+            ErrorReason::Unsupported { .. } | ErrorReason::Predicate { .. }
+            | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
             ErrorReason::ResourceLimit { .. } => None,
         }
@@ -856,6 +920,7 @@ impl ErrorReason {
             | ErrorReason::Cancelled { .. }
             | ErrorReason::Signalled { .. }
             | ErrorReason::Stdin { .. }
+            | ErrorReason::Predicate { .. }
             | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
             ErrorReason::ResourceLimit { .. } => None,
@@ -884,6 +949,7 @@ impl ErrorReason {
             | ErrorReason::Unsupported { .. }
             | ErrorReason::Cancelled { .. }
             | ErrorReason::Stdin { .. }
+            | ErrorReason::Predicate { .. }
             | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
             ErrorReason::ResourceLimit { .. } => None,
@@ -917,6 +983,7 @@ impl ErrorReason {
             | ErrorReason::Cancelled { .. }
             | ErrorReason::Signalled { .. }
             | ErrorReason::Stdin { .. }
+            | ErrorReason::Predicate { .. }
             | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
             ErrorReason::ResourceLimit { .. } => None,
@@ -955,6 +1022,7 @@ impl ErrorReason {
             | ErrorReason::Cancelled { .. }
             | ErrorReason::Signalled { .. }
             | ErrorReason::Stdin { .. }
+            | ErrorReason::Predicate { .. }
             | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
             ErrorReason::ResourceLimit { .. } => None,
@@ -982,6 +1050,7 @@ impl ErrorReason {
             | ErrorReason::Cancelled { .. }
             | ErrorReason::Signalled { .. }
             | ErrorReason::Stdin { .. }
+            | ErrorReason::Predicate { .. }
             | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
             ErrorReason::ResourceLimit { .. } => None,
@@ -1009,6 +1078,7 @@ impl ErrorReason {
             | ErrorReason::Cancelled { .. }
             | ErrorReason::Signalled { .. }
             | ErrorReason::Stdin { .. }
+            | ErrorReason::Predicate { .. }
             | ErrorReason::Io(_) => None,
         }
     }
@@ -1034,6 +1104,7 @@ impl ErrorReason {
             | ErrorReason::Cancelled { .. }
             | ErrorReason::Signalled { .. }
             | ErrorReason::Stdin { .. }
+            | ErrorReason::Predicate { .. }
             | ErrorReason::Io(_) => None,
         }
     }
@@ -1091,7 +1162,8 @@ impl ErrorReason {
             | ErrorReason::Unsupported { .. }
             | ErrorReason::Cancelled { .. }
             | ErrorReason::Signalled { .. }
-            | ErrorReason::Stdin { .. } => None,
+            | ErrorReason::Stdin { .. }
+            | ErrorReason::Predicate { .. } => None,
             #[cfg(feature = "limits")]
             ErrorReason::ResourceLimit { .. } => None,
         }
@@ -1418,6 +1490,15 @@ impl Error {
         ErrorReason::Io(source).into()
     }
 
+    /// Wrap the error a fallible control predicate returned as an
+    /// [`ErrorReason::Predicate`], tagged with a stable `predicate` identifier
+    /// (`"stop_when"`, `"give_up_when"`, `"health_check"`, `"when"`).
+    /// Crate-private: only the crate's own predicate-consultation sites (the
+    /// `Supervisor` `try_*` twins and `ScriptedRunner::try_when`) produce it.
+    pub(crate) fn predicate(predicate: &'static str, source: PredicateError) -> Self {
+        ErrorReason::Predicate { predicate, source }.into()
+    }
+
     /// Construct a [`Parse`](ErrorReason::Parse) from a caller-supplied parser's own
     /// failure message. Unlike `exit`/`timeout`/`signalled`/`spawn`/`not_found`/
     /// `stdin` above (`#[doc(hidden)]` insulated constructors meant for test
@@ -1553,6 +1634,13 @@ impl fmt::Debug for ErrorReason {
                 .field("source", source)
                 .finish(),
             ErrorReason::Io(source) => f.debug_tuple("Io").field(source).finish(),
+            ErrorReason::Predicate { predicate, source } => f
+                .debug_struct("Predicate")
+                .field("predicate", predicate)
+                // The caller's own error — printed like any other `#[source]`
+                // (`Spawn`/`Stdin`/`Io`), not a captured stream, so no length cap.
+                .field("source", source)
+                .finish(),
         }
     }
 }
