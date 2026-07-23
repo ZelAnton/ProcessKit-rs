@@ -1742,6 +1742,17 @@ impl Command {
         self.ok_codes.clone().unwrap_or_else(|| vec![0])
     }
 
+    /// The exit codes explicitly configured via [`ok_codes`](Self::ok_codes), if
+    /// any — `None` when unset, in which case the default `{0}` applies (see
+    /// [`ok_codes_vec`](Self::ok_codes_vec) for the always-populated effective
+    /// set). Mirrors [`configured_timeout`](Self::configured_timeout): the raw
+    /// *configured* state, not a resolved default — lets `ScriptedRunner::when`
+    /// predicates and other inspection code (see the "Public accessors" note
+    /// above) tell "left at the default" apart from "explicitly set to `{0}`".
+    pub fn configured_ok_codes(&self) -> Option<&[i32]> {
+        self.ok_codes.as_deref()
+    }
+
     /// Build a `tokio::process::Command` for the low-level
     /// [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) escape hatch.
     /// Not part of the advertised surface; prefer the `start`/`output_string`/`run` verbs.

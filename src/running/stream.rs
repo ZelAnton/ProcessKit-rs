@@ -60,6 +60,33 @@ pub struct Finished {
     pub stderr_truncated: bool,
 }
 
+impl Finished {
+    /// Build a `Finished` from its fields — a `#[doc(hidden)]` insulated
+    /// constructor for a wrapper/serialization layer to reconstruct a value
+    /// directly, by the same "one insulated constructor instead of a struct
+    /// literal" rationale as [`Error::exit`](crate::Error::exit) — `Finished`'s
+    /// own `#[non_exhaustive]` already rejects a struct literal from outside
+    /// this crate even though every field is `pub` (see the type's own doc for
+    /// why: a future release may attach more fields without a breaking change).
+    /// Off the documented surface, but `pub` so downstream code can call it;
+    /// semver-covered like any public item.
+    ///
+    /// Mirrors every field, so a value round-trips through this constructor and
+    /// reading the fields back byte-for-byte. No combination of these fields can
+    /// be internally contradictory: `outcome` is this crate's own [`Outcome`],
+    /// already mutually exclusive by construction (an exit code and a signal
+    /// can never both be present), and `stderr`/`stderr_truncated` are
+    /// independent telemetry with no cross-field invariant to violate.
+    #[doc(hidden)]
+    pub fn from_parts(outcome: Outcome, stderr: impl Into<String>, stderr_truncated: bool) -> Self {
+        Finished {
+            outcome,
+            stderr: stderr.into(),
+            stderr_truncated,
+        }
+    }
+}
+
 impl RunningProcess {
     /// Stream the child's standard output line by line. Call this **once**.
     ///
@@ -939,5 +966,23 @@ mod tests {
         p_err.await.expect("stderr producer");
         assert_eq!(out, N, "every stdout line received");
         assert_eq!(err, N, "every stderr line received");
+    }
+
+    /// T-179: a `Finished` built by the `#[doc(hidden)]` `from_parts`
+    /// constructor and read back through its (public) fields reproduces the
+    /// original, field for field.
+    #[test]
+    fn finished_from_parts_round_trips_every_field() {
+        let original = Finished::from_parts(Outcome::Signalled(Some(9)), "boom", true);
+        assert_eq!(original.outcome, Outcome::Signalled(Some(9)));
+        assert_eq!(original.stderr, "boom");
+        assert!(original.stderr_truncated);
+
+        let rebuilt = Finished::from_parts(
+            original.outcome,
+            original.stderr.clone(),
+            original.stderr_truncated,
+        );
+        assert_eq!(original, rebuilt);
     }
 }

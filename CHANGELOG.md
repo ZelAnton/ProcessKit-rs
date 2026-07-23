@@ -13,6 +13,21 @@ to a dated version section.
 
 ### Added
 
+- Add `ProcessResult::configured_timeout()` / `ok_codes()` — accessors for the
+  two configuration fields (the run's timeout, the accepted exit-code set) that
+  participate in `ProcessResult`'s `PartialEq` but previously had no way to be
+  read back. Add the `Command` twin `configured_ok_codes()`, alongside the
+  already-existing `configured_timeout()`. Add `#[doc(hidden)]` `from_parts`
+  constructors — insulated, off the documented surface but `pub` and
+  semver-covered, by the same precedent as `Error::exit`/`timeout`/… — for
+  `ProcessResult`, `Finished`, `RunProfile`, and `SupervisionOutcome`, so a
+  wrapper/serialization layer (e.g. a cross-language binding) can reconstruct
+  one of these values directly instead of programming a test double just to
+  produce one. (`Outcome` needs no equivalent: `#[non_exhaustive]` on a plain
+  enum does not block constructing an existing tuple/unit variant from outside
+  the crate, so `Outcome::Exited(0)` already works anywhere.) Purely
+  additive — no change to `PartialEq`/`Hash`/`Debug` semantics on any of these
+  types
 - Add `Command::stdout_raw_tee(writer)` / `stderr_raw_tee(writer)` — a
   **byte-accurate** tee that writes each chunk to `writer` *exactly as read from
   the child's pipe*, before any decoding or line splitting. Where

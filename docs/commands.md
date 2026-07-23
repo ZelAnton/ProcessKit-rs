@@ -665,6 +665,8 @@ async fn main() -> processkit::Result<()> {
     result.combined();     // stdout + stderr concatenated
     result.diagnostic();   // stderr if non-empty, else stdout — the human-facing line
                            // (git/jj put "CONFLICT …" on stdout!)
+    result.configured_timeout(); // Option<Duration> — the timeout this run was launched with
+    result.ok_codes();     // &[i32] — the accepted exit codes ({0} by default)
 
     // Opt into erroring whenever you're ready:
     let ok = result.ensure_success()?; // Exit / Timeout / Signalled (signal-kill) as typed errors

@@ -353,6 +353,43 @@ pub struct SupervisionOutcome {
     pub liveness_kills: u32,
 }
 
+impl SupervisionOutcome {
+    /// Build a `SupervisionOutcome` from its fields — a `#[doc(hidden)]`
+    /// insulated constructor for a wrapper/serialization layer to reconstruct a
+    /// value directly, by the same "one insulated constructor instead of a
+    /// struct literal" rationale as [`Error::exit`](crate::Error::exit) —
+    /// `SupervisionOutcome`'s own `#[non_exhaustive]` already rejects a struct
+    /// literal from outside this crate even though every field is `pub` (see
+    /// the type's own doc for why). Off the documented surface, but `pub` so
+    /// downstream code can call it; semver-covered like any public item.
+    ///
+    /// Mirrors every field, so a value round-trips through this constructor and
+    /// reading the fields back byte-for-byte. No combination of these fields
+    /// can be internally contradictory: `final_result` is itself a
+    /// [`ProcessResult`], which enforces its own invariants (see
+    /// [`ProcessResult::from_parts`](crate::ProcessResult::from_parts)),
+    /// `stopped` is this crate's own [`StopReason`], and the three counters are
+    /// independent telemetry with no cross-field invariant to violate — a
+    /// caller passing e.g. `restarts < liveness_kills` gets a value that is
+    /// merely a lossy summary of an odd history, not a contradictory one.
+    #[doc(hidden)]
+    pub fn from_parts(
+        final_result: ProcessResult<String>,
+        restarts: u32,
+        stopped: StopReason,
+        storm_pauses: u32,
+        liveness_kills: u32,
+    ) -> Self {
+        SupervisionOutcome {
+            final_result,
+            restarts,
+            stopped,
+            storm_pauses,
+            liveness_kills,
+        }
+    }
+}
+
 /// A consistent, point-in-time snapshot of a live [`SupervisionSession`]'s
 /// state — read atomically under the same lock the supervision loop publishes
 /// each change under, so every field agrees with the others (no torn read).
@@ -2051,6 +2088,41 @@ mod tests {
         assert_eq!(RestartPolicy::from_name(""), None);
         assert_eq!(StopReason::from_name("gaveup"), None);
         assert_eq!(StopReason::from_name("exhausted"), None);
+    }
+
+    /// T-179: a `SupervisionOutcome` built by the `#[doc(hidden)]` `from_parts`
+    /// constructor and read back through its (public) fields reproduces the
+    /// original, field for field.
+    #[test]
+    fn supervision_outcome_from_parts_round_trips_every_field() {
+        let final_result = ProcessResult::new(
+            "tool".into(),
+            "out".to_owned(),
+            String::new(),
+            Outcome::Exited(0),
+            None,
+        );
+        let original = SupervisionOutcome::from_parts(
+            final_result.clone(),
+            3,
+            StopReason::RestartsExhausted,
+            2,
+            1,
+        );
+        assert_eq!(original.final_result, final_result);
+        assert_eq!(original.restarts, 3);
+        assert_eq!(original.stopped, StopReason::RestartsExhausted);
+        assert_eq!(original.storm_pauses, 2);
+        assert_eq!(original.liveness_kills, 1);
+
+        let rebuilt = SupervisionOutcome::from_parts(
+            original.final_result.clone(),
+            original.restarts,
+            original.stopped,
+            original.storm_pauses,
+            original.liveness_kills,
+        );
+        assert_eq!(original, rebuilt);
     }
 
     /// Per-call outcome sequence; panics if exhausted, so an unexpected restart fails loudly.

@@ -18,6 +18,19 @@ use crate::error::Error;
 /// bare `Outcome` does not carry — use
 /// [`ProcessResult::is_success`](crate::ProcessResult::is_success) (which honors
 /// `ok_codes`) rather than assuming `Exited(0)`.
+///
+/// There is also no `#[doc(hidden)]` constructor here (unlike
+/// [`ProcessResult::from_parts`],
+/// [`Finished::from_parts`](crate::Finished::from_parts),
+/// [`RunProfile::from_parts`](crate::RunProfile::from_parts),
+/// [`SupervisionOutcome::from_parts`](crate::SupervisionOutcome::from_parts)):
+/// `#[non_exhaustive]` on a plain enum blocks only an external exhaustive
+/// `match` and struct-variant literal syntax, not construction of an existing
+/// tuple/unit variant — `Outcome::Exited(0)` already works from any crate. Each
+/// variant is a single field (or none), so there is no cross-field
+/// invariant a constructor could enforce that the variant shape doesn't
+/// already guarantee — a wrapper reconstructing a value writes the variant
+/// directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Outcome {
@@ -300,6 +313,28 @@ impl<T> ProcessResult<T> {
         self.outcome.signal()
     }
 
+    /// The [`Command::timeout`](crate::Command::timeout) this run was launched
+    /// with, if any — carried so [`ensure_success`](Self::ensure_success) /
+    /// [`require_code`](Self::require_code) can build a faithful
+    /// [`Error::Timeout`]. Participates in this type's [`PartialEq`] (see the
+    /// impl for the full contract): two results with the same visible outcome
+    /// but a different configured timeout are **not** equal, and this accessor
+    /// is what lets a caller (e.g. a serialization wrapper) tell them apart —
+    /// mirrors [`Command::configured_timeout`](crate::Command::configured_timeout).
+    pub fn configured_timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    /// The exit codes this result treats as success — `[0]` by default, or the
+    /// set widened via [`Command::ok_codes`](crate::Command::ok_codes). Backs
+    /// [`is_success`](Self::is_success) / [`ensure_success`](Self::ensure_success)
+    /// and, like [`configured_timeout`](Self::configured_timeout), participates
+    /// in this type's [`PartialEq`] — the other config field a caller needs to
+    /// read back to tell two visibly-identical results apart.
+    pub fn ok_codes(&self) -> &[i32] {
+        &self.ok_codes
+    }
+
     /// Whether the process exited with an **accepted** code — `0` by default, or
     /// any code in the set configured via
     /// [`Command::ok_codes`](crate::Command::ok_codes).
@@ -464,6 +499,52 @@ impl<T> ProcessResult<T> {
             self.ok_codes = ok_codes;
         }
         self
+    }
+
+    /// Build a `ProcessResult` from its complete set of fields — a
+    /// `#[doc(hidden)]` insulated constructor for a wrapper/serialization layer
+    /// (e.g. a cross-language binding restoring a value it persisted itself) to
+    /// reconstruct one directly, by the same "one insulated constructor instead
+    /// of a struct literal" rationale as [`Error::exit`](crate::Error::exit) —
+    /// the private fields already reject a struct literal from outside this
+    /// crate outright. Off the documented surface, but `pub` so downstream code
+    /// can call it; semver-covered like any public item.
+    ///
+    /// Mirrors every field this type carries (the same set [`fmt::Debug`]
+    /// prints), so a value round-trips through this constructor and the
+    /// accessors byte-for-byte — including `duration`/`truncated`/the overflow
+    /// totals, which are not part of [`PartialEq`] (see the impl above) but are
+    /// still real telemetry a wrapper may want to preserve. `ok_codes` follows
+    /// [`Command::ok_codes`](crate::Command::ok_codes): an empty set is ignored
+    /// (it would make every exit a failure) and the default `{0}` stands.
+    ///
+    /// No combination of these fields can be internally contradictory: `outcome`
+    /// is this crate's own [`Outcome`] — already mutually exclusive by
+    /// construction (an exit code and a signal can never both be present) — and
+    /// every other field here is independent telemetry with no cross-field
+    /// invariant to violate.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "flat reconstruction of every field this type carries"
+    )]
+    pub fn from_parts(
+        program: impl Into<String>,
+        stdout: T,
+        stderr: impl Into<String>,
+        outcome: Outcome,
+        timeout: Option<Duration>,
+        duration: Duration,
+        truncated: bool,
+        total_lines: usize,
+        total_bytes: usize,
+        ok_codes: Vec<i32>,
+    ) -> Self {
+        Self::new(program.into(), stdout, stderr.into(), outcome, timeout)
+            .with_duration(duration)
+            .with_truncated(truncated)
+            .with_overflow_totals(total_lines, total_bytes)
+            .with_ok_codes(ok_codes)
     }
 }
 
@@ -1261,5 +1342,132 @@ mod tests {
                 .contains("5s"),
             "a known timeout shows the duration"
         );
+    }
+
+    /// T-179: pin — two results are equal iff every field that participates in
+    /// `PartialEq` (program/stdout/stderr/outcome/`configured_timeout`/
+    /// `ok_codes`) agrees, once read back through the accessors. `duration`/
+    /// `truncated` are deliberately excluded from equality (see
+    /// `equality_ignores_duration_and_truncation`), so they're excluded here too.
+    #[test]
+    fn configured_timeout_and_ok_codes_participate_in_equality() {
+        let base = ProcessResult::new(
+            "p".into(),
+            "out".to_owned(),
+            "err".to_owned(),
+            Outcome::Exited(0),
+            Some(Duration::from_secs(1)),
+        )
+        .with_ok_codes(vec![0, 1]);
+        assert_eq!(base.configured_timeout(), Some(Duration::from_secs(1)));
+        assert_eq!(base.ok_codes(), &[0, 1]);
+
+        // An identical clone is equal, and its accessors agree component-wise.
+        let same = base.clone();
+        assert_eq!(base, same);
+        assert_eq!(base.configured_timeout(), same.configured_timeout());
+        assert_eq!(base.ok_codes(), same.ok_codes());
+
+        // Flipping only the configured timeout breaks equality — the accessor
+        // that previously had no way to be read is exactly what surfaces it.
+        let diff_timeout = ProcessResult::new(
+            "p".into(),
+            "out".to_owned(),
+            "err".to_owned(),
+            Outcome::Exited(0),
+            Some(Duration::from_secs(2)),
+        )
+        .with_ok_codes(vec![0, 1]);
+        assert_ne!(base, diff_timeout);
+        assert_ne!(base.configured_timeout(), diff_timeout.configured_timeout());
+
+        // Flipping only ok_codes breaks equality too.
+        let diff_codes = base.clone().with_ok_codes(vec![0]);
+        assert_ne!(base, diff_codes);
+        assert_ne!(base.ok_codes(), diff_codes.ok_codes());
+
+        // Two results that agree on every one of these fields are equal, even
+        // when constructed independently.
+        let rebuilt = ProcessResult::new(
+            base.program().to_owned(),
+            base.stdout().clone(),
+            base.stderr().to_owned(),
+            base.outcome(),
+            base.configured_timeout(),
+        )
+        .with_ok_codes(base.ok_codes().to_vec());
+        assert_eq!(base, rebuilt);
+    }
+
+    /// T-179: a value built by the `#[doc(hidden)]` `from_parts` constructor and
+    /// read back through the accessors reproduces the original, field for field
+    /// — including `duration`/`truncated`/the overflow totals, which sit outside
+    /// `PartialEq` but are still real fields the constructor mirrors.
+    #[test]
+    fn from_parts_round_trips_every_field() {
+        let original = ProcessResult::from_parts(
+            "git",
+            "out".to_owned(),
+            "err".to_owned(),
+            Outcome::Exited(2),
+            Some(Duration::from_millis(750)),
+            Duration::from_secs(3),
+            true,
+            123,
+            4567,
+            vec![0, 2],
+        );
+        assert_eq!(original.program(), "git");
+        assert_eq!(original.stdout(), "out");
+        assert_eq!(original.stderr(), "err");
+        assert_eq!(original.outcome(), Outcome::Exited(2));
+        assert_eq!(
+            original.configured_timeout(),
+            Some(Duration::from_millis(750))
+        );
+        assert_eq!(original.duration(), Duration::from_secs(3));
+        assert!(original.truncated());
+        assert_eq!(original.total_lines(), 123);
+        assert_eq!(original.total_bytes(), 4567);
+        assert_eq!(original.ok_codes(), &[0, 2]);
+
+        // Rebuilding purely from what the accessors report reproduces an equal
+        // value (equality covers program/stdout/stderr/outcome/timeout/ok_codes)
+        // and the non-equality telemetry (duration/truncated/totals) round-trips
+        // too.
+        let rebuilt = ProcessResult::from_parts(
+            original.program(),
+            original.stdout().clone(),
+            original.stderr(),
+            original.outcome(),
+            original.configured_timeout(),
+            original.duration(),
+            original.truncated(),
+            original.total_lines(),
+            original.total_bytes(),
+            original.ok_codes().to_vec(),
+        );
+        assert_eq!(original, rebuilt);
+        assert_eq!(rebuilt.duration(), original.duration());
+        assert_eq!(rebuilt.truncated(), original.truncated());
+        assert_eq!(rebuilt.total_lines(), original.total_lines());
+        assert_eq!(rebuilt.total_bytes(), original.total_bytes());
+
+        // An empty `ok_codes` is ignored, matching `Command::ok_codes` /
+        // `with_ok_codes` — the default `{0}` stands rather than making every
+        // exit a failure.
+        let empty_codes = ProcessResult::from_parts(
+            "p",
+            String::new(),
+            String::new(),
+            Outcome::Exited(0),
+            None,
+            Duration::ZERO,
+            false,
+            0,
+            0,
+            vec![],
+        );
+        assert_eq!(empty_codes.ok_codes(), &[0]);
     }
 }

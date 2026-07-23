@@ -660,6 +660,7 @@ pub fn processkit::Command::arguments(&self) -> &[std::ffi::os_str::OsString]
 pub fn processkit::Command::cancel_on(self, tokio_util::sync::cancellation_token::CancellationToken) -> Self
 pub async fn processkit::Command::checked(&self) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
 pub fn processkit::Command::command_line(&self) -> alloc::string::String
+pub fn processkit::Command::configured_ok_codes(&self) -> core::option::Option<&[i32]>
 pub fn processkit::Command::configured_timeout(&self) -> core::option::Option<core::time::Duration>
 pub fn processkit::Command::create_no_window(self) -> Self
 pub fn processkit::Command::current_dir(self, impl core::convert::AsRef<std::path::Path>) -> Self
@@ -1002,10 +1003,12 @@ pub fn processkit::ProcessResult<alloc::string::String>::diagnostic(&self) -> &s
 pub fn processkit::ProcessResult<alloc::string::String>::output_contains_any(&self, impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::AsRef<str>>) -> bool
 impl<T> processkit::ProcessResult<T>
 pub fn processkit::ProcessResult<T>::code(&self) -> core::option::Option<i32>
+pub fn processkit::ProcessResult<T>::configured_timeout(&self) -> core::option::Option<core::time::Duration>
 pub fn processkit::ProcessResult<T>::duration(&self) -> core::time::Duration
 pub fn processkit::ProcessResult<T>::ensure_success(self) -> core::result::Result<Self, processkit::Error> where T: StdoutText
 pub fn processkit::ProcessResult<T>::into_stdout(self) -> T
 pub fn processkit::ProcessResult<T>::is_success(&self) -> bool
+pub fn processkit::ProcessResult<T>::ok_codes(&self) -> &[i32]
 pub fn processkit::ProcessResult<T>::outcome(&self) -> processkit::Outcome
 pub fn processkit::ProcessResult<T>::program(&self) -> &str
 pub fn processkit::ProcessResult<T>::signal(&self) -> core::option::Option<i32>
