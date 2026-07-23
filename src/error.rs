@@ -400,7 +400,244 @@ pub enum ErrorReason {
     Io(std::io::Error),
 }
 
+/// The **kind** of an [`Error`] — a total, compact classification of the failure
+/// into one bucket per operational disposition, reached through
+/// [`Error::kind`] / [`ErrorReason::kind`].
+///
+/// Where [`ErrorReason`] is the *structured* failure mode (every field of every
+/// variant), `ErrorKind` is the *routing* classification a consumer needs when it
+/// maps failures onto its **own** shape — a CLI folding each disposition into a
+/// distinct process exit code, a cross-language binding raising a matching
+/// exception class, a router picking a retry policy. It is **total**: every
+/// [`ErrorReason`] variant — present and future — maps to exactly one kind, and
+/// the mapping is an exhaustive `match` inside the crate (no catch-all), so a new
+/// `ErrorReason` variant cannot ship without a deliberate kind decision.
+///
+/// It is deliberately **coarser** than [`ErrorReason`] and is **not** a
+/// replacement for matching the reason when you need the details: read
+/// [`Error::reason`] for the exit code, the captured streams, the timeout
+/// duration, the `PATH` searched, and so on. `kind()` answers "which category of
+/// failure is this?"; `reason()` answers "what exactly happened?".
+///
+/// The shape mirrors [`std::io::Error`] / [`std::io::ErrorKind`]: a rich error
+/// carrying an open-ended set of coarse kinds (hence [`Other`](ErrorKind::Other)
+/// and `#[non_exhaustive]`). A downstream `match` on `ErrorKind` must therefore
+/// carry a catch-all arm — prefer that to enumerating every kind, so a future
+/// kind routes somewhere sane instead of breaking your build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// The program could not be located — from [`ErrorReason::NotFound`]. The
+    /// twin of [`Error::is_not_found`]; the "is it installed?" bucket.
+    NotFound,
+    /// The program was located but the OS refused to start it, for a reason
+    /// other than a permission denial — from a non-`PermissionDenied`
+    /// [`ErrorReason::Spawn`] (a bad working directory, a `.cmd`/`.bat` needing
+    /// `cmd.exe`, a transient `ETXTBSY`/lock, …).
+    Spawn,
+    /// A permission denial at the spawn/IO layer — the `PermissionDenied` subset
+    /// of [`ErrorReason::Spawn`] / [`ErrorReason::Io`]. The twin of
+    /// [`Error::is_permission_denied`]; split out of [`Spawn`](ErrorKind::Spawn)
+    /// / [`Other`](ErrorKind::Other) because an ACL/executable-bit problem is a
+    /// distinct operator action (fix permissions) from a generic launch or IO
+    /// failure.
+    PermissionDenied,
+    /// A requested resource limit could not be enforced — from
+    /// [`ErrorReason::ResourceLimit`] (`limits` feature). Gated exactly like the
+    /// variant it classifies, so a `--no-default-features` build has neither.
+    #[cfg(feature = "limits")]
+    ResourceLimit,
+    /// An operation is unsupported by the active containment mechanism on this
+    /// platform — from [`ErrorReason::Unsupported`] (e.g. any `Signal` but `Kill`
+    /// on Windows Job Objects).
+    Unsupported,
+    /// The run exceeded its [`Command::timeout`](crate::Command::timeout) and was
+    /// killed — from [`ErrorReason::Timeout`]. The twin of [`Error::is_timeout`].
+    /// A readiness-probe deadline ([`ErrorReason::NotReady`]) is **not** this — it
+    /// never kills the child — and classifies as [`Other`](ErrorKind::Other),
+    /// matching [`is_timeout`](Error::is_timeout)'s scoping.
+    Timeout,
+    /// The run was deliberately cancelled via its
+    /// [`CancellationToken`](crate::Command::cancel_on) — from
+    /// [`ErrorReason::Cancelled`]. The twin of [`Error::is_cancelled`]; a
+    /// caller-initiated stop, never retried.
+    Cancelled,
+    /// The process ran to completion but exited non-zero — from
+    /// [`ErrorReason::Exit`]. The exit code itself is on the reason
+    /// ([`Error::code`]).
+    Exit,
+    /// The process was killed by a signal (**Unix**, or a modelled
+    /// double/cassette) — from [`ErrorReason::Signalled`]. The twin of
+    /// [`Error::is_signalled`]; the signal number, when known, is on the reason
+    /// ([`Error::signal`]).
+    Signalled,
+    /// The catch-all IO/other bucket — every remaining [`ErrorReason`] variant
+    /// that is not one of the categories above:
+    /// [`CassetteMiss`](ErrorReason::CassetteMiss),
+    /// [`Parse`](ErrorReason::Parse), [`NotReady`](ErrorReason::NotReady),
+    /// [`OutputTooLarge`](ErrorReason::OutputTooLarge),
+    /// [`Stdin`](ErrorReason::Stdin), and a non-`PermissionDenied`
+    /// [`Io`](ErrorReason::Io). Mirrors [`std::io::ErrorKind::Other`]: a genuine
+    /// but uncategorized backend/IO failure. Read [`Error::reason`] to tell them
+    /// apart when it matters.
+    Other,
+}
+
+impl ErrorKind {
+    /// This kind's **stable machine identifier**: a short, lowercase
+    /// `snake_case` string (`"not_found"`, `"permission_denied"`, `"exit"`, …)
+    /// that is part of the crate's compatibility surface.
+    ///
+    /// Use it for machine-readable output — a CLI's JSONL schema, a
+    /// cross-language binding, a structured log field — where a consumer needs
+    /// one canonical spelling per kind instead of hand-maintaining its own
+    /// mapping table. It is a *diagnostic* name, **not** a wire/serialization
+    /// format, but it is held stable all the same: a **new** kind gets a **new**
+    /// identifier, and an existing identifier is **never renamed** without a
+    /// major release.
+    ///
+    /// There is deliberately **no** `from_name` inverse: an `ErrorKind` is a
+    /// classification the crate *reports*, never one supplied back to it (the
+    /// same asymmetry as [`Outcome::name`](crate::Outcome::name)).
+    pub fn name(&self) -> &'static str {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new kind is a compile error here, so it can never
+        // silently ship without a stable identifier.
+        match self {
+            ErrorKind::NotFound => "not_found",
+            ErrorKind::Spawn => "spawn",
+            ErrorKind::PermissionDenied => "permission_denied",
+            ErrorKind::Unsupported => "unsupported",
+            ErrorKind::Timeout => "timeout",
+            ErrorKind::Cancelled => "cancelled",
+            ErrorKind::Exit => "exit",
+            ErrorKind::Signalled => "signalled",
+            ErrorKind::Other => "other",
+            #[cfg(feature = "limits")]
+            ErrorKind::ResourceLimit => "resource_limit",
+        }
+    }
+}
+
+/// The overflow counters carried by an
+/// [`OutputTooLarge`](ErrorReason::OutputTooLarge) failure, read through
+/// [`Error::output_overflow`] / [`ErrorReason::output_overflow`] without
+/// destructuring the `#[non_exhaustive]` variant.
+///
+/// A single grouped snapshot rather than four scalar accessors, because the two
+/// ceilings are themselves `Option` (`None` = that axis had no cap): a bare
+/// `Option<usize>` accessor could not tell "not an `OutputTooLarge`" apart from
+/// "`OutputTooLarge` with no line cap". You only hold an `OutputOverflow` when
+/// the error *was* an overflow, so the ceilings read as their honest `Option`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OutputOverflow {
+    total_lines: usize,
+    total_bytes: usize,
+    max_lines: Option<usize>,
+    max_bytes: Option<usize>,
+}
+
+impl OutputOverflow {
+    /// Total lines that arrived, retained **plus** dropped —
+    /// [`OutputTooLarge::total_lines`](ErrorReason::OutputTooLarge).
+    pub fn total_lines(&self) -> usize {
+        self.total_lines
+    }
+
+    /// Total raw bytes read from the output pipe, retained **plus** dropped,
+    /// including line terminators and pre-decode invalid-UTF-8 bytes —
+    /// [`OutputTooLarge::total_bytes`](ErrorReason::OutputTooLarge). The same raw
+    /// pipe-byte accounting as
+    /// [`stdout_bytes_seen`](crate::RunningProcess::stdout_bytes_seen) /
+    /// [`stderr_bytes_seen`](crate::RunningProcess::stderr_bytes_seen).
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    /// The configured line ceiling
+    /// ([`OutputBufferPolicy::max_lines`](crate::OutputBufferPolicy::max_lines)),
+    /// or `None` when only a byte ceiling was set —
+    /// [`OutputTooLarge::max_lines`](ErrorReason::OutputTooLarge).
+    pub fn max_lines(&self) -> Option<usize> {
+        self.max_lines
+    }
+
+    /// The configured byte ceiling
+    /// ([`OutputBufferPolicy::max_bytes`](crate::OutputBufferPolicy::max_bytes)),
+    /// or `None` when only a line ceiling was set —
+    /// [`OutputTooLarge::max_bytes`](ErrorReason::OutputTooLarge).
+    pub fn max_bytes(&self) -> Option<usize> {
+        self.max_bytes
+    }
+}
+
 impl ErrorReason {
+    /// This failure's [`ErrorKind`] — its **total** classification into one
+    /// coarse routing bucket. Every variant maps to exactly one kind through an
+    /// exhaustive `match` (no catch-all), so a future variant cannot ship
+    /// without a deliberate kind. The classification is *derived* from each
+    /// variant's existing semantics, not invented:
+    ///
+    /// - [`NotFound`](ErrorReason::NotFound) → [`ErrorKind::NotFound`];
+    /// - [`Spawn`](ErrorReason::Spawn) → [`ErrorKind::PermissionDenied`] when its
+    ///   `source` is a `PermissionDenied`, else [`ErrorKind::Spawn`];
+    /// - [`Io`](ErrorReason::Io) → [`ErrorKind::PermissionDenied`] when its inner
+    ///   error is a `PermissionDenied`, else [`ErrorKind::Other`] (matching
+    ///   [`is_permission_denied`](Self::is_permission_denied)'s `Spawn`/`Io`
+    ///   scope);
+    /// - [`Timeout`](ErrorReason::Timeout) → [`ErrorKind::Timeout`],
+    ///   [`Cancelled`](ErrorReason::Cancelled) → [`ErrorKind::Cancelled`],
+    ///   [`Exit`](ErrorReason::Exit) → [`ErrorKind::Exit`],
+    ///   [`Signalled`](ErrorReason::Signalled) → [`ErrorKind::Signalled`],
+    ///   [`Unsupported`](ErrorReason::Unsupported) → [`ErrorKind::Unsupported`];
+    /// - `ErrorReason::ResourceLimit` → `ErrorKind::ResourceLimit` (`limits`
+    ///   feature; bare code spans, not intra-doc links, because the variant is
+    ///   absent from a `--no-default-features` build);
+    /// - [`CassetteMiss`](ErrorReason::CassetteMiss),
+    ///   [`Parse`](ErrorReason::Parse), [`NotReady`](ErrorReason::NotReady),
+    ///   [`OutputTooLarge`](ErrorReason::OutputTooLarge),
+    ///   [`Stdin`](ErrorReason::Stdin) → [`ErrorKind::Other`].
+    ///
+    /// This is a *routing* answer, **not** a replacement for matching the
+    /// variant: for the exit code, captured streams, timeout duration, or which
+    /// limit failed, read the variant (or the payload accessors) directly.
+    pub fn kind(&self) -> ErrorKind {
+        // Exhaustive on purpose (no `_` arm) though the enum is
+        // `#[non_exhaustive]`: within the defining crate a new variant is a
+        // compile error here, forcing a deliberate kind rather than silently
+        // falling into a catch-all bucket.
+        match self {
+            ErrorReason::NotFound { .. } => ErrorKind::NotFound,
+            ErrorReason::Spawn { source, .. } => {
+                if source.kind() == std::io::ErrorKind::PermissionDenied {
+                    ErrorKind::PermissionDenied
+                } else {
+                    ErrorKind::Spawn
+                }
+            }
+            ErrorReason::Io(source) => {
+                if source.kind() == std::io::ErrorKind::PermissionDenied {
+                    ErrorKind::PermissionDenied
+                } else {
+                    ErrorKind::Other
+                }
+            }
+            ErrorReason::Timeout { .. } => ErrorKind::Timeout,
+            ErrorReason::Cancelled { .. } => ErrorKind::Cancelled,
+            ErrorReason::Exit { .. } => ErrorKind::Exit,
+            ErrorReason::Signalled { .. } => ErrorKind::Signalled,
+            ErrorReason::Unsupported { .. } => ErrorKind::Unsupported,
+            ErrorReason::CassetteMiss { .. }
+            | ErrorReason::OutputTooLarge { .. }
+            | ErrorReason::NotReady { .. }
+            | ErrorReason::Parse { .. }
+            | ErrorReason::Stdin { .. } => ErrorKind::Other,
+            #[cfg(feature = "limits")]
+            ErrorReason::ResourceLimit { .. } => ErrorKind::ResourceLimit,
+        }
+    }
+
     /// The best human-facing message for a failed run, trimmed of surrounding
     /// whitespace: captured standard error if it carries text, otherwise the
     /// captured standard output (where `git` puts `CONFLICT …` and `git commit`
@@ -653,6 +890,104 @@ impl ErrorReason {
         }
     }
 
+    /// The run deadline that elapsed for a [`Timeout`](ErrorReason::Timeout);
+    /// `None` for every other variant. The payload twin of
+    /// [`is_timeout`](Self::is_timeout): reads
+    /// [`Timeout::timeout`](ErrorReason::Timeout) off the error without
+    /// destructuring the variant.
+    ///
+    /// Scoped to the **run** timeout only. A readiness-probe deadline
+    /// ([`NotReady`](ErrorReason::NotReady)) is a separate clock that never kills
+    /// the child, so it reads `None` here — matching
+    /// [`is_timeout`](Self::is_timeout)'s scoping; reach its `timeout` field
+    /// directly if you need it.
+    pub fn timeout_duration(&self) -> Option<Duration> {
+        // Exhaustive on purpose (like `code`/`signal`): a future timeout-carrying
+        // variant must add itself here, not fall through a `_`.
+        match self {
+            ErrorReason::Timeout { timeout, .. } => Some(*timeout),
+            ErrorReason::Spawn { .. }
+            | ErrorReason::NotFound { .. }
+            | ErrorReason::CassetteMiss { .. }
+            | ErrorReason::Exit { .. }
+            | ErrorReason::OutputTooLarge { .. }
+            | ErrorReason::NotReady { .. }
+            | ErrorReason::Parse { .. }
+            | ErrorReason::Unsupported { .. }
+            | ErrorReason::Cancelled { .. }
+            | ErrorReason::Signalled { .. }
+            | ErrorReason::Stdin { .. }
+            | ErrorReason::Io(_) => None,
+            #[cfg(feature = "limits")]
+            ErrorReason::ResourceLimit { .. } => None,
+        }
+    }
+
+    /// The overflow counters of an
+    /// [`OutputTooLarge`](ErrorReason::OutputTooLarge) failure as an
+    /// [`OutputOverflow`] snapshot (total lines/bytes plus the configured
+    /// ceilings); `None` for every other variant. Reads the fields off the error
+    /// without destructuring the `#[non_exhaustive]` variant.
+    pub fn output_overflow(&self) -> Option<OutputOverflow> {
+        // Exhaustive on purpose (like `code`/`signal`): a future variant must add
+        // itself here, not fall through a `_`.
+        match self {
+            ErrorReason::OutputTooLarge {
+                max_lines,
+                max_bytes,
+                total_lines,
+                total_bytes,
+                ..
+            } => Some(OutputOverflow {
+                total_lines: *total_lines,
+                total_bytes: *total_bytes,
+                max_lines: *max_lines,
+                max_bytes: *max_bytes,
+            }),
+            ErrorReason::Spawn { .. }
+            | ErrorReason::NotFound { .. }
+            | ErrorReason::CassetteMiss { .. }
+            | ErrorReason::Exit { .. }
+            | ErrorReason::Timeout { .. }
+            | ErrorReason::NotReady { .. }
+            | ErrorReason::Parse { .. }
+            | ErrorReason::Unsupported { .. }
+            | ErrorReason::Cancelled { .. }
+            | ErrorReason::Signalled { .. }
+            | ErrorReason::Stdin { .. }
+            | ErrorReason::Io(_) => None,
+            #[cfg(feature = "limits")]
+            ErrorReason::ResourceLimit { .. } => None,
+        }
+    }
+
+    /// The operation description of an
+    /// [`Unsupported`](ErrorReason::Unsupported) failure (e.g. `"signal(Hup)"`,
+    /// `"suspend"`); `None` for every other variant. Reads
+    /// [`Unsupported::operation`](ErrorReason::Unsupported) off the error without
+    /// destructuring the variant.
+    pub fn unsupported_operation(&self) -> Option<&str> {
+        // Exhaustive on purpose (like `code`/`signal`): a future variant must add
+        // itself here, not fall through a `_`.
+        match self {
+            ErrorReason::Unsupported { operation } => Some(operation),
+            ErrorReason::Spawn { .. }
+            | ErrorReason::NotFound { .. }
+            | ErrorReason::CassetteMiss { .. }
+            | ErrorReason::Exit { .. }
+            | ErrorReason::Timeout { .. }
+            | ErrorReason::OutputTooLarge { .. }
+            | ErrorReason::NotReady { .. }
+            | ErrorReason::Parse { .. }
+            | ErrorReason::Cancelled { .. }
+            | ErrorReason::Signalled { .. }
+            | ErrorReason::Stdin { .. }
+            | ErrorReason::Io(_) => None,
+            #[cfg(feature = "limits")]
+            ErrorReason::ResourceLimit { .. } => None,
+        }
+    }
+
     /// Which limit a [`ResourceLimit`](ErrorReason::ResourceLimit) failure is about;
     /// `None` for every other variant. Reads the field off the error without
     /// destructuring the `#[non_exhaustive]` variant.
@@ -815,6 +1150,14 @@ impl Error {
         *self.reason
     }
 
+    /// This failure's [`ErrorKind`] — its total classification into one coarse
+    /// routing bucket. See [`ErrorReason::kind`] for the full mapping. A routing
+    /// answer, not a replacement for [`reason`](Self::reason) when you need the
+    /// details.
+    pub fn kind(&self) -> ErrorKind {
+        self.reason.kind()
+    }
+
     /// The best human-facing message for a failed run — see
     /// [`ErrorReason::diagnostic`].
     pub fn diagnostic(&self) -> Option<&str> {
@@ -878,6 +1221,24 @@ impl Error {
     /// [`ErrorReason::signal`].
     pub fn signal(&self) -> Option<i32> {
         self.reason.signal()
+    }
+
+    /// The run deadline that elapsed for a timeout — see
+    /// [`ErrorReason::timeout_duration`].
+    pub fn timeout_duration(&self) -> Option<Duration> {
+        self.reason.timeout_duration()
+    }
+
+    /// The overflow counters of an output-too-large failure — see
+    /// [`ErrorReason::output_overflow`].
+    pub fn output_overflow(&self) -> Option<OutputOverflow> {
+        self.reason.output_overflow()
+    }
+
+    /// The operation description of an unsupported-operation failure — see
+    /// [`ErrorReason::unsupported_operation`].
+    pub fn unsupported_operation(&self) -> Option<&str> {
+        self.reason.unsupported_operation()
     }
 
     /// Which limit a [`ResourceLimit`](ErrorReason::ResourceLimit) failure is
@@ -2355,5 +2716,291 @@ mod tests {
             ErrorReason::Parse { program, message }
                 if program == "git" && message == "unexpected token"
         ));
+    }
+
+    fn output_too_large() -> ErrorReason {
+        ErrorReason::OutputTooLarge {
+            program: "noisy".into(),
+            max_lines: Some(100),
+            max_bytes: None,
+            total_lines: 250,
+            total_bytes: 9001,
+        }
+    }
+
+    #[test]
+    fn kind_pins_the_classification_for_every_error_reason_variant() {
+        use std::io::ErrorKind as IoKind;
+
+        // One pin per source `ErrorReason` variant — the total classification is
+        // derived from each variant's existing semantics, never invented.
+        assert_eq!(
+            ErrorReason::NotFound {
+                program: "x".into(),
+                searched: None,
+            }
+            .kind(),
+            ErrorKind::NotFound
+        );
+        // Spawn splits on its io source: a permission denial is its own kind, any
+        // other launch failure (here a bad cwd -> NotFound io kind) is `Spawn`.
+        assert_eq!(spawn(IoKind::NotFound).kind(), ErrorKind::Spawn);
+        assert_eq!(
+            spawn(IoKind::PermissionDenied).kind(),
+            ErrorKind::PermissionDenied
+        );
+        // Io splits the same way: a permission denial is `PermissionDenied`, any
+        // other crate-internal IO error is the catch-all `Other`.
+        assert_eq!(
+            ErrorReason::Io(std::io::Error::from(IoKind::PermissionDenied)).kind(),
+            ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            ErrorReason::Io(std::io::Error::from(IoKind::BrokenPipe)).kind(),
+            ErrorKind::Other
+        );
+        assert_eq!(
+            ErrorReason::CassetteMiss {
+                program: "x".into()
+            }
+            .kind(),
+            ErrorKind::Other
+        );
+        assert_eq!(Error::exit("git", 1, "", "").kind(), ErrorKind::Exit);
+        assert_eq!(
+            Error::timeout("git", Duration::from_secs(1), "", "").kind(),
+            ErrorKind::Timeout
+        );
+        assert_eq!(output_too_large().kind(), ErrorKind::Other);
+        assert_eq!(
+            ErrorReason::NotReady {
+                program: "server".into(),
+                timeout: Duration::from_secs(1),
+            }
+            .kind(),
+            ErrorKind::Other
+        );
+        assert_eq!(
+            ErrorReason::Parse {
+                program: "jq".into(),
+                message: "boom".into(),
+            }
+            .kind(),
+            ErrorKind::Other
+        );
+        assert_eq!(
+            ErrorReason::Unsupported {
+                operation: "suspend".into(),
+            }
+            .kind(),
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            ErrorReason::Cancelled {
+                program: "job".into(),
+            }
+            .kind(),
+            ErrorKind::Cancelled
+        );
+        assert_eq!(
+            Error::signalled("git", Some(9), "", "").kind(),
+            ErrorKind::Signalled
+        );
+        assert_eq!(
+            Error::stdin("git", std::io::Error::from(IoKind::Other)).kind(),
+            ErrorKind::Other
+        );
+
+        #[cfg(feature = "limits")]
+        assert_eq!(
+            ErrorReason::ResourceLimit {
+                kind: crate::limits::LimitKind::Memory,
+                reason: crate::limits::LimitReason::Unsupported,
+                detail: "no container".into(),
+            }
+            .kind(),
+            ErrorKind::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn kind_matches_what_every_crate_error_constructor_produces() {
+        use std::io::ErrorKind as IoKind;
+
+        // The crate's own error factories each land in the expected род.
+        assert_eq!(Error::exit("git", 2, "o", "e").kind(), ErrorKind::Exit);
+        assert_eq!(
+            Error::timeout("git", Duration::from_secs(3), "o", "e").kind(),
+            ErrorKind::Timeout
+        );
+        assert_eq!(
+            Error::signalled("git", None, "o", "e").kind(),
+            ErrorKind::Signalled
+        );
+        assert_eq!(
+            Error::spawn("git", std::io::Error::from(IoKind::NotFound)).kind(),
+            ErrorKind::Spawn
+        );
+        assert_eq!(
+            Error::spawn("git", std::io::Error::from(IoKind::PermissionDenied)).kind(),
+            ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            Error::not_found("git", Some("/usr/bin".into())).kind(),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            Error::stdin("git", std::io::Error::from(IoKind::BrokenPipe)).kind(),
+            ErrorKind::Other
+        );
+        assert_eq!(Error::parse("git", "boom").kind(), ErrorKind::Other);
+        assert_eq!(
+            Error::io(std::io::Error::from(IoKind::InvalidInput)).kind(),
+            ErrorKind::Other
+        );
+        assert_eq!(
+            Error::io(std::io::Error::from(IoKind::PermissionDenied)).kind(),
+            ErrorKind::PermissionDenied
+        );
+        // The crate's own "stdout not piped" IO helper is a plain Other backend
+        // error, not a permission or spawn condition.
+        assert_eq!(stdout_not_piped_error("git").kind(), ErrorKind::Other);
+    }
+
+    #[test]
+    fn kind_stays_consistent_with_the_is_classifiers() {
+        use std::io::ErrorKind as IoKind;
+
+        // The new total род must agree with the existing point classifiers — a
+        // regression that drifts one from the other is caught here.
+        let cases: [Error; 6] = [
+            Error::not_found("x", None),
+            spawn(IoKind::PermissionDenied),
+            Error::timeout("x", Duration::from_secs(1), "", ""),
+            ErrorReason::Cancelled {
+                program: "x".into(),
+            }
+            .into(),
+            Error::signalled("x", None, "", ""),
+            Error::exit("x", 1, "", ""),
+        ];
+        for err in &cases {
+            assert_eq!(err.is_not_found(), err.kind() == ErrorKind::NotFound);
+            assert_eq!(
+                err.is_permission_denied(),
+                err.kind() == ErrorKind::PermissionDenied
+            );
+            assert_eq!(err.is_timeout(), err.kind() == ErrorKind::Timeout);
+            assert_eq!(err.is_cancelled(), err.kind() == ErrorKind::Cancelled);
+            assert_eq!(err.is_signalled(), err.kind() == ErrorKind::Signalled);
+        }
+    }
+
+    #[test]
+    fn error_kind_name_is_a_stable_identifier_per_kind() {
+        assert_eq!(ErrorKind::NotFound.name(), "not_found");
+        assert_eq!(ErrorKind::Spawn.name(), "spawn");
+        assert_eq!(ErrorKind::PermissionDenied.name(), "permission_denied");
+        assert_eq!(ErrorKind::Unsupported.name(), "unsupported");
+        assert_eq!(ErrorKind::Timeout.name(), "timeout");
+        assert_eq!(ErrorKind::Cancelled.name(), "cancelled");
+        assert_eq!(ErrorKind::Exit.name(), "exit");
+        assert_eq!(ErrorKind::Signalled.name(), "signalled");
+        assert_eq!(ErrorKind::Other.name(), "other");
+        #[cfg(feature = "limits")]
+        assert_eq!(ErrorKind::ResourceLimit.name(), "resource_limit");
+    }
+
+    #[test]
+    fn timeout_duration_reads_only_the_run_timeout() {
+        let dur = Duration::from_millis(1500);
+        assert_eq!(
+            Error::timeout("git", dur, "", "").timeout_duration(),
+            Some(dur)
+        );
+        // A readiness-probe deadline is a separate clock and reads None here,
+        // exactly like `is_timeout()` returns false for it.
+        let not_ready = ErrorReason::NotReady {
+            program: "server".into(),
+            timeout: Duration::from_secs(9),
+        };
+        assert_eq!(not_ready.timeout_duration(), None);
+        assert!(!not_ready.is_timeout());
+        // Every other variant reports None too.
+        assert_eq!(Error::exit("git", 1, "", "").timeout_duration(), None);
+        assert_eq!(Error::not_found("git", None).timeout_duration(), None);
+    }
+
+    #[test]
+    fn output_overflow_snapshots_the_ceiling_counters() {
+        let overflow = output_too_large().output_overflow().expect("some");
+        assert_eq!(overflow.total_lines(), 250);
+        assert_eq!(overflow.total_bytes(), 9001);
+        assert_eq!(overflow.max_lines(), Some(100));
+        // `None` here is an honest "no byte ceiling was set", distinguishable
+        // from a non-overflow error's `output_overflow() == None` (the reason the
+        // accessor returns a struct, not four scalar `Option<usize>`s).
+        assert_eq!(overflow.max_bytes(), None);
+
+        // Every non-overflow variant reports None.
+        assert_eq!(Error::exit("git", 1, "", "").output_overflow(), None);
+        assert_eq!(
+            Error::timeout("git", Duration::from_secs(1), "", "").output_overflow(),
+            None
+        );
+    }
+
+    #[test]
+    fn unsupported_operation_reads_only_the_unsupported_variant() {
+        let err = ErrorReason::Unsupported {
+            operation: "signal(Hup)".into(),
+        };
+        assert_eq!(err.unsupported_operation(), Some("signal(Hup)"));
+        // Every other variant reports None.
+        assert_eq!(Error::exit("git", 1, "", "").unsupported_operation(), None);
+        assert_eq!(
+            ErrorReason::Cancelled {
+                program: "job".into()
+            }
+            .unsupported_operation(),
+            None
+        );
+    }
+
+    #[test]
+    fn error_wrapper_delegates_kind_and_payload_accessors_to_the_reason() {
+        // The pointer-sized `Error` wrapper mirrors every new accessor to its
+        // inner `ErrorReason`, exactly like the existing `code`/`signal` delegates.
+        let timeout: Error = ErrorReason::Timeout {
+            program: "git".into(),
+            timeout: Duration::from_secs(2),
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_bytes: None,
+        }
+        .into();
+        assert_eq!(timeout.kind(), timeout.reason().kind());
+        assert_eq!(timeout.kind(), ErrorKind::Timeout);
+        assert_eq!(
+            timeout.timeout_duration(),
+            timeout.reason().timeout_duration()
+        );
+
+        let overflow: Error = output_too_large().into();
+        assert_eq!(
+            overflow.output_overflow(),
+            overflow.reason().output_overflow()
+        );
+        assert_eq!(overflow.kind(), ErrorKind::Other);
+
+        let unsupported: Error = ErrorReason::Unsupported {
+            operation: "suspend".into(),
+        }
+        .into();
+        assert_eq!(
+            unsupported.unsupported_operation(),
+            unsupported.reason().unsupported_operation()
+        );
+        assert_eq!(unsupported.kind(), ErrorKind::Unsupported);
     }
 }
