@@ -845,7 +845,8 @@ impl ErrorReason {
             | ErrorReason::Cancelled { program }
             | ErrorReason::Signalled { program, .. }
             | ErrorReason::Stdin { program, .. } => Some(program),
-            ErrorReason::Unsupported { .. } | ErrorReason::Predicate { .. }
+            ErrorReason::Unsupported { .. }
+            | ErrorReason::Predicate { .. }
             | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
             ErrorReason::ResourceLimit { .. } => None,

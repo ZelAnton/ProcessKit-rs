@@ -490,7 +490,10 @@ impl Rule {
     /// a [`TryPredicate`](Rule::TryPredicate) may return `Err` — the predicate's
     /// own error, which `matched_reply` turns into an
     /// [`ErrorReason::Predicate`](crate::ErrorReason::Predicate) and propagates.
-    fn matches(&self, command: &Command) -> std::result::Result<bool, crate::error::PredicateError> {
+    fn matches(
+        &self,
+        command: &Command,
+    ) -> std::result::Result<bool, crate::error::PredicateError> {
         match self {
             // Match the program *and* the argument prefix, so `.on(["git",
             // "status"])` answers for `git status …` but not `rm status`. An empty

@@ -69,8 +69,11 @@ const MIN_HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(1);
 /// [`ErrorReason::Predicate`](crate::ErrorReason::Predicate). One storage shape
 /// serves both so the drive loop consults a single probe field.
 type HealthProbe = Box<
-    dyn Fn() -> Pin<Box<dyn Future<Output = std::result::Result<bool, crate::error::PredicateError>> + Send>>
-        + Send
+    dyn Fn() -> Pin<
+            Box<
+                dyn Future<Output = std::result::Result<bool, crate::error::PredicateError>> + Send,
+            >,
+        > + Send
         + Sync,
 >;
 
@@ -157,7 +160,9 @@ enum Incarnation {
     /// `select!` branch drops `run_to_result`, releasing its `CurrentGuard` and
     /// the child's kill-on-drop handle synchronously — no leak on this exit path),
     /// but supervision **aborts** with this error rather than restarting.
-    LivenessError { source: crate::error::PredicateError },
+    LivenessError {
+        source: crate::error::PredicateError,
+    },
 }
 
 /// What the supervision loop should do after a restart-eligible incarnation
@@ -820,14 +825,24 @@ pub struct Supervisor<R: ProcessRunner = JobRunner> {
     /// consults one field; an infallible predicate simply never resolves `Err`.
     #[allow(clippy::type_complexity)]
     stop_when: Option<
-        Box<dyn Fn(&ProcessResult<String>) -> std::result::Result<bool, crate::error::PredicateError> + Send + Sync>,
+        Box<
+            dyn Fn(
+                    &ProcessResult<String>,
+                ) -> std::result::Result<bool, crate::error::PredicateError>
+                + Send
+                + Sync,
+        >,
     >,
     /// The permanent-failure classifier; see [`give_up_when`](Self::give_up_when) /
     /// [`try_give_up_when`](Self::try_give_up_when). Stored fallible like
     /// [`stop_when`](Self::stop_when).
     #[allow(clippy::type_complexity)]
     give_up_when: Option<
-        Box<dyn Fn(&GiveUpAttempt<'_>) -> std::result::Result<bool, crate::error::PredicateError> + Send + Sync>,
+        Box<
+            dyn Fn(&GiveUpAttempt<'_>) -> std::result::Result<bool, crate::error::PredicateError>
+                + Send
+                + Sync,
+        >,
     >,
     /// The output-capture policy applied to every incarnation. Defaults to a
     /// bounded tail (see [`default_supervision_capture`]); override with
@@ -1095,12 +1110,17 @@ impl<R: ProcessRunner> Supervisor<R> {
     #[must_use]
     pub fn try_stop_when<E>(
         mut self,
-        predicate: impl Fn(&ProcessResult<String>) -> std::result::Result<bool, E> + Send + Sync + 'static,
+        predicate: impl Fn(&ProcessResult<String>) -> std::result::Result<bool, E>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self
     where
         E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
     {
-        self.stop_when = Some(Box::new(move |result| predicate(result).map_err(Into::into)));
+        self.stop_when = Some(Box::new(move |result| {
+            predicate(result).map_err(Into::into)
+        }));
         self
     }
 
@@ -1172,7 +1192,9 @@ impl<R: ProcessRunner> Supervisor<R> {
     where
         E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
     {
-        self.give_up_when = Some(Box::new(move |attempt| classifier(attempt).map_err(Into::into)));
+        self.give_up_when = Some(Box::new(move |attempt| {
+            classifier(attempt).map_err(Into::into)
+        }));
         self
     }
 
@@ -1766,9 +1788,7 @@ impl<R: ProcessRunner> Supervisor<R> {
         factor: f64,
         shared: &SessionShared,
     ) -> GateOutcome {
-        if crashed
-            && let Some(classifier) = &self.give_up_when
-        {
+        if crashed && let Some(classifier) = &self.give_up_when {
             match classifier(&GiveUpAttempt::Crashed(result)) {
                 Ok(true) => return GateOutcome::GaveUp,
                 // Not permanent — restart per policy, as infallible `false` does.
