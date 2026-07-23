@@ -1,7 +1,7 @@
 //! The scripted backend: canned "child" doubles that feed the same pump
 //! machinery a real [`RealProc`](super::RealProc) does, so hermetic test doubles
 //! exercise the exact code paths a live run does. Only [`crate::doubles`] and
-//! [`crate::cassette`] construct these — they reach in via the narrow surface
+//! `crate::cassette` construct these — they reach in via the narrow surface
 //! re-exported from [`super`] ([`ScriptedProc`], [`ScriptedResultInfo`],
 //! [`split_pump_lines`], and [`RunningProcess::from_scripted`]).
 
@@ -171,11 +171,11 @@ pub(crate) struct ScriptedProc {
     exit_at: Option<tokio::time::Instant>,
     /// Whether this double models a [`use_pty`](crate::Command::use_pty) run, set
     /// by [`from_scripted`](RunningProcess::from_scripted). Gates the hermetic
-    /// [`resize`](Self::resize) model so a non-PTY scripted handle refuses a
+    /// [`RunningProcess::resize_pty`] model so a non-PTY scripted handle refuses a
     /// resize exactly as a real non-PTY one does.
     #[cfg(feature = "pty")]
     pty: bool,
-    /// Every `(cols, rows)` accepted by [`resize`](Self::resize), in call order —
+    /// Every `(cols, rows)` accepted by [`RunningProcess::resize_pty`], in call order —
     /// the hermetic model of a live PTY resize (no real pty). Lets a test observe
     /// that a resize was delivered, and in what geometry.
     #[cfg(feature = "pty")]

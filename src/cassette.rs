@@ -1082,7 +1082,7 @@ enum Mode<R> {
 ///   missed the cassette entirely.
 /// - The replayed result carries the *replaying* command's
 ///   [`timeout`](Command::timeout), so a recorded timed-out run surfaces as
-///   [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) with the real deadline.
+///   [`ErrorReason::Timeout`] with the real deadline.
 /// - Covers the **text and streaming verbs**: `output_string` replays the
 ///   captured result, and [`start`](crate::ProcessRunner::start) replays the
 ///   recorded output through a scripted [`RunningProcess`](crate::RunningProcess)
@@ -1096,7 +1096,7 @@ enum Mode<R> {
 ///   never comes; bound it with a [`Command::timeout`](crate::Command::timeout), or
 ///   script it with a [`ScriptedRunner`](crate::testing::ScriptedRunner) instead).
 /// - **The runner's `output_bytes` verb is unsupported**
-///   ([`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported)) in both modes: a cassette
+///   ([`ErrorReason::Unsupported`]) in both modes: a cassette
 ///   stores lossy-UTF-8 text and cannot reproduce the exact raw bytes that verb
 ///   promises — capture bytes from a real or scripted runner. (This guards the
 ///   convenient default route, which would otherwise re-encode the recorded text

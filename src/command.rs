@@ -330,7 +330,7 @@ impl Command {
     /// the child's own working directory once [`current_dir`](Self::current_dir)
     /// is also set.
     ///
-    /// If resolution fails everywhere, [`ErrorReason::NotFound`](crate::ErrorReason::NotFound)'s
+    /// If resolution fails everywhere, [`ErrorReason::NotFound`]'s
     /// `searched` includes these directories — first, in priority order — ahead
     /// of the `PATH` directories, so the diagnostic doesn't hide that they were
     /// checked too.
@@ -445,7 +445,7 @@ impl Command {
     /// [`gid`](Self::gid) — the group id is set **before** the user id (once
     /// the uid drops, changing gid is no longer permitted), an ordering the
     /// standard library guarantees. On non-Unix targets the run fails with
-    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) — a requested
+    /// [`ErrorReason::Unsupported`] — a requested
     /// privilege drop is never silently skipped.
     ///
     /// **Linux cgroup caveat:** under the cgroup v2 mechanism
@@ -481,7 +481,7 @@ impl Command {
     /// Ordering is handled for you: the OS applies `setgroups` → `setgid` →
     /// `setuid` (groups and gid must be set while still privileged, before the
     /// uid drops). On non-Unix targets the run fails with
-    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) — never silently
+    /// [`ErrorReason::Unsupported`] — never silently
     /// skipped. The Linux cgroup-v2 caveat from [`uid`](Self::uid) applies
     /// unchanged.
     pub fn groups(mut self, gids: impl AsRef<[u32]>) -> Self {
@@ -495,7 +495,7 @@ impl Command {
     /// Containment is preserved: the group tracks the new session's process
     /// group (whose id is the child's pid), so kill-on-drop and the teardown
     /// verbs still reach it. On non-Unix targets the run fails with
-    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported).
+    /// [`ErrorReason::Unsupported`].
     ///
     /// Honored by the `Command`-driven launch paths (`run`/`output_*`/
     /// `start`, [`ProcessGroup::start`](crate::ProcessGroup::start),
@@ -517,7 +517,7 @@ impl Command {
     /// a priority-class flag OR'd into `creation_flags`, the same seam as
     /// [`create_no_window`](Self::create_no_window). Unlike the privilege
     /// builders this never yields
-    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) — see
+    /// [`ErrorReason::Unsupported`] — see
     /// [`Priority`](crate::Priority) for why both platforms cover every
     /// variant, and the Unix caveat that lowering `nice` below its inherited
     /// value — [`Priority::AboveNormal`](crate::Priority::AboveNormal)/
@@ -538,7 +538,7 @@ impl Command {
     /// `pre_exec` seam as [`priority`](Self::priority) and
     /// [`umask`](Self::umask). Linux is the only supported platform: Windows,
     /// macOS, BSD, and other Unix targets fail with
-    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) rather than
+    /// [`ErrorReason::Unsupported`] rather than
     /// silently inheriting the caller's I/O priority. See [`IoPriority`](crate::IoPriority)
     /// for the Linux classes, data range, and privilege caveat.
     ///
@@ -556,7 +556,7 @@ impl Command {
     /// Applied via `pre_exec`, alongside [`setsid`](Self::setsid)/
     /// [`groups`](Self::groups) — another knob on that same seam. On
     /// non-Unix targets the run fails with
-    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) rather than
+    /// [`ErrorReason::Unsupported`] rather than
     /// silently ignoring the requested mask. Only the low permission bits are
     /// meaningful (as with the `umask(2)` syscall itself); pass the value you
     /// would give the `umask` shell builtin, e.g. `0o022`.
@@ -861,7 +861,7 @@ impl Command {
     ///
     /// Outside a [`Pipeline`](crate::Pipeline) this is a **no-op**: a single
     /// run's status is already plain data in its
-    /// [`ProcessResult`](crate::ProcessResult), and
+    /// [`ProcessResult`], and
     /// [`ensure_success`](crate::ProcessResult::ensure_success) stays opt-in
     /// — `unchecked` does not relax it, nor a whole-chain
     /// [`Pipeline::timeout`](crate::Pipeline::timeout).
@@ -975,7 +975,7 @@ impl Command {
 
     /// Treat these exit codes (not just `0`) as success for the checking verbs —
     /// [`run`](Self::run) (and `run_unit`/`checked` via
-    /// [`ProcessRunnerExt`](crate::ProcessRunnerExt)) and
+    /// [`ProcessRunnerExt`]) and
     /// [`ProcessResult::ensure_success`] / [`is_success`](ProcessResult::is_success).
     /// For tools whose non-zero exit is a normal result — `grep` (1 = no match),
     /// `diff` (1 = differs), rsync's code families — so callers don't hand-match.
@@ -996,7 +996,7 @@ impl Command {
     /// Tie this run to `token`: cancelling it kills the process tree and makes
     /// every consuming path (`run`/`output_string`/`output_bytes`/`wait`/
     /// `exit_code`/`probe`/`profile`/`finish` and the streamed
-    /// finishers) resolve to [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled).
+    /// finishers) resolve to [`ErrorReason::Cancelled`].
     /// In a [`Pipeline`](crate::Pipeline), a token on any stage cancels that
     /// stage and the cancellation errors the whole pipeline (the private
     /// pipeline group tears the other stages down).
@@ -1017,7 +1017,7 @@ impl Command {
     /// pre-spawn short-circuit. A mid-run cancel during
     /// [`wait_for_line`](crate::RunningProcess::wait_for_line), by contrast,
     /// closes the stream and surfaces as that probe's
-    /// [`ErrorReason::NotReady`](crate::ErrorReason::NotReady), not `Cancelled` — the
+    /// [`ErrorReason::NotReady`], not `Cancelled` — the
     /// consuming finisher afterwards still reports `Cancelled`.
     ///
     /// A cancelled run is never retried: [`retry`](Self::retry) policies and
@@ -1041,10 +1041,10 @@ impl Command {
     ///
     /// Applies to the **success-checking** helpers —
     /// `run`/`run_unit`/`checked`/`exit_code`/`probe`/`parse`/`try_parse` — on
-    /// [`Command`](Self::run), on [`ProcessRunnerExt`](crate::ProcessRunnerExt),
+    /// [`Command`](Self::run), on [`ProcessRunnerExt`],
     /// and on [`CliClient`](crate::CliClient): the ones that surface failure as an
     /// [`Error`] the classifier can inspect (e.g. a transient network failure in
-    /// `stderr`, or [`ErrorReason::Timeout`](crate::ErrorReason::Timeout)). The non-erroring
+    /// `stderr`, or [`ErrorReason::Timeout`]). The non-erroring
     /// `output_string`/`output_bytes` paths don't retry.
     ///
     /// Each attempt **re-executes the whole command** — a fresh process. Only
@@ -1082,7 +1082,7 @@ impl Command {
     /// Use a reusable source (`from_string`/`from_bytes`/`from_file`/
     /// `from_iter_lines`) to retry unconditionally. (A one-shot source *re-run*
     /// outside this retry loop — a `Supervisor` incarnation, a pipeline re-run —
-    /// does fail loud with [`ErrorReason::Io`](crate::ErrorReason::Io) `InvalidInput` at
+    /// does fail loud with [`ErrorReason::Io`] `InvalidInput` at
     /// launch instead.)
     ///
     /// **Inert outside the success-checking verbs.** A `retry` policy is
@@ -1202,7 +1202,7 @@ impl Command {
     /// interactive pipe. Setting `inherit_stdin` **and** one of those is a
     /// contradiction (feed the child a source *and* let it read the terminal?),
     /// so it is rejected at the launch boundary with a typed
-    /// [`ErrorReason::Io`](crate::ErrorReason::Io) (`InvalidInput`) — the same failure mode
+    /// [`ErrorReason::Io`] (`InvalidInput`) — the same failure mode
     /// as the other stdin misconfiguration the crate refuses (re-running a
     /// consumed one-shot source) — rather than silently letting one win. Drop the
     /// other stdin knob to resolve it.
@@ -1263,7 +1263,7 @@ impl Command {
     }
 
     /// Set how the child's standard output stream is connected (default:
-    /// [`StdioMode::Piped`](crate::StdioMode::Piped)).
+    /// [`StdioMode::Piped`]).
     ///
     /// - **`Piped`** (default) — captured into a pipe; all output-retrieval
     ///   verbs (`output_string`, `stdout_lines`, …) read from it.
@@ -1284,7 +1284,7 @@ impl Command {
     }
 
     /// Set how the child's standard error stream is connected (default:
-    /// [`StdioMode::Piped`](crate::StdioMode::Piped)).
+    /// [`StdioMode::Piped`]).
     ///
     /// Same semantics as [`stdout`](Self::stdout): `Piped` captures,
     /// `Inherit` passes through, `Null` suppresses.
@@ -1558,7 +1558,7 @@ impl Command {
     /// so the value the policy returns (not the raw line) is what lands in the
     /// capture backlog and therefore in
     /// [`output_string`](crate::RunningProcess::output_string) /
-    /// [`ProcessResult`](crate::ProcessResult) and the streaming verbs
+    /// [`ProcessResult`] and the streaming verbs
     /// ([`stdout_lines`](crate::RunningProcess::stdout_lines) /
     /// [`events`](crate::RunningProcess::events)).
     ///
@@ -1571,7 +1571,7 @@ impl Command {
     /// redacts env *values*).
     ///
     /// A single whole-command knob (like [`output_buffer`](Self::output_buffer)):
-    /// the policy is handed the [`OutputStream`](crate::OutputStream) each line
+    /// the policy is handed the [`OutputStream`] each line
     /// came from, so one implementation can treat stdout and stderr differently.
     /// A repeat call replaces the previous policy (builder semantics).
     ///
@@ -1693,7 +1693,7 @@ impl Command {
     /// switches, and OSC title/hyperlink escapes: with this on, the line predicates
     /// ([`wait_for_line`](crate::RunningProcess::wait_for_line) / `first_line`),
     /// [`output_string`](crate::RunningProcess::output_string) /
-    /// [`ProcessResult`](crate::ProcessResult), and the streaming verbs
+    /// [`ProcessResult`], and the streaming verbs
     /// ([`stdout_lines`](crate::RunningProcess::stdout_lines) /
     /// [`events`](crate::RunningProcess::events)) all carry the de-escaped text.
     /// It drops CSI (`ESC [ … final`), OSC (`ESC ] … BEL/ST`), DCS/SOS/PM/APC
@@ -1713,7 +1713,7 @@ impl Command {
     /// [`capture_policy`](Self::capture_policy), sanitization runs **first** so a
     /// secret-scrubbing policy matches on already-cleaned text (a token cannot
     /// hide behind a color escape). A line past an
-    /// [`OutputBufferPolicy`](crate::OutputBufferPolicy) byte cap is judged on its
+    /// [`OutputBufferPolicy`] byte cap is judged on its
     /// **raw** length (before this transform) and, if over-cap, is never assembled
     /// — so, like the handlers/tee, sanitization never sees it.
     ///
@@ -1848,7 +1848,7 @@ impl Command {
     /// `PATH` away from the process `PATH` — an explicit `PATH` override/removal,
     /// [`env_clear`](Self::env_clear), or [`inherit_env`](Self::inherit_env)
     /// (which clears the inherited set). When true, the *`PATH`*-directory
-    /// naming in [`ErrorReason::NotFound`](crate::ErrorReason::NotFound) is skipped:
+    /// naming in [`ErrorReason::NotFound`] is skipped:
     /// `find_in_path` reads the *process* `PATH`, so against a custom child
     /// `PATH` that list would be wrong. [`prefer_local`](Self::prefer_local)
     /// directories are unaffected by this gate and still get named — they're
@@ -2250,7 +2250,7 @@ impl Command {
     /// [`timeout`](Self::timeout)/[`cancel_on`](Self::cancel_on)/
     /// [`timeout_grace`](Self::timeout_grace)/
     /// [`windows_graceful_ctrl_break`](Self::windows_graceful_ctrl_break) wiring —
-    /// you drive the bare [`tokio::process::Child`](tokio::process::Child) (draining
+    /// you drive the bare [`tokio::process::Child`] (draining
     /// its pipes, reaping it) yourself. On Windows,
     /// [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) re-sets the child's
     /// creation flags to make containment race-free, so a creation flag left on this
@@ -2262,8 +2262,8 @@ impl Command {
     ///
     /// The same preflight failures a normal launch would raise while resolving the
     /// program / opening a `stdout_file` redirect
-    /// ([`ErrorReason::Io`](crate::ErrorReason::Io)), plus
-    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) for a
+    /// ([`ErrorReason::Io`]), plus
+    /// [`ErrorReason::Unsupported`] for a
     /// Linux-only I/O-priority request on another platform.
     pub fn to_tokio_command(&self) -> Result<tokio::process::Command> {
         self.build_tokio()
@@ -2600,7 +2600,7 @@ impl Command {
     /// for everything else, `start`/`run`/`output_*` are what you want.
     ///
     /// The returned [`DetachedChild`] is a **separate, non-interchangeable type**
-    /// (not a [`RunningProcess`](crate::RunningProcess)) carrying nothing but the
+    /// (not a [`RunningProcess`]) carrying nothing but the
     /// [`pid`](DetachedChild::pid) — no `kill`, no timeout, no capture, no
     /// teardown — precisely because it is no longer contained.
     ///
@@ -2638,7 +2638,7 @@ impl Command {
     ///
     /// A detached child has no owner to enforce a timeout, no pump to capture
     /// output, and no interactive stdin, so a `Command` carrying any of those knobs
-    /// is refused with [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported)
+    /// is refused with [`ErrorReason::Unsupported`]
     /// naming it — **never** silently ignored (the same "fail loud, don't drop a
     /// requested behavior" contract as `uid`/`gid`/`umask` off Unix). The refused
     /// knobs are: [`timeout`](Self::timeout)/[`timeout_grace`](Self::timeout_grace),
@@ -2665,12 +2665,12 @@ impl Command {
     ///
     /// # Errors
     ///
-    /// - [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) — an
+    /// - [`ErrorReason::Unsupported`] — an
     ///   incompatible knob (above), or a POSIX-only privilege primitive requested
     ///   off Unix.
-    /// - [`ErrorReason::NotFound`](crate::ErrorReason::NotFound) — the program could
+    /// - [`ErrorReason::NotFound`] — the program could
     ///   not be located.
-    /// - [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) — the program was located
+    /// - [`ErrorReason::Spawn`] — the program was located
     ///   but the OS refused to start it (bad working directory, permission denied, a
     ///   Windows `.cmd`/`.bat` that needs `cmd.exe`, …).
     ///
@@ -2738,7 +2738,7 @@ impl Command {
 
     /// Reject a `Command` configuration [`spawn_detached`](Self::spawn_detached)
     /// cannot honor — loudly and typed, never silently ignored. Each incompatible
-    /// knob surfaces as [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported)
+    /// knob surfaces as [`ErrorReason::Unsupported`]
     /// naming it, matching the crate's precedent for a refused spawn-time request
     /// (`uid`/`gid`/`umask` off Unix).
     fn ensure_detach_compatible(&self) -> Result<()> {
@@ -2930,7 +2930,7 @@ impl Command {
     ///   a previous run.
     #[cfg_attr(
         feature = "limits",
-        doc = "- [`ErrorReason::ResourceLimit`](crate::ErrorReason::ResourceLimit) — a resource cap configured on the run's group could not be enforced."
+        doc = "- [`ErrorReason::ResourceLimit`] — a resource cap configured on the run's group could not be enforced."
     )]
     pub async fn start(&self) -> Result<RunningProcess> {
         JobRunner::new().start(self).await
@@ -2970,9 +2970,9 @@ impl Command {
 
     /// Run to completion and return just the exit code (output is discarded). A
     /// run that yields no code surfaces as an error — a timeout as
-    /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout), a signal-kill as
-    /// [`ErrorReason::Signalled`](crate::ErrorReason::Signalled) — consistent with
-    /// [`ProcessRunnerExt::exit_code`](crate::ProcessRunnerExt::exit_code) and
+    /// [`ErrorReason::Timeout`], a signal-kill as
+    /// [`ErrorReason::Signalled`] — consistent with
+    /// [`ProcessRunnerExt::exit_code`] and
     /// [`CliClient::exit_code`](crate::CliClient::exit_code).
     ///
     /// # Errors
@@ -2987,7 +2987,7 @@ impl Command {
 
     /// Run to completion, requiring an **accepted** exit (`0` by default, widened
     /// by [`ok_codes`](Self::ok_codes)), and return trimmed stdout. Any other
-    /// code is [`ErrorReason::Exit`](crate::ErrorReason::Exit).
+    /// code is [`ErrorReason::Exit`].
     ///
     /// # Errors
     ///
@@ -3007,7 +3007,7 @@ impl Command {
     /// captured [`ProcessResult`] (untrimmed stdout) — the building block when you
     /// need the whole result after success-checking rather than trimmed stdout
     /// ([`run`](Self::run)) or the raw result ([`output_string`](Self::output_string)).
-    /// Consistent with [`ProcessRunnerExt::checked`](crate::ProcessRunnerExt::checked)
+    /// Consistent with [`ProcessRunnerExt::checked`]
     /// and [`CliClient::checked`](crate::CliClient::checked).
     ///
     /// # Errors
@@ -3025,7 +3025,7 @@ impl Command {
 
     /// Run for the side effect: require an **accepted** exit (`0`, or any code in
     /// [`ok_codes`](Self::ok_codes)) and discard the output. Consistent with
-    /// [`ProcessRunnerExt::run_unit`](crate::ProcessRunnerExt::run_unit) and
+    /// [`ProcessRunnerExt::run_unit`] and
     /// [`CliClient::run_unit`](crate::CliClient::run_unit).
     ///
     /// # Errors
@@ -3040,8 +3040,8 @@ impl Command {
 
     /// Run a predicate command and read its exit code as a boolean: exit `0` →
     /// `Ok(true)`, exit `1` → `Ok(false)`, anything else → `Err` (any other code
-    /// as [`ErrorReason::Exit`], a timeout as [`ErrorReason::Timeout`](crate::ErrorReason::Timeout),
-    /// a signal-kill as [`ErrorReason::Signalled`](crate::ErrorReason::Signalled)). For tools
+    /// as [`ErrorReason::Exit`], a timeout as [`ErrorReason::Timeout`],
+    /// a signal-kill as [`ErrorReason::Signalled`]). For tools
     /// whose exit code *is* the answer —
     /// `git diff --quiet`, `git show-ref --verify --quiet`, `grep -q`, …
     ///
@@ -3059,7 +3059,7 @@ impl Command {
     /// Run (requiring an **accepted** exit) and feed stdout to an **infallible**
     /// `parse` closure, returning the parsed value. Fails loud on a bounded-buffer
     /// truncation so the parser never sees a clipped tail. Consistent with
-    /// [`ProcessRunnerExt::parse`](crate::ProcessRunnerExt::parse) and
+    /// [`ProcessRunnerExt::parse`] and
     /// [`CliClient::parse`](crate::CliClient::parse).
     ///
     /// # Errors
@@ -3079,16 +3079,16 @@ impl Command {
 
     /// Run (requiring an **accepted** exit) and feed stdout to a *fallible*
     /// `parse` closure (the JSON-deserialization shape; a failure becomes
-    /// [`ErrorReason::Parse`](crate::ErrorReason::Parse) or whatever the closure returns).
+    /// [`ErrorReason::Parse`] or whatever the closure returns).
     /// Fails loud on truncation. Consistent with
-    /// [`ProcessRunnerExt::try_parse`](crate::ProcessRunnerExt::try_parse) and
+    /// [`ProcessRunnerExt::try_parse`] and
     /// [`CliClient::try_parse`](crate::CliClient::try_parse).
     ///
     /// # Errors
     ///
     /// Everything [`parse`](Self::parse) can return, plus whatever the fallible
     /// `parse` closure yields on malformed output — typically
-    /// [`ErrorReason::Parse`](crate::ErrorReason::Parse).
+    /// [`ErrorReason::Parse`].
     pub async fn try_parse<T, F>(&self, parse: F) -> Result<T>
     where
         T: Send,
@@ -3150,7 +3150,7 @@ impl Command {
     ///
     /// # Errors
     ///
-    /// [`ErrorReason::NotFound`](crate::ErrorReason::NotFound) when the program can't be
+    /// [`ErrorReason::NotFound`] when the program can't be
     /// located — not installed, not on `PATH`, or a path that doesn't resolve to
     /// an executable. Its `searched` field lists the directories that were
     /// checked (`prefer_local` first, then `PATH`) for a bare-name lookup, and is
@@ -3466,7 +3466,7 @@ pub(crate) enum PathSource {
 
 /// The outcome of resolving a command's `program` to a concrete executable path
 /// **without spawning it** — the single decision the live launch path's
-/// [`ErrorReason::NotFound`](crate::ErrorReason::NotFound) enrichment (in `runner.rs`) and
+/// [`ErrorReason::NotFound`] enrichment (in `runner.rs`) and
 /// the spawn-free [`which`](crate::which) / [`Command::resolve_program`]
 /// preflight both derive from, so the two can never disagree about whether a
 /// program is available.
@@ -3477,7 +3477,7 @@ pub(crate) enum ProgramResolution {
     /// name the same way [`find_in_path_in`] models; preflight returns it.
     Found(PathBuf),
     /// Not resolvable. `searched` is the directory list for
-    /// [`ErrorReason::NotFound`](crate::ErrorReason::NotFound)'s field: `Some` for a
+    /// [`ErrorReason::NotFound`]'s field: `Some` for a
     /// bare-name `PATH` lookup (the searched dirs, `prefer_local` first),
     /// `None` for a path-form program (no `PATH` search applied).
     NotFound { searched: Option<String> },
@@ -3607,7 +3607,7 @@ pub(crate) fn probe_prefer_local(dirs: &[PathBuf], program: &OsStr) -> Option<Pa
 }
 
 /// Build the combined `searched` diagnostic for
-/// [`ErrorReason::NotFound`](crate::ErrorReason::NotFound): the [`Command::prefer_local`]
+/// [`ErrorReason::NotFound`]: the [`Command::prefer_local`]
 /// directories (first, in priority order) followed by the `PATH` directories
 /// (`path_searched`, as returned by [`find_in_path`]) — joined by the
 /// platform's `PATH`-list separator (`:` on Unix, `;` on Windows), matching

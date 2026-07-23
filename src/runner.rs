@@ -277,7 +277,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// [`timeout`](crate::Command::timeout): a `Some` deadline surfaces as
     /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) and tears the process down. On an
     /// **own-group** runner ([`JobRunner`], the default) that teardown covers the
-    /// whole tree; on a **shared** [`ProcessGroup`](crate::ProcessGroup) it reaches
+    /// whole tree; on a **shared** [`ProcessGroup`] it reaches
     /// the run's direct child by pid — a forking child's grandchildren (and, on the
     /// Linux cgroup mechanism, a direct child that catches the graceful signal and
     /// closes stdout but keeps running) may outlive the probe until the group is
@@ -948,7 +948,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     Ok(process)
 }
 
-/// Translate a raw spawn [`Error`] into the crate's launch error, mapping the
+/// Translate a raw spawn [`Error`](crate::Error) into the crate's launch error, mapping the
 /// OS's opaque `NotFound` into [`ErrorReason::NotFound`](crate::ErrorReason::NotFound)
 /// (enriched with the searched dirs for a bare name, or reclassified as
 /// [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) when the program *is* locatable

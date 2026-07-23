@@ -10,7 +10,7 @@
 //!   snapshot and/or a callback, and returns a synthetic successful result —
 //!   the seam behind a tool's own `--dry-run` echo mode.
 //!
-//! Behind the `mock` feature, [`mockall`] additionally generates a `MockRunner`
+//! Behind the `mock` feature, `mockall` additionally generates a `MockRunner`
 //! for expectation-style mocking. All of these live under
 //! [`processkit::testing`](crate::testing), not the crate root.
 //!
@@ -27,7 +27,7 @@
 //! `output_string` replay also does not model a bounded-buffer **truncation** policy
 //! (a canned reply is returned whole, `truncated() == false`), so the
 //! checking-verb truncation error won't fire against a bulk double — to
-//! exercise that, drive output through a scripted [`start`] handle (whose canned
+//! exercise that, drive output through a scripted [`start`](crate::ProcessRunner::start) handle (whose canned
 //! lines flow through the real buffer policy).
 //!
 //! Instant replies never observe a `cancel_on` token (they resolve before any
@@ -489,7 +489,7 @@ impl Reply {
     /// path would hand back for the same output.
     ///
     /// The live bulk path decodes the child's bytes, splits them into lines under
-    /// the command's [`LineTerminator`], then rejoins with `\n`
+    /// the command's [`LineTerminator`](crate::LineTerminator), then rejoins with `\n`
     /// (`stdout_lines.join("\n")`) — so a trailing terminator is dropped and CRLF
     /// is normalized to LF. Canned text gets the *same* treatment here (via
     /// [`split_pump_lines`](crate::running::split_pump_lines)), so
@@ -941,7 +941,7 @@ fn commit_stdin_reservation(reservation: Option<crate::stdin::StdinReservation>)
 /// scripted/real `start`, the live pumps invoke the handlers instead.
 ///
 /// Splits the canned text with [`split_pump_lines`](crate::running::split_pump_lines)
-/// under the command's per-stream [`LineTerminator`], exactly as the live pump
+/// under the command's per-stream [`LineTerminator`](crate::LineTerminator), exactly as the live pump
 /// does — so the lines a handler sees on the fake match the ones a real run would
 /// deliver (and the ones `into_result` joins back into the result).
 pub(crate) fn replay_line_handlers(command: &Command, stdout: &str, stderr: &str) {

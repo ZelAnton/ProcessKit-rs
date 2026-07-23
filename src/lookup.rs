@@ -3,7 +3,7 @@
 //!
 //! [`process_info`] answers "does this pid name a process, and what is it?" with
 //! the same best-effort fields a group member carries in a
-//! [`MemberInfo`](crate::MemberInfo); [`process_is_alive`] answers "is the *same*
+//! [`MemberInfo`]; [`process_is_alive`] answers "is the *same*
 //! process I saw earlier still running?" — reuse-safe, by pairing the pid with the
 //! start-time token, so a recycled number is not mistaken for the original.
 //!

@@ -98,7 +98,7 @@ impl RunningProcess {
     /// when that is a concern. The command's [`timeout`](crate::Command::timeout)
     /// bounds the stream: at the deadline the process tree is killed, pipes close,
     /// and a following
-    /// [`finish`](Self::finish) reports [`Outcome::TimedOut`](crate::Outcome::TimedOut)
+    /// [`finish`](Self::finish) reports [`Outcome::TimedOut`]
     /// even if the child caught the signal and exited cleanly within the grace.
     ///
     /// Returns `Err` instead of a silently-empty stream when stdout was not piped
@@ -308,7 +308,7 @@ impl RunningProcess {
     /// itself is the caller's own responsibility and is not tracked here.
     ///
     /// A run killed by its [`timeout`](crate::Command::timeout) reports
-    /// [`Outcome::TimedOut`](crate::Outcome::TimedOut), even if the child caught
+    /// [`Outcome::TimedOut`], even if the child caught
     /// the signal and exited cleanly within the grace — matching the bulk verbs.
     ///
     /// Designed to pair with `stdout_lines` (consume the stdout stream first),
@@ -561,7 +561,7 @@ pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, gate: &PidGate) {
 /// hard kill. Windows has no signal tier — hard kill.
 ///
 /// The signal → poll → kill algorithm lives in the shared unix driver
-/// [`crate::sys::graceful::run_pid`], which documents the load-bearing
+/// `crate::sys::graceful::run_pid`, which documents the load-bearing
 /// guarantee: the final `SIGKILL` still fires for a child that caught the
 /// signal, closed stdout, and kept running. To make that guarantee hold when a
 /// streaming consumer drops its handle mid-grace, arm this via

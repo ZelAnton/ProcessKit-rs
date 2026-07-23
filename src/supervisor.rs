@@ -7,13 +7,13 @@
 //! question **"keep this alive"**: restart a child whenever it exits (unless its
 //! exit satisfies the policy or a predicate), with bounded restarts and
 //! exponential backoff plus jitter — a minimal `runit`/`systemd`-style keeper on
-//! top of the runner layer. Its [`RestartPolicy`](crate::RestartPolicy) is the
+//! top of the runner layer. Its [`RestartPolicy`] is the
 //! keep-alive twin of that `RetryPolicy`.
 //!
 //! Built entirely on the [`ProcessRunner`] seam, so supervision logic is
 //! hermetically testable with the crate's doubles, and
 //! [`with_runner(&group)`](Supervisor::with_runner) runs every incarnation
-//! inside one shared kill-on-drop [`ProcessGroup`](crate::ProcessGroup).
+//! inside one shared kill-on-drop [`ProcessGroup`].
 
 use std::future::Future;
 use std::pin::Pin;
@@ -297,7 +297,7 @@ pub enum StopReason {
     /// [`GaveUp`](Self::GaveUp) / [`RestartsExhausted`](Self::RestartsExhausted);
     /// either way the number of liveness force-kills is reported in
     /// [`SupervisionOutcome::liveness_kills`], and the final run's
-    /// [`ProcessResult`] carries [`Outcome::Signalled`](crate::Outcome::Signalled).
+    /// [`ProcessResult`] carries [`Outcome::Signalled`].
     Unhealthy,
     /// A caller asked the live [`SupervisionSession`] to stop
     /// ([`SupervisionSession::stop`]): the current incarnation (if any) was
@@ -759,7 +759,7 @@ impl SessionShared {
     }
 }
 
-/// Releases the published live child ([`SessionShared::current`]) when
+/// Releases the published live child ([`SessionState::current`]) when
 /// [`run_to_result`](Supervisor::run_to_result) leaves by **any** path — a
 /// normal return *or* the future being dropped mid-run, which is exactly what a
 /// liveness [`health_check`](Supervisor::health_check) kill does (the losing
@@ -805,7 +805,7 @@ enum Wake {
 /// threshold 5.0 once enabled).
 ///
 /// Runs go through a [`ProcessRunner`] — [`JobRunner`] by default. Override
-/// with [`with_runner`](Self::with_runner) to share a [`ProcessGroup`](crate::ProcessGroup)
+/// with [`with_runner`](Self::with_runner) to share a [`ProcessGroup`]
 /// or inject a test double.
 pub struct Supervisor<R: ProcessRunner = JobRunner> {
     command: Command,
