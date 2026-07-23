@@ -148,6 +148,7 @@ pub fn processkit::testing::ScriptedRunner::fallback(self, processkit::testing::
 pub fn processkit::testing::ScriptedRunner::new() -> Self
 pub fn processkit::testing::ScriptedRunner::on<I, S>(self, I, processkit::testing::Reply) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub fn processkit::testing::ScriptedRunner::on_sequence<I, S, R>(self, I, R) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>, R: core::iter::traits::collect::IntoIterator<Item = processkit::testing::Reply>
+pub fn processkit::testing::ScriptedRunner::try_when<F, E>(self, F, processkit::testing::Reply) -> Self where F: core::ops::function::Fn(&processkit::Command) -> core::result::Result<bool, E> + core::marker::Send + core::marker::Sync + 'static, E: core::convert::Into<alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>> + 'static
 pub fn processkit::testing::ScriptedRunner::when<F>(self, F, processkit::testing::Reply) -> Self where F: core::ops::function::Fn(&processkit::Command) -> bool + core::marker::Send + core::marker::Sync + 'static
 impl core::default::Default for processkit::testing::ScriptedRunner
 pub fn processkit::testing::ScriptedRunner::default() -> processkit::testing::ScriptedRunner
@@ -171,6 +172,7 @@ pub processkit::ErrorKind::Exit
 pub processkit::ErrorKind::NotFound
 pub processkit::ErrorKind::Other
 pub processkit::ErrorKind::PermissionDenied
+pub processkit::ErrorKind::Predicate
 pub processkit::ErrorKind::ResourceLimit
 pub processkit::ErrorKind::Signalled
 pub processkit::ErrorKind::Spawn
@@ -221,6 +223,9 @@ pub processkit::ErrorReason::OutputTooLarge::total_lines: usize
 #[non_exhaustive] pub processkit::ErrorReason::Parse
 pub processkit::ErrorReason::Parse::message: alloc::string::String
 pub processkit::ErrorReason::Parse::program: alloc::string::String
+#[non_exhaustive] pub processkit::ErrorReason::Predicate
+pub processkit::ErrorReason::Predicate::predicate: &'static str
+pub processkit::ErrorReason::Predicate::source: alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>
 #[non_exhaustive] pub processkit::ErrorReason::ResourceLimit
 pub processkit::ErrorReason::ResourceLimit::detail: alloc::string::String
 pub processkit::ErrorReason::ResourceLimit::kind: processkit::LimitKind
@@ -1445,6 +1450,9 @@ pub fn processkit::Supervisor<R>::restart(self, processkit::RestartPolicy) -> Se
 pub async fn processkit::Supervisor<R>::run(self) -> processkit::Result<processkit::SupervisionOutcome>
 pub fn processkit::Supervisor<R>::stop_when(self, impl core::ops::function::Fn(&processkit::ProcessResult<alloc::string::String>) -> bool + core::marker::Send + core::marker::Sync + 'static) -> Self
 pub fn processkit::Supervisor<R>::storm_pause(self, core::time::Duration) -> Self
+pub fn processkit::Supervisor<R>::try_give_up_when<E>(self, impl core::ops::function::Fn(&processkit::GiveUpAttempt<'_>) -> core::result::Result<bool, E> + core::marker::Send + core::marker::Sync + 'static) -> Self where E: core::convert::Into<alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>> + 'static
+pub fn processkit::Supervisor<R>::try_health_check<F, Fut, E>(self, F, core::time::Duration) -> Self where F: core::ops::function::Fn() -> Fut + core::marker::Send + core::marker::Sync + 'static, Fut: core::future::future::Future<Output = core::result::Result<bool, E>> + core::marker::Send + 'static, E: core::convert::Into<alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>> + 'static
+pub fn processkit::Supervisor<R>::try_stop_when<E>(self, impl core::ops::function::Fn(&processkit::ProcessResult<alloc::string::String>) -> core::result::Result<bool, E> + core::marker::Send + core::marker::Sync + 'static) -> Self where E: core::convert::Into<alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>> + 'static
 pub fn processkit::Supervisor<R>::with_runner<R2: processkit::ProcessRunner>(self, R2) -> processkit::Supervisor<R2>
 impl<R: processkit::ProcessRunner> core::fmt::Debug for processkit::Supervisor<R>
 pub fn processkit::Supervisor<R>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

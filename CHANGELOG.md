@@ -29,6 +29,28 @@ to a dated version section.
   to the group was released mid-series (the weak handle stops upgrading) — never
   silently repeating the last snapshot and never hanging the caller. Additive:
   `sample_stats` / `StatsSampler` are unchanged
+- Give the **control predicates a fallible channel**: `Supervisor::try_stop_when`
+  / `try_give_up_when` / `try_health_check` and `ScriptedRunner::try_when` — the
+  `try_*` twins of the existing infallible predicates, each taking a predicate that
+  returns `Result<bool, E>` (async `Result<bool, E>` for `try_health_check`) for any
+  `E: Into<Box<dyn Error + Send + Sync>>`. `Ok(true)`/`Ok(false)` behave **exactly**
+  as the infallible sibling's `true`/`false`; an `Err` **aborts** the operation and
+  surfaces to the caller as a new `ErrorReason::Predicate` (kind `ErrorKind::Predicate`)
+  carrying the predicate's own error **verbatim** as its `source` — never a fabricated
+  stop/give-up/unhealthy verdict. A failing `try_health_check` probe still tears the
+  live incarnation down by the same drop-kill a liveness failure uses, so aborting on a
+  probe error leaks no child. For a wrapper over a language where any callback can throw
+  (e.g. a `processkit-py` binding) this replaces two independent error-smuggling
+  machines with one typed channel. Additive: the infallible `stop_when`/`give_up_when`/
+  `health_check`/`when` are unchanged, and setting a `try_*` twin replaces its sibling on
+  the same slot.
+- Add the `ErrorReason::Predicate { predicate, source }` variant and its
+  `ErrorKind::Predicate` classification (both `#[non_exhaustive]`, unconditional) — the
+  failure mode a fallible control predicate (above) raises. `predicate` is a stable
+  identifier (`"stop_when"`/`"give_up_when"`/`"health_check"`/`"when"`); `source` is the
+  predicate's own boxed error. It joins the total `ErrorKind` classification (T-174) as
+  its own routing bucket, distinct from `Other`, so a consumer can tell "the caller's
+  control callback failed" apart from a backend/IO failure.
 - Narrate the **graceful-teardown transitions** on the `tracing` seam (feature
   `tracing`): the shared teardown driver now emits a `debug` event per transition on
   the `processkit` target — `soft_signal` (the SIGTERM / CTRL_BREAK was issued) →

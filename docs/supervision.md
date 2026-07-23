@@ -271,6 +271,63 @@ Unset by default: a permanent failure restarts forever exactly as before,
 bounded only by `max_restarts` / the storm guard — adding `give_up_when` never
 changes existing behavior until you set it.
 
+## Fallible control predicates
+
+The control predicates above are infallible — `stop_when` and `give_up_when`
+return `bool`, `health_check` resolves to `bool`. When your predicate can itself
+**fail** (an I/O probe, a classification that parses something, or — the driving
+case — a callback in a wrapper over a language where any callback can throw),
+each has a `try_*` twin that returns `Result<bool, E>` for any
+`E: Into<Box<dyn Error + Send + Sync>>`:
+
+| infallible | fallible twin | predicate returns |
+| --- | --- | --- |
+| `stop_when` | `try_stop_when` | `Result<bool, E>` |
+| `give_up_when` | `try_give_up_when` | `Result<bool, E>` |
+| `health_check` | `try_health_check` | `impl Future<Output = Result<bool, E>>` |
+
+`Ok(true)` / `Ok(false)` behave **exactly** as the infallible twin's `true` /
+`false`. An `Err`, however, **aborts** supervision and surfaces to the caller as
+`run()`'s `Err` — an `ErrorReason::Predicate` (kind `ErrorKind::Predicate`)
+carrying your predicate's own error **verbatim** as its `source`:
+
+```rust,no_run
+use processkit::{Command, Supervisor};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let outcome = Supervisor::new(Command::new("my-server"))
+        // The probe may itself fail — e.g. a health endpoint whose body your
+        // parser rejects. An `Err` aborts supervision (surfaced as an
+        // `ErrorReason::Predicate`) instead of voting "unhealthy".
+        .try_health_check(|| async { probe_health().await }, Duration::from_secs(5))
+        .run()
+        .await?;
+    println!("stopped: {:?}", outcome.stopped);
+    Ok(())
+}
+
+# #[derive(Debug)] struct ProbeError;
+# impl std::fmt::Display for ProbeError {
+#     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "probe error") }
+# }
+# impl std::error::Error for ProbeError {}
+# async fn probe_health() -> Result<bool, ProbeError> { Ok(true) }
+```
+
+The distinction is deliberate: a predicate error is **never** a fabricated
+verdict. A normal `stop_when`/`try_stop_when` match (`Ok(true)`) ends supervision
+with a benign `SupervisionOutcome` (`StopReason::Predicate`); a predicate `Err`
+ends it with a *failure* the caller can tell apart by `err.kind() ==
+ErrorKind::Predicate` and recover the original error from
+`err.reason()`'s `Predicate { source, .. }`. A failing `try_health_check` probe
+still tears the live incarnation down by the same kill a liveness failure uses —
+so aborting on a probe error leaks no child.
+
+Each twin is purely additive: setting `try_stop_when` (etc.) replaces its
+infallible sibling on the same slot, and the infallible builders are unchanged.
+
 ## Outcomes
 
 `run()` resolves to a `SupervisionOutcome`:
@@ -399,6 +456,12 @@ A [cancelled](timeouts-and-cancellation.md#cancellation) incarnation is
 `Err(ErrorReason::Cancelled)` immediately. The token never un-cancels, so a restart
 could only produce another instantly-cancelled run — the supervisor refuses
 the futile loop.
+
+A [fallible control predicate](#fallible-control-predicates) (`try_stop_when` /
+`try_give_up_when` / `try_health_check`) that returns `Err` is likewise terminal:
+`run()` returns `Err(ErrorReason::Predicate)` — kind `ErrorKind::Predicate`,
+carrying your predicate's own error verbatim as its `source` — rather than a
+fabricated stop/unhealthy verdict.
 
 ---
 

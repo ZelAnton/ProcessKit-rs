@@ -468,6 +468,8 @@ pub(crate) fn scripted_running_from_parts(
 }
 
 type Predicate = Box<dyn Fn(&Command) -> bool + Send + Sync>;
+type TryPredicate =
+    Box<dyn Fn(&Command) -> std::result::Result<bool, crate::error::PredicateError> + Send + Sync>;
 
 enum Rule {
     /// Match when the command's **program name followed by its arguments**
@@ -476,24 +478,37 @@ enum Rule {
     Prefix(Vec<OsString>),
     /// Match when the predicate accepts the command.
     Predicate(Predicate),
+    /// Match when the **fallible** predicate accepts the command; a predicate
+    /// error aborts rule resolution and surfaces to the caller as an
+    /// [`ErrorReason::Predicate`](crate::ErrorReason::Predicate). Registered by
+    /// [`ScriptedRunner::try_when`].
+    TryPredicate(TryPredicate),
 }
 
 impl Rule {
-    fn matches(&self, command: &Command) -> bool {
+    /// Whether this rule matches `command`. `Ok(bool)` for the infallible rules;
+    /// a [`TryPredicate`](Rule::TryPredicate) may return `Err` — the predicate's
+    /// own error, which `matched_reply` turns into an
+    /// [`ErrorReason::Predicate`](crate::ErrorReason::Predicate) and propagates.
+    fn matches(
+        &self,
+        command: &Command,
+    ) -> std::result::Result<bool, crate::error::PredicateError> {
         match self {
             // Match the program *and* the argument prefix, so `.on(["git",
             // "status"])` answers for `git status …` but not `rm status`. An empty
             // prefix matches any command. The program name itself compares via
             // `program_names_match` (Windows case/extension normalization); the
             // argument prefix is always an exact, case-sensitive comparison.
-            Rule::Prefix(prefix) => match prefix.split_first() {
+            Rule::Prefix(prefix) => Ok(match prefix.split_first() {
                 Some((program, args)) => {
                     program_names_match(program.as_os_str(), command.program())
                         && command.arguments().starts_with(args)
                 }
                 None => true,
-            },
-            Rule::Predicate(pred) => pred(command),
+            }),
+            Rule::Predicate(pred) => Ok(pred(command)),
+            Rule::TryPredicate(pred) => pred(command),
         }
     }
 }
@@ -683,6 +698,32 @@ impl ScriptedRunner {
         self
     }
 
+    /// The **fallible twin** of [`when`](Self::when): reply with `reply` when
+    /// `predicate` returns `Ok(true)`, but if it returns `Err`, **abort** the run
+    /// — the verb driving this command fails with an
+    /// [`ErrorReason::Predicate`](crate::ErrorReason::Predicate) carrying the
+    /// predicate's own error verbatim, and no later rule is consulted.
+    /// `Ok(false)` behaves exactly as a non-matching [`when`](Self::when) (rule
+    /// resolution continues to the next rule / the fallback).
+    ///
+    /// The [`ScriptedRunner`] counterpart of the [`Supervisor`](crate::Supervisor)
+    /// `try_*` predicate twins: a wrapper over a language whose match callback can
+    /// throw can propagate that failure through the hermetic double instead of
+    /// swallowing it. Additive — the infallible [`when`](Self::when) is unchanged.
+    pub fn try_when<F, E>(mut self, predicate: F, reply: Reply) -> Self
+    where
+        F: Fn(&Command) -> std::result::Result<bool, E> + Send + Sync + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    {
+        self.push_rule(
+            Rule::TryPredicate(Box::new(move |command| {
+                predicate(command).map_err(Into::into)
+            })),
+            vec![reply],
+        );
+        self
+    }
+
     /// Reply with `reply` for any command no rule matched.
     pub fn fallback(mut self, reply: Reply) -> Self {
         self.fallback = Some(reply);
@@ -731,7 +772,14 @@ impl ScriptedRunner {
     /// through its reply sequence.
     fn matched_reply(&self, command: &Command, program: &str) -> Result<&Reply> {
         for entry in &self.rules {
-            if entry.rule.matches(command) {
+            // A fallible `try_when` predicate that errs aborts rule resolution
+            // right here — later rules are not consulted, no reply cursor advances
+            // — and the verb fails with the predicate's own error carried verbatim.
+            let matched = entry
+                .rule
+                .matches(command)
+                .map_err(|source| crate::Error::predicate("when", source))?;
+            if matched {
                 let i = entry
                     .next
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2306,6 +2354,75 @@ mod tests {
             .unwrap();
         assert_eq!(miss.code(), Some(1));
         assert!(!miss.is_success());
+    }
+
+    // --- Fallible `try_when` predicate (T-178) ------------------------------
+
+    /// A caller predicate error with a distinctive tag, recovered by downcast to
+    /// prove `try_when`'s error reaches the caller verbatim.
+    #[derive(Debug)]
+    struct WhenBoom(&'static str);
+    impl std::fmt::Display for WhenBoom {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "when boom: {}", self.0)
+        }
+    }
+    impl std::error::Error for WhenBoom {}
+
+    #[tokio::test]
+    async fn try_when_error_aborts_the_run() {
+        // A fallible predicate that errs fails the verb with a typed `Predicate`
+        // error carrying the predicate's own error verbatim — not a canned reply.
+        let runner = ScriptedRunner::new()
+            .try_when(|_c| Err::<bool, _>(WhenBoom("kaboom")), Reply::ok("never"))
+            .fallback(Reply::ok("fallback"));
+        let err = runner
+            .output_string(&Command::new("tool").arg("x"))
+            .await
+            .expect_err("a try_when predicate error must fail the run");
+        assert_eq!(
+            err.kind(),
+            crate::ErrorKind::Predicate,
+            "must classify as ErrorKind::Predicate, got {err:?}"
+        );
+        match err.reason() {
+            crate::ErrorReason::Predicate { predicate, source } => {
+                assert_eq!(*predicate, "when");
+                let boom = source
+                    .downcast_ref::<WhenBoom>()
+                    .expect("the predicate's own error is carried verbatim");
+                assert_eq!(boom.0, "kaboom");
+            }
+            other => panic!("expected ErrorReason::Predicate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_when_ok_true_matches_and_replies() {
+        let runner = ScriptedRunner::new().try_when(
+            |c| Ok::<_, WhenBoom>(c.arguments().iter().any(|a| a == "--version")),
+            Reply::ok("v2"),
+        );
+        let out = runner
+            .output_string(&Command::new("tool").arg("--version"))
+            .await
+            .expect("Ok(true) serves the reply");
+        assert_eq!(out.stdout(), "v2");
+        assert!(out.is_success());
+    }
+
+    #[tokio::test]
+    async fn try_when_ok_false_falls_through_to_the_fallback() {
+        // Ok(false) is a non-match, exactly like an infallible `when` returning
+        // false: resolution continues to the fallback rather than erroring.
+        let runner = ScriptedRunner::new()
+            .try_when(|_c| Ok::<_, WhenBoom>(false), Reply::ok("never"))
+            .fallback(Reply::fail(7, "fell through"));
+        let out = runner
+            .output_string(&Command::new("tool").arg("x"))
+            .await
+            .expect("Ok(false) is a benign non-match, not an error");
+        assert_eq!(out.code(), Some(7));
     }
 
     #[tokio::test]

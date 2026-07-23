@@ -129,6 +129,14 @@ The pieces:
   but not `git foobar` (and not `rm foo`). Use
   [`on_sequence`](https://docs.rs/processkit) to serve an ordered sequence of
   replies (each once, then the last repeats) for a fail-then-succeed scenario.
+- **`when` has a fallible twin, `try_when`** — the predicate returns
+  `Result<bool, E>` (any `E: Into<Box<dyn Error + Send + Sync>>`). `Ok(true)` /
+  `Ok(false)` match exactly as `when`'s `true` / `false`, but an `Err` **aborts
+  the run**: the verb fails with an `ErrorReason::Predicate` (kind
+  `ErrorKind::Predicate`) carrying the predicate's own error verbatim, and no
+  later rule is consulted. The `ScriptedRunner` counterpart of the `Supervisor`
+  [`try_*` predicate twins](supervision.md#fallible-control-predicates) — for
+  exercising a wrapper whose match callback can throw.
 - **No match and no fallback is a loud error** (`ErrorReason::Spawn`, not-found) —
   an unexpected invocation can't slip through a test silently.
 - Bulk runs also **replay the canned lines through the command's
