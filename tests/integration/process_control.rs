@@ -246,8 +246,8 @@ fn windows_signal_non_kill_is_unsupported() {
             .signal(sig)
             .expect_err("a non-Kill signal with no soft-close target must be rejected on Windows");
         assert!(
-            matches!(err, processkit::Error::Unsupported { .. }),
-            "expected Error::Unsupported for {sig:?}, got {err:?}"
+            matches!(err.reason(), processkit::ErrorReason::Unsupported { .. }),
+            "expected ErrorReason::Unsupported for {sig:?}, got {err:?}"
         );
     }
 }
@@ -261,7 +261,7 @@ fn windows_soft_stop_scope_on_empty_group_is_unsupported() {
     // The soft-stop capability report agrees with the narrowed `signal` contract:
     // a group with neither a console-CTRL leader nor a windowed member can soft-stop
     // nothing, so the report is `Unsupported` and a real `signal(Term)` would return
-    // `Error::Unsupported` — the caller can decide up front without firing (and
+    // `ErrorReason::Unsupported` — the caller can decide up front without firing (and
     // parsing back) the error. The probe is side-effect-free (no spawn, no signal).
     let group = ProcessGroup::new().expect("create group");
     assert_eq!(
@@ -273,7 +273,7 @@ fn windows_soft_stop_scope_on_empty_group_is_unsupported() {
         .signal(Signal::Term)
         .expect_err("no soft-close target on an empty Windows group");
     assert!(
-        matches!(err, processkit::Error::Unsupported { .. }),
+        matches!(err.reason(), processkit::ErrorReason::Unsupported { .. }),
         "the report and the real signal outcome agree on Unsupported, got {err:?}"
     );
 }
@@ -697,7 +697,7 @@ async fn adopt_of_a_reaped_child_errors_instead_of_tracking_nothing() {
         .adopt(&child)
         .expect_err("adopting a reaped child must error");
     assert!(
-        matches!(err, processkit::Error::Io(_)),
+        matches!(err.reason(), processkit::ErrorReason::Io(_)),
         "expected the no-pid Io error, got {err:?}"
     );
 }
@@ -758,7 +758,7 @@ async fn empty_group_accepts_lifecycle_calls() {
             .signal(Signal::Term)
             .expect_err("Term on an empty Windows group has no soft-close target");
         assert!(
-            matches!(err, processkit::Error::Unsupported { .. }),
+            matches!(err.reason(), processkit::ErrorReason::Unsupported { .. }),
             "expected Unsupported, got {err:?}"
         );
     } else {

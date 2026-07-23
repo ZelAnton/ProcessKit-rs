@@ -74,7 +74,7 @@ use crate::{Error, Result};
 ///
 /// # Errors
 ///
-/// [`Error::Io`] when the process may exist but couldn't be inspected — a
+/// [`ErrorReason::Io`](crate::ErrorReason::Io) when the process may exist but couldn't be inspected — a
 /// permission denial (a Windows protected process, a Linux `hidepid` mount, a macOS
 /// restricted process) or another OS read failure.
 ///
@@ -97,7 +97,7 @@ use crate::{Error, Result};
 /// # }
 /// ```
 pub fn process_info(pid: u32) -> Result<Option<MemberInfo>> {
-    crate::sys::process_info(pid).map_err(Error::Io)
+    crate::sys::process_info(pid).map_err(Error::io)
 }
 
 /// Reuse-safe liveness: is the process at `pid` **still the same instance** you saw
@@ -139,7 +139,7 @@ pub fn process_info(pid: u32) -> Result<Option<MemberInfo>> {
 ///
 /// # Errors
 ///
-/// [`Error::Io`] when the pid may name a live process but couldn't be inspected —
+/// [`ErrorReason::Io`](crate::ErrorReason::Io) when the pid may name a live process but couldn't be inspected —
 /// the same permission/OS-error surface as [`process_info`].
 ///
 /// # Examples

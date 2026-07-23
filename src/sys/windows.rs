@@ -784,6 +784,14 @@ impl Job {
     }
 }
 
+/// Read-only prediction of the [`Mechanism`] a fresh [`Job`] would use on this host,
+/// computed **without creating a Job Object or spawning anything** — always a
+/// Windows [`Mechanism::JobObject`], so there is nothing to probe and nothing is
+/// created. Mirrors [`Job::mechanism`]; backs the public `host_containment()` query.
+pub(crate) fn detect_mechanism() -> Mechanism {
+    Mechanism::JobObject
+}
+
 /// The Job-backed [`GracefulTarget`](crate::sys::graceful::GracefulTarget) for the
 /// Windows soft-shutdown tier. It plugs the Job Object into the *same*
 /// signal → poll → escalate loop the unix backends drive

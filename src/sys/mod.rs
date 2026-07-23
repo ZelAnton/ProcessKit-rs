@@ -378,3 +378,17 @@ impl Job {
         self.0.mechanism()
     }
 }
+
+/// Read-only prediction of the containment [`Mechanism`] a fresh [`Job`] would use
+/// on this host **right now**, computed without creating any OS object or spawning
+/// a process — the detection extracted from the group-creation path so it can back
+/// the public `host_containment()` query as well.
+///
+/// A fixed constant on Windows ([`Mechanism::JobObject`]) and macOS/BSD
+/// ([`Mechanism::ProcessGroup`]); on Linux a best-effort read-only probe of cgroup
+/// v2 availability and writability that agrees with [`Job::new`]'s selection on any
+/// real host, differing only in the rare window where a writable-looking cgroup then
+/// rejects leaf creation (see the Linux backend's `detect_mechanism`).
+pub(crate) fn detect_mechanism() -> Mechanism {
+    imp::detect_mechanism()
+}

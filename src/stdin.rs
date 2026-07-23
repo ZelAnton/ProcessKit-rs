@@ -36,7 +36,7 @@ fn lock_cell<T>(cell: &Arc<Mutex<T>>) -> MutexGuard<'_, T> {
 /// [`from_lines`](Self::from_lines)) are one-shot — their payload feeds the
 /// first run that actually **starts a child** and is consumed then. Re-running
 /// or retrying a [`Command`](crate::Command) that reuses a consumed one-shot
-/// source **fails loud** (an [`Error::Io`](crate::Error::Io) at launch) rather
+/// source **fails loud** (an [`ErrorReason::Io`](crate::ErrorReason::Io) at launch) rather
 /// than silently feeding the next run empty stdin; use a reusable source
 /// (`from_string`/`from_bytes`/`from_file`/`from_iter_lines`) to re-run.
 ///

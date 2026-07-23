@@ -396,7 +396,7 @@ the error itself as `run()`'s `Err`.
 
 A [cancelled](timeouts-and-cancellation.md#cancellation) incarnation is
 **terminal**: `run()` returns
-`Err(Error::Cancelled)` immediately. The token never un-cancels, so a restart
+`Err(ErrorReason::Cancelled)` immediately. The token never un-cancels, so a restart
 could only produce another instantly-cancelled run — the supervisor refuses
 the futile loop.
 
