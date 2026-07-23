@@ -14,6 +14,8 @@ use crate::member::MemberInfo;
 use crate::shutdown_report::ShutdownReport;
 #[cfg(feature = "process-control")]
 use crate::signal::Signal;
+#[cfg(feature = "process-control")]
+use crate::soft_stop::SoftStopScope;
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
 use crate::sys::Job;
@@ -418,6 +420,53 @@ impl ProcessGroup {
         self.job
             .signal(sig)
             .map_err(|source| map_unsupported(source, format!("signal({sig:?})")))
+    }
+
+    /// The reach of a **soft stop** on this group *right now* — the honest
+    /// capability answer to "if I ask this group to stop gracefully
+    /// ([`signal(Signal::Term)`](Self::signal) / [`Signal::Int`](crate::Signal::Int)),
+    /// which of its members will actually receive it?" — queried **before** the
+    /// attempt so a caller need not fire a `signal`, catch an
+    /// [`Error::Unsupported`](crate::Error::Unsupported), and reverse-engineer the
+    /// scope.
+    ///
+    /// The group-axis analogue of
+    /// [`Command::kill_on_parent_death_scope`](crate::Command::kill_on_parent_death_scope):
+    /// where that reports the abrupt-owner-death cleanup reach fixed per platform,
+    /// this reports the *deliberate soft stop* reach read from this group's **live
+    /// membership**, so the same build can answer differently for different groups
+    /// (most visibly on Windows). See [`SoftStopScope`] for the full contract.
+    ///
+    /// # Side-effect-free
+    ///
+    /// A pure read: it delivers **no** signal, posts **no** `WM_CLOSE`, spawns
+    /// nothing, creates no container, and does not mutate the group — asking never
+    /// changes what a subsequent [`signal`](Self::signal) does. It is read from
+    /// the *same* live-membership primitives `signal(Int/Term)` acts on, so its
+    /// answer is consistent with the outcome a real soft stop would then have.
+    ///
+    /// # Platform reach
+    ///
+    /// - **Linux cgroup v2, macOS/BSD, Linux process-group fallback** —
+    ///   [`SoftStopScope::WholeTree`]: `signal(Int/Term)` reaches every member of
+    ///   the tree (the cgroup, or every tracked process group via `killpg`), so a
+    ///   soft stop is always available and never `Unsupported` here.
+    /// - **Windows** — [`SoftStopScope::OptInMembers`] when the group holds a live
+    ///   console-CTRL leader (a child spawned with
+    ///   [`Command::windows_graceful_ctrl_break`](crate::Command::windows_graceful_ctrl_break))
+    ///   or a live windowed member (reachable by `WM_CLOSE`);
+    ///   [`SoftStopScope::Unsupported`] when it holds **neither** (an empty group,
+    ///   or plain windowless children with no console opt-in), which is exactly
+    ///   when [`signal(Signal::Term)`](Self::signal) would return
+    ///   [`Error::Unsupported`](crate::Error::Unsupported).
+    ///
+    /// This describes the *soft* tier only: the unconditional hard kill
+    /// ([`Signal::Kill`](crate::Signal::Kill), [`kill_all`](Self::kill_all),
+    /// dropping the group) always tears the whole tree down regardless of this
+    /// value.
+    #[cfg(feature = "process-control")]
+    pub fn soft_stop_scope(&self) -> SoftStopScope {
+        self.job.soft_stop_scope()
     }
 
     /// Suspend (freeze) every process in the group.

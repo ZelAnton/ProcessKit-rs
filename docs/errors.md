@@ -90,7 +90,7 @@ enums carry that table for you:
 
 | Method | On | Direction |
 |---|---|---|
-| `name() -> &'static str` | `Mechanism`, `Outcome`, `ParentDeathCleanup`, `StopReason`, `LimitKind`, `LimitReason`, `StdioMode`, `LineTerminator`, `OverflowMode`, `Priority`, `RestartPolicy` | A short, lowercase `snake_case` identifier for the variant. |
+| `name() -> &'static str` | `Mechanism`, `Outcome`, `ParentDeathCleanup`, `SoftStopScope`, `StopReason`, `LimitKind`, `LimitReason`, `StdioMode`, `LineTerminator`, `OverflowMode`, `Priority`, `RestartPolicy` | A short, lowercase `snake_case` identifier for the variant. |
 | `name() -> Option<&'static str>` | `Signal` | `Some(id)` for a curated signal; `None` for the raw-number `Signal::Other` (render its `i32` instead). |
 | `from_name(&str) -> Option<Self>` | every enum above **except** `Outcome` | Parse an identifier back into the value; `None` — not a default — for an unrecognized name. |
 
@@ -103,6 +103,9 @@ to hand-write conversions, without committing the crate to a second serialized
 shape). `Mechanism` and `ParentDeathCleanup` use the spellings downstream tools
 already publish (`job_object`/`cgroup_v2`/`process_group`,
 `whole_tree`/`direct_child_only`/`none`), so adopting them needs no migration.
+`SoftStopScope` (the group-axis soft-stop reach, `process-control`) reuses the
+same `whole_tree` and `none` spellings for its shared cases, adding
+`opt_in_members` for the Windows partial-reach case.
 
 ```rust
 use processkit::{Mechanism, Priority};

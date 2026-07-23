@@ -15,6 +15,7 @@ containment is the solution, and the reason this crate exists.)
 - [Putting processes in](#putting-processes-in)
 - [Tearing down: drop, terminate, shutdown](#tearing-down-drop-terminate-shutdown)
 - [Signalling the whole tree](#signalling-the-whole-tree)
+- [Asking whether a soft stop is available](#asking-whether-a-soft-stop-is-available)
 - [Suspending and resuming](#suspending-and-resuming)
 - [Listing members](#listing-members)
 - [Resource limits](#resource-limits)
@@ -275,6 +276,58 @@ no state reader exists, every `EPERM` — stays swallowed. An `ESRCH` race (the
 member already exited) is still success. `Signal::Other(0)` is the POSIX
 existence probe: it returns `Ok` having **delivered nothing** (a live target was
 reached, not signalled).
+
+## Asking whether a soft stop is available
+
+Before you fire a soft stop (`signal(Signal::Term)` / `Signal::Int`), you can ask
+the group whether one will actually reach anything — `soft_stop_scope()` returns a
+`SoftStopScope` **capability report**, so a caller cancelling a run on *its own*
+schedule (a UI Cancel, a control-socket command, a timeout it owns) can decide up
+front whether to attempt a graceful stop and can tell its user the real reach,
+instead of firing a `signal`, catching `Error::Unsupported`, and reverse-engineering
+the scope. It is the group-axis sibling of
+`Command::kill_on_parent_death_scope() -> ParentDeathCleanup`, but read from the
+group's **live membership** (not fixed per platform) and **side-effect-free** — it
+delivers no signal, posts no `WM_CLOSE`, spawns nothing, and does not mutate the
+group.
+
+```rust,no_run
+use processkit::{Command, ProcessGroup, Signal, SoftStopScope};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::new()?;
+    let _server = group
+        .start(&Command::new("my-server").windows_graceful_ctrl_break())
+        .await?;
+
+    // Decide BEFORE attempting — no Error::Unsupported to parse back.
+    match group.soft_stop_scope() {
+        SoftStopScope::WholeTree | SoftStopScope::OptInMembers => {
+            group.signal(Signal::Term)?; // a soft stop will reach a member
+        }
+        SoftStopScope::Unsupported => {
+            group.kill_all()?; // no soft tier here — go straight to the hard kill
+        }
+        other => eprintln!("unknown soft-stop scope: {}", other.name()),
+    }
+    Ok(())
+}
+```
+
+| Mechanism | `soft_stop_scope()` | Why |
+|---|---|---|
+| Linux cgroup v2, macOS/BSD, Linux pgroup fallback | `WholeTree` | `signal(Int/Term)` reaches every member of the tree (the cgroup, or every tracked process group via `killpg`); never `Unsupported` |
+| Windows, with a live console-CTRL leader (`windows_graceful_ctrl_break`) or a windowed member | `OptInMembers` | a soft close reaches only members it can *trigger* — a curated subset, not the whole tree |
+| Windows, with neither | `Unsupported` | a Job Object has no POSIX signal and there is nothing to soft-close, so `signal(Int/Term)` would return `Error::Unsupported` |
+
+Consistent with `signal` by construction: it reads the very same live-membership
+primitives `signal(Int/Term)` acts on, so what it reports matches what a real soft
+stop would then reach. It describes the *soft* tier only — the unconditional hard
+kill (`Signal::Kill`, `kill_all`, dropping the group) always tears the whole tree
+down regardless. `SoftStopScope` is `#[non_exhaustive]` and carries a stable
+`name()` / `from_name()` machine identifier (`whole_tree` / `opt_in_members` /
+`none`), like the other reporting enums.
 
 ## Suspending and resuming
 

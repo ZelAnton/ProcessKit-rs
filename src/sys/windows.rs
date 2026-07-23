@@ -490,6 +490,41 @@ impl Job {
         }
     }
 
+    /// The reach of a soft `Int`/`Term` stop on this job right now — a
+    /// side-effect-free capability probe answering the exact question
+    /// `signal(Int/Term)` would act on, but **without** delivering anything.
+    ///
+    /// A Job Object has no POSIX signal, so a soft stop reaches only members it can
+    /// *trigger*: a live recorded console-CTRL leader (opted in via
+    /// `windows_new_process_group` / `windows_graceful_ctrl_break`) or any live
+    /// member owning a top-level window (`WM_CLOSE`). Reports
+    /// [`OptInMembers`](crate::SoftStopScope::OptInMembers) when at least one such
+    /// member is live, else [`Unsupported`](crate::SoftStopScope::Unsupported) —
+    /// matching where `signal(Int/Term)` returns `Ok` versus `Unsupported`.
+    ///
+    /// Read from the same live-membership primitives the delivery path uses
+    /// (`ctrl_break_leader_is_live` — the shared recycle-safe `IsProcessInJob`
+    /// guard — and the probe-mode `job_has_windowed_member`), so it never sends a
+    /// `GenerateConsoleCtrlEvent`, never posts a `WM_CLOSE`, and never mutates the
+    /// recorded-leader list (no pruning) — asking cannot change the answer to a
+    /// later `signal`.
+    #[cfg(feature = "process-control")]
+    pub(crate) fn soft_stop_scope(&self) -> crate::SoftStopScope {
+        let leaders = self
+            .ctrl_break_leaders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let has_live_leader = leaders
+            .iter()
+            .any(|&pid| ctrl_break_leader_is_live(pid, self.handle));
+        if has_live_leader || job_has_windowed_member(self.handle) {
+            crate::SoftStopScope::OptInMembers
+        } else {
+            crate::SoftStopScope::Unsupported
+        }
+    }
+
     #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {
         self.for_each_member_thread(true)
@@ -818,19 +853,11 @@ impl super::graceful::GracefulTarget for SoftShutdownTarget<'_> {
 fn ctrl_break_live_leaders(leaders: &[u32], job: HANDLE) -> usize {
     let mut signalled = 0;
     for &pid in leaders {
-        // Never pass 0: `GenerateConsoleCtrlEvent(_, 0)` targets EVERY process
-        // sharing this console — including us. A recorded leader is always a real,
-        // nonzero pid, but guard defensively.
-        if pid == 0 {
-            continue;
-        }
-        // Recycle guard (mirrors the suspend/resume C13 discipline): only signal a
-        // leader that is STILL a live member of THIS job. A leader that already
-        // exited may have had its pid reused as an unrelated process's group id
-        // sharing our console; `IsProcessInJob` fails safe (a gone/denied pid reads
-        // as "not a member"), so the event is never diverted onto a stranger's
-        // group.
-        if !process_is_in_job(pid, job) {
+        // Skip a pid that is not a live member of THIS job (see
+        // `ctrl_break_leader_is_live`): a zero pid would target EVERY process
+        // sharing our console, and a gone/recycled leader could divert the event
+        // onto a stranger's group.
+        if !ctrl_break_leader_is_live(pid, job) {
             continue;
         }
         // SAFETY: a console control event to a process group id; a delivery failure
@@ -843,6 +870,22 @@ fn ctrl_break_live_leaders(leaders: &[u32], job: HANDLE) -> usize {
         signalled += 1;
     }
     signalled
+}
+
+/// Whether a recorded console-CTRL leader `pid` is STILL a live member of `job`
+/// — the recycle-safe predicate the soft-stop paths share so "which leader
+/// counts as reachable" never drifts between the side-effect-free capability
+/// probe ([`Job::soft_stop_scope`](Job::soft_stop_scope)) and the actual
+/// `GenerateConsoleCtrlEvent` delivery ([`ctrl_break_live_leaders`]).
+///
+/// A **zero** pid reads false: it is never a real recorded leader, and
+/// `GenerateConsoleCtrlEvent(_, 0)` would otherwise target every process sharing
+/// this console (including us). A **gone / recycled / access-denied** pid also
+/// reads false — `IsProcessInJob` fails safe (a non-member reads "not a member")
+/// — so neither path is ever diverted onto an unrelated process's group (mirrors
+/// the suspend/resume C13 recycle discipline).
+fn ctrl_break_leader_is_live(pid: u32, job: HANDLE) -> bool {
+    pid != 0 && process_is_in_job(pid, job)
 }
 
 /// Drives the [`EnumWindows`] top-level-window walk for the GUI-graceful tier: the
@@ -1808,6 +1851,150 @@ mod ctrl_break_tests {
                 "{sig:?} remains Unsupported on Windows"
             );
         }
+    }
+
+    /// The side-effect-free soft-stop capability probe agrees with the narrowed
+    /// `signal` contract on the negative case: a fresh empty job has neither a
+    /// console-CTRL leader nor a windowed member, so `soft_stop_scope` reports
+    /// `Unsupported` — exactly when `signal(Int/Term)` would too. No spawn, no
+    /// signal delivered.
+    #[cfg(feature = "process-control")]
+    #[test]
+    fn soft_stop_scope_on_an_empty_job_is_unsupported() {
+        let job = new_job();
+        assert_eq!(
+            job.soft_stop_scope(),
+            crate::SoftStopScope::Unsupported,
+            "an empty job can soft-stop nothing"
+        );
+    }
+
+    /// The probe counts only leaders that are STILL live members of THIS job,
+    /// exactly as `ctrl_break_live_leaders` does before delivering — so a recorded
+    /// leader that is NOT a member (here our own pid, a non-member, mirroring
+    /// `a_recorded_non_member_leader_is_never_signalled`) does not fake a soft-stop
+    /// capability. The job being otherwise empty (no windowed member either), the
+    /// honest answer stays `Unsupported`. Reads state without pruning the recorded
+    /// list or delivering anything — the test process reaching its assertions is
+    /// proof no CTRL_BREAK was sent to the (handler-less) runner.
+    #[cfg(feature = "process-control")]
+    #[test]
+    fn soft_stop_scope_ignores_a_non_member_leader() {
+        let job = new_job();
+        // SAFETY: a plain read of our own pid — a non-member of this job.
+        let me = unsafe { GetCurrentProcessId() };
+        job.ctrl_break_leaders
+            .lock()
+            .expect("lock leaders")
+            .push(me);
+
+        assert_eq!(
+            job.soft_stop_scope(),
+            crate::SoftStopScope::Unsupported,
+            "a recorded but non-member leader is not a reachable soft-stop target"
+        );
+        // The probe is side-effect-free: it must not have pruned the recorded
+        // (stale) leader out of the list.
+        assert_eq!(
+            job.ctrl_break_leaders.lock().expect("lock leaders").len(),
+            1,
+            "soft_stop_scope must not mutate the recorded-leader list"
+        );
+    }
+
+    /// A ~30s console child, spawned into its own process group so a CTRL_BREAK
+    /// reaches its group and not the test runner's console.
+    #[cfg(feature = "process-control")]
+    fn opt_in_sleeper() -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("ping");
+        cmd.args(["-n", "30", "127.0.0.1"]);
+        cmd
+    }
+
+    /// Poll `process_is_in_job` up to ~5s for the just-spawned child to read as a
+    /// live member (it should be immediate) before treating it as a soft-stop
+    /// target — the membership the probe/delivery both key off.
+    #[cfg(feature = "process-control")]
+    async fn wait_until_member(pid: u32, job: &super::Job) {
+        for _ in 0..500 {
+            if super::process_is_in_job(pid, job.handle) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("pid {pid} never became a live job member");
+    }
+
+    /// Item 1 (the closed test gap): `Job::signal(Term)` / `Job::signal(Int)`
+    /// against a job holding a REAL, live opt-in console leader returns `Ok(())` —
+    /// the direct positive `signal` assertion the existing tests never made (they
+    /// drive `graceful_shutdown` with a non-member stand-in leader, or the empty-job
+    /// `Unsupported` case only). The child is spawned with
+    /// `windows_new_process_group`, so the CTRL_BREAK lands on its own group, not
+    /// the runner's console; `ping` ignores it (K-028) and rides on, so the job
+    /// stays reapable at the end.
+    #[cfg(feature = "process-control")]
+    #[tokio::test]
+    #[ignore = "spawns a real opt-in console child and soft-signals it"]
+    async fn signal_term_and_int_reach_a_live_opt_in_leader() {
+        let job = new_job();
+        let opts = crate::sys::SpawnOptions {
+            windows_new_process_group: true,
+            ..Default::default()
+        };
+        let mut child = job
+            .spawn(&mut opt_in_sleeper(), &opts)
+            .expect("spawn opt-in console child");
+        let pid = child.id().expect("child has a pid");
+        wait_until_member(pid, &job).await;
+
+        // The opt-in leader is a live member, so the soft close reaches it:
+        // `signal` returns Ok rather than the empty-job Unsupported.
+        job.signal(crate::Signal::Term)
+            .expect("Term reaches a live opt-in console leader");
+        job.signal(crate::Signal::Int)
+            .expect("Int reaches a live opt-in console leader");
+
+        // Tear the tree down deterministically regardless of the child's own
+        // CTRL_BREAK handling.
+        let _ = job.kill_all();
+        let _ = child.wait().await;
+    }
+
+    /// The Windows positive for the capability probe: with a real, live opt-in
+    /// console leader in the job, `soft_stop_scope` reports `OptInMembers`, and it
+    /// is consistent with the real `signal` outcome on that same job (both agree a
+    /// soft stop is available). The side-effect-free probe is called BEFORE any
+    /// signal.
+    #[cfg(feature = "process-control")]
+    #[tokio::test]
+    #[ignore = "spawns a real opt-in console child and probes soft-stop availability"]
+    async fn soft_stop_scope_reports_opt_in_members_for_a_live_leader() {
+        let job = new_job();
+        let opts = crate::sys::SpawnOptions {
+            windows_new_process_group: true,
+            ..Default::default()
+        };
+        let mut child = job
+            .spawn(&mut opt_in_sleeper(), &opts)
+            .expect("spawn opt-in console child");
+        let pid = child.id().expect("child has a pid");
+        wait_until_member(pid, &job).await;
+
+        // The probe (side-effect-free, before any delivery) sees the live opt-in
+        // leader and reports the soft stop as available.
+        assert_eq!(
+            job.soft_stop_scope(),
+            crate::SoftStopScope::OptInMembers,
+            "a live opt-in console leader makes a soft stop available"
+        );
+        // Consistency with the actual verb: a real soft `signal` succeeds on the
+        // same job, matching what the probe reported.
+        job.signal(crate::Signal::Term)
+            .expect("Term reaches the live opt-in leader the probe reported");
+
+        let _ = job.kill_all();
+        let _ = child.wait().await;
     }
 
     /// With a recorded leader, `graceful_shutdown` takes the CTRL_BREAK path

@@ -136,6 +136,7 @@ sends a real signal.
 | Capability | Windows | Linux cgroup | Linux pgroup | macOS/BSD |
 |---|---|---|---|---|
 | Arbitrary signal (`Hup`, `Usr1`, `Other(n)`, …) | 🟡 `Kill`, plus `Int`/`Term` as a best-effort soft close (`CTRL_BREAK` + `WM_CLOSE`); others unsupported | ✅ | ✅ | ✅ |
+| `soft_stop_scope()` (soft `Int`/`Term` reach) | 🟡 `OptInMembers` with a console/windowed member, else `Unsupported` | `WholeTree` | `WholeTree` | `WholeTree` |
 | `suspend` / `resume` | 🟡 per-thread counts | ✅ `cgroup.freeze` | ✅ `SIGSTOP`/`CONT` | ✅ `SIGSTOP`/`CONT` |
 
 On **both** Unix mechanisms, a `signal` broadcast surfaces a real send failure as
@@ -150,6 +151,18 @@ and `Signal::Other(0)` returns `Ok` having delivered nothing (the POSIX existenc
 probe). On the cgroup mechanism the `SIGSTOP`/`SIGCONT` fallback used for
 `suspend`/`resume` on pre-5.2 kernels (no `cgroup.freeze`) surfaces failures the
 same way.
+
+`soft_stop_scope()` answers, *before* you attempt a soft `Int`/`Term`, which
+members it would reach — a side-effect-free `SoftStopScope` capability report read
+from the group's live membership, so a caller cancelling on its own schedule can
+decide up front instead of firing a `signal` and parsing an `Error::Unsupported`
+back. The Unix backends always reach the whole tree (`WholeTree`, never
+`Unsupported`); Windows reports `OptInMembers` when a live console-CTRL leader
+(`windows_graceful_ctrl_break`) or a windowed member exists, and `Unsupported`
+otherwise — exactly the split where `signal(Int/Term)` returns `Ok` versus
+`Error::Unsupported`. It is the group-axis sibling of
+`kill_on_parent_death_scope()` below, but read at runtime rather than fixed per
+platform. Gated on the **`process-control`** feature, like `signal`.
 
 **Inspection & accounting**
 
