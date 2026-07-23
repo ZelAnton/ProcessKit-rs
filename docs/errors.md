@@ -102,7 +102,7 @@ failure onto your own shape — a CLI folding each disposition into a distinct
 process exit code, a cross-language binding raising a matching exception class, a
 router picking a retry policy — you want one **total** classification instead of
 a chain of `is_*` checks ending in "everything else". `err.kind()` is that: a
-compact [`ErrorKind`](https://docs.rs/processkit/latest/processkit/enum.ErrorKind.html)
+compact [`ErrorKind`]
 with one bucket per operational disposition, **derived** from each variant's
 existing semantics (not invented), and covering every variant — present and
 future — through an exhaustive `match` inside the crate.
