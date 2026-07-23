@@ -13,6 +13,16 @@ to a dated version section.
 
 ### Added
 
+- Add `RunningProcess::drain()` — a discard-style wait that **respects the
+  configured `Command::output_buffer` byte cap**. It drains both pipes (the child
+  never blocks on a full one), feeds every fitting line to the configured
+  `stdout_tee`/`stderr_tee` and `on_stdout_line`/`on_stderr_line` sinks, retains
+  nothing itself, and returns the same `Outcome` classification as `wait`. Unlike
+  `wait` (which pins a fixed internal in-flight cap and ignores `output_buffer`),
+  `drain` bounds held memory by the configured `max_bytes`, so a
+  hundreds-of-megabytes build log already being teed to a file streams through
+  without ever being held in memory — no more capturing with `output_string` only
+  to throw the result away
 - Windows graceful shutdown now posts `WM_CLOSE` (best-effort, *posted* not sent)
   to every top-level window a live job member owns before the hard
   `TerminateJobObject`, so a windowed child (Electron app, desktop tool, windowed

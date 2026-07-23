@@ -36,12 +36,54 @@ async fn main() -> processkit::Result<()> {
     // Consume the handle exactly one way:
     //   output_string() / output_bytes()  → capture everything (same as the one-shot verbs)
     //   wait()                            → just the Outcome; output is discarded
+    //   drain()                           → like wait(), but honors output_buffer's byte cap; feeds tees, retains nothing
     //   finish()                 → after streaming stdout (below)
     //   profile(every)                    → resource samples; output discarded, like wait() (stats feature)
     let outcome = run.wait().await?;   // Outcome: Exited(code) / Signalled(sig) / TimedOut
     Ok(())
 }
 ```
+
+### `wait()` vs `drain()`
+
+Both wait for exit while draining stdout/stderr so the child never blocks on a
+full pipe, and both return the same `Outcome`. They differ only in the in-flight
+memory bound:
+
+- **`wait()`** ignores `output_buffer` and pins a large fixed internal cap. Reach
+  for it when you just want the exit outcome.
+- **`drain()`** honors the configured
+  [`output_buffer`](commands.md) **byte cap** ([`with_max_bytes`]) for the
+  in-flight bound, retaining nothing. Reach for it when the output is already going
+  where you want it — a `stdout_tee`/`stderr_tee` writing to a file, or an
+  `on_stdout_line`/`on_stderr_line` handler — and you want held memory bounded by
+  *your* configured limit rather than the child's output size. Those sinks still
+  see every line that fits the cap; a line longer than the byte cap is skipped for
+  every sink alike (counted only via the truncation signal), and an unbounded
+  `output_buffer` falls back to the same fixed floor `wait` uses.
+
+```rust,no_run
+use processkit::{Command, OutputBufferPolicy};
+use tokio::fs::File;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Tee a noisy build to a file, keep only ~1 MiB in flight, capture nothing.
+    let log = File::create("build.log").await?;
+    let outcome = Command::new("cargo")
+        .args(["build", "--release"])
+        .output_buffer(OutputBufferPolicy::unbounded().with_max_bytes(1 << 20))
+        .stdout_tee(log)
+        .start()
+        .await?
+        .drain()
+        .await?;
+    println!("build finished: {outcome:?}");
+    Ok(())
+}
+```
+
+[`with_max_bytes`]: https://docs.rs/processkit/latest/processkit/struct.OutputBufferPolicy.html#method.with_max_bytes
 
 `start()` puts the child in a **private group the handle owns**: dropping the
 `RunningProcess` kills the whole tree, exactly like dropping a one-shot run's

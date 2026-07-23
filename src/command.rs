@@ -1199,7 +1199,10 @@ impl Command {
     /// cap) if every line must reach the tee. The discard verbs
     /// ([`wait`](crate::RunningProcess::wait) / `profile`) apply a large internal
     /// in-flight byte cap for the same memory bound, so a line exceeding it is
-    /// likewise not teed under those verbs.
+    /// likewise not teed under those verbs;
+    /// [`drain`](crate::RunningProcess::drain) instead honors *this* configured
+    /// byte cap, so a line exceeding the configured
+    /// [`max_bytes`](crate::OutputBufferPolicy::max_bytes) is the one skipped there.
     ///
     /// Requires stdout to be [`Piped`](crate::StdioMode::Piped) (the default):
     /// the tee fires from the capture pump, so it is a no-op under
@@ -1235,6 +1238,18 @@ impl Command {
     /// Cap the in-memory backlog of captured output lines (see
     /// [`OutputBufferPolicy`]). The pump still drains the pipe; only retention is
     /// bounded.
+    ///
+    /// This policy governs the **capturing** verbs
+    /// ([`output_string`](crate::RunningProcess::output_string) and a streamed
+    /// [`finish`](crate::RunningProcess::finish)) and, for its **byte** ceiling
+    /// only, the in-flight bound of
+    /// [`drain`](crate::RunningProcess::drain). The discard verbs
+    /// [`wait`](crate::RunningProcess::wait) / `profile` ignore it entirely
+    /// (they pin a fixed internal in-flight cap); `drain` is the discard path that
+    /// *honors* this byte cap — retaining nothing, but bounding held memory by the
+    /// configured [`max_bytes`](OutputBufferPolicy::max_bytes) rather than the
+    /// child's output size. `max_lines` never affects the discard paths (they
+    /// retain nothing).
     pub fn output_buffer(mut self, policy: OutputBufferPolicy) -> Self {
         self.output_buffer = policy;
         self

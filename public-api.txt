@@ -1044,6 +1044,7 @@ impl core::panic::unwind_safe::UnwindSafe for processkit::RunProfile
 pub struct processkit::RunningProcess
 impl processkit::RunningProcess
 pub fn processkit::RunningProcess::cpu_time(&self) -> core::option::Option<core::time::Duration>
+pub async fn processkit::RunningProcess::drain(self) -> processkit::Result<processkit::Outcome>
 pub fn processkit::RunningProcess::elapsed(&self) -> core::time::Duration
 pub fn processkit::RunningProcess::kills_tree_on_drop(&self) -> bool
 pub async fn processkit::RunningProcess::output_bytes(self) -> processkit::Result<processkit::ProcessResult<alloc::vec::Vec<u8>>>
