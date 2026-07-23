@@ -1625,6 +1625,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn max_bytes_error_mode_counts_line_terminator_against_ceiling() {
+        // Error-mode byte ceilings count raw pipe bytes: content that exactly
+        // fits still trips once its trailing newline is read.
+        let policy = OutputBufferPolicy::unbounded()
+            .with_overflow(OverflowMode::Error)
+            .with_max_bytes(2);
+        let sink = SharedLines::new(&policy);
+        let raw = b"ab\n";
+        pump_lines(raw.as_slice(), encoding_rs::UTF_8, None, sink.clone()).await;
+
+        assert!(
+            sink.overflowed(),
+            "the newline must count against the raw-byte Error ceiling"
+        );
+        assert_eq!(sink.seen_bytes(), raw.len());
+    }
+
+    #[tokio::test]
     async fn max_bytes_under_the_cap_does_not_trip_or_drop() {
         // Within the byte cap, nothing is dropped and (under Error) nothing trips.
         let policy = OutputBufferPolicy::fail_loud(10).with_max_bytes(100);

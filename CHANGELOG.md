@@ -129,6 +129,10 @@ to a dated version section.
 
 ### Changed
 
+- `Error::OutputTooLarge.total_bytes` and the `OverflowMode::Error` plus
+  `max_bytes` ceiling now count raw bytes read from the output pipe, including
+  line terminators and invalid UTF-8 bytes, rather than decoded line-content
+  bytes
 - Release publishing now uses crates.io Trusted Publishing — a short-lived token
   minted over GitHub OIDC per run — instead of a stored long-lived
   `CRATES_IO_TOKEN` secret

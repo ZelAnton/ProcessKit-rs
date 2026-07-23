@@ -192,10 +192,12 @@ pub enum Error {
         max_bytes: Option<usize>,
         /// Total lines that arrived (retained + dropped).
         total_lines: usize,
-        /// Total bytes of decoded line text seen (retained + dropped) — the
-        /// same unit [`max_bytes`](crate::OutputBufferPolicy::max_bytes) caps:
-        /// the sum of line lengths with the trailing newline (and one `\r`)
-        /// stripped, not the raw stream size.
+        /// Total raw bytes read from the relevant output pipe (retained +
+        /// dropped), including line terminators such as LF and CRLF and bytes
+        /// that were invalid UTF-8 before decoding. This uses the same raw
+        /// pipe-byte accounting exposed by
+        /// [`stdout_bytes_seen`](crate::RunningProcess::stdout_bytes_seen)
+        /// and [`stderr_bytes_seen`](crate::RunningProcess::stderr_bytes_seen).
         total_bytes: usize,
     },
 

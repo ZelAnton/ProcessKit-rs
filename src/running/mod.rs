@@ -2238,6 +2238,30 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn output_string_errors_when_line_terminator_exceeds_raw_byte_cap() {
+        let cmd = Command::new("tool").output_buffer(
+            OutputBufferPolicy::unbounded()
+                .with_overflow(OverflowMode::Error)
+                .with_max_bytes(2),
+        );
+        let err = ScriptedRunner::new()
+            .fallback(Reply::ok("ab\n"))
+            .start(&cmd)
+            .await
+            .expect("scripted start")
+            .output_string()
+            .await
+            .expect_err("the newline must exceed the raw-byte cap");
+
+        match err {
+            Error::OutputTooLarge { total_bytes, .. } => {
+                assert_eq!(total_bytes, 3, "content plus the newline is reported")
+            }
+            other => panic!("expected OutputTooLarge, got {other:?}"),
+        }
+    }
+
     /// A bare `finish()` still drains BOTH pipes under the default (unbounded)
     /// policy: stdout is discarded (never returned — `Finished` carries no stdout),
     /// stderr is captured in the background and handed back.

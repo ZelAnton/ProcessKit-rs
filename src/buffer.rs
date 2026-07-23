@@ -226,8 +226,10 @@ pub enum OverflowMode {
     /// `fail_loud(n)` when you want a real cap.
     ///
     /// **Counts the total, not the backlog.** The ceiling fires on the
-    /// *cumulative* output the pump has seen — total lines and total bytes — not
-    /// on how much is currently buffered. A streaming consumer
+    /// *cumulative* output the pump has seen — total lines and, for
+    /// `max_bytes`, raw bytes read from the pipe before decoding, including
+    /// line terminators and invalid UTF-8 bytes — not on how much is currently
+    /// buffered. A streaming consumer
     /// ([`stdout_lines`](crate::RunningProcess::stdout_lines)) draining lines as
     /// they arrive frees buffer space but does **not** reset the ceiling, so
     /// `fail_loud(100)` errors on the 101st line whether it is read through
@@ -390,7 +392,12 @@ impl OutputBufferPolicy {
     /// `fail_loud(100).with_max_bytes(1 << 20)` errors on whichever ceiling — 100
     /// lines or 1 MiB — is reached first. Under the drop modes a single line
     /// larger than the cap is dropped whole (it cannot fit); under
-    /// [`OverflowMode::Error`] it trips the fail-loud ceiling.
+    /// [`OverflowMode::Error`] it trips the fail-loud ceiling. The accounting is
+    /// intentionally asymmetric: drop-mode retention remains bounded by decoded
+    /// line-content byte lengths, while the `Error` ceiling counts raw bytes read
+    /// from the pipe, including terminators and invalid UTF-8 bytes, before
+    /// decoding. Thus a line whose content exactly fits the cap can still trip
+    /// the `Error` ceiling when its terminator is read.
     ///
     /// **This affects every sink, not just the buffer:** a line longer than
     /// `max_bytes` is never assembled by the pump, so it is silently skipped
