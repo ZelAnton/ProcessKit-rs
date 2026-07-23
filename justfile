@@ -54,7 +54,8 @@ test-all:
 # `--cfg docsrs` build is `docsrs-doc` below, since it needs a nightly
 # toolchain this recipe doesn't assume is installed).
 doc-all:
-    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+    @# Restrict --document-private-items to --all-features, just like CI
+    RUSTDOCFLAGS="-D warnings" cargo doc --document-private-items --no-deps --all-features
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features
 
 # Optional: the two nightly-toolchain CI jobs that don't need external

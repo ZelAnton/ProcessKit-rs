@@ -251,7 +251,9 @@ jobs:
       # The crate's docs are intra-doc-link dense; a broken link degrades the
       # docs.rs page silently (doctests don't catch it). Build both the
       # docs.rs configuration (all features) and the minimal one.
-      - run: cargo doc --no-deps --all-features
+      # NOTE: The --document-private-items flag is only used with --all-features
+      # so private docs can freely reference items hidden behind feature flags.
+      - run: cargo doc --no-deps --document-private-items --all-features
         env:
           RUSTDOCFLAGS: -D warnings
       - run: cargo doc --no-deps --no-default-features
