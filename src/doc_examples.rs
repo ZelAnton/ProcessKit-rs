@@ -50,6 +50,12 @@ mod guides {
     #[doc(hidden)]
     #[doc = include_str!("../docs/batch.md")]
     mod docs_batch {}
+
+    /// `docs/comparison.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/comparison.md")]
+    mod docs_comparison {}
+
     /// `docs/cookbook.md`.
     #[doc(hidden)]
     #[doc = include_str!("../docs/cookbook.md")]

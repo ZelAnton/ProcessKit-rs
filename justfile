@@ -122,3 +122,9 @@ typos:
 public-api-diff:
     cargo +nightly public-api --simplified --all-features > public-api-current.txt
     diff public-api.txt public-api-current.txt && echo "(no changes)"
+
+# Compare processkit's end-to-end process handling with the plain Tokio and
+# standard-library APIs. This is intentionally local-only: results vary with
+# the OS, scheduler, toolchain, and machine, and are not a CI gate.
+bench-compare:
+    cargo bench --bench compare
