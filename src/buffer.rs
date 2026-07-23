@@ -182,7 +182,7 @@ pub enum OverflowMode {
     /// [`DropOldest`](OverflowMode::DropOldest)).
     DropNewest,
     /// Fail-loud ceiling: once the buffer is full, the run errors with
-    /// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge) rather than
+    /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) rather than
     /// silently dropping lines. The pipe is still drained (so the child never
     /// blocks); excess lines are counted but not retained.
     ///
@@ -222,7 +222,7 @@ pub enum OverflowMode {
     /// *unbounded* buffer (no `max_lines` and no `max_bytes`) this mode is a
     /// misconfiguration — a fail-loud ceiling with no ceiling — so it is treated
     /// as **zero-tolerance**: the run errors on *any* line-pumped output
-    /// (`Error::OutputTooLarge`), rather than silently retaining everything. Use
+    /// (`ErrorReason::OutputTooLarge`), rather than silently retaining everything. Use
     /// `fail_loud(n)` when you want a real cap.
     ///
     /// **Counts the total, not the backlog.** The ceiling fires on the
@@ -368,7 +368,7 @@ impl OutputBufferPolicy {
     /// Retain at most `max_lines` and error when full — a fail-loud ceiling.
     ///
     /// Equivalent to `bounded(max_lines).with_overflow(OverflowMode::Error)`.
-    /// The run errors with [`Error::OutputTooLarge`](crate::Error::OutputTooLarge)
+    /// The run errors with [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge)
     /// once this limit is reached; excess lines are counted but not retained.
     pub fn fail_loud(max_lines: usize) -> Self {
         Self {
@@ -437,7 +437,7 @@ impl Default for OutputBufferPolicy {
 /// - No cap (`None`): retain everything (the default — byte-for-byte the old
 ///   behavior).
 /// - [`OverflowMode::Error`]: flag overflow and stop retaining past the cap; the
-///   caller drains the pipe to EOF and then raises `Error::OutputTooLarge`.
+///   caller drains the pipe to EOF and then raises `ErrorReason::OutputTooLarge`.
 /// - [`OverflowMode::DropNewest`]: keep the first `cap` bytes (head), flag
 ///   truncation.
 /// - [`OverflowMode::DropOldest`]: keep roughly the last `cap` bytes (tail). The

@@ -3,7 +3,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::error::Error;
+use crate::error::{Error, ErrorReason};
 
 /// How a run ended — the explicit form of the `code()`/`timed_out()` pair.
 ///
@@ -137,7 +137,7 @@ pub struct ProcessResult<T> {
     stdout: T,
     stderr: String,
     outcome: Outcome,
-    /// Carried so the success-checking helpers can build a faithful [`Error::Timeout`].
+    /// Carried so the success-checking helpers can build a faithful [`ErrorReason::Timeout`].
     timeout: Option<Duration>,
     /// `Duration::ZERO` for synthetic results that didn't time a real process.
     duration: Duration,
@@ -145,7 +145,7 @@ pub struct ProcessResult<T> {
     /// dropped captured output lines.
     truncated: bool,
     /// Retained + dropped, so a checking verb can build a faithful
-    /// [`Error::OutputTooLarge`]; meaningful only when `truncated`.
+    /// [`ErrorReason::OutputTooLarge`]; meaningful only when `truncated`.
     total_lines: usize,
     total_bytes: usize,
     /// Exit codes treated as success by [`is_success`](Self::is_success) /
@@ -313,12 +313,12 @@ impl<T> ProcessResult<T> {
     ///
     /// # Errors
     ///
-    /// - [`Error::Timeout`] if the run was killed by its deadline (checked
+    /// - [`ErrorReason::Timeout`] if the run was killed by its deadline (checked
     ///   *first*, so a run that both timed out and exited non-zero reports the
     ///   timeout).
-    /// - [`Error::Signalled`](crate::Error::Signalled) if it was terminated by a
+    /// - [`ErrorReason::Signalled`](crate::ErrorReason::Signalled) if it was terminated by a
     ///   signal, with no exit code.
-    /// - [`Error::Exit`] for an exit code outside the accepted set, carrying the
+    /// - [`ErrorReason::Exit`] for an exit code outside the accepted set, carrying the
     ///   code and both captured streams in full (the
     ///   [`Display`](std::fmt::Display) impl bounds what it prints; the fields
     ///   stay complete for classification).
@@ -328,34 +328,37 @@ impl<T> ProcessResult<T> {
     {
         match self.outcome {
             Outcome::Exited(code) if self.ok_codes.contains(&code) => Ok(self),
-            Outcome::TimedOut => Err(Error::Timeout {
+            Outcome::TimedOut => Err(ErrorReason::Timeout {
                 program: self.program.clone(),
                 timeout: self.timeout.unwrap_or_default(),
                 stdout: self.stdout.as_text(),
                 stderr: self.stderr.clone(),
                 stdout_bytes: self.stdout.into_raw(),
-            }),
-            Outcome::Signalled(signal) => Err(Error::Signalled {
+            }
+            .into()),
+            Outcome::Signalled(signal) => Err(ErrorReason::Signalled {
                 program: self.program.clone(),
                 signal,
                 stdout: self.stdout.as_text(),
                 stderr: self.stderr.clone(),
                 stdout_bytes: self.stdout.into_raw(),
-            }),
-            Outcome::Exited(code) => Err(Error::Exit {
+            }
+            .into()),
+            Outcome::Exited(code) => Err(ErrorReason::Exit {
                 program: self.program.clone(),
                 code,
                 stdout: self.stdout.as_text(),
                 stderr: self.stderr.clone(),
                 stdout_bytes: self.stdout.into_raw(),
-            }),
+            }
+            .into()),
         }
     }
 
     /// The exit code for the code-returning convenience helpers
     /// (`Command::exit_code`, `ProcessRunnerExt::exit_code`, `CliClient::exit_code`):
-    /// a timeout surfaces as [`Error::Timeout`], a signal-kill (no code) as
-    /// [`Error::Signalled`], otherwise the code. Takes `self` by value (rather
+    /// a timeout surfaces as [`ErrorReason::Timeout`], a signal-kill (no code) as
+    /// [`ErrorReason::Signalled`], otherwise the code. Takes `self` by value (rather
     /// than `&self`) so the bytes-path payload can move its raw stdout into the
     /// error instead of cloning it — every call site already holds a
     /// freshly-produced, otherwise-unused `ProcessResult`.
@@ -365,20 +368,22 @@ impl<T> ProcessResult<T> {
     {
         match self.outcome {
             Outcome::Exited(code) => Ok(code),
-            Outcome::TimedOut => Err(Error::Timeout {
+            Outcome::TimedOut => Err(ErrorReason::Timeout {
                 program: self.program.clone(),
                 timeout: self.timeout.unwrap_or_default(),
                 stdout: self.stdout.as_text(),
                 stderr: self.stderr.clone(),
                 stdout_bytes: self.stdout.into_raw(),
-            }),
-            Outcome::Signalled(signal) => Err(Error::Signalled {
+            }
+            .into()),
+            Outcome::Signalled(signal) => Err(ErrorReason::Signalled {
                 program: self.program.clone(),
                 signal,
                 stdout: self.stdout.as_text(),
                 stderr: self.stderr.clone(),
                 stdout_bytes: self.stdout.into_raw(),
-            }),
+            }
+            .into()),
         }
     }
 
@@ -413,7 +418,7 @@ impl<T> ProcessResult<T> {
     }
 
     /// Record the total lines/bytes the streams produced (retained + dropped),
-    /// so a checking verb can build a faithful [`Error::OutputTooLarge`] when it
+    /// so a checking verb can build a faithful [`ErrorReason::OutputTooLarge`] when it
     /// refuses truncated output. Producer-only.
     pub(crate) fn with_overflow_totals(mut self, total_lines: usize, total_bytes: usize) -> Self {
         self.total_lines = total_lines;
@@ -435,7 +440,7 @@ impl<T> ProcessResult<T> {
 
     /// Refuse silently-truncated output. The checking verbs that hand back
     /// stdout *as if complete* (`run`/`parse`/`try_parse`) call this so a bounded
-    /// drop-policy that discarded lines surfaces as [`Error::OutputTooLarge`]
+    /// drop-policy that discarded lines surfaces as [`ErrorReason::OutputTooLarge`]
     /// rather than feeding a parser a truncated tail. The lenient capture verbs
     /// (`output_string`/`output_bytes`/`checked`) do **not** call it — they
     /// return the result with [`truncated`](Self::truncated) set so the caller
@@ -446,13 +451,14 @@ impl<T> ProcessResult<T> {
         max_bytes: Option<usize>,
     ) -> Result<(), Error> {
         if self.truncated {
-            return Err(Error::OutputTooLarge {
+            return Err(ErrorReason::OutputTooLarge {
                 program: self.program.clone(),
                 max_lines,
                 max_bytes,
                 total_lines: self.total_lines,
                 total_bytes: self.total_bytes,
-            });
+            }
+            .into());
         }
         Ok(())
     }
@@ -565,7 +571,7 @@ fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
             .any(|w| w.eq_ignore_ascii_case(needle))
 }
 
-/// Render captured stdout as text for [`Error::Exit`], whatever the payload type:
+/// Render captured stdout as text for [`ErrorReason::Exit`], whatever the payload type:
 /// a [`String`] is taken as-is; raw bytes are decoded lossily. Also exposes the
 /// exact captured bytes when the payload type carries them losslessly
 /// (`Vec<u8>` — the `output_bytes()` path), so a checking verb
@@ -706,9 +712,9 @@ mod tests {
         assert!(!killed.timed_out());
         assert!(!killed.is_success());
         assert_eq!(killed.outcome(), Outcome::Signalled(Some(9)));
-        match killed.ensure_success().unwrap_err() {
+        match killed.ensure_success().unwrap_err().into_reason() {
             // The captured stdout flows into the error.
-            Error::Signalled {
+            ErrorReason::Signalled {
                 program,
                 signal,
                 stdout,
@@ -777,8 +783,8 @@ mod tests {
         assert!(!bad.is_success());
         assert_eq!(bad.code(), Some(2));
         let err = bad.ensure_success().unwrap_err();
-        match err {
-            Error::Exit {
+        match err.into_reason() {
+            ErrorReason::Exit {
                 program,
                 code,
                 stdout,
@@ -821,7 +827,8 @@ mod tests {
             conflict.diagnostic(),
             "CONFLICT (content): merge conflict in a.rs"
         );
-        let Error::Exit { .. } = conflict.clone().ensure_success().unwrap_err() else {
+        let ErrorReason::Exit { .. } = conflict.clone().ensure_success().unwrap_err().into_reason()
+        else {
             panic!("expected Exit");
         };
         assert_eq!(
@@ -853,8 +860,8 @@ mod tests {
         );
         assert!(timed.timed_out());
         assert_eq!(timed.code(), None);
-        match timed.ensure_success().unwrap_err() {
-            Error::Timeout {
+        match timed.ensure_success().unwrap_err().into_reason() {
+            ErrorReason::Timeout {
                 program,
                 timeout,
                 stdout,
@@ -872,8 +879,8 @@ mod tests {
     #[test]
     fn signal_kill_surfaces_as_signalled_error() {
         // A signal-terminated run (no code, not a timeout) must surface
-        // `Error::Signalled` from both `require_code` and `ensure_success`,
-        // never a synthetic `Error::Exit { code: -1 }` sentinel.
+        // `ErrorReason::Signalled` from both `require_code` and `ensure_success`,
+        // never a synthetic `ErrorReason::Exit { code: -1 }` sentinel.
         let killed = ProcessResult::new(
             "git".into(),
             "out".to_owned(),
@@ -884,11 +891,11 @@ mod tests {
         assert_eq!(killed.code(), None);
         assert!(!killed.is_success());
         assert!(matches!(
-            killed.clone().require_code().unwrap_err(),
-            Error::Signalled { .. }
+            killed.clone().require_code().unwrap_err().reason(),
+            ErrorReason::Signalled { .. }
         ));
-        match killed.ensure_success().unwrap_err() {
-            Error::Signalled {
+        match killed.ensure_success().unwrap_err().into_reason() {
+            ErrorReason::Signalled {
                 program, signal, ..
             } => {
                 assert_eq!(program, "git");
@@ -995,7 +1002,9 @@ mod tests {
             None,
         );
         assert_eq!(bad.stderr().len(), 10_000);
-        let Error::Exit { stdout, stderr, .. } = bad.ensure_success().unwrap_err() else {
+        let ErrorReason::Exit { stdout, stderr, .. } =
+            bad.ensure_success().unwrap_err().into_reason()
+        else {
             panic!("expected Exit");
         };
         assert_eq!(stdout.len(), 10_000, "full stdout carried, untruncated");
@@ -1026,8 +1035,8 @@ mod tests {
             Some(raw.as_slice()),
             "the exact pre-decode bytes must survive, byte for byte"
         );
-        match &err {
-            Error::Exit { stdout_bytes, .. } => {
+        match err.reason() {
+            ErrorReason::Exit { stdout_bytes, .. } => {
                 assert_eq!(stdout_bytes.as_deref(), Some(raw.as_slice()));
             }
             other => panic!("expected Exit, got {other:?}"),
@@ -1073,8 +1082,8 @@ mod tests {
         .with_ok_codes(vec![0, 1]);
         assert!(!two.is_success(), "an unaccepted code is still a failure");
         assert!(matches!(
-            two.ensure_success().unwrap_err(),
-            Error::Exit { code: 2, .. }
+            two.ensure_success().unwrap_err().reason(),
+            ErrorReason::Exit { code: 2, .. }
         ));
     }
 
@@ -1119,8 +1128,11 @@ mod tests {
         )
         .with_truncated(true)
         .with_overflow_totals(5000, 1_000_000);
-        match truncated.reject_if_truncated(Some(100), None) {
-            Err(Error::OutputTooLarge {
+        match truncated
+            .reject_if_truncated(Some(100), None)
+            .map_err(|e| e.into_reason())
+        {
+            Err(ErrorReason::OutputTooLarge {
                 program,
                 max_lines,
                 max_bytes,

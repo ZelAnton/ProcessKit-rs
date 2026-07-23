@@ -28,9 +28,9 @@ guarantee:
   panic, a dropped future — the tree still dies. See
   [Process groups](process-groups.md).
 - **Honest failure instead of silent degradation.** A resource cap that can't
-  be enforced fails the call with a typed `Error::ResourceLimit` rather than
+  be enforced fails the call with a typed `ErrorReason::ResourceLimit` rather than
   handing back a group that looks capped but isn't; a privilege-drop knob
-  unsupported on the current platform fails with `Error::Unsupported` rather
+  unsupported on the current platform fails with `ErrorReason::Unsupported` rather
   than being quietly skipped. Nothing you asked for is ever dropped on the
   floor without telling you.
 - **No secrets in diagnostics by default.** Argv and environment *values*
@@ -112,7 +112,7 @@ async fn main() -> processkit::Result<()> {
 
 **Creation fails fast when a cap can't be enforced.** `with_options` (and
 `ProcessGroup::new` if any limit was requested) returns
-`Error::ResourceLimit { kind, reason, detail }` instead of handing back a
+`ErrorReason::ResourceLimit { kind, reason, detail }` instead of handing back a
 group that looks capped but isn't — an unenforced limit is no protection for
 an untrusted child. `reason` tells you *why*: `Unsupported` means no
 whole-tree mechanism exists at all here (macOS/the BSDs, or a Linux host
@@ -165,7 +165,7 @@ alone leaves the child holding the *parent's* (often root's) supplementary
 groups, which can still grant access you meant to remove; always pair
 `uid`/`gid` with an explicit `groups()` (or `groups([])` to drop every
 extra). `uid`/`gid`/`groups`/`setsid`/`umask` are Unix-only: on Windows the
-run fails with `Error::Unsupported` rather than silently proceeding without
+run fails with `ErrorReason::Unsupported` rather than silently proceeding without
 a drop — a wrapper that must run cross-platform should branch on the
 platform ahead of time rather than assume the drop happened. None of this
 needs an external helper (`setpriv`/`su-exec`/`gosu`) or a shell — the crate
@@ -255,7 +255,7 @@ async fn main() -> processkit::Result<()> {
   [Running commands → buffer policies](commands.md#buffer-policies--bounding-memory-on-chatty-children).
 - **`timeout`** kills the whole tree (not just the direct child) at the
   deadline, on every consuming verb — captured as data on the capturing
-  verbs, raised as `Error::Timeout` on the checking ones. A caller-initiated
+  verbs, raised as `ErrorReason::Timeout` on the checking ones. A caller-initiated
   abandonment (rather than a fixed deadline) is `cancel_on(token)` instead —
   it always errors, on every path. Detail: [Timeouts, retries &
   cancellation](timeouts-and-cancellation.md).
@@ -290,7 +290,7 @@ async fn main() -> processkit::Result<()> {
   from hanging on unexpected input; it says nothing about what the child
   can do once running.
 - **A resource limit or privilege drop this crate refused to apply
-  (`Error::ResourceLimit`/`Error::Unsupported`) is not "close enough".**
+  (`ErrorReason::ResourceLimit`/`ErrorReason::Unsupported`) is not "close enough".**
   Treat either as a hard stop for the launch, not a degraded-but-acceptable
   mode — see [§2](#2-resource-limits-and-their-platform-caveats) and
   [§3](#3-drop-privileges-in-the-right-order).

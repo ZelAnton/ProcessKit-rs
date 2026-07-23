@@ -3,24 +3,28 @@
 use std::fmt;
 use std::time::Duration;
 
-/// Errors produced when launching or running a child process.
+/// The structured failure mode behind an [`Error`] — the enum you reach through
+/// [`Error::reason`].
 ///
-/// Spawn failures, a non-zero exit ([`Exit`](Error::Exit)), timeouts, and IO
+/// Spawn failures, a non-zero exit ([`Exit`](ErrorReason::Exit)), timeouts, and IO
 /// errors fold into one structured enum, so callers can pattern-match on the
-/// failure mode instead of parsing strings.
+/// failure mode instead of parsing strings. It is carried behind a pointer-sized
+/// [`Error`] wrapper (`Box<ErrorReason>`), so a `Result<T, Error>` never inlines
+/// the largest variant's captured streams — match on it via
+/// `err.reason()`.
 ///
-/// `Debug` is **manual, not derived**: the [`Exit`](Error::Exit) variant
+/// `Debug` is **manual, not derived**: the [`Exit`](ErrorReason::Exit) variant
 /// carries both captured streams in full, and a derived `Debug` would dump them
 /// — potentially multi-MiB — into a `{e:?}` log line or an `.unwrap()` panic
 /// message. The manual impl bounds each stream to a 200-byte preview (mirroring
 /// the [`Display`](std::fmt::Display) tail cap) and redacts
-/// [`NotFound`](Error::NotFound)'s
+/// [`NotFound`](ErrorReason::NotFound)'s
 /// `searched` (the `PATH` env value) to a directory count, honoring the crate's
 /// "never log environment values" rule. The exact streams remain reachable via
 /// the public fields.
 #[derive(thiserror::Error)]
 #[non_exhaustive]
-pub enum Error {
+pub enum ErrorReason {
     /// The child process could not be started (binary not found, permission
     /// denied, …).
     #[error("could not start `{program}`: {source}")]
@@ -38,9 +42,9 @@ pub enum Error {
     /// executable. The **single** representation of "program not found": the
     /// launch path routes every such failure here regardless of how the program
     /// was named (bare name vs path) or platform, so a caller matches one
-    /// variant and [`is_not_found`](Error::is_not_found) classifies it.
+    /// variant and [`is_not_found`](ErrorReason::is_not_found) classifies it.
     ///
-    /// Distinct from [`Spawn`](Error::Spawn), which covers OS-level failures
+    /// Distinct from [`Spawn`](ErrorReason::Spawn), which covers OS-level failures
     /// once the program *is* located (permission denied, busy, a bad working
     /// directory, a `.cmd`/`.bat` on Windows that needs `cmd.exe`, etc.) —
     /// those are **not** `is_not_found`.
@@ -70,11 +74,11 @@ pub enum Error {
 
     /// A cassette replay found **no recording** matching the invocation — a
     /// stale or incomplete cassette, not a missing program. Kept distinct
-    /// from [`Spawn`](Error::Spawn) / [`NotFound`](Error::NotFound) so a wrapper
+    /// from [`Spawn`](ErrorReason::Spawn) / [`NotFound`](ErrorReason::NotFound) so a wrapper
     /// that treats "tool not installed" as an *optional* dependency does not
     /// silently swallow a stale cassette as an absent tool.
     ///
-    /// [`is_not_found`](Error::is_not_found) returns `false` for this variant.
+    /// [`is_not_found`](ErrorReason::is_not_found) returns `false` for this variant.
     #[error(
         "`{program}`: no cassette entry matches this invocation (stale or incomplete cassette)"
     )]
@@ -126,7 +130,7 @@ pub enum Error {
         /// "raw" form to recover. When `Some`, these bytes are the exact
         /// pre-decode stdout — `stdout` is a lossy UTF-8 decode of this same
         /// data, so the two may differ when the stream was not valid UTF-8.
-        /// Read via [`Error::stdout_bytes`].
+        /// Read via [`ErrorReason::stdout_bytes`].
         stdout_bytes: Option<Vec<u8>>,
     },
 
@@ -141,7 +145,7 @@ pub enum Error {
     ///
     /// The one-line `Display` message appends the **last non-empty line** of
     /// [`diagnostic`](Self::diagnostic), capped at 200 bytes — just like
-    /// [`Exit`](Error::Exit) — so a log line stays actionable without dumping
+    /// [`Exit`](ErrorReason::Exit) — so a log line stays actionable without dumping
     /// the captured streams.
     #[error("{}", display_timeout(program, *timeout, stdout, stderr))]
     #[non_exhaustive]
@@ -161,10 +165,10 @@ pub enum Error {
         /// (bounded) reaches the `Display` message.
         stderr: String,
         /// The exact captured stdout bytes before the kill, when the producing
-        /// path captured raw bytes — see [`Exit`](Error::Exit)'s `stdout_bytes`
+        /// path captured raw bytes — see [`Exit`](ErrorReason::Exit)'s `stdout_bytes`
         /// field for the full contract. `None` on the text path, or when the
         /// producing path captured nothing (a streaming probe). Read via
-        /// [`Error::stdout_bytes`].
+        /// [`ErrorReason::stdout_bytes`].
         stdout_bytes: Option<Vec<u8>>,
     },
 
@@ -207,7 +211,7 @@ pub enum Error {
     /// accepted, the check never returned `true`, or the child exited before
     /// becoming ready.
     ///
-    /// Distinct from [`Timeout`](Error::Timeout): a probe deadline is separate
+    /// Distinct from [`Timeout`](ErrorReason::Timeout): a probe deadline is separate
     /// from the run's own [`Command::timeout`](crate::Command::timeout), and a
     /// failed probe does **not** kill the child — the caller decides what
     /// happens next.
@@ -230,7 +234,7 @@ pub enum Error {
     /// parser the caller maps into this variant).
     ///
     /// `message` is caller-built and routinely embeds the unparsed output in
-    /// full, so — like the [`Exit`](Error::Exit) streams — both `Display` and
+    /// full, so — like the [`Exit`](ErrorReason::Exit) streams — both `Display` and
     /// `Debug` bound it to a 200-byte preview; the complete text stays
     /// reachable via the public field.
     #[error("{}", display_parse(program, message))]
@@ -269,7 +273,7 @@ pub enum Error {
         /// Human-readable detail — the validation message for
         /// [`LimitReason::Invalid`](crate::LimitReason::Invalid), or the
         /// underlying OS error text otherwise. Bounded like other free-text
-        /// fields (see [`Parse`](Error::Parse)'s `message`) in `Display`/`Debug`.
+        /// fields (see [`Parse`](ErrorReason::Parse)'s `message`) in `Display`/`Debug`.
         detail: String,
     },
 
@@ -289,13 +293,13 @@ pub enum Error {
     /// ([`Command::cancel_on`](crate::Command::cancel_on)) and its process
     /// tree was killed.
     ///
-    /// Asymmetric with [`Timeout`](Error::Timeout) by design: a timeout is
+    /// Asymmetric with [`Timeout`](ErrorReason::Timeout) by design: a timeout is
     /// *captured* (`ProcessResult::timed_out`) on the non-checking paths,
     /// whereas a cancellation is **always** raised on every consuming path.
     /// When a run both times out and is cancelled, cancellation wins (it is
     /// checked first).
     ///
-    /// Unlike [`Timeout`](Error::Timeout) / [`Signalled`](Error::Signalled),
+    /// Unlike [`Timeout`](ErrorReason::Timeout) / [`Signalled`](ErrorReason::Signalled),
     /// this carries **no captured streams**: cancellation is a deliberate
     /// caller action that stops the run *immediately*. On the pre-spawn path (the
     /// token was already cancelled) nothing was captured at all; on the consuming
@@ -310,13 +314,13 @@ pub enum Error {
 
     /// The process was terminated by a signal (**Unix only**) without producing an
     /// exit code. `signal` carries the signal number when the kernel reports one,
-    /// else `None`. On **Windows** a killed process reports [`Exit`](Error::Exit)
+    /// else `None`. On **Windows** a killed process reports [`Exit`](ErrorReason::Exit)
     /// with a platform code, never this — a live `Signalled` cannot occur there; it
     /// arises only from a [`ScriptedRunner`](crate::testing::ScriptedRunner) or a
     /// `record`-feature cassette replay, which report `Signalled(None)` to mirror
     /// Unix.
     ///
-    /// Distinct from [`Exit`](Error::Exit): a signal-terminated run has no exit
+    /// Distinct from [`Exit`](ErrorReason::Exit): a signal-terminated run has no exit
     /// code to check — it is always a failure. Produced by
     /// [`ensure_success`](crate::ProcessResult::ensure_success) and the
     /// `require_code` path when the outcome is
@@ -325,7 +329,7 @@ pub enum Error {
     /// Carries whatever the run captured before the signal killed it — a
     /// crashing tool's partial stderr is often the diagnostic — reachable via
     /// [`diagnostic`](Self::diagnostic) and the public fields. The one-line
-    /// `Display` appends the bounded diagnostic tail, like [`Exit`](Error::Exit).
+    /// `Display` appends the bounded diagnostic tail, like [`Exit`](ErrorReason::Exit).
     #[error("{}", display_signalled(program, *signal, stdout, stderr))]
     #[non_exhaustive]
     Signalled {
@@ -342,9 +346,9 @@ pub enum Error {
         /// non-empty line (bounded) reaches the `Display` message.
         stderr: String,
         /// The exact captured stdout bytes before the kill, when the producing
-        /// path captured raw bytes — see [`Exit`](Error::Exit)'s `stdout_bytes`
+        /// path captured raw bytes — see [`Exit`](ErrorReason::Exit)'s `stdout_bytes`
         /// field for the full contract. `None` on the text path. Read via
-        /// [`Error::stdout_bytes`].
+        /// [`ErrorReason::stdout_bytes`].
         stdout_bytes: Option<Vec<u8>>,
     },
 
@@ -352,8 +356,8 @@ pub enum Error {
     /// than the routine broken pipe.
     ///
     /// This is raised by the consuming paths **only when the
-    /// run otherwise succeeded** — a non-zero [`Exit`](Error::Exit), a
-    /// [`Signalled`](Error::Signalled), or a [`Timeout`](Error::Timeout) is the
+    /// run otherwise succeeded** — a non-zero [`Exit`](ErrorReason::Exit), a
+    /// [`Signalled`](ErrorReason::Signalled), or a [`Timeout`](ErrorReason::Timeout) is the
     /// "realer" failure and wins (the stdin error is then dropped). A broken
     /// pipe (`EPIPE` / `ERROR_BROKEN_PIPE` — the child closing stdin before
     /// reading all of it) is routine and **never** surfaces. Diagnoses a
@@ -361,9 +365,9 @@ pub enum Error {
     /// The stdin source ([`Command::stdin`](crate::Command::stdin))
     /// is written on a background task; this carries that task's failure.
     ///
-    /// The io-level classifiers ([`is_transient`](Error::is_transient),
-    /// [`is_not_found`](Error::is_not_found),
-    /// [`is_permission_denied`](Error::is_permission_denied)) deliberately return
+    /// The io-level classifiers ([`is_transient`](ErrorReason::is_transient),
+    /// [`is_not_found`](ErrorReason::is_not_found),
+    /// [`is_permission_denied`](ErrorReason::is_permission_denied)) deliberately return
     /// `false` here: they classify spawn/launch conditions, and the run already
     /// *succeeded* — a blanket retry would re-run a command that worked. Inspect
     /// `source` directly if a stdin-specific retry is wanted.
@@ -381,30 +385,30 @@ pub enum Error {
     /// (waiting for exit, issuing a kill), controlling a process group
     /// (signalling, reaping, sampling stats), or reading/writing a cassette
     /// file. It is **not** a spawn/launch condition (those are
-    /// [`Spawn`](Error::Spawn) / [`NotFound`](Error::NotFound)).
+    /// [`Spawn`](ErrorReason::Spawn) / [`NotFound`](ErrorReason::NotFound)).
     ///
     /// There is **deliberately no blanket `From<std::io::Error>`**: the
     /// crate never lets an arbitrary foreign `io::Error` fall into this variant
     /// via `?`. Every `Io` is constructed explicitly at a known site, so the
-    /// io-level classifiers ([`is_transient`](Error::is_transient),
-    /// [`is_permission_denied`](Error::is_permission_denied)) only ever see an
+    /// io-level classifiers ([`is_transient`](ErrorReason::is_transient),
+    /// [`is_permission_denied`](ErrorReason::is_permission_denied)) only ever see an
     /// IO error the crate itself produced — never an unrelated one a caller's
     /// `?` happened to route through here.
     #[error(transparent)]
     Io(std::io::Error),
 }
 
-impl Error {
+impl ErrorReason {
     /// The best human-facing message for a failed run, trimmed of surrounding
     /// whitespace: captured standard error if it carries text, otherwise the
     /// captured standard output (where `git` puts `CONFLICT …` and `git commit`
     /// puts `nothing to commit`). Covers the variants that capture streams — a
-    /// non-zero [`Exit`](Error::Exit), a [`Timeout`](Error::Timeout) (the partial
-    /// output of a hung-then-killed tool), and a [`Signalled`](Error::Signalled)
+    /// non-zero [`Exit`](ErrorReason::Exit), a [`Timeout`](ErrorReason::Timeout) (the partial
+    /// output of a hung-then-killed tool), and a [`Signalled`](ErrorReason::Signalled)
     /// crash. Returns `None` when there is no captured output to show — a silent
     /// run (both streams blank) or a variant that carries none
-    /// ([`Spawn`](Error::Spawn), [`Cancelled`](Error::Cancelled),
-    /// [`Parse`](Error::Parse), [`Io`](Error::Io)) — so a caller can fall back to
+    /// ([`Spawn`](ErrorReason::Spawn), [`Cancelled`](ErrorReason::Cancelled),
+    /// [`Parse`](ErrorReason::Parse), [`Io`](ErrorReason::Io)) — so a caller can fall back to
     /// the [`Display`](std::fmt::Display) message. For the raw, untrimmed stream
     /// match on the variant's fields directly.
     pub fn diagnostic(&self) -> Option<&str> {
@@ -412,27 +416,27 @@ impl Error {
         // here rather than fall through a `_ => None` and be invisible to
         // `diagnostic()`. `#[non_exhaustive]` only constrains downstream matches.
         match self {
-            Error::Exit { stdout, stderr, .. }
-            | Error::Timeout { stdout, stderr, .. }
-            | Error::Signalled { stdout, stderr, .. } => exit_diagnostic(stdout, stderr),
-            Error::Spawn { .. }
-            | Error::NotFound { .. }
-            | Error::CassetteMiss { .. }
-            | Error::OutputTooLarge { .. }
-            | Error::NotReady { .. }
-            | Error::Parse { .. }
-            | Error::Unsupported { .. }
-            | Error::Cancelled { .. }
-            | Error::Stdin { .. }
-            | Error::Io(_) => None,
+            ErrorReason::Exit { stdout, stderr, .. }
+            | ErrorReason::Timeout { stdout, stderr, .. }
+            | ErrorReason::Signalled { stdout, stderr, .. } => exit_diagnostic(stdout, stderr),
+            ErrorReason::Spawn { .. }
+            | ErrorReason::NotFound { .. }
+            | ErrorReason::CassetteMiss { .. }
+            | ErrorReason::OutputTooLarge { .. }
+            | ErrorReason::NotReady { .. }
+            | ErrorReason::Parse { .. }
+            | ErrorReason::Unsupported { .. }
+            | ErrorReason::Cancelled { .. }
+            | ErrorReason::Stdin { .. }
+            | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
-            Error::ResourceLimit { .. } => None,
+            ErrorReason::ResourceLimit { .. } => None,
         }
     }
 
     /// The captured standard output, for the variants that carry a stream — a
-    /// non-zero [`Exit`](Error::Exit), a [`Timeout`](Error::Timeout) (partial
-    /// output before the kill), or a [`Signalled`](Error::Signalled) crash —
+    /// non-zero [`Exit`](ErrorReason::Exit), a [`Timeout`](ErrorReason::Timeout) (partial
+    /// output before the kill), or a [`Signalled`](ErrorReason::Signalled) crash —
     /// `None` for every other variant. The raw stream in full (untrimmed); for
     /// the best one-line message use [`diagnostic`](Self::diagnostic), for both
     /// streams joined [`combined`](Self::combined). Reads the stream off the error
@@ -448,8 +452,8 @@ impl Error {
     }
 
     /// The **exact** captured stdout bytes, when available — `Some` only for a
-    /// stream-bearing variant ([`Exit`](Error::Exit) / [`Timeout`](Error::Timeout)
-    /// / [`Signalled`](Error::Signalled)) produced by a checking verb built over
+    /// stream-bearing variant ([`Exit`](ErrorReason::Exit) / [`Timeout`](ErrorReason::Timeout)
+    /// / [`Signalled`](ErrorReason::Signalled)) produced by a checking verb built over
     /// [`output_bytes`](crate::Command::output_bytes) (e.g.
     /// `output_bytes().await?.ensure_success()?`); `None` for every other
     /// variant, and for a stream-bearing variant produced on the text path
@@ -461,21 +465,21 @@ impl Error {
         // Exhaustive on purpose (like `streams`): a future stream-carrying
         // variant must add itself here, not fall through a `_`.
         match self {
-            Error::Exit { stdout_bytes, .. }
-            | Error::Timeout { stdout_bytes, .. }
-            | Error::Signalled { stdout_bytes, .. } => stdout_bytes.as_deref(),
-            Error::Spawn { .. }
-            | Error::NotFound { .. }
-            | Error::CassetteMiss { .. }
-            | Error::OutputTooLarge { .. }
-            | Error::NotReady { .. }
-            | Error::Parse { .. }
-            | Error::Unsupported { .. }
-            | Error::Cancelled { .. }
-            | Error::Stdin { .. }
-            | Error::Io(_) => None,
+            ErrorReason::Exit { stdout_bytes, .. }
+            | ErrorReason::Timeout { stdout_bytes, .. }
+            | ErrorReason::Signalled { stdout_bytes, .. } => stdout_bytes.as_deref(),
+            ErrorReason::Spawn { .. }
+            | ErrorReason::NotFound { .. }
+            | ErrorReason::CassetteMiss { .. }
+            | ErrorReason::OutputTooLarge { .. }
+            | ErrorReason::NotReady { .. }
+            | ErrorReason::Parse { .. }
+            | ErrorReason::Unsupported { .. }
+            | ErrorReason::Cancelled { .. }
+            | ErrorReason::Stdin { .. }
+            | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
-            Error::ResourceLimit { .. } => None,
+            ErrorReason::ResourceLimit { .. } => None,
         }
     }
 
@@ -492,34 +496,34 @@ impl Error {
     }
 
     /// The captured `(stdout, stderr)` for the stream-bearing variants
-    /// ([`Exit`](Error::Exit) / [`Timeout`](Error::Timeout) /
-    /// [`Signalled`](Error::Signalled)), `None` for the rest — the single
+    /// ([`Exit`](ErrorReason::Exit) / [`Timeout`](ErrorReason::Timeout) /
+    /// [`Signalled`](ErrorReason::Signalled)), `None` for the rest — the single
     /// exhaustive match the public stream accessors above derive from.
     fn streams(&self) -> Option<(&str, &str)> {
         // Exhaustive on purpose (like `diagnostic`/`io_source`): a future
         // stream-carrying variant must add itself here, not fall through a `_`.
         match self {
-            Error::Exit { stdout, stderr, .. }
-            | Error::Timeout { stdout, stderr, .. }
-            | Error::Signalled { stdout, stderr, .. } => Some((stdout, stderr)),
-            Error::Spawn { .. }
-            | Error::NotFound { .. }
-            | Error::CassetteMiss { .. }
-            | Error::OutputTooLarge { .. }
-            | Error::NotReady { .. }
-            | Error::Parse { .. }
-            | Error::Unsupported { .. }
-            | Error::Cancelled { .. }
-            | Error::Stdin { .. }
-            | Error::Io(_) => None,
+            ErrorReason::Exit { stdout, stderr, .. }
+            | ErrorReason::Timeout { stdout, stderr, .. }
+            | ErrorReason::Signalled { stdout, stderr, .. } => Some((stdout, stderr)),
+            ErrorReason::Spawn { .. }
+            | ErrorReason::NotFound { .. }
+            | ErrorReason::CassetteMiss { .. }
+            | ErrorReason::OutputTooLarge { .. }
+            | ErrorReason::NotReady { .. }
+            | ErrorReason::Parse { .. }
+            | ErrorReason::Unsupported { .. }
+            | ErrorReason::Cancelled { .. }
+            | ErrorReason::Stdin { .. }
+            | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
-            Error::ResourceLimit { .. } => None,
+            ErrorReason::ResourceLimit { .. } => None,
         }
     }
 
     /// The program (the CLI tool) this error is attributed to — `Some` for every
-    /// variant that names one (all except [`Unsupported`](Error::Unsupported),
-    /// [`Io`](Error::Io), and the `limits`-only `ResourceLimit`), `None` otherwise.
+    /// variant that names one (all except [`Unsupported`](ErrorReason::Unsupported),
+    /// [`Io`](ErrorReason::Io), and the `limits`-only `ResourceLimit`), `None` otherwise.
     /// The [`Error`] twin of
     /// [`ProcessResult::program`](crate::ProcessResult::program): the one
     /// cross-cutting datum a wrapper routes or logs on, read without destructuring
@@ -528,42 +532,42 @@ impl Error {
         // Exhaustive on purpose (like `diagnostic`/`streams`/`io_source`): a future
         // program-naming variant must add itself here, not fall through a `_`.
         match self {
-            Error::Spawn { program, .. }
-            | Error::NotFound { program, .. }
-            | Error::CassetteMiss { program }
-            | Error::Exit { program, .. }
-            | Error::Timeout { program, .. }
-            | Error::OutputTooLarge { program, .. }
-            | Error::NotReady { program, .. }
-            | Error::Parse { program, .. }
-            | Error::Cancelled { program }
-            | Error::Signalled { program, .. }
-            | Error::Stdin { program, .. } => Some(program),
-            Error::Unsupported { .. } | Error::Io(_) => None,
+            ErrorReason::Spawn { program, .. }
+            | ErrorReason::NotFound { program, .. }
+            | ErrorReason::CassetteMiss { program }
+            | ErrorReason::Exit { program, .. }
+            | ErrorReason::Timeout { program, .. }
+            | ErrorReason::OutputTooLarge { program, .. }
+            | ErrorReason::NotReady { program, .. }
+            | ErrorReason::Parse { program, .. }
+            | ErrorReason::Cancelled { program }
+            | ErrorReason::Signalled { program, .. }
+            | ErrorReason::Stdin { program, .. } => Some(program),
+            ErrorReason::Unsupported { .. } | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
-            Error::ResourceLimit { .. } => None,
+            ErrorReason::ResourceLimit { .. } => None,
         }
     }
 
     /// Whether the **program could not be located** — it is not installed, not
     /// on `PATH`, or the given path does not resolve to an executable. True for
-    /// [`NotFound`](Error::NotFound) and **only** that variant: the launch
+    /// [`NotFound`](ErrorReason::NotFound) and **only** that variant: the launch
     /// path funnels every program-not-found failure into `NotFound`, so this is
     /// the one check a caller needs to surface a "command not installed?" hint.
     ///
     /// `false` for every other variant — notably it does **not** fire for a
-    /// missing or invalid working directory (a [`Spawn`](Error::Spawn) carrying
+    /// missing or invalid working directory (a [`Spawn`](ErrorReason::Spawn) carrying
     /// [`NotFound`](std::io::ErrorKind::NotFound)/`NotADirectory`): a bad `cwd`
     /// is not a missing program, so the hint would mislead. It is also `false`
     /// for a program that *is* installed but can't be executed directly (e.g. a
     /// Windows `.cmd`/`.bat` that needs `cmd.exe` — surfaced as `Spawn`).
     pub fn is_not_found(&self) -> bool {
-        matches!(self, Error::NotFound { .. })
+        matches!(self, ErrorReason::NotFound { .. })
     }
 
     /// Whether this is a spawn/IO **permission denial** (`EACCES`/`EPERM`): the
     /// binary isn't executable, or the OS refused the launch. True for
-    /// [`Spawn`](Error::Spawn) / [`Io`](Error::Io) carrying
+    /// [`Spawn`](ErrorReason::Spawn) / [`Io`](ErrorReason::Io) carrying
     /// [`PermissionDenied`](std::io::ErrorKind::PermissionDenied); `false`
     /// otherwise.
     pub fn is_permission_denied(&self) -> bool {
@@ -574,12 +578,12 @@ impl Error {
     /// Whether this is a **transient** spawn/IO condition a bare retry can clear
     /// — interrupted (`EINTR`), would-block (`EAGAIN`), a busy resource, a
     /// text-file-busy executable mid-write (`ETXTBSY`), or a Windows sharing/lock
-    /// violation. Classifies the [`Spawn`](Error::Spawn)/[`Io`](Error::Io) IO
+    /// violation. Classifies the [`Spawn`](ErrorReason::Spawn)/[`Io`](ErrorReason::Io) IO
     /// error only.
     ///
     /// **Scope: IO/spawn-level, never exit codes.** Whether a tool's non-zero
-    /// [`Exit`](Error::Exit) is retryable is domain-specific (a `git` 128 is not
-    /// generically transient) — that stays the caller's call. [`Timeout`](Error::Timeout)
+    /// [`Exit`](ErrorReason::Exit) is retryable is domain-specific (a `git` 128 is not
+    /// generically transient) — that stays the caller's call. [`Timeout`](ErrorReason::Timeout)
     /// is also excluded by design; compose it if wanted:
     /// `e.is_transient() || e.is_timeout()`.
     ///
@@ -589,7 +593,7 @@ impl Error {
         self.io_source().is_some_and(is_transient_io)
     }
 
-    /// The process exit code for a non-zero [`Exit`](Error::Exit); `None` for
+    /// The process exit code for a non-zero [`Exit`](ErrorReason::Exit); `None` for
     /// every other variant (a timeout or a signal kill carries no exit code).
     /// The same `code()` the crate's other disposition types expose
     /// ([`ProcessResult::code`](crate::ProcessResult::code) /
@@ -601,25 +605,25 @@ impl Error {
         // carrying variant must add itself here, not fall through a `_` and be
         // silently invisible to `code()`.
         match self {
-            Error::Exit { code, .. } => Some(*code),
-            Error::Spawn { .. }
-            | Error::NotFound { .. }
-            | Error::CassetteMiss { .. }
-            | Error::Timeout { .. }
-            | Error::OutputTooLarge { .. }
-            | Error::NotReady { .. }
-            | Error::Parse { .. }
-            | Error::Unsupported { .. }
-            | Error::Cancelled { .. }
-            | Error::Signalled { .. }
-            | Error::Stdin { .. }
-            | Error::Io(_) => None,
+            ErrorReason::Exit { code, .. } => Some(*code),
+            ErrorReason::Spawn { .. }
+            | ErrorReason::NotFound { .. }
+            | ErrorReason::CassetteMiss { .. }
+            | ErrorReason::Timeout { .. }
+            | ErrorReason::OutputTooLarge { .. }
+            | ErrorReason::NotReady { .. }
+            | ErrorReason::Parse { .. }
+            | ErrorReason::Unsupported { .. }
+            | ErrorReason::Cancelled { .. }
+            | ErrorReason::Signalled { .. }
+            | ErrorReason::Stdin { .. }
+            | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
-            Error::ResourceLimit { .. } => None,
+            ErrorReason::ResourceLimit { .. } => None,
         }
     }
 
-    /// The signal number for a [`Signalled`](Error::Signalled) run terminated
+    /// The signal number for a [`Signalled`](ErrorReason::Signalled) run terminated
     /// with a **known** signal (**Unix only**); `None` for every other variant and
     /// for a signal the kernel didn't expose — the [`Error`] twin of
     /// [`ProcessResult::signal`](crate::ProcessResult::signal) /
@@ -629,25 +633,25 @@ impl Error {
         // Exhaustive on purpose (like `streams`/`program`): a future signal-
         // carrying variant must add itself here, not fall through a `_`.
         match self {
-            Error::Signalled { signal, .. } => *signal,
-            Error::Spawn { .. }
-            | Error::NotFound { .. }
-            | Error::CassetteMiss { .. }
-            | Error::Exit { .. }
-            | Error::Timeout { .. }
-            | Error::OutputTooLarge { .. }
-            | Error::NotReady { .. }
-            | Error::Parse { .. }
-            | Error::Unsupported { .. }
-            | Error::Cancelled { .. }
-            | Error::Stdin { .. }
-            | Error::Io(_) => None,
+            ErrorReason::Signalled { signal, .. } => *signal,
+            ErrorReason::Spawn { .. }
+            | ErrorReason::NotFound { .. }
+            | ErrorReason::CassetteMiss { .. }
+            | ErrorReason::Exit { .. }
+            | ErrorReason::Timeout { .. }
+            | ErrorReason::OutputTooLarge { .. }
+            | ErrorReason::NotReady { .. }
+            | ErrorReason::Parse { .. }
+            | ErrorReason::Unsupported { .. }
+            | ErrorReason::Cancelled { .. }
+            | ErrorReason::Stdin { .. }
+            | ErrorReason::Io(_) => None,
             #[cfg(feature = "limits")]
-            Error::ResourceLimit { .. } => None,
+            ErrorReason::ResourceLimit { .. } => None,
         }
     }
 
-    /// Which limit a [`ResourceLimit`](Error::ResourceLimit) failure is about;
+    /// Which limit a [`ResourceLimit`](ErrorReason::ResourceLimit) failure is about;
     /// `None` for every other variant. Reads the field off the error without
     /// destructuring the `#[non_exhaustive]` variant.
     #[cfg(feature = "limits")]
@@ -655,24 +659,24 @@ impl Error {
         // Exhaustive on purpose (like `signal`/`program`): a future variant
         // must add itself here, not fall through a `_`.
         match self {
-            Error::ResourceLimit { kind, .. } => Some(*kind),
-            Error::Spawn { .. }
-            | Error::NotFound { .. }
-            | Error::CassetteMiss { .. }
-            | Error::Exit { .. }
-            | Error::Timeout { .. }
-            | Error::OutputTooLarge { .. }
-            | Error::NotReady { .. }
-            | Error::Parse { .. }
-            | Error::Unsupported { .. }
-            | Error::Cancelled { .. }
-            | Error::Signalled { .. }
-            | Error::Stdin { .. }
-            | Error::Io(_) => None,
+            ErrorReason::ResourceLimit { kind, .. } => Some(*kind),
+            ErrorReason::Spawn { .. }
+            | ErrorReason::NotFound { .. }
+            | ErrorReason::CassetteMiss { .. }
+            | ErrorReason::Exit { .. }
+            | ErrorReason::Timeout { .. }
+            | ErrorReason::OutputTooLarge { .. }
+            | ErrorReason::NotReady { .. }
+            | ErrorReason::Parse { .. }
+            | ErrorReason::Unsupported { .. }
+            | ErrorReason::Cancelled { .. }
+            | ErrorReason::Signalled { .. }
+            | ErrorReason::Stdin { .. }
+            | ErrorReason::Io(_) => None,
         }
     }
 
-    /// Why a [`ResourceLimit`](Error::ResourceLimit) failure occurred; `None`
+    /// Why a [`ResourceLimit`](ErrorReason::ResourceLimit) failure occurred; `None`
     /// for every other variant. Reads the field off the error without
     /// destructuring the `#[non_exhaustive]` variant.
     #[cfg(feature = "limits")]
@@ -680,83 +684,273 @@ impl Error {
         // Exhaustive on purpose (like `signal`/`program`): a future variant
         // must add itself here, not fall through a `_`.
         match self {
-            Error::ResourceLimit { reason, .. } => Some(*reason),
-            Error::Spawn { .. }
-            | Error::NotFound { .. }
-            | Error::CassetteMiss { .. }
-            | Error::Exit { .. }
-            | Error::Timeout { .. }
-            | Error::OutputTooLarge { .. }
-            | Error::NotReady { .. }
-            | Error::Parse { .. }
-            | Error::Unsupported { .. }
-            | Error::Cancelled { .. }
-            | Error::Signalled { .. }
-            | Error::Stdin { .. }
-            | Error::Io(_) => None,
+            ErrorReason::ResourceLimit { reason, .. } => Some(*reason),
+            ErrorReason::Spawn { .. }
+            | ErrorReason::NotFound { .. }
+            | ErrorReason::CassetteMiss { .. }
+            | ErrorReason::Exit { .. }
+            | ErrorReason::Timeout { .. }
+            | ErrorReason::OutputTooLarge { .. }
+            | ErrorReason::NotReady { .. }
+            | ErrorReason::Parse { .. }
+            | ErrorReason::Unsupported { .. }
+            | ErrorReason::Cancelled { .. }
+            | ErrorReason::Signalled { .. }
+            | ErrorReason::Stdin { .. }
+            | ErrorReason::Io(_) => None,
         }
     }
 
     /// Whether the run was killed because it exceeded its
     /// [`Command::timeout`](crate::Command::timeout) — i.e. this is a
-    /// [`Timeout`](Error::Timeout). First-class here so the
+    /// [`Timeout`](ErrorReason::Timeout). First-class here so the
     /// [`is_transient`](Self::is_transient) retry-composition example can read
     /// `e.is_transient() || e.is_timeout()` rather than matching the variant by hand.
     /// The [`Error`] twin of the crate-wide deadline predicate
     /// [`ProcessResult::timed_out`](crate::ProcessResult::timed_out) (named
     /// `is_timeout` here to sit alongside the error's `is_*` predicate family).
     pub fn is_timeout(&self) -> bool {
-        matches!(self, Error::Timeout { .. })
+        matches!(self, ErrorReason::Timeout { .. })
     }
 
     /// Whether the run was deliberately cancelled via its
     /// [`Command::cancel_on`](crate::Command::cancel_on) token — i.e. this is a
-    /// [`Cancelled`](Error::Cancelled). A caller that initiated the stop can
+    /// [`Cancelled`](ErrorReason::Cancelled). A caller that initiated the stop can
     /// swallow it rather than log or retry it as a real failure (the same
     /// disposition [`Supervisor`](crate::Supervisor) treats as terminal), without
     /// destructuring the variant.
     pub fn is_cancelled(&self) -> bool {
-        matches!(self, Error::Cancelled { .. })
+        matches!(self, ErrorReason::Cancelled { .. })
     }
 
     /// Whether the run was killed by a signal — i.e. this is a
-    /// [`Signalled`](Error::Signalled). Distinct from [`signal`](Self::signal):
+    /// [`Signalled`](ErrorReason::Signalled). Distinct from [`signal`](Self::signal):
     /// this is `true` even when the kernel didn't expose a number (a Unix kill
     /// where `signal()` is `None`, or any platform's signal disposition), so it is
     /// the reliable "died by a signal?" check — the predicate twin of
     /// [`is_timeout`](Self::is_timeout) / [`is_cancelled`](Self::is_cancelled),
     /// without destructuring the variant.
     pub fn is_signalled(&self) -> bool {
-        matches!(self, Error::Signalled { .. })
+        matches!(self, ErrorReason::Signalled { .. })
     }
 
     /// The underlying [`std::io::Error`] for the variants that carry one
-    /// ([`Spawn`](Error::Spawn), [`Io`](Error::Io)) — the basis for the io-level
+    /// ([`Spawn`](ErrorReason::Spawn), [`Io`](ErrorReason::Io)) — the basis for the io-level
     /// classifiers above.
     fn io_source(&self) -> Option<&std::io::Error> {
         // Exhaustive on purpose: a future variant carrying an `io::Error` must
         // add itself here so the io-level classifiers (`is_transient`,
         // `is_permission_denied`) see it, rather than slipping through a wildcard.
         match self {
-            Error::Spawn { source, .. } => Some(source),
-            Error::Io(source) => Some(source),
-            Error::NotFound { .. }
-            | Error::CassetteMiss { .. }
-            | Error::Exit { .. }
-            | Error::Timeout { .. }
-            | Error::OutputTooLarge { .. }
-            | Error::NotReady { .. }
-            | Error::Parse { .. }
-            | Error::Unsupported { .. }
-            | Error::Cancelled { .. }
-            | Error::Signalled { .. }
-            | Error::Stdin { .. } => None,
+            ErrorReason::Spawn { source, .. } => Some(source),
+            ErrorReason::Io(source) => Some(source),
+            ErrorReason::NotFound { .. }
+            | ErrorReason::CassetteMiss { .. }
+            | ErrorReason::Exit { .. }
+            | ErrorReason::Timeout { .. }
+            | ErrorReason::OutputTooLarge { .. }
+            | ErrorReason::NotReady { .. }
+            | ErrorReason::Parse { .. }
+            | ErrorReason::Unsupported { .. }
+            | ErrorReason::Cancelled { .. }
+            | ErrorReason::Signalled { .. }
+            | ErrorReason::Stdin { .. } => None,
             #[cfg(feature = "limits")]
-            Error::ResourceLimit { .. } => None,
+            ErrorReason::ResourceLimit { .. } => None,
         }
     }
+}
 
-    /// Construct an [`Exit`](Error::Exit) — a `#[doc(hidden)]` convenience for
+/// The crate's error type: a **pointer-sized** handle to a structured
+/// [`ErrorReason`].
+///
+/// `Error` is a thin wrapper around a boxed [`ErrorReason`] — one pointer wide
+/// ([`size_of::<Error>()`](std::mem::size_of) equals a pointer) — so a
+/// `Result<T, Error>` on the crate's pervasive process-launch path, and any
+/// enum that embeds this one (a caller's own `vcs_core::Error`, say), stays
+/// small instead of carrying the largest variant's captured streams inline. The
+/// shape mirrors [`std::io::Error`] / [`std::io::ErrorKind`].
+///
+/// Match on the failure mode through [`reason`](Error::reason):
+///
+/// ```
+/// # use processkit::{Error, ErrorReason};
+/// # fn classify(err: &Error) {
+/// match err.reason() {
+///     ErrorReason::NotFound { program, .. } => eprintln!("install `{program}`?"),
+///     ErrorReason::Exit { code, .. } => eprintln!("exited with {code}"),
+///     _ => {}
+/// }
+/// # }
+/// ```
+///
+/// or reach for the read accessors ([`code`](Error::code),
+/// [`program`](Error::program), [`diagnostic`](Error::diagnostic), the `is_*`
+/// predicates, …), which delegate to the inner [`ErrorReason`].
+/// [`Display`](std::fmt::Display), [`Debug`](std::fmt::Debug), and
+/// [`source`](std::error::Error::source) delegate too, so the manual `Debug`
+/// (200-byte stream previews, `PATH` redaction, control-/bidi-sanitizing) and
+/// the `thiserror` `Display` behave exactly as when matching the reason
+/// directly — the wrapper adds no envelope of its own.
+pub struct Error {
+    reason: Box<ErrorReason>,
+}
+
+impl Error {
+    /// The structured [`ErrorReason`] behind this error — the enum to `match`
+    /// on for the failure mode. `Error` is a pointer-sized wrapper; this
+    /// borrows the boxed reason without moving it.
+    pub fn reason(&self) -> &ErrorReason {
+        &self.reason
+    }
+
+    /// Consume the wrapper and hand back the **owned** [`ErrorReason`] — for when
+    /// you need to move a field out of the reason (a captured stream, the owned
+    /// `io::Error`) rather than borrow it via [`reason`](Self::reason), or to
+    /// `match err.into_reason() { … }` and bind fields by value.
+    #[must_use]
+    pub fn into_reason(self) -> ErrorReason {
+        *self.reason
+    }
+
+    /// The best human-facing message for a failed run — see
+    /// [`ErrorReason::diagnostic`].
+    pub fn diagnostic(&self) -> Option<&str> {
+        self.reason.diagnostic()
+    }
+
+    /// The captured standard output for the stream-bearing variants — see
+    /// [`ErrorReason::stdout`].
+    pub fn stdout(&self) -> Option<&str> {
+        self.reason.stdout()
+    }
+
+    /// The captured standard error for the stream-bearing variants — see
+    /// [`ErrorReason::stderr`].
+    pub fn stderr(&self) -> Option<&str> {
+        self.reason.stderr()
+    }
+
+    /// The exact captured stdout bytes, when available — see
+    /// [`ErrorReason::stdout_bytes`].
+    pub fn stdout_bytes(&self) -> Option<&[u8]> {
+        self.reason.stdout_bytes()
+    }
+
+    /// Standard output followed by standard error, joined — see
+    /// [`ErrorReason::combined`].
+    pub fn combined(&self) -> Option<String> {
+        self.reason.combined()
+    }
+
+    /// The program this error is attributed to — see [`ErrorReason::program`].
+    pub fn program(&self) -> Option<&str> {
+        self.reason.program()
+    }
+
+    /// Whether the program could not be located — see
+    /// [`ErrorReason::is_not_found`].
+    pub fn is_not_found(&self) -> bool {
+        self.reason.is_not_found()
+    }
+
+    /// Whether this is a spawn/IO permission denial — see
+    /// [`ErrorReason::is_permission_denied`].
+    pub fn is_permission_denied(&self) -> bool {
+        self.reason.is_permission_denied()
+    }
+
+    /// Whether this is a transient spawn/IO condition a bare retry can clear —
+    /// see [`ErrorReason::is_transient`].
+    pub fn is_transient(&self) -> bool {
+        self.reason.is_transient()
+    }
+
+    /// The process exit code for a non-zero [`Exit`](ErrorReason::Exit) — see
+    /// [`ErrorReason::code`].
+    pub fn code(&self) -> Option<i32> {
+        self.reason.code()
+    }
+
+    /// The signal number for a signal-terminated run — see
+    /// [`ErrorReason::signal`].
+    pub fn signal(&self) -> Option<i32> {
+        self.reason.signal()
+    }
+
+    /// Which limit a [`ResourceLimit`](ErrorReason::ResourceLimit) failure is
+    /// about — see [`ErrorReason::limit_kind`].
+    #[cfg(feature = "limits")]
+    pub fn limit_kind(&self) -> Option<crate::limits::LimitKind> {
+        self.reason.limit_kind()
+    }
+
+    /// Why a [`ResourceLimit`](ErrorReason::ResourceLimit) failure occurred —
+    /// see [`ErrorReason::limit_reason`].
+    #[cfg(feature = "limits")]
+    pub fn limit_reason(&self) -> Option<crate::limits::LimitReason> {
+        self.reason.limit_reason()
+    }
+
+    /// Whether the run was killed for exceeding its timeout — see
+    /// [`ErrorReason::is_timeout`].
+    pub fn is_timeout(&self) -> bool {
+        self.reason.is_timeout()
+    }
+
+    /// Whether the run was deliberately cancelled — see
+    /// [`ErrorReason::is_cancelled`].
+    pub fn is_cancelled(&self) -> bool {
+        self.reason.is_cancelled()
+    }
+
+    /// Whether the run was killed by a signal — see
+    /// [`ErrorReason::is_signalled`].
+    pub fn is_signalled(&self) -> bool {
+        self.reason.is_signalled()
+    }
+}
+
+impl From<ErrorReason> for Error {
+    fn from(reason: ErrorReason) -> Self {
+        Error {
+            reason: Box::new(reason),
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&*self.reason, f)
+    }
+}
+
+/// `Debug` delegates to the inner [`ErrorReason`]'s manual `Debug`, so `{e:?}`
+/// and `.unwrap()` panic messages keep the same bounded stream previews and
+/// `PATH` redaction — the wrapper prints exactly the reason, no envelope.
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.reason, f)
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.reason.source()
+    }
+}
+
+/// Compile-time guard that `Error` stays one pointer wide. A regression here
+/// (inlining a variant's fields back into the wrapper) would re-bloat every
+/// `Result<T, Error>` and re-trigger the `result_large_err` /
+/// `large_enum_variant` lints this `Box<ErrorReason>` wrapper exists to silence.
+const _: () = assert!(
+    std::mem::size_of::<Error>() == std::mem::size_of::<*const ()>(),
+    "Error must remain pointer-sized (a Box<ErrorReason> handle)"
+);
+
+impl Error {
+    /// Construct an [`Exit`](ErrorReason::Exit) — a `#[doc(hidden)]` convenience for
     /// custom [`ProcessRunner`](crate::ProcessRunner) doubles and error-classifier
     /// tests, so they stop spelling out the struct literal (which the variant's
     /// `#[non_exhaustive]` already rejects outside this crate, and which a future
@@ -776,16 +970,17 @@ impl Error {
         stdout: impl Into<String>,
         stderr: impl Into<String>,
     ) -> Self {
-        Error::Exit {
+        ErrorReason::Exit {
             program: program.into(),
             code,
             stdout: stdout.into(),
             stderr: stderr.into(),
             stdout_bytes: None,
         }
+        .into()
     }
 
-    /// Construct a [`Timeout`](Error::Timeout) — see [`exit`](Self::exit).
+    /// Construct a [`Timeout`](ErrorReason::Timeout) — see [`exit`](Self::exit).
     #[doc(hidden)]
     pub fn timeout(
         program: impl Into<String>,
@@ -793,16 +988,17 @@ impl Error {
         stdout: impl Into<String>,
         stderr: impl Into<String>,
     ) -> Self {
-        Error::Timeout {
+        ErrorReason::Timeout {
             program: program.into(),
             timeout,
             stdout: stdout.into(),
             stderr: stderr.into(),
             stdout_bytes: None,
         }
+        .into()
     }
 
-    /// Construct a [`Signalled`](Error::Signalled) — see [`exit`](Self::exit).
+    /// Construct a [`Signalled`](ErrorReason::Signalled) — see [`exit`](Self::exit).
     #[doc(hidden)]
     pub fn signalled(
         program: impl Into<String>,
@@ -810,82 +1006,96 @@ impl Error {
         stdout: impl Into<String>,
         stderr: impl Into<String>,
     ) -> Self {
-        Error::Signalled {
+        ErrorReason::Signalled {
             program: program.into(),
             signal,
             stdout: stdout.into(),
             stderr: stderr.into(),
             stdout_bytes: None,
         }
+        .into()
     }
 
-    /// Construct a [`Spawn`](Error::Spawn) — see [`exit`](Self::exit).
+    /// Construct a [`Spawn`](ErrorReason::Spawn) — see [`exit`](Self::exit).
     #[doc(hidden)]
     pub fn spawn(program: impl Into<String>, source: std::io::Error) -> Self {
-        Error::Spawn {
+        ErrorReason::Spawn {
             program: program.into(),
             source,
         }
+        .into()
     }
 
-    /// Construct a [`NotFound`](Error::NotFound) — see [`exit`](Self::exit).
+    /// Construct a [`NotFound`](ErrorReason::NotFound) — see [`exit`](Self::exit).
     #[doc(hidden)]
     pub fn not_found(program: impl Into<String>, searched: Option<String>) -> Self {
-        Error::NotFound {
+        ErrorReason::NotFound {
             program: program.into(),
             searched,
         }
+        .into()
     }
 
-    /// Construct a [`Stdin`](Error::Stdin) — see [`exit`](Self::exit).
+    /// Construct a [`Stdin`](ErrorReason::Stdin) — see [`exit`](Self::exit).
     #[doc(hidden)]
     pub fn stdin(program: impl Into<String>, source: std::io::Error) -> Self {
-        Error::Stdin {
+        ErrorReason::Stdin {
             program: program.into(),
             source,
         }
+        .into()
     }
 
-    /// Construct a [`Parse`](Error::Parse) from a caller-supplied parser's own
+    /// Wrap a crate-internal [`std::io::Error`] as [`Io`](ErrorReason::Io).
+    /// Crate-private on purpose: there is deliberately **no** blanket
+    /// `From<std::io::Error>` (see [`Io`](ErrorReason::Io)), so every `Io` is
+    /// built at a known site — this is the one insulated way the crate does it,
+    /// including point-free `.map_err(Error::io)`.
+    pub(crate) fn io(source: std::io::Error) -> Self {
+        ErrorReason::Io(source).into()
+    }
+
+    /// Construct a [`Parse`](ErrorReason::Parse) from a caller-supplied parser's own
     /// failure message. Unlike `exit`/`timeout`/`signalled`/`spawn`/`not_found`/
     /// `stdin` above (`#[doc(hidden)]` insulated constructors meant for test
     /// doubles), this one is left on the **documented public surface**: an
     /// external parser that inspects a tool's output outside this crate's own
     /// `try_parse` helpers has no other way to report a parse failure as an
-    /// `Error::Parse` once the variant is `#[non_exhaustive]`, and that path is
+    /// `ErrorReason::Parse` once the variant is `#[non_exhaustive]`, and that path is
     /// a normal production use, not just a test-doubling convenience.
     pub fn parse(program: impl Into<String>, message: impl Into<String>) -> Self {
-        Error::Parse {
+        ErrorReason::Parse {
             program: program.into(),
             message: message.into(),
         }
+        .into()
     }
 }
 
-/// Manual `Debug`: bounds the [`Exit`](Error::Exit) streams and redacts
+/// Manual `Debug`: bounds the [`Exit`](ErrorReason::Exit) streams and redacts
 /// the `PATH` value, so `{e:?}` / `.unwrap()` neither dumps a multi-MiB stream
 /// nor logs an environment value. Every other variant mirrors what the derive
 /// would print.
-impl fmt::Debug for Error {
+impl fmt::Debug for ErrorReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Spawn { program, source } => f
+            ErrorReason::Spawn { program, source } => f
                 .debug_struct("Spawn")
                 .field("program", program)
                 .field("source", source)
                 .finish(),
-            Error::NotFound { program, searched } => f
+            ErrorReason::NotFound { program, searched } => f
                 .debug_struct("NotFound")
                 .field("program", program)
                 // `searched` is the `PATH` env value — never rendered; summarize
                 // as a directory count (`None` renders as `None`).
                 .field("searched", &searched.as_deref().map(SearchedRedaction))
                 .finish(),
-            Error::CassetteMiss { program } => f
+            ErrorReason::CassetteMiss { program } => f
                 .debug_struct("CassetteMiss")
                 .field("program", program)
                 .finish(),
-            Error::Exit {
+            ErrorReason::Exit {
                 program,
                 code,
                 stdout,
@@ -899,7 +1109,7 @@ impl fmt::Debug for Error {
                 .field("stderr", &StreamPreview(stderr))
                 .field("stdout_bytes", &BytesPreview(stdout_bytes.as_deref()))
                 .finish(),
-            Error::Timeout {
+            ErrorReason::Timeout {
                 program,
                 timeout,
                 stdout,
@@ -913,7 +1123,7 @@ impl fmt::Debug for Error {
                 .field("stderr", &StreamPreview(stderr))
                 .field("stdout_bytes", &BytesPreview(stdout_bytes.as_deref()))
                 .finish(),
-            Error::OutputTooLarge {
+            ErrorReason::OutputTooLarge {
                 program,
                 max_lines,
                 max_bytes,
@@ -927,19 +1137,19 @@ impl fmt::Debug for Error {
                 .field("total_lines", total_lines)
                 .field("total_bytes", total_bytes)
                 .finish(),
-            Error::NotReady { program, timeout } => f
+            ErrorReason::NotReady { program, timeout } => f
                 .debug_struct("NotReady")
                 .field("program", program)
                 .field("timeout", timeout)
                 .finish(),
-            Error::Parse { program, message } => f
+            ErrorReason::Parse { program, message } => f
                 .debug_struct("Parse")
                 .field("program", program)
                 // Caller-built, often the full unparsed output — bound it.
                 .field("message", &StreamPreview(message))
                 .finish(),
             #[cfg(feature = "limits")]
-            Error::ResourceLimit {
+            ErrorReason::ResourceLimit {
                 kind,
                 reason,
                 detail,
@@ -952,15 +1162,15 @@ impl fmt::Debug for Error {
                 // is short today.
                 .field("detail", &StreamPreview(detail))
                 .finish(),
-            Error::Unsupported { operation } => f
+            ErrorReason::Unsupported { operation } => f
                 .debug_struct("Unsupported")
                 .field("operation", operation)
                 .finish(),
-            Error::Cancelled { program } => f
+            ErrorReason::Cancelled { program } => f
                 .debug_struct("Cancelled")
                 .field("program", program)
                 .finish(),
-            Error::Signalled {
+            ErrorReason::Signalled {
                 program,
                 signal,
                 stdout,
@@ -974,18 +1184,18 @@ impl fmt::Debug for Error {
                 .field("stderr", &StreamPreview(stderr))
                 .field("stdout_bytes", &BytesPreview(stdout_bytes.as_deref()))
                 .finish(),
-            Error::Stdin { program, source } => f
+            ErrorReason::Stdin { program, source } => f
                 .debug_struct("Stdin")
                 .field("program", program)
                 .field("source", source)
                 .finish(),
-            Error::Io(source) => f.debug_tuple("Io").field(source).finish(),
+            ErrorReason::Io(source) => f.debug_tuple("Io").field(source).finish(),
         }
     }
 }
 
 /// `Debug` for a captured stream, bounded to a 200-byte char-boundary preview
-/// with a `(+N bytes)` note — the [`Exit`](Error::Exit) streams can be multi-MiB
+/// with a `(+N bytes)` note — the [`Exit`](ErrorReason::Exit) streams can be multi-MiB
 /// and must never flood a `{e:?}` log line or `.unwrap()` panic message. Mirrors
 /// the [`Display`](std::fmt::Display) tail cap in [`display_exit`].
 pub(crate) struct StreamPreview<'a>(pub(crate) &'a str);
@@ -1005,8 +1215,8 @@ impl fmt::Debug for StreamPreview<'_> {
     }
 }
 
-/// `Debug` for the `stdout_bytes` field of [`Exit`](Error::Exit) /
-/// [`Timeout`](Error::Timeout) / [`Signalled`](Error::Signalled): never dumps
+/// `Debug` for the `stdout_bytes` field of [`Exit`](ErrorReason::Exit) /
+/// [`Timeout`](ErrorReason::Timeout) / [`Signalled`](ErrorReason::Signalled): never dumps
 /// the raw bytes (they may be binary, may carry secrets, and can be
 /// multi-MiB — the same "no unbounded payload in Debug" rule
 /// [`StreamPreview`] follows for the text streams) — only a length summary
@@ -1022,7 +1232,7 @@ impl fmt::Debug for BytesPreview<'_> {
     }
 }
 
-/// `Debug` for [`NotFound`](Error::NotFound)'s `searched`: the `PATH` value is an
+/// `Debug` for [`NotFound`](ErrorReason::NotFound)'s `searched`: the `PATH` value is an
 /// environment value and must never be logged, so it renders only as a directory
 /// count (`<N directories>`) — never the directories themselves.
 struct SearchedRedaction<'a>(&'a str);
@@ -1049,7 +1259,7 @@ fn display_not_found(program: &str, searched: &Option<String>) -> String {
     }
 }
 
-/// Builds the [`Error::Io`] raised when a capture verb is called on a command
+/// Builds the [`ErrorReason::Io`] raised when a capture verb is called on a command
 /// whose stdout was not piped (`Command::stdout` set to `Inherit`/`Null`, or
 /// redirected to a file). The
 /// live runner (`RunningProcess::ensure_stdout_capturable`) and both test
@@ -1057,7 +1267,7 @@ fn display_not_found(program: &str, searched: &Option<String>) -> String {
 /// branch) must reject this identically, so they all route through this one
 /// constructor instead of hand-rolling the message and `ErrorKind`.
 pub(crate) fn stdout_not_piped_error(program: &str) -> Error {
-    Error::Io(std::io::Error::new(
+    ErrorReason::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         format!(
             "`{program}`: stdout is not piped (Command::stdout was set to \
@@ -1065,6 +1275,7 @@ pub(crate) fn stdout_not_piped_error(program: &str) -> Error {
              use StdioMode::Piped to capture it"
         ),
     ))
+    .into()
 }
 
 /// `Parse`'s one-line `Display`: `` failed to parse `{program}` output: {message} ``
@@ -1086,7 +1297,7 @@ fn display_parse(program: &str, message: &str) -> String {
 /// `ResourceLimit`'s one-line `Display`: `` {kind} limit {reason}: {detail} ``,
 /// e.g. `` memory limit could not be enforced: enabling cgroup controllers... ``
 /// or `` CPU limit is invalid: cpu_quota must be a finite value greater than 0 ``.
-/// `detail` is bounded/sanitized like [`Parse`](Error::Parse)'s `message` — it
+/// `detail` is bounded/sanitized like [`Parse`](ErrorReason::Parse)'s `message` — it
 /// may embed a raw OS error string, never trusted to be short or clean.
 #[cfg(feature = "limits")]
 fn display_resource_limit(
@@ -1204,7 +1415,7 @@ const DIAG_CAP: usize = 200;
 /// budget counts only `text`, never what `out` already holds. The single
 /// sanitize-and-cap loop shared by the `Display` paths that embed
 /// attacker-influenced text — the diagnostic tail ([`append_diagnostic_tail`])
-/// and the [`Parse`](Error::Parse) message head ([`display_parse`]) — so the
+/// and the [`Parse`](ErrorReason::Parse) message head ([`display_parse`]) — so the
 /// control-/bidi-injection defense and the cap can't drift apart.
 fn push_sanitized_capped(out: &mut String, text: &str, cap: usize) {
     let mut written = 0usize;
@@ -1276,6 +1487,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn error_is_pointer_sized() {
+        // The whole point of the `Box<ErrorReason>` wrapper: `Error` stays one
+        // pointer wide so `Result<T, Error>` never inlines the largest variant's
+        // captured streams (and the `result_large_err`/`large_enum_variant` lints
+        // stay quiet). A compile-time `const _` in the module also pins this; this
+        // test surfaces the same guarantee in the test report.
+        assert_eq!(
+            std::mem::size_of::<Error>(),
+            std::mem::size_of::<*const ()>(),
+            "Error must remain pointer-sized (a Box<ErrorReason> handle)"
+        );
+        assert_eq!(
+            std::mem::size_of::<crate::Result<()>>(),
+            std::mem::size_of::<*const ()>(),
+            "Result<(), Error> must be pointer-sized too"
+        );
+    }
+
+    #[test]
     fn stream_accessors_cover_the_stream_bearing_variants() {
         // Exit/Timeout/Signalled expose stdout/stderr/combined; combined mirrors
         // ProcessResult::combined (a `\n` between only when both are non-empty
@@ -1301,7 +1531,7 @@ mod tests {
         assert_eq!(only_err.combined().as_deref(), Some("err"));
 
         // Non-stream variants carry no streams.
-        let not_ready = Error::NotReady {
+        let not_ready = ErrorReason::NotReady {
             program: "server".into(),
             timeout: Duration::from_secs(1),
         };
@@ -1335,7 +1565,7 @@ mod tests {
         assert!(unknown_sig.is_signalled());
         assert!(!exit.is_signalled() && !timeout.is_signalled());
 
-        let cancelled = Error::Cancelled {
+        let cancelled = ErrorReason::Cancelled {
             program: "job".into(),
         };
         assert!(cancelled.is_cancelled());
@@ -1349,7 +1579,7 @@ mod tests {
         // (Unsupported, Io) return None.
         assert_eq!(Error::exit("git", 1, "", "").program(), Some("git"));
         assert_eq!(
-            Error::NotReady {
+            ErrorReason::NotReady {
                 program: "server".into(),
                 timeout: Duration::from_secs(1),
             }
@@ -1357,26 +1587,26 @@ mod tests {
             Some("server")
         );
         assert_eq!(
-            Error::Cancelled {
+            ErrorReason::Cancelled {
                 program: "job".into()
             }
             .program(),
             Some("job")
         );
         assert_eq!(
-            Error::Unsupported {
+            ErrorReason::Unsupported {
                 operation: "suspend".into()
             }
             .program(),
             None
         );
         assert_eq!(
-            Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)).program(),
+            ErrorReason::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)).program(),
             None
         );
         #[cfg(feature = "limits")]
         assert_eq!(
-            Error::ResourceLimit {
+            ErrorReason::ResourceLimit {
                 kind: crate::limits::LimitKind::Memory,
                 reason: crate::limits::LimitReason::Unsupported,
                 detail: "no container".into()
@@ -1391,15 +1621,15 @@ mod tests {
         // The constructors insulate doubles/tests from a future field addition to
         // these variants; round-trip through the accessors confirms the variant.
         assert!(matches!(
-            Error::exit("git", 2, "o", "e"),
-            Error::Exit { code: 2, .. }
+            Error::exit("git", 2, "o", "e").reason(),
+            ErrorReason::Exit { code: 2, .. }
         ));
         assert!(matches!(
-            Error::timeout("git", Duration::from_secs(3), "o", "e"),
-            Error::Timeout { .. }
+            Error::timeout("git", Duration::from_secs(3), "o", "e").reason(),
+            ErrorReason::Timeout { .. }
         ));
-        match Error::signalled("git", None, "o", "e") {
-            Error::Signalled { signal, .. } => assert_eq!(signal, None),
+        match Error::signalled("git", None, "o", "e").into_reason() {
+            ErrorReason::Signalled { signal, .. } => assert_eq!(signal, None),
             other => panic!("expected Signalled, got {other:?}"),
         }
     }
@@ -1409,7 +1639,7 @@ mod tests {
         // A hostile child's stderr last line carrying ANSI/BEL/NUL must not reach
         // a `{err}` log/terminal verbatim — control bytes become U+FFFD, while
         // printable text survives.
-        let err = Error::Exit {
+        let err = ErrorReason::Exit {
             program: "tool".into(),
             code: 1,
             stdout: String::new(),
@@ -1428,7 +1658,7 @@ mod tests {
     fn display_tail_strips_bidi_controls_against_trojan_source() {
         // A hostile stderr last line carrying bidi-override controls
         // (CVE-2021-42574) must not reach a `{err}` line and visually reorder it.
-        let err = Error::Exit {
+        let err = ErrorReason::Exit {
             program: "tool".into(),
             code: 1,
             stdout: String::new(),
@@ -1447,7 +1677,7 @@ mod tests {
         // U+2028 / U+2029 are NOT `char::is_control()`, yet terminals and log
         // viewers render them as a newline — a hostile last line carrying them
         // must not inject a break into the one-line `{err}` render.
-        let err = Error::Exit {
+        let err = ErrorReason::Exit {
             program: "tool".into(),
             code: 1,
             stdout: String::new(),
@@ -1466,7 +1696,7 @@ mod tests {
         // `Parse` messages routinely embed attacker-influenced unparsed output;
         // the one-line Display must neutralize control AND bidi controls, not
         // just truncate.
-        let err = Error::Parse {
+        let err = ErrorReason::Parse {
             program: "jq".into(),
             message: "bad\x1b[31m\x07token\u{202E}flip\u{2069}sep\u{2028}end".into(),
         };
@@ -1485,7 +1715,7 @@ mod tests {
         // A derived Debug would dump both full streams into `{e:?}` /
         // `.unwrap()`. The manual Debug bounds each to a 200-byte preview.
         let huge = "x".repeat(10_000);
-        let err = Error::Exit {
+        let err = ErrorReason::Exit {
             program: "tool".into(),
             code: 1,
             stdout: huge.clone(),
@@ -1505,7 +1735,7 @@ mod tests {
         // The bounded preview is still present and marked as truncated.
         assert!(dbg.contains("(+9800 bytes)"), "got: {dbg}");
         // A short stream is shown verbatim (no truncation note).
-        let small = Error::Exit {
+        let small = ErrorReason::Exit {
             program: "tool".into(),
             code: 2,
             stdout: "hello".into(),
@@ -1578,7 +1808,7 @@ mod tests {
         // `stdout_bytes` may carry the same multi-MiB payload as `stdout` (just
         // pre-decode) — Debug must summarize its length, never dump the bytes.
         let huge_bytes = vec![b'y'; 10_000];
-        let err = Error::Exit {
+        let err = ErrorReason::Exit {
             program: "tool".into(),
             code: 1,
             stdout: String::from_utf8_lossy(&huge_bytes).into_owned(),
@@ -1595,7 +1825,7 @@ mod tests {
             "must not dump the raw bytes: {dbg}"
         );
 
-        let none_err = Error::Exit {
+        let none_err = ErrorReason::Exit {
             program: "tool".into(),
             code: 1,
             stdout: String::new(),
@@ -1610,7 +1840,7 @@ mod tests {
     fn debug_redacts_the_path_value_in_not_found() {
         // `searched` is the PATH env value and must never appear in Debug
         // (which feeds `{e:?}` logs and `.unwrap()` panics).
-        let err = Error::NotFound {
+        let err = ErrorReason::NotFound {
             program: "tool".into(),
             searched: Some("/secret/bin:/another/private/dir".into()),
         };
@@ -1629,7 +1859,7 @@ mod tests {
     fn exit_display_appends_a_bounded_diagnostic_tail() {
         // The Display stays one actionable line — program + code + the LAST
         // non-empty diagnostic line — never the full captured streams.
-        let err = Error::Exit {
+        let err = ErrorReason::Exit {
             program: "git".into(),
             code: 2,
             stdout: "CONFLICT (content): merge conflict in a.rs".into(),
@@ -1639,7 +1869,7 @@ mod tests {
         assert_eq!(err.to_string(), "`git` exited with code 2: fatal: boom");
 
         // stderr blank → the stdout-borne message (git's CONFLICT) is used.
-        let err = Error::Exit {
+        let err = ErrorReason::Exit {
             program: "git".into(),
             code: 2,
             stdout: "CONFLICT (content): merge conflict in a.rs".into(),
@@ -1654,7 +1884,7 @@ mod tests {
 
     #[test]
     fn exit_display_with_blank_streams_has_no_trailing_colon() {
-        let err = Error::Exit {
+        let err = ErrorReason::Exit {
             program: "git".into(),
             code: 2,
             stdout: String::new(),
@@ -1669,7 +1899,7 @@ mod tests {
         // A multi-KiB single-line stderr must not poison the log line: the
         // tail is cut at 200 bytes on a char boundary, with an ellipsis.
         let huge = "é".repeat(3000); // 2 bytes/char exercises the boundary
-        let err = Error::Exit {
+        let err = ErrorReason::Exit {
             program: "x".into(),
             code: 1,
             stdout: String::new(),
@@ -1686,7 +1916,7 @@ mod tests {
     fn diagnostic_is_none_for_non_exit_variants() {
         // A timeout that captured nothing has no diagnostic (streams-bearing
         // case covered in `timeout_and_signalled_carry_diagnostic_streams`).
-        let timeout = Error::Timeout {
+        let timeout = ErrorReason::Timeout {
             program: "git".into(),
             timeout: Duration::from_secs(1),
             stdout: String::new(),
@@ -1694,24 +1924,24 @@ mod tests {
             stdout_bytes: None,
         };
         assert_eq!(timeout.diagnostic(), None);
-        let unsupported = Error::Unsupported {
+        let unsupported = ErrorReason::Unsupported {
             operation: "suspend".into(),
         };
         assert_eq!(unsupported.diagnostic(), None);
-        let not_ready = Error::NotReady {
+        let not_ready = ErrorReason::NotReady {
             program: "server".into(),
             timeout: Duration::from_secs(10),
         };
         assert_eq!(not_ready.diagnostic(), None);
         {
-            let cancelled = Error::Cancelled {
+            let cancelled = ErrorReason::Cancelled {
                 program: "job".into(),
             };
             assert_eq!(cancelled.diagnostic(), None);
         }
         #[cfg(feature = "limits")]
         {
-            let limit = Error::ResourceLimit {
+            let limit = ErrorReason::ResourceLimit {
                 kind: crate::limits::LimitKind::Memory,
                 reason: crate::limits::LimitReason::Unenforceable,
                 detail: "cgroup controller delegation unavailable".into(),
@@ -1722,7 +1952,7 @@ mod tests {
 
     #[test]
     fn cancelled_display_names_the_program() {
-        let err = Error::Cancelled {
+        let err = ErrorReason::Cancelled {
             program: "long-job".into(),
         };
         assert_eq!(err.to_string(), "`long-job` was cancelled");
@@ -1734,7 +1964,7 @@ mod tests {
     fn timeout_and_signalled_carry_diagnostic_streams() {
         // A hung-then-killed tool's partial stderr is the explanation —
         // reachable via diagnostic(), and its last line tails the Display.
-        let timeout = Error::Timeout {
+        let timeout = ErrorReason::Timeout {
             program: "db-migrate".into(),
             timeout: Duration::from_secs(30),
             stdout: String::new(),
@@ -1751,7 +1981,7 @@ mod tests {
         );
 
         // stderr blank → the stdout-borne message is used (mirrors Exit).
-        let signalled = Error::Signalled {
+        let signalled = ErrorReason::Signalled {
             program: "worker".into(),
             signal: Some(11),
             stdout: "processing batch 7\n".into(),
@@ -1770,7 +2000,7 @@ mod tests {
         // Captured streams must be bounded in Debug, exactly like Exit — a
         // multi-MiB partial capture must never flood `{e:?}`.
         let huge = "x".repeat(10_000);
-        let timeout = Error::Timeout {
+        let timeout = ErrorReason::Timeout {
             program: "t".into(),
             timeout: Duration::from_secs(1),
             stdout: huge.clone(),
@@ -1782,7 +2012,7 @@ mod tests {
         assert!(!dbg.contains(&"x".repeat(300)), "must not dump the stream");
         assert!(dbg.contains("(+9800 bytes)"), "got: {dbg}");
 
-        let signalled = Error::Signalled {
+        let signalled = ErrorReason::Signalled {
             program: "s".into(),
             signal: None,
             stdout: huge.clone(),
@@ -1800,7 +2030,7 @@ mod tests {
         // unparsed output — it must be bounded like the `Exit` streams, never
         // dumped whole into a `{e}` log line or a `{e:?}` panic message.
         let huge = "x".repeat(10_000);
-        let err = Error::Parse {
+        let err = ErrorReason::Parse {
             program: "jq".into(),
             message: huge,
         };
@@ -1828,7 +2058,7 @@ mod tests {
         assert!(dbg.contains("bytes)"), "truncation note present: {dbg}");
 
         // A short message is shown verbatim (no truncation, no ellipsis).
-        let small = Error::Parse {
+        let small = ErrorReason::Parse {
             program: "jq".into(),
             message: "unexpected token at line 3".into(),
         };
@@ -1841,7 +2071,7 @@ mod tests {
 
     #[test]
     fn not_ready_display_names_program_and_timeout() {
-        let err = Error::NotReady {
+        let err = ErrorReason::NotReady {
             program: "my-server".into(),
             timeout: Duration::from_secs(10),
         };
@@ -1850,7 +2080,7 @@ mod tests {
 
     #[test]
     fn unsupported_display_names_the_operation() {
-        let err = Error::Unsupported {
+        let err = ErrorReason::Unsupported {
             operation: "signal(Hup)".into(),
         };
         assert_eq!(
@@ -1864,7 +2094,7 @@ mod tests {
     fn resource_limit_display_carries_kind_and_reason() {
         use crate::limits::{LimitKind, LimitReason};
 
-        let unsupported = Error::ResourceLimit {
+        let unsupported = ErrorReason::ResourceLimit {
             kind: LimitKind::Memory,
             reason: LimitReason::Unsupported,
             detail: "no cgroup or Job Object available".into(),
@@ -1874,7 +2104,7 @@ mod tests {
             "memory limit is not supported on this platform: no cgroup or Job Object available"
         );
 
-        let unenforceable = Error::ResourceLimit {
+        let unenforceable = ErrorReason::ResourceLimit {
             kind: LimitKind::Cpu,
             reason: LimitReason::Unenforceable,
             detail: "delegation unavailable".into(),
@@ -1884,7 +2114,7 @@ mod tests {
             "CPU limit could not be enforced: delegation unavailable"
         );
 
-        let invalid = Error::ResourceLimit {
+        let invalid = ErrorReason::ResourceLimit {
             kind: LimitKind::Processes,
             reason: LimitReason::Invalid,
             detail: "max_processes must be greater than 0".into(),
@@ -1895,7 +2125,7 @@ mod tests {
         );
 
         // A blank detail omits the trailing colon.
-        let no_detail = Error::ResourceLimit {
+        let no_detail = ErrorReason::ResourceLimit {
             kind: LimitKind::Memory,
             reason: LimitReason::Unsupported,
             detail: String::new(),
@@ -1911,7 +2141,7 @@ mod tests {
     fn resource_limit_accessors_read_kind_and_reason_without_destructuring() {
         use crate::limits::{LimitKind, LimitReason};
 
-        let err = Error::ResourceLimit {
+        let err = ErrorReason::ResourceLimit {
             kind: LimitKind::Cpu,
             reason: LimitReason::Invalid,
             detail: "boom".into(),
@@ -1927,7 +2157,7 @@ mod tests {
 
     #[test]
     fn signalled_display_and_diagnostic() {
-        let with_signal = Error::Signalled {
+        let with_signal = ErrorReason::Signalled {
             program: "git".into(),
             signal: Some(9),
             stdout: String::new(),
@@ -1940,7 +2170,7 @@ mod tests {
         assert!(!with_signal.is_permission_denied());
         assert!(!with_signal.is_transient());
 
-        let no_signal = Error::Signalled {
+        let no_signal = ErrorReason::Signalled {
             program: "git".into(),
             signal: None,
             stdout: String::new(),
@@ -1952,7 +2182,7 @@ mod tests {
 
     #[test]
     fn not_found_display_and_classifier() {
-        let err = Error::NotFound {
+        let err = ErrorReason::NotFound {
             program: "my-tool".into(),
             searched: Some("/usr/bin:/usr/local/bin".into()),
         };
@@ -1975,14 +2205,14 @@ mod tests {
         // A path-form program (or a customized PATH) is `NotFound` with
         // `searched: None` — no PATH lookup happened, so the message must not
         // claim "on PATH". Still `is_not_found()`.
-        let err = Error::NotFound {
+        let err = ErrorReason::NotFound {
             program: "/no/such/tool".into(),
             searched: None,
         };
         assert_eq!(err.to_string(), "`/no/such/tool` not found");
         assert!(err.is_not_found());
         // The bare-name case (a real PATH search) still says "on PATH".
-        let bare = Error::NotFound {
+        let bare = ErrorReason::NotFound {
             program: "tool".into(),
             searched: Some("/usr/bin".into()),
         };
@@ -1990,10 +2220,11 @@ mod tests {
     }
 
     fn spawn(kind: std::io::ErrorKind) -> Error {
-        Error::Spawn {
+        ErrorReason::Spawn {
             program: "x".into(),
             source: std::io::Error::from(kind),
         }
+        .into()
     }
 
     #[test]
@@ -2003,14 +2234,14 @@ mod tests {
         // `Spawn`/`Io` carrying a `NotFound` io kind (e.g. a bad cwd) is not a
         // missing program, so the "not installed?" hint can't misfire.
         assert!(
-            Error::NotFound {
+            ErrorReason::NotFound {
                 program: "x".into(),
                 searched: None,
             }
             .is_not_found()
         );
         assert!(!spawn(NotFound).is_not_found());
-        assert!(!Error::Io(std::io::Error::from(NotFound)).is_not_found());
+        assert!(!ErrorReason::Io(std::io::Error::from(NotFound)).is_not_found());
         assert!(!spawn(NotFound).is_permission_denied());
 
         assert!(spawn(PermissionDenied).is_permission_denied());
@@ -2032,7 +2263,7 @@ mod tests {
         ] {
             assert!(spawn(kind).is_transient(), "{kind:?} should be transient");
             assert!(
-                Error::Io(std::io::Error::from(kind)).is_transient(),
+                ErrorReason::Io(std::io::Error::from(kind)).is_transient(),
                 "{kind:?} (Io) should be transient"
             );
         }
@@ -2041,7 +2272,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn etxtbsy_is_transient_on_unix() {
-        let err = Error::Spawn {
+        let err = ErrorReason::Spawn {
             program: "busy".into(),
             source: std::io::Error::from_raw_os_error(libc::ETXTBSY),
         };
@@ -2053,7 +2284,7 @@ mod tests {
     #[test]
     fn sharing_and_lock_violations_are_transient_on_windows() {
         for code in [32, 33] {
-            let err = Error::Spawn {
+            let err = ErrorReason::Spawn {
                 program: "locked".into(),
                 source: std::io::Error::from_raw_os_error(code),
             };
@@ -2068,7 +2299,7 @@ mod tests {
     fn classifiers_are_false_for_non_io_variants() {
         // A tool's non-zero exit is never an io-level classification (its
         // retryability is the caller's domain), and Timeout is excluded too.
-        let exit = Error::Exit {
+        let exit = ErrorReason::Exit {
             program: "git".into(),
             code: 128,
             stdout: String::new(),
@@ -2076,7 +2307,7 @@ mod tests {
             stdout_bytes: None,
         };
         assert!(!exit.is_not_found() && !exit.is_permission_denied() && !exit.is_transient());
-        let timeout = Error::Timeout {
+        let timeout = ErrorReason::Timeout {
             program: "x".into(),
             timeout: Duration::from_secs(1),
             stdout: String::new(),
@@ -2092,34 +2323,34 @@ mod tests {
     #[test]
     fn spawn_not_found_stdin_and_parse_constructors_build_the_expected_variant() {
         let spawn = Error::spawn("git", std::io::Error::from_raw_os_error(2));
-        match spawn {
-            Error::Spawn { program, source } => {
+        match spawn.into_reason() {
+            ErrorReason::Spawn { program, source } => {
                 assert_eq!(program, "git");
                 assert_eq!(source.raw_os_error(), Some(2));
             }
-            other => panic!("expected Error::Spawn, got {other:?}"),
+            other => panic!("expected ErrorReason::Spawn, got {other:?}"),
         }
 
         let not_found = Error::not_found("my-tool", Some("/usr/bin".into()));
         assert!(matches!(
-            &not_found,
-            Error::NotFound { program, searched }
+            not_found.reason(),
+            ErrorReason::NotFound { program, searched }
                 if program == "my-tool" && searched.as_deref() == Some("/usr/bin")
         ));
 
         let stdin = Error::stdin("git", std::io::Error::from_raw_os_error(32));
-        match stdin {
-            Error::Stdin { program, source } => {
+        match stdin.into_reason() {
+            ErrorReason::Stdin { program, source } => {
                 assert_eq!(program, "git");
                 assert_eq!(source.raw_os_error(), Some(32));
             }
-            other => panic!("expected Error::Stdin, got {other:?}"),
+            other => panic!("expected ErrorReason::Stdin, got {other:?}"),
         }
 
         let parse = Error::parse("git", "unexpected token");
         assert!(matches!(
-            &parse,
-            Error::Parse { program, message }
+            parse.reason(),
+            ErrorReason::Parse { program, message }
                 if program == "git" && message == "unexpected token"
         ));
     }

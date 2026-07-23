@@ -14,7 +14,7 @@
 /// [`ProcessGroup::soft_stop_scope`](crate::ProcessGroup::soft_stop_scope) so a
 /// caller (for example a CLI wrapping this crate) can decide *up front* whether a
 /// soft stop is worth attempting — and state the real reach to its own user —
-/// instead of firing a `signal`, parsing an [`Error::Unsupported`](crate::Error::Unsupported)
+/// instead of firing a `signal`, parsing an [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported)
 /// back, and guessing at the scope from a hard-coded platform assumption. It is
 /// the group-axis analogue of
 /// [`Command::kill_on_parent_death_scope`](crate::Command::kill_on_parent_death_scope)'s
@@ -77,7 +77,7 @@ pub enum SoftStopScope {
     /// **No** soft stop is available on this group: not one member can receive a
     /// graceful `Int`/`Term`, so [`signal(Signal::Term)`](crate::ProcessGroup::signal)
     /// / [`Signal::Int`](crate::Signal::Int) would return
-    /// [`Error::Unsupported`](crate::Error::Unsupported). Windows, when the group
+    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported). Windows, when the group
     /// has neither a console-CTRL leader nor a windowed member (an empty group, or
     /// a tree of plain windowless children with no console opt-in). The
     /// unconditional hard kill still works — this reports only the soft tier's

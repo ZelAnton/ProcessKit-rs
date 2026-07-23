@@ -227,10 +227,10 @@ async fn concurrent_kill_reaps_every_handle() {
 }
 
 /// 6. A cancellation storm: fire many tokens at once and assert every in-flight
-///    run resolves to `Error::Cancelled` (and its tree is torn down).
+///    run resolves to `ErrorReason::Cancelled` (and its tree is torn down).
 #[tokio::test]
 async fn cancellation_storm_resolves_every_call() {
-    use processkit::{CancellationToken, Error};
+    use processkit::{CancellationToken, ErrorReason};
 
     if skip_unless_enabled("cancellation_storm") {
         return;
@@ -257,8 +257,8 @@ async fn cancellation_storm_resolves_every_call() {
             .expect("cancelled run resolves in time")
             .expect("task did not panic");
         assert!(
-            matches!(result, Err(Error::Cancelled { .. })),
-            "every cancelled run resolves to Error::Cancelled, got {result:?}"
+            matches!(&result, Err(e) if matches!(e.reason(), ErrorReason::Cancelled { .. })),
+            "every cancelled run resolves to ErrorReason::Cancelled, got {result:?}"
         );
     }
 }

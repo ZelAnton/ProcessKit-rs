@@ -336,8 +336,8 @@ async fn second_stdout_lines_call_is_a_loud_error() {
         .stdout_lines()
         .expect_err("a second stdout_lines must be a loud error");
     assert!(
-        matches!(err, processkit::Error::Io(_)),
-        "expected Error::Io, got {err:?}"
+        matches!(err.reason(), processkit::ErrorReason::Io(_)),
+        "expected ErrorReason::Io, got {err:?}"
     );
 
     let _ = process.finish().await;

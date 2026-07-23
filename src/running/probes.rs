@@ -22,7 +22,7 @@ use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorReason, Result};
 
 use super::RunningProcess;
 
@@ -37,7 +37,7 @@ const CONNECT_ATTEMPT_CAP: Duration = Duration::from_secs(1);
 
 impl RunningProcess {
     /// Wait until a stdout line matches `predicate` (returning that line), or
-    /// fail with [`Error::NotReady`] when `within` elapses — or immediately
+    /// fail with [`ErrorReason::NotReady`] when `within` elapses — or immediately
     /// when stdout closes before a match (e.g. the child exited and no
     /// descendant kept the pipe open), since no further line can arrive. A
     /// child that exits while a descendant still holds its stdout keeps the
@@ -68,11 +68,11 @@ impl RunningProcess {
     ///
     /// # Errors
     ///
-    /// - [`Error::NotReady`] when `within` elapses with no matching line, or
+    /// - [`ErrorReason::NotReady`] when `within` elapses with no matching line, or
     ///   immediately when stdout closes first (no further line can arrive). This
-    ///   is a *probe* deadline — distinct from [`Error::Timeout`], and a failed
+    ///   is a *probe* deadline — distinct from [`ErrorReason::Timeout`], and a failed
     ///   probe neither kills the child nor flips its outcome to `TimedOut`.
-    /// - [`Error::Io`] when stdout was not piped, or a prior streaming verb
+    /// - [`ErrorReason::Io`] when stdout was not piped, or a prior streaming verb
     ///   already consumed it (so no line stream can be drained).
     pub async fn wait_for_line(
         &mut self,
@@ -102,7 +102,7 @@ impl RunningProcess {
     }
 
     /// Wait until `check` (re-invoked every ~50 ms, first attempt immediate)
-    /// returns `true`, or fail with [`Error::NotReady`] when `within` elapses —
+    /// returns `true`, or fail with [`ErrorReason::NotReady`] when `within` elapses —
     /// or immediately when the child exits first (a dead process never becomes
     /// ready).
     ///
@@ -137,9 +137,9 @@ impl RunningProcess {
     ///
     /// # Errors
     ///
-    /// [`Error::NotReady`] when `within` elapses before `check` returns `true`,
+    /// [`ErrorReason::NotReady`] when `within` elapses before `check` returns `true`,
     /// or immediately when the child exits first (a dead process never becomes
-    /// ready). This is a *probe* deadline — distinct from [`Error::Timeout`]: a
+    /// ready). This is a *probe* deadline — distinct from [`ErrorReason::Timeout`]: a
     /// failed probe does not kill the child or touch its outcome.
     pub async fn wait_for<F, Fut>(&mut self, check: F, within: Duration) -> Result<()>
     where
@@ -150,7 +150,7 @@ impl RunningProcess {
     }
 
     /// Wait until a TCP connection to `addr` is accepted, or fail with
-    /// [`Error::NotReady`] when `within` elapses — or immediately when the
+    /// [`ErrorReason::NotReady`] when `within` elapses — or immediately when the
     /// child exits first.
     ///
     /// One connect attempt per ~50 ms tick (each attempt itself bounded so a
@@ -163,9 +163,9 @@ impl RunningProcess {
     ///
     /// # Errors
     ///
-    /// [`Error::NotReady`] when `within` elapses before a connection to `addr` is
+    /// [`ErrorReason::NotReady`] when `within` elapses before a connection to `addr` is
     /// accepted, or immediately when the child exits first. This is a *probe*
-    /// deadline — distinct from [`Error::Timeout`]: a failed probe does not kill
+    /// deadline — distinct from [`ErrorReason::Timeout`]: a failed probe does not kill
     /// the child or touch its outcome.
     pub async fn wait_for_port(&mut self, addr: SocketAddr, within: Duration) -> Result<()> {
         // Clamp so a `Duration::MAX`-ish `within` can't overflow the deadline.
@@ -191,7 +191,7 @@ impl RunningProcess {
     }
 
     /// Wait until a Unix domain socket at `path` accepts a connection, or fail
-    /// with [`Error::NotReady`] when `within` elapses — or immediately when the
+    /// with [`ErrorReason::NotReady`] when `within` elapses — or immediately when the
     /// child exits first. The successful connection is dropped immediately;
     /// merely finding a socket file is not enough, so an orphaned socket from a
     /// dead server does not count as ready.
@@ -202,14 +202,14 @@ impl RunningProcess {
     /// [`OutputBufferPolicy`](crate::OutputBufferPolicy), like
     /// [`wait_for_port`](Self::wait_for_port). Unix domain sockets are available
     /// only on platforms with AF_UNIX; other targets return
-    /// [`Error::Unsupported`] immediately.
+    /// [`ErrorReason::Unsupported`] immediately.
     ///
     /// # Errors
     ///
-    /// [`Error::NotReady`] when `within` elapses before a connection to `path` is
+    /// [`ErrorReason::NotReady`] when `within` elapses before a connection to `path` is
     /// accepted, or immediately when the child exits first. This is a *probe*
-    /// deadline — distinct from [`Error::Timeout`]: a failed probe does not kill
-    /// the child or touch its outcome. [`Error::Unsupported`] is returned on
+    /// deadline — distinct from [`ErrorReason::Timeout`]: a failed probe does not kill
+    /// the child or touch its outcome. [`ErrorReason::Unsupported`] is returned on
     /// platforms without AF_UNIX support.
     pub async fn wait_for_socket(
         &mut self,
@@ -219,9 +219,10 @@ impl RunningProcess {
         #[cfg(not(unix))]
         {
             let _ = (path, within);
-            Err(Error::Unsupported {
+            Err(ErrorReason::Unsupported {
                 operation: "wait_for_socket".into(),
-            })
+            }
+            .into())
         }
 
         #[cfg(unix)]
@@ -298,10 +299,11 @@ impl RunningProcess {
     }
 
     fn not_ready(&self, within: Duration) -> Error {
-        Error::NotReady {
+        ErrorReason::NotReady {
             program: self.program.clone(),
             timeout: within,
         }
+        .into()
     }
 }
 
@@ -328,7 +330,7 @@ mod tests {
 
     use crate::command::Command;
     use crate::doubles::{Reply, ScriptedRunner};
-    use crate::error::Error;
+    use crate::error::ErrorReason;
     use crate::runner::ProcessRunner;
 
     /// T-134: a readiness probe must background-drain piped stderr even when
@@ -438,7 +440,10 @@ mod tests {
             .wait_for_socket(&path, Duration::from_millis(150))
             .await
             .expect_err("a missing listener must time out");
-        assert!(matches!(error, Error::NotReady { .. }), "got {error:?}");
+        assert!(
+            matches!(error.reason(), ErrorReason::NotReady { .. }),
+            "got {error:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -456,7 +461,10 @@ mod tests {
             .wait_for_socket(&path, Duration::from_secs(30))
             .await
             .expect_err("an exited child cannot become ready");
-        assert!(matches!(error, Error::NotReady { .. }), "got {error:?}");
+        assert!(
+            matches!(error.reason(), ErrorReason::NotReady { .. }),
+            "got {error:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -486,7 +494,10 @@ mod tests {
             .wait_for_socket(&path, Duration::from_millis(150))
             .await
             .expect_err("an orphaned socket file has no accepting listener");
-        assert!(matches!(error, Error::NotReady { .. }), "got {error:?}");
+        assert!(
+            matches!(error.reason(), ErrorReason::NotReady { .. }),
+            "got {error:?}"
+        );
     }
 
     #[cfg(windows)]
@@ -503,7 +514,7 @@ mod tests {
             .await
             .expect_err("Windows has no AF_UNIX readiness probe");
         assert!(
-            matches!(error, Error::Unsupported { ref operation } if operation == "wait_for_socket"),
+            matches!(error.reason(), ErrorReason::Unsupported { operation } if operation == "wait_for_socket"),
             "got {error:?}"
         );
     }
