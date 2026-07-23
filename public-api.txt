@@ -263,6 +263,9 @@ impl<'a> !core::panic::unwind_safe::UnwindSafe for processkit::GiveUpAttempt<'a>
 pub processkit::LimitKind::Cpu
 pub processkit::LimitKind::Memory
 pub processkit::LimitKind::Processes
+impl processkit::LimitKind
+pub fn processkit::LimitKind::from_name(&str) -> core::option::Option<Self>
+pub fn processkit::LimitKind::name(&self) -> &'static str
 impl core::clone::Clone for processkit::LimitKind
 pub fn processkit::LimitKind::clone(&self) -> processkit::LimitKind
 impl core::cmp::Eq for processkit::LimitKind
@@ -283,6 +286,9 @@ impl core::panic::unwind_safe::UnwindSafe for processkit::LimitKind
 pub processkit::LimitReason::Invalid
 pub processkit::LimitReason::Unenforceable
 pub processkit::LimitReason::Unsupported
+impl processkit::LimitReason
+pub fn processkit::LimitReason::from_name(&str) -> core::option::Option<Self>
+pub fn processkit::LimitReason::name(&self) -> &'static str
 impl core::clone::Clone for processkit::LimitReason
 pub fn processkit::LimitReason::clone(&self) -> processkit::LimitReason
 impl core::cmp::Eq for processkit::LimitReason
@@ -302,6 +308,9 @@ impl core::panic::unwind_safe::UnwindSafe for processkit::LimitReason
 #[non_exhaustive] pub enum processkit::LineTerminator
 pub processkit::LineTerminator::CarriageReturn
 pub processkit::LineTerminator::Newline
+impl processkit::LineTerminator
+pub fn processkit::LineTerminator::from_name(&str) -> core::option::Option<Self>
+pub fn processkit::LineTerminator::name(&self) -> &'static str
 impl core::clone::Clone for processkit::LineTerminator
 pub fn processkit::LineTerminator::clone(&self) -> processkit::LineTerminator
 impl core::cmp::Eq for processkit::LineTerminator
@@ -324,6 +333,9 @@ impl core::panic::unwind_safe::UnwindSafe for processkit::LineTerminator
 pub processkit::Mechanism::CgroupV2
 pub processkit::Mechanism::JobObject
 pub processkit::Mechanism::ProcessGroup
+impl processkit::Mechanism
+pub fn processkit::Mechanism::from_name(&str) -> core::option::Option<Self>
+pub fn processkit::Mechanism::name(&self) -> &'static str
 impl core::clone::Clone for processkit::Mechanism
 pub fn processkit::Mechanism::clone(&self) -> processkit::Mechanism
 impl core::cmp::Eq for processkit::Mechanism
@@ -346,6 +358,7 @@ pub processkit::Outcome::Signalled(core::option::Option<i32>)
 pub processkit::Outcome::TimedOut
 impl processkit::Outcome
 pub fn processkit::Outcome::code(&self) -> core::option::Option<i32>
+pub fn processkit::Outcome::name(&self) -> &'static str
 pub fn processkit::Outcome::signal(&self) -> core::option::Option<i32>
 pub fn processkit::Outcome::timed_out(&self) -> bool
 impl core::clone::Clone for processkit::Outcome
@@ -388,6 +401,9 @@ impl core::panic::unwind_safe::UnwindSafe for processkit::OutputEvent
 pub processkit::OverflowMode::DropNewest
 pub processkit::OverflowMode::DropOldest
 pub processkit::OverflowMode::Error
+impl processkit::OverflowMode
+pub fn processkit::OverflowMode::from_name(&str) -> core::option::Option<Self>
+pub fn processkit::OverflowMode::name(&self) -> &'static str
 impl core::clone::Clone for processkit::OverflowMode
 pub fn processkit::OverflowMode::clone(&self) -> processkit::OverflowMode
 impl core::cmp::Eq for processkit::OverflowMode
@@ -408,6 +424,9 @@ impl core::panic::unwind_safe::UnwindSafe for processkit::OverflowMode
 pub processkit::ParentDeathCleanup::DirectChildOnly
 pub processkit::ParentDeathCleanup::Unsupported
 pub processkit::ParentDeathCleanup::WholeTree
+impl processkit::ParentDeathCleanup
+pub fn processkit::ParentDeathCleanup::from_name(&str) -> core::option::Option<Self>
+pub fn processkit::ParentDeathCleanup::name(&self) -> &'static str
 impl core::clone::Clone for processkit::ParentDeathCleanup
 pub fn processkit::ParentDeathCleanup::clone(&self) -> processkit::ParentDeathCleanup
 impl core::cmp::Eq for processkit::ParentDeathCleanup
@@ -430,6 +449,9 @@ pub processkit::Priority::BelowNormal
 pub processkit::Priority::High
 pub processkit::Priority::Idle
 pub processkit::Priority::Normal
+impl processkit::Priority
+pub fn processkit::Priority::from_name(&str) -> core::option::Option<Self>
+pub fn processkit::Priority::name(&self) -> &'static str
 impl core::clone::Clone for processkit::Priority
 pub fn processkit::Priority::clone(&self) -> processkit::Priority
 impl core::cmp::Eq for processkit::Priority
@@ -450,6 +472,9 @@ impl core::panic::unwind_safe::UnwindSafe for processkit::Priority
 pub processkit::RestartPolicy::Always
 pub processkit::RestartPolicy::Never
 pub processkit::RestartPolicy::OnCrash
+impl processkit::RestartPolicy
+pub fn processkit::RestartPolicy::from_name(&str) -> core::option::Option<Self>
+pub fn processkit::RestartPolicy::name(&self) -> &'static str
 impl core::clone::Clone for processkit::RestartPolicy
 pub fn processkit::RestartPolicy::clone(&self) -> processkit::RestartPolicy
 impl core::cmp::Eq for processkit::RestartPolicy
@@ -475,6 +500,9 @@ pub processkit::Signal::Quit
 pub processkit::Signal::Term
 pub processkit::Signal::Usr1
 pub processkit::Signal::Usr2
+impl processkit::Signal
+pub fn processkit::Signal::from_name(&str) -> core::option::Option<Self>
+pub fn processkit::Signal::name(&self) -> core::option::Option<&'static str>
 impl core::clone::Clone for processkit::Signal
 pub fn processkit::Signal::clone(&self) -> processkit::Signal
 impl core::cmp::Eq for processkit::Signal
@@ -497,6 +525,9 @@ impl core::panic::unwind_safe::UnwindSafe for processkit::Signal
 pub processkit::StdioMode::Inherit
 pub processkit::StdioMode::Null
 pub processkit::StdioMode::Piped
+impl processkit::StdioMode
+pub fn processkit::StdioMode::from_name(&str) -> core::option::Option<Self>
+pub fn processkit::StdioMode::name(&self) -> &'static str
 impl core::clone::Clone for processkit::StdioMode
 pub fn processkit::StdioMode::clone(&self) -> processkit::StdioMode
 impl core::cmp::Eq for processkit::StdioMode
@@ -522,6 +553,9 @@ pub processkit::StopReason::Predicate
 pub processkit::StopReason::RestartsExhausted
 pub processkit::StopReason::Stopped
 pub processkit::StopReason::Unhealthy
+impl processkit::StopReason
+pub fn processkit::StopReason::from_name(&str) -> core::option::Option<Self>
+pub fn processkit::StopReason::name(&self) -> &'static str
 impl core::clone::Clone for processkit::StopReason
 pub fn processkit::StopReason::clone(&self) -> processkit::StopReason
 impl core::cmp::Eq for processkit::StopReason

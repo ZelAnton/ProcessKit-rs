@@ -53,3 +53,84 @@ pub enum ParentDeathCleanup {
     /// guarantee via `Drop` still holds when the owner exits normally.)
     Unsupported,
 }
+
+impl ParentDeathCleanup {
+    /// This scope's **stable machine identifier**: a short, lowercase
+    /// `snake_case` string (`"whole_tree"`, `"direct_child_only"`, `"none"`)
+    /// that is part of the crate's compatibility surface.
+    ///
+    /// Use it for machine-readable output — a CLI's JSONL schema, a
+    /// cross-language binding, a structured log field — where a consumer needs
+    /// one canonical spelling per variant instead of hand-maintaining its own
+    /// mapping table. It is a *diagnostic* name, **not** a wire/serialization
+    /// format, but it is held stable all the same: a **new** variant gets a
+    /// **new** identifier, and an existing identifier is **never renamed**
+    /// without a major release. [`from_name`](Self::from_name) parses it back.
+    ///
+    /// [`Unsupported`](Self::Unsupported) reports `"none"` — "no parent-death
+    /// cleanup" — matching the spelling downstream tools already publish, so
+    /// adopting these identifiers needs no migration on their side.
+    pub fn name(&self) -> &'static str {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never silently ship without a stable identifier.
+        match self {
+            ParentDeathCleanup::WholeTree => "whole_tree",
+            ParentDeathCleanup::DirectChildOnly => "direct_child_only",
+            ParentDeathCleanup::Unsupported => "none",
+        }
+    }
+
+    /// Parse a [`name`](Self::name) identifier back into a `ParentDeathCleanup`.
+    ///
+    /// Returns `None` for any string that is not exactly one of the stable
+    /// identifiers — an honest miss, never a silent default, so a consumer that
+    /// reads an unknown name (for example one minted by a newer version of this
+    /// crate) must handle the gap rather than mis-decode it. Round-trips with
+    /// [`name`](Self::name): `ParentDeathCleanup::from_name(c.name()) ==
+    /// Some(c)` for every variant.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "whole_tree" => Some(ParentDeathCleanup::WholeTree),
+            "direct_child_only" => Some(ParentDeathCleanup::DirectChildOnly),
+            "none" => Some(ParentDeathCleanup::Unsupported),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ParentDeathCleanup;
+
+    const ALL: &[ParentDeathCleanup] = &[
+        ParentDeathCleanup::WholeTree,
+        ParentDeathCleanup::DirectChildOnly,
+        ParentDeathCleanup::Unsupported,
+    ];
+
+    #[test]
+    fn name_pins_each_variant() {
+        assert_eq!(ParentDeathCleanup::WholeTree.name(), "whole_tree");
+        assert_eq!(
+            ParentDeathCleanup::DirectChildOnly.name(),
+            "direct_child_only"
+        );
+        // `Unsupported` reports `none`, matching the downstream spelling.
+        assert_eq!(ParentDeathCleanup::Unsupported.name(), "none");
+    }
+
+    #[test]
+    fn name_from_name_round_trips_every_variant() {
+        for &c in ALL {
+            assert_eq!(ParentDeathCleanup::from_name(c.name()), Some(c));
+        }
+    }
+
+    #[test]
+    fn from_name_rejects_unknown_without_defaulting() {
+        assert_eq!(ParentDeathCleanup::from_name("unsupported"), None);
+        assert_eq!(ParentDeathCleanup::from_name("WholeTree"), None);
+        assert_eq!(ParentDeathCleanup::from_name(""), None);
+    }
+}

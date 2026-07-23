@@ -40,6 +40,27 @@ to a dated version section.
 - Publish build-provenance attestations for release artifacts (the packaged
   `.crate` and its `SHA256SUMS`, attached to each GitHub Release); see
   "Verifying provenance" in README.md / SECURITY.md
+- Add stable machine identifiers to the reporting and configuration enums.
+  `Mechanism`, `Outcome`, `ParentDeathCleanup`, `StopReason`, `LimitKind`,
+  `LimitReason`, `StdioMode`, `LineTerminator`, `OverflowMode`, `Priority`,
+  `RestartPolicy`, and `Signal` each gain a `name()` returning a short,
+  lowercase `snake_case` identifier held stable as part of the compatibility
+  surface — a diagnostic name, not a wire format: a new variant gets a new name,
+  and an existing name is never renamed without a major release. Every enum
+  whose value can arrive from outside (config / CLI / another language) also
+  gains `from_name(&str)`, an honest inverse that returns `None` on an
+  unrecognized name rather than defaulting silently. `Mechanism` and
+  `ParentDeathCleanup` use the spellings downstream tools already publish
+  (`job_object`/`cgroup_v2`/`process_group`,
+  `whole_tree`/`direct_child_only`/`none`), so adopting them needs no migration.
+  `Outcome::name()` names the disposition only (`exited`/`signalled`/`timed_out`)
+  and has no inverse — the name alone cannot carry the exit code / signal number.
+  `Signal::name()` returns `Option`, `None` for the raw-number `Other` escape
+  hatch. No optional `serde` feature ships for these enums (deliberately
+  declined; rationale in `decisions/serde-reporting-enums-2026-07.md`): the
+  string methods already let consumers drop their hand-maintained tables without
+  committing the crate to a second serialized-shape compatibility surface or an
+  extra optional dependency
 
 ### Changed
 

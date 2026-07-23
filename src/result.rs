@@ -82,6 +82,36 @@ impl Outcome {
     pub fn timed_out(&self) -> bool {
         matches!(self, Outcome::TimedOut)
     }
+
+    /// This outcome's **stable machine identifier** — the *kind* of
+    /// disposition as a short, lowercase `snake_case` string (`"exited"`,
+    /// `"signalled"`, `"timed_out"`), part of the crate's compatibility
+    /// surface.
+    ///
+    /// Use it for machine-readable output — a CLI's JSONL schema, a
+    /// cross-language binding, a structured log field — where a consumer needs
+    /// one canonical spelling per disposition instead of hand-maintaining its
+    /// own mapping table. It is a *diagnostic* name, **not** a wire format, but
+    /// it is held stable all the same: a **new** variant gets a **new**
+    /// identifier, and an existing identifier is **never renamed** without a
+    /// major release.
+    ///
+    /// This names the disposition **only**; the payload (the exit code of
+    /// [`Exited`](Self::Exited), the signal number of [`Signalled`](Self::Signalled))
+    /// travels separately via [`code`](Self::code) / [`signal`](Self::signal).
+    /// There is deliberately no `from_name` inverse: the name alone cannot
+    /// reconstruct that payload, and an `Outcome` is a *reported* result, never
+    /// supplied to the crate from the outside.
+    pub fn name(&self) -> &'static str {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never silently ship without a stable identifier.
+        match self {
+            Outcome::Exited(_) => "exited",
+            Outcome::Signalled(_) => "signalled",
+            Outcome::TimedOut => "timed_out",
+        }
+    }
 }
 
 /// The captured result of running a process to completion.
@@ -620,6 +650,17 @@ mod tests {
         );
         assert_eq!(killed.signal(), Some(9));
         assert_eq!(killed.code(), None);
+    }
+
+    #[test]
+    fn name_pins_each_disposition_regardless_of_payload() {
+        // The kind identifier is a compatibility surface and must not drift; it
+        // names the disposition only, independent of the carried payload.
+        assert_eq!(Outcome::Exited(0).name(), "exited");
+        assert_eq!(Outcome::Exited(137).name(), "exited");
+        assert_eq!(Outcome::Signalled(Some(9)).name(), "signalled");
+        assert_eq!(Outcome::Signalled(None).name(), "signalled");
+        assert_eq!(Outcome::TimedOut.name(), "timed_out");
     }
 
     #[test]

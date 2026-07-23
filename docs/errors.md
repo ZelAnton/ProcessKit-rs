@@ -11,6 +11,7 @@ which variant fires from where, how to classify it, and what to do about it.
 - [Variant reference](#variant-reference)
 - [Variants that look alike but aren't](#variants-that-look-alike-but-arent)
 - [Classifiers](#classifiers)
+- [Stable machine identifiers](#stable-machine-identifiers)
 - [Matching under `#[non_exhaustive]`](#matching-under-non_exhaustive)
 - [Errors and retries](#errors-and-retries)
 - [Errors and supervision](#errors-and-supervision)
@@ -78,6 +79,51 @@ which variant fires from where, how to classify it, and what to do about it.
 | `program()` | Every variant that names one | `None` only for `Unsupported`, `Io`, and (`limits` feature) `ResourceLimit` — the ones with no single program to attribute. |
 | `limit_kind()` / `limit_reason()` (`limits` feature) | `ResourceLimit` only | Read structured fields instead of parsing `detail`'s English text. |
 | `diagnostic()` | `Exit` / `Timeout` / `Signalled` (`Some`) | Stderr if it carries text, else stdout (`git`/`jj` put decisive output there), else `None`. |
+
+## Stable machine identifiers
+
+When you publish a machine-readable contract *over* this crate's types — a
+CLI's JSONL schema, a cross-language binding, a structured log field — you need
+one canonical string per enum variant, not a table you hand-maintain (and that
+silently mislabels a new variant as "unknown"). The reporting and configuration
+enums carry that table for you:
+
+| Method | On | Direction |
+|---|---|---|
+| `name() -> &'static str` | `Mechanism`, `Outcome`, `ParentDeathCleanup`, `StopReason`, `LimitKind`, `LimitReason`, `StdioMode`, `LineTerminator`, `OverflowMode`, `Priority`, `RestartPolicy` | A short, lowercase `snake_case` identifier for the variant. |
+| `name() -> Option<&'static str>` | `Signal` | `Some(id)` for a curated signal; `None` for the raw-number `Signal::Other` (render its `i32` instead). |
+| `from_name(&str) -> Option<Self>` | every enum above **except** `Outcome` | Parse an identifier back into the value; `None` — not a default — for an unrecognized name. |
+
+The identifiers are a **compatibility surface**, held stable like the rest of
+the public API: a **new** variant gets a **new** identifier, and an existing
+identifier is **never renamed** without a major release. They are *diagnostic*
+names, deliberately **not** a wire/serialization format — there is no `serde`
+feature that serializes these enums (the string methods already remove the need
+to hand-write conversions, without committing the crate to a second serialized
+shape). `Mechanism` and `ParentDeathCleanup` use the spellings downstream tools
+already publish (`job_object`/`cgroup_v2`/`process_group`,
+`whole_tree`/`direct_child_only`/`none`), so adopting them needs no migration.
+
+```rust
+use processkit::{Mechanism, Priority};
+
+// Forward — a stable identifier for machine-readable output:
+assert_eq!(Mechanism::CgroupV2.name(), "cgroup_v2");
+assert_eq!(Priority::BelowNormal.name(), "below_normal");
+
+// Inverse (a config value, a CLI flag, a call from another language) — an
+// honest `None` on an unrecognized name, never a silent default:
+assert_eq!(Priority::from_name("below_normal"), Some(Priority::BelowNormal));
+assert_eq!(Priority::from_name("turbo"), None);
+```
+
+Two enums are asymmetric on purpose. `Outcome::name()` reports the *disposition*
+only (`exited` / `signalled` / `timed_out`) and has **no** `from_name` — the
+name alone can't carry the exit code or signal number (read those from
+[`code()`](https://docs.rs/processkit/latest/processkit/struct.ProcessResult.html#method.code)
+/ `signal()`), and an `Outcome` is always *reported* by the crate, never
+supplied to it. `Signal::name()` returns `Option` because the `Other(i32)`
+escape hatch has no curated name.
 
 ## Matching under `#[non_exhaustive]`
 

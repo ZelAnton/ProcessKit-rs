@@ -61,6 +61,63 @@ pub enum Signal {
     Other(i32),
 }
 
+impl Signal {
+    /// This signal's **stable machine identifier** for a curated variant: a
+    /// short, lowercase `snake_case` string (`"term"`, `"kill"`, `"int"`,
+    /// `"hup"`, `"quit"`, `"usr1"`, `"usr2"`), part of the crate's
+    /// compatibility surface.
+    ///
+    /// Use it for machine-readable output — a CLI's JSONL schema, a
+    /// cross-language binding, a structured log field — where a consumer needs
+    /// one canonical spelling per variant instead of hand-maintaining its own
+    /// mapping table. It is a *diagnostic* name, **not** a wire/serialization
+    /// format, but it is held stable all the same: a **new** curated variant
+    /// gets a **new** identifier, and an existing identifier is **never
+    /// renamed** without a major release.
+    ///
+    /// Returns `None` for the [`Other`](Signal::Other) escape hatch: a raw
+    /// signal number has no curated name, so render (and parse) its inner `i32`
+    /// directly rather than inventing a placeholder that could not round-trip.
+    /// [`from_name`](Self::from_name) parses the curated identifiers back.
+    pub fn name(&self) -> Option<&'static str> {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never silently ship without a decision about its identifier.
+        match self {
+            Signal::Term => Some("term"),
+            Signal::Kill => Some("kill"),
+            Signal::Int => Some("int"),
+            Signal::Hup => Some("hup"),
+            Signal::Quit => Some("quit"),
+            Signal::Usr1 => Some("usr1"),
+            Signal::Usr2 => Some("usr2"),
+            Signal::Other(_) => None,
+        }
+    }
+
+    /// Parse a curated [`name`](Self::name) identifier back into a `Signal` —
+    /// the direction a config value or CLI flag naming a signal needs.
+    ///
+    /// Covers the curated variants only; returns `None` for any other string —
+    /// an honest miss, never a silent default. The [`Other`](Signal::Other)
+    /// escape hatch is *not* reached through a name (it has none): parse a raw
+    /// signal number into an `i32` and construct `Signal::Other(n)` yourself.
+    /// Round-trips with [`name`](Self::name): for every curated variant,
+    /// `Signal::from_name(s.name().unwrap()) == Some(s)`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "term" => Some(Signal::Term),
+            "kill" => Some(Signal::Kill),
+            "int" => Some(Signal::Int),
+            "hup" => Some(Signal::Hup),
+            "quit" => Some(Signal::Quit),
+            "usr1" => Some(Signal::Usr1),
+            "usr2" => Some(Signal::Usr2),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(unix)]
 impl Signal {
     /// The raw POSIX signal number for this signal.
@@ -94,6 +151,54 @@ mod tests {
         assert_eq!(Signal::Usr2.raw(), libc::SIGUSR2);
         // The escape hatch is verbatim — no mapping, no validation here.
         assert_eq!(Signal::Other(64).raw(), 64);
+    }
+
+    /// Every curated (named) variant, for round-trip coverage. `Other` is
+    /// excluded deliberately — it carries a raw number and has no curated name.
+    const CURATED: &[Signal] = &[
+        Signal::Term,
+        Signal::Kill,
+        Signal::Int,
+        Signal::Hup,
+        Signal::Quit,
+        Signal::Usr1,
+        Signal::Usr2,
+    ];
+
+    #[test]
+    fn name_pins_each_curated_variant() {
+        assert_eq!(Signal::Term.name(), Some("term"));
+        assert_eq!(Signal::Kill.name(), Some("kill"));
+        assert_eq!(Signal::Int.name(), Some("int"));
+        assert_eq!(Signal::Hup.name(), Some("hup"));
+        assert_eq!(Signal::Quit.name(), Some("quit"));
+        assert_eq!(Signal::Usr1.name(), Some("usr1"));
+        assert_eq!(Signal::Usr2.name(), Some("usr2"));
+    }
+
+    #[test]
+    fn other_has_no_curated_name() {
+        // The raw-number escape hatch reports no name (render its i32 instead),
+        // and no name parses back to it.
+        assert_eq!(Signal::Other(9).name(), None);
+        assert_eq!(Signal::Other(0).name(), None);
+    }
+
+    #[test]
+    fn name_from_name_round_trips_every_curated_variant() {
+        for &s in CURATED {
+            let name = s.name().expect("curated variant has a name");
+            assert_eq!(Signal::from_name(name), Some(s));
+        }
+    }
+
+    #[test]
+    fn from_name_rejects_unknown_and_other_without_defaulting() {
+        assert_eq!(Signal::from_name("Term"), None);
+        assert_eq!(Signal::from_name("sigterm"), None);
+        assert_eq!(Signal::from_name("other"), None);
+        assert_eq!(Signal::from_name("9"), None);
+        assert_eq!(Signal::from_name(""), None);
     }
 
     #[test]

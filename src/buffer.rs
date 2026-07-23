@@ -28,6 +28,47 @@ pub enum StdioMode {
     Null,
 }
 
+impl StdioMode {
+    /// This mode's **stable machine identifier**: a short, lowercase
+    /// `snake_case` string (`"piped"`, `"inherit"`, `"null"`) that is part of
+    /// the crate's compatibility surface.
+    ///
+    /// Use it for machine-readable output — a CLI's JSONL schema, a
+    /// cross-language binding, a structured log field — where a consumer needs
+    /// one canonical spelling per variant instead of hand-maintaining its own
+    /// mapping table. It is a *diagnostic* name, **not** a wire/serialization
+    /// format, but it is held stable all the same: a **new** variant gets a
+    /// **new** identifier, and an existing identifier is **never renamed**
+    /// without a major release. [`from_name`](Self::from_name) parses it back —
+    /// the direction a config file or CLI flag choosing a mode needs.
+    pub fn name(&self) -> &'static str {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never silently ship without a stable identifier.
+        match self {
+            StdioMode::Piped => "piped",
+            StdioMode::Inherit => "inherit",
+            StdioMode::Null => "null",
+        }
+    }
+
+    /// Parse a [`name`](Self::name) identifier back into a `StdioMode` — the
+    /// direction a config value or CLI flag selecting a mode needs.
+    ///
+    /// Accepts only the canonical identifier ([`Piped`](Self::Piped) is
+    /// `"piped"`, not `"pipe"`), returning `None` for anything else — an honest
+    /// miss, never a silent default. Round-trips with [`name`](Self::name):
+    /// `StdioMode::from_name(m.name()) == Some(m)` for every variant.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "piped" => Some(StdioMode::Piped),
+            "inherit" => Some(StdioMode::Inherit),
+            "null" => Some(StdioMode::Null),
+            _ => None,
+        }
+    }
+}
+
 /// How the output pump decides where one captured/streamed line ends.
 ///
 /// Set per stream on [`Command`](crate::Command) via
@@ -80,6 +121,45 @@ pub enum LineTerminator {
     /// it arrives (never assembled whole), exactly as an over-cap `\n` line is,
     /// so a runaway `\r`-free frame cannot exhaust memory.
     CarriageReturn,
+}
+
+impl LineTerminator {
+    /// This terminator's **stable machine identifier**: a short, lowercase
+    /// `snake_case` string (`"newline"`, `"carriage_return"`) that is part of
+    /// the crate's compatibility surface.
+    ///
+    /// Use it for machine-readable output — a CLI's JSONL schema, a
+    /// cross-language binding, a structured log field — where a consumer needs
+    /// one canonical spelling per variant instead of hand-maintaining its own
+    /// mapping table. It is a *diagnostic* name, **not** a wire/serialization
+    /// format, but it is held stable all the same: a **new** variant gets a
+    /// **new** identifier, and an existing identifier is **never renamed**
+    /// without a major release. [`from_name`](Self::from_name) parses it back —
+    /// the direction a config file or CLI flag choosing a terminator needs.
+    pub fn name(&self) -> &'static str {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never silently ship without a stable identifier.
+        match self {
+            LineTerminator::Newline => "newline",
+            LineTerminator::CarriageReturn => "carriage_return",
+        }
+    }
+
+    /// Parse a [`name`](Self::name) identifier back into a `LineTerminator` —
+    /// the direction a config value or CLI flag selecting a terminator needs.
+    ///
+    /// Returns `None` for any string that is not exactly one of the stable
+    /// identifiers — an honest miss, never a silent default. Round-trips with
+    /// [`name`](Self::name): `LineTerminator::from_name(t.name()) == Some(t)`
+    /// for every variant.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "newline" => Some(LineTerminator::Newline),
+            "carriage_return" => Some(LineTerminator::CarriageReturn),
+            _ => None,
+        }
+    }
 }
 
 /// What to drop when a bounded output buffer is full.
@@ -154,6 +234,47 @@ pub enum OverflowMode {
     /// `output_string` or streamed. (`DropOldest`/`DropNewest` still bound the
     /// retained *backlog*, the ring-buffer semantics they imply.)
     Error,
+}
+
+impl OverflowMode {
+    /// This mode's **stable machine identifier**: a short, lowercase
+    /// `snake_case` string (`"drop_oldest"`, `"drop_newest"`, `"error"`) that
+    /// is part of the crate's compatibility surface.
+    ///
+    /// Use it for machine-readable output — a CLI's JSONL schema, a
+    /// cross-language binding, a structured log field — where a consumer needs
+    /// one canonical spelling per variant instead of hand-maintaining its own
+    /// mapping table. It is a *diagnostic* name, **not** a wire/serialization
+    /// format, but it is held stable all the same: a **new** variant gets a
+    /// **new** identifier, and an existing identifier is **never renamed**
+    /// without a major release. [`from_name`](Self::from_name) parses it back —
+    /// the direction a config file or CLI flag choosing a mode needs.
+    pub fn name(&self) -> &'static str {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never silently ship without a stable identifier.
+        match self {
+            OverflowMode::DropOldest => "drop_oldest",
+            OverflowMode::DropNewest => "drop_newest",
+            OverflowMode::Error => "error",
+        }
+    }
+
+    /// Parse a [`name`](Self::name) identifier back into an `OverflowMode` —
+    /// the direction a config value or CLI flag selecting a mode needs.
+    ///
+    /// Returns `None` for any string that is not exactly one of the stable
+    /// identifiers — an honest miss, never a silent default. Round-trips with
+    /// [`name`](Self::name): `OverflowMode::from_name(m.name()) == Some(m)` for
+    /// every variant.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "drop_oldest" => Some(OverflowMode::DropOldest),
+            "drop_newest" => Some(OverflowMode::DropNewest),
+            "error" => Some(OverflowMode::Error),
+            _ => None,
+        }
+    }
 }
 
 /// Caps how many captured/streamed output lines are retained in memory.
@@ -394,6 +515,62 @@ mod tests {
 
     fn flags() -> (AtomicBool, AtomicBool) {
         (AtomicBool::new(false), AtomicBool::new(false))
+    }
+
+    // ---- Stable machine identifiers (name()/from_name()) ----
+
+    const ALL_STDIO_MODES: &[StdioMode] = &[StdioMode::Piped, StdioMode::Inherit, StdioMode::Null];
+    const ALL_LINE_TERMINATORS: &[LineTerminator] =
+        &[LineTerminator::Newline, LineTerminator::CarriageReturn];
+    const ALL_OVERFLOW_MODES: &[OverflowMode] = &[
+        OverflowMode::DropOldest,
+        OverflowMode::DropNewest,
+        OverflowMode::Error,
+    ];
+
+    #[test]
+    fn stdio_mode_name_pins_each_variant() {
+        assert_eq!(StdioMode::Piped.name(), "piped");
+        assert_eq!(StdioMode::Inherit.name(), "inherit");
+        assert_eq!(StdioMode::Null.name(), "null");
+    }
+
+    #[test]
+    fn line_terminator_name_pins_each_variant() {
+        assert_eq!(LineTerminator::Newline.name(), "newline");
+        assert_eq!(LineTerminator::CarriageReturn.name(), "carriage_return");
+    }
+
+    #[test]
+    fn overflow_mode_name_pins_each_variant() {
+        assert_eq!(OverflowMode::DropOldest.name(), "drop_oldest");
+        assert_eq!(OverflowMode::DropNewest.name(), "drop_newest");
+        assert_eq!(OverflowMode::Error.name(), "error");
+    }
+
+    #[test]
+    fn buffer_enum_names_round_trip_every_variant() {
+        for &m in ALL_STDIO_MODES {
+            assert_eq!(StdioMode::from_name(m.name()), Some(m));
+        }
+        for &t in ALL_LINE_TERMINATORS {
+            assert_eq!(LineTerminator::from_name(t.name()), Some(t));
+        }
+        for &m in ALL_OVERFLOW_MODES {
+            assert_eq!(OverflowMode::from_name(m.name()), Some(m));
+        }
+    }
+
+    #[test]
+    fn buffer_enum_from_name_rejects_unknown_without_defaulting() {
+        // The canonical `StdioMode::Piped` identifier is `piped`, not `pipe`:
+        // the legacy alias is deliberately not accepted as a stable name.
+        assert_eq!(StdioMode::from_name("pipe"), None);
+        assert_eq!(StdioMode::from_name("Piped"), None);
+        assert_eq!(LineTerminator::from_name("lf"), None);
+        assert_eq!(LineTerminator::from_name("cr"), None);
+        assert_eq!(OverflowMode::from_name("drop-oldest"), None);
+        assert_eq!(OverflowMode::from_name(""), None);
     }
 
     // ---- OverflowMode::Error: `buf.len() + chunk.len() > cap`, `room = cap.saturating_sub(buf.len())` ----

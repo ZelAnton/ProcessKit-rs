@@ -176,6 +176,48 @@ pub enum RestartPolicy {
     Never,
 }
 
+impl RestartPolicy {
+    /// This policy's **stable machine identifier**: a short, lowercase
+    /// `snake_case` string (`"always"`, `"on_crash"`, `"never"`) that is part
+    /// of the crate's compatibility surface.
+    ///
+    /// Use it for machine-readable output — a CLI's JSONL schema, a
+    /// cross-language binding, a structured log field — where a consumer needs
+    /// one canonical spelling per variant instead of hand-maintaining its own
+    /// mapping table. It is a *diagnostic* name, **not** a wire/serialization
+    /// format, but it is held stable all the same: a **new** variant gets a
+    /// **new** identifier, and an existing identifier is **never renamed**
+    /// without a major release. [`from_name`](Self::from_name) parses it back —
+    /// the direction a config file or CLI flag choosing a policy needs.
+    pub fn name(&self) -> &'static str {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never silently ship without a stable identifier.
+        match self {
+            RestartPolicy::Always => "always",
+            RestartPolicy::OnCrash => "on_crash",
+            RestartPolicy::Never => "never",
+        }
+    }
+
+    /// Parse a [`name`](Self::name) identifier back into a `RestartPolicy` —
+    /// the direction a config value or CLI flag selecting a policy needs.
+    ///
+    /// Returns `None` for any string that is not exactly one of the stable
+    /// identifiers — an honest miss, never a silent default, so an unknown
+    /// value fails loudly rather than defaulting to some policy the caller
+    /// never asked for. Round-trips with [`name`](Self::name):
+    /// `RestartPolicy::from_name(p.name()) == Some(p)` for every variant.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "always" => Some(RestartPolicy::Always),
+            "on_crash" => Some(RestartPolicy::OnCrash),
+            "never" => Some(RestartPolicy::Never),
+            _ => None,
+        }
+    }
+}
+
 /// Why supervision ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -218,6 +260,52 @@ pub enum StopReason {
     /// stop; [`run`](Supervisor::run), which exposes no live handle, never
     /// reports it.
     Stopped,
+}
+
+impl StopReason {
+    /// This reason's **stable machine identifier**: a short, lowercase
+    /// `snake_case` string (`"predicate"`, `"policy_satisfied"`, `"gave_up"`,
+    /// `"restarts_exhausted"`, `"unhealthy"`, `"stopped"`) that is part of the
+    /// crate's compatibility surface.
+    ///
+    /// Use it for machine-readable output — a CLI's JSONL schema, a
+    /// cross-language binding, a structured log field — where a consumer needs
+    /// one canonical spelling per variant instead of hand-maintaining its own
+    /// mapping table. It is a *diagnostic* name, **not** a wire/serialization
+    /// format, but it is held stable all the same: a **new** variant gets a
+    /// **new** identifier, and an existing identifier is **never renamed**
+    /// without a major release. [`from_name`](Self::from_name) parses it back.
+    pub fn name(&self) -> &'static str {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never silently ship without a stable identifier.
+        match self {
+            StopReason::Predicate => "predicate",
+            StopReason::PolicySatisfied => "policy_satisfied",
+            StopReason::GaveUp => "gave_up",
+            StopReason::RestartsExhausted => "restarts_exhausted",
+            StopReason::Unhealthy => "unhealthy",
+            StopReason::Stopped => "stopped",
+        }
+    }
+
+    /// Parse a [`name`](Self::name) identifier back into a `StopReason`.
+    ///
+    /// Returns `None` for any string that is not exactly one of the stable
+    /// identifiers — an honest miss, never a silent default. Round-trips with
+    /// [`name`](Self::name): `StopReason::from_name(r.name()) == Some(r)` for
+    /// every variant.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "predicate" => Some(StopReason::Predicate),
+            "policy_satisfied" => Some(StopReason::PolicySatisfied),
+            "gave_up" => Some(StopReason::GaveUp),
+            "restarts_exhausted" => Some(StopReason::RestartsExhausted),
+            "unhealthy" => Some(StopReason::Unhealthy),
+            "stopped" => Some(StopReason::Stopped),
+            _ => None,
+        }
+    }
 }
 
 /// What the [`give_up_when`](Supervisor::give_up_when) classifier inspects: a
@@ -1914,6 +2002,56 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    const ALL_RESTART_POLICIES: &[RestartPolicy] = &[
+        RestartPolicy::Always,
+        RestartPolicy::OnCrash,
+        RestartPolicy::Never,
+    ];
+    const ALL_STOP_REASONS: &[StopReason] = &[
+        StopReason::Predicate,
+        StopReason::PolicySatisfied,
+        StopReason::GaveUp,
+        StopReason::RestartsExhausted,
+        StopReason::Unhealthy,
+        StopReason::Stopped,
+    ];
+
+    #[test]
+    fn restart_policy_name_pins_each_variant() {
+        assert_eq!(RestartPolicy::Always.name(), "always");
+        assert_eq!(RestartPolicy::OnCrash.name(), "on_crash");
+        assert_eq!(RestartPolicy::Never.name(), "never");
+    }
+
+    #[test]
+    fn stop_reason_name_pins_each_variant() {
+        assert_eq!(StopReason::Predicate.name(), "predicate");
+        assert_eq!(StopReason::PolicySatisfied.name(), "policy_satisfied");
+        assert_eq!(StopReason::GaveUp.name(), "gave_up");
+        assert_eq!(StopReason::RestartsExhausted.name(), "restarts_exhausted");
+        assert_eq!(StopReason::Unhealthy.name(), "unhealthy");
+        assert_eq!(StopReason::Stopped.name(), "stopped");
+    }
+
+    #[test]
+    fn supervisor_enum_names_round_trip_every_variant() {
+        for &p in ALL_RESTART_POLICIES {
+            assert_eq!(RestartPolicy::from_name(p.name()), Some(p));
+        }
+        for &r in ALL_STOP_REASONS {
+            assert_eq!(StopReason::from_name(r.name()), Some(r));
+        }
+    }
+
+    #[test]
+    fn supervisor_enum_from_name_rejects_unknown_without_defaulting() {
+        assert_eq!(RestartPolicy::from_name("OnCrash"), None);
+        assert_eq!(RestartPolicy::from_name("on-crash"), None);
+        assert_eq!(RestartPolicy::from_name(""), None);
+        assert_eq!(StopReason::from_name("gaveup"), None);
+        assert_eq!(StopReason::from_name("exhausted"), None);
+    }
 
     /// Per-call outcome sequence; panics if exhausted, so an unexpected restart fails loudly.
     struct SeqRunner {

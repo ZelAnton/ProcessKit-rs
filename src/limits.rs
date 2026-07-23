@@ -111,6 +111,45 @@ pub enum LimitKind {
     Cpu,
 }
 
+impl LimitKind {
+    /// This kind's **stable machine identifier**: a short, lowercase
+    /// `snake_case` string (`"memory"`, `"processes"`, `"cpu"`) that is part of
+    /// the crate's compatibility surface.
+    ///
+    /// Use it for machine-readable output — a CLI's JSONL schema, a
+    /// cross-language binding, a structured log field — where a consumer needs
+    /// one canonical spelling per variant instead of hand-maintaining its own
+    /// mapping table. It is a *diagnostic* name, **not** a wire/serialization
+    /// format, but it is held stable all the same: a **new** variant gets a
+    /// **new** identifier, and an existing identifier is **never renamed**
+    /// without a major release. [`from_name`](Self::from_name) parses it back.
+    pub fn name(&self) -> &'static str {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never silently ship without a stable identifier.
+        match self {
+            LimitKind::Memory => "memory",
+            LimitKind::Processes => "processes",
+            LimitKind::Cpu => "cpu",
+        }
+    }
+
+    /// Parse a [`name`](Self::name) identifier back into a `LimitKind`.
+    ///
+    /// Returns `None` for any string that is not exactly one of the stable
+    /// identifiers — an honest miss, never a silent default. Round-trips with
+    /// [`name`](Self::name): `LimitKind::from_name(k.name()) == Some(k)` for
+    /// every variant.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "memory" => Some(LimitKind::Memory),
+            "processes" => Some(LimitKind::Processes),
+            "cpu" => Some(LimitKind::Cpu),
+            _ => None,
+        }
+    }
+}
+
 /// Why a requested resource limit could not be applied — the classification an
 /// [`Error::ResourceLimit`](crate::Error::ResourceLimit) failure carries so a
 /// caller (e.g. the `processkit-py` binding) can branch on the *kind* of failure
@@ -133,4 +172,87 @@ pub enum LimitReason {
     /// [`ResourceLimits`] for the "real root only" requirement), or a Windows
     /// Job Object that rejected the limit.
     Unenforceable,
+}
+
+impl LimitReason {
+    /// This reason's **stable machine identifier**: a short, lowercase
+    /// `snake_case` string (`"invalid"`, `"unsupported"`, `"unenforceable"`)
+    /// that is part of the crate's compatibility surface.
+    ///
+    /// Use it for machine-readable output — a CLI's JSONL schema, a
+    /// cross-language binding, a structured log field — where a consumer needs
+    /// one canonical spelling per variant instead of hand-maintaining its own
+    /// mapping table. It is a *diagnostic* name, **not** a wire/serialization
+    /// format, but it is held stable all the same: a **new** variant gets a
+    /// **new** identifier, and an existing identifier is **never renamed**
+    /// without a major release. [`from_name`](Self::from_name) parses it back.
+    pub fn name(&self) -> &'static str {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never silently ship without a stable identifier.
+        match self {
+            LimitReason::Invalid => "invalid",
+            LimitReason::Unsupported => "unsupported",
+            LimitReason::Unenforceable => "unenforceable",
+        }
+    }
+
+    /// Parse a [`name`](Self::name) identifier back into a `LimitReason`.
+    ///
+    /// Returns `None` for any string that is not exactly one of the stable
+    /// identifiers — an honest miss, never a silent default. Round-trips with
+    /// [`name`](Self::name): `LimitReason::from_name(r.name()) == Some(r)` for
+    /// every variant.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "invalid" => Some(LimitReason::Invalid),
+            "unsupported" => Some(LimitReason::Unsupported),
+            "unenforceable" => Some(LimitReason::Unenforceable),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LimitKind, LimitReason};
+
+    const ALL_KINDS: &[LimitKind] = &[LimitKind::Memory, LimitKind::Processes, LimitKind::Cpu];
+    const ALL_REASONS: &[LimitReason] = &[
+        LimitReason::Invalid,
+        LimitReason::Unsupported,
+        LimitReason::Unenforceable,
+    ];
+
+    #[test]
+    fn limit_kind_name_pins_each_variant() {
+        assert_eq!(LimitKind::Memory.name(), "memory");
+        assert_eq!(LimitKind::Processes.name(), "processes");
+        assert_eq!(LimitKind::Cpu.name(), "cpu");
+    }
+
+    #[test]
+    fn limit_reason_name_pins_each_variant() {
+        assert_eq!(LimitReason::Invalid.name(), "invalid");
+        assert_eq!(LimitReason::Unsupported.name(), "unsupported");
+        assert_eq!(LimitReason::Unenforceable.name(), "unenforceable");
+    }
+
+    #[test]
+    fn name_from_name_round_trips_every_variant() {
+        for &k in ALL_KINDS {
+            assert_eq!(LimitKind::from_name(k.name()), Some(k));
+        }
+        for &r in ALL_REASONS {
+            assert_eq!(LimitReason::from_name(r.name()), Some(r));
+        }
+    }
+
+    #[test]
+    fn from_name_rejects_unknown_without_defaulting() {
+        assert_eq!(LimitKind::from_name("Memory"), None);
+        assert_eq!(LimitKind::from_name("ram"), None);
+        assert_eq!(LimitReason::from_name(""), None);
+        assert_eq!(LimitReason::from_name("unenforced"), None);
+    }
 }

@@ -60,6 +60,27 @@
 //!
 //! [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
 //!
+//! **Stable machine identifiers.** The reporting and configuration enums —
+//! [`Mechanism`], [`Outcome`], [`ParentDeathCleanup`], [`StopReason`],
+//! [`StdioMode`], [`LineTerminator`], [`OverflowMode`], [`Priority`],
+//! [`RestartPolicy`], plus the feature-gated `LimitKind` / `LimitReason`
+//! (`limits`) and `Signal` (`process-control`), given as bare names here since
+//! this crate-root doc also builds with those features off — each
+//! expose a `name()` that returns a short, lowercase `snake_case` identifier
+//! for machine-readable output (a CLI's JSONL schema, a cross-language binding,
+//! a structured log field), so a consumer publishing a contract over these
+//! types has one canonical spelling per variant instead of a hand-maintained
+//! table. These identifiers are a *diagnostic* surface, **not** a wire format,
+//! but they carry the same stability promise as the rest of the public API: a
+//! new variant gets a new identifier, and an existing identifier is never
+//! renamed without a major release. Every enum whose value can arrive from
+//! outside (config, CLI, another language) also has a `from_name(&str)` inverse
+//! that returns `None` — an honest miss, never a silent default — on an
+//! unrecognized name. See the [Errors guide]'s "Stable machine identifiers"
+//! section for the whole set.
+//!
+//! [Errors guide]: https://github.com/ZelAnton/ProcessKit-rs/blob/main/docs/errors.md
+//!
 //! Beyond this page, the repository ships a narrative [guide set] — a
 //! task-oriented [cookbook] ("I want to …" → snippet), a deep guide per
 //! capability, and every per-platform caveat collected in one place.
