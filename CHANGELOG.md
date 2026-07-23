@@ -13,6 +13,11 @@ to a dated version section.
 
 ### Added
 
+- Add `RunningProcess::stdout_bytes_seen()` and
+  `RunningProcess::stderr_bytes_seen()` live monotonic counters. They report
+  raw bytes read from each pipe before decoding, including bytes discarded by
+  buffer overflow or oversized-line handling, and report `0` for streams that
+  are not pumped.
 - Add `Command::stdout_raw_tee(writer)` / `stderr_raw_tee(writer)` — a
   **byte-accurate** tee that writes each chunk to `writer` *exactly as read from
   the child's pipe*, before any decoding or line splitting. Where

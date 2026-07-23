@@ -1,6 +1,6 @@
 //! Background output pump: drain a child's stream line by line into a shared,
-//! bounded buffer, decoding text and feeding optional per-line handlers and a
-//! live line counter.
+//! bounded buffer, decoding text and feeding optional per-line handlers and
+//! live line/byte counters.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -124,9 +124,9 @@ struct Inner {
     /// Sum of the retained lines' byte lengths — kept in step with `lines` so
     /// the byte backlog can be bounded without re-summing.
     bytes: usize,
-    /// Cumulative bytes the pump has seen (including dropped lines) — the byte
-    /// analogue of `SharedLines::count`, used by the `Error` fail-loud ceiling
-    /// which fires on the total seen, not the current backlog.
+    /// Cumulative raw bytes read from the pipe, including bytes in dropped
+    /// lines and line terminators. This is the byte analogue of
+    /// `SharedLines::count` and is updated before decoding.
     seen_bytes: usize,
     mode: OverflowMode,
     closed: bool,
@@ -223,7 +223,6 @@ impl SharedLines {
         let mut policy_dropped = false;
         {
             let mut inner = self.inner.lock().expect("SharedLines poisoned");
-            inner.seen_bytes = inner.seen_bytes.saturating_add(line.len());
             // A dropped streaming consumer flips `discarding` on (via
             // `start_discarding`): keep counting/draining, but skip all
             // retention and overflow bookkeeping so an adopting discard verb
@@ -244,13 +243,11 @@ impl SharedLines {
                             (lines_cap, bytes_cap) => {
                                 lines_cap.is_some_and(|n| total_lines > n)
                                     || bytes_cap.is_some_and(|b| {
-                                        // Raw content-byte total, *and* the same
+                                        // Raw pipe-byte total, plus the same
                                         // derived line-count bound `over_backlog`
-                                        // uses: without it, a flood of empty lines
-                                        // (each `+0` to `seen_bytes`) would never
-                                        // trip a byte-only fail-loud ceiling, so
-                                        // `OverflowMode::Error` could never fire and
-                                        // the anti-DoS guarantee would be defeated.
+                                        // uses. The latter keeps this cumulative
+                                        // ceiling aligned with the retained
+                                        // backlog's minimum per-line footprint.
                                         inner.seen_bytes > b || total_lines > b
                                     })
                             }
@@ -313,19 +310,19 @@ impl SharedLines {
     }
 
     /// Record a line whose own byte length exceeds `max_bytes`: it is counted
-    /// and added to the seen-byte total, but never retained (it cannot fit the
-    /// cap). Under [`OverflowMode::Error`] it trips the fail-loud ceiling; under
-    /// the drop modes it sets the truncation signal. A discarding sink instead
-    /// only counts the line and its bytes, skipping all retention and overflow
-    /// bookkeeping like [`push`](Self::push). Mirrors the "cannot fit" accounting
-    /// in [`push`](Self::push) for a line the pump never buffered (so it is also
-    /// not delivered to the per-line handler or tee).
-    pub(crate) fn record_oversized_line(&self, byte_len: usize) {
+    /// and never retained (it cannot fit the cap). Under [`OverflowMode::Error`]
+    /// it trips the fail-loud ceiling; under the drop modes it sets the
+    /// truncation signal. Raw bytes are accounted for at the read boundary in
+    /// [`pump_lines_core`], before this decoded-line bookkeeping runs. A
+    /// discarding sink instead only counts the line, skipping all retention and
+    /// overflow bookkeeping like [`push`](Self::push). Mirrors the "cannot fit"
+    /// accounting in [`push`](Self::push) for a line the pump never buffered (so
+    /// it is also not delivered to the per-line handler or tee).
+    pub(crate) fn record_oversized_line(&self, _byte_len: usize) {
         self.count.fetch_add(1, Ordering::Relaxed);
         let mut policy_dropped = false;
         {
             let mut inner = self.inner.lock().expect("SharedLines poisoned");
-            inner.seen_bytes = inner.seen_bytes.saturating_add(byte_len);
             // A discarded streaming consumer retains nothing and skips all
             // overflow bookkeeping, even for an over-cap line the pump skipped.
             if !inner.discarding {
@@ -384,14 +381,19 @@ impl SharedLines {
         self.count.load(Ordering::Relaxed)
     }
 
-    /// Total bytes seen by the pump (including dropped lines) — the byte
-    /// analogue of [`count`](Self::count), used to report the byte total on a
-    /// fail-loud overflow.
+    /// Total raw bytes read by the pump (including dropped lines and line
+    /// terminators), updated before decoding.
     pub(crate) fn seen_bytes(&self) -> usize {
         self.inner
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .seen_bytes
+    }
+
+    /// Add bytes read directly from the pipe before decoding or line splitting.
+    pub(crate) fn add_seen_bytes(&self, byte_count: usize) {
+        let mut inner = self.inner.lock().expect("SharedLines poisoned");
+        inner.seen_bytes = inner.seen_bytes.saturating_add(byte_count);
     }
 
     /// Lines discarded by the buffer policy (DropOldest/DropNewest/Error), not
@@ -844,7 +846,7 @@ where
     let mut pending = String::new(); // decoded text not yet split into a line
     let mut chunk = [0u8; CHUNK];
     // `Some(bytes_so_far)` while skipping an over-cap line: bytes are discarded as
-    // decoded, only the length is tracked for the seen-byte total.
+    // decoded; raw bytes are accounted for at the read boundary below.
     let mut oversized: Option<usize> = None;
     loop {
         // Distinguish a clean EOF (`Ok(0)`) from a read error: both stop the
@@ -873,6 +875,9 @@ where
         // A clean EOF / read error / broken pipe read yields `n == 0`, so nothing
         // is written for them; only real data chunks reach the sink.
         if n > 0 {
+            // Account at the read boundary: tee backpressure or lossy decoding
+            // must not delay or change the raw-byte counter.
+            sink.0.add_seen_bytes(n);
             tee_raw_chunk(&mut raw_tee, &chunk[..n]).await;
         }
         // Reserve the decoder's worst-case output up front so `decode_to_string`
@@ -1288,6 +1293,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seen_bytes_counts_raw_input_before_decode_and_overflow() {
+        let policy = OutputBufferPolicy::bounded(1)
+            .with_overflow(OverflowMode::DropNewest)
+            .with_max_bytes(3);
+        let sink = SharedLines::new(&policy);
+        let raw = b"\xff\xfe\nabcdef\nok\n";
+
+        pump_lines(raw.as_slice(), encoding_rs::UTF_8, None, sink.clone()).await;
+
+        assert_eq!(
+            sink.seen_bytes(),
+            raw.len(),
+            "invalid bytes, terminators, and dropped/oversized lines are all counted"
+        );
+        assert!(sink.dropped() >= 1, "the oversized line is dropped");
+    }
+
+    #[tokio::test]
     async fn start_discarding_drops_the_backlog_and_retains_nothing_after() {
         // The mechanism behind "a discard verb adopts a dropped stream's sink":
         // the buffered backlog is freed and later pushes keep nothing, while the
@@ -1672,10 +1695,9 @@ mod tests {
 
     #[tokio::test]
     async fn max_bytes_error_mode_trips_on_a_flood_of_empty_lines() {
-        // Content-byte-only accounting leaves `seen_bytes` at 0 forever for an
-        // all-empty-line flood, so a byte-only fail-loud ceiling would never
-        // fire — defeating the crate's "memory cannot be exhausted" guarantee.
-        // The derived per-line minimum must still trip it.
+        // A flood of empty lines still has one raw byte per line (the newline),
+        // so the raw-byte ceiling trips while the pump drains the pipe. The
+        // derived per-line minimum remains the retained-buffer anti-DoS guard.
         let policy = OutputBufferPolicy::unbounded()
             .with_overflow(OverflowMode::Error)
             .with_max_bytes(100);
@@ -1743,8 +1765,8 @@ mod tests {
         );
         assert_eq!(
             single.seen_bytes(),
-            14,
-            "over-cap content (10) excluding the CRLF, plus the retained 'tail' (4)"
+            17,
+            "all bytes read from the pipe, including the CRLF and final newline"
         );
         assert_eq!(split.drain(), vec!["tail"], "the over-cap line is dropped");
         assert_eq!(single.drain(), vec!["tail"]);
@@ -1755,7 +1777,7 @@ mod tests {
         // The deferral must not lose a `\r` that is real content: when the byte
         // after a held-back `\r` is NOT `\n` (a lone CR mid-line), it counts. An
         // over-cap line "XXXXXXXXXX\rYYYYY\n" split right after the `\r` records
-        // all 16 content bytes (no terminator CR exists here — the `\r` is data).
+        // all 17 raw bytes (the lone `\r` is data, and the final `\n` is read too).
         let mut first = vec![b'X'; 10];
         first.push(b'\r');
         let reader = ChunkedReader::new([first, b"YYYYY\n".to_vec()]);
@@ -1763,8 +1785,8 @@ mod tests {
         pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()).await;
         assert_eq!(
             sink.seen_bytes(),
-            16,
-            "a lone CR before non-newline content is counted, not dropped"
+            17,
+            "all raw bytes are counted, including the lone CR and final newline"
         );
         assert!(
             sink.drain().is_empty(),
@@ -2261,8 +2283,8 @@ mod tests {
         );
         assert_eq!(
             single.seen_bytes(),
-            14,
-            "over-cap content (10) excluding the CR, plus the retained 'tail' (4)"
+            16,
+            "all bytes read from the pipe, including the CR and final newline"
         );
         assert_eq!(split.drain(), vec!["tail"]);
     }
@@ -3049,7 +3071,7 @@ mod tests {
             "the over-cap tail is not delivered as a line"
         );
         assert_eq!(sink.count(), 1, "the real line is counted");
-        assert_eq!(sink.seen_bytes(), 1, "its one byte is charged");
+        assert_eq!(sink.seen_bytes(), 1, "its one raw byte is counted");
         assert!(sink.drain().is_empty(), "nothing fits a 0-byte cap");
     }
 
@@ -3078,8 +3100,8 @@ mod tests {
         assert_eq!(sink.count(), 1);
         assert_eq!(
             sink.seen_bytes(),
-            0,
-            "an empty line charges 0 content bytes"
+            1,
+            "the line terminator is a byte read from the pipe"
         );
         assert!(sink.drain().is_empty(), "a 0-byte budget retains nothing");
     }
@@ -3095,8 +3117,10 @@ mod tests {
                 .with_overflow(OverflowMode::Error)
                 .with_max_bytes(4),
         );
-        at.push("ab".into()); // seen 2
-        at.push("cd".into()); // seen 4 -> exactly on the cap
+        at.add_seen_bytes(2);
+        at.push("ab".into());
+        at.add_seen_bytes(2);
+        at.push("cd".into()); // 4 raw bytes -> exactly on the cap
         assert!(
             !at.overflowed(),
             "a cumulative total exactly at the byte cap does not trip"
@@ -3112,8 +3136,10 @@ mod tests {
                 .with_overflow(OverflowMode::Error)
                 .with_max_bytes(4),
         );
-        over.push("ab".into()); // seen 2
-        over.push("cde".into()); // seen 5 > 4 -> trips
+        over.add_seen_bytes(2);
+        over.push("ab".into());
+        over.add_seen_bytes(3);
+        over.push("cde".into()); // 5 raw bytes > 4 -> trips
         assert!(
             over.overflowed(),
             "one byte past the cap trips the fail-loud ceiling"
@@ -3122,9 +3148,9 @@ mod tests {
 
     #[tokio::test]
     async fn error_mode_derived_line_ceiling_trips_on_empty_lines() {
-        // Empty lines add 0 to seen_bytes, so only the derived `total_lines > b`
-        // bound can trip OverflowMode::Error under a byte cap. Exactly `b` empty
-        // lines are within budget; the (b+1)-th trips it.
+        // This direct SharedLines push seam has no pipe bytes to account for, so
+        // empty lines exercise the derived `total_lines > b` guard directly.
+        // Exactly `b` empty lines are within budget; the (b+1)-th trips it.
         let at = SharedLines::new(
             &OutputBufferPolicy::unbounded()
                 .with_overflow(OverflowMode::Error)
@@ -3221,8 +3247,8 @@ mod tests {
         );
         assert_eq!(
             sink.seen_bytes(),
-            15,
-            "all 15 content bytes are accounted for"
+            16,
+            "all raw bytes, including the final newline, are accounted for"
         );
     }
 
@@ -3264,7 +3290,7 @@ mod tests {
         assert_eq!(
             sink.seen_bytes(),
             20_000_000,
-            "all 20M bytes are accounted for"
+            "all 20M raw bytes are accounted for"
         );
     }
 
@@ -3311,7 +3337,7 @@ mod tests {
         assert_eq!(
             sink.seen_bytes(),
             28_000_000,
-            "all 28M bytes are accounted for"
+            "all 28M raw bytes are accounted for"
         );
     }
 
@@ -3426,7 +3452,7 @@ mod tests {
                     .expect("current-thread runtime");
                 rt.block_on(pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()));
 
-                let expected_bytes: usize = expected.iter().map(String::len).sum();
+                let expected_bytes = bytes.len();
                 prop_assert_eq!(sink.count(), expected.len(), "no line lost or fabricated");
                 prop_assert_eq!(sink.seen_bytes(), expected_bytes, "byte counter is exact");
                 prop_assert_eq!(sink.dropped(), 0, "unbounded policy drops nothing");

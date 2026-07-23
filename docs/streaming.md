@@ -142,6 +142,12 @@ Things to know:
   [Timeouts & cancellation](timeouts-and-cancellation.md).
 - Line counters tick live: `run.stdout_line_count()` / `stderr_line_count()`
   are cheap progress gauges even while you stream.
+- Byte counters tick live: `run.stdout_bytes_seen()` /
+  `stderr_bytes_seen()` count raw bytes read from each pipe before decoding or
+  line splitting. They are monotonic and include bytes discarded by the
+  buffer policy, including oversized lines, and remain stable after the pump
+  completes. A stream that is not pumped (a file redirect or
+  `StdioMode::Null`/`Inherit`) reports `0` honestly.
 - The [buffer policy and line handlers](commands.md#output-handling) apply to
   streamed runs too — a handler sees each line on the pump, in addition to
   your loop.

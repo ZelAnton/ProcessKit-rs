@@ -992,6 +992,10 @@ mod tests {
                 let mut expected = ExpectedLines::default();
                 for line in input {
                     expected.push(line.clone(), policy);
+                    // `SharedLines::push` is below the pipe-read seam in this
+                    // model test; simulate the raw bytes that pump_lines_core
+                    // accounts for before it calls push.
+                    sink.add_seen_bytes(line.len());
                     sink.push(line);
                     prop_assert_eq!(sink.count(), expected.count);
                     prop_assert_eq!(sink.seen_bytes(), expected.seen_bytes);

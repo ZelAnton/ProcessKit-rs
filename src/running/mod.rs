@@ -479,6 +479,28 @@ impl RunningProcess {
         self.stderr_sink.as_ref().map_or(0, |s| s.count())
     }
 
+    /// Raw bytes read from stdout's pipe so far, before decoding or line
+    /// splitting. The counter is monotonic, includes bytes discarded by any
+    /// [`OutputBufferPolicy`] (including oversized lines), and remains stable
+    /// after the process and its pump complete. A stream that is not pumped —
+    /// for example a file redirect or [`StdioMode::Null`](crate::StdioMode::Null)
+    /// / [`StdioMode::Inherit`](crate::StdioMode::Inherit) — returns `0` rather
+    /// than an unknown sentinel.
+    pub fn stdout_bytes_seen(&self) -> usize {
+        self.stdout_sink.as_ref().map_or(0, |s| s.seen_bytes())
+    }
+
+    /// Raw bytes read from stderr's pipe so far, before decoding or line
+    /// splitting. The counter is monotonic, includes bytes discarded by any
+    /// [`OutputBufferPolicy`] (including oversized lines), and remains stable
+    /// after the process and its pump complete. A stream that is not pumped —
+    /// for example a file redirect or [`StdioMode::Null`](crate::StdioMode::Null)
+    /// / [`StdioMode::Inherit`](crate::StdioMode::Inherit) — returns `0` rather
+    /// than an unknown sentinel.
+    pub fn stderr_bytes_seen(&self) -> usize {
+        self.stderr_sink.as_ref().map_or(0, |s| s.seen_bytes())
+    }
+
     /// Take the interactive stdin writer, if the command was built with
     /// [`keep_stdin_open`](crate::Command::keep_stdin_open). Returns `None` after
     /// the first call (or when stdin was not kept open).

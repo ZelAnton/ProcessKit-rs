@@ -8,6 +8,142 @@ use processkit::{Command, Finished, Outcome, OutputBufferPolicy};
 
 use crate::common::*;
 
+fn byte_counter_child() -> (Command, usize, usize) {
+    if cfg!(windows) {
+        // cmd's echo emits CRLF, so the expected totals include both bytes of
+        // each line terminator.
+        (
+            Command::new("cmd").args(["/c", "echo alpha&echo beta&echo gamma&echo error>&2"]),
+            b"alpha\r\nbeta\r\ngamma\r\n".len(),
+            b"error\r\n".len(),
+        )
+    } else {
+        (
+            Command::new("sh").args([
+                "-c",
+                "printf 'alpha\\nbeta\\ngamma\\n'; printf 'error\\n' >&2",
+            ]),
+            b"alpha\nbeta\ngamma\n".len(),
+            b"error\n".len(),
+        )
+    }
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess and exercises the live pumps"]
+async fn byte_counters_include_dropped_lines_and_all_pipe_bytes() {
+    use tokio_stream::StreamExt;
+
+    let policies = [
+        OutputBufferPolicy::unbounded(),
+        OutputBufferPolicy::bounded(1),
+        OutputBufferPolicy::bounded(1).with_overflow(processkit::OverflowMode::DropNewest),
+    ];
+
+    for policy in policies {
+        let (cmd, expected_stdout, expected_stderr) = byte_counter_child();
+        let mut process = cmd
+            .output_buffer(policy)
+            .start()
+            .await
+            .expect("start byte-counter child");
+        let mut stdout = process.stdout_lines().expect("take stdout stream");
+        while stdout.next().await.is_some() {}
+
+        assert_eq!(
+            process.stdout_bytes_seen(),
+            expected_stdout,
+            "stdout total must include bytes discarded by {policy:?}"
+        );
+        assert_eq!(
+            process.stderr_bytes_seen(),
+            expected_stderr,
+            "stderr total must include bytes discarded by {policy:?}"
+        );
+        let _ = process.finish().await.expect("finish byte-counter child");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess with non-UTF-8 output"]
+async fn byte_counters_count_non_utf8_pipe_bytes() {
+    use tokio_stream::StreamExt;
+
+    let mut process = Command::new("sh")
+        .args(["-c", r"printf '\377\376\n'"])
+        .start()
+        .await
+        .expect("start non-UTF-8 child");
+    let mut stdout = process.stdout_lines().expect("take stdout stream");
+    while stdout.next().await.is_some() {}
+
+    assert_eq!(
+        process.stdout_bytes_seen(),
+        3,
+        "two invalid bytes plus the newline are counted before decoding"
+    );
+    let _ = process.finish().await.expect("finish non-UTF-8 child");
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess"]
+async fn byte_counters_are_stable_after_the_pumps_complete() {
+    use tokio_stream::StreamExt;
+
+    let (cmd, expected_stdout, expected_stderr) = byte_counter_child();
+    let mut process = cmd.start().await.expect("start byte-counter child");
+    let mut stdout = process.stdout_lines().expect("take stdout stream");
+    while stdout.next().await.is_some() {}
+
+    let stdout_seen = process.stdout_bytes_seen();
+    let stderr_seen = process.stderr_bytes_seen();
+    assert_eq!(stdout_seen, expected_stdout);
+    assert_eq!(stderr_seen, expected_stderr);
+    tokio::task::yield_now().await;
+    assert_eq!(process.stdout_bytes_seen(), stdout_seen);
+    assert_eq!(process.stderr_bytes_seen(), stderr_seen);
+    let _ = process.finish().await.expect("finish byte-counter child");
+}
+
+#[tokio::test]
+#[ignore = "spawns real subprocesses with non-pumped output"]
+async fn byte_counters_report_zero_for_non_pumped_streams() {
+    let null = byte_counter_child()
+        .0
+        .stdout(processkit::StdioMode::Null)
+        .stderr(processkit::StdioMode::Null)
+        .start()
+        .await
+        .expect("start null-output child");
+    assert_eq!(null.stdout_bytes_seen(), 0);
+    assert_eq!(null.stderr_bytes_seen(), 0);
+    null.wait().await.expect("wait null-output child");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (file_cmd, _, _) = byte_counter_child();
+    let file = file_cmd
+        .stdout_file(dir.path().join("stdout.log"))
+        .stderr_file(dir.path().join("stderr.log"))
+        .start()
+        .await
+        .expect("start file-output child");
+    assert_eq!(file.stdout_bytes_seen(), 0);
+    assert_eq!(file.stderr_bytes_seen(), 0);
+    file.wait().await.expect("wait file-output child");
+
+    let (inherit_cmd, _, _) = byte_counter_child();
+    let inherited = inherit_cmd
+        .stdout(processkit::StdioMode::Inherit)
+        .stderr(processkit::StdioMode::Inherit)
+        .start()
+        .await
+        .expect("start inherited-output child");
+    assert_eq!(inherited.stdout_bytes_seen(), 0);
+    assert_eq!(inherited.stderr_bytes_seen(), 0);
+    inherited.wait().await.expect("wait inherited-output child");
+}
+
 #[tokio::test]
 #[ignore = "spawns a real subprocess that outlives its timeout"]
 async fn streaming_honors_timeout() {

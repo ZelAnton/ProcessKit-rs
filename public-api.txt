@@ -1136,7 +1136,9 @@ pub async fn processkit::RunningProcess::profile(self, core::time::Duration) -> 
 pub async fn processkit::RunningProcess::shutdown(self, core::time::Duration) -> processkit::Result<processkit::Outcome>
 pub fn processkit::RunningProcess::start_kill(&mut self) -> processkit::Result<()>
 pub fn processkit::RunningProcess::start_time(&self) -> std::time::SystemTime
+pub fn processkit::RunningProcess::stderr_bytes_seen(&self) -> usize
 pub fn processkit::RunningProcess::stderr_line_count(&self) -> usize
+pub fn processkit::RunningProcess::stdout_bytes_seen(&self) -> usize
 pub fn processkit::RunningProcess::stdout_line_count(&self) -> usize
 pub fn processkit::RunningProcess::take_stdin(&mut self) -> core::option::Option<processkit::ProcessStdin>
 pub async fn processkit::RunningProcess::wait(self) -> processkit::Result<processkit::Outcome>
