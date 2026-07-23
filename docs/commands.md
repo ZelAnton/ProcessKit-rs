@@ -396,9 +396,12 @@ async fn main() -> processkit::Result<()> {
 ```
 
 `DropOldest` (the default) keeps a rolling tail; `DropNewest` freezes the
-head. `bounded(0)` retains nothing — useful when a line handler (below) is the
-real consumer. Under a *line* cap, dropped or not, **every** line still feeds
-the handlers and the line counters.
+head — a **contiguous prefix** of the output: the first line that doesn't fit
+*seals* the head, so every later line is dropped too (even a shorter one that
+would still fit), never leaving a set that skipped a dropped line and kept a
+later one. `bounded(0)` retains nothing — useful when a line handler (below) is
+the real consumer. Under a *line* cap, dropped or not, **every** line still
+feeds the handlers and the line counters.
 
 The line cap alone does not bound memory — one enormous newline-free "line"
 (`base64 -w0`) is held whole. Add `with_max_bytes` to cap the *retained bytes*

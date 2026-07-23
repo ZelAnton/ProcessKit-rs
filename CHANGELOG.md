@@ -27,6 +27,10 @@ to a dated version section.
   and chain-wide `timeout`/`cancel_on` bound the live session
 - Add a seeded randomized-interleaving stress harness for the process lifecycle
 - Add "Running untrusted children" hardening guide (`docs/untrusted-children.md`)
+- Add comparative benchmarks (`benches/compare.rs`) and the
+  [benchmarking guide](docs/comparison.md) for end-to-end capture, streaming,
+  and concurrent fan-out comparisons with plain Tokio and standard-library
+  process APIs
 - Add `Supervisor::start()` returning a live `SupervisionSession` (status
   snapshot, graceful stop, wait)
 - Add `RunningProcess::wait_for_socket` for Unix domain socket readiness probes
@@ -59,7 +63,17 @@ to a dated version section.
   on these edge inputs truthful (not a breaking API change)
 
 ### Fixed
--
+
+- `OverflowMode::DropNewest` with a `max_bytes` cap now keeps a true contiguous
+  **prefix** (head) of the output: once a line is dropped (an over-cap line, or
+  one over the remaining byte budget) the head is sealed and every later line is
+  dropped too. Previously a shorter line arriving after a dropped longer line
+  could still be retained, leaving a non-contiguous set that skipped the dropped
+  line — so the retained buffer was not a prefix of the process's output.
+  `DropOldest`/`Error` are unaffected. (Audit also confirmed `max_bytes = 0`
+  never delivers a phantom empty segment to line handlers, the streaming verbs,
+  or the seen-byte accounting before real output — behavior already correct,
+  now pinned by regression and property tests.)
 
 ## [2.3.2] - 2026-07-22
 

@@ -23,6 +23,7 @@
 - [Cookbook](cookbook.md)
 - [Running commands](commands.md)
 - [Running many at once](batch.md)
+- [Comparative benchmarks](comparison.md)
 - [Process groups](process-groups.md)
 - [Streaming & interactive I/O](streaming.md)
 - [Pipelines](pipelines.md)

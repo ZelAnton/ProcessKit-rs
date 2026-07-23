@@ -287,6 +287,10 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 name = "pump"
 harness = false
 
+[[bench]]
+name = "compare"
+harness = false
+
 [target.'cfg(windows)'.dev-dependencies]
 # Liveness probe (OpenProcess) in the integration tests that prove a grandchild is
 # reaped with its job — integration tests can't see the non-dev windows-sys.

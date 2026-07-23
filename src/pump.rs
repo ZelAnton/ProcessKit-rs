@@ -138,6 +138,15 @@ struct Inner {
     /// still-running pump keeps draining the pipe (so the child never blocks) but
     /// retains nothing, so the backlog can't grow O(total).
     discarding: bool,
+    /// `OverflowMode::DropNewest` only: set the first time a line is dropped
+    /// (it did not fit a ceiling, or it was an over-cap line the pump skipped via
+    /// [`record_oversized_line`](SharedLines::record_oversized_line)). Once set,
+    /// every later line is dropped too. This keeps the retained buffer a
+    /// **contiguous prefix** (head) of the process's output: without it, an
+    /// over-budget long line would be dropped while a *shorter* line after it
+    /// still fit and got retained, so the buffer would skip a line and no longer
+    /// be a true prefix. Unused by `DropOldest`/`Error` (never read there).
+    dropnewest_sealed: bool,
 }
 
 impl Inner {
@@ -197,6 +206,7 @@ impl SharedLines {
                 closed: false,
                 overflowed: false,
                 discarding: false,
+                dropnewest_sealed: false,
             }),
             notify: Notify::new(),
             count: AtomicUsize::new(0),
@@ -269,13 +279,19 @@ impl SharedLines {
                             }
                         }
                     }
-                    // "Head": keep what is buffered; drop the incoming line if it
-                    // would breach either ceiling.
+                    // "Head": keep a contiguous *prefix* of the output. Retain the
+                    // line only while the head is unsealed AND it fits both
+                    // ceilings; the first line that does not fit seals the head, so
+                    // every later line is dropped too. Without the seal an
+                    // over-budget long line would be dropped while a shorter line
+                    // after it still fit and got retained — the buffer would skip a
+                    // line and stop being a true prefix of the process's output.
                     OverflowMode::DropNewest => {
-                        if inner.would_fit(line.len()) {
+                        if !inner.dropnewest_sealed && inner.would_fit(line.len()) {
                             inner.bytes += line.len();
                             inner.lines.push_back(line);
                         } else {
+                            inner.dropnewest_sealed = true;
                             policy_dropped = true;
                         }
                     }
@@ -313,8 +329,15 @@ impl SharedLines {
             // A discarded streaming consumer retains nothing and skips all
             // overflow bookkeeping, even for an over-cap line the pump skipped.
             if !inner.discarding {
-                if matches!(inner.mode, OverflowMode::Error) {
-                    inner.overflowed = true;
+                match inner.mode {
+                    // The over-cap line trips the fail-loud ceiling.
+                    OverflowMode::Error => inner.overflowed = true,
+                    // An over-cap line can never fit the head, so it seals the
+                    // contiguous prefix: no later (shorter) line may be retained,
+                    // or the retained buffer would no longer be a prefix of the
+                    // output. Mirrors the seal in [`push`](Self::push).
+                    OverflowMode::DropNewest => inner.dropnewest_sealed = true,
+                    OverflowMode::DropOldest => {}
                 }
                 policy_dropped = true;
             }
@@ -2524,6 +2547,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drop_newest_seals_head_after_an_over_cap_line() {
+        // T-165 continuous-prefix invariant: under DropNewest + a byte cap, an
+        // over-cap ("overflowing") line seals the head, so a SHORTER later line
+        // that would fit the remaining budget must NOT be retained — otherwise the
+        // buffer would skip the dropped line and stop being a prefix of the output.
+        let policy = OutputBufferPolicy::unbounded()
+            .with_overflow(OverflowMode::DropNewest)
+            .with_max_bytes(3);
+        let sink = SharedLines::new(&policy);
+        // "aa" fits (2 <= 3); "bbbb" is over-cap (4 > 3), dropped whole via the
+        // pump's oversized-skip path; "c" would fit the remaining budget but must
+        // be dropped — retaining ["aa", "c"] would be a non-contiguous subset.
+        pump_lines(
+            &b"aa\nbbbb\nc\n"[..],
+            encoding_rs::UTF_8,
+            None,
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            sink.drain(),
+            vec!["aa"],
+            "the over-cap line seals the head; the later short line is not retained"
+        );
+        assert_eq!(sink.count(), 3, "every line is still counted");
+        assert!(
+            sink.dropped() >= 2,
+            "the over-cap line and the sealed-off tail are both dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_newest_seals_head_after_an_over_budget_line() {
+        // Same invariant when the sealing line is NOT itself over-cap but merely
+        // over the *remaining* budget (so it routes through `push`, not the pump's
+        // oversized-skip path): a shorter line after it must still be dropped.
+        let policy = OutputBufferPolicy::unbounded()
+            .with_overflow(OverflowMode::DropNewest)
+            .with_max_bytes(4);
+        let sink = SharedLines::new(&policy);
+        // "aaa" fits (3 <= 4); "bb" would push the sum to 5 > 4, so it is dropped
+        // and seals the head; "c" would fit (3 + 1 = 4) but must be dropped too.
+        pump_lines(&b"aaa\nbb\nc\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
+        assert_eq!(
+            sink.drain(),
+            vec!["aaa"],
+            "the first over-budget line seals the head; the later fitting line is not retained"
+        );
+        assert_eq!(sink.count(), 3);
+        assert!(sink.dropped() >= 2);
+    }
+
+    #[tokio::test]
+    async fn drop_newest_push_seals_head_and_stays_a_prefix() {
+        // The seal lives in `push`, proven directly (no pump): a shorter line
+        // pushed by hand after an over-budget one is not retained.
+        let policy = OutputBufferPolicy::unbounded()
+            .with_overflow(OverflowMode::DropNewest)
+            .with_max_bytes(3);
+        let sink = SharedLines::new(&policy);
+        sink.push("aa".into()); // 2 bytes, fits
+        sink.push("bb".into()); // 2 + 2 = 4 > 3, dropped -> seals the head
+        sink.push("a".into()); // would fit (2 + 1 = 3) but the head is sealed
+        assert_eq!(
+            sink.drain(),
+            vec!["aa"],
+            "once the head is sealed, a later fitting line is still dropped"
+        );
+        assert_eq!(
+            sink.dropped(),
+            2,
+            "both post-seal lines are counted as dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_bytes_zero_empty_stream_delivers_no_phantom_segment() {
+        // T-165 scenario 1: at `max_bytes = 0` an empty stream must NOT deliver a
+        // phantom empty segment to the handler, the buffer, or `seen_bytes` before
+        // any real output. Already correct in Rust — the pump only emits a line
+        // when a real terminator is decoded — pinned here as a regression.
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = seen.clone();
+        let handler: LineHandler =
+            Arc::new(move |line: &str| captured.lock().unwrap().push(line.to_owned()));
+        let policy = OutputBufferPolicy::unbounded()
+            .with_overflow(OverflowMode::DropNewest)
+            .with_max_bytes(0);
+        let sink = SharedLines::new(&policy);
+        pump_lines(&b""[..], encoding_rs::UTF_8, Some(handler), sink.clone()).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no phantom line reaches the handler"
+        );
+        assert_eq!(sink.count(), 0, "no phantom line is counted");
+        assert_eq!(sink.seen_bytes(), 0, "no phantom bytes are accounted");
+        assert!(sink.drain().is_empty(), "nothing retained");
+    }
+
+    #[tokio::test]
+    async fn max_bytes_zero_unterminated_output_is_not_a_phantom_segment() {
+        // At `max_bytes = 0`, real content with no trailing newline is an over-cap
+        // line (its 1 byte exceeds the 0-byte cap): it is counted and its bytes are
+        // charged, but it is NOT delivered to the handler or retained — and it is
+        // never fabricated into a phantom EMPTY segment. Pins that the cap-0 path
+        // routes real output through the oversized-skip accounting.
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = seen.clone();
+        let handler: LineHandler =
+            Arc::new(move |line: &str| captured.lock().unwrap().push(line.to_owned()));
+        let policy = OutputBufferPolicy::unbounded()
+            .with_overflow(OverflowMode::DropNewest)
+            .with_max_bytes(0);
+        let sink = SharedLines::new(&policy);
+        pump_lines(&b"a"[..], encoding_rs::UTF_8, Some(handler), sink.clone()).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the over-cap tail is not delivered as a line"
+        );
+        assert_eq!(sink.count(), 1, "the real line is counted");
+        assert_eq!(sink.seen_bytes(), 1, "its one byte is charged");
+        assert!(sink.drain().is_empty(), "nothing fits a 0-byte cap");
+    }
+
+    #[tokio::test]
+    async fn max_bytes_zero_real_empty_line_reaches_the_handler_but_is_not_retained() {
+        // A genuine empty line (a real `\n` from the process) has 0 content bytes,
+        // which fits a 0-byte cap (`0 <= 0`), so it IS delivered to the handler —
+        // it is real output, not a phantom. It is still not *retained*: a 0-byte
+        // budget holds zero lines (the derived per-line charge), so `would_fit`
+        // rejects it. This distinguishes the cap-0 empty-line path from scenario
+        // 1's phantom-before-real-output (which never happens; see the pins above).
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = seen.clone();
+        let handler: LineHandler =
+            Arc::new(move |line: &str| captured.lock().unwrap().push(line.to_owned()));
+        let policy = OutputBufferPolicy::unbounded()
+            .with_overflow(OverflowMode::DropNewest)
+            .with_max_bytes(0);
+        let sink = SharedLines::new(&policy);
+        pump_lines(&b"\n"[..], encoding_rs::UTF_8, Some(handler), sink.clone()).await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![""],
+            "a real empty line reaches the handler"
+        );
+        assert_eq!(sink.count(), 1);
+        assert_eq!(
+            sink.seen_bytes(),
+            0,
+            "an empty line charges 0 content bytes"
+        );
+        assert!(sink.drain().is_empty(), "a 0-byte budget retains nothing");
+    }
+
+    #[tokio::test]
     async fn error_mode_byte_ceiling_retains_at_cap_and_trips_past_it() {
         // OverflowMode::Error with a byte cap fires on the cumulative seen-byte
         // total. A total sitting exactly on `max_bytes` is within budget
@@ -2817,6 +2996,15 @@ mod tests {
             .prop_map(|chars| chars.into_iter().collect())
         }
 
+        /// ASCII lines (byte length == char count) of length 0..=10, so a line's
+        /// length straddles the small (1..=8) byte cap the DropNewest prefix
+        /// proptest uses — over-cap (long) and short lines interleave frequently,
+        /// which is exactly what exercises the head-sealing invariant.
+        fn arb_prefix_line() -> impl Strategy<Value = String> {
+            prop::collection::vec(prop::char::range('a', 'j'), 0..=10)
+                .prop_map(|chars| chars.into_iter().collect())
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -2895,6 +3083,65 @@ mod tests {
                 // the retained backlog can never exceed the total lines seen.
                 let lines = sink.drain();
                 prop_assert!(lines.len() <= sink.count());
+            }
+
+            /// T-165 continuous-prefix invariant: under `OverflowMode::DropNewest`
+            /// with a byte cap, the retained buffer must ALWAYS be a contiguous
+            /// prefix (head) of the process's actual line output — for any
+            /// interleaving of long (over-cap) and short lines, at any chunk
+            /// boundaries. Generated sequences of lines whose lengths span both
+            /// sides of the cap, joined with `\n`, chunked arbitrarily, and pumped
+            /// through DropNewest: `retained == lines[..retained.len()]`, never a
+            /// subset that skipped a dropped line and kept a later shorter one.
+            #[test]
+            fn drop_newest_retains_a_contiguous_prefix_under_a_byte_cap(
+                lines in prop::collection::vec(arb_prefix_line(), 0..16),
+                max_bytes in 1usize..=8,
+                max_lines in prop::option::of(1usize..=16),
+                chunk_sizes in prop::collection::vec(1usize..=7, 1..20),
+            ) {
+                let mut text = String::new();
+                for line in &lines {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+                let bytes = text.into_bytes();
+                let chunks = to_chunks(&bytes, &chunk_sizes);
+                let reader = ChunkedReader::new(chunks);
+                let mut policy = OutputBufferPolicy::unbounded()
+                    .with_overflow(OverflowMode::DropNewest)
+                    .with_max_bytes(max_bytes);
+                policy.max_lines = max_lines;
+                let sink = SharedLines::new(&policy);
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("current-thread runtime");
+                rt.block_on(pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()));
+
+                let retained = sink.drain();
+                // The core invariant: the retained set is a true prefix of the
+                // output — never a subset that skipped a dropped line and kept a
+                // later shorter one.
+                prop_assert!(
+                    lines.starts_with(&retained),
+                    "retained {:?} is not a contiguous prefix of output {:?}",
+                    retained,
+                    lines
+                );
+                // Every line is still counted, and each retained line fits the byte
+                // cap (an over-cap line can never be part of the head).
+                prop_assert_eq!(sink.count(), lines.len(), "every line counted");
+                for r in &retained {
+                    prop_assert!(
+                        r.len() <= max_bytes,
+                        "retained line {:?} exceeds the {}-byte cap",
+                        r,
+                        max_bytes
+                    );
+                }
+                // A prefix shorter than the whole output means something was
+                // dropped, and vice versa — the truncation signal is exact.
+                prop_assert_eq!(retained.len() < lines.len(), sink.dropped() > 0);
             }
         }
     }
