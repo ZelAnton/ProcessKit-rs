@@ -27,6 +27,10 @@ to a dated version section.
   and chain-wide `timeout`/`cancel_on` bound the live session
 - Add a seeded randomized-interleaving stress harness for the process lifecycle
 - Add "Running untrusted children" hardening guide (`docs/untrusted-children.md`)
+- Add comparative benchmarks (`benches/compare.rs`) and the
+  [benchmarking guide](docs/comparison.md) for end-to-end capture, streaming,
+  and concurrent fan-out comparisons with plain Tokio and standard-library
+  process APIs
 - Add `Supervisor::start()` returning a live `SupervisionSession` (status
   snapshot, graceful stop, wait)
 - Add `RunningProcess::wait_for_socket` for Unix domain socket readiness probes
