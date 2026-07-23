@@ -49,7 +49,17 @@ to a dated version section.
   when the group has neither a console-CTRL leader nor a windowed member
 
 ### Fixed
--
+
+- `OverflowMode::DropNewest` with a `max_bytes` cap now keeps a true contiguous
+  **prefix** (head) of the output: once a line is dropped (an over-cap line, or
+  one over the remaining byte budget) the head is sealed and every later line is
+  dropped too. Previously a shorter line arriving after a dropped longer line
+  could still be retained, leaving a non-contiguous set that skipped the dropped
+  line — so the retained buffer was not a prefix of the process's output.
+  `DropOldest`/`Error` are unaffected. (Audit also confirmed `max_bytes = 0`
+  never delivers a phantom empty segment to line handlers, the streaming verbs,
+  or the seen-byte accounting before real output — behavior already correct,
+  now pinned by regression and property tests.)
 
 ## [2.3.2] - 2026-07-22
 

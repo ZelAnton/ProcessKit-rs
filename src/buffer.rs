@@ -89,7 +89,17 @@ pub enum OverflowMode {
     /// Ring-buffer / "tail" semantics: discard the oldest line so the most
     /// recent output survives.
     DropOldest,
-    /// "Head" semantics: keep what is already buffered and discard new lines.
+    /// "Head" semantics: keep a contiguous **prefix** (head) of the output.
+    ///
+    /// Each line is retained while it fits the ceiling(s); the first line that
+    /// does not fit *seals* the head, so every line after it is dropped too —
+    /// even a shorter later line that would still fit on its own. This keeps the
+    /// retained buffer a true prefix of the process's output
+    /// (`retained == output[..k]` for some `k`), never a set that skipped an
+    /// over-budget line and kept a later shorter one. A single line longer than
+    /// [`max_bytes`](OutputBufferPolicy::max_bytes) can never fit, so it seals
+    /// the head as well (it is dropped whole, like under
+    /// [`DropOldest`](OverflowMode::DropOldest)).
     DropNewest,
     /// Fail-loud ceiling: once the buffer is full, the run errors with
     /// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge) rather than
@@ -711,6 +721,10 @@ mod tests {
             seen_bytes: usize,
             dropped: usize,
             overflowed: bool,
+            /// `DropNewest` only: the head has been sealed by a first drop, so
+            /// every later line is dropped too (keeps the retained set a
+            /// contiguous prefix). Mirrors `Inner::dropnewest_sealed`.
+            sealed: bool,
         }
 
         impl ExpectedLines {
@@ -757,9 +771,13 @@ mod tests {
                             && policy.max_bytes.is_none_or(|cap| {
                                 bytes + line.len() <= cap && self.lines.len() < cap
                             });
-                        if fits {
+                        // Seal the head on the first drop, matching the production
+                        // contiguous-prefix invariant: once any line is dropped, no
+                        // later (possibly shorter) line may be retained.
+                        if !self.sealed && fits {
                             self.lines.push(line);
                         } else {
+                            self.sealed = true;
                             self.dropped += 1;
                         }
                     }
