@@ -135,7 +135,7 @@ enum GateOutcome {
     /// with [`StopReason::RestartsExhausted`].
     Exhausted,
     /// A cancel token fired during the backoff/storm pause — end supervision
-    /// with `Error::Cancelled`.
+    /// with `ErrorReason::Cancelled`.
     Cancelled,
     /// A [`SupervisionSession::stop`] fired during the backoff/storm pause — end
     /// supervision with [`StopReason::Stopped`], launching no further incarnation.
@@ -255,7 +255,7 @@ pub enum StopReason {
     /// ([`SupervisionSession::stop`]): the current incarnation (if any) was
     /// stopped through its graceful path and supervision ended deliberately —
     /// distinct from a crash, an exhausted budget, a cancellation
-    /// ([`Error::Cancelled`](crate::Error::Cancelled)), or a
+    /// ([`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled)), or a
     /// [`stop_when`](Supervisor::stop_when) match. Only produced by a session
     /// stop; [`run`](Supervisor::run), which exposes no live handle, never
     /// reports it.
@@ -498,7 +498,7 @@ impl SupervisionSession {
     /// # Errors
     ///
     /// The same surface as [`run`](Supervisor::run) (a terminating spawn/IO
-    /// failure, or a cancel-token [`Error::Cancelled`](crate::Error::Cancelled)).
+    /// failure, or a cancel-token [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled)).
     pub async fn wait(mut self) -> Result<SupervisionOutcome> {
         Self::await_completion(self.completion.take()).await
     }
@@ -540,11 +540,11 @@ impl SupervisionSession {
     ) -> Result<SupervisionOutcome> {
         match completion {
             Some(rx) => rx.await.unwrap_or_else(|_| {
-                Err(crate::Error::Io(std::io::Error::other(
+                Err(crate::Error::io(std::io::Error::other(
                     "supervision task ended without reporting an outcome",
                 )))
             }),
-            None => Err(crate::Error::Io(std::io::Error::other(
+            None => Err(crate::Error::io(std::io::Error::other(
                 "supervision outcome already taken",
             ))),
         }
@@ -740,7 +740,7 @@ enum Wake {
     /// The delay elapsed normally.
     Elapsed,
     /// The command's [`cancel_on`](Command::cancel_on) token fired — a terminal
-    /// [`Error::Cancelled`](crate::Error::Cancelled).
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled).
     Cancelled,
     /// A [`SupervisionSession::stop`] was requested — end with
     /// [`StopReason::Stopped`].
@@ -1185,7 +1185,7 @@ impl<R: ProcessRunner> Supervisor<R> {
     ///
     /// An incarnation cancelled via its token ([`Command::cancel_on`](crate::Command::cancel_on))
     /// is **terminal**: supervision returns that
-    /// `Error::Cancelled` immediately, regardless of policy or budget — the
+    /// `ErrorReason::Cancelled` immediately, regardless of policy or budget — the
     /// token stays cancelled, so a restart would only be cancelled again.
     ///
     /// A [`health_check`](Self::health_check) force-kill relies on this same
@@ -1223,7 +1223,7 @@ impl<R: ProcessRunner> Supervisor<R> {
         // Reject up front a configuration that could genuinely need a second
         // incarnation but only has a one-shot stdin source to feed it: the
         // first incarnation would consume the source, and every restart after
-        // it would fail to launch at all (`Error::Io`, "already consumed" —
+        // it would fail to launch at all (`ErrorReason::Io`, "already consumed" —
         // see `runner::take_stdin_for_run`), which under the default OnCrash
         // policy spins forever as a rapid crash-restart-backoff loop instead
         // of ever making progress. Caught here, before the first run even
@@ -1277,7 +1277,7 @@ impl<R: ProcessRunner> Supervisor<R> {
             // Each incarnation carries a fresh cancel token so a graceful stop
             // can reach a shared-group / capture-only child (its only lever); it
             // is a *child* of any caller `cancel_on` token, so caller cancellation
-            // still propagates and stays a terminal `Error::Cancelled`.
+            // still propagates and stays a terminal `ErrorReason::Cancelled`.
             let inc_cancel = self
                 .command
                 .cancel_token()
@@ -1667,7 +1667,7 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// the classic path did: for a piped stdout the same [`output_string`] the
     /// bulk capture verb runs, otherwise a [`finish`] that drains only any
     /// independently-piped stderr and preserves the exit outcome. A **capture-only**
-    /// runner (whose `start` is [`Unsupported`](crate::Error::Unsupported)) latches
+    /// runner (whose `start` is [`Unsupported`](crate::ErrorReason::Unsupported)) latches
     /// `spawn_capable` off and falls back to the plain capture verb — verbatim
     /// classic behavior, minus the live pid / graceful stop. The sole callee of
     /// [`run_incarnation`](Self::run_incarnation), which additionally races this
@@ -1688,7 +1688,7 @@ impl<R: ProcessRunner> Supervisor<R> {
         let started = Instant::now();
         let handle = match self.runner.start(command).await {
             Ok(handle) => handle,
-            Err(crate::Error::Unsupported { .. }) => {
+            Err(err) if matches!(err.reason(), crate::ErrorReason::Unsupported { .. }) => {
                 // A capture-only runner: it exposes no live handle. Drive this and
                 // every later incarnation through the plain capture verb instead —
                 // no live pid / graceful stop, but supervision is unaffected.
@@ -1781,9 +1781,10 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// The terminal `Cancelled` error for supervision cut short by a cancel token
     /// firing during a backoff or storm pause.
     fn cancelled_err(&self, command: &Command) -> crate::Error {
-        crate::Error::Cancelled {
+        crate::ErrorReason::Cancelled {
             program: command.program_name(),
         }
+        .into()
     }
 
     /// Whether this supervisor's configuration could genuinely need more than
@@ -1811,12 +1812,12 @@ impl<R: ProcessRunner> Supervisor<R> {
 
     /// The typed, early error for [`may_restart`](Self::may_restart) +
     /// [`has_unusable_one_shot_stdin`](Self::has_unusable_one_shot_stdin) both
-    /// holding: the same `Error::Io`/`InvalidInput` shape
+    /// holding: the same `ErrorReason::Io`/`InvalidInput` shape
     /// `runner::take_stdin_for_run` raises when a later incarnation actually
     /// hits the consumed source, but reported before any incarnation runs at
     /// all instead of after a wasted (and then endlessly repeated) attempt.
     fn one_shot_restart_err(&self) -> crate::Error {
-        crate::Error::Io(std::io::Error::new(
+        crate::Error::io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "`{}`: this supervisor's restart policy ({:?}, max_restarts: {:?}) may run \
@@ -2193,10 +2194,11 @@ mod tests {
     }
 
     fn spawn_err() -> Result<ProcessResult<String>> {
-        Err(crate::Error::Spawn {
+        Err(crate::ErrorReason::Spawn {
             program: "fake".into(),
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such binary"),
-        })
+        }
+        .into())
     }
 
     fn supervise(runner: SeqRunner) -> Supervisor<SeqRunner> {
@@ -2416,13 +2418,18 @@ mod tests {
         // task: a mistyped program name never recovers on its own.
         let err = supervise(SeqRunner::new(vec![spawn_err()]))
             .give_up_when(|attempt| match attempt {
-                GiveUpAttempt::Failed(err) => matches!(err, crate::Error::Spawn { .. }),
+                GiveUpAttempt::Failed(err) => {
+                    matches!(err.reason(), crate::ErrorReason::Spawn { .. })
+                }
                 GiveUpAttempt::Crashed(_) => false,
             })
             .run()
             .await
             .expect_err("a classified-permanent spawn failure must not restart forever");
-        assert!(matches!(err, crate::Error::Spawn { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), crate::ErrorReason::Spawn { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -2508,7 +2515,10 @@ mod tests {
             .run()
             .await
             .expect_err("the budget-exhausting attempt errored");
-        assert!(matches!(err, crate::Error::Spawn { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), crate::ErrorReason::Spawn { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -2526,9 +2536,10 @@ mod tests {
         // Always would restart any failure; Cancelled must end supervision at
         // once — the second reply is never consumed (SeqRunner panics if so).
         let err = supervise(SeqRunner::new(vec![
-            Err(crate::Error::Cancelled {
+            Err(crate::ErrorReason::Cancelled {
                 program: "fake".into(),
-            }),
+            }
+            .into()),
             ok(),
         ]))
         .restart(RestartPolicy::Always)
@@ -2536,7 +2547,10 @@ mod tests {
         .run()
         .await
         .expect_err("a cancelled incarnation is terminal");
-        assert!(matches!(err, crate::Error::Cancelled { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), crate::ErrorReason::Cancelled { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -2546,7 +2560,10 @@ mod tests {
             .run()
             .await
             .expect_err("Never does not retry a spawn failure");
-        assert!(matches!(err, crate::Error::Spawn { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), crate::ErrorReason::Spawn { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2757,15 +2774,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cancellation_is_terminal_before_any_storm_pause() {
         let start = tokio::time::Instant::now();
-        let err = supervise(SeqRunner::new(vec![Err(crate::Error::Cancelled {
+        let err = supervise(SeqRunner::new(vec![Err(crate::ErrorReason::Cancelled {
             program: "fake".into(),
-        })]))
+        }
+        .into())]))
         .storm_pause(Duration::from_secs(60))
         .failure_threshold(0.0)
         .run()
         .await
         .expect_err("cancelled is terminal");
-        assert!(matches!(err, crate::Error::Cancelled { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), crate::ErrorReason::Cancelled { .. }),
+            "got {err:?}"
+        );
         assert_eq!(start.elapsed(), Duration::ZERO, "no storm pause was taken");
     }
 
@@ -2860,7 +2881,10 @@ mod tests {
         });
         let start = tokio::time::Instant::now();
         let err = sv.run().await.expect_err("cancelled during backoff");
-        assert!(matches!(err, crate::Error::Cancelled { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), crate::ErrorReason::Cancelled { .. }),
+            "got {err:?}"
+        );
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "backoff must be cancellable promptly (~100ms), took {:?}",
@@ -2903,7 +2927,10 @@ mod tests {
             .run()
             .await
             .expect_err("an unlimited OnCrash policy could need a second incarnation");
-        assert!(matches!(err, crate::Error::Io(_)), "got {err:?}");
+        assert!(
+            matches!(err.reason(), crate::ErrorReason::Io(_)),
+            "got {err:?}"
+        );
         assert_eq!(
             start.elapsed(),
             Duration::ZERO,
@@ -2924,7 +2951,10 @@ mod tests {
         .run()
         .await
         .expect_err("Always could always need a second incarnation");
-        assert!(matches!(err, crate::Error::Io(_)), "got {err:?}");
+        assert!(
+            matches!(err.reason(), crate::ErrorReason::Io(_)),
+            "got {err:?}"
+        );
         assert_eq!(start.elapsed(), Duration::ZERO);
     }
 
@@ -2943,7 +2973,10 @@ mod tests {
         .run()
         .await
         .expect_err("max_restarts(2) could still need a second incarnation");
-        assert!(matches!(err, crate::Error::Io(_)), "got {err:?}");
+        assert!(
+            matches!(err.reason(), crate::ErrorReason::Io(_)),
+            "got {err:?}"
+        );
         assert_eq!(start.elapsed(), Duration::ZERO);
     }
 

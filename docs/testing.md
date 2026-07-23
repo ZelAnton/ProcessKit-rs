@@ -54,7 +54,7 @@ scripted handle whose canned lines flow through the same pump machinery a real
 child uses — `stdout_lines`, `wait_for_line`, and `finish` behave
 identically, with no subprocess (see
 [Scripted streaming](#scripted-streaming) below). An `output_string`-only custom
-runner keeps compiling: `start` is defaulted to `Error::Unsupported`.
+runner keeps compiling: `start` is defaulted to `ErrorReason::Unsupported`.
 
 ```rust,no_run
 use processkit::{Command, ProcessRunner, ProcessRunnerExt, Result};
@@ -108,7 +108,7 @@ The pieces:
   with stderr. **`Reply::lines(["a", "b"])`** — exit 0 with the lines joined
   (and streamed one by one on a scripted [`start`](#scripted-streaming)).
   **`Reply::timeout()`** — a timed-out run (the checking helpers raise
-  `Error::Timeout` from it, carrying the command's own configured deadline). On a
+  `ErrorReason::Timeout` from it, carrying the command's own configured deadline). On a
   scripted [`start`](#scripted-streaming) it resolves *immediately* as timed-out;
   to exercise a real deadline race, use `Reply::pending()` + a `Command::timeout`.
   **`.with_stdout(text)`** — attach stdout to any of them (e.g. the
@@ -117,7 +117,7 @@ The pieces:
 - **`Reply::pending()`** — parks the call until the
   command's cancellation token (per-command `cancel_on` or the client-level
   [`default_cancel_on`](timeouts-and-cancellation.md#client-level-default))
-  fires, resolving with `Error::Cancelled` — so a test can prove an
+  fires, resolving with `ErrorReason::Cancelled` — so a test can prove an
   orchestration *actually cancels* a blocked call, not just that it formats a
   canned error — or until the command's `timeout` deadline elapses, resolving
   timed-out (`Outcome::TimedOut`) on the bulk verbs and `start` alike, like a
@@ -129,7 +129,7 @@ The pieces:
   but not `git foobar` (and not `rm foo`). Use
   [`on_sequence`](https://docs.rs/processkit) to serve an ordered sequence of
   replies (each once, then the last repeats) for a fail-then-succeed scenario.
-- **No match and no fallback is a loud error** (`Error::Spawn`, not-found) —
+- **No match and no fallback is a loud error** (`ErrorReason::Spawn`, not-found) —
   an unexpected invocation can't slip through a test silently.
 - Bulk runs also **replay the canned lines through the command's
   `on_stdout_line`/`on_stderr_line` handlers**, so a wrapper's
@@ -329,12 +329,12 @@ Semantics worth knowing before you commit a cassette:
 | Match key | program + args + a stdin **source digest** (hashed, never persisted: in-memory bytes hash their content, a `from_file` source hashes its path) — no stdin (absent or `Stdin::empty()`) keys distinctly; lossy UTF-8 on the text parts. **`cwd` is not part of the key by default** — a cassette recorded from one absolute working directory still replays when the same invocation runs from another (a dev box vs. a CI workspace); `cwd` is still stored on the entry, verbatim, for visibility. Opt in to a stricter key with `match_on_cwd` / `match_on_env` (below) |
 | Environment | **values never reach the file** — only sorted variable names, so *env* secrets can't leak through a committed fixture. Env is **not matched by default**, so irrelevant env differences can't cause spurious misses. Opt in with `match_on_env(["NAME", …])` to also key on selected variables' *values* — still via a **digest**, so raw values remain off-disk (see [Opt-in stricter matching](#opt-in-stricter-matching-cwd--selected-env-values)) |
 | Duplicates of one key | replay in capture order, then the **last entry repeats** — a recorded sequence (`git rev-parse HEAD` before/after a commit) replays faithfully, while retry/probe loops keep getting a stable final answer |
-| Miss | strict `Error::CassetteMiss` (distinct from a missing program — `is_not_found()` is `false`) — replay never spawns a surprise subprocess; a stale cassette fails loudly |
-| Timeouts | a recorded timed-out run replays as one, surfacing `Error::Timeout` with the *replaying* command's deadline |
-| Format | pretty-printed JSON with a `version` field; unknown versions / corrupt files / an entry with a contradictory outcome / a file over 64 MiB are `Error::Io(InvalidData)`, a missing file keeps `NotFound` |
-| Err results | recorded and replayed faithfully (`Error::Spawn`/`NotFound`/`Stdin`/`OutputTooLarge`/`Unsupported`/`Io` — with its `ErrorKind` preserved by name — plus an `Other` fallback); replaying such an entry surfaces the reconstructed error instead of `Error::CassetteMiss`. `Error::Cancelled` is the one exception — never recorded, since replay short-circuits on the replaying command's own token first |
+| Miss | strict `ErrorReason::CassetteMiss` (distinct from a missing program — `is_not_found()` is `false`) — replay never spawns a surprise subprocess; a stale cassette fails loudly |
+| Timeouts | a recorded timed-out run replays as one, surfacing `ErrorReason::Timeout` with the *replaying* command's deadline |
+| Format | pretty-printed JSON with a `version` field; unknown versions / corrupt files / an entry with a contradictory outcome / a file over 64 MiB are `ErrorReason::Io(InvalidData)`, a missing file keeps `NotFound` |
+| Err results | recorded and replayed faithfully (`ErrorReason::Spawn`/`NotFound`/`Stdin`/`OutputTooLarge`/`Unsupported`/`Io` — with its `ErrorKind` preserved by name — plus an `Other` fallback); replaying such an entry surfaces the reconstructed error instead of `ErrorReason::CassetteMiss`. `ErrorReason::Cancelled` is the one exception — never recorded, since replay short-circuits on the replaying command's own token first |
 | Verbs (`output_string` + `start`) | a cassette is **verb-agnostic**: record through either and replay through either. Replaying `start` hands back a scripted `RunningProcess` whose recorded lines flow through the command's real pumps (`stdout_lines` / `wait_for_line` / `finish`), no subprocess. *Recording* a `start` captures the run whole (the child runs to completion before the handle returns), so an **interactive** run fed stdin mid-stream can't be recorded that way — bound it with `Command::timeout` or script it with `ScriptedRunner` |
-| `output_bytes` | **unsupported** (`Error::Unsupported`) in both modes — a lossy-UTF-8 text fixture can't reproduce exact raw bytes; capture bytes from a real or scripted runner |
+| `output_bytes` | **unsupported** (`ErrorReason::Unsupported`) in both modes — a lossy-UTF-8 text fixture can't reproduce exact raw bytes; capture bytes from a real or scripted runner |
 
 Only env **values** are redacted. `program`, `args`, `cwd`, `stdout`, and
 `stderr` are stored **verbatim** and can carry secrets (a `--password=…` flag, a
@@ -439,7 +439,7 @@ impl<R: ProcessRunner> Git<R> {
     }
 
     /// Branch list, parsed — the parser is fallible and returns the crate's
-    /// `Result`, typically an `Error::Parse` naming the program.
+    /// `Result`, typically an `ErrorReason::Parse` naming the program.
     pub async fn branches(&self, repo: &Path) -> Result<Vec<String>> {
         self.core
             .try_parse(
@@ -472,7 +472,7 @@ The generated type is `Git<R: ProcessRunner = JobRunner>` with `Git::new()`,
 it as `self.core` from the wrapper's own methods) whose helpers
 speak the crate-wide verb vocabulary: `run` (trimmed stdout), `output_string` (full
 result), `run_unit` (success only), `exit_code`, `probe`, plus `parse`
-(infallible) and `try_parse` (fallible → `Error::Parse`).
+(infallible) and `try_parse` (fallible → `ErrorReason::Parse`).
 
 And the payoff — the wrapper tests hermetically with any double:
 

@@ -105,6 +105,31 @@ pub(crate) fn read_stat_meta(pid: u32) -> Option<StatMeta> {
     })
 }
 
+/// Error-aware sibling of [`read_stat_meta`] for the standalone
+/// [`process_info`](crate::process_info) query, which must tell **"no such
+/// process"** apart from **"can't look"**: `Ok(None)` when the `/proc/<pid>/stat`
+/// read fails with `NotFound` (`ENOENT` — the pid is genuinely gone, an honest
+/// negative), `Err` on any other IO error (notably `EACCES` under a `hidepid`
+/// mount — the process may well exist, so the caller must never read this as
+/// "dead"), and `Ok(Some(_))` with each enriching field independently parsed
+/// (a parse miss on one leaves the others intact) when the single stat line is
+/// read. One read, so the three fields describe one consistent instant.
+#[cfg(feature = "process-control")]
+pub(crate) fn read_stat_meta_checked(pid: u32) -> std::io::Result<Option<StatMeta>> {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => Ok(Some(StatMeta {
+            ppid: ppid_from_stat(&stat),
+            comm: comm_from_stat(&stat),
+            starttime: starttime_from_stat(&stat),
+        })),
+        // `ENOENT` is the honest "no such process" — not an error, a negative
+        // answer. Every other failure (permission denial, an OS error) leaves
+        // existence unknown, so it surfaces as `Err` rather than a false "gone".
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// The trio of enriching fields [`read_stat_meta`] pulls from one `/proc/<pid>/stat`
 /// read. Each is independently `Option` — an unparsable field is `None`, never a
 /// fabricated value.

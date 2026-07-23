@@ -212,14 +212,20 @@ fn read_member_info(pid: i32) -> Option<MemberInfo> {
     Some(MemberInfo::new(pid as u32, m.ppid, m.comm, m.starttime))
 }
 
-/// The Apple reader — see the doc above the Linux `read_member_info`.
+/// One `proc_pidinfo(PROC_PIDTBSDINFO)` fill for `pid`, distinguishing **gone**
+/// from **can't look** — the single `proc_bsdinfo` read shared by the group
+/// member snapshot ([`read_member_info`]) and the standalone
+/// [`process_info`](crate::process_info) query, so neither carries an independent
+/// copy of the syscall dance.
 ///
-/// **macOS / the other Apple targets** — one `proc_pidinfo(PROC_PIDTBSDINFO)` fill
-/// (the same `proc_bsdinfo` `read_identity`/`is_live_non_zombie` read): `pbi_ppid`,
-/// the short `pbi_comm` image name, and the creation time folded to microseconds
-/// since the Unix epoch. A short/failed fill means the pid is gone/unreadable.
+/// `Ok(Some(info))` on a full-size fill (the process exists and is readable),
+/// `Ok(None)` when the errno is `ESRCH` (no such process — an honest negative),
+/// and `Err` on any other failure (notably `EPERM` on a process this caller may
+/// not inspect — so the standalone query never reads "not allowed to look" as
+/// "dead"; the group-snapshot caller collapses both `Ok(None)` and `Err` back to
+/// "skip this pid").
 #[cfg(all(feature = "process-control", target_vendor = "apple"))]
-fn read_member_info(pid: i32) -> Option<MemberInfo> {
+fn fill_bsdinfo(pid: i32) -> io::Result<Option<libc::proc_bsdinfo>> {
     // SAFETY: `proc_bsdinfo` is plain-old-data (integers and byte arrays), for
     // which an all-zero bit pattern is a valid initialized value.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -235,19 +241,107 @@ fn read_member_info(pid: i32) -> Option<MemberInfo> {
             want,
         )
     };
-    if got != want {
-        return None;
+    if got == want {
+        return Ok(Some(info));
     }
+    // A gone pid reports `ESRCH` → an honest "no such process"; `EPERM` (a
+    // process we may not inspect) or any other errno is a genuine "couldn't look"
+    // error, so the standalone query never mistakes an existing process for dead.
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        Ok(None)
+    } else {
+        Err(err)
+    }
+}
+
+/// Assemble a [`MemberInfo`] from a filled `proc_bsdinfo`: `pbi_ppid`, the short
+/// `pbi_comm` image name, and the creation time folded to microseconds since the
+/// Unix epoch — shared by [`read_member_info`] and [`process_info`] so the field
+/// mapping exists once.
+#[cfg(all(feature = "process-control", target_vendor = "apple"))]
+fn build_member_info(pid: u32, info: &libc::proc_bsdinfo) -> MemberInfo {
     let start_time = info
         .pbi_start_tvsec
         .saturating_mul(1_000_000)
         .saturating_add(info.pbi_start_tvusec);
-    Some(MemberInfo::new(
-        pid as u32,
+    MemberInfo::new(
+        pid,
         Some(info.pbi_ppid),
         comm_to_string(&info.pbi_comm),
         Some(start_time),
-    ))
+    )
+}
+
+/// The Apple reader — see the doc above the Linux `read_member_info`.
+///
+/// **macOS / the other Apple targets** — one [`fill_bsdinfo`] read (the same
+/// `proc_bsdinfo` `read_identity`/`is_live_non_zombie` fill), mapped to a
+/// [`MemberInfo`] by [`build_member_info`]. A gone/unreadable pid (either arm of
+/// `fill_bsdinfo`'s `Ok(None)`/`Err`) collapses to `None` — a vanished leader is
+/// skipped, never a fabricated record.
+#[cfg(all(feature = "process-control", target_vendor = "apple"))]
+fn read_member_info(pid: i32) -> Option<MemberInfo> {
+    fill_bsdinfo(pid)
+        .ok()
+        .flatten()
+        .map(|info| build_member_info(pid as u32, &info))
+}
+
+/// Identity + best-effort metadata for an **arbitrary** pid — the Apple backend of
+/// the standalone [`process_info`](crate::process_info) query. Reuses the same
+/// [`fill_bsdinfo`] read the group snapshot uses, but preserves its "gone vs can't
+/// look" distinction: `Ok(None)` for `ESRCH`, `Err` for `EPERM`/other, `Ok(Some)`
+/// otherwise. A pid that does not fit `pid_t` (`i32`) cannot name a real process,
+/// so it is an honest `Ok(None)`.
+#[cfg(all(feature = "process-control", target_vendor = "apple"))]
+pub(crate) fn process_info(pid: u32) -> io::Result<Option<MemberInfo>> {
+    let Ok(spid) = i32::try_from(pid) else {
+        return Ok(None);
+    };
+    Ok(fill_bsdinfo(spid)?.map(|info| build_member_info(pid, &info)))
+}
+
+/// Identity + best-effort metadata for an **arbitrary** pid — the bare-BSD backend
+/// of the standalone [`process_info`](crate::process_info) query.
+///
+/// No per-process introspection is wired up on the BSDs (the same
+/// `sysctl(KERN_PROC)` divergence that leaves [`read_identity`] `None` there), so
+/// existence is probed with a **zero-signal** `kill(pid, 0)` — which delivers
+/// nothing — and the pid is reported with every enriching field honestly `None`:
+/// - `0` → the process exists (and is signalable): `Ok(Some(pid, None…))`.
+/// - `EPERM` → the process exists but is not ours to signal; for a read-only
+///   existence query that is still a positive answer, and no restricted field is
+///   being read anyway, so `Ok(Some(pid, None…))` — never a permission `Err` here
+///   (there is nothing to be denied *looking* at).
+/// - `ESRCH` → no such process: `Ok(None)`.
+/// - any other errno → a genuine `Err`.
+///
+/// A pid that does not fit `pid_t` (`i32`) cannot name a real process — and casting
+/// it could turn `kill` into a *process-group* signal — so it is an honest
+/// `Ok(None)` before any syscall.
+#[cfg(all(
+    feature = "process-control",
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+pub(crate) fn process_info(pid: u32) -> io::Result<Option<MemberInfo>> {
+    let Ok(spid) = i32::try_from(pid) else {
+        return Ok(None);
+    };
+    // SAFETY: the null signal (`0`) delivers nothing; it only probes whether the
+    // pid names a live process the caller could signal.
+    let rc = unsafe { libc::kill(spid, 0) };
+    if rc == 0 {
+        return Ok(Some(MemberInfo::new(pid, None, None, None)));
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        // Exists but not ours to signal — still a positive existence answer.
+        Some(libc::EPERM) => Ok(Some(MemberInfo::new(pid, None, None, None))),
+        // No such process — the honest negative.
+        Some(libc::ESRCH) => Ok(None),
+        _ => Err(err),
+    }
 }
 
 /// Decode a NUL-terminated `c_char` `comm` array (`proc_bsdinfo::pbi_comm`) into a

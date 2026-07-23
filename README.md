@@ -253,7 +253,7 @@ rule allows only for the real hierarchy root — *not* a cgroup-namespace root (
 ordinary container EBUSYs too), and *not* under a systemd session/scope/service. The crate
 does not migrate your process to work around it, so in practice limits apply only at a
 minimal non-systemd init. When a requested limit can't be enforced, `with_options`
-returns `Error::ResourceLimit` instead of a silently-unbounded group — an unapplied cap
+returns `ErrorReason::ResourceLimit` instead of a silently-unbounded group — an unapplied cap
 is no protection.
 
 *Deeper: [Process groups → resource limits](docs/process-groups.md).*
@@ -279,7 +279,7 @@ async fn main() -> processkit::Result<()> {
 ```
 
 Signals are POSIX-only: on Windows just `Signal::Kill` is deliverable (it maps to
-the Job Object terminate) and anything else returns `Error::Unsupported`.
+the Job Object terminate) and anything else returns `ErrorReason::Unsupported`.
 `Signal::Kill` always takes the same whole-tree hard-kill path as
 `kill_all()`. Suspend/resume work everywhere a container exists — one
 `cgroup.freeze` write covering the subtree on Linux, `SIGSTOP`/`SIGCONT` on
@@ -475,7 +475,7 @@ async fn health_check() -> bool {
 
 A probe that doesn't pass within its deadline — or that can no longer pass
 (the child exits; for `wait_for_line`, its stdout closes) — fails with
-`Error::NotReady` (distinct from `Error::Timeout`, which is the run's own
+`ErrorReason::NotReady` (distinct from `ErrorReason::Timeout`, which is the run's own
 `Command::timeout`) and **does not kill the child**: the caller decides what
 happens next. `wait_for_line` consumes stdout up to the match
 (continue with `finish`); `wait_for_port` / `wait_for` background-drain and
@@ -553,7 +553,7 @@ async fn main() -> processkit::Result<()> {
 `inherit_env` clears the environment and copies only the named parent vars
 (explicit `env`/`env_remove` still apply on top); it works everywhere. `uid` /
 `gid` (group id is set before user id) and `setsid` are POSIX-only — on other
-targets the run fails with `Error::Unsupported` rather than silently skipping
+targets the run fails with `ErrorReason::Unsupported` rather than silently skipping
 a privilege drop. One Linux caveat: under the **cgroup** mechanism the child
 joins its cgroup after the uid has already dropped, and the auto-created
 cgroup isn't writable by the target user — the spawn fails with a permission
@@ -573,7 +573,7 @@ macOS/BSD have no equivalent (documented no-op).
 
 Hand a command a
 [`CancellationToken`] (re-exported from `tokio-util`); cancelling the token
-kills the process tree, and every consuming path reports `Error::Cancelled`:
+kills the process tree, and every consuming path reports `ErrorReason::Cancelled`:
 
 ```rust,no_run
 use processkit::{CancellationToken, Command};
@@ -592,7 +592,7 @@ async fn main() -> processkit::Result<()> {
     // elsewhere — a shutdown signal, a sibling failure, a UI button:
     token.cancel();
 
-    assert!(matches!(job.await.unwrap(), Err(processkit::Error::Cancelled { .. })));
+    assert!(matches!(job.await.unwrap().map_err(|e| e.into_reason()), Err(processkit::ErrorReason::Cancelled { .. })));
     Ok(())
 }
 ```
@@ -655,7 +655,7 @@ async fn main() -> processkit::Result<()> {
 > (own-group handle) or the direct child (shared-group handle) is killed, the
 > pipes close, and the stream ends. A `cancel_on` token ends
 > the stream the same way, and the following `finish` reports
-> `Error::Cancelled`. For an ad-hoc bound, wrapping the loop in
+> `ErrorReason::Cancelled`. For an ad-hoc bound, wrapping the loop in
 > [`tokio::time::timeout`] and dropping the handle (which kills the tree) still
 > works.
 
@@ -670,7 +670,7 @@ use processkit::Command;
 
 // `ProcessStdin`'s writer methods return `std::io::Result` (idiomatic for a
 // writer), so this example uses `Box<dyn std::error::Error>` to mix them with the
-// crate's `Result`; in a `processkit::Result` function, `.map_err(processkit::Error::Io)?`.
+// crate's `Result`; in a `processkit::Result` function, `.map_err(processkit::ErrorReason::Io)?`.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `bc` evaluates each stdin line and prints the result on stdout.
@@ -785,7 +785,7 @@ file is written `0600`. When one invocation was recorded
 several times, replay serves the entries in capture order and then repeats the
 last one — a recorded sequence of changing outputs replays faithfully, while
 retry/probe loops keep getting a stable final answer. An invocation absent from
-the cassette is a strict `Error::CassetteMiss` (distinct from a missing program,
+the cassette is a strict `ErrorReason::CassetteMiss` (distinct from a missing program,
 so `is_not_found()` is `false`; replay never spawns a surprise subprocess), and
 the file carries a format `version` so future readers fail loudly instead of
 misreading old fixtures.

@@ -165,88 +165,89 @@ impl core::marker::UnsafeUnpin for processkit::testing::ScriptedRunner
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::testing::ScriptedRunner
 impl !core::panic::unwind_safe::UnwindSafe for processkit::testing::ScriptedRunner
 pub macro processkit::cli_client!
-#[non_exhaustive] pub enum processkit::Error
-pub processkit::Error::Cancelled
-pub processkit::Error::Cancelled::program: alloc::string::String
-pub processkit::Error::CassetteMiss
-pub processkit::Error::CassetteMiss::program: alloc::string::String
-#[non_exhaustive] pub processkit::Error::Exit
-pub processkit::Error::Exit::code: i32
-pub processkit::Error::Exit::program: alloc::string::String
-pub processkit::Error::Exit::stderr: alloc::string::String
-pub processkit::Error::Exit::stdout: alloc::string::String
-pub processkit::Error::Exit::stdout_bytes: core::option::Option<alloc::vec::Vec<u8>>
-pub processkit::Error::Io(core::io::error::Error)
-#[non_exhaustive] pub processkit::Error::NotFound
-pub processkit::Error::NotFound::program: alloc::string::String
-pub processkit::Error::NotFound::searched: core::option::Option<alloc::string::String>
-pub processkit::Error::NotReady
-pub processkit::Error::NotReady::program: alloc::string::String
-pub processkit::Error::NotReady::timeout: core::time::Duration
-#[non_exhaustive] pub processkit::Error::OutputTooLarge
-pub processkit::Error::OutputTooLarge::max_bytes: core::option::Option<usize>
-pub processkit::Error::OutputTooLarge::max_lines: core::option::Option<usize>
-pub processkit::Error::OutputTooLarge::program: alloc::string::String
-pub processkit::Error::OutputTooLarge::total_bytes: usize
-pub processkit::Error::OutputTooLarge::total_lines: usize
-#[non_exhaustive] pub processkit::Error::Parse
-pub processkit::Error::Parse::message: alloc::string::String
-pub processkit::Error::Parse::program: alloc::string::String
-#[non_exhaustive] pub processkit::Error::ResourceLimit
-pub processkit::Error::ResourceLimit::detail: alloc::string::String
-pub processkit::Error::ResourceLimit::kind: processkit::LimitKind
-pub processkit::Error::ResourceLimit::reason: processkit::LimitReason
-#[non_exhaustive] pub processkit::Error::Signalled
-pub processkit::Error::Signalled::program: alloc::string::String
-pub processkit::Error::Signalled::signal: core::option::Option<i32>
-pub processkit::Error::Signalled::stderr: alloc::string::String
-pub processkit::Error::Signalled::stdout: alloc::string::String
-pub processkit::Error::Signalled::stdout_bytes: core::option::Option<alloc::vec::Vec<u8>>
-#[non_exhaustive] pub processkit::Error::Spawn
-pub processkit::Error::Spawn::program: alloc::string::String
-pub processkit::Error::Spawn::source: core::io::error::Error
-#[non_exhaustive] pub processkit::Error::Stdin
-pub processkit::Error::Stdin::program: alloc::string::String
-pub processkit::Error::Stdin::source: core::io::error::Error
-#[non_exhaustive] pub processkit::Error::Timeout
-pub processkit::Error::Timeout::program: alloc::string::String
-pub processkit::Error::Timeout::stderr: alloc::string::String
-pub processkit::Error::Timeout::stdout: alloc::string::String
-pub processkit::Error::Timeout::stdout_bytes: core::option::Option<alloc::vec::Vec<u8>>
-pub processkit::Error::Timeout::timeout: core::time::Duration
-pub processkit::Error::Unsupported
-pub processkit::Error::Unsupported::operation: alloc::string::String
-impl processkit::Error
-pub fn processkit::Error::code(&self) -> core::option::Option<i32>
-pub fn processkit::Error::combined(&self) -> core::option::Option<alloc::string::String>
-pub fn processkit::Error::diagnostic(&self) -> core::option::Option<&str>
-pub fn processkit::Error::is_cancelled(&self) -> bool
-pub fn processkit::Error::is_not_found(&self) -> bool
-pub fn processkit::Error::is_permission_denied(&self) -> bool
-pub fn processkit::Error::is_signalled(&self) -> bool
-pub fn processkit::Error::is_timeout(&self) -> bool
-pub fn processkit::Error::is_transient(&self) -> bool
-pub fn processkit::Error::limit_kind(&self) -> core::option::Option<processkit::LimitKind>
-pub fn processkit::Error::limit_reason(&self) -> core::option::Option<processkit::LimitReason>
-pub fn processkit::Error::parse(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
-pub fn processkit::Error::program(&self) -> core::option::Option<&str>
-pub fn processkit::Error::signal(&self) -> core::option::Option<i32>
-pub fn processkit::Error::stderr(&self) -> core::option::Option<&str>
-pub fn processkit::Error::stdout(&self) -> core::option::Option<&str>
-pub fn processkit::Error::stdout_bytes(&self) -> core::option::Option<&[u8]>
-impl core::error::Error for processkit::Error
-pub fn processkit::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
-impl core::fmt::Debug for processkit::Error
-pub fn processkit::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::fmt::Display for processkit::Error
-pub fn processkit::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Freeze for processkit::Error
-impl core::marker::Send for processkit::Error
-impl core::marker::Sync for processkit::Error
-impl core::marker::Unpin for processkit::Error
-impl core::marker::UnsafeUnpin for processkit::Error
-impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Error
-impl !core::panic::unwind_safe::UnwindSafe for processkit::Error
+#[non_exhaustive] pub enum processkit::ErrorReason
+pub processkit::ErrorReason::Cancelled
+pub processkit::ErrorReason::Cancelled::program: alloc::string::String
+pub processkit::ErrorReason::CassetteMiss
+pub processkit::ErrorReason::CassetteMiss::program: alloc::string::String
+#[non_exhaustive] pub processkit::ErrorReason::Exit
+pub processkit::ErrorReason::Exit::code: i32
+pub processkit::ErrorReason::Exit::program: alloc::string::String
+pub processkit::ErrorReason::Exit::stderr: alloc::string::String
+pub processkit::ErrorReason::Exit::stdout: alloc::string::String
+pub processkit::ErrorReason::Exit::stdout_bytes: core::option::Option<alloc::vec::Vec<u8>>
+pub processkit::ErrorReason::Io(core::io::error::Error)
+#[non_exhaustive] pub processkit::ErrorReason::NotFound
+pub processkit::ErrorReason::NotFound::program: alloc::string::String
+pub processkit::ErrorReason::NotFound::searched: core::option::Option<alloc::string::String>
+pub processkit::ErrorReason::NotReady
+pub processkit::ErrorReason::NotReady::program: alloc::string::String
+pub processkit::ErrorReason::NotReady::timeout: core::time::Duration
+#[non_exhaustive] pub processkit::ErrorReason::OutputTooLarge
+pub processkit::ErrorReason::OutputTooLarge::max_bytes: core::option::Option<usize>
+pub processkit::ErrorReason::OutputTooLarge::max_lines: core::option::Option<usize>
+pub processkit::ErrorReason::OutputTooLarge::program: alloc::string::String
+pub processkit::ErrorReason::OutputTooLarge::total_bytes: usize
+pub processkit::ErrorReason::OutputTooLarge::total_lines: usize
+#[non_exhaustive] pub processkit::ErrorReason::Parse
+pub processkit::ErrorReason::Parse::message: alloc::string::String
+pub processkit::ErrorReason::Parse::program: alloc::string::String
+#[non_exhaustive] pub processkit::ErrorReason::ResourceLimit
+pub processkit::ErrorReason::ResourceLimit::detail: alloc::string::String
+pub processkit::ErrorReason::ResourceLimit::kind: processkit::LimitKind
+pub processkit::ErrorReason::ResourceLimit::reason: processkit::LimitReason
+#[non_exhaustive] pub processkit::ErrorReason::Signalled
+pub processkit::ErrorReason::Signalled::program: alloc::string::String
+pub processkit::ErrorReason::Signalled::signal: core::option::Option<i32>
+pub processkit::ErrorReason::Signalled::stderr: alloc::string::String
+pub processkit::ErrorReason::Signalled::stdout: alloc::string::String
+pub processkit::ErrorReason::Signalled::stdout_bytes: core::option::Option<alloc::vec::Vec<u8>>
+#[non_exhaustive] pub processkit::ErrorReason::Spawn
+pub processkit::ErrorReason::Spawn::program: alloc::string::String
+pub processkit::ErrorReason::Spawn::source: core::io::error::Error
+#[non_exhaustive] pub processkit::ErrorReason::Stdin
+pub processkit::ErrorReason::Stdin::program: alloc::string::String
+pub processkit::ErrorReason::Stdin::source: core::io::error::Error
+#[non_exhaustive] pub processkit::ErrorReason::Timeout
+pub processkit::ErrorReason::Timeout::program: alloc::string::String
+pub processkit::ErrorReason::Timeout::stderr: alloc::string::String
+pub processkit::ErrorReason::Timeout::stdout: alloc::string::String
+pub processkit::ErrorReason::Timeout::stdout_bytes: core::option::Option<alloc::vec::Vec<u8>>
+pub processkit::ErrorReason::Timeout::timeout: core::time::Duration
+pub processkit::ErrorReason::Unsupported
+pub processkit::ErrorReason::Unsupported::operation: alloc::string::String
+impl processkit::ErrorReason
+pub fn processkit::ErrorReason::code(&self) -> core::option::Option<i32>
+pub fn processkit::ErrorReason::combined(&self) -> core::option::Option<alloc::string::String>
+pub fn processkit::ErrorReason::diagnostic(&self) -> core::option::Option<&str>
+pub fn processkit::ErrorReason::is_cancelled(&self) -> bool
+pub fn processkit::ErrorReason::is_not_found(&self) -> bool
+pub fn processkit::ErrorReason::is_permission_denied(&self) -> bool
+pub fn processkit::ErrorReason::is_signalled(&self) -> bool
+pub fn processkit::ErrorReason::is_timeout(&self) -> bool
+pub fn processkit::ErrorReason::is_transient(&self) -> bool
+pub fn processkit::ErrorReason::limit_kind(&self) -> core::option::Option<processkit::LimitKind>
+pub fn processkit::ErrorReason::limit_reason(&self) -> core::option::Option<processkit::LimitReason>
+pub fn processkit::ErrorReason::program(&self) -> core::option::Option<&str>
+pub fn processkit::ErrorReason::signal(&self) -> core::option::Option<i32>
+pub fn processkit::ErrorReason::stderr(&self) -> core::option::Option<&str>
+pub fn processkit::ErrorReason::stdout(&self) -> core::option::Option<&str>
+pub fn processkit::ErrorReason::stdout_bytes(&self) -> core::option::Option<&[u8]>
+impl core::convert::From<processkit::ErrorReason> for processkit::Error
+pub fn processkit::Error::from(processkit::ErrorReason) -> Self
+impl core::error::Error for processkit::ErrorReason
+pub fn processkit::ErrorReason::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for processkit::ErrorReason
+pub fn processkit::ErrorReason::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for processkit::ErrorReason
+pub fn processkit::ErrorReason::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for processkit::ErrorReason
+impl core::marker::Send for processkit::ErrorReason
+impl core::marker::Sync for processkit::ErrorReason
+impl core::marker::Unpin for processkit::ErrorReason
+impl core::marker::UnsafeUnpin for processkit::ErrorReason
+impl !core::panic::unwind_safe::RefUnwindSafe for processkit::ErrorReason
+impl !core::panic::unwind_safe::UnwindSafe for processkit::ErrorReason
 #[non_exhaustive] pub enum processkit::GiveUpAttempt<'a>
 pub processkit::GiveUpAttempt::Crashed(&'a processkit::ProcessResult<alloc::string::String>)
 pub processkit::GiveUpAttempt::Failed(&'a processkit::Error)
@@ -748,6 +749,43 @@ impl core::marker::Unpin for processkit::Command
 impl core::marker::UnsafeUnpin for processkit::Command
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Command
 impl !core::panic::unwind_safe::UnwindSafe for processkit::Command
+pub struct processkit::Error
+impl processkit::Error
+pub fn processkit::Error::code(&self) -> core::option::Option<i32>
+pub fn processkit::Error::combined(&self) -> core::option::Option<alloc::string::String>
+pub fn processkit::Error::diagnostic(&self) -> core::option::Option<&str>
+pub fn processkit::Error::into_reason(self) -> processkit::ErrorReason
+pub fn processkit::Error::is_cancelled(&self) -> bool
+pub fn processkit::Error::is_not_found(&self) -> bool
+pub fn processkit::Error::is_permission_denied(&self) -> bool
+pub fn processkit::Error::is_signalled(&self) -> bool
+pub fn processkit::Error::is_timeout(&self) -> bool
+pub fn processkit::Error::is_transient(&self) -> bool
+pub fn processkit::Error::limit_kind(&self) -> core::option::Option<processkit::LimitKind>
+pub fn processkit::Error::limit_reason(&self) -> core::option::Option<processkit::LimitReason>
+pub fn processkit::Error::program(&self) -> core::option::Option<&str>
+pub fn processkit::Error::reason(&self) -> &processkit::ErrorReason
+pub fn processkit::Error::signal(&self) -> core::option::Option<i32>
+pub fn processkit::Error::stderr(&self) -> core::option::Option<&str>
+pub fn processkit::Error::stdout(&self) -> core::option::Option<&str>
+pub fn processkit::Error::stdout_bytes(&self) -> core::option::Option<&[u8]>
+impl processkit::Error
+pub fn processkit::Error::parse(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+impl core::convert::From<processkit::ErrorReason> for processkit::Error
+pub fn processkit::Error::from(processkit::ErrorReason) -> Self
+impl core::error::Error for processkit::Error
+pub fn processkit::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for processkit::Error
+pub fn processkit::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for processkit::Error
+pub fn processkit::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for processkit::Error
+impl core::marker::Send for processkit::Error
+impl core::marker::Sync for processkit::Error
+impl core::marker::Unpin for processkit::Error
+impl core::marker::UnsafeUnpin for processkit::Error
+impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Error
+impl !core::panic::unwind_safe::UnwindSafe for processkit::Error
 #[non_exhaustive] pub struct processkit::Finished
 pub processkit::Finished::outcome: processkit::Outcome
 pub processkit::Finished::stderr: alloc::string::String
@@ -767,6 +805,27 @@ impl core::marker::Unpin for processkit::Finished
 impl core::marker::UnsafeUnpin for processkit::Finished
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::Finished
 impl core::panic::unwind_safe::UnwindSafe for processkit::Finished
+#[non_exhaustive] pub struct processkit::HostContainment
+impl processkit::HostContainment
+pub fn processkit::HostContainment::crate_version(&self) -> &'static str
+pub fn processkit::HostContainment::mechanism(&self) -> processkit::Mechanism
+pub fn processkit::HostContainment::parent_death_cleanup(&self) -> processkit::ParentDeathCleanup
+pub fn processkit::HostContainment::soft_stop_scope(&self) -> processkit::SoftStopScope
+impl core::clone::Clone for processkit::HostContainment
+pub fn processkit::HostContainment::clone(&self) -> processkit::HostContainment
+impl core::cmp::Eq for processkit::HostContainment
+impl core::cmp::PartialEq for processkit::HostContainment
+pub fn processkit::HostContainment::eq(&self, &processkit::HostContainment) -> bool
+impl core::fmt::Debug for processkit::HostContainment
+pub fn processkit::HostContainment::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for processkit::HostContainment
+impl core::marker::Freeze for processkit::HostContainment
+impl core::marker::Send for processkit::HostContainment
+impl core::marker::Sync for processkit::HostContainment
+impl core::marker::Unpin for processkit::HostContainment
+impl core::marker::UnsafeUnpin for processkit::HostContainment
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::HostContainment
+impl core::panic::unwind_safe::UnwindSafe for processkit::HostContainment
 pub struct processkit::JobRunner
 impl processkit::JobRunner
 pub fn processkit::JobRunner::new() -> Self
@@ -1141,7 +1200,9 @@ pub async fn processkit::RunningProcess::profile(self, core::time::Duration) -> 
 pub async fn processkit::RunningProcess::shutdown(self, core::time::Duration) -> processkit::Result<processkit::Outcome>
 pub fn processkit::RunningProcess::start_kill(&mut self) -> processkit::Result<()>
 pub fn processkit::RunningProcess::start_time(&self) -> std::time::SystemTime
+pub fn processkit::RunningProcess::stderr_bytes_seen(&self) -> usize
 pub fn processkit::RunningProcess::stderr_line_count(&self) -> usize
+pub fn processkit::RunningProcess::stdout_bytes_seen(&self) -> usize
 pub fn processkit::RunningProcess::stdout_line_count(&self) -> usize
 pub fn processkit::RunningProcess::take_stdin(&mut self) -> core::option::Option<processkit::ProcessStdin>
 pub async fn processkit::RunningProcess::wait(self) -> processkit::Result<processkit::Outcome>
@@ -1388,9 +1449,12 @@ pub fn T::probe<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::
 pub fn T::run<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<alloc::string::String>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn T::run_unit<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<()>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn T::try_parse<'life0, 'life1, 'async_trait, T, F>(&'life0 self, &'life1 processkit::Command, F) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<T>> + core::marker::Send + 'async_trait)>> where T: core::marker::Send + 'async_trait, F: core::ops::function::FnOnce(&str) -> processkit::Result<T> + core::marker::Send + 'async_trait, Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn processkit::host_containment() -> processkit::HostContainment
 pub async fn processkit::output_all<R, I>(I, usize, &R) -> alloc::vec::Vec<processkit::Result<processkit::ProcessResult<alloc::string::String>>> where R: processkit::ProcessRunner + ?core::marker::Sized, I: core::iter::traits::collect::IntoIterator<Item = processkit::Command>
 pub async fn processkit::output_all_bytes<R, I>(I, usize, &R) -> alloc::vec::Vec<processkit::Result<processkit::ProcessResult<alloc::vec::Vec<u8>>>> where R: processkit::ProcessRunner + ?core::marker::Sized, I: core::iter::traits::collect::IntoIterator<Item = processkit::Command>
 pub async fn processkit::output_string<I, S>(impl core::convert::AsRef<std::ffi::os_str::OsStr>, I) -> processkit::Result<processkit::ProcessResult<alloc::string::String>> where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
+pub fn processkit::process_info(u32) -> processkit::Result<core::option::Option<processkit::MemberInfo>>
+pub fn processkit::process_is_alive(u32, core::option::Option<u64>) -> processkit::Result<bool>
 pub async fn processkit::run<I, S>(impl core::convert::AsRef<std::ffi::os_str::OsStr>, I) -> processkit::Result<alloc::string::String> where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub async fn processkit::wait_all(&mut [&mut processkit::RunningProcess]) -> processkit::Result<alloc::vec::Vec<processkit::Outcome>>
 pub async fn processkit::wait_any(&mut [&mut processkit::RunningProcess]) -> processkit::Result<(usize, processkit::Outcome)>

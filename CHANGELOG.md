@@ -28,6 +28,51 @@ to a dated version section.
   the crate, so `Outcome::Exited(0)` already works anywhere.) Purely
   additive — no change to `PartialEq`/`Hash`/`Debug` semantics on any of these
   types
+- Add free-standing `process_info(pid) -> Result<Option<MemberInfo>>` and
+  `process_is_alive(pid, start_time) -> Result<bool>` (needs `process-control`) —
+  the standalone twin of `ProcessGroup::members_info` for a pid held **outside** any
+  group (a pid saved to disk across runs, a launch registry checking a
+  crash-surviving owner, an e2e probe watching a process from outside its
+  container). `process_info` returns the same best-effort `MemberInfo` a group
+  member carries — parent pid, image name, and the start-time identity token — read
+  through the crate's existing per-platform readers (`/proc/<pid>/stat` on Linux,
+  `proc_pidinfo` on macOS, `Toolhelp32` + the creation `FILETIME` on Windows, a
+  `kill(pid, 0)` existence probe on the bare BSDs), never a second implementation
+  and never reading argv/environment. It answers with a deliberate three-way
+  contract: `Ok(Some(info))` when the process exists, `Ok(None)` when the pid names
+  **no** process (an honest negative — the "it's gone" answer), and `Err` when the
+  process may exist but couldn't be inspected (no permission — a Windows
+  protected/`System` process, a Linux `hidepid` mount, a macOS restricted process —
+  or an OS read error), so "not allowed to look" is never mistaken for "dead".
+  `process_is_alive` pairs the pid with the saved start-time token for **reuse-safe**
+  liveness: `Ok(true)` only when the process exists *and* its current start time
+  matches the saved one, so a recycled number (same pid, different start time) reads
+  as `Ok(false)` rather than a false "alive"; where the platform reports no start
+  time (the bare BSDs) it degrades to number-only liveness, no weaker than a
+  hand-written check and never a false "dead". Purely additive
+- Add `processkit::host_containment() -> HostContainment` — a **spawn-free,
+  side-effect-free** host capability query: it reports how process containment
+  behaves on this host *without creating a container or spawning anything*, so a
+  consumer's preflight (a *doctor* / host-check command whose contract is "no side
+  effects") can state the real story up front instead of having to build a
+  `ProcessGroup` just to read `mechanism()`. The new `#[non_exhaustive]`
+  `HostContainment` carries: `mechanism()` — which `Mechanism` a group created here
+  and now would use, determined by a read-only probe (a fixed constant on
+  Windows/macOS/BSD; on Linux a cheap read-only check of cgroup v2 availability and
+  writability that agrees with a real `ProcessGroup::new`, best-effort in the rare
+  window where a writable-looking cgroup then rejects creation); `soft_stop_scope()`
+  (needs `process-control`) — the host-level reach of a soft stop (`WholeTree` on the
+  Unix backends, `OptInMembers` on Windows; a *specific* group still reads its own,
+  possibly narrower, scope from `ProcessGroup::soft_stop_scope()`);
+  `parent_death_cleanup()` — the same `ParentDeathCleanup` that
+  `Command::kill_on_parent_death_scope()` reports, reused not recomputed; and
+  `crate_version()`. The mechanism detection is lifted out of the group-creation path
+  so the query and the real selection share one source of truth. Purely additive
+- Add `RunningProcess::stdout_bytes_seen()` and
+  `RunningProcess::stderr_bytes_seen()` live monotonic counters. They report
+  raw bytes read from each pipe before decoding, including bytes discarded by
+  buffer overflow or oversized-line handling, and report `0` for streams that
+  are not pumped.
 - Add `Command::stdout_raw_tee(writer)` / `stderr_raw_tee(writer)` — a
   **byte-accurate** tee that writes each chunk to `writer` *exactly as read from
   the child's pipe*, before any decoding or line splitting. Where
@@ -139,6 +184,34 @@ to a dated version section.
 
 ### Changed
 
+- `ErrorReason::OutputTooLarge.total_bytes` and the `OverflowMode::Error` plus
+  `max_bytes` ceiling now count raw bytes read from the output pipe, including
+  line terminators and invalid UTF-8 bytes, rather than decoded line-content
+  bytes
+- **Breaking:** `Error` is now a **pointer-sized wrapper** around a boxed
+  `ErrorReason` (`struct Error { .. }` holding a `Box<ErrorReason>`) instead of a
+  large enum, mirroring `std::io::Error` / `ErrorKind`. This shrinks `Error` from
+  100+ bytes to one pointer, so every `Result<T, Error>` on the run path — and any
+  enum that embeds one (e.g. a caller's `vcs_core::Error`) — stays small, and the
+  default `result_large_err` / `large_enum_variant` clippy lints no longer fire on
+  the crate's public path. The former enum, with **every variant and field
+  unchanged** (`Spawn`, `NotFound`, `CassetteMiss`, `Exit`, `Timeout`,
+  `OutputTooLarge`, `NotReady`, `Parse`, `ResourceLimit`, `Unsupported`,
+  `Cancelled`, `Signalled`, `Stdin`, `Io`), is now the re-exported `ErrorReason`,
+  reached via `err.reason() -> &ErrorReason` (or `err.into_reason() -> ErrorReason`
+  to take ownership). A `From<ErrorReason> for Error` is provided. All read
+  accessors (`code()`, `program()`, `stdout()`/`stderr()`/`stdout_bytes()`,
+  `diagnostic()`, `combined()`, `is_not_found()`/`is_timeout()`/`is_cancelled()`/
+  `is_signalled()`/`is_transient()`/`is_permission_denied()`, `signal()`,
+  `limit_kind()`/`limit_reason()`), `Display`, `Debug` (with its unchanged
+  200-byte stream previews, `PATH` redaction, and control-/bidi-sanitizing), and
+  `source()` work on `Error` directly as before — only a **direct variant match**
+  needs updating: `match err { Error::Exit { .. } => … }` becomes
+  `match err.reason() { ErrorReason::Exit { .. } => … }`. The `#[doc(hidden)]`
+  constructors (`Error::exit`/`timeout`/`signalled`/`spawn`/`not_found`/`stdin`)
+  and the public `Error::parse(..)` are unchanged and still return an `Error`. A
+  compile-time assertion pins `size_of::<Error>()` to a pointer. See
+  [Upgrading](docs/upgrading.md) (GitHub issue #21)
 - Release publishing now uses crates.io Trusted Publishing — a short-lived token
   minted over GitHub OIDC per run — instead of a stored long-lived
   `CRATES_IO_TOKEN` secret

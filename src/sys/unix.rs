@@ -146,6 +146,15 @@ impl Job {
     }
 }
 
+/// Read-only prediction of the [`Mechanism`] a fresh [`Job`] would use on this host,
+/// computed **without creating any OS object or spawning anything** — always the
+/// POSIX [`Mechanism::ProcessGroup`] backend on macOS/BSD (no cgroups or Job Objects
+/// exist here), so there is nothing to probe. Mirrors [`Job::mechanism`]; backs the
+/// public `host_containment()` query.
+pub(crate) fn detect_mechanism() -> Mechanism {
+    Mechanism::ProcessGroup
+}
+
 #[cfg(feature = "stats")]
 pub(crate) fn process_metrics(_pid: u32, _expected: Option<ProcIdentity>) -> ProcMetrics {
     // Not *implemented* on these targets (returns the empty default), rather than
@@ -157,6 +166,18 @@ pub(crate) fn process_metrics(_pid: u32, _expected: Option<ProcIdentity>) -> Pro
     // irrelevant while no metrics are reported — an all-`None` default can never
     // misattribute a recycled pid's counters, so it is honestly ignored.
     ProcMetrics::default()
+}
+
+/// Identity + best-effort metadata for an **arbitrary** pid — the macOS/BSD
+/// backend of the standalone [`process_info`](crate::process_info) query.
+/// Delegates to the shared POSIX process-group module, which reuses the very
+/// `proc_pidinfo` reader (macOS) or `kill(pid, 0)` existence probe (the bare BSDs)
+/// the group tracking already relies on, and keeps its "no such process" (`Ok(None)`)
+/// vs "can't look" (`Err`) distinction. Works for any pid the caller holds, not
+/// only tracked group leaders.
+#[cfg(feature = "process-control")]
+pub(crate) fn process_info(pid: u32) -> io::Result<Option<MemberInfo>> {
+    crate::sys::pgroup::process_info(pid)
 }
 
 #[cfg(feature = "stats")]

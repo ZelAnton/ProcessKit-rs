@@ -4,14 +4,17 @@
 /// An enriched snapshot of one member of a [`ProcessGroup`](crate::ProcessGroup)
 /// — its pid plus best-effort metadata (parent pid, image name, start time).
 ///
-/// Produced by [`ProcessGroup::members_info`](crate::ProcessGroup::members_info),
-/// the metadata-carrying companion to
-/// [`members`](crate::ProcessGroup::members) (which returns bare pids). *Which*
-/// processes appear follows the **same** platform matrix as `members` — the whole
-/// tree on Windows and Linux-cgroup, the tracked group *leaders* on the POSIX
-/// process-group fallback (macOS/BSD and Linux without a usable cgroup). The
-/// enriching fields beyond [`pid`](Self::pid) are each independently `Option` and
-/// are `None` wherever the platform can't report them — never a fabricated value.
+/// Produced two ways, both filling the same fields the same way: by
+/// [`ProcessGroup::members_info`](crate::ProcessGroup::members_info) — the
+/// metadata-carrying companion to [`members`](crate::ProcessGroup::members) (which
+/// returns bare pids) — for a *member* of a group, and by the free-standing
+/// [`process_info`](crate::process_info) query for an **arbitrary** pid the caller
+/// holds *outside* any group. From `members_info`, *which* processes appear follows
+/// the **same** platform matrix as `members` — the whole tree on Windows and
+/// Linux-cgroup, the tracked group *leaders* on the POSIX process-group fallback
+/// (macOS/BSD and Linux without a usable cgroup). The enriching fields beyond
+/// [`pid`](Self::pid) are each independently `Option` and are `None` wherever the
+/// platform can't report them — never a fabricated value.
 ///
 /// # Field availability by platform
 ///

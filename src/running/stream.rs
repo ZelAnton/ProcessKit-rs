@@ -106,7 +106,7 @@ impl RunningProcess {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`](crate::Error::Io) when stdout was not piped, or a prior
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io) when stdout was not piped, or a prior
     /// streaming verb ([`stdout_lines`](Self::stdout_lines) /
     /// [`output_events`](Self::output_events) / `wait_for_line`) already consumed
     /// it — returned instead of a stream that would silently be empty.
@@ -319,14 +319,14 @@ impl RunningProcess {
     ///
     /// A timeout or signal-kill is *captured* in the returned [`Finished`]'s
     /// [`outcome`](Finished::outcome), not raised. The `Err` cases are
-    /// [`Error::Cancelled`](crate::Error::Cancelled) (the run was cancelled via
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) (the run was cancelled via
     /// [`Command::cancel_on`](crate::Command::cancel_on)),
-    /// [`Error::OutputTooLarge`](crate::Error::OutputTooLarge) (a fail-loud
+    /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) (a fail-loud
     /// [`OutputBufferPolicy`](crate::OutputBufferPolicy) overflowed on a sink the
     /// caller opted into by streaming — a bare `finish` discards untouched stdout
-    /// and never trips it), [`Error::Stdin`](crate::Error::Stdin) (a
+    /// and never trips it), [`ErrorReason::Stdin`](crate::ErrorReason::Stdin) (a
     /// non-broken-pipe stdin-source failure on an otherwise-successful run), or
-    /// [`Error::Io`](crate::Error::Io) (waiting on the child failed).
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io) (waiting on the child failed).
     pub async fn finish(mut self) -> Result<Finished> {
         // A bare `finish()` (no prior `stdout_lines`/`output_events` took stdout)
         // still has to drain the leftover stdout so the child can't block on a full
@@ -383,17 +383,18 @@ impl RunningProcess {
             .flatten()
         {
             if sink.overflowed() {
-                return Err(crate::Error::OutputTooLarge {
+                return Err(crate::ErrorReason::OutputTooLarge {
                     program: self.program.clone(),
                     max_lines: self.buffer.max_lines,
                     max_bytes: self.buffer.max_bytes,
                     total_lines: sink.count(),
                     total_bytes: sink.seen_bytes(),
-                });
+                }
+                .into());
             }
         }
         // A first OS read error on either pipe means an incomplete capture:
-        // surface it as `Error::Io` rather than a silently-short "success". Unlike
+        // surface it as `ErrorReason::Io` rather than a silently-short "success". Unlike
         // the overflow check above (skipped for a bare finish's discarded stdout,
         // which the caller never asked to capture), a read error is an OS-level
         // failure of the child's pipe, so it is surfaced for the streamed and the
@@ -405,7 +406,7 @@ impl RunningProcess {
             .flatten()
         {
             if let Some(source) = sink.take_read_error() {
-                return Err(crate::Error::Io(source));
+                return Err(crate::Error::io(source));
             }
         }
         // `dropped()` = lines the buffer policy discarded from the background
@@ -435,7 +436,7 @@ impl RunningProcess {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`](crate::Error::Io) when stdout was not piped, or a prior
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io) when stdout was not piped, or a prior
     /// streaming verb already consumed it — returned instead of a stream that
     /// would silently be empty.
     pub fn output_events(&mut self) -> Result<OutputEvents> {
@@ -797,7 +798,7 @@ mod tests {
 
     /// T-087: after a streamed stdout hit an OS read error mid-stream, the
     /// streaming consumer wakes and ends (the sink closes), and the consuming
-    /// `finish` reports the cause as `Error::Io` — not a silently-short success.
+    /// `finish` reports the cause as `ErrorReason::Io` — not a silently-short success.
     /// The recorded error stands in for one a real pump would set (the pump seam
     /// is covered in `pump.rs`).
     #[tokio::test]
@@ -818,8 +819,8 @@ mod tests {
             .as_ref()
             .expect("streaming installed the stdout sink")
             .set_read_error(std::io::Error::other("stream read boom"));
-        match run.finish().await {
-            Err(crate::Error::Io(e)) => assert_eq!(e.to_string(), "stream read boom"),
+        match run.finish().await.map_err(|e| e.into_reason()) {
+            Err(crate::ErrorReason::Io(e)) => assert_eq!(e.to_string(), "stream read boom"),
             other => panic!("expected Err(Io) for an incomplete streamed capture, got {other:?}"),
         }
     }

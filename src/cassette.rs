@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::command::Command;
 use crate::doubles::Invocation;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorReason, Result};
 use crate::result::{Outcome, ProcessResult};
 use crate::runner::{JobRunner, ProcessRunner};
 
@@ -183,18 +183,18 @@ struct Entry {
 /// invocation raises the *same error* the recording run did, instead of the
 /// call silently falling through to a plain [`Entry`] read (or, before this
 /// existed, missing the cassette entirely with a misleading
-/// [`Error::CassetteMiss`]).
+/// [`ErrorReason::CassetteMiss`]).
 ///
 /// Deliberately **not** every [`Error`] variant: only the ones the raw
 /// [`ProcessRunner::output_string`]/[`ProcessRunner::start`] seam can actually
 /// return in record mode land here. A variant produced by a *checking* verb
 /// layered over an otherwise-successful [`ProcessResult`] —
-/// [`Exit`](Error::Exit), [`Timeout`](Error::Timeout),
-/// [`Signalled`](Error::Signalled) — is already reproduced through the
+/// [`Exit`](ErrorReason::Exit), [`Timeout`](ErrorReason::Timeout),
+/// [`Signalled`](ErrorReason::Signalled) — is already reproduced through the
 /// existing `code`/`timed_out`/`signal` fields and never needs this; only a
 /// call that returned no [`ProcessResult`] at all does.
 ///
-/// [`Cancelled`](Error::Cancelled) is deliberately **excluded** (never
+/// [`Cancelled`](ErrorReason::Cancelled) is deliberately **excluded** (never
 /// recorded, like the pre-this-task "record nothing" behavior): replay
 /// already short-circuits a *replaying* command's own cancelled token before
 /// ever consulting the cassette (mirroring the live runner's pre-spawn
@@ -205,11 +205,11 @@ struct Entry {
 /// [`Error`] addition, or one not listed above) still lands here via
 /// [`Other`](CassetteError::Other), carrying its `Display` message — so an
 /// `Err` is always reproduced as *some* error, never silently dropped back to
-/// a [`Error::CassetteMiss`].
+/// a [`ErrorReason::CassetteMiss`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 enum CassetteError {
-    /// [`Error::Spawn`]: the child could not be started.
+    /// [`ErrorReason::Spawn`]: the child could not be started.
     Spawn {
         /// The OS error's [`std::io::ErrorKind`], named — see
         /// [`io_kind_name`]/[`io_kind_from_name`].
@@ -217,15 +217,15 @@ enum CassetteError {
         /// The OS error's `Display` text.
         message: String,
     },
-    /// [`Error::NotFound`]: the program could not be located.
+    /// [`ErrorReason::NotFound`]: the program could not be located.
     NotFound {
         /// The `PATH` directories searched, joined — see
-        /// [`Error::NotFound`]'s `searched` field. Never logged elsewhere;
+        /// [`ErrorReason::NotFound`]'s `searched` field. Never logged elsewhere;
         /// stored here exactly like the rest of a cassette (verbatim,
         /// reviewed before committing).
         searched: Option<String>,
     },
-    /// [`Error::Stdin`]: feeding the child's stdin failed for a reason other
+    /// [`ErrorReason::Stdin`]: feeding the child's stdin failed for a reason other
     /// than a routine broken pipe.
     Stdin {
         /// See [`Spawn`](CassetteError::Spawn)'s `os_kind`.
@@ -233,20 +233,20 @@ enum CassetteError {
         /// The OS error's `Display` text.
         message: String,
     },
-    /// [`Error::OutputTooLarge`]: the captured output exceeded its ceiling.
+    /// [`ErrorReason::OutputTooLarge`]: the captured output exceeded its ceiling.
     OutputTooLarge {
         max_lines: Option<usize>,
         max_bytes: Option<usize>,
         total_lines: usize,
         total_bytes: usize,
     },
-    /// [`Error::Unsupported`]: the operation is not supported on this
+    /// [`ErrorReason::Unsupported`]: the operation is not supported on this
     /// platform/mechanism.
     Unsupported {
         /// A short description of the unsupported operation.
         operation: String,
     },
-    /// [`Error::Io`]: a low-level IO error from the crate's own machinery.
+    /// [`ErrorReason::Io`]: a low-level IO error from the crate's own machinery.
     Io {
         /// See [`Spawn`](CassetteError::Spawn)'s `os_kind`.
         os_kind: String,
@@ -254,7 +254,7 @@ enum CassetteError {
         message: String,
     },
     /// Any other `Error` variant, kept only as a `Display` message. Replays
-    /// as [`Error::Io`] with [`std::io::ErrorKind::Other`] — not the original
+    /// as [`ErrorReason::Io`] with [`std::io::ErrorKind::Other`] — not the original
     /// variant, but still a loud, informative `Err` rather than a silent
     /// cassette miss.
     Other {
@@ -265,22 +265,22 @@ enum CassetteError {
 
 impl CassetteError {
     /// Capture the inner runner's `Err` for the cassette, or `None` for
-    /// [`Error::Cancelled`] (see the type doc — deliberately never recorded).
+    /// [`ErrorReason::Cancelled`] (see the type doc — deliberately never recorded).
     fn from_error(err: &Error) -> Option<Self> {
-        Some(match err {
-            Error::Cancelled { .. } => return None,
-            Error::Spawn { source, .. } => CassetteError::Spawn {
+        Some(match err.reason() {
+            ErrorReason::Cancelled { .. } => return None,
+            ErrorReason::Spawn { source, .. } => CassetteError::Spawn {
                 os_kind: io_kind_name(source.kind()).to_owned(),
                 message: source.to_string(),
             },
-            Error::NotFound { searched, .. } => CassetteError::NotFound {
+            ErrorReason::NotFound { searched, .. } => CassetteError::NotFound {
                 searched: searched.clone(),
             },
-            Error::Stdin { source, .. } => CassetteError::Stdin {
+            ErrorReason::Stdin { source, .. } => CassetteError::Stdin {
                 os_kind: io_kind_name(source.kind()).to_owned(),
                 message: source.to_string(),
             },
-            Error::OutputTooLarge {
+            ErrorReason::OutputTooLarge {
                 max_lines,
                 max_bytes,
                 total_lines,
@@ -292,10 +292,10 @@ impl CassetteError {
                 total_lines: *total_lines,
                 total_bytes: *total_bytes,
             },
-            Error::Unsupported { operation } => CassetteError::Unsupported {
+            ErrorReason::Unsupported { operation } => CassetteError::Unsupported {
                 operation: operation.clone(),
             },
-            Error::Io(source) => CassetteError::Io {
+            ErrorReason::Io(source) => CassetteError::Io {
                 os_kind: io_kind_name(source.kind()).to_owned(),
                 message: source.to_string(),
             },
@@ -308,16 +308,16 @@ impl CassetteError {
     /// Reconstruct the [`Error`] this cassette error stands for, attributed to
     /// `program` (the replaying command's own [`Command::program_name`]).
     fn to_error(&self, program: &str) -> Error {
-        match self {
-            CassetteError::Spawn { os_kind, message } => Error::Spawn {
+        Error::from(match self {
+            CassetteError::Spawn { os_kind, message } => ErrorReason::Spawn {
                 program: program.to_owned(),
                 source: std::io::Error::new(io_kind_from_name(os_kind), message.clone()),
             },
-            CassetteError::NotFound { searched } => Error::NotFound {
+            CassetteError::NotFound { searched } => ErrorReason::NotFound {
                 program: program.to_owned(),
                 searched: searched.clone(),
             },
-            CassetteError::Stdin { os_kind, message } => Error::Stdin {
+            CassetteError::Stdin { os_kind, message } => ErrorReason::Stdin {
                 program: program.to_owned(),
                 source: std::io::Error::new(io_kind_from_name(os_kind), message.clone()),
             },
@@ -326,22 +326,24 @@ impl CassetteError {
                 max_bytes,
                 total_lines,
                 total_bytes,
-            } => Error::OutputTooLarge {
+            } => ErrorReason::OutputTooLarge {
                 program: program.to_owned(),
                 max_lines: *max_lines,
                 max_bytes: *max_bytes,
                 total_lines: *total_lines,
                 total_bytes: *total_bytes,
             },
-            CassetteError::Unsupported { operation } => Error::Unsupported {
+            CassetteError::Unsupported { operation } => ErrorReason::Unsupported {
                 operation: operation.clone(),
             },
-            CassetteError::Io { os_kind, message } => Error::Io(std::io::Error::new(
+            CassetteError::Io { os_kind, message } => ErrorReason::Io(std::io::Error::new(
                 io_kind_from_name(os_kind),
                 message.clone(),
             )),
-            CassetteError::Other { message } => Error::Io(std::io::Error::other(message.clone())),
-        }
+            CassetteError::Other { message } => {
+                ErrorReason::Io(std::io::Error::other(message.clone()))
+            }
+        })
     }
 }
 
@@ -646,7 +648,7 @@ fn lock_sibling(path: &Path) -> std::path::PathBuf {
 
 /// The `Err` raised when another writer is saving the same cassette right now.
 /// Its [`WouldBlock`](std::io::ErrorKind::WouldBlock) kind makes the wrapping
-/// [`Error::Io`] satisfy [`Error::is_transient`](crate::Error::is_transient) — so
+/// [`ErrorReason::Io`] satisfy [`Error::is_transient`](crate::Error::is_transient) — so
 /// the loser can simply retry once the winner's save completes, and the last
 /// confirmed-good cassette is preserved rather than silently overwritten.
 fn concurrent_save_conflict() -> std::io::Error {
@@ -943,11 +945,12 @@ fn reject_unrecordable_stdin(command: &Command) -> Result<()> {
         .effective_stdin_source()
         .is_some_and(|s| s.is_one_shot())
     {
-        return Err(Error::Unsupported {
+        return Err(ErrorReason::Unsupported {
             operation: "cassette record/replay with one-shot streaming stdin \
                         (from_reader/from_lines); use from_bytes/from_string/from_file"
                 .to_string(),
-        });
+        }
+        .into());
     }
     Ok(())
 }
@@ -1033,7 +1036,7 @@ enum Mode<R> {
 /// failure, a missing program, … — is recorded too (as a discriminant + payload;
 /// an internal, non-public schema detail — not every `Error` variant is
 /// representable, an unmodeled one falls back to its `Display` text),
-/// **except** [`Error::Cancelled`], which is never recorded (a caller-driven
+/// **except** [`ErrorReason::Cancelled`], which is never recorded (a caller-driven
 /// cancellation isn't a fact about the invocation to replay). Either way the
 /// real error still propagates to the record-mode caller unchanged.
 ///
@@ -1072,14 +1075,14 @@ enum Mode<R> {
 ///   values — a broader always-on env-keying alternative was considered and
 ///   deferred.)
 /// - **Duplicates** replay in capture order, then the last entry repeats.
-/// - **A miss is [`Error::CassetteMiss`]** (not `is_not_found()`): never a
+/// - **A miss is [`ErrorReason::CassetteMiss`]** (not `is_not_found()`): never a
 ///   surprise subprocess. A **recorded `Err`** replays as that same `Error`
 ///   rather than a result — this is a genuine behavioral difference from
 ///   cassettes written before this existed, where such an invocation instead
 ///   missed the cassette entirely.
 /// - The replayed result carries the *replaying* command's
 ///   [`timeout`](Command::timeout), so a recorded timed-out run surfaces as
-///   [`Error::Timeout`](crate::Error::Timeout) with the real deadline.
+///   [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) with the real deadline.
 /// - Covers the **text and streaming verbs**: `output_string` replays the
 ///   captured result, and [`start`](crate::ProcessRunner::start) replays the
 ///   recorded output through a scripted [`RunningProcess`](crate::RunningProcess)
@@ -1093,7 +1096,7 @@ enum Mode<R> {
 ///   never comes; bound it with a [`Command::timeout`](crate::Command::timeout), or
 ///   script it with a [`ScriptedRunner`](crate::testing::ScriptedRunner) instead).
 /// - **The runner's `output_bytes` verb is unsupported**
-///   ([`Error::Unsupported`](crate::Error::Unsupported)) in both modes: a cassette
+///   ([`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported)) in both modes: a cassette
 ///   stores lossy-UTF-8 text and cannot reproduce the exact raw bytes that verb
 ///   promises — capture bytes from a real or scripted runner. (This guards the
 ///   convenient default route, which would otherwise re-encode the recorded text
@@ -1207,7 +1210,7 @@ impl<R: ProcessRunner> RecordReplayRunner<R> {
     /// `O_EXCL` temp, so writers never stomp one temp or delete another's (a
     /// stale temp from a crashed writer is a harmless orphan). The lock is taken
     /// **non-blocking**: if another writer holds it at that instant, the save is
-    /// refused with a *transient* [`Error::Io`]
+    /// refused with a *transient* [`ErrorReason::Io`]
     /// ([`WouldBlock`](std::io::ErrorKind::WouldBlock), so
     /// [`is_transient`](crate::Error::is_transient) is `true` — retry once the
     /// other save completes) rather than silently overwriting it. This trades the
@@ -1217,7 +1220,7 @@ impl<R: ProcessRunner> RecordReplayRunner<R> {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the recorded entries cannot be serialized to JSON; if
+    /// [`ErrorReason::Io`] if the recorded entries cannot be serialized to JSON; if
     /// another writer holds the save lock (a transient
     /// [`WouldBlock`](std::io::ErrorKind::WouldBlock) conflict — see
     /// *Concurrency*); or if writing, renaming, or fsync'ing the cassette (or its
@@ -1251,8 +1254,8 @@ impl<R: ProcessRunner> RecordReplayRunner<R> {
             entries: entries.clone(),
         };
         let json = serde_json::to_string_pretty(&cassette)
-            .map_err(|e| Error::Io(std::io::Error::from(e)))?;
-        write_cassette(path, &json).map_err(Error::Io)?;
+            .map_err(|e| ErrorReason::Io(std::io::Error::from(e)))?;
+        write_cassette(path, &json).map_err(Error::io)?;
         dirty.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -1275,7 +1278,7 @@ fn validate_entry_outcome(entry: &Entry) -> Result<()> {
         + usize::from(entry.signal.is_some());
     if entry.error.is_some() {
         if indicators > 0 {
-            return Err(Error::Io(std::io::Error::new(
+            return Err(Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "cassette entry for `{}` carries both a recorded `error` and an outcome \
@@ -1287,7 +1290,7 @@ fn validate_entry_outcome(entry: &Entry) -> Result<()> {
         return Ok(());
     }
     if indicators > 1 {
-        return Err(Error::Io(std::io::Error::new(
+        return Err(Error::io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
                 "cassette entry for `{}` has a contradictory outcome: at most one of \
@@ -1305,7 +1308,7 @@ impl RecordReplayRunner<JobRunner> {
     ///
     /// # Errors
     ///
-    /// Always [`Error::Io`]: a missing file keeps its `NotFound` kind; a corrupt
+    /// Always [`ErrorReason::Io`]: a missing file keeps its `NotFound` kind; a corrupt
     /// file, a contradictory entry, an unknown format `version`, or a cassette
     /// over the 64 MiB size limit is `InvalidData`.
     pub fn replay(path: impl AsRef<Path>) -> Result<Self> {
@@ -1314,7 +1317,7 @@ impl RecordReplayRunner<JobRunner> {
         if let Ok(meta) = std::fs::metadata(path)
             && meta.len() > MAX_CASSETTE_BYTES
         {
-            return Err(Error::Io(std::io::Error::new(
+            return Err(Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "cassette is {} bytes, over the {MAX_CASSETTE_BYTES}-byte limit",
@@ -1322,7 +1325,7 @@ impl RecordReplayRunner<JobRunner> {
                 ),
             )));
         }
-        let text = std::fs::read_to_string(path).map_err(Error::Io)?;
+        let text = std::fs::read_to_string(path).map_err(Error::io)?;
         Self::from_cassette_text(&text)
     }
 
@@ -1383,7 +1386,7 @@ pub fn fuzz_cassette_replay(text: &str, calls: &[(String, Vec<String>)]) {
                         .await
                         .expect_err("a recorded error must replay as an error");
                     assert!(
-                        !matches!(err, Error::CassetteMiss { .. }),
+                        !matches!(err.reason(), ErrorReason::CassetteMiss { .. }),
                         "a matched recorded error must not become a cassette miss"
                     );
                 }
@@ -1398,7 +1401,7 @@ pub fn fuzz_cassette_replay(text: &str, calls: &[(String, Vec<String>)]) {
                     assert_eq!(actual.outcome(), expected_result.outcome());
                 }
                 None => match replayer.output_string(&command).await {
-                    Err(Error::CassetteMiss { .. }) => {}
+                    Err(ErrorReason::CassetteMiss { .. }) => {}
                     other => {
                         panic!("an unmatched invocation must be a CassetteMiss, got {other:?}")
                     }
@@ -1419,9 +1422,9 @@ fn replay_slots_from_text(text: &str) -> Result<HashMap<Key, ReplaySlot>> {
         version: u32,
     }
     let header: CassetteHeader =
-        serde_json::from_str(text).map_err(|e| Error::Io(std::io::Error::from(e)))?;
+        serde_json::from_str(text).map_err(|e| ErrorReason::Io(std::io::Error::from(e)))?;
     if header.version > CASSETTE_VERSION {
-        return Err(Error::Io(std::io::Error::new(
+        return Err(Error::io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
                 "cassette version {} is not supported (this build reads up to version {CASSETTE_VERSION})",
@@ -1430,7 +1433,7 @@ fn replay_slots_from_text(text: &str) -> Result<HashMap<Key, ReplaySlot>> {
         )));
     }
     let cassette: Cassette =
-        serde_json::from_str(text).map_err(|e| Error::Io(std::io::Error::from(e)))?;
+        serde_json::from_str(text).map_err(|e| ErrorReason::Io(std::io::Error::from(e)))?;
     let mut slots: HashMap<Key, ReplaySlot> = HashMap::new();
     for entry in cassette.entries {
         validate_entry_outcome(&entry)?;
@@ -1500,9 +1503,10 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 if let Some(token) = command.cancel_token()
                     && token.is_cancelled()
                 {
-                    return Err(Error::Cancelled {
+                    return Err(ErrorReason::Cancelled {
                         program: command.program_name(),
-                    });
+                    }
+                    .into());
                 }
                 // A capture verb on `stdout(Inherit/Null)` has nothing to read —
                 // the real runner and the scripted double both reject it, and the
@@ -1524,9 +1528,10 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                     {
                         Some(slot) => slot,
                         None => {
-                            return Err(Error::CassetteMiss {
+                            return Err(ErrorReason::CassetteMiss {
                                 program: command.program_name(),
-                            });
+                            }
+                            .into());
                         }
                     };
                     slot.play().clone()
@@ -1549,11 +1554,12 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
     /// bytes through the defaulted `start` path; capture bytes from a real or
     /// scripted runner instead.
     async fn output_bytes(&self, _command: &Command) -> Result<ProcessResult<Vec<u8>>> {
-        Err(Error::Unsupported {
+        Err(ErrorReason::Unsupported {
             operation: "output_bytes on a cassette (a lossy-UTF-8 text fixture cannot \
                         reproduce exact bytes; capture them from a real or scripted runner)"
                 .to_string(),
-        })
+        }
+        .into())
     }
 
     async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
@@ -1634,9 +1640,10 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 if let Some(token) = command.cancel_token()
                     && token.is_cancelled()
                 {
-                    return Err(Error::Cancelled {
+                    return Err(ErrorReason::Cancelled {
                         program: command.program_name(),
-                    });
+                    }
+                    .into());
                 }
                 let invocation = Invocation::from_command(command);
                 let stdin_digest = stdin_digest_of(command);
@@ -1646,9 +1653,10 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                     {
                         Some(slot) => slot,
                         None => {
-                            return Err(Error::CassetteMiss {
+                            return Err(ErrorReason::CassetteMiss {
                                 program: command.program_name(),
-                            });
+                            }
+                            .into());
                         }
                     };
                     slot.play().clone()
@@ -1966,7 +1974,7 @@ mod tests {
             .await
             .expect_err("output_bytes must be unsupported in record mode");
         assert!(
-            matches!(rec_err, Error::Unsupported { .. }),
+            matches!(rec_err.reason(), ErrorReason::Unsupported { .. }),
             "got {rec_err:?}"
         );
         // The rejected call recorded nothing; a real entry is still needed to load.
@@ -1982,7 +1990,7 @@ mod tests {
             .await
             .expect_err("output_bytes must be unsupported in replay mode");
         assert!(
-            matches!(rep_err, Error::Unsupported { .. }),
+            matches!(rep_err.reason(), ErrorReason::Unsupported { .. }),
             "got {rep_err:?}"
         );
     }
@@ -2029,7 +2037,7 @@ mod tests {
         let err = RecordReplayRunner::replay(&path)
             .expect_err("a contradictory outcome must be rejected");
         assert!(
-            matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidData),
+            matches!(err.reason(), ErrorReason::Io(e) if e.kind() == std::io::ErrorKind::InvalidData),
             "got {err:?}"
         );
     }
@@ -2049,9 +2057,9 @@ mod tests {
             .output_string(&Command::new("tool").arg("--other"))
             .await
             .expect_err("an unrecorded invocation must not be served");
-        match &err {
-            Error::CassetteMiss { program } => assert_eq!(program, "tool"),
-            other => panic!("expected Error::CassetteMiss, got {other:?}"),
+        match err.reason() {
+            ErrorReason::CassetteMiss { program } => assert_eq!(program, "tool"),
+            other => panic!("expected ErrorReason::CassetteMiss, got {other:?}"),
         }
         // A stale cassette is NOT mistaken for a missing program.
         assert!(
@@ -2130,7 +2138,10 @@ mod tests {
             .output_string(&Command::new("tool").stdin(crate::Stdin::from_reader(&b"payload"[..])))
             .await
             .expect_err("record must reject a one-shot streaming stdin");
-        assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::Unsupported { .. }),
+            "got {err:?}"
+        );
 
         // Record a plain entry so the cassette loads, then prove replay rejects
         // a streaming stdin too.
@@ -2144,7 +2155,10 @@ mod tests {
             .output_string(&Command::new("tool").stdin(crate::Stdin::from_reader(&b"payload"[..])))
             .await
             .expect_err("replay must reject a one-shot streaming stdin");
-        assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::Unsupported { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -2204,7 +2218,10 @@ mod tests {
             .output_string(&Command::new("tool"))
             .await
             .expect_err("a no-stdin call must not match a stdin-recorded entry");
-        assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::CassetteMiss { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -2229,9 +2246,9 @@ mod tests {
             )
             .await
             .expect_err("run() raises the captured timeout");
-        match err {
-            Error::Timeout { timeout, .. } => assert_eq!(timeout, Duration::from_secs(7)),
-            other => panic!("expected Error::Timeout, got {other:?}"),
+        match err.into_reason() {
+            ErrorReason::Timeout { timeout, .. } => assert_eq!(timeout, Duration::from_secs(7)),
+            other => panic!("expected ErrorReason::Timeout, got {other:?}"),
         }
     }
 
@@ -2297,20 +2314,20 @@ mod tests {
     #[tokio::test]
     async fn load_errors_are_typed_io() {
         let (_dir, path) = temp_cassette();
-        match RecordReplayRunner::replay(&path) {
-            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+        match RecordReplayRunner::replay(&path).map_err(|e| e.into_reason()) {
+            Err(ErrorReason::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
             other => panic!("expected Io(NotFound), got {other:?}"),
         }
 
         std::fs::write(&path, "{ not json").unwrap();
-        match RecordReplayRunner::replay(&path) {
-            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+        match RecordReplayRunner::replay(&path).map_err(|e| e.into_reason()) {
+            Err(ErrorReason::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
             other => panic!("expected Io(InvalidData), got {other:?}"),
         }
 
         std::fs::write(&path, r#"{ "version": 99, "entries": [] }"#).unwrap();
-        match RecordReplayRunner::replay(&path) {
-            Err(Error::Io(e)) => {
+        match RecordReplayRunner::replay(&path).map_err(|e| e.into_reason()) {
+            Err(ErrorReason::Io(e)) => {
                 assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
                 assert!(e.to_string().contains("version 99"), "got: {e}");
             }
@@ -2331,8 +2348,8 @@ mod tests {
             r#"{ "version": 99, "entries": [ { "program": "x", "args": [], "code": "not-a-number" } ] }"#,
         )
         .unwrap();
-        match RecordReplayRunner::replay(&path) {
-            Err(Error::Io(e)) => {
+        match RecordReplayRunner::replay(&path).map_err(|e| e.into_reason()) {
+            Err(ErrorReason::Io(e)) => {
                 assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
                 assert!(
                     e.to_string().contains("version 99"),
@@ -2366,8 +2383,8 @@ mod tests {
             .output_string(&cmd)
             .await
             .expect_err("a non-piped stdout must error, even against a matching entry");
-        match err {
-            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        match err.into_reason() {
+            ErrorReason::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
             other => panic!("expected Io(InvalidInput), got {other:?}"),
         }
     }
@@ -2449,12 +2466,18 @@ mod tests {
             .output_string(&Command::new("other").arg("build").current_dir("dir-b"))
             .await
             .expect_err("a different program is still a miss");
-        assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::CassetteMiss { .. }),
+            "got {err:?}"
+        );
         let err = replayer
             .output_string(&Command::new("tool").arg("test").current_dir("dir-b"))
             .await
             .expect_err("different args are still a miss");
-        assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::CassetteMiss { .. }),
+            "got {err:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -2636,7 +2659,7 @@ mod tests {
             .await
             .expect_err("the refused save's run must be absent");
         assert!(
-            matches!(miss, Error::CassetteMiss { .. }),
+            matches!(miss.reason(), ErrorReason::CassetteMiss { .. }),
             "the clobbering entry must be absent (a miss), got {miss:?}"
         );
     }
@@ -2697,7 +2720,7 @@ mod tests {
             .save()
             .expect_err("renaming the temp over a directory must fail, not silently succeed");
         assert!(
-            matches!(err, Error::Io(_)),
+            matches!(err.reason(), ErrorReason::Io(_)),
             "a write/rename failure is an Io error, got {err:?}"
         );
         // The recorder is still dirty; dropping it re-runs the best-effort flush,
@@ -2782,7 +2805,10 @@ mod tests {
             .run(&Command::new("tool"))
             .await
             .expect_err("run must reject a truncated replay");
-        assert!(matches!(err, Error::OutputTooLarge { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::OutputTooLarge { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -2841,7 +2867,10 @@ mod tests {
             .output_string(&Command::new("tool").arg("--version").cancel_on(token))
             .await
             .expect_err("a pre-cancelled token must short-circuit replay");
-        assert!(matches!(err, Error::Cancelled { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::Cancelled { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -2863,17 +2892,20 @@ mod tests {
             .start(&Command::new("tool").arg("--version").cancel_on(token))
             .await
             .expect_err("a pre-cancelled token must short-circuit start replay");
-        assert!(matches!(err, Error::Cancelled { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::Cancelled { .. }),
+            "got {err:?}"
+        );
     }
 
     /// An inner runner whose `output_string` always fails with a fixed `Error`
     /// (never a `ProcessResult`) — stands in for a real spawn/lookup failure so
     /// record mode has an `Err` to capture (T-018).
-    struct FailingInner(fn(&str) -> Error);
+    struct FailingInner(fn(&str) -> ErrorReason);
     #[async_trait::async_trait]
     impl ProcessRunner for FailingInner {
         async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
-            Err((self.0)(&command.program_name()))
+            Err((self.0)(&command.program_name()).into())
         }
     }
 
@@ -2881,9 +2913,9 @@ mod tests {
     async fn record_of_a_not_found_err_replays_the_same_not_found_error() {
         // T-018: a record-mode call that returns `Err` must no longer vanish
         // into thin air — replaying the same invocation must reproduce the
-        // recorded `Error::NotFound`, not miss the cassette.
+        // recorded `ErrorReason::NotFound`, not miss the cassette.
         let (_dir, path) = temp_cassette();
-        let inner = FailingInner(|program| Error::NotFound {
+        let inner = FailingInner(|program| ErrorReason::NotFound {
             program: program.to_owned(),
             searched: Some("/usr/bin:/bin".to_owned()),
         });
@@ -2893,7 +2925,7 @@ mod tests {
             .await
             .expect_err("the inner runner's Err must still reach the record-mode caller");
         assert!(
-            matches!(&record_err, Error::NotFound { .. }),
+            matches!(record_err.reason(), ErrorReason::NotFound { .. }),
             "got {record_err:?}"
         );
         recorder.save().expect("save");
@@ -2903,12 +2935,12 @@ mod tests {
             .output_string(&Command::new("ghost"))
             .await
             .expect_err("replay must reproduce the recorded NotFound, not CassetteMiss");
-        match &replay_err {
-            Error::NotFound { program, searched } => {
+        match replay_err.reason() {
+            ErrorReason::NotFound { program, searched } => {
                 assert_eq!(program, "ghost");
                 assert_eq!(searched.as_deref(), Some("/usr/bin:/bin"));
             }
-            other => panic!("expected Error::NotFound, got {other:?}"),
+            other => panic!("expected ErrorReason::NotFound, got {other:?}"),
         }
         assert!(
             replay_err.is_not_found(),
@@ -2918,7 +2950,7 @@ mod tests {
         // The same round trip through `start`, which shares the recording and
         // replay machinery with `output_string`.
         let (_dir2, path2) = temp_cassette();
-        let inner2 = FailingInner(|program| Error::NotFound {
+        let inner2 = FailingInner(|program| ErrorReason::NotFound {
             program: program.to_owned(),
             searched: None,
         });
@@ -2933,7 +2965,10 @@ mod tests {
             .start(&Command::new("ghost"))
             .await
             .expect_err("start replay must reproduce the recorded NotFound");
-        assert!(matches!(err2, Error::NotFound { .. }), "got {err2:?}");
+        assert!(
+            matches!(err2.reason(), ErrorReason::NotFound { .. }),
+            "got {err2:?}"
+        );
     }
 
     #[tokio::test]
@@ -2942,7 +2977,7 @@ mod tests {
         // classifiers (`is_permission_denied`) to still work after replay, not
         // just the message text.
         let (_dir, path) = temp_cassette();
-        let inner = FailingInner(|program| Error::Spawn {
+        let inner = FailingInner(|program| ErrorReason::Spawn {
             program: program.to_owned(),
             source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
         });
@@ -2958,7 +2993,10 @@ mod tests {
             .output_string(&Command::new("tool"))
             .await
             .expect_err("replay reproduces the recorded Spawn error");
-        assert!(matches!(err, Error::Spawn { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::Spawn { .. }),
+            "got {err:?}"
+        );
         assert!(
             err.is_permission_denied(),
             "the recorded os error kind must survive replay: {err:?}"
@@ -2967,13 +3005,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancelled_record_mode_call_is_never_persisted_to_the_cassette() {
-        // Error::Cancelled is caller-state, not a fact about the invocation —
+        // ErrorReason::Cancelled is caller-state, not a fact about the invocation —
         // recording it would make an unrelated future replay wrongly cancelled.
         // It must simply not appear in the cassette (like the old "record
         // nothing for an Err" behavior), so a later real recording of the same
         // invocation can still be captured normally.
         let (_dir, path) = temp_cassette();
-        let inner = FailingInner(|program| Error::Cancelled {
+        let inner = FailingInner(|program| ErrorReason::Cancelled {
             program: program.to_owned(),
         });
         let recorder = RecordReplayRunner::record(&path, inner);
@@ -2981,7 +3019,7 @@ mod tests {
             .output_string(&Command::new("tool"))
             .await
             .expect_err("the cancelled call still surfaces its real error to the caller");
-        assert!(matches!(err, Error::Cancelled { .. }));
+        assert!(matches!(err.reason(), ErrorReason::Cancelled { .. }));
         recorder.save().expect("save");
 
         let replayer = RecordReplayRunner::replay(&path).expect("load");
@@ -2990,7 +3028,7 @@ mod tests {
             .await
             .expect_err("a cassette with no recorded entry for this invocation must miss");
         assert!(
-            matches!(err, Error::CassetteMiss { .. }),
+            matches!(err.reason(), ErrorReason::CassetteMiss { .. }),
             "Cancelled must never be persisted, got {err:?}"
         );
     }
@@ -3019,14 +3057,14 @@ mod tests {
 
     #[tokio::test]
     async fn unmodeled_error_variant_falls_back_to_other_rather_than_dropping_silently() {
-        // `Error::Parse` has no dedicated `CassetteError` arm — `from_error`'s
+        // `ErrorReason::Parse` has no dedicated `CassetteError` arm — `from_error`'s
         // catch-all `other =>` routes it into `CassetteError::Other`, and
-        // `to_error` reconstructs that as `Error::Io(ErrorKind::Other)` carrying
+        // `to_error` reconstructs that as `ErrorReason::Io(ErrorKind::Other)` carrying
         // the original `Display` text, never the original variant. This is the
         // lossy safety-net path: it must still land as *some* Err, never a
         // silent CassetteMiss.
         let (_dir, path) = temp_cassette();
-        let inner = FailingInner(|program| Error::Parse {
+        let inner = FailingInner(|program| ErrorReason::Parse {
             program: program.to_owned(),
             message: "unexpected token at line 3".to_owned(),
         });
@@ -3043,23 +3081,23 @@ mod tests {
             .output_string(&Command::new("tool"))
             .await
             .expect_err("replay must reproduce the Other fallback, not miss the cassette");
-        match err {
-            Error::Io(source) => {
+        match err.into_reason() {
+            ErrorReason::Io(source) => {
                 assert_eq!(source.kind(), std::io::ErrorKind::Other, "got {source:?}");
                 assert_eq!(source.to_string(), expected_message);
             }
-            other => panic!("expected Error::Io(ErrorKind::Other), got {other:?}"),
+            other => panic!("expected ErrorReason::Io(ErrorKind::Other), got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn modeled_unsupported_error_round_trips_exactly_through_replay() {
-        // Unlike `Parse` above, `Error::Unsupported` has an explicit
+        // Unlike `Parse` above, `ErrorReason::Unsupported` has an explicit
         // `CassetteError::Unsupported` arm in `from_error`/`to_error`, so it
         // must survive record/replay with full fidelity (variant and fields),
         // not just as a lossy `Other` message.
         let (_dir, path) = temp_cassette();
-        let inner = FailingInner(|_program| Error::Unsupported {
+        let inner = FailingInner(|_program| ErrorReason::Unsupported {
             operation: "signal(Hup)".to_owned(),
         });
         let recorder = RecordReplayRunner::record(&path, inner);
@@ -3074,9 +3112,9 @@ mod tests {
             .output_string(&Command::new("tool"))
             .await
             .expect_err("replay must reproduce Unsupported, not miss the cassette");
-        match err {
-            Error::Unsupported { operation } => assert_eq!(operation, "signal(Hup)"),
-            other => panic!("expected Error::Unsupported, got {other:?}"),
+        match err.into_reason() {
+            ErrorReason::Unsupported { operation } => assert_eq!(operation, "signal(Hup)"),
+            other => panic!("expected ErrorReason::Unsupported, got {other:?}"),
         }
     }
 
@@ -3135,7 +3173,10 @@ mod tests {
             .output_string(&Command::new("tool").env("MODE", "slow"))
             .await
             .expect_err("a differing selected env value must miss under the policy");
-        assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::CassetteMiss { .. }),
+            "got {err:?}"
+        );
 
         let still_hit = replayer
             .run(
@@ -3238,7 +3279,10 @@ mod tests {
             .output_string(&Command::new("tool")) // FLAG untouched
             .await
             .expect_err("an untouched selected var must not match a set-var recording");
-        assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::CassetteMiss { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -3270,7 +3314,10 @@ mod tests {
             .output_string(&Command::new("tool").current_dir("/work/b"))
             .await
             .expect_err("a differing cwd must miss under match_on_cwd");
-        assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::CassetteMiss { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -3294,7 +3341,10 @@ mod tests {
             .output_string(&Command::new("tool").env("MODE", "a"))
             .await
             .expect_err("a policy-keyed entry must not match a no-policy replay");
-        assert!(matches!(err, Error::CassetteMiss { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::CassetteMiss { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

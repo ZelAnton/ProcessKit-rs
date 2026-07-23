@@ -112,6 +112,30 @@ pub(crate) fn process_identity(pid: u32) -> Option<ProcIdentity> {
     imp::process_identity(pid)
 }
 
+/// Identity + best-effort metadata for an **arbitrary** pid (not one tracked by
+/// any group) — the platform-dispatching core of the public
+/// [`process_info`](crate::process_info) query. Returns the same fields a
+/// [`MemberInfo`](crate::MemberInfo) carries for a group member, read through the
+/// **same** per-platform readers (`/proc/<pid>/stat` on Linux, `proc_pidinfo` on
+/// macOS, `Toolhelp32` + creation `FILETIME` on Windows, a `kill(pid, 0)` existence
+/// probe on the bare BSDs).
+///
+/// The three-way contract every backend upholds:
+/// - `Ok(Some(info))` — the process exists; each enriching field is honestly
+///   `Option` (`None` where the platform can't report it).
+/// - `Ok(None)` — the process definitively does **not** exist (an honest negative,
+///   never an error).
+/// - `Err` — the process may exist but couldn't be inspected (a permission denial
+///   or other OS error), so a caller never mistakes "not allowed to look" for
+///   "dead".
+///
+/// Reads no argv/environment on any platform — the crate's standing "never
+/// argv/env" rule.
+#[cfg(feature = "process-control")]
+pub(crate) fn process_info(pid: u32) -> io::Result<Option<crate::member::MemberInfo>> {
+    imp::process_info(pid)
+}
+
 // Shared POSIX process-group backend for both the Linux fallback and macOS/BSD.
 #[cfg(unix)]
 pub(crate) mod pgroup;
@@ -353,4 +377,18 @@ impl Job {
     pub(crate) fn mechanism(&self) -> Mechanism {
         self.0.mechanism()
     }
+}
+
+/// Read-only prediction of the containment [`Mechanism`] a fresh [`Job`] would use
+/// on this host **right now**, computed without creating any OS object or spawning
+/// a process — the detection extracted from the group-creation path so it can back
+/// the public `host_containment()` query as well.
+///
+/// A fixed constant on Windows ([`Mechanism::JobObject`]) and macOS/BSD
+/// ([`Mechanism::ProcessGroup`]); on Linux a best-effort read-only probe of cgroup
+/// v2 availability and writability that agrees with [`Job::new`]'s selection on any
+/// real host, differing only in the rare window where a writable-looking cgroup then
+/// rejects leaf creation (see the Linux backend's `detect_mechanism`).
+pub(crate) fn detect_mechanism() -> Mechanism {
+    imp::detect_mechanism()
 }
