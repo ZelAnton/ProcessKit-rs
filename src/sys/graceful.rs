@@ -33,12 +33,76 @@ use tokio::time::{Instant, sleep};
 /// How often the graceful tier re-checks whether the tree has drained.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// What became of a graceful teardown's best-effort **soft-signal** tier — the
+/// observed fate of the `SIGTERM` / `CTRL_BREAK` / `WM_CLOSE` request the driver
+/// issues before the grace window. The always-available, feature-agnostic core
+/// behind the public `SoftSignal` report enum: it carries no public `Signal`, so
+/// the unconditional `shutdown`/`shutdown_ref` paths can produce it too (and
+/// simply discard it).
+///
+/// A target that actually reaches [`run`] always *has* a soft-signal tier (unix
+/// always signals; the Windows atomic branch that has neither a console-CTRL
+/// leader nor a windowed member never drives the driver), so
+/// [`signal_all`](GracefulTarget::signal_all) only ever returns [`Sent`](Self::Sent)
+/// or [`Failed`](Self::Failed). [`Unsupported`](Self::Unsupported) is synthesised
+/// by that atomic branch alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SoftDelivery {
+    /// The soft signal was delivered best-effort to the tree (a POSIX signal on
+    /// unix; at least one `CTRL_BREAK`/`WM_CLOSE` trigger posted on the Windows
+    /// soft tier).
+    Sent,
+    /// This platform/target has no soft-signal tier for the group, so the teardown
+    /// could only hard-kill: a windowless Windows Job Object with no console-CTRL
+    /// leader. Constructed only by that Windows atomic branch — every Unix backend
+    /// always has a real `SIGTERM` tier — so it is dead on Unix (the variant stays
+    /// in the cross-platform enum the public `SoftSignal::Unsupported` maps from).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Unsupported,
+    /// A soft-signal tier exists but the best-effort delivery failed for every
+    /// target (a uid-changed member rejecting the signal on unix; no live
+    /// console/window target reached on Windows).
+    Failed,
+}
+
+/// The observed facts of one whole-tree graceful teardown, surfaced by the shared
+/// driver [`run`] (and synthesised by the Windows atomic branch that bypasses it).
+/// The always-available core the public `ShutdownReport` is built from; kept
+/// feature-agnostic so the unconditional `shutdown`/`shutdown_ref` paths produce it
+/// and discard it, while the `process-control`-gated public method reads it.
+#[derive(Debug, Clone, Copy)]
+// Only the `process-control`-gated public report reads these fields; the
+// unconditional shutdown paths construct and discard the value.
+#[cfg_attr(not(feature = "process-control"), allow(dead_code))]
+pub(crate) struct GracefulOutcome {
+    /// The fate of the best-effort soft-signal tier.
+    pub soft: SoftDelivery,
+    /// Live members observed just before the soft signal, or `None` if the
+    /// membership could not be read.
+    pub members_before: Option<usize>,
+    /// Live members observed after the grace window and any hard kill, or `None`
+    /// if the membership could not be read.
+    pub members_after: Option<usize>,
+    /// Whether the tree drained within the grace window, before any hard kill.
+    pub drained: bool,
+    /// Whether the driver escalated to a hard kill.
+    pub escalated: bool,
+    /// How long the teardown actually took. Measured on the tokio clock, so the
+    /// hermetic paused-clock tests observe virtual time (an early drain reports a
+    /// short duration, not the whole grace).
+    pub elapsed: Duration,
+}
+
 /// The per-backend primitives behind the shared escalation algorithm: a
-/// teardown target the [`run`] driver can signal, observe, and hard-kill.
+/// teardown target the [`run`] driver can signal, observe, count, and hard-kill.
 pub(crate) trait GracefulTarget {
-    /// Best-effort graceful signal to every process in the tree. Failures are
-    /// swallowed — the driver proceeds to poll regardless.
-    fn signal_all(&self, signal: i32);
+    /// Best-effort graceful signal to every process in the tree, reporting whether
+    /// the tier actually delivered ([`SoftDelivery::Sent`]) or failed for every
+    /// target ([`SoftDelivery::Failed`]). Delivery failures never stop the driver —
+    /// it proceeds to poll regardless; the verdict is recorded for the report only.
+    /// A target reaching this method always has a soft-signal tier, so it never
+    /// returns [`SoftDelivery::Unsupported`].
+    fn signal_all(&self, signal: i32) -> SoftDelivery;
 
     /// Whether the tree has fully drained (no tracked process remains alive).
     /// May refresh a backend's internal liveness cache (e.g. the pgroup
@@ -46,6 +110,15 @@ pub(crate) trait GracefulTarget {
     /// survivor would corrupt a later `members()`/`stats()` under
     /// `escalate = false`.
     fn is_drained(&self) -> bool;
+
+    /// How many tracked members are currently alive, or `None` if the membership
+    /// could not be read (e.g. an unreadable `cgroup.procs` or a failed Job Object
+    /// query). Probe-only, like [`is_drained`](Self::is_drained): it must **not**
+    /// prune the tracked set (the report's before/after counts are observations,
+    /// not a teardown side-effect). Counts the same member set the backend's
+    /// `members()` reports (the whole tree on the cgroup/Job Object mechanisms, the
+    /// tracked group leaders on the POSIX process-group fallback).
+    fn alive_count(&self) -> Option<usize>;
 
     /// Forcibly kill any survivors. Called only when escalation is requested
     /// and the tree has not drained by the deadline.
@@ -74,15 +147,23 @@ pub(crate) async fn run(
     signal: i32,
     timeout: Duration,
     escalate: bool,
-) -> io::Result<()> {
+) -> io::Result<GracefulOutcome> {
+    // Anchor the reported duration on the tokio clock (like the deadline below), so
+    // a hermetic paused-clock test sees virtual time: an early drain reports the few
+    // polls it actually slept, not the whole grace.
+    let started = Instant::now();
+    // The membership *before* the soft signal — one of the report's headline facts.
+    // A probe-only read (no pruning), like `is_drained`.
+    let members_before = target.alive_count();
     // Snapshot the re-arm generation up front: any spawn/adopt that re-arms the
     // backstop after this point must win over this shutdown's later spare, so the
     // window has to cover the signal + poll below, not just the final `request`.
     let epoch = skip_drop_kill.begin_shutdown();
-    // Best-effort: the graceful tier proceeds to polling regardless.
-    target.signal_all(signal);
+    // Best-effort: the graceful tier proceeds to polling regardless of the verdict,
+    // which is recorded for the report only.
+    let soft = target.signal_all(signal);
     // Clamp so a `Duration::MAX`-ish timeout can't overflow the `Instant` add.
-    let deadline = Instant::now() + timeout.min(crate::MAX_DEADLINE);
+    let deadline = started + timeout.min(crate::MAX_DEADLINE);
     while !target.is_drained() {
         let now = Instant::now();
         if now >= deadline {
@@ -92,16 +173,36 @@ pub(crate) async fn run(
         // relative to the remaining grace.
         sleep(POLL_INTERVAL.min(deadline - now)).await;
     }
-    if escalate && !target.is_drained() {
-        target.hard_kill()?;
-    } else if !escalate {
-        // Tell Drop not to hard-kill the survivors the caller chose to leave
-        // alive; the latch makes the decision visible whichever thread runs Drop.
-        // Keyed to `epoch`, so a spawn/adopt that re-armed mid-shutdown wins and
-        // this spare becomes a no-op — the fresh child is still torn down.
-        skip_drop_kill.request(epoch);
-    }
-    Ok(())
+    // Whether the tree drained within the grace, before any hard kill — read once
+    // and reused for both the escalation decision and the report.
+    let drained = target.is_drained();
+    let escalated = escalate && !drained;
+    let kill_result = if escalated {
+        target.hard_kill()
+    } else {
+        if !escalate {
+            // Tell Drop not to hard-kill the survivors the caller chose to leave
+            // alive; the latch makes the decision visible whichever thread runs
+            // Drop. Keyed to `epoch`, so a spawn/adopt that re-armed mid-shutdown
+            // wins and this spare becomes a no-op — the fresh child is still torn
+            // down.
+            skip_drop_kill.request(epoch);
+        }
+        Ok(())
+    };
+    // The membership *after* everything — survivors spared (`!escalate`), zombies a
+    // pgroup `SIGKILL` left unreaped, or zero on an atomic drain. Read after the
+    // kill so the report reflects the final state.
+    let members_after = target.alive_count();
+    let elapsed = started.elapsed();
+    kill_result.map(|()| GracefulOutcome {
+        soft,
+        members_before,
+        members_after,
+        drained,
+        escalated,
+        elapsed,
+    })
 }
 
 /// The per-target primitives behind the **single-child** graceful kill-and-reap:
@@ -269,8 +370,9 @@ mod tests {
     }
 
     impl GracefulTarget for FakeTarget {
-        fn signal_all(&self, _signal: i32) {
+        fn signal_all(&self, _signal: i32) -> SoftDelivery {
             self.signals.fetch_add(1, Ordering::Relaxed);
+            SoftDelivery::Sent
         }
 
         fn is_drained(&self) -> bool {
@@ -280,6 +382,15 @@ mod tests {
             }
             self.alive_polls.store(remaining - 1, Ordering::Relaxed);
             false
+        }
+
+        fn alive_count(&self) -> Option<usize> {
+            // Model a live count that tracks the drain: `alive_polls` counts down to
+            // 0 as `is_drained` is polled, so the "before" read (pre-drain) reports
+            // the initial members and the "after" read (post-drain) reports 0. A
+            // saturating `usize::MAX` (the never-drains cases) is reported as-is —
+            // those tests assert on hard-kill counts, not the member tally.
+            Some(self.alive_polls.load(Ordering::Relaxed))
         }
 
         fn hard_kill(&self) -> io::Result<()> {
@@ -386,7 +497,9 @@ mod tests {
             polls: AtomicUsize,
         }
         impl GracefulTarget for RacingRearm<'_> {
-            fn signal_all(&self, _signal: i32) {}
+            fn signal_all(&self, _signal: i32) -> SoftDelivery {
+                SoftDelivery::Sent
+            }
             fn is_drained(&self) -> bool {
                 if self.polls.fetch_add(1, Ordering::Relaxed) == 1 {
                     // A concurrent spawn/adopt re-arms the backstop for a fresh
@@ -394,6 +507,9 @@ mod tests {
                     self.latch.clear();
                 }
                 false
+            }
+            fn alive_count(&self) -> Option<usize> {
+                None
             }
             fn hard_kill(&self) -> io::Result<()> {
                 Ok(())
@@ -454,6 +570,62 @@ mod tests {
         run(&target, &skip, 15, Duration::MAX, true)
             .await
             .expect("graceful run with saturating timeout");
+    }
+
+    // The headline property of the whole task: a tree that drains early does NOT
+    // burn the whole grace, and the reported `elapsed` proves it (measured on the
+    // tokio clock, so the paused runtime advances only by the polls actually slept).
+    #[tokio::test(start_paused = true)]
+    async fn outcome_reports_an_early_drain_without_spending_the_whole_grace() {
+        let target = FakeTarget::new(3); // alive for a few polls, then drained
+        let skip = crate::sys::SkipDropKill::new();
+        let outcome = run(&target, &skip, 15, Duration::from_secs(30), true)
+            .await
+            .expect("graceful run");
+        assert_eq!(outcome.soft, SoftDelivery::Sent, "the soft signal was issued");
+        assert!(outcome.drained, "the tree drained within the grace");
+        assert!(!outcome.escalated, "an in-time drain needs no hard kill");
+        assert_eq!(outcome.members_before, Some(3), "three members before the signal");
+        assert_eq!(outcome.members_after, Some(0), "none left after the drain");
+        assert!(
+            outcome.elapsed < Duration::from_secs(30),
+            "an early drain must not spend the whole grace window (took {:?})",
+            outcome.elapsed
+        );
+    }
+
+    // Escalation is reflected in the report: a tree that never drains within the
+    // grace is hard-killed, and `escalated` says so.
+    #[tokio::test]
+    async fn outcome_reports_escalation_when_the_tree_does_not_drain() {
+        let target = FakeTarget::new(usize::MAX); // never drains
+        let skip = crate::sys::SkipDropKill::new();
+        let outcome = run(&target, &skip, 15, Duration::ZERO, true)
+            .await
+            .expect("graceful run");
+        assert!(!outcome.drained, "the tree never drained");
+        assert!(outcome.escalated, "escalation to the hard kill is reported");
+        assert_eq!(
+            target.hard_kills.load(Ordering::Relaxed),
+            1,
+            "the hard kill actually fired"
+        );
+        assert!(outcome.members_before.is_some(), "a member count was read");
+    }
+
+    // A non-escalating shutdown that leaves survivors reports `drained = false`,
+    // `escalated = false`, and sets the skip latch so Drop spares them.
+    #[tokio::test]
+    async fn outcome_reports_spared_survivors_without_escalating() {
+        let target = FakeTarget::new(usize::MAX); // never drains
+        let skip = crate::sys::SkipDropKill::new();
+        let outcome = run(&target, &skip, 15, Duration::ZERO, false)
+            .await
+            .expect("graceful run");
+        assert!(!outcome.drained, "the tree was left running, not drained");
+        assert!(!outcome.escalated, "a non-escalating shutdown never hard-kills");
+        assert_eq!(target.hard_kills.load(Ordering::Relaxed), 0, "no hard kill");
+        assert!(skip.is_set(), "survivors are spared on Drop");
     }
 
     /// A scriptable [`PidTarget`] for the single-child driver: records the

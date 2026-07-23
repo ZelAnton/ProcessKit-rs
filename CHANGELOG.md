@@ -23,6 +23,19 @@ to a dated version section.
   hundreds-of-megabytes build log already being teed to a file streams through
   without ever being held in memory — no more capturing with `output_string` only
   to throw the result away
+- Add `ProcessGroup::stop(grace, escalate)` (needs `process-control`), the
+  observable sibling of `shutdown_ref`: the same graceful teardown
+  (`SIGTERM` / `CTRL_BREAK` / `WM_CLOSE` → wait → escalate) with an explicit grace
+  and escalation flag, returning a new `#[non_exhaustive]` `ShutdownReport` of what
+  the kernel *observed* — the attempted soft signal via the new `SoftSignal` enum
+  (`Sent`/`Unsupported`/`Failed`, so a windowless Windows Job Object honestly
+  reports "no soft-signal tier"), the live member counts before and after, whether
+  the tree drained within the grace or was escalated to a hard kill, and the actual
+  elapsed. `stop(Duration::ZERO, true)` is a "kill and wait for the tree to actually
+  empty" that bare `kill_all` (which returns as soon as the kill is *issued*) does
+  not offer. Purely additive — `shutdown`/`shutdown_ref` and every teardown
+  guarantee (kill-on-drop, the spawn/adopt re-arm race, no extra wait without a
+  grace) are unchanged
 - Windows graceful shutdown now posts `WM_CLOSE` (best-effort, *posted* not sent)
   to every top-level window a live job member owns before the hard
   `TerminateJobObject`, so a windowed child (Electron app, desktop tool, windowed

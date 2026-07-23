@@ -169,6 +169,16 @@ delivered `SIGTERM` to PID 1, the handler fired, `shutdown()` tore the tree
 down, and the process exited well inside Docker's default 10-second grace —
 no `SIGKILL` needed.)
 
+To *observe* that teardown — log whether the tree drained within your grace or had
+to be hard-killed, export the elapsed as a shutdown metric, or drive your own race
+between the orchestrator's `SIGTERM` and a control-socket "drain" command — use the
+`process-control` [`ProcessGroup::stop(grace, escalate)`](process-groups.md#observing-the-teardown-stop-and-shutdownreport)
+in place of `shutdown()`: the same teardown, returning a `ShutdownReport` (the
+attempted soft signal, member counts before/after, drained-within-grace vs
+escalated, and the actual elapsed). `stop(Duration::ZERO, true)` additionally gives
+a "kill and wait for the tree to actually empty" that bare `kill_all` — which
+returns as soon as the kill is *issued* — does not.
+
 Two things worth setting deliberately, both already documented at the
 `ProcessGroup`/`Command` level:
 

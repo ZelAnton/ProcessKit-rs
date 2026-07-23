@@ -493,6 +493,26 @@ impl core::marker::Unpin for processkit::Signal
 impl core::marker::UnsafeUnpin for processkit::Signal
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::Signal
 impl core::panic::unwind_safe::UnwindSafe for processkit::Signal
+#[non_exhaustive] pub enum processkit::SoftSignal
+pub processkit::SoftSignal::Failed(processkit::Signal)
+pub processkit::SoftSignal::Sent(processkit::Signal)
+pub processkit::SoftSignal::Unsupported
+impl core::clone::Clone for processkit::SoftSignal
+pub fn processkit::SoftSignal::clone(&self) -> processkit::SoftSignal
+impl core::cmp::Eq for processkit::SoftSignal
+impl core::cmp::PartialEq for processkit::SoftSignal
+pub fn processkit::SoftSignal::eq(&self, &processkit::SoftSignal) -> bool
+impl core::fmt::Debug for processkit::SoftSignal
+pub fn processkit::SoftSignal::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for processkit::SoftSignal
+impl core::marker::StructuralPartialEq for processkit::SoftSignal
+impl core::marker::Freeze for processkit::SoftSignal
+impl core::marker::Send for processkit::SoftSignal
+impl core::marker::Sync for processkit::SoftSignal
+impl core::marker::Unpin for processkit::SoftSignal
+impl core::marker::UnsafeUnpin for processkit::SoftSignal
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::SoftSignal
+impl core::panic::unwind_safe::UnwindSafe for processkit::SoftSignal
 #[non_exhaustive] pub enum processkit::StdioMode
 pub processkit::StdioMode::Inherit
 pub processkit::StdioMode::Null
@@ -852,6 +872,7 @@ pub async fn processkit::ProcessGroup::shutdown_ref(&self) -> processkit::Result
 pub fn processkit::ProcessGroup::signal(&self, processkit::Signal) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::spawn(&self, tokio::process::Command) -> processkit::Result<tokio::process::Child>
 pub fn processkit::ProcessGroup::stats(&self) -> processkit::Result<processkit::ProcessGroupStats>
+pub async fn processkit::ProcessGroup::stop(&self, core::time::Duration, bool) -> processkit::Result<processkit::ShutdownReport>
 pub fn processkit::ProcessGroup::suspend(&self) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::update_limits(&mut self, processkit::ResourceLimits) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::with_options(processkit::ProcessGroupOptions) -> processkit::Result<Self>
@@ -1079,6 +1100,30 @@ impl core::marker::Unpin for processkit::RunningProcess
 impl core::marker::UnsafeUnpin for processkit::RunningProcess
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::RunningProcess
 impl !core::panic::unwind_safe::UnwindSafe for processkit::RunningProcess
+#[non_exhaustive] pub struct processkit::ShutdownReport
+impl processkit::ShutdownReport
+pub fn processkit::ShutdownReport::attempted_signal(&self) -> core::option::Option<processkit::Signal>
+pub fn processkit::ShutdownReport::drained_within_grace(&self) -> bool
+pub fn processkit::ShutdownReport::elapsed(&self) -> core::time::Duration
+pub fn processkit::ShutdownReport::escalated(&self) -> bool
+pub fn processkit::ShutdownReport::members_after(&self) -> core::option::Option<usize>
+pub fn processkit::ShutdownReport::members_before(&self) -> core::option::Option<usize>
+pub fn processkit::ShutdownReport::soft_signal(&self) -> processkit::SoftSignal
+impl core::clone::Clone for processkit::ShutdownReport
+pub fn processkit::ShutdownReport::clone(&self) -> processkit::ShutdownReport
+impl core::cmp::Eq for processkit::ShutdownReport
+impl core::cmp::PartialEq for processkit::ShutdownReport
+pub fn processkit::ShutdownReport::eq(&self, &processkit::ShutdownReport) -> bool
+impl core::fmt::Debug for processkit::ShutdownReport
+pub fn processkit::ShutdownReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for processkit::ShutdownReport
+impl core::marker::Freeze for processkit::ShutdownReport
+impl core::marker::Send for processkit::ShutdownReport
+impl core::marker::Sync for processkit::ShutdownReport
+impl core::marker::Unpin for processkit::ShutdownReport
+impl core::marker::UnsafeUnpin for processkit::ShutdownReport
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::ShutdownReport
+impl core::panic::unwind_safe::UnwindSafe for processkit::ShutdownReport
 pub struct processkit::StatsSampler<'a>
 impl core::fmt::Debug for processkit::StatsSampler<'_>
 pub fn processkit::StatsSampler<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

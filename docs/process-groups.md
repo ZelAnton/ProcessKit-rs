@@ -103,6 +103,7 @@ edges worth knowing:
 | `drop(group)` | Immediate **hard kill** of the whole tree (kill-on-close) | The safety net — always on |
 | `group.kill_all()` | The same hard kill, group stays usable (cgroup-`kill` / Job Object / process-group backends). On a **pre-5.14 Linux kernel** lacking `cgroup.kill`, the per-pid `SIGKILL` fallback returns `Err` if the tree doesn't drain (a fork bomb still out-spawning, or `D`-state zombies) | Explicit teardown mid-flight; idempotent |
 | `group.shutdown().await` | Unix: `SIGTERM` → wait `shutdown_timeout` → `SIGKILL` survivors (if `escalate_to_kill`); Windows: atomic job kill when `escalate_to_kill`, else the survivors are **spared** (handle closed without kill-on-close) — unless a child opted into `windows_graceful_ctrl_break` (see below), which gives Windows a real `CTRL_BREAK` → wait → kill tier. Consumes the group (`shutdown_ref(&self)` is the same teardown, borrowing — for a group held behind an `Arc`/supervisor) | Graceful service stop |
+| `group.stop(grace, escalate).await` | The **observable** graceful stop (needs `process-control`): the *same* teardown as `shutdown_ref`, with an explicit `grace`/`escalate`, returning a `ShutdownReport` — the attempted soft signal (and whether it landed), member counts before/after, whether the tree drained within the grace or was hard-killed, and the actual elapsed. Borrows the group (usable afterwards) | You own the end-of-run race and want the observed facts — or a "kill and wait" via `stop(Duration::ZERO, true)` |
 
 ```rust,no_run
 use processkit::{Command, ProcessGroup, ProcessGroupOptions};
@@ -177,6 +178,57 @@ any live member that owns a top-level window (including forked descendants and
 adopted children), needs no console and no opt-in, but only a member that actually
 has a window. A member with neither a window nor the console opt-in is hard-killed
 promptly at the deadline. Off Windows the builder is a no-op.
+
+### Observing the teardown: `stop` and `ShutdownReport`
+
+> Requires the default-on **`process-control`** feature (the report carries a
+> `Signal`).
+
+`shutdown`/`shutdown_ref` are fire-and-forget — they report only success or an
+error. When you own your *own* end-of-run race (a timeout ⨯ Ctrl-C ⨯
+control-socket race, not a `Command::timeout`) you usually want to stop the instant
+the tree is empty rather than always spend the whole grace, and to report the tier
+the kernel *observed* rather than what you *tried*. `ProcessGroup::stop(grace,
+escalate)` is that verb: the same `SIGTERM` / `CTRL_BREAK` / `WM_CLOSE` → wait →
+escalate ladder, taking `grace`/`escalate` explicitly and returning a
+[`ShutdownReport`](https://docs.rs/processkit/latest/processkit/struct.ShutdownReport.html).
+
+```rust,no_run
+use processkit::{Command, ProcessGroup};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::new()?;
+    let _service = group.start(&Command::new("my-service")).await?;
+
+    // SIGTERM, up to 5s to drain, then SIGKILL survivors — and report what happened.
+    let report = group.stop(Duration::from_secs(5), true).await?;
+    if report.drained_within_grace() {
+        println!("clean exit in {:?}", report.elapsed());
+    } else if report.escalated() {
+        let survivors = report.members_after().unwrap_or(0);
+        eprintln!("hard-killed {survivors} survivor(s) after the grace");
+    }
+    if let Some(sig) = report.attempted_signal() {
+        println!("attempted soft signal: {sig:?}");
+    }
+    Ok(())
+}
+```
+
+The report is honest per platform. `members_before`/`members_after` count the same
+member set as [`members`](#listing-members) — the whole
+tree on the Job Object / cgroup mechanisms, the tracked group *leaders* on the
+process-group fallback (where an unreaped zombie still counts, so reap your handles
+for a true `members_after`). The `soft_signal()` verdict is three-way —
+`SoftSignal::Sent(sig)`, `SoftSignal::Failed(sig)`, or `SoftSignal::Unsupported`;
+the last arises **only** on a windowless Windows Job Object with no console-CTRL
+leader (every Unix mechanism always has a real `SIGTERM` tier). `stop(Duration::ZERO,
+true)` is the "**kill and wait**" path: it hard-kills at once (a zero grace waits
+not at all) and reports what was still live — where bare `kill_all` returns as soon
+as the kill is *issued*. `shutdown`/`shutdown_ref` are unchanged; `stop` is purely
+additive.
 
 ## Signalling the whole tree
 
