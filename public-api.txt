@@ -1015,6 +1015,8 @@ pub fn processkit::ProcessResult<T>::signal(&self) -> core::option::Option<i32>
 pub fn processkit::ProcessResult<T>::stderr(&self) -> &str
 pub fn processkit::ProcessResult<T>::stdout(&self) -> &T
 pub fn processkit::ProcessResult<T>::timed_out(&self) -> bool
+pub fn processkit::ProcessResult<T>::total_bytes(&self) -> usize
+pub fn processkit::ProcessResult<T>::total_lines(&self) -> usize
 pub fn processkit::ProcessResult<T>::truncated(&self) -> bool
 impl core::fmt::Debug for processkit::ProcessResult<alloc::string::String>
 pub fn processkit::ProcessResult<alloc::string::String>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

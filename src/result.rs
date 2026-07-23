@@ -22,7 +22,7 @@ use crate::error::Error;
 /// There is also no `#[doc(hidden)]` constructor here (unlike
 /// [`ProcessResult::from_parts`],
 /// [`Finished::from_parts`](crate::Finished::from_parts),
-/// [`RunProfile::from_parts`](crate::RunProfile::from_parts),
+/// `RunProfile`,
 /// [`SupervisionOutcome::from_parts`](crate::SupervisionOutcome::from_parts)):
 /// `#[non_exhaustive]` on a plain enum blocks only an external exhaustive
 /// `match` and struct-variant literal syntax, not construction of an existing
@@ -458,13 +458,13 @@ impl<T> ProcessResult<T> {
 
     /// Total lines seen across the captured streams (retained + dropped) —
     /// companion to [`truncated`](Self::truncated) for re-stamping a folded
-    /// result (e.g. the pipeline pipefail fold). Producer-only.
-    pub(crate) fn total_lines(&self) -> usize {
+    /// result (e.g. the pipeline pipefail fold).
+    pub fn total_lines(&self) -> usize {
         self.total_lines
     }
 
     /// Total bytes seen across the captured streams (retained + dropped).
-    pub(crate) fn total_bytes(&self) -> usize {
+    pub fn total_bytes(&self) -> usize {
         self.total_bytes
     }
 
