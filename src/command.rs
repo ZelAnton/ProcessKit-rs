@@ -1744,7 +1744,7 @@ impl Command {
 
     /// The exit codes explicitly configured via [`ok_codes`](Self::ok_codes), if
     /// any — `None` when unset, in which case the default `{0}` applies (see
-    /// [`ok_codes_vec`](Self::ok_codes_vec) for the always-populated effective
+    /// `ok_codes_vec` for the always-populated effective
     /// set). Mirrors [`configured_timeout`](Self::configured_timeout): the raw
     /// *configured* state, not a resolved default — lets `ScriptedRunner::when`
     /// predicates and other inspection code (see the "Public accessors" note

@@ -315,8 +315,8 @@ impl<T> ProcessResult<T> {
 
     /// The [`Command::timeout`](crate::Command::timeout) this run was launched
     /// with, if any — carried so [`ensure_success`](Self::ensure_success) /
-    /// [`require_code`](Self::require_code) can build a faithful
-    /// [`Error::Timeout`]. Participates in this type's [`PartialEq`] (see the
+    /// `require_code` can build a faithful
+    /// [`ErrorReason::Timeout`]. Participates in this type's [`PartialEq`] (see the
     /// impl for the full contract): two results with the same visible outcome
     /// but a different configured timeout are **not** equal, and this accessor
     /// is what lets a caller (e.g. a serialization wrapper) tell them apart —
