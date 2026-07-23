@@ -29,6 +29,8 @@ mod parent_death;
 mod pipeline;
 #[cfg(feature = "process-control")]
 mod process_control;
+#[cfg(feature = "pty")]
+mod pty;
 mod races;
 mod readiness;
 #[cfg(unix)]

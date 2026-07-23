@@ -805,7 +805,18 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         creation_flags: command.extra_creation_flags(),
         kill_on_parent_death: command.wants_kill_on_parent_death(),
         windows_new_process_group: command.wants_windows_graceful_ctrl_break(),
+        use_pty: command.wants_pty(),
     };
+    // PTY mode diverges here: the child is spawned over a single pseudo-terminal
+    // master (openpty / ConPTY) instead of three pipes, so its stdin wiring and
+    // handle construction differ. Everything up to this point (stdin reservation,
+    // cwd/cancel preflight, `SpawnOptions`) is shared. `opts` is `Copy` and the
+    // moved values are only used on the (unreachable-when-`use_pty`) pipe path
+    // below, so this conditional move type-checks.
+    #[cfg(feature = "pty")]
+    if command.wants_pty() {
+        return launch_pty(group, command, tokio_cmd, opts, stdin_reservation).await;
+    }
     // Translate the OS's opaque NotFound into `ErrorReason::NotFound` after the spawn
     // attempt, so the OS stays the source of truth. The cwd was validated above,
     // so NotFound here is genuinely the program. A bare name reports searched dirs;
@@ -921,6 +932,134 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         cancel_token: command.cancel_token(),
     });
     // Pid-only watchdog; own-group runs re-arm with full group+pid via `attach_group`.
+    process.arm_cancel_watchdog();
+    Ok(process)
+}
+
+/// Translate a raw spawn [`Error`] into the crate's launch error, mapping the
+/// OS's opaque `NotFound` into [`ErrorReason::NotFound`](crate::ErrorReason::NotFound)
+/// (enriched with the searched dirs for a bare name, or reclassified as
+/// [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) when the program *is* locatable
+/// but not directly executable) — the same enrichment the pipe launch path does
+/// inline. Shared with the PTY launch path so the two never diverge on how a
+/// missing program is reported.
+#[cfg(feature = "pty")]
+fn map_spawn_error(command: &Command, err: crate::Error) -> crate::Error {
+    match err.into_reason() {
+        crate::ErrorReason::Spawn { source, .. }
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            if is_bare_name(command.program()) {
+                let path = if command.customizes_path() {
+                    PathSource::Skip
+                } else {
+                    PathSource::ProcessPath
+                };
+                match resolve_program(command.program(), command.prefer_local_dirs(), path) {
+                    ProgramResolution::Found(_) => crate::ErrorReason::Spawn {
+                        program: command.program_name(),
+                        source,
+                    }
+                    .into(),
+                    ProgramResolution::NotFound { searched } => crate::ErrorReason::NotFound {
+                        program: command.program_name(),
+                        searched,
+                    }
+                    .into(),
+                }
+            } else {
+                crate::ErrorReason::NotFound {
+                    program: command.program_name(),
+                    searched: None,
+                }
+                .into()
+            }
+        }
+        other => other.into(),
+    }
+}
+
+/// The [`launch`] counterpart for [`Command::use_pty`](crate::Command::use_pty):
+/// spawn the child over a single pseudo-terminal master (openpty / ConPTY),
+/// contained in the same group, and wrap it in a merged-stream
+/// [`RunningProcess`]. Shares `launch`'s stdin-reservation contract — the
+/// reservation is committed once the child exists, and the same one-shot stdin
+/// payload is driven into the master's input side on a background task.
+#[cfg(feature = "pty")]
+async fn launch_pty(
+    group: &ProcessGroup,
+    command: &Command,
+    mut tokio_cmd: tokio::process::Command,
+    opts: crate::sys::SpawnOptions,
+    stdin_reservation: Option<crate::stdin::StdinReservation>,
+) -> Result<RunningProcess> {
+    // The Windows raw-`CreateProcessW` path needs the fully-resolved env (it
+    // bypasses `std`'s env handling); ignored on Unix.
+    let env = command.resolved_pty_env();
+    let pty = group
+        .spawn_pty_with_options(&mut tokio_cmd, &opts, env)
+        .map_err(|e| map_spawn_error(command, e))?;
+    // A child now exists: commit the reservation so a one-shot source is consumed
+    // for good (see `launch`).
+    let taken_stdin = stdin_reservation.map(crate::stdin::StdinReservation::commit);
+    let pid = pty.pid;
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        target: "processkit",
+        program = %command.program_name(),
+        pid = ?pid,
+        mechanism = ?group.mechanism(),
+        "pty child spawned"
+    );
+
+    let crate::sys::pty::PtySpawn {
+        child,
+        reader,
+        writer,
+        pid: _,
+    } = pty;
+
+    // Stdin wiring over the single master input side. `keep_stdin_open` keeps the
+    // writer for `take_stdin`; a configured source is driven into it on a
+    // background task (dropping it afterwards, best-effort EOF); otherwise the
+    // writer is dropped.
+    let (writer_for_stdin, stdin_task) = if command.keeps_stdin_open() {
+        (Some(writer), None)
+    } else {
+        match taken_stdin {
+            Some(payload) if !payload.is_empty() => {
+                let mut sink = writer;
+                let task = tokio::spawn(async move {
+                    let result = payload.write_to(&mut sink).await;
+                    drop(sink);
+                    result
+                });
+                (None, Some(task))
+            }
+            _ => {
+                drop(writer);
+                (None, None)
+            }
+        }
+    };
+
+    let mut process = RunningProcess::from_pty(crate::running::PtySpawned {
+        program: command.program_name(),
+        child,
+        reader,
+        writer: writer_for_stdin,
+        own_group: None,
+        stdin_task,
+        timeout: command.configured_timeout(),
+        timeout_grace: command.configured_timeout_grace(),
+        timeout_signal: command.timeout_signal_raw(),
+        pid,
+        stdout_config: command.stdout_config(),
+        buffer: command.output_buffer_policy(),
+        ok_codes: command.ok_codes_vec(),
+        stdout_piped: command.stdout_is_piped(),
+        cancel_token: command.cancel_token(),
+    });
     process.arm_cancel_watchdog();
     Ok(process)
 }

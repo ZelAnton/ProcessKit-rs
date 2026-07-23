@@ -224,6 +224,27 @@ buffer policies, timeouts, retry, pipelines, supervision, the non-socket
 readiness probes, the test doubles, cassettes, cancellation — is
 **platform-agnostic** and behaves identically everywhere.
 
+## PTY mode (`use_pty`, the `pty` feature)
+
+[`Command::use_pty`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.use_pty)
+launches the child under a real pseudo-terminal instead of three pipes, so an
+`isatty()`-gated tool works. Per platform:
+
+| | Unix | Windows |
+|---|---|---|
+| Mechanism | `openpty` — the pty slave becomes the child's stdio, spawned through the **same** cgroup/process-group containment path as any other run | `CreatePseudoConsole` (ConPTY) — the child is created suspended, `AssignProcessToJobObject`'d to the **same** Job Object, then resumed |
+| stdout/stderr | **merged** onto the single master (the `on_stderr_line`/`stderr_tee` split collapses; `ProcessResult::stderr` is empty) | **merged**, same |
+| Echo control | terminal **echo disabled** (termios) so a written secret is not echoed back into the merged output | ConPTY has no portable per-write echo control — echo behavior is host-managed (not disabled) |
+| Containment | unchanged — cgroup/pgroup kill-on-drop reaps the whole tree | unchanged — Job Object kill-on-close reaps the whole tree |
+
+Off by default and additive: with the `pty` feature off (or on but `use_pty`
+unset) the three-pipe behavior is byte-identical. It is a **minimal
+single-master-fd mode**, not a terminal emulator. The Windows master I/O runs
+over the ConPTY pipes bridged by dedicated blocking threads (acceptable for the
+low-volume interactive use case). Whether a Windows ConPTY child's *standard
+handles* bind to the pseudoconsole (rather than a launcher-inherited console) can
+depend on the host's console state; the containment and spawn are validated on CI.
+
 ## Caveats
 
 The honest fine print, mostly consequences of OS semantics:

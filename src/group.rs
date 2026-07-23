@@ -258,6 +258,23 @@ impl ProcessGroup {
         Ok(child)
     }
 
+    /// `spawn_with_options` under a pseudo-terminal (the
+    /// [`Command::use_pty`](crate::Command::use_pty) launch path): the child joins
+    /// this group exactly as [`spawn_with_options`](Self::spawn_with_options)'s
+    /// does, but over a single PTY master instead of three pipes. `env` is the
+    /// child's resolved environment for the Windows raw-spawn path.
+    #[cfg(feature = "pty")]
+    pub(crate) fn spawn_pty_with_options(
+        &self,
+        cmd: &mut Command,
+        opts: &crate::sys::SpawnOptions,
+        env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+    ) -> Result<crate::sys::pty::PtySpawn> {
+        self.job
+            .spawn_pty(cmd, opts, env)
+            .map_err(|source| Error::spawn(program_name(cmd), source))
+    }
+
     /// Attach an already-started [`Child`] to this group.
     ///
     /// Only the child itself is moved into the group; processes it has *already*

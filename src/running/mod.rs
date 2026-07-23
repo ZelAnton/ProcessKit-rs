@@ -133,6 +133,33 @@ pub(crate) struct Spawned {
     pub cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
+/// The fields produced by a PTY spawn, handed to [`RunningProcess::from_pty`].
+/// The PTY analogue of [`Spawned`]: one **merged** output reader (stdout+stderr
+/// collapsed onto the master) instead of a stdout/stderr pair, a single-fd
+/// `writer` for stdin, and a platform [`PtyChild`](crate::sys::pty::PtyChild) in
+/// place of a tokio `Child`.
+#[cfg(feature = "pty")]
+pub(crate) struct PtySpawned {
+    pub program: String,
+    pub child: crate::sys::pty::PtyChild,
+    /// The merged stdout+stderr, read through the standard pump.
+    pub reader: OutputReader,
+    /// The master's input side (stdin), unless it was moved into `stdin_task`.
+    pub writer: Option<crate::sys::pty::PtyWriter>,
+    pub own_group: Option<ProcessGroup>,
+    pub stdin_task: Option<JoinHandle<std::io::Result<()>>>,
+    pub timeout: Option<Duration>,
+    pub timeout_grace: Option<Duration>,
+    pub timeout_signal: i32,
+    pub pid: Option<u32>,
+    /// The pump config for the merged stream (the command's stdout config).
+    pub stdout_config: StreamConfig,
+    pub buffer: OutputBufferPolicy,
+    pub ok_codes: Vec<i32>,
+    pub stdout_piped: bool,
+    pub cancel_token: Option<tokio_util::sync::CancellationToken>,
+}
+
 /// A handle to a process spawned by a runner.
 pub struct RunningProcess {
     // The Option fields below encode the handle's de-facto states (fresh /
@@ -231,17 +258,57 @@ pub struct RunningProcess {
     scripted_result: Option<ScriptedResultInfo>,
 }
 
-/// A boxed output reader: real `ChildStdout`/`ChildStderr` or scripted bytes.
-/// Both flow through the same pump machinery via `AsyncRead`.
-type OutputReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+/// A boxed output reader: real `ChildStdout`/`ChildStderr`, scripted bytes, or a
+/// PTY master. All flow through the same pump machinery via `AsyncRead`. `+ Sync`
+/// keeps [`RunningProcess`] `Sync` (as it was before the PTY backend stored one on
+/// `PtyProc`); every concrete reader boxed here — `ChildStdout`/`ChildStderr`, the
+/// scripted `DuplexStream`, and the per-platform PTY masters — is `Sync`.
+type OutputReader = Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>;
 
-/// The I/O-bearing half of a [`RunningProcess`]: a real OS child or a scripted
-/// double that feeds canned bytes through the same pumps/sinks. Platform code
-/// only ever constructs `Real`.
+/// The I/O-bearing half of a [`RunningProcess`]: a real OS child, a scripted
+/// double that feeds canned bytes through the same pumps/sinks, or a PTY child
+/// whose merged output flows through the same pumps over a single master.
+/// Platform code only ever constructs `Real`/`Pty`.
 enum Backend {
-    // Boxed: both variants are large and the enum lives in every handle.
+    // Boxed: the variants are large and the enum lives in every handle.
     Real(Box<RealProc>),
     Scripted(Box<ScriptedProc>),
+    /// A child spawned under a pseudo-terminal ([`Command::use_pty`](crate::Command::use_pty)).
+    /// Its stdout and stderr are **merged** onto the single master reader, so it
+    /// exposes no separate stderr; stdin is the master's input side.
+    #[cfg(feature = "pty")]
+    Pty(Box<PtyProc>),
+}
+
+/// The PTY-child fields. Mirrors [`RealProc`] but over a single pseudo-terminal
+/// master: one merged reader (stdout+stderr collapsed), one writer (stdin), and a
+/// platform [`PtyChild`](crate::sys::pty::PtyChild) lifecycle handle in place of a
+/// tokio `Child`. Containment (`own_group`) and the stdin-writer task are handled
+/// exactly as for a real child.
+#[cfg(feature = "pty")]
+struct PtyProc {
+    /// The owned PTY child. `Some` for the whole live-handle lifetime; taken to
+    /// `None` only by [`RunningProcess::drop`] on the detached-reap path.
+    child: Option<crate::sys::pty::PtyChild>,
+    own_group: Option<Arc<ProcessGroup>>,
+    /// The merged stdout+stderr, read through the standard pump. Taken by the
+    /// first pump that consumes it.
+    reader: Option<OutputReader>,
+    /// The master's input side (the child's stdin). Taken by
+    /// [`take_stdin`](RunningProcess::take_stdin), or moved into `stdin_task`.
+    writer: Option<crate::sys::pty::PtyWriter>,
+    stdin_task: Option<JoinHandle<std::io::Result<()>>>,
+}
+
+#[cfg(feature = "pty")]
+impl PtyProc {
+    /// The owned PTY child (present until [`RunningProcess::drop`] extracts it on
+    /// the detached-reap path — never on any live-handle path).
+    fn child_mut(&mut self) -> &mut crate::sys::pty::PtyChild {
+        self.child
+            .as_mut()
+            .expect("pty child is present until Drop extracts it")
+    }
 }
 
 /// The real-child fields — exactly the ones that touch the OS.
@@ -276,6 +343,8 @@ impl Backend {
         match self {
             Backend::Real(real) => real.own_group.as_ref(),
             Backend::Scripted(s) => s.own_group(),
+            #[cfg(feature = "pty")]
+            Backend::Pty(pty) => pty.own_group.as_ref(),
         }
     }
 
@@ -283,6 +352,8 @@ impl Backend {
         match self {
             Backend::Real(_) => None,
             Backend::Scripted(s) => Some(s.kill_handle()),
+            #[cfg(feature = "pty")]
+            Backend::Pty(_) => None,
         }
     }
 
@@ -290,6 +361,9 @@ impl Backend {
         match self {
             Backend::Real(real) => real.stdout_pipe.take().map(|p| Box::new(p) as OutputReader),
             Backend::Scripted(s) => s.take_stdout_reader(),
+            // The PTY master carries the merged stdout+stderr.
+            #[cfg(feature = "pty")]
+            Backend::Pty(pty) => pty.reader.take(),
         }
     }
 
@@ -297,6 +371,10 @@ impl Backend {
         match self {
             Backend::Real(real) => real.stderr_pipe.take().map(|p| Box::new(p) as OutputReader),
             Backend::Scripted(s) => s.take_stderr_reader(),
+            // PTY merges stderr into the master, so there is no separate stderr —
+            // the `on_stderr_line`/stderr split collapses (documented on `use_pty`).
+            #[cfg(feature = "pty")]
+            Backend::Pty(_) => None,
         }
     }
 }
@@ -347,9 +425,58 @@ impl RunningProcess {
         }
     }
 
+    /// Build a live handle for a PTY spawn. The merged master reader flows through
+    /// the same pump as a real child's stdout; there is no separate stderr, so
+    /// `stderr_config`/`stderr_sink` stay at their defaults and no stderr pump ever
+    /// runs (the `on_stderr_line`/stderr split collapses, per
+    /// [`Command::use_pty`](crate::Command::use_pty)).
+    #[cfg(feature = "pty")]
+    pub(crate) fn from_pty(s: PtySpawned) -> Self {
+        Self {
+            program: s.program,
+            backend: Backend::Pty(Box::new(PtyProc {
+                child: Some(s.child),
+                own_group: s.own_group.map(Arc::new),
+                reader: Some(s.reader),
+                writer: s.writer,
+                stdin_task: s.stdin_task,
+            })),
+            timeout: s.timeout,
+            timeout_grace: s.timeout_grace,
+            timeout_signal: s.timeout_signal,
+            pid: s.pid,
+            #[cfg(feature = "stats")]
+            proc_identity: s.pid.and_then(crate::sys::process_identity),
+            stdout_config: s.stdout_config,
+            // No separate stderr stream on a PTY — this is never read.
+            stderr_config: StreamConfig::new(),
+            buffer: s.buffer,
+            ok_codes: s.ok_codes,
+            stdout_sink: None,
+            stderr_sink: None,
+            stdout_pump: None,
+            stderr_pump: None,
+            stdin_error: None,
+            stdout_piped: s.stdout_piped,
+            deadline_task: None,
+            timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
+            pid_gate: Arc::new(PidGate::new(s.pid)),
+            cancel_token: s.cancel_token,
+            cancel_task: None,
+            cancel_at_exit: None,
+            started: Instant::now(),
+            deadline_anchor: tokio::time::Instant::now(),
+            start_time: SystemTime::now(),
+            scripted_result: None,
+        }
+    }
+
     pub(crate) fn attach_group(&mut self, group: ProcessGroup) {
-        if let Backend::Real(real) = &mut self.backend {
-            real.own_group = Some(Arc::new(group));
+        match &mut self.backend {
+            Backend::Real(real) => real.own_group = Some(Arc::new(group)),
+            #[cfg(feature = "pty")]
+            Backend::Pty(pty) => pty.own_group = Some(Arc::new(group)),
+            Backend::Scripted(_) => {}
         }
         // Re-arm the cancel watchdog now that the group is known: upgrade from
         // the pid-only task armed in `launch` to a full group+pid kill.
@@ -409,6 +536,10 @@ impl RunningProcess {
         match &mut self.backend {
             Backend::Real(real) => real.stdout_pipe.take(),
             Backend::Scripted(_) => None,
+            // A PTY master is not a `ChildStdout`, and a merged terminal stream
+            // does not compose into a shell-free pipeline — so no pipe to hand off.
+            #[cfg(feature = "pty")]
+            Backend::Pty(_) => None,
         }
     }
 
@@ -510,6 +641,9 @@ impl RunningProcess {
             // Scripted doubles don't model interactive stdin yet; `None` matches
             // the "stdin wasn't kept open" contract.
             Backend::Scripted(_) => None,
+            // The PTY master's input side is the child's stdin.
+            #[cfg(feature = "pty")]
+            Backend::Pty(pty) => pty.writer.take().map(ProcessStdin::from_pty),
         }
     }
 
@@ -1226,6 +1360,8 @@ impl RunningProcess {
     async fn observe_stdin_task(&mut self) {
         let task = match &mut self.backend {
             Backend::Real(real) => real.stdin_task.take(),
+            #[cfg(feature = "pty")]
+            Backend::Pty(pty) => pty.stdin_task.take(),
             Backend::Scripted(_) => None,
         };
         let Some(task) = task else {
@@ -1234,8 +1370,11 @@ impl RunningProcess {
         if !task.is_finished() {
             // Not done yet — re-park for the post-pump `finalize_stdin_task`, so
             // a writer that fails during `join_pumps` is not silently lost.
-            if let Backend::Real(real) = &mut self.backend {
-                real.stdin_task = Some(task);
+            match &mut self.backend {
+                Backend::Real(real) => real.stdin_task = Some(task),
+                #[cfg(feature = "pty")]
+                Backend::Pty(pty) => pty.stdin_task = Some(task),
+                Backend::Scripted(_) => {}
             }
             return;
         }
@@ -1262,6 +1401,8 @@ impl RunningProcess {
     async fn finalize_stdin_task(&mut self) {
         let task = match &mut self.backend {
             Backend::Real(real) => real.stdin_task.take(),
+            #[cfg(feature = "pty")]
+            Backend::Pty(pty) => pty.stdin_task.take(),
             Backend::Scripted(_) => None,
         };
         let Some(task) = task else {
@@ -1356,9 +1497,14 @@ impl RunningProcess {
     /// elapse). Returns the [`Outcome`] of the run.
     async fn drive_to_exit(&mut self) -> Result<Outcome> {
         // Close an untaken `keep_stdin_open` pipe so a stdin-reading child sees
-        // EOF instead of blocking to its timeout.
-        if let Backend::Real(real) = &mut self.backend {
-            drop(real.stdin_pipe.take());
+        // EOF instead of blocking to its timeout. (For a PTY the input side is the
+        // master's write end; dropping it closes our write handle — a clean EOF on
+        // Windows, best-effort on Unix, where a pty has no half-close.)
+        match &mut self.backend {
+            Backend::Real(real) => drop(real.stdin_pipe.take()),
+            #[cfg(feature = "pty")]
+            Backend::Pty(pty) => drop(pty.writer.take()),
+            Backend::Scripted(_) => {}
         }
         // Short-circuit when already reaped: re-running the select would fire the
         // cancel arm immediately for an already-cancelled token and overwrite the
@@ -1425,6 +1571,21 @@ impl RunningProcess {
                         #[cfg(not(unix))]
                         Outcome::Signalled(None)
                     }
+                }
+            }
+            // The PTY child reaps through the same gate discipline as `Real` (the
+            // Unix pty child IS a tokio `Child`; the Windows ConPTY child holds its
+            // process handle open across the wait, so its pid is never freed
+            // mid-wait). `PtyExitStatus` carries the code and (Unix) the signal.
+            #[cfg(feature = "pty")]
+            Backend::Pty(pty) => {
+                let status = pty.child_mut().reap(&gate).await.map_err(Error::io)?;
+                match status.code() {
+                    Some(code) => Outcome::Exited(code),
+                    #[cfg(unix)]
+                    None => Outcome::Signalled(status.signal()),
+                    #[cfg(not(unix))]
+                    None => Outcome::Signalled(None),
                 }
             }
             // A scripted double owns no OS process, so its gate is pid-less: no reap
@@ -1543,6 +1704,17 @@ impl RunningProcess {
                 // unblocks, and an unbounded wait hangs shared-group handles.
                 let _ = tokio::time::timeout(PUMP_TEARDOWN, real.child_mut().wait()).await;
             }
+            // The PTY child tears down exactly like `Real`: kill through the owned
+            // handle, retire the gate before the group kill, then bound the reap.
+            #[cfg(feature = "pty")]
+            Backend::Pty(pty) => {
+                let _ = pty.child_mut().start_kill();
+                gate.retire();
+                if let Some(group) = &pty.own_group {
+                    let _ = group.kill_all();
+                }
+                let _ = tokio::time::timeout(PUMP_TEARDOWN, pty.child_mut().wait()).await;
+            }
             Backend::Scripted(s) => s.kill(),
         }
     }
@@ -1627,6 +1799,50 @@ impl RunningProcess {
                     gate.retire();
                 }
             },
+            // The PTY child follows the same graceful tiers as `Real`: an own-group
+            // handle drives the whole-tree signal→grace→kill through the group; a
+            // shared-group handle reaches only its direct child (a real signal on
+            // Unix, a hard kill on Windows, which has no signal tier).
+            #[cfg(feature = "pty")]
+            Backend::Pty(pty) => match pty.own_group.clone() {
+                Some(group) => {
+                    let teardown = async move {
+                        let _ = group.graceful_terminate(grace, signal).await;
+                    };
+                    let reap = async {
+                        let r = tokio::time::timeout(
+                            grace.saturating_add(PUMP_TEARDOWN),
+                            pty.child_mut().wait(),
+                        )
+                        .await;
+                        gate.retire();
+                        r
+                    };
+                    let _ = tokio::join!(teardown, reap);
+                }
+                None => {
+                    #[cfg(unix)]
+                    {
+                        stream::signal_direct_child(pty.child_mut().id(), signal);
+                        let reaped_cleanly = matches!(
+                            tokio::time::timeout(grace, pty.child_mut().wait()).await,
+                            Ok(Ok(_))
+                        );
+                        if !reaped_cleanly {
+                            let _ = pty.child_mut().start_kill();
+                            let _ =
+                                tokio::time::timeout(PUMP_TEARDOWN, pty.child_mut().wait()).await;
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = signal;
+                        let _ = pty.child_mut().start_kill();
+                        let _ = tokio::time::timeout(PUMP_TEARDOWN, pty.child_mut().wait()).await;
+                    }
+                    gate.retire();
+                }
+            },
             Backend::Scripted(s) => s.kill(),
         }
     }
@@ -1641,6 +1857,8 @@ impl RunningProcess {
         // the window the async `backend_wait` backstop can only bound.
         let exited = gate.reap_under_lock(|| match &mut self.backend {
             Backend::Real(real) => matches!(real.child_mut().try_wait(), Ok(Some(_))),
+            #[cfg(feature = "pty")]
+            Backend::Pty(pty) => matches!(pty.child_mut().try_wait(), Ok(Some(_))),
             Backend::Scripted(s) => s.has_exited_now(),
         });
         if exited {
@@ -1690,6 +1908,12 @@ impl RunningProcess {
                 Ok(()) => {}
                 // tokio/std currently return `Ok` for a reaped child; treat
                 // `InvalidInput` as the same no-op in case that ever changes.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+                Err(e) => return Err(Error::io(e)),
+            },
+            #[cfg(feature = "pty")]
+            Backend::Pty(pty) => match pty.child_mut().start_kill() {
+                Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
                 Err(e) => return Err(Error::io(e)),
             },
@@ -1820,6 +2044,21 @@ impl Drop for RunningProcess {
                     // the gate governs only the raw pid-kill, never the group kill.
                     self.pid_gate.retire();
                 }
+            }
+            // The PTY child takes the conservative structural-drop path (no
+            // detached grace hand-off): abort the stdin writer, then retire the
+            // gate synchronously — before the `PtyProc` (and its `PtyChild`) drops
+            // at the end of this `drop()` and frees the pid — so a deadline/cancel
+            // watchdog still mid-poll on another thread can never raw-kill a
+            // recycled pid (the same "retire before the pid is freed" discipline
+            // the `Real` else-branch uses). An own-group PTY tree still dies with
+            // its group; a shared-group PTY child is left to the caller's group.
+            #[cfg(feature = "pty")]
+            Backend::Pty(pty) => {
+                if let Some(task) = pty.stdin_task.take() {
+                    task.abort();
+                }
+                self.pid_gate.retire();
             }
             Backend::Scripted(s) => s.kill(),
         }

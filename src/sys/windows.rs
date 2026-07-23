@@ -411,6 +411,20 @@ impl Job {
         Ok(guard.disarm())
     }
 
+    /// Spawn `cmd` under a ConPTY pseudoconsole and assign the child to **this**
+    /// Job Object, so the PTY child is contained identically to
+    /// [`spawn`](Self::spawn). `env` is the child's resolved environment for the
+    /// raw `CreateProcessW` path (which bypasses `std`'s env handling).
+    #[cfg(feature = "pty")]
+    pub(crate) fn spawn_pty(
+        &self,
+        cmd: &mut Command,
+        opts: &crate::sys::SpawnOptions,
+        env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+    ) -> io::Result<crate::sys::pty::PtySpawn> {
+        crate::sys::pty::spawn_pty(cmd, opts, env, self.handle, &self.skip_drop_kill)
+    }
+
     #[cfg(feature = "process-control")]
     pub(crate) fn adopt(&self, child: &Child) -> io::Result<()> {
         let handle = child

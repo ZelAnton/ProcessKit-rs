@@ -6,7 +6,9 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use std::task::{Context, Poll};
+
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_stream::{Stream, StreamExt};
 
 /// A boxed async reader, shared so [`Stdin`] stays `Clone` (one-shot: consumed
@@ -365,12 +367,61 @@ impl fmt::Debug for Stdin {
 /// [`Stdin::from_reader`] — are safe: the crate writes them on a background task
 /// that runs concurrently with the output pumps.)
 pub struct ProcessStdin {
-    sink: tokio::process::ChildStdin,
+    sink: StdinSink,
+}
+
+/// The interactive stdin target: a real child's stdin pipe, or (with the `pty`
+/// feature) a PTY master's input side. An enum rather than a boxed `dyn` so the
+/// **default** build's `ProcessStdin` keeps `ChildStdin`'s full auto-trait set
+/// (`Sync`, `UnwindSafe`, …) unchanged — only the `pty` variant, gated behind the
+/// feature, relaxes it.
+enum StdinSink {
+    Child(tokio::process::ChildStdin),
+    #[cfg(feature = "pty")]
+    Pty(crate::sys::pty::PtyWriter),
+}
+
+impl AsyncWrite for StdinSink {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            StdinSink::Child(c) => Pin::new(c).poll_write(cx, buf),
+            #[cfg(feature = "pty")]
+            StdinSink::Pty(p) => Pin::new(p).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            StdinSink::Child(c) => Pin::new(c).poll_flush(cx),
+            #[cfg(feature = "pty")]
+            StdinSink::Pty(p) => Pin::new(p).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            StdinSink::Child(c) => Pin::new(c).poll_shutdown(cx),
+            #[cfg(feature = "pty")]
+            StdinSink::Pty(p) => Pin::new(p).poll_shutdown(cx),
+        }
+    }
 }
 
 impl ProcessStdin {
     pub(crate) fn new(sink: tokio::process::ChildStdin) -> Self {
-        Self { sink }
+        Self {
+            sink: StdinSink::Child(sink),
+        }
+    }
+
+    /// Wrap a PTY master's input side (the child's stdin under
+    /// [`Command::use_pty`](crate::Command::use_pty)). The write API is identical;
+    /// only the underlying fd/handle differs.
+    #[cfg(feature = "pty")]
+    pub(crate) fn from_pty(sink: crate::sys::pty::PtyWriter) -> Self {
+        Self {
+            sink: StdinSink::Pty(sink),
+        }
     }
 
     /// Write raw bytes to stdin.
@@ -432,18 +483,20 @@ impl ProcessStdin {
     /// [`InvalidInput`](std::io::ErrorKind::InvalidInput) error rather than
     /// silently writing a meaningless byte.
     ///
-    /// **This writes exactly one raw byte into the child's stdin pipe — it is
-    /// not a real terminal signal.** A genuine SIGINT/SIGTSTP/etc. is something
-    /// the OS terminal driver raises for a *foreground process group attached to
-    /// a TTY*; here there is no TTY, only a plain pipe, so the child only
-    /// "reacts" if the child itself reads its stdin and recognizes the byte
-    /// (as many REPLs and line editors do — e.g. readline treats `\x04` as
-    /// end-of-input). A child that doesn't inspect its stdin for control bytes
-    /// will not be interrupted or signaled by this call. Real terminal-signal
-    /// semantics (the kernel actually delivering `SIGINT` etc. to the child)
-    /// require a pseudo-terminal, which this crate does not yet provide; a
-    /// real PTY would let the OS deliver an actual signal to the child instead
-    /// of relying on it to recognize a control byte in its input stream.
+    /// **This writes exactly one raw byte into the child's stdin — it is not a
+    /// real terminal signal.** A genuine SIGINT/SIGTSTP/etc. is something the OS
+    /// terminal driver raises for a *foreground process group attached to a TTY*.
+    /// Over a plain pipe there is no TTY, so the child only "reacts" if it reads
+    /// its stdin and recognizes the byte (as many REPLs and line editors do — e.g.
+    /// readline treats `\x04` as end-of-input). A child that doesn't inspect its
+    /// stdin for control bytes will not be interrupted or signaled by this call.
+    ///
+    /// Real terminal-signal semantics (the kernel delivering `SIGINT` etc. to the
+    /// child) require a pseudo-terminal. Build the command with
+    /// [`Command::use_pty`](crate::Command::use_pty) (the `pty` feature) and this
+    /// same call writes the control byte into the PTY's line discipline, so the
+    /// terminal driver can raise the actual signal — the reason PTY mode exists for
+    /// tty-only tools. Without a PTY it stays a best-effort raw byte, as above.
     ///
     /// # Errors
     ///

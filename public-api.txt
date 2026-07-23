@@ -767,6 +767,7 @@ pub async fn processkit::Command::try_parse<T, F>(&self, F) -> processkit::Resul
 pub fn processkit::Command::uid(self, u32) -> Self
 pub fn processkit::Command::umask(self, u32) -> Self
 pub fn processkit::Command::unchecked_in_pipe(self) -> Self
+pub fn processkit::Command::use_pty(self) -> Self
 pub fn processkit::Command::windows_graceful_ctrl_break(self) -> Self
 pub fn processkit::Command::working_dir(&self) -> core::option::Option<&std::path::Path>
 impl core::clone::Clone for processkit::Command
@@ -1186,8 +1187,8 @@ impl core::marker::Send for processkit::ProcessStdin
 impl core::marker::Sync for processkit::ProcessStdin
 impl core::marker::Unpin for processkit::ProcessStdin
 impl core::marker::UnsafeUnpin for processkit::ProcessStdin
-impl core::panic::unwind_safe::RefUnwindSafe for processkit::ProcessStdin
-impl core::panic::unwind_safe::UnwindSafe for processkit::ProcessStdin
+impl !core::panic::unwind_safe::RefUnwindSafe for processkit::ProcessStdin
+impl !core::panic::unwind_safe::UnwindSafe for processkit::ProcessStdin
 #[non_exhaustive] pub struct processkit::ResourceLimits
 pub processkit::ResourceLimits::cpu_quota: core::option::Option<f64>
 pub processkit::ResourceLimits::max_memory: core::option::Option<u64>

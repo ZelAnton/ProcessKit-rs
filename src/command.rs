@@ -169,6 +169,10 @@ pub struct Command {
     /// `CREATE_NEW_PROCESS_GROUP` and send it `CTRL_BREAK` before the grace
     /// window. A no-op off Windows (Unix already has a real signal tier).
     windows_graceful_ctrl_break: bool,
+    /// Spawn the child under a pseudo-terminal instead of three pipes (see
+    /// [`Self::use_pty`]). Off by default; only present with the `pty` feature.
+    #[cfg(feature = "pty")]
+    use_pty: bool,
     /// When cancelled, the run's tree is killed and every consuming path
     /// resolves to `ErrorReason::Cancelled`. Cheap to clone (internally `Arc`'d), so
     /// a `Command` clone — including each `Pipeline` stage and each
@@ -213,6 +217,8 @@ impl Command {
             kill_on_parent_death: false,
             creation_flags_extra: 0,
             windows_graceful_ctrl_break: false,
+            #[cfg(feature = "pty")]
+            use_pty: false,
             cancel_token: None,
         }
     }
@@ -639,6 +645,57 @@ impl Command {
     /// overwrites creation flags wholesale, does not participate.
     pub fn windows_graceful_ctrl_break(mut self) -> Self {
         self.windows_graceful_ctrl_break = true;
+        self
+    }
+
+    /// Spawn the child under a **pseudo-terminal** (PTY) instead of three
+    /// independent pipes, so tools that *demand* a controlling terminal work.
+    ///
+    /// Off by default. When set, the child is launched over a single PTY master
+    /// — `openpty` on Unix, `CreatePseudoConsole` (ConPTY) on Windows — so
+    /// `isatty()` reports a terminal and a program that refuses to run (or that
+    /// hangs waiting for a prompt) without one behaves normally: an
+    /// `isatty()`-gated agentic CLI, an `ssh`/`sudo` **password**/passphrase
+    /// prompt, a credential helper. This is a **minimal single-master-fd mode**,
+    /// not a general terminal emulator.
+    ///
+    /// # stdout and stderr are merged
+    ///
+    /// A PTY has one master fd carrying the child's combined output, so in this
+    /// mode **stdout and stderr are merged** and can no longer be separated. The
+    /// merged stream is delivered exactly where stdout normally is
+    /// (`output_string`, `stdout_lines`, `on_stdout_line`, `stdout_tee`, …);
+    /// [`on_stderr_line`](Self::on_stderr_line) is **never called** and
+    /// [`stderr_tee`](Self::stderr_tee) never receives anything, because there is
+    /// no separate stderr to deliver. [`ProcessResult::stderr`](crate::ProcessResult::stderr)
+    /// is empty for a PTY run. If you need stdout and stderr apart, do not use
+    /// PTY mode.
+    ///
+    /// # Interactive input
+    ///
+    /// [`keep_stdin_open`](Self::keep_stdin_open) plus
+    /// [`take_stdin`](crate::RunningProcess::take_stdin) drive the master's input
+    /// side exactly as with a pipe, and a configured [`stdin`](Self::stdin)
+    /// source is written to it. On **Unix** the PTY line discipline's terminal
+    /// **echo is disabled** so a written password is not echoed back into the
+    /// merged output (see [`ProcessStdin`](crate::ProcessStdin)); the Windows
+    /// ConPTY has no portable per-write echo control, so that guarantee is
+    /// Unix-only.
+    ///
+    /// # Containment is unchanged
+    ///
+    /// The PTY child is placed in the **same** Job Object / cgroup / process
+    /// group as any other child, so whole-tree kill-on-drop, timeouts, and
+    /// cancellation behave identically — the pseudo-terminal only changes the
+    /// I/O wiring, never the teardown guarantee.
+    ///
+    /// Available only with the `pty` crate feature. A no-op-shaped note for
+    /// callers who leave it unset: without this the existing three-pipe behavior
+    /// is byte-for-byte unchanged.
+    #[cfg(feature = "pty")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "pty")))]
+    pub fn use_pty(mut self) -> Self {
+        self.use_pty = true;
         self
     }
 
@@ -1532,6 +1589,21 @@ impl Command {
         self.kill_on_parent_death
     }
 
+    /// Whether [`use_pty`](Self::use_pty) was requested (read by the launch seam
+    /// to route the spawn through the PTY path). Always `false` without the `pty`
+    /// feature, so the non-PTY spawn is byte-identical.
+    #[cfg(feature = "pty")]
+    pub(crate) fn wants_pty(&self) -> bool {
+        self.use_pty
+    }
+
+    /// Without the `pty` feature there is no PTY mode, so a launch never routes
+    /// through the PTY spawn path.
+    #[cfg(not(feature = "pty"))]
+    pub(crate) fn wants_pty(&self) -> bool {
+        false
+    }
+
     /// The cancellation token, if any (an `Arc`-cheap clone).
     pub(crate) fn cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
         self.cancel_token.clone()
@@ -1740,6 +1812,57 @@ impl Command {
     /// The exit codes this command treats as success (defaults to `[0]`).
     pub(crate) fn ok_codes_vec(&self) -> Vec<i32> {
         self.ok_codes.clone().unwrap_or_else(|| vec![0])
+    }
+
+    /// The child's fully-resolved environment for the Windows raw-`CreateProcessW`
+    /// PTY spawn, which bypasses `std`'s env handling (ConPTY needs a raw spawn).
+    ///
+    /// `None` means "inherit the parent environment unchanged" (a null env block),
+    /// `Some(list)` is the exact set of `KEY=VALUE` pairs the child should get —
+    /// mirroring the [`env_clear`](Self::env_clear) / [`inherit_env`](Self::inherit_env)
+    /// / [`env`](Self::env) / [`env_remove`](Self::env_remove) layering
+    /// [`build_tokio`](Self::build_tokio) applies (so a customized-env PTY run
+    /// matches a customized-env pipe run). Keys are folded case-insensitively —
+    /// matching Windows env semantics — and returned in that (sorted) order, which
+    /// `CreateProcessW`'s Unicode env block also requires. Computed cross-platform
+    /// to keep the spawn seam uniform; only the Windows backend consumes it (on
+    /// Unix the pty child keeps `build_tokio`'s env, applied by `std`).
+    #[cfg(feature = "pty")]
+    pub(crate) fn resolved_pty_env(&self) -> Option<Vec<(OsString, OsString)>> {
+        if !self.env_clear && self.inherit_env.is_none() && self.envs.is_empty() {
+            return None; // no customization → inherit the parent env unchanged
+        }
+        use std::collections::BTreeMap;
+        // Fold on an upper-cased key so a later `env("path", …)` overrides an
+        // inherited `PATH`, matching Windows' case-insensitive env — and BTreeMap
+        // order gives the case-insensitively sorted block `CreateProcessW` wants.
+        let ci = |k: &OsStr| OsString::from(k.to_string_lossy().to_uppercase());
+        let mut map: BTreeMap<OsString, (OsString, OsString)> = BTreeMap::new();
+        // Seed from the parent env only when neither `env_clear` nor `inherit_env`
+        // asked for a clean slate — exactly `build_tokio`'s condition.
+        if !self.env_clear && self.inherit_env.is_none() {
+            for (k, v) in std::env::vars_os() {
+                map.insert(ci(&k), (k, v));
+            }
+        }
+        if let Some(names) = &self.inherit_env {
+            for name in names {
+                if let Some(v) = std::env::var_os(name) {
+                    map.insert(ci(name), (name.clone(), v));
+                }
+            }
+        }
+        for (k, v) in &self.envs {
+            match v {
+                Some(val) => {
+                    map.insert(ci(k), (k.clone(), val.clone()));
+                }
+                None => {
+                    map.remove(&ci(k));
+                }
+            }
+        }
+        Some(map.into_values().collect())
     }
 
     /// The exit codes explicitly configured via [`ok_codes`](Self::ok_codes), if

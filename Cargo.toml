@@ -218,6 +218,22 @@ tracing = ["dep:tracing"]
 # records real `Invocation → ProcessResult` pairs to a JSON fixture and replays
 # them hermetically. Off by default; pulls in serde + serde_json.
 record = ["dep:serde", "dep:serde_json"]
+# Opt-in single-master-fd PTY launch mode (`Command::use_pty`): spawn the child
+# under a pseudo-terminal — `openpty` (Unix) / `CreatePseudoConsole` ConPTY
+# (Windows) — instead of three independent pipes, so tools that demand a
+# controlling terminal (an `isatty()`-gated agentic CLI, a `sudo`/`ssh` password
+# prompt) work. stdout and stderr are MERGED onto the one master, so the
+# `on_stderr_line`/stderr split collapses in this mode (see `Command::use_pty`).
+# Containment is unchanged — the PTY child still lives in the same Job Object /
+# cgroup / process group, so kill-on-drop reaps the whole tree. Off by default
+# and additive: with the feature off (or on but `use_pty` unset) the existing
+# three-pipe behavior is byte-identical. On Windows it needs one extra
+# `windows-sys` FFI feature (`CreatePipe` for the ConPTY I/O pipes — the ConPTY,
+# `STARTUPINFOEXW` proc-thread-attribute, and raw `CreateProcessW` APIs are
+# already covered by the `Win32_System_Console`/`Win32_System_Threading` features
+# enabled below); on Unix it needs no new crate (`openpty`/termios are `libc`,
+# already a unix dep).
+pty = ["windows-sys/Win32_System_Pipes"]
 
 [target.'cfg(windows)'.dependencies]
 # Win32 Job Object FFI for kill-on-close process trees: CreateJobObjectW /

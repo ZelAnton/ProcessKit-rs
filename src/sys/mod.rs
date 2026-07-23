@@ -167,6 +167,14 @@ pub(crate) mod graceful;
 // syscall behind `force_kill` differs); driven by `crate::running`.
 pub(crate) mod pid_gate;
 
+// The opt-in PTY launch backend (`Command::use_pty`): `openpty` (Unix) /
+// `CreatePseudoConsole` ConPTY (Windows) instead of three pipes, wired into the
+// SAME per-platform containment path as `Job::spawn` (K-032). Compiled only with
+// the `pty` feature; the merged-stream `Backend::Pty` in `crate::running`
+// consumes what it hands back.
+#[cfg(feature = "pty")]
+pub(crate) mod pty;
+
 /// Per-spawn knobs that must reach the platform backend (the
 /// `tokio::process::Command` can't carry them: creation flags have no getter,
 /// and the pgroup backend must know about `setsid` *before* it sets a process
@@ -201,6 +209,16 @@ pub(crate) struct SpawnOptions {
     /// documented on [`Command::kill_on_parent_death`](crate::Command::kill_on_parent_death).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub kill_on_parent_death: bool,
+    /// Spawn the child under a pseudo-terminal instead of three independent
+    /// pipes (`openpty` on Unix, `CreatePseudoConsole` ConPTY on Windows) — the
+    /// opt-in [`Command::use_pty`](crate::Command::use_pty) mode. Consulted only
+    /// by the PTY spawn path (`crate::sys::pty`), which is compiled only with the
+    /// `pty` feature; without the feature the field is always `false` and the
+    /// spawn is byte-identical to the three-pipe path. Containment is unchanged —
+    /// the PTY child is assigned to the same job/cgroup/process group as any
+    /// other child.
+    #[cfg_attr(not(feature = "pty"), allow(dead_code))]
+    pub use_pty: bool,
 }
 
 // processkit supports only Unix and Windows: it relies on `tokio::process` and
@@ -261,6 +279,24 @@ impl Job {
     /// reaped when the job is killed or dropped.
     pub(crate) fn spawn(&self, cmd: &mut Command, opts: &SpawnOptions) -> io::Result<Child> {
         self.0.spawn(cmd, opts)
+    }
+
+    /// Spawn `cmd` under a pseudo-terminal as a member of this job — the
+    /// [`Command::use_pty`](crate::Command::use_pty) backend. `env` is the child's
+    /// resolved environment for the Windows raw-`CreateProcessW` path (ignored on
+    /// Unix, whose pty child keeps the tokio `Command`'s env). The child joins the
+    /// **same** job as [`spawn`](Self::spawn), so containment is unchanged.
+    #[cfg(feature = "pty")]
+    pub(crate) fn spawn_pty(
+        &self,
+        cmd: &mut Command,
+        opts: &SpawnOptions,
+        env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+    ) -> io::Result<pty::PtySpawn> {
+        // The launch seam routes here only for `use_pty`; the flag on the options
+        // records that intent for the platform backend.
+        debug_assert!(opts.use_pty, "spawn_pty requires SpawnOptions::use_pty");
+        self.0.spawn_pty(cmd, opts, env)
     }
 
     /// Attach an already-started child to this job.

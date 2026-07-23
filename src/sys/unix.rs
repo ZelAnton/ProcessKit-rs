@@ -53,6 +53,20 @@ impl Job {
         self.group.spawn(cmd, opts)
     }
 
+    /// Spawn `cmd` under a pseudo-terminal, reusing this backend's normal
+    /// process-group containment for the actual spawn (K-032). `env` is unused
+    /// here — the Unix pty child keeps the tokio `Command`'s env (`std` applies
+    /// it); it exists only to match the cross-platform seam.
+    #[cfg(feature = "pty")]
+    pub(crate) fn spawn_pty(
+        &self,
+        cmd: &mut Command,
+        opts: &crate::sys::SpawnOptions,
+        _env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+    ) -> io::Result<crate::sys::pty::PtySpawn> {
+        crate::sys::pty::spawn_pty(cmd, opts, |c, o| self.group.spawn(c, o))
+    }
+
     #[cfg(feature = "process-control")]
     pub(crate) fn adopt(&self, child: &Child) -> io::Result<()> {
         self.group.adopt(child)

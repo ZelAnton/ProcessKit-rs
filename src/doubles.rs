@@ -363,6 +363,11 @@ impl Reply {
         command: &Command,
         recorded: Option<crate::running::ScriptedResultInfo>,
     ) -> crate::RunningProcess {
+        // PTY mode merges stdout and stderr onto the single master; the scripted
+        // double models that collapse (see `split_pty_streams`), so a hermetic PTY
+        // test needs no real tty.
+        let (stdout_text, stderr_text) = Self::split_pty_streams(command, self.stdout, self.stderr);
+
         // A pending reply never exits on its own; everything else exits after
         // its (possibly zero) total line-delay budget. A canned timeout exits
         // immediately as a timed-out outcome, mirroring `into_result`.
@@ -375,8 +380,8 @@ impl Reply {
             // the max, or a lagging stderr gets truncated at the shorter
             // stdout-derived lifetime (which a real child never does). `str::lines`
             // matches the count the pumps actually deliver.
-            let stdout_lines = self.stdout.lines().count() as u32;
-            let stderr_lines = self.stderr.lines().count() as u32;
+            let stdout_lines = stdout_text.lines().count() as u32;
+            let stderr_lines = stderr_text.lines().count() as u32;
             let lines = stdout_lines.max(stderr_lines);
             // Saturate and clamp so a `Duration::MAX`-ish `line_delay` can't
             // overflow the multiply or the later `Instant + lifetime` deadline.
@@ -388,8 +393,8 @@ impl Reply {
             Some(self.code)
         };
         let scripted = crate::running::ScriptedProc::new(
-            self.stdout,
-            self.stderr,
+            stdout_text,
+            stderr_text,
             code_for_scripted,
             self.timed_out,
             self.signal,
@@ -421,13 +426,40 @@ impl Reply {
         } else {
             Outcome::Exited(self.code)
         };
+        // PTY mode collapses stderr into the merged master (see `split_pty_streams`),
+        // so the bulk double reports it the same way the streaming one does.
+        let (stdout_src, stderr_src) = Self::split_pty_streams(command, self.stdout, self.stderr);
         let stdout =
-            crate::running::split_pump_lines(&self.stdout, command.stdout_config().terminator)
+            crate::running::split_pump_lines(&stdout_src, command.stdout_config().terminator)
                 .join("\n");
         let stderr =
-            crate::running::split_pump_lines(&self.stderr, command.stderr_config().terminator)
+            crate::running::split_pump_lines(&stderr_src, command.stderr_config().terminator)
                 .join("\n");
         ProcessResult::new(program, stdout, stderr, outcome, timeout)
+    }
+
+    /// Apply the PTY single-master merge to the canned streams: with
+    /// [`Command::use_pty`](crate::Command::use_pty) set, stderr folds into stdout
+    /// (separated by a newline) and stderr is emptied — modeling the terminal's
+    /// merged output — otherwise the streams pass through unchanged. Shared by the
+    /// bulk ([`into_result`](Self::into_result)) and streaming
+    /// ([`into_running`](Self::into_running)) scripted paths so the double collapses
+    /// the split identically on both. A no-op without the `pty` feature.
+    fn split_pty_streams(command: &Command, stdout: String, stderr: String) -> (String, String) {
+        #[cfg(feature = "pty")]
+        if command.wants_pty() {
+            let mut merged = stdout;
+            if !stderr.is_empty() {
+                if !merged.is_empty() && !merged.ends_with('\n') {
+                    merged.push('\n');
+                }
+                merged.push_str(&stderr);
+            }
+            return (merged, String::new());
+        }
+        #[cfg(not(feature = "pty"))]
+        let _ = command;
+        (stdout, stderr)
     }
 }
 
@@ -2151,6 +2183,42 @@ mod tests {
         assert!(
             matches!(err.reason(), crate::error::ErrorReason::Cancelled { .. }),
             "got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "pty")]
+    #[tokio::test]
+    async fn scripted_pty_merges_stderr_into_the_single_master() {
+        // The ScriptedRunner PTY variant models the single-master merge without a
+        // real tty: canned stderr is folded into the merged stdout and no separate
+        // stderr is delivered, exactly as a real PTY run collapses the split. This
+        // lets hermetic tests exercise the merged-stream contract on any platform.
+
+        // Without `use_pty`, the two streams stay separate.
+        let plain = ScriptedRunner::new()
+            .fallback(Reply::ok("out-line").with_stderr("err-line"))
+            .output_string(&Command::new("x"))
+            .await
+            .expect("plain scripted reply");
+        assert_eq!(plain.stdout(), "out-line");
+        assert_eq!(plain.stderr(), "err-line");
+
+        // With `use_pty`, stderr collapses into the merged stdout and no separate
+        // stderr is delivered.
+        let ptyed = ScriptedRunner::new()
+            .fallback(Reply::ok("out-line").with_stderr("err-line"))
+            .output_string(&Command::new("x").use_pty())
+            .await
+            .expect("pty scripted reply");
+        assert!(
+            ptyed.stdout().contains("out-line") && ptyed.stdout().contains("err-line"),
+            "the merged master must carry both streams, got {:?}",
+            ptyed.stdout()
+        );
+        assert_eq!(
+            ptyed.stderr(),
+            "",
+            "PTY mode delivers no separate stderr (the on_stderr_line split collapses)"
         );
     }
 

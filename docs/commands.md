@@ -280,9 +280,10 @@ async fn main() -> processkit::Result<()> {
 
 Reach for it when a child must talk to the real terminal — `git commit` opening
 `$EDITOR`, a tool prompting for a password or a yes/no — or to forward the
-parent's piped stdin straight through. Until a pseudo-terminal exists (a future
-direction, not yet provided) this covers the common non-tty-negotiating
-interactive cases without the crate having to pump bytes. Because the child reads
+parent's piped stdin straight through. This covers the common non-tty-negotiating
+interactive cases without the crate having to pump bytes; a tool that truly
+demands a *tty* (not just inherited stdin) instead wants
+[`use_pty`](#interactive-auth--tty) (the `pty` feature). Because the child reads
 the parent's stdin directly, the crate neither feeds nor captures that input, and
 `take_stdin()` returns `None` (as for a non-`keep_stdin_open` run). Capturing and
 streaming the child's *output* is unaffected.
@@ -597,15 +598,34 @@ downgrading to a lower priority.
 `umask` is Unix-only — like `setsid`/`groups`, requesting it on Windows fails
 with `ErrorReason::Unsupported` rather than being silently ignored.
 
-**Interactive auth / TTY.** processkit wires **pipes**, not a pseudo-terminal,
-so a tool that *demands* a tty — an `ssh`/`sudo` **password** prompt, some
-credential helpers — won't get one (PTY support is not implemented; the
-trade-off is recorded in `decisions/permissions-privileges-pty-network.md`). Drive
-such tools **non-interactively** instead: key-based auth, `ssh -o
-BatchMode=yes`, `GIT_SSH_COMMAND` / `GIT_TERMINAL_PROMPT=0`, or feed a known
-answer over [interactive stdin](streaming.md#interactive-stdin). Conversational
-tools that read stdin without needing a tty already work today via
-`keep_stdin_open` + `stdout_lines`.
+**Interactive auth / TTY.** By default processkit wires **pipes**, not a
+pseudo-terminal, so a tool that *demands* a tty — an `ssh`/`sudo` **password**
+prompt, some credential helpers, an `isatty()`-gated agentic CLI — won't get one.
+Two ways to satisfy them:
+
+- **Non-interactive (no PTY needed).** Prefer this when possible: key-based auth,
+  `ssh -o BatchMode=yes`, `GIT_SSH_COMMAND` / `GIT_TERMINAL_PROMPT=0`, or feed a
+  known answer over [interactive stdin](streaming.md#interactive-stdin).
+  Conversational tools that read stdin without needing a tty work today via
+  `keep_stdin_open` + `stdout_lines`.
+- **PTY mode (`use_pty`, the `pty` feature).** For a tool that truly requires a
+  controlling terminal, `Command::use_pty()` launches it under a real
+  pseudo-terminal — `openpty` on Unix, `CreatePseudoConsole` (ConPTY) on Windows —
+  so `isatty()` reports a terminal. This is a **minimal single-master-fd mode**,
+  not a terminal emulator, with three things to know:
+  - **stdout and stderr are merged** onto the one master, so in this mode the
+    `on_stderr_line` / `stderr_tee` split collapses and
+    `ProcessResult::stderr` is empty — the whole output arrives where stdout does.
+  - Interactive input runs over the same master
+    (`keep_stdin_open` + `take_stdin`); on **Unix** terminal **echo is disabled**
+    so a written password is not echoed back into the merged output (the ConPTY
+    has no portable per-write echo control, so that is Unix-only).
+  - **Containment is unchanged** — the PTY child lives in the same
+    job/cgroup/process group, so whole-tree kill-on-drop, timeouts, and
+    cancellation behave exactly as for a piped run.
+
+  The historical defer/design is recorded in
+  `decisions/permissions-privileges-pty-network.md` §4.
 
 ## Consuming verbs
 

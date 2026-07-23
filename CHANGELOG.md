@@ -13,6 +13,24 @@ to a dated version section.
 
 ### Added
 
+- Add an opt-in **PTY launch mode** behind the new `pty` feature:
+  `Command::use_pty()` spawns the child under a real pseudo-terminal — `openpty`
+  on Unix, `CreatePseudoConsole` (ConPTY) on Windows — instead of three pipes, so
+  a tool that *demands* a controlling terminal (an `isatty()`-gated agentic CLI,
+  an `ssh`/`sudo` password prompt) works. A new `Backend::Pty` feeds the child's
+  **merged** stdout+stderr through the same output pump as a piped run over a
+  single master, so in this mode the `on_stderr_line`/`stderr_tee` split collapses
+  and `ProcessResult::stderr` is empty (documented on `use_pty`). Interactive
+  input runs over the same master (`keep_stdin_open` + `take_stdin`); on Unix
+  terminal echo is disabled (termios) so a written secret is not echoed back into
+  the merged output. **Containment is unchanged** — the PTY child is placed in the
+  **same** Job Object / cgroup / process group as any other run (K-032), so
+  whole-tree kill-on-drop, timeouts, and cancellation behave identically. Off by
+  default and strictly additive: with the feature off (or on but `use_pty` unset)
+  the existing three-pipe behavior is byte-for-byte unchanged. `ScriptedRunner`
+  gains a PTY variant (it models the stderr→stdout merge) so hermetic tests need
+  no real tty. Resolves the PTY deferral in
+  `decisions/permissions-privileges-pty-network.md` §4
 - Add `OwnedStatsSampler` — an owning, `'static` twin of the borrowing
   `StatsSampler` (feature `stats`). Built from an `&Arc<ProcessGroup>` via
   `OwnedStatsSampler::new`, it is `Send + 'static`, so — unlike the sampler
