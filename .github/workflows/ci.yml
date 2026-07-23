@@ -65,6 +65,22 @@ jobs:
       # 3-OS clippy matrix; this runs on Linux for the feature dimension only.
       - run: cargo hack --feature-powerset --depth 2 check --all-targets
 
+
+  fuzz-check:
+    name: fuzz harness (cfg check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Checks the `#[cfg(fuzzing)]` code without actually running cargo-fuzz.
+      # Ordinary cargo check/clippy/test never set that cfg,
+      # so type errors would go unnoticed until fuzz.yml
+      # runs its daily schedule.
+      - run: cargo check --all-features --lib
+        env:
+          RUSTFLAGS: --cfg fuzzing
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

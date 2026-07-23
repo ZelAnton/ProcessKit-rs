@@ -6,12 +6,14 @@
 # `just --list` shows all recipes.
 
 # Fast everyday gate: fmt, clippy (all features), tests (all features,
-# including the real-subprocess/`--include-ignored` ones). Not a full CI
-# mirror — use `just ci` before opening a PR for that.
+# including the real-subprocess/`--include-ignored` ones), and the
+# `#[cfg(fuzzing)]` type-check. Not a full CI mirror — use `just ci` before
+# opening a PR for that.
 check:
     cargo fmt --all --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test --all-features -- --include-ignored
+    just fuzz-check
 
 # Full local mirror of the CI workflow's stable-toolchain jobs: fmt, clippy in
 # the three feature configurations the CI matrix checks, the feature-powerset
@@ -22,7 +24,7 @@ check:
 # services/tokens (coverage/coveralls, cargo-deny, public-api diff,
 # semver-checks) — see the optional recipes below for the ones that can still
 # run locally.
-ci: fmt-check clippy-all hack test-all doc-all typos
+ci: fmt-check clippy-all hack test-all doc-all typos fuzz-check
 
 # Mirrors the CI `fmt` job.
 fmt-check:
@@ -108,6 +110,11 @@ test-musl:
             cargo test --all-features -- --include-ignored && \
             cargo test -- --include-ignored && \
             cargo test --no-default-features -- --include-ignored'
+
+# Mirrors the fuzz-check CI job. Type-checks the `#[cfg(fuzzing)]` code
+# without actually running `cargo-fuzz` or requiring a nightly toolchain.
+fuzz-check:
+    RUSTFLAGS="--cfg fuzzing" cargo check --all-features --lib
 
 # Mirrors the CI `typos` job. Requires the `typos` CLI
 # (`cargo install typos-cli`). Config/allow-list is `_typos.toml`.
