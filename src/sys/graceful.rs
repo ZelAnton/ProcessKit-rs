@@ -967,6 +967,19 @@ mod tests {
         phases: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
+    // Keep one subscriber registered for the whole test process. `tracing` caches
+    // callsite interest globally, so installing per-test subscribers lets parallel
+    // tests invalidate each other's capture setup.
+    #[cfg(feature = "tracing")]
+    static INSTALL_PHASE_CAPTURE_SUBSCRIBER: std::sync::Once = std::sync::Once::new();
+
+    #[cfg(feature = "tracing")]
+    std::thread_local! {
+        static ACTIVE_PHASE_CAPTURE: std::cell::RefCell<Option<PhaseCapture>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
     #[cfg(feature = "tracing")]
     impl PhaseCapture {
         fn phases(&self) -> Vec<String> {
@@ -991,7 +1004,10 @@ mod tests {
     }
 
     #[cfg(feature = "tracing")]
-    impl tracing::Subscriber for PhaseCapture {
+    struct PhaseCaptureSubscriber;
+
+    #[cfg(feature = "tracing")]
+    impl tracing::Subscriber for PhaseCaptureSubscriber {
         fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
             true
         }
@@ -1004,28 +1020,67 @@ mod tests {
             let mut phase = None;
             event.record(&mut PhaseVisitor(&mut phase));
             if let Some(phase) = phase {
-                self.phases.lock().expect("phase capture lock").push(phase);
+                ACTIVE_PHASE_CAPTURE.with(|active| {
+                    if let Some(capture) = active.borrow().as_ref() {
+                        capture
+                            .phases
+                            .lock()
+                            .expect("phase capture lock")
+                            .push(phase);
+                    }
+                });
             }
         }
         fn enter(&self, _span: &tracing::span::Id) {}
         fn exit(&self, _span: &tracing::span::Id) {}
     }
 
-    /// Install a fresh [`PhaseCapture`] as the thread-local default subscriber, drive
-    /// `body` to completion on a current-thread runtime (so every event lands on this
-    /// thread, where the capture is installed), and return the ordered `phase` values.
+    #[cfg(feature = "tracing")]
+    struct ActivePhaseCapture;
+
+    #[cfg(feature = "tracing")]
+    impl ActivePhaseCapture {
+        fn install(capture: PhaseCapture) -> Self {
+            ACTIVE_PHASE_CAPTURE.with(|active| {
+                assert!(
+                    active.borrow().is_none(),
+                    "phase capture scopes must not nest on one thread"
+                );
+                active.replace(Some(capture));
+            });
+            Self
+        }
+    }
+
+    #[cfg(feature = "tracing")]
+    impl Drop for ActivePhaseCapture {
+        fn drop(&mut self) {
+            ACTIVE_PHASE_CAPTURE.with(|active| {
+                active.replace(None);
+            });
+        }
+    }
+
+    /// Route events to a fresh [`PhaseCapture`] on this thread, drive `body` to
+    /// completion on a current-thread runtime (so every event lands on this thread),
+    /// and return the ordered `phase` values.
     #[cfg(feature = "tracing")]
     fn capture_teardown_phases<F, Fut>(body: F) -> Vec<String>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        INSTALL_PHASE_CAPTURE_SUBSCRIBER.call_once(|| {
+            tracing::subscriber::set_global_default(PhaseCaptureSubscriber)
+                .expect("install phase capture subscriber");
+        });
         let capture = PhaseCapture::default();
+        let _active_capture = ActivePhaseCapture::install(capture.clone());
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .expect("current-thread runtime");
-        tracing::subscriber::with_default(capture.clone(), || rt.block_on(body()));
+        rt.block_on(body());
         capture.phases()
     }
 

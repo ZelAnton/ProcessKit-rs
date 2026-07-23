@@ -170,7 +170,10 @@ async fn owned_sample_stats_ends_when_the_group_is_released() {
     let again = tokio::time::timeout(Duration::from_secs(5), samples.next())
         .await
         .expect("fused poll bounded");
-    assert!(again.is_none(), "the ended series must not resume: {again:?}");
+    assert!(
+        again.is_none(),
+        "the ended series must not resume: {again:?}"
+    );
 }
 
 #[tokio::test]

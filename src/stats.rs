@@ -363,7 +363,7 @@ impl RunProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{OwnedStatsSampler, Outcome, RunProfile};
+    use super::{Outcome, OwnedStatsSampler, RunProfile};
     use std::sync::Arc;
     use std::time::Duration;
 
