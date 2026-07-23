@@ -7,7 +7,7 @@
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -510,6 +510,74 @@ fn cgroup2_root() -> Option<PathBuf> {
     None
 }
 
+/// This process's **own** cgroup directory under the v2 `root` — the parent under
+/// which a fresh leaf cgroup would be created. On v2, `/proc/self/cgroup` is a
+/// single `0::<path>` line; the path is joined onto `root` (a missing/unparsable
+/// file falls back to the root itself, `rel = "/"`). Shared by [`Cgroup::create`]
+/// (which then `mkdir`s a leaf here) and the read-only [`detect_mechanism`] (which
+/// only *probes* whether a leaf could be created), so the "where is our cgroup"
+/// resolution is single-sourced and cannot drift between the two paths.
+fn cgroup2_self_dir(root: &Path) -> io::Result<PathBuf> {
+    let self_cgroup = std::fs::read_to_string("/proc/self/cgroup")?;
+    let rel = self_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .unwrap_or("/")
+        .trim();
+    Ok(root.join(rel.trim_start_matches('/')))
+}
+
+/// Whether a new sub-directory (a leaf cgroup) could be created inside `dir` right
+/// now, decided by a **pure permission probe that creates nothing**. `mkdir`ing an
+/// entry inside `dir` needs write + search (execute) permission on `dir` itself, so
+/// that is exactly what is checked, via `faccessat(…, AT_EACCESS)` on the effective
+/// ids (matching the ids the real `mkdir` in [`Cgroup::create`] would run under — a
+/// read-only mount fails this the same `EROFS` way `mkdir` would). This is the
+/// read-only stand-in for the authoritative `mkdir` the group-creation path
+/// performs: best-effort, so the rare window where a writable-looking `dir` then
+/// rejects creation (a race, an LSM policy) is where [`detect_mechanism`]'s
+/// prediction may differ from the mechanism `Job::new` ultimately falls back to.
+fn dir_allows_subdir_creation(dir: &Path) -> bool {
+    let Ok(c_path) = CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `faccessat` is a pure permission query — it creates and modifies
+    // nothing. `c_path` is a valid NUL-terminated path; the mode/flags are
+    // constants. `AT_EACCESS` checks the effective uid/gid, matching `mkdir`.
+    let rc = unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        )
+    };
+    rc == 0
+}
+
+/// Read-only prediction of the [`Mechanism`] a fresh [`Job`] would use on this host
+/// right now, **without creating any cgroup directory or spawning a process** —
+/// the detection extracted from the group-creation path so the public
+/// `host_containment()` query and `Job::new` agree.
+///
+/// Reports [`Mechanism::CgroupV2`] when a cgroup v2 hierarchy is mounted
+/// ([`cgroup2_root`]) **and** this process's own cgroup dir ([`cgroup2_self_dir`])
+/// would accept a new leaf ([`dir_allows_subdir_creation`]) — the same two facts
+/// `Cgroup::create` needs — otherwise [`Mechanism::ProcessGroup`] (the POSIX
+/// process-group fallback). The cgroup branch is **best-effort**: it uses a cheap
+/// read-only permission probe rather than actually creating the leaf, so in the
+/// rare case a writable-looking cgroup then rejects the `mkdir` this may report
+/// `CgroupV2` where `Job::new` falls back to `ProcessGroup`.
+pub(crate) fn detect_mechanism() -> Mechanism {
+    let Some(root) = cgroup2_root() else {
+        return Mechanism::ProcessGroup;
+    };
+    match cgroup2_self_dir(&root) {
+        Ok(parent) if dir_allows_subdir_creation(&parent) => Mechanism::CgroupV2,
+        _ => Mechanism::ProcessGroup,
+    }
+}
+
 struct Cgroup {
     path: PathBuf,
 }
@@ -524,14 +592,10 @@ impl Cgroup {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "cgroup v2 not mounted"))?;
         let root = root.as_path();
 
-        // Our own cgroup: on v2, `/proc/self/cgroup` is a single `0::<path>` line.
-        let self_cgroup = std::fs::read_to_string("/proc/self/cgroup")?;
-        let rel = self_cgroup
-            .lines()
-            .find_map(|line| line.strip_prefix("0::"))
-            .unwrap_or("/")
-            .trim();
-        let parent = root.join(rel.trim_start_matches('/'));
+        // Our own cgroup (the parent the leaf is created under), resolved by the
+        // shared helper the read-only `detect_mechanism` query also uses so the two
+        // can never disagree on *where* this process's cgroup is.
+        let parent = cgroup2_self_dir(root)?;
 
         // Without limits, no controllers are enabled — `cgroup.kill` needs none,
         // and that sidesteps the "no internal processes" rule. mkdir is the
@@ -2554,6 +2618,104 @@ mod member_sample_tests {
         assert!(
             process_metrics(me, None).cpu_time.is_some(),
             "an unchecked read (identity None) still reports metrics"
+        );
+    }
+}
+
+/// Tests for the read-only mechanism detection (`detect_mechanism`) that backs the
+/// public `host_containment()` query: it must never create a cgroup directory, and
+/// must agree with a really-created group's mechanism on this same host.
+#[cfg(test)]
+mod detect_mechanism_tests {
+    use std::path::Path;
+
+    use super::{
+        Job, cgroup2_root, cgroup2_self_dir, detect_mechanism, dir_allows_subdir_creation,
+    };
+    use crate::Mechanism;
+
+    /// Build a bare `Job`, papering over the `limits`-feature gate on `Job::new`.
+    fn new_job() -> Job {
+        #[cfg(feature = "limits")]
+        {
+            Job::new(&crate::limits::ResourceLimits::default()).expect("create a job")
+        }
+        #[cfg(not(feature = "limits"))]
+        {
+            Job::new().expect("create a job")
+        }
+    }
+
+    #[test]
+    fn detection_reports_a_valid_linux_mechanism() {
+        // Linux is cgroup v2 or its POSIX process-group fallback — never anything
+        // else, and never a silent "unknown".
+        assert!(
+            matches!(
+                detect_mechanism(),
+                Mechanism::CgroupV2 | Mechanism::ProcessGroup
+            ),
+            "linux detection is cgroup v2 or its pgroup fallback"
+        );
+    }
+
+    #[test]
+    fn the_writability_probe_creates_no_filesystem_entry() {
+        // `detect_mechanism`'s only cgroup-side filesystem touch is this permission
+        // probe; prove it writes nothing by probing a fresh, empty scratch dir and
+        // asserting the dir stays empty afterwards — the "no new cgroup directory"
+        // guarantee the host query is built on, isolated from any parallel test.
+        let tmp =
+            std::env::temp_dir().join(format!("processkit-detect-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("scratch dir");
+        let _ = dir_allows_subdir_creation(&tmp);
+        let stayed_empty = std::fs::read_dir(&tmp)
+            .expect("read scratch dir")
+            .next()
+            .is_none();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            stayed_empty,
+            "the writability probe must create no filesystem entry"
+        );
+    }
+
+    #[test]
+    fn query_creates_no_cgroup_dir_and_matches_a_real_group() {
+        // Count `processkit-*` leaf dirs under this process's own cgroup (if it is
+        // resolvable/readable on this host) before and after hammering the read-only
+        // query: it must leave that set unchanged — unlike `Cgroup::create`, which
+        // `mkdir`s a leaf. The snapshot is taken *before* any group is created below,
+        // so this test never races its own `new_job()`.
+        let parent = cgroup2_root().and_then(|root| cgroup2_self_dir(&root).ok());
+        let count_pk_dirs = |dir: &Path| -> usize {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return 0;
+            };
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("processkit-"))
+                .count()
+        };
+        let before = parent.as_deref().map(count_pk_dirs);
+        for _ in 0..32 {
+            let _ = detect_mechanism();
+        }
+        let after = parent.as_deref().map(count_pk_dirs);
+        assert_eq!(
+            before, after,
+            "the read-only host query must create no cgroup directory"
+        );
+
+        // And it must agree with a really-created group's mechanism on this host —
+        // the core consistency contract (cgroup v2 with or without delegation, or
+        // the pgroup fallback, whichever this host actually yields).
+        let job = new_job();
+        assert_eq!(
+            detect_mechanism(),
+            job.mechanism(),
+            "the read-only mechanism query must match a really-created group's mechanism"
         );
     }
 }

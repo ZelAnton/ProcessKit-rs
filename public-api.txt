@@ -766,6 +766,27 @@ impl core::marker::Unpin for processkit::Finished
 impl core::marker::UnsafeUnpin for processkit::Finished
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::Finished
 impl core::panic::unwind_safe::UnwindSafe for processkit::Finished
+#[non_exhaustive] pub struct processkit::HostContainment
+impl processkit::HostContainment
+pub fn processkit::HostContainment::crate_version(&self) -> &'static str
+pub fn processkit::HostContainment::mechanism(&self) -> processkit::Mechanism
+pub fn processkit::HostContainment::parent_death_cleanup(&self) -> processkit::ParentDeathCleanup
+pub fn processkit::HostContainment::soft_stop_scope(&self) -> processkit::SoftStopScope
+impl core::clone::Clone for processkit::HostContainment
+pub fn processkit::HostContainment::clone(&self) -> processkit::HostContainment
+impl core::cmp::Eq for processkit::HostContainment
+impl core::cmp::PartialEq for processkit::HostContainment
+pub fn processkit::HostContainment::eq(&self, &processkit::HostContainment) -> bool
+impl core::fmt::Debug for processkit::HostContainment
+pub fn processkit::HostContainment::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for processkit::HostContainment
+impl core::marker::Freeze for processkit::HostContainment
+impl core::marker::Send for processkit::HostContainment
+impl core::marker::Sync for processkit::HostContainment
+impl core::marker::Unpin for processkit::HostContainment
+impl core::marker::UnsafeUnpin for processkit::HostContainment
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::HostContainment
+impl core::panic::unwind_safe::UnwindSafe for processkit::HostContainment
 pub struct processkit::JobRunner
 impl processkit::JobRunner
 pub fn processkit::JobRunner::new() -> Self
@@ -1383,6 +1404,7 @@ pub fn T::probe<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::
 pub fn T::run<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<alloc::string::String>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn T::run_unit<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<()>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn T::try_parse<'life0, 'life1, 'async_trait, T, F>(&'life0 self, &'life1 processkit::Command, F) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<T>> + core::marker::Send + 'async_trait)>> where T: core::marker::Send + 'async_trait, F: core::ops::function::FnOnce(&str) -> processkit::Result<T> + core::marker::Send + 'async_trait, Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn processkit::host_containment() -> processkit::HostContainment
 pub async fn processkit::output_all<R, I>(I, usize, &R) -> alloc::vec::Vec<processkit::Result<processkit::ProcessResult<alloc::string::String>>> where R: processkit::ProcessRunner + ?core::marker::Sized, I: core::iter::traits::collect::IntoIterator<Item = processkit::Command>
 pub async fn processkit::output_all_bytes<R, I>(I, usize, &R) -> alloc::vec::Vec<processkit::Result<processkit::ProcessResult<alloc::vec::Vec<u8>>>> where R: processkit::ProcessRunner + ?core::marker::Sized, I: core::iter::traits::collect::IntoIterator<Item = processkit::Command>
 pub async fn processkit::output_string<I, S>(impl core::convert::AsRef<std::ffi::os_str::OsStr>, I) -> processkit::Result<processkit::ProcessResult<alloc::string::String>> where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>

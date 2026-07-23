@@ -60,6 +60,33 @@ for the fail-fast alternative when a cap truly matters. Whichever mechanism
 you land on, whole-tree kill-on-drop itself is unconditional — the fallback
 only narrows *accounting and limits*, never containment.
 
+**Preflight without spawning anything.** A container entrypoint often runs a
+host-check / *doctor* step before it starts any real work, whose whole point is
+to have **no side effects** — no child spawned, no container created. Such a step
+can't build a `ProcessGroup` just to read `mechanism()`, so use
+`host_containment()` instead: it reports the mechanism a group *would* get here (plus the reach of a
+soft stop and abrupt-owner-death cleanup, and the crate version) from cheap
+read-only checks, creating nothing — on Linux specifically, no new cgroup
+directory. The mechanism it predicts is the same one a real `ProcessGroup::new`
+selects; the Linux cgroup answer is best-effort (it checks whether a cgroup
+*could* be created rather than creating one), so in the rare window where a
+writable-looking cgroup then rejects creation the live `mechanism()` is the final
+word.
+
+```rust,no_run
+fn main() {
+    let host = processkit::host_containment();
+    // Log the containment story a run *would* get — no container created, no
+    // process spawned (on Linux: no cgroup directory left behind):
+    println!(
+        "mechanism={:?} parent_death={:?} processkit={}",
+        host.mechanism(),
+        host.parent_death_cleanup(),
+        host.crate_version(),
+    );
+}
+```
+
 ## PID 1: signals, zombies, and what's contained
 
 Inside a container your process is almost always PID 1 — Docker and

@@ -16,7 +16,10 @@
 //!   with the group, so an exiting or panicking owner doesn't leak subprocesses.
 //!   Containment is a Windows [Job Object], a Linux [cgroup v2] (with a POSIX
 //!   process-group fallback), or a POSIX process group on macOS/BSD —
-//!   observable via [`Mechanism`]. Two caveats the [`ProcessGroup`] /
+//!   observable via [`Mechanism`]. A spawn-free [`host_containment`] reports
+//!   which [`Mechanism`] (and the reach of soft stop / abrupt-owner-death
+//!   cleanup) a group *would* get on this host, before any group exists. Two
+//!   caveats the [`ProcessGroup`] /
 //!   [`Mechanism`] docs spell out: the guarantee rides on `Drop` running (a
 //!   `panic = "abort"` process, or a `SIGKILL`/power-loss of the *owner*, skips
 //!   it — the OS-owned Job Object / cgroup still reaps on handle close, the POSIX
@@ -256,7 +259,7 @@ pub use error::{Error, Result};
 pub use group::{ProcessGroup, ProcessGroupOptions};
 #[cfg(feature = "limits")]
 pub use limits::{LimitKind, LimitReason, ResourceLimits};
-pub use mechanism::Mechanism;
+pub use mechanism::{HostContainment, Mechanism};
 #[cfg(feature = "process-control")]
 pub use member::MemberInfo;
 pub use parent_death::ParentDeathCleanup;
@@ -366,6 +369,30 @@ where
 /// it — the same error, with the same classification, a real run would give.
 pub fn which(program: impl AsRef<OsStr>) -> Result<std::path::PathBuf> {
     Command::new(program).resolve_program()
+}
+
+/// Report how process containment behaves on **this** host **without creating a
+/// container or spawning anything** — a spawn-free preflight (a *doctor* /
+/// host-check command that must have no side effects) that answers what a
+/// [`ProcessGroup`] would otherwise only reveal *after* it exists: which
+/// [`Mechanism`] a group created here and now would use, how far a soft stop
+/// reaches, what the OS guarantees on abrupt owner death, and this crate's version.
+///
+/// See [`HostContainment`] for the full contract of each field. In particular the
+/// [`mechanism`](HostContainment::mechanism) is determined by a read-only probe
+/// (see [`Mechanism::detect`]) that on Linux is **best-effort**: it inspects whether
+/// a cgroup could be created rather than creating one, so in a rare window it can
+/// differ from the mechanism a real [`ProcessGroup::new`](ProcessGroup::new) falls
+/// back to. Like [`which`], no async runtime is required.
+///
+/// ```
+/// let host = processkit::host_containment();
+/// // e.g. log the containment story a run *would* get, before starting anything:
+/// let _ = (host.mechanism(), host.parent_death_cleanup(), host.crate_version());
+/// ```
+#[must_use]
+pub fn host_containment() -> HostContainment {
+    HostContainment::probe()
 }
 
 /// Wait for whichever of several running processes exits **first**, returning

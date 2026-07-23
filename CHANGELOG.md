@@ -13,6 +13,24 @@ to a dated version section.
 
 ### Added
 
+- Add `processkit::host_containment() -> HostContainment` — a **spawn-free,
+  side-effect-free** host capability query: it reports how process containment
+  behaves on this host *without creating a container or spawning anything*, so a
+  consumer's preflight (a *doctor* / host-check command whose contract is "no side
+  effects") can state the real story up front instead of having to build a
+  `ProcessGroup` just to read `mechanism()`. The new `#[non_exhaustive]`
+  `HostContainment` carries: `mechanism()` — which `Mechanism` a group created here
+  and now would use, determined by a read-only probe (a fixed constant on
+  Windows/macOS/BSD; on Linux a cheap read-only check of cgroup v2 availability and
+  writability that agrees with a real `ProcessGroup::new`, best-effort in the rare
+  window where a writable-looking cgroup then rejects creation); `soft_stop_scope()`
+  (needs `process-control`) — the host-level reach of a soft stop (`WholeTree` on the
+  Unix backends, `OptInMembers` on Windows; a *specific* group still reads its own,
+  possibly narrower, scope from `ProcessGroup::soft_stop_scope()`);
+  `parent_death_cleanup()` — the same `ParentDeathCleanup` that
+  `Command::kill_on_parent_death_scope()` reports, reused not recomputed; and
+  `crate_version()`. The mechanism detection is lifted out of the group-creation path
+  so the query and the real selection share one source of truth. Purely additive
 - Add `Command::stdout_raw_tee(writer)` / `stderr_raw_tee(writer)` — a
   **byte-accurate** tee that writes each chunk to `writer` *exactly as read from
   the child's pipe*, before any decoding or line splitting. Where

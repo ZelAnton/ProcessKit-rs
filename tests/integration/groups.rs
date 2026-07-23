@@ -27,6 +27,61 @@ async fn group_reports_the_platforms_mechanism() {
     assert_eq!(mechanism, Mechanism::ProcessGroup);
 }
 
+/// The spawn-free host query
+/// ([`host_containment`](processkit::host_containment)) must report the **same**
+/// mechanism a really-created [`ProcessGroup`] on this host reports — the core
+/// consistency contract: the read-only prediction agrees with the actual selection
+/// (Linux with or without cgroup delegation, Windows, macOS). It also reuses the
+/// existing `ParentDeathCleanup` capability query, and its soft-stop reach matches a
+/// live group's where that is deterministic.
+#[tokio::test]
+#[ignore = "creates an OS job/cgroup to cross-check the read-only host query"]
+async fn host_containment_matches_a_real_group() {
+    // The read-only query — no container created, no process spawned.
+    let host = processkit::host_containment();
+
+    // A really-created group on this same host.
+    let group = ProcessGroup::new().expect("create group");
+    assert_eq!(
+        host.mechanism(),
+        group.mechanism(),
+        "the read-only host query must predict the mechanism a real group gets"
+    );
+
+    // The parent-death field is exactly the existing capability query's answer.
+    assert_eq!(
+        host.parent_death_cleanup(),
+        processkit::Command::kill_on_parent_death_scope(),
+        "the host report reuses Command::kill_on_parent_death_scope()"
+    );
+
+    // Version is this crate's version.
+    assert_eq!(host.crate_version(), env!("CARGO_PKG_VERSION"));
+
+    // Soft-stop reach: on the Unix backends it is deterministically WholeTree, so it
+    // must match an (empty) live group's per-group scope. On Windows the host-level
+    // value is the OptInMembers *maximum*; an empty group narrows to Unsupported
+    // per-group, so equality is not expected there — assert the host maximum instead.
+    #[cfg(feature = "process-control")]
+    {
+        use processkit::SoftStopScope;
+        #[cfg(unix)]
+        assert_eq!(
+            host.soft_stop_scope(),
+            group.soft_stop_scope(),
+            "on Unix the host soft-stop reach equals a live group's (WholeTree)"
+        );
+        #[cfg(unix)]
+        assert_eq!(host.soft_stop_scope(), SoftStopScope::WholeTree);
+        #[cfg(windows)]
+        assert_eq!(
+            host.soft_stop_scope(),
+            SoftStopScope::OptInMembers,
+            "on Windows the host reports the opt-in-members maximum a Job Object can reach"
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "spawns a long-lived subprocess and asserts kill-on-drop"]
 async fn dropping_group_kills_children() {

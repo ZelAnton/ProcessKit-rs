@@ -70,6 +70,18 @@ recipe in `justfile` for details.
 | `CgroupV2` | Linux (with delegation) | A private cgroup; children join in `pre_exec`, before `exec`, so descendants can never escape; teardown is `cgroup.kill` |
 | `ProcessGroup` | macOS, BSDs, Linux fallback | POSIX process groups (`setpgid`); teardown is `killpg`; tracked per started/adopted child |
 
+To learn which mechanism you *would* get **without creating a group** — for a
+spawn-free preflight / host-check that must have no side effects — call
+`host_containment()`,
+which returns a `HostContainment` (`mechanism()`, plus `soft_stop_scope()`,
+`parent_death_cleanup()`, and `crate_version()`) from read-only checks that create
+no container and spawn no process (on Linux: no cgroup directory). The predicted
+mechanism matches a real `ProcessGroup::new` on the same host; the Linux cgroup
+answer is best-effort (it probes whether a cgroup *could* be created rather than
+creating one), so a live `ProcessGroup::mechanism()` remains the final word in the
+rare window where a writable-looking cgroup then rejects creation. See [Running in
+containers → Which containment mechanism you get](containers.md#which-containment-mechanism-you-get).
+
 On Linux the cgroup backend requires controller **delegation**, and resource
 limits specifically need this process to run at the **real cgroup-v2 root**. The
 crate creates the limit cgroup under this process's own cgroup and enables the

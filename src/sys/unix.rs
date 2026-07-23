@@ -146,6 +146,15 @@ impl Job {
     }
 }
 
+/// Read-only prediction of the [`Mechanism`] a fresh [`Job`] would use on this host,
+/// computed **without creating any OS object or spawning anything** — always the
+/// POSIX [`Mechanism::ProcessGroup`] backend on macOS/BSD (no cgroups or Job Objects
+/// exist here), so there is nothing to probe. Mirrors [`Job::mechanism`]; backs the
+/// public `host_containment()` query.
+pub(crate) fn detect_mechanism() -> Mechanism {
+    Mechanism::ProcessGroup
+}
+
 #[cfg(feature = "stats")]
 pub(crate) fn process_metrics(_pid: u32, _expected: Option<ProcIdentity>) -> ProcMetrics {
     // Not *implemented* on these targets (returns the empty default), rather than
