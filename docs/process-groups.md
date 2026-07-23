@@ -255,7 +255,7 @@ async fn main() -> processkit::Result<()> {
 | Platform | Deliverable signals |
 |---|---|
 | Linux (cgroup or pgroup), macOS/BSD | Any — `Term`, `Kill`, `Int`, `Hup`, `Quit`, `Usr1`, `Usr2`, `Other(n)` |
-| Windows | `Kill` (Job Object terminate); `Int`/`Term` as a best-effort soft close (`CTRL_BREAK` to console leaders + `WM_CLOSE` to windowed members) — `Error::Unsupported` only when neither exists; every other signal → `Error::Unsupported` |
+| Windows | `Kill` (Job Object terminate); `Int`/`Term` as a best-effort soft close (`CTRL_BREAK` to console leaders + `WM_CLOSE` to windowed members) — `ErrorReason::Unsupported` only when neither exists; every other signal → `ErrorReason::Unsupported` |
 
 `Signal::Kill` always takes the same *atomic* whole-tree kill path as
 `kill_all` (`cgroup.kill` / `killpg` / job terminate), so it cannot miss
@@ -284,7 +284,7 @@ the group whether one will actually reach anything — `soft_stop_scope()` retur
 `SoftStopScope` **capability report**, so a caller cancelling a run on *its own*
 schedule (a UI Cancel, a control-socket command, a timeout it owns) can decide up
 front whether to attempt a graceful stop and can tell its user the real reach,
-instead of firing a `signal`, catching `Error::Unsupported`, and reverse-engineering
+instead of firing a `signal`, catching `ErrorReason::Unsupported`, and reverse-engineering
 the scope. It is the group-axis sibling of
 `Command::kill_on_parent_death_scope() -> ParentDeathCleanup`, but read from the
 group's **live membership** (not fixed per platform) and **side-effect-free** — it
@@ -301,7 +301,7 @@ async fn main() -> processkit::Result<()> {
         .start(&Command::new("my-server").windows_graceful_ctrl_break())
         .await?;
 
-    // Decide BEFORE attempting — no Error::Unsupported to parse back.
+    // Decide BEFORE attempting — no ErrorReason::Unsupported to parse back.
     match group.soft_stop_scope() {
         SoftStopScope::WholeTree | SoftStopScope::OptInMembers => {
             group.signal(Signal::Term)?; // a soft stop will reach a member
@@ -319,7 +319,7 @@ async fn main() -> processkit::Result<()> {
 |---|---|---|
 | Linux cgroup v2, macOS/BSD, Linux pgroup fallback | `WholeTree` | `signal(Int/Term)` reaches every member of the tree (the cgroup, or every tracked process group via `killpg`); never `Unsupported` |
 | Windows, with a live console-CTRL leader (`windows_graceful_ctrl_break`) or a windowed member | `OptInMembers` | a soft close reaches only members it can *trigger* — a curated subset, not the whole tree |
-| Windows, with neither | `Unsupported` | a Job Object has no POSIX signal and there is nothing to soft-close, so `signal(Int/Term)` would return `Error::Unsupported` |
+| Windows, with neither | `Unsupported` | a Job Object has no POSIX signal and there is nothing to soft-close, so `signal(Int/Term)` would return `ErrorReason::Unsupported` |
 
 Consistent with `signal` by construction: it reads the very same live-membership
 primitives `signal(Int/Term)` acts on, so what it reports matches what a real soft
@@ -472,7 +472,7 @@ async fn main() -> processkit::Result<()> {
 `cpu_quota` is a fraction of a **single** core (`2.0` = two cores). Limits
 need a real container; when a requested cap can't be enforced — no Job
 Object/cgroup, or a Linux cgroup whose controllers can't be enabled —
-`with_options` returns `Error::ResourceLimit { kind, reason, detail }` instead
+`with_options` returns `ErrorReason::ResourceLimit { kind, reason, detail }` instead
 of handing back a silently-unbounded group: `kind` names the limit
 (`max_memory`/`max_processes`/`cpu_quota`), `reason` says whether the value was
 simply invalid, the platform has no whole-tree mechanism at all
@@ -516,7 +516,7 @@ set the axes you want capped). On Windows the live Job Object's caps are
 reissued; on Linux cgroup v2 the `memory.max` / `pids.max` / `cpu.max` files are
 rewritten (a removed axis written back to `max`). It routes through the same
 live container the tree-control verbs use, so the same platform matrix and
-`Error::ResourceLimit { kind, reason, detail }` classification apply — a
+`ErrorReason::ResourceLimit { kind, reason, detail }` classification apply — a
 process-group mechanism (macOS/BSD, the Linux fallback) refuses any requested
 cap with `Unsupported` rather than silently dropping it, while lifting *all*
 caps there is a trivial success.

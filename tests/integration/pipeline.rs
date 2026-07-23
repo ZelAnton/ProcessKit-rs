@@ -126,7 +126,7 @@ async fn pipeline_pipefail_attributes_the_first_failure() {
         .await
         .expect_err("a failing stage must fail run()");
     assert!(
-        matches!(err, processkit::Error::Exit { code: 3, .. }),
+        matches!(err.reason(), processkit::ErrorReason::Exit { code: 3, .. }),
         "expected Exit with code 3, got {err:?}"
     );
 }
@@ -173,7 +173,7 @@ async fn pipeline_failure_tears_down_a_quiet_upstream_on_a_raw_stage_error_too()
     // T-085: distinct from `pipeline_failure_tears_down_a_quiet_upstream_immediately`
     // above — that test's failure is a *checked* `Outcome` (a plain non-zero
     // exit), which already fired proactive teardown before this fix landed.
-    // This one's failure is a *raw* `Err` (`Error::Cancelled`, via a per-stage
+    // This one's failure is a *raw* `Err` (`ErrorReason::Cancelled`, via a per-stage
     // `Command::cancel_on` on just the LAST stage — deliberately not the
     // whole-chain `Pipeline::cancel_on`, so the quiet upstream carries no
     // token of its own) surfacing straight out of a stage's task, past the
@@ -199,7 +199,7 @@ async fn pipeline_failure_tears_down_a_quiet_upstream_on_a_raw_stage_error_too()
         .await
         .expect_err("a per-stage-cancelled last stage must surface as Err");
     assert!(
-        matches!(err, processkit::Error::Cancelled { .. }),
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
         "expected Cancelled, got {err:?}"
     );
     assert!(
@@ -610,7 +610,7 @@ async fn pipeline_parse_fails_loud_on_a_truncated_last_stage() {
         .await
         .expect_err("a truncated last stage must fail loud");
     assert!(
-        matches!(err, processkit::Error::OutputTooLarge { .. }),
+        matches!(err.reason(), processkit::ErrorReason::OutputTooLarge { .. }),
         "got {err:?}"
     );
 }
@@ -633,7 +633,7 @@ async fn pipeline_run_fails_loud_on_a_truncated_last_stage() {
         .await
         .expect_err("a truncated last stage must fail loud on run()");
     assert!(
-        matches!(err, processkit::Error::OutputTooLarge { .. }),
+        matches!(err.reason(), processkit::ErrorReason::OutputTooLarge { .. }),
         "got {err:?}"
     );
 }
@@ -642,7 +642,7 @@ async fn pipeline_run_fails_loud_on_a_truncated_last_stage() {
 #[ignore = "spawns a real long-running pipeline and cancels it"]
 async fn pipeline_cancel_on_tears_the_whole_chain_down() {
     // S-1: a token fired mid-run cancels every stage; the run resolves to
-    // Error::Cancelled rather than hanging on the endless producer.
+    // ErrorReason::Cancelled rather than hanging on the endless producer.
     use tokio_util::sync::CancellationToken;
     let token = CancellationToken::new();
     let chain = endless_yes()
@@ -660,7 +660,7 @@ async fn pipeline_cancel_on_tears_the_whole_chain_down() {
         .await
         .expect_err("a cancelled chain errors");
     assert!(
-        matches!(err, processkit::Error::Cancelled { .. }),
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
         "expected Cancelled, got {err:?}"
     );
     assert!(
@@ -782,8 +782,8 @@ async fn pipeline_start_streams_last_stage_lines() {
         .stdout_lines()
         .expect_err("a second stdout_lines must be a loud error");
     assert!(
-        matches!(reused, processkit::Error::Io(_)),
-        "expected Error::Io, got {reused:?}"
+        matches!(reused.reason(), processkit::ErrorReason::Io(_)),
+        "expected ErrorReason::Io, got {reused:?}"
     );
 
     assert!(
@@ -1052,7 +1052,7 @@ async fn pipeline_start_cancel_ends_the_live_chain() {
     .await
     .expect_err("a cancelled chain surfaces as Err");
     assert!(
-        matches!(err, processkit::Error::Cancelled { .. }),
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
         "expected Cancelled, got {err:?}"
     );
     assert!(
@@ -1077,8 +1077,8 @@ async fn pipeline_start_errors_on_a_partially_started_chain() {
         .expect_err("a bogus second stage must fail start()");
     assert!(
         matches!(
-            err,
-            processkit::Error::NotFound { .. } | processkit::Error::Spawn { .. }
+            err.reason(),
+            processkit::ErrorReason::NotFound { .. } | processkit::ErrorReason::Spawn { .. }
         ),
         "expected NotFound/Spawn, got {err:?}"
     );
@@ -1109,8 +1109,8 @@ async fn pipeline_start_reaps_a_partially_started_chain() {
         .expect_err("a bogus second stage must fail start()");
     assert!(
         matches!(
-            err,
-            processkit::Error::NotFound { .. } | processkit::Error::Spawn { .. }
+            err.reason(),
+            processkit::ErrorReason::NotFound { .. } | processkit::ErrorReason::Spawn { .. }
         ),
         "expected NotFound/Spawn, got {err:?}"
     );

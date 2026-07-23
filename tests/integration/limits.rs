@@ -4,14 +4,15 @@
 #[cfg(windows)]
 use processkit::Command;
 use processkit::{
-    Error, LimitKind, LimitReason, Mechanism, ProcessGroup, ProcessGroupOptions, ResourceLimits,
+    ErrorReason, LimitKind, LimitReason, Mechanism, ProcessGroup, ProcessGroupOptions,
+    ResourceLimits,
 };
 
 #[tokio::test]
 #[ignore = "creates an OS job/cgroup with a resource limit"]
 async fn limits_are_enforced_or_rejected_per_platform() {
     // Setting a limit must either be honored by a real container (Windows Job
-    // Object / Linux cgroup) or fail fast with `Error::ResourceLimit` — never
+    // Object / Linux cgroup) or fail fast with `ErrorReason::ResourceLimit` — never
     // silently hand back an unbounded group.
     let res =
         ProcessGroup::with_options(ProcessGroupOptions::default().max_memory(64 * 1024 * 1024));
@@ -19,13 +20,13 @@ async fn limits_are_enforced_or_rejected_per_platform() {
         let group = res.expect("Windows Job Objects enforce a memory cap");
         assert!(matches!(group.mechanism(), Mechanism::JobObject));
     } else if cfg!(target_os = "linux") {
-        match res {
+        match res.map_err(|e| e.into_reason()) {
             Ok(group) => assert!(matches!(group.mechanism(), Mechanism::CgroupV2)),
             // Common on dev boxes / CI without cgroup delegation — the fail-fast
             // path. A capable mechanism (cgroup v2 is mounted) exists here; this
             // *specific* request just couldn't be applied — `Unenforceable`, not
             // `Unsupported`.
-            Err(Error::ResourceLimit { kind, reason, .. }) => {
+            Err(ErrorReason::ResourceLimit { kind, reason, .. }) => {
                 assert_eq!(kind, LimitKind::Memory);
                 assert_eq!(reason, LimitReason::Unenforceable);
                 eprintln!("skipping cgroup enforcement: controller delegation unavailable");
@@ -35,8 +36,8 @@ async fn limits_are_enforced_or_rejected_per_platform() {
     } else {
         // macOS/BSD have no whole-tree cap at all — `Unsupported`, not
         // `Unenforceable` (no mechanism exists to even attempt this against).
-        match res {
-            Err(Error::ResourceLimit { kind, reason, .. }) => {
+        match res.map_err(|e| e.into_reason()) {
+            Err(ErrorReason::ResourceLimit { kind, reason, .. }) => {
                 assert_eq!(kind, LimitKind::Memory);
                 assert_eq!(reason, LimitReason::Unsupported);
             }
@@ -161,7 +162,7 @@ async fn windows_process_count_limit_is_enforced() {
 async fn update_limits_applies_or_refuses_per_platform() {
     // A live group starts unbounded; `update_limits` must then either be honored by
     // a real container (Windows Job Object / Linux cgroup) or fail fast with
-    // `Error::ResourceLimit` — never silently leave the tree unbounded — exactly as
+    // `ErrorReason::ResourceLimit` — never silently leave the tree unbounded — exactly as
     // requesting the cap at creation does.
     let mut group = ProcessGroup::new().expect("create group");
     let mut limits = ResourceLimits::default();
@@ -174,14 +175,14 @@ async fn update_limits_applies_or_refuses_per_platform() {
         // Branch on the active mechanism: a delegated cgroup either applies the cap
         // (at the real hierarchy root) or reports `Unenforceable`; the pgroup
         // fallback (no usable cgroup) has no accounting at all — `Unsupported`.
-        match (group.mechanism(), res) {
+        match (group.mechanism(), res.map_err(|e| e.into_reason())) {
             (Mechanism::CgroupV2, Ok(())) => {}
-            (Mechanism::CgroupV2, Err(Error::ResourceLimit { kind, reason, .. })) => {
+            (Mechanism::CgroupV2, Err(ErrorReason::ResourceLimit { kind, reason, .. })) => {
                 assert_eq!(kind, LimitKind::Memory);
                 assert_eq!(reason, LimitReason::Unenforceable);
                 eprintln!("cgroup present but controllers can't be enabled off the real root");
             }
-            (Mechanism::ProcessGroup, Err(Error::ResourceLimit { kind, reason, .. })) => {
+            (Mechanism::ProcessGroup, Err(ErrorReason::ResourceLimit { kind, reason, .. })) => {
                 assert_eq!(kind, LimitKind::Memory);
                 assert_eq!(reason, LimitReason::Unsupported);
                 eprintln!("no usable cgroup — the fallback has no whole-tree accounting");
@@ -190,8 +191,8 @@ async fn update_limits_applies_or_refuses_per_platform() {
         }
     } else {
         // macOS/BSD: no whole-tree cap mechanism exists at all — `Unsupported`.
-        match res {
-            Err(Error::ResourceLimit { kind, reason, .. }) => {
+        match res.map_err(|e| e.into_reason()) {
+            Err(ErrorReason::ResourceLimit { kind, reason, .. }) => {
                 assert_eq!(kind, LimitKind::Memory);
                 assert_eq!(reason, LimitReason::Unsupported);
             }
@@ -211,8 +212,8 @@ async fn update_limits_reuses_validation_and_survives_teardown() {
     let mut group = ProcessGroup::new().expect("create group");
     let mut bad = ResourceLimits::default();
     bad.max_memory = Some(0);
-    match group.update_limits(bad) {
-        Err(Error::ResourceLimit { kind, reason, .. }) => {
+    match group.update_limits(bad).map_err(|e| e.into_reason()) {
+        Err(ErrorReason::ResourceLimit { kind, reason, .. }) => {
             assert_eq!(kind, LimitKind::Memory);
             assert_eq!(reason, LimitReason::Invalid);
         }
@@ -289,7 +290,7 @@ async fn linux_update_limits_rewrites_cgroup_or_is_observably_refused() {
                     .update_limits(ResourceLimits::default())
                     .expect("lifting all caps on the cgroup must succeed");
             }
-            Err(Error::ResourceLimit {
+            Err(ErrorReason::ResourceLimit {
                 kind,
                 reason: LimitReason::Unenforceable,
                 ..
@@ -303,7 +304,7 @@ async fn linux_update_limits_rewrites_cgroup_or_is_observably_refused() {
         },
         Mechanism::ProcessGroup => {
             match group.update_limits(limits) {
-                Err(Error::ResourceLimit { kind, reason, .. }) => {
+                Err(ErrorReason::ResourceLimit { kind, reason, .. }) => {
                     assert_eq!(kind, LimitKind::Processes);
                     assert_eq!(reason, LimitReason::Unsupported);
                 }

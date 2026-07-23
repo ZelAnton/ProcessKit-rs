@@ -54,8 +54,8 @@ async fn cancel_mid_run_errors_and_kills_only_the_cancelled_child() {
     .await
     .expect_err("a cancelled run must error, not produce a result");
     assert!(
-        matches!(err, processkit::Error::Cancelled { .. }),
-        "expected Error::Cancelled, got {err:?}"
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+        "expected ErrorReason::Cancelled, got {err:?}"
     );
     canceller.await.expect("canceller task");
     // The cancelled child is dead AND reaped by the time `output_string`
@@ -81,7 +81,7 @@ async fn client_default_cancel_on_cancels_a_real_run() {
 
     // The client-level default (`default_cancel_on`) acceptance: a hanging
     // child run through a client configured once is killed — tree and all —
-    // when the token fires, surfacing Error::Cancelled to the awaiting call.
+    // when the token fires, surfacing ErrorReason::Cancelled to the awaiting call.
     let token = CancellationToken::new();
     let sleeper = sleep_secs(30);
     let client = CliClient::new(sleeper.program()).default_cancel_on(token.clone());
@@ -103,8 +103,8 @@ async fn client_default_cancel_on_cancels_a_real_run() {
     .await
     .expect_err("a cancelled run must error, not produce a result");
     assert!(
-        matches!(err, processkit::Error::Cancelled { .. }),
-        "expected Error::Cancelled, got {err:?}"
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+        "expected ErrorReason::Cancelled, got {err:?}"
     );
     canceller.await.expect("canceller task");
     // Death proof: the prompt Cancelled return (the cancel arm kills the tree
@@ -130,8 +130,8 @@ async fn pre_cancelled_token_short_circuits_before_spawning() {
     .await
     .expect_err("a pre-cancelled run must not start");
     assert!(
-        matches!(err, processkit::Error::Cancelled { .. }),
-        "expected Error::Cancelled, got {err:?}"
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+        "expected ErrorReason::Cancelled, got {err:?}"
     );
 }
 
@@ -199,8 +199,8 @@ async fn cancel_ends_the_stream_and_finish_reports_it() {
         .await
         .expect_err("finishing a cancelled streamed run must error");
     assert!(
-        matches!(err, processkit::Error::Cancelled { .. }),
-        "expected Error::Cancelled, got {err:?}"
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+        "expected ErrorReason::Cancelled, got {err:?}"
     );
 }
 
@@ -242,7 +242,7 @@ async fn first_line_cancel_surfaces_cancelled_promptly() {
     .await;
     canceller.await.expect("canceller task");
     assert!(
-        matches!(result, Err(processkit::Error::Cancelled { .. })),
+        matches!(&result, Err(e) if matches!(e.reason(), processkit::ErrorReason::Cancelled { .. })),
         "a cancelled streaming probe must error Cancelled, got {result:?}"
     );
 }
@@ -287,7 +287,7 @@ async fn shared_group_first_line_cancel_tears_down_the_child() {
     .await;
     canceller.await.expect("canceller task");
     assert!(
-        matches!(result, Err(processkit::Error::Cancelled { .. })),
+        matches!(&result, Err(e) if matches!(e.reason(), processkit::ErrorReason::Cancelled { .. })),
         "a cancelled shared-group probe must error Cancelled, got {result:?}"
     );
 
@@ -352,7 +352,7 @@ async fn shared_group_first_line_cancel_without_timeout_is_bounded_on_a_forking_
     .await;
     canceller.await.expect("canceller task");
     assert!(
-        matches!(result, Err(processkit::Error::Cancelled { .. })),
+        matches!(&result, Err(e) if matches!(e.reason(), processkit::ErrorReason::Cancelled { .. })),
         "a cancelled no-timeout probe on a forking shared-group child must return \
          Cancelled promptly, got {result:?}"
     );

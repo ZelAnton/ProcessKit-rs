@@ -108,7 +108,7 @@ pub(crate) struct SharedLines {
     /// EOF (or a broken-pipe read, treated as EOF) leaves it `None`. A consuming
     /// finisher reads it (via [`take_read_error`](Self::take_read_error)) after
     /// the pump joins and surfaces an incomplete capture as
-    /// [`Error::Io`](crate::Error::Io) instead of a silent short read reported as
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io) instead of a silent short read reported as
     /// a full, successful capture. Its own `Mutex` (not `Inner`'s) so the hot
     /// `push` path is untouched; poison is recovered rather than propagated,
     /// matching [`close`](Self::close).
@@ -131,7 +131,7 @@ struct Inner {
     mode: OverflowMode,
     closed: bool,
     /// Set when `OverflowMode::Error` is active and a ceiling is reached — the
-    /// consuming path turns this into [`Error::OutputTooLarge`](crate::Error::OutputTooLarge).
+    /// consuming path turns this into [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge).
     overflowed: bool,
     /// Flipped on by [`start_discarding`](SharedLines::start_discarding) when a
     /// streaming consumer is gone and a discard verb adopts this sink: the
@@ -236,7 +236,7 @@ impl SharedLines {
                     // the ceiling. With neither cap set it is a ceiling with no
                     // ceiling — a misconfiguration treated as zero-tolerance. The pipe
                     // is still drained so the child never blocks; the consuming verb
-                    // turns `overflowed` into `Error::OutputTooLarge`.
+                    // turns `overflowed` into `ErrorReason::OutputTooLarge`.
                     OverflowMode::Error => {
                         let over = match (inner.max_lines, inner.max_bytes) {
                             (None, None) => true,
@@ -405,7 +405,7 @@ impl SharedLines {
 
     /// Record the first OS read error the pump hit while draining the stream —
     /// the incomplete-capture signal a consuming finisher turns into
-    /// [`Error::Io`](crate::Error::Io). Only the *first* error is kept (a later
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io). Only the *first* error is kept (a later
     /// one is ignored); a clean EOF, or a broken-pipe read treated as EOF, records
     /// nothing. Poison-tolerant, like [`close`](Self::close), because it runs on
     /// the pump task's normal *and* unwind exit paths.
@@ -419,7 +419,7 @@ impl SharedLines {
     /// Take the recorded OS read error, if any. Consumes it (by value — a
     /// `std::io::Error` is not `Clone`), so a consuming finisher calls it once
     /// after the pump has joined and wraps a `Some` in
-    /// [`Error::Io`](crate::Error::Io); `None` means the stream drained to a clean
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io); `None` means the stream drained to a clean
     /// EOF and the capture is complete.
     pub(crate) fn take_read_error(&self) -> Option<std::io::Error> {
         self.read_error
@@ -597,7 +597,7 @@ pub(crate) async fn pump_lines_term<R>(
 /// reads to EOF so the child never blocks on a full pipe; on an OS read error it
 /// flushes what it has, **records the error on the sink**
 /// ([`set_read_error`](SharedLines::set_read_error)) so a consuming finisher can
-/// surface the incomplete capture as [`Error::Io`](crate::Error::Io) rather than
+/// surface the incomplete capture as [`ErrorReason::Io`](crate::ErrorReason::Io) rather than
 /// a silent short read, and closes the sink. A broken-pipe read (the writer end
 /// closing) is the normal end of a stream and is treated as a clean EOF, not an
 /// error.
@@ -1001,7 +1001,7 @@ where
                 // Record the OS read error AFTER flushing the partial tail (so the
                 // already-decoded prefix is still delivered) and before the sink
                 // closes, so a finisher that joins this pump surfaces the
-                // incomplete capture as `Error::Io`.
+                // incomplete capture as `ErrorReason::Io`.
                 sink.0.set_read_error(e);
             }
             break;
@@ -1954,7 +1954,7 @@ mod tests {
     async fn clean_eof_records_no_read_error() {
         // A stream that drains to a normal EOF is a complete capture: the sink must
         // carry no read error, so a finisher reports success rather than
-        // `Error::Io` — the non-regression guard against a false-positive read error.
+        // `ErrorReason::Io` — the non-regression guard against a false-positive read error.
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
         pump_lines(&b"a\nb\n"[..], encoding_rs::UTF_8, None, sink.clone()).await;
         assert_eq!(sink.drain(), vec!["a", "b"]);
@@ -1986,7 +1986,7 @@ mod tests {
         // stream — std maps it to `Ok(0)` already, but the pump also defensively
         // folds it into a clean EOF: the buffered line is delivered and NO read
         // error is recorded, so a normal writer-closed stream never spuriously
-        // reports `Error::Io`.
+        // reports `ErrorReason::Io`.
         let reader = ChunkedReader::erroring_with(
             [b"tail\n".to_vec()],
             std::io::Error::from(std::io::ErrorKind::BrokenPipe),

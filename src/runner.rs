@@ -58,7 +58,7 @@ pub trait ProcessRunner: Send + Sync {
     /// `&ProcessGroup` / [`JobRunner`] like text ones. Defaulted in terms of
     /// [`start`](Self::start) — so a runner that overrides `start` gets byte
     /// capture for free, and an `output_string`-only runner (one that does **not**
-    /// override `start`) surfaces [`Error::Unsupported`](crate::Error::Unsupported),
+    /// override `start`) surfaces [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported),
     /// matching `start`. A text fixture (a `record`-feature cassette stores
     /// lossy-UTF-8) cannot reproduce exact bytes; capture bytes from a real or
     /// scripted runner.
@@ -69,7 +69,7 @@ pub trait ProcessRunner: Send + Sync {
     /// Start `command` and return a live [`RunningProcess`] for streaming,
     /// readiness probes, or incremental consumption.
     ///
-    /// Defaulted to [`Error::Unsupported`](crate::Error::Unsupported) so an
+    /// Defaulted to [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) so an
     /// `output_string`-only runner (a hand-rolled double, a cassette runner) keeps
     /// compiling; the real runners ([`JobRunner`], `&ProcessGroup`) and
     /// [`ScriptedRunner`](crate::testing::ScriptedRunner) override it.
@@ -83,9 +83,10 @@ pub trait ProcessRunner: Send + Sync {
     /// guarantee statically.
     async fn start(&self, command: &Command) -> Result<RunningProcess> {
         let _ = command;
-        Err(crate::Error::Unsupported {
+        Err(crate::ErrorReason::Unsupported {
             operation: "start".into(),
-        })
+        }
+        .into())
     }
 }
 
@@ -158,7 +159,7 @@ impl<R: ProcessRunner + ?Sized> ProcessRunner for std::sync::Arc<R> {
 pub trait ProcessRunnerExt: ProcessRunner {
     /// Run, require an **accepted** exit, and return trimmed stdout. Accepted is
     /// `0` by default, widened by [`Command::ok_codes`](crate::Command::ok_codes);
-    /// any other code is [`Error::Exit`](crate::Error::Exit).
+    /// any other code is [`ErrorReason::Exit`](crate::ErrorReason::Exit).
     async fn run(&self, command: &Command) -> Result<String> {
         let result = self.checked(command).await?;
         // `run` presents stdout as if complete, so fail loud on a bounded-buffer
@@ -175,8 +176,8 @@ pub trait ProcessRunnerExt: ProcessRunner {
     }
 
     /// Run and return just the exit code. A run that produced no code surfaces as
-    /// an error — a timeout as [`Error::Timeout`](crate::Error::Timeout), a
-    /// signal-kill as [`Error::Signalled`](crate::Error::Signalled) — rather than a
+    /// an error — a timeout as [`ErrorReason::Timeout`](crate::ErrorReason::Timeout), a
+    /// signal-kill as [`ErrorReason::Signalled`](crate::ErrorReason::Signalled) — rather than a
     /// synthetic sentinel, mirroring
     /// [`ensure_success`](crate::ProcessResult::ensure_success).
     async fn exit_code(&self, command: &Command) -> Result<i32> {
@@ -188,9 +189,9 @@ pub trait ProcessRunnerExt: ProcessRunner {
 
     /// Run a predicate command and read its exit code as a boolean: exit `0` →
     /// `Ok(true)`, exit `1` → `Ok(false)`, anything else → `Err` (other code as
-    /// [`Error::Exit`](crate::Error::Exit), timeout as
-    /// [`Error::Timeout`](crate::Error::Timeout), signal-kill as
-    /// [`Error::Signalled`](crate::Error::Signalled)). For
+    /// [`ErrorReason::Exit`](crate::ErrorReason::Exit), timeout as
+    /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout), signal-kill as
+    /// [`ErrorReason::Signalled`](crate::ErrorReason::Signalled)). For
     /// commands whose exit code *is* the answer — `git diff --quiet`, `grep -q`, …
     async fn probe(&self, command: &Command) -> Result<bool> {
         retrying(command, || async {
@@ -251,7 +252,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
 
     /// Run (requiring an **accepted** exit) and feed the captured stdout to a
     /// *fallible* `parse` closure — the shape of JSON deserialization, where a
-    /// parse failure becomes [`Error::Parse`](crate::Error::Parse) (or whatever
+    /// parse failure becomes [`ErrorReason::Parse`](crate::ErrorReason::Parse) (or whatever
     /// error the closure returns). Like [`parse`](Self::parse) it is built on
     /// [`checked`](Self::checked), fails loud on truncation, and — being generic
     /// over `F` — cannot be dispatched through a `dyn ProcessRunnerExt` **object**
@@ -274,7 +275,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
     /// Stream `command`'s stdout and return the first line matching `predicate`
     /// (`None` if the stream ends first), bounded by the command's
     /// [`timeout`](crate::Command::timeout): a `Some` deadline surfaces as
-    /// [`Error::Timeout`](crate::Error::Timeout) and tears the process down. On an
+    /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) and tears the process down. On an
     /// **own-group** runner ([`JobRunner`], the default) that teardown covers the
     /// whole tree; on a **shared** [`ProcessGroup`](crate::ProcessGroup) it reaches
     /// the run's direct child by pid — a forking child's grandchildren (and, on the
@@ -385,21 +386,22 @@ pub trait ProcessRunnerExt: ProcessRunner {
                     .saturating_add(TEARDOWN_BACKSTOP_MARGIN);
                 match tokio::time::timeout(backstop, raced).await {
                     Ok(Ok(found)) => found,
-                    Ok(Err(())) => return Err(crate::Error::Cancelled { program }),
+                    Ok(Err(())) => return Err(crate::ErrorReason::Cancelled { program }.into()),
                     Err(_elapsed) => {
-                        return Err(crate::Error::Timeout {
+                        return Err(crate::ErrorReason::Timeout {
                             program,
                             timeout: limit,
                             stdout: String::new(), // streaming probe buffers nothing
                             stderr: String::new(),
                             stdout_bytes: None,
-                        });
+                        }
+                        .into());
                     }
                 }
             }
             None => match raced.await {
                 Ok(found) => found,
-                Err(()) => return Err(crate::Error::Cancelled { program }),
+                Err(()) => return Err(crate::ErrorReason::Cancelled { program }.into()),
             },
         };
         // Distinguish a deadline kill (arbiter `TS_TIMED_OUT`, set before the kill,
@@ -413,13 +415,14 @@ pub trait ProcessRunnerExt: ProcessRunner {
         if found.is_none()
             && arbiter.load(std::sync::atomic::Ordering::Acquire) == crate::running::TS_TIMED_OUT
         {
-            return Err(crate::Error::Timeout {
+            return Err(crate::ErrorReason::Timeout {
                 program,
                 timeout: timeout.unwrap_or_default(),
                 stdout: String::new(),
                 stderr: String::new(),
                 stdout_bytes: None,
-            });
+            }
+            .into());
         }
         Ok(found)
     }
@@ -427,11 +430,11 @@ pub trait ProcessRunnerExt: ProcessRunner {
 
 /// Whether `err` is a launch failure **guaranteed to have occurred before any
 /// child process was spawned** — the program was never located
-/// ([`Error::NotFound`](crate::Error::NotFound)), the spawn attempt itself
-/// failed ([`Error::Spawn`](crate::Error::Spawn) — including a transient
+/// ([`ErrorReason::NotFound`](crate::ErrorReason::NotFound)), the spawn attempt itself
+/// failed ([`ErrorReason::Spawn`](crate::ErrorReason::Spawn) — including a transient
 /// `ETXTBSY` that [`Error::is_transient`](crate::Error::is_transient) accepts),
 /// or a required platform primitive was refused up front
-/// ([`Error::Unsupported`](crate::Error::Unsupported)). In each of these no live
+/// ([`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported)). In each of these no live
 /// child ever existed.
 ///
 /// This is what lets [`retrying`] safely re-run a command carrying a **one-shot**
@@ -441,7 +444,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
 /// rolls the reservation back and leaves the payload intact for the retried
 /// attempt. Every other error may have reached a live child that already
 /// consumed the source, so it is **not** treated as pre-child — including the
-/// ambiguous [`Error::Io`](crate::Error::Io), which arises both before a child
+/// ambiguous [`ErrorReason::Io`](crate::ErrorReason::Io), which arises both before a child
 /// (a process group that could not be created, a source already consumed by an
 /// *earlier* run) and after one (driving or tearing down a live child).
 ///
@@ -450,10 +453,10 @@ pub trait ProcessRunnerExt: ProcessRunner {
 /// correctly refused a one-shot retry until it is deliberately added here.
 fn is_pre_child_launch_failure(err: &crate::Error) -> bool {
     matches!(
-        err,
-        crate::Error::NotFound { .. }
-            | crate::Error::Spawn { .. }
-            | crate::Error::Unsupported { .. }
+        err.reason(),
+        crate::ErrorReason::NotFound { .. }
+            | crate::ErrorReason::Spawn { .. }
+            | crate::ErrorReason::Unsupported { .. }
     )
 }
 
@@ -525,9 +528,10 @@ where
                                 tokio::select! {
                                     biased;
                                     () = token.cancelled() => {
-                                        return Err(crate::Error::Cancelled {
+                                        return Err(crate::ErrorReason::Cancelled {
                                             program: command.program_name(),
-                                        });
+                                        }
+                                        .into());
                                     }
                                     () = tokio::time::sleep(delay) => {}
                                 }
@@ -561,17 +565,17 @@ impl JobRunner {
     ///
     /// # Errors
     ///
-    /// The full launch surface: [`Error::NotFound`](crate::Error::NotFound) or
-    /// [`Error::Spawn`](crate::Error::Spawn) (the program could not be located or
-    /// started), [`Error::Unsupported`](crate::Error::Unsupported) (a POSIX-only
+    /// The full launch surface: [`ErrorReason::NotFound`](crate::ErrorReason::NotFound) or
+    /// [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) (the program could not be located or
+    /// started), [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) (a POSIX-only
     /// primitive — user/group switch, `setsid`, umask — unavailable on this
-    /// platform), [`Error::Cancelled`](crate::Error::Cancelled) (the command's
-    /// token was already cancelled), or [`Error::Io`](crate::Error::Io) (the
+    /// platform), [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) (the command's
+    /// token was already cancelled), or [`ErrorReason::Io`](crate::ErrorReason::Io) (the
     /// private [`ProcessGroup`] could not be created, or a one-shot streaming
     /// stdin source was already consumed by a previous run).
     #[cfg_attr(
         feature = "limits",
-        doc = "A resource cap on the new group that cannot be enforced is [`Error::ResourceLimit`](crate::Error::ResourceLimit)."
+        doc = "A resource cap on the new group that cannot be enforced is [`ErrorReason::ResourceLimit`](crate::ErrorReason::ResourceLimit)."
     )]
     pub async fn start(&self, command: &Command) -> Result<RunningProcess> {
         let group = ProcessGroup::new()?;
@@ -599,12 +603,12 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// The launch surface: [`Error::NotFound`](crate::Error::NotFound) /
-    /// [`Error::Spawn`](crate::Error::Spawn) (locate/start failure),
-    /// [`Error::Unsupported`](crate::Error::Unsupported) (a POSIX-only primitive
+    /// The launch surface: [`ErrorReason::NotFound`](crate::ErrorReason::NotFound) /
+    /// [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) (locate/start failure),
+    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) (a POSIX-only primitive
     /// unavailable on this platform),
-    /// [`Error::Cancelled`](crate::Error::Cancelled) (a pre-cancelled token), or
-    /// [`Error::Io`](crate::Error::Io) (e.g. a one-shot stdin source already
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) (a pre-cancelled token), or
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io) (e.g. a one-shot stdin source already
     /// consumed). Unlike [`JobRunner::start`], no new group is created here — the
     /// child joins this existing group.
     pub async fn start(&self, command: &Command) -> Result<RunningProcess> {
@@ -663,7 +667,7 @@ pub(crate) fn take_stdin_for_run(
         // `Stdin::empty()`). Reject the conflict here, at the shared launch
         // boundary every runner routes through (live launch, the scripted/fake
         // doubles, and cassette record via `JobRunner`), as a typed
-        // `Error::Io(InvalidInput)` — the same failure mode as the one-shot-consumed
+        // `ErrorReason::Io(InvalidInput)` — the same failure mode as the one-shot-consumed
         // guard below — rather than silently letting one setting win.
         if command.keeps_stdin_open() {
             return Err(inherit_stdin_conflict(command, "keep_stdin_open()"));
@@ -684,7 +688,7 @@ pub(crate) fn take_stdin_for_run(
     match command.stdin_source() {
         Some(source) => match source.take_for_run() {
             Ok(reservation) => Ok(Some(reservation)),
-            Err(crate::stdin::OneShotConsumed) => Err(crate::Error::Io(std::io::Error::new(
+            Err(crate::stdin::OneShotConsumed) => Err(crate::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "`{}`: its one-shot streaming stdin (from_reader/from_lines) was \
@@ -701,11 +705,11 @@ pub(crate) fn take_stdin_for_run(
 
 /// The typed error raised when [`Command::inherit_stdin`](crate::Command::inherit_stdin)
 /// is combined with another stdin knob that would drive/close stdin (`other`
-/// names it). An `Error::Io(InvalidInput)` — mirroring the crate's other
+/// names it). An `ErrorReason::Io(InvalidInput)` — mirroring the crate's other
 /// stdin-misconfiguration refusal (a consumed one-shot source) — so a caller
 /// gets one uniform "bad stdin setup" failure mode to match on.
 fn inherit_stdin_conflict(command: &Command, other: &str) -> crate::Error {
-    crate::Error::Io(std::io::Error::new(
+    crate::Error::io(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         format!(
             "`{}`: inherit_stdin() cannot be combined with {other} — a child either \
@@ -726,29 +730,34 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     #[cfg(not(unix))]
     {
         if command.requested_uid().is_some() {
-            return Err(crate::Error::Unsupported {
+            return Err(crate::ErrorReason::Unsupported {
                 operation: "uid".into(),
-            });
+            }
+            .into());
         }
         if command.requested_gid().is_some() {
-            return Err(crate::Error::Unsupported {
+            return Err(crate::ErrorReason::Unsupported {
                 operation: "gid".into(),
-            });
+            }
+            .into());
         }
         if command.requested_groups() {
-            return Err(crate::Error::Unsupported {
+            return Err(crate::ErrorReason::Unsupported {
                 operation: "groups".into(),
-            });
+            }
+            .into());
         }
         if command.wants_setsid() {
-            return Err(crate::Error::Unsupported {
+            return Err(crate::ErrorReason::Unsupported {
                 operation: "setsid".into(),
-            });
+            }
+            .into());
         }
         if command.requested_umask().is_some() {
-            return Err(crate::Error::Unsupported {
+            return Err(crate::ErrorReason::Unsupported {
                 operation: "umask".into(),
-            });
+            }
+            .into());
         }
     }
 
@@ -756,9 +765,10 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     if let Some(token) = command.cancel_token()
         && token.is_cancelled()
     {
-        return Err(crate::Error::Cancelled {
+        return Err(crate::ErrorReason::Cancelled {
             program: command.program_name(),
-        });
+        }
+        .into());
     }
 
     // A missing/non-directory cwd produces a bare ENOENT, indistinguishable from
@@ -771,13 +781,14 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         } else {
             (std::io::ErrorKind::NotFound, "does not exist")
         };
-        return Err(crate::Error::Spawn {
+        return Err(crate::ErrorReason::Spawn {
             program: command.program_name(),
             source: std::io::Error::new(
                 kind,
                 format!("working directory {what}: {}", cwd.display()),
             ),
-        });
+        }
+        .into());
     }
 
     // Reserve stdin before the spawn: a concurrent second run of a one-shot
@@ -795,50 +806,61 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         kill_on_parent_death: command.wants_kill_on_parent_death(),
         windows_new_process_group: command.wants_windows_graceful_ctrl_break(),
     };
-    // Translate the OS's opaque NotFound into `Error::NotFound` after the spawn
+    // Translate the OS's opaque NotFound into `ErrorReason::NotFound` after the spawn
     // attempt, so the OS stays the source of truth. The cwd was validated above,
     // so NotFound here is genuinely the program. A bare name reports searched dirs;
     // a path-form program gets `searched: None`.
     let mut child = match group.spawn_with_options(&mut tokio_cmd, &opts) {
         Ok(child) => child,
-        Err(crate::Error::Spawn { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            if is_bare_name(command.program()) {
-                // Reuse the *same* spawn-free resolution the preflight helper
-                // uses (`command::resolve_program`) to enrich the diagnostic —
-                // one decision, so the two can never disagree. `prefer_local`
-                // is parent-side (plain filesystem probes, independent of the
-                // child env), so it is always searched and always safe to name;
-                // the process `PATH` is searched only when the command has NOT
-                // relocated the child `PATH` (`PathSource::Skip` otherwise —
-                // the process `PATH` would be the wrong list to name there).
-                let path = if command.customizes_path() {
-                    PathSource::Skip
-                } else {
-                    PathSource::ProcessPath
-                };
-                return match resolve_program(command.program(), command.prefer_local_dirs(), path) {
-                    // Located parent-side (a `prefer_local` match) or on `PATH`,
-                    // yet the OS still refused with NotFound — the program
-                    // exists but isn't *directly* executable (e.g. a .cmd/.bat
-                    // on Windows), which is a `Spawn` condition, not "missing".
-                    ProgramResolution::Found(_) => Err(crate::Error::Spawn {
-                        program: command.program_name(),
-                        source,
-                    }),
-                    ProgramResolution::NotFound { searched } => Err(crate::Error::NotFound {
-                        program: command.program_name(),
-                        searched,
-                    }),
-                };
+        Err(err) => match err.into_reason() {
+            crate::ErrorReason::Spawn { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                if is_bare_name(command.program()) {
+                    // Reuse the *same* spawn-free resolution the preflight helper
+                    // uses (`command::resolve_program`) to enrich the diagnostic —
+                    // one decision, so the two can never disagree. `prefer_local`
+                    // is parent-side (plain filesystem probes, independent of the
+                    // child env), so it is always searched and always safe to name;
+                    // the process `PATH` is searched only when the command has NOT
+                    // relocated the child `PATH` (`PathSource::Skip` otherwise —
+                    // the process `PATH` would be the wrong list to name there).
+                    let path = if command.customizes_path() {
+                        PathSource::Skip
+                    } else {
+                        PathSource::ProcessPath
+                    };
+                    return match resolve_program(
+                        command.program(),
+                        command.prefer_local_dirs(),
+                        path,
+                    ) {
+                        // Located parent-side (a `prefer_local` match) or on `PATH`,
+                        // yet the OS still refused with NotFound — the program
+                        // exists but isn't *directly* executable (e.g. a .cmd/.bat
+                        // on Windows), which is a `Spawn` condition, not "missing".
+                        ProgramResolution::Found(_) => Err(crate::ErrorReason::Spawn {
+                            program: command.program_name(),
+                            source,
+                        }
+                        .into()),
+                        ProgramResolution::NotFound { searched } => {
+                            Err(crate::ErrorReason::NotFound {
+                                program: command.program_name(),
+                                searched,
+                            }
+                            .into())
+                        }
+                    };
+                }
+                return Err(crate::ErrorReason::NotFound {
+                    program: command.program_name(),
+                    searched: None,
+                }
+                .into());
             }
-            return Err(crate::Error::NotFound {
-                program: command.program_name(),
-                searched: None,
-            });
-        }
-        Err(other) => return Err(other),
+            other => return Err(other.into()),
+        },
     };
     // A child now exists: commit the reservation so a one-shot source is consumed
     // for good. Every failure path above returned before this point, dropping the
@@ -906,7 +928,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::Error;
+    use crate::error::{Error, ErrorReason};
     use crate::result::Outcome;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
@@ -920,8 +942,8 @@ mod tests {
             .await
             .expect_err("the deliberately absent program must not launch");
 
-        match err {
-            Error::NotFound {
+        match err.into_reason() {
+            ErrorReason::NotFound {
                 searched: Some(_), ..
             } => {}
             other => panic!("a Unix backslash name must be enriched as bare: {other:?}"),
@@ -972,7 +994,7 @@ mod tests {
 
     /// `inherit_stdin()` + `keep_stdin_open()` is a contradiction (share the
     /// parent's stdin AND be handed an interactive pipe) and is rejected at the
-    /// launch boundary with a typed `Error::Io(InvalidInput)`, not a silent
+    /// launch boundary with a typed `ErrorReason::Io(InvalidInput)`, not a silent
     /// last-write-wins.
     #[test]
     fn inherit_stdin_conflicts_with_keep_stdin_open() {
@@ -980,9 +1002,9 @@ mod tests {
         // (it guards a live payload), so assert on the error via `match`, not
         // `expect_err`.
         let command = Command::new("child").inherit_stdin().keep_stdin_open();
-        match take_stdin_for_run(&command) {
-            Err(Error::Io(io)) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput),
-            Err(other) => panic!("expected Error::Io(InvalidInput), got {other:?}"),
+        match take_stdin_for_run(&command).map_err(|e| e.into_reason()) {
+            Err(ErrorReason::Io(io)) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput),
+            Err(other) => panic!("expected ErrorReason::Io(InvalidInput), got {other:?}"),
             Ok(_) => panic!("inherit_stdin + keep_stdin_open must be rejected"),
         }
         // Order-independent: the conflict is rejected regardless of builder order.
@@ -1005,9 +1027,9 @@ mod tests {
             crate::Stdin::from_reader(&b"stream"[..]),
         ] {
             let command = Command::new("child").stdin(source).inherit_stdin();
-            match take_stdin_for_run(&command) {
-                Err(Error::Io(io)) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput),
-                Err(other) => panic!("expected Error::Io(InvalidInput), got {other:?}"),
+            match take_stdin_for_run(&command).map_err(|e| e.into_reason()) {
+                Err(ErrorReason::Io(io)) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput),
+                Err(other) => panic!("expected ErrorReason::Io(InvalidInput), got {other:?}"),
                 Ok(_) => panic!("inherit_stdin + a stdin source must be rejected"),
             }
         }
@@ -1068,7 +1090,7 @@ mod tests {
     async fn retry_retries_until_success() {
         let runner = flaky(2);
         let cmd = Command::new("x").retry(5, Duration::from_millis(0), |e| {
-            matches!(e, Error::Exit { .. })
+            matches!(e.reason(), ErrorReason::Exit { .. })
         });
         assert_eq!(runner.run(&cmd).await.unwrap(), "out");
         assert_eq!(runner.calls.load(Ordering::SeqCst), 3); // 2 failures + 1 success
@@ -1114,7 +1136,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_shot_stdin_is_not_retried_on_a_post_child_error() {
-        // `flaky` reports a non-zero exit — a *post-child* `Error::Exit`: a child
+        // `flaky` reports a non-zero exit — a *post-child* `ErrorReason::Exit`: a child
         // ran, so a one-shot source would have been consumed. The gate refuses to
         // retry it (contrast the pre-child launch failure covered below), while a
         // re-runnable source still retries to the cap.
@@ -1272,7 +1294,7 @@ mod tests {
             .await
             .expect_err("a post-child timeout on a one-shot command errors");
         assert!(
-            matches!(err, Error::Timeout { .. }),
+            matches!(err.reason(), ErrorReason::Timeout { .. }),
             "the first post-child error is returned as-is, got {err:?}"
         );
         assert_eq!(
@@ -1288,8 +1310,8 @@ mod tests {
         let runner = ScriptedRunner::new().on(["tool", "x"], Reply::fail(2, "boom"));
         let cmd = Command::new("tool").args(["x"]).ok_codes([0, 1, 2]);
         assert!(matches!(
-            runner.probe(&cmd).await,
-            Err(Error::Exit { code: 2, .. })
+            runner.probe(&cmd).await.map_err(|e| e.into_reason()),
+            Err(ErrorReason::Exit { code: 2, .. })
         ));
     }
 
@@ -1311,14 +1333,19 @@ mod tests {
         let ok_runner = ScriptedRunner::new().on(["tool"], Reply::ok("nope"));
         let err = ok_runner
             .try_parse::<u32, _>(&Command::new("tool"), |s| {
-                s.trim().parse::<u32>().map_err(|e| Error::Parse {
-                    program: "tool".into(),
-                    message: e.to_string(),
+                s.trim().parse::<u32>().map_err(|e| {
+                    crate::Error::from(ErrorReason::Parse {
+                        program: "tool".into(),
+                        message: e.to_string(),
+                    })
                 })
             })
             .await
             .expect_err("a parser failure is an error");
-        assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::Parse { .. }),
+            "got {err:?}"
+        );
 
         let fail_runner = ScriptedRunner::new().on(["tool"], Reply::fail(3, "boom"));
         let err = fail_runner
@@ -1327,7 +1354,10 @@ mod tests {
             })
             .await
             .expect_err("a non-zero exit is an error");
-        assert!(matches!(err, Error::Exit { code: 3, .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::Exit { code: 3, .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1353,7 +1383,10 @@ mod tests {
             })
             .await
             .expect_err("a truncated capture must fail loud, not parse a clipped tail");
-        assert!(matches!(err, Error::OutputTooLarge { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::OutputTooLarge { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1377,7 +1410,10 @@ mod tests {
             .run(&cmd)
             .await
             .expect_err("a cancelled backoff errors");
-        assert!(matches!(err, Error::Cancelled { .. }), "got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::Cancelled { .. }),
+            "got {err:?}"
+        );
         assert!(
             start.elapsed() < Duration::from_secs(60),
             "the backoff must be cancellable, took {:?}",
@@ -1390,7 +1426,7 @@ mod tests {
     async fn retry_sleeps_the_backoff_between_attempts() {
         let runner = flaky(2);
         let cmd = Command::new("x").retry(5, Duration::from_millis(100), |e| {
-            matches!(e, Error::Exit { .. })
+            matches!(e.reason(), ErrorReason::Exit { .. })
         });
         let start = tokio::time::Instant::now();
         assert_eq!(runner.run(&cmd).await.unwrap(), "out");
@@ -1411,9 +1447,10 @@ mod tests {
     impl ProcessRunner for AlwaysCancelled {
         async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            Err(Error::Cancelled {
+            Err(ErrorReason::Cancelled {
                 program: command.program().to_string_lossy().into_owned(),
-            })
+            }
+            .into())
         }
     }
 
@@ -1423,7 +1460,7 @@ mod tests {
         let cmd = Command::new("x").retry(5, Duration::from_millis(0), |_| true);
         let err = runner.run(&cmd).await.expect_err("cancelled run errors");
         assert!(
-            matches!(err, Error::Cancelled { .. }),
+            matches!(err.reason(), ErrorReason::Cancelled { .. }),
             "expected Cancelled, got {err:?}"
         );
         assert_eq!(
@@ -1524,7 +1561,10 @@ mod tests {
             .await
             .expect_err("a missing program must error");
         assert!(
-            matches!(err, Error::NotFound { .. } | Error::Spawn { .. }),
+            matches!(
+                err.reason(),
+                ErrorReason::NotFound { .. } | ErrorReason::Spawn { .. }
+            ),
             "expected a pre-child launch failure, got {err:?}"
         );
 
@@ -1544,7 +1584,10 @@ mod tests {
             .output_string(&stdin_echo(source))
             .await
             .expect_err("the one-shot source is consumed after the successful run");
-        assert!(matches!(err, Error::Io(_)), "expected Io, got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::Io(_)),
+            "expected Io, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1567,7 +1610,7 @@ mod tests {
         // The loser fails loud on the taken source, not silently with empty stdin.
         let loser = if r1.is_err() { r1 } else { r2 };
         assert!(
-            matches!(loser.unwrap_err(), Error::Io(_)),
+            matches!(loser.unwrap_err().reason(), ErrorReason::Io(_)),
             "the losing concurrent launch must fail loud"
         );
     }
@@ -1588,7 +1631,7 @@ mod tests {
             .await
             .expect_err("a pre-cancelled launch errors");
         assert!(
-            matches!(err, Error::Cancelled { .. }),
+            matches!(err.reason(), ErrorReason::Cancelled { .. }),
             "expected Cancelled, got {err:?}"
         );
 
@@ -1622,6 +1665,9 @@ mod tests {
             .output_string(&exits_zero(source))
             .await
             .expect_err("the one-shot source stays consumed after a successful spawn");
-        assert!(matches!(err, Error::Io(_)), "expected Io, got {err:?}");
+        assert!(
+            matches!(err.reason(), ErrorReason::Io(_)),
+            "expected Io, got {err:?}"
+        );
     }
 }
