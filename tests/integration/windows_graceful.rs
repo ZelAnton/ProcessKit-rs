@@ -365,3 +365,127 @@ async fn windows_windowless_child_is_hard_killed_promptly_not_after_the_grace() 
         "the windowless child was hard-killed by the atomic fallback (got {outcome:?})"
     );
 }
+
+// --- T-167: the observable graceful stop (`ProcessGroup::stop` → `ShutdownReport`) ---
+
+// A windowless child with no console-CTRL opt-in has no soft-signal tier, so the
+// Job Object takes the atomic branch: the report says `SoftSignal::Unsupported`
+// (no signal attempted), escalates promptly, and does NOT wait out the grace.
+#[cfg(feature = "process-control")]
+#[tokio::test]
+#[ignore = "spawns a real windowless subprocess; T-167 stop() reports an unsupported soft signal"]
+async fn windows_windowless_stop_reports_unsupported_soft_signal_and_escalates_promptly() {
+    use processkit::SoftSignal;
+
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default().shutdown_timeout(Duration::from_secs(20)),
+    )
+    .expect("create group");
+    let run = group
+        .start(&Command::new("ping").args(["-n", "30", "127.0.0.1"]))
+        .await
+        .expect("start");
+    // Settle into its ~30s run so it is unambiguously alive at stop.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let start = Instant::now();
+    let report = completes_within(
+        Duration::from_secs(10),
+        "windowless stop",
+        group.stop(Duration::from_secs(20), true),
+    )
+    .await
+    .expect("stop ok");
+
+    assert_eq!(
+        report.soft_signal(),
+        SoftSignal::Unsupported,
+        "a windowless Job Object with no console-CTRL leader has no soft-signal tier"
+    );
+    assert_eq!(
+        report.attempted_signal(),
+        None,
+        "nothing soft was attempted"
+    );
+    assert!(
+        report.escalated(),
+        "the live tree was hard-killed (TerminateJobObject) (report: {report:?})"
+    );
+    assert!(
+        !report.drained_within_grace(),
+        "a live windowless tree does not soft-drain"
+    );
+    assert!(
+        report.members_before().is_some_and(|n| n >= 1),
+        "the ping child was alive before the kill (report: {report:?})"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "the atomic branch is prompt — it does NOT wait out the 20s grace (took {:?})",
+        start.elapsed()
+    );
+
+    let outcome = completes_within(Duration::from_secs(5), "reap", run.wait())
+        .await
+        .expect("wait");
+    assert!(
+        !matches!(outcome, Outcome::Exited(0)),
+        "the windowless child was hard-killed by the atomic fallback (got {outcome:?})"
+    );
+}
+
+// A windowed member gives the Job Object a soft tier: `stop` drives the shared
+// grace loop, posts `WM_CLOSE`, the child closes within the grace, and the report
+// says `SoftSignal::Sent(Term)` with `drained_within_grace == true`, no escalation.
+#[cfg(feature = "process-control")]
+#[tokio::test]
+#[ignore = "spawns a real GUI subprocess; T-167 stop() reports a WM_CLOSE soft signal that drained"]
+async fn windows_wm_close_stop_reports_a_sent_soft_signal_that_drained() {
+    use processkit::{Signal, SoftSignal};
+
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default().shutdown_timeout(Duration::from_secs(25)),
+    )
+    .expect("create group");
+    let (cmd, _script) = wm_close_powershell();
+    let mut run = group.start(&cmd).await.expect("start");
+    run.wait_for_line(|l| l.contains("ready"), Duration::from_secs(30))
+        .await
+        .expect("window shown");
+
+    let report = completes_within(
+        Duration::from_secs(30),
+        "wm-close stop",
+        group.stop(Duration::from_secs(25), true),
+    )
+    .await
+    .expect("stop ok");
+
+    assert_eq!(
+        report.soft_signal(),
+        SoftSignal::Sent(Signal::Term),
+        "the WM_CLOSE soft trigger reached the windowed member"
+    );
+    assert_eq!(report.attempted_signal(), Some(Signal::Term));
+    assert!(
+        report.drained_within_grace(),
+        "the windowed child closed within the grace (report: {report:?})"
+    );
+    assert!(
+        !report.escalated(),
+        "an in-time WM_CLOSE drain needs no TerminateJobObject"
+    );
+    assert!(
+        report.elapsed() < Duration::from_secs(12),
+        "an early WM_CLOSE drain must not ride the 25s grace (report: {report:?})"
+    );
+
+    let outcome = completes_within(Duration::from_secs(5), "reap", run.wait())
+        .await
+        .expect("wait");
+    assert_eq!(
+        outcome,
+        Outcome::Exited(43),
+        "the child exited via its WM_CLOSE FormClosing handler (code 43), not the hard-kill fallback"
+    );
+}

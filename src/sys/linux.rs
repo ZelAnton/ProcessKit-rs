@@ -312,7 +312,7 @@ impl Job {
         signal: i32,
         timeout: Duration,
         escalate: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<super::graceful::GracefulOutcome> {
         match &self.backend {
             // The cgroup signals/observes/kills the tree through the cgroup file
             // API; the shared driver owns the poll-and-escalate algorithm.
@@ -1167,14 +1167,27 @@ impl Cgroup {
 }
 
 impl super::graceful::GracefulTarget for Cgroup {
-    fn signal_all(&self, signal: i32) {
+    fn signal_all(&self, signal: i32) -> super::graceful::SoftDelivery {
         // Best-effort: a delivery failure (a member that exited, EPERM) doesn't
-        // stop the graceful tier from proceeding to poll.
-        let _ = self.signal(signal);
+        // stop the graceful tier from proceeding to poll — the verdict is recorded
+        // only for the report. An `Ok` sweep (including an empty cgroup) is `Sent`;
+        // a surfaced send failure is `Failed`.
+        match self.signal(signal) {
+            Ok(()) => super::graceful::SoftDelivery::Sent,
+            Err(_) => super::graceful::SoftDelivery::Failed,
+        }
     }
 
     fn is_drained(&self) -> bool {
         self.is_empty().unwrap_or(false)
+    }
+
+    fn alive_count(&self) -> Option<usize> {
+        // The whole tree's live members (`cgroup.procs`), matching `members()`. A
+        // removed cgroup reads empty (`Some(0)`); an unreadable membership is
+        // unknown, reported `None` rather than a false 0 — the same fail-safe
+        // `is_drained` applies (there mapped to "not drained").
+        self.members().ok().map(|members| members.len())
     }
 
     fn hard_kill(&self) -> io::Result<()> {
@@ -2108,12 +2121,17 @@ mod rearm_race_tests {
         polls: AtomicUsize,
     }
     impl crate::sys::graceful::GracefulTarget for RacingRearm<'_> {
-        fn signal_all(&self, _signal: i32) {}
+        fn signal_all(&self, _signal: i32) -> crate::sys::graceful::SoftDelivery {
+            crate::sys::graceful::SoftDelivery::Sent
+        }
         fn is_drained(&self) -> bool {
             if self.polls.fetch_add(1, Ordering::Relaxed) == 1 {
                 self.latch.clear();
             }
             false
+        }
+        fn alive_count(&self) -> Option<usize> {
+            None
         }
         fn hard_kill(&self) -> std::io::Result<()> {
             Ok(())

@@ -11,6 +11,8 @@ use crate::mechanism::Mechanism;
 #[cfg(feature = "process-control")]
 use crate::member::MemberInfo;
 #[cfg(feature = "process-control")]
+use crate::shutdown_report::ShutdownReport;
+#[cfg(feature = "process-control")]
 use crate::signal::Signal;
 #[cfg(feature = "stats")]
 use crate::stats::ProcessGroupStats;
@@ -666,6 +668,87 @@ impl ProcessGroup {
             .await
             .map_err(Error::Io)?;
         Ok(())
+    }
+
+    /// Gracefully stop the group with an explicit `grace` and escalation, returning
+    /// a [`ShutdownReport`] of what the teardown **actually observed** — the
+    /// introspective, parameterized sibling of
+    /// [`shutdown_ref`](Self::shutdown_ref).
+    ///
+    /// Like [`shutdown_ref`](Self::shutdown_ref) it borrows the group (`&self`, so
+    /// it works behind an `Arc` / a supervisor and the group stays usable
+    /// afterwards) and drives the same teardown: send the graceful signal
+    /// (`SIGTERM`; a `CTRL_BREAK`/`WM_CLOSE` trigger on the Windows soft tier), wait
+    /// up to `grace` for the tree to drain, then `SIGKILL` (/ `cgroup.kill` /
+    /// `TerminateJobObject`) survivors when `escalate` is set, or spare them when it
+    /// is not. Unlike `shutdown_ref` — which reads
+    /// [`shutdown_timeout`](ProcessGroupOptions::shutdown_timeout) /
+    /// [`escalate_to_kill`](ProcessGroupOptions::escalate_to_kill) from the group's
+    /// options and returns only success-or-error — this takes `grace` / `escalate`
+    /// explicitly and returns the observed [`ShutdownReport`]: the attempted soft
+    /// signal and whether it landed, the member counts before and after, whether the
+    /// tree drained within the grace or was escalated to a hard kill, and the actual
+    /// elapsed time.
+    ///
+    /// A consumer that owns its own end-of-run race (its deadline is a
+    /// timeout ⨯ Ctrl-C ⨯ control-socket race, not a
+    /// [`Command::timeout`](crate::Command::timeout)) can use the report to stop the
+    /// instant the tree is empty — rather than always spending the whole grace — and
+    /// to report the tier the kernel *observed* rather than what it *tried*.
+    ///
+    /// # Kill and wait for drainage
+    ///
+    /// Call `stop(Duration::ZERO, true)` for a **confirmed** hard kill: it kills the
+    /// tree at once (a zero grace elapses immediately) and the returned report tells
+    /// you what was still live at the end via [`members_after`](ShutdownReport::members_after)
+    /// — the "kill and wait until the members actually vanish" path that bare
+    /// [`kill_all`](Self::kill_all) (which returns as soon as the kill is *issued*)
+    /// does not offer. (`kill_all` itself is unchanged.)
+    ///
+    /// # Backward compatibility
+    ///
+    /// Purely additive: [`shutdown`](Self::shutdown) /
+    /// [`shutdown_ref`](Self::shutdown_ref) and their behavior are unchanged, and the
+    /// unconditional guarantees hold — dropping the group is still an immediate
+    /// `SIGKILL` backstop, a straggler spawned during a non-escalating stop keeps
+    /// that backstop (its spare is keyed to a generation the join bumps), and no
+    /// extra wait is introduced beyond `grace` (a `Duration::ZERO` grace waits not at
+    /// all).
+    ///
+    /// # Reaping caveat (POSIX process-group mechanism)
+    ///
+    /// The same caveat as [`shutdown`](Self::shutdown): on the
+    /// [`Mechanism::ProcessGroup`](crate::Mechanism) fallback an unreaped **zombie**
+    /// still reads as alive, so a child that exits on `SIGTERM` but whose handle was
+    /// never awaited reads live for the full `grace` and inflates
+    /// [`members_after`](ShutdownReport::members_after). Await each child you start
+    /// into the group. The Windows Job Object and Linux cgroup mechanisms are immune.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the teardown fails — the same surface as
+    /// [`shutdown`](Self::shutdown): when `escalate` performs the final hard kill,
+    /// the undrained-tree failure on the legacy pre-5.14 per-pid fallback and a
+    /// process-group member that rejects `SIGKILL` with `EPERM` while still alive. A
+    /// best-effort **soft**-signal failure is **not** an error — it is reported as
+    /// [`SoftSignal::Failed`](crate::SoftSignal::Failed) in the returned report and
+    /// the teardown proceeds.
+    #[cfg(feature = "process-control")]
+    pub async fn stop(&self, grace: Duration, escalate: bool) -> Result<ShutdownReport> {
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            target: "processkit",
+            mechanism = ?self.mechanism(),
+            grace_ms = grace.as_millis() as u64,
+            escalate,
+            "graceful stop (reporting): TERM, grace, then KILL"
+        );
+        let outcome = self
+            .job
+            .graceful_shutdown(crate::sys::SIGTERM_RAW, grace, escalate)
+            .await
+            .map_err(Error::Io)?;
+        Ok(ShutdownReport::from_outcome(outcome, Signal::Term))
     }
 
     /// Gracefully tear the tree down **without consuming** the group — the

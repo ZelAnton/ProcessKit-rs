@@ -217,6 +217,11 @@ mod result;
 mod retry;
 mod runner;
 mod running;
+// `ShutdownReport` / `SoftSignal` — the observed facts of a graceful
+// `ProcessGroup::stop`. Gated with the method (and the `Signal` its `SoftSignal`
+// carries).
+#[cfg(feature = "process-control")]
+mod shutdown_report;
 #[cfg(feature = "process-control")]
 mod signal;
 #[cfg(feature = "stats")]
@@ -266,6 +271,8 @@ pub use result::{Outcome, ProcessResult};
 pub use retry::RetryPolicy;
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
 pub use running::{Finished, OutputEvent, OutputEvents, OutputLine, RunningProcess, StdoutLines};
+#[cfg(feature = "process-control")]
+pub use shutdown_report::{ShutdownReport, SoftSignal};
 #[cfg(feature = "process-control")]
 pub use signal::Signal;
 #[cfg(feature = "stats")]

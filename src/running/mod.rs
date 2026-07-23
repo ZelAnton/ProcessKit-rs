@@ -91,8 +91,19 @@ struct FinishedLines {
 enum CaptureMode {
     /// Retain both streams' lines (`output_string`).
     Lines,
-    /// Pump (so the child never blocks on a full pipe) but drop the lines.
+    /// Pump (so the child never blocks on a full pipe) but drop the lines,
+    /// bounding the in-flight assembly with a fixed internal cap
+    /// ([`DISCARD_INFLIGHT_CAP`]) — the caller's `output_buffer` is ignored
+    /// (`wait`/`profile`).
     Discard,
+    /// Like [`Discard`](Self::Discard) — pump, feed the configured tee/per-line
+    /// handlers, retain nothing, classify the outcome exactly as `wait` — but
+    /// bound the in-flight assembly by the caller's configured
+    /// [`Command::output_buffer`](crate::Command::output_buffer) byte cap
+    /// (falling back to [`DISCARD_INFLIGHT_CAP`] when it is unbounded) so held
+    /// memory tracks the *configured* limit, not the child's output size
+    /// (`drain`).
+    DrainBounded,
 }
 
 /// The fields produced by a spawn, handed to [`RunningProcess::from_spawned`].
@@ -788,6 +799,58 @@ impl RunningProcess {
             .outcome)
     }
 
+    /// Wait for exit like [`wait`](Self::wait) — draining both pipes so the child
+    /// never blocks on a full one and returning the same [`Outcome`] classification
+    /// — but **respecting the configured
+    /// [`Command::output_buffer`](crate::Command::output_buffer) byte cap** for the
+    /// in-flight memory bound instead of `wait`'s fixed internal cap.
+    ///
+    /// Use this when the output is already going where you want it — a
+    /// [`stdout_tee`](crate::Command::stdout_tee)/`stderr_tee` writing to a file, or
+    /// an [`on_stdout_line`](crate::Command::on_stdout_line)/`on_stderr_line`
+    /// handler — and you have no use for an in-memory capture. Those sinks still
+    /// receive **every** decoded line (exactly as under `wait`); `drain` simply
+    /// retains nothing itself, so a build log of hundreds of megabytes is streamed
+    /// through to your tee without ever being held in memory. Contrast
+    /// [`output_string`](Self::output_string), which would retain the whole
+    /// capture only for you to throw it away.
+    ///
+    /// The one behavioral difference from [`wait`](Self::wait) is the in-flight
+    /// bound: `wait` ignores `output_buffer` and pins a large fixed internal cap,
+    /// whereas `drain` bounds the pump's line assembly by the configured
+    /// [`max_bytes`](crate::OutputBufferPolicy::max_bytes) byte ceiling. Held
+    /// memory therefore tracks the *configured* limit, not the child's output
+    /// size. As with any byte cap
+    /// ([`with_max_bytes`](crate::OutputBufferPolicy::with_max_bytes)), a single
+    /// line whose length exceeds the cap is never assembled — so it is neither teed
+    /// nor handed to the per-line handler, counted only via the truncation signal.
+    /// An **unbounded** `output_buffer` (no byte cap) falls back to the same fixed
+    /// internal cap `wait` uses, so a newline-free flood still cannot exhaust
+    /// memory. `max_lines` is irrelevant here (it governs retention, and `drain`
+    /// retains nothing).
+    ///
+    /// # Errors
+    ///
+    /// The same surface as [`wait`](Self::wait): a timeout or signal-kill is
+    /// *captured* in the returned [`Outcome`], not raised. The `Err` cases are
+    /// [`Error::Cancelled`] (the run was cancelled via
+    /// [`Command::cancel_on`](crate::Command::cancel_on) — always raised),
+    /// [`Error::Stdin`] (a non-broken-pipe stdin-source failure on an
+    /// otherwise-successful run), or [`Error::Io`] (waiting on the child, or a
+    /// pipe read, failed). A [`fail_loud`](crate::OutputBufferPolicy::fail_loud)
+    /// policy does **not** raise [`Error::OutputTooLarge`] here — like `wait`,
+    /// `drain` captures nothing, so there is no backlog to overflow.
+    pub async fn drain(mut self) -> Result<Outcome> {
+        Ok(self
+            .finish_lines(
+                CaptureMode::DrainBounded,
+                /* expose_counts */ false,
+                || {},
+            )
+            .await?
+            .outcome)
+    }
+
     /// Gracefully stop the process tree: `SIGTERM`, wait up to `grace`, then
     /// `SIGKILL` any survivor. On Windows the kill is atomic and `grace` is not
     /// awaited.
@@ -977,39 +1040,46 @@ impl RunningProcess {
         on_exit: impl FnOnce(),
     ) -> Result<FinishedLines> {
         // The capturing path needs a piped stdout; fail loudly rather than return
-        // empty. The discard path (wait/profile) reads nothing, so it is exempt.
+        // empty. The discard paths (wait/profile/drain) hand nothing back, so a
+        // non-piped stdout is fine for them — they are exempt.
         if matches!(capture, CaptureMode::Lines) {
             self.ensure_stdout_capturable()?;
         }
         // Reuse a sink already populated by a prior streaming call so that
         // output_string after stdout_lines/output_events sees those lines rather
-        // than returning empty. For the discard path use a retain-nothing sink
-        // (not the user's policy) so a chatty child never accumulates O(total)
-        // heap in wait/profile. The byte cap bounds the pump's in-flight line
-        // assembly too — `bounded(0)` alone retains no lines but would still let
-        // a newline-free flood grow the in-flight buffer without limit.
-        let discard_policy = discard_sink_policy();
-        let sink_policy: &OutputBufferPolicy = match capture {
-            CaptureMode::Discard => &discard_policy,
-            CaptureMode::Lines => &self.buffer,
+        // than returning empty. For the discard paths use a retain-nothing sink
+        // (not the user's retention policy) so a chatty child never accumulates
+        // O(total) heap in wait/profile/drain. The byte cap bounds the pump's
+        // in-flight line assembly too — `bounded(0)` alone retains no lines but
+        // would still let a newline-free flood grow the in-flight buffer without
+        // limit. `wait`/`profile` pin that cap to the fixed `discard_sink_policy`;
+        // `drain` honors the caller's configured `output_buffer` byte cap
+        // (`drain_sink_policy`) so held memory tracks the *configured* limit.
+        let sink_policy: OutputBufferPolicy = match capture {
+            CaptureMode::Discard => discard_sink_policy(),
+            CaptureMode::DrainBounded => drain_sink_policy(&self.buffer),
+            CaptureMode::Lines => self.buffer,
         };
         let stdout_sink = self
             .stdout_sink
             .clone()
-            .unwrap_or_else(|| SharedLines::new(sink_policy));
+            .unwrap_or_else(|| SharedLines::new(&sink_policy));
         let stderr_sink = self
             .stderr_sink
             .clone()
-            .unwrap_or_else(|| SharedLines::new(sink_policy));
+            .unwrap_or_else(|| SharedLines::new(&sink_policy));
         // The discard verbs must never accumulate a user-policy backlog. A sink
         // adopted from a *dropped* stream is still in the caller's
         // `OutputBufferPolicy` (possibly unbounded); switch it to retain-nothing
         // *before* `drive_to_exit` so a chatty child can't grow O(total) heap
-        // while we wait for it to exit. A freshly built sink already uses
-        // `discard_sink_policy`, so this is a no-op there. The capture path
-        // (`output_string`) leaves the sink untouched so it can still hand back
-        // the streamed tail.
-        if matches!(capture, CaptureMode::Discard) {
+        // while we wait for it to exit. A freshly built sink already uses a
+        // retain-nothing policy (`discard_sink_policy`/`drain_sink_policy`), so
+        // this is a no-op there. Both discard paths (`wait`/`profile` and `drain`)
+        // share this one `start_discarding` seam rather than forking a second
+        // retain-nothing variant, keeping the `DropNewest` seal-on-first-drop
+        // latch (K-054) single-sourced. The capture path (`output_string`) leaves
+        // the sink untouched so it can still hand back the streamed tail.
+        if matches!(capture, CaptureMode::Discard | CaptureMode::DrainBounded) {
             stdout_sink.start_discarding();
             stderr_sink.start_discarding();
         }
@@ -1067,7 +1137,7 @@ impl RunningProcess {
 
         let (stdout_lines, stderr_lines) = match capture {
             CaptureMode::Lines => (stdout_sink.drain(), stderr_sink.drain()),
-            CaptureMode::Discard => (Vec::new(), Vec::new()),
+            CaptureMode::Discard | CaptureMode::DrainBounded => (Vec::new(), Vec::new()),
         };
         Ok(FinishedLines {
             outcome,
@@ -1747,6 +1817,20 @@ fn discard_sink_policy() -> OutputBufferPolicy {
     OutputBufferPolicy::bounded(0).with_max_bytes(DISCARD_INFLIGHT_CAP)
 }
 
+/// The retain-nothing sink policy for [`RunningProcess::drain`]: like
+/// [`discard_sink_policy`] it keeps no lines, but it bounds the pump's in-flight
+/// assembly by the caller's *configured*
+/// [`OutputBufferPolicy::max_bytes`](crate::OutputBufferPolicy::max_bytes)
+/// instead of the fixed [`DISCARD_INFLIGHT_CAP`]. A configured byte cap is
+/// honored verbatim (so held memory tracks the configured limit, not the child's
+/// output size); an *unbounded* policy falls back to [`DISCARD_INFLIGHT_CAP`] so
+/// a newline-free flood still can't grow the in-flight buffer unboundedly — the
+/// same anti-OOM floor `wait` always applies. Only the **byte** ceiling is read:
+/// `max_lines` governs retention, and `drain` retains nothing.
+fn drain_sink_policy(buffer: &OutputBufferPolicy) -> OutputBufferPolicy {
+    OutputBufferPolicy::bounded(0).with_max_bytes(buffer.max_bytes.unwrap_or(DISCARD_INFLIGHT_CAP))
+}
+
 /// The running accumulator behind [`RunningProcess::profile`]: the latest CPU
 /// reading, the peak memory across samples, and how many ticks ran.
 #[cfg(feature = "stats")]
@@ -2199,6 +2283,195 @@ mod tests {
         assert_eq!(
             run.wait().await.expect("wait after a dropped stream"),
             Outcome::Exited(0)
+        );
+    }
+
+    /// `drain_sink_policy` derives a retain-nothing sink whose in-flight byte cap
+    /// tracks the *configured* `output_buffer` — the memory-bound contract of
+    /// `drain`, pinned with exact values (K-017): a configured byte cap is used
+    /// verbatim; an unbounded policy falls back to the fixed anti-OOM floor; and
+    /// the sink is always pure retain-nothing (line cap 0, drop-oldest), never
+    /// inheriting the caller's line cap or `Error` overflow mode.
+    #[test]
+    fn drain_sink_policy_tracks_the_configured_byte_cap() {
+        // A configured byte cap is honored verbatim (memory tracks the *limit*).
+        let p = drain_sink_policy(&OutputBufferPolicy::unbounded().with_max_bytes(4096));
+        assert_eq!(
+            p.max_bytes,
+            Some(4096),
+            "configured byte cap is used verbatim"
+        );
+        assert_eq!(p.max_lines, Some(0), "drain retains no lines");
+        assert_eq!(
+            p.overflow,
+            OverflowMode::DropOldest,
+            "the retain-nothing sink never carries the caller's overflow mode"
+        );
+
+        // Unbounded → the same fixed anti-OOM floor `wait` always applies, so a
+        // newline-free flood still cannot grow the in-flight buffer unboundedly.
+        let p = drain_sink_policy(&OutputBufferPolicy::unbounded());
+        assert_eq!(p.max_bytes, Some(DISCARD_INFLIGHT_CAP));
+        assert_eq!(p.max_lines, Some(0));
+
+        // A fail-loud caller policy contributes only its byte cap: the sink must
+        // NOT inherit `Error` (that would resurrect the overflow bookkeeping
+        // `drain` deliberately skips, K-054) nor the caller's line cap.
+        let p = drain_sink_policy(&OutputBufferPolicy::fail_loud(100).with_max_bytes(1 << 20));
+        assert_eq!(p.max_bytes, Some(1 << 20));
+        assert_eq!(p.max_lines, Some(0));
+        assert_eq!(p.overflow, OverflowMode::DropOldest);
+    }
+
+    /// `drain` feeds every decoded line to the configured per-line handler while
+    /// retaining nothing, even when the child prints far more than the configured
+    /// byte cap — and it classifies the outcome exactly as `wait`. The child emits
+    /// 500 short lines under a 64-byte cap: each line fits (so it is delivered),
+    /// the running total dwarfs the cap, and `drain` holds no backlog. Proven by an
+    /// exact delivered-line counter (K-017), never by timing.
+    #[tokio::test]
+    async fn drain_feeds_every_fitting_line_and_matches_wait_outcome() {
+        let lines: Vec<String> = (0..500).map(|i| format!("line-{i:04}")).collect();
+        // A byte cap far below the cumulative output, but above any single line,
+        // so nothing is skipped for the memory bound.
+        let cap = OutputBufferPolicy::unbounded().with_max_bytes(64);
+
+        // drain: the handler must see all 500 lines; nothing is retained.
+        let seen_drain = Arc::new(AtomicUsize::new(0));
+        let sink = seen_drain.clone();
+        let cmd = Command::new("chatty")
+            .output_buffer(cap)
+            .on_stdout_line(move |_| {
+                sink.fetch_add(1, Ordering::Relaxed);
+            });
+        let drain_outcome = ScriptedRunner::new()
+            .fallback(Reply::lines(lines.clone()))
+            .start(&cmd)
+            .await
+            .expect("scripted start")
+            .drain()
+            .await
+            .expect("drain");
+        assert_eq!(
+            seen_drain.load(Ordering::Relaxed),
+            500,
+            "drain must feed every fitting line to the per-line handler"
+        );
+
+        // wait on the identical input: same delivery, same outcome classification.
+        let seen_wait = Arc::new(AtomicUsize::new(0));
+        let sink = seen_wait.clone();
+        let cmd = Command::new("chatty")
+            .output_buffer(cap)
+            .on_stdout_line(move |_| {
+                sink.fetch_add(1, Ordering::Relaxed);
+            });
+        let wait_outcome = ScriptedRunner::new()
+            .fallback(Reply::lines(lines))
+            .start(&cmd)
+            .await
+            .expect("scripted start")
+            .wait()
+            .await
+            .expect("wait");
+        assert_eq!(
+            seen_wait.load(Ordering::Relaxed),
+            500,
+            "wait feeds the same lines to the handler; drain skips nothing wait delivers"
+        );
+        assert_eq!(
+            drain_outcome, wait_outcome,
+            "drain classifies the outcome exactly as wait"
+        );
+        assert_eq!(drain_outcome, Outcome::Exited(0));
+    }
+
+    /// `drain` classifies a non-zero exit exactly as `wait` — the same
+    /// non-checking contract (a failing code is captured in the `Outcome`, not
+    /// raised as an error).
+    #[tokio::test]
+    async fn drain_matches_wait_on_a_failing_outcome() {
+        let reply = || Reply::fail(2, "boom").with_stdout("o1\no2\n");
+        let drained = ScriptedRunner::new()
+            .fallback(reply())
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start")
+            .drain()
+            .await
+            .expect("drain does not raise a non-zero exit");
+        let waited = ScriptedRunner::new()
+            .fallback(reply())
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start")
+            .wait()
+            .await
+            .expect("wait does not raise a non-zero exit");
+        assert_eq!(drained, waited, "drain and wait agree on a failing outcome");
+        assert_eq!(drained, Outcome::Exited(2));
+    }
+
+    /// `drain` retains nothing, so a `fail_loud` policy must NOT raise
+    /// `OutputTooLarge` for output the caller never asked to capture — exactly like
+    /// `wait` (and unlike `output_string`, which WOULD overflow). Pins the discard
+    /// contract: `drain` reuses the one `start_discarding` seam, so it does no
+    /// retention/overflow bookkeeping (K-054), never forking a second variant.
+    #[tokio::test]
+    async fn drain_does_not_error_under_fail_loud() {
+        let cmd = Command::new("tool").output_buffer(OutputBufferPolicy::fail_loud(1));
+        let drained = ScriptedRunner::new()
+            .fallback(Reply::lines(["a", "b", "c", "d"]))
+            .start(&cmd)
+            .await
+            .expect("scripted start")
+            .drain()
+            .await
+            .expect("drain must not error under fail_loud");
+        let waited = ScriptedRunner::new()
+            .fallback(Reply::lines(["a", "b", "c", "d"]))
+            .start(&cmd)
+            .await
+            .expect("scripted start")
+            .wait()
+            .await
+            .expect("wait must not error under fail_loud either");
+        assert_eq!(
+            drained, waited,
+            "drain and wait agree: uncaptured output does not trip fail_loud"
+        );
+        assert_eq!(drained, Outcome::Exited(0));
+    }
+
+    /// `drain` honors the *configured* `output_buffer` byte cap for its in-flight
+    /// bound — the one behavior distinguishing it from `wait` (whose cap is a fixed
+    /// 64 MiB). A single line longer than the configured cap is never assembled, so
+    /// it reaches neither the per-line handler nor a tee (counted only via the
+    /// truncation signal), while every fitting line is delivered in full. This is
+    /// what bounds held memory to the *configured* limit rather than the output
+    /// size.
+    #[tokio::test]
+    async fn drain_honors_the_configured_byte_cap() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        // 8-byte cap: "aaaa"/"bbbb" fit; the 40-'x' line is over-cap and skipped.
+        let over_cap = "x".repeat(40);
+        let cmd = Command::new("tool")
+            .output_buffer(OutputBufferPolicy::unbounded().with_max_bytes(8))
+            .on_stdout_line(move |line| sink.lock().unwrap().push(line.to_owned()));
+        let outcome = ScriptedRunner::new()
+            .fallback(Reply::lines(["aaaa", over_cap.as_str(), "bbbb"]))
+            .start(&cmd)
+            .await
+            .expect("scripted start")
+            .drain()
+            .await
+            .expect("drain");
+        assert_eq!(outcome, Outcome::Exited(0));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["aaaa".to_owned(), "bbbb".to_owned()],
+            "the over-cap line is skipped by the configured byte cap; fitting lines are delivered"
         );
     }
 

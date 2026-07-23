@@ -120,7 +120,7 @@ impl Job {
         signal: i32,
         timeout: Duration,
         escalate: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<super::graceful::GracefulOutcome> {
         self.group
             .graceful_shutdown(signal, timeout, escalate)
             .await
