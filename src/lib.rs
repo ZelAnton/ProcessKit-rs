@@ -130,7 +130,8 @@
 //! guarantee is unconditional in every configuration.
 //!
 //! - **`stats`** — resource measurement: `ProcessGroupStats`,
-//!   `ProcessGroup::stats` (plus the `sample_stats` time-series sampler), the
+//!   `ProcessGroup::stats` (plus the `sample_stats` time-series sampler and its
+//!   owning `'static` twin `OwnedStatsSampler`), the
 //!   per-process `RunningProcess::cpu_time`/`peak_memory_bytes` diagnostics,
 //!   and the `RunningProcess::profile` run summary. **Opt-in** for its
 //!   specialized purpose (on Windows it calls the system `ProcessStatus`/PSAPI
@@ -297,7 +298,7 @@ pub use signal::Signal;
 #[cfg(feature = "process-control")]
 pub use soft_stop::SoftStopScope;
 #[cfg(feature = "stats")]
-pub use stats::{ProcessGroupStats, RunProfile, StatsSampler};
+pub use stats::{OwnedStatsSampler, ProcessGroupStats, RunProfile, StatsSampler};
 pub use stdin::{ProcessStdin, Stdin};
 pub use supervisor::{
     GiveUpAttempt, RestartPolicy, StopReason, SupervisionOutcome, SupervisionSession,

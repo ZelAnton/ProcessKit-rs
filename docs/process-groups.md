@@ -641,6 +641,54 @@ the group, so it can neither outlive it nor keep it (and the kill-on-drop
 guarantee) alive. For a *single run's* end-to-end summary, see
 [`profile`](streaming.md#per-run-telemetry).
 
+### An owning, `'static` sampler
+
+Because `sample_stats` borrows the group, its `StatsSampler` is tied to that
+borrow — it can't be moved into a [`tokio::spawn`]ed task or handed across an FFI
+boundary, both of which need a `'static` value. When the group already lives
+behind a shared [`Arc`] (a long-lived service, a supervisor, an FFI wrapper),
+reach instead for `OwnedStatsSampler`, the owning twin — the sampling analogue of
+how [`shutdown_ref`](#tearing-down-drop-terminate-shutdown) is the non-consuming
+twin of `shutdown`:
+
+```rust,no_run
+use std::sync::Arc;
+use std::time::Duration;
+
+use processkit::prelude::StreamExt;
+use processkit::{Command, OwnedStatsSampler, ProcessGroup};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = Arc::new(ProcessGroup::new()?);
+    let _worker = group.start(&Command::new("worker")).await?;
+
+    // `Send + 'static`: build it from `&Arc<…>` (the caller keeps the `Arc`) and
+    // move it into a task. Same cadence as `sample_stats` — first sample
+    // immediate, then one per interval, missed ticks skipped.
+    let mut samples = OwnedStatsSampler::new(&group, Duration::from_millis(250));
+    tokio::spawn(async move {
+        while let Some(s) = samples.next().await {
+            println!("rss now: {:?}", s.peak_memory_bytes);
+        }
+        // The series ended: either the container can no longer report, or every
+        // `Arc` to the group was dropped and the tree is gone.
+    });
+    Ok(())
+}
+```
+
+It holds the group only **weakly**, so — exactly like the borrowing
+`StatsSampler` — it never keeps the group or its kill-on-drop guarantee alive; a
+sampler left running in a detached task can't pin a tree that should have been
+torn down. That makes its behaviour when the group goes away well-defined: the
+stream ends — yields `None`, and stays ended (it is fused) — on the first tick
+that can't produce a snapshot, whether because the container was torn down (a
+failed `stats()`, same as the borrowing sampler) **or** because every strong
+`Arc` to the group was released while the sampler ran (the weak handle no longer
+upgrades). It never silently repeats the last snapshot and never leaves the task
+awaiting a tick that will never come.
+
 ---
 
 Next: [Streaming & interactive I/O](streaming.md) ·

@@ -987,6 +987,21 @@ impl core::marker::Unpin for processkit::OutputOverflow
 impl core::marker::UnsafeUnpin for processkit::OutputOverflow
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::OutputOverflow
 impl core::panic::unwind_safe::UnwindSafe for processkit::OutputOverflow
+pub struct processkit::OwnedStatsSampler
+impl processkit::OwnedStatsSampler
+pub fn processkit::OwnedStatsSampler::new(&alloc::sync::Arc<processkit::ProcessGroup>, core::time::Duration) -> Self
+impl core::fmt::Debug for processkit::OwnedStatsSampler
+pub fn processkit::OwnedStatsSampler::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl futures_core::stream::Stream for processkit::OwnedStatsSampler
+pub type processkit::OwnedStatsSampler::Item = processkit::ProcessGroupStats
+pub fn processkit::OwnedStatsSampler::poll_next(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::option::Option<Self::Item>>
+impl core::marker::Freeze for processkit::OwnedStatsSampler
+impl core::marker::Send for processkit::OwnedStatsSampler
+impl core::marker::Sync for processkit::OwnedStatsSampler
+impl core::marker::Unpin for processkit::OwnedStatsSampler
+impl core::marker::UnsafeUnpin for processkit::OwnedStatsSampler
+impl !core::panic::unwind_safe::RefUnwindSafe for processkit::OwnedStatsSampler
+impl !core::panic::unwind_safe::UnwindSafe for processkit::OwnedStatsSampler
 pub struct processkit::Pipeline
 impl processkit::Pipeline
 pub fn processkit::Pipeline::cancel_on(self, tokio_util::sync::cancellation_token::CancellationToken) -> Self

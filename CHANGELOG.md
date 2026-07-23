@@ -13,6 +13,22 @@ to a dated version section.
 
 ### Added
 
+- Add `OwnedStatsSampler` — an owning, `'static` twin of the borrowing
+  `StatsSampler` (feature `stats`). Built from an `&Arc<ProcessGroup>` via
+  `OwnedStatsSampler::new`, it is `Send + 'static`, so — unlike the sampler
+  `ProcessGroup::sample_stats` returns, which is pinned to the borrow — it can be
+  moved into a `tokio::spawn`ed task or across an FFI boundary and sampled there,
+  the shape an `Arc`-held group (a long-lived service, a supervisor, a
+  cross-language wrapper) needs. It drives the **same** interval engine as
+  `StatsSampler` (first sample immediate, then one per interval, missed ticks
+  skipped) rather than forking the cadence, and holds the group only **weakly**:
+  like the borrowing sampler it never keeps the group or its kill-on-drop
+  guarantee alive. Its end-of-series behaviour is therefore well-defined — the
+  stream yields `None` (fused) on the first tick that can't produce a snapshot,
+  whether the container was torn down (a failed `stats()`) or every strong `Arc`
+  to the group was released mid-series (the weak handle stops upgrading) — never
+  silently repeating the last snapshot and never hanging the caller. Additive:
+  `sample_stats` / `StatsSampler` are unchanged
 - Narrate the **graceful-teardown transitions** on the `tracing` seam (feature
   `tracing`): the shared teardown driver now emits a `debug` event per transition on
   the `processkit` target — `soft_signal` (the SIGTERM / CTRL_BREAK was issued) →

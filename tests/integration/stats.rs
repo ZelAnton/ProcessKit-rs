@@ -62,6 +62,118 @@ async fn sample_stats_yields_a_live_series() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real subprocess and samples the group via the owning sampler"]
+async fn owned_sample_stats_yields_a_live_series_from_a_spawned_task() {
+    use std::sync::Arc;
+
+    use processkit::OwnedStatsSampler;
+    use tokio_stream::StreamExt;
+
+    let group = Arc::new(ProcessGroup::new().expect("create group"));
+    let _child = group.start(&sleeper()).await.expect("start sleeper");
+
+    // The owning sampler is `Send + 'static`, so — unlike the borrowing
+    // `StatsSampler` — it can be *moved into* a spawned task and driven there.
+    // That move is itself the runtime proof of the `Send + 'static` pin.
+    let mut samples = OwnedStatsSampler::new(&group, Duration::from_millis(50));
+    let seen = tokio::spawn(async move {
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            let snapshot = tokio::time::timeout(Duration::from_secs(5), samples.next())
+                .await
+                .expect("sample in time")
+                .expect("series still live");
+            out.push(snapshot);
+        }
+        out
+    })
+    .await
+    .expect("sampler task");
+
+    for (n, snapshot) in seen.iter().enumerate() {
+        assert!(
+            snapshot.active_process_count >= 1,
+            "owned sample #{n} saw no live process: {snapshot:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess and samples via both samplers"]
+async fn owned_and_borrowing_samplers_agree_on_a_live_group() {
+    use std::sync::Arc;
+
+    use processkit::OwnedStatsSampler;
+    use tokio_stream::StreamExt;
+
+    // Driven over the *same* live group, the owning sampler yields the same kind
+    // of series as the borrowing one (shared `SamplerCore`, not a forked
+    // implementation): each tick a live snapshot with the process counted.
+    let group = Arc::new(ProcessGroup::new().expect("create group"));
+    let _child = group.start(&sleeper()).await.expect("start sleeper");
+
+    let mut borrowing = group.sample_stats(Duration::from_millis(50));
+    let mut owning = OwnedStatsSampler::new(&group, Duration::from_millis(50));
+
+    for n in 0..3 {
+        let b = tokio::time::timeout(Duration::from_secs(5), borrowing.next())
+            .await
+            .expect("borrowing sample in time")
+            .expect("borrowing series live");
+        let o = tokio::time::timeout(Duration::from_secs(5), owning.next())
+            .await
+            .expect("owning sample in time")
+            .expect("owning series live");
+        assert!(
+            b.active_process_count >= 1 && o.active_process_count >= 1,
+            "sample #{n} disagreed on liveness: borrowing={b:?} owning={o:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess, then releases the group mid-series"]
+async fn owned_sample_stats_ends_when_the_group_is_released() {
+    use std::sync::Arc;
+
+    use processkit::OwnedStatsSampler;
+    use tokio_stream::StreamExt;
+
+    let group = Arc::new(ProcessGroup::new().expect("create group"));
+    let child = group.start(&sleeper()).await.expect("start sleeper");
+
+    let mut samples = OwnedStatsSampler::new(&group, Duration::from_millis(50));
+    let first = tokio::time::timeout(Duration::from_secs(5), samples.next())
+        .await
+        .expect("first sample in time")
+        .expect("series live while the group is held");
+    assert!(
+        first.active_process_count >= 1,
+        "expected a live process before release: {first:?}"
+    );
+
+    // Release every strong handle to the group: the child was started into the
+    // group by `&self` (it holds no `Arc`), so dropping our `Arc` is the last
+    // one — the tree is hard-killed on `Drop` and the sampler's `Weak` can no
+    // longer upgrade. The series must end honestly (bounded, not hung; not a
+    // repeat of `first`).
+    drop(child);
+    drop(group);
+    let after = tokio::time::timeout(Duration::from_secs(5), samples.next())
+        .await
+        .expect("post-release poll must be bounded, not hung");
+    assert!(
+        after.is_none(),
+        "a released group must end the owning series, got {after:?}"
+    );
+    // Fused: it stays ended.
+    let again = tokio::time::timeout(Duration::from_secs(5), samples.next())
+        .await
+        .expect("fused poll bounded");
+    assert!(again.is_none(), "the ended series must not resume: {again:?}");
+}
+
+#[tokio::test]
 #[ignore = "spawns a real subprocess and profiles its run"]
 async fn profile_summarizes_a_run() {
     let profile = group_started_short_run()

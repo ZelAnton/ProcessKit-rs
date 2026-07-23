@@ -323,6 +323,21 @@ re-applies a fresh set to the live tree (a full replacement) for adaptive
 tightening or relaxing, and refuses — rather than silently drops — a cap on a
 mechanism that can't enforce it, exactly as creation does.
 
+**Reading the tree's usage, even where `limits` can't be enforced.** Reporting
+isn't gated on a cap being enforceable: [`ProcessGroup::stats`](process-groups.md#stats-and-sampling)
+and the `sample_stats` time-series (the opt-in `stats` feature) still answer
+inside a container — the live **process count** on every backend, plus total CPU
+time and peak memory wherever a real cgroup or Job Object is active (a plain
+unprivileged container's process-group fallback leaves those two `None`, mirroring
+its unavailable `limits`). A long-lived containerized service typically holds its
+group behind an `Arc` (shared with a supervisor, or a metrics task) — for that
+shape reach for
+[`OwnedStatsSampler`](process-groups.md#an-owning-static-sampler), the
+`Send + 'static` owning sampler: it takes an `&Arc<ProcessGroup>`, so it can be
+moved into a spawned telemetry task without being tied to the borrow's lifetime,
+holds the group only weakly (never pinning a tree that should be torn down), and
+ends its series honestly if the group is ever released.
+
 Running something you don't trust inside that container? See [Running
 untrusted children](untrusted-children.md) for the full hardening checklist —
 containment, resource limits, privilege drop, env hygiene, output/wall-time

@@ -1,8 +1,9 @@
 //! Diagnostic counters for a [`ProcessGroup`](crate::ProcessGroup), plus the
-//! time-series sampler ([`StatsSampler`]) and the per-run profile summary
-//! ([`RunProfile`]).
+//! time-series samplers ([`StatsSampler`] and its owning `'static` twin
+//! [`OwnedStatsSampler`]) and the per-run profile summary ([`RunProfile`]).
 
 use std::pin::Pin;
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -55,6 +56,68 @@ pub struct ProcessGroupStats {
     pub peak_memory_bytes: Option<u64>,
 }
 
+/// The shared cadence-and-fuse engine behind both stats samplers.
+///
+/// The polling contract — clamp a zero period, take the first sample
+/// immediately, skip missed ticks rather than burst to catch up, and latch the
+/// series *done* on the first tick that can't produce a snapshot — lives here
+/// exactly once. Both the borrowing [`StatsSampler`] and the owning
+/// [`OwnedStatsSampler`] drive their [`Stream`](tokio_stream::Stream) through
+/// it, so the two never fork the sampling semantics.
+struct SamplerCore {
+    interval: tokio::time::Interval,
+    /// Latched once a snapshot can't be produced: the series has ended for
+    /// good, and further polls keep returning `None` (a well-behaved, fused
+    /// stream) instead of resuming if the group recovers.
+    done: bool,
+}
+
+impl SamplerCore {
+    fn new(every: Duration) -> Self {
+        // tokio panics on a zero period; clamp rather than make the constructor fallible.
+        let every = every.max(Duration::from_millis(1));
+        let mut interval = tokio::time::interval(every);
+        // Each tick wants the *current* state; replaying missed ticks would
+        // fabricate identical samples.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        SamplerCore {
+            interval,
+            done: false,
+        }
+    }
+
+    /// The configured sampling period (after the zero-clamp) — for `Debug`.
+    fn period(&self) -> Duration {
+        self.interval.period()
+    }
+
+    /// Poll the next tick, then give `take_snapshot` the chance to produce it.
+    ///
+    /// `take_snapshot` returns `None` for **either** end-of-series cause — the
+    /// group's container can no longer report (a failed `stats()`), or the
+    /// owning sampler's group has been dropped entirely (its last `Arc`
+    /// released, so the `Weak` no longer upgrades). Both latch `done` and fuse
+    /// the stream to `None`: the series never silently repeats its last sample
+    /// and never resumes.
+    fn poll_next(
+        &mut self,
+        cx: &mut Context<'_>,
+        take_snapshot: impl FnOnce() -> Option<ProcessGroupStats>,
+    ) -> Poll<Option<ProcessGroupStats>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        std::task::ready!(self.interval.poll_tick(cx));
+        match take_snapshot() {
+            Some(snapshot) => Poll::Ready(Some(snapshot)),
+            None => {
+                self.done = true;
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
 /// A periodic [`ProcessGroupStats`] series — created by
 /// [`ProcessGroup::sample_stats`].
 ///
@@ -65,28 +128,20 @@ pub struct ProcessGroupStats {
 /// fails to report, e.g. after its container is torn down.
 ///
 /// The sampler *borrows* the group, so it can neither outlive it nor keep it
-/// (and its kill-on-drop guarantee) alive.
+/// (and its kill-on-drop guarantee) alive. When the group is held behind a
+/// shared [`Arc`] and you need a sampler that isn't tied to that borrow — one
+/// that is `Send + 'static` and can move between tasks or across an FFI
+/// boundary — use the owning twin [`OwnedStatsSampler`].
 pub struct StatsSampler<'a> {
     group: &'a ProcessGroup,
-    interval: tokio::time::Interval,
-    /// Latched once a snapshot fails: the series has ended for good, and
-    /// further polls keep returning `None` (a well-behaved, fused stream)
-    /// instead of resuming if the group recovers.
-    done: bool,
+    core: SamplerCore,
 }
 
 impl<'a> StatsSampler<'a> {
     pub(crate) fn new(group: &'a ProcessGroup, every: Duration) -> Self {
-        // tokio panics on a zero period; clamp rather than make the constructor fallible.
-        let every = every.max(Duration::from_millis(1));
-        let mut interval = tokio::time::interval(every);
-        // Each tick wants the *current* state; replaying missed ticks would
-        // fabricate identical samples.
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         StatsSampler {
             group,
-            interval,
-            done: false,
+            core: SamplerCore::new(every),
         }
     }
 }
@@ -94,8 +149,8 @@ impl<'a> StatsSampler<'a> {
 impl std::fmt::Debug for StatsSampler<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StatsSampler")
-            .field("period", &self.interval.period())
-            .field("done", &self.done)
+            .field("period", &self.core.period())
+            .field("done", &self.core.done)
             .finish_non_exhaustive()
     }
 }
@@ -105,17 +160,95 @@ impl tokio_stream::Stream for StatsSampler<'_> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if this.done {
-            return Poll::Ready(None);
+        let group = this.group;
+        // A failed `stats()` (torn-down container) ends the borrowed series,
+        // exactly as before — `.ok()` collapses the error into the shared
+        // `None`-means-done contract.
+        this.core.poll_next(cx, || group.stats().ok())
+    }
+}
+
+/// A periodic [`ProcessGroupStats`] series that does **not** borrow the group by
+/// lifetime — the owning, `'static` twin of [`StatsSampler`], for a group held
+/// behind a shared [`Arc`].
+///
+/// Built from an `&Arc<ProcessGroup>` (via [`new`](Self::new)), it is
+/// `Send + 'static`, so — unlike [`StatsSampler`], which is pinned to the
+/// group's lifetime — it can be moved into a [`tokio::spawn`]ed task or across
+/// an FFI boundary and sampled there. It shares the exact
+/// [`Stream`](tokio_stream::Stream) contract of [`StatsSampler`]: first sample
+/// immediate, then one per interval, missed ticks skipped rather than burst
+/// (the cadence is the same `SamplerCore`, not a second implementation).
+///
+/// # It holds the group *weakly*
+///
+/// The sampler keeps only a [`Weak`] handle, so — like the borrowing
+/// [`StatsSampler`] — it neither keeps the group nor its kill-on-drop guarantee
+/// alive: a lingering sampler (e.g. one left running in a detached task) can
+/// never pin a process tree that should have been torn down. That property is
+/// what makes the end-of-series contract below possible.
+///
+/// # End of series
+///
+/// The stream yields `None` — for good, it is fused — on the **first** tick
+/// that can't produce a snapshot, for either reason:
+///
+/// - the group is still alive but its container was torn down, so
+///   [`stats()`](ProcessGroup::stats) fails (identical to [`StatsSampler`]); or
+/// - the group has been **released entirely** — every strong [`Arc`] dropped —
+///   while the sampler was running, so the [`Weak`] no longer upgrades.
+///
+/// In both cases the series ends **honestly**: it never silently repeats the
+/// last snapshot, never fabricates one, and never leaves the caller awaiting a
+/// tick that will never come.
+pub struct OwnedStatsSampler {
+    group: Weak<ProcessGroup>,
+    core: SamplerCore,
+}
+
+impl OwnedStatsSampler {
+    /// Start an owning stats series over a group held behind a shared [`Arc`].
+    ///
+    /// Takes the group by shared reference and downgrades it to a [`Weak`]
+    /// handle: the caller keeps their `Arc`, and this sampler does **not**
+    /// extend the group's life (see the type's [end-of-series](Self#end-of-series)
+    /// contract). A zero `every` is clamped to 1 ms, matching
+    /// [`ProcessGroup::sample_stats`].
+    ///
+    /// The `'static`, `Send` counterpart of [`ProcessGroup::sample_stats`]:
+    /// reach for it when the group lives under an `Arc` and the sampler must
+    /// outlive the borrow (move into a spawned task, cross an FFI boundary);
+    /// reach for `sample_stats` when a plain borrow suffices.
+    pub fn new(group: &Arc<ProcessGroup>, every: Duration) -> Self {
+        OwnedStatsSampler {
+            group: Arc::downgrade(group),
+            core: SamplerCore::new(every),
         }
-        std::task::ready!(this.interval.poll_tick(cx));
-        match this.group.stats() {
-            Ok(snapshot) => Poll::Ready(Some(snapshot)),
-            Err(_) => {
-                this.done = true;
-                Poll::Ready(None)
-            }
-        }
+    }
+}
+
+impl std::fmt::Debug for OwnedStatsSampler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedStatsSampler")
+            .field("period", &self.core.period())
+            .field("done", &self.core.done)
+            // Whether the group is still reachable — a released group reads
+            // `false`, which is exactly when the next tick ends the series.
+            .field("group_alive", &(self.group.strong_count() > 0))
+            .finish_non_exhaustive()
+    }
+}
+
+impl tokio_stream::Stream for OwnedStatsSampler {
+    type Item = ProcessGroupStats;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let OwnedStatsSampler { group, core } = this;
+        // Upgrade the weak handle per tick: `None` if the group was released
+        // entirely, else a failed `stats()` (torn-down container) also collapses
+        // to `None` — both end the series through the shared `SamplerCore`.
+        core.poll_next(cx, || group.upgrade().and_then(|g| g.stats().ok()))
     }
 }
 
@@ -230,7 +363,8 @@ impl RunProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{Outcome, RunProfile};
+    use super::{OwnedStatsSampler, Outcome, RunProfile};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[tokio::test]
@@ -238,6 +372,48 @@ mod tests {
         // tokio's interval panics on a zero period; the constructor must clamp.
         let group = crate::ProcessGroup::new().expect("create group");
         let _sampler = group.sample_stats(Duration::ZERO);
+    }
+
+    /// T-180: the owning sampler exists precisely to move between tasks / across
+    /// an FFI boundary, so it must be `Send + 'static`. A compile-time pin — if
+    /// the type ever stops being `Send + 'static` (e.g. someone swaps the `Weak`
+    /// for a borrow), this stops compiling.
+    #[test]
+    fn owned_sampler_is_send_and_static() {
+        fn assert_send_static<T: Send + 'static>() {}
+        assert_send_static::<OwnedStatsSampler>();
+    }
+
+    #[tokio::test]
+    async fn owned_sampler_zero_interval_does_not_panic() {
+        // Same zero-period clamp as the borrowing sampler — the shared
+        // `SamplerCore` owns it, so the owning constructor must not panic either.
+        let group = Arc::new(crate::ProcessGroup::new().expect("create group"));
+        let _sampler = OwnedStatsSampler::new(&group, Duration::ZERO);
+    }
+
+    /// T-180: releasing the group entirely while the owning sampler runs must
+    /// end the series **honestly** — `None`, fused — not hang the caller or
+    /// repeat a stale snapshot. Here the only strong handle is dropped before
+    /// the first tick, so the weak upgrade fails and the series ends at once.
+    #[tokio::test]
+    async fn owned_sampler_ends_when_group_released() {
+        use tokio_stream::StreamExt;
+
+        let group = Arc::new(crate::ProcessGroup::new().expect("create group"));
+        let mut sampler = OwnedStatsSampler::new(&group, Duration::from_millis(1));
+        // Drop the last strong `Arc`: the group is torn down and the sampler's
+        // `Weak` can no longer upgrade.
+        drop(group);
+        assert!(
+            sampler.next().await.is_none(),
+            "a released group must end the owning sampler's series"
+        );
+        // Fused: it stays ended, never resuming.
+        assert!(
+            sampler.next().await.is_none(),
+            "the series must stay ended (fused), not resume"
+        );
     }
 
     #[test]
