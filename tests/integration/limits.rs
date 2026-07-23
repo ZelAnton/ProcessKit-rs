@@ -290,12 +290,8 @@ async fn linux_update_limits_rewrites_cgroup_or_is_observably_refused() {
                     .update_limits(ResourceLimits::default())
                     .expect("lifting all caps on the cgroup must succeed");
             }
-            Err(ErrorReason::ResourceLimit {
-                kind,
-                reason: LimitReason::Unenforceable,
-                ..
-            }) => {
-                assert_eq!(kind, LimitKind::Processes);
+            Err(e) if e.limit_reason() == Some(LimitReason::Unenforceable) => {
+                assert_eq!(e.limit_kind(), Some(LimitKind::Processes));
                 eprintln!(
                     "cgroup controllers can't be enabled off the real root — refused, not silent"
                 );
@@ -304,9 +300,8 @@ async fn linux_update_limits_rewrites_cgroup_or_is_observably_refused() {
         },
         Mechanism::ProcessGroup => {
             match group.update_limits(limits) {
-                Err(ErrorReason::ResourceLimit { kind, reason, .. }) => {
-                    assert_eq!(kind, LimitKind::Processes);
-                    assert_eq!(reason, LimitReason::Unsupported);
+                Err(e) if e.limit_reason() == Some(LimitReason::Unsupported) => {
+                    assert_eq!(e.limit_kind(), Some(LimitKind::Processes));
                 }
                 other => panic!("the pgroup fallback must refuse a limited update: {other:?}"),
             }
