@@ -1496,10 +1496,10 @@ impl RunningProcess {
     /// Wait for the child to exit, applying the timeout (killing the tree on
     /// elapse). Returns the [`Outcome`] of the run.
     async fn drive_to_exit(&mut self) -> Result<Outcome> {
-        // Close an untaken `keep_stdin_open` pipe so a stdin-reading child sees
-        // EOF instead of blocking to its timeout. (For a PTY the input side is the
-        // master's write end; dropping it closes our write handle — a clean EOF on
-        // Windows, best-effort on Unix, where a pty has no half-close.)
+        // Close an untaken `keep_stdin_open` writer so a stdin-reading child sees
+        // EOF instead of blocking to its timeout. A Windows ConPTY writer sends
+        // the console EOF gesture while its session-lifetime host pipe stays open;
+        // Unix remains best-effort because a pty master has no half-close.
         match &mut self.backend {
             Backend::Real(real) => drop(real.stdin_pipe.take()),
             #[cfg(feature = "pty")]

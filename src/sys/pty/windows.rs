@@ -126,6 +126,9 @@ pub(crate) struct PtyChild {
     process: Arc<OwnedProcess>,
     thread: HANDLE,
     hpc: HPCON,
+    /// Keeps the ConPTY host-input pipe open independently of the public writer.
+    /// Closing that pipe asks conhost to close the console; it is not child EOF.
+    input_keepalive: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     /// Set once the pseudoconsole has been closed, so it is closed exactly once
     /// (by the reap that ends the run, or by `Drop`) and never double-closed.
     hpc_closed: bool,
@@ -181,6 +184,10 @@ impl PtyChild {
         })
         .await
         .map_err(io::Error::other)?;
+        // The input pipe is a ConPTY session-lifetime resource. Only release our
+        // keepalive once the client process is already gone; releasing it while
+        // conhost is starting can turn the broken pipe into CTRL_CLOSE_EVENT.
+        self.input_keepalive.take();
         // The child has exited, but conhost can still have its final rendered
         // frame in flight. Let the bridge drain to quiescence before requesting
         // EOF; the reader stays live throughout, as ConPTY requires for teardown.
@@ -244,6 +251,10 @@ impl Drop for PtyChild {
         // handle. The process handle closes with its `Arc` (possibly after a
         // detached wait finishes).
         self.close_pty();
+        // Close the input bridge only after requesting pseudoconsole teardown.
+        // A separately-owned ProcessStdin may keep it alive until that writer is
+        // dropped, just like an ordinary child-stdin handle.
+        self.input_keepalive.take();
         // SAFETY: `thread` is owned solely here and closed exactly once.
         unsafe {
             if !self.thread.is_null() {
@@ -570,11 +581,6 @@ pub(crate) fn spawn_pty(
     // across `CreateProcessW` below so the child propagates pseudoconsole-overridable
     // null defaults rather than inheriting the launcher's redirected stdio.
     let has_console = launcher_has_console();
-    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
-    // Confirms/denies round 2's premise: if this is `true` on the CI runner, the
-    // headless branch (and its fix) was never taken; if `false`, the branch ran
-    // yet the failure persists, so the cause is elsewhere.
-    eprintln!("[T182-DIAG] launcher_has_console = {has_console}");
     let si = conpty_startup_info(attr_list, has_console);
 
     let mut command_line = build_command_line(cmd);
@@ -588,27 +594,10 @@ pub(crate) fn spawn_pty(
     // same race-free sequence `Job::spawn` uses. `EXTENDED_STARTUPINFO_PRESENT`
     // activates the pseudoconsole attribute list.
     //
-    // Always give the ConPTY child its own console process group
-    // (CREATE_NEW_PROCESS_GROUP), unconditionally — not gated on
-    // `opts.windows_new_process_group` as the non-PTY `Job::spawn` path is. A new
-    // process group is the only mechanism that makes a Windows process immune to
-    // CTRL_C_EVENT by default: without it, a CTRL_C_EVENT sent to ANY process on a
-    // console is delivered to EVERY process attached to that console regardless of
-    // process-group boundaries (Ctrl+C ignores group boundaries, unlike
-    // Ctrl+Break). A ConPTY child already lives isolated in its own pseudoconsole
-    // session and has no reason to share a process group with anything else, so
-    // isolating it costs nothing observable and closes a real failure: a stray
-    // CTRL_C_EVENT in the CI test environment (concurrent `windows_graceful::*`
-    // tests in the same `--include-ignored` binary, or the runner/step wrapper)
-    // was killing the child with STATUS_CONTROL_C_EXIT (0xC000013A) ~130ms after
-    // spawn, before it could run its probe (T-182). `opts.windows_new_process_group`
-    // remains the opt-in switch that drives the graceful-ctrl-break *leader
-    // registration* in `Job::spawn`; the PTY path registers no leaders, so
-    // decoupling the creation flag from it here changes no graceful behavior.
-    let mut flags = CREATE_SUSPENDED
-        | EXTENDED_STARTUPINFO_PRESENT
-        | CREATE_NEW_PROCESS_GROUP
-        | opts.creation_flags;
+    let mut flags = CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | opts.creation_flags;
+    if opts.windows_new_process_group {
+        flags |= CREATE_NEW_PROCESS_GROUP;
+    }
     let (env_ptr, env_flag): (*const std::ffi::c_void, u32) = match &env_block {
         Some(block) => (block.as_ptr().cast(), CREATE_UNICODE_ENVIRONMENT),
         None => (std::ptr::null(), 0),
@@ -666,19 +655,8 @@ pub(crate) fn spawn_pty(
     // is cleaned up — never an uncontained leak.
     // SAFETY: `pi.hProcess` is the freshly-created (suspended) child; `job` is a
     // valid job handle for the caller's lifetime.
-    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
-    // Surface the assign result (and GetLastError on failure) explicitly, testing
-    // the hypothesis that an outer GH Actions job object rejects/perturbs our
-    // AssignProcessToJobObject on the ConPTY child.
-    let diag_assign_ok = unsafe { AssignProcessToJobObject(job, pi.hProcess) };
-    if diag_assign_ok == 0 {
+    if unsafe { AssignProcessToJobObject(job, pi.hProcess) } == 0 {
         let e = io::Error::last_os_error();
-        // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
-        eprintln!(
-            "[T182-DIAG] AssignProcessToJobObject FAILED (pid={}): {e} (raw_os_error={:?})",
-            pi.dwProcessId,
-            e.raw_os_error()
-        );
         unsafe {
             TerminateProcess(pi.hProcess, 1);
             close(pi.hProcess);
@@ -689,21 +667,11 @@ pub(crate) fn spawn_pty(
         }
         return Err(e);
     }
-    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
-    eprintln!(
-        "[T182-DIAG] AssignProcessToJobObject ok (pid={})",
-        pi.dwProcessId
-    );
     // A fresh killable member joined the job — re-arm kill-on-close so a prior
     // survivor-sparing shutdown does not spare it (mirrors `Job::spawn`).
     skip_drop_kill.clear();
     // SAFETY: resuming the primary thread of the now-contained child.
     unsafe { ResumeThread(pi.hThread) };
-    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
-    // Marks the instant the child begins executing, so the reader thread can log
-    // each chunk's and EOF's relative offset (how long the runner waited).
-    let diag_spawn_started = std::time::Instant::now();
-
     let pid = pi.dwProcessId;
     // `output_read` (merged stdout+stderr) and `input_write` (stdin) are
     // *synchronous* anonymous pipes; tokio has no async adapter for them, so each
@@ -711,19 +679,16 @@ pub(crate) fn spawn_pty(
     // bridged to async over a channel (the established pattern for blocking Windows
     // pipes). Acceptable for the minimal, low-volume interactive PTY mode.
     let output_activity = Arc::new(OutputActivity::default());
-    let reader: PtyReader = Box::new(bridge_reader(
-        output_read,
-        Arc::clone(&output_activity),
-        // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
-        diag_spawn_started,
-    ));
-    let writer: PtyWriter = Box::new(bridge_writer(input_write));
+    let reader: PtyReader = Box::new(bridge_reader(output_read, Arc::clone(&output_activity)));
+    let (writer, input_keepalive) = bridge_writer(input_write);
+    let writer: PtyWriter = Box::new(writer);
 
     Ok(PtySpawn {
         child: PtyChild {
             process: Arc::new(OwnedProcess(pi.hProcess)),
             thread: pi.hThread,
             hpc,
+            input_keepalive: Some(input_keepalive),
             hpc_closed: false,
             output_activity,
             pid,
@@ -758,12 +723,7 @@ impl SendHandle {
 /// the pipe and forwards chunks over a bounded channel (whose fullness
 /// backpressures the reader thread, and thus the child). A `0`-length read (EOF,
 /// on pseudoconsole close) or an error ends the thread.
-fn bridge_reader(
-    handle: HANDLE,
-    output_activity: Arc<OutputActivity>,
-    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
-    diag_started: std::time::Instant,
-) -> ChannelReader {
+fn bridge_reader(handle: HANDLE, output_activity: Arc<OutputActivity>) -> ChannelReader {
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let h = SendHandle(handle);
     std::thread::spawn(move || {
@@ -771,38 +731,10 @@ fn bridge_reader(
         // SAFETY: the handle is owned by this thread; the `File` closes it on drop.
         let mut file = unsafe { h.into_file() };
         let mut buf = [0u8; 8192];
-        // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
-        let mut diag_chunks = 0usize;
-        let mut diag_total = 0usize;
         loop {
             match file.read(&mut buf) {
-                Ok(0) => {
-                    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
-                    eprintln!(
-                        "[T182-DIAG] bridge_reader EOF at +{:?} ({diag_chunks} chunk(s), {diag_total} bytes total)",
-                        diag_started.elapsed()
-                    );
-                    break;
-                }
-                Err(e) => {
-                    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
-                    eprintln!(
-                        "[T182-DIAG] bridge_reader read error at +{:?} after {diag_chunks} chunk(s): {e}",
-                        diag_started.elapsed()
-                    );
-                    break;
-                }
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
-                    // Bounded, escaped preview: this is the child's own PTY probe
-                    // output (TTY/PIPE/"reply:hello") — no secrets are possible here.
-                    diag_chunks += 1;
-                    diag_total += n;
-                    eprintln!(
-                        "[T182-DIAG] bridge_reader chunk #{diag_chunks} at +{:?}: {n} bytes, preview={:?}",
-                        diag_started.elapsed(),
-                        String::from_utf8_lossy(&buf[..n.min(120)])
-                    );
                     output_activity.record_chunk();
                     if tx.blocking_send(buf[..n].to_vec()).is_err() {
                         break;
@@ -819,9 +751,12 @@ fn bridge_reader(
 }
 
 /// Bridge a synchronous write pipe to async: a dedicated OS thread blocking-writes
-/// each chunk received over an unbounded channel. Dropping the [`ChannelWriter`]
-/// closes the channel, ending the thread and closing the pipe (EOF to the child).
-fn bridge_writer(handle: HANDLE) -> ChannelWriter {
+/// each chunk received over an unbounded channel.
+///
+/// The returned sender clone is owned by [`PtyChild`] for the session lifetime.
+/// ConPTY treats a closed host-input pipe as a request to close the pseudoconsole,
+/// so a public writer ending must not be what closes the underlying pipe.
+fn bridge_writer(handle: HANDLE) -> (ChannelWriter, tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let h = SendHandle(handle);
     std::thread::spawn(move || {
@@ -835,7 +770,14 @@ fn bridge_writer(handle: HANDLE) -> ChannelWriter {
             let _ = file.flush();
         }
     });
-    ChannelWriter { tx }
+    let keepalive = tx.clone();
+    (
+        ChannelWriter {
+            tx,
+            shutdown: false,
+        },
+        keepalive,
+    )
 }
 
 /// The async read half of the pipe bridge: drains `Vec<u8>` chunks from the reader
@@ -896,6 +838,21 @@ impl AsyncRead for ChannelReader {
 /// so `poll_write` never blocks the runtime.
 struct ChannelWriter {
     tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    shutdown: bool,
+}
+
+impl ChannelWriter {
+    /// Deliver the Windows console EOF gesture without closing ConPTY's host
+    /// input pipe. `Console.ReadLine` recognizes Ctrl-Z followed by Enter as EOF.
+    fn send_eof(&mut self) -> io::Result<()> {
+        if self.shutdown {
+            return Ok(());
+        }
+        self.shutdown = true;
+        self.tx
+            .send(vec![0x1a, b'\r'])
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "pty stdin writer closed"))
+    }
 }
 
 impl AsyncWrite for ChannelWriter {
@@ -904,6 +861,12 @@ impl AsyncWrite for ChannelWriter {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if self.shutdown {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "pty stdin writer closed",
+            )));
+        }
         match self.tx.send(buf.to_vec()) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(_) => Poll::Ready(Err(io::Error::new(
@@ -917,8 +880,16 @@ impl AsyncWrite for ChannelWriter {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(self.send_eof())
+    }
+}
+
+impl Drop for ChannelWriter {
+    fn drop(&mut self) {
+        // Drop has no error channel; an exited child routinely closes its input
+        // before its writer is released, so a failed best-effort EOF is benign.
+        let _ = self.send_eof();
     }
 }
 

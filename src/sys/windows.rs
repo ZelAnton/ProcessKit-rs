@@ -136,11 +136,6 @@ unsafe impl Sync for Job {}
 
 impl Job {
     pub(crate) fn new(#[cfg(feature = "limits")] limits: &ResourceLimits) -> io::Result<Self> {
-        // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
-        // Before we create our own Job Object, report (once) whether the runner
-        // process is already inside some OUTER job — testing whether GH Actions
-        // wraps the step in a job the ConPTY child inherits constraints from.
-        diag_report_outer_job_membership_once();
         // SAFETY: null name/attributes request an unnamed job with defaults.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
@@ -1275,36 +1270,6 @@ fn process_is_in_job(pid: u32, job: HANDLE) -> bool {
     // SAFETY: handle came from OpenProcess; closed exactly once.
     unsafe { CloseHandle(handle) };
     ok != 0 && in_job != 0
-}
-
-/// TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
-///
-/// Report (exactly once per process) whether THIS process (the test runner) is
-/// already a member of some OUTER Job Object before this crate creates its own.
-/// `IsProcessInJob` with a NULL job handle answers "is this process in ANY job?"
-/// (MSDN). The value is constant for the process lifetime, so a `Once` guard
-/// keeps it to a single line no matter how many `Job`s the test binary creates.
-fn diag_report_outer_job_membership_once() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let mut in_job: i32 = 0;
-        // SAFETY: `GetCurrentProcess` returns a pseudo-handle (never closed); a
-        // NULL job handle asks `IsProcessInJob` about membership in ANY job; and
-        // `in_job` is an owned out-param left untouched (0) if the call fails.
-        let ok = unsafe {
-            IsProcessInJob(
-                windows_sys::Win32::System::Threading::GetCurrentProcess(),
-                std::ptr::null_mut(),
-                &mut in_job,
-            )
-        };
-        eprintln!(
-            "[T182-DIAG] runner already in an outer job object = {} (IsProcessInJob call ok = {})",
-            ok != 0 && in_job != 0,
-            ok != 0
-        );
-    });
 }
 
 /// Enumerate the pids currently assigned to the job.

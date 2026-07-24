@@ -23,18 +23,10 @@ use crate::common::{completes_within, poll_until};
 /// A child that prints `TTY` when its stdin is a terminal and `PIPE` otherwise.
 fn isatty_probe() -> Command {
     if cfg!(windows) {
-        // `-NonInteractive` plus an explicit `Remove-Module PSReadLine` keep the
-        // console host from initialising PSReadLine, whose win32-input-mode /
-        // focus-reporting VT negotiation (`?9001` / `?1004`) shows up only on the
-        // CI Windows image and there kills the host with STATUS_CONTROL_C_EXIT
-        // before the `-Command` body runs. The probe itself is unchanged: a real
-        // PowerShell process under a real ConPTY still reports its own tty state.
         Command::new("powershell").args([
             "-NoProfile",
-            "-NonInteractive",
             "-Command",
-            "Remove-Module PSReadLine -ErrorAction SilentlyContinue; \
-             if ([Console]::IsInputRedirected) { 'PIPE' } else { 'TTY' }",
+            "if ([Console]::IsInputRedirected) { 'PIPE' } else { 'TTY' }",
         ])
     } else {
         Command::new("sh").args(["-c", "if [ -t 0 ]; then echo TTY; else echo PIPE; fi"])
@@ -44,17 +36,10 @@ fn isatty_probe() -> Command {
 /// A child that reads one line and echoes `reply:<line>`.
 fn prompt_responder() -> Command {
     if cfg!(windows) {
-        // Same PSReadLine avoidance as `isatty_probe`: `[Console]::In.ReadLine()`
-        // reads the console input stream directly, so `-NonInteractive` (which only
-        // suppresses PowerShell's own interactive prompting) does not change the
-        // round-trip, it just stops the host from arming the PSReadLine VT
-        // negotiation that aborts the process on the CI image.
         Command::new("powershell").args([
             "-NoProfile",
-            "-NonInteractive",
             "-Command",
-            "Remove-Module PSReadLine -ErrorAction SilentlyContinue; \
-             $l = [Console]::In.ReadLine(); Write-Output \"reply:$l\"",
+            "$l = [Console]::In.ReadLine(); Write-Output \"reply:$l\"",
         ])
     } else {
         Command::new("sh").args(["-c", "read line; printf 'reply:%s\\n' \"$line\""])
@@ -95,15 +80,6 @@ async fn pty_child_sees_a_tty() {
     )
     .await
     .expect("pty run");
-    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
-    // Did powershell exit 0 (ran but produced no visible output) or fail? Printed
-    // to the test runner's stderr, which cargo test shows for a FAILED test.
-    eprintln!(
-        "[T182-DIAG] pty_child_sees_a_tty: outcome={} code={:?} stdout={:?}",
-        out.outcome().name(),
-        out.code(),
-        out.stdout()
-    );
     assert!(
         out.stdout().contains("TTY"),
         "an isatty child must see a terminal under PTY, got {:?}",
@@ -123,6 +99,75 @@ async fn pty_child_sees_a_tty() {
         plain.stdout().contains("PIPE"),
         "without PTY the child sees a pipe, got {:?}",
         plain.stdout()
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns a real pseudo-terminal"]
+async fn pty_unused_stdin_does_not_close_the_conpty_session() {
+    // Closing the ConPTY host-input pipe is a console-close request, not an EOF
+    // for the child. Keep it alive while a child that never reads stdin runs.
+    let child = Command::new("powershell").args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Start-Sleep -Milliseconds 750; Write-Output READY",
+    ]);
+    let result = completes_within(
+        Duration::from_secs(20),
+        "ConPTY child with unused stdin",
+        JobRunner::new().output_string(&child.use_pty()),
+    )
+    .await
+    .expect("pty run");
+
+    assert_eq!(
+        result.code(),
+        Some(0),
+        "closing the public stdin writer must not close the ConPTY session: {result:?}"
+    );
+    assert!(
+        result.stdout().contains("READY"),
+        "the child must reach its command body: {:?}",
+        result.stdout()
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns a real pseudo-terminal"]
+async fn pty_finish_sends_console_eof_without_closing_the_session() {
+    let child = Command::new("powershell").args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$count = 0; while ($null -ne [Console]::In.ReadLine()) { $count++ }; Write-Output \"lines:$count\"",
+    ]);
+    let mut process = JobRunner::new()
+        .start(&child.use_pty().keep_stdin_open())
+        .await
+        .expect("start pty child");
+    let mut stdin = process.take_stdin().expect("pty stdin writer");
+    stdin.write_line("one").await.expect("write input");
+    stdin.finish().await.expect("finish input");
+
+    let result = completes_within(
+        Duration::from_secs(20),
+        "ConPTY console EOF",
+        process.output_string(),
+    )
+    .await
+    .expect("output");
+    assert_eq!(
+        result.code(),
+        Some(0),
+        "console EOF must be graceful: {result:?}"
+    );
+    assert!(
+        result.stdout().contains("lines:1"),
+        "the child must consume one line and then observe EOF: {:?}",
+        result.stdout()
     );
 }
 
@@ -148,13 +193,6 @@ async fn pty_prompt_response_round_trips_over_the_master() {
     )
     .await
     .expect("output");
-    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
-    eprintln!(
-        "[T182-DIAG] pty_prompt_response: outcome={} code={:?} stdout={:?}",
-        result.outcome().name(),
-        result.code(),
-        result.stdout()
-    );
     assert!(
         result.stdout().contains("reply:hello"),
         "the master must carry the child's reply, got {:?}",
