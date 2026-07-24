@@ -375,10 +375,20 @@ pub struct ProcessStdin {
 /// **default** build's `ProcessStdin` keeps `ChildStdin`'s full auto-trait set
 /// (`Sync`, `UnwindSafe`, …) unchanged — only the `pty` variant, gated behind the
 /// feature, relaxes it.
+///
+/// The `Scripted` variant backs a hermetic [`ScriptedRunner`](crate::testing::ScriptedRunner)
+/// dialog (see [`Reply::dialog`](crate::testing::Reply::dialog)): its write end is a
+/// `tokio::io::DuplexStream` whose read end the scripted "child"'s feeder polls,
+/// so `take_stdin` → `write_line` → the child reacting is exercised with no real
+/// pipe or pty. `DuplexStream` is `Send + Sync + Unpin` (an `Arc<Mutex<…>>`
+/// internally), so this always-present variant does **not** relax `ProcessStdin`'s
+/// auto-trait set the way the `pty` variant does.
 enum StdinSink {
     Child(tokio::process::ChildStdin),
     #[cfg(feature = "pty")]
     Pty(crate::sys::pty::PtyWriter),
+    /// A hermetic scripted double's stdin (the write end of an in-process duplex).
+    Scripted(tokio::io::DuplexStream),
 }
 
 impl AsyncWrite for StdinSink {
@@ -391,6 +401,7 @@ impl AsyncWrite for StdinSink {
             StdinSink::Child(c) => Pin::new(c).poll_write(cx, buf),
             #[cfg(feature = "pty")]
             StdinSink::Pty(p) => Pin::new(p).poll_write(cx, buf),
+            StdinSink::Scripted(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -399,6 +410,7 @@ impl AsyncWrite for StdinSink {
             StdinSink::Child(c) => Pin::new(c).poll_flush(cx),
             #[cfg(feature = "pty")]
             StdinSink::Pty(p) => Pin::new(p).poll_flush(cx),
+            StdinSink::Scripted(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -407,6 +419,7 @@ impl AsyncWrite for StdinSink {
             StdinSink::Child(c) => Pin::new(c).poll_shutdown(cx),
             #[cfg(feature = "pty")]
             StdinSink::Pty(p) => Pin::new(p).poll_shutdown(cx),
+            StdinSink::Scripted(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -438,6 +451,17 @@ impl ProcessStdin {
     pub(crate) fn from_pty(sink: crate::sys::pty::PtyWriter) -> Self {
         Self {
             sink: StdinSink::Pty(sink),
+        }
+    }
+
+    /// Wrap the write end of a hermetic scripted double's stdin duplex (see
+    /// [`Reply::dialog`](crate::testing::Reply::dialog)). The write API is
+    /// identical; the "child" reading this input is a scripted feeder, not a real
+    /// process — so a dialog test drives `take_stdin` → `write_line` → the child's
+    /// reaction with no real pipe or pty.
+    pub(crate) fn from_scripted(sink: tokio::io::DuplexStream) -> Self {
+        Self {
+            sink: StdinSink::Scripted(sink),
         }
     }
 

@@ -19,6 +19,7 @@ bounded and torn down as a unit. See
 - [The full lifecycle as one stream (`events()`)](#the-full-lifecycle-as-one-stream-events)
 - [Interactive stdin](#interactive-stdin)
 - [Readiness probes](#readiness-probes)
+- [Prompt-aware waiting (`wait_for_output`)](#prompt-aware-waiting-wait_for_output)
 - [Racing children with `wait_any`](#racing-children-with-wait_any)
 - [Per-run telemetry](#per-run-telemetry)
 
@@ -537,6 +538,82 @@ Probe semantics, deliberately uniform:
 - `wait_for_socket` uses a real connection attempt, not just a socket-file
   existence check, and returns `ErrorReason::Unsupported` immediately on platforms
   without AF_UNIX (including Windows).
+
+## Prompt-aware waiting (`wait_for_output`)
+
+`wait_for_line` only ever sees **complete lines** — text with its terminator. An
+interactive prompt is the opposite: `Password: `, `passphrase: `, `(y/N) `, a
+REPL `>>> ` are all written **without** a trailing newline and then *blocked on*,
+waiting for you to answer. Such a prompt never becomes a line, so `wait_for_line`
+(and `stdout_lines`) cannot see it until the stream ends — the "wait for the
+prompt, then answer it" dialog can't be expressed line by line.
+
+`wait_for_output(predicate, within)` closes that gap. It is the `expect`-style
+primitive (in the spirit of `rexpect`): it matches the child's **current
+un-terminated output tail** — the partial line the pump has decoded but not yet
+split — and hands it back so you can answer over `take_stdin()`. PTY is the
+motivating case (a merged terminal stream is full of un-terminated prompts), but
+it is **not** PTY-specific — a plain piped run benefits too (e.g. a progress
+meter that rewrites one line without a newline).
+
+Unlike `wait_for_line`, it **does not consume stdout** and is **repeatable**: a
+whole session is a sequence of `wait_for_output` → answer turns, one per prompt.
+
+```rust
+use processkit::{Command, ProcessRunner};
+use processkit::testing::{Reply, ScriptedRunner};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // A hermetic stand-in for a tool that prompts, reads a secret, then
+    // continues — no real subprocess. `Reply::dialog` emits the prompt, waits
+    // for the answer over stdin, then emits the continuation.
+    let runner = ScriptedRunner::new()
+        .fallback(Reply::dialog("Password: ", "granted, welcome> "));
+
+    let mut run = runner
+        .start(&Command::new("login").keep_stdin_open())
+        .await?;
+
+    // Wait for the un-terminated `Password: ` prompt (a whole line never arrives).
+    let prompt = run
+        .wait_for_output(|tail| tail.ends_with("Password: "), Duration::from_secs(5))
+        .await?;
+    assert!(prompt.contains("Password:"));
+
+    // Answer it, then wait for the next (also un-terminated) prompt.
+    run.take_stdin().expect("interactive stdin").write_line("s3cret").await?;
+    let cont = run
+        .wait_for_output(|tail| tail.contains("welcome>"), Duration::from_secs(5))
+        .await?;
+    assert!(cont.contains("welcome>"));
+
+    Ok(())
+}
+```
+
+Semantics, and how it differs from `wait_for_line`:
+
+- **Un-terminated tail, not lines.** `wait_for_output` matches the live partial
+  line; once the child terminates it with a newline it becomes a *complete line*
+  (seen by `wait_for_line` / `stdout_lines`, not here). So answer a prompt before
+  waiting for the next, and reach for `wait_for_line` when you want whole lines.
+- **Non-consuming and repeatable.** It only peeks while the background pump keeps
+  draining stdout under your `OutputBufferPolicy`; the handle stays usable for
+  `take_stdin`, further `wait_for_output` calls, and `finish`. `wait_for_line`
+  *takes* the stdout stream and so is one-shot.
+- **Raw, not redacted.** The predicate (and the returned fragment) see the tail
+  **before** any `capture_policy` redaction (see [Redaction at capture](#redaction-at-capture-capture_policy)) —
+  the same observation category as `handler` / `tee` / `raw_tee` / `output_bytes`,
+  not the redacted backlog `wait_for_line` and `ProcessResult` draw from. A
+  partial line can't be run through a per-line redactor, and a prompt
+  is a synchronization token you match verbatim. The retained/`finish`ed output
+  stays redacted independently — just match on prompts, not on secret-bearing
+  partial text.
+- **Same probe deadline.** It fails with `ErrorReason::NotReady` when `within`
+  elapses (or stdout closes) with no match, never killing the child or arming the
+  run's `timeout` watchdog — exactly like the readiness probes above.
 
 ## Racing children with `wait_any`
 

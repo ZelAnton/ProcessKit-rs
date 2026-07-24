@@ -676,9 +676,11 @@ impl RunningProcess {
     pub fn take_stdin(&mut self) -> Option<ProcessStdin> {
         match &mut self.backend {
             Backend::Real(real) => real.stdin_pipe.take().map(ProcessStdin::new),
-            // Scripted doubles don't model interactive stdin yet; `None` matches
-            // the "stdin wasn't kept open" contract.
-            Backend::Scripted(_) => None,
+            // A scripted double models interactive stdin only for a
+            // `Reply::dialog` (its feeder reads what the test writes and answers);
+            // a plain reply carries no stdin writer, so this stays `None` — the
+            // "stdin wasn't kept open" contract for a non-dialog double.
+            Backend::Scripted(s) => s.take_stdin_writer().map(ProcessStdin::from_scripted),
             // The PTY master's input side is the child's stdin.
             #[cfg(feature = "pty")]
             Backend::Pty(pty) => pty.writer.take().map(ProcessStdin::from_pty),

@@ -120,6 +120,7 @@ impl<R> core::panic::unwind_safe::RefUnwindSafe for processkit::testing::Recordi
 impl<R> core::panic::unwind_safe::UnwindSafe for processkit::testing::RecordingRunner<R> where R: core::panic::unwind_safe::UnwindSafe
 pub struct processkit::testing::Reply
 impl processkit::testing::Reply
+pub fn processkit::testing::Reply::dialog(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn processkit::testing::Reply::fail(i32, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn processkit::testing::Reply::lines<I, S>(I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn processkit::testing::Reply::not_found() -> Self
@@ -1338,6 +1339,7 @@ pub fn processkit::RunningProcess::stdout_lines(&mut self) -> processkit::Result
 impl processkit::RunningProcess
 pub async fn processkit::RunningProcess::wait_for<F, Fut>(&mut self, F, core::time::Duration) -> processkit::Result<()> where F: core::ops::function::FnMut() -> Fut + core::marker::Send, Fut: core::future::future::Future<Output = bool> + core::marker::Send
 pub async fn processkit::RunningProcess::wait_for_line(&mut self, impl core::ops::function::Fn(&str) -> bool + core::marker::Send, core::time::Duration) -> processkit::Result<alloc::string::String>
+pub async fn processkit::RunningProcess::wait_for_output(&mut self, impl core::ops::function::Fn(&str) -> bool + core::marker::Send, core::time::Duration) -> processkit::Result<alloc::string::String>
 pub async fn processkit::RunningProcess::wait_for_port(&mut self, core::net::socket_addr::SocketAddr, core::time::Duration) -> processkit::Result<()>
 pub async fn processkit::RunningProcess::wait_for_socket(&mut self, impl core::convert::AsRef<std::path::Path>, core::time::Duration) -> processkit::Result<()>
 impl core::fmt::Debug for processkit::RunningProcess

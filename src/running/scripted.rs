@@ -116,18 +116,58 @@ impl ScriptedKill {
     }
 }
 
+/// A scripted child's **natural** (non-kill) exit signal, clonable so a detached
+/// dialog feeder can end the run cleanly once it has written its response —
+/// distinct from [`ScriptedKill`] (`Signalled`): firing this resolves
+/// [`wait_outcome`](ScriptedProc::wait_outcome) to the canned exit code. Never
+/// fired for a plain time/`pending`-based reply, so those keep their existing
+/// `exit_at`/kill-only lifecycle.
+#[derive(Clone)]
+struct ScriptedExit {
+    /// Latched once the child has exited on its own — read by the non-blocking
+    /// [`has_exited_now`](ScriptedProc::has_exited_now).
+    flag: Arc<AtomicBool>,
+    /// Wakes a parked [`wait_outcome`](ScriptedProc::wait_outcome); `notify_one`
+    /// stores a permit so an exit fired before the wait parks is not missed.
+    signal: Arc<Notify>,
+}
+
+impl ScriptedExit {
+    fn new() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            signal: Arc::new(Notify::new()),
+        }
+    }
+
+    fn fire(&self) {
+        self.flag.store(true, Ordering::Release);
+        self.signal.notify_one();
+    }
+}
+
 /// A scripted "child": canned output readers (fed by detached writer tasks so
 /// per-line delays work under a paused clock) plus a canned exit.
 pub(crate) struct ScriptedProc {
     stdout: Option<tokio::io::DuplexStream>,
     stderr: Option<tokio::io::DuplexStream>,
+    /// The write end of a hermetic dialog's stdin duplex — handed to
+    /// [`take_stdin`](RunningProcess::take_stdin) so a
+    /// [`Reply::dialog`](crate::testing::Reply::dialog) test can answer the
+    /// prompt. `None` for a non-dialog reply (which models no interactive stdin),
+    /// matching the pre-existing "scripted handles don't model stdin" contract.
+    stdin: Option<tokio::io::DuplexStream>,
     kill: ScriptedKill,
+    /// Natural (non-kill) exit, fired by a dialog feeder once it has written its
+    /// response — see [`ScriptedExit`]. Inert (never fired) for a plain reply.
+    exit: ScriptedExit,
     code: Option<i32>,
     timed_out: bool,
     signal: Option<i32>,
     /// When the scripted child "exits": `Some(at)` resolves at that instant
-    /// (now = immediately), `None` never exits on its own (`Reply::pending` —
-    /// cancel/timeout still end it).
+    /// (now = immediately), `None` never exits on its own (`Reply::pending` and a
+    /// [`dialog`](Self::new_dialog) both use `None` — cancel/timeout, or the
+    /// dialog's own [`exit`](Self::exit) signal, end it).
     exit_at: Option<tokio::time::Instant>,
     /// Whether this double models a [`use_pty`](crate::Command::use_pty) run, set
     /// by [`from_scripted`](RunningProcess::from_scripted). Gates the hermetic
@@ -188,11 +228,13 @@ impl ScriptedProc {
         Self {
             stdout: Some(stdout),
             stderr: Some(stderr),
+            stdin: None,
             kill: ScriptedKill {
                 killed: Arc::new(AtomicBool::new(false)),
                 signal: Arc::new(Notify::new()),
                 feeders: Arc::new(feeders),
             },
+            exit: ScriptedExit::new(),
             code,
             timed_out,
             signal,
@@ -202,6 +244,87 @@ impl ScriptedProc {
             #[cfg(feature = "pty")]
             resizes: Vec::new(),
         }
+    }
+
+    /// Assemble a hermetic **interactive dialog** double: write `prompt` to
+    /// stdout immediately (typically *without* a trailing newline, so it surfaces
+    /// as the un-terminated tail
+    /// [`wait_for_output`](RunningProcess::wait_for_output) matches), then block
+    /// until the caller writes to stdin (via [`take_stdin`](RunningProcess::take_stdin)),
+    /// then write `response` and exit `code`. Models one prompt/answer turn with
+    /// no real pipe or pty — the reactive counterpart of the time-driven
+    /// [`new`](Self::new) feeder. stderr is empty (PTY mode merges it into the one
+    /// master anyway, and a dialog's content rides stdout).
+    ///
+    /// The `response` is written the moment stdin is received (not on a timer), so
+    /// the exchange is deterministic without a paused clock. Aborting the run
+    /// (kill/drop) hangs up the feeder like any other scripted child.
+    pub(crate) fn new_dialog(prompt: String, response: String, code: i32) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // stdout: the feeder writes the prompt, waits for stdin, writes the
+        // response, then drops its end (EOF). stderr: an immediately-dropped tx
+        // (empty). stdin: the caller writes the write end; the feeder reads the
+        // read end.
+        let (mut stdout_tx, stdout_rx) = tokio::io::duplex(64 * 1024);
+        let (_stderr_tx, stderr_rx) = tokio::io::duplex(64 * 1024); // dropped → EOF
+        let (stdin_write, mut stdin_read) = tokio::io::duplex(64 * 1024);
+
+        let exit = ScriptedExit::new();
+        let exit_for_feeder = exit.clone();
+        let task = tokio::spawn(async move {
+            // 1. Emit the prompt as an un-terminated tail and flush so the pump
+            //    (and a `wait_for_output` observer) sees it before we block.
+            if stdout_tx.write_all(prompt.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = stdout_tx.flush().await;
+            // 2. Wait for the caller to answer. Any input completes the turn — the
+            //    hermetic model of a child's `read(stdin)` returning; a closed
+            //    stdin (Ok(0)) or error ends the run with no continuation.
+            let mut buf = [0u8; 1024];
+            if let Ok(n) = stdin_read.read(&mut buf).await
+                && n > 0
+            {
+                // 3. Emit the continuation (also flushed).
+                let _ = stdout_tx.write_all(response.as_bytes()).await;
+                let _ = stdout_tx.flush().await;
+            }
+            // 4. Drop stdout_tx → EOF, then signal a clean natural exit.
+            drop(stdout_tx);
+            exit_for_feeder.fire();
+        });
+        let feeders = vec![task.abort_handle()];
+
+        Self {
+            stdout: Some(stdout_rx),
+            stderr: Some(stderr_rx),
+            stdin: Some(stdin_write),
+            kill: ScriptedKill {
+                killed: Arc::new(AtomicBool::new(false)),
+                signal: Arc::new(Notify::new()),
+                feeders: Arc::new(feeders),
+            },
+            exit,
+            code: Some(code),
+            timed_out: false,
+            signal: None,
+            // Event-driven exit (via `exit`), so no time-based `exit_at`.
+            exit_at: None,
+            #[cfg(feature = "pty")]
+            pty: false,
+            #[cfg(feature = "pty")]
+            resizes: Vec::new(),
+        }
+    }
+
+    /// Take the write end of a dialog double's stdin (see
+    /// [`new_dialog`](Self::new_dialog)), for
+    /// [`RunningProcess::take_stdin`](crate::RunningProcess::take_stdin)'s scripted
+    /// branch. `None` after the first call, or for a non-dialog reply that models
+    /// no interactive stdin.
+    pub(super) fn take_stdin_writer(&mut self) -> Option<tokio::io::DuplexStream> {
+        self.stdin.take()
     }
 
     pub(super) fn kill(&self) {
@@ -265,7 +388,9 @@ impl ScriptedProc {
     /// A kill AFTER the scripted child already exited naturally must still
     /// report the cached natural outcome — a real child's exit status survives a
     /// post-exit kill. Only an un-exited (or never-exiting `pending`) script that
-    /// is killed is `Signalled`.
+    /// is killed is `Signalled`. A [`dialog`](Self::new_dialog) exits cleanly via
+    /// its own [`exit`](Self::exit) signal, which resolves to the canned code just
+    /// like a time-based `exit_at` would.
     pub(super) async fn wait_outcome(&mut self) -> Outcome {
         fn classify(code: Option<i32>, timed_out: bool, signal: Option<i32>) -> Outcome {
             match (code, timed_out) {
@@ -275,11 +400,13 @@ impl ScriptedProc {
             }
         }
 
-        let already_exited = matches!(self.exit_at, Some(at) if at <= tokio::time::Instant::now());
+        let already_exited = matches!(self.exit_at, Some(at) if at <= tokio::time::Instant::now())
+            || self.exit.flag.load(Ordering::Acquire);
         if self.kill.killed.load(Ordering::Acquire) && !already_exited {
             Outcome::Signalled(None)
         } else if already_exited {
-            // Cached natural outcome even if a kill landed afterwards.
+            // Cached natural outcome (time- or dialog-driven) even if a kill
+            // landed afterwards.
             classify(self.code, self.timed_out, self.signal)
         } else {
             match self.exit_at {
@@ -288,21 +415,29 @@ impl ScriptedProc {
                     tokio::select! {
                         biased;
                         () = self.kill.signal.notified() => Outcome::Signalled(None),
+                        () = self.exit.signal.notified() => classify(self.code, self.timed_out, self.signal),
                         () = tokio::time::sleep_until(at) => classify(self.code, self.timed_out, self.signal),
                     }
                 }
+                // A `pending` reply parks on kill only; a `dialog` also resolves
+                // once its feeder fires the natural-exit signal.
                 None => {
-                    self.kill.signal.notified().await;
-                    Outcome::Signalled(None)
+                    tokio::select! {
+                        biased;
+                        () = self.kill.signal.notified() => Outcome::Signalled(None),
+                        () = self.exit.signal.notified() => classify(self.code, self.timed_out, self.signal),
+                    }
                 }
             }
         }
     }
 
     /// The scripted counterpart of `RunningProcess::has_exited_now` — a
-    /// non-blocking poll of whether the script has already ended.
+    /// non-blocking poll of whether the script has already ended (killed,
+    /// dialog-exited, or past its time-based `exit_at`).
     pub(super) fn has_exited_now(&self) -> bool {
         self.kill.killed.load(Ordering::Acquire)
+            || self.exit.flag.load(Ordering::Acquire)
             || self
                 .exit_at
                 .is_some_and(|at| tokio::time::Instant::now() >= at)

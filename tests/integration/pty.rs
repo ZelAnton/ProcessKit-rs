@@ -46,6 +46,28 @@ fn prompt_responder() -> Command {
     }
 }
 
+/// A child that writes an **un-terminated** prompt (`passphrase: `, no newline),
+/// reads a line, then prints `unlocked:<line>`. The prompt goes to stderr, which
+/// is unbuffered — so it reaches the master immediately, even though it has no
+/// newline to flush a line-buffered stdout — and PTY mode merges it onto the one
+/// master the pump reads. This is exactly the un-terminated prompt
+/// `wait_for_output` exists to catch (and `wait_for_line` cannot).
+fn unterminated_passphrase_prompt() -> Command {
+    if cfg!(windows) {
+        Command::new("powershell").args([
+            "-NoProfile",
+            "-Command",
+            "[Console]::Error.Write('passphrase: '); \
+             $l = [Console]::In.ReadLine(); [Console]::Out.WriteLine(\"unlocked:$l\")",
+        ])
+    } else {
+        Command::new("sh").args([
+            "-c",
+            "printf 'passphrase: ' >&2; read line; printf 'unlocked:%s\\n' \"$line\"",
+        ])
+    }
+}
+
 /// A long-running, output-free sleeper, per platform.
 fn sleeper() -> Command {
     if cfg!(windows) {
@@ -196,6 +218,48 @@ async fn pty_prompt_response_round_trips_over_the_master() {
     assert!(
         result.stdout().contains("reply:hello"),
         "the master must carry the child's reply, got {:?}",
+        result.stdout()
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real pseudo-terminal"]
+async fn pty_wait_for_output_catches_an_unterminated_prompt_then_answers() {
+    // The rexpect-style flow over a real tty: wait for the un-terminated
+    // `passphrase: ` prompt (which never becomes a line, so `wait_for_line` could
+    // not see it), answer it over the master, and confirm the child continued —
+    // all while `wait_for_output` left the handle usable (`output_string` after).
+    let mut proc = JobRunner::new()
+        .start(&unterminated_passphrase_prompt().use_pty().keep_stdin_open())
+        .await
+        .expect("start pty child");
+
+    let prompt = completes_within(
+        Duration::from_secs(20),
+        "pty un-terminated prompt",
+        proc.wait_for_output(|tail| tail.contains("passphrase:"), Duration::from_secs(15)),
+    )
+    .await
+    .expect("the un-terminated prompt tail must match");
+    assert!(prompt.contains("passphrase:"), "got {prompt:?}");
+
+    // Non-consuming: the handle is still usable to answer and drain the rest.
+    proc.take_stdin()
+        .expect("pty stdin writer")
+        .write_line("open-sesame")
+        .await
+        .expect("answer the prompt");
+
+    let result = completes_within(
+        Duration::from_secs(20),
+        "pty wait_for_output continuation",
+        proc.output_string(),
+    )
+    .await
+    .expect("output");
+    assert!(
+        result.stdout().contains("unlocked:open-sesame"),
+        "the child must have consumed the answer and continued, got {:?}",
         result.stdout()
     );
 }

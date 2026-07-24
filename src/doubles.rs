@@ -76,6 +76,14 @@ pub struct Reply {
     /// reply is a spawn-side failure — the match never "runs" at all, so every
     /// other field is unused. Checked before both bulk and streaming consumption.
     spawn_error: Option<SpawnError>,
+    /// Set by [`dialog`](Self::dialog): `Some((prompt, response))` makes a
+    /// streaming (`start`) run an interactive dialog — emit `prompt` (typically
+    /// un-terminated), wait for the caller to answer over
+    /// [`take_stdin`](crate::RunningProcess::take_stdin), then emit `response` and
+    /// exit 0. Only the streaming path honors it; the bulk `output_string` path
+    /// treats a dialog as its `prompt + response` concatenation (there is no
+    /// interactive stdin to answer).
+    dialog: Option<(String, String)>,
 }
 
 /// A spawn-side failure a [`Reply`] can express (see
@@ -110,6 +118,7 @@ impl Reply {
             pending: false,
             line_delay: None,
             spawn_error: None,
+            dialog: None,
         }
     }
 
@@ -127,6 +136,7 @@ impl Reply {
             pending: false,
             line_delay: None,
             spawn_error: None,
+            dialog: None,
         }
     }
 
@@ -153,6 +163,7 @@ impl Reply {
             pending: false,
             line_delay: None,
             spawn_error: None,
+            dialog: None,
         }
     }
 
@@ -171,6 +182,7 @@ impl Reply {
             pending: false,
             line_delay: None,
             spawn_error: None,
+            dialog: None,
         }
     }
 
@@ -205,7 +217,64 @@ impl Reply {
             pending: true,
             line_delay: None,
             spawn_error: None,
+            dialog: None,
         }
+    }
+
+    /// A hermetic **interactive dialog** reply for a streaming (`start`) run: on
+    /// [`start`](crate::ProcessRunner::start) the scripted child writes `prompt`
+    /// to stdout, waits for the caller to answer over
+    /// [`take_stdin`](crate::RunningProcess::take_stdin), then writes `response`
+    /// and exits 0 — modeling one prompt/answer turn with **no real pipe or pty**.
+    ///
+    /// This is the double for the
+    /// [`wait_for_output`](crate::RunningProcess::wait_for_output) idiom: give
+    /// `prompt` **no trailing newline** so it surfaces as the un-terminated tail
+    /// `wait_for_output` matches (a `Password: ` a real child would block on), and
+    /// give `response` whatever the child prints next — itself an un-terminated
+    /// tail (e.g. a next prompt) so a second `wait_for_output` can see it. Build
+    /// the command with [`use_pty`](crate::Command::use_pty) (the motivating case)
+    /// and/or [`keep_stdin_open`](crate::Command::keep_stdin_open); the double
+    /// hands back a working `take_stdin` either way.
+    ///
+    /// The `response` is written the instant stdin is received (not on a timer),
+    /// so the exchange is deterministic without a paused clock. On the **bulk**
+    /// `output_string` path there is no interactive stdin to answer, so a dialog
+    /// reply degrades to its `prompt` immediately followed by `response` as
+    /// ordinary output.
+    ///
+    /// ```
+    /// use processkit::{Command, ProcessRunner};
+    /// use processkit::testing::{Reply, ScriptedRunner};
+    /// use std::time::Duration;
+    ///
+    /// let rt = tokio::runtime::Builder::new_current_thread()
+    ///     .enable_all().build().unwrap();
+    /// rt.block_on(async {
+    ///     let runner = ScriptedRunner::new()
+    ///         .fallback(Reply::dialog("Password: ", "granted> "));
+    ///     let mut run = runner
+    ///         .start(&Command::new("login").use_pty().keep_stdin_open())
+    ///         .await
+    ///         .expect("start dialog");
+    ///     // Wait for the un-terminated prompt, then answer it.
+    ///     let prompt = run
+    ///         .wait_for_output(|tail| tail.contains("Password:"), Duration::from_secs(1))
+    ///         .await
+    ///         .expect("prompt");
+    ///     assert!(prompt.contains("Password:"));
+    ///     run.take_stdin().expect("stdin").write_line("s3cret").await.expect("answer");
+    ///     let cont = run
+    ///         .wait_for_output(|tail| tail.contains("granted"), Duration::from_secs(1))
+    ///         .await
+    ///         .expect("continuation");
+    ///     assert!(cont.contains("granted"));
+    /// });
+    /// ```
+    pub fn dialog(prompt: impl Into<String>, response: impl Into<String>) -> Self {
+        let mut reply = Self::ok(String::new());
+        reply.dialog = Some((prompt.into(), response.into()));
+        reply
     }
 
     /// A successful reply whose stdout is `lines` joined with `\n` — reads
@@ -338,6 +407,7 @@ impl Reply {
             pending: false,
             line_delay: None,
             spawn_error: None,
+            dialog: None,
         }
     }
 
@@ -363,6 +433,16 @@ impl Reply {
         command: &Command,
         recorded: Option<crate::running::ScriptedResultInfo>,
     ) -> crate::RunningProcess {
+        // An interactive dialog reply builds a stdin-reactive scripted child
+        // instead of the time/line-driven feeder: emit the prompt, wait for the
+        // caller's `take_stdin` answer, emit the response, exit 0. `recorded` is
+        // irrelevant here (a dialog is a live `ScriptedRunner` reply, never a
+        // cassette replay).
+        if let Some((prompt, response)) = self.dialog {
+            let scripted = crate::running::ScriptedProc::new_dialog(prompt, response, 0);
+            return crate::RunningProcess::from_scripted(command, scripted, None);
+        }
+
         // PTY mode merges stdout and stderr onto the single master; the scripted
         // double models that collapse (see `split_pty_streams`), so a hermetic PTY
         // test needs no real tty.
@@ -426,9 +506,16 @@ impl Reply {
         } else {
             Outcome::Exited(self.code)
         };
+        // A dialog has no interactive stdin on the bulk path, so it degrades to
+        // its `prompt` immediately followed by `response` as ordinary stdout —
+        // whatever a non-interactive capture of that exchange would have seen.
+        let (self_stdout, self_stderr) = match self.dialog {
+            Some((prompt, response)) => (format!("{prompt}{response}"), self.stderr),
+            None => (self.stdout, self.stderr),
+        };
         // PTY mode collapses stderr into the merged master (see `split_pty_streams`),
         // so the bulk double reports it the same way the streaming one does.
-        let (stdout_src, stderr_src) = Self::split_pty_streams(command, self.stdout, self.stderr);
+        let (stdout_src, stderr_src) = Self::split_pty_streams(command, self_stdout, self_stderr);
         let stdout =
             crate::running::split_pump_lines(&stdout_src, command.stdout_config().terminator)
                 .join("\n");
@@ -1760,6 +1847,23 @@ mod tests {
         // The bulk verb (which never decodes) agrees, so the two verbs match.
         let bulk = runner.output_string(&cmd).await.expect("bulk run");
         assert_eq!(bulk.stdout(), start.stdout());
+    }
+
+    /// On the bulk `output_string` path there is no interactive stdin to answer,
+    /// so a `Reply::dialog` degrades to its prompt immediately followed by its
+    /// response — an ordinary non-interactive capture of the exchange. (The
+    /// interactive round-trip lives on the streaming `start` path; see
+    /// `running::probes` tests.)
+    #[tokio::test]
+    async fn dialog_reply_degrades_to_prompt_plus_response_on_the_bulk_path() {
+        let runner = ScriptedRunner::new().fallback(Reply::dialog("Password: ", "granted\n"));
+        let result = runner
+            .output_string(&Command::new("login").keep_stdin_open())
+            .await
+            .expect("bulk dialog");
+        assert!(result.is_success());
+        // "Password: granted\n" → line-split/rejoined like any captured output.
+        assert_eq!(result.stdout(), "Password: granted");
     }
 
     #[tokio::test(start_paused = true)]

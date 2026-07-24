@@ -47,6 +47,16 @@ impl RunningProcess {
     /// The readiness idiom: start a server, wait for its "listening on …"
     /// banner, then use it — no arbitrary sleeps.
     ///
+    /// **Line-oriented, by design.** This matches only **complete lines** — it
+    /// sees a line once its terminator (`\n`, or a `\r` in
+    /// [`CarriageReturn`](crate::LineTerminator::CarriageReturn) mode) arrives.
+    /// An interactive prompt (`Password: `, `(y/N) `, a REPL `>>> `) is written
+    /// **without** a trailing newline and then blocked on, so it never becomes a
+    /// line and this probe cannot see it until the stream ends. To wait on such
+    /// an un-terminated prompt — the "wait for the prompt, then answer it" PTY
+    /// idiom — use [`wait_for_output`](Self::wait_for_output), which matches the
+    /// live partial tail and, unlike this probe, does **not** consume stdout.
+    ///
     /// # Caveats
     ///
     /// - **Consumes stdout** up to and including the matching line (the same
@@ -97,6 +107,128 @@ impl RunningProcess {
         };
         match tokio::time::timeout(within, search).await {
             Ok(Some(line)) => Ok(line),
+            Ok(None) | Err(_) => Err(self.not_ready(within)),
+        }
+    }
+
+    /// Wait until the child's **current un-terminated output tail** satisfies
+    /// `predicate` (returning that tail), or fail with
+    /// [`ErrorReason::NotReady`] when `within` elapses — or when stdout closes
+    /// with no match, since no further output can arrive.
+    ///
+    /// This is the `expect`-style primitive (in the spirit of `rexpect`) for the
+    /// PTY "wait for the prompt, then answer it" idiom: an interactive prompt —
+    /// `Password: `, `passphrase: `, `(y/N) `, a REPL `>>> ` — is written
+    /// **without** a trailing newline and then blocked on, so it is a *partial
+    /// line*, never a complete one. [`wait_for_line`](Self::wait_for_line) only
+    /// ever sees whole lines and so cannot observe such a prompt until the stream
+    /// ends; this probe matches the **live partial tail** the pump has decoded
+    /// but not yet split into a line, and hands it back so you can
+    /// [`take_stdin`](Self::take_stdin) and answer.
+    ///
+    /// PTY is the motivating case (a merged tty stream is full of un-terminated
+    /// prompts), but this is **not** PTY-specific — a plain piped run benefits
+    /// too, e.g. a progress meter that rewrites one line without ever emitting a
+    /// newline.
+    ///
+    /// # Non-consuming and repeatable
+    ///
+    /// Unlike [`wait_for_line`](Self::wait_for_line) (which *takes* the stdout
+    /// stream, so it is one-shot), this probe only **peeks** at the tail while the
+    /// background pump keeps draining stdout under the caller's
+    /// [`OutputBufferPolicy`](crate::OutputBufferPolicy). The handle stays fully
+    /// usable afterward: [`take_stdin`](Self::take_stdin) to answer the prompt,
+    /// call `wait_for_output` **again** for the next prompt of a multi-turn
+    /// dialog, and [`finish`](Self::finish) for the outcome and stderr. A typical
+    /// session is a *sequence* of `wait_for_output` → `take_stdin`-answer turns
+    /// (each prompt is its own un-terminated tail). The tail reflects the
+    /// **current** partial line: once the child terminates it with a newline it
+    /// becomes a complete line (seen by [`wait_for_line`](Self::wait_for_line) /
+    /// [`stdout_lines`](Self::stdout_lines), not here) and the tail moves on to
+    /// whatever follows — so answer a prompt before waiting for the next, or a
+    /// still-standing tail can match again.
+    ///
+    /// # Raw vs. redacted
+    ///
+    /// `predicate` sees the tail **raw** — *before* any
+    /// [`Command::capture_policy`](crate::Command::capture_policy) redaction —
+    /// putting `wait_for_output` in the same observation category as the
+    /// `handler` / `tee` / `raw_tee` / `output_bytes` seams (which by design also
+    /// observe the raw line), **not** the redacted retained backlog that
+    /// [`wait_for_line`](Self::wait_for_line) and
+    /// [`ProcessResult`](crate::ProcessResult) draw from. A partial line cannot be
+    /// meaningfully run through a per-complete-line redaction policy, and a prompt
+    /// is a synchronization token you must match on verbatim — so matching (and
+    /// the returned fragment) is raw. The retained/`finish`ed output stays
+    /// redacted independently; just don't rely on the returned fragment being
+    /// scrubbed, and match on prompts rather than on secret-bearing partial text.
+    ///
+    /// # Behavior
+    ///
+    /// - Background-drains stdout (and stderr) like the other probes, **without**
+    ///   arming the [`Command::timeout`](crate::Command::timeout) watchdog — a
+    ///   failed probe never kills the child or flips the run to `TimedOut`.
+    /// - Bounded solely by `within`; the predicate is re-checked each time the
+    ///   tail changes (event-driven, no busy-spin).
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorReason::NotReady`] when `within` elapses with no matching tail, or
+    ///   when stdout closes first with no match. A *probe* deadline — distinct
+    ///   from [`ErrorReason::Timeout`]; the child is neither killed nor flipped to
+    ///   `TimedOut`.
+    /// - [`ErrorReason::Io`] when stdout was not piped, or a prior
+    ///   [`stdout_lines`](Self::stdout_lines) / [`events`](Self::events) /
+    ///   `wait_for_line` already consumed it (so there is no live tail to watch).
+    pub async fn wait_for_output(
+        &mut self,
+        predicate: impl Fn(&str) -> bool + Send,
+        within: Duration,
+    ) -> Result<String> {
+        // Ensure stdout (and stderr) are being background-drained so the pump is
+        // publishing the partial tail — WITHOUT taking the stdout stream for
+        // ourselves. This is idempotent: a first call installs the pumps; a repeat
+        // call (the next turn of a dialog, or after another probe) is a no-op, so
+        // `wait_for_output` is freely repeatable, unlike the one-shot
+        // `wait_for_line`.
+        self.ensure_background_drains();
+        // No stdout sink means stdout was not piped (or an earlier consuming verb
+        // took it): there is no live tail to watch. Fail loud like `wait_for_line`
+        // rather than block forever on a tail that can never appear.
+        let Some(sink) = self.stdout_sink.clone() else {
+            return Err(Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "`{}`: stdout is not observable for wait_for_output — it was not piped, \
+                     or a prior stdout_lines/events/wait_for_line already consumed it",
+                    self.program
+                ),
+            )));
+        };
+        let search = async {
+            loop {
+                // Snapshot the tail off the lock, then run the (possibly slow or
+                // panicking) predicate without holding `Inner` — never blocking the
+                // pump or poisoning its state. A match wins over `closed`, so a
+                // final un-terminated prompt is still matchable right at close.
+                let (tail, closed) = sink.partial_tail_snapshot();
+                if let Some(tail) = tail
+                    && predicate(&tail)
+                {
+                    return Some(tail);
+                }
+                if closed {
+                    return None; // stream ended with no match — none can arrive.
+                }
+                // Park until the next buffer change (a tail update, a pushed line,
+                // or close). `notify_one`'s stored permit covers a change that
+                // lands between the snapshot above and this await, so no wakeup is
+                // lost and the re-check sees it.
+                sink.clone().changed().await;
+            }
+        };
+        match tokio::time::timeout(within, search).await {
+            Ok(Some(tail)) => Ok(tail),
             Ok(None) | Err(_) => Err(self.not_ready(within)),
         }
     }
@@ -318,6 +450,7 @@ impl RunningProcess {
 fn probe_futures_are_send(rp: &mut RunningProcess) {
     fn assert_send<T: Send>(_: &T) {}
     assert_send(&rp.wait_for_line(|line| line.is_empty(), Duration::ZERO));
+    assert_send(&rp.wait_for_output(|tail| tail.is_empty(), Duration::ZERO));
     assert_send(&rp.wait_for(|| async { true }, Duration::ZERO));
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
     assert_send(&rp.wait_for_port(addr, Duration::ZERO));
@@ -551,5 +684,160 @@ mod tests {
             ),
             "the probe must not replace the stderr sink an earlier stream installed"
         );
+    }
+
+    /// The core promise: `wait_for_output` sees an **un-terminated** prompt — the
+    /// partial tail `wait_for_line`/`stdout_lines` cannot observe until the stream
+    /// ends — and hands it back. The scripted dialog writes `Password: ` with no
+    /// newline and then blocks on stdin, exactly like a real prompting tool.
+    #[tokio::test]
+    async fn wait_for_output_matches_an_unterminated_prompt_tail() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::dialog("Password: ", "ignored"))
+            .start(&Command::new("login").keep_stdin_open())
+            .await
+            .expect("scripted dialog start");
+
+        let matched = run
+            .wait_for_output(|tail| tail.ends_with("Password: "), Duration::from_secs(5))
+            .await
+            .expect("the un-terminated prompt tail must match");
+        assert_eq!(matched, "Password: ");
+    }
+
+    /// `wait_for_output` does **not** consume the tail and is **repeatable**:
+    /// re-checking the same still-standing prompt matches again (unlike
+    /// `wait_for_line`, which takes the stdout stream one-shot).
+    #[tokio::test]
+    async fn wait_for_output_is_non_consuming_and_repeatable() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::dialog("proceed? (y/N) ", "ignored"))
+            .start(&Command::new("tool").keep_stdin_open())
+            .await
+            .expect("scripted dialog start");
+
+        let first = run
+            .wait_for_output(|t| t.contains("(y/N)"), Duration::from_secs(5))
+            .await
+            .expect("first match");
+        // The tail was only peeked, so a second probe still sees the same prompt.
+        let second = run
+            .wait_for_output(|t| t.contains("(y/N)"), Duration::from_secs(5))
+            .await
+            .expect("second match on the still-standing prompt");
+        assert_eq!(first, second);
+    }
+
+    /// The full hermetic dialog: wait for the prompt, answer over `take_stdin`,
+    /// wait for the (also un-terminated) continuation, then `finish` cleanly —
+    /// proving the handle stays fully usable after a match.
+    #[tokio::test]
+    async fn wait_for_output_full_dialog_then_finish() {
+        use crate::result::Outcome;
+
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::dialog("Password: ", "granted, welcome> "))
+            .start(&Command::new("login").keep_stdin_open())
+            .await
+            .expect("scripted dialog start");
+
+        let prompt = run
+            .wait_for_output(|t| t.contains("Password:"), Duration::from_secs(5))
+            .await
+            .expect("prompt");
+        assert!(prompt.contains("Password:"), "got {prompt:?}");
+
+        // Answer it — the scripted feeder reacts to the stdin write.
+        run.take_stdin()
+            .expect("scripted dialog exposes an interactive stdin")
+            .write_line("s3cret")
+            .await
+            .expect("write the answer");
+
+        let cont = run
+            .wait_for_output(|t| t.contains("welcome>"), Duration::from_secs(5))
+            .await
+            .expect("continuation prompt after answering");
+        assert!(cont.contains("welcome>"), "got {cont:?}");
+
+        // The handle is still usable: finish reports the dialog's clean exit.
+        let finished = run.finish().await.expect("finish the dialog");
+        assert_eq!(finished.outcome, Outcome::Exited(0));
+    }
+
+    /// A timeout with no matching tail fails with `NotReady` — the same probe
+    /// deadline the readiness probes use, never the run's own `Timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_output_times_out_with_not_ready() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::pending())
+            .start(&Command::new("quiet").keep_stdin_open())
+            .await
+            .expect("scripted start");
+
+        let error = run
+            .wait_for_output(|_| true, Duration::from_millis(150))
+            .await
+            .expect_err("a child that never prints a tail must time out");
+        assert!(
+            matches!(error.reason(), ErrorReason::NotReady { .. }),
+            "got {error:?}"
+        );
+    }
+
+    /// A non-piped stdout has no live tail to watch, so `wait_for_output` fails
+    /// loud (`Io`) rather than blocking on a tail that can never appear — mirroring
+    /// `wait_for_line`'s non-piped contract.
+    #[tokio::test]
+    async fn wait_for_output_errors_when_stdout_is_not_piped() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::pending())
+            .start(&Command::new("tool").stdout(crate::StdioMode::Null))
+            .await
+            .expect("scripted start");
+
+        let error = run
+            .wait_for_output(|_| true, Duration::from_secs(5))
+            .await
+            .expect_err("no piped stdout means no observable tail");
+        assert!(
+            matches!(error.reason(), ErrorReason::Io { .. }),
+            "got {error:?}"
+        );
+    }
+
+    /// The PTY-variant `ScriptedRunner` dialog: the same `wait_for_output` +
+    /// `take_stdin` round-trip over a `use_pty` handle, hermetic (no real tty).
+    #[cfg(feature = "pty")]
+    #[tokio::test]
+    async fn wait_for_output_pty_dialog_round_trips() {
+        use crate::result::Outcome;
+
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::dialog("passphrase: ", "unlocked $ "))
+            .start(&Command::new("ssh-agent").use_pty().keep_stdin_open())
+            .await
+            .expect("scripted pty dialog start");
+
+        let prompt = run
+            .wait_for_output(|t| t.ends_with("passphrase: "), Duration::from_secs(5))
+            .await
+            .expect("pty prompt");
+        assert_eq!(prompt, "passphrase: ");
+
+        run.take_stdin()
+            .expect("pty scripted stdin")
+            .write_line("open sesame")
+            .await
+            .expect("answer the passphrase prompt");
+
+        let cont = run
+            .wait_for_output(|t| t.contains("unlocked"), Duration::from_secs(5))
+            .await
+            .expect("continuation over the merged master");
+        assert!(cont.contains("unlocked"), "got {cont:?}");
+
+        let finished = run.finish().await.expect("finish the pty dialog");
+        assert_eq!(finished.outcome, Outcome::Exited(0));
     }
 }

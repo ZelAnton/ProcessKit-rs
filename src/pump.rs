@@ -209,6 +209,23 @@ struct Inner {
     /// still fit and got retained, so the buffer would skip a line and no longer
     /// be a true prefix. Unused by `DropOldest`/`Error` (never read there).
     dropnewest_sealed: bool,
+    /// The current **unterminated tail**: decoded content the pump has read but
+    /// not yet split into a complete line (no line terminator seen for it yet).
+    /// This is the *live partial line* — an interactive prompt like `Password: `
+    /// that the child writes without a trailing newline and then blocks on,
+    /// which the line-oriented backlog (and so `wait_for_line`/`stdout_lines`)
+    /// never sees until the stream ends. It exists **only** to back
+    /// [`RunningProcess::wait_for_output`](crate::RunningProcess::wait_for_output);
+    /// it is a *side view* of what is otherwise the pump's local `pending`
+    /// buffer, and is deliberately **independent** of every retention/overflow
+    /// counter beside it: the pump updates it via
+    /// [`set_partial_tail`](SharedLines::set_partial_tail) *without* touching
+    /// `seen_bytes` ([[K-059]]), `count`, `dropped`, or the `dropnewest_sealed`
+    /// seal ([[K-054]]), so exposing the tail can never re-decide retention or
+    /// shift the byte/line accounting an existing consumer relies on. The text
+    /// is **raw** — pre-`capture_policy` — mirroring `handler`/`tee`/`raw_tee`'s
+    /// observation category (see `pump_lines_core`'s `emit`).
+    partial_tail: String,
 }
 
 impl Inner {
@@ -269,6 +286,7 @@ impl SharedLines {
                 overflowed: false,
                 discarding: false,
                 dropnewest_sealed: false,
+                partial_tail: String::new(),
             }),
             notify: Notify::new(),
             count: AtomicUsize::new(0),
@@ -456,6 +474,50 @@ impl SharedLines {
     pub(crate) fn add_seen_bytes(&self, byte_count: usize) {
         let mut inner = self.inner.lock().expect("SharedLines poisoned");
         inner.seen_bytes = inner.seen_bytes.saturating_add(byte_count);
+    }
+
+    /// Publish the current **unterminated tail** — the decoded content the pump
+    /// has read but not yet emitted as a complete line (`pending` in
+    /// [`pump_lines_core`]) — so a
+    /// [`wait_for_output`](crate::RunningProcess::wait_for_output) observer can
+    /// match a prompt the child wrote without a trailing newline. The pump calls
+    /// this once per read, after splitting out every complete line.
+    ///
+    /// Deliberately a **side channel**: it writes only [`Inner::partial_tail`]
+    /// and never the `seen_bytes` ([[K-059]]) / `count` / `dropped` /
+    /// `dropnewest_sealed` ([[K-054]]) state on the same lock, so surfacing the
+    /// tail cannot re-run a retention/overflow decision or shift an accounting
+    /// unit an existing consumer depends on. Notifies waiters **only on an actual
+    /// change**, so a stream of complete lines (whose tail stays empty every
+    /// read) does not spuriously wake — and a live prompt that stops changing
+    /// (the child now blocking on input) is published exactly once and then left
+    /// stable for the observer to match.
+    pub(crate) fn set_partial_tail(&self, tail: &str) {
+        let mut inner = self.inner.lock().expect("SharedLines poisoned");
+        if inner.partial_tail != tail {
+            inner.partial_tail.clear();
+            inner.partial_tail.push_str(tail);
+            drop(inner);
+            // A tail update is a buffer change like a `push`: wake a parked
+            // `wait_for_output` (the stored permit covers a waiter that registers
+            // just after this).
+            self.notify.notify_one();
+        }
+    }
+
+    /// Snapshot the current unterminated tail (cloned so the predicate runs off
+    /// the lock, never blocking the pump or poisoning `Inner` on a panicking
+    /// user predicate) and whether the pump has closed. `None` tail means there
+    /// is no live partial line right now (the last content ended on a line
+    /// boundary). Backs [`wait_for_output`](crate::RunningProcess::wait_for_output).
+    pub(crate) fn partial_tail_snapshot(&self) -> (Option<String>, bool) {
+        let inner = self.inner.lock().expect("SharedLines poisoned");
+        let tail = if inner.partial_tail.is_empty() {
+            None
+        } else {
+            Some(inner.partial_tail.clone())
+        };
+        (tail, inner.closed)
     }
 
     /// Lines discarded by the buffer policy (DropOldest/DropNewest/Error), not
@@ -1049,6 +1111,23 @@ where
         }
         drain_consumed_prefix(&mut pending, start);
 
+        // Publish the current unterminated tail for a `wait_for_output` observer,
+        // AFTER every complete line for this read has already been emitted. This
+        // is a pure side view of the pump's own `pending` remainder — it moves no
+        // `seen_bytes`/`count`/`dropnewest_sealed` state (K-054/K-059), so it can
+        // never re-decide retention. While skipping an over-cap line the tail is
+        // being discarded (never retained, handed to no sink), so nothing is
+        // matchable — publish an empty tail to match that bypass. At EOF this
+        // still runs (the final `pending` is published) and is then left in place:
+        // the finalizer below turns that content into a complete line, but the
+        // last published tail stays visible so a final un-terminated prompt is
+        // matchable right up to and including close.
+        if oversized.is_some() {
+            sink.0.set_partial_tail("");
+        } else {
+            sink.0.set_partial_tail(&pending);
+        }
+
         if eof {
             // Finalize a final line (or an un-terminated over-cap tail). At EOF the
             // split loop above ran with `eof = true`, so in `\r`-aware mode a
@@ -1401,6 +1480,54 @@ mod tests {
             "invalid bytes, terminators, and dropped/oversized lines are all counted"
         );
         assert!(sink.dropped() >= 1, "the oversized line is dropped");
+    }
+
+    /// The partial-tail side view (backing `wait_for_output`) exposes the
+    /// un-terminated remainder — the content after the last line terminator —
+    /// while a stream that ends exactly on a line boundary leaves no tail.
+    #[tokio::test]
+    async fn partial_tail_exposes_the_unterminated_remainder() {
+        // A complete line, then an un-terminated prompt.
+        let with_tail = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(
+            &b"loading\nPassword: "[..],
+            encoding_rs::UTF_8,
+            None,
+            with_tail.clone(),
+        )
+        .await;
+        let (tail, closed) = with_tail.partial_tail_snapshot();
+        assert_eq!(tail.as_deref(), Some("Password: "));
+        assert!(closed, "the pump closed at EOF");
+        // The tail is a side view: at EOF the same un-terminated content is ALSO
+        // finalized into the backlog (the pump's existing final-line behavior), so
+        // the backlog carries both lines — the side view never replaces it.
+        assert_eq!(with_tail.drain(), vec!["loading", "Password: "]);
+
+        // A stream ending on a terminator has no live tail.
+        let no_tail = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines(&b"done\n"[..], encoding_rs::UTF_8, None, no_tail.clone()).await;
+        let (tail, _) = no_tail.partial_tail_snapshot();
+        assert_eq!(
+            tail, None,
+            "content ending on a newline leaves no partial tail"
+        );
+    }
+
+    /// Publishing the tail is a pure side channel: it must not perturb the
+    /// `seen_bytes` (K-059), `count`, or `dropped` accounting an existing consumer
+    /// relies on. Same input, checked with the tail machinery live.
+    #[tokio::test]
+    async fn partial_tail_does_not_disturb_byte_or_line_accounting() {
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        let raw = b"one\ntwo\ntail-without-newline";
+        pump_lines(raw.as_slice(), encoding_rs::UTF_8, None, sink.clone()).await;
+
+        assert_eq!(sink.seen_bytes(), raw.len(), "raw byte count is unchanged");
+        assert_eq!(sink.count(), 3, "two lines plus the finalized tail line");
+        assert_eq!(sink.dropped(), 0, "nothing was dropped");
+        let (tail, _) = sink.partial_tail_snapshot();
+        assert_eq!(tail.as_deref(), Some("tail-without-newline"));
     }
 
     #[tokio::test]
