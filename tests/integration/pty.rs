@@ -23,10 +23,18 @@ use crate::common::{completes_within, poll_until};
 /// A child that prints `TTY` when its stdin is a terminal and `PIPE` otherwise.
 fn isatty_probe() -> Command {
     if cfg!(windows) {
+        // `-NonInteractive` plus an explicit `Remove-Module PSReadLine` keep the
+        // console host from initialising PSReadLine, whose win32-input-mode /
+        // focus-reporting VT negotiation (`?9001` / `?1004`) shows up only on the
+        // CI Windows image and there kills the host with STATUS_CONTROL_C_EXIT
+        // before the `-Command` body runs. The probe itself is unchanged: a real
+        // PowerShell process under a real ConPTY still reports its own tty state.
         Command::new("powershell").args([
             "-NoProfile",
+            "-NonInteractive",
             "-Command",
-            "if ([Console]::IsInputRedirected) { 'PIPE' } else { 'TTY' }",
+            "Remove-Module PSReadLine -ErrorAction SilentlyContinue; \
+             if ([Console]::IsInputRedirected) { 'PIPE' } else { 'TTY' }",
         ])
     } else {
         Command::new("sh").args(["-c", "if [ -t 0 ]; then echo TTY; else echo PIPE; fi"])
@@ -36,10 +44,17 @@ fn isatty_probe() -> Command {
 /// A child that reads one line and echoes `reply:<line>`.
 fn prompt_responder() -> Command {
     if cfg!(windows) {
+        // Same PSReadLine avoidance as `isatty_probe`: `[Console]::In.ReadLine()`
+        // reads the console input stream directly, so `-NonInteractive` (which only
+        // suppresses PowerShell's own interactive prompting) does not change the
+        // round-trip, it just stops the host from arming the PSReadLine VT
+        // negotiation that aborts the process on the CI image.
         Command::new("powershell").args([
             "-NoProfile",
+            "-NonInteractive",
             "-Command",
-            "$l = [Console]::In.ReadLine(); Write-Output \"reply:$l\"",
+            "Remove-Module PSReadLine -ErrorAction SilentlyContinue; \
+             $l = [Console]::In.ReadLine(); Write-Output \"reply:$l\"",
         ])
     } else {
         Command::new("sh").args(["-c", "read line; printf 'reply:%s\\n' \"$line\""])
