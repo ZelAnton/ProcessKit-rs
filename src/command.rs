@@ -165,6 +165,9 @@ pub struct Command {
     /// Unix (`nice`/`setpriority`) and Windows (priority class) — never
     /// gated as `Unsupported`.
     priority: Option<crate::Priority>,
+    /// Linux I/O-scheduling priority (see [`Self::io_priority`]). Unsupported
+    /// on every other target.
+    io_priority: Option<crate::IoPriority>,
     /// File-mode creation mask for the child (Unix `umask(2)`, see
     /// [`Self::umask`]). Unix-only — `Unsupported` elsewhere.
     umask: Option<u32>,
@@ -230,6 +233,7 @@ impl Command {
             groups: None,
             setsid: false,
             priority: None,
+            io_priority: None,
             umask: None,
             kill_on_parent_death: false,
             creation_flags_extra: 0,
@@ -508,6 +512,25 @@ impl Command {
     /// Last-write-wins with an earlier call, like [`timeout`](Self::timeout).
     pub fn priority(mut self, priority: crate::Priority) -> Self {
         self.priority = Some(priority);
+        self
+    }
+
+    /// Set the Linux I/O-scheduling priority for this child, so background disk
+    /// work can yield to foreground users.
+    ///
+    /// Applied with `ioprio_set(2)` in the child before `exec`, on the same
+    /// `pre_exec` seam as [`priority`](Self::priority) and
+    /// [`umask`](Self::umask). Linux is the only supported platform: Windows,
+    /// macOS, BSD, and other Unix targets fail with
+    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) rather than
+    /// silently inheriting the caller's I/O priority. See [`IoPriority`](crate::IoPriority)
+    /// for the Linux classes, data range, and privilege caveat.
+    ///
+    /// This configuration is owner-dependent and is therefore refused by
+    /// [`spawn_detached`](Self::spawn_detached). Last-write-wins with an earlier
+    /// call, like [`timeout`](Self::timeout).
+    pub fn io_priority(mut self, priority: crate::IoPriority) -> Self {
+        self.io_priority = Some(priority);
         self
     }
 
@@ -1833,6 +1856,12 @@ impl Command {
         self.umask
     }
 
+    /// The requested Linux I/O priority — read by the non-Linux unsupported gate.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn requested_io_priority(&self) -> Option<crate::IoPriority> {
+        self.io_priority
+    }
+
     // ----- Public accessors -----------------------------------------------
     // Let `ScriptedRunner::when(|cmd| …)` predicates and other inspection read
     // what a command will run. Named to avoid clashing with the builder methods
@@ -2040,7 +2069,9 @@ impl Command {
     ///
     /// The same preflight failures a normal launch would raise while resolving the
     /// program / opening a `stdout_file` redirect
-    /// ([`ErrorReason::Io`](crate::ErrorReason::Io)).
+    /// ([`ErrorReason::Io`](crate::ErrorReason::Io)), plus
+    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) for a
+    /// Linux-only I/O-priority request on another platform.
     pub fn to_tokio_command(&self) -> Result<tokio::process::Command> {
         self.build_tokio()
     }
@@ -2048,6 +2079,14 @@ impl Command {
     /// Build the `tokio` command with stdio wired for capture. Containment
     /// (cgroup/job/process-group) is added by the group's `spawn`.
     pub(crate) fn build_tokio(&self) -> Result<tokio::process::Command> {
+        #[cfg(not(target_os = "linux"))]
+        if self.io_priority.is_some() {
+            return Err(ErrorReason::Unsupported {
+                operation: "io_priority (Linux-only)".into(),
+            }
+            .into());
+        }
+
         // A bare-name `program` may be spawned via a resolved absolute path so
         // the OS launches *exactly* what the spawn-free preflight
         // (`resolve_program`) reports it would: a `prefer_local` match (always),
@@ -2089,14 +2128,12 @@ impl Command {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            // Priority and umask are independent of the privilege-drop hooks
-            // below; register them first so a `Priority::High` that needs
-            // CAP_SYS_NICE/root is still requested while the child holds its
-            // original (pre-drop) privileges. Both the `Some(groups)` and
-            // `None` branches below perform the whole uid/gid drop inside a
-            // user `pre_exec` closure registered *after* these hooks, so this
-            // ordering guarantee holds uniformly regardless of whether
-            // `groups` was set.
+            // CPU/I/O priority and umask are independent of the privilege-drop
+            // hooks below; register scheduling hooks first so a privileged
+            // priority request is made while the child still holds its original
+            // credentials. Both the `Some(groups)` and `None` branches below
+            // perform the whole uid/gid drop inside a user `pre_exec` closure
+            // registered after these hooks, so that guarantee holds uniformly.
             if let Some(priority) = self.priority {
                 let nice = priority.nice_value();
                 // SAFETY: setpriority is async-signal-safe; `nice` is a plain
@@ -2104,6 +2141,22 @@ impl Command {
                 unsafe {
                     cmd.as_std_mut().pre_exec(move || {
                         if libc::setpriority(libc::PRIO_PROCESS, 0, nice) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(priority) = self.io_priority {
+                let value = priority.linux_value().map_err(Error::io)?;
+                const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+                // SAFETY: `syscall(SYS_ioprio_set, ...)` is a direct Linux system
+                // call; its arguments are integer copies and it allocates nothing
+                // in the post-fork child.
+                unsafe {
+                    cmd.as_std_mut().pre_exec(move || {
+                        if libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, value) == -1 {
                             return Err(std::io::Error::last_os_error());
                         }
                         Ok(())
@@ -2523,6 +2576,9 @@ impl Command {
         }
         if self.windows_graceful_ctrl_break {
             return refuse("windows_graceful_ctrl_break");
+        }
+        if self.io_priority.is_some() {
+            return refuse("io_priority (owner-dependent)");
         }
         // stdin can only be null for a detached child.
         if self.keep_stdin_open {
@@ -3005,6 +3061,7 @@ impl fmt::Debug for Command {
             .field("groups", &self.groups)
             .field("setsid", &self.setsid)
             .field("priority", &self.priority)
+            .field("io_priority", &self.io_priority)
             .field("umask", &self.umask)
             .field("kill_on_parent_death", &self.kill_on_parent_death)
             .field("creation_flags_extra", &self.creation_flags_extra)
@@ -3781,12 +3838,14 @@ mod tests {
     }
 
     #[test]
-    fn priority_and_umask_record_their_requests() {
+    fn scheduling_knobs_record_their_requests() {
         let cmd = Command::new("x")
             .priority(crate::Priority::BelowNormal)
+            .io_priority(crate::IoPriority::BestEffort(7))
             .umask(0o022);
         let debug = format!("{cmd:?}");
         assert!(debug.contains("BelowNormal"), "debug: {debug}");
+        assert!(debug.contains("BestEffort(7)"), "debug: {debug}");
         assert!(debug.contains("umask: Some(18)"), "debug: {debug}"); // 0o022 == 18
         assert!(
             !format!("{:?}", Command::new("x")).contains("BelowNormal"),
@@ -3820,6 +3879,37 @@ mod tests {
         // such accessor at all, because it is never gated.
         assert_eq!(Command::new("x").umask(0o022).requested_umask(), Some(18));
         assert_eq!(Command::new("x").requested_umask(), None);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn io_priority_is_gated_unsupported_on_non_linux() {
+        let err = Command::new("x")
+            .io_priority(crate::IoPriority::Idle)
+            .build_tokio()
+            .expect_err("I/O priority must be refused outside Linux");
+        assert!(
+            matches!(err.reason(), crate::ErrorReason::Unsupported { operation } if operation.contains("io_priority")),
+            "got {err:?}"
+        );
+        assert_eq!(
+            Command::new("x")
+                .io_priority(crate::IoPriority::Idle)
+                .requested_io_priority(),
+            Some(crate::IoPriority::Idle)
+        );
+    }
+
+    #[test]
+    fn spawn_detached_refuses_io_priority_loudly() {
+        let err = Command::new("x")
+            .io_priority(crate::IoPriority::Idle)
+            .spawn_detached()
+            .expect_err("a detached spawn must refuse an owner-dependent I/O priority");
+        assert!(
+            matches!(err.reason(), crate::ErrorReason::Unsupported { operation } if operation.contains("io_priority")),
+            "got {err:?}"
+        );
     }
 
     #[test]

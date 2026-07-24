@@ -562,7 +562,7 @@ Containment is preserved in every combination; the platform fine print
 the pdeathsig thread caveat) is collected in
 [Platform support](platform-support.md#caveats).
 
-### Scheduling: CPU priority and `umask`
+### Scheduling: CPU priority, I/O priority, and `umask`
 
 Two more spawn-time knobs, reusing the same seams as the builders above —
 Unix `pre_exec`, Windows `creation_flags` — for background/batch children
@@ -570,13 +570,18 @@ that shouldn't starve the foreground, and for controlling the permissions of
 files a child creates:
 
 ```rust,no_run
-use processkit::{Command, Priority};
+use processkit::{Command, IoPriority, Priority};
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {
     // Run at a lower CPU-scheduling priority — supported on BOTH platforms.
     Command::new("batch-job")
         .priority(Priority::BelowNormal)
+        .run().await?;
+
+    // Linux only: yield disk time to foreground users.
+    Command::new("indexer")
+        .io_priority(IoPriority::BestEffort(7))
         .run().await?;
 
     // Unix only: files this child creates get 0644/0755 instead of 0666/0777.
@@ -594,6 +599,15 @@ or even requesting `Priority::Normal` under a positively-niced parent (e.g. a
 `nice`d CI/batch launcher) — needs `CAP_SYS_NICE`/root; without it the OS
 rejects the change and the spawn fails loud (`ErrorReason::Spawn`), never silently
 downgrading to a lower priority.
+
+`io_priority` is Linux-only: it calls `ioprio_set(2)` in `pre_exec` before the
+program starts. `BestEffort(7)` is the lowest normal Linux I/O priority; smaller
+data values are more urgent, while `Idle` runs only when the device is otherwise
+idle. `RealTime` can starve other users and normally needs `CAP_SYS_ADMIN`; a
+rejected request fails as `ErrorReason::Spawn`. On Windows, macOS/BSD, and other
+Unix targets, requesting I/O priority fails with `ErrorReason::Unsupported` rather
+than silently inheriting the caller's I/O priority. It is also refused by
+`spawn_detached`, whose owner-independent launch contract cannot honor it.
 
 `umask` is Unix-only — like `setsid`/`groups`, requesting it on Windows fails
 with `ErrorReason::Unsupported` rather than being silently ignored.
@@ -757,7 +771,7 @@ dumping multi-KiB streams into it.
 ## Escape hatch: a platform knob the crate doesn't model
 
 `Command` exposes typed builders for the OS knobs that carry their weight —
-`priority`, `umask`, `create_no_window`, `windows_graceful_ctrl_break`,
+`priority`, `io_priority`, `umask`, `create_no_window`, `windows_graceful_ctrl_break`,
 `run_as` (uid/gid), `parent_death`, and so on. New *real* needs are added the
 same way: as a typed verb, so the command stays inspectable (its `Debug`, its
 `Clone`, and — with the `record` feature — the cassette it serialises to all
@@ -778,7 +792,7 @@ use processkit::{Command, ProcessGroup};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the OS command exactly as ProcessKit would: program resolution,
-    // environment, working directory, priority/umask, capture-wired stdio.
+    // environment, working directory, scheduling/umask knobs, capture-wired stdio.
     let raw = Command::new("odd-tool")
         .args(["--serve"])
         .to_tokio_command()?;
@@ -799,7 +813,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 **What survives, and what you give up.** `to_tokio_command()` carries over
 everything the builder resolves at the OS level (program/args/cwd, the layered
 environment, the Unix `priority`/`umask`/privilege-drop/`setsid` `pre_exec`
-hooks, Windows creation flags, and stdio wired for capture). Spawning the result
+hooks (including Linux-only `io_priority`), Windows creation flags, and stdio wired
+for capture). Spawning the result
 through [`ProcessGroup::spawn`](process-groups.md) still enrolls the child in the
 group's Job/cgroup/process-group, so **containment is preserved** — kill-on-drop
 and the group-level teardown verbs still reach it. What you leave behind is the
