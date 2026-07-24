@@ -806,6 +806,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         kill_on_parent_death: command.wants_kill_on_parent_death(),
         windows_new_process_group: command.wants_windows_graceful_ctrl_break(),
         use_pty: command.wants_pty(),
+        pty_size: command.configured_pty_size(),
     };
     // PTY mode diverges here: the child is spawned over a single pseudo-terminal
     // master (openpty / ConPTY) instead of three pipes, so its stdin wiring and

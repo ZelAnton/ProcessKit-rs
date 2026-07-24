@@ -29,7 +29,8 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, GetConsoleWindow, GetStdHandle, HPCON,
-    STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+    ResizePseudoConsole, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    SetStdHandle,
 };
 use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows_sys::Win32::System::Pipes::CreatePipe;
@@ -47,6 +48,17 @@ use crate::sys::pid_gate::PidGate;
 use super::{PtyExitStatus, PtyReader, PtySpawn, PtyWriter};
 
 const STILL_ACTIVE: u32 = 259;
+
+/// Build a ConPTY [`COORD`] from a `(cols, rows)` window size. `COORD`'s fields
+/// are signed 16-bit, so a size beyond `i16::MAX` (far past any real terminal) is
+/// clamped rather than wrapped negative — a defensive cap, never hit in practice.
+fn coord(cols: u16, rows: u16) -> COORD {
+    let clamp = |v: u16| v.min(i16::MAX as u16) as i16;
+    COORD {
+        X: clamp(cols),
+        Y: clamp(rows),
+    }
+}
 
 // Conhost reports the client's final console writes asynchronously after its
 // process handle becomes signalled. This is a drain quiescence, not a caller
@@ -205,6 +217,31 @@ impl PtyChild {
             // SAFETY: `hpc` is a live pseudoconsole handle, closed exactly once.
             unsafe { ClosePseudoConsole(self.hpc) };
         }
+    }
+
+    /// Resize the ConPTY pseudoconsole to `cols`×`rows` via `ResizePseudoConsole`.
+    /// conhost reflows its screen buffer and the client observes the new geometry
+    /// through the console API (`GetConsoleScreenBufferInfo`) — the live-resize
+    /// half of [`Command::pty_size`](crate::Command::pty_size).
+    ///
+    /// `&self`: `ResizePseudoConsole` takes the console handle by value and mutates
+    /// no Rust-side state. The caller
+    /// ([`RunningProcess::resize_pty`](crate::RunningProcess)) gates on the child
+    /// still running, so the pseudoconsole has not yet been closed by a reap.
+    ///
+    /// Windows note: unlike Unix `TIOCSWINSZ` there is no `SIGWINCH`; a console
+    /// client learns of the change on its next console query, and conhost may
+    /// reflow asynchronously — the resize is delivered best-effort, not
+    /// synchronously observable at the returned instant.
+    pub(crate) fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        // SAFETY: `hpc` is a live pseudoconsole handle for the call's duration —
+        // the caller gated on the child still running, so no reap/`Drop` has closed
+        // it. `ResizePseudoConsole` returns an `HRESULT`; non-zero is a failure.
+        let hr = unsafe { ResizePseudoConsole(self.hpc, coord(cols, rows)) };
+        if hr != 0 {
+            return Err(io::Error::from_raw_os_error(hr));
+        }
+        Ok(())
     }
 
     /// Non-blocking exit poll.
@@ -513,7 +550,8 @@ pub(crate) fn spawn_pty(
     // child's ends before that would leave the render pipe with no writer and the
     // output empty. They are closed only on the success path below (and by the
     // error cleanups) — see `close_child_ends`.
-    let size = COORD { X: 80, Y: 24 };
+    let (cols, rows) = opts.pty_size.unwrap_or(super::DEFAULT_PTY_SIZE);
+    let size = coord(cols, rows);
     // `HPCON` is an `isize` handle in windows-sys, not a pointer.
     let mut hpc: HPCON = 0;
     // SAFETY: valid pipe handles and an out-pointer for the pseudoconsole handle.
@@ -913,5 +951,24 @@ mod tests {
         // `STARTF_USESTDHANDLES`, so the null slots are not consulted at all.
         let inherited = conpty_startup_info(std::ptr::null_mut(), false);
         assert_eq!(inherited.StartupInfo.dwFlags & STARTF_USESTDHANDLES, 0);
+    }
+
+    #[test]
+    fn coord_maps_a_window_size_and_clamps_beyond_i16() {
+        // An ordinary size passes through unchanged.
+        let c = coord(120, 40);
+        assert_eq!((c.X, c.Y), (120, 40));
+
+        // The default is the historical 80×24.
+        let d = coord(
+            super::super::DEFAULT_PTY_SIZE.0,
+            super::super::DEFAULT_PTY_SIZE.1,
+        );
+        assert_eq!((d.X, d.Y), (80, 24));
+
+        // A size past `i16::MAX` (never a real terminal) is clamped, not wrapped
+        // negative — a defensive guard on the signed `COORD` fields.
+        let big = coord(u16::MAX, 40_000);
+        assert_eq!((big.X, big.Y), (i16::MAX, i16::MAX));
     }
 }

@@ -13,6 +13,21 @@ to a dated version section.
 
 ### Added
 
+- Add pseudo-terminal **window-size control** for `use_pty` runs (the `pty`
+  feature): `Command::pty_size(cols, rows)` sets the terminal's initial geometry
+  at spawn (replacing the previously hard-coded 80×24 — still the default when
+  unset), and `RunningProcess::resize_pty(cols, rows)` resizes a **live** session
+  so a host window resize can be propagated to the child. On Unix `resize_pty`
+  issues `TIOCSWINSZ` on the master, delivering `SIGWINCH` to the child's
+  foreground process group; on Windows it calls `ResizePseudoConsole` (no
+  `SIGWINCH` — the client observes the new geometry on its next console query, and
+  conhost may reflow asynchronously). `resize_pty` returns a typed
+  `ErrorReason::Unsupported` — never a panic or a silent no-op — on a non-PTY run
+  or once the child has exited; `pty_size` on a non-`use_pty` command is a
+  documented no-op. The PTY-variant `ScriptedRunner` models both hermetically (a
+  configured spawn size and live resizes) with no real pseudo-terminal, so both
+  are unit-testable. Additive: an existing PTY run that sets neither keeps the
+  byte-identical 80×24 behavior
 - Add `Command::spawn_detached` — the crate's **one deliberate, opt-in escape**
   from kill-on-drop containment, for the legitimate handoff cases (daemonizing, a
   `nohup`-style helper meant to *outlive* its launcher). It spawns the child

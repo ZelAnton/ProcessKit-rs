@@ -129,6 +129,17 @@ pub(crate) struct ScriptedProc {
     /// (now = immediately), `None` never exits on its own (`Reply::pending` —
     /// cancel/timeout still end it).
     exit_at: Option<tokio::time::Instant>,
+    /// Whether this double models a [`use_pty`](crate::Command::use_pty) run, set
+    /// by [`from_scripted`](RunningProcess::from_scripted). Gates the hermetic
+    /// [`resize`](Self::resize) model so a non-PTY scripted handle refuses a
+    /// resize exactly as a real non-PTY one does.
+    #[cfg(feature = "pty")]
+    pty: bool,
+    /// Every `(cols, rows)` accepted by [`resize`](Self::resize), in call order —
+    /// the hermetic model of a live PTY resize (no real pty). Lets a test observe
+    /// that a resize was delivered, and in what geometry.
+    #[cfg(feature = "pty")]
+    resizes: Vec<(u16, u16)>,
 }
 
 impl ScriptedProc {
@@ -186,11 +197,45 @@ impl ScriptedProc {
             timed_out,
             signal,
             exit_at: lifetime.map(|d| tokio::time::Instant::now() + d),
+            #[cfg(feature = "pty")]
+            pty: false,
+            #[cfg(feature = "pty")]
+            resizes: Vec::new(),
         }
     }
 
     pub(super) fn kill(&self) {
         self.kill.fire();
+    }
+
+    /// Mark whether this double models a [`use_pty`](crate::Command::use_pty) run
+    /// — set once at [`from_scripted`](RunningProcess::from_scripted) time from the
+    /// command's PTY flag.
+    #[cfg(feature = "pty")]
+    pub(super) fn set_pty_mode(&mut self, pty: bool) {
+        self.pty = pty;
+    }
+
+    /// Whether this double models a PTY run (backs
+    /// [`RunningProcess::resize_pty`](crate::RunningProcess)'s scripted branch).
+    #[cfg(feature = "pty")]
+    pub(super) fn models_pty(&self) -> bool {
+        self.pty
+    }
+
+    /// Hermetically model a live PTY resize: record the requested `(cols, rows)`.
+    /// The caller has already verified this double is a PTY and still "running",
+    /// so this only bookkeeps — there is no real pseudo-terminal to resize.
+    #[cfg(feature = "pty")]
+    pub(super) fn record_resize(&mut self, cols: u16, rows: u16) {
+        self.resizes.push((cols, rows));
+    }
+
+    /// The resizes recorded by [`record_resize`](Self::record_resize), in order —
+    /// a test-only window into the hermetic resize model.
+    #[cfg(all(test, feature = "pty"))]
+    pub(super) fn recorded_resizes(&self) -> &[(u16, u16)] {
+        &self.resizes
     }
 
     /// The scripted counterpart of `Backend::own_group` — a scripted double has
@@ -283,6 +328,15 @@ impl RunningProcess {
         scripted: ScriptedProc,
         recorded: Option<ScriptedResultInfo>,
     ) -> Self {
+        // Carry the command's PTY intent onto the double so a scripted
+        // `use_pty` handle answers `resize_pty` (and a non-PTY one refuses it)
+        // exactly as a real handle would — hermetically, with no real pty.
+        #[cfg(feature = "pty")]
+        let scripted = {
+            let mut scripted = scripted;
+            scripted.set_pty_mode(command.wants_pty());
+            scripted
+        };
         Self {
             program: command.program_name(),
             backend: Backend::Scripted(Box::new(scripted)),

@@ -26,12 +26,57 @@ use super::{EofOnEio, PtyExitStatus, PtyReader, PtySpawn, PtyWriter};
 /// pipe-spawned child — only the I/O wiring differs.
 pub(crate) struct PtyChild {
     child: Child,
+    /// A dedicated dup of the pty **master** kept solely for the live-resize
+    /// `TIOCSWINSZ` ioctl (see [`resize`](Self::resize)). It is a plain owned fd,
+    /// never registered with the reactor — the ioctl needs only a valid master
+    /// fd, not readiness gating, so it does not touch the `AsyncFd`-driven
+    /// reader/writer (K-072) and cannot conflict with their read/write
+    /// registration. Sharing the master's open file description with the
+    /// reader/writer, it does not alter end-of-session semantics: the merged
+    /// reader still sees `EIO`/EOF the instant the slave closes (child exit),
+    /// which is independent of how many master dups remain open.
+    resize_fd: OwnedFd,
 }
 
 impl PtyChild {
     /// The child's pid, or `None` once reaped.
     pub(crate) fn id(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    /// Resize the pseudo-terminal to `cols`×`rows` via `TIOCSWINSZ` on the master
+    /// fd. The kernel updates the terminal's window size and delivers `SIGWINCH`
+    /// to the child's foreground process group, so a size-aware child (a TUI, a
+    /// pager) re-renders for the new geometry — the live-resize half of
+    /// [`Command::pty_size`](crate::Command::pty_size).
+    ///
+    /// `&self`: the ioctl mutates no Rust-side state, only the kernel's tty. The
+    /// caller ([`RunningProcess::resize_pty`](crate::RunningProcess)) has already
+    /// gated on the child still running, so this never runs against a torn-down
+    /// session.
+    pub(crate) fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        let winsize = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `resize_fd` is a valid, owned pty master fd for the call's
+        // duration; `TIOCSWINSZ` reads the window size through the trailing
+        // `*const winsize`, which points at a fully-initialised local. The request
+        // constant is coerced to whatever integer type this target's `ioctl`
+        // signature expects (`c_ulong` on glibc/BSD/Apple, `c_int` on musl).
+        let rc = unsafe {
+            libc::ioctl(
+                self.resize_fd.as_raw_fd(),
+                libc::TIOCSWINSZ as _,
+                &raw const winsize,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// Gated reap: poll the child's exit under the [`PidGate`] so the pid-freeing
@@ -95,18 +140,19 @@ fn disable_echo(fd: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Open a pseudo-terminal, returning the (master, slave) fds as owned handles.
-fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
+/// Open a pseudo-terminal sized `cols`×`rows`, returning the (master, slave) fds
+/// as owned handles.
+fn open_pty(cols: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
-    // A sane default window size so a size-querying child gets something usable
-    // (a zero size makes some TUI tools misbehave). Purely cosmetic for the
-    // minimal single-master-fd mode. `mut` because the `winp` parameter of
+    // The child's initial window size ([`Command::pty_size`], default 80×24 — a
+    // zero size makes some TUI tools misbehave). Live-resizable afterwards via
+    // `TIOCSWINSZ` (see `PtyChild::resize`). `mut` because the `winp` parameter of
     // `openpty` is `*const winsize` only on glibc; on the BSD/Apple libc it is
     // `*mut winsize`, so a `&mut` is required to satisfy every target.
     let mut winsize = libc::winsize {
-        ws_row: 24,
-        ws_col: 80,
+        ws_row: rows,
+        ws_col: cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
@@ -279,7 +325,8 @@ pub(crate) fn spawn_pty<F>(cmd: &mut Command, opts: &SpawnOptions, spawn: F) -> 
 where
     F: FnOnce(&mut Command, &SpawnOptions) -> io::Result<Child>,
 {
-    let (master, slave) = open_pty()?;
+    let (cols, rows) = opts.pty_size.unwrap_or(super::DEFAULT_PTY_SIZE);
+    let (master, slave) = open_pty(cols, rows)?;
     disable_echo(&slave)?;
 
     // The child needs the slave on all three of stdin/stdout/stderr, and
@@ -306,11 +353,19 @@ where
     // pool with a read+write thread apiece. The `EofOnEio` wrapper is unchanged —
     // the end-of-session `EIO` still surfaces from `poll_read` as a clean EOF.
     let master_w = master.try_clone()?;
+    // A third dup, retained by `PtyChild` solely for the live-resize ioctl. It
+    // stays a plain blocking-view owned fd (never wrapped in `AsyncFd`); sharing
+    // the master's open file description it inherits the `O_NONBLOCK` the
+    // reader/writer set, which is irrelevant to an ioctl.
+    let master_resize = master.try_clone()?;
     let reader: PtyReader = Box::new(EofOnEio(AsyncPtyMaster::new(master)?));
     let writer: PtyWriter = Box::new(AsyncPtyMaster::new(master_w)?);
 
     Ok(PtySpawn {
-        child: PtyChild { child },
+        child: PtyChild {
+            child,
+            resize_fd: master_resize,
+        },
         reader,
         writer,
         pid,

@@ -762,6 +762,7 @@ pub fn processkit::Command::prefer_local(self, impl core::convert::Into<std::pat
 pub fn processkit::Command::priority(self, processkit::Priority) -> Self
 pub async fn processkit::Command::probe(&self) -> processkit::Result<bool>
 pub fn processkit::Command::program(&self) -> &std::ffi::os_str::OsStr
+pub fn processkit::Command::pty_size(self, u16, u16) -> Self
 pub fn processkit::Command::resolve_program(&self) -> processkit::Result<std::path::PathBuf>
 pub fn processkit::Command::retry(self, u32, core::time::Duration, impl core::ops::function::Fn(&processkit::Error) -> bool + core::marker::Send + core::marker::Sync + 'static) -> Self
 pub fn processkit::Command::retry_never(self) -> Self
@@ -1320,6 +1321,7 @@ pub async fn processkit::RunningProcess::output_string(self) -> processkit::Resu
 pub fn processkit::RunningProcess::peak_memory_bytes(&self) -> core::option::Option<u64>
 pub fn processkit::RunningProcess::pid(&self) -> core::option::Option<u32>
 pub async fn processkit::RunningProcess::profile(self, core::time::Duration) -> processkit::Result<processkit::RunProfile>
+pub fn processkit::RunningProcess::resize_pty(&mut self, u16, u16) -> processkit::Result<()>
 pub async fn processkit::RunningProcess::shutdown(self, core::time::Duration) -> processkit::Result<processkit::Outcome>
 pub fn processkit::RunningProcess::start_kill(&mut self) -> processkit::Result<()>
 pub fn processkit::RunningProcess::start_time(&self) -> std::time::SystemTime

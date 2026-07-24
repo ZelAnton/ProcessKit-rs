@@ -3417,4 +3417,73 @@ mod tests {
             .expect("cancel-before-reserve left the one-shot source intact");
         assert!(out.is_success(), "got {out:?}");
     }
+
+    /// A `use_pty` scripted double hermetically models a live resize: each
+    /// `resize_pty` on a still-running double succeeds and its geometry is
+    /// recorded — no real pseudo-terminal involved.
+    #[cfg(feature = "pty")]
+    #[tokio::test]
+    async fn scripted_pty_double_models_live_resize() {
+        // A pending reply never "exits" on its own, so the modeled session stays
+        // live for the whole test.
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let cmd = Command::new("tui").use_pty().pty_size(100, 30);
+        let mut run = runner.start(&cmd).await.expect("scripted pty start");
+
+        run.resize_pty(120, 40)
+            .expect("a live scripted PTY accepts a resize");
+        run.resize_pty(80, 24).expect("and a second resize");
+
+        assert_eq!(
+            run.scripted_recorded_resizes(),
+            Some(vec![(120, 40), (80, 24)]),
+            "the PTY double must record every delivered resize, in order"
+        );
+    }
+
+    /// `resize_pty` on a scripted double that is **not** a `use_pty` run refuses
+    /// honestly (there is no terminal to resize) and records nothing — matching a
+    /// real non-PTY handle.
+    #[cfg(feature = "pty")]
+    #[tokio::test]
+    async fn resize_pty_on_a_non_pty_scripted_double_is_unsupported() {
+        use crate::error::ErrorReason;
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let cmd = Command::new("plain"); // no use_pty
+        let mut run = runner.start(&cmd).await.expect("scripted start");
+
+        let err = run
+            .resize_pty(120, 40)
+            .expect_err("a non-PTY run has no terminal to resize");
+        assert!(
+            matches!(err.reason(), ErrorReason::Unsupported { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            run.scripted_recorded_resizes(),
+            Some(vec![]),
+            "a refused resize records nothing"
+        );
+    }
+
+    /// Once a scripted PTY double has "exited", `resize_pty` fails honestly (the
+    /// modeled terminal is gone) rather than silently succeeding.
+    #[cfg(feature = "pty")]
+    #[tokio::test]
+    async fn resize_pty_after_a_scripted_pty_double_exits_is_unsupported() {
+        use crate::error::ErrorReason;
+        // A no-delay reply "exits" immediately, so the modeled terminal is gone by
+        // the time we resize.
+        let runner = ScriptedRunner::new().fallback(Reply::ok("done"));
+        let cmd = Command::new("quick").use_pty();
+        let mut run = runner.start(&cmd).await.expect("scripted pty start");
+
+        let err = run
+            .resize_pty(120, 40)
+            .expect_err("resize after the modeled process exited must fail honestly");
+        assert!(
+            matches!(err.reason(), ErrorReason::Unsupported { .. }),
+            "got {err:?}"
+        );
+    }
 }
