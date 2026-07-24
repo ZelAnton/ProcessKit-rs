@@ -16,6 +16,7 @@ bounded and torn down as a unit. See
 
 - [Lifecycle](#lifecycle)
 - [Streaming stdout](#streaming-stdout)
+- [The full lifecycle as one stream (`events()`)](#the-full-lifecycle-as-one-stream-events)
 - [Interactive stdin](#interactive-stdin)
 - [Readiness probes](#readiness-probes)
 - [Racing children with `wait_any`](#racing-children-with-wait_any)
@@ -130,7 +131,7 @@ async fn main() -> processkit::Result<()> {
 Things to know:
 
 - **Call `stdout_lines()` once.** It is fallible: a second `stdout_lines` /
-  `output_events` call (stdout is consumed once), or a non-piped stdout
+  `events` call (stdout is consumed once), or a non-piped stdout
   (`StdioMode::Inherit`/`Null` or `Command::stdout_file*`), returns `Err` rather than a silently-empty
   stream.
 - **The command's `timeout` bounds the stream**: at the deadline the tree
@@ -180,7 +181,7 @@ async fn main() -> processkit::Result<()> {
         // Frame the stream you actually consume: `stdout_lines()` surfaces
         // stdout only (stderr is drained in the background and discarded), so
         // put the CR framing on stdout. If a tool draws its bar on stderr,
-        // set `line_terminator(..)` for both streams and read `output_events()`.
+        // set `line_terminator(..)` for both streams and read `events()`.
         .stdout_line_terminator(LineTerminator::CarriageReturn)
         .start()
         .await?;
@@ -253,7 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The raw tee fires from the line/streaming verbs (`output_string`, `start` +
-`stdout_lines` / `output_events`, `wait` / `drain`). It is a **no-op** under
+`stdout_lines` / `events`, `wait` / `drain`). It is a **no-op** under
 `stdout(Inherit)` / `stdout(Null)` / a `stdout_file` redirect — none run a capture
 pump — and under `output_bytes`, whose own return value already *is* the exact raw
 stdout. Reach for it when you need the raw bytes *alongside* decoded lines.
@@ -292,7 +293,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .capture_policy(RedactTokens)
         .output_string()
         .await?;
-    // `out.stdout()` — and a streamed `stdout_lines` / `output_events` — carry
+    // `out.stdout()` — and a streamed `stdout_lines` / `events` — carry
     // the redacted text; the raw secret never reached the buffer.
     assert!(!out.stdout().contains("token=hunter2"));
     Ok(())
@@ -318,6 +319,68 @@ policy. *How much* is retained stays `OutputBufferPolicy`'s job (the two compose
 the policy shapes each retained line's content, the buffer policy bounds how many
 survive). A policy that panics **fails closed** — the offending line is blanked,
 never leaked raw.
+
+## The full lifecycle as one stream (`events()`)
+
+`stdout_lines()` gives you stdout; `events()` gives you the child's **whole
+lifecycle** as one ordered, typed stream — the single asynchronous source a TUI,
+dashboard, or supervisor wants, instead of stitching together separate channels
+for "started", output, and "exited":
+
+```text
+Started { pid } → interleaved Stdout / Stderr lines → Exited(outcome)
+```
+
+- **`ProcessEvent::Started { pid }`** leads the stream, emitted as soon as the
+  pid is known (before any output). `pid` is `None` for a scripted double.
+- **`ProcessEvent::Stdout(line)` / `Stderr(line)`** carry each decoded
+  [`OutputLine`] (read `line.text()`), the two streams polled fairly so neither
+  starves the other.
+- **`ProcessEvent::Exited(outcome)`** ends the stream, carrying the run's
+  [`Outcome`] — the same value `finish()` reports.
+
+The enum is `#[non_exhaustive]`: a `match` needs a `_` arm, and future kinds
+(e.g. the graceful-teardown transitions) can be added without a breaking change.
+`ProcessEvent::name()` gives a stable `"started"` / `"stdout"` / `"stderr"` /
+`"exited"` tag for logging or serialization.
+
+**Drive the stream and the finisher together.** The terminal `Exited` is
+delivered when the run is *reaped* — which is what `finish()` (or `wait()`) does.
+So poll the stream and that finisher **concurrently** (e.g. with `tokio::join!`),
+rather than draining the stream to completion first and only then calling
+`finish()` — the stream would park waiting for an `Exited` no one is yet
+producing. After the stream ends, `finish()`'s `stderr` is empty because stderr
+was delivered to you as `Stderr` events.
+
+```rust,no_run
+use processkit::prelude::StreamExt;
+use processkit::{Command, ProcessEvent};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let mut run = Command::new("deploy").start().await?;
+
+    let mut events = run.events()?;
+    let render = async {
+        while let Some(ev) = events.next().await {
+            match ev {
+                ProcessEvent::Started { pid } => eprintln!("started {pid:?}"),
+                ProcessEvent::Stdout(line) => println!("{}", line.text()),
+                ProcessEvent::Stderr(line) => eprintln!("! {}", line.text()),
+                ProcessEvent::Exited(outcome) => eprintln!("exited {outcome:?}"),
+                _ => {} // non_exhaustive: future event kinds
+            }
+        }
+    };
+    // Poll the event stream and the reaping `finish()` together.
+    let (_, finished) = tokio::join!(render, run.finish());
+    println!("run finished: {:?}", finished?.outcome);
+    Ok(())
+}
+```
+
+[`OutputLine`]: https://docs.rs/processkit/latest/processkit/struct.OutputLine.html
+[`Outcome`]: https://docs.rs/processkit/latest/processkit/enum.Outcome.html
 
 ## Interactive stdin
 
@@ -425,7 +488,7 @@ Probe semantics, deliberately uniform:
   continue with `finish`. `wait_for_port` / `wait_for_socket` / `wait_for`
   drain the same way but never hand any of it back mid-probe; `wait` /
   `output_string` afterward still see the full captured output, but
-  `output_bytes` or a fresh `stdout_lines` / `output_events` call do not
+  `output_bytes` or a fresh `stdout_lines` / `events` call do not
   compose with any of the four probes (same as calling `wait_for_line`
   first).
 - `wait_for_socket` uses a real connection attempt, not just a socket-file

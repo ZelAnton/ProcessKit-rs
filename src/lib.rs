@@ -300,7 +300,7 @@ pub use cassette::{fuzz_cassette_parse, fuzz_cassette_replay};
 pub use result::{Outcome, ProcessResult};
 pub use retry::RetryPolicy;
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
-pub use running::{Finished, OutputEvent, OutputEvents, OutputLine, RunningProcess, StdoutLines};
+pub use running::{Finished, OutputLine, ProcessEvent, ProcessEvents, RunningProcess, StdoutLines};
 #[cfg(feature = "process-control")]
 pub use shutdown_report::{ShutdownReport, SoftSignal};
 #[cfg(feature = "process-control")]
@@ -604,7 +604,7 @@ pub mod prelude {
 
     /// Re-exported from [`tokio_stream`] so callers can `.next()` the stdout/event
     /// streams (e.g. [`StdoutLines`](crate::StdoutLines) /
-    /// [`OutputEvents`](crate::OutputEvents)) without a direct `tokio-stream`
+    /// [`ProcessEvents`](crate::ProcessEvents)) without a direct `tokio-stream`
     /// dependency. Collides with `futures::StreamExt` under a glob import — import
     /// by path (`processkit::prelude::StreamExt`) if both traits are in scope.
     pub use tokio_stream::StreamExt;
@@ -979,26 +979,29 @@ mod tests {
         );
     }
 
-    // A second output_events call is likewise a loud error.
+    // A second events() call is likewise a loud error: the first call consumed
+    // stdout, so the second must fail rather than yield a silently-empty stream.
     #[tokio::test]
-    async fn second_output_events_is_a_loud_error() {
+    async fn second_events_call_is_a_loud_error() {
         use crate::doubles::{Reply, ScriptedRunner};
-        use crate::prelude::StreamExt;
         use crate::runner::ProcessRunner;
         let runner = ScriptedRunner::new().fallback(Reply::fail(1, "stderr-only"));
         let mut run = runner
             .start(&crate::Command::new("prog"))
             .await
             .expect("start");
-        let mut first = run.output_events().expect("first output_events");
-        while first.next().await.is_some() {}
+        // The first call takes stdout; the second fails immediately on the
+        // already-consumed stdout (no need to drain the first stream, which would
+        // park awaiting its terminal `Exited` from a not-yet-driven finisher).
+        let first = run.events().expect("first events");
         let err = run
-            .output_events()
-            .expect_err("a second output_events must be a loud error");
+            .events()
+            .expect_err("a second events call must be a loud error");
         assert!(
             matches!(err.reason(), crate::ErrorReason::Io(_)),
             "got {err:?}"
         );
+        drop(first);
         let _ = run.finish().await;
     }
 }

@@ -332,7 +332,11 @@ match ev {
 
 Or, when you don't care which stream produced the line, use the new accessor:
 
-```rust,no_run
+<!-- `text`, not `rust`: `processkit::OutputEvent` was the 0.11-era name for this
+     enum; 3.0 renamed it to `ProcessEvent` (see that section above), so this
+     historical example no longer compiles against the current type. The
+     `ev.text()` accessor it shows still exists on today's `ProcessEvent`. -->
+```text
 fn handle(ev: processkit::OutputEvent) {
 if let Some(text) = ev.text() {
     println!("{text}");

@@ -10,7 +10,7 @@ mod probes;
 mod scripted;
 mod stream;
 
-pub use stream::{Finished, OutputEvent, OutputEvents, OutputLine, StdoutLines};
+pub use stream::{Finished, OutputLine, ProcessEvent, ProcessEvents, StdoutLines};
 // Re-exported so `crate::doubles`/`crate::cassette` keep addressing these at
 // `crate::running::...` even though they now live in the `scripted` submodule.
 pub(crate) use scripted::{ScriptedProc, ScriptedResultInfo, split_pump_lines};
@@ -166,7 +166,7 @@ pub struct RunningProcess {
     // streaming / consumed) implicitly. No runtime state enum on purpose:
     // consuming verbs take `self` by value (double consumption is a compile
     // error), and the two &mut entry points handle a repeat call without
-    // panicking — `stdout_lines`/`output_events` return a loud `Err`, and
+    // panicking — `stdout_lines`/`events` return a loud `Err`, and
     // `take_stdin` returns `None`. A state enum would only add panic paths to
     // guard doors the borrow checker already locks.
     program: String,
@@ -256,6 +256,17 @@ pub struct RunningProcess {
     // a consumed replay reports them instead of the values the re-pumped canned
     // output would derive. `None` for a real child or a plain scripted reply.
     scripted_result: Option<ScriptedResultInfo>,
+    // A live `events()` lifecycle stream's terminal `ProcessEvent::Exited` is fed
+    // from here: the single reap choke point (`on_reaped`) publishes the run's
+    // `Outcome` on this channel, which the stream drains once its output pipes
+    // close. `None` unless `events()` armed a stream; a pure addition to the reap
+    // path — a `send` on a dropped receiver (the stream was dropped) is ignored.
+    exit_event_tx: Option<tokio::sync::oneshot::Sender<Outcome>>,
+    // Set by `events()`: stderr is delivered to the caller as `ProcessEvent::Stderr`
+    // events, so `finish` must NOT also drain it into `Finished::stderr` (that
+    // would race the live stream for the lines). `Finished::stderr` is empty by
+    // design for an events run.
+    merged_events_stream: bool,
 }
 
 /// A boxed output reader: real `ChildStdout`/`ChildStderr`, scripted bytes, or a
@@ -422,6 +433,8 @@ impl RunningProcess {
             deadline_anchor: tokio::time::Instant::now(),
             start_time: SystemTime::now(),
             scripted_result: None,
+            exit_event_tx: None,
+            merged_events_stream: false,
         }
     }
 
@@ -468,6 +481,8 @@ impl RunningProcess {
             deadline_anchor: tokio::time::Instant::now(),
             start_time: SystemTime::now(),
             scripted_result: None,
+            exit_event_tx: None,
+            merged_events_stream: false,
         }
     }
 
@@ -677,7 +692,7 @@ impl RunningProcess {
             return Err(Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "`{}`: stdout was already consumed by an earlier stdout_lines/output_events \
+                    "`{}`: stdout was already consumed by an earlier stdout_lines/events \
                      call — stream it once (a second call would yield an empty stream)",
                     self.program
                 ),
@@ -1205,7 +1220,7 @@ impl RunningProcess {
             self.ensure_stdout_capturable()?;
         }
         // Reuse a sink already populated by a prior streaming call so that
-        // output_string after stdout_lines/output_events sees those lines rather
+        // output_string after stdout_lines/events sees those lines rather
         // than returning empty. For the discard paths use a retain-nothing sink
         // (not the user's retention policy) so a chatty child never accumulates
         // O(total) heap in wait/profile/drain. The byte cap bounds the pump's
@@ -1490,7 +1505,17 @@ impl RunningProcess {
             // Moot — `checked_outcome` maps the cancel snapshot to `Err(Cancelled)`.
             ExitCause::Cancelled => Outcome::Signalled(None),
         };
-        self.classify_timed_out(outcome)
+        let outcome = self.classify_timed_out(outcome);
+        // Feed a live `events()` lifecycle stream its terminal
+        // `ProcessEvent::Exited`. This is the single reap choke point every
+        // consuming finisher (`finish`/`wait`/`drain`/…) funnels through, so the
+        // stream sees the exact `Outcome` the finisher reports. A no-op unless
+        // `events()` armed a stream; `send` failing (the stream was dropped) is
+        // ignored. Purely additive — no reap/gate/teardown invariant is touched.
+        if let Some(tx) = self.exit_event_tx.take() {
+            let _ = tx.send(outcome);
+        }
+        outcome
     }
 
     /// Wait for the child to exit, applying the timeout (killing the tree on
