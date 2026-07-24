@@ -321,6 +321,15 @@ async fn main() -> processkit::Result<()> {
   terminal it doesn't have". If a tool *demands* a tty (an `ssh`/`sudo`
   password prompt), that's a different, unrelated limitation — see [Running
   commands → interactive auth](commands.md#privileges-and-spawn-flags).
+- **Kill-on-drop stops at your machine's process tree — it does not cross an
+  `ssh` hop (or any remote-execution client).** The whole-tree guarantee reaps
+  the local tree, including a local `ssh` *client*; the command that client runs
+  on a **remote** host is beyond its reach, so a dropped handle, a `timeout`, or
+  a panic that kills the client can leave the remote command running, orphaned.
+  Contain the remote side *on the remote side* — `ssh -tt` (a connection drop
+  then delivers `SIGHUP` to the remote session), a server-side `timeout(1)` or
+  unit deadline. See the cookbook's [Driving ssh](cookbook.md#driving-ssh)
+  recipe for the full boundary and mitigations.
 - **Stdin closed by default is hygiene, not confinement.** It stops a child
   from hanging on unexpected input; it says nothing about what the child
   can do once running.

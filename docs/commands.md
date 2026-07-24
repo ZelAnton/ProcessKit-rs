@@ -624,6 +624,11 @@ Two ways to satisfy them:
     job/cgroup/process group, so whole-tree kill-on-drop, timeouts, and
     cancellation behave exactly as for a piped run.
 
+  For the end-to-end `ssh` case specifically — the non-interactive path, the
+  PTY passphrase dialog, the exit-code-255 split, and the boundary where
+  kill-on-drop stops at the local ssh client (the *remote* command is not
+  contained) — see the cookbook's [Driving ssh](cookbook.md#driving-ssh) recipe.
+
   The historical defer/design is recorded in
   `decisions/permissions-privileges-pty-network.md` §4.
 

@@ -17,6 +17,7 @@ runtime and `use processkit::Command;` unless shown otherwise.
 - [Feed the child's stdin](#feed-the-childs-stdin)
 - [Stream output as it arrives](#stream-output-as-it-arrives)
 - [Talk to an interactive child](#talk-to-an-interactive-child)
+- [Driving ssh](#driving-ssh)
 - [Pipe commands without a shell](#pipe-commands-without-a-shell)
 - [Start a server and wait until it's ready](#start-a-server-and-wait-until-its-ready)
 - [Tear down several children as a unit](#tear-down-several-children-as-a-unit)
@@ -324,6 +325,116 @@ methods return `std::io::Result` (idiomatic for a writer) — convert with
 `Box<dyn std::error::Error>`.
 
 *Fine print: [Streaming & interactive I/O → interactive stdin](streaming.md).*
+
+## Driving ssh
+
+`ssh` is the one tool worth its own recipe. It often *demands* a terminal
+(password/passphrase prompts), and — alone among the tools you'll launch — it
+spawns work on **another host**, past anything kill-on-drop can reach. Two
+things to get right: how you authenticate, and what "contained" does and
+doesn't cover.
+
+**Prefer the non-interactive path — key auth, `BatchMode=yes`, ordinary
+pipes.** With key-based auth and `BatchMode=yes`, ssh never prompts, so a plain
+run captures the remote command's output like any local one:
+
+```rust,no_run
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let result = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "deploy@host", "systemctl is-active app"])
+        .output_string()
+        .await?;
+
+    match result.code() {
+        // 255 is ssh's OWN failure (host unreachable, auth/BatchMode rejected) —
+        // NOT the remote command's exit; don't read it as the remote result.
+        Some(255) => eprintln!("ssh could not connect: {}", result.stderr()),
+        // Any other code came straight through from the remote command.
+        Some(code) => println!("remote `systemctl is-active` exited {code}"),
+        None => eprintln!("ssh was signalled or timed out on this side"),
+    }
+    Ok(())
+}
+```
+
+**Exit code 255 is ssh's own "connection/auth failed", not the remote
+command's code.** ssh forwards the remote command's real exit status as its own
+— *except* 255, which it reserves for its own failures (host unreachable, auth
+rejected, `BatchMode` with no usable key). A caller that cares about the remote
+side must special-case 255 before trusting the code, as above. The one residual
+ambiguity ssh can't resolve for you: a remote command that *itself* exits 255
+looks identical to a connection failure.
+
+**The remote command line is parsed by the *remote* shell — the crate's
+shell-free guarantee stops at the local process.** processkit runs the local
+`ssh` with **no shell**: its argv is passed literally, with no interpolation and
+no injection surface (the crate's shell-free property). But `ssh host "some
+command"` hands that command string to a login shell **on the far end**, which
+word-splits and expands it like any shell line. So any value you interpolate
+into a remote command needs manual quoting/escaping (or build it so no untrusted
+value reaches the remote shell at all) — the injection surface the local API
+removes reappears on the remote side.
+
+**Password / passphrase / host-key prompts need a PTY.** When key-auth isn't an
+option, `use_pty()` (the `pty` feature) gives ssh the terminal it insists on;
+drive the prompt over the merged master with `keep_stdin_open` + `take_stdin`:
+
+```rust,no_run
+use processkit::Command;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut run = Command::new("ssh")
+        .args(["deploy@host", "systemctl status app"])
+        .use_pty()          // real terminal (needs the `pty` feature) so ssh prompts
+        .keep_stdin_open()
+        .start()
+        .await?;
+
+    // Best-effort today: wait for the prompt line, then write the secret over
+    // the same master (not echoed back on Unix). See the note just below on
+    // prompts that arrive without a trailing newline.
+    run.wait_for_line(|l| l.contains("passphrase"), Duration::from_secs(10)).await?;
+    let mut stdin = run.take_stdin().expect("stdin kept open");
+    stdin.write_line("s3cr3t-passphrase").await?;
+
+    // stdout and stderr are MERGED onto the one master in PTY mode — read the
+    // rest of the exchange from run.stdout_lines().
+    Ok(())
+}
+```
+
+`wait_for_line` fires only on a *complete*, newline-terminated line, but many
+prompts — `Enter passphrase for key …:` — arrive **without** a trailing
+newline, so the matcher above can miss a bare prompt. Waiting that matches an
+unterminated tail (a prompt-aware readiness probe) is planned; until it lands,
+treat the line matcher as best-effort and prefer the non-interactive path
+wherever the deployment allows it.
+
+**The containment boundary stops at the local ssh client.** kill-on-drop,
+`timeout`, and cancellation reap the *local* process tree — here, the `ssh`
+client itself. They do **not** reach across the connection: dropping the handle
+(or a timeout, or a panic) severs the local ssh client, but the command it
+started **on the remote host** can keep running, orphaned. The crate's
+whole-tree guarantee is about *your* machine's process tree; an ssh hop is a
+boundary it cannot cross. Contain the remote side on the remote side:
+
+- **`ssh -tt`** forces a remote pseudo-terminal, so when the connection drops
+  the remote session receives `SIGHUP` — which ends many (not all) remote
+  programs.
+- **A server-side deadline** — `ssh host 'timeout 300 long-job'`, or the
+  service's own timeout/idle limit — bounds the remote work regardless of the
+  local client's fate.
+- For anything that *must* be torn down reliably, make the remote command own
+  its own lifecycle (a unit/scope with a deadline, a job the remote scheduler
+  can kill), not the ssh client's liveness.
+
+*Fine print: [Running commands → interactive auth](commands.md#privileges-and-spawn-flags) ·
+[Running untrusted children → what not to rely on](untrusted-children.md#what-not-to-rely-on).*
 
 ## Pipe commands without a shell
 
