@@ -5,10 +5,15 @@
 //! disabled so a written secret is not echoed back into the merged output.
 
 use std::io;
+use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::AsRawFd;
+use std::pin::Pin;
 use std::process::Stdio;
+use std::task::{Context, Poll};
 
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::process::{Child, Command};
 
 use crate::sys::SpawnOptions;
@@ -133,6 +138,136 @@ fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok((master, slave))
 }
 
+/// Put `fd` into non-blocking mode (`O_NONBLOCK`) so every `read`/`write` on the
+/// master either makes progress at once or returns `EWOULDBLOCK` — the
+/// precondition for driving it through the reactor rather than a blocking-pool
+/// thread. The flag lives on the shared *open file description*, so a dup (the
+/// reader/writer split below) inherits it; setting it on each dup is idempotent.
+/// Only the master is touched — the slave (the child's tty) stays blocking, so
+/// the child sees an ordinary terminal.
+fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
+    let raw = fd.as_raw_fd();
+    // SAFETY: `F_GETFL`/`F_SETFL` on a valid, open fd; the call reads/writes only
+    // the fd's status flags, no memory through a pointer.
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: as above; `flags` is the value just read back from `F_GETFL`.
+    if unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The Unix PTY master fd, driven through tokio's reactor via [`AsyncFd`] instead
+/// of the blocking pool.
+///
+/// The fd is `O_NONBLOCK`, so each `read`/`write` either makes progress at once
+/// or returns `EWOULDBLOCK`; on the latter the reactor parks the task until the
+/// master is readable/writable again. This replaces the previous
+/// `tokio::fs::File` wrapper, which drove every read/write through a
+/// blocking-pool thread — acceptable for a single low-volume session, but a
+/// thread-per-session tax under the dozens-of-concurrent-PTY orchestration
+/// workload this mode targets.
+///
+/// The inner [`std::fs::File`] owns the fd (closed on drop — [`AsyncFd`]
+/// deregisters it from the reactor first) and supplies the actual
+/// `read(2)`/`write(2)` through `&File`'s [`Read`]/[`Write`] impls; `AsyncFd`
+/// contributes only the readiness gating.
+#[derive(Debug)]
+struct AsyncPtyMaster {
+    master: AsyncFd<std::fs::File>,
+}
+
+impl AsyncPtyMaster {
+    /// Wrap an owned pty master fd for reactor-driven, non-blocking I/O.
+    ///
+    /// Must run inside a tokio runtime — [`AsyncFd::new`] registers the fd with
+    /// the current reactor. `spawn_pty` is called from the async launch path, so
+    /// that context is always present.
+    fn new(fd: OwnedFd) -> io::Result<Self> {
+        set_nonblocking(&fd)?;
+        Ok(Self {
+            master: AsyncFd::new(std::fs::File::from(fd))?,
+        })
+    }
+}
+
+impl AsyncRead for AsyncPtyMaster {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            let mut guard = match this.master.poll_read_ready(cx) {
+                Poll::Ready(Ok(guard)) => guard,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
+            // `initialize_unfilled` zeroes the tail we hand to `read(2)`, so the
+            // read is sound without unsafe. A short read simply fills less of it.
+            let unfilled = buf.initialize_unfilled();
+            match guard.try_io(|inner| {
+                let mut file: &std::fs::File = inner.get_ref();
+                file.read(unfilled)
+            }) {
+                Ok(Ok(n)) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                // A genuine read error (including the end-of-session `EIO` the
+                // `EofOnEio` wrapper turns into a clean EOF) surfaces unchanged.
+                Ok(Err(e)) => return Poll::Ready(Err(e)),
+                // `WouldBlock`: `try_io` consumed the readiness, so loop to re-arm
+                // the reactor wait — the next `poll_read_ready` returns `Pending`.
+                Err(_would_block) => continue,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for AsyncPtyMaster {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        loop {
+            let mut guard = match this.master.poll_write_ready(cx) {
+                Poll::Ready(Ok(guard)) => guard,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
+            match guard.try_io(|inner| {
+                let mut file: &std::fs::File = inner.get_ref();
+                file.write(data)
+            }) {
+                Ok(result) => return Poll::Ready(result),
+                // `WouldBlock`: readiness consumed, loop to re-arm the wait.
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // A pty master holds no user-space write buffer — `write(2)` hands bytes
+        // straight to the tty line discipline — so there is nothing to flush.
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // A pty master has no half-close: EOF to the child comes from *closing*
+        // the writer's fd (on drop), not a shutdown gesture. Mirror the previous
+        // `tokio::fs::File` writer, whose shutdown was likewise a no-op (the fd
+        // closes on drop); `finish()` on a Unix PTY stays best-effort.
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// Spawn `cmd` under a pseudo-terminal, wiring the slave as its stdio and running
 /// the actual spawn through `spawn` (the platform's normal containment path), so
 /// the child is contained identically to a pipe-spawned run.
@@ -165,13 +300,14 @@ where
 
     // The reader and writer each own a dup of the master (same open description),
     // so the pump can read the merged output while stdin is written concurrently;
-    // both closing closes the master. `tokio::fs::File` drives the fd through the
-    // blocking pool — acceptable for the minimal, low-volume interactive mode.
+    // both dropping closes the master. Each dup is driven through the reactor via
+    // `AsyncFd` in non-blocking mode (no blocking-pool thread per session), so
+    // many concurrent PTY sessions scale on the reactor instead of taxing the
+    // pool with a read+write thread apiece. The `EofOnEio` wrapper is unchanged —
+    // the end-of-session `EIO` still surfaces from `poll_read` as a clean EOF.
     let master_w = master.try_clone()?;
-    let reader: PtyReader = Box::new(EofOnEio(tokio::fs::File::from_std(std::fs::File::from(
-        master,
-    ))));
-    let writer: PtyWriter = Box::new(tokio::fs::File::from_std(std::fs::File::from(master_w)));
+    let reader: PtyReader = Box::new(EofOnEio(AsyncPtyMaster::new(master)?));
+    let writer: PtyWriter = Box::new(AsyncPtyMaster::new(master_w)?);
 
     Ok(PtySpawn {
         child: PtyChild { child },

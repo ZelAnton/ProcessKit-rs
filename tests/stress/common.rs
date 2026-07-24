@@ -71,6 +71,44 @@ pub(crate) fn long_sleeper() -> Command {
     }
 }
 
+/// A child for the concurrent-PTY stress: floods `n` numbered lines then prints
+/// the unique `marker` and exits 0 — per platform. The flood drives the PTY
+/// master's *merged, non-blocking* reader under sustained output while `marker`
+/// gives each concurrent session a distinct end-of-stream sentinel, so a session
+/// that drained all the way to EOF is provable per-session. `marker` must be
+/// `[A-Za-z0-9-]` only (the call sites pass `PTY-DONE-<n>`), safe unquoted in
+/// `sh` and inside a PowerShell single-quoted string.
+#[cfg(feature = "pty")]
+pub(crate) fn pty_flood_then_marker(n: u32, marker: &str) -> Command {
+    if cfg!(windows) {
+        Command::new("powershell").args([
+            "-NoProfile",
+            "-Command",
+            &format!("for ($i = 1; $i -le {n}; $i++) {{ $i }}; Write-Output '{marker}'"),
+        ])
+    } else {
+        Command::new("sh").args(["-c", &format!("seq {n}; echo {marker}")])
+    }
+}
+
+/// A child for the concurrent-PTY round-trip stress: reads one line from its
+/// (terminal) stdin and echoes `reply:<line>`, then exits — per platform. Drives
+/// the master's write side (the prompt) and read side (the reply) concurrently,
+/// the exact interleaving the Unix non-blocking (`AsyncFd`) rewrite must keep
+/// correct across many simultaneous sessions.
+#[cfg(feature = "pty")]
+pub(crate) fn pty_prompt_responder() -> Command {
+    if cfg!(windows) {
+        Command::new("powershell").args([
+            "-NoProfile",
+            "-Command",
+            "$l = [Console]::In.ReadLine(); Write-Output \"reply:$l\"",
+        ])
+    } else {
+        Command::new("sh").args(["-c", "read line; printf 'reply:%s\\n' \"$line\""])
+    }
+}
+
 /// Best-effort count of this process's open file descriptors/handles, used to
 /// assert spawn/reap churn doesn't leak them. `None` means the platform
 /// mechanism is unavailable or failed (no `/proc`, no `lsof` on `$PATH`, an

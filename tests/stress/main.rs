@@ -396,3 +396,123 @@ async fn cgroup_directory_is_removed_on_drop() {
     #[cfg(not(target_os = "linux"))]
     eprintln!("[stress] cgroup_directory_is_removed_on_drop: cgroup v2 is Linux-only — skipping");
 }
+
+/// 10. Many concurrent PTY sessions — behaviour at *multiplicity* for the
+///     single-master-fd PTY mode, the dimension the Unix non-blocking
+///     (`AsyncFd`) master rewrite targets: dozens of parallel agentic-CLI
+///     sessions with continuous output, not one low-volume interactive dialog.
+///     Gated on the `pty` feature so the default build still compiles this
+///     binary; on Unix it exercises the reactor-driven master, on Windows the
+///     ConPTY pipes (already non-blocking) — the mode's correctness holds on
+///     both.
+///
+///     Two facets, each fanned out to N sessions running concurrently:
+///
+///       A. **Output flood.** Each session floods lines then a unique marker;
+///          assert every session exits 0 (the non-blocking reader kept draining,
+///          never blocking the child on a full master) and its output reaches the
+///          marker (it drained to EOF). Exercises the merged **read** path across
+///          many masters at once.
+///       B. **Prompt/response round-trip.** Each session writes a unique line to
+///          the master and reads `reply:<line>` back; assert every reply arrives.
+///          Exercises concurrent **write + read** on distinct masters — the
+///          interleaving the non-blocking rewrite must keep correct at scale.
+#[cfg(feature = "pty")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_pty_sessions_stay_correct_at_scale() {
+    if skip_unless_enabled("concurrent_pty_sessions") {
+        return;
+    }
+    // A PTY session is heavier than the `true`/`cmd` bursts elsewhere (a shell
+    // and a pseudo-terminal apiece), so a moderate fan-out proves multiplicity
+    // without oversubscribing a CI runner. Each `Command::use_pty()` run gets its
+    // own private group, so the sessions are fully independent.
+    const SESSIONS: usize = 16;
+    const FLOOD_LINES: u32 = 500;
+    // Generous per-session join bound: the sessions run concurrently, so this is
+    // a safety net against a hang (a wedged non-blocking reader that never sees
+    // readiness), not the expected wall-clock.
+    const SESSION_GRACE: Duration = Duration::from_secs(120);
+
+    // Facet A: concurrent output floods. Spawn every session first (they run
+    // concurrently), then join each and check it drained cleanly to its marker.
+    let floods: Vec<_> = (0..SESSIONS)
+        .map(|i| {
+            let marker = format!("PTY-DONE-{i}");
+            tokio::spawn(async move {
+                let out = pty_flood_then_marker(FLOOD_LINES, &marker)
+                    .use_pty()
+                    .output_string()
+                    .await
+                    .map_err(|e| format!("flood session {i}: run failed: {e:?}"))?;
+                Ok::<_, String>((marker, out))
+            })
+        })
+        .collect();
+
+    for (i, task) in floods.into_iter().enumerate() {
+        let (marker, out) = tokio::time::timeout(SESSION_GRACE, task)
+            .await
+            .unwrap_or_else(|_| panic!("pty flood session {i} did not finish within the grace"))
+            .expect("pty flood task did not panic")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            out.is_success(),
+            "pty flood session {i} must exit cleanly — the non-blocking reader kept \
+             draining the master, never blocking the child on a full buffer: {:?}",
+            out.code()
+        );
+        assert!(
+            out.stdout().contains(&marker),
+            "pty flood session {i} must drain all the way to its end-of-stream marker \
+             {marker:?}, got {} bytes of merged output",
+            out.stdout().len()
+        );
+    }
+
+    // Facet B: concurrent prompt/response round-trips (write + read interleaved
+    // on each master).
+    let dialogs: Vec<_> = (0..SESSIONS)
+        .map(|i| {
+            let line = format!("ping-{i}");
+            tokio::spawn(async move {
+                let mut proc = pty_prompt_responder()
+                    .use_pty()
+                    .keep_stdin_open()
+                    .start()
+                    .await
+                    .map_err(|e| format!("dialog session {i}: start failed: {e:?}"))?;
+                let mut stdin = proc
+                    .take_stdin()
+                    .ok_or_else(|| format!("dialog session {i}: no stdin writer on a keep-open child"))?;
+                stdin
+                    .write_line(&line)
+                    .await
+                    .map_err(|e| format!("dialog session {i}: write_line failed: {e:?}"))?;
+                // Closing the writer is the child's stdin EOF; the child has its
+                // one cooked line already, so it now replies and exits.
+                drop(stdin);
+                let out = proc
+                    .output_string()
+                    .await
+                    .map_err(|e| format!("dialog session {i}: output_string failed: {e:?}"))?;
+                Ok::<_, String>((line, out))
+            })
+        })
+        .collect();
+
+    for (i, task) in dialogs.into_iter().enumerate() {
+        let (line, out) = tokio::time::timeout(SESSION_GRACE, task)
+            .await
+            .unwrap_or_else(|_| panic!("pty dialog session {i} did not finish within the grace"))
+            .expect("pty dialog task did not panic")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let expected = format!("reply:{line}");
+        assert!(
+            out.stdout().contains(&expected),
+            "pty dialog session {i} must round-trip its prompt over the master \
+             (expected {expected:?}), got {:?}",
+            out.stdout()
+        );
+    }
+}
