@@ -749,6 +749,67 @@ non-empty line, capped at 200 bytes), so a bare `eprintln!("{e}")` reads
 `` `git` exited with code 2: fatal: boom `` — actionable in a log line without
 dumping multi-KiB streams into it.
 
+## Escape hatch: a platform knob the crate doesn't model
+
+`Command` exposes typed builders for the OS knobs that carry their weight —
+`priority`, `umask`, `create_no_window`, `windows_graceful_ctrl_break`,
+`run_as` (uid/gid), `parent_death`, and so on. New *real* needs are added the
+same way: as a typed verb, so the command stays inspectable (its `Debug`, its
+`Clone`, and — with the `record` feature — the cassette it serialises to all
+stay truthful). There is deliberately **no** `before_spawn`-style hook that
+stores an opaque closure to mutate the raw command per launch: a stored mutator
+is invisible to `Debug`/`Clone` and would make a recorded cassette *lie* — it
+would replay the command as written while a different, mutated command actually
+ran. (The full reasoning is in `decisions/before-spawn-hook-2026-07.md`.)
+
+When you genuinely hit a platform knob the crate has no verb for — a niche
+creation flag, your own `pre_exec` — the honest escape is to lower the builder
+to a raw [`tokio::process::Command`] and spawn it into a
+[`ProcessGroup`](process-groups.md):
+
+```rust,no_run
+use processkit::{Command, ProcessGroup};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Build the OS command exactly as ProcessKit would: program resolution,
+    // environment, working directory, priority/umask, capture-wired stdio.
+    let raw = Command::new("odd-tool")
+        .args(["--serve"])
+        .to_tokio_command()?;
+
+    // `raw` is a plain `tokio::process::Command`. Set the platform knob the
+    // builder has no typed verb for here — e.g. a raw creation flag on Windows
+    // or your own `pre_exec` on Unix.
+
+    // Spawn INTO a group so containment still holds (see below).
+    let group = ProcessGroup::new()?;
+    let mut child = group.spawn(raw)?;
+    let status = child.wait().await?; // the bare tokio Child is yours to drive
+    let _ = status;
+    Ok(())
+}
+```
+
+**What survives, and what you give up.** `to_tokio_command()` carries over
+everything the builder resolves at the OS level (program/args/cwd, the layered
+environment, the Unix `priority`/`umask`/privilege-drop/`setsid` `pre_exec`
+hooks, Windows creation flags, and stdio wired for capture). Spawning the result
+through [`ProcessGroup::spawn`](process-groups.md) still enrolls the child in the
+group's Job/cgroup/process-group, so **containment is preserved** — kill-on-drop
+and the group-level teardown verbs still reach it. What you leave behind is the
+high-level machinery that lives *above* the OS command: the async output pump and
+capture, the `ProcessResult`/`RunningProcess` verbs, and the per-run
+`timeout`/`cancel_on`/`timeout_grace`/`windows_graceful_ctrl_break` wiring. You
+own the bare [`tokio::process::Child`] — draining its pipes and reaping it are
+your job. (On Windows, `spawn` re-sets creation flags for a race-free
+job assignment, so a creation flag left on the raw command is overwritten there;
+prefer the typed `create_no_window` on a high-level launch path — see
+[Process groups](process-groups.md) for the full raw-`spawn` contract.)
+
+[`tokio::process::Command`]: https://docs.rs/tokio/latest/tokio/process/struct.Command.html
+[`tokio::process::Child`]: https://docs.rs/tokio/latest/tokio/process/struct.Child.html
+
 ---
 
 Next: [Streaming & interactive I/O](streaming.md) ·

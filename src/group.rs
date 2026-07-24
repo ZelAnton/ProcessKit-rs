@@ -210,8 +210,9 @@ impl ProcessGroup {
     /// group and is reaped when the group is killed or dropped. The caller is
     /// responsible for configuring `cmd`'s stdio; the group only handles
     /// containment. To build a capture-wired `tokio::process::Command` from a
-    /// [`Command`](crate::Command), use its `to_tokio_command()` bridge (a hidden
-    /// raw-tokio helper), or construct the `tokio::process::Command` directly.
+    /// [`Command`](crate::Command), use its
+    /// [`to_tokio_command()`](crate::Command::to_tokio_command) escape-hatch
+    /// bridge, or construct the `tokio::process::Command` directly.
     ///
     /// **Windows:** to make containment race-free the child is created
     /// `CREATE_SUSPENDED`, assigned to the job, then resumed. This **overwrites**

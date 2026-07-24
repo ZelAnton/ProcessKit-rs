@@ -788,6 +788,7 @@ pub fn processkit::Command::timeout(self, core::time::Duration) -> Self
 pub fn processkit::Command::timeout_grace(self, core::time::Duration) -> Self
 pub fn processkit::Command::timeout_opt(self, core::option::Option<core::time::Duration>) -> Self
 pub fn processkit::Command::timeout_signal(self, processkit::Signal) -> Self
+pub fn processkit::Command::to_tokio_command(&self) -> processkit::Result<tokio::process::Command>
 pub async fn processkit::Command::try_parse<T, F>(&self, F) -> processkit::Result<T> where T: core::marker::Send, F: core::ops::function::FnOnce(&str) -> processkit::Result<T> + core::marker::Send
 pub fn processkit::Command::uid(self, u32) -> Self
 pub fn processkit::Command::umask(self, u32) -> Self

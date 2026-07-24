@@ -1939,10 +1939,52 @@ impl Command {
         self.ok_codes.as_deref()
     }
 
-    /// Build a `tokio::process::Command` for the low-level
-    /// [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) escape hatch.
-    /// Not part of the advertised surface; prefer the `start`/`output_string`/`run` verbs.
-    #[doc(hidden)]
+    /// Lower this builder to a raw [`tokio::process::Command`] — the escape hatch
+    /// for a platform knob ProcessKit deliberately doesn't model.
+    ///
+    /// **Prefer the typed verbs.** Almost every launch should go through
+    /// `run`/`output_string`/`output_bytes`/[`start`](crate::ProcessGroup::start)
+    /// or a [`ProcessGroup`](crate::ProcessGroup): those drive the async output
+    /// pump, capture, timeouts/cancellation, and the graceful-teardown machinery
+    /// for you. This bridge exists for the rare case where you need to set
+    /// something on the OS command that the builder has no typed knob for (a niche
+    /// creation flag, your own `pre_exec`), *without* re-deriving the crate's
+    /// launch wiring by hand.
+    ///
+    /// The returned command carries everything this builder resolves at the OS
+    /// level: the (optionally `prefer_local`-resolved) program and arguments, the
+    /// working directory, the layered environment
+    /// ([`env_clear`](Self::env_clear)/[`inherit_env`](Self::inherit_env)/
+    /// [`env`](Self::env)/[`env_remove`](Self::env_remove)), the platform launch
+    /// hooks (Unix `priority`/`umask`/privilege-drop/[`setsid`](Self::setsid)
+    /// `pre_exec` hooks; Windows creation flags), and stdio wired to match the
+    /// builder's [`stdout`](Self::stdout_file)/`stdin` configuration (piped for
+    /// capture by default). Mutate the returned command, then hand it to
+    /// [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) to keep containment.
+    ///
+    /// **What you keep, and what you give up.** Spawning the result through
+    /// [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) still enrolls the child
+    /// in the group's Job/cgroup/process-group, so **containment is preserved**
+    /// (kill-on-drop and the group-level teardown verbs still reach it). You
+    /// **give up** the high-level machinery keyed off this builder that lives
+    /// *above* the OS command: the async output pump and capture, the
+    /// `ProcessResult`/`RunningProcess` verbs, and the per-run
+    /// [`timeout`](Self::timeout)/[`cancel_on`](Self::cancel_on)/
+    /// [`timeout_grace`](Self::timeout_grace)/
+    /// [`windows_graceful_ctrl_break`](Self::windows_graceful_ctrl_break) wiring —
+    /// you drive the bare [`tokio::process::Child`](tokio::process::Child) (draining
+    /// its pipes, reaping it) yourself. On Windows,
+    /// [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) re-sets the child's
+    /// creation flags to make containment race-free, so a creation flag left on this
+    /// command is overwritten by that path (see its docs) — reach for the typed
+    /// [`create_no_window`](Self::create_no_window) on a high-level launch path
+    /// instead.
+    ///
+    /// # Errors
+    ///
+    /// The same preflight failures a normal launch would raise while resolving the
+    /// program / opening a `stdout_file` redirect
+    /// ([`ErrorReason::Io`](crate::ErrorReason::Io)).
     pub fn to_tokio_command(&self) -> Result<tokio::process::Command> {
         self.build_tokio()
     }
