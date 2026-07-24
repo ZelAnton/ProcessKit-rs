@@ -13,6 +13,13 @@ to a dated version section.
 
 ### Added
 
+- Give `use_pty()` children a coherent spawn-time terminal identity. Unix PTYs
+  default `TERM=xterm-256color`; Unix and Windows set `COLUMNS`/`LINES` from
+  `pty_size(cols, rows)` or the same shared 80×24 fallback used by the PTY
+  backend. Windows deliberately does not synthesize `TERM` because ConPTY
+  exposes VT handling through console APIs. Explicit `env`/`env_remove`
+  operations for all three names remain authoritative across `env_clear` and
+  `inherit_env` layering.
 - Add Linux I/O scheduling for child processes: `Command::io_priority(IoPriority)`
   applies `ioprio_set(2)` in `pre_exec`, with `Idle`, `BestEffort(0..=7)`, and
   `RealTime(0..=7)` classes. The request fails loudly with `ErrorReason::Unsupported`

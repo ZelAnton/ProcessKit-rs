@@ -444,7 +444,9 @@ tools care about its **size**: it drives line wrapping, TUI/progress layout, and
 pager behavior. Set the initial geometry with `pty_size(cols, rows)` (default
 80×24), and change it on a *running* session with
 `RunningProcess::resize_pty(cols, rows)` — the way you propagate a host window
-resize down to the child:
+resize down to the child. At spawn, `COLUMNS`/`LINES` match that initial
+geometry (and Unix defaults `TERM=xterm-256color`); explicit `env`/`env_remove`
+operations override those values:
 
 ```rust,no_run
 use processkit::prelude::StreamExt;
@@ -479,6 +481,9 @@ on **Windows** `ResizePseudoConsole` has no signal, so a console client observes
 the new size on its next console query and conhost may reflow a little later. On a
 non-`use_pty` command `pty_size` is a documented no-op (nothing to size). See
 [platform support](platform-support.md#pty-mode-use_pty-the-pty-feature).
+Because a running process's environment is immutable, live resize does not
+rewrite `COLUMNS`/`LINES`; applications learn the new size through the platform
+resize mechanism.
 
 ### PTY output hygiene: line framing and VT sanitization
 

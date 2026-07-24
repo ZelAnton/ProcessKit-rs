@@ -626,7 +626,7 @@ Two ways to satisfy them:
   controlling terminal, `Command::use_pty()` launches it under a real
   pseudo-terminal — `openpty` on Unix, `CreatePseudoConsole` (ConPTY) on Windows —
   so `isatty()` reports a terminal. This is a **minimal single-master-fd mode**,
-  not a terminal emulator, with three things to know:
+  not a terminal emulator, with four things to know:
   - **stdout and stderr are merged** onto the one master, so in this mode the
     `on_stderr_line` / `stderr_tee` split collapses and
     `ProcessResult::stderr` is empty — the whole output arrives where stdout does.
@@ -634,6 +634,10 @@ Two ways to satisfy them:
     (`keep_stdin_open` + `take_stdin`); on **Unix** terminal **echo is disabled**
     so a written password is not echoed back into the merged output (the ConPTY
     has no portable per-write echo control, so that is Unix-only).
+  - The child receives `COLUMNS`/`LINES` matching the initial PTY size (80×24,
+    or `pty_size(cols, rows)`). Unix also defaults `TERM=xterm-256color`;
+    Windows relies on ConPTY's console/VT APIs and does not synthesize `TERM`.
+    Explicit `env(...)` or `env_remove(...)` calls for any of these names win.
   - **Containment is unchanged** — the PTY child lives in the same
     job/cgroup/process group, so whole-tree kill-on-drop, timeouts, and
     cancellation behave exactly as for a piped run.

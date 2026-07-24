@@ -1145,7 +1145,7 @@ impl Invocation {
             program: command.program().to_os_string(),
             args: command.arguments().to_vec(),
             cwd: command.working_dir().map(std::path::Path::to_path_buf),
-            envs: command.env_overrides().to_vec(),
+            envs: command.spawn_env_ops(),
             has_stdin: command
                 .effective_stdin_source()
                 .is_some_and(|stdin| !stdin.is_empty()),
@@ -1167,9 +1167,10 @@ impl Invocation {
     /// returned. Key matching follows the platform's environment rules —
     /// **case-insensitive on Windows** (where env names are), case-sensitive
     /// elsewhere — matching the key a spawn resolves. These accessors reflect the
-    /// invocation's explicit **per-variable** overrides (`env`/`env_remove`) only,
-    /// not whole-environment scoping (`env_clear`/`inherit_env`, which an
-    /// `Invocation` doesn't capture). For the common assertions prefer
+    /// invocation's effective **per-variable** operations: explicit
+    /// `env`/`env_remove`, plus any defaults the selected launch mode contributes
+    /// (for example PTY terminal identity). It does not capture whole-environment
+    /// scoping (`env_clear`/`inherit_env`). For the common assertions prefer
     /// [`env_is`](Self::env_is) / [`has_env`](Self::has_env).
     pub fn env(&self, name: impl AsRef<OsStr>) -> Option<Option<&OsStr>> {
         let name = name.as_ref();
@@ -1556,6 +1557,51 @@ mod tests {
         assert!(!inv.has_env("PAGER")); // removed
         assert!(!inv.has_env("TMPVAR")); // set then removed
         assert!(!inv.has_env("HOME")); // untouched
+    }
+
+    #[cfg(feature = "pty")]
+    #[test]
+    fn invocation_captures_pty_terminal_identity_and_user_overrides() {
+        let (default_cols, default_rows) = crate::sys::pty::DEFAULT_PTY_SIZE;
+        let default = Invocation::from_command(&Command::new("tui").use_pty());
+        assert!(default.env_is("COLUMNS", default_cols.to_string()));
+        assert!(default.env_is("LINES", default_rows.to_string()));
+        #[cfg(unix)]
+        assert!(default.env_is("TERM", "xterm-256color"));
+        #[cfg(windows)]
+        assert_eq!(
+            default.env("TERM"),
+            None,
+            "ConPTY must not synthesize a Unix TERM identity"
+        );
+
+        let custom = Invocation::from_command(
+            &Command::new("tui")
+                .use_pty()
+                .pty_size(132, 43)
+                .env("TERM", "screen")
+                .env("COLUMNS", "101")
+                .env_remove("LINES"),
+        );
+        assert!(custom.env_is("TERM", "screen"));
+        assert!(custom.env_is("COLUMNS", "101"));
+        assert_eq!(custom.env("LINES"), Some(None));
+
+        // Whole-environment scoping chooses the inheritance base; PTY identity
+        // is still seeded above it unless an explicit operation removes a key.
+        for scoped in [
+            Command::new("tui").use_pty().env_clear(),
+            Command::new("tui").use_pty().inherit_env(["PATH"]),
+        ] {
+            let invocation = Invocation::from_command(&scoped);
+            assert!(invocation.env_is("COLUMNS", default_cols.to_string()));
+            assert!(invocation.env_is("LINES", default_rows.to_string()));
+        }
+
+        let plain = Invocation::from_command(&Command::new("tool"));
+        assert_eq!(plain.env("COLUMNS"), None);
+        assert_eq!(plain.env("LINES"), None);
+        assert_eq!(plain.env("TERM"), None);
     }
 
     #[test]
