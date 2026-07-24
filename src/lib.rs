@@ -165,6 +165,14 @@
 //!   terminate/shutdown, retry attempts, supervisor restarts and storm
 //!   pauses, and teardown anomalies (stdin-writer failures, pump overruns).
 //!   Never logs argv or environment values.
+//! - **`metrics`** — [`metrics`](https://docs.rs/metrics) counters and histograms
+//!   over data the crate already computes: run/spawn counters, run-duration
+//!   histograms, an exit-code/timeout/cancel/signal tally, and retry / supervisor
+//!   restart / storm-pause events. A thin façade — the crate emits into whatever
+//!   global recorder (a Prometheus/OTel exporter) the consumer installs. Labels
+//!   carry only program name / mechanism / outcome / exit code — **never** argv or
+//!   environment values, and no unbounded-cardinality key like a pid. See the
+//!   `docs/observability.md` guide.
 //! - **`record`** — record/replay cassettes over the [`ProcessRunner`] seam:
 //!   `RecordReplayRunner` records real `Invocation → ProcessResult` pairs to a
 //!   JSON fixture once, then replays them hermetically — no subprocess in CI.
@@ -227,6 +235,12 @@ mod mechanism;
 // with the methods it exists for.
 #[cfg(feature = "process-control")]
 mod member;
+// Optional `metrics` counters/histograms over data the crate already computes
+// (run/spawn counters, duration histograms, exit-code/timeout/cancel tally,
+// retry/restart events). A thin, additive façade like the `tracing` seam, with the
+// same secret-hygiene rule (never argv/env in labels). Gated on its feature.
+#[cfg(feature = "metrics")]
+mod metrics;
 // `ParentDeathCleanup` — the honest per-platform capability report for
 // `Command::kill_on_parent_death`. Unconditional, like the knob it describes.
 mod parent_death;

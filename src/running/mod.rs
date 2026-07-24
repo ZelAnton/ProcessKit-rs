@@ -1660,13 +1660,27 @@ impl RunningProcess {
             self.drive_to_exit_inner().await?
         };
         let outcome = self.on_reaped(cause);
+        // One elapsed read off the existing `started` anchor, shared by both
+        // observability seams — metrics add no third clock (K-007).
+        #[cfg(any(feature = "tracing", feature = "metrics"))]
+        let elapsed = self.started.elapsed();
         #[cfg(feature = "tracing")]
         tracing::debug!(
             target: "processkit",
             program = %self.program,
             outcome = ?outcome,
-            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            elapsed_ms = elapsed.as_millis() as u64,
             "process exited"
+        );
+        // `on_reaped` has already snapshotted the cancel disposition, so a run
+        // torn down by cancellation (reported here as `Signalled(None)`) is tallied
+        // as `cancelled`, not `signalled`.
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_run(
+            &self.program,
+            &outcome,
+            self.cancel_at_exit == Some(true),
+            elapsed,
         );
         Ok(outcome)
     }

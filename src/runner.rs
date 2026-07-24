@@ -504,6 +504,8 @@ where
                         // `tries` is the attempts-so-far count (1-based); the delay
                         // before the next attempt uses the 0-based retry index.
                         let delay = c.policy.delay_for(tries - 1);
+                        #[cfg(feature = "metrics")]
+                        crate::metrics::record_retry(&command.program_name());
                         #[cfg(feature = "tracing")]
                         tracing::debug!(
                             target: "processkit",
@@ -889,6 +891,8 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         mechanism = ?group.mechanism(),
         "child spawned"
     );
+    #[cfg(feature = "metrics")]
+    crate::metrics::record_spawn(&command.program_name(), group.mechanism());
 
     let (stdin_pipe, stdin_task) = if command.keeps_stdin_open() {
         (child.stdin.take(), None)
@@ -1012,6 +1016,8 @@ async fn launch_pty(
         mechanism = ?group.mechanism(),
         "pty child spawned"
     );
+    #[cfg(feature = "metrics")]
+    crate::metrics::record_spawn(&command.program_name(), group.mechanism());
 
     let crate::sys::pty::PtySpawn {
         child,

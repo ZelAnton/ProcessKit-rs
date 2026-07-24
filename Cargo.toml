@@ -158,6 +158,15 @@ tokio-stream = { version = "0.1.1", features = ["io-util"] }
 # sites use isn't supported yet (`fieldset!` recursion / "no rules expected"
 # macro-expansion errors).
 tracing = { version = "0.1.6", optional = true }
+# Optional metrics emission (counters/histograms over data the crate already
+# computes — program/mechanism/outcome/exit code/duration, deliberately NOT argv
+# or env, which routinely carry secrets). Off by default; zero cost unless the
+# `metrics` feature is enabled. A thin façade like `tracing`: the crate emits into
+# whatever global recorder the consumer installs (a Prometheus/OTel exporter),
+# pulling no exporter of its own. `0.24` floor: the `counter!`/`histogram!` macros
+# and the `Recorder`/`set_global_recorder` API the emission layer and its
+# secret-hygiene test use are the current 0.23+-line shape; pin the live major.
+metrics = { version = "0.24", optional = true }
 # Optional auto-generated `MockRunner` for downstream tests. Test-only; pulled
 # in solely behind the `mock` feature, never in production builds.
 mockall = { version = "0.15", optional = true }
@@ -217,6 +226,14 @@ mock = ["dep:mockall"]
 # Emit a `tracing` event per command run (program, exit code, duration —
 # argv/env are deliberately not logged: they routinely carry secrets).
 tracing = ["dep:tracing"]
+# Emit `metrics` counters/histograms over data the crate already computes: run and
+# spawn counters, run/teardown duration histograms, an exit-code/timeout/cancel/
+# signal tally, and retry/supervisor-restart/storm events. Labels carry only
+# program name / mechanism / outcome class / exit code — never argv or env values
+# (same secret-hygiene rule as `tracing`), and never an unbounded-cardinality value
+# like a pid or a full argv. Off by default; additive — with the feature off the
+# emission sites compile out entirely (a pure visibility gate).
+metrics = ["dep:metrics"]
 # Record/replay cassettes over the `ProcessRunner` seam: `RecordReplayRunner`
 # records real `Invocation → ProcessResult` pairs to a JSON fixture and replays
 # them hermetically. Off by default; pulls in serde + serde_json.

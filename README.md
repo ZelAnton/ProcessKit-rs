@@ -203,6 +203,7 @@ end to end:
 | [Timeouts, retries & cancellation](docs/timeouts-and-cancellation.md) | Captured vs raised deadlines, retry classifiers, `CancellationToken` |
 | [Errors](docs/errors.md) | Every `Error` variant → source → recommended reaction, the subtle look-alikes, classifiers, matching under `#[non_exhaustive]`, ties to retries & supervision |
 | [Supervision](docs/supervision.md) | Restart policies, backoff & jitter, stop conditions, outcomes |
+| [Observability](docs/observability.md) | The `tracing` events and `metrics` counters/histograms over already-computed run data — secret-hygiene (never argv/env), cardinality, wiring an exporter |
 | [Testing your code](docs/testing.md) | The `ProcessRunner` seam, scripted/recording/mock doubles, cassettes, `CliClient` |
 | [Platform support](docs/platform-support.md) | Mechanisms, all capability matrices, every caveat |
 | [Running untrusted children](docs/untrusted-children.md) | Hardening checklist for launching an untrusted program: containment, resource limits, privilege drop, env hygiene, output/wall-time bounds |
@@ -227,6 +228,7 @@ guarantee is unconditional in every configuration.
 | `record` | — | record/replay cassettes (pulls `serde`) |
 | `mock` | — | `mockall`-generated `MockRunner` (test-only; its surface is semver-exempt — prefer `ScriptedRunner`/`RecordingRunner`) |
 | `tracing` | — | lifecycle events: spawn/exit, timeout/cancel, teardown, retries, storms (never argv/env) |
+| `metrics` | — | counters/histograms over already-computed run data: run/spawn counters, duration histograms, exit-code/timeout/cancel tally, retry/restart/storm events, into any `metrics` recorder (never argv/env) |
 
 ## Capping a group's resources
 

@@ -30,6 +30,7 @@
 - [Timeouts, retries & cancellation](timeouts-and-cancellation.md)
 - [Errors](errors.md)
 - [Supervision](supervision.md)
+- [Observability](observability.md)
 - [Testing your code](testing.md)
 - [Platform support](platform-support.md)
 - [Running in containers](containers.md)
