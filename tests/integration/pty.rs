@@ -113,11 +113,17 @@ async fn pty_prompt_response_round_trips_over_the_master() {
         .await
         .expect("start pty child");
     let mut stdin = proc.take_stdin().expect("pty stdin writer");
+    // `write_line` maps Enter to CR for ConPTY (LF remains correct elsewhere),
+    // so the same interactive API completes a cooked line read on both families.
     stdin.write_line("hello").await.expect("write the prompt");
     drop(stdin);
-    let result = completes_within(Duration::from_secs(20), "pty prompt/response", proc.output_string())
-        .await
-        .expect("output");
+    let result = completes_within(
+        Duration::from_secs(20),
+        "pty prompt/response",
+        proc.output_string(),
+    )
+    .await
+    .expect("output");
     assert!(
         result.stdout().contains("reply:hello"),
         "the master must carry the child's reply, got {:?}",
@@ -138,11 +144,18 @@ async fn pty_disables_echo_so_a_written_secret_is_not_echoed() {
         .await
         .expect("start pty child");
     let mut stdin = proc.take_stdin().expect("pty stdin writer");
-    stdin.write_line("s3cr3t-passphrase").await.expect("write the secret");
-    drop(stdin);
-    let result = completes_within(Duration::from_secs(20), "pty echo-off", proc.output_string())
+    stdin
+        .write_line("s3cr3t-passphrase")
         .await
-        .expect("output");
+        .expect("write the secret");
+    drop(stdin);
+    let result = completes_within(
+        Duration::from_secs(20),
+        "pty echo-off",
+        proc.output_string(),
+    )
+    .await
+    .expect("output");
     assert!(
         !result.stdout().contains("s3cr3t-passphrase"),
         "echo must be disabled — the secret must not appear in the merged output, got {:?}",

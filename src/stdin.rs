@@ -382,7 +382,11 @@ enum StdinSink {
 }
 
 impl AsyncWrite for StdinSink {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         match self.get_mut() {
             StdinSink::Child(c) => Pin::new(c).poll_write(cx, buf),
             #[cfg(feature = "pty")]
@@ -404,6 +408,19 @@ impl AsyncWrite for StdinSink {
             #[cfg(feature = "pty")]
             StdinSink::Pty(p) => Pin::new(p).poll_shutdown(cx),
         }
+    }
+}
+
+impl StdinSink {
+    /// The byte sequence that represents pressing Enter for this input target.
+    fn line_terminator(&self) -> &'static [u8] {
+        #[cfg(all(windows, feature = "pty"))]
+        if matches!(self, Self::Pty(_)) {
+            // ConPTY consumes virtual-terminal input: Enter is CR. A lone LF is
+            // Ctrl-J and does not complete a cooked `ReadLine` prompt.
+            return b"\r";
+        }
+        b"\n"
     }
 }
 
@@ -435,8 +452,9 @@ impl ProcessStdin {
         self.sink.write_all(bytes).await
     }
 
-    /// Write `line` followed by `\n` (UTF-8), flushing so the child sees it
-    /// promptly.
+    /// Write `line` followed by the target's Enter sequence (UTF-8), flushing so
+    /// the child sees it promptly. This is `\r` for a Windows ConPTY and `\n` for
+    /// a regular stdin pipe or Unix PTY. [`write`](Self::write) remains byte-exact.
     ///
     /// # Errors
     ///
@@ -444,8 +462,9 @@ impl ProcessStdin {
     /// the flush — commonly [`BrokenPipe`](std::io::ErrorKind::BrokenPipe) once
     /// the child has closed stdin or exited.
     pub async fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        let terminator = self.sink.line_terminator();
         self.sink.write_all(line.as_bytes()).await?;
-        self.sink.write_all(b"\n").await?;
+        self.sink.write_all(terminator).await?;
         self.sink.flush().await
     }
 

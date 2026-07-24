@@ -22,14 +22,15 @@ use tokio::process::Command;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-use windows_sys::Win32::System::Console::{ClosePseudoConsole, CreatePseudoConsole, COORD, HPCON};
+use windows_sys::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON};
 use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
-    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-    ResumeThread, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use crate::sys::SpawnOptions;
@@ -283,6 +284,28 @@ fn to_wide_nul(s: &OsStr) -> Vec<u16> {
     v
 }
 
+/// Build startup information that cannot leak the launcher's console handles
+/// into a ConPTY child.
+///
+/// `bInheritHandles = FALSE` only disables ordinary inheritable handles. A
+/// debugger, test runner, or terminal can still pre-populate the child's three
+/// standard-handle slots from the launch environment. Unless those slots are
+/// explicitly selected and cleared, the new pseudoconsole session may attach
+/// successfully while the child keeps writing to the launcher's console. The
+/// Windows Console team-prescribed contract is `STARTF_USESTDHANDLES` plus three
+/// null handles; ConPTY then installs its own console handles during process
+/// initialization.
+fn conpty_startup_info(attr_list: LPPROC_THREAD_ATTRIBUTE_LIST) -> STARTUPINFOEXW {
+    let mut si = STARTUPINFOEXW::default();
+    si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = std::ptr::null_mut();
+    si.StartupInfo.hStdOutput = std::ptr::null_mut();
+    si.StartupInfo.hStdError = std::ptr::null_mut();
+    si.lpAttributeList = attr_list;
+    si
+}
+
 /// Spawn `cmd` under a ConPTY, assigning the child to `job` for containment.
 ///
 /// `env` is the child's resolved environment (see
@@ -384,13 +407,14 @@ pub(crate) fn spawn_pty(
         return Err(e);
     }
 
-    let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
-    si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-    si.lpAttributeList = attr_list;
+    let si = conpty_startup_info(attr_list);
 
     let mut command_line = build_command_line(cmd);
     let env_block = build_env_block(env);
-    let cwd_wide = cmd.as_std().get_current_dir().map(|p| to_wide_nul(p.as_os_str()));
+    let cwd_wide = cmd
+        .as_std()
+        .get_current_dir()
+        .map(|p| to_wide_nul(p.as_os_str()));
 
     // Suspended containment: create suspended, assign to the job, resume — the
     // same race-free sequence `Job::spawn` uses. `EXTENDED_STARTUPINFO_PRESENT`
@@ -416,13 +440,8 @@ pub(crate) fn spawn_pty(
             command_line.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
-            0, // do not inherit handles — the child's console (and thus its std
-            // handles) comes from the pseudoconsole attribute; on a headless host
-            // (no parent console to inherit) the child uses the pseudoconsole for
-            // its std I/O. NOTE: when the *launching* process itself owns a console
-            // (e.g. an interactive `cargo test` terminal), Windows may still route
-            // the child's std handles to that inherited console rather than the
-            // pseudoconsole — a known ConPTY interaction validated on headless CI.
+            0, // no ordinary handle inheritance; the explicitly-null standard
+            // handles above are replaced by the attached pseudoconsole
             flags,
             env_ptr,
             cwd_ptr,
@@ -624,7 +643,11 @@ struct ChannelWriter {
 }
 
 impl AsyncWrite for ChannelWriter {
-    fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         match self.tx.send(buf.to_vec()) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(_) => Poll::Ready(Err(io::Error::new(
@@ -640,5 +663,23 @@ impl AsyncWrite for ChannelWriter {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conpty_startup_info_explicitly_clears_standard_handles() {
+        let si = conpty_startup_info(std::ptr::null_mut());
+
+        assert_eq!(
+            si.StartupInfo.dwFlags & STARTF_USESTDHANDLES,
+            STARTF_USESTDHANDLES
+        );
+        assert!(si.StartupInfo.hStdInput.is_null());
+        assert!(si.StartupInfo.hStdOutput.is_null());
+        assert!(si.StartupInfo.hStdError.is_null());
     }
 }

@@ -356,6 +356,13 @@ to a dated version section.
 
 ### Fixed
 
+- Make Windows ConPTY launches explicitly clear all three inherited standard
+  handles with `STARTF_USESTDHANDLES`, allowing the pseudoconsole to install its
+  own stdin/stdout/stderr even when ProcessKit itself runs under a debugger,
+  test runner, or an existing console. This prevents child output from escaping
+  to the launcher's terminal while only conhost's VT frames reach the PTY master.
+  `ProcessStdin::write_line` now also sends the ConPTY Enter sequence (`\r`), so
+  cooked prompt/response reads complete; raw `write` remains byte-exact
 - `OverflowMode::DropNewest` with a `max_bytes` cap now keeps a true contiguous
   **prefix** (head) of the output: once a line is dropped (an over-cap line, or
   one over the remaining byte budget) the head is sealed and every later line is

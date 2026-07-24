@@ -276,7 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stdin = run.take_stdin().expect("stdin was kept open");
     let mut answers = run.stdout_lines()?;
 
-    stdin.write_line("2 + 2").await?;             // writes "2 + 2\n", flushed
+    stdin.write_line("2 + 2").await?;             // sends a line + Enter, flushed
     println!("= {}", answers.next().await.unwrap());
 
     stdin.write_line("6 * 7").await?;
@@ -289,10 +289,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`ProcessStdin` offers `write(&[u8])`, `write_line(&str)` (newline + flush),
+`ProcessStdin` offers `write(&[u8])`, `write_line(&str)` (terminal Enter + flush),
 `flush()`, and `finish()` (EOF). Dropping the writer — or the whole
 `RunningProcess` — closes stdin too; `finish()` just makes the EOF explicit
-and awaitable.
+and awaitable. `write_line` sends `\n` to a pipe or Unix PTY and `\r` to a
+Windows ConPTY, where a lone LF is Ctrl-J rather than the Enter key; use `write`
+when you need byte-exact input.
 
 **Avoid the full-duplex deadlock.** A child's stdout pipe has a finite OS
 buffer; once it fills, the child blocks *writing* stdout until something reads
