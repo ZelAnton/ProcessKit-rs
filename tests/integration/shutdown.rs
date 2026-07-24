@@ -339,15 +339,16 @@ async fn graceful_timeout_on_a_streamed_run_signals_and_ends_the_stream() {
 }
 
 #[tokio::test]
-#[ignore = "spawns a real subprocess and times out an output_events run gracefully"]
+#[ignore = "spawns a real subprocess and times out an events run gracefully"]
 async fn graceful_timeout_on_an_events_run_reports_timed_out() {
-    use processkit::OutputEvent;
+    use processkit::ProcessEvent;
     use tokio_stream::StreamExt;
 
-    // B1 parity for the events path: `output_events` arms the same deadline
-    // watchdog as `stdout_lines`, and `finish` classifies via the same
-    // `timed_out` flag, so a graceful streamed timeout must report
-    // `Outcome::TimedOut` here too — not the child's in-grace `exit 0`.
+    // B1 parity for the events path: `events` arms the same deadline watchdog as
+    // `stdout_lines`, and `finish` classifies via the same `timed_out` flag, so a
+    // graceful streamed timeout must report `Outcome::TimedOut` here too — not the
+    // child's in-grace `exit 0`. The stream's terminal `Exited` carries the same
+    // classified outcome, delivered by the concurrently-driven `finish`.
     let mut run = Command::new("sh")
         .args(["-c", "trap 'exit 0' TERM; echo ready; while :; do :; done"])
         .timeout(Duration::from_millis(500))
@@ -357,30 +358,44 @@ async fn graceful_timeout_on_an_events_run_reports_timed_out() {
         .expect("start");
 
     let start = Instant::now();
-    let mut events = run.output_events().unwrap();
-    let mut saw_ready = false;
-    let drained = tokio::time::timeout(Duration::from_secs(8), async {
+    let mut events = run.events().unwrap();
+    // Drive the event stream and the reaping `finish` together: the terminal
+    // `Exited` is published when the run is reaped, so draining the stream first
+    // would park waiting for it.
+    let collect = async {
+        let mut saw_ready = false;
+        let mut saw_started = false;
+        let mut exit_outcome = None;
         while let Some(ev) = events.next().await {
-            if let OutputEvent::Stdout(l) = ev {
-                saw_ready |= l.text().contains("ready");
+            match ev {
+                ProcessEvent::Started { .. } => saw_started = true,
+                ProcessEvent::Stdout(l) => saw_ready |= l.text().contains("ready"),
+                ProcessEvent::Exited(o) => exit_outcome = Some(o),
+                _ => {}
             }
         }
-    })
+        (saw_started, saw_ready, exit_outcome)
+    };
+    let drained = tokio::time::timeout(
+        Duration::from_secs(8),
+        async { tokio::join!(collect, run.finish()) },
+    )
     .await;
-    assert!(
-        drained.is_ok(),
-        "the events stream must end within the grace"
-    );
-    assert!(
-        saw_ready,
-        "the ready banner must arrive before the deadline"
-    );
+    let ((saw_started, saw_ready, exit_outcome), finished) =
+        drained.expect("the events stream and finish must complete within the grace");
+    let outcome = finished.expect("finish").outcome;
 
-    let outcome = run.finish().await.expect("finish").outcome;
+    assert!(saw_started, "Started must lead the stream");
+    assert!(saw_ready, "the ready banner must arrive before the deadline");
     assert_eq!(
         outcome,
         Outcome::TimedOut,
         "an events run whose deadline fired must report TimedOut (parity with finish)"
+    );
+    assert_eq!(
+        exit_outcome,
+        Some(Outcome::TimedOut),
+        "the terminal Exited event carries the same classified outcome as finish"
     );
     assert!(
         start.elapsed() < Duration::from_secs(8),

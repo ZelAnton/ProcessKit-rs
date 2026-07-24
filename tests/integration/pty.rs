@@ -264,3 +264,76 @@ async fn pty_child_stays_contained_and_is_reaped_on_drop() {
     )
     .await;
 }
+
+#[tokio::test]
+#[ignore = "spawns a real pseudo-terminal"]
+async fn pty_events_stream_carries_the_full_lifecycle() {
+    use processkit::{Outcome, ProcessEvent};
+    use tokio_stream::StreamExt;
+
+    // The lifecycle `events()` stream runs identically on the `Backend::Pty`
+    // pump: `Started` leads, the child's output arrives as `Stdout` events over
+    // the single merged master (so there are no separate `Stderr` events), and
+    // the terminal `Exited` carries the run's outcome. Driven the documented way
+    // (the stream and `finish` polled together).
+    let child = if cfg!(windows) {
+        Command::new("powershell").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Write-Output pty-1; Write-Output pty-2",
+        ])
+    } else {
+        Command::new("sh").args(["-c", "echo pty-1; echo pty-2"])
+    };
+
+    let mut run = child.use_pty().start().await.expect("start pty events run");
+    let pid = run.pid();
+    let mut events = run.events().expect("events");
+    let collect = async {
+        let mut names = Vec::new();
+        let mut started_pid = None;
+        let mut lines = Vec::new();
+        let mut exit_outcome = None;
+        while let Some(ev) = events.next().await {
+            names.push(ev.name());
+            match ev {
+                ProcessEvent::Started { pid } => started_pid = Some(pid),
+                ProcessEvent::Stdout(l) => lines.push(l.text().to_owned()),
+                ProcessEvent::Exited(o) => exit_outcome = Some(o),
+                _ => {}
+            }
+        }
+        (names, started_pid, lines, exit_outcome)
+    };
+    let outcome = completes_within(
+        Duration::from_secs(20),
+        "pty events lifecycle run",
+        async { tokio::join!(collect, run.finish()) },
+    )
+    .await;
+    let ((names, started_pid, lines, exit_outcome), finished) = outcome;
+    let finished = finished.expect("finish");
+
+    assert_eq!(names.first(), Some(&"started"), "Started leads the stream");
+    assert_eq!(names.last(), Some(&"exited"), "Exited ends the stream");
+    assert_eq!(
+        started_pid,
+        Some(pid),
+        "the Started event mirrors the handle's pid"
+    );
+    assert!(
+        !names.contains(&"stderr"),
+        "a merged PTY stream produces no separate stderr events, got {names:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("pty-1")) && lines.iter().any(|l| l.contains("pty-2")),
+        "both stdout lines arrive as events over the master, got {lines:?}"
+    );
+    assert_eq!(
+        exit_outcome,
+        Some(Outcome::Exited(0)),
+        "the terminal Exited carries the run's outcome"
+    );
+    assert_eq!(finished.outcome, Outcome::Exited(0));
+}

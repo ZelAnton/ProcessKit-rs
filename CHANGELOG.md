@@ -13,6 +13,22 @@ to a dated version section.
 
 ### Added
 
+- Extend the `events()` stream (see the breaking rename under **Changed**) with
+  two **lifecycle** event kinds so one asynchronous stream now carries a process's
+  whole life — `Started` → interleaved `Stdout`/`Stderr` → `Exited` — instead of
+  three separate channels. `ProcessEvent::Started { pid }` leads the stream,
+  emitted as soon as the pid is known (before any output; `pid` is `None` for a
+  scripted double). `ProcessEvent::Exited(Outcome)` ends it, emitted when the run
+  is reaped, carrying the **same** `Outcome` `finish()` reports (not a parallel
+  type). Both are observed by the running layer itself — no live sink is threaded
+  through the teardown backends. A new `ProcessEvent::name()` gives a stable
+  snake_case tag (`"started"`/`"stdout"`/`"stderr"`/`"exited"`), by the same
+  convention as `Outcome::name()`. The graceful-teardown transitions
+  (`soft_signal`/`grace_started`/`drained`/`escalated`/`spared`) are deliberately
+  **not** in this enum yet — with no per-call consumer they stay on the `tracing`
+  seam and in `ShutdownReport`; because `ProcessEvent` is `#[non_exhaustive]` they
+  can be added here additively once a consumer needs them, without a breaking
+  change. Works identically on the piped and `Backend::Pty` pumps.
 - Add an opt-in **PTY launch mode** behind the new `pty` feature:
   `Command::use_pty()` spawns the child under a real pseudo-terminal — `openpty`
   on Unix, `CreatePseudoConsole` (ConPTY) on Windows — instead of three pipes, so
@@ -307,10 +323,21 @@ to a dated version section.
 
 ### Changed
 
-- `ErrorReason::OutputTooLarge.total_bytes` and the `OverflowMode::Error` plus
-  `max_bytes` ceiling now count raw bytes read from the output pipe, including
-  line terminators and invalid UTF-8 bytes, rather than decoded line-content
-  bytes
+- **Breaking:** the merged output-event stream is now a full **process-lifecycle**
+  stream. `RunningProcess::output_events()` is renamed **`events()`** and the
+  event enum `OutputEvent` is renamed **`ProcessEvent`** (the stream type
+  `OutputEvents` → `ProcessEvents`); the old names are removed outright (no
+  deprecated alias — a deliberate 3.0 major break). The contract widened from
+  "which output line" to "an event in the process's life", so the old names had
+  become a lie. `ProcessEvent::Stdout`/`Stderr` carry the same `OutputLine`
+  payload with unchanged semantics, and `ProcessEvent::text()` still returns
+  `Some` for those and `None` for a non-line event. `PipelineSession::output_events`
+  is renamed to `events` in lockstep. Migration: rename the verb (`output_events`
+  → `events`) and the type (`OutputEvent` → `ProcessEvent`), add a `_` arm for the
+  new non-line variants (the enum stays `#[non_exhaustive]`), and — because the
+  new terminal `Exited` event is delivered when the run is reaped — drive the
+  stream and its `finish()`/`wait()` finisher **together** (e.g. `tokio::join!`)
+  rather than draining the stream to completion and only then finishing.
 - **Breaking:** `Error` is now a **pointer-sized wrapper** around a boxed
   `ErrorReason` (`struct Error { .. }` holding a `Box<ErrorReason>`) instead of a
   large enum, mirroring `std::io::Error` / `ErrorKind`. This shrinks `Error` from

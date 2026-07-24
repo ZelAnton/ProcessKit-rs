@@ -1150,7 +1150,7 @@ impl Command {
     /// With `Inherit`/`Null` there is no pipe to read, so the bulk capture
     /// verbs (`output_string`/`output_bytes`) **error** rather than return
     /// silently-empty output, and the streaming verbs (`stdout_lines`/
-    /// `output_events`) yield an empty stream. Use a discard verb (`wait`) to run
+    /// `events`) yield an empty stream. Use a discard verb (`wait`) to run
     /// a command whose stdout you don't want to capture. Calling this after
     /// [`stdout_file`](Self::stdout_file) restores a normal stdio mode.
     pub fn stdout(mut self, mode: crate::StdioMode) -> Self {
@@ -1232,7 +1232,7 @@ impl Command {
     /// fills, the child blocks on its next write) rather than blocking the
     /// runtime. The sink must make forward progress, though: a destination
     /// that blocks *forever* (not merely slow) stalls the pump — no further
-    /// lines are buffered and a live `stdout_lines`/`output_events` consumer
+    /// lines are buffered and a live `stdout_lines`/`events` consumer
     /// parks — until the run's teardown grace aborts the pump. A write error
     /// disables the tee for the rest of the run — surfaced as a `tracing` warn
     /// under the `tracing` feature, not silently swallowed — and capture is
@@ -1277,7 +1277,7 @@ impl Command {
     /// run no pump. It is likewise inert under
     /// [`output_bytes`](Self::output_bytes), which captures stdout **raw** (no
     /// line pump) — reach for a stdout tee with the line verbs (`output_string`,
-    /// `start` + `stdout_lines`, `output_events`).
+    /// `start` + `stdout_lines`, `events`).
     pub fn stdout_tee<W>(mut self, writer: W) -> Self
     where
         W: tokio::io::AsyncWrite + Send + Unpin + 'static,
@@ -1370,7 +1370,7 @@ impl Command {
     /// [`output_bytes`](Self::output_bytes), whose *own* return value already **is**
     /// the exact raw stdout (a separate raw drain, no line pump) — reach for the
     /// raw tee with the line/streaming verbs (`output_string`, `start` +
-    /// `stdout_lines` / `output_events`, `wait` / `drain`) when you need the raw
+    /// `stdout_lines` / `events`, `wait` / `drain`) when you need the raw
     /// bytes *alongside* decoded lines.
     ///
     /// # Record/replay caveat
@@ -1436,7 +1436,7 @@ impl Command {
     /// [`output_string`](crate::RunningProcess::output_string) /
     /// [`ProcessResult`](crate::ProcessResult) and the streaming verbs
     /// ([`stdout_lines`](crate::RunningProcess::stdout_lines) /
-    /// [`output_events`](crate::RunningProcess::output_events)).
+    /// [`events`](crate::RunningProcess::events)).
     ///
     /// This is the capture-*shaping* counterpart to the *observing*
     /// [`on_stdout_line`](Self::on_stdout_line)/[`on_stderr_line`](Self::on_stderr_line)
@@ -1499,7 +1499,7 @@ impl Command {
     /// frame at a time** instead of piling up as a single line that only surfaces
     /// at EOF. In that mode each `\r`-delimited frame is a line for *every* line
     /// sink alike — [`stdout_lines`](crate::RunningProcess::stdout_lines) /
-    /// [`output_events`](crate::RunningProcess::output_events), the
+    /// [`events`](crate::RunningProcess::events), the
     /// [`on_stdout_line`](Self::on_stdout_line)/[`on_stderr_line`](Self::on_stderr_line)
     /// handlers, the [`stdout_tee`](Self::stdout_tee)/[`stderr_tee`](Self::stderr_tee)
     /// sinks, and `output_string` — so there is a single, shared notion of a line.

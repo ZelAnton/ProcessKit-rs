@@ -24,7 +24,7 @@ use crate::command::Command;
 use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::result::{Outcome, ProcessResult};
-use crate::running::{Finished, OutputEvents, RunningProcess, StdoutLines};
+use crate::running::{Finished, ProcessEvents, RunningProcess, StdoutLines};
 use crate::sync::atomic::{AtomicU8, Ordering};
 
 /// A chain of [`Command`]s connected stdout→stdin — built with
@@ -306,7 +306,7 @@ impl Pipeline {
     ///
     /// - the **last** stage's stdout as it arrives —
     ///   [`stdout_lines`](PipelineSession::stdout_lines) /
-    ///   [`output_events`](PipelineSession::output_events), with the same
+    ///   [`events`](PipelineSession::events), with the same
     ///   consume-once contract as [`RunningProcess`](crate::RunningProcess) (a
     ///   second take is a loud `Err`, never a silently-empty stream);
     /// - a readiness wait on that stream —
@@ -829,7 +829,7 @@ impl Pipeline {
 ///
 /// Drive it like a `RunningProcess`:
 ///
-/// - [`stdout_lines`](Self::stdout_lines) / [`output_events`](Self::output_events)
+/// - [`stdout_lines`](Self::stdout_lines) / [`events`](Self::events)
 ///   — the last stage's stdout, line by line or as interleaved events, with the
 ///   same **consume-once** contract (a second take is a loud `Err`).
 /// - [`wait_for_line`](Self::wait_for_line) — wait for a readiness banner on that
@@ -902,25 +902,27 @@ impl PipelineSession {
     ///
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) when the last stage's stdout was not piped,
     /// or a prior streaming verb ([`stdout_lines`](Self::stdout_lines) /
-    /// [`output_events`](Self::output_events) / [`wait_for_line`](Self::wait_for_line))
+    /// [`events`](Self::events) / [`wait_for_line`](Self::wait_for_line))
     /// already consumed it — returned instead of a silently-empty stream.
     pub fn stdout_lines(&mut self) -> Result<StdoutLines> {
         self.last_mut().stdout_lines()
     }
 
-    /// Stream the **last** stage's stdout **and** stderr as one ordered sequence of
-    /// [`OutputEvent`](crate::OutputEvent)s — the multi-stage analogue of
-    /// [`RunningProcess::output_events`](crate::RunningProcess::output_events). Call
-    /// this **once**. Note this surfaces only the *last* stage's stderr as events;
+    /// Stream the **last** stage's full lifecycle as one ordered sequence of
+    /// [`ProcessEvent`](crate::ProcessEvent)s — the multi-stage analogue of
+    /// [`RunningProcess::events`](crate::RunningProcess::events). Call this
+    /// **once**. Note this surfaces only the *last* stage's stderr as events;
     /// inner stages' stderr still folds into the pipefail diagnostics at
-    /// [`finish`](Self::finish).
+    /// [`finish`](Self::finish). Like the single-command verb, the terminal
+    /// [`Exited`](crate::ProcessEvent::Exited) is delivered by the reaping
+    /// [`finish`](Self::finish), so drive this stream and `finish` together.
     ///
     /// # Errors
     ///
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) when the last stage's stdout was not piped,
     /// or a prior streaming verb already consumed it.
-    pub fn output_events(&mut self) -> Result<OutputEvents> {
-        self.last_mut().output_events()
+    pub fn events(&mut self) -> Result<ProcessEvents> {
+        self.last_mut().events()
     }
 
     /// Wait until a line on the **last** stage's stdout matches `predicate`
