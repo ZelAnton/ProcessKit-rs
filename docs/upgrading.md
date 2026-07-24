@@ -63,6 +63,140 @@ The `#[doc(hidden)]` constructors (`Error::exit`/`timeout`/`signalled`/`spawn`/
 `not_found`/`stdin`) and the public `Error::parse(..)` are unchanged and still
 return an `Error`.
 
+### The merged output stream is now a process-lifecycle stream (`output_events()` → `events()`, `OutputEvent` → `ProcessEvent`)
+
+The merged output-event stream widened from "which output line" to "an event in the
+process's life", so the verb and its enum are renamed to match — a deliberate 3.0
+break with **no** deprecated alias:
+
+| Before | After |
+|---|---|
+| `RunningProcess::output_events()` (verb) | `RunningProcess::events()` |
+| `PipelineSession::output_events()` (verb) | `PipelineSession::events()` |
+| `OutputEvent` (event enum) | `ProcessEvent` |
+| `OutputEvents` (stream type) | `ProcessEvents` |
+
+**Who it affects:** anyone that calls `output_events()` or matches an `OutputEvent`.
+The rename is **compiler-caught** — a build after the bump flags every site (*"no
+method named `output_events`"* / *"cannot find type `OutputEvent`"*).
+`ProcessEvent::Stdout`/`Stderr` carry the same `OutputLine` payload with unchanged
+semantics, and `ProcessEvent::text()` still returns `Some` for a line event and
+`None` otherwise. The stream also gained two **lifecycle** variants —
+`ProcessEvent::Started { pid }` (leads the stream) and `ProcessEvent::Exited(Outcome)`
+(ends it) — so one stream now carries `Started` → `Stdout`/`Stderr` → `Exited`. The
+enum stays `#[non_exhaustive]`, so a `_` arm covers them (and any future kind).
+
+Fix — rename the verb and the type, and add a `_` arm.
+
+Before:
+
+<!-- `text`, not `rust`: `output_events()`/`OutputEvent` no longer exist (renamed,
+     no alias), and `running`/`events` are free variables with no async subprocess
+     context here — so this can't compile. This crate's CI runs the doctests in
+     this file (`src/doc_examples.rs` includes it), so a `rust` fence would fail. -->
+```text
+use processkit::OutputEvent;
+
+let mut events = running.output_events()?;
+while let Some(ev) = events.next().await {
+    match ev {
+        OutputEvent::Stdout(line) => println!("out: {}", line.text()),
+        OutputEvent::Stderr(line) => eprintln!("err: {}", line.text()),
+        _ => {}
+    }
+}
+```
+
+After — the verb is `events()`, the enum is `ProcessEvent`, and the new lifecycle
+variants are handled (or fall through the `_` arm):
+
+```rust,no_run
+use processkit::ProcessEvent;
+fn handle(ev: ProcessEvent) {
+    match ev {
+        ProcessEvent::Stdout(line) => println!("out: {}", line.text()),
+        ProcessEvent::Stderr(line) => eprintln!("err: {}", line.text()),
+        ProcessEvent::Started { pid, .. } => eprintln!("started: {pid:?}"),
+        ProcessEvent::Exited(_outcome) => eprintln!("exited"),
+        _ => {}
+    }
+}
+```
+
+**Behavior change — drive the stream *concurrently* with the finisher (not
+compiler-caught).** Because `Exited` is delivered when the run is reaped, the stream
+now parks after both pipes close and yields its terminal `Exited` only once the run
+is finished. So the old "drain the stream to its end, *then* call `finish()`/`wait()`"
+shape deadlocks — the stream is waiting for the reap that `finish()` performs. Drive
+the two **together** instead (e.g. `tokio::join!` the stream loop and `finish()`), or
+`wait()`/`finish()` on a separate task while you consume the stream. If you only used
+`output_events()` for its output lines and always `finish()`ed separately afterward,
+switch to consuming both concurrently.
+
+### `output_bytes` and `OutputTooLarge` now count *raw* bytes read from the pipe
+
+Not compiler-caught. The `max_bytes` ceiling (`OverflowMode::Error` and the drop
+modes) and the `total_bytes` an `OutputTooLarge` failure reports now count the **raw**
+bytes read off the output pipe — including line terminators and invalid-UTF-8 bytes —
+rather than the decoded line-content bytes they counted before. For typical ASCII/UTF-8
+line output the two are identical; they diverge for output with CRLF terminators or
+non-UTF-8 bytes, where the raw count is slightly higher.
+
+**Who it affects:** a caller that set a byte cap (`with_max_bytes`) and depends on the
+*exact* threshold at which capture truncates/errors, or that reads
+`OutputOverflow::total_bytes()` / the `total_bytes` field and compares it against a
+precise expected value. Fix: re-check those thresholds/assertions against the raw-byte
+count. If you set no byte cap, nothing changes.
+
+### `ProcessGroup::signal` reports the soft-stop outcome more truthfully
+
+Two behavior changes to `ProcessGroup::signal(Signal::Int | Signal::Term)`, neither
+compiler-caught (the signature is unchanged, `Result<()>`):
+
+- **Windows:** it now best-effort soft-closes the tree (a console `CTRL_BREAK` to
+  `windows_graceful_ctrl_break` leaders plus `WM_CLOSE` to windowed members) and
+  returns `Ok` when it had something to signal, instead of *always* returning
+  `Error::Unsupported`. It still returns `Unsupported` only when the group has neither
+  a console-CTRL leader nor a windowed member. A caller that treated the old blanket
+  `Unsupported` as "Windows never soft-stops" should stop assuming that.
+- **POSIX process-group mechanism (macOS/BSD, and the Linux process-group fallback):**
+  a genuinely failed send now surfaces as `Error::Io` instead of being swallowed behind
+  a false `Ok` — an `EINVAL` (an out-of-range `Signal::Other(n)`) or an `EPERM` from a
+  live, non-zombie member now reaches the caller. An already-exited member (`ESRCH`), a
+  harmless zombie-only `EPERM`, an empty group, and the `Signal::Other(0)` existence
+  probe still report `Ok`. A caller that ignored the return value is unaffected; one
+  that inspects it now sees these real failures.
+
+### Also new in 3.0 (additive — nothing to migrate)
+
+These are new capabilities, not migrations — no code changes are forced. Reach for them
+if they help:
+
+- `Command::spawn_detached()` → `DetachedChild` — the one deliberate, opt-in escape
+  from kill-on-drop containment, for a child meant to *outlive* its launcher
+  (daemonize, a `nohup`-style helper). It **inverts the crate's headline guarantee on
+  purpose**, so it is a separate, minimal type (just the `pid`) and loudly refuses every
+  owner-dependent knob rather than dropping it silently. See its rustdoc before using it.
+- `Command::capture_policy(...)` + the `CapturePolicy` trait and `OutputStream` enum — a
+  typed redaction-at-capture seam: transform each captured line (e.g. scrub a secret)
+  *before* it is retained in the backlog / `ProcessResult`. The handler/tee/`output_bytes`
+  paths still see the unredacted text — only the retained capture is rewritten — and a
+  panicking policy fails closed (the line is dropped, never leaked).
+- `Command::to_tokio_command()` is no longer `#[doc(hidden)]` — it is now a documented,
+  honest low-level escape hatch (pair it with `ProcessGroup::spawn` to keep containment
+  while dropping the high-level verbs/pump/capture). See the "Escape hatch" section in
+  the commands guide.
+- An opt-in **PTY launch mode** behind the new `pty` feature (`Command::use_pty()`) for a
+  tool that demands a controlling terminal.
+
+### Verify the upgrade
+
+```sh
+cargo update -p processkit
+cargo build      # the events()/ProcessEvent rename and the Error struct change are compiler-caught
+cargo test       # catches the events()-concurrency, output_bytes byte-count, and signal behavior changes if you rely on them
+```
+
 ## 2.1.0 (from 1.2.x)
 
 > **2.0.0 and 1.3.0 were withdrawn — upgrade straight from 1.2.x to 2.1.0.**

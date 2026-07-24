@@ -219,6 +219,14 @@ pub(crate) struct SpawnOptions {
     /// other child.
     #[cfg_attr(not(feature = "pty"), allow(dead_code))]
     pub use_pty: bool,
+    /// The pseudo-terminal window size (`(cols, rows)`) for a `use_pty` spawn, or
+    /// `None` to fall back to the backend default ([`pty::DEFAULT_PTY_SIZE`]).
+    /// Set from [`Command::pty_size`](crate::Command::pty_size). Consulted only by
+    /// the PTY spawn path (`crate::sys::pty`, `pty`-feature only) — without
+    /// `use_pty` the launch never routes there, so a size configured on a non-PTY
+    /// command is a documented no-op (never applied to the three-pipe spawn).
+    #[cfg_attr(not(feature = "pty"), allow(dead_code))]
+    pub pty_size: Option<(u16, u16)>,
 }
 
 // processkit supports only Unix and Windows: it relies on `tokio::process` and

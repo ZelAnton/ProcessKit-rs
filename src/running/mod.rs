@@ -390,6 +390,29 @@ impl Backend {
     }
 }
 
+/// The honest refusal [`RunningProcess::resize_pty`](RunningProcess::resize_pty)
+/// gives for a run that has no pseudo-terminal to resize (a three-pipe child or a
+/// non-PTY scripted double) — a typed [`ErrorReason::Unsupported`] naming the
+/// operation, matching the crate's precedent for a refused mode-specific request.
+#[cfg(feature = "pty")]
+fn pty_resize_not_a_pty(program: &str) -> Error {
+    ErrorReason::Unsupported {
+        operation: format!("resize_pty on `{program}` (not a use_pty run)"),
+    }
+    .into()
+}
+
+/// The honest refusal [`RunningProcess::resize_pty`](RunningProcess::resize_pty)
+/// gives once the PTY child has exited (the pseudo-terminal is gone) — a typed
+/// [`ErrorReason::Unsupported`] rather than a panic or a silently-dropped resize.
+#[cfg(feature = "pty")]
+fn pty_resize_gone(program: &str) -> Error {
+    ErrorReason::Unsupported {
+        operation: format!("resize_pty on `{program}` (the process has already exited)"),
+    }
+    .into()
+}
+
 impl RunningProcess {
     pub(crate) fn from_spawned(s: Spawned) -> Self {
         Self {
@@ -671,6 +694,102 @@ impl RunningProcess {
     /// scripted test double (no OS tree).
     pub fn kills_tree_on_drop(&self) -> bool {
         self.backend.own_group().is_some()
+    }
+
+    /// Resize the running pseudo-terminal to `cols` columns by `rows` rows.
+    ///
+    /// The live counterpart of [`Command::pty_size`](crate::Command::pty_size):
+    /// propagate a host window resize (`SIGWINCH`-style) into a live PTY child so a
+    /// TUI/pager re-renders for the new geometry. On **Unix** it issues
+    /// `TIOCSWINSZ` on the master, which delivers `SIGWINCH` to the child's
+    /// foreground process group; on **Windows** it calls `ResizePseudoConsole` (a
+    /// console client learns of the change on its next console query — there is no
+    /// `SIGWINCH`, and conhost may reflow asynchronously).
+    ///
+    /// Callable at any point while you still hold the handle — typically
+    /// interleaved with driving an owned output stream
+    /// ([`stdout_lines`](Self::stdout_lines)/[`events`](Self::events)) and writing
+    /// the [`take_stdin`](Self::take_stdin) side of a live session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported),
+    /// never panicking and never silently ignoring, when the resize cannot apply:
+    ///
+    /// - the run is **not** a PTY run (no [`use_pty`](crate::Command::use_pty)),
+    ///   including a non-PTY scripted double — there is no terminal to resize; or
+    /// - the child has **already exited** — the pseudo-terminal is gone.
+    ///
+    /// A genuine OS failure of the resize syscall surfaces as
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io).
+    ///
+    /// The PTY-variant scripted double ([`ScriptedRunner`](crate::testing::ScriptedRunner)
+    /// with [`use_pty`](crate::Command::use_pty)) models this hermetically:
+    /// `resize_pty` succeeds while the double is "running" and fails with the same
+    /// `Unsupported` shape once it has "exited" or when the double is not a PTY —
+    /// so a resize can be exercised in tests without a real pseudo-terminal.
+    #[cfg(feature = "pty")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "pty")))]
+    pub fn resize_pty(&mut self, cols: u16, rows: u16) -> Result<()> {
+        // `program` is a distinct field from `backend`, so this immutable borrow
+        // coexists with the `&mut self.backend` match below (disjoint-field NLL).
+        let program = &self.program;
+        // Clone the gate up front — exactly as `has_exited_now` does — so the PTY
+        // arm's liveness reap can run under the gate lock without borrowing `self`
+        // again while `self.backend` is mutably matched below (disjoint-field NLL).
+        let gate = self.pid_gate.clone();
+        match &mut self.backend {
+            Backend::Pty(pty) => {
+                // `child` is present on every live-handle path (only `Drop` extracts
+                // it, and `Drop` is the handle's final act); treat an absent child
+                // as "already torn down" rather than panicking.
+                if pty.child.is_none() {
+                    return Err(pty_resize_gone(program));
+                }
+                // A resize on an exited child is meaningless (and the pseudoconsole
+                // may already be closed) — surface it honestly instead of poking a
+                // dead terminal. But tokio's `try_wait` REAPS an exited child and
+                // frees its pid, so it must run through `PidGate::reap_under_lock` —
+                // exactly as the sibling `has_exited_now` does — fusing the pid-free
+                // and the gate retire into one critical section. A bare `try_wait`
+                // here would free the pid off-gate without retiring the gate: a
+                // detached force-kill watchdog (which raw-`kill`s the pid until the
+                // gate is retired) could then observe the gate still live and SIGKILL
+                // an unrelated process the OS had recycled that freed pid for.
+                let exited =
+                    gate.reap_under_lock(|| matches!(pty.child_mut().try_wait(), Ok(Some(_))));
+                if exited {
+                    return Err(pty_resize_gone(program));
+                }
+                pty.child_mut().resize(cols, rows).map_err(Error::io)
+            }
+            // A scripted double answers only when it models a PTY run; the model is
+            // hermetic (records the size, no real tty). A non-PTY scripted handle
+            // refuses exactly as a real non-PTY run does.
+            Backend::Scripted(scripted) => {
+                if !scripted.models_pty() {
+                    return Err(pty_resize_not_a_pty(program));
+                }
+                if scripted.has_exited_now() {
+                    return Err(pty_resize_gone(program));
+                }
+                scripted.record_resize(cols, rows);
+                Ok(())
+            }
+            // A real (three-pipe) child has no terminal to resize.
+            Backend::Real(_) => Err(pty_resize_not_a_pty(program)),
+        }
+    }
+
+    /// A test-only view of the resizes a scripted PTY double recorded (`None` for
+    /// a non-scripted backend) — lets a hermetic unit test assert that
+    /// [`resize_pty`](Self::resize_pty) delivered the requested geometry.
+    #[cfg(all(test, feature = "pty"))]
+    pub(crate) fn scripted_recorded_resizes(&self) -> Option<Vec<(u16, u16)>> {
+        match &self.backend {
+            Backend::Scripted(scripted) => Some(scripted.recorded_resizes().to_vec()),
+            _ => None,
+        }
     }
 
     /// A bulk capture verb on a stdout that wasn't piped (`Inherit`/`Null`) would

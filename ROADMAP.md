@@ -8,13 +8,15 @@
 >
 > **Stability since 1.0.** The crate has shipped **1.0** and follows
 > [Semantic Versioning](https://semver.org/): the public API is stable, and any
-> breaking change lands only in a new **major** version. A breaking major has
-> since shipped (**2.1.0**, reshaping parts of the public interface — see
-> [Upgrading](docs/upgrading.md)); items below are scoped to respect the same
-> discipline going forward — additive work targets the `2.x` line, and anything
-> that would reshape the public interface again is deferred to a future major.
-> (The history above this point describes the pre-1.0 development sweeps, when
-> the shape could still move freely.)
+> breaking change lands only in a new **major** version. One breaking major has
+> shipped (**2.1.0**, reshaping parts of the public interface), and a **3.0 major is
+> now in preparation** — it collects this cycle's breaking changes (the `Error` struct
+> reshape and the `output_events()` → `events()` / `OutputEvent` → `ProcessEvent` stream
+> rename) under [`[Unreleased]`](CHANGELOG.md); see [Upgrading](docs/upgrading.md) for
+> the migration. Items below respect the same discipline: additive work can ride the
+> current line, and anything that would reshape the public interface again is batched
+> into the pending major rather than slipped into a minor. (The history above this point
+> describes the pre-1.0 development sweeps, when the shape could still move freely.)
 >
 > Items are roughly ordered by leverage, not strict sequence. Cost is a gut
 > estimate (trivial / moderate / major).
@@ -81,6 +83,10 @@ Verified fmt/clippy/doc/test/cross-compile.
 sink — async, backpressuring, error-surfacing, independent of `on_*_line`; the buffer
 gained a `with_max_bytes` ceiling; and `Error::OutputTooLarge` became
 `{ program, line_limit, byte_limit, total_lines, total_bytes }`. See the CHANGELOG.)*
+*(Renamed and widened in the pending 3.0 major: `OutputEvent`/`OutputEvents`/
+`output_events()` became `ProcessEvent`/`ProcessEvents`/`events()`, and the merged
+stream gained `Started`/`Exited` lifecycle events — see [`[Unreleased]`](CHANGELOG.md)
+and [Upgrading](docs/upgrading.md).)*
 
 ### 3. Program resolution & error-quality completion — `which`/PATH + cwd-relative clarity ✅ SHIPPED (2026-06-10)
 *Dimension: user-scenario / ergonomics · Cost: moderate*
@@ -183,10 +189,19 @@ line. Verified fmt/clippy/doc/test/cross-compile.
   knobs (`nice`/`ionice`/`umask`, [`ideas/next-scheduling-knobs.md`](ideas/next-scheduling-knobs.md))
   remain consumer-gated. `prefer_local` and `send_control` are now shipped and have been
   moved to the Shipped section above.
-- **`later-*` ideas** (PTY, runtime-agnostic, lite/sys split, detached handoff,
-  extensibility hooks, observability/docs-site, cassette-cwd portability, retry jitter,
-  the new pluggable buffer-policy seam and internal-simplification notes) remain gated on
-  a concrete consumer or further-out — see those records.
+- **`later-*` ideas:** several landed in the pending 3.0 major —
+  [`ideas/later-pty-support.md`](ideas/later-pty-support.md) (the `pty` feature /
+  `Command::use_pty()`), [`ideas/later-detached-handoff.md`](ideas/later-detached-handoff.md)
+  (`Command::spawn_detached()` → `DetachedChild`), and
+  [`ideas/later-buffer-policy-seam.md`](ideas/later-buffer-policy-seam.md) (the
+  `CapturePolicy` redaction-at-capture seam) shipped. The storable-hook half of
+  [`ideas/later-extensibility-hooks.md`](ideas/later-extensibility-hooks.md) (the
+  `before_spawn` raw-`Command` mutator) was assessed and **declined**
+  ([`decisions/before-spawn-hook-2026-07.md`](decisions/before-spawn-hook-2026-07.md)),
+  leaving the now-documented `Command::to_tokio_command()` as the honest escape hatch.
+  The rest (runtime-agnostic, lite/sys split, observability/docs-site, cassette-cwd
+  portability, retry jitter, internal-simplification notes) remain gated on a concrete
+  consumer or further-out — see those records.
 - **`cargo-semver-checks` + clippy `pedantic`** stay in `ideas/next-ci-*` — semver-checks
   pays off only *after* the 1.0 freeze; full pedantic is a noisy triage. The targeted
   `# Errors`/`# Panics` doc convention (the high-value slice of pedantic for this

@@ -436,6 +436,49 @@ interactivity — give the command `Stdin::from_lines(stream)` /
 `Stdin::from_reader(reader)` and let the background writer feed it; see the
 [stdin source table](commands.md#standard-input).
 
+### PTY window size and live resize
+
+Under `use_pty` the child runs on a real pseudo-terminal, and terminal-aware
+tools care about its **size**: it drives line wrapping, TUI/progress layout, and
+pager behavior. Set the initial geometry with `pty_size(cols, rows)` (default
+80×24), and change it on a *running* session with
+`RunningProcess::resize_pty(cols, rows)` — the way you propagate a host window
+resize down to the child:
+
+```rust,no_run
+use processkit::prelude::StreamExt;
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Open the terminal at 120×40 instead of the 80×24 default.
+    let mut run = Command::new("htop").use_pty().pty_size(120, 40).start().await?;
+    let mut screen = run.stdout_lines()?;
+
+    // …later, the host window grows — tell the child so it re-renders.
+    run.resize_pty(160, 50)?;
+
+    while let Some(line) = screen.next().await {
+        // render `line`…
+        let _ = line;
+        break;
+    }
+    Ok(())
+}
+```
+
+`resize_pty` works while you still hold the handle — typically interleaved with
+driving an owned `stdout_lines()`/`events()` stream and the `take_stdin()` writer
+of a live session. It returns
+[`ErrorReason::Unsupported`](https://docs.rs/processkit/latest/processkit/enum.ErrorReason.html)
+— never a panic or a silent no-op — on a run that is **not** `use_pty` (there is
+no terminal to size) or once the child has **exited**. Platform delivery differs:
+on **Unix** the resize (`TIOCSWINSZ`) raises `SIGWINCH` on the child immediately;
+on **Windows** `ResizePseudoConsole` has no signal, so a console client observes
+the new size on its next console query and conhost may reflow a little later. On a
+non-`use_pty` command `pty_size` is a documented no-op (nothing to size). See
+[platform support](platform-support.md#pty-mode-use_pty-the-pty-feature).
+
 ## Readiness probes
 
 "Start a server, then use it" needs *ready*, not merely *started*. Four probes
