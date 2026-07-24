@@ -775,6 +775,20 @@ impl Command {
     /// Available only with the `pty` crate feature. A note for callers who leave
     /// it unset: without this the existing three-pipe behavior — including the
     /// `Newline` framing default — is byte-for-byte unchanged.
+    ///
+    /// # Terminal identity and environment overrides
+    ///
+    /// At spawn, ProcessKit identifies the terminal it creates: Unix children
+    /// receive `TERM=xterm-256color`, and every PTY child receives `COLUMNS` and
+    /// `LINES` matching the initial PTY geometry (80×24 by default, or the size
+    /// set with [`pty_size`](Self::pty_size)). Windows does not synthesize
+    /// `TERM`: ConPTY exposes VT handling through the Windows console APIs, so
+    /// any inherited `TERM` remains governed by the normal environment rules.
+    ///
+    /// These values are defaults, not forced overrides. Explicit
+    /// [`env`](Self::env) or [`env_remove`](Self::env_remove) operations for
+    /// `TERM`, `COLUMNS`, or `LINES` always win, including with
+    /// [`env_clear`](Self::env_clear) or [`inherit_env`](Self::inherit_env).
     #[cfg(feature = "pty")]
     #[cfg_attr(docsrs, doc(cfg(feature = "pty")))]
     pub fn use_pty(mut self) -> Self {
@@ -788,7 +802,13 @@ impl Command {
     /// The size matters to terminal-aware children: it drives line wrapping,
     /// progress-bar/TUI layout, and pager behavior, and is the geometry a child
     /// reads back with an `isatty`/`TIOCGWINSZ`-style query. Without this the PTY
-    /// opens at the conventional **80×24** default.
+    /// opens at the conventional **80×24** default. At spawn, the child's
+    /// `COLUMNS` and `LINES` environment defaults are set to the same values;
+    /// explicit [`env`](Self::env) / [`env_remove`](Self::env_remove) operations
+    /// for either name win. A later
+    /// [`RunningProcess::resize_pty`](crate::RunningProcess::resize_pty) changes
+    /// the live terminal geometry but cannot rewrite an already-running
+    /// process's environment.
     ///
     /// # Only meaningful with `use_pty`
     ///
@@ -2049,6 +2069,36 @@ impl Command {
         &self.envs
     }
 
+    /// Environment operations applied at spawn, in priority order.
+    ///
+    /// PTY identity defaults are seeded first and explicit user operations are
+    /// appended afterwards, so every launch consumer gets the same last-write-
+    /// wins behavior. Keeping this derivation here prevents the Unix
+    /// `build_tokio`, Windows raw-ConPTY, and hermetic `Invocation` paths from
+    /// drifting apart.
+    pub(crate) fn spawn_env_ops(&self) -> Vec<(OsString, Option<OsString>)> {
+        let mut ops = Vec::new();
+        #[cfg(feature = "pty")]
+        if self.use_pty {
+            let (cols, rows) = self.pty_size.unwrap_or(crate::sys::pty::DEFAULT_PTY_SIZE);
+            #[cfg(unix)]
+            ops.push((
+                OsString::from("TERM"),
+                Some(OsString::from("xterm-256color")),
+            ));
+            ops.push((
+                OsString::from("COLUMNS"),
+                Some(OsString::from(cols.to_string())),
+            ));
+            ops.push((
+                OsString::from("LINES"),
+                Some(OsString::from(rows.to_string())),
+            ));
+        }
+        ops.extend(self.envs.iter().cloned());
+        ops
+    }
+
     /// The configured stdin source, if any.
     pub fn stdin_source(&self) -> Option<&Stdin> {
         self.stdin.as_ref()
@@ -2119,7 +2169,8 @@ impl Command {
     /// Unix the pty child keeps `build_tokio`'s env, applied by `std`).
     #[cfg(feature = "pty")]
     pub(crate) fn resolved_pty_env(&self) -> Option<Vec<(OsString, OsString)>> {
-        if !self.env_clear && self.inherit_env.is_none() && self.envs.is_empty() {
+        let env_ops = self.spawn_env_ops();
+        if !self.env_clear && self.inherit_env.is_none() && env_ops.is_empty() {
             return None; // no customization → inherit the parent env unchanged
         }
         use std::collections::BTreeMap;
@@ -2142,7 +2193,7 @@ impl Command {
                 }
             }
         }
-        for (k, v) in &self.envs {
+        for (k, v) in &env_ops {
             match v {
                 Some(val) => {
                     map.insert(ci(k), (k.clone(), val.clone()));
@@ -2257,7 +2308,7 @@ impl Command {
                 }
             }
         }
-        for (key, value) in &self.envs {
+        for (key, value) in self.spawn_env_ops() {
             match value {
                 Some(val) => {
                     cmd.env(key, val);
@@ -5132,6 +5183,32 @@ mod tests {
                 .pty_size(200, 50)
                 .configured_pty_size(),
             Some((200, 50)),
+        );
+    }
+
+    #[cfg(all(feature = "pty", windows))]
+    #[test]
+    fn resolved_conpty_env_uses_shared_identity_defaults_and_explicit_overrides() {
+        let env = Command::new("tui")
+            .use_pty()
+            .pty_size(120, 40)
+            .env_clear()
+            .env("columns", "132")
+            .env_remove("LINES")
+            .resolved_pty_env()
+            .expect("PTY identity requires an explicit ConPTY environment block");
+        let find = |name: &str| {
+            env.iter()
+                .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+        };
+
+        assert_eq!(find("COLUMNS").as_deref(), Some("132"));
+        assert_eq!(find("LINES"), None);
+        assert_eq!(
+            find("TERM"),
+            None,
+            "ConPTY exposes terminal capabilities without a synthesized TERM"
         );
     }
 }

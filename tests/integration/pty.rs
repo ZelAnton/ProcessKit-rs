@@ -33,6 +33,24 @@ fn isatty_probe() -> Command {
     }
 }
 
+/// A child that reports the terminal identity ProcessKit supplied.
+fn terminal_identity_probe() -> Command {
+    if cfg!(windows) {
+        Command::new("powershell").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Write-Output ('COLUMNS=' + $env:COLUMNS); \
+             Write-Output ('LINES=' + $env:LINES)",
+        ])
+    } else {
+        Command::new("sh").args([
+            "-c",
+            "printf 'TERM=%s\\nCOLUMNS=%s\\nLINES=%s\\n' \"$TERM\" \"$COLUMNS\" \"$LINES\"",
+        ])
+    }
+}
+
 /// A child that reads one line and echoes `reply:<line>`.
 fn prompt_responder() -> Command {
     if cfg!(windows) {
@@ -121,6 +139,42 @@ async fn pty_child_sees_a_tty() {
         plain.stdout().contains("PIPE"),
         "without PTY the child sees a pipe, got {:?}",
         plain.stdout()
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real pseudo-terminal"]
+async fn pty_child_receives_terminal_identity_matching_its_initial_size() {
+    let default = completes_within(
+        Duration::from_secs(20),
+        "default PTY terminal identity",
+        JobRunner::new().output_string(&terminal_identity_probe().use_pty()),
+    )
+    .await
+    .expect("default-size pty run");
+    assert!(
+        default.stdout().contains("COLUMNS=80") && default.stdout().contains("LINES=24"),
+        "default identity must match the default 80x24 PTY: {:?}",
+        default.stdout()
+    );
+    #[cfg(unix)]
+    assert!(
+        default.stdout().contains("TERM=xterm-256color"),
+        "Unix PTY identity must advertise xterm-256color: {:?}",
+        default.stdout()
+    );
+
+    let sized = completes_within(
+        Duration::from_secs(20),
+        "custom-size PTY terminal identity",
+        JobRunner::new().output_string(&terminal_identity_probe().use_pty().pty_size(101, 37)),
+    )
+    .await
+    .expect("custom-size pty run");
+    assert!(
+        sized.stdout().contains("COLUMNS=101") && sized.stdout().contains("LINES=37"),
+        "identity must match pty_size(101, 37): {:?}",
+        sized.stdout()
     );
 }
 
