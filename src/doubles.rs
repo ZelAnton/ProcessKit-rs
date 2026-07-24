@@ -438,13 +438,17 @@ impl Reply {
         ProcessResult::new(program, stdout, stderr, outcome, timeout)
     }
 
-    /// Apply the PTY single-master merge to the canned streams: with
-    /// [`Command::use_pty`](crate::Command::use_pty) set, stderr folds into stdout
-    /// (separated by a newline) and stderr is emptied — modeling the terminal's
-    /// merged output — otherwise the streams pass through unchanged. Shared by the
+    /// Apply the PTY single-master merge to the canned streams: with PTY mode set,
+    /// stderr folds into stdout (separated by a newline) and stderr is emptied —
+    /// modeling the terminal's merged output — otherwise the streams pass through unchanged. Shared by the
     /// bulk ([`into_result`](Self::into_result)) and streaming
     /// ([`into_running`](Self::into_running)) scripted paths so the double collapses
     /// the split identically on both. A no-op without the `pty` feature.
+    #[cfg_attr(
+        feature = "pty",
+        doc = "\nPTY mode is requested with [`Command::use_pty`](crate::Command::use_pty)."
+    )]
+    #[cfg_attr(not(feature = "pty"), doc = "\nPTY mode requires the `pty` feature.")]
     fn split_pty_streams(command: &Command, stdout: String, stderr: String) -> (String, String) {
         #[cfg(feature = "pty")]
         if command.wants_pty() {

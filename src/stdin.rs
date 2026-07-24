@@ -511,11 +511,8 @@ impl ProcessStdin {
     /// stdin for control bytes will not be interrupted or signaled by this call.
     ///
     /// Real terminal-signal semantics (the kernel delivering `SIGINT` etc. to the
-    /// child) require a pseudo-terminal. Build the command with
-    /// [`Command::use_pty`](crate::Command::use_pty) (the `pty` feature) and this
-    /// same call writes the control byte into the PTY's line discipline, so the
-    /// terminal driver can raise the actual signal — the reason PTY mode exists for
-    /// tty-only tools. Without a PTY it stays a best-effort raw byte, as above.
+    /// child) require a pseudo-terminal. Without one this stays a best-effort raw
+    /// byte, as above.
     ///
     /// # Errors
     ///
@@ -524,6 +521,14 @@ impl ProcessStdin {
     /// [`std::io::Error`] from writing to the child's stdin pipe — commonly
     /// [`BrokenPipe`](std::io::ErrorKind::BrokenPipe) once the child has closed
     /// stdin or exited.
+    #[cfg_attr(
+        feature = "pty",
+        doc = "\nBuild the command with [`Command::use_pty`](crate::Command::use_pty) (the `pty` feature) and this same call writes the control byte into the PTY's line discipline, so the terminal driver can raise the actual signal — the reason PTY mode exists for tty-only tools."
+    )]
+    #[cfg_attr(
+        not(feature = "pty"),
+        doc = "\nEnable the `pty` feature and build the command in PTY mode for real terminal-signal semantics."
+    )]
     pub async fn send_control(&mut self, c: char) -> std::io::Result<()> {
         let byte = control_byte(c)?;
         self.sink.write_all(&[byte]).await

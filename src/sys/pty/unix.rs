@@ -96,9 +96,8 @@ fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut slave: libc::c_int = -1;
     // A sane default window size so a size-querying child gets something usable
     // (a zero size makes some TUI tools misbehave). Purely cosmetic for the
-    // minimal single-master-fd mode. `mut` so a `*mut` pointer works on both the
-    // Linux (`*const winsize`) and BSD/macOS (`*mut winsize`) `openpty` signatures.
-    let mut winsize = libc::winsize {
+    // minimal single-master-fd mode.
+    let winsize = libc::winsize {
         ws_row: 24,
         ws_col: 80,
         ws_xpixel: 0,
@@ -106,16 +105,14 @@ fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
     };
     // SAFETY: `openpty` writes the two fds through the out-pointers; the name
     // buffer is null (we don't want the slave name), the termios is null (default
-    // line discipline), and a valid winsize is supplied. `*mut`-typed pointers are
-    // passed for the termios/winsize params so the call type-checks under both the
-    // Linux (`*const`) and BSD/macOS (`*mut`) `openpty` prototypes.
+    // line discipline), and a valid winsize is supplied.
     let rc = unsafe {
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut::<libc::termios>(),
-            &mut winsize,
+            &winsize,
         )
     };
     if rc != 0 {

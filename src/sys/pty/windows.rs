@@ -14,11 +14,16 @@ use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::process::Command;
+use tokio::sync::Notify;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
@@ -39,6 +44,55 @@ use crate::sys::pid_gate::PidGate;
 use super::{PtyExitStatus, PtyReader, PtySpawn, PtyWriter};
 
 const STILL_ACTIVE: u32 = 259;
+
+// Conhost reports the client's final console writes asynchronously after its
+// process handle becomes signalled. This is a drain quiescence, not a caller
+// timeout: closing the pseudoconsole immediately can discard that final frame.
+const CONPTY_OUTPUT_QUIESCENCE: Duration = Duration::from_millis(100);
+
+/// Cross-thread observation of bytes the ConPTY render pipe has delivered.
+///
+/// The process handle can signal before conhost has forwarded the child's final
+/// console write. Keeping a monotonic sequence alongside the notification avoids
+/// a missed wake-up between the bridge thread's write and an async waiter arming.
+#[derive(Default)]
+struct OutputActivity {
+    sequence: AtomicU64,
+    changed: Notify,
+}
+
+impl OutputActivity {
+    fn record_chunk(&self) {
+        self.sequence.fetch_add(1, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    /// Wait until the render pipe has been quiet long enough to close the
+    /// pseudoconsole without racing conhost's final frame.
+    async fn wait_for_quiescence(&self) {
+        let mut sequence = self.sequence.load(Ordering::Acquire);
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            // `record_chunk` can run between the first load and `notified()`.
+            // The second load makes that race visible even though `Notify` does
+            // not retain a permit for `notify_waiters`.
+            let current = self.sequence.load(Ordering::Acquire);
+            if current != sequence {
+                sequence = current;
+                continue;
+            }
+            if tokio::time::timeout(CONPTY_OUTPUT_QUIESCENCE, changed)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            sequence = self.sequence.load(Ordering::Acquire);
+        }
+    }
+}
 
 /// An owned Windows process `HANDLE`, closed on drop. Shared behind an `Arc` so a
 /// detached exit-wait (a `spawn_blocking` `WaitForSingleObject`) keeps the handle
@@ -72,6 +126,7 @@ pub(crate) struct PtyChild {
     /// Set once the pseudoconsole has been closed, so it is closed exactly once
     /// (by the reap that ends the run, or by `Drop`) and never double-closed.
     hpc_closed: bool,
+    output_activity: Arc<OutputActivity>,
     pid: u32,
 }
 
@@ -123,8 +178,11 @@ impl PtyChild {
         })
         .await
         .map_err(io::Error::other)?;
-        // The child has exited — close the pseudoconsole so `output_read` drains
-        // to EOF (see the doc above).
+        // The child has exited, but conhost can still have its final rendered
+        // frame in flight. Let the bridge drain to quiescence before requesting
+        // EOF; the reader stays live throughout, as ConPTY requires for teardown.
+        self.output_activity.wait_for_quiescence().await;
+        // Now close the pseudoconsole so `output_read` drains to EOF (see above).
         self.close_pty();
         Ok(PtyExitStatus::from_code(code.map(|c| c as i32)))
     }
@@ -495,7 +553,8 @@ pub(crate) fn spawn_pty(
     // is driven by a dedicated OS thread doing blocking `ReadFile`/`WriteFile` and
     // bridged to async over a channel (the established pattern for blocking Windows
     // pipes). Acceptable for the minimal, low-volume interactive PTY mode.
-    let reader: PtyReader = Box::new(bridge_reader(output_read));
+    let output_activity = Arc::new(OutputActivity::default());
+    let reader: PtyReader = Box::new(bridge_reader(output_read, Arc::clone(&output_activity)));
     let writer: PtyWriter = Box::new(bridge_writer(input_write));
 
     Ok(PtySpawn {
@@ -504,6 +563,7 @@ pub(crate) fn spawn_pty(
             thread: pi.hThread,
             hpc,
             hpc_closed: false,
+            output_activity,
             pid,
         },
         reader,
@@ -536,7 +596,7 @@ impl SendHandle {
 /// the pipe and forwards chunks over a bounded channel (whose fullness
 /// backpressures the reader thread, and thus the child). A `0`-length read (EOF,
 /// on pseudoconsole close) or an error ends the thread.
-fn bridge_reader(handle: HANDLE) -> ChannelReader {
+fn bridge_reader(handle: HANDLE, output_activity: Arc<OutputActivity>) -> ChannelReader {
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let h = SendHandle(handle);
     std::thread::spawn(move || {
@@ -548,6 +608,7 @@ fn bridge_reader(handle: HANDLE) -> ChannelReader {
             match file.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    output_activity.record_chunk();
                     if tx.blocking_send(buf[..n].to_vec()).is_err() {
                         break;
                     }
