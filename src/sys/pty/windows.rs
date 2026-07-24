@@ -587,10 +587,28 @@ pub(crate) fn spawn_pty(
     // Suspended containment: create suspended, assign to the job, resume — the
     // same race-free sequence `Job::spawn` uses. `EXTENDED_STARTUPINFO_PRESENT`
     // activates the pseudoconsole attribute list.
-    let mut flags = CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | opts.creation_flags;
-    if opts.windows_new_process_group {
-        flags |= CREATE_NEW_PROCESS_GROUP;
-    }
+    //
+    // Always give the ConPTY child its own console process group
+    // (CREATE_NEW_PROCESS_GROUP), unconditionally — not gated on
+    // `opts.windows_new_process_group` as the non-PTY `Job::spawn` path is. A new
+    // process group is the only mechanism that makes a Windows process immune to
+    // CTRL_C_EVENT by default: without it, a CTRL_C_EVENT sent to ANY process on a
+    // console is delivered to EVERY process attached to that console regardless of
+    // process-group boundaries (Ctrl+C ignores group boundaries, unlike
+    // Ctrl+Break). A ConPTY child already lives isolated in its own pseudoconsole
+    // session and has no reason to share a process group with anything else, so
+    // isolating it costs nothing observable and closes a real failure: a stray
+    // CTRL_C_EVENT in the CI test environment (concurrent `windows_graceful::*`
+    // tests in the same `--include-ignored` binary, or the runner/step wrapper)
+    // was killing the child with STATUS_CONTROL_C_EXIT (0xC000013A) ~130ms after
+    // spawn, before it could run its probe (T-182). `opts.windows_new_process_group`
+    // remains the opt-in switch that drives the graceful-ctrl-break *leader
+    // registration* in `Job::spawn`; the PTY path registers no leaders, so
+    // decoupling the creation flag from it here changes no graceful behavior.
+    let mut flags = CREATE_SUSPENDED
+        | EXTENDED_STARTUPINFO_PRESENT
+        | CREATE_NEW_PROCESS_GROUP
+        | opts.creation_flags;
     let (env_ptr, env_flag): (*const std::ffi::c_void, u32) = match &env_block {
         Some(block) => (block.as_ptr().cast(), CREATE_UNICODE_ENVIRONMENT),
         None => (std::ptr::null(), 0),
