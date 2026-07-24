@@ -214,8 +214,20 @@ fn skip_escape(bytes: &[u8], start: usize) -> usize {
                 j
             }
         }
-        // Any other two-byte escape (`Fe`/`Fs`/`Fp`: `RIS` = `ESC c`, …).
-        _ => (start + 2).min(n),
+        // Any other two-byte escape (`Fe`/`Fs`/`Fp`: `RIS` = `ESC c`,
+        // `IND`/`NEL`/`HTS`, …). Such a final is ALWAYS a single ASCII byte, so
+        // consuming it (`start + 2`) lands on a char boundary — and `start + 2
+        // <= n` here, since `bytes.get(start + 1)` above already proved
+        // `start + 1 < n`. If the byte after `ESC` is instead the non-ASCII lead
+        // of a multi-byte UTF-8 scalar (`ESC ©`/`ESC €`/`ESC 🚀` — a truncated or
+        // garbled escape a terminal-driven child can emit before a glyph), it is
+        // no valid escape final at all: drop only the `ESC` (`start + 1`, still a
+        // boundary because `ESC` is ASCII) and leave the scalar as content.
+        // Returning `start + 2` there would index the SECOND byte of that scalar
+        // — not a char boundary — and later panic `strip_vt`'s `&line[..]` slice
+        // with "byte index N is not a char boundary" (R-01).
+        _ if kind < 0x80 => start + 2,
+        _ => start + 1,
     }
 }
 
@@ -287,6 +299,16 @@ fn strip_vt(line: &str) -> Cow<'_, str> {
             // `copy_from..i` ends on an ASCII byte, always a char boundary.
             out.push_str(&line[copy_from..i]);
             i = skip_escape(bytes, i);
+            // `skip_escape` must always return a char boundary so the next
+            // `&line[..]` slice can never split a multi-byte scalar (R-01):
+            // every arm lands after an ASCII byte, on `ESC`/end, or — for an
+            // unrecognized non-ASCII byte after `ESC` — on that scalar's own
+            // lead byte. Pin the contract here so a future edit that breaks it
+            // trips at the source, not at an incidental downstream slice panic.
+            debug_assert!(
+                line.is_char_boundary(i),
+                "skip_escape returned non-char-boundary index {i} in {line:?}"
+            );
             copy_from = i;
         } else if is_strippable_control(b) {
             out.push_str(&line[copy_from..i]);
@@ -2204,6 +2226,35 @@ mod tests {
         assert_eq!(strip_vt("value\x1b[31"), "value"); // CSI params, no final
         assert_eq!(strip_vt("t\x1b]0;unterminated title"), "t"); // OSC, no BEL/ST
         assert_eq!(strip_vt("end\x1b"), "end"); // lone trailing ESC
+    }
+
+    #[test]
+    fn strip_vt_keeps_multibyte_scalar_after_unrecognized_escape() {
+        // R-01 regression. An `ESC` immediately before a multi-byte UTF-8 scalar
+        // is a truncated/garbled escape a terminal-driven child can emit before a
+        // glyph. The byte after `ESC` is that scalar's NON-ASCII lead byte, which
+        // matches no escape introducer and used to hit `skip_escape`'s catch-all
+        // `(start + 2).min(n)` — an index pointing at the scalar's SECOND byte,
+        // i.e. NOT a char boundary — so the next `&line[..]` slice in `strip_vt`
+        // panicked "byte index N is not a char boundary". Now only the `ESC` is
+        // dropped and the scalar is kept as content. Covers 2-, 3- and 4-byte
+        // scalars, plus the exact `ESC ©` / `ESC €` cases called out in review.
+        let cases: &[(&str, &str)] = &[
+            ("\u{1b}\u{a9}", "\u{a9}"),                   // ESC + © (2-byte)
+            ("\u{1b}\u{20ac}", "\u{20ac}"),               // ESC + € (3-byte)
+            ("\u{1b}\u{1f680}", "\u{1f680}"),             // ESC + 🚀 (4-byte)
+            ("pre\u{1b}\u{20ac}post", "pre\u{20ac}post"), // scalar mid-line
+            ("a\u{1b}\u{a9}b", "a\u{a9}b"),
+            ("end\u{1b}\u{a9}", "end\u{a9}"), // scalar at line end
+            // Doubled `ESC` before a multibyte scalar: the first `ESC` is dropped,
+            // the second re-parsed (also unrecognized) and dropped, scalar kept.
+            ("\u{1b}\u{1b}\u{20ac}", "\u{20ac}"),
+            // A run of box-drawing glyphs (3-byte each) after `ESC`.
+            ("\u{1b}\u{2500}\u{2502}\u{2514}", "\u{2500}\u{2502}\u{2514}"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(strip_vt(raw), *want, "sanitizing {raw:?}");
+        }
     }
 
     #[tokio::test]
@@ -4338,6 +4389,29 @@ mod tests {
                 .prop_map(|chars| chars.into_iter().collect())
         }
 
+        /// A single "line" for fuzzing the VT sanitizer (`strip_vt`), heavily
+        /// biased toward `ESC` and other control/escape introducers so they land
+        /// directly before arbitrary — and frequently multi-byte — scalars. That
+        /// `ESC`-then-multibyte adjacency is exactly what regressed in R-01
+        /// (`skip_escape` returning a mid-scalar byte index). No `\n`/`\r`: a
+        /// single decoded line never contains a line terminator, and the sanitizer
+        /// operates strictly per line.
+        fn arb_vt_fuzz_line() -> impl Strategy<Value = String> {
+            prop::collection::vec(
+                prop_oneof![
+                    3 => Just('\u{1b}'),                       // ESC introducer
+                    1 => Just('\u{7f}'),                       // DEL (strippable)
+                    1 => Just('\u{07}'),                       // BEL (OSC terminator)
+                    1 => Just('['),                            // common CSI second byte
+                    1 => Just(']'),                            // common OSC second byte
+                    4 => any::<char>()
+                        .prop_filter("no CR/LF", |c| !matches!(*c, '\n' | '\r')),
+                ],
+                0..24,
+            )
+            .prop_map(|chars| chars.into_iter().collect())
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -4475,6 +4549,55 @@ mod tests {
                 // A prefix shorter than the whole output means something was
                 // dropped, and vice versa — the truncation signal is exact.
                 prop_assert_eq!(retained.len() < lines.len(), sink.dropped() > 0);
+            }
+
+            /// R-01 as a property, at the sanitizer itself: `strip_vt` must never
+            /// panic and must always yield valid UTF-8 for ANY line, however
+            /// malformed its escapes — in particular an `ESC` directly before a
+            /// multi-byte scalar, which used to make `skip_escape` return a
+            /// mid-scalar byte index and panic the `&line[..]` slice. The input is
+            /// biased toward `ESC`/control introducers so that adjacency is hit
+            /// constantly. Idempotence (a second pass is a no-op) is asserted too:
+            /// it can only hold if every escape was consumed on a char boundary,
+            /// so it doubles as a boundary-correctness check.
+            #[test]
+            fn strip_vt_never_panics_on_arbitrary_malformed_escapes(
+                line in arb_vt_fuzz_line(),
+            ) {
+                let cleaned = strip_vt(&line).into_owned();
+                let twice = strip_vt(&cleaned).into_owned();
+                prop_assert_eq!(
+                    twice,
+                    cleaned,
+                    "strip_vt must be idempotent (every escape consumed on a char boundary)"
+                );
+            }
+
+            /// The sanitizer-enabled twin of
+            /// `pump_never_panics_on_arbitrary_bytes_under_any_chunking` (R-01):
+            /// that existing panic-freedom proptest runs the DEFAULT config, so the
+            /// `sanitize_vt: true` path — the only one that reaches
+            /// `strip_vt`/`skip_escape` — was never fuzzed, and the
+            /// `ESC`-before-multibyte panic slipped through a green self-check.
+            /// Arbitrary bytes (routinely decoding to multi-byte UTF-8 with
+            /// interleaved `ESC`s), chunked at arbitrary read boundaries, pumped
+            /// with the sanitizer on: reaching here without a panic — plus
+            /// internally consistent counters — is the invariant.
+            #[test]
+            fn sanitizing_pump_never_panics_on_arbitrary_bytes_under_any_chunking(
+                raw in prop::collection::vec(any::<u8>(), 0..512),
+                chunk_sizes in prop::collection::vec(1usize..=9, 1..20),
+            ) {
+                let chunks = to_chunks(&raw, &chunk_sizes);
+                let reader = ChunkedReader::new(chunks);
+                let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("current-thread runtime");
+                rt.block_on(pump_lines_core(reader, sanitize_config(), sink.clone()));
+
+                let lines = sink.drain();
+                prop_assert!(lines.len() <= sink.count());
             }
         }
     }
