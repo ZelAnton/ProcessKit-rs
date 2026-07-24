@@ -166,7 +166,7 @@ tracing = { version = "0.1.6", optional = true }
 # pulling no exporter of its own. `0.24` floor: the `counter!`/`histogram!` macros
 # and the `Recorder`/`set_global_recorder` API the emission layer and its
 # secret-hygiene test use are the current 0.23+-line shape; pin the live major.
-metrics = { version = "0.24", optional = true }
+metrics = { version = "0.24.6", optional = true }
 # Optional auto-generated `MockRunner` for downstream tests. Test-only; pulled
 # in solely behind the `mock` feature, never in production builds.
 mockall = { version = "0.15", optional = true }

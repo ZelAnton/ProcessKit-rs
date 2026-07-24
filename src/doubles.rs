@@ -254,7 +254,7 @@ impl Reply {
     ///     let runner = ScriptedRunner::new()
     ///         .fallback(Reply::dialog("Password: ", "granted> "));
     ///     let mut run = runner
-    ///         .start(&Command::new("login").use_pty().keep_stdin_open())
+    ///         .start(&Command::new("login").keep_stdin_open())
     ///         .await
     ///         .expect("start dialog");
     ///     // Wait for the un-terminated prompt, then answer it.
