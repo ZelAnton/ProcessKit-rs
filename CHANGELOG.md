@@ -13,6 +13,12 @@ to a dated version section.
 
 ### Added
 
+- Add Linux I/O scheduling for child processes: `Command::io_priority(IoPriority)`
+  applies `ioprio_set(2)` in `pre_exec`, with `Idle`, `BestEffort(0..=7)`, and
+  `RealTime(0..=7)` classes. The request fails loudly with `ErrorReason::Unsupported`
+  outside Linux and is refused for `spawn_detached`; invalid data values and
+  kernel privilege rejections fail before or during spawn rather than silently
+  inheriting a different priority.
 - Add pseudo-terminal **window-size control** for `use_pty` runs (the `pty`
   feature): `Command::pty_size(cols, rows)` sets the terminal's initial geometry
   at spawn (replacing the previously hard-coded 80×24 — still the default when
@@ -40,7 +46,8 @@ to a dated version section.
   `RunningProcess`) and: (1) refuses any owner-dependent knob — a timeout, capture
   wiring (`on_stdout_line`/tees/`capture_policy`), an interactive stdin
   (`keep_stdin_open`/`inherit_stdin`/a `stdin` source), `retry`, `cancel_on`,
-  `kill_on_parent_death`, `windows_graceful_ctrl_break`, `use_pty` — with a loud,
+  `kill_on_parent_death`, `windows_graceful_ctrl_break`, Linux `io_priority`,
+  `use_pty` — with a loud,
   typed `ErrorReason::Unsupported` naming it, never a silent drop; (2) allows only
   **null (default) or a file redirect** for stdio, never a pipe (which would
   deadlock a child once its owner is gone); and (3) deliberately does **not** break

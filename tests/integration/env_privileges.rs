@@ -1,10 +1,12 @@
 //! Environment and privilege builders: inherit_env, uid/gid, setsid,
-//! priority/umask, and the Windows-only/unix-only unsupported gates.
+//! CPU/I/O priority, umask, and the Windows-only/unix-only unsupported gates.
 
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use processkit::Command;
+#[cfg(target_os = "linux")]
+use processkit::IoPriority;
 #[cfg(unix)]
 use processkit::Mechanism;
 use processkit::Priority;
@@ -142,6 +144,27 @@ async fn priority_and_umask_apply_before_exec() {
         u32::from_str_radix(out.trim(), 8).expect("umask prints octal"),
         0o027,
         "the requested umask must be visible inside the child"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "spawns a real subprocess to check ioprio_set"]
+async fn io_priority_applies_before_exec() {
+    // `ionice -p $$` reads the Linux kernel's actual I/O priority for this
+    // shell, so this proves `ioprio_set` ran in pre_exec before `sh` execed.
+    // Idle is available to an unprivileged process and is unambiguous in the
+    // tool's output.
+    let out = Command::new("sh")
+        .args(["-c", "ionice -p $$"])
+        .io_priority(IoPriority::Idle)
+        .run()
+        .await
+        .expect("run I/O-priority child");
+    assert_eq!(
+        out.trim(),
+        "idle",
+        "the child must retain idle I/O priority"
     );
 }
 
@@ -337,6 +360,12 @@ async fn windows_unix_only_builders_are_unsupported() {
         (
             Command::new("cmd").args(["/c", "exit 0"]).umask(0o022),
             "umask",
+        ),
+        (
+            Command::new("cmd")
+                .args(["/c", "exit 0"])
+                .io_priority(processkit::IoPriority::Idle),
+            "io_priority",
         ),
     ] {
         let err = command

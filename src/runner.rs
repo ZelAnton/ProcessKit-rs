@@ -569,9 +569,9 @@ impl JobRunner {
     ///
     /// The full launch surface: [`ErrorReason::NotFound`](crate::ErrorReason::NotFound) or
     /// [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) (the program could not be located or
-    /// started), [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) (a POSIX-only
-    /// primitive — user/group switch, `setsid`, umask — unavailable on this
-    /// platform), [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) (the command's
+    /// started), [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) (a requested
+    /// platform primitive — user/group switch, `setsid`, umask, or Linux I/O
+    /// priority — unavailable on this platform), [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) (the command's
     /// token was already cancelled), or [`ErrorReason::Io`](crate::ErrorReason::Io) (the
     /// private [`ProcessGroup`] could not be created, or a one-shot streaming
     /// stdin source was already consumed by a previous run).
@@ -607,8 +607,8 @@ impl ProcessGroup {
     ///
     /// The launch surface: [`ErrorReason::NotFound`](crate::ErrorReason::NotFound) /
     /// [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) (locate/start failure),
-    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) (a POSIX-only primitive
-    /// unavailable on this platform),
+    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) (a requested POSIX or
+    /// Linux-only primitive unavailable on this platform),
     /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) (a pre-cancelled token), or
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) (e.g. a one-shot stdin source already
     /// consumed). Unlike [`JobRunner::start`], no new group is created here — the
@@ -725,10 +725,10 @@ fn inherit_stdin_conflict(command: &Command, other: &str) -> crate::Error {
 /// Build the OS command, spawn it into `group`, wire stdin, and wrap everything
 /// in a [`RunningProcess`] (with no owned group).
 pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<RunningProcess> {
-    // A requested privilege drop, session detach, or umask must never be
-    // silently skipped: on targets without the POSIX primitives, fail before
-    // spawning. (`priority` is deliberately absent here — it is implemented on
-    // both platform families and never gated as Unsupported.)
+    // A requested privilege drop, session detach, umask, or I/O priority must
+    // never be silently skipped: on targets without the relevant primitive,
+    // fail before spawning. (`priority` is deliberately absent here — it is
+    // implemented on both platform families and never gated as Unsupported.)
     #[cfg(not(unix))]
     {
         if command.requested_uid().is_some() {
@@ -761,6 +761,13 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
             }
             .into());
         }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if command.requested_io_priority().is_some() {
+        return Err(crate::ErrorReason::Unsupported {
+            operation: "io_priority (Linux-only)".into(),
+        }
+        .into());
     }
 
     // Already cancelled: short-circuit before spawning.

@@ -53,7 +53,8 @@
 //!   [`Command::inherit_env`] (env allow-list), [`Command::uid`] /
 //!   [`Command::gid`] (Unix privilege drop), [`Command::setsid`],
 //!   [`Command::create_no_window`], [`Command::priority`] (CPU-scheduling
-//!   priority, both platforms), [`Command::umask`] (Unix file-creation mask).
+//!   priority, both platforms), [`Command::io_priority`] (Linux I/O scheduling),
+//!   [`Command::umask`] (Unix file-creation mask).
 //!
 //! Async throughout (tokio). Errors are the structured [`Error`]; a non-zero
 //! exit is reported in [`ProcessResult`], not raised, until you call
@@ -222,6 +223,7 @@ mod doc_examples;
 mod doubles;
 mod error;
 mod group;
+mod io_priority;
 #[cfg(feature = "limits")]
 mod limits;
 // `process_info` / `process_is_alive` — the free-standing identity & reuse-safe
@@ -290,6 +292,7 @@ pub use command::Command;
 pub use detached::DetachedChild;
 pub use error::{Error, ErrorKind, ErrorReason, OutputOverflow, Result};
 pub use group::{ProcessGroup, ProcessGroupOptions};
+pub use io_priority::IoPriority;
 #[cfg(feature = "limits")]
 pub use limits::{LimitKind, LimitReason, ResourceLimits};
 #[cfg(feature = "process-control")]
