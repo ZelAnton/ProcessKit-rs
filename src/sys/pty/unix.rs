@@ -8,6 +8,7 @@ use std::io;
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::task::{Context, Poll};
@@ -340,9 +341,45 @@ where
     cmd.stdout(Stdio::from(slave_out));
     cmd.stderr(Stdio::from(slave_err));
 
-    // Spawn through the caller's containment path (cgroup/pgroup join happens in
-    // that path's `pre_exec`, unchanged by the pty wiring above).
-    let child = spawn(cmd, opts)?;
+    // A terminal sends SIGWINCH only to its foreground process group. Make this
+    // child a session leader and acquire the slave as its controlling terminal;
+    // the session's initial process group is then foreground by default. A normal
+    // pipe spawn deliberately keeps its existing session behavior, so this is
+    // local to PTY launches.
+    let mut pty_opts = *opts;
+    if !pty_opts.setsid {
+        // SAFETY: the closure calls only setsid() and reads errno, both of which
+        // are async-signal-safe in the post-fork child.
+        unsafe {
+            cmd.as_std_mut().pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+    pty_opts.setsid = true;
+    // `build_tokio` registers a requested setsid hook before this one; when PTY
+    // mode supplied it above, that hook was likewise registered first. std runs
+    // user hooks in registration order, so fd 0 is claimed only after setsid().
+    // SAFETY: fd 0 is the pty slave after std has installed child stdio; ioctl
+    // reads no Rust memory and is async-signal-safe.
+    unsafe {
+        cmd.as_std_mut().pre_exec(|| {
+            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+
+    // Spawn through the caller's containment path (cgroup/process-group join
+    // happens in that path's pre_exec hooks); the forced setsid group has pgid
+    // equal to pid, which the process-group tracker handles identically.
+    let child = spawn(cmd, &pty_opts)?;
     let pid = child.id();
 
     // The reader and writer each own a dup of the master (same open description),

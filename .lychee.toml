@@ -20,6 +20,9 @@ exclude = [
   # Forward-reference to unreleased CapturePolicy (T-186); remove after the next
   # ProcessKit release makes the trait available on docs.rs.
   "docs\\.rs/processkit/latest/processkit/trait\\.CapturePolicy\\.html",
+  # Forward-reference to unreleased ErrorReason; remove after the next ProcessKit
+  # release makes the enum available on docs.rs.
+  "docs\\.rs/processkit/latest/processkit/enum\\.ErrorReason\\.html",
 ]
 
 # `docs/SUMMARY.md` deliberately contains empty-href draft entries used by the
