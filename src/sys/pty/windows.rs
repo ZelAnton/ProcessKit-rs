@@ -27,7 +27,10 @@ use tokio::sync::Notify;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-use windows_sys::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON};
+use windows_sys::Win32::System::Console::{
+    COORD, ClosePseudoConsole, CreatePseudoConsole, GetConsoleWindow, GetStdHandle, HPCON,
+    STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+};
 use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
@@ -342,26 +345,120 @@ fn to_wide_nul(s: &OsStr) -> Vec<u16> {
     v
 }
 
-/// Build startup information that cannot leak the launcher's console handles
-/// into a ConPTY child.
+/// Whether the launching process is itself attached to a console.
 ///
-/// `bInheritHandles = FALSE` only disables ordinary inheritable handles. A
-/// debugger, test runner, or terminal can still pre-populate the child's three
-/// standard-handle slots from the launch environment. Unless those slots are
-/// explicitly selected and cleared, the new pseudoconsole session may attach
-/// successfully while the child keeps writing to the launcher's console. The
-/// Windows Console team-prescribed contract is `STARTF_USESTDHANDLES` plus three
-/// null handles; ConPTY then installs its own console handles during process
-/// initialization.
-fn conpty_startup_info(attr_list: LPPROC_THREAD_ATTRIBUTE_LIST) -> STARTUPINFOEXW {
+/// `GetConsoleWindow` returns null exactly when this process has no console — the
+/// *headless* case: a service-hosted CI runner step, or a windowed (GUI-subsystem)
+/// parent. It is non-null under an interactive terminal (a developer's
+/// `cargo test` from a console).
+///
+/// A ConPTY child must never take its standard handles from the launcher — those
+/// must come from the pseudoconsole — but the two launch environments empirically
+/// need **different** ways to guarantee that (a split this crate's own Windows CI
+/// vs. local runs exposed), so this selects between them:
+///   * **Console-attached launcher:** [`conpty_startup_info`] requests
+///     `STARTF_USESTDHANDLES` with three null handles, severing the launcher's
+///     console std handles so the child binds to the pseudoconsole instead of
+///     rendering into the launcher's terminal.
+///   * **Headless launcher:** `STARTF_USESTDHANDLES` is *not* requested (per the
+///     Microsoft ConPTY sample, which lets the pseudoconsole own the handles);
+///     the launcher's own (redirected) std handles are instead temporarily nulled
+///     across `CreateProcessW` (see [`NulledLauncherStdio`]) so the child
+///     propagates null defaults the pseudoconsole overrides. Requesting
+///     `STARTF_USESTDHANDLES` here is what stranded the child with no console
+///     output binding on headless CI (only conhost's own initial frame reached
+///     the master, never the child's writes).
+fn launcher_has_console() -> bool {
+    // SAFETY: `GetConsoleWindow` takes no arguments and only reads this process's
+    // console association; the returned `HWND` is inspected, never dereferenced.
+    !unsafe { GetConsoleWindow() }.is_null()
+}
+
+/// Build startup information for the ConPTY child.
+///
+/// When `sever_console_std_handles` is set (a console-attached launcher — see
+/// [`launcher_has_console`]), request `STARTF_USESTDHANDLES` with three null
+/// standard handles: `bInheritHandles = FALSE` alone does not stop a
+/// console-attached launcher (a debugger, test runner, or terminal) from
+/// pre-populating the child's three standard-handle slots from its own console,
+/// which would let the child keep writing to the *launcher's* console while the
+/// pseudoconsole attaches; nulling the slots severs that so ConPTY installs its
+/// own console handles during process initialization.
+///
+/// When it is **clear** (a headless launcher), leave `STARTF_USESTDHANDLES`
+/// unset: the pseudoconsole then owns the child's standard handles (the Microsoft
+/// ConPTY sample's arrangement). Setting it with null handles instead strands the
+/// child with no console output binding on some Windows builds (the headless-CI
+/// failure); the launcher-side null in [`NulledLauncherStdio`] severs inheritance
+/// there without this flag.
+fn conpty_startup_info(
+    attr_list: LPPROC_THREAD_ATTRIBUTE_LIST,
+    sever_console_std_handles: bool,
+) -> STARTUPINFOEXW {
     let mut si = STARTUPINFOEXW::default();
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    si.StartupInfo.hStdInput = std::ptr::null_mut();
-    si.StartupInfo.hStdOutput = std::ptr::null_mut();
-    si.StartupInfo.hStdError = std::ptr::null_mut();
+    if sever_console_std_handles {
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = std::ptr::null_mut();
+        si.StartupInfo.hStdOutput = std::ptr::null_mut();
+        si.StartupInfo.hStdError = std::ptr::null_mut();
+    }
     si.lpAttributeList = attr_list;
     si
+}
+
+/// Temporarily replaces the *launcher's* own three standard handles with null for
+/// the span of a `CreateProcessW`, restoring them on drop.
+///
+/// Used only on a headless launcher (see [`launcher_has_console`]), where the
+/// ConPTY child is created **without** `STARTF_USESTDHANDLES` so the pseudoconsole
+/// owns its handles. Without `STARTF_USESTDHANDLES`, `CreateProcessW` propagates
+/// the launcher's `ProcessParameters` standard-handle *values* into the child, so
+/// a launcher whose own stdio is redirected (a CI step capturing output to a pipe)
+/// would have the child inherit that redirect and write past the pseudoconsole
+/// entirely. Nulling the launcher's slots for the spawn makes the child propagate
+/// null defaults, which the pseudoconsole then overrides with its own console
+/// handles during initialization — the same end state the console-launcher path
+/// reaches via `STARTF_USESTDHANDLES`, but without the flag that stranded the
+/// child on headless CI.
+///
+/// A process-wide lock is held for the whole window because `SetStdHandle` mutates
+/// process-global state; the swap is confined to the (fast, synchronous)
+/// `CreateProcessW` call and never spans an `.await`.
+struct NulledLauncherStdio {
+    saved: [(STD_HANDLE, HANDLE); 3],
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl NulledLauncherStdio {
+    fn install() -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut saved = [
+            (STD_INPUT_HANDLE, std::ptr::null_mut()),
+            (STD_OUTPUT_HANDLE, std::ptr::null_mut()),
+            (STD_ERROR_HANDLE, std::ptr::null_mut()),
+        ];
+        for (which, prev) in &mut saved {
+            // SAFETY: `Get`/`SetStdHandle` only read/replace this process's own
+            // standard-handle slots; the previous value is captured for restore.
+            unsafe {
+                *prev = GetStdHandle(*which);
+                SetStdHandle(*which, std::ptr::null_mut());
+            }
+        }
+        Self { saved, _lock: lock }
+    }
+}
+
+impl Drop for NulledLauncherStdio {
+    fn drop(&mut self) {
+        for (which, prev) in self.saved {
+            // SAFETY: restores the exact handle value captured in `install`, on the
+            // same process-global slot, still under the held lock.
+            unsafe { SetStdHandle(which, prev) };
+        }
+    }
 }
 
 /// Spawn `cmd` under a ConPTY, assigning the child to `job` for containment.
@@ -465,7 +562,15 @@ pub(crate) fn spawn_pty(
         return Err(e);
     }
 
-    let si = conpty_startup_info(attr_list);
+    // Bind the child's standard handles to the pseudoconsole, never the launcher's.
+    // A console-attached launcher and a headless one need different guarantees for
+    // that (see `launcher_has_console`): the former severs its console std handles
+    // via `STARTF_USESTDHANDLES`; the latter must NOT set that flag (it stranded the
+    // child with no output on headless CI) and instead nulls its own std handles
+    // across `CreateProcessW` below so the child propagates pseudoconsole-overridable
+    // null defaults rather than inheriting the launcher's redirected stdio.
+    let has_console = launcher_has_console();
+    let si = conpty_startup_info(attr_list, has_console);
 
     let mut command_line = build_command_line(cmd);
     let env_block = build_env_block(env);
@@ -489,23 +594,32 @@ pub(crate) fn spawn_pty(
     let cwd_ptr = cwd_wide.as_ref().map_or(std::ptr::null(), |w| w.as_ptr());
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: `command_line` is a mutable NUL-terminated wide buffer (CreateProcessW
-    // may write to it); the startup info's `cb` and attribute list are set; the
-    // env block (when present) is double-NUL terminated with the matching flag.
-    let created = unsafe {
-        CreateProcessW(
-            std::ptr::null(),
-            command_line.as_mut_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            0, // no ordinary handle inheritance; the explicitly-null standard
-            // handles above are replaced by the attached pseudoconsole
-            flags,
-            env_ptr,
-            cwd_ptr,
-            std::ptr::from_ref(&si.StartupInfo),
-            &mut pi,
-        )
+    let created = {
+        // Headless launcher only: null the launcher's own (possibly redirected)
+        // std handles across the spawn so the child does not propagate them and
+        // instead binds to the pseudoconsole. Restored the instant this guard drops
+        // (end of block); a no-op for a console launcher, which severs via the
+        // startup info above instead.
+        let _nulled_stdio = (!has_console).then(NulledLauncherStdio::install);
+        // SAFETY: `command_line` is a mutable NUL-terminated wide buffer
+        // (CreateProcessW may write to it); the startup info's `cb` and attribute
+        // list are set; the env block (when present) is double-NUL terminated with
+        // the matching flag.
+        unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                command_line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0, // no ordinary handle inheritance; the child's standard handles
+                // come from the pseudoconsole (severed from the launcher above)
+                flags,
+                env_ptr,
+                cwd_ptr,
+                std::ptr::from_ref(&si.StartupInfo),
+                &mut pi,
+            )
+        }
     };
     // The attribute list is no longer needed once the child is created.
     unsafe { DeleteProcThreadAttributeList(attr_list) };
@@ -732,15 +846,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn conpty_startup_info_explicitly_clears_standard_handles() {
-        let si = conpty_startup_info(std::ptr::null_mut());
-
+    fn conpty_startup_info_severs_std_handles_only_when_requested() {
+        // Console-attached launcher: sever the inherited console std handles.
+        let severed = conpty_startup_info(std::ptr::null_mut(), true);
         assert_eq!(
-            si.StartupInfo.dwFlags & STARTF_USESTDHANDLES,
+            severed.StartupInfo.dwFlags & STARTF_USESTDHANDLES,
             STARTF_USESTDHANDLES
         );
-        assert!(si.StartupInfo.hStdInput.is_null());
-        assert!(si.StartupInfo.hStdOutput.is_null());
-        assert!(si.StartupInfo.hStdError.is_null());
+        assert!(severed.StartupInfo.hStdInput.is_null());
+        assert!(severed.StartupInfo.hStdOutput.is_null());
+        assert!(severed.StartupInfo.hStdError.is_null());
+
+        // Headless launcher: leave the std handles to the pseudoconsole — no
+        // `STARTF_USESTDHANDLES`, so the null slots are not consulted at all.
+        let inherited = conpty_startup_info(std::ptr::null_mut(), false);
+        assert_eq!(inherited.StartupInfo.dwFlags & STARTF_USESTDHANDLES, 0);
     }
 }
