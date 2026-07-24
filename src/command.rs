@@ -183,6 +183,12 @@ pub struct Command {
     /// [`Self::use_pty`]). Off by default; only present with the `pty` feature.
     #[cfg(feature = "pty")]
     use_pty: bool,
+    /// The initial pseudo-terminal window size `(cols, rows)` for a
+    /// [`use_pty`](Self::use_pty) spawn (see [`Self::pty_size`]). `None` falls back
+    /// to the backend default (80×24). Read only on the PTY launch path — a
+    /// documented no-op without `use_pty`.
+    #[cfg(feature = "pty")]
+    pty_size: Option<(u16, u16)>,
     /// When cancelled, the run's tree is killed and every consuming path
     /// resolves to `ErrorReason::Cancelled`. Cheap to clone (internally `Arc`'d), so
     /// a `Command` clone — including each `Pipeline` stage and each
@@ -230,6 +236,8 @@ impl Command {
             windows_graceful_ctrl_break: false,
             #[cfg(feature = "pty")]
             use_pty: false,
+            #[cfg(feature = "pty")]
+            pty_size: None,
             cancel_token: None,
         }
     }
@@ -707,6 +715,37 @@ impl Command {
     #[cfg_attr(docsrs, doc(cfg(feature = "pty")))]
     pub fn use_pty(mut self) -> Self {
         self.use_pty = true;
+        self
+    }
+
+    /// Set the **initial window size** — `cols` columns by `rows` rows — of the
+    /// pseudo-terminal opened by [`use_pty`](Self::use_pty).
+    ///
+    /// The size matters to terminal-aware children: it drives line wrapping,
+    /// progress-bar/TUI layout, and pager behavior, and is the geometry a child
+    /// reads back with an `isatty`/`TIOCGWINSZ`-style query. Without this the PTY
+    /// opens at the conventional **80×24** default.
+    ///
+    /// # Only meaningful with `use_pty`
+    ///
+    /// This is a **PTY-only** knob. On a command that is **not**
+    /// [`use_pty`](Self::use_pty) it is a documented **no-op** — the three-pipe
+    /// launch has no terminal to size, so the value is simply never read (it is
+    /// *not* silently applied anywhere, and it is *not* an error to set; it just
+    /// does nothing). Order-independent: `pty_size(..).use_pty()` and
+    /// `use_pty().pty_size(..)` are equivalent.
+    ///
+    /// # Live resize
+    ///
+    /// To change the size of an already-running session (e.g. propagating a host
+    /// window resize / `SIGWINCH`), use
+    /// [`RunningProcess::resize_pty`](crate::RunningProcess::resize_pty).
+    ///
+    /// Available only with the `pty` crate feature.
+    #[cfg(feature = "pty")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "pty")))]
+    pub fn pty_size(mut self, cols: u16, rows: u16) -> Self {
+        self.pty_size = Some((cols, rows));
         self
     }
 
@@ -1666,6 +1705,22 @@ impl Command {
     #[cfg(not(feature = "pty"))]
     pub(crate) fn wants_pty(&self) -> bool {
         false
+    }
+
+    /// The configured [`pty_size`](Self::pty_size) `(cols, rows)`, or `None` to
+    /// use the backend default (80×24). Read by the launch seam to fill
+    /// [`SpawnOptions::pty_size`](crate::sys::SpawnOptions). Always `None` without
+    /// the `pty` feature, so the non-PTY spawn is byte-identical.
+    #[cfg(feature = "pty")]
+    pub(crate) fn configured_pty_size(&self) -> Option<(u16, u16)> {
+        self.pty_size
+    }
+
+    /// See [`configured_pty_size`](Self::configured_pty_size) — always `None`
+    /// without the `pty` feature.
+    #[cfg(not(feature = "pty"))]
+    pub(crate) fn configured_pty_size(&self) -> Option<(u16, u16)> {
+        None
     }
 
     /// The cancellation token, if any (an `Arc`-cheap clone).
@@ -4695,6 +4750,45 @@ mod tests {
         assert_eq!(
             super::probe_dir(dir.path(), OsStr::new("git.cmd")),
             Some(dir.path().join("git.cmd"))
+        );
+    }
+
+    #[cfg(feature = "pty")]
+    #[test]
+    fn pty_size_builder_records_the_requested_geometry() {
+        // Configured size is carried through to the launch-seam getter.
+        let sized = Command::new("tui").use_pty().pty_size(120, 40);
+        assert_eq!(sized.configured_pty_size(), Some((120, 40)));
+
+        // Unset → `None`, so the backend falls back to its 80×24 default.
+        assert_eq!(
+            Command::new("tui").use_pty().configured_pty_size(),
+            None,
+            "an unset pty_size resolves to the backend default, not a stored value"
+        );
+
+        // Order-independent, and independent of `use_pty` (it is a plain stored
+        // value the PTY launch path reads only when it is a PTY run).
+        assert_eq!(
+            Command::new("x")
+                .pty_size(90, 30)
+                .use_pty()
+                .configured_pty_size(),
+            Some((90, 30)),
+        );
+        assert_eq!(
+            Command::new("x").pty_size(90, 30).configured_pty_size(),
+            Some((90, 30)),
+            "pty_size is stored even without use_pty (a documented no-op at launch)",
+        );
+
+        // The last call wins if set twice.
+        assert_eq!(
+            Command::new("x")
+                .pty_size(10, 10)
+                .pty_size(200, 50)
+                .configured_pty_size(),
+            Some((200, 50)),
         );
     }
 }

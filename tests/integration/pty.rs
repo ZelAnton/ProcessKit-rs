@@ -237,6 +237,90 @@ async fn pty_disables_echo_so_a_written_secret_is_not_echoed() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real pseudo-terminal"]
+async fn pty_size_sets_the_initial_window_and_resize_pty_delivers_a_new_one() {
+    use tokio_stream::StreamExt;
+
+    // The child traps `SIGWINCH` FIRST (so a resize can't be missed once the
+    // initial size prints), reports its terminal size, then re-reports on every
+    // resize. `stty size` reads the tty on stdin (the pty slave) and prints
+    // "<rows> <cols>". A loop of short sleeps keeps the shell interruptible so the
+    // WINCH trap fires promptly; kill-on-drop reaps the whole thing at the end.
+    let child = Command::new("sh").args([
+        "-c",
+        "trap 'stty size' WINCH; stty size; while :; do sleep 0.2; done",
+    ]);
+    let mut proc = JobRunner::new()
+        .start(&child.use_pty().pty_size(100, 30))
+        .await
+        .expect("start pty child");
+
+    let mut lines = proc.stdout_lines().expect("merged pty output stream");
+
+    // The initial line reflects the spawn-time `pty_size(100, 30)` — `stty size`
+    // prints rows then cols, so "30 100". `StdoutLines` yields each line as a
+    // `String`.
+    let first = completes_within(
+        Duration::from_secs(20),
+        "pty initial size line",
+        lines.next(),
+    )
+    .await
+    .expect("an initial size line");
+    assert_eq!(
+        first.trim(),
+        "30 100",
+        "the child's initial terminal size must reflect pty_size(100, 30)"
+    );
+
+    // Live resize: TIOCSWINSZ updates the master and delivers SIGWINCH, so the
+    // trap re-reports the new geometry "40 120".
+    proc.resize_pty(120, 40)
+        .expect("live resize on a running pty");
+
+    let second = completes_within(Duration::from_secs(20), "pty resized size line", async {
+        // Defensively skip any blank line; take the next non-empty size report.
+        loop {
+            match lines.next().await {
+                Some(l) if l.trim().is_empty() => continue,
+                other => break other,
+            }
+        }
+    })
+    .await
+    .expect("a post-resize size line");
+    assert_eq!(
+        second.trim(),
+        "40 120",
+        "after resize_pty the child must observe the new terminal size via SIGWINCH"
+    );
+
+    // Kill-on-drop reaps the looping shell (own-group teardown).
+    drop(proc);
+}
+
+#[tokio::test]
+#[ignore = "spawns a real child"]
+async fn resize_pty_on_a_real_non_pty_run_is_unsupported() {
+    // A three-pipe (non-`use_pty`) run has no terminal, so `resize_pty` refuses
+    // honestly on the real `Backend::Real` path — it never panics or silently
+    // no-ops.
+    let mut proc = JobRunner::new()
+        .start(&sleeper())
+        .await
+        .expect("start plain child");
+    let err = proc
+        .resize_pty(120, 40)
+        .expect_err("a non-PTY run cannot be resized");
+    assert!(
+        matches!(err.reason(), processkit::ErrorReason::Unsupported { .. }),
+        "a non-PTY resize must be Unsupported, got {err:?}"
+    );
+    drop(proc);
+}
+
 #[tokio::test]
 #[ignore = "spawns a real pseudo-terminal"]
 async fn pty_child_stays_contained_and_is_reaped_on_drop() {

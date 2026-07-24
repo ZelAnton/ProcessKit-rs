@@ -35,6 +35,13 @@ mod imp;
 // `Child` + `openpty` master) or Windows (raw `CreateProcessW` + ConPTY) form.
 pub(crate) use imp::{PtyChild, spawn_pty};
 
+/// The pseudo-terminal window size a PTY spawn falls back to when no explicit
+/// [`Command::pty_size`](crate::Command::pty_size) was requested — `(cols, rows)`
+/// = 80×24, the historical hard-coded default and the conventional terminal
+/// dimensions a size-querying child expects. Shared by both platform backends so
+/// the "unset → 80×24" rule lives in exactly one place.
+pub(crate) const DEFAULT_PTY_SIZE: (u16, u16) = (80, 24);
+
 /// A boxed async reader over the PTY master's **merged** output (stdout+stderr).
 /// Flows through the same [`pump_lines_core`](crate::pump) machinery a real
 /// child's stdout does — the pump is generic over [`AsyncRead`](tokio::io::AsyncRead).

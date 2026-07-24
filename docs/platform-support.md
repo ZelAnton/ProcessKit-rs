@@ -235,6 +235,8 @@ launches the child under a real pseudo-terminal instead of three pipes, so an
 | Mechanism | `openpty` — the pty slave becomes the child's stdio, spawned through the **same** cgroup/process-group containment path as any other run | `CreatePseudoConsole` (ConPTY) — the child is created suspended, `AssignProcessToJobObject`'d to the **same** Job Object, then resumed |
 | stdout/stderr | **merged** onto the single master (the `on_stderr_line`/`stderr_tee` split collapses; `ProcessResult::stderr` is empty) | **merged**, same |
 | Echo control | terminal **echo disabled** (termios) so a written secret is not echoed back into the merged output | ConPTY has no portable per-write echo control — echo behavior is host-managed (not disabled) |
+| Window size | `winsize` passed to `openpty`, default 80×24; set with [`Command::pty_size(cols, rows)`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.pty_size) | `COORD` passed to `CreatePseudoConsole`, default 80×24; same builder |
+| Live resize | [`RunningProcess::resize_pty(cols, rows)`](https://docs.rs/processkit/latest/processkit/struct.RunningProcess.html#method.resize_pty) → `TIOCSWINSZ` on the master, which delivers **`SIGWINCH`** to the child's foreground process group | `resize_pty` → `ResizePseudoConsole`; **no `SIGWINCH`** — a console client learns of the new geometry on its next console query, and conhost may reflow **asynchronously** (delivery is best-effort, not synchronously observable) |
 | Containment | unchanged — cgroup/pgroup kill-on-drop reaps the whole tree | unchanged — Job Object kill-on-close reaps the whole tree |
 
 Off by default and additive: with the `pty` feature off (or on but `use_pty`
@@ -244,6 +246,19 @@ over the ConPTY pipes bridged by dedicated blocking threads (acceptable for the
 low-volume interactive use case). Whether a Windows ConPTY child's *standard
 handles* bind to the pseudoconsole (rather than a launcher-inherited console) can
 depend on the host's console state; the containment and spawn are validated on CI.
+
+**Window size and live resize.** The pseudo-terminal opens at 80×24 unless
+[`Command::pty_size(cols, rows)`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.pty_size)
+requests otherwise (a documented **no-op** on a non-`use_pty` command — the
+three-pipe launch has no terminal to size). Change a *running* session's size —
+e.g. propagating a host window resize — with
+[`RunningProcess::resize_pty(cols, rows)`](https://docs.rs/processkit/latest/processkit/struct.RunningProcess.html#method.resize_pty).
+It returns [`ErrorReason::Unsupported`](https://docs.rs/processkit/latest/processkit/enum.ErrorReason.html)
+(never a panic or a silent no-op) on a non-PTY run or once the child has exited.
+The platform delivery differs: Unix `TIOCSWINSZ` raises `SIGWINCH` on the child
+synchronously, whereas Windows `ResizePseudoConsole` has no signal — conhost
+reflows and the client observes the new geometry on its next console query,
+possibly a little later.
 
 ## Caveats
 
