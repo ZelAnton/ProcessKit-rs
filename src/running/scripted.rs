@@ -325,6 +325,8 @@ impl RunningProcess {
             deadline_anchor: tokio::time::Instant::now(),
             start_time: SystemTime::now(),
             scripted_result: recorded,
+            exit_event_tx: None,
+            merged_events_stream: false,
         }
     }
 

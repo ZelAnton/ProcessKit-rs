@@ -1875,11 +1875,12 @@ mod tests {
         );
     }
 
-    /// Parity for the merged `output_events` stream: the same deadline bound
-    /// applies, so the event stream ends at the timeout and `finish`
-    /// reports `TimedOut`.
+    /// Parity for the merged `events` stream: the same deadline bound applies, so
+    /// the deadline fires before any delayed line arrives — the stream carries
+    /// only `Started` then the terminal `Exited`, and `finish` reports `TimedOut`.
+    /// Driven the documented way (the stream and `finish` polled together).
     #[tokio::test(start_paused = true)]
-    async fn scripted_output_events_is_bounded_by_command_timeout() {
+    async fn scripted_events_stream_is_bounded_by_command_timeout() {
         use tokio_stream::StreamExt;
         let runner = ScriptedRunner::new().fallback(
             Reply::lines(["tick", "tock"]).with_line_delay(std::time::Duration::from_secs(10)),
@@ -1887,13 +1888,22 @@ mod tests {
         let cmd = Command::new("clock").timeout(std::time::Duration::from_secs(3));
         let mut run = runner.start(&cmd).await.expect("scripted start");
 
-        let mut events = run.output_events().unwrap();
-        assert!(
-            events.next().await.is_none(),
-            "the merged event stream must end at the command's deadline"
-        );
+        let mut events = run.events().unwrap();
+        let collect = async {
+            let mut names = Vec::new();
+            while let Some(ev) = events.next().await {
+                names.push(ev.name());
+            }
+            names
+        };
+        let (names, finished) = tokio::join!(collect, run.finish());
+        let outcome = finished.expect("finish").outcome;
 
-        let outcome = run.finish().await.expect("finish").outcome;
+        assert_eq!(
+            names,
+            ["started", "exited"],
+            "the deadline fires before any delayed line, so only Started and Exited arrive"
+        );
         assert_eq!(outcome, Outcome::TimedOut);
     }
 

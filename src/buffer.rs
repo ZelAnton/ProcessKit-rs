@@ -18,7 +18,7 @@ pub enum StdioMode {
     /// Capture the stream into a pipe (the default). Enables line buffering,
     /// per-line handlers, and all output-retrieval verbs. Required for
     /// [`stdout_lines`](crate::RunningProcess::stdout_lines),
-    /// [`output_events`](crate::RunningProcess::output_events), and
+    /// [`events`](crate::RunningProcess::events), and
     /// `output_string` / `output_bytes` to see any output.
     #[default]
     Piped,
@@ -82,7 +82,7 @@ impl StdioMode {
 ///
 /// This is one shared definition of "a line" for the whole line-pumped path:
 /// what [`stdout_lines`](crate::RunningProcess::stdout_lines) /
-/// [`output_events`](crate::RunningProcess::output_events) yield, what the
+/// [`events`](crate::RunningProcess::events) yield, what the
 /// per-line handlers ([`on_stdout_line`](crate::Command::on_stdout_line)) see,
 /// what a [`stdout_tee`](crate::Command::stdout_tee) writes (each line followed
 /// by a `\n`), and what [`output_string`](crate::Command::output_string) joins.
@@ -440,7 +440,7 @@ impl Default for OutputBufferPolicy {
 ///
 /// Passed to [`CapturePolicy::on_capture`] so a single policy can treat stdout
 /// and stderr differently (e.g. redact only the stream a passphrase prompt is
-/// echoed on). It mirrors the [`OutputEvent`](crate::OutputEvent) stdout/stderr
+/// echoed on). It mirrors the [`ProcessEvent`](crate::ProcessEvent) stdout/stderr
 /// split, but is a small `Copy` discriminator so the capture seam does not force
 /// a consumer to depend on the streaming event type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -500,7 +500,7 @@ impl OutputStream {
 /// therefore in [`output_string`](crate::Command::output_string) /
 /// [`ProcessResult`](crate::ProcessResult) and the streaming verbs
 /// ([`stdout_lines`](crate::RunningProcess::stdout_lines) /
-/// [`output_events`](crate::RunningProcess::output_events)). This is what the
+/// [`events`](crate::RunningProcess::events)). This is what the
 /// observing [`on_stdout_line`](crate::Command::on_stdout_line) /
 /// `on_stderr_line` handlers cannot do: they run *alongside* capture and can see
 /// a line but not *shape* what is retained.

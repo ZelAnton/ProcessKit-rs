@@ -1,4 +1,4 @@
-//! Incremental stdout streaming: [`StdoutLines`], [`OutputEvents`], the
+//! Incremental stdout streaming: [`StdoutLines`], [`ProcessEvents`], the
 //! watchdog tasks that bound a streamed run (deadline/cancel), and the unified
 //! `finish`.
 
@@ -19,7 +19,7 @@ use super::RunningProcess;
 
 /// The outcome of a run driven via
 /// [`stdout_lines`](RunningProcess::stdout_lines) or
-/// [`output_events`](RunningProcess::output_events): how the run ended plus
+/// [`events`](RunningProcess::events): how the run ended plus
 /// the captured standard error. Returned by
 /// [`RunningProcess::finish`].
 ///
@@ -108,7 +108,7 @@ impl RunningProcess {
     ///
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) when stdout was not piped, or a prior
     /// streaming verb ([`stdout_lines`](Self::stdout_lines) /
-    /// [`output_events`](Self::output_events) / `wait_for_line`) already consumed
+    /// [`events`](Self::events) / `wait_for_line`) already consumed
     /// it — returned instead of a stream that would silently be empty.
     pub fn stdout_lines(&mut self) -> Result<StdoutLines> {
         // Drain stdout AND arm the timeout watchdog. `wait_for_line` instead calls
@@ -328,7 +328,7 @@ impl RunningProcess {
     /// non-broken-pipe stdin-source failure on an otherwise-successful run), or
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) (waiting on the child failed).
     pub async fn finish(mut self) -> Result<Finished> {
-        // A bare `finish()` (no prior `stdout_lines`/`output_events` took stdout)
+        // A bare `finish()` (no prior `stdout_lines`/`events` took stdout)
         // still has to drain the leftover stdout so the child can't block on a full
         // pipe — but the caller never asked to capture it. Pump it through the
         // internal retain-nothing discard sink (not the user's `OutputBufferPolicy`):
@@ -412,12 +412,20 @@ impl RunningProcess {
         // `dropped()` = lines the buffer policy discarded from the background
         // stderr drain, not lines this call itself failed to observe — matches
         // the same signal `output_string`/`output_bytes` derive `truncated` from.
+        // (A flag read, safe to take while a live `events()` stream still pops.)
         let stderr_truncated = self.stderr_sink.as_ref().is_some_and(|s| s.dropped() > 0);
-        let stderr = self
-            .stderr_sink
-            .as_ref()
-            .map(|sink| sink.drain().join("\n"))
-            .unwrap_or_default();
+        // A live `events()` stream delivers stderr to the caller as
+        // `ProcessEvent::Stderr`; do NOT also drain it here, which would race that
+        // stream for the lines. `Finished::stderr` is empty by design for an
+        // events run (the caller already has stderr as events).
+        let stderr = if self.merged_events_stream {
+            String::new()
+        } else {
+            self.stderr_sink
+                .as_ref()
+                .map(|sink| sink.drain().join("\n"))
+                .unwrap_or_default()
+        };
         Ok(Finished {
             outcome,
             stderr,
@@ -425,21 +433,55 @@ impl RunningProcess {
         })
     }
 
-    /// Stream both stdout and stderr as a single ordered sequence of
-    /// [`OutputEvent`] items. Call this **once**.
+    /// Stream the child's full lifecycle as a single ordered sequence of
+    /// [`ProcessEvent`]s: [`Started`](ProcessEvent::Started) first, then stdout
+    /// and stderr lines interleaved, then [`Exited`](ProcessEvent::Exited). Call
+    /// this **once**.
     ///
-    /// Interleaving is best-effort; the two streams are polled **fairly** so a
-    /// continuously-ready stream can't starve the other. Returns `Err` instead of
-    /// a silently-empty stream when stdout was not piped or was already consumed.
-    /// Call [`finish`](Self::finish) after draining — its `stderr` will be empty
-    /// since stderr was delivered as events.
+    /// Line interleaving is best-effort; the two streams are polled **fairly** so
+    /// a continuously-ready stream can't starve the other. Returns `Err` instead
+    /// of a silently-empty stream when stdout was not piped or was already
+    /// consumed.
+    ///
+    /// **Drive it alongside a consuming finisher.** The terminal
+    /// [`Exited`](ProcessEvent::Exited) is delivered when the run is reaped, which
+    /// is what [`finish`](Self::finish) / [`wait`](Self::wait) do — so poll this
+    /// stream and that finisher **together** (e.g. with `tokio::join!`) rather
+    /// than draining the stream to completion first, which would park waiting for
+    /// an `Exited` no one is producing. After the stream ends,
+    /// [`finish`](Self::finish)'s `stderr` is empty since stderr was delivered as
+    /// events.
+    ///
+    /// ```no_run
+    /// use processkit::prelude::StreamExt;
+    /// use processkit::{Command, ProcessEvent};
+    ///
+    /// # async fn run() -> processkit::Result<()> {
+    /// let mut run = Command::new("build").start().await?;
+    /// let mut events = run.events()?;
+    /// let render = async {
+    ///     while let Some(ev) = events.next().await {
+    ///         match ev {
+    ///             ProcessEvent::Started { pid } => eprintln!("started {pid:?}"),
+    ///             ProcessEvent::Stdout(l) => println!("{}", l.text()),
+    ///             ProcessEvent::Stderr(l) => eprintln!("{}", l.text()),
+    ///             ProcessEvent::Exited(outcome) => eprintln!("exited {outcome:?}"),
+    ///             _ => {}
+    ///         }
+    ///     }
+    /// };
+    /// let (_, finished) = tokio::join!(render, run.finish());
+    /// finished?;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) when stdout was not piped, or a prior
     /// streaming verb already consumed it — returned instead of a stream that
     /// would silently be empty.
-    pub fn output_events(&mut self) -> Result<OutputEvents> {
+    pub fn events(&mut self) -> Result<ProcessEvents> {
         self.ensure_stdout_streamable()?;
         debug_assert!(
             self.stdout_sink.is_none(),
@@ -476,7 +518,15 @@ impl RunningProcess {
 
         self.arm_stream_deadline();
 
-        Ok(OutputEvents {
+        // Hand the run's reap (in `on_reaped`) a channel to publish the outcome on
+        // so the stream can emit the terminal `Exited`, and mark that stderr is
+        // being delivered as events so `finish` doesn't also drain it into
+        // `Finished` (racing this live stream for the lines).
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+        self.exit_event_tx = Some(exit_tx);
+        self.merged_events_stream = true;
+
+        Ok(ProcessEvents {
             stdout_sink,
             stderr_sink,
             stdout_wait: None,
@@ -484,6 +534,9 @@ impl RunningProcess {
             stdout_done: false,
             stderr_done: false,
             prefer_stdout: true,
+            start_pid: self.pid,
+            started_emitted: false,
+            exit_rx: Some(exit_rx),
         })
     }
 }
@@ -622,38 +675,93 @@ impl Stream for StdoutLines {
     }
 }
 
-/// An event produced by a child process: a decoded line from stdout or stderr.
+/// A lifecycle event produced by a running child process, yielded by
+/// [`RunningProcess::events`], which merges the process's lifecycle transitions
+/// and its two output streams into a **single ordered sequence**:
 ///
-/// Yielded by [`RunningProcess::output_events`], which merges both streams into
-/// a single, ordered sequence.
+/// [`Started`](Self::Started) → interleaved [`Stdout`](Self::Stdout) /
+/// [`Stderr`](Self::Stderr) lines → [`Exited`](Self::Exited).
 ///
-/// Non-exhaustive: a future release may add a third kind of event (e.g. a
-/// lifecycle marker) without a breaking change, so a `match` on `OutputEvent`
-/// needs a `_` arm. Each per-stream line is an [`OutputLine`] (rather than a bare
-/// `String`) so per-line metadata can be attached there without a breaking change
-/// either.
+/// This is the crate's one asynchronous source of process events: a TUI,
+/// dashboard, or orchestrator gets `started`, every output line, and the final
+/// exit outcome from one stream instead of stitching them together from separate
+/// channels.
+///
+/// # Scope
+///
+/// This enum currently carries **`Started`, the output lines, and `Exited`** —
+/// the facts the running layer observes directly. It deliberately does **not**
+/// (yet) carry the graceful-teardown transitions (`soft_signal` →
+/// `grace_started` → `drained` / `escalated` / `spared`): with no per-call
+/// programmatic consumer, threading a live sink for them through the teardown
+/// backends would be blast radius in concurrency-sensitive code for a
+/// speculative surface. Those live facts remain available on the `tracing` seam,
+/// and as a typed value after the fact via
+/// [`ShutdownReport`](crate::ShutdownReport). Because this enum is
+/// `#[non_exhaustive]`, those phases (and any other kind) can be added here
+/// **additively** later, once a consumer needs them, without a breaking change.
+///
+/// `#[non_exhaustive]`: a future release may add another kind of event without a
+/// breaking change, so a `match` on `ProcessEvent` needs a `_` arm. Each
+/// per-stream line is an [`OutputLine`] (rather than a bare `String`) so per-line
+/// metadata can be attached there without a breaking change either.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum OutputEvent {
+pub enum ProcessEvent {
+    /// The process has started — the **first** event of the stream, emitted as
+    /// soon as the pid is known, before any output line. `pid` is `None` for a
+    /// scripted double (which owns no OS process) or a platform that could not
+    /// report one.
+    Started {
+        /// The child's OS process id, mirroring [`RunningProcess::pid`] at spawn.
+        pid: Option<u32>,
+    },
     /// A line from the child's standard output.
     Stdout(OutputLine),
     /// A line from the child's standard error.
     Stderr(OutputLine),
+    /// The process has exited — the **last** event of the stream, emitted once
+    /// the child is reaped, carrying the run's [`Outcome`]
+    /// ([`Exited`](Outcome::Exited) / [`Signalled`](Outcome::Signalled) /
+    /// [`TimedOut`](Outcome::TimedOut)) — the same value
+    /// [`Finished::outcome`](crate::Finished) reports, not a parallel type. It is
+    /// delivered by the consuming finisher ([`finish`](RunningProcess::finish) /
+    /// [`wait`](RunningProcess::wait)) reaping the child, so drive the stream and
+    /// that finisher together (see [`events`](RunningProcess::events)).
+    Exited(Outcome),
 }
 
-impl OutputEvent {
+impl ProcessEvent {
+    /// A stable, snake_case identifier for this event's kind
+    /// (`"started"` / `"stdout"` / `"stderr"` / `"exited"`), by the same
+    /// convention as [`Outcome::name`](crate::Outcome::name) — suitable as a
+    /// serde tag or a log field that survives a `Debug`-format change.
+    pub fn name(&self) -> &'static str {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never silently ship without a stable identifier.
+        match self {
+            ProcessEvent::Started { .. } => "started",
+            ProcessEvent::Stdout(_) => "stdout",
+            ProcessEvent::Stderr(_) => "stderr",
+            ProcessEvent::Exited(_) => "exited",
+        }
+    }
+
     /// The decoded text of this event's line, if it carries one. `Some` for
-    /// [`Stdout`](OutputEvent::Stdout)/[`Stderr`](OutputEvent::Stderr); `None` for
-    /// a future non-line event kind. Convenience for consumers that don't care
-    /// which stream a line came from.
+    /// [`Stdout`](ProcessEvent::Stdout)/[`Stderr`](ProcessEvent::Stderr); `None`
+    /// for the non-line lifecycle events
+    /// [`Started`](ProcessEvent::Started)/[`Exited`](ProcessEvent::Exited).
+    /// Convenience for consumers that don't care which stream a line came from.
     pub fn text(&self) -> Option<&str> {
         match self {
-            OutputEvent::Stdout(line) | OutputEvent::Stderr(line) => Some(line.text()),
+            ProcessEvent::Stdout(line) | ProcessEvent::Stderr(line) => Some(line.text()),
+            ProcessEvent::Started { .. } | ProcessEvent::Exited(_) => None,
         }
     }
 }
 
-/// One decoded line carried by an [`OutputEvent`].
+/// One decoded line carried by a [`ProcessEvent`].
 ///
 /// `#[non_exhaustive]`: a future release may attach per-line metadata (e.g. a
 /// timestamp or a monotonic line index) without a breaking change. The line text
@@ -681,11 +789,14 @@ impl OutputLine {
     }
 }
 
-/// A merged `Stream` of both stdout and stderr lines (see
-/// [`RunningProcess::output_events`]).
+/// A `Stream` of a running child's [`ProcessEvent`]s (see
+/// [`RunningProcess::events`]).
 ///
-/// Lines are interleaved in the order they arrive at the async runtime.
-pub struct OutputEvents {
+/// [`Started`](ProcessEvent::Started) is yielded first, then stdout and stderr
+/// lines interleaved in the order they arrive at the async runtime, and finally
+/// [`Exited`](ProcessEvent::Exited) once the run is reaped by its consuming
+/// finisher.
+pub struct ProcessEvents {
     stdout_sink: Arc<SharedLines>,
     stderr_sink: Arc<SharedLines>,
     stdout_wait: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
@@ -695,19 +806,37 @@ pub struct OutputEvents {
     /// Which stream gets the first look each poll. Flipped after every emitted
     /// line so a continuously-ready stream can't starve the other.
     prefer_stdout: bool,
+    /// The pid captured at [`events`](RunningProcess::events) time, carried in
+    /// the leading [`Started`](ProcessEvent::Started) event.
+    start_pid: Option<u32>,
+    /// Whether the leading [`Started`](ProcessEvent::Started) has been emitted.
+    started_emitted: bool,
+    /// The channel the consuming finisher publishes the run's [`Outcome`] on when
+    /// it reaps the child; drained once, after both output streams close, into
+    /// the terminal [`Exited`](ProcessEvent::Exited). `None` once that event has
+    /// been emitted (or the sender was dropped without a reap — a handle dropped
+    /// without being finished — ending the stream without an `Exited`).
+    exit_rx: Option<tokio::sync::oneshot::Receiver<Outcome>>,
 }
 
-impl std::fmt::Debug for OutputEvents {
+impl std::fmt::Debug for ProcessEvents {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OutputEvents").finish_non_exhaustive()
+        f.debug_struct("ProcessEvents").finish_non_exhaustive()
     }
 }
 
-impl Stream for OutputEvents {
-    type Item = OutputEvent;
+impl Stream for ProcessEvents {
+    type Item = ProcessEvent;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<OutputEvent>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<ProcessEvent>> {
         let this = self.get_mut();
+        // `Started` leads the stream, before any output is polled.
+        if !this.started_emitted {
+            this.started_emitted = true;
+            return Poll::Ready(Some(ProcessEvent::Started {
+                pid: this.start_pid,
+            }));
+        }
         loop {
             for stdout_turn in [this.prefer_stdout, !this.prefer_stdout] {
                 if stdout_turn && !this.stdout_done {
@@ -715,7 +844,7 @@ impl Stream for OutputEvents {
                         Popped::Line(line) => {
                             this.stdout_wait = None;
                             this.prefer_stdout = false; // stderr gets the next first look
-                            return Poll::Ready(Some(OutputEvent::Stdout(OutputLine {
+                            return Poll::Ready(Some(ProcessEvent::Stdout(OutputLine {
                                 text: line,
                             })));
                         }
@@ -730,7 +859,7 @@ impl Stream for OutputEvents {
                         Popped::Line(line) => {
                             this.stderr_wait = None;
                             this.prefer_stdout = true;
-                            return Poll::Ready(Some(OutputEvent::Stderr(OutputLine {
+                            return Poll::Ready(Some(ProcessEvent::Stderr(OutputLine {
                                 text: line,
                             })));
                         }
@@ -744,7 +873,25 @@ impl Stream for OutputEvents {
             }
 
             if this.stdout_done && this.stderr_done {
-                return Poll::Ready(None);
+                // Both output streams are drained: the child has exited (its
+                // pipes are EOF). Deliver the terminal `Exited` once the run's
+                // consuming finisher reaps it and publishes the outcome, then end.
+                return match this.exit_rx.as_mut() {
+                    Some(rx) => match Pin::new(rx).poll(cx) {
+                        Poll::Ready(Ok(outcome)) => {
+                            this.exit_rx = None;
+                            Poll::Ready(Some(ProcessEvent::Exited(outcome)))
+                        }
+                        // Sender dropped without a reap (the handle was dropped
+                        // rather than finished): end without an `Exited`.
+                        Poll::Ready(Err(_)) => {
+                            this.exit_rx = None;
+                            Poll::Ready(None)
+                        }
+                        Poll::Pending => Poll::Pending,
+                    },
+                    None => Poll::Ready(None),
+                };
             }
 
             // Register a wait future for each open stream so a wakeup from either
@@ -825,8 +972,26 @@ mod tests {
         }
     }
 
+    /// A `ProcessEvents` built with `started_emitted: true` / `exit_rx: None`
+    /// isolates the stdout/stderr line-merging behavior (the leading `Started`
+    /// and trailing `Exited` are exercised end to end in the scripted tests).
+    fn line_only_events(stdout_sink: Arc<SharedLines>, stderr_sink: Arc<SharedLines>) -> ProcessEvents {
+        ProcessEvents {
+            stdout_sink,
+            stderr_sink,
+            stdout_wait: None,
+            stderr_wait: None,
+            stdout_done: false,
+            stderr_done: false,
+            prefer_stdout: true,
+            start_pid: None,
+            started_emitted: true,
+            exit_rx: None,
+        }
+    }
+
     #[tokio::test]
-    async fn output_events_interleaves_fairly_between_two_ready_streams() {
+    async fn events_interleave_fairly_between_two_ready_streams() {
         let policy = OutputBufferPolicy::unbounded();
         let stdout_sink = SharedLines::new(&policy);
         let stderr_sink = SharedLines::new(&policy);
@@ -839,20 +1004,13 @@ mod tests {
         stdout_sink.close_now();
         stderr_sink.close_now();
 
-        let mut events = OutputEvents {
-            stdout_sink,
-            stderr_sink,
-            stdout_wait: None,
-            stderr_wait: None,
-            stdout_done: false,
-            stderr_done: false,
-            prefer_stdout: true,
-        };
+        let mut events = line_only_events(stdout_sink, stderr_sink);
         let mut seq = Vec::new();
         while let Some(ev) = events.next().await {
             seq.push(match ev {
-                OutputEvent::Stdout(l) => format!("O:{}", l.text()),
-                OutputEvent::Stderr(l) => format!("E:{}", l.text()),
+                ProcessEvent::Stdout(l) => format!("O:{}", l.text()),
+                ProcessEvent::Stderr(l) => format!("E:{}", l.text()),
+                other => panic!("unexpected event: {other:?}"),
             });
         }
         assert_eq!(
@@ -863,7 +1021,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn output_event_carries_an_output_line_with_a_text_accessor() {
+    async fn process_event_carries_an_output_line_with_a_text_accessor() {
         let policy = OutputBufferPolicy::unbounded();
         let stdout_sink = SharedLines::new(&policy);
         let stderr_sink = SharedLines::new(&policy);
@@ -871,23 +1029,15 @@ mod tests {
         stderr_sink.push("err".to_owned());
         stdout_sink.close_now();
         stderr_sink.close_now();
-        let mut events = OutputEvents {
-            stdout_sink,
-            stderr_sink,
-            stdout_wait: None,
-            stderr_wait: None,
-            stdout_done: false,
-            stderr_done: false,
-            prefer_stdout: true,
-        };
+        let mut events = line_only_events(stdout_sink, stderr_sink);
         let first = events.next().await.expect("a stdout event");
         assert!(
-            matches!(&first, OutputEvent::Stdout(line) if line.text() == "out"),
+            matches!(&first, ProcessEvent::Stdout(line) if line.text() == "out"),
             "stdout event carries an OutputLine: {first:?}"
         );
         assert_eq!(first.text(), Some("out"), "text() reads the line");
         let second = events.next().await.expect("a stderr event");
-        assert!(matches!(&second, OutputEvent::Stderr(line) if line.text() == "err"));
+        assert!(matches!(&second, ProcessEvent::Stderr(line) if line.text() == "err"));
         assert_eq!(second.text(), Some("err"));
     }
 
@@ -924,7 +1074,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn output_events_lose_no_line_under_two_racing_producers() {
+    async fn events_lose_no_line_under_two_racing_producers() {
         const N: usize = 3_000;
         let stdout_sink = SharedLines::new(&OutputBufferPolicy::unbounded());
         let stderr_sink = SharedLines::new(&OutputBufferPolicy::unbounded());
@@ -941,21 +1091,14 @@ mod tests {
         };
         let p_out = feed(stdout_sink.clone());
         let p_err = feed(stderr_sink.clone());
-        let mut events = OutputEvents {
-            stdout_sink,
-            stderr_sink,
-            stdout_wait: None,
-            stderr_wait: None,
-            stdout_done: false,
-            stderr_done: false,
-            prefer_stdout: true,
-        };
+        let mut events = line_only_events(stdout_sink, stderr_sink);
         let consume = async {
             let (mut out, mut err) = (0usize, 0usize);
             while let Some(ev) = events.next().await {
                 match ev {
-                    OutputEvent::Stdout(_) => out += 1,
-                    OutputEvent::Stderr(_) => err += 1,
+                    ProcessEvent::Stdout(_) => out += 1,
+                    ProcessEvent::Stderr(_) => err += 1,
+                    _ => {}
                 }
             }
             (out, err)
@@ -967,6 +1110,108 @@ mod tests {
         p_err.await.expect("stderr producer");
         assert_eq!(out, N, "every stdout line received");
         assert_eq!(err, N, "every stderr line received");
+    }
+
+    /// T-184: the full lifecycle stream over the scripted backend (the
+    /// two-stream / `Piped` shape) — `Started` leads, both stdout lines and the
+    /// stderr line arrive as events, and the terminal `Exited` carries the run's
+    /// `Outcome`. Driven the documented way: the events stream and the consuming
+    /// `finish` polled together.
+    #[tokio::test]
+    async fn events_stream_emits_started_lines_and_exited() {
+        use crate::command::Command;
+        use crate::doubles::{Reply, ScriptedRunner};
+        use crate::runner::ProcessRunner;
+
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok("out-1\nout-2").with_stderr("err-1"))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+
+        let mut events = run.events().expect("events");
+        let collect = async {
+            let mut names = Vec::new();
+            let mut outcome = None;
+            while let Some(ev) = events.next().await {
+                names.push(ev.name());
+                if let ProcessEvent::Exited(o) = ev {
+                    outcome = Some(o);
+                }
+            }
+            (names, outcome)
+        };
+        let ((names, outcome), finished) = tokio::join!(collect, run.finish());
+        let finished = finished.expect("finish");
+
+        assert_eq!(names.first(), Some(&"started"), "Started leads the stream");
+        assert_eq!(names.last(), Some(&"exited"), "Exited ends the stream");
+        assert_eq!(
+            names.iter().filter(|n| **n == "stdout").count(),
+            2,
+            "both stdout lines arrive as events"
+        );
+        assert_eq!(
+            names.iter().filter(|n| **n == "stderr").count(),
+            1,
+            "the stderr line arrives as an event"
+        );
+        assert_eq!(
+            outcome,
+            Some(Outcome::Exited(0)),
+            "Exited carries the run's outcome"
+        );
+        assert_eq!(finished.outcome, Outcome::Exited(0));
+        assert!(
+            finished.stderr.is_empty(),
+            "stderr was delivered as events, so Finished::stderr is empty"
+        );
+    }
+
+    /// T-184: the same lifecycle stream over a single, merged output stream (the
+    /// `Backend::Pty` shape, modeled here by a scripted reply with no stderr):
+    /// `Started`, the stdout lines, then `Exited`, with no stderr events. The
+    /// `events` state machine is backend-agnostic, so this is the merged-pump
+    /// parity of the two-stream case above.
+    #[tokio::test]
+    async fn events_stream_over_a_merged_single_stream() {
+        use crate::command::Command;
+        use crate::doubles::{Reply, ScriptedRunner};
+        use crate::runner::ProcessRunner;
+
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok("merged-1\nmerged-2\nmerged-3"))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+
+        let mut events = run.events().expect("events");
+        let collect = async {
+            let mut seq = Vec::new();
+            while let Some(ev) = events.next().await {
+                match ev {
+                    ProcessEvent::Started { pid } => seq.push(format!("started:{pid:?}")),
+                    ProcessEvent::Stdout(l) => seq.push(format!("out:{}", l.text())),
+                    ProcessEvent::Stderr(l) => seq.push(format!("err:{}", l.text())),
+                    ProcessEvent::Exited(o) => seq.push(format!("exited:{}", o.name())),
+                }
+            }
+            seq
+        };
+        let (seq, finished) = tokio::join!(collect, run.finish());
+        let _ = finished.expect("finish");
+
+        assert_eq!(
+            seq,
+            [
+                "started:None",
+                "out:merged-1",
+                "out:merged-2",
+                "out:merged-3",
+                "exited:exited",
+            ],
+            "Started → stdout lines → Exited, with no stderr events on a merged stream"
+        );
     }
 
     /// T-179: a `Finished` built by the `#[doc(hidden)]` `from_parts`

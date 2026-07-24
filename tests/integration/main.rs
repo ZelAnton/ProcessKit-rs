@@ -20,6 +20,7 @@ mod common;
 mod batch;
 mod cancellation;
 mod capture;
+mod detached;
 mod env_privileges;
 mod groups;
 #[cfg(feature = "limits")]

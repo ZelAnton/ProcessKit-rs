@@ -1,0 +1,152 @@
+//! `Command::spawn_detached`: the one deliberate opt-in escape from kill-on-drop
+//! containment. Three ends of the contract are covered against real processes:
+//!
+//! - a **detached** child (a new session on Unix / not in this crate's Job Object
+//!   on Windows) **survives** dropping its `DetachedChild` handle — the drop does
+//!   nothing to it;
+//! - an ordinary **contained** `start()` child is still **hard-killed** when its
+//!   handle drops (kill-on-drop has not regressed); and
+//! - a detached child's stdout can be sent to a **file** redirect (the only
+//!   non-null stdio a detached child is allowed — never a pipe).
+//!
+//! Real subprocesses, so `#[ignore]`d like the rest of this suite. The detached
+//! children are self-terminating with a bounded lifetime, and every one is killed
+//! + reaped before the test returns, so nothing is leaked on CI.
+
+use std::time::Duration;
+
+use crate::common::{poll_until, sleep_secs, sleeper, two_line_echo};
+
+// --- per-platform liveness + cleanup for a NON-crate-owned (detached) child ---
+
+/// Whether `pid` is still alive. A detached child is not tracked by tokio or any
+/// group of ours, so this is a bare existence probe.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // Signal 0 probes existence without sending anything: `Ok`/`EPERM` = alive.
+    let probed = unsafe { libc::kill(pid as i32, 0) };
+    probed == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    crate::common::windows_pid_alive(pid)
+}
+
+/// Kill + reap a detached child we spawned. Its handle is not tokio-owned, so on
+/// Unix a bare kill would leave a zombie for this test process's lifetime (the
+/// child is still our child — `setsid` does not reparent it). Safe to call on an
+/// already-exited child (kill is then a no-op; the reap collects the zombie).
+#[cfg(unix)]
+fn kill_and_reap(pid: u32) {
+    // SAFETY: `pid` is a child we spawned; a blocking `waitpid` returns at once
+    // once it is dead, and `WUNTRACED`-free plain wait reaps the zombie.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+        let mut status = 0i32;
+        libc::waitpid(pid as i32, &mut status, 0);
+    }
+}
+
+#[cfg(windows)]
+fn kill_and_reap(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    // SAFETY: terminate access only; a null handle means the pid is already gone.
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if !handle.is_null() {
+        // SAFETY: `handle` came from `OpenProcess`; terminated then closed once.
+        unsafe {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "spawns a real detached child that outlives its owner handle"]
+async fn detached_child_survives_dropping_its_handle() {
+    // A self-terminating child with a bounded lifetime (CI-safe): it sleeps a few
+    // seconds then exits on its own, so even if cleanup were skipped nothing lingers.
+    // The DetachedChild handle is scoped so it is *dropped* before the liveness
+    // check: dropping the owner handle must NOT kill the child — that is the whole
+    // point of a deliberate detach. (A DetachedChild has no kill-on-drop glue by
+    // design, so its drop is a no-op; letting it fall out of scope shows exactly
+    // that, and contrasts with `contained_start_still_kills_on_drop`.)
+    let pid = {
+        let detached = sleep_secs(4)
+            .spawn_detached()
+            .expect("spawn a detached child");
+        detached.pid()
+    };
+
+    // Well within the child's ~4s lifetime, and with the owner handle already
+    // dropped, it must still be alive.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        pid_alive(pid),
+        "detached child {pid} must survive dropping its DetachedChild handle"
+    );
+
+    kill_and_reap(pid);
+}
+
+#[tokio::test]
+#[ignore = "spawns a real contained child to prove kill-on-drop has not regressed"]
+async fn contained_start_still_kills_on_drop() {
+    // The control: an ordinary `start()` child stays inside a kill-on-drop group,
+    // so dropping its handle hard-kills it — proving the detached path above is the
+    // deliberate exception, not a general regression of containment.
+    let running = sleeper().start().await.expect("start a contained child");
+    let pid = running.pid().expect("the contained child has a pid");
+
+    // Sanity: it is alive while the handle is held.
+    assert!(
+        pid_alive(pid),
+        "contained child {pid} should be alive at start"
+    );
+
+    drop(running); // kill-on-drop backstop: synchronous SIGKILL / job kill
+
+    // The kill is immediate; reaping is asynchronous (tokio / OS), and on Windows
+    // the pid can stay briefly openable past exit (poll down to gone, don't assert
+    // instantly).
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        "contained child dies on handle drop",
+        || !pid_alive(pid),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "spawns a real detached child writing to a file redirect"]
+async fn detached_child_can_redirect_stdout_to_a_file() {
+    // A file redirect is the ONLY non-null stdio a detached child is allowed (a
+    // pipe would deadlock it once the owner is gone). Prove the redirect is wired:
+    // the child's stdout lands in the file.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let log = dir.path().join("detached-out.log");
+
+    let pid = two_line_echo()
+        .stdout_file(&log)
+        .spawn_detached()
+        .expect("spawn a detached child with a file redirect")
+        .pid();
+
+    // The child writes and exits quickly; poll until its output reaches the file.
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        "detached child's stdout reaches the file",
+        || {
+            std::fs::read_to_string(&log)
+                .map(|s| s.contains("first"))
+                .unwrap_or(false)
+        },
+    )
+    .await;
+
+    kill_and_reap(pid); // no-op if it already exited; reaps any zombie
+}

@@ -52,7 +52,7 @@ impl RunningProcess {
     /// - **Consumes stdout** up to and including the matching line (the same
     ///   one-shot stdout drain [`stdout_lines`](Self::stdout_lines) uses — if
     ///   stdout was already consumed by an earlier `stdout_lines` /
-    ///   `output_events` / `wait_for_line`, or was not piped, this returns an
+    ///   `events` / `wait_for_line`, or was not piped, this returns an
     ///   `Err` rather than a stream that is forever `NotReady`). Continue
     ///   with [`finish`](Self::finish) for the outcome and stderr;
     ///   [`wait_for`](Self::wait_for) / [`wait_for_port`](Self::wait_for_port)
@@ -116,11 +116,11 @@ impl RunningProcess {
     /// Retention lets later consumption such as
     /// [`output_string`](Self::output_string) collect the same drained output;
     /// an existing [`stdout_lines`](Self::stdout_lines) /
-    /// [`output_events`](Self::output_events) consumer also reads that sink. It
+    /// [`events`](Self::events) consumer also reads that sink. It
     /// still composes with [`wait`](Self::wait) and other later consumers that
     /// pick up the same background-drained sink — but *not* with
     /// [`output_bytes`](Self::output_bytes) or a fresh
-    /// [`stdout_lines`](Self::stdout_lines) / [`output_events`](Self::output_events)
+    /// [`stdout_lines`](Self::stdout_lines) / [`events`](Self::events)
     /// afterward, exactly like calling `wait_for_line` first (see its
     /// "Consumes stdout" caveat). A failed probe does not kill the child. The
     /// deadline bounds the polling loop, not an in-flight check: a slow

@@ -416,26 +416,6 @@ impl core::marker::Unpin for processkit::Outcome
 impl core::marker::UnsafeUnpin for processkit::Outcome
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::Outcome
 impl core::panic::unwind_safe::UnwindSafe for processkit::Outcome
-#[non_exhaustive] pub enum processkit::OutputEvent
-pub processkit::OutputEvent::Stderr(processkit::OutputLine)
-pub processkit::OutputEvent::Stdout(processkit::OutputLine)
-impl processkit::OutputEvent
-pub fn processkit::OutputEvent::text(&self) -> core::option::Option<&str>
-impl core::clone::Clone for processkit::OutputEvent
-pub fn processkit::OutputEvent::clone(&self) -> processkit::OutputEvent
-impl core::cmp::Eq for processkit::OutputEvent
-impl core::cmp::PartialEq for processkit::OutputEvent
-pub fn processkit::OutputEvent::eq(&self, &processkit::OutputEvent) -> bool
-impl core::fmt::Debug for processkit::OutputEvent
-pub fn processkit::OutputEvent::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for processkit::OutputEvent
-impl core::marker::Freeze for processkit::OutputEvent
-impl core::marker::Send for processkit::OutputEvent
-impl core::marker::Sync for processkit::OutputEvent
-impl core::marker::Unpin for processkit::OutputEvent
-impl core::marker::UnsafeUnpin for processkit::OutputEvent
-impl core::panic::unwind_safe::RefUnwindSafe for processkit::OutputEvent
-impl core::panic::unwind_safe::UnwindSafe for processkit::OutputEvent
 #[non_exhaustive] pub enum processkit::OutputStream
 pub processkit::OutputStream::Stderr
 pub processkit::OutputStream::Stdout
@@ -531,6 +511,30 @@ impl core::marker::Unpin for processkit::Priority
 impl core::marker::UnsafeUnpin for processkit::Priority
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::Priority
 impl core::panic::unwind_safe::UnwindSafe for processkit::Priority
+#[non_exhaustive] pub enum processkit::ProcessEvent
+pub processkit::ProcessEvent::Exited(processkit::Outcome)
+pub processkit::ProcessEvent::Started
+pub processkit::ProcessEvent::Started::pid: core::option::Option<u32>
+pub processkit::ProcessEvent::Stderr(processkit::OutputLine)
+pub processkit::ProcessEvent::Stdout(processkit::OutputLine)
+impl processkit::ProcessEvent
+pub fn processkit::ProcessEvent::name(&self) -> &'static str
+pub fn processkit::ProcessEvent::text(&self) -> core::option::Option<&str>
+impl core::clone::Clone for processkit::ProcessEvent
+pub fn processkit::ProcessEvent::clone(&self) -> processkit::ProcessEvent
+impl core::cmp::Eq for processkit::ProcessEvent
+impl core::cmp::PartialEq for processkit::ProcessEvent
+pub fn processkit::ProcessEvent::eq(&self, &processkit::ProcessEvent) -> bool
+impl core::fmt::Debug for processkit::ProcessEvent
+pub fn processkit::ProcessEvent::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for processkit::ProcessEvent
+impl core::marker::Freeze for processkit::ProcessEvent
+impl core::marker::Send for processkit::ProcessEvent
+impl core::marker::Sync for processkit::ProcessEvent
+impl core::marker::Unpin for processkit::ProcessEvent
+impl core::marker::UnsafeUnpin for processkit::ProcessEvent
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::ProcessEvent
+impl core::panic::unwind_safe::UnwindSafe for processkit::ProcessEvent
 #[non_exhaustive] pub enum processkit::RestartPolicy
 pub processkit::RestartPolicy::Always
 pub processkit::RestartPolicy::Never
@@ -765,6 +769,7 @@ pub fn processkit::Command::retry_with(self, processkit::RetryPolicy, impl core:
 pub async fn processkit::Command::run(&self) -> processkit::Result<alloc::string::String>
 pub async fn processkit::Command::run_unit(&self) -> processkit::Result<()>
 pub fn processkit::Command::setsid(self) -> Self
+pub fn processkit::Command::spawn_detached(&self) -> processkit::Result<processkit::DetachedChild>
 pub async fn processkit::Command::start(&self) -> processkit::Result<processkit::RunningProcess>
 pub fn processkit::Command::stderr(self, processkit::StdioMode) -> Self
 pub fn processkit::Command::stderr_encoding(self, &'static encoding_rs::Encoding) -> Self
@@ -814,6 +819,18 @@ impl core::marker::Unpin for processkit::Command
 impl core::marker::UnsafeUnpin for processkit::Command
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Command
 impl !core::panic::unwind_safe::UnwindSafe for processkit::Command
+pub struct processkit::DetachedChild
+impl processkit::DetachedChild
+pub fn processkit::DetachedChild::pid(&self) -> u32
+impl core::fmt::Debug for processkit::DetachedChild
+pub fn processkit::DetachedChild::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for processkit::DetachedChild
+impl core::marker::Send for processkit::DetachedChild
+impl core::marker::Sync for processkit::DetachedChild
+impl core::marker::Unpin for processkit::DetachedChild
+impl core::marker::UnsafeUnpin for processkit::DetachedChild
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::DetachedChild
+impl core::panic::unwind_safe::UnwindSafe for processkit::DetachedChild
 pub struct processkit::Error
 impl processkit::Error
 pub fn processkit::Error::code(&self) -> core::option::Option<i32>
@@ -965,19 +982,6 @@ impl core::marker::Unpin for processkit::OutputBufferPolicy
 impl core::marker::UnsafeUnpin for processkit::OutputBufferPolicy
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::OutputBufferPolicy
 impl core::panic::unwind_safe::UnwindSafe for processkit::OutputBufferPolicy
-pub struct processkit::OutputEvents
-impl core::fmt::Debug for processkit::OutputEvents
-pub fn processkit::OutputEvents::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl futures_core::stream::Stream for processkit::OutputEvents
-pub type processkit::OutputEvents::Item = processkit::OutputEvent
-pub fn processkit::OutputEvents::poll_next(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::option::Option<processkit::OutputEvent>>
-impl core::marker::Freeze for processkit::OutputEvents
-impl core::marker::Send for processkit::OutputEvents
-impl !core::marker::Sync for processkit::OutputEvents
-impl core::marker::Unpin for processkit::OutputEvents
-impl core::marker::UnsafeUnpin for processkit::OutputEvents
-impl !core::panic::unwind_safe::RefUnwindSafe for processkit::OutputEvents
-impl !core::panic::unwind_safe::UnwindSafe for processkit::OutputEvents
 #[non_exhaustive] pub struct processkit::OutputLine
 impl processkit::OutputLine
 pub fn processkit::OutputLine::into_text(self) -> alloc::string::String
@@ -1065,8 +1069,8 @@ impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Pipeline
 impl !core::panic::unwind_safe::UnwindSafe for processkit::Pipeline
 pub struct processkit::PipelineSession
 impl processkit::PipelineSession
+pub fn processkit::PipelineSession::events(&mut self) -> processkit::Result<processkit::ProcessEvents>
 pub async fn processkit::PipelineSession::finish(self) -> processkit::Result<processkit::Finished>
-pub fn processkit::PipelineSession::output_events(&mut self) -> processkit::Result<processkit::OutputEvents>
 pub fn processkit::PipelineSession::pid(&self) -> core::option::Option<u32>
 pub fn processkit::PipelineSession::start_kill(&mut self) -> processkit::Result<()>
 pub fn processkit::PipelineSession::stdout_lines(&mut self) -> processkit::Result<processkit::StdoutLines>
@@ -1082,6 +1086,19 @@ impl core::marker::Unpin for processkit::PipelineSession
 impl core::marker::UnsafeUnpin for processkit::PipelineSession
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::PipelineSession
 impl !core::panic::unwind_safe::UnwindSafe for processkit::PipelineSession
+pub struct processkit::ProcessEvents
+impl core::fmt::Debug for processkit::ProcessEvents
+pub fn processkit::ProcessEvents::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl futures_core::stream::Stream for processkit::ProcessEvents
+pub type processkit::ProcessEvents::Item = processkit::ProcessEvent
+pub fn processkit::ProcessEvents::poll_next(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::option::Option<processkit::ProcessEvent>>
+impl core::marker::Freeze for processkit::ProcessEvents
+impl core::marker::Send for processkit::ProcessEvents
+impl !core::marker::Sync for processkit::ProcessEvents
+impl core::marker::Unpin for processkit::ProcessEvents
+impl core::marker::UnsafeUnpin for processkit::ProcessEvents
+impl !core::panic::unwind_safe::RefUnwindSafe for processkit::ProcessEvents
+impl !core::panic::unwind_safe::UnwindSafe for processkit::ProcessEvents
 pub struct processkit::ProcessGroup
 impl processkit::ProcessGroup
 pub fn processkit::ProcessGroup::adopt(&self, &tokio::process::Child) -> processkit::Result<()>
@@ -1313,8 +1330,8 @@ pub fn processkit::RunningProcess::stdout_line_count(&self) -> usize
 pub fn processkit::RunningProcess::take_stdin(&mut self) -> core::option::Option<processkit::ProcessStdin>
 pub async fn processkit::RunningProcess::wait(self) -> processkit::Result<processkit::Outcome>
 impl processkit::RunningProcess
+pub fn processkit::RunningProcess::events(&mut self) -> processkit::Result<processkit::ProcessEvents>
 pub async fn processkit::RunningProcess::finish(self) -> processkit::Result<processkit::Finished>
-pub fn processkit::RunningProcess::output_events(&mut self) -> processkit::Result<processkit::OutputEvents>
 pub fn processkit::RunningProcess::stdout_lines(&mut self) -> processkit::Result<processkit::StdoutLines>
 impl processkit::RunningProcess
 pub async fn processkit::RunningProcess::wait_for<F, Fut>(&mut self, F, core::time::Duration) -> processkit::Result<()> where F: core::ops::function::FnMut() -> Fut + core::marker::Send, Fut: core::future::future::Future<Output = bool> + core::marker::Send

@@ -340,7 +340,7 @@ starts a fresh log for each spawn. The command's `stdout(StdioMode::…)` /
 `stderr(StdioMode::…)` setters are last-wins and clear a prior file destination.
 
 A redirected stdout is deliberately **not piped**. `output_string`,
-`output_bytes`, `stdout_lines`, and `output_events` therefore reject it just as
+`output_bytes`, `stdout_lines`, and `events` therefore reject it just as
 they reject `Inherit`/`Null`; call `start().await?.wait().await?` (or supervise
 the command) when only its exit outcome matters. Stderr may be redirected
 independently; it does not prevent stdout capture.
