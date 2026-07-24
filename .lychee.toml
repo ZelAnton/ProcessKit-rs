@@ -17,6 +17,9 @@
 exclude = [
   "/ideas($|/)",
   "/decisions($|/)",
+  # Forward-reference to unreleased CapturePolicy (T-186); remove after the next
+  # ProcessKit release makes the trait available on docs.rs.
+  "docs\\.rs/processkit/latest/processkit/trait\\.CapturePolicy\\.html",
 ]
 
 # `docs/SUMMARY.md` deliberately contains empty-href draft entries used by the
