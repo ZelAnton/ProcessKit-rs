@@ -207,3 +207,17 @@ line. Verified fmt/clippy/doc/test/cross-compile.
   the residual honest need is already served by the T-151 `ParentDeathCleanup` report
   plus the documented "keep an external owner (subreaper / `systemd` scope)" remedy.
   Carries a bounded revisit condition for a read-only, inspection-only identifier getter.
+- **The `processkit-sys` sync-core split** (a synchronous, no-tokio containment crate —
+  `src/sys/**` extracted so a consumer without an async runtime can contain and kill a
+  process tree, with `processkit` layered on top as the async wrapper;
+  [`ideas/later-lite-build-sys-split.md`](ideas/later-lite-build-sys-split.md)) →
+  assessed for the 3.0 major and **deferred** in
+  [`decisions/sync-core-processkit-sys-split.md`](decisions/sync-core-processkit-sys-split.md).
+  The "3.0 is the only window" framing does not hold: a *layered* extraction
+  (`processkit` keeps its public types and wraps the core, or re-exports the leaf sync
+  types) is additive and non-breaking, so it needs **no major** — it can land in any
+  future minor the moment a concrete consumer appears. Absent that consumer (still
+  none), the standing "don't ship a second SemVer-committed public surface
+  speculatively" discipline ([`decisions/runtime-tokio-only.md`](decisions/runtime-tokio-only.md))
+  governs. `encoding_rs` stays mandatory on the async crate; the make-it-optional lever
+  rides along with the deferred split, not as a standalone change.
