@@ -418,8 +418,11 @@ async fn pty_size_sets_the_initial_window_and_resize_pty_delivers_a_new_one() {
                 .expect("live resize on a running pty");
         }
 
-        // Wait up to 5 seconds per attempt for the resized output.
-        let found = completes_within(Duration::from_secs(5), "pty resized size line", async {
+        // Wait up to 5 seconds per attempt for the resized output. Unlike
+        // `completes_within`, a plain `tokio::time::timeout` here returns an
+        // `Err` (rather than panicking) when the window elapses, so a slow
+        // attempt can be retried instead of failing the whole test outright.
+        let found = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match lines.next().await {
                     Some(l) if l.trim().is_empty() => continue,
@@ -429,11 +432,14 @@ async fn pty_size_sets_the_initial_window_and_resize_pty_delivers_a_new_one() {
         })
         .await;
 
-        if let Ok(line) = found {
-            if line.trim() == "40 120" {
+        match found {
+            Ok(Some(line)) if line.trim() == "40 120" => {
                 second = Some(line);
                 break;
             }
+            // A stray non-matching line, a closed stream, or a per-attempt
+            // timeout: all fall through to the next retry attempt.
+            Ok(Some(_)) | Ok(None) | Err(_) => {}
         }
     }
 
