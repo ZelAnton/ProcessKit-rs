@@ -45,6 +45,7 @@ every per-OS caveat in one place.
 | [Timeouts, retries & cancellation](timeouts-and-cancellation.md) | How a deadline is *captured* vs when it errors, retry policies and their classifier, and cancellation: per-command tokens and the client-level `default_cancel_on` |
 | [Errors](errors.md) | Every `Error` variant, where it comes from and the recommended reaction, the subtle look-alikes (`Timeout` vs `Cancelled`, `NotReady` vs `Timeout`, `NotFound` vs `Spawn`, `CassetteMiss`), the classifiers (`is_not_found`, `is_timeout`, `code()`/`signal()`/…), matching under `#[non_exhaustive]`, and how retries/supervision use the classifiers |
 | [Supervision](supervision.md) | Keeping a child alive: restart policies, backoff & jitter math, the failure-storm guard, stop conditions, outcomes, supervising inside a shared group |
+| [Observability](observability.md) | The `tracing` event seam and the `metrics` counters/histograms over data the crate already computes — what's measured, the secret-hygiene guarantee (never argv/env), label cardinality, and wiring a backend exporter |
 | [Testing your code](testing.md) | The `ProcessRunner` seam — bulk **and** streaming: `ScriptedRunner` (incl. scripted `start()` with canned, paced lines), `RecordingRunner`, `MockRunner`, record/replay cassettes, and building hermetically-testable CLI wrappers with `CliClient` |
 | [Platform support](platform-support.md) | The containment mechanisms, every per-feature support matrix in one place, and the platform caveats worth knowing before you ship |
 | [Running in containers](containers.md) | Docker/Kubernetes specifics: which mechanism you actually get, PID 1 signal/reaping behavior, graceful shutdown on the orchestrator's `SIGTERM`, minimal musl/Alpine images, and container limits vs. the crate's own `limits` |
@@ -64,6 +65,7 @@ guarantee is unconditional in every configuration.
 | `limits` | off | Whole-tree resource caps on `ProcessGroupOptions` (`max_memory` / `max_processes` / `cpu_quota`), `ErrorReason::ResourceLimit`; implies `stats` | — |
 | `mock` | off | A `mockall`-generated `MockRunner` for expectation-style tests (test-only; its `expect_*` surface is **semver-exempt**, tracking `mockall` — prefer `ScriptedRunner`/`RecordingRunner` for a stable double) | `mockall` |
 | `tracing` | off | Events on the `processkit` target: spawn/exit, timeout & cancel firing, per-transition graceful teardown (`soft_signal` → `grace_started` → `drained`/`escalated`/`spared`), retries, supervisor storms, teardown anomalies (never argv/env) | `tracing` |
+| `metrics` | off | Counters/histograms over already-computed run data: run/spawn counters, run-duration histograms, an exit-code/timeout/cancel tally, retry/restart/storm events — into any `metrics` recorder you install (never argv/env). See [Observability](observability.md) | `metrics` |
 | `record` | off | `RecordReplayRunner` JSON cassettes over the runner seam | `serde`, `serde_json` |
 
 ```toml

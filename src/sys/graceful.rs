@@ -218,32 +218,38 @@ pub(crate) async fn run(
     // kill so the report reflects the final state.
     let members_after = target.alive_count();
     let elapsed = started.elapsed();
-    // The terminal teardown transition, narrated live on the same seam: one of
+    // The terminal teardown transition, narrated live on the same seam(s): one of
     // `drained` (exited within the grace), `escalated` (grace elapsed → hard kill),
     // or `spared` (grace elapsed, a non-escalating stop left survivors alive). Reads
     // the driver's own already-computed facts — no second source (single seam,
     // K-032/K-054) — and holds no handle across an await (K-044 is not implicated:
     // this is a plain synchronous emit at a discrete transition point, not in the
     // poll loop). `elapsed`'s anchor is the tokio clock, like `ShutdownReport`'s
-    // (K-007 — a single-function reporting anchor).
+    // (K-007 — a single-function reporting anchor; the metrics histogram reuses this
+    // same `elapsed`, adding no third clock). `phase` is a stable snake_case token
+    // shared verbatim by both the `tracing` event and the `metrics` teardown tally.
+    #[cfg(any(feature = "tracing", feature = "metrics"))]
+    let phase = if escalated {
+        "escalated"
+    } else if drained {
+        "drained"
+    } else {
+        "spared"
+    };
     #[cfg(feature = "tracing")]
+    tracing::debug!(
+        target: "processkit",
+        phase,
+        drained,
+        escalated,
+        members_after = ?members_after,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "graceful teardown: grace window closed"
+    );
+    #[cfg(feature = "metrics")]
     {
-        let phase = if escalated {
-            "escalated"
-        } else if drained {
-            "drained"
-        } else {
-            "spared"
-        };
-        tracing::debug!(
-            target: "processkit",
-            phase,
-            drained,
-            escalated,
-            members_after = ?members_after,
-            elapsed_ms = elapsed.as_millis() as u64,
-            "graceful teardown: grace window closed"
-        );
+        crate::metrics::record_teardown(phase);
+        crate::metrics::record_teardown_duration(phase, elapsed);
     }
     kill_result.map(|()| GracefulOutcome {
         soft,
@@ -337,6 +343,8 @@ pub(crate) async fn run_pid(target: &impl PidTarget, signal: i32, grace: Duratio
         }
         if !target.is_alive() {
             // exited (and reaped) within the grace → skip the SIGKILL
+            #[cfg(feature = "metrics")]
+            crate::metrics::record_teardown("drained");
             #[cfg(feature = "tracing")]
             tracing::debug!(
                 target: "processkit",
@@ -349,6 +357,8 @@ pub(crate) async fn run_pid(target: &impl PidTarget, signal: i32, grace: Duratio
         // relative to the remaining grace.
         sleep(POLL_INTERVAL.min(deadline - now)).await;
     }
+    #[cfg(feature = "metrics")]
+    crate::metrics::record_teardown("escalated");
     #[cfg(feature = "tracing")]
     tracing::debug!(
         target: "processkit",

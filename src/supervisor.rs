@@ -2119,6 +2119,11 @@ impl<R: ProcessRunner> Supervisor<R> {
             return Wake::Elapsed;
         }
         let pause = apply_jitter(pause, self.jitter);
+        // A plain synchronous emit at a discrete decision point (not on the
+        // health-check `select!` path, and holding nothing across the await
+        // below) — K-044 is not implicated.
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_storm_pause();
         #[cfg(feature = "tracing")]
         tracing::warn!(
             target: "processkit",
@@ -2146,6 +2151,9 @@ impl<R: ProcessRunner> Supervisor<R> {
     async fn sleep_backoff(&self, restarts: u32, factor: f64, shared: &SessionShared) -> Wake {
         let delay = backoff_delay(self.backoff_base, factor, restarts, self.max_backoff);
         let delay = apply_jitter(delay, self.jitter);
+        // Synchronous emit before the backoff await; holds nothing across it.
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_restart();
         #[cfg(feature = "tracing")]
         tracing::debug!(
             target: "processkit",
