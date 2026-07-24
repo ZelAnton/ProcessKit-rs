@@ -306,11 +306,9 @@ async fn pty_events_stream_carries_the_full_lifecycle() {
         }
         (names, started_pid, lines, exit_outcome)
     };
-    let outcome = completes_within(
-        Duration::from_secs(20),
-        "pty events lifecycle run",
-        async { tokio::join!(collect, run.finish()) },
-    )
+    let outcome = completes_within(Duration::from_secs(20), "pty events lifecycle run", async {
+        tokio::join!(collect, run.finish())
+    })
     .await;
     let ((names, started_pid, lines, exit_outcome), finished) = outcome;
     let finished = finished.expect("finish");

@@ -376,17 +376,19 @@ async fn graceful_timeout_on_an_events_run_reports_timed_out() {
         }
         (saw_started, saw_ready, exit_outcome)
     };
-    let drained = tokio::time::timeout(
-        Duration::from_secs(8),
-        async { tokio::join!(collect, run.finish()) },
-    )
+    let drained = tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::join!(collect, run.finish())
+    })
     .await;
     let ((saw_started, saw_ready, exit_outcome), finished) =
         drained.expect("the events stream and finish must complete within the grace");
     let outcome = finished.expect("finish").outcome;
 
     assert!(saw_started, "Started must lead the stream");
-    assert!(saw_ready, "the ready banner must arrive before the deadline");
+    assert!(
+        saw_ready,
+        "the ready banner must arrive before the deadline"
+    );
     assert_eq!(
         outcome,
         Outcome::TimedOut,

@@ -482,9 +482,9 @@ async fn concurrent_pty_sessions_stay_correct_at_scale() {
                     .start()
                     .await
                     .map_err(|e| format!("dialog session {i}: start failed: {e:?}"))?;
-                let mut stdin = proc
-                    .take_stdin()
-                    .ok_or_else(|| format!("dialog session {i}: no stdin writer on a keep-open child"))?;
+                let mut stdin = proc.take_stdin().ok_or_else(|| {
+                    format!("dialog session {i}: no stdin writer on a keep-open child")
+                })?;
                 stdin
                     .write_line(&line)
                     .await

@@ -697,7 +697,7 @@ impl Stream for StdoutLines {
 /// backends would be blast radius in concurrency-sensitive code for a
 /// speculative surface. Those live facts remain available on the `tracing` seam,
 /// and as a typed value after the fact via
-/// [`ShutdownReport`](crate::ShutdownReport). Because this enum is
+/// `ShutdownReport`. Because this enum is
 /// `#[non_exhaustive]`, those phases (and any other kind) can be added here
 /// **additively** later, once a consumer needs them, without a breaking change.
 ///
@@ -975,7 +975,10 @@ mod tests {
     /// A `ProcessEvents` built with `started_emitted: true` / `exit_rx: None`
     /// isolates the stdout/stderr line-merging behavior (the leading `Started`
     /// and trailing `Exited` are exercised end to end in the scripted tests).
-    fn line_only_events(stdout_sink: Arc<SharedLines>, stderr_sink: Arc<SharedLines>) -> ProcessEvents {
+    fn line_only_events(
+        stdout_sink: Arc<SharedLines>,
+        stderr_sink: Arc<SharedLines>,
+    ) -> ProcessEvents {
         ProcessEvents {
             stdout_sink,
             stderr_sink,
