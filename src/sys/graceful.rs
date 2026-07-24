@@ -1018,6 +1018,18 @@ mod tests {
 
     #[cfg(feature = "tracing")]
     impl tracing::Subscriber for PhaseCaptureSubscriber {
+        fn register_callsite(
+            &self,
+            _metadata: &tracing::Metadata<'_>,
+        ) -> tracing::subscriber::Interest {
+            // Return `sometimes()` to force tracing to re-evaluate `enabled()` on every event,
+            // preventing callsite interest from being cached as "disabled" before this
+            // subscriber is installed. This fixes race conditions where an earlier test or
+            // the default dispatcher might touch a callsite before `PhaseCaptureSubscriber`
+            // becomes global, locking in a cached "disabled" answer that persists even after
+            // `set_global_default` installs us.
+            tracing::subscriber::Interest::sometimes()
+        }
         fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
             true
         }

@@ -233,7 +233,7 @@ impl Reply {
     /// `wait_for_output` matches (a `Password: ` a real child would block on), and
     /// give `response` whatever the child prints next — itself an un-terminated
     /// tail (e.g. a next prompt) so a second `wait_for_output` can see it. Build
-    /// the command with [`use_pty`](crate::Command::use_pty) (the motivating case)
+    /// the command with `use_pty` (the motivating case)
     /// and/or [`keep_stdin_open`](crate::Command::keep_stdin_open); the double
     /// hands back a working `take_stdin` either way.
     ///
