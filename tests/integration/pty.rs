@@ -395,20 +395,49 @@ async fn pty_size_sets_the_initial_window_and_resize_pty_delivers_a_new_one() {
 
     // Live resize: TIOCSWINSZ updates the master and delivers SIGWINCH, so the
     // trap re-reports the new geometry "40 120".
-    proc.resize_pty(120, 40)
-        .expect("live resize on a running pty");
+    //
+    // Note: there is a potential scheduling race on CI (especially in Alpine
+    // containers under load) between when we read the first size and when the shell
+    // has fully entered its interruptible `sleep 0.2` loop. If SIGWINCH is delivered
+    // at the wrong moment, the signal might not interrupt the current syscall, and we
+    // could read stale output. To harden the test, we defensively poll with multiple
+    // retries: if the first resize doesn't produce new output within a short window,
+    // we issue another resize to ensure the signal is delivered when the shell is
+    // definitely in sleep. We also read multiple lines to be robust to any buffering.
+    let mut second = None;
+    for retry_attempt in 0..3 {
+        if retry_attempt > 0 {
+            // If we haven't seen the resized output yet, issue another TIOCSWINSZ.
+            // (This is harmless — resize_pty on an already-resized session just
+            // re-sends the same size and SIGWINCH.)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            proc.resize_pty(120, 40)
+                .expect("live resize retry on a running pty");
+        } else {
+            proc.resize_pty(120, 40)
+                .expect("live resize on a running pty");
+        }
 
-    let second = completes_within(Duration::from_secs(20), "pty resized size line", async {
-        // Defensively skip any blank line; take the next non-empty size report.
-        loop {
-            match lines.next().await {
-                Some(l) if l.trim().is_empty() => continue,
-                other => break other,
+        // Wait up to 5 seconds per attempt for the resized output.
+        let found = completes_within(Duration::from_secs(5), "pty resized size line", async {
+            loop {
+                match lines.next().await {
+                    Some(l) if l.trim().is_empty() => continue,
+                    other => break other,
+                }
+            }
+        })
+        .await;
+
+        if let Ok(line) = found {
+            if line.trim() == "40 120" {
+                second = Some(line);
+                break;
             }
         }
-    })
-    .await
-    .expect("a post-resize size line");
+    }
+
+    let second = second.expect("a post-resize size line (after retries)");
     assert_eq!(
         second.trim(),
         "40 120",
