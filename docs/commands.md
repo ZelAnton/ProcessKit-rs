@@ -638,10 +638,18 @@ Two ways to satisfy them:
     job/cgroup/process group, so whole-tree kill-on-drop, timeouts, and
     cancellation behave exactly as for a piped run.
 
-  For the end-to-end `ssh` case specifically — the non-interactive path, the
-  PTY passphrase dialog, the exit-code-255 split, and the boundary where
-  kill-on-drop stops at the local ssh client (the *remote* command is not
-  contained) — see the cookbook's [Driving ssh](cookbook.md#driving-ssh) recipe.
+  Scenario recipes live in the cookbook: [run an `isatty()`-requiring
+  tool](cookbook.md#run-a-tool-that-requires-a-terminal), [wait for an
+  unterminated prompt and answer](cookbook.md#answer-an-unterminated-pty-prompt),
+  [consume agent-CLI progress](cookbook.md#read-in-place-progress-from-an-agent-cli),
+  [avoid full-duplex deadlock](cookbook.md#avoid-pty-full-duplex-deadlocks), and
+  [test the PTY contract hermetically](cookbook.md#test-pty-behavior-without-a-terminal).
+  The streaming guide owns the detailed [PTY I/O
+  mechanics](streaming.md#pty-dialog-wait-for-a-prompt-then-answer) and
+  [output-hygiene knobs](streaming.md#pty-output-hygiene-line-framing-and-vt-sanitization).
+  For the end-to-end `ssh` case specifically — including the boundary where
+  kill-on-drop stops at the local client — see [Driving
+  ssh](cookbook.md#driving-ssh).
 
   The historical defer/design is recorded in
   `decisions/permissions-privileges-pty-network.md` §4.

@@ -428,14 +428,58 @@ stdout, the child stops reading stdin (blocked on stdout), your `write` parks
 waiting for stdin buffer space, and neither side progresses. The `bc` example
 above is safe because it interleaves one write with one read; when you both feed
 a sizable stdin **and** the child produces output, drain `stdout_lines` from one
-task while writing stdin from another. (The non-interactive `Stdin::from_*`
-sources are safe — the crate writes them on a background task that runs
-concurrently with the output pumps.)
+task while writing stdin from another. The same rule applies to a PTY's
+single, full-duplex master: awaiting one large write while no sink reads merged
+output can deadlock. (The non-interactive `Stdin::from_*` sources are safe —
+the crate writes them on a background task that runs concurrently with the
+output pumps.)
 
 For *one-directional* streamed input (a channel, a file tail) you don't need
 interactivity — give the command `Stdin::from_lines(stream)` /
 `Stdin::from_reader(reader)` and let the background writer feed it; see the
 [stdin source table](commands.md#standard-input).
+
+### PTY dialog: wait for a prompt, then answer
+
+A terminal prompt is usually an un-terminated tail (`Password: `), not a line.
+Combine `use_pty`, `keep_stdin_open`, and `wait_for_output` to drive an
+expect-style exchange without guessing when the child is ready:
+
+```rust,no_run
+use processkit::Command;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut run = Command::new("terminal-login")
+        .use_pty()
+        .pty_size(100, 30)
+        .keep_stdin_open()
+        .start()
+        .await?;
+
+    run.wait_for_output(
+        |tail| tail.ends_with("Password: "),
+        Duration::from_secs(10),
+    )
+    .await?;
+    run.take_stdin()
+        .expect("PTY stdin was kept open")
+        .write_line("secret supplied by a protected source")
+        .await?;
+
+    run.finish().await?;
+    Ok(())
+}
+```
+
+On Unix, the PTY slave has echo disabled so the answer is not copied into the
+merged capture. That guarantee is Unix-only; ConPTY offers no portable
+equivalent, so a Windows caller sending secrets should avoid retaining or
+logging the transcript. The prompt wait itself is byte-driven on both
+platforms. Signal-driven terminal behavior is separate: on Unix, `use_pty`
+creates a controlling terminal so terminal signals such as the `SIGWINCH`
+raised by `resize_pty` reach the child as described below.
 
 ### PTY window size and live resize
 
@@ -470,8 +514,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `resize_pty` works while you still hold the handle — typically interleaved with
 driving an owned `stdout_lines()`/`events()` stream and the `take_stdin()` writer
-of a live session. It returns
-[`ErrorReason::Unsupported`](https://docs.rs/processkit/latest/processkit/enum.ErrorReason.html)
+of a live session. It returns `ErrorReason::Unsupported`
 — never a panic or a silent no-op — on a run that is **not** `use_pty` (there is
 no terminal to size) or once the child has **exited**. Platform delivery differs:
 on **Unix** the resize (`TIOCSWINSZ`) raises `SIGWINCH` on the child immediately;
@@ -489,7 +532,7 @@ line-oriented consumer gets sensible output — one automatic, one opt-in:
   progress by redrawing a line in place with a bare `\r` (no `\n` until the end).
   Under the default `Newline` framing that whole progress stream is *one*
   ever-growing line that only surfaces at EOF; so `use_pty` makes the **effective**
-  default [`line_terminator`](https://docs.rs/processkit/latest/processkit/enum.LineTerminator.html)
+  default `line_terminator`
   `CarriageReturn`, and each redraw becomes its own frame/line live. This only
   changes *where* lines split (a `\r\n` still counts as one terminator), so it is
   the safe default for the mode. An explicit `line_terminator(...)` — even
@@ -498,22 +541,24 @@ line-oriented consumer gets sensible output — one automatic, one opt-in:
   cursor moves, alternate-screen switches, OSC window-title/hyperlink codes) into
   their merged output, so `output_string`, `wait_for_line`/`first_line`, and the
   streaming verbs otherwise carry `\x1b[31m…`-mucked strings. Turn on
-  [`Command::sanitize_vt()`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.sanitize_vt)
+  `Command::sanitize_vt()`
   to strip those sequences (and lone control codes, keeping tabs) from the capture
   backlog. It is opt-in because it is *destructive* — it removes bytes from the
   captured output — unlike the non-destructive framing default.
 
 ```rust,no_run
 use processkit::prelude::StreamExt;
-use processkit::Command;
+use processkit::{Command, LineTerminator};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // A PTY agent CLI: `\r`-framed progress by default, plus opt-in de-escaping,
-    // so each captured line is readable text instead of an `\x1b[…m`-laden blob.
+    // A PTY agent CLI: make the progress-frame contract explicit and opt into
+    // de-escaping, so every captured line is readable text.
     let mut run = Command::new("agent")
-        .use_pty()        // effective line terminator defaults to CarriageReturn
-        .sanitize_vt()    // strip colors / cursor moves / OSC from the captured lines
+        .use_pty()
+        .pty_size(120, 30)
+        .line_terminator(LineTerminator::CarriageReturn)
+        .sanitize_vt()
         .start()
         .await?;
     let mut lines = run.stdout_lines()?;
@@ -526,8 +571,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Because a PTY merges both child descriptors into its logical stdout, the
+whole-command setters above are the clearest spelling. For a wrapper that can
+also run over ordinary pipes, the per-stream variants let each real pipe keep
+its own policy:
+
+```rust,no_run
+use processkit::{Command, LineTerminator};
+
+fn command_for_pipes() -> Command {
+    Command::new("agent")
+        .stdout_line_terminator(LineTerminator::CarriageReturn)
+        .stderr_line_terminator(LineTerminator::CarriageReturn)
+        .stdout_sanitize_vt()
+        .stderr_sanitize_vt()
+}
+
+fn command_for_pty() -> Command {
+    Command::new("agent")
+        .use_pty()
+        .pty_size(120, 30)
+        .line_terminator(LineTerminator::CarriageReturn)
+        .sanitize_vt()
+}
+
+fn main() {
+    let _ = (command_for_pipes(), command_for_pty());
+}
+```
+
+In PTY mode, `stderr_line_terminator` and `stderr_sanitize_vt` have no separate
+stream to act on: the child stderr bytes have already joined stdout on the
+master. Likewise, `on_stderr_line` is not delivered and the final stderr
+capture is empty. Use the stdout/whole-command settings for PTY output, or use
+pipes when preserving stream identity is required.
+
 Sanitization shapes **only the capture backlog** — exactly the boundary
-[`capture_policy`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.capture_policy)
+`capture_policy`
 draws. The per-line handlers (`on_stdout_line`), the decoded `stdout_tee`, the
 byte-plane `stdout_raw_tee`, and `output_bytes` are independent and keep seeing the
 raw, escape-laden bytes; if you also tee to a log and want it clean, sanitize in

@@ -17,6 +17,11 @@ runtime and `use processkit::Command;` unless shown otherwise.
 - [Feed the child's stdin](#feed-the-childs-stdin)
 - [Stream output as it arrives](#stream-output-as-it-arrives)
 - [Talk to an interactive child](#talk-to-an-interactive-child)
+- [Run a tool that requires a terminal](#run-a-tool-that-requires-a-terminal)
+- [Answer an unterminated PTY prompt](#answer-an-unterminated-pty-prompt)
+- [Read in-place progress from an agent CLI](#read-in-place-progress-from-an-agent-cli)
+- [Avoid PTY full-duplex deadlocks](#avoid-pty-full-duplex-deadlocks)
+- [Test PTY behavior without a terminal](#test-pty-behavior-without-a-terminal)
 - [Driving ssh](#driving-ssh)
 - [Pipe commands without a shell](#pipe-commands-without-a-shell)
 - [Start a server and wait until it's ready](#start-a-server-and-wait-until-its-ready)
@@ -326,6 +331,216 @@ methods return `std::io::Result` (idiomatic for a writer) — convert with
 
 *Fine print: [Streaming & interactive I/O → interactive stdin](streaming.md).*
 
+## Run a tool that requires a terminal
+
+Some tools change behavior behind `isatty()` or refuse to start without a
+controlling terminal. Enable the `pty` feature, opt this run into PTY mode, and
+read its output through the usual capture verbs:
+
+```rust,no_run
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let result = Command::new("terminal-only-tool")
+        .arg("--status")
+        .use_pty()
+        .pty_size(120, 30)
+        .output_string()
+        .await?;
+
+    // A PTY has one merged output stream. Everything the child wrote to its
+    // terminal is captured as stdout; the separate stderr result is empty.
+    println!("{}", result.stdout());
+    assert!(result.stderr().is_empty());
+    Ok(())
+}
+```
+
+`use_pty()` changes the transport, not the lifecycle: timeout, cancellation,
+containment, and kill-on-drop behave as for a piped child. It is a minimal
+terminal session rather than a terminal emulator; set `pty_size` when wrapping
+and layout matter.
+
+*Fine print: [Streaming → PTY window size and live resize](streaming.md#pty-window-size-and-live-resize) ·
+[Platform support → PTY mode](platform-support.md#pty-mode-use_pty-the-pty-feature).*
+
+## Answer an unterminated PTY prompt
+
+Terminal prompts commonly end in `": "` rather than a newline. Use
+`wait_for_output`, not `wait_for_line`, to match that live partial tail; then
+answer over the same PTY master:
+
+```rust,no_run
+use processkit::Command;
+use std::time::Duration;
+
+async fn authenticate(secret: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut run = Command::new("sudo")
+        .args(["-k", "-v"])
+        .use_pty()
+        .keep_stdin_open()
+        .start()
+        .await?;
+
+    run.wait_for_output(
+        |tail| tail.contains("Password:"),
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let mut stdin = run.take_stdin().expect("PTY stdin was kept open");
+    stdin.write_line(secret).await?;
+    run.finish().await?;
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    authenticate("secret supplied by a protected source").await
+}
+```
+
+On Unix, processkit disables terminal echo for its PTY slave, so the secret is
+not copied into merged output. That echo-off guarantee is **Unix-only**:
+ConPTY has no portable per-session equivalent, so do not retain or log the
+merged transcript when sending a secret on Windows. `wait_for_output` is
+byte-driven and works for ordinary prompts on both platforms; it does not need
+a newline or a signal from the child.
+
+*Fine print: [Streaming → prompt-aware waiting](streaming.md#prompt-aware-waiting-wait_for_output) ·
+[Running commands → interactive auth / TTY](commands.md#privileges-and-spawn-flags).*
+
+## Read in-place progress from an agent CLI
+
+Agent CLIs often require a terminal, redraw progress with bare carriage returns,
+and decorate it with VT/ANSI control sequences. Frame each redraw as a line and
+sanitize the captured text before inspecting it:
+
+```rust,no_run
+use processkit::prelude::StreamExt;
+use processkit::{Command, LineTerminator};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut run = Command::new("agent")
+        .arg("run")
+        .use_pty()
+        // PTY output is the logical stdout stream. `line_terminator(...)`
+        // is the equivalent whole-command spelling.
+        .stdout_line_terminator(LineTerminator::CarriageReturn)
+        .stdout_sanitize_vt()
+        .start()
+        .await?;
+
+    let mut frames = run.stdout_lines()?;
+    while let Some(frame) = frames.next().await {
+        println!("agent: {frame}");
+    }
+    run.finish().await?;
+    Ok(())
+}
+```
+
+PTY mode already defaults to carriage-return-aware framing; spelling it out is
+useful when this behavior is part of your wrapper's contract. Use
+`line_terminator` and `sanitize_vt` to configure both logical streams when the
+same builder may also run without PTY. VT sanitization is destructive and
+affects captured text only; exact-byte output and raw tees remain untouched.
+
+*Fine print: [Streaming → PTY output hygiene](streaming.md#pty-output-hygiene-line-framing-and-vt-sanitization) ·
+[Untrusted children → content transforms](untrusted-children.md).*
+
+## Avoid PTY full-duplex deadlocks
+
+A PTY master, like a pair of pipes, has finite kernel buffers. Do not await a
+large write while leaving output unread: the child may fill its output buffer,
+stop reading input, and leave both sides parked. Drain and write concurrently:
+
+```rust,no_run
+use processkit::prelude::StreamExt;
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let payload = vec![b'x'; 4 * 1024 * 1024];
+    let mut run = Command::new("terminal-filter")
+        .use_pty()
+        .keep_stdin_open()
+        .start()
+        .await?;
+    let mut stdin = run.take_stdin().expect("PTY stdin was kept open");
+    let mut output = run.stdout_lines()?;
+
+    let write = async move {
+        stdin.write(&payload).await?;
+        stdin.finish().await
+    };
+    let drain = async move {
+        while let Some(line) = output.next().await {
+            println!("{line}");
+        }
+        Ok::<(), std::io::Error>(())
+    };
+
+    tokio::try_join!(write, drain)?;
+    run.finish().await?;
+    Ok(())
+}
+```
+
+Also remember that a PTY has no independent stderr channel. Both child file
+descriptors arrive through `stdout_lines`/`on_stdout_line`;
+`on_stderr_line` is not delivered, `stderr_tee` has nothing to write, and the
+finished result's stderr is empty. If stream identity matters, use ordinary
+pipes instead of PTY.
+
+*Fine print: [Streaming → interactive stdin](streaming.md#interactive-stdin) ·
+[Running commands → interactive auth / TTY](commands.md#privileges-and-spawn-flags).*
+
+## Test PTY behavior without a terminal
+
+The `ScriptedRunner` PTY variant is selected by putting `use_pty()` on the
+scripted command. It hermetically models the merged master and PTY line framing,
+so CI needs neither a real terminal nor a platform-specific helper:
+
+```rust
+use processkit::prelude::StreamExt;
+use processkit::testing::{Reply, ScriptedRunner};
+use processkit::{Command, LineTerminator, ProcessRunner};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let runner = ScriptedRunner::new().fallback(
+        Reply::ok("working 10%\rworking 100%\r")
+            .with_stderr("final diagnostic"),
+    );
+    let command = Command::new("agent")
+        .use_pty()
+        .line_terminator(LineTerminator::CarriageReturn);
+
+    let mut run = runner.start(&command).await?;
+    let mut merged = run.stdout_lines()?;
+    let mut seen = Vec::new();
+    while let Some(frame) = merged.next().await {
+        seen.push(frame);
+    }
+    let finished = run.finish().await?;
+
+    assert!(seen.iter().any(|line| line == "working 100%"));
+    assert!(seen.iter().any(|line| line == "final diagnostic"));
+    assert!(finished.stderr.is_empty());
+    Ok(())
+}
+```
+
+For dialogs, script `Reply::dialog("Password: ", "accepted\n")`; it emits the
+unterminated prompt, waits for `take_stdin()` to receive an answer, then emits
+the continuation. This exercises `wait_for_output` without subprocess timing.
+
+*Fine print: [Testing → scripted streaming](testing.md#scripted-streaming) ·
+[Streaming → prompt-aware waiting](streaming.md#prompt-aware-waiting-wait_for_output).*
+
 ## Driving ssh
 
 `ssh` is the one tool worth its own recipe. It often *demands* a terminal
@@ -395,10 +610,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .start()
         .await?;
 
-    // Best-effort today: wait for the prompt line, then write the secret over
-    // the same master (not echoed back on Unix). See the note just below on
-    // prompts that arrive without a trailing newline.
-    run.wait_for_line(|l| l.contains("passphrase"), Duration::from_secs(10)).await?;
+    // Match the live, unterminated prompt tail; no newline is required.
+    run.wait_for_output(
+        |tail| tail.contains("passphrase"),
+        Duration::from_secs(10),
+    )
+    .await?;
     let mut stdin = run.take_stdin().expect("stdin kept open");
     stdin.write_line("s3cr3t-passphrase").await?;
 
@@ -408,12 +625,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`wait_for_line` fires only on a *complete*, newline-terminated line, but many
-prompts — `Enter passphrase for key …:` — arrive **without** a trailing
-newline, so the matcher above can miss a bare prompt. Waiting that matches an
-unterminated tail (a prompt-aware readiness probe) is planned; until it lands,
-treat the line matcher as best-effort and prefer the non-interactive path
-wherever the deployment allows it.
+`wait_for_output` sees the un-terminated prompt tail that `wait_for_line`
+deliberately cannot. The same platform echo caveat as the general
+[PTY prompt recipe](#answer-an-unterminated-pty-prompt) applies: echo is
+disabled by processkit on Unix, but not portably controllable through ConPTY.
 
 **The containment boundary stops at the local ssh client.** kill-on-drop,
 `timeout`, and cancellation reap the *local* process tree — here, the `ssh`
