@@ -359,6 +359,10 @@ to a dated version section.
   new terminal `Exited` event is delivered when the run is reaped — drive the
   stream and its `finish()`/`wait()` finisher **together** (e.g. `tokio::join!`)
   rather than draining the stream to completion and only then finishing.
+- `ErrorReason::OutputTooLarge.total_bytes` and the `OverflowMode::Error` plus
+  `max_bytes` ceiling now count raw bytes read from the output pipe, including
+  line terminators and invalid UTF-8 bytes, rather than decoded line-content
+  bytes
 - **Breaking:** `Error` is now a **pointer-sized wrapper** around a boxed
   `ErrorReason` (`struct Error { .. }` holding a `Box<ErrorReason>`) instead of a
   large enum, mirroring `std::io::Error` / `ErrorKind`. This shrinks `Error` from
