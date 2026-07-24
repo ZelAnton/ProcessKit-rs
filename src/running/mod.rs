@@ -734,22 +734,34 @@ impl RunningProcess {
         // `program` is a distinct field from `backend`, so this immutable borrow
         // coexists with the `&mut self.backend` match below (disjoint-field NLL).
         let program = &self.program;
+        // Clone the gate up front — exactly as `has_exited_now` does — so the PTY
+        // arm's liveness reap can run under the gate lock without borrowing `self`
+        // again while `self.backend` is mutably matched below (disjoint-field NLL).
+        let gate = self.pid_gate.clone();
         match &mut self.backend {
             Backend::Pty(pty) => {
                 // `child` is present on every live-handle path (only `Drop` extracts
                 // it, and `Drop` is the handle's final act); treat an absent child
                 // as "already torn down" rather than panicking.
-                let Some(child) = pty.child.as_mut() else {
+                if pty.child.is_none() {
                     return Err(pty_resize_gone(program));
-                };
+                }
                 // A resize on an exited child is meaningless (and the pseudoconsole
                 // may already be closed) — surface it honestly instead of poking a
-                // dead terminal. `try_wait` reaps nothing; it only polls exit.
-                match child.try_wait() {
-                    Ok(Some(_)) => Err(pty_resize_gone(program)),
-                    Ok(None) => child.resize(cols, rows).map_err(Error::io),
-                    Err(e) => Err(Error::io(e)),
+                // dead terminal. But tokio's `try_wait` REAPS an exited child and
+                // frees its pid, so it must run through `PidGate::reap_under_lock` —
+                // exactly as the sibling `has_exited_now` does — fusing the pid-free
+                // and the gate retire into one critical section. A bare `try_wait`
+                // here would free the pid off-gate without retiring the gate: a
+                // detached force-kill watchdog (which raw-`kill`s the pid until the
+                // gate is retired) could then observe the gate still live and SIGKILL
+                // an unrelated process the OS had recycled that freed pid for.
+                let exited =
+                    gate.reap_under_lock(|| matches!(pty.child_mut().try_wait(), Ok(Some(_))));
+                if exited {
+                    return Err(pty_resize_gone(program));
                 }
+                pty.child_mut().resize(cols, rows).map_err(Error::io)
             }
             // A scripted double answers only when it models a PTY run; the model is
             // hermetic (records the size, no real tty). A non-PTY scripted handle
