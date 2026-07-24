@@ -791,6 +791,7 @@ pub fn processkit::Command::retry_never(self) -> Self
 pub fn processkit::Command::retry_with(self, processkit::RetryPolicy, impl core::ops::function::Fn(&processkit::Error) -> bool + core::marker::Send + core::marker::Sync + 'static) -> Self
 pub async fn processkit::Command::run(&self) -> processkit::Result<alloc::string::String>
 pub async fn processkit::Command::run_unit(&self) -> processkit::Result<()>
+pub fn processkit::Command::sanitize_vt(self) -> Self
 pub fn processkit::Command::setsid(self) -> Self
 pub fn processkit::Command::spawn_detached(&self) -> processkit::Result<processkit::DetachedChild>
 pub async fn processkit::Command::start(&self) -> processkit::Result<processkit::RunningProcess>
@@ -801,6 +802,7 @@ pub fn processkit::Command::stderr_file_append(self, impl core::convert::AsRef<s
 pub fn processkit::Command::stderr_file_truncate(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn processkit::Command::stderr_line_terminator(self, processkit::LineTerminator) -> Self
 pub fn processkit::Command::stderr_raw_tee<W>(self, W) -> Self where W: tokio::io::async_write::AsyncWrite + core::marker::Send + core::marker::Unpin + 'static
+pub fn processkit::Command::stderr_sanitize_vt(self) -> Self
 pub fn processkit::Command::stderr_tee<W>(self, W) -> Self where W: tokio::io::async_write::AsyncWrite + core::marker::Send + core::marker::Unpin + 'static
 pub fn processkit::Command::stdin(self, processkit::Stdin) -> Self
 pub fn processkit::Command::stdin_source(&self) -> core::option::Option<&processkit::Stdin>
@@ -811,6 +813,7 @@ pub fn processkit::Command::stdout_file_append(self, impl core::convert::AsRef<s
 pub fn processkit::Command::stdout_file_truncate(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn processkit::Command::stdout_line_terminator(self, processkit::LineTerminator) -> Self
 pub fn processkit::Command::stdout_raw_tee<W>(self, W) -> Self where W: tokio::io::async_write::AsyncWrite + core::marker::Send + core::marker::Unpin + 'static
+pub fn processkit::Command::stdout_sanitize_vt(self) -> Self
 pub fn processkit::Command::stdout_tee<W>(self, W) -> Self where W: tokio::io::async_write::AsyncWrite + core::marker::Send + core::marker::Unpin + 'static
 pub fn processkit::Command::timeout(self, core::time::Duration) -> Self
 pub fn processkit::Command::timeout_grace(self, core::time::Duration) -> Self

@@ -34,6 +34,32 @@ to a dated version section.
   configured spawn size and live resizes) with no real pseudo-terminal, so both
   are unit-testable. Additive: an existing PTY run that sets neither keeps the
   byte-identical 80×24 behavior
+- Make PTY (and any terminal-driven) **merged output line-consumable** with two
+  decisions on the line-oriented capture path. (1) `Command::use_pty()` now
+  defaults the **effective** `line_terminator` to `LineTerminator::CarriageReturn`
+  instead of `Newline`, so a child's bare-`\r` progress redraws stream as
+  individual frames/lines rather than piling into one ever-growing line only seen
+  at EOF; it is a *non-destructive* reframing (`\r\n` stays one terminator), applied
+  only when the caller has not pinned a terminator — an explicit
+  `line_terminator(...)`/`stdout_line_terminator(...)`/`stderr_line_terminator(...)`
+  (even `Newline`) always wins, order-independently. (2) Add the opt-in VT/ANSI
+  **output sanitizer** `Command::sanitize_vt()` (plus per-stream
+  `stdout_sanitize_vt()` / `stderr_sanitize_vt()`): each captured line is stripped
+  of CSI (`ESC [ … final`), OSC (`ESC ] … BEL/ST`), DCS/SOS/PM/APC string escapes,
+  other `ESC` escapes, and lone C0 control codes / `DEL` — keeping the horizontal
+  tab — so `output_string`, `wait_for_line`/`first_line`, `ProcessResult`, and the
+  streaming verbs carry readable text instead of `\x1b[…m`-mucked strings. Kept
+  opt-in because stripping is *destructive*. Sanitization shapes **only the capture
+  backlog**, the same boundary as `capture_policy`: the per-line handlers, decoded
+  tees, byte-plane `raw_tee`, and `output_bytes` still observe the raw bytes, and a
+  line past an `OutputBufferPolicy` byte cap is judged on its raw length and never
+  reaches the sanitizer. When both are set, sanitization runs **before**
+  `capture_policy` so a secret-scrubbing policy matches on already-cleaned text. An
+  escape split across pump reads is stripped whole (the line is reassembled before
+  the per-line transform runs). The raw-pipe-byte accounting (`seen_bytes`,
+  `Error::OutputTooLarge.total_bytes`), the line/`dropped` counters, and the
+  `DropNewest` seal are unaffected. Off by default and strictly additive: a run that
+  calls neither knob captures byte-for-byte as before
 - Add `Command::spawn_detached` — the crate's **one deliberate, opt-in escape**
   from kill-on-drop containment, for the legitimate handoff cases (daemonizing, a
   `nohup`-style helper meant to *outlive* its launcher). It spawns the child

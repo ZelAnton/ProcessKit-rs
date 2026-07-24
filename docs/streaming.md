@@ -480,6 +480,64 @@ the new size on its next console query and conhost may reflow a little later. On
 non-`use_pty` command `pty_size` is a documented no-op (nothing to size). See
 [platform support](platform-support.md#pty-mode-use_pty-the-pty-feature).
 
+### PTY output hygiene: line framing and VT sanitization
+
+A PTY child writes like a terminal, which two things about `use_pty` handle so a
+line-oriented consumer gets sensible output — one automatic, one opt-in:
+
+- **Framing is `\r`-aware by default under `use_pty`.** Terminal tools draw
+  progress by redrawing a line in place with a bare `\r` (no `\n` until the end).
+  Under the default `Newline` framing that whole progress stream is *one*
+  ever-growing line that only surfaces at EOF; so `use_pty` makes the **effective**
+  default [`line_terminator`](https://docs.rs/processkit/latest/processkit/enum.LineTerminator.html)
+  `CarriageReturn`, and each redraw becomes its own frame/line live. This only
+  changes *where* lines split (a `\r\n` still counts as one terminator), so it is
+  the safe default for the mode. An explicit `line_terminator(...)` — even
+  `Newline` — always wins, so you can pin the framing if you need to.
+- **Escape sanitization is opt-in.** Agentic CLIs spray VT/ANSI escapes (colors,
+  cursor moves, alternate-screen switches, OSC window-title/hyperlink codes) into
+  their merged output, so `output_string`, `wait_for_line`/`first_line`, and the
+  streaming verbs otherwise carry `\x1b[31m…`-mucked strings. Turn on
+  [`Command::sanitize_vt()`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.sanitize_vt)
+  to strip those sequences (and lone control codes, keeping tabs) from the capture
+  backlog. It is opt-in because it is *destructive* — it removes bytes from the
+  captured output — unlike the non-destructive framing default.
+
+```rust,no_run
+use processkit::prelude::StreamExt;
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // A PTY agent CLI: `\r`-framed progress by default, plus opt-in de-escaping,
+    // so each captured line is readable text instead of an `\x1b[…m`-laden blob.
+    let mut run = Command::new("agent")
+        .use_pty()        // effective line terminator defaults to CarriageReturn
+        .sanitize_vt()    // strip colors / cursor moves / OSC from the captured lines
+        .start()
+        .await?;
+    let mut lines = run.stdout_lines()?;
+    while let Some(line) = lines.next().await {
+        // `line` is a clean, de-escaped frame — safe for a `contains(...)` probe.
+        let _ = line;
+        break;
+    }
+    Ok(())
+}
+```
+
+Sanitization shapes **only the capture backlog** — exactly the boundary
+[`capture_policy`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.capture_policy)
+draws. The per-line handlers (`on_stdout_line`), the decoded `stdout_tee`, the
+byte-plane `stdout_raw_tee`, and `output_bytes` are independent and keep seeing the
+raw, escape-laden bytes; if you also tee to a log and want it clean, sanitize in
+that sink. When combined with `capture_policy`, sanitization runs **first**, so a
+secret-scrubbing policy matches on already-cleaned text rather than a token a color
+escape could split mid-word. Set it per stream with `stdout_sanitize_vt()` /
+`stderr_sanitize_vt()` when only one stream needs it. See
+[platform support](platform-support.md#pty-mode-use_pty-the-pty-feature) for the
+per-platform PTY table.
+
 ## Readiness probes
 
 "Start a server, then use it" needs *ready*, not merely *started*. Four probes

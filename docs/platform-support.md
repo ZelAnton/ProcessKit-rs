@@ -238,6 +238,8 @@ launches the child under a real pseudo-terminal instead of three pipes, so an
 | Echo control | terminal **echo disabled** (termios) so a written secret is not echoed back into the merged output | ConPTY has no portable per-write echo control — echo behavior is host-managed (not disabled) |
 | Window size | `winsize` passed to `openpty`, default 80×24; set with [`Command::pty_size(cols, rows)`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.pty_size) | `COORD` passed to `CreatePseudoConsole`, default 80×24; same builder |
 | Live resize | [`RunningProcess::resize_pty(cols, rows)`](https://docs.rs/processkit/latest/processkit/struct.RunningProcess.html#method.resize_pty) → `TIOCSWINSZ` on the master, which delivers **`SIGWINCH`** to the child's foreground process group | `resize_pty` → `ResizePseudoConsole`; **no `SIGWINCH`** — a console client learns of the new geometry on its next console query, and conhost may reflow **asynchronously** (delivery is best-effort, not synchronously observable) |
+| Line framing | effective [`LineTerminator`](https://docs.rs/processkit/latest/processkit/enum.LineTerminator.html) defaults to **`CarriageReturn`** (bare-`\r` progress frames stream as lines; an explicit `line_terminator(...)` wins), platform-agnostic | same |
+| Output hygiene | opt-in [`Command::sanitize_vt()`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.sanitize_vt) strips VT/ANSI escapes + lone control codes from the captured lines (backlog only), platform-agnostic | same |
 | Containment | unchanged — cgroup/pgroup kill-on-drop reaps the whole tree | unchanged — Job Object kill-on-close reaps the whole tree |
 
 Off by default and additive: with the `pty` feature off (or on but `use_pty`
@@ -260,6 +262,23 @@ The platform delivery differs: Unix `TIOCSWINSZ` raises `SIGWINCH` on the child
 synchronously, whereas Windows `ResizePseudoConsole` has no signal — conhost
 reflows and the client observes the new geometry on its next console query,
 possibly a little later.
+
+**Line framing and output hygiene (platform-agnostic).** A PTY child writes CRLF,
+draws progress with bare `\r`, and emits VT/ANSI escapes. Two decisions make the
+merged output line-consumable, both identical on every platform: (1) `use_pty`
+defaults the **effective** line terminator to
+[`CarriageReturn`](https://docs.rs/processkit/latest/processkit/enum.LineTerminator.html)
+so `\r` progress frames stream as individual lines instead of one growing blob (a
+*non-destructive* reframing; an explicit
+[`line_terminator(...)`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.line_terminator)
+— even `Newline` — overrides it); and (2) the *opt-in*
+[`Command::sanitize_vt()`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.sanitize_vt)
+strips escape sequences and lone control codes (keeping tabs) from the captured
+lines — kept opt-in because it is *destructive*. Sanitization scopes to the capture
+backlog only (the handlers, tees, and `output_bytes` still see the raw bytes),
+mirroring
+[`capture_policy`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.capture_policy);
+see the [streaming guide](streaming.md#pty-output-hygiene-line-framing-and-vt-sanitization).
 
 ## Caveats
 

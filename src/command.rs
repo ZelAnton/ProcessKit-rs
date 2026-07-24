@@ -192,6 +192,18 @@ pub struct Command {
     /// documented no-op without `use_pty`.
     #[cfg(feature = "pty")]
     pty_size: Option<(u16, u16)>,
+    /// Whether the caller explicitly chose stdout's / stderr's
+    /// [`LineTerminator`] (via `line_terminator`/`stdout_line_terminator`/
+    /// `stderr_line_terminator`). Only consulted by the PTY auto-default in
+    /// [`stdout_config`](Self::stdout_config)/[`stderr_config`](Self::stderr_config):
+    /// [`use_pty`](Self::use_pty) makes the *effective* terminator default to
+    /// [`LineTerminator::CarriageReturn`] — but only while this is `false`, so an
+    /// explicit choice (including `Newline`) always wins, order-independently.
+    /// Feature-gated because it exists solely for that PTY resolution.
+    #[cfg(feature = "pty")]
+    stdout_terminator_explicit: bool,
+    #[cfg(feature = "pty")]
+    stderr_terminator_explicit: bool,
     /// When cancelled, the run's tree is killed and every consuming path
     /// resolves to `ErrorReason::Cancelled`. Cheap to clone (internally `Arc`'d), so
     /// a `Command` clone — including each `Pipeline` stage and each
@@ -242,6 +254,10 @@ impl Command {
             use_pty: false,
             #[cfg(feature = "pty")]
             pty_size: None,
+            #[cfg(feature = "pty")]
+            stdout_terminator_explicit: false,
+            #[cfg(feature = "pty")]
+            stderr_terminator_explicit: false,
             cancel_token: None,
         }
     }
@@ -724,6 +740,31 @@ impl Command {
     /// ConPTY has no portable per-write echo control, so that guarantee is
     /// Unix-only.
     ///
+    /// # Line framing default (`\r`-aware) and output hygiene
+    ///
+    /// A PTY child writes like a terminal: CRLF line endings, progress bars
+    /// redrawn in place with a bare `\r` (no `\n` until the end), and VT/ANSI
+    /// escape sequences (colors, cursor moves, alternate screen, OSC titles). Two
+    /// deliberate, coded decisions handle this — one automatic, one opt-in:
+    ///
+    /// - **Framing is auto `\r`-aware.** Under `use_pty` the **effective** default
+    ///   [`line_terminator`](Self::line_terminator) is
+    ///   [`CarriageReturn`](LineTerminator::CarriageReturn) instead of `Newline`,
+    ///   so each progress redraw surfaces as its own line rather than piling into
+    ///   one ever-growing string a naive consumer never sees framed. This is a
+    ///   **non-destructive** reframing (it only changes where lines split), so it
+    ///   is the sensible default for the mode; a `\r\n` still counts as one
+    ///   terminator, so ordinary CRLF text reads unchanged. It is applied only
+    ///   when you have **not** pinned a terminator yourself — an explicit
+    ///   [`line_terminator`](Self::line_terminator) (even `Newline`) always wins,
+    ///   order-independently of `use_pty`.
+    /// - **Escape sanitization stays opt-in.** Stripping VT/ANSI escapes is
+    ///   **destructive** (it removes bytes from the captured output), so it is
+    ///   *not* turned on automatically — reach for
+    ///   [`sanitize_vt`](Self::sanitize_vt) when you want the merged output
+    ///   de-escaped for line predicates and transcripts. Leaving it off keeps the
+    ///   PTY's bytes verbatim in the backlog.
+    ///
     /// # Containment is unchanged
     ///
     /// The PTY child is placed in the **same** Job Object / cgroup / process
@@ -731,9 +772,9 @@ impl Command {
     /// cancellation behave identically — the pseudo-terminal only changes the
     /// I/O wiring, never the teardown guarantee.
     ///
-    /// Available only with the `pty` crate feature. A no-op-shaped note for
-    /// callers who leave it unset: without this the existing three-pipe behavior
-    /// is byte-for-byte unchanged.
+    /// Available only with the `pty` crate feature. A note for callers who leave
+    /// it unset: without this the existing three-pipe behavior — including the
+    /// `Newline` framing default — is byte-for-byte unchanged.
     #[cfg(feature = "pty")]
     #[cfg_attr(docsrs, doc(cfg(feature = "pty")))]
     pub fn use_pty(mut self) -> Self {
@@ -1575,17 +1616,38 @@ impl Command {
     /// [`stderr_line_terminator`](Self::stderr_line_terminator) when only one
     /// stream carries progress output (progress usually lands on stderr, while
     /// stdout stays newline-structured data).
+    ///
+    /// # Interaction with `use_pty`
+    ///
+    /// A PTY child writes progress as bare `\r` redraws, so `use_pty` (with the
+    /// `pty` feature) makes the **effective** default terminator
+    /// [`CarriageReturn`](LineTerminator::CarriageReturn) instead of `Newline`,
+    /// so a naive PTY consumer gets framed progress rather than one ever-growing
+    /// line (see `use_pty` for the rationale). Calling this
+    /// method — with **either** variant, including an explicit `Newline` — opts
+    /// out of that auto-default and pins your choice, order-independently of
+    /// `use_pty`.
     pub fn line_terminator(mut self, terminator: LineTerminator) -> Self {
         self.stdout_config.terminator = terminator;
         self.stderr_config.terminator = terminator;
+        #[cfg(feature = "pty")]
+        {
+            self.stdout_terminator_explicit = true;
+            self.stderr_terminator_explicit = true;
+        }
         self
     }
 
     /// Choose where the line pump splits **stdout** into lines (see
     /// [`LineTerminator`]); the stderr framing is left untouched. See
-    /// [`line_terminator`](Self::line_terminator) for both streams at once.
+    /// [`line_terminator`](Self::line_terminator) for both streams at once (and
+    /// for how it interacts with the `use_pty` auto-default).
     pub fn stdout_line_terminator(mut self, terminator: LineTerminator) -> Self {
         self.stdout_config.terminator = terminator;
+        #[cfg(feature = "pty")]
+        {
+            self.stdout_terminator_explicit = true;
+        }
         self
     }
 
@@ -1594,6 +1656,68 @@ impl Command {
     /// progress output lands on stderr while stdout stays newline-structured.
     pub fn stderr_line_terminator(mut self, terminator: LineTerminator) -> Self {
         self.stderr_config.terminator = terminator;
+        #[cfg(feature = "pty")]
+        {
+            self.stderr_terminator_explicit = true;
+        }
+        self
+    }
+
+    /// Enable the opt-in **VT/ANSI output sanitizer** on **both** streams' capture
+    /// backlog: each decoded line is stripped of terminal escape sequences and
+    /// lone control codes before it is retained, so a line-oriented consumer sees
+    /// readable text instead of `\x1b[31m…`-mucked strings.
+    ///
+    /// The motivating case is a PTY agent CLI (`use_pty`, the `pty` feature) whose
+    /// **merged** output is full of colors, cursor moves, alternate-screen
+    /// switches, and OSC title/hyperlink escapes: with this on, the line predicates
+    /// ([`wait_for_line`](crate::RunningProcess::wait_for_line) / `first_line`),
+    /// [`output_string`](crate::RunningProcess::output_string) /
+    /// [`ProcessResult`](crate::ProcessResult), and the streaming verbs
+    /// ([`stdout_lines`](crate::RunningProcess::stdout_lines) /
+    /// [`events`](crate::RunningProcess::events)) all carry the de-escaped text.
+    /// It drops CSI (`ESC [ … final`), OSC (`ESC ] … BEL/ST`), DCS/SOS/PM/APC
+    /// string escapes, other two-/n-byte `ESC` escapes, and lone C0 control bytes
+    /// / `DEL` — **keeping** the horizontal tab `\t`.
+    ///
+    /// # Scope (the same boundary as `capture_policy`)
+    ///
+    /// Sanitization shapes **only the capture backlog**, exactly like
+    /// [`capture_policy`](Self::capture_policy). The observing per-line handlers
+    /// ([`on_stdout_line`](Self::on_stdout_line)/`on_stderr_line`), the decoded
+    /// [`stdout_tee`](Self::stdout_tee)/`stderr_tee`, the byte-plane
+    /// [`stdout_raw_tee`](Self::stdout_raw_tee)/`stderr_raw_tee`, and the raw
+    /// [`output_bytes`](crate::RunningProcess::output_bytes) stream are
+    /// **independent** and keep seeing the un-sanitized bytes — if you also tee to
+    /// a log and want it clean, sanitize in that sink. When combined with
+    /// [`capture_policy`](Self::capture_policy), sanitization runs **first** so a
+    /// secret-scrubbing policy matches on already-cleaned text (a token cannot
+    /// hide behind a color escape). A line past an
+    /// [`OutputBufferPolicy`](crate::OutputBufferPolicy) byte cap is judged on its
+    /// **raw** length (before this transform) and, if over-cap, is never assembled
+    /// — so, like the handlers/tee, sanitization never sees it.
+    ///
+    /// Off by default and strictly additive: an existing run that never calls this
+    /// captures byte-for-byte as before. Set it per stream with
+    /// [`stdout_sanitize_vt`](Self::stdout_sanitize_vt) /
+    /// [`stderr_sanitize_vt`](Self::stderr_sanitize_vt).
+    pub fn sanitize_vt(mut self) -> Self {
+        self.stdout_config.sanitize_vt = true;
+        self.stderr_config.sanitize_vt = true;
+        self
+    }
+
+    /// Enable the [`sanitize_vt`](Self::sanitize_vt) VT/ANSI sanitizer on
+    /// **stdout** only; stderr capture is left verbatim.
+    pub fn stdout_sanitize_vt(mut self) -> Self {
+        self.stdout_config.sanitize_vt = true;
+        self
+    }
+
+    /// Enable the [`sanitize_vt`](Self::sanitize_vt) VT/ANSI sanitizer on
+    /// **stderr** only; stdout capture is left verbatim.
+    pub fn stderr_sanitize_vt(mut self) -> Self {
+        self.stderr_config.sanitize_vt = true;
         self
     }
 
@@ -1644,6 +1768,15 @@ impl Command {
         let mut config = self.stdout_config.clone();
         config.stream = OutputStream::Stdout;
         config.buffer_policy = self.capture_policy.clone();
+        // A PTY child writes progress as bare `\r` redraws: default the effective
+        // terminator to `CarriageReturn` under `use_pty` (unless the caller pinned
+        // one) so those frames stream as lines instead of one growing blob. See
+        // `use_pty`'s rustdoc for why this framing default is auto — and why the
+        // (destructive) sanitizer is NOT.
+        #[cfg(feature = "pty")]
+        if self.use_pty && !self.stdout_terminator_explicit {
+            config.terminator = LineTerminator::CarriageReturn;
+        }
         config
     }
 
@@ -1654,6 +1787,15 @@ impl Command {
         let mut config = self.stderr_config.clone();
         config.stream = OutputStream::Stderr;
         config.buffer_policy = self.capture_policy.clone();
+        // Mirror the stdout PTY `CarriageReturn` auto-default (see
+        // [`stdout_config`](Self::stdout_config)). PTY mode merges stderr into the
+        // stdout master, so this stderr config is unused under `use_pty`; keeping
+        // the resolution symmetric avoids a surprising asymmetry for any consumer
+        // that reads it.
+        #[cfg(feature = "pty")]
+        if self.use_pty && !self.stderr_terminator_explicit {
+            config.terminator = LineTerminator::CarriageReturn;
+        }
         config
     }
 
@@ -3053,6 +3195,8 @@ impl fmt::Debug for Command {
             .field("stderr_encoding", &self.stderr_config.encoding.name())
             .field("stdout_line_terminator", &self.stdout_config.terminator)
             .field("stderr_line_terminator", &self.stderr_config.terminator)
+            .field("stdout_sanitize_vt", &self.stdout_config.sanitize_vt)
+            .field("stderr_sanitize_vt", &self.stderr_config.sanitize_vt)
             .field("has_retry", &self.retry.is_some())
             .field("inherit_env", &self.inherit_env)
             .field("uid", &self.uid)
@@ -3597,6 +3741,115 @@ mod tests {
         assert!(
             dbg.contains("stdout_line_terminator") && dbg.contains("CarriageReturn"),
             "Debug should surface the line-terminator mode: {dbg}"
+        );
+    }
+
+    #[test]
+    fn sanitize_vt_defaults_off_and_setters_target_the_right_streams() {
+        // Default: neither stream sanitizes — capture is verbatim.
+        let default = Command::new("x");
+        assert!(!default.stdout_config.sanitize_vt);
+        assert!(!default.stderr_config.sanitize_vt);
+
+        // The combined setter enables both.
+        let both = Command::new("x").sanitize_vt();
+        assert!(both.stdout_config.sanitize_vt);
+        assert!(both.stderr_config.sanitize_vt);
+
+        // Per-stream setters touch only their own stream.
+        let out_only = Command::new("x").stdout_sanitize_vt();
+        assert!(out_only.stdout_config.sanitize_vt);
+        assert!(
+            !out_only.stderr_config.sanitize_vt,
+            "stdout_sanitize_vt must not touch stderr"
+        );
+        let err_only = Command::new("x").stderr_sanitize_vt();
+        assert!(err_only.stderr_config.sanitize_vt);
+        assert!(!err_only.stdout_config.sanitize_vt);
+
+        // Surfaced in Debug for introspection.
+        let dbg = format!("{both:?}");
+        assert!(
+            dbg.contains("stdout_sanitize_vt: true") && dbg.contains("stderr_sanitize_vt: true"),
+            "Debug should surface the sanitizer state: {dbg}"
+        );
+    }
+
+    // The whole-command policy injection is threaded into both stream configs
+    // regardless of the sanitizer, so the sanitizer flag also survives the getter.
+    #[test]
+    fn sanitize_vt_flag_survives_the_stream_config_getters() {
+        let cmd = Command::new("x").stdout_sanitize_vt();
+        assert!(
+            cmd.stdout_config().sanitize_vt,
+            "the getter carries the stdout sanitizer flag to the pump"
+        );
+        assert!(!cmd.stderr_config().sanitize_vt, "stderr stays verbatim");
+    }
+
+    #[cfg(feature = "pty")]
+    #[test]
+    fn use_pty_defaults_effective_terminator_to_carriage_return() {
+        // The coded PTY framing decision: `use_pty` makes the EFFECTIVE default
+        // terminator `CarriageReturn` (so bare-`\r` progress frames stream as
+        // lines), resolved in the config getter — order-independent with `pty_size`
+        // and independent of which order `use_pty` is called.
+        let pty = Command::new("agent").use_pty();
+        assert_eq!(
+            pty.stdout_config().terminator,
+            LineTerminator::CarriageReturn,
+            "use_pty defaults the effective stdout terminator to CarriageReturn"
+        );
+        assert_eq!(
+            pty.stderr_config().terminator,
+            LineTerminator::CarriageReturn,
+            "the resolution is symmetric on stderr (unused under PTY, but consistent)"
+        );
+
+        // The STORED config is untouched (the default is applied only at getter
+        // time), and a non-PTY command is unchanged.
+        assert_eq!(pty.stdout_config.terminator, LineTerminator::Newline);
+        let piped = Command::new("agent");
+        assert_eq!(piped.stdout_config().terminator, LineTerminator::Newline);
+    }
+
+    #[cfg(feature = "pty")]
+    #[test]
+    fn explicit_line_terminator_wins_over_the_pty_auto_default() {
+        // An explicit choice — including `Newline` — pins the terminator and opts
+        // out of the PTY auto-default, order-independently of `use_pty`.
+        let pinned_newline = Command::new("agent")
+            .use_pty()
+            .line_terminator(LineTerminator::Newline);
+        assert_eq!(
+            pinned_newline.stdout_config().terminator,
+            LineTerminator::Newline,
+            "explicit Newline must beat the PTY CarriageReturn auto-default"
+        );
+
+        // Order-independent: setting the terminator before use_pty is the same.
+        let other_order = Command::new("agent")
+            .line_terminator(LineTerminator::Newline)
+            .use_pty();
+        assert_eq!(
+            other_order.stdout_config().terminator,
+            LineTerminator::Newline
+        );
+
+        // A per-stream explicit choice pins only that stream; the other still
+        // takes the PTY auto-default.
+        let stderr_pinned = Command::new("agent")
+            .use_pty()
+            .stderr_line_terminator(LineTerminator::Newline);
+        assert_eq!(
+            stderr_pinned.stderr_config().terminator,
+            LineTerminator::Newline,
+            "pinned stderr wins"
+        );
+        assert_eq!(
+            stderr_pinned.stdout_config().terminator,
+            LineTerminator::CarriageReturn,
+            "un-pinned stdout still auto-defaults to CarriageReturn"
         );
     }
 

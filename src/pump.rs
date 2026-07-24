@@ -149,6 +149,184 @@ fn apply_capture_policy(
     }
 }
 
+/// `ESC` (`0x1B`) — the introducer of every VT/ANSI escape sequence.
+const ESC: u8 = 0x1B;
+/// `BEL` (`0x07`) — one of the two OSC string terminators (the other is `ST`,
+/// `ESC \`).
+const BEL: u8 = 0x07;
+
+/// Whether `b` is a C0 control byte (or `DEL`, `0x7F`) the VT sanitizer drops.
+///
+/// The horizontal tab `\t` (`0x09`) is kept — it is legitimate column content,
+/// not terminal control — and `ESC` (`0x1B`) is excluded here because the escape
+/// parser ([`skip_escape`]) consumes it together with its whole sequence. A
+/// line-*content* `\r` (kept as content only by [`LineTerminator::Newline`], since
+/// the `\r`-aware mode treats it as a terminator that never reaches the content)
+/// is deliberately dropped as bare cursor-return noise; `\n` never appears in a
+/// content line under either mode.
+fn is_strippable_control(b: u8) -> bool {
+    (b < 0x20 && b != b'\t' && b != ESC) || b == 0x7F
+}
+
+/// Return the index just past the escape sequence beginning at `bytes[start]`
+/// (which the caller has verified is [`ESC`]) — the extent [`strip_vt`] drops. An
+/// **incomplete** sequence (no terminator before the line ends) returns
+/// `bytes.len()`, dropping the dangling remainder rather than leaving a mangled
+/// tail in the line.
+fn skip_escape(bytes: &[u8], start: usize) -> usize {
+    let n = bytes.len();
+    // A lone `ESC` at the very end of the line: drop it.
+    let Some(&kind) = bytes.get(start + 1) else {
+        return n;
+    };
+    match kind {
+        // CSI: `ESC [` (params/intermediates `0x20..=0x3F`)* final `0x40..=0x7E`
+        // — colors, cursor moves, erase/scroll, alternate-screen switches.
+        b'[' => {
+            let mut j = start + 2;
+            while j < n && (0x20..=0x3F).contains(&bytes[j]) {
+                j += 1;
+            }
+            // Consume the final byte too; if the line ended first (or the byte
+            // there is not a valid final), drop what we have as an incomplete CSI.
+            if j < n && (0x40..=0x7E).contains(&bytes[j]) {
+                j + 1
+            } else {
+                j
+            }
+        }
+        // OSC (`ESC ]`) and the DCS/SOS/PM/APC string escapes (`ESC` `P`/`X`/`^`/
+        // `_`) share a body terminated by `BEL` or `ST` (`ESC \`).
+        b']' | b'P' | b'X' | b'^' | b'_' => skip_string_escape(bytes, start + 2),
+        // `ESC ESC`: drop only the first `ESC`; the second is re-parsed from
+        // scratch by the caller's loop (so `ESC ESC [ … m` still strips the CSI).
+        ESC => start + 1,
+        // nF escapes: `ESC` (intermediate `0x20..=0x2F`)+ final `0x30..=0x7E`
+        // (charset selection like `ESC ( B`).
+        0x20..=0x2F => {
+            let mut j = start + 1;
+            while j < n && (0x20..=0x2F).contains(&bytes[j]) {
+                j += 1;
+            }
+            if j < n && (0x30..=0x7E).contains(&bytes[j]) {
+                j + 1
+            } else {
+                j
+            }
+        }
+        // Any other two-byte escape (`Fe`/`Fs`/`Fp`: `RIS` = `ESC c`, …).
+        _ => (start + 2).min(n),
+    }
+}
+
+/// Skip an OSC/DCS/SOS/PM/APC string body starting at `from`, up to and including
+/// its `BEL` or `ST` (`ESC \`) terminator. A bare `ESC` that is **not** the start
+/// of an `ST` ends the scan *before* it, so that `ESC` is re-parsed as a fresh
+/// escape rather than swallowed with the string body. An unterminated body runs
+/// to the end of the line.
+fn skip_string_escape(bytes: &[u8], from: usize) -> usize {
+    let n = bytes.len();
+    let mut j = from;
+    while j < n {
+        match bytes[j] {
+            BEL => return j + 1,
+            ESC if bytes.get(j + 1) == Some(&b'\\') => return j + 2,
+            ESC => return j,
+            _ => j += 1,
+        }
+    }
+    n
+}
+
+/// Strip terminal control noise — VT/ANSI escape sequences and lone C0 control
+/// codes — from one **complete** decoded line, for the opt-in
+/// [`Command::sanitize_vt`](crate::Command::sanitize_vt) capture-hygiene seam.
+///
+/// Removes what a terminal-driven child (an agentic CLI under `use_pty`, a
+/// progress/TUI tool) sprays into its
+/// merged output, so a line-oriented consumer — `wait_for_line`/`first_line`,
+/// [`output_string`](crate::RunningProcess::output_string), the streaming verbs —
+/// sees readable text instead of `\x1b[31m…`-mucked strings. It drops:
+///
+/// - **CSI** — `ESC [` … a final byte `0x40..=0x7E` (colors, cursor moves,
+///   erase/scroll, alternate-screen switches);
+/// - **OSC** — `ESC ]` … `BEL`/`ST` (window-title / hyperlink escapes);
+/// - **DCS/SOS/PM/APC** string escapes — `ESC` `P`/`X`/`^`/`_` … `ST`;
+/// - other two-/n-byte `ESC` escapes (charset selection, `RIS`, …);
+/// - lone **C0 control** bytes and `DEL`, **except** the horizontal tab `\t`.
+///
+/// A sequence with no terminator before the line ends (a dangling `ESC [` at line
+/// end) is dropped to the line end, never left as a mangled tail. The pump calls
+/// this only on a *complete* line — already reassembled in its `pending` buffer
+/// from however many pipe reads it spanned — so an escape **split across chunk/
+/// read boundaries is already whole here**, stripped in one piece with no
+/// per-read carry state (a valid CSI/OSC never contains `\n`/`\r`, so it cannot
+/// straddle a line boundary either).
+///
+/// Returns [`Cow::Borrowed`] of the **input** line (never of some other `&str`)
+/// on its unchanged fast path, so the caller reuses the already-owned line with
+/// no re-allocation — and, unlike an arbitrary [`CapturePolicy`], that identity
+/// is guaranteed by construction, so no pointer check is needed here (contrast
+/// [`apply_capture_policy`]'s [[K-065]] guard).
+fn strip_vt(line: &str) -> Cow<'_, str> {
+    let bytes = line.as_bytes();
+    // Fast path: no escape and nothing strippable — return the input untouched,
+    // AS the same `Cow::Borrowed(line)` so the caller can reuse its owned buffer.
+    // Every escape/control byte is ASCII (`< 0x80`), so scanning bytes never
+    // splits a multi-byte UTF-8 character.
+    if !bytes.iter().any(|&b| b == ESC || is_strippable_control(b)) {
+        return Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut copy_from = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == ESC {
+            // Flush the clean run up to the escape, then skip the whole sequence.
+            // `copy_from..i` ends on an ASCII byte, always a char boundary.
+            out.push_str(&line[copy_from..i]);
+            i = skip_escape(bytes, i);
+            copy_from = i;
+        } else if is_strippable_control(b) {
+            out.push_str(&line[copy_from..i]);
+            i += 1;
+            copy_from = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&line[copy_from..]);
+    Cow::Owned(out)
+}
+
+/// Run the opt-in VT sanitizer over one decoded `line` when
+/// [`sanitize_vt`](StreamConfig::sanitize_vt) is set, returning the text to hand
+/// onward. Off (the default) returns the line untouched with no allocation.
+///
+/// Like [`apply_capture_policy`], this shapes **only** what is retained: the
+/// pump runs it in `emit` *after* the raw-observing handler/tee (which keep
+/// seeing the un-sanitized decoded line, matching the [`CapturePolicy`] boundary,
+/// see [[K-066]]) and *before* the capture policy — so a secret-scrubbing policy
+/// matches on already-cleaned text, never one where a color escape could hide a
+/// token mid-word (`to\x1b[0mken`). It touches none of the `count`/`seen_bytes`/
+/// overflow bookkeeping ([[K-054]]/[[K-059]]), which runs on its returned text in
+/// `SharedLines::push` exactly as for a raw or capture-policy-shaped line.
+fn apply_vt_sanitize(enabled: bool, line: String) -> String {
+    if !enabled {
+        return line;
+    }
+    match strip_vt(&line) {
+        // `strip_vt` returns `Cow::Borrowed` only on its unchanged fast path, and
+        // only ever of the input `line` — so reusing the owned `line` is sound
+        // WITHOUT the pointer-identity guard `apply_capture_policy` needs for an
+        // arbitrary policy ([[K-065]]); the contract is guaranteed here, not
+        // merely observed.
+        Cow::Borrowed(_) => line,
+        Cow::Owned(scrubbed) => scrubbed,
+    }
+}
+
 /// A shared, bounded line buffer written by a [`pump_lines`] task and read by
 /// the bulk collectors (drain) or the streaming consumer (`next_line`).
 ///
@@ -648,6 +826,14 @@ pub(crate) struct StreamConfig {
     /// leaves capture verbatim. A whole-command knob shared by both streams;
     /// [`stream`](Self::stream) tells it which one it is looking at.
     pub buffer_policy: Option<SharedCapturePolicy>,
+    /// Opt-in VT/ANSI **sanitizer** for the capture backlog
+    /// ([`Command::sanitize_vt`](crate::Command::sanitize_vt)): when `true`, each
+    /// decoded line is stripped of escape sequences and lone control codes
+    /// ([`strip_vt`]) **just before** the [`buffer_policy`](Self::buffer_policy)
+    /// and the backlog — after the raw-observing handler/tee, so it shapes only
+    /// what is retained (the same boundary as the capture policy). `false` (the
+    /// default) leaves capture verbatim.
+    pub sanitize_vt: bool,
     /// Which stream this config drives — handed to
     /// [`CapturePolicy::on_capture`](crate::CapturePolicy::on_capture) so one
     /// policy can distinguish stdout from stderr.
@@ -666,6 +852,7 @@ impl StreamConfig {
             raw_tee: None,
             terminator: LineTerminator::Newline,
             buffer_policy: None,
+            sanitize_vt: false,
             stream: OutputStream::Stdout,
         }
     }
@@ -797,6 +984,7 @@ where
         raw_tee,
         terminator,
         buffer_policy,
+        sanitize_vt,
         stream,
     } = config;
     // Close the sink on *every* exit from this task: a panic out of this loop
@@ -837,15 +1025,18 @@ where
     }
 
     // Emit one decoded line: run the (panic-isolated) handler, await the tee
-    // (disabling it on a write error), run the optional capture policy over the
-    // line, then buffer whatever it returns. The handler and tee — pure
-    // observation seams — see the *raw* decoded line; the capture policy runs
-    // last, in front of the backlog only, so redaction shapes what is retained
-    // without changing what those sinks observe.
+    // (disabling it on a write error), then shape the backlog copy — the opt-in
+    // VT sanitizer first, then the optional capture policy — and buffer the
+    // result. The handler and tee — pure observation seams — see the *raw*
+    // decoded line; the sanitizer and capture policy run last, in front of the
+    // backlog only, so hygiene/redaction shape what is retained without changing
+    // what those sinks observe. The sanitizer runs *before* the policy so a
+    // secret-scrubbing policy matches on already-cleaned text.
     async fn emit(
         handler: &mut Option<LineHandler>,
         tee: &mut Option<TeeSink>,
         buffer_policy: &Option<SharedCapturePolicy>,
+        sanitize_vt: bool,
         stream: OutputStream,
         sink: &SharedLines,
         line: String,
@@ -870,7 +1061,11 @@ where
                 );
             }
         }
-        sink.push(apply_capture_policy(buffer_policy, stream, line));
+        sink.push(apply_capture_policy(
+            buffer_policy,
+            stream,
+            apply_vt_sanitize(sanitize_vt, line),
+        ));
     }
 
     // Where the next complete line ends within `pending`.
@@ -1074,6 +1269,7 @@ where
                                 &mut handler,
                                 &mut tee,
                                 &buffer_policy,
+                                sanitize_vt,
                                 stream,
                                 &sink.0,
                                 line,
@@ -1154,6 +1350,7 @@ where
                         &mut handler,
                         &mut tee,
                         &buffer_policy,
+                        sanitize_vt,
                         stream,
                         &sink.0,
                         line,
@@ -1938,6 +2135,239 @@ mod tests {
         )
         .await;
         assert_eq!(sink.drain(), vec!["secret one", "secret two"]);
+    }
+
+    // --- Opt-in VT/ANSI sanitizer (`sanitize_vt`) ----------------------------
+
+    /// A stdout `StreamConfig` with the VT sanitizer on (all other knobs default).
+    fn sanitize_config() -> StreamConfig {
+        StreamConfig {
+            sanitize_vt: true,
+            ..StreamConfig::new()
+        }
+    }
+
+    #[test]
+    fn strip_vt_leaves_plain_text_borrowed_and_unchanged() {
+        // The no-op fast path must return `Cow::Borrowed` OF THE INPUT so the
+        // caller reuses its owned line with no re-allocation. A tab is content,
+        // kept verbatim.
+        for plain in ["", "hello world", "col\tumns", "üñîçödé keeps 8-bit bytes"] {
+            match strip_vt(plain) {
+                Cow::Borrowed(b) => {
+                    assert!(std::ptr::eq(b.as_ptr(), plain.as_ptr()) && b.len() == plain.len());
+                }
+                Cow::Owned(_) => panic!("plain text must not allocate: {plain:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn strip_vt_removes_csi_osc_and_control_codes() {
+        // A representative sweep of what a terminal-driven child emits.
+        let cases: &[(&str, &str)] = &[
+            // SGR color set/reset around content.
+            ("\x1b[31mred\x1b[0m", "red"),
+            // Multi-parameter SGR (bold + fg).
+            ("\x1b[1;32mok\x1b[m done", "ok done"),
+            // Cursor move / erase-line.
+            ("a\x1b[2Kb\x1b[10;5Hc", "abc"),
+            // Alternate-screen enter/leave (private CSI with `?`).
+            ("\x1b[?1049hscreen\x1b[?1049l", "screen"),
+            // OSC window-title, BEL-terminated.
+            ("\x1b]0;my title\x07visible", "visible"),
+            // OSC hyperlink, ST-terminated (`ESC \`).
+            ("\x1b]8;;https://x\x1b\\link\x1b]8;;\x1b\\", "link"),
+            // DCS string escape, ST-terminated.
+            ("pre\x1bPq#0;1;0\x1b\\post", "prepost"),
+            // Charset-selection nF escape.
+            ("\x1b(Btext", "text"),
+            // RIS (two-byte `ESC c`).
+            ("\x1bcreset", "reset"),
+            // Lone C0 controls (BEL, backspace, form-feed) dropped; tab kept.
+            ("a\x07b\x08\x0cc\td", "abc\td"),
+            // A bare CR kept as content by `Newline` mode is dropped as noise.
+            ("keep\rme", "keepme"),
+            // Doubled ESC: the first is dropped, the CSI after it still stripped.
+            ("\x1b\x1b[31mx", "x"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(strip_vt(raw), *want, "sanitizing {raw:?}");
+        }
+    }
+
+    #[test]
+    fn strip_vt_drops_incomplete_trailing_escape() {
+        // A sequence with no terminator before the line ends must be dropped
+        // whole — never left as a mangled tail in the retained line.
+        assert_eq!(strip_vt("value\x1b["), "value"); // dangling CSI intro
+        assert_eq!(strip_vt("value\x1b[31"), "value"); // CSI params, no final
+        assert_eq!(strip_vt("t\x1b]0;unterminated title"), "t"); // OSC, no BEL/ST
+        assert_eq!(strip_vt("end\x1b"), "end"); // lone trailing ESC
+    }
+
+    #[tokio::test]
+    async fn sanitize_scrubs_backlog_only_handler_and_tee_see_raw() {
+        // The boundary a reviewer must trust — identical in shape to the
+        // `capture_policy` boundary test: sanitization scopes to the backlog; the
+        // observing handler and decoded tee still see the RAW, escape-laden line.
+        let teed = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let handler: LineHandler =
+            Arc::new(move |line: &str| captured.lock().unwrap().push(line.to_owned()));
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"\x1b[32mbuilding\x1b[0m target\n"[..],
+            StreamConfig {
+                handler: Some(handler),
+                tee: Some(tee_of(VecSink(teed.clone()))),
+                sanitize_vt: true,
+                ..StreamConfig::new()
+            },
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            sink.drain(),
+            vec!["building target"],
+            "the backlog is sanitized"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["\u{1b}[32mbuilding\u{1b}[0m target"],
+            "the handler observes the raw escape-laden line (un-sanitized seam)"
+        );
+        assert_eq!(
+            String::from_utf8(teed.lock().unwrap().clone()).unwrap(),
+            "\u{1b}[32mbuilding\u{1b}[0m target\n",
+            "the decoded tee observes the raw line too"
+        );
+    }
+
+    #[tokio::test]
+    async fn sanitize_strips_escape_split_across_chunk_boundaries_whole() {
+        // The chunk-split requirement: an escape sequence cut between pump reads
+        // must be stripped in one piece, leaving no tail of garbage. The line is
+        // reassembled in `pending` before it reaches the per-line sanitizer, so
+        // EVERY split point of a fixed escape-laden line must yield the same clean
+        // text.
+        let raw = b"start\x1b[1;31mMID\x1b]0;title\x07END\n";
+        let want = "startMIDEND";
+        for split in 1..raw.len() {
+            let reader = ChunkedReader::new([raw[..split].to_vec(), raw[split..].to_vec()]);
+            let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+            pump_lines_core(reader, sanitize_config(), sink.clone()).await;
+            assert_eq!(
+                sink.drain(),
+                vec![want],
+                "split at byte {split} must still strip the whole sequence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sanitize_runs_before_capture_policy_so_the_policy_sees_clean_text() {
+        // Documented ordering: the sanitizer runs BEFORE the capture policy, so a
+        // secret-scrubbing policy matches on already-cleaned text — a token broken
+        // up by a color escape (`sec\x1b[0mret`) is rejoined to `secret` and then
+        // redacted. Were the order reversed, the policy would see the raw split
+        // token and miss it.
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"token=sec\x1b[0mret-abc\n"[..],
+            StreamConfig {
+                sanitize_vt: true,
+                buffer_policy: Some(Arc::new(RedactSecrets)),
+                ..StreamConfig::new()
+            },
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            sink.drain(),
+            vec!["token=[REDACTED]-abc"],
+            "sanitize-then-redact: the color escape can't hide the token from the policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn sanitize_off_leaves_capture_verbatim() {
+        // Default off: escapes are retained byte-for-byte (opt-in only).
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"\x1b[31mred\x1b[0m\n"[..],
+            StreamConfig::new(),
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(sink.drain(), vec!["\u{1b}[31mred\u{1b}[0m"]);
+    }
+
+    #[tokio::test]
+    async fn sanitize_does_not_disturb_raw_byte_or_line_accounting() {
+        // K-059: `seen_bytes` is the RAW pre-decode pipe-byte count; sanitizing
+        // content must not shift it. K-054-adjacent: every line is still counted
+        // and nothing is dropped by the (content-only) transform.
+        let raw = b"\x1b[31mred\x1b[0m\nplain\n\x1b[1mbold\x1b[0m\n";
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(&raw[..], sanitize_config(), sink.clone()).await;
+        assert_eq!(
+            sink.seen_bytes(),
+            raw.len(),
+            "seen_bytes still counts every raw pipe byte, escapes included"
+        );
+        assert_eq!(sink.count(), 3, "every line counted");
+        assert_eq!(sink.dropped(), 0, "the content transform drops no line");
+        assert_eq!(sink.drain(), vec!["red", "plain", "bold"]);
+    }
+
+    #[tokio::test]
+    async fn sanitize_composes_with_cr_frames() {
+        // Sanitization and `\r`-aware framing compose: each progress frame is a
+        // line, and its in-frame color codes are stripped.
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"\x1b[32m50%\x1b[0m\r\x1b[32m100%\x1b[0m\n"[..],
+            StreamConfig {
+                sanitize_vt: true,
+                terminator: LineTerminator::CarriageReturn,
+                ..StreamConfig::new()
+            },
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(sink.drain(), vec!["50%", "100%"], "clean per-frame lines");
+    }
+
+    #[tokio::test]
+    async fn sanitize_preserves_k054_dropnewest_seal() {
+        // K-054 regression: the DropNewest seal-on-first-drop latch still holds
+        // with sanitization on. The byte cap gates on the RAW (pre-sanitize) line
+        // length — exactly like `capture_policy` (the cap is judged before the
+        // transform) — so the retained line's escapes are kept within the cap
+        // here; sanitizing then proves it is the CLEANED text that lands, while
+        // the seal keeps the backlog a contiguous prefix. `\x1b[mok` is 5 raw
+        // bytes (≤ 6, retained → "ok"); `toolongline` is 11 > 6 (over-cap → seals
+        // the head via `record_oversized_line`); `hi` alone would fit but the seal
+        // is latched, so it is dropped.
+        let policy = OutputBufferPolicy::unbounded()
+            .with_max_bytes(6)
+            .with_overflow(OverflowMode::DropNewest);
+        let sink = SharedLines::new(&policy);
+        pump_lines_core(
+            &b"\x1b[mok\ntoolongline\nhi\n"[..],
+            sanitize_config(),
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(sink.count(), 3, "every line counted");
+        assert_eq!(
+            sink.drain(),
+            vec!["ok"],
+            "the seal latched on the first over-cap line; the retained line is sanitized"
+        );
+        assert!(sink.dropped() > 0, "the truncation signal fires");
     }
 
     // `ChunkedReader` lives at module scope (shared with the `proptests`
