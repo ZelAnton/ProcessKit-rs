@@ -436,6 +436,30 @@ impl core::marker::Unpin for processkit::OutputEvent
 impl core::marker::UnsafeUnpin for processkit::OutputEvent
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::OutputEvent
 impl core::panic::unwind_safe::UnwindSafe for processkit::OutputEvent
+#[non_exhaustive] pub enum processkit::OutputStream
+pub processkit::OutputStream::Stderr
+pub processkit::OutputStream::Stdout
+impl processkit::OutputStream
+pub fn processkit::OutputStream::from_name(&str) -> core::option::Option<Self>
+pub fn processkit::OutputStream::name(&self) -> &'static str
+impl core::clone::Clone for processkit::OutputStream
+pub fn processkit::OutputStream::clone(&self) -> processkit::OutputStream
+impl core::cmp::Eq for processkit::OutputStream
+impl core::cmp::PartialEq for processkit::OutputStream
+pub fn processkit::OutputStream::eq(&self, &processkit::OutputStream) -> bool
+impl core::fmt::Debug for processkit::OutputStream
+pub fn processkit::OutputStream::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for processkit::OutputStream
+pub fn processkit::OutputStream::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for processkit::OutputStream
+impl core::marker::StructuralPartialEq for processkit::OutputStream
+impl core::marker::Freeze for processkit::OutputStream
+impl core::marker::Send for processkit::OutputStream
+impl core::marker::Sync for processkit::OutputStream
+impl core::marker::Unpin for processkit::OutputStream
+impl core::marker::UnsafeUnpin for processkit::OutputStream
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::OutputStream
+impl core::panic::unwind_safe::UnwindSafe for processkit::OutputStream
 #[non_exhaustive] pub enum processkit::OverflowMode
 pub processkit::OverflowMode::DropNewest
 pub processkit::OverflowMode::DropOldest
@@ -697,6 +721,7 @@ pub fn processkit::Command::arg(self, impl core::convert::AsRef<std::ffi::os_str
 pub fn processkit::Command::args<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub fn processkit::Command::arguments(&self) -> &[std::ffi::os_str::OsString]
 pub fn processkit::Command::cancel_on(self, tokio_util::sync::cancellation_token::CancellationToken) -> Self
+pub fn processkit::Command::capture_policy(self, impl processkit::CapturePolicy + 'static) -> Self
 pub async fn processkit::Command::checked(&self) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
 pub fn processkit::Command::command_line(&self) -> alloc::string::String
 pub fn processkit::Command::configured_ok_codes(&self) -> core::option::Option<&[i32]>
@@ -1464,6 +1489,9 @@ impl<R> core::marker::Unpin for processkit::Supervisor<R> where R: core::marker:
 impl<R> core::marker::UnsafeUnpin for processkit::Supervisor<R> where R: core::marker::UnsafeUnpin
 impl<R> !core::panic::unwind_safe::RefUnwindSafe for processkit::Supervisor<R>
 impl<R> !core::panic::unwind_safe::UnwindSafe for processkit::Supervisor<R>
+pub trait processkit::CapturePolicy: core::marker::Send + core::marker::Sync
+pub fn processkit::CapturePolicy::name(&self) -> &str
+pub fn processkit::CapturePolicy::on_capture<'a>(&self, processkit::OutputStream, &'a str) -> alloc::borrow::Cow<'a, str>
 pub trait processkit::IntoCommand<R: processkit::ProcessRunner>: processkit::client::sealed::Sealed
 impl<R: processkit::ProcessRunner, S: core::convert::AsRef<std::ffi::os_str::OsStr>, const N: usize> processkit::IntoCommand<R> for &[S; N]
 impl<R: processkit::ProcessRunner, S: core::convert::AsRef<std::ffi::os_str::OsStr>, const N: usize> processkit::IntoCommand<R> for [S; N]

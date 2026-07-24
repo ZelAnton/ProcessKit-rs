@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use encoding_rs::Encoding;
 
-use crate::buffer::{LineTerminator, OutputBufferPolicy, StdioMode};
+use crate::buffer::{
+    CapturePolicy, LineTerminator, OutputBufferPolicy, OutputStream, SharedCapturePolicy, StdioMode,
+};
 use crate::error::{Error, ErrorReason, Result};
 use crate::parent_death::ParentDeathCleanup;
 use crate::pump::StreamConfig;
@@ -141,6 +143,13 @@ pub struct Command {
     stdout_file: Option<FileRedirect>,
     stderr_file: Option<FileRedirect>,
     output_buffer: OutputBufferPolicy,
+    /// Optional consumer [`CapturePolicy`] redaction/transform seam, applied to
+    /// each decoded line of **both** streams just before it enters the capture
+    /// backlog. A whole-command knob (like [`output_buffer`](Self::output_buffer)),
+    /// injected into each stream's [`StreamConfig`] by
+    /// [`stdout_config`](Self::stdout_config)/[`stderr_config`](Self::stderr_config)
+    /// with the matching [`OutputStream`] tag. `None` leaves capture verbatim.
+    capture_policy: Option<SharedCapturePolicy>,
     retry: Option<RetryConfig>,
     /// `Some` once `inherit_env` was called (even with an empty list): clear
     /// the inherited environment and copy only these parent vars.
@@ -206,6 +215,7 @@ impl Command {
             stdout_file: None,
             stderr_file: None,
             output_buffer: OutputBufferPolicy::unbounded(),
+            capture_policy: None,
             retry: None,
             inherit_env: None,
             uid: None,
@@ -1419,6 +1429,46 @@ impl Command {
         self
     }
 
+    /// Install a [`CapturePolicy`] — a typed **redaction-at-capture** seam that
+    /// shapes each decoded line of *both* streams **just before it is retained**,
+    /// so the value the policy returns (not the raw line) is what lands in the
+    /// capture backlog and therefore in
+    /// [`output_string`](crate::RunningProcess::output_string) /
+    /// [`ProcessResult`](crate::ProcessResult) and the streaming verbs
+    /// ([`stdout_lines`](crate::RunningProcess::stdout_lines) /
+    /// [`output_events`](crate::RunningProcess::output_events)).
+    ///
+    /// This is the capture-*shaping* counterpart to the *observing*
+    /// [`on_stdout_line`](Self::on_stdout_line)/[`on_stderr_line`](Self::on_stderr_line)
+    /// handlers: those see each line but run *alongside* capture and cannot
+    /// change what is retained. Use it to scrub a secret a child echoes to its
+    /// output before it settles in the captured result — completing the crate's
+    /// secret-hygiene posture (a cassette stores env *names* only; `Debug`
+    /// redacts env *values*).
+    ///
+    /// A single whole-command knob (like [`output_buffer`](Self::output_buffer)):
+    /// the policy is handed the [`OutputStream`](crate::OutputStream) each line
+    /// came from, so one implementation can treat stdout and stderr differently.
+    /// A repeat call replaces the previous policy (builder semantics).
+    ///
+    /// # Scope
+    ///
+    /// The seam shapes **only the capture backlog**. The per-line handlers, the
+    /// decoded [`stdout_tee`](Self::stdout_tee)/`stderr_tee`, the byte-plane
+    /// [`stdout_raw_tee`](Self::stdout_raw_tee)/`stderr_raw_tee`, and the raw
+    /// stdout of [`output_bytes`](crate::RunningProcess::output_bytes) are
+    /// **independent** and see the line un-redacted — if you also tee to a log,
+    /// redact in that sink too. A line past an
+    /// [`OutputBufferPolicy`] byte cap
+    /// ([`with_max_bytes`](OutputBufferPolicy::with_max_bytes)) is never
+    /// assembled, so — like the handlers/tee — the policy never sees it. See
+    /// [`CapturePolicy`] for the full contract (including its fail-closed panic
+    /// behavior).
+    pub fn capture_policy(mut self, policy: impl CapturePolicy + 'static) -> Self {
+        self.capture_policy = Some(Arc::new(policy));
+        self
+    }
+
     /// Decode stdout with `encoding` instead of UTF-8 (e.g.
     /// `encoding_rs::SHIFT_JIS`).
     pub fn stdout_encoding(mut self, encoding: &'static Encoding) -> Self {
@@ -1522,13 +1572,26 @@ impl Command {
     /// for the spawn. Replaces the four individual `out_encoding`/`stdout_handler`/
     /// `stdout_tee_sink`/`out_line_terminator` proxies — the launch paths take the
     /// whole [`StreamConfig`]. Cheap: handler and tee are `Arc`s.
+    ///
+    /// The whole-command [`capture_policy`](Self::capture_policy) and the
+    /// [`OutputStream::Stdout`] tag are injected here (rather than stored on the
+    /// per-stream config) so a single owning point wires the redaction seam into
+    /// every pump — every launch path already routes through this getter.
     pub(crate) fn stdout_config(&self) -> StreamConfig {
-        self.stdout_config.clone()
+        let mut config = self.stdout_config.clone();
+        config.stream = OutputStream::Stdout;
+        config.buffer_policy = self.capture_policy.clone();
+        config
     }
 
     /// The stderr stream's pump config — see [`stdout_config`](Self::stdout_config).
+    /// Injects the same [`capture_policy`](Self::capture_policy) with the
+    /// [`OutputStream::Stderr`] tag.
     pub(crate) fn stderr_config(&self) -> StreamConfig {
-        self.stderr_config.clone()
+        let mut config = self.stderr_config.clone();
+        config.stream = OutputStream::Stderr;
+        config.buffer_policy = self.capture_policy.clone();
+        config
     }
 
     pub(crate) fn output_buffer_policy(&self) -> OutputBufferPolicy {
@@ -2511,6 +2574,12 @@ impl fmt::Debug for Command {
             .field("has_stdout_raw_tee", &self.stdout_config.raw_tee.is_some())
             .field("has_stderr_raw_tee", &self.stderr_config.raw_tee.is_some())
             .field("output_buffer", &self.output_buffer)
+            // The named seam is introspectable, unlike an opaque closure: report
+            // its `name()` (never captured data) when a policy is installed.
+            .field(
+                "capture_policy",
+                &self.capture_policy.as_ref().map(|p| p.name()),
+            )
             .field("stdout_encoding", &self.stdout_config.encoding.name())
             .field("stderr_encoding", &self.stderr_config.encoding.name())
             .field("stdout_line_terminator", &self.stdout_config.terminator)
@@ -3285,6 +3354,53 @@ mod tests {
         let with = Command::new("x").cancel_on(tokio_util::sync::CancellationToken::new());
         assert!(format!("{with:?}").contains("has_cancel_token: true"));
         assert!(format!("{:?}", Command::new("x")).contains("has_cancel_token: false"));
+    }
+
+    /// A trivial identity [`crate::CapturePolicy`] for the config/Debug tests.
+    struct NamedPolicy(&'static str);
+    impl crate::CapturePolicy for NamedPolicy {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn on_capture<'a>(
+            &self,
+            _stream: crate::OutputStream,
+            line: &'a str,
+        ) -> std::borrow::Cow<'a, str> {
+            std::borrow::Cow::Borrowed(line)
+        }
+    }
+
+    #[test]
+    fn capture_policy_threads_into_both_stream_configs_with_stream_tags() {
+        // The whole-command policy reaches BOTH pumps via the config getters,
+        // each stamped with its own `OutputStream` tag; a plain command carries
+        // none. This is the single owning point (K-012) — no per-stream re-derive.
+        let plain = Command::new("x");
+        assert!(plain.stdout_config().buffer_policy.is_none());
+        assert!(plain.stderr_config().buffer_policy.is_none());
+
+        let cmd = Command::new("x").capture_policy(NamedPolicy("test-policy"));
+        let out = cmd.stdout_config();
+        let err = cmd.stderr_config();
+        assert!(out.buffer_policy.is_some(), "stdout pump gets the policy");
+        assert!(err.buffer_policy.is_some(), "stderr pump gets the policy");
+        assert_eq!(out.stream, crate::OutputStream::Stdout);
+        assert_eq!(err.stream, crate::OutputStream::Stderr);
+        assert_eq!(
+            out.buffer_policy.as_ref().unwrap().name(),
+            "test-policy",
+            "the same policy is shared across both streams"
+        );
+    }
+
+    #[test]
+    fn debug_reports_capture_policy_name_not_contents() {
+        // The named seam is introspectable (unlike an opaque closure): Debug
+        // surfaces its `name()`, and `None` when unset — never captured data.
+        let with = Command::new("x").capture_policy(NamedPolicy("redactor-x"));
+        assert!(format!("{with:?}").contains(r#"capture_policy: Some("redactor-x")"#));
+        assert!(format!("{:?}", Command::new("x")).contains("capture_policy: None"));
     }
 
     #[test]

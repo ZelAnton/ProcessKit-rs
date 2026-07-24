@@ -1545,3 +1545,54 @@ async fn first_line_returns_none_when_the_stream_ends_without_a_match() {
     .expect("run succeeds");
     assert_eq!(found, None);
 }
+
+/// A whole-command [`processkit::CapturePolicy`] that scrubs every `secret`
+/// occurrence as each line is captured — the redaction-at-capture use case.
+struct RedactSecret;
+impl processkit::CapturePolicy for RedactSecret {
+    fn name(&self) -> &str {
+        "redact-secret"
+    }
+    fn on_capture<'a>(
+        &self,
+        _stream: processkit::OutputStream,
+        line: &'a str,
+    ) -> std::borrow::Cow<'a, str> {
+        if line.contains("secret") {
+            std::borrow::Cow::Owned(line.replace("secret", "[REDACTED]"))
+        } else {
+            std::borrow::Cow::Borrowed(line)
+        }
+    }
+}
+
+/// A real child prints a secret to stdout; a `capture_policy` scrubs it before
+/// it settles, so the captured `ProcessResult` never contains the raw secret.
+/// End-to-end proof of the Command -> pump -> ProcessResult wiring.
+#[tokio::test]
+#[ignore = "spawns a real subprocess"]
+async fn capture_policy_redacts_captured_output_end_to_end() {
+    let cmd = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo token=secret-abc& echo plain-line"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'token=secret-abc\nplain-line\n'"])
+    };
+    let result = cmd
+        .capture_policy(RedactSecret)
+        .output_string()
+        .await
+        .expect("run succeeds");
+    let stdout = result.stdout();
+    assert!(
+        stdout.contains("[REDACTED]"),
+        "the redaction landed in the captured result: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("secret"),
+        "the raw secret must never reach ProcessResult: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("plain-line"),
+        "non-matching lines are captured verbatim: {stdout:?}"
+    );
+}

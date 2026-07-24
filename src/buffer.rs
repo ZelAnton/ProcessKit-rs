@@ -1,5 +1,7 @@
 //! Policy for capping the in-memory backlog of captured output lines.
 
+use std::borrow::Cow;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How a child process's standard output or error stream is connected.
@@ -433,6 +435,157 @@ impl Default for OutputBufferPolicy {
         Self::unbounded()
     }
 }
+
+/// Which of a child's two captured streams a decoded line came from.
+///
+/// Passed to [`CapturePolicy::on_capture`] so a single policy can treat stdout
+/// and stderr differently (e.g. redact only the stream a passphrase prompt is
+/// echoed on). It mirrors the [`OutputEvent`](crate::OutputEvent) stdout/stderr
+/// split, but is a small `Copy` discriminator so the capture seam does not force
+/// a consumer to depend on the streaming event type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum OutputStream {
+    /// The child's standard output.
+    Stdout,
+    /// The child's standard error.
+    Stderr,
+}
+
+impl OutputStream {
+    /// This stream's **stable machine identifier**: a short, lowercase
+    /// `snake_case` string (`"stdout"`, `"stderr"`) that is part of the crate's
+    /// compatibility surface.
+    ///
+    /// Use it for machine-readable output — a CLI's JSONL schema, a
+    /// cross-language binding, a structured log field — where a consumer needs
+    /// one canonical spelling per variant instead of hand-maintaining its own
+    /// mapping table. It is a *diagnostic* name, **not** a wire/serialization
+    /// format, but it is held stable all the same: a **new** variant gets a
+    /// **new** identifier, and an existing identifier is **never renamed**
+    /// without a major release. [`from_name`](Self::from_name) parses it back.
+    pub fn name(&self) -> &'static str {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never silently ship without a stable identifier.
+        match self {
+            OutputStream::Stdout => "stdout",
+            OutputStream::Stderr => "stderr",
+        }
+    }
+
+    /// Parse a [`name`](Self::name) identifier back into an `OutputStream`.
+    ///
+    /// Returns `None` for any string that is not exactly one of the stable
+    /// identifiers — an honest miss, never a silent default. Round-trips with
+    /// [`name`](Self::name): `OutputStream::from_name(s.name()) == Some(s)` for
+    /// every variant.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "stdout" => Some(OutputStream::Stdout),
+            "stderr" => Some(OutputStream::Stderr),
+            _ => None,
+        }
+    }
+}
+
+/// A consumer-supplied, typed seam that shapes each decoded line **just before
+/// it enters the capture backlog** — the redaction-at-capture extension point.
+///
+/// Set on a command with
+/// [`Command::capture_policy`](crate::Command::capture_policy). For every
+/// decoded line that fits the [`OutputBufferPolicy`] byte cap, the pump calls
+/// [`on_capture`](Self::on_capture) *before* the line is retained, so the value
+/// you return — not the raw line — is what lands in the capture backlog and
+/// therefore in [`output_string`](crate::Command::output_string) /
+/// [`ProcessResult`](crate::ProcessResult) and the streaming verbs
+/// ([`stdout_lines`](crate::RunningProcess::stdout_lines) /
+/// [`output_events`](crate::RunningProcess::output_events)). This is what the
+/// observing [`on_stdout_line`](crate::Command::on_stdout_line) /
+/// `on_stderr_line` handlers cannot do: they run *alongside* capture and can see
+/// a line but not *shape* what is retained.
+///
+/// # Why a typed seam, not a stored closure
+///
+/// The 2026-06 architecture audit rejected opaque, general-purpose
+/// `on_command`/`default_map` per-command *stored closures* — but it *accepts*
+/// typed, narrow, named seams (that is exactly what
+/// [`ProcessRunner`](crate::ProcessRunner) is). `CapturePolicy` is the same
+/// shape: a single, named, introspectable boundary on the one well-defined
+/// extension point (the in-memory backlog the pump writes to), not a closure
+/// grab-bag. The required [`name`](Self::name) makes a configured policy visible
+/// in `Command`'s `Debug` rather than an anonymous `<closure>`.
+///
+/// # Scope and boundaries (important for secret hygiene)
+///
+/// This seam shapes **only the capture backlog**. It completes the crate's
+/// secret-hygiene posture (a cassette stores env *names* only; `Debug` redacts
+/// env *values*) by letting you scrub a secret a child echoes to its output
+/// *before* it settles in the captured result — the motivating case being PTY
+/// agent CLIs whose merged output is prone to passphrases/tokens.
+///
+/// It deliberately does **not** reach the other, independent sinks, which keep
+/// their existing contract and see the line **un-redacted**:
+///
+/// - the per-line [`on_stdout_line`](crate::Command::on_stdout_line) /
+///   `on_stderr_line` handlers and the decoded
+///   [`stdout_tee`](crate::Command::stdout_tee) / `stderr_tee` — they are
+///   *observation* seams; if you also tee to a log, redact in that sink too;
+/// - the byte-plane [`stdout_raw_tee`](crate::Command::stdout_raw_tee) /
+///   `stderr_raw_tee` — a verbatim byte firehose, by contract un-decodable and
+///   so un-redactable here;
+/// - a line whose length exceeds the [`OutputBufferPolicy`] **byte** cap
+///   ([`with_max_bytes`](OutputBufferPolicy::with_max_bytes)): it is never
+///   assembled, so — exactly like the handlers/tee — it never reaches the
+///   policy (a policy cannot rescue an over-cap line, and a byte cap is judged
+///   on the *raw* line length, before your transform);
+/// - the raw stdout of [`output_bytes`](crate::Command::output_bytes), which is
+///   captured whole with no line pump (this seam is line-oriented).
+///
+/// # What you can do
+///
+/// [`on_capture`](Self::on_capture) is a pure line **transform**: return the
+/// text to retain — the same line unchanged
+/// ([`Cow::Borrowed`](std::borrow::Cow::Borrowed)`(line)`), a redacted rewrite
+/// ([`Cow::Owned`](std::borrow::Cow::Owned)), or an empty string to elide the
+/// content while keeping the line's slot (and the exact line/byte counters).
+/// *How much* is retained and eviction on overflow stay
+/// [`OutputBufferPolicy`]'s job (the built-in [`OverflowMode`] fast path is
+/// unchanged): the two compose orthogonally — the policy decides each retained
+/// line's *content*, the buffer policy decides *how many* survive. Retention
+/// bookkeeping (the byte backlog, the `DropNewest` seal-on-first-drop latch)
+/// runs on your returned text, and the cumulative line / raw-pipe-byte counters
+/// are untouched by it.
+///
+/// # Panics
+///
+/// A panicking policy is isolated like a per-line handler, but **fails closed**:
+/// the offending line is retained *empty* (never the raw, possibly-secret line
+/// it was meant to scrub), a `tracing` warn is emitted (when that feature is
+/// on), and the policy stays active for later lines. Prefer a panic-free policy
+/// — a redactor that panics blanks its output rather than leaking it.
+pub trait CapturePolicy: Send + Sync {
+    /// A short, stable, human-readable name for this policy (e.g.
+    /// `"redact-tokens"`), surfaced in [`Command`](crate::Command)'s `Debug` so
+    /// a configured policy is introspectable rather than an anonymous closure.
+    fn name(&self) -> &str;
+
+    /// Shape one decoded `line` from `stream` just before it enters the capture
+    /// backlog, returning the text to retain.
+    ///
+    /// Return [`Cow::Borrowed`](std::borrow::Cow::Borrowed)`(line)` to retain it
+    /// unchanged (no allocation), a [`Cow::Owned`](std::borrow::Cow::Owned) to
+    /// retain a rewritten/redacted line, or an empty string to blank it. The
+    /// line has already had its terminator stripped (the shape
+    /// [`stdout_lines`](crate::RunningProcess::stdout_lines) yields). Keep it
+    /// cheap: it runs on the capture pump, in front of every retained line.
+    fn on_capture<'a>(&self, stream: OutputStream, line: &'a str) -> Cow<'a, str>;
+}
+
+/// A shared, type-erased [`CapturePolicy`] carried by a `Command`/pump. Cloned
+/// into each stream's pump config; the `Arc` keeps it cheap and lets one policy
+/// serve both streams.
+pub(crate) type SharedCapturePolicy = Arc<dyn CapturePolicy>;
 
 /// Append `chunk` to a raw-byte capture buffer (used by
 /// [`output_bytes`](crate::Command::output_bytes)) under an

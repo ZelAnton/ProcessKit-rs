@@ -2,6 +2,7 @@
 //! bounded buffer, decoding text and feeding optional per-line handlers and
 //! live line/byte counters.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -11,7 +12,9 @@ use encoding_rs::{Encoding, UTF_8};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Notify;
 
-use crate::buffer::{LineTerminator, OutputBufferPolicy, OverflowMode};
+use crate::buffer::{
+    LineTerminator, OutputBufferPolicy, OutputStream, OverflowMode, SharedCapturePolicy,
+};
 
 // The oversized-line paths deliberately discard decoded text before it can
 // accumulate. Unit tests need to observe that internal bound without making it
@@ -83,6 +86,65 @@ pub(crate) fn invoke_handler_isolated(handler: &mut Option<LineHandler>, line: &
                 target: "processkit",
                 "line handler panicked; disabled for the rest of the run"
             );
+        }
+    }
+}
+
+/// Run the optional consumer [`CapturePolicy`](crate::CapturePolicy) over one
+/// decoded `line` just before it enters the backlog, returning the text to
+/// retain. `None` policy (the default) returns the line verbatim with no
+/// allocation. A policy that returns [`Cow::Borrowed`] pointing back at the
+/// input `line` reuses the already-owned `String` (no re-allocation); a
+/// [`Cow::Owned`], or a `Cow::Borrowed` of some *other* text (e.g. a
+/// `&'static` placeholder), retains that text — copied when borrowed.
+///
+/// The policy is **panic-isolated** like [`invoke_handler_isolated`], but
+/// **fails closed**: because this seam exists to scrub secrets, a panicking
+/// policy must not fall back to retaining the raw (possibly-secret) line, so the
+/// line is retained *empty* instead. The policy is **not** disabled — it is
+/// retried on the next line — so a transient panic can't silently leave the rest
+/// of the run un-redacted; a policy that panics on every line simply blanks
+/// every line (a loud, safe symptom), never leaking. `AssertUnwindSafe` is sound
+/// for the same reason as the handler: the closure only borrows the shared
+/// `&dyn CapturePolicy` and the `&line`, and neither is observed torn after a
+/// caught panic.
+fn apply_capture_policy(
+    policy: &Option<SharedCapturePolicy>,
+    stream: OutputStream,
+    line: String,
+) -> String {
+    let Some(policy) = policy else {
+        return line;
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        policy.on_capture(stream, &line)
+    }));
+    match outcome {
+        Ok(Cow::Owned(redacted)) => redacted,
+        Ok(Cow::Borrowed(borrowed)) => {
+            // Reuse the already-owned `line` (no re-allocation) ONLY when the
+            // policy handed back exactly it — same pointer and length. A policy
+            // may instead borrow a *different* `&str` (a `&'static` placeholder
+            // like `""`), which must be copied, not confused for the input line.
+            // `borrowed` is a plain reference with no drop glue, so its borrow of
+            // `line` ends here, freeing `line` to move in the identity branch.
+            let is_input_line =
+                std::ptr::eq(borrowed.as_ptr(), line.as_ptr()) && borrowed.len() == line.len();
+            if is_input_line {
+                line
+            } else {
+                borrowed.to_owned()
+            }
+        }
+        Err(_) => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                target: "processkit",
+                stream = stream.name(),
+                "capture policy panicked; the line was retained empty (fail-closed) \
+                 and the policy left active for later lines"
+            );
+            String::new()
         }
     }
 }
@@ -489,19 +551,21 @@ pub(crate) type TeeSink = Arc<tokio::sync::Mutex<Box<dyn tokio::io::AsyncWrite +
 /// rather than buffering without bound.
 pub(crate) type RawTeeSink = TeeSink;
 
-/// The five per-stream pump knobs that differ between stdout and stderr — the
-/// decode [`encoding`](Self::encoding), an optional per-line
-/// [`handler`](Self::handler), an optional decoded-line [`tee`](Self::tee) sink,
-/// an optional [`raw_tee`](Self::raw_tee) byte sink, and the line
-/// [`terminator`](Self::terminator) mode — carried as one value.
+/// The per-stream pump knobs that differ between stdout and stderr — the decode
+/// [`encoding`](Self::encoding), an optional per-line [`handler`](Self::handler),
+/// an optional decoded-line [`tee`](Self::tee) sink, an optional
+/// [`raw_tee`](Self::raw_tee) byte sink, the line
+/// [`terminator`](Self::terminator) mode, plus the optional
+/// [`buffer_policy`](Self::buffer_policy) redaction seam and which
+/// [`stream`](Self::stream) this config drives — carried as one value.
 ///
 /// Held one-per-stream by [`Command`](crate::Command),
 /// [`Spawned`](crate::running::Spawned), and
 /// [`RunningProcess`](crate::RunningProcess), and handed to [`pump_lines_core`]
 /// whole. Folding the knobs into a single struct means a new per-stream knob
 /// is threaded through *this* type instead of duplicated across every field pair
-/// and pump call site. Cheap to clone: `handler`/`tee`/`raw_tee` are `Arc`s and
-/// the rest is `Copy`.
+/// and pump call site. Cheap to clone: `handler`/`tee`/`raw_tee`/`buffer_policy`
+/// are `Arc`s and the rest is `Copy`.
 #[derive(Clone)]
 pub(crate) struct StreamConfig {
     /// Decode bytes with this encoding (default UTF-8).
@@ -516,6 +580,16 @@ pub(crate) struct StreamConfig {
     pub raw_tee: Option<RawTeeSink>,
     /// Where the pump splits the stream into lines (default `\n`-only).
     pub terminator: LineTerminator,
+    /// Optional consumer [`CapturePolicy`](crate::CapturePolicy): a redaction/
+    /// transform seam applied to each decoded line **just before it is
+    /// retained** in the backlog (see [`pump_lines_core`]). `None` (the default)
+    /// leaves capture verbatim. A whole-command knob shared by both streams;
+    /// [`stream`](Self::stream) tells it which one it is looking at.
+    pub buffer_policy: Option<SharedCapturePolicy>,
+    /// Which stream this config drives — handed to
+    /// [`CapturePolicy::on_capture`](crate::CapturePolicy::on_capture) so one
+    /// policy can distinguish stdout from stderr.
+    pub stream: OutputStream,
 }
 
 impl StreamConfig {
@@ -529,6 +603,8 @@ impl StreamConfig {
             tee: None,
             raw_tee: None,
             terminator: LineTerminator::Newline,
+            buffer_policy: None,
+            stream: OutputStream::Stdout,
         }
     }
 
@@ -558,9 +634,7 @@ pub(crate) async fn pump_lines<R>(
         StreamConfig {
             encoding,
             handler,
-            tee: None,
-            raw_tee: None,
-            terminator: LineTerminator::Newline,
+            ..StreamConfig::new()
         },
         sink,
     )
@@ -582,10 +656,8 @@ pub(crate) async fn pump_lines_term<R>(
         reader,
         StreamConfig {
             encoding,
-            handler: None,
-            tee: None,
-            raw_tee: None,
             terminator,
+            ..StreamConfig::new()
         },
         sink,
     )
@@ -662,6 +734,8 @@ where
         tee,
         raw_tee,
         terminator,
+        buffer_policy,
+        stream,
     } = config;
     // Close the sink on *every* exit from this task: a panic out of this loop
     // must never leave a streaming `StdoutLines` consumer parked.
@@ -701,10 +775,16 @@ where
     }
 
     // Emit one decoded line: run the (panic-isolated) handler, await the tee
-    // (disabling it on a write error), then buffer the line.
+    // (disabling it on a write error), run the optional capture policy over the
+    // line, then buffer whatever it returns. The handler and tee — pure
+    // observation seams — see the *raw* decoded line; the capture policy runs
+    // last, in front of the backlog only, so redaction shapes what is retained
+    // without changing what those sinks observe.
     async fn emit(
         handler: &mut Option<LineHandler>,
         tee: &mut Option<TeeSink>,
+        buffer_policy: &Option<SharedCapturePolicy>,
+        stream: OutputStream,
         sink: &SharedLines,
         line: String,
     ) {
@@ -728,7 +808,7 @@ where
                 );
             }
         }
-        sink.push(line);
+        sink.push(apply_capture_policy(buffer_policy, stream, line));
     }
 
     // Where the next complete line ends within `pending`.
@@ -928,7 +1008,15 @@ where
                         if cap.is_none_or(|c| len <= c) {
                             let line = sub[..len].to_owned(); // drop the terminator sequence
                             start += term.resume;
-                            emit(&mut handler, &mut tee, &sink.0, line).await;
+                            emit(
+                                &mut handler,
+                                &mut tee,
+                                &buffer_policy,
+                                stream,
+                                &sink.0,
+                                line,
+                            )
+                            .await;
                         } else {
                             // Over-cap line, terminator already here: drop it whole,
                             // counting its content length.
@@ -983,7 +1071,15 @@ where
                 if cap.is_some_and(|c| line.len() > c) {
                     sink.0.record_oversized_line(line.len());
                 } else {
-                    emit(&mut handler, &mut tee, &sink.0, line).await;
+                    emit(
+                        &mut handler,
+                        &mut tee,
+                        &buffer_policy,
+                        stream,
+                        &sink.0,
+                        line,
+                    )
+                    .await;
                 }
             }
             // Flush the tee once at stream end (best-effort).
@@ -1131,10 +1227,7 @@ pub fn fuzz_decode_pump_lines(raw: &[u8], chunk_sizes: &[u8], encoding_idx: u8) 
         reader,
         StreamConfig {
             encoding,
-            handler: None,
-            tee: None,
-            raw_tee: None,
-            terminator: LineTerminator::Newline,
+            ..StreamConfig::new()
         },
         sink.clone(),
     ));
@@ -1148,7 +1241,7 @@ pub fn fuzz_decode_pump_lines(raw: &[u8], chunk_sizes: &[u8], encoding_idx: u8) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::OutputBufferPolicy;
+    use crate::buffer::{CapturePolicy, OutputBufferPolicy};
 
     #[tokio::test]
     async fn pumps_utf8_lines_and_counts() {
@@ -1465,6 +1558,259 @@ mod tests {
             matches!(sink.try_pop(), Popped::Closed),
             "sink closes normally after the drain"
         );
+    }
+
+    // --- CapturePolicy: redaction-at-capture seam (T-186) --------------------
+    //
+    // The policy runs *in front of* the backlog: it shapes what is retained
+    // (and thus what `drain`/streaming/`output_string` see), unlike the
+    // observing per-line handler/tee which run alongside capture. These tests
+    // pin that placement, the stream tag, the empty-line elision, the
+    // fail-closed panic contract, and that it composes with the built-in
+    // overflow modes rather than forking a second retention path.
+
+    /// A policy that rewrites every `secret` occurrence, borrowing (no alloc)
+    /// when a line has none. Records nothing — used to assert retained content.
+    struct RedactSecrets;
+    impl CapturePolicy for RedactSecrets {
+        fn name(&self) -> &str {
+            "redact-secrets"
+        }
+        fn on_capture<'a>(&self, _stream: OutputStream, line: &'a str) -> Cow<'a, str> {
+            if line.contains("secret") {
+                Cow::Owned(line.replace("secret", "[REDACTED]"))
+            } else {
+                Cow::Borrowed(line)
+            }
+        }
+    }
+
+    fn policy_config(policy: SharedCapturePolicy, stream: OutputStream) -> StreamConfig {
+        StreamConfig {
+            buffer_policy: Some(policy),
+            stream,
+            ..StreamConfig::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_policy_shapes_what_is_retained_not_just_observed() {
+        // The redacting policy changes what actually lands in the backlog: the
+        // retained lines carry `[REDACTED]`, not the raw `secret`, proving the
+        // seam runs before retention (what `output_string`/`ProcessResult` and
+        // the streaming verbs read).
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"keep me\ntoken=secret-abc\nsecret and secret\nplain\n"[..],
+            policy_config(Arc::new(RedactSecrets), OutputStream::Stdout),
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(sink.count(), 4, "every line is still counted");
+        assert_eq!(
+            sink.drain(),
+            vec![
+                "keep me",
+                "token=[REDACTED]-abc",
+                "[REDACTED] and [REDACTED]",
+                "plain",
+            ],
+            "the backlog holds the redacted lines, not the raw ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_policy_shapes_backlog_only_handler_and_tee_see_raw() {
+        // The boundary the reviewer must trust: the policy scopes to the backlog.
+        // The observing handler and decoded tee — independent seams — still see
+        // the RAW line; only the retained backlog is redacted. A consumer who
+        // also tees to a log is responsible for that sink (documented contract).
+        let teed = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let handler: LineHandler =
+            Arc::new(move |line: &str| captured.lock().unwrap().push(line.to_owned()));
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"token=secret-xyz\n"[..],
+            StreamConfig {
+                handler: Some(handler),
+                tee: Some(tee_of(VecSink(teed.clone()))),
+                buffer_policy: Some(Arc::new(RedactSecrets)),
+                ..StreamConfig::new()
+            },
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(
+            sink.drain(),
+            vec!["token=[REDACTED]-xyz"],
+            "the backlog is redacted"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["token=secret-xyz"],
+            "the handler observes the raw line (separate, un-redacted seam)"
+        );
+        assert_eq!(
+            String::from_utf8(teed.lock().unwrap().clone()).unwrap(),
+            "token=secret-xyz\n",
+            "the decoded tee observes the raw line too"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_policy_is_handed_the_stream_identity() {
+        // One policy, applied to both streams, can tell them apart: it receives
+        // the `OutputStream` the config drives.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        struct RecordStream(Arc<Mutex<Vec<OutputStream>>>);
+        impl CapturePolicy for RecordStream {
+            fn name(&self) -> &str {
+                "record-stream"
+            }
+            fn on_capture<'a>(&self, stream: OutputStream, line: &'a str) -> Cow<'a, str> {
+                self.0.lock().unwrap().push(stream);
+                Cow::Borrowed(line)
+            }
+        }
+        let policy: SharedCapturePolicy = Arc::new(RecordStream(seen.clone()));
+
+        let out_sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"a\n"[..],
+            policy_config(policy.clone(), OutputStream::Stdout),
+            out_sink.clone(),
+        )
+        .await;
+        let err_sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"b\n"[..],
+            policy_config(policy, OutputStream::Stderr),
+            err_sink.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![OutputStream::Stdout, OutputStream::Stderr],
+            "the policy saw each stream's identity"
+        );
+        // Borrowed lines are retained verbatim (no re-allocation, same content).
+        assert_eq!(out_sink.drain(), vec!["a"]);
+        assert_eq!(err_sink.drain(), vec!["b"]);
+    }
+
+    #[tokio::test]
+    async fn capture_policy_can_blank_a_line_keeping_its_slot() {
+        // Returning an empty string elides the *content* while keeping the line
+        // (and the exact line counter) — the "drop the payload, not the row"
+        // shape. Retention stays `OutputBufferPolicy`'s job.
+        struct BlankMatches;
+        impl CapturePolicy for BlankMatches {
+            fn name(&self) -> &str {
+                "blank-matches"
+            }
+            fn on_capture<'a>(&self, _stream: OutputStream, line: &'a str) -> Cow<'a, str> {
+                if line.starts_with("drop") {
+                    Cow::Borrowed("")
+                } else {
+                    Cow::Borrowed(line)
+                }
+            }
+        }
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"keep1\ndrop-this\nkeep2\n"[..],
+            policy_config(Arc::new(BlankMatches), OutputStream::Stdout),
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(sink.count(), 3, "the blanked line is still a counted line");
+        assert_eq!(sink.drain(), vec!["keep1", "", "keep2"]);
+    }
+
+    #[tokio::test]
+    async fn panicking_capture_policy_fails_closed_without_leaking() {
+        // A policy that panics must NOT fall back to retaining the raw line (a
+        // redactor that leaks the secret it was meant to scrub is the worst
+        // outcome): the offending line is retained EMPTY, the line is still
+        // counted, and the policy stays active so later lines are still shaped.
+        struct PanicOnSecret;
+        impl CapturePolicy for PanicOnSecret {
+            fn name(&self) -> &str {
+                "panic-on-secret"
+            }
+            fn on_capture<'a>(&self, _stream: OutputStream, line: &'a str) -> Cow<'a, str> {
+                if line.contains("secret") {
+                    panic!("policy blew up on a secret line");
+                }
+                Cow::Owned(format!("ok:{line}"))
+            }
+        }
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        let task = tokio::spawn(pump_lines_core(
+            &b"one\ntop-secret-value\ntwo\n"[..],
+            policy_config(Arc::new(PanicOnSecret), OutputStream::Stdout),
+            sink.clone(),
+        ));
+        task.await
+            .expect("the pump task must survive a capture-policy panic");
+        assert_eq!(sink.count(), 3, "every line is still counted");
+        let retained = sink.drain();
+        assert_eq!(
+            retained,
+            vec!["ok:one", "", "ok:two"],
+            "the panicking line is blanked (never the raw secret), later lines still shaped"
+        );
+        assert!(
+            !retained.iter().any(|l| l.contains("secret")),
+            "the raw secret line must never reach the backlog"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_policy_composes_with_drop_oldest_on_transformed_length() {
+        // The built-in overflow modes are a separate, unchanged fast path: they
+        // evict on the policy's *returned* content. Here the policy shrinks each
+        // line to one char, so a 2-line cap retains the last two shrunk lines —
+        // retention ran on the transformed text, not the raw line.
+        struct FirstChar;
+        impl CapturePolicy for FirstChar {
+            fn name(&self) -> &str {
+                "first-char"
+            }
+            fn on_capture<'a>(&self, _stream: OutputStream, line: &'a str) -> Cow<'a, str> {
+                Cow::Owned(line.chars().take(1).collect())
+            }
+        }
+        let sink = SharedLines::new(&OutputBufferPolicy::bounded(2));
+        pump_lines_core(
+            &b"alpha\nbravo\ncharlie\ndelta\n"[..],
+            policy_config(Arc::new(FirstChar), OutputStream::Stdout),
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(sink.count(), 4, "every line counted");
+        assert_eq!(
+            sink.drain(),
+            vec!["c", "d"],
+            "DropOldest kept the last two, each shaped by the policy"
+        );
+        assert!(sink.dropped() > 0, "the overflow drop signal still fires");
+    }
+
+    #[tokio::test]
+    async fn no_capture_policy_leaves_capture_verbatim() {
+        // The default (no policy) path is byte-for-byte unchanged.
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        pump_lines_core(
+            &b"secret one\nsecret two\n"[..],
+            StreamConfig::new(),
+            sink.clone(),
+        )
+        .await;
+        assert_eq!(sink.drain(), vec!["secret one", "secret two"]);
     }
 
     // `ChunkedReader` lives at module scope (shared with the `proptests`
@@ -2325,6 +2671,7 @@ mod tests {
                 tee: Some(tee_of(VecSink(buf.clone()))),
                 raw_tee: None,
                 terminator: LineTerminator::CarriageReturn,
+                ..StreamConfig::new()
             },
             sink.clone(),
         )
@@ -2384,6 +2731,7 @@ mod tests {
                 tee: Some(tee_of(buffered)),
                 raw_tee: None,
                 terminator: LineTerminator::Newline,
+                ..StreamConfig::new()
             },
             sink.clone(),
         )
@@ -2411,6 +2759,7 @@ mod tests {
                 tee: Some(tee_of(VecSink(buf.clone()))),
                 raw_tee: None,
                 terminator: LineTerminator::Newline,
+                ..StreamConfig::new()
             },
             sink.clone(),
         )
@@ -2455,6 +2804,7 @@ mod tests {
                 tee: Some(tee_of(ErrSink)),
                 raw_tee: None,
                 terminator: LineTerminator::Newline,
+                ..StreamConfig::new()
             },
             sink.clone(),
         )
@@ -2510,6 +2860,7 @@ mod tests {
                 tee: Some(tee_of(FlushErrSink)),
                 raw_tee: None,
                 terminator: LineTerminator::Newline,
+                ..StreamConfig::new()
             },
             sink.clone(),
         )
@@ -2538,6 +2889,7 @@ mod tests {
                 tee: Some(tee_of(VecSink(buf.clone()))),
                 raw_tee: None,
                 terminator: LineTerminator::Newline,
+                ..StreamConfig::new()
             },
             sink.clone(),
         )
@@ -2562,11 +2914,8 @@ mod tests {
     /// no line handler or line tee) — the common shape for the raw-tee tests.
     fn raw_only_config(raw_tee: RawTeeSink) -> StreamConfig {
         StreamConfig {
-            encoding: encoding_rs::UTF_8,
-            handler: None,
-            tee: None,
             raw_tee: Some(raw_tee),
-            terminator: LineTerminator::Newline,
+            ..StreamConfig::new()
         }
     }
 
@@ -2769,6 +3118,7 @@ mod tests {
                 tee: Some(tee_of(VecSink(lines.clone()))),
                 raw_tee: Some(tee_of(VecSink(raw.clone()))),
                 terminator: LineTerminator::Newline,
+                ..StreamConfig::new()
             },
             sink.clone(),
         )

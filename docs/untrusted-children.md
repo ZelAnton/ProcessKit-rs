@@ -224,6 +224,41 @@ crate never logs argv" extends to cassette recording — it's the one
 opt-in feature where argv reaches disk on purpose. Detail: [Testing your
 code → record/replay cassettes](testing.md#recordreplay-cassettes).
 
+**Redacting what a child *prints* — `capture_policy`.** The rules above cover
+what the crate logs (argv/env) and stores (cassettes); the remaining leak is a
+secret the *child itself* echoes to stdout/stderr — a passphrase prompt from an
+agent CLI under a pseudo-terminal, a token re-printed in a diagnostic — which
+otherwise lands in the captured `ProcessResult` verbatim. `capture_policy`
+installs a typed [`CapturePolicy`] that shapes each decoded line **before it is
+retained**, so you can scrub the secret out of the capture (and the streaming
+verbs) at the source:
+
+```rust,no_run
+use std::borrow::Cow;
+use processkit::{Command, CapturePolicy, OutputStream};
+
+struct Scrub;
+impl CapturePolicy for Scrub {
+    fn name(&self) -> &str { "scrub" }
+    fn on_capture<'a>(&self, _s: OutputStream, line: &'a str) -> Cow<'a, str> {
+        if line.contains("passphrase") { Cow::Borrowed("<redacted>") } else { Cow::Borrowed(line) }
+    }
+}
+
+# async fn f() -> Result<(), Box<dyn std::error::Error>> {
+let out = Command::new("agent").capture_policy(Scrub).output_string().await?;
+# let _ = out; Ok(()) }
+```
+
+It is a **narrow, capture-scoped** seam: it shapes the backlog only. The
+`on_*_line` handlers, a `stdout_tee`/`stderr_tee`, and `stdout_raw_tee` are
+independent and still see the un-redacted line — if you also tee a child's output
+to a log, scrub in that sink too, or don't tee a stream that can carry secrets. A
+policy that panics fails closed (the line is blanked, never leaked). Full contract
+and examples: [Streaming → redaction at capture](streaming.md#redaction-at-capture-capture_policy).
+
+[`CapturePolicy`]: https://docs.rs/processkit/latest/processkit/trait.CapturePolicy.html
+
 ## 5. Bound output, wall time, and give yourself an exit
 
 An untrusted child can flood its own stdout/stderr, hang forever, or need to

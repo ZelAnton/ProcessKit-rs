@@ -258,6 +258,67 @@ The raw tee fires from the line/streaming verbs (`output_string`, `start` +
 pump — and under `output_bytes`, whose own return value already *is* the exact raw
 stdout. Reach for it when you need the raw bytes *alongside* decoded lines.
 
+### Redaction at capture (`capture_policy`)
+
+Every plane above either *observes* a line (`on_stdout_line`, `stdout_tee`) or
+returns it verbatim (`stdout_raw_tee`, `output_bytes`). None can *change what is
+retained*: a secret a child echoes — a passphrase prompt from an agent CLI, a
+`--token` re-printed in a diagnostic — lands in the captured `ProcessResult`
+word for word. `capture_policy` is the seam that shapes the backlog **before**
+the line settles:
+
+```rust,no_run
+use std::borrow::Cow;
+use processkit::{Command, CapturePolicy, OutputStream};
+
+// A typed, named policy — introspectable in `Command`'s `Debug`, not an opaque
+// closure. It rewrites secrets as each line is captured.
+struct RedactTokens;
+impl CapturePolicy for RedactTokens {
+    fn name(&self) -> &str { "redact-tokens" }
+    fn on_capture<'a>(&self, _stream: OutputStream, line: &'a str) -> Cow<'a, str> {
+        if let Some(i) = line.find("token=") {
+            Cow::Owned(format!("{}token=[REDACTED]", &line[..i]))
+        } else {
+            Cow::Borrowed(line) // unchanged: retained verbatim, no allocation
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let out = Command::new("agent-cli")
+        .arg("login")
+        .capture_policy(RedactTokens)
+        .output_string()
+        .await?;
+    // `out.stdout()` — and a streamed `stdout_lines` / `output_events` — carry
+    // the redacted text; the raw secret never reached the buffer.
+    assert!(!out.stdout().contains("token=hunter2"));
+    Ok(())
+}
+```
+
+Return `Cow::Borrowed(line)` to keep a line unchanged (no allocation), a
+`Cow::Owned` to rewrite it, or an empty string to blank the content while
+keeping the line's slot and the exact line counter. The policy is handed the
+`OutputStream` each line came from, so one implementation can treat stdout and
+stderr differently. This completes the crate's secret-hygiene story — a cassette
+stores env *names* only, `Debug` redacts env *values*, and `capture_policy`
+scrubs secrets a child prints — see
+[Running untrusted children](untrusted-children.md#4-keep-the-environment-hermetic).
+
+**Scope.** The seam shapes the capture backlog only — `output_string` /
+`ProcessResult` and the streaming verbs. The observing `on_*_line` handlers, the
+decoded `stdout_tee` / `stderr_tee`, the byte-plane `stdout_raw_tee`, and the raw
+stdout of `output_bytes` are **independent** and see the line un-redacted; if you
+also tee to a log, redact in that sink too. A line past an `OutputBufferPolicy`
+byte cap is never assembled, so — like the handlers/tee — it never reaches the
+policy. *How much* is retained stays `OutputBufferPolicy`'s job (the two compose:
+the policy shapes each retained line's content, the buffer policy bounds how many
+survive). A policy that panics **fails closed** — the offending line is blanked,
+never leaked raw.
+
 ## Interactive stdin
 
 Conversational tools — write a request, read the response, repeat. Keep stdin
