@@ -570,6 +570,11 @@ pub(crate) fn spawn_pty(
     // across `CreateProcessW` below so the child propagates pseudoconsole-overridable
     // null defaults rather than inheriting the launcher's redirected stdio.
     let has_console = launcher_has_console();
+    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
+    // Confirms/denies round 2's premise: if this is `true` on the CI runner, the
+    // headless branch (and its fix) was never taken; if `false`, the branch ran
+    // yet the failure persists, so the cause is elsewhere.
+    eprintln!("[T182-DIAG] launcher_has_console = {has_console}");
     let si = conpty_startup_info(attr_list, has_console);
 
     let mut command_line = build_command_line(cmd);
@@ -643,8 +648,19 @@ pub(crate) fn spawn_pty(
     // is cleaned up — never an uncontained leak.
     // SAFETY: `pi.hProcess` is the freshly-created (suspended) child; `job` is a
     // valid job handle for the caller's lifetime.
-    if unsafe { AssignProcessToJobObject(job, pi.hProcess) } == 0 {
+    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
+    // Surface the assign result (and GetLastError on failure) explicitly, testing
+    // the hypothesis that an outer GH Actions job object rejects/perturbs our
+    // AssignProcessToJobObject on the ConPTY child.
+    let diag_assign_ok = unsafe { AssignProcessToJobObject(job, pi.hProcess) };
+    if diag_assign_ok == 0 {
         let e = io::Error::last_os_error();
+        // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
+        eprintln!(
+            "[T182-DIAG] AssignProcessToJobObject FAILED (pid={}): {e} (raw_os_error={:?})",
+            pi.dwProcessId,
+            e.raw_os_error()
+        );
         unsafe {
             TerminateProcess(pi.hProcess, 1);
             close(pi.hProcess);
@@ -655,11 +671,20 @@ pub(crate) fn spawn_pty(
         }
         return Err(e);
     }
+    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
+    eprintln!(
+        "[T182-DIAG] AssignProcessToJobObject ok (pid={})",
+        pi.dwProcessId
+    );
     // A fresh killable member joined the job — re-arm kill-on-close so a prior
     // survivor-sparing shutdown does not spare it (mirrors `Job::spawn`).
     skip_drop_kill.clear();
     // SAFETY: resuming the primary thread of the now-contained child.
     unsafe { ResumeThread(pi.hThread) };
+    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
+    // Marks the instant the child begins executing, so the reader thread can log
+    // each chunk's and EOF's relative offset (how long the runner waited).
+    let diag_spawn_started = std::time::Instant::now();
 
     let pid = pi.dwProcessId;
     // `output_read` (merged stdout+stderr) and `input_write` (stdin) are
@@ -668,7 +693,12 @@ pub(crate) fn spawn_pty(
     // bridged to async over a channel (the established pattern for blocking Windows
     // pipes). Acceptable for the minimal, low-volume interactive PTY mode.
     let output_activity = Arc::new(OutputActivity::default());
-    let reader: PtyReader = Box::new(bridge_reader(output_read, Arc::clone(&output_activity)));
+    let reader: PtyReader = Box::new(bridge_reader(
+        output_read,
+        Arc::clone(&output_activity),
+        // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
+        diag_spawn_started,
+    ));
     let writer: PtyWriter = Box::new(bridge_writer(input_write));
 
     Ok(PtySpawn {
@@ -710,7 +740,12 @@ impl SendHandle {
 /// the pipe and forwards chunks over a bounded channel (whose fullness
 /// backpressures the reader thread, and thus the child). A `0`-length read (EOF,
 /// on pseudoconsole close) or an error ends the thread.
-fn bridge_reader(handle: HANDLE, output_activity: Arc<OutputActivity>) -> ChannelReader {
+fn bridge_reader(
+    handle: HANDLE,
+    output_activity: Arc<OutputActivity>,
+    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
+    diag_started: std::time::Instant,
+) -> ChannelReader {
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let h = SendHandle(handle);
     std::thread::spawn(move || {
@@ -718,10 +753,38 @@ fn bridge_reader(handle: HANDLE, output_activity: Arc<OutputActivity>) -> Channe
         // SAFETY: the handle is owned by this thread; the `File` closes it on drop.
         let mut file = unsafe { h.into_file() };
         let mut buf = [0u8; 8192];
+        // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
+        let mut diag_chunks = 0usize;
+        let mut diag_total = 0usize;
         loop {
             match file.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => {
+                    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
+                    eprintln!(
+                        "[T182-DIAG] bridge_reader EOF at +{:?} ({diag_chunks} chunk(s), {diag_total} bytes total)",
+                        diag_started.elapsed()
+                    );
+                    break;
+                }
+                Err(e) => {
+                    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
+                    eprintln!(
+                        "[T182-DIAG] bridge_reader read error at +{:?} after {diag_chunks} chunk(s): {e}",
+                        diag_started.elapsed()
+                    );
+                    break;
+                }
                 Ok(n) => {
+                    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
+                    // Bounded, escaped preview: this is the child's own PTY probe
+                    // output (TTY/PIPE/"reply:hello") — no secrets are possible here.
+                    diag_chunks += 1;
+                    diag_total += n;
+                    eprintln!(
+                        "[T182-DIAG] bridge_reader chunk #{diag_chunks} at +{:?}: {n} bytes, preview={:?}",
+                        diag_started.elapsed(),
+                        String::from_utf8_lossy(&buf[..n.min(120)])
+                    );
                     output_activity.record_chunk();
                     if tx.blocking_send(buf[..n].to_vec()).is_err() {
                         break;

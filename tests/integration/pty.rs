@@ -80,6 +80,15 @@ async fn pty_child_sees_a_tty() {
     )
     .await
     .expect("pty run");
+    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
+    // Did powershell exit 0 (ran but produced no visible output) or fail? Printed
+    // to the test runner's stderr, which cargo test shows for a FAILED test.
+    eprintln!(
+        "[T182-DIAG] pty_child_sees_a_tty: outcome={} code={:?} stdout={:?}",
+        out.outcome().name(),
+        out.code(),
+        out.stdout()
+    );
     assert!(
         out.stdout().contains("TTY"),
         "an isatty child must see a terminal under PTY, got {:?}",
@@ -124,6 +133,13 @@ async fn pty_prompt_response_round_trips_over_the_master() {
     )
     .await
     .expect("output");
+    // TEMP DIAGNOSTIC — T-182 CI investigation, remove after root cause confirmed.
+    eprintln!(
+        "[T182-DIAG] pty_prompt_response: outcome={} code={:?} stdout={:?}",
+        result.outcome().name(),
+        result.code(),
+        result.stdout()
+    );
     assert!(
         result.stdout().contains("reply:hello"),
         "the master must carry the child's reply, got {:?}",
