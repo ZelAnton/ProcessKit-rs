@@ -24,7 +24,11 @@
 //!   `panic = "abort"` process, or a `SIGKILL`/power-loss of the *owner*, skips
 //!   it — the OS-owned Job Object / cgroup still reaps on handle close, the POSIX
 //!   process-group fallback does not), and on the process-group mechanism a child
-//!   that calls `setsid` escapes containment. The whole tree can be
+//!   that calls `setsid` escapes containment. The one *deliberate* way out is
+//!   [`Command::spawn_detached`] — an explicit, loudly-named opt-in that hands
+//!   back a [`DetachedChild`] the crate never kills, reaps, times out, or
+//!   contains (it inverts this guarantee on purpose; see its docs). The whole
+//!   tree can be
 //!   signalled (`ProcessGroup::signal`, see `Signal`), paused/resumed
 //!   (`ProcessGroup::suspend` / `ProcessGroup::resume`), and inspected
 //!   (`ProcessGroup::members`); [`wait_any`] races several running processes
@@ -183,6 +187,9 @@ mod buffer;
 mod cassette;
 mod client;
 mod command;
+// The one deliberate opt-in escape from kill-on-drop containment
+// (`Command::spawn_detached` → `DetachedChild`).
+mod detached;
 // FNV-1a helper shared by the two cassette-key digests (`Stdin::content_digest`
 // and `MatchPolicy::digest_of`), so their constants + mix loop have one home and
 // can't drift apart. Both call sites live under `record`, so the helper does too.
@@ -266,6 +273,7 @@ pub use buffer::{
 };
 pub use client::{CliClient, IntoCommand};
 pub use command::Command;
+pub use detached::DetachedChild;
 pub use error::{Error, ErrorKind, ErrorReason, OutputOverflow, Result};
 pub use group::{ProcessGroup, ProcessGroupOptions};
 #[cfg(feature = "limits")]

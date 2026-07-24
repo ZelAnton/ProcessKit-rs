@@ -13,6 +13,27 @@ to a dated version section.
 
 ### Added
 
+- Add `Command::spawn_detached` — the crate's **one deliberate, opt-in escape**
+  from kill-on-drop containment, for the legitimate handoff cases (daemonizing, a
+  `nohup`-style helper meant to *outlive* its launcher). It spawns the child
+  **outside** this crate's containment — a **new session** (`setsid`) on Unix, and
+  **not assigned** to the Job Object on Windows — and hands back a new
+  `DetachedChild` type carrying only the `pid`: no `kill`, no `wait`, no timeout,
+  no capture, no teardown verbs, because it is no longer contained. Dropping the
+  handle does **nothing** to the child. It **inverts the headline guarantee on
+  purpose**, so it is a separate, non-interchangeable type (never a
+  `RunningProcess`) and: (1) refuses any owner-dependent knob — a timeout, capture
+  wiring (`on_stdout_line`/tees/`capture_policy`), an interactive stdin
+  (`keep_stdin_open`/`inherit_stdin`/a `stdin` source), `retry`, `cancel_on`,
+  `kill_on_parent_death`, `windows_graceful_ctrl_break`, `use_pty` — with a loud,
+  typed `ErrorReason::Unsupported` naming it, never a silent drop; (2) allows only
+  **null (default) or a file redirect** for stdio, never a pipe (which would
+  deadlock a child once its owner is gone); and (3) deliberately does **not** break
+  a child out of a *host* Job Object / cgroup it inherits (a CI runner, a
+  `systemd` scope, this crate's own supervisor) — it escapes only *this crate's*
+  per-run containment. Program/args/env/working-directory and the privilege-drop
+  knobs (`uid`/`gid`/`groups`/`umask`/`priority`) are honored. Additive: every
+  existing verb keeps its kill-on-drop guarantee unchanged
 - Add an opt-in **PTY launch mode** behind the new `pty` feature:
   `Command::use_pty()` spawns the child under a real pseudo-terminal — `openpty`
   on Unix, `CreatePseudoConsole` (ConPTY) on Windows — instead of three pipes, so

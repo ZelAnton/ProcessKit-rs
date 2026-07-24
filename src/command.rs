@@ -13,6 +13,7 @@ use encoding_rs::Encoding;
 use crate::buffer::{
     CapturePolicy, LineTerminator, OutputBufferPolicy, OutputStream, SharedCapturePolicy, StdioMode,
 };
+use crate::detached::DetachedChild;
 use crate::error::{Error, ErrorReason, Result};
 use crate::parent_death::ParentDeathCleanup;
 use crate::pump::StreamConfig;
@@ -2240,6 +2241,321 @@ impl Command {
         }
     }
 
+    // --- Detached spawn (deliberately outside kill-on-drop containment) ----
+
+    /// Spawn the child **deliberately released from this crate's kill-on-drop
+    /// containment**, handing back a [`DetachedChild`] whose lifetime is entirely
+    /// yours: the crate will never kill, reap, time out, or capture it.
+    ///
+    /// # Warning — this inverts the crate's headline guarantee
+    ///
+    /// Every other run/`start` verb keeps the child in a kill-on-drop container,
+    /// so nothing is orphaned. `spawn_detached` is the crate's **one** deliberate
+    /// escape hatch for the legitimate handoff cases — daemonizing, a
+    /// `nohup`-style long-lived helper meant to outlive the launcher — where the
+    /// child *must* survive its owner. Reach for it only when you truly want that;
+    /// for everything else, `start`/`run`/`output_*` are what you want.
+    ///
+    /// The returned [`DetachedChild`] is a **separate, non-interchangeable type**
+    /// (not a [`RunningProcess`](crate::RunningProcess)) carrying nothing but the
+    /// [`pid`](DetachedChild::pid) — no `kill`, no timeout, no capture, no
+    /// teardown — precisely because it is no longer contained.
+    ///
+    /// # Detach happens *at birth*
+    ///
+    /// - **Unix** — the child is launched into a **new session** (`setsid`), so it
+    ///   has no controlling terminal and its own session/process group; it is not
+    ///   tracked by any of this crate's kill-on-drop groups.
+    /// - **Windows** — the child is **not assigned** to this crate's Job Object,
+    ///   so closing/dropping any handle here cannot kill it. It is **not** made to
+    ///   break away from an *external* Job Object the OS already places it in — see
+    ///   below.
+    ///
+    /// # Still bound by a *host* container (by design)
+    ///
+    /// "Detached" means detached from **this crate's** per-run containment — **not**
+    /// from a broader host container your process already lives in. If your process
+    /// runs under an external Windows Job Object or a Linux cgroup (a CI runner, a
+    /// `systemd` scope, this crate's own supervisor), the child may still inherit
+    /// and be bound by it. `spawn_detached` deliberately does **not** attempt a job
+    /// breakaway or cgroup escape: that would be hostile to whoever set up the host
+    /// containment (and on Windows would simply fail the spawn where breakaway is
+    /// disallowed).
+    ///
+    /// # stdio: null, or a file — never a pipe
+    ///
+    /// A detached child has no owner draining its output, so a pipe would deadlock
+    /// it the moment the buffer fills after you go away (the classic daemon bug).
+    /// stdout/stderr are therefore **null by default**; the only alternative is a
+    /// **file redirect** ([`stdout_file`](Self::stdout_file) /
+    /// [`stderr_file`](Self::stderr_file) and their `_append` forms). stdin is
+    /// always null. A pipe or an inherited parent fd is rejected (see below).
+    ///
+    /// # Rejected configuration — a loud, typed refusal
+    ///
+    /// A detached child has no owner to enforce a timeout, no pump to capture
+    /// output, and no interactive stdin, so a `Command` carrying any of those knobs
+    /// is refused with [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported)
+    /// naming it — **never** silently ignored (the same "fail loud, don't drop a
+    /// requested behavior" contract as `uid`/`gid`/`umask` off Unix). The refused
+    /// knobs are: [`timeout`](Self::timeout)/[`timeout_grace`](Self::timeout_grace),
+    /// [`retry`](Self::retry)/[`retry_with`](Self::retry_with),
+    /// [`cancel_on`](Self::cancel_on),
+    /// [`kill_on_parent_death`](Self::kill_on_parent_death) (its exact opposite),
+    /// [`windows_graceful_ctrl_break`](Self::windows_graceful_ctrl_break),
+    /// [`keep_stdin_open`](Self::keep_stdin_open)/[`inherit_stdin`](Self::inherit_stdin)/
+    /// a configured [`stdin`](Self::stdin) source, any capture wiring
+    /// ([`on_stdout_line`](Self::on_stdout_line)/[`on_stderr_line`](Self::on_stderr_line),
+    /// the tee sinks, a [`capture_policy`](Self::capture_policy)), an inherited
+    /// stdout/stderr connection, and (with the `pty` feature) `use_pty`.
+    /// Program/argument/env/working-directory and the
+    /// privilege-drop knobs ([`uid`](Self::uid)/[`gid`](Self::gid)/
+    /// [`groups`](Self::groups)/[`umask`](Self::umask)/[`priority`](Self::priority))
+    /// **are** honored — a detached daemon may still drop privileges.
+    ///
+    /// # Not `async`
+    ///
+    /// Detaching is fire-and-forget: there is nothing to await and no tokio runtime
+    /// is required, so this is a plain synchronous spawn (like the low-level
+    /// [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) escape hatch), callable
+    /// from daemonizing code that runs before any runtime exists.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) — an
+    ///   incompatible knob (above), or a POSIX-only privilege primitive requested
+    ///   off Unix.
+    /// - [`ErrorReason::NotFound`](crate::ErrorReason::NotFound) — the program could
+    ///   not be located.
+    /// - [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) — the program was located
+    ///   but the OS refused to start it (bad working directory, permission denied, a
+    ///   Windows `.cmd`/`.bat` that needs `cmd.exe`, …).
+    ///
+    /// ```no_run
+    /// use processkit::Command;
+    ///
+    /// // Launch a long-lived helper that must outlive this process, logging to a
+    /// // file (never a pipe — there is no owner left to drain one).
+    /// let child = Command::new("my-daemon")
+    ///     .arg("--serve")
+    ///     .stdout_file("/var/log/my-daemon.log")
+    ///     .spawn_detached()?;
+    /// println!("detached daemon pid = {}", child.pid());
+    /// // Dropping `child` does NOT kill the daemon — it keeps running.
+    /// # Ok::<(), processkit::Error>(())
+    /// ```
+    pub fn spawn_detached(&self) -> Result<DetachedChild> {
+        self.ensure_detach_compatible()?;
+
+        // A missing/non-directory cwd otherwise surfaces as a bare ENOENT,
+        // indistinguishable from "program not found" — name the real cause up
+        // front, mirroring `runner::launch`.
+        if let Some(cwd) = self.working_dir()
+            && !cwd.is_dir()
+        {
+            let (kind, what) = if cwd.exists() {
+                (std::io::ErrorKind::NotADirectory, "is not a directory")
+            } else {
+                (std::io::ErrorKind::NotFound, "does not exist")
+            };
+            return Err(ErrorReason::Spawn {
+                program: self.program_name(),
+                source: std::io::Error::new(
+                    kind,
+                    format!("working directory {what}: {}", cwd.display()),
+                ),
+            }
+            .into());
+        }
+
+        let mut cmd = self.build_detached_tokio()?;
+        // Spawn via `std` directly: a detached child is deliberately NOT registered
+        // with the tokio reactor or assigned to any group of ours — it is fully
+        // handed off. `std::process::Child`'s `Drop` neither kills nor waits the
+        // child (the OS reaps it — on Unix, `init` once this process exits), so
+        // dropping the handle below leaves the child running.
+        let child = match cmd.as_std_mut().spawn() {
+            Ok(child) => child,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(self.detached_not_found(source));
+            }
+            Err(source) => {
+                return Err(ErrorReason::Spawn {
+                    program: self.program_name(),
+                    source,
+                }
+                .into());
+            }
+        };
+        let pid = child.id();
+        // Detach: dropping the `std` handle neither kills nor reaps it.
+        drop(child);
+        Ok(DetachedChild::new(pid))
+    }
+
+    /// Reject a `Command` configuration [`spawn_detached`](Self::spawn_detached)
+    /// cannot honor — loudly and typed, never silently ignored. Each incompatible
+    /// knob surfaces as [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported)
+    /// naming it, matching the crate's precedent for a refused spawn-time request
+    /// (`uid`/`gid`/`umask` off Unix).
+    fn ensure_detach_compatible(&self) -> Result<()> {
+        let refuse = |what: &str| -> Result<()> {
+            Err(ErrorReason::Unsupported {
+                operation: format!("spawn_detached with {what}"),
+            }
+            .into())
+        };
+
+        // Knobs that need an owner/pump the detach path deliberately doesn't keep.
+        if self.configured_timeout().is_some() {
+            return refuse("a timeout");
+        }
+        if self.timeout_grace.is_some() {
+            return refuse("a graceful-timeout window");
+        }
+        if self.retry.is_some() {
+            return refuse("a retry policy");
+        }
+        if self.cancel_token.is_some() {
+            return refuse("a cancellation token");
+        }
+        if self.kill_on_parent_death {
+            // The exact inverse of detach — it would kill the child when the owner
+            // dies, where detach is precisely about outliving the owner.
+            return refuse("kill_on_parent_death");
+        }
+        if self.windows_graceful_ctrl_break {
+            return refuse("windows_graceful_ctrl_break");
+        }
+        // stdin can only be null for a detached child.
+        if self.keep_stdin_open {
+            return refuse("keep_stdin_open");
+        }
+        if self.stdin_inherit {
+            return refuse("inherit_stdin");
+        }
+        if self.stdin.is_some() {
+            return refuse("a stdin source");
+        }
+        // Any capture wiring: a detached child has no pump to feed it.
+        if self.stdout_config.handler.is_some() || self.stderr_config.handler.is_some() {
+            return refuse("an output line handler");
+        }
+        if self.stdout_config.tee.is_some()
+            || self.stderr_config.tee.is_some()
+            || self.stdout_config.raw_tee.is_some()
+            || self.stderr_config.raw_tee.is_some()
+        {
+            return refuse("an output tee sink");
+        }
+        if self.capture_policy.is_some() {
+            return refuse("a capture policy");
+        }
+        // Only null (default) or a file redirect is allowed; an inherited
+        // stdout/stderr fd would dangle once the owner's console/pipe closes.
+        if matches!(self.stdout_mode, StdioMode::Inherit)
+            || matches!(self.stderr_mode, StdioMode::Inherit)
+        {
+            return refuse("an inherited stdout/stderr (use a file redirect, or leave it null)");
+        }
+        #[cfg(feature = "pty")]
+        if self.use_pty {
+            return refuse("a pseudo-terminal (use_pty)");
+        }
+
+        // POSIX-only privilege primitives are unavailable off Unix — the same loud
+        // refusal the run helpers give, so a requested drop is never silently
+        // skipped for a detached child either. (On Unix these are honored.)
+        #[cfg(not(unix))]
+        {
+            if self.uid.is_some() {
+                return refuse("uid (POSIX-only)");
+            }
+            if self.gid.is_some() {
+                return refuse("gid (POSIX-only)");
+            }
+            if self.groups.is_some() {
+                return refuse("supplementary groups (POSIX-only)");
+            }
+            if self.umask.is_some() {
+                return refuse("umask (POSIX-only)");
+            }
+            if self.setsid {
+                return refuse("setsid (POSIX-only)");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Build the `tokio` command for [`spawn_detached`](Self::spawn_detached): the
+    /// full program/env/privilege-drop build from [`build_tokio`](Self::build_tokio),
+    /// but with a **new session forced on Unix** (`setsid` — detach at birth) and
+    /// stdio rewired to the detached policy (null, or a file redirect — never a
+    /// pipe or an inherited fd, which would deadlock or dangle once the owner is
+    /// gone). Incompatible knobs were already rejected by
+    /// [`ensure_detach_compatible`](Self::ensure_detach_compatible).
+    fn build_detached_tokio(&self) -> Result<tokio::process::Command> {
+        let mut base = self.clone();
+        // Detach at birth: force a new session on Unix even if `.setsid()` was not
+        // called. Idempotent with an explicit call — the field just gates the one
+        // `setsid` pre-exec hook `build_tokio` installs. (Off Unix there is no
+        // session mechanism; detach there is "not assigned to a Job Object", which
+        // this path achieves by never creating one.)
+        #[cfg(unix)]
+        {
+            base.setsid = true;
+        }
+        // Detached stdio policy: keep any file redirect; force everything else to
+        // null. The only stdout/stderr connection that can reach here is the
+        // default `Piped` (neutralized to null — a detached child must never own a
+        // pipe with no reader) or an explicit file (kept). stdin is always null.
+        base.stdin = None;
+        base.keep_stdin_open = false;
+        base.stdin_inherit = false;
+        if base.stdout_file.is_none() {
+            base.stdout_mode = StdioMode::Null;
+        }
+        if base.stderr_file.is_none() {
+            base.stderr_mode = StdioMode::Null;
+        }
+        base.build_tokio()
+    }
+
+    /// Map an OS `NotFound` spawn failure to the enriched reason a live launch
+    /// would produce — [`NotFound`](crate::ErrorReason::NotFound) (with the
+    /// `searched` directories for a bare name) when the program truly isn't
+    /// resolvable, or [`Spawn`](crate::ErrorReason::Spawn) when it resolves but the
+    /// OS still refused it directly (a `.cmd`/`.bat` on Windows). Mirrors
+    /// `runner::launch`'s post-spawn translation, sharing the same spawn-free
+    /// [`resolve_program`] so the two can't disagree.
+    fn detached_not_found(&self, source: std::io::Error) -> Error {
+        if is_bare_name(&self.program) {
+            let path = if self.customizes_path() {
+                PathSource::Skip
+            } else {
+                PathSource::ProcessPath
+            };
+            return match resolve_program(&self.program, &self.prefer_local, path) {
+                ProgramResolution::Found(_) => ErrorReason::Spawn {
+                    program: self.program_name(),
+                    source,
+                }
+                .into(),
+                ProgramResolution::NotFound { searched } => ErrorReason::NotFound {
+                    program: self.program_name(),
+                    searched,
+                }
+                .into(),
+            };
+        }
+        ErrorReason::NotFound {
+            program: self.program_name(),
+            searched: None,
+        }
+        .into()
+    }
+
     // --- Live handle (private one-shot group) ------------------------------
 
     /// Start the command and return a live [`RunningProcess`] backed by a fresh
@@ -3269,6 +3585,77 @@ mod tests {
         assert_eq!(scope, ParentDeathCleanup::DirectChildOnly);
         #[cfg(all(unix, not(target_os = "linux")))]
         assert_eq!(scope, ParentDeathCleanup::Unsupported);
+    }
+
+    // --- spawn_detached: the loud, typed refusals (all reached *before* any
+    //     spawn, so these are pure and CI-safe — no subprocess) --------------
+
+    #[test]
+    fn spawn_detached_refuses_a_timeout_loudly() {
+        let err = Command::new("x")
+            .timeout(std::time::Duration::from_secs(1))
+            .spawn_detached()
+            .expect_err("a timeout has no owner to enforce on a detached child");
+        match err.reason() {
+            crate::ErrorReason::Unsupported { operation } => {
+                assert!(
+                    operation.contains("spawn_detached") && operation.contains("timeout"),
+                    "operation should name the offending knob: {operation}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_detached_refuses_capture_and_interactive_knobs() {
+        // A representative sample of the rejected knobs — each a loud, typed
+        // refusal (never a silent drop), all short-circuited before any spawn.
+        let refused: Vec<(&str, Command)> = vec![
+            ("keep_stdin_open", Command::new("x").keep_stdin_open()),
+            ("inherit_stdin", Command::new("x").inherit_stdin()),
+            (
+                "stdin source",
+                Command::new("x").stdin(crate::Stdin::from_string("in")),
+            ),
+            ("output handler", Command::new("x").on_stdout_line(|_| {})),
+            (
+                "cancel token",
+                Command::new("x").cancel_on(crate::CancellationToken::new()),
+            ),
+            (
+                "retry policy",
+                Command::new("x").retry(3, std::time::Duration::ZERO, |_| true),
+            ),
+            (
+                "kill_on_parent_death",
+                Command::new("x").kill_on_parent_death(),
+            ),
+        ];
+        for (what, cmd) in refused {
+            let err = cmd
+                .spawn_detached()
+                .expect_err("a detached spawn must refuse this knob loudly");
+            assert!(
+                matches!(err.reason(), crate::ErrorReason::Unsupported { .. }),
+                "{what} must be refused with Unsupported, got {err:?}"
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn spawn_detached_refuses_posix_privilege_off_unix() {
+        // uid/gid/umask/setsid are POSIX-only; off Unix a detached spawn refuses
+        // them just as the run helpers do — never a silent skip of a privilege drop.
+        let err = Command::new("x")
+            .uid(1000)
+            .spawn_detached()
+            .expect_err("uid is a POSIX-only primitive off Unix");
+        assert!(
+            matches!(err.reason(), crate::ErrorReason::Unsupported { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

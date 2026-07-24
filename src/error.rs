@@ -294,11 +294,18 @@ pub enum ErrorReason {
     /// this platform.
     ///
     /// Raised by `ProcessGroup::signal` for any signal other than
-    /// `Signal::Kill` on Windows (Job Objects have no POSIX signals).
+    /// `Signal::Kill` on Windows (Job Objects have no POSIX signals), and by a
+    /// POSIX-only privilege primitive (`uid`/`gid`/`umask`/`setsid`) requested on
+    /// a non-Unix target. Also the typed refusal
+    /// [`Command::spawn_detached`](crate::Command::spawn_detached) gives when the
+    /// `Command` carries a knob a detached child can't honor (a timeout, capture
+    /// wiring, an interactive stdin, …): `operation` then names the offending
+    /// combination (e.g. `"spawn_detached with a timeout"`) so it is refused
+    /// loudly rather than silently ignored.
     #[error("operation `{operation}` is not supported on this platform")]
     Unsupported {
-        /// A short description of the operation, e.g. `"signal(Hup)"` or
-        /// `"suspend"`.
+        /// A short description of the operation, e.g. `"signal(Hup)"`,
+        /// `"suspend"`, or `"spawn_detached with a timeout"`.
         operation: String,
     },
 

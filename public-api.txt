@@ -765,6 +765,7 @@ pub fn processkit::Command::retry_with(self, processkit::RetryPolicy, impl core:
 pub async fn processkit::Command::run(&self) -> processkit::Result<alloc::string::String>
 pub async fn processkit::Command::run_unit(&self) -> processkit::Result<()>
 pub fn processkit::Command::setsid(self) -> Self
+pub fn processkit::Command::spawn_detached(&self) -> processkit::Result<processkit::DetachedChild>
 pub async fn processkit::Command::start(&self) -> processkit::Result<processkit::RunningProcess>
 pub fn processkit::Command::stderr(self, processkit::StdioMode) -> Self
 pub fn processkit::Command::stderr_encoding(self, &'static encoding_rs::Encoding) -> Self
@@ -813,6 +814,18 @@ impl core::marker::Unpin for processkit::Command
 impl core::marker::UnsafeUnpin for processkit::Command
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::Command
 impl !core::panic::unwind_safe::UnwindSafe for processkit::Command
+pub struct processkit::DetachedChild
+impl processkit::DetachedChild
+pub fn processkit::DetachedChild::pid(&self) -> u32
+impl core::fmt::Debug for processkit::DetachedChild
+pub fn processkit::DetachedChild::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for processkit::DetachedChild
+impl core::marker::Send for processkit::DetachedChild
+impl core::marker::Sync for processkit::DetachedChild
+impl core::marker::Unpin for processkit::DetachedChild
+impl core::marker::UnsafeUnpin for processkit::DetachedChild
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::DetachedChild
+impl core::panic::unwind_safe::UnwindSafe for processkit::DetachedChild
 pub struct processkit::Error
 impl processkit::Error
 pub fn processkit::Error::code(&self) -> core::option::Option<i32>
