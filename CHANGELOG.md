@@ -341,6 +341,20 @@ to a dated version section.
   string methods already let consumers drop their hand-maintained tables without
   committing the crate to a second serialized-shape compatibility surface or an
   extra optional dependency
+- Add `Command::capture_policy(...)` plus the `CapturePolicy` trait and the
+  `OutputStream` enum it takes — a typed **redaction-at-capture** seam. Its
+  `on_capture(OutputStream, &str) -> Cow<str>` transforms each captured line at the
+  single point the crate retains it (before it enters the backlog / `ProcessResult`),
+  so a secret can be scrubbed from the retained capture. Deliberate **security
+  boundary**: the live paths — the `on_stdout_line`/`on_stderr_line` handlers,
+  `stdout_tee`/`stderr_tee`, `stdout_raw_tee`/`stderr_raw_tee`, and the `output_bytes`
+  return value — all still see the **unredacted** text; only the retained capture is
+  rewritten. A panicking policy fails **closed** (the line is dropped, the secret never
+  leaks). Orthogonal to the overflow/eviction buffer policy
+  (`OutputBufferPolicy`/`OverflowMode`), which bounds *how much* is kept, not *what* the
+  content is; the capture invariants (`DropNewest` seal-latch, raw pre-decode
+  `seen_bytes`, `count`/`dropped`/`overflowed`) are untouched. `CapturePolicy::name()`
+  is introspectable and shows in `Debug`. Purely additive
 
 ### Changed
 
@@ -405,6 +419,23 @@ to a dated version section.
   `Signal::Other(0)` remains the POSIX existence probe — it returns `Ok` having
   delivered nothing. Signatures are unchanged; this only makes the error report
   on these edge inputs truthful (not a breaking API change)
+- `Command::to_tokio_command()` is no longer `#[doc(hidden)]` — it is now a
+  documented, honest low-level escape hatch for a platform knob the high-level builder
+  doesn't model. Paired with `ProcessGroup::spawn` it keeps containment (the child is
+  still assigned to the Job Object / cgroup / process group) while giving up the
+  high-level verbs, output pump, capture, and teardown machinery; a new "Escape hatch"
+  section in `docs/commands.md` documents the path. The method was already `pub` and
+  semver-covered — only its documentation visibility changed (the storable
+  `before_spawn` raw-`Command` mutator hook was assessed for 3.0 and declined; see
+  `decisions/before-spawn-hook-2026-07.md`)
+
+### Removed
+
+- **Breaking:** the pre-3.0 output-stream names, removed outright with **no** deprecated
+  alias (they were renamed — see the **Changed** entry above for the migration and the
+  new concurrent-drive requirement): `RunningProcess::output_events()` and
+  `PipelineSession::output_events()` (now `events()`), the `OutputEvent` event enum (now
+  `ProcessEvent`), and the `OutputEvents` stream type (now `ProcessEvents`)
 
 ### Fixed
 
