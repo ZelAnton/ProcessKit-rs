@@ -60,7 +60,7 @@ sys backends       (sys/{mod,windows,linux,unix,pgroup,graceful}.rs) — OS cont
   the *consuming* capture paths (drive-to-exit, kill/teardown, the post-exit
   checkpoint); `probes.rs` holds the **non-consuming** readiness probes
   (`wait_for_line`/`wait_for`/`wait_for_port`); `stream.rs` holds the
-  incremental stdout streaming surface (`StdoutLines`/`OutputEvents`) and the
+  incremental streaming surface (`StdoutLines`/`ProcessEvents`) and the
   watchdog tasks that bound a *streamed* run. `RunningProcess` wraps one of two
   backends (`Backend::Real` — a real `tokio::process::Child` — or
   `Backend::Scripted` — a canned reply from the test doubles), so the capture
@@ -173,7 +173,7 @@ watchdog is armed.
 `wait`/`finish_lines`) drive both streams through `pump_lines_core` into a
 `SharedLines` per stream, then `drive_to_exit` races the child's natural exit
 against the cancel token and the deadline (see "Cancel-vs-timeout arbitration"
-below). Streaming verbs (`stdout_lines`/`output_events`) instead hand the
+below). Streaming verbs (`stdout_lines`/`events`) instead hand the
 caller a `Stream` reading directly off `SharedLines`, and arm a *separate*
 watchdog if the run has a timeout (so a streamed run's deadline still fires
 even though nothing is presently awaiting `drive_to_exit`). A second call to a

@@ -240,6 +240,59 @@ the `processkit` target, for every graceful path (`stop`, `shutdown`, a run-leve
 (both derive from the same driver outcome); neither can influence the teardown, and
 neither carries argv/env.
 
+## Deliberately detaching a child (`spawn_detached`)
+
+**This inverts the crate's headline guarantee — on purpose.** Everything above is
+about *keeping* a tree contained so nothing escapes. `Command::spawn_detached` is
+the crate's one deliberate escape hatch for the opposite need: a child that
+**must outlive its launcher** — daemonizing, a `nohup`-style long-lived helper, a
+handoff to a process you want to keep running after this one exits.
+
+```rust,no_run
+use processkit::Command;
+
+# fn main() -> processkit::Result<()> {
+// Launch a helper that survives this process. Its stdout goes to a file — never
+// a pipe, which would deadlock the child once nothing is left to drain it.
+let child = Command::new("my-daemon")
+    .arg("--serve")
+    .stdout_file("/var/log/my-daemon.log")
+    .spawn_detached()?;
+println!("detached daemon pid = {}", child.pid());
+// Dropping `child` does NOT kill the daemon — the crate is done with it.
+# Ok(())
+# }
+```
+
+What it does, and what it deliberately does **not**:
+
+- **Detach at birth.** Unix — a **new session** (`setsid`), no controlling
+  terminal. Windows — the child is **not assigned** to this crate's Job Object.
+  It is *not* made to break away from a Job Object / cgroup the host already put
+  *your* process in (a CI runner, a `systemd` scope, this crate's own supervisor):
+  that would be hostile to whoever set up the host containment. So a detached
+  child escapes **this crate's** per-run containment, not a broader host one it
+  inherits.
+- **A separate, non-interchangeable type.** You get a `DetachedChild` carrying
+  only the `pid` — no `kill`, no `wait`, no timeout, no capture, no teardown verbs
+  — because it is no longer contained. Dropping it does nothing to the child.
+  (Left as a bare code span, not a `docs.rs` link: this type ships in the next
+  release, so a `docs.rs` URL would 404 until then.)
+- **stdio is null, or a file — never a pipe.** With no owner left to drain it, a
+  pipe would deadlock the child the moment its buffer fills. stdout/stderr are
+  null by default; the only alternative is a file redirect (`stdout_file` /
+  `stderr_file`). stdin is always null.
+- **Incompatible knobs are refused loudly.** A `Command` carrying a timeout,
+  capture wiring (`on_stdout_line`/tees/`capture_policy`), an interactive stdin
+  (`keep_stdin_open`/`inherit_stdin`/a `stdin` source), `retry`, `cancel_on`,
+  `kill_on_parent_death` (its exact opposite), or `windows_graceful_ctrl_break` is
+  rejected with a typed `ErrorReason::Unsupported` naming it — never silently
+  ignored. Program/args/env/working-directory and the privilege-drop knobs
+  (`uid`/`gid`/`groups`/`umask`/`priority`) **are** honored.
+
+Reach for `spawn_detached` **only** when you truly want a child to outlive its
+launcher. For everything else, `start`/`run`/`output_*` keep the child contained.
+
 ## Signalling the whole tree
 
 > `signal`/`suspend`/`resume`/`members`/`adopt` — this section and the two

@@ -281,9 +281,9 @@ async fn main() -> processkit::Result<()> {
 
 The session mirrors `RunningProcess`:
 
-- **`stdout_lines()` / `output_events()`** — the last stage's stdout (lines) or
-  its stdout+stderr (interleaved events), each **consume-once** (a second take is
-  a loud `Err`, never a silently-empty stream).
+- **`stdout_lines()` / `events()`** — the last stage's stdout (lines) or its full
+  lifecycle (`Started` → interleaved stdout+stderr → `Exited`), each
+  **consume-once** (a second take is a loud `Err`, never a silently-empty stream).
 - **`wait_for_line(pred, within)`** — wait for a readiness banner on that stream
   without tearing the chain down (an `ErrorReason::NotReady` on timeout, like the
   single-process probe).

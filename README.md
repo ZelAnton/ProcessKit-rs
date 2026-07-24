@@ -56,6 +56,17 @@ is a kernel operation over the whole tree, not a best-effort signal to one pid:
 - **Testable.** One trait seam ([`ProcessRunner`]) swaps the real spawner for
   scripted doubles or record/replay cassettes — no subprocess in your tests.
 
+**One deliberate exception.** For the legitimate handoff cases — daemonizing, a
+`nohup`-style helper meant to *outlive* its launcher — `Command::spawn_detached`
+is a single, loudly-named opt-in that spawns a child **outside** this containment
+(a new session on Unix, unassigned to the Job Object on Windows) and hands back a
+`DetachedChild` the crate never kills, reaps, times out, or captures. It inverts
+the headline guarantee *on purpose*, so it is a separate, non-interchangeable
+type, it refuses any owner-dependent knob (a timeout, capture wiring, interactive
+stdin) with a loud typed error rather than ignoring it, and it deliberately does
+**not** break a child out of a *host* Job Object / cgroup it inherits (a CI
+runner, a `systemd` scope) — it escapes only *this crate's* per-run containment.
+
 ### How it compares
 
 | | whole-tree kill-on-drop | async | limits / stats | streaming · pipelines · supervision |
