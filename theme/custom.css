@@ -85,6 +85,13 @@
     max-width: 100%;
 }
 
+/* mdBook 0.4.40 runs highlight.js over every <code> node, so inline code in a
+   table heading otherwise paints a code-block rectangle over the header. */
+.content table thead code,
+.content table thead code.hljs {
+    background: transparent;
+}
+
 /* Pinned title ("Overview") above the divider */
 .sidebar .chapter li:not(.chapter-item):not(.spacer) > a {
     font-size: 0.88em;
