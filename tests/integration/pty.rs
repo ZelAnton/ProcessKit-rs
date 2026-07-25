@@ -361,14 +361,15 @@ async fn pty_disables_echo_so_a_written_secret_is_not_echoed() {
 async fn pty_size_sets_the_initial_window_and_resize_pty_delivers_a_new_one() {
     use tokio_stream::StreamExt;
 
-    // The child traps `SIGWINCH` FIRST (so a resize can't be missed once the
-    // initial size prints), reports its terminal size, then re-reports on every
-    // resize. `stty size` reads the tty on stdin (the pty slave) and prints
-    // "<rows> <cols>". A loop of short sleeps keeps the shell interruptible so the
+    // The child first removes ProcessKit's initial COLUMNS/LINES environment
+    // defaults: BusyBox `stty size` prefers those immutable values to TIOCGWINSZ,
+    // which would make Alpine report the spawn size forever. It then traps
+    // `SIGWINCH`, reports the actual terminal size from the slave, and re-reports
+    // on every resize. A loop of short sleeps keeps the shell interruptible so the
     // WINCH trap fires promptly; kill-on-drop reaps the whole thing at the end.
     let child = Command::new("sh").args([
         "-c",
-        "trap 'stty size' WINCH; stty size; while :; do sleep 0.2; done",
+        "unset COLUMNS LINES; trap 'sleep 0.1; stty size' WINCH; stty size; while :; do sleep 0.2; done",
     ]);
     let mut proc = JobRunner::new()
         .start(&child.use_pty().pty_size(100, 30))
@@ -394,53 +395,52 @@ async fn pty_size_sets_the_initial_window_and_resize_pty_delivers_a_new_one() {
     );
 
     // Live resize: TIOCSWINSZ updates the master and delivers SIGWINCH, so the
-    // trap re-reports the new geometry "40 120".
+    // trap re-reports the new geometry "40 120". Linux's PTY driver signals the
+    // foreground group immediately before copying the new winsize to both sides;
+    // the short delay in the trap keeps a fast shell on another CPU from querying
+    // the slave inside that kernel-level handoff window.
     //
     // Note: there is a potential scheduling race on CI (especially in Alpine
     // containers under load) between when we read the first size and when the shell
     // has fully entered its interruptible `sleep 0.2` loop. If SIGWINCH is delivered
     // at the wrong moment, the signal might not interrupt the current syscall, and we
     // could read stale output. To harden the test, we defensively poll with multiple
-    // retries: if the first resize doesn't produce new output within a short window,
-    // we issue another resize to ensure the signal is delivered when the shell is
-    // definitely in sleep. We also read multiple lines to be robust to any buffering.
+    // retries. Linux does not send another SIGWINCH when TIOCSWINSZ receives the
+    // already-current geometry, so each retry first nudges to a distinct size before
+    // restoring the requested one. The reader ignores the nudge report and any stale
+    // output until it observes the requested geometry.
     let mut second = None;
     for retry_attempt in 0..3 {
         if retry_attempt > 0 {
-            // If we haven't seen the resized output yet, issue another TIOCSWINSZ.
-            // (This is harmless — resize_pty on an already-resized session just
-            // re-sends the same size and SIGWINCH.)
+            // Force a real geometry transition: repeating 120x40 alone is a no-op
+            // in the Linux tty layer and therefore cannot recover a missed signal.
             tokio::time::sleep(Duration::from_millis(100)).await;
-            proc.resize_pty(120, 40)
-                .expect("live resize retry on a running pty");
-        } else {
-            proc.resize_pty(120, 40)
-                .expect("live resize on a running pty");
+            proc.resize_pty(119, 39)
+                .expect("live resize nudge on a running pty");
         }
+        proc.resize_pty(120, 40)
+            .expect("live resize on a running pty");
 
         // Wait up to 5 seconds per attempt for the resized output. Unlike
         // `completes_within`, a plain `tokio::time::timeout` here returns an
         // `Err` (rather than panicking) when the window elapses, so a slow
         // attempt can be retried instead of failing the whole test outright.
         let found = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match lines.next().await {
-                    Some(l) if l.trim().is_empty() => continue,
-                    other => break other,
+            while let Some(line) = lines.next().await {
+                if line.trim() == "40 120" {
+                    return Some(line);
                 }
             }
+            None
         })
         .await;
 
-        match found {
-            Ok(Some(line)) if line.trim() == "40 120" => {
-                second = Some(line);
-                break;
-            }
-            // A stray non-matching line, a closed stream, or a per-attempt
-            // timeout: all fall through to the next retry attempt.
-            Ok(Some(_)) | Ok(None) | Err(_) => {}
+        if let Ok(Some(line)) = found {
+            second = Some(line);
+            break;
         }
+        // A closed stream or a per-attempt timeout falls through to the next
+        // retry. Non-matching lines were consumed inside the attempt.
     }
 
     let second = second.expect("a post-resize size line (after retries)");
