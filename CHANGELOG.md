@@ -15,7 +15,10 @@ to a dated version section.
 -
 
 ### Changed
--
+
+- Redesign the Pages landing page around the illustrated cover, live project
+  badges, a concise no-orphan introduction, and direct install, guide, and API
+  entry points.
 
 ### Fixed
 -

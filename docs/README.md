@@ -1,28 +1,64 @@
-# processkit — documentation
+![processkit: async child-process management with a no-orphan guarantee](processkit-cover.png)
 
-`processkit` is a child-process toolkit for Rust in two layers:
+[![Crates.io](https://img.shields.io/crates/v/processkit.svg)](https://crates.io/crates/processkit)
+[![Docs.rs](https://docs.rs/processkit/badge.svg)](https://docs.rs/processkit)
+[![CI](https://github.com/ZelAnton/ProcessKit-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/ZelAnton/ProcessKit-rs/actions/workflows/ci.yml)
+[![Coverage Status](https://coveralls.io/repos/github/ZelAnton/ProcessKit-rs/badge.svg?branch=main)](https://coveralls.io/github/ZelAnton/ProcessKit-rs?branch=main)
+[![License: MIT](https://img.shields.io/crates/l/processkit.svg)](https://github.com/ZelAnton/ProcessKit-rs/blob/main/LICENSE)
+[![MSRV](https://img.shields.io/crates/msrv/processkit.svg)](https://github.com/ZelAnton/ProcessKit-rs/blob/main/Cargo.toml)
 
-```text
-┌─────────────────────────────────────────────────────────────────┐
-│  Runner layer (async, tokio)                                    │
-│  Command · RunningProcess · Pipeline · Supervisor · CliClient   │
-│  capture / streaming / PTY / interactive stdin / readiness      │
-│  testing seam: ProcessRunner → ScriptedRunner / RecordReplay…   │
-├─────────────────────────────────────────────────────────────────┤
-│  Group layer (kill-on-drop containment)                         │
-│  ProcessGroup: spawn / adopt / signal / suspend / members /     │
-│  stats / limits / shutdown                                      │
-├─────────────────────────────────────────────────────────────────┤
-│  OS mechanisms                                                  │
-│  Windows Job Object · Linux cgroup v2 · POSIX process group     │
-└─────────────────────────────────────────────────────────────────┘
+Async child-process management for Rust + [tokio](https://tokio.rs/) with a
+kernel-backed **no-orphan guarantee**: every process you start — and everything
+*it* spawns — lives in a kill-on-drop container (a **Windows Job Object**, a
+**Linux cgroup v2**, or a **POSIX process group**), so no descendant ever
+outlives your program.
+
+Beyond spawning a subprocess: run-and-capture, line streaming, interactive
+stdin, real pseudo-terminal (PTY) sessions, shell-free pipelines, readiness
+probes, timeouts & cancellation, supervision with restart/backoff, and a
+mockable runner seam for subprocess-free tests.
+
+```bash
+cargo add processkit
 ```
 
-Every `Command` run gets containment for free: the one-shot helpers spawn into
-a fresh private group that dies with the run, so a panicking caller never
-leaks a process tree. The layers are also usable independently — a raw
-`ProcessGroup` can contain children you spawn yourself, and the runner's
-test doubles never touch the OS at all.
+```rust,no_run
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let version = Command::new("cargo").arg("--version").run().await?;
+    println!("{version}");
+    Ok(())
+}
+```
+
+**Continue:** [find a recipe](cookbook.md) · [learn the command model](commands.md)
+· [browse the API](https://docs.rs/processkit)
+
+## Why processkit?
+
+`std::process` and `tokio::process` reach (at most) the direct child. The
+processes *it* spawned — a build tool's compiler children, the real payload
+behind a wrapper (`cmd /c …`, `sh -c …`), a test's helper servers — can survive
+a timeout, a panic, or a dropped future and keep running as orphans.
+
+`processkit` puts every child inside the operating system's own containment
+primitive. Teardown is one operation over the whole process tree, not a
+best-effort signal to one PID:
+
+- **Nothing escapes silently.** Dropping a run or group reaps every descendant;
+  the active [`Mechanism`](https://docs.rs/processkit/latest/processkit/enum.Mechanism.html)
+  tells you which OS guarantee is in effect.
+- **Terminal when you need one.** The opt-in `pty` feature gives terminal-only
+  tools a real controlling terminal while keeping the same containment and
+  kill-on-drop lifecycle.
+- **Honest outcomes.** A non-zero exit remains inspectable data until you ask
+  for success; timeouts, cancellation, spawn failures, and resource limits stay
+  distinct in the typed error model.
+- **Async and testable.** Streaming, pipelines, readiness, and supervision are
+  tokio-native, while the `ProcessRunner` seam replaces real processes with
+  scripted or record/replay doubles in tests.
 
 ## 3.0 highlights
 
