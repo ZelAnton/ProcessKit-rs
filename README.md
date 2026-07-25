@@ -827,11 +827,17 @@ misreading old fixtures.
 
 ## Other languages
 
-Not on Rust? [**`processkit-py`**](https://pypi.org/project/processkit-py/) is a
-Python wrapper (PyO3 bindings) over this crate's core — same kill-on-drop
-containment, same underlying engine, an asyncio-facing API on top. This crate
-remains the single source of truth for the containment/runner logic; file
-core bugs and feature requests here.
+Not on Rust?
+
+- [**`processkit-py`**](https://pypi.org/project/processkit-py/) is a Python
+  wrapper (PyO3 bindings) over this crate's core — the same kill-on-drop
+  containment and underlying engine, with an asyncio-facing API on top.
+- [**ProcessKit for .NET**](https://github.com/ZelAnton/ProcessKit-fSharp) is a
+  native F# sibling implementation with first-class F# and C# APIs and the same
+  kernel-backed no-orphan model.
+
+This crate remains the source of truth for the Rust core and its Python
+bindings; file their core bugs and feature requests here.
 
 ## Contributing
 

@@ -19,9 +19,13 @@ to a dated version section.
 - Redesign the Pages landing page around the illustrated cover, live project
   badges, a concise no-orphan introduction, and direct install, guide, and API
   entry points.
+- Add the native .NET sibling to the repository's cross-language links while
+  keeping language alternatives out of the Rust Pages landing page.
 
 ### Fixed
--
+
+- Prevent the closing untrusted-process note in the containers guide from
+  rendering as an oversized Setext heading.
 
 ## [3.0.1] - 2026-07-25
 

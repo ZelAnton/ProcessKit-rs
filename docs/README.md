@@ -175,9 +175,3 @@ CI instead of silently lying to a reader. The hidden harness only builds under
 `--all-features`, so a plain `cargo test` with the default features does
 **not** exercise this check. See `src/doc_examples.rs` for the (test-only,
 hidden) harness.
-
-## Other languages
-
-Not on Rust? [`processkit-py`](https://pypi.org/project/processkit-py/) wraps
-this crate's core in a Python (PyO3/asyncio) API — this crate stays the single
-source of truth for the containment/runner logic underneath.
