@@ -388,7 +388,9 @@ jobs:
       # without uploading — catches build/packaging/metadata errors cleanly,
       # before the irreversible publish below consumes a real attempt. No token
       # needed for a dry run; release-notes.md is outside the tree so it is not
-      # packaged.
+      # packaged. Also does a registry-index lookup, which surfaces an
+      # already-published version early (the real publish step below tolerates
+      # that case too, but this fails faster on a clean re-run).
       - name: Verify the crate publishes (dry run)
         # `--locked` asserts Cargo.lock matches the (just-bumped) manifest, so
         # the dry run can't silently re-resolve / rewrite the lockfile and dirty
@@ -396,7 +398,20 @@ jobs:
         # clean-tree check). cargo set-version already updated the lock.
         run: cargo publish --locked --dry-run
 
-      # Checksums over the packaged `.crate` the dry run just wrote to
+      # Produce the actual `.crate` artifact at cargo's documented, stable
+      # output path (`target/package/<name>-<version>.crate`). `cargo publish
+      # --dry-run` above also packages internally, but (as of newer cargo)
+      # stages its dry-run copy under an internal `target/package/tmp-crate/`
+      # scratch path instead of leaving it at the top level — an
+      # implementation detail we shouldn't depend on. `cargo package --locked`
+      # re-packages (verifying the build again) and writes to the stable path
+      # the checksums/attestation steps below expect; the bytes are
+      # deterministic for the same source + locked deps, so they match what
+      # dry-run just verified and what the real publish uploads.
+      - name: Package the crate
+        run: cargo package --locked
+
+      # Checksums over the packaged `.crate` the previous step just wrote to
       # target/package/. These bytes are what the publish below uploads —
       # `cargo package` is deterministic for the same source + locked deps, and
       # nothing edits the tree between here and the publish. Written to
