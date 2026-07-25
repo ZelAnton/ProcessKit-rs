@@ -1401,7 +1401,7 @@ pub fn fuzz_cassette_replay(text: &str, calls: &[(String, Vec<String>)]) {
                     assert_eq!(actual.outcome(), expected_result.outcome());
                 }
                 None => match replayer.output_string(&command).await {
-                    Err(ErrorReason::CassetteMiss { .. }) => {}
+                    Err(e) if matches!(e.reason(), ErrorReason::CassetteMiss { .. }) => {}
                     other => {
                         panic!("an unmatched invocation must be a CassetteMiss, got {other:?}")
                     }
