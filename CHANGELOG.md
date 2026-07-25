@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [3.0.0] - 2026-07-25
+
+### Added
 
 - Give `use_pty()` children a coherent spawn-time terminal identity. Unix PTYs
   default `TERM=xterm-256color`; Unix and Windows set `COLUMNS`/`LINES` from
@@ -2850,7 +2861,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.3.2...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.3.2...v3.0.0
 [2.3.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.3.1...v2.3.2
 [2.3.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.2.5...v2.3.0
