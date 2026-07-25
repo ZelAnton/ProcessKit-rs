@@ -15,6 +15,17 @@ to a dated version section.
 -
 
 ### Changed
+-
+
+### Fixed
+-
+
+## [3.0.2] - 2026-07-25
+
+### Added
+-
+
+### Changed
 
 - Redesign the Pages landing page around the illustrated cover, live project
   badges, a concise no-orphan introduction, and direct install, guide, and API
@@ -2888,7 +2899,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.0.1...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.0.2...HEAD
+[3.0.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.0.1...v3.0.2
 [3.0.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.0.0...v3.0.1
 [3.0.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.3.2...v3.0.0
 [2.3.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.3.1...v2.3.2
