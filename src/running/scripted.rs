@@ -260,7 +260,7 @@ impl ScriptedProc {
     /// the exchange is deterministic without a paused clock. Aborting the run
     /// (kill/drop) hangs up the feeder like any other scripted child.
     pub(crate) fn new_dialog(prompt: String, response: String, code: i32) -> Self {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         // stdout: the feeder writes the prompt, waits for stdin, writes the
         // response, then drops its end (EOF). stderr: an immediately-dropped tx
@@ -279,11 +279,15 @@ impl ScriptedProc {
                 return;
             }
             let _ = stdout_tx.flush().await;
-            // 2. Wait for the caller to answer. Any input completes the turn — the
-            //    hermetic model of a child's `read(stdin)` returning; a closed
-            //    stdin (Ok(0)) or error ends the run with no continuation.
-            let mut buf = [0u8; 1024];
-            if let Ok(n) = stdin_read.read(&mut buf).await
+            // 2. Wait for one complete answer line. `ProcessStdin::write_line`
+            //    writes the text and Enter separately, so treating the first
+            //    fragment as the whole answer can close the duplex between those
+            //    writes and race the caller into `BrokenPipe`. EOF after non-empty
+            //    input also completes the answer, like a line reader on a pipe.
+            let mut answer = Vec::new();
+            if let Ok(n) = BufReader::new(&mut stdin_read)
+                .read_until(b'\n', &mut answer)
+                .await
                 && n > 0
             {
                 // 3. Emit the continuation (also flushed).
