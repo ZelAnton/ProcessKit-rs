@@ -26,8 +26,9 @@ to a dated version section.
 
 - Prevent the closing untrusted-process note in the containers guide from
   rendering as an oversized Setext heading.
-- Keep inline code in every Pages table header on the header's own background
-  instead of letting highlight.js paint a contrasting code-block rectangle.
+- Keep inline code in every Pages table header aligned with the header's own
+  background, color, and typography instead of inheriting code-block styling
+  from highlight.js.
 
 ## [3.0.1] - 2026-07-25
 

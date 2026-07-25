@@ -86,10 +86,22 @@
 }
 
 /* mdBook 0.4.40 runs highlight.js over every <code> node, so inline code in a
-   table heading otherwise paints a code-block rectangle over the header. */
+   table heading otherwise keeps code-block colors and typography. */
 .content table thead code,
 .content table thead code.hljs {
     background: transparent;
+    border-radius: 0;
+    color: inherit;
+    display: inline;
+    font: inherit;
+    padding: 0;
+}
+
+/* Syntax-token spans can carry their own foreground or background. */
+.content table thead code * {
+    background: transparent;
+    color: inherit;
+    font: inherit;
 }
 
 /* Pinned title ("Overview") above the divider */
