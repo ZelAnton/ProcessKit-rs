@@ -765,6 +765,32 @@ mod tests {
         assert_eq!(finished.outcome, Outcome::Exited(0));
     }
 
+    /// A dialog keeps reading until Enter even when `write_line` must cross the
+    /// scripted duplex capacity. Reading only its first fragment used to close
+    /// stdin before the terminator write and surface `BrokenPipe` to the caller.
+    #[tokio::test]
+    async fn scripted_dialog_reads_a_complete_large_answer_line() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::dialog("answer: ", "accepted> "))
+            .start(&Command::new("quiz").keep_stdin_open())
+            .await
+            .expect("scripted dialog start");
+
+        run.wait_for_output(|tail| tail == "answer: ", Duration::from_secs(5))
+            .await
+            .expect("prompt");
+
+        let answer = "x".repeat(128 * 1024);
+        run.take_stdin()
+            .expect("scripted dialog stdin")
+            .write_line(&answer)
+            .await
+            .expect("the complete answer and Enter are accepted");
+
+        let finished = run.finish().await.expect("finish the dialog");
+        assert_eq!(finished.outcome, crate::Outcome::Exited(0));
+    }
+
     /// A timeout with no matching tail fails with `NotReady` — the same probe
     /// deadline the readiness probes use, never the run's own `Timeout`.
     #[tokio::test(start_paused = true)]
