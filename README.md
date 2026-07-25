@@ -7,9 +7,9 @@ Job Object**, or a POSIX process group), so no descendant ever outlives
 your program.
 
 Beyond spawning a subprocess: run-and-capture, line streaming, interactive
-stdin, shell-free pipelines, readiness probes, timeouts & cancellation,
-supervision with restart/backoff, and a mockable runner seam for
-subprocess-free tests.
+stdin, opt-in pseudo-terminal (PTY) sessions, shell-free pipelines, readiness
+probes, timeouts & cancellation, supervision with restart/backoff, and a
+mockable runner seam for subprocess-free tests.
 
 [![Crates.io](https://img.shields.io/crates/v/processkit.svg)](https://crates.io/crates/processkit)
 [![Docs.rs](https://docs.rs/processkit/badge.svg)](https://docs.rs/processkit)
@@ -82,15 +82,27 @@ The first column is the differentiator: a child's *descendants* are contained
 and reaped as a unit (Job Object / cgroup v2 / process group), not just the
 direct child.
 
-> **Status:** stable — **2.x** is the current published line. A **3.0 major is in
-> preparation**, gathering this cycle's breaking changes (the `Error` struct reshape
-> and the `output_events()` → `events()` / `OutputEvent` → `ProcessEvent` stream
-> rename) under [`[Unreleased]`](CHANGELOG.md) — see the
-> [upgrading guide](docs/upgrading.md) for the migration. The public API follows
-> [Semantic Versioning](https://semver.org/): breaking changes land only in a new
-> major version, so `2.x` upgrades stay backward-compatible; the most recent
-> *published* breaking release was **2.1.0** (renamed from a withdrawn `1.3.0`/`2.0.0`).
-> See [`CHANGELOG.md`](CHANGELOG.md).
+> **Status:** stable — **3.x** is the current published line; the latest release
+> is [`3.0.0`](https://github.com/ZelAnton/ProcessKit-rs/releases/tag/v3.0.0).
+> The public API follows [Semantic Versioning](https://semver.org/): a
+> `processkit = "3"` requirement accepts compatible `3.x` upgrades but not a
+> future `4.0`. See [`CHANGELOG.md`](CHANGELOG.md).
+
+## What's new in 3.0
+
+- **Real PTY sessions.** Enable the opt-in `pty` feature and call
+  `Command::use_pty()` for a child that requires a controlling terminal:
+  `openpty` on Unix, `CreatePseudoConsole` (ConPTY) on Windows. Initial and live
+  window sizing use `pty_size` / `resize_pty`; output is the terminal's merged
+  stdout/stderr stream, while the existing job/cgroup/process-group containment
+  and kill-on-drop guarantee remain unchanged. Start with the
+  [PTY dialog guide](docs/streaming.md#pty-dialog-wait-for-a-prompt-then-answer)
+  and check the [platform matrix](docs/platform-support.md#pty-mode-use_pty-the-pty-feature).
+- **Smaller, decomposed errors.** `Error` is now a pointer-sized wrapper around
+  `Box<ErrorReason>`. Existing classifiers and accessors stay on `Error`; code
+  that matched enum variants now uses `err.reason()` (or `into_reason()`), and
+  `ErrorKind` provides a coarser total routing classification. See
+  [Errors](docs/errors.md) and the [2.x → 3.0 migration](docs/upgrading.md#300-from-2x).
 
 ## Install
 
@@ -198,16 +210,16 @@ end to end:
 | [Running many at once](docs/batch.md) | Bounded `output_all` / `output_all_bytes` fan-out, containment choices, and `wait_any` / `wait_all` races and joins |
 | [Comparative benchmarks](docs/comparison.md) | End-to-end processkit vs. plain Tokio and standard-library baselines for capture, streaming, and concurrent fan-out |
 | [Process groups](docs/process-groups.md) | Containment, teardown, signals, suspend/resume, members, limits, stats |
-| [Streaming & interactive I/O](docs/streaming.md) | Line streaming, conversational stdin, readiness probes, `wait_any`, profiling |
+| [Streaming & interactive I/O](docs/streaming.md) | Line streaming, conversational stdin, PTY dialogs/window resize/output hygiene, readiness probes, `wait_any`, profiling |
 | [Pipelines](docs/pipelines.md) | Shell-free `a \| b \| c`, pipefail attribution, chain timeouts |
 | [Timeouts, retries & cancellation](docs/timeouts-and-cancellation.md) | Captured vs raised deadlines, retry classifiers, `CancellationToken` |
-| [Errors](docs/errors.md) | Every `Error` variant → source → recommended reaction, the subtle look-alikes, classifiers, matching under `#[non_exhaustive]`, ties to retries & supervision |
+| [Errors](docs/errors.md) | The `Error` wrapper and every `ErrorReason` variant → source → recommended reaction, `ErrorKind`, subtle look-alikes, classifiers, and ties to retries & supervision |
 | [Supervision](docs/supervision.md) | Restart policies, backoff & jitter, stop conditions, outcomes |
 | [Observability](docs/observability.md) | The `tracing` events and `metrics` counters/histograms over already-computed run data — secret-hygiene (never argv/env), cardinality, wiring an exporter |
 | [Testing your code](docs/testing.md) | The `ProcessRunner` seam, scripted/recording/mock doubles, cassettes, `CliClient` |
 | [Platform support](docs/platform-support.md) | Mechanisms, all capability matrices, every caveat |
 | [Running untrusted children](docs/untrusted-children.md) | Hardening checklist for launching an untrusted program: containment, resource limits, privilege drop, env hygiene, output/wall-time bounds |
-| [Upgrading](docs/upgrading.md) | Per-version consumer upgrade notes — what changed on each release and how to migrate across a major bump |
+| [Upgrading](docs/upgrading.md) | Per-version consumer upgrade notes, including the 2.x → 3.0 `ErrorReason` and lifecycle-event migrations |
 
 API reference: [docs.rs/processkit](https://docs.rs/processkit).
 
@@ -229,6 +241,7 @@ guarantee is unconditional in every configuration.
 | `mock` | — | `mockall`-generated `MockRunner` (test-only; its surface is semver-exempt — prefer `ScriptedRunner`/`RecordingRunner`) |
 | `tracing` | — | lifecycle events: spawn/exit, timeout/cancel, teardown, retries, storms (never argv/env) |
 | `metrics` | — | counters/histograms over already-computed run data: run/spawn counters, duration histograms, exit-code/timeout/cancel tally, retry/restart/storm events, into any `metrics` recorder (never argv/env) |
+| `pty` | — | real pseudo-terminal launch mode (`openpty` on Unix, ConPTY on Windows), interactive master input, merged output, initial/live window sizing |
 
 ## Capping a group's resources
 
@@ -295,12 +308,15 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-Signals are POSIX-only: on Windows just `Signal::Kill` is deliverable (it maps to
-the Job Object terminate) and anything else returns `ErrorReason::Unsupported`.
-`Signal::Kill` always takes the same whole-tree hard-kill path as
-`kill_all()`. Suspend/resume work everywhere a container exists — one
-`cgroup.freeze` write covering the subtree on Linux, `SIGSTOP`/`SIGCONT` on
-macOS/BSD and the Linux process-group fallback (both idempotent), and
+Signals map directly to POSIX signals on Unix. On Windows, `Signal::Kill` takes
+the Job Object whole-tree terminate path; `Int`/`Term` make a best-effort soft
+stop through `CTRL_BREAK` for opted-in console process groups plus `WM_CLOSE`
+for windowed members, and return `ErrorReason::Unsupported` only when neither is
+reachable. Other Windows signals are unsupported. `soft_stop_scope()` lets a
+caller inspect that reach before acting. Suspend/resume work everywhere a
+container exists — one `cgroup.freeze` write covering the subtree on Linux,
+`SIGSTOP`/`SIGCONT` on macOS/BSD and the Linux process-group fallback (both
+idempotent), and
 per-thread suspension on Windows (best-effort; only there nested suspends
 stack and need matching resumes).
 

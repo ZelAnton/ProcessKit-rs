@@ -6,7 +6,7 @@
 ┌─────────────────────────────────────────────────────────────────┐
 │  Runner layer (async, tokio)                                    │
 │  Command · RunningProcess · Pipeline · Supervisor · CliClient   │
-│  capture / streaming / interactive stdin / readiness probes     │
+│  capture / streaming / PTY / interactive stdin / readiness      │
 │  testing seam: ProcessRunner → ScriptedRunner / RecordReplay…   │
 ├─────────────────────────────────────────────────────────────────┤
 │  Group layer (kill-on-drop containment)                         │
@@ -24,6 +24,25 @@ leaks a process tree. The layers are also usable independently — a raw
 `ProcessGroup` can contain children you spawn yourself, and the runner's
 test doubles never touch the OS at all.
 
+## 3.0 highlights
+
+- **PTY support is here.** With the opt-in `pty` feature,
+  `Command::use_pty()` gives terminal-only tools a real controlling terminal:
+  `openpty` on Unix and `CreatePseudoConsole` (ConPTY) on Windows. The terminal
+  has one merged output stream, supports interactive input plus initial/live
+  window sizing, and stays inside the same kill-on-drop containment as a piped
+  run. Start with the [PTY dialog](streaming.md#pty-dialog-wait-for-a-prompt-then-answer)
+  and [window-size](streaming.md#pty-window-size-and-live-resize) sections, then
+  check the [platform matrix](platform-support.md#pty-mode-use_pty-the-pty-feature).
+- **Errors are split by responsibility.** `Error` is now a pointer-sized wrapper
+  around `Box<ErrorReason>`; its existing accessors remain the convenient path,
+  `reason()` exposes the structured variant, and `ErrorKind` is the coarse total
+  classification for routing. See [Errors](errors.md) for the model and
+  [Upgrading](upgrading.md#300-from-2x) for the 2.x migration.
+
+The complete release record is in the
+[`v3.0.0` release](https://github.com/ZelAnton/ProcessKit-rs/releases/tag/v3.0.0).
+
 ## Guides
 
 **New to the crate?** Start with the [Cookbook](cookbook.md) — short
@@ -40,17 +59,17 @@ every per-OS caveat in one place.
 | [Running many at once](batch.md) | Bounded `output_all` / `output_all_bytes` fan-out, shared versus independent containment, and `wait_any` / `wait_all` races and joins |
 | [Comparative benchmarks](comparison.md) | End-to-end processkit vs. plain Tokio and standard-library baselines across capture, streaming, and concurrent fan-out |
 | [Process groups](process-groups.md) | Kill-on-drop containment: creating groups, spawning/adopting, teardown verbs, whole-tree signals, suspend/resume, member listing, resource limits, stats sampling |
-| [Streaming & interactive I/O](streaming.md) | `start()` and the live `RunningProcess`: line streaming, interactive stdin, readiness probes (`wait_for_line` / `wait_for_port` / `wait_for`), racing children with `wait_any`, per-run profiling |
+| [Streaming & interactive I/O](streaming.md) | `start()` and the live `RunningProcess`: line streaming, interactive stdin, PTY dialogs/window resize/output hygiene, readiness probes (`wait_for_line` / `wait_for_port` / `wait_for`), racing children with `wait_any`, per-run profiling |
 | [Pipelines](pipelines.md) | `a \| b \| c` without a shell (the `\|` operator works too): wiring, pipefail attribution, `unchecked_in_pipe()` stages for the `\| head` pattern, timeouts, stdin/stdout at the ends, re-running chains |
 | [Timeouts, retries & cancellation](timeouts-and-cancellation.md) | How a deadline is *captured* vs when it errors, retry policies and their classifier, and cancellation: per-command tokens and the client-level `default_cancel_on` |
-| [Errors](errors.md) | Every `Error` variant, where it comes from and the recommended reaction, the subtle look-alikes (`Timeout` vs `Cancelled`, `NotReady` vs `Timeout`, `NotFound` vs `Spawn`, `CassetteMiss`), the classifiers (`is_not_found`, `is_timeout`, `code()`/`signal()`/…), matching under `#[non_exhaustive]`, and how retries/supervision use the classifiers |
+| [Errors](errors.md) | The `Error` wrapper, every `ErrorReason` variant, `ErrorKind`, subtle look-alikes (`Timeout` vs `Cancelled`, `NotReady` vs `Timeout`, `NotFound` vs `Spawn`, `CassetteMiss`), classifiers, and how retries/supervision use them |
 | [Supervision](supervision.md) | Keeping a child alive: restart policies, backoff & jitter math, the failure-storm guard, stop conditions, outcomes, supervising inside a shared group |
 | [Observability](observability.md) | The `tracing` event seam and the `metrics` counters/histograms over data the crate already computes — what's measured, the secret-hygiene guarantee (never argv/env), label cardinality, and wiring a backend exporter |
 | [Testing your code](testing.md) | The `ProcessRunner` seam — bulk **and** streaming: `ScriptedRunner` (incl. scripted `start()` with canned, paced lines), `RecordingRunner`, `MockRunner`, record/replay cassettes, and building hermetically-testable CLI wrappers with `CliClient` |
 | [Platform support](platform-support.md) | The containment mechanisms, every per-feature support matrix in one place, and the platform caveats worth knowing before you ship |
 | [Running in containers](containers.md) | Docker/Kubernetes specifics: which mechanism you actually get, PID 1 signal/reaping behavior, graceful shutdown on the orchestrator's `SIGTERM`, minimal musl/Alpine images, and container limits vs. the crate's own `limits` |
 | [Running untrusted children](untrusted-children.md) | A hardening checklist for launching a program you don't trust: containment, resource limits, privilege drop order, environment hygiene, output/wall-time bounds — what the crate guarantees, what it doesn't, and where to go for real isolation |
-| [Upgrading](upgrading.md) | Per-version consumer upgrade notes — what changed on each release and the exact change to make across a major bump |
+| [Upgrading](upgrading.md) | Per-version consumer upgrade notes, including the 2.x → 3.0 `ErrorReason` and lifecycle-event migrations |
 | [What's next](whats-next.md) | Where the containment/runner approach is headed beyond this Rust crate |
 
 ## Feature flags
@@ -67,10 +86,11 @@ guarantee is unconditional in every configuration.
 | `tracing` | off | Events on the `processkit` target: spawn/exit, timeout & cancel firing, per-transition graceful teardown (`soft_signal` → `grace_started` → `drained`/`escalated`/`spared`), retries, supervisor storms, teardown anomalies (never argv/env) | `tracing` |
 | `metrics` | off | Counters/histograms over already-computed run data: run/spawn counters, run-duration histograms, an exit-code/timeout/cancel tally, retry/restart/storm events — into any `metrics` recorder you install (never argv/env). See [Observability](observability.md) | `metrics` |
 | `record` | off | `RecordReplayRunner` JSON cassettes over the runner seam | `serde`, `serde_json` |
+| `pty` | off | Real pseudo-terminal launch mode (`openpty` on Unix, ConPTY on Windows), interactive master input, merged output, initial/live window sizing | `windows-sys/Win32_System_Pipes` (Windows) |
 
 ```toml
 [dependencies]
-processkit = { version = "…", features = ["limits"] }
+processkit = { version = "3", features = ["limits"] }
 ```
 
 ## The 60-second tour

@@ -15,7 +15,10 @@ to a dated version section.
 -
 
 ### Changed
--
+
+- Refresh the README and Pages landing page for the 3.0.0 release: surface the
+  new PTY backend and `Error`/`ErrorReason` split, add the missing `pty` feature
+  entry, and align the upgrading guide with the current 3.x line.
 
 ### Fixed
 -

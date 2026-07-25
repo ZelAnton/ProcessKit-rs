@@ -6,11 +6,11 @@ the full record; this page is the "I depend on it, what do I do" view.
 
 > **Versioning.** From 1.0.0 onward `processkit` follows
 > [Semantic Versioning](https://semver.org/spec/v2.0.0.html): the public API is
-> stable, and any breaking change lands only in a new **major** version, so `2.x`
-> upgrades are backward-compatible. The default Cargo requirement `processkit = "2"`
-> (or `"2.1"` to also require the latest breaking release) already does the right
-> thing — it allows `2.*` but not `3.0`. Skim the relevant section here before each
-> major bump. (The `mock` feature's `mockall`-generated `expect_*` surface stays
+> stable, and any breaking change lands only in a new **major** version. The
+> current line is **3.x**: `processkit = "3"` accepts compatible `3.*` upgrades
+> but not a future `4.0`. A consumer still declaring `processkit = "2"` remains
+> on 2.x until it deliberately changes the requirement and applies the migration
+> below. (The `mock` feature's `mockall`-generated `expect_*` surface stays
 > semver-exempt — it tracks the `mockall` version.)
 
 ## 3.0.0 (from 2.x)
@@ -156,16 +156,45 @@ compiler-caught (the signature is unchanged, `Result<()>`):
 - **Windows:** it now best-effort soft-closes the tree (a console `CTRL_BREAK` to
   `windows_graceful_ctrl_break` leaders plus `WM_CLOSE` to windowed members) and
   returns `Ok` when it had something to signal, instead of *always* returning
-  `Error::Unsupported`. It still returns `Unsupported` only when the group has neither
+  `ErrorReason::Unsupported`. It still returns `Unsupported` only when the group has neither
   a console-CTRL leader nor a windowed member. A caller that treated the old blanket
   `Unsupported` as "Windows never soft-stops" should stop assuming that.
 - **POSIX process-group mechanism (macOS/BSD, and the Linux process-group fallback):**
-  a genuinely failed send now surfaces as `Error::Io` instead of being swallowed behind
+  a genuinely failed send now surfaces as `ErrorReason::Io` instead of being swallowed behind
   a false `Ok` — an `EINVAL` (an out-of-range `Signal::Other(n)`) or an `EPERM` from a
   live, non-zombie member now reaches the caller. An already-exited member (`ESRCH`), a
   harmless zombie-only `EPERM`, an empty group, and the `Signal::Other(0)` existence
   probe still report `Ok`. A caller that ignored the return value is unaffected; one
   that inspects it now sees these real failures.
+
+### PTY support is now available (additive)
+
+3.0 adds an opt-in real pseudo-terminal backend for tools that require a
+controlling terminal (`isatty()`-gated CLIs, password prompts, full-screen or
+in-place terminal output):
+
+```toml
+[dependencies]
+processkit = { version = "3", features = ["pty"] }
+```
+
+`Command::use_pty()` selects `openpty` on Unix or `CreatePseudoConsole` (ConPTY)
+on Windows. It is additive: without the feature, or with the feature enabled but
+`use_pty()` unset, the existing three-pipe launch path is unchanged. Once selected:
+
+- stdout and stderr are merged onto the terminal master, so
+  `ProcessResult::stderr` is empty;
+- interactive input uses `keep_stdin_open()` + `RunningProcess::take_stdin()`;
+- `pty_size(cols, rows)` sets the initial geometry and `resize_pty(cols, rows)`
+  updates a live session;
+- the child stays in the same Job Object, cgroup, or process group, so timeout,
+  cancellation, and kill-on-drop retain their whole-tree guarantee.
+
+This is a terminal transport, not a terminal emulator. Unix and ConPTY differ in
+echo control, Enter/EOF handling, environment, and resize notification; read the
+[PTY streaming guide](streaming.md#pty-dialog-wait-for-a-prompt-then-answer) and
+[platform matrix](platform-support.md#pty-mode-use_pty-the-pty-feature) before
+building an interactive protocol around it.
 
 ### Also new in 3.0 (additive — nothing to migrate)
 
@@ -186,9 +215,6 @@ if they help:
   honest low-level escape hatch (pair it with `ProcessGroup::spawn` to keep containment
   while dropping the high-level verbs/pump/capture). See the "Escape hatch" section in
   the commands guide.
-- An opt-in **PTY launch mode** behind the new `pty` feature (`Command::use_pty()`) for a
-  tool that demands a controlling terminal.
-
 ### Verify the upgrade
 
 ```sh
