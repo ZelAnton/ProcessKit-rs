@@ -83,7 +83,7 @@ and reaped as a unit (Job Object / cgroup v2 / process group), not just the
 direct child.
 
 > **Status:** stable — **3.x** is the current published line; the latest release
-> is [`3.0.0`](https://github.com/ZelAnton/ProcessKit-rs/releases/tag/v3.0.0).
+> is available on the [GitHub Releases page](https://github.com/ZelAnton/ProcessKit-rs/releases/latest).
 > The public API follows [Semantic Versioning](https://semver.org/): a
 > `processkit = "3"` requirement accepts compatible `3.x` upgrades but not a
 > future `4.0`. See [`CHANGELOG.md`](CHANGELOG.md).
@@ -103,6 +103,34 @@ direct child.
   that matched enum variants now uses `err.reason()` (or `into_reason()`), and
   `ErrorKind` provides a coarser total routing classification. See
   [Errors](docs/errors.md) and the [2.x → 3.0 migration](docs/upgrading.md#300-from-2x).
+- **One stream for the full process lifecycle.** The renamed `events()` stream
+  now yields `ProcessEvent::Started`, ordered stdout/stderr lines, and
+  `ProcessEvent::Exited`. Pipelines and supervisors also gained live
+  `PipelineSession` / `SupervisionSession` handles, so multi-stage and restarted
+  workloads can be observed and stopped while they run. See [lifecycle events](docs/streaming.md#the-full-lifecycle-as-one-stream-events),
+  [live pipelines](docs/pipelines.md#streaming-a-live-chain), and
+  [live supervision](docs/supervision.md#live-sessions-start).
+- **Explicit control over a process tree's lifetime.** `ProcessGroup::stop`
+  reports the graceful-soft-stop → wait → hard-kill path as a `ShutdownReport`,
+  `update_limits` changes caps on a live group, and `spawn_detached` is the
+  deliberately separate escape hatch for a child that must outlive its launcher.
+  See [observable teardown](docs/process-groups.md#observing-the-teardown-stop-and-shutdownreport),
+  [live limits](docs/process-groups.md#updating-a-live-group), and
+  [detached children](docs/process-groups.md#deliberately-detaching-a-child-spawn_detached).
+- **Streaming results and safer capture.** `output_stream` /
+  `output_stream_bytes` yield bounded batch work in completion order;
+  byte-accurate raw tees expose the undecoded stream; and `CapturePolicy`
+  transforms retained lines before they enter a result, making redaction a
+  first-class capture boundary. See [results as they finish](docs/batch.md#results-as-they-finish),
+  [raw output](docs/streaming.md#byte-accurate-raw-output-stdout_raw_tee), and
+  [redaction at capture](docs/streaming.md#redaction-at-capture-capture_policy).
+- **Runtime capability and process introspection.** `host_containment()` reports
+  the effective host mechanism without spawning, `process_info` plus
+  `process_is_alive` provide reuse-safe PID checks outside a group, and the new
+  `metrics` feature exports run/retry/restart counters and duration histograms
+  without recording argv or environment values. See [platform support](docs/platform-support.md#containment-mechanisms),
+  [process identity](docs/process-groups.md#identifying-a-process-by-pid-outside-a-group),
+  and [observability](docs/observability.md#metrics).
 
 ## Install
 

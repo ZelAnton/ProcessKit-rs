@@ -21,6 +21,9 @@ to a dated version section.
   entry points.
 - Add the native .NET sibling to the repository's cross-language links while
   keeping language alternatives out of the Rust Pages landing page.
+- Expand the README and Pages 3.0 highlights with the release's significant
+  lifecycle streams and live sessions, process-tree controls, completion-order
+  batch capture, redaction/raw-output seams, and runtime introspection.
 
 ### Fixed
 

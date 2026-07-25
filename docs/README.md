@@ -75,6 +75,33 @@ best-effort signal to one PID:
   `reason()` exposes the structured variant, and `ErrorKind` is the coarse total
   classification for routing. See [Errors](errors.md) for the model and
   [Upgrading](upgrading.md#300-from-2x) for the 2.x migration.
+- **Lifecycle streaming is end to end.** The renamed `events()` stream carries
+  `ProcessEvent::Started` → ordered output → `ProcessEvent::Exited`, while
+  `Pipeline::start()` and `Supervisor::start()` expose live sessions for
+  observing and stopping multi-stage or restarted workloads. Continue with
+  [lifecycle events](streaming.md#the-full-lifecycle-as-one-stream-events),
+  [live pipelines](pipelines.md#streaming-a-live-chain), and
+  [live supervision](supervision.md#live-sessions-start).
+- **Tree shutdown and ownership are explicit.** `ProcessGroup::stop()` returns a
+  `ShutdownReport`, `update_limits()` changes resource caps on a live group, and
+  `spawn_detached()` is a separate opt-in for the exceptional child that must
+  outlive its launcher. See [observable teardown](process-groups.md#observing-the-teardown-stop-and-shutdownreport),
+  [live limits](process-groups.md#updating-a-live-group), and
+  [detached children](process-groups.md#deliberately-detaching-a-child-spawn_detached).
+- **Batch streaming and capture are production-ready.** Completion-order
+  `output_stream` fan-out no longer holds fast results behind slow work;
+  byte-accurate raw tees expose the undecoded stream; and `CapturePolicy`
+  redacts or reshapes retained lines before they enter a result. See
+  [results as they finish](batch.md#results-as-they-finish),
+  [raw output](streaming.md#byte-accurate-raw-output-stdout_raw_tee), and
+  [redaction at capture](streaming.md#redaction-at-capture-capture_policy).
+- **The host is inspectable before and after launch.** `host_containment()`
+  reports the effective containment mechanism without spawning;
+  `process_info()` / `process_is_alive()` provide reuse-safe PID identity checks;
+  and the new `metrics` feature publishes secret-safe counters and histograms.
+  See [Platform support](platform-support.md#containment-mechanisms),
+  [process identity](process-groups.md#identifying-a-process-by-pid-outside-a-group),
+  and [Observability](observability.md#metrics).
 
 The complete release record is in the
 [`v3.0.0` release](https://github.com/ZelAnton/ProcessKit-rs/releases/tag/v3.0.0).
