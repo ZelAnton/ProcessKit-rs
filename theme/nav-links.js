@@ -2,7 +2,7 @@
 //
 // mdBook's SUMMARY.md cannot express a sidebar entry that points at an external
 // URL: a list item's link target must be a chapter file in `src`, and a raw URL
-// makes the build fail ("failed to read chapter https://..."). The three
+// makes the build fail ("failed to read chapter https://..."). The four
 // implementation entries are therefore carried in SUMMARY.md as *draft prefix
 // chapters* (bare `[Title]()` links, no chapter files) pinned above
 // `[Overview](README.md)` in the same un-numbered prefix block. Production is
@@ -11,10 +11,11 @@
 // <li class="chapter-item expanded affix "><div>...</div></li>.
 // The selector below deliberately targets this bare <div> output, which is the
 // same version-specific shape used by the ProcessKit-fSharp reference.
-// This script upgrades the two external entries to live links and marks the
+// This script upgrades the three external entries to live links and marks the
 // local implementation as a non-clickable indicator:
 //
 //   * "Rust version"   -> a non-clickable indicator for this implementation.
+//   * "CLI Runner"     -> a live external link to the CLI runner's docs site.
 //   * "Python wrapper" -> a live external link to the Python wrapper's docs site.
 //   * ".NET version"   -> a live external link to the .NET implementation's site.
 //
@@ -25,6 +26,7 @@
 
   var ENTRIES = {
     "Rust version": { placeholder: "Current implementation" },
+    "CLI Runner": { href: "https://zelanton.github.io/ProcessKit-CLI/" },
     "Python wrapper": { href: "https://zelanton.github.io/processkit-py/" },
     ".NET version": { href: "https://zelanton.github.io/ProcessKit-fSharp/" }
   };

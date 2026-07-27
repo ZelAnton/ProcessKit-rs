@@ -15,7 +15,8 @@ to a dated version section.
 -
 
 ### Changed
--
+
+- Add the CLI runner documentation to the Pages implementation switcher.
 
 ### Fixed
 -
