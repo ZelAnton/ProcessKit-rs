@@ -15,6 +15,8 @@ to a dated version section.
 
 - Add stderr line and partial-tail readiness probes with the same non-killing
   deadline semantics as their stdout counterparts.
+- Add an opt-in cassette scrub hook that redacts arguments, working directories,
+  and captured output before persistence while keeping replay keys symmetric.
 
 ### Changed
 

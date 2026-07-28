@@ -28,8 +28,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +38,31 @@ use crate::doubles::Invocation;
 use crate::error::{Error, ErrorReason, Result};
 use crate::result::{Outcome, ProcessResult};
 use crate::runner::{JobRunner, ProcessRunner};
+
+/// A secret-bearing text field passed to a cassette scrub hook.
+///
+/// Configure the hook with [`RecordReplayRunner::scrub_with`]. Arguments are
+/// presented one at a time and in order; the other variants contain the whole
+/// field. The program name and environment values are not passed: the former is
+/// needed as the stable tool identity, while the latter are never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CassetteField {
+    /// One command-line argument.
+    Argument,
+    /// The configured working directory.
+    Cwd,
+    /// Captured standard output.
+    Stdout,
+    /// Captured standard error.
+    Stderr,
+}
+
+type ScrubHook = dyn Fn(CassetteField, &str) -> String
+    + Send
+    + Sync
+    + std::panic::UnwindSafe
+    + std::panic::RefUnwindSafe;
 
 /// The on-disk format revision. Bumped if the cassette schema ever changes
 /// incompatibly; loading a cassette with an unknown version fails loudly
@@ -96,8 +121,10 @@ struct Cassette {
 /// Strings are lossy UTF-8 (the cassette is a text fixture). **Only env
 /// *values* are redacted** — overrides are stored as variable *names* only.
 /// Everything else (`program`, `args`, `cwd`, `stdout`, `stderr`) is stored
-/// **verbatim** and can carry secrets — a `--password=…` argv, a token echoed
-/// to stdout — so review a cassette before committing it. `timeout` is
+/// **verbatim by default** and can carry secrets — a `--password=…` argv, a
+/// token echoed to stdout. [`RecordReplayRunner::scrub_with`] can transform the
+/// secret-bearing fields before persistence; still review a cassette before
+/// committing it. `timeout` is
 /// deliberately absent: it is the *command's* configuration, re-read at replay
 /// time, exactly like the live runner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -463,7 +490,7 @@ impl MatchPolicy {
     /// no more than it did before (still just variable names). Two invocations
     /// whose selected values differ produce different digests and thus miss each
     /// other on replay; identical selected values collide (the intended hit).
-    fn digest_of(&self, invocation: &Invocation) -> Option<u64> {
+    fn digest_of(&self, invocation: &Invocation, scrubber: Option<&ScrubHook>) -> Option<u64> {
         if self.is_empty() {
             return None;
         }
@@ -475,12 +502,20 @@ impl MatchPolicy {
         let mut h = crate::digest::Fnv1a::new();
         if self.match_cwd {
             // Tag the field so an empty-cwd policy can't alias a same-length env
-            // digest; `cwd` is lossless bytes (also stored verbatim on the entry).
+            // digest. Without a scrub hook cwd uses its lossless platform bytes;
+            // with one, the same scrubbed lossy text stored on the entry is keyed
+            // on both record and replay.
             h.mix(b"cwd\0");
             match &invocation.cwd {
                 Some(cwd) => {
                     h.mix(&[1]);
-                    h.mix(cwd.as_os_str().as_encoded_bytes());
+                    match scrubber {
+                        Some(scrub) => {
+                            let cwd = cwd.to_string_lossy();
+                            h.mix(scrub(CassetteField::Cwd, &cwd).as_bytes());
+                        }
+                        None => h.mix(cwd.as_os_str().as_encoded_bytes()),
+                    }
                 }
                 None => h.mix(&[0]),
             }
@@ -520,7 +555,8 @@ fn is_zero_u64(n: &u64) -> bool {
 /// Write `json` to `path`, restricting the file to owner-only (`0600`) on Unix.
 ///
 /// A cassette redacts env *values* (it stores names only), but argv, cwd,
-/// stdout, and stderr are stored **verbatim** — any of which can carry a secret.
+/// stdout, and stderr are stored **verbatim by default** — any of which can
+/// carry a secret. [`RecordReplayRunner::scrub_with`] can redact them first.
 /// So the file is created owner-only rather than inheriting a world-readable
 /// umask.
 ///
@@ -767,7 +803,11 @@ impl Entry {
     /// (successful-call and `Err`-call) — everything [`from_parts`](Self::from_parts)
     /// and [`from_error`](Self::from_error) build identically, so the two
     /// constructors can't drift on how the key is derived.
-    fn key_fields(invocation: &Invocation, stdin_digest: Option<u64>) -> KeyFields {
+    fn key_fields(
+        invocation: &Invocation,
+        stdin_digest: Option<u64>,
+        scrubber: Option<&ScrubHook>,
+    ) -> KeyFields {
         let mut env_names: Vec<String> = invocation
             .envs
             .iter()
@@ -782,12 +822,21 @@ impl Entry {
             args: invocation
                 .args
                 .iter()
-                .map(|a| a.to_string_lossy().into_owned())
+                .map(|arg| {
+                    let arg = arg.to_string_lossy();
+                    match scrubber {
+                        Some(scrub) => scrub(CassetteField::Argument, &arg),
+                        None => arg.into_owned(),
+                    }
+                })
                 .collect(),
-            cwd: invocation
-                .cwd
-                .as_ref()
-                .map(|c| c.to_string_lossy().into_owned()),
+            cwd: invocation.cwd.as_ref().map(|cwd| {
+                let cwd = cwd.to_string_lossy();
+                match scrubber {
+                    Some(scrub) => scrub(CassetteField::Cwd, &cwd),
+                    None => cwd.into_owned(),
+                }
+            }),
             stdin_digest,
             has_stdin: invocation.has_stdin,
             env_names,
@@ -803,8 +852,9 @@ impl Entry {
         result: &ProcessResult<String>,
         stdin_digest: Option<u64>,
         match_digest: Option<u64>,
+        scrubber: Option<&ScrubHook>,
     ) -> Self {
-        let key = Self::key_fields(invocation, stdin_digest);
+        let key = Self::key_fields(invocation, stdin_digest, scrubber);
         Self {
             program: key.program,
             args: key.args,
@@ -813,8 +863,14 @@ impl Entry {
             match_digest,
             has_stdin: key.has_stdin,
             env_names: key.env_names,
-            stdout: result.stdout().clone(),
-            stderr: result.stderr().to_owned(),
+            stdout: scrubber.map_or_else(
+                || result.stdout().clone(),
+                |scrub| scrub(CassetteField::Stdout, result.stdout()),
+            ),
+            stderr: scrubber.map_or_else(
+                || result.stderr().to_owned(),
+                |scrub| scrub(CassetteField::Stderr, result.stderr()),
+            ),
             code: result.code(),
             timed_out: result.timed_out(),
             // Exhaustive (no wildcard) so a future `Outcome` variant is a compile
@@ -840,8 +896,9 @@ impl Entry {
         stdin_digest: Option<u64>,
         match_digest: Option<u64>,
         error: CassetteError,
+        scrubber: Option<&ScrubHook>,
     ) -> Self {
-        let key = Self::key_fields(invocation, stdin_digest);
+        let key = Self::key_fields(invocation, stdin_digest, scrubber);
         Self {
             program: key.program,
             args: key.args,
@@ -965,17 +1022,28 @@ fn reject_unrecordable_stdin(command: &Command) -> Result<()> {
 /// from the key **by default** and folded in only under an opt-in `policy` (see
 /// [`Key`]'s doc and [`MatchPolicy`]); an empty policy digests to `None`, keying
 /// the same as a no-policy / older field-less entry.
-fn key_of(invocation: &Invocation, stdin_digest: Option<u64>, policy: &MatchPolicy) -> Key {
+fn key_of(
+    invocation: &Invocation,
+    stdin_digest: Option<u64>,
+    policy: &MatchPolicy,
+    scrubber: Option<&ScrubHook>,
+) -> Key {
     (
         invocation.program.to_string_lossy().into_owned(),
         invocation
             .args
             .iter()
-            .map(|a| a.to_string_lossy().into_owned())
+            .map(|arg| {
+                let arg = arg.to_string_lossy();
+                match scrubber {
+                    Some(scrub) => scrub(CassetteField::Argument, &arg),
+                    None => arg.into_owned(),
+                }
+            })
             .collect(),
         invocation.has_stdin,
         stdin_digest,
-        policy.digest_of(invocation),
+        policy.digest_of(invocation, scrubber),
     )
 }
 
@@ -1047,8 +1115,9 @@ enum Mode<R> {
 ///   against an otherwise-identical invocation run from a different one (see the
 ///   type doc's "Portability of the match key"). Env override *values* are never
 ///   written — only sorted variable names. Everything else (argv, cwd, stdout,
-///   stderr) is stored verbatim, so review fixtures before committing. File is
-///   written owner-only (`0600`) on Unix.
+///   stderr) is stored verbatim unless [`scrub_with`](Self::scrub_with) is
+///   configured, so review fixtures before committing. File is written
+///   owner-only (`0600`) on Unix.
 /// - **Opt-in stricter matching**: [`match_on_cwd`](Self::match_on_cwd) and
 ///   [`match_on_env`](Self::match_on_env) add the working directory and/or the
 ///   *values* of named env variables to the key — for a tool whose output truly
@@ -1116,6 +1185,9 @@ pub struct RecordReplayRunner<R: ProcessRunner = JobRunner> {
     /// sides: record folds its digest onto each entry, replay recomputes it from
     /// the live invocation — see [`MatchPolicy`].
     policy: MatchPolicy,
+    /// Optional field-aware redaction applied before fixture persistence and to
+    /// replay lookup keys. User code is always invoked outside cassette locks.
+    scrubber: Option<Arc<ScrubHook>>,
 }
 
 impl<R: ProcessRunner> RecordReplayRunner<R> {
@@ -1131,7 +1203,34 @@ impl<R: ProcessRunner> RecordReplayRunner<R> {
                 dirty: AtomicBool::new(false),
             },
             policy: MatchPolicy::default(),
+            scrubber: None,
         }
+    }
+
+    /// Scrub secret-bearing cassette fields before they are persisted.
+    ///
+    /// The hook receives each argument, cwd, stdout, and stderr with a
+    /// [`CassetteField`] discriminator and returns the fixture-safe replacement.
+    /// Record-mode callers still receive the real, unsanitized process result;
+    /// only the stored entry is transformed. During replay the same hook is
+    /// applied to the live arguments (and cwd when `match_on_cwd` is active)
+    /// before lookup, so a secret argument can match its redacted fixture key.
+    /// Set the same deterministic hook on both the recorder and replayer.
+    ///
+    /// The hook may run concurrently when the runner is shared. It is never
+    /// called while an internal cassette mutex is held.
+    #[must_use]
+    pub fn scrub_with<F>(mut self, scrubber: F) -> Self
+    where
+        F: Fn(CassetteField, &str) -> String
+            + Send
+            + Sync
+            + std::panic::UnwindSafe
+            + std::panic::RefUnwindSafe
+            + 'static,
+    {
+        self.scrubber = Some(Arc::new(scrubber));
+        self
     }
 
     /// Opt in to matching on the **working directory** too, on top of the
@@ -1338,6 +1437,7 @@ impl RecordReplayRunner<JobRunner> {
                 slots: Mutex::new(replay_slots_from_text(text)?),
             },
             policy: MatchPolicy::default(),
+            scrubber: None,
         })
     }
 }
@@ -1377,6 +1477,7 @@ pub fn fuzz_cassette_replay(text: &str, calls: &[(String, Vec<String>)]) {
                 &invocation,
                 stdin_digest_of(&command),
                 &MatchPolicy::default(),
+                None,
             );
             let expected_entry = expected.get_mut(&key).map(|slot| slot.play().clone());
             match expected_entry {
@@ -1465,16 +1566,19 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 // The active policy's digest (None for the portable default),
                 // folded onto the entry so replay keys on cwd/env without
                 // re-persisting the raw values.
-                let match_digest = self.policy.digest_of(&invocation);
+                let scrubber = self.scrubber.as_deref();
+                let match_digest = self.policy.digest_of(&invocation, scrubber);
                 match inner.output_string(command).await {
                     Ok(result) => {
-                        let mut entries = recorded.lock().expect("cassette mutex poisoned");
-                        entries.push(Entry::from_parts(
+                        let entry = Entry::from_parts(
                             &invocation,
                             &result,
                             stdin_digest,
                             match_digest,
-                        ));
+                            scrubber,
+                        );
+                        let mut entries = recorded.lock().expect("cassette mutex poisoned");
+                        entries.push(entry);
                         dirty.store(true, Ordering::SeqCst);
                         Ok(result)
                     }
@@ -1483,13 +1587,15 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                         // reproduces it instead of missing the cassette; still
                         // surface the real error to this record-mode caller.
                         if let Some(cassette_err) = CassetteError::from_error(&err) {
-                            let mut entries = recorded.lock().expect("cassette mutex poisoned");
-                            entries.push(Entry::from_error(
+                            let entry = Entry::from_error(
                                 &invocation,
                                 stdin_digest,
                                 match_digest,
                                 cassette_err,
-                            ));
+                                scrubber,
+                            );
+                            let mut entries = recorded.lock().expect("cassette mutex poisoned");
+                            entries.push(entry);
                             dirty.store(true, Ordering::SeqCst);
                         }
                         Err(err)
@@ -1520,12 +1626,17 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 }
                 let invocation = Invocation::from_command(command);
                 let stdin_digest = stdin_digest_of(command);
+                let key = key_of(
+                    &invocation,
+                    stdin_digest,
+                    &self.policy,
+                    self.scrubber.as_deref(),
+                );
                 // Release the lock before invoking line handlers — a handler that
                 // re-enters this replayer would otherwise deadlock.
                 let entry = {
                     let mut slots = slots.lock().expect("cassette mutex poisoned");
-                    let slot = match slots.get_mut(&key_of(&invocation, stdin_digest, &self.policy))
-                    {
+                    let slot = match slots.get_mut(&key) {
                         Some(slot) => slot,
                         None => {
                             return Err(ErrorReason::CassetteMiss {
@@ -1590,30 +1701,39 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 // must stay silent or every handler/tee would fire twice.
                 let invocation = Invocation::from_command(command);
                 let stdin_digest = stdin_digest_of(command);
-                let match_digest = self.policy.digest_of(&invocation);
+                let scrubber = self.scrubber.as_deref();
+                let match_digest = self.policy.digest_of(&invocation, scrubber);
                 match inner
                     .output_string(&command.without_line_side_effects())
                     .await
                 {
                     Ok(result) => {
-                        let entry =
-                            Entry::from_parts(&invocation, &result, stdin_digest, match_digest);
+                        let entry = Entry::from_parts(
+                            &invocation,
+                            &result,
+                            stdin_digest,
+                            match_digest,
+                            scrubber,
+                        );
                         {
                             let mut entries = recorded.lock().expect("cassette mutex poisoned");
-                            entries.push(entry.clone());
+                            entries.push(entry);
                             dirty.store(true, Ordering::SeqCst);
                         }
                         Ok(crate::doubles::scripted_running_from_parts(
                             command,
-                            entry.stdout,
-                            entry.stderr,
-                            entry.code,
-                            entry.timed_out,
-                            entry.signal,
-                            entry.truncated,
-                            entry.total_lines,
-                            entry.total_bytes,
-                            std::time::Duration::from_millis(entry.duration_ms),
+                            result.stdout().clone(),
+                            result.stderr().to_owned(),
+                            result.code(),
+                            result.timed_out(),
+                            match result.outcome() {
+                                Outcome::Signalled(signal) => signal,
+                                Outcome::Exited(_) | Outcome::TimedOut => None,
+                            },
+                            result.truncated(),
+                            result.total_lines(),
+                            result.total_bytes(),
+                            result.duration(),
                         ))
                     }
                     Err(err) => {
@@ -1621,13 +1741,15 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                         // reproduces it instead of missing the cassette; still
                         // surface the real error to this record-mode caller.
                         if let Some(cassette_err) = CassetteError::from_error(&err) {
-                            let mut entries = recorded.lock().expect("cassette mutex poisoned");
-                            entries.push(Entry::from_error(
+                            let entry = Entry::from_error(
                                 &invocation,
                                 stdin_digest,
                                 match_digest,
                                 cassette_err,
-                            ));
+                                scrubber,
+                            );
+                            let mut entries = recorded.lock().expect("cassette mutex poisoned");
+                            entries.push(entry);
                             dirty.store(true, Ordering::SeqCst);
                         }
                         Err(err)
@@ -1647,10 +1769,15 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 }
                 let invocation = Invocation::from_command(command);
                 let stdin_digest = stdin_digest_of(command);
+                let key = key_of(
+                    &invocation,
+                    stdin_digest,
+                    &self.policy,
+                    self.scrubber.as_deref(),
+                );
                 let entry = {
                     let mut slots = slots.lock().expect("cassette mutex poisoned");
-                    let slot = match slots.get_mut(&key_of(&invocation, stdin_digest, &self.policy))
-                    {
+                    let slot = match slots.get_mut(&key) {
                         Some(slot) => slot,
                         None => {
                             return Err(ErrorReason::CassetteMiss {
@@ -1731,6 +1858,106 @@ impl<R: ProcessRunner> Drop for RecordReplayRunner<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scrub_secrets(field: CassetteField, text: &str) -> String {
+        match field {
+            CassetteField::Argument => text.replace("s3cret", "<redacted>"),
+            CassetteField::Cwd => text.replace("private-root", "<root>"),
+            CassetteField::Stdout | CassetteField::Stderr => text.replace("s3cret", "<redacted>"),
+        }
+    }
+
+    #[tokio::test]
+    async fn scrub_hook_redacts_fixture_and_matches_replay_symmetrically() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("scrubbed.json");
+        let command = Command::new("tool")
+            .arg("--token=s3cret")
+            .current_dir("private-root");
+        let recorder = RecordReplayRunner::record(
+            &path,
+            ScriptedRunner::new()
+                .fallback(Reply::ok("token=s3cret\n").with_stderr("warning: s3cret\n")),
+        )
+        .match_on_cwd()
+        .scrub_with(scrub_secrets);
+
+        let raw = recorder
+            .output_string(&command)
+            .await
+            .expect("record raw result");
+        assert_eq!(raw.stdout(), "token=s3cret");
+        assert_eq!(raw.stderr(), "warning: s3cret");
+        recorder.save().expect("save scrubbed fixture");
+
+        let json = std::fs::read_to_string(&path).expect("read fixture");
+        assert!(!json.contains("s3cret"), "secret leaked into {json}");
+        assert!(!json.contains("private-root"), "cwd leaked into {json}");
+        assert!(json.contains("<redacted>"));
+        assert!(json.contains("<root>"));
+
+        let replayer = RecordReplayRunner::replay(&path)
+            .expect("load cassette")
+            .match_on_cwd()
+            .scrub_with(scrub_secrets);
+        let replayed = replayer
+            .output_string(&command)
+            .await
+            .expect("redacted argument and cwd match their fixture key");
+        assert_eq!(replayed.stdout(), "token=<redacted>");
+        assert_eq!(replayed.stderr(), "warning: <redacted>");
+    }
+
+    #[tokio::test]
+    async fn record_start_returns_raw_output_while_storing_scrubbed_output() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("stream-scrubbed.json");
+        let recorder = RecordReplayRunner::record(
+            &path,
+            ScriptedRunner::new().fallback(Reply::ok("s3cret\n").with_stderr("s3cret warning\n")),
+        )
+        .scrub_with(scrub_secrets);
+
+        let run = recorder
+            .start(&Command::new("tool"))
+            .await
+            .expect("record streaming run");
+        let raw = run.output_string().await.expect("consume returned handle");
+        assert_eq!(raw.stdout(), "s3cret");
+        assert_eq!(raw.stderr(), "s3cret warning");
+        recorder.save().expect("save scrubbed fixture");
+
+        let json = std::fs::read_to_string(path).expect("read fixture");
+        assert!(!json.contains("s3cret"), "secret leaked into {json}");
+    }
+
+    #[tokio::test]
+    async fn scrub_hook_also_redacts_and_matches_recorded_error_entries() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("error-scrubbed.json");
+        let command = Command::new("missing-tool").arg("--token=s3cret");
+        let recorder =
+            RecordReplayRunner::record(&path, ScriptedRunner::new().fallback(Reply::not_found()))
+                .scrub_with(scrub_secrets);
+
+        let record_error = recorder
+            .output_string(&command)
+            .await
+            .expect_err("inner not-found propagates");
+        assert!(record_error.is_not_found());
+        recorder.save().expect("save error fixture");
+        let json = std::fs::read_to_string(&path).expect("read fixture");
+        assert!(!json.contains("s3cret"), "secret leaked into {json}");
+
+        let replayer = RecordReplayRunner::replay(path)
+            .expect("load cassette")
+            .scrub_with(scrub_secrets);
+        let replay_error = replayer
+            .output_string(&command)
+            .await
+            .expect_err("scrubbed error key replays");
+        assert!(replay_error.is_not_found());
+    }
     use crate::doubles::{Reply, ScriptedRunner};
     use crate::result::Outcome;
     use crate::runner::ProcessRunnerExt;
@@ -3389,7 +3616,7 @@ mod tests {
         };
         let set = Invocation::from_command(&Command::new("tool").env("MODE", "fast"));
         assert_eq!(
-            env_policy.digest_of(&set),
+            env_policy.digest_of(&set, None),
             Some(0xb9f4_ba02_d660_e742),
             "env-value digest changed — invalidates every recorded cassette"
         );
@@ -3402,13 +3629,13 @@ mod tests {
         };
         let in_dir = Invocation::from_command(&Command::new("tool").current_dir("/work/a"));
         assert_eq!(
-            cwd_policy.digest_of(&in_dir),
+            cwd_policy.digest_of(&in_dir, None),
             Some(0x1926_ae14_ca39_bd8e),
             "cwd digest changed — invalidates every recorded cassette"
         );
 
         // An empty policy keys to `None` (no `match_digest` on the entry) — the
         // portable default is unchanged by the refactor.
-        assert_eq!(MatchPolicy::default().digest_of(&set), None);
+        assert_eq!(MatchPolicy::default().digest_of(&set, None), None);
     }
 }

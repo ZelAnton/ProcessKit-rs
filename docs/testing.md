@@ -334,7 +334,7 @@ Semantics worth knowing before you commit a cassette:
 
 | Aspect | Behavior |
 |---|---|
-| Match key | program + args + a stdin **source digest** (hashed, never persisted: in-memory bytes hash their content, a `from_file` source hashes its path) — no stdin (absent or `Stdin::empty()`) keys distinctly; lossy UTF-8 on the text parts. **`cwd` is not part of the key by default** — a cassette recorded from one absolute working directory still replays when the same invocation runs from another (a dev box vs. a CI workspace); `cwd` is still stored on the entry, verbatim, for visibility. Opt in to a stricter key with `match_on_cwd` / `match_on_env` (below) |
+| Match key | program + args + a stdin **source digest** (hashed, never persisted: in-memory bytes hash their content, a `from_file` source hashes its path) — no stdin (absent or `Stdin::empty()`) keys distinctly; lossy UTF-8 on the text parts. **`cwd` is not part of the key by default** — a cassette recorded from one absolute working directory still replays when the same invocation runs from another (a dev box vs. a CI workspace); `cwd` is still stored on the entry for visibility. Opt in to a stricter key with `match_on_cwd` / `match_on_env` (below). A `scrub_with` hook transforms args symmetrically on record and replay (and cwd too when matched), so redacted keys still hit |
 | Environment | **values never reach the file** — only sorted variable names, so *env* secrets can't leak through a committed fixture. Env is **not matched by default**, so irrelevant env differences can't cause spurious misses. Opt in with `match_on_env(["NAME", …])` to also key on selected variables' *values* — still via a **digest**, so raw values remain off-disk (see [Opt-in stricter matching](#opt-in-stricter-matching-cwd--selected-env-values)) |
 | Duplicates of one key | replay in capture order, then the **last entry repeats** — a recorded sequence (`git rev-parse HEAD` before/after a commit) replays faithfully, while retry/probe loops keep getting a stable final answer |
 | Miss | strict `ErrorReason::CassetteMiss` (distinct from a missing program — `is_not_found()` is `false`) — replay never spawns a surprise subprocess; a stale cassette fails loudly |
@@ -344,9 +344,38 @@ Semantics worth knowing before you commit a cassette:
 | Verbs (`output_string` + `start`) | a cassette is **verb-agnostic**: record through either and replay through either. Replaying `start` hands back a scripted `RunningProcess` whose recorded lines flow through the command's real pumps (`stdout_lines` / `wait_for_line` / `finish`), no subprocess. *Recording* a `start` captures the run whole (the child runs to completion before the handle returns), so an **interactive** run fed stdin mid-stream can't be recorded that way — bound it with `Command::timeout` or script it with `ScriptedRunner` |
 | `output_bytes` | **unsupported** (`ErrorReason::Unsupported`) in both modes — a lossy-UTF-8 text fixture can't reproduce exact raw bytes; capture bytes from a real or scripted runner |
 
-Only env **values** are redacted. `program`, `args`, `cwd`, `stdout`, and
-`stderr` are stored **verbatim** and can carry secrets (a `--password=…` flag, a
-token echoed to output), so review a fixture before committing it. On Unix the
+By default only env **values** are excluded. `program`, `args`, `cwd`, `stdout`,
+and `stderr` are stored **verbatim** and can carry secrets (a `--password=…`
+flag, a token echoed to output). For a fixture that can contain one, opt into a
+field-aware scrub hook:
+
+```rust,no_run
+use processkit::{JobRunner, ProcessRunnerExt};
+use processkit::testing::{CassetteField, RecordReplayRunner};
+
+let scrub = |field: CassetteField, text: &str| match field {
+    CassetteField::Argument | CassetteField::Stdout | CassetteField::Stderr =>
+        text.replace("s3cret", "<redacted>"),
+    CassetteField::Cwd => text.replace("/home/alice", "<workspace>"),
+    _ => text.to_owned(),
+};
+
+let recorder = RecordReplayRunner::record("fixtures/tool.json", JobRunner::new())
+    .scrub_with(scrub);
+// run commands, then recorder.save()?;
+
+// Apply the same deterministic hook before replay lookup: a live secret argv
+// is transformed to the same redacted key stored in the fixture.
+let replayer = RecordReplayRunner::replay("fixtures/tool.json")?
+    .scrub_with(scrub);
+# let _ = (recorder, replayer);
+# Ok::<(), processkit::Error>(())
+```
+
+The hook changes only the persisted entry. Record-mode callers still receive
+the real unsanitized stdout/stderr; replay naturally returns the scrubbed text
+that exists in the fixture. Use the same deterministic hook on both runners.
+Still review a fixture before committing it. On Unix the
 file is written `0600` and the write **refuses to follow a symlink** at the
 cassette path (`O_NOFOLLOW`, so a planted link can't redirect the secret-bearing
 write — it fails loud instead). On Windows the file inherits the containing

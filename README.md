@@ -840,9 +840,12 @@ from a different one (a CI workspace, a teammate's checkout). Environment
 override **values never reach the file** — only the
 sorted variable names, so env values can't leak through a committed fixture (and
 env differences can't cause spurious misses). **Note:** argv, cwd, stdout, and
-stderr *are* stored **verbatim** and can carry secrets (a `--password=…` flag, a
-token echoed to output) — review a fixture before committing it; on Unix the
-file is written `0600`. When one invocation was recorded
+stderr are stored **verbatim by default** and can carry secrets (a
+`--password=…` flag, a token echoed to output). Use the opt-in field-aware
+`scrub_with` hook to replace secrets before persistence; apply the same
+deterministic hook to replay so redacted argv keys match. Record-mode callers
+still receive the original unsanitized result. Review a fixture before
+committing it; on Unix the file is written `0600`. When one invocation was recorded
 several times, replay serves the entries in capture order and then repeats the
 last one — a recorded sequence of changing outputs replays faithfully, while
 retry/probe loops keep getting a stable final answer. An invocation absent from

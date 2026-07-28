@@ -590,7 +590,7 @@ pub mod testing {
 
     /// Record/replay cassette runner (enabled by the `record` feature).
     #[cfg(feature = "record")]
-    pub use crate::cassette::RecordReplayRunner;
+    pub use crate::cassette::{CassetteField, RecordReplayRunner};
 
     /// The `mockall`-generated mock of [`ProcessRunner`](crate::ProcessRunner)
     /// (enabled by the `mock` feature), re-exported under a friendlier name.

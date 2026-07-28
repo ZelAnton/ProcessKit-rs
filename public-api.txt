@@ -4,6 +4,29 @@ pub mod processkit::prelude
 pub use processkit::prelude::Encoding
 pub use processkit::prelude::StreamExt
 pub mod processkit::testing
+#[non_exhaustive] pub enum processkit::testing::CassetteField
+pub processkit::testing::CassetteField::Argument
+pub processkit::testing::CassetteField::Cwd
+pub processkit::testing::CassetteField::Stderr
+pub processkit::testing::CassetteField::Stdout
+impl core::clone::Clone for processkit::testing::CassetteField
+pub fn processkit::testing::CassetteField::clone(&self) -> processkit::testing::CassetteField
+impl core::cmp::Eq for processkit::testing::CassetteField
+impl core::cmp::PartialEq for processkit::testing::CassetteField
+pub fn processkit::testing::CassetteField::eq(&self, &processkit::testing::CassetteField) -> bool
+impl core::fmt::Debug for processkit::testing::CassetteField
+pub fn processkit::testing::CassetteField::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for processkit::testing::CassetteField
+pub fn processkit::testing::CassetteField::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for processkit::testing::CassetteField
+impl core::marker::StructuralPartialEq for processkit::testing::CassetteField
+impl core::marker::Freeze for processkit::testing::CassetteField
+impl core::marker::Send for processkit::testing::CassetteField
+impl core::marker::Sync for processkit::testing::CassetteField
+impl core::marker::Unpin for processkit::testing::CassetteField
+impl core::marker::UnsafeUnpin for processkit::testing::CassetteField
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::testing::CassetteField
+impl core::panic::unwind_safe::UnwindSafe for processkit::testing::CassetteField
 pub struct processkit::testing::DryRunRunner
 impl processkit::testing::DryRunRunner
 pub fn processkit::testing::DryRunRunner::commands(&self) -> alloc::vec::Vec<alloc::string::String>
@@ -83,6 +106,7 @@ pub fn processkit::testing::RecordReplayRunner<R>::match_on_cwd(self) -> Self
 pub fn processkit::testing::RecordReplayRunner<R>::match_on_env<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn processkit::testing::RecordReplayRunner<R>::record(impl core::convert::Into<std::path::PathBuf>, R) -> Self
 pub fn processkit::testing::RecordReplayRunner<R>::save(&self) -> processkit::Result<()>
+pub fn processkit::testing::RecordReplayRunner<R>::scrub_with<F>(self, F) -> Self where F: core::ops::function::Fn(processkit::testing::CassetteField, &str) -> alloc::string::String + core::marker::Send + core::marker::Sync + core::panic::unwind_safe::UnwindSafe + core::panic::unwind_safe::RefUnwindSafe + 'static
 impl<R: processkit::ProcessRunner> core::fmt::Debug for processkit::testing::RecordReplayRunner<R>
 pub fn processkit::testing::RecordReplayRunner<R>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<R: processkit::ProcessRunner> core::ops::drop::Drop for processkit::testing::RecordReplayRunner<R>
