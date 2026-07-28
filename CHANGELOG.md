@@ -17,9 +17,14 @@ to a dated version section.
 ### Changed
 
 - Add the CLI runner documentation to the Pages implementation switcher.
+- Simplify oversized-line pump tracking by removing unused length accumulation.
 
 ### Fixed
--
+
+- Keep Windows graceful shutdown on its prompt atomic path when all recorded
+  CTRL_BREAK leaders are stale.
+- Surface genuine Windows ConPTY termination failures while preserving
+  idempotent kills for already-exited children.
 
 ## [3.0.2] - 2026-07-25
 

@@ -591,8 +591,8 @@ impl SharedLines {
         self.inner.lock().expect("SharedLines poisoned").max_bytes
     }
 
-    /// Record a line whose own byte length exceeds `max_bytes`: it is counted
-    /// and never retained (it cannot fit the cap). Under [`OverflowMode::Error`]
+    /// Record an over-cap line skipped by the pump: it is counted and never
+    /// retained (it cannot fit the cap). Under [`OverflowMode::Error`]
     /// it trips the fail-loud ceiling; under the drop modes it sets the
     /// truncation signal. Raw bytes are accounted for at the read boundary in
     /// [`pump_lines_core`], before this decoded-line bookkeeping runs. A
@@ -600,7 +600,7 @@ impl SharedLines {
     /// overflow bookkeeping like [`push`](Self::push). Mirrors the "cannot fit"
     /// accounting in [`push`](Self::push) for a line the pump never buffered (so
     /// it is also not delivered to the per-line handler or tee).
-    pub(crate) fn record_oversized_line(&self, _byte_len: usize) {
+    pub(crate) fn record_oversized_line(&self) {
         self.count.fetch_add(1, Ordering::Relaxed);
         let mut policy_dropped = false;
         {
@@ -1161,11 +1161,10 @@ where
 
     // How many leading bytes of `sub` (the buffered prefix of an over-cap line
     // being skipped) to advance past, EXCEPT a single trailing `\r`, held back
-    // rather than counted in case it is the CR of a CRLF whose `\n` lands in the
-    // next chunk (a terminator, which `content_len` excludes). Deferring keeps
-    // the recorded length identical regardless of read boundary; a `\r` that
-    // turns out to be mid-line content is counted later (a subsequent split,
-    // another `skip_over_cap_len` pass, or the EOF finalizer carries it on).
+    // rather than discarded in case it is the CR of a CRLF whose `\n` lands in
+    // the next chunk. Deferring keeps terminator classification identical
+    // regardless of read boundary; a `\r` that turns out to be mid-line content
+    // is discarded by a subsequent split, skip pass, or the EOF finalizer.
     // Index-only (no buffer mutation): the caller advances its cursor by the
     // returned amount and bulk-drains the consumed prefix once per chunk,
     // instead of memmove-ing the tail on every skipped line.
@@ -1206,9 +1205,9 @@ where
     let mut decoder = encoding.new_decoder_with_bom_removal();
     let mut pending = String::new(); // decoded text not yet split into a line
     let mut chunk = [0u8; CHUNK];
-    // `Some(bytes_so_far)` while skipping an over-cap line: bytes are discarded as
-    // decoded; raw bytes are accounted for at the read boundary below.
-    let mut oversized: Option<usize> = None;
+    // True while skipping an over-cap line. Decoded content is discarded until
+    // its terminator; raw bytes are accounted for at the read boundary below.
+    let mut oversized = false;
     loop {
         // Distinguish a clean EOF (`Ok(0)`) from a read error: both stop the
         // pump, but only a clean EOF signals the decoder's end-of-stream flush. On
@@ -1261,22 +1260,19 @@ where
         let mut start = 0usize;
         loop {
             let sub = &pending[start..];
-            if let Some(skipped) = oversized {
-                // Skipping an over-cap line: discard through its terminator, keeping
-                // only its length for accounting.
+            if oversized {
+                // Skipping an over-cap line: discard through its terminator.
                 match next_terminator(sub, terminator, eof) {
                     Some(term) => {
-                        let line_len = skipped.saturating_add(term.content_len);
                         start += term.resume;
-                        oversized = None;
-                        sink.0.record_oversized_line(line_len);
+                        oversized = false;
+                        sink.0.record_oversized_line();
                     }
                     None => {
                         #[cfg(test)]
                         observe_skip_call();
                         let advance = skip_over_cap_len(sub);
                         start += advance;
-                        oversized = Some(skipped.saturating_add(advance));
                         break;
                     }
                 }
@@ -1300,10 +1296,10 @@ where
                             )
                             .await;
                         } else {
-                            // Over-cap line, terminator already here: drop it whole,
-                            // counting its content length.
+                            // Over-cap line, terminator already here: drop it whole
+                            // and record the skipped line once.
                             start += term.resume;
-                            sink.0.record_oversized_line(len);
+                            sink.0.record_oversized_line();
                         }
                     }
                     // No terminator yet and already over the cap: skip to it. A lone
@@ -1322,7 +1318,7 @@ where
                         observe_skip_call();
                         let advance = skip_over_cap_len(sub);
                         start += advance;
-                        oversized = Some(advance);
+                        oversized = true;
                         break;
                     }
                     None => break,
@@ -1342,7 +1338,7 @@ where
         // the finalizer below turns that content into a complete line, but the
         // last published tail stays visible so a final un-terminated prompt is
         // matchable right up to and including close.
-        if oversized.is_some() {
+        if oversized {
             sink.0.set_partial_tail("");
         } else {
             sink.0.set_partial_tail(&pending);
@@ -1353,12 +1349,11 @@ where
             // split loop above ran with `eof = true`, so in `\r`-aware mode a
             // trailing `\r` was already resolved as a frame terminator; whatever
             // remains in `pending` here is pure content with no terminator.
-            if let Some(skipped) = oversized.take() {
+            if oversized {
                 // An un-terminated tail: `pending` is all content (in `Newline`
                 // mode a trailing `\r` is content; in `\r`-aware mode none remains).
-                let line_len = skipped.saturating_add(pending.len());
                 pending.clear();
-                sink.0.record_oversized_line(line_len);
+                sink.0.record_oversized_line();
             } else if !pending.is_empty() {
                 // An un-terminated final line: `pending` is all content (in
                 // `Newline` mode a trailing `\r` is content). Re-apply the byte cap:
@@ -1368,7 +1363,7 @@ where
                 // over-cap line — not emitted.
                 let line = std::mem::take(&mut pending);
                 if cap.is_some_and(|c| line.len() > c) {
-                    sink.0.record_oversized_line(line.len());
+                    sink.0.record_oversized_line();
                 } else {
                     emit(
                         &mut handler,
@@ -1774,7 +1769,7 @@ mod tests {
         let policy = OutputBufferPolicy::fail_loud(10).with_max_bytes(3);
         let sink = SharedLines::new(&policy);
         sink.start_discarding();
-        sink.record_oversized_line(4);
+        sink.record_oversized_line();
 
         assert_eq!(sink.count(), 1, "the oversized line is still counted");
         assert_eq!(sink.dropped(), 0, "discarding skips truncation bookkeeping");

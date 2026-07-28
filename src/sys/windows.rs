@@ -530,9 +530,7 @@ impl Job {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let has_live_leader = leaders
-            .iter()
-            .any(|&pid| ctrl_break_leader_is_live(pid, self.handle));
+        let has_live_leader = has_live_ctrl_break_leader(&leaders, self.handle);
         if has_live_leader || job_has_windowed_member(self.handle) {
             crate::SoftStopScope::OptInMembers
         } else {
@@ -688,9 +686,7 @@ impl Job {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let has_live_leader = leaders
-            .iter()
-            .any(|&pid| ctrl_break_leader_is_live(pid, self.handle));
+        let has_live_leader = has_live_ctrl_break_leader(&leaders, self.handle);
         if has_live_leader || job_has_windowed_member(self.handle) {
             let target = SoftShutdownTarget { job: self, leaders };
             return super::graceful::run(&target, &self.skip_drop_kill, signal, timeout, escalate)
@@ -912,6 +908,15 @@ fn ctrl_break_live_leaders(leaders: &[u32], job: HANDLE) -> usize {
 /// the suspend/resume C13 recycle discipline).
 fn ctrl_break_leader_is_live(pid: u32, job: HANDLE) -> bool {
     pid != 0 && process_is_in_job(pid, job)
+}
+
+/// Whether a recorded-leader snapshot contains at least one live member of this
+/// job. Capability reporting and graceful-teardown branching share this helper so
+/// they cannot drift on which stale/recycled pids count as a reachable soft tier.
+fn has_live_ctrl_break_leader(leaders: &[u32], job: HANDLE) -> bool {
+    leaders
+        .iter()
+        .any(|&pid| ctrl_break_leader_is_live(pid, job))
 }
 
 /// Drives the [`EnumWindows`] top-level-window walk for the GUI-graceful tier: the

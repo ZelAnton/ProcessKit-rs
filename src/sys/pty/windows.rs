@@ -51,9 +51,9 @@ const STILL_ACTIVE: u32 = 259;
 
 fn classify_terminate_failure(
     terminate_error: io::Error,
-    observed_exit_code: Option<u32>,
+    process_has_exited: bool,
 ) -> io::Result<()> {
-    if observed_exit_code.is_some_and(|code| code != STILL_ACTIVE) {
+    if process_has_exited {
         Ok(())
     } else {
         Err(terminate_error)
@@ -287,15 +287,15 @@ impl PtyChild {
         }
 
         let terminate_error = io::Error::last_os_error();
-        let mut code = 0;
         // `TerminateProcess` reports access-denied after a process has already
         // terminated, but that code can also describe a genuine rejection. Query
-        // the owned handle instead of classifying by error number: only a known
-        // non-active process is the documented idempotent no-op.
-        // SAFETY: `self.process.0` remains a valid owned handle; `code` is an
-        // owned out-param.
-        let queried = unsafe { GetExitCodeProcess(self.process.0, &mut code) };
-        classify_terminate_failure(terminate_error, (queried != 0).then_some(code))
+        // the owned handle instead of classifying by error number. Waiting with a
+        // zero timeout is an exact exit test, unlike `GetExitCodeProcess`, whose
+        // `STILL_ACTIVE` value is ambiguous with a real exit code of 259.
+        // SAFETY: `self.process.0` remains a valid owned handle; a zero timeout is
+        // a non-blocking observation.
+        let process_has_exited = unsafe { WaitForSingleObject(self.process.0, 0) } == WAIT_OBJECT_0;
+        classify_terminate_failure(terminate_error, process_has_exited)
     }
 }
 
@@ -993,14 +993,10 @@ mod tests {
 
     #[test]
     fn terminate_failure_is_benign_only_for_a_known_exited_process() {
-        assert!(classify_terminate_failure(io::Error::from_raw_os_error(5), Some(0)).is_ok());
+        assert!(classify_terminate_failure(io::Error::from_raw_os_error(5), true).is_ok());
 
-        let live = classify_terminate_failure(io::Error::from_raw_os_error(5), Some(STILL_ACTIVE))
+        let live = classify_terminate_failure(io::Error::from_raw_os_error(5), false)
             .expect_err("a live process preserves the termination failure");
         assert_eq!(live.raw_os_error(), Some(5));
-
-        let unknown = classify_terminate_failure(io::Error::from_raw_os_error(6), None)
-            .expect_err("a failed exit-code query preserves the termination failure");
-        assert_eq!(unknown.raw_os_error(), Some(6));
     }
 }
