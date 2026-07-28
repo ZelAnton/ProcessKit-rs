@@ -49,6 +49,17 @@ use super::{PtyExitStatus, PtyReader, PtySpawn, PtyWriter};
 
 const STILL_ACTIVE: u32 = 259;
 
+fn classify_terminate_failure(
+    terminate_error: io::Error,
+    observed_exit_code: Option<u32>,
+) -> io::Result<()> {
+    if observed_exit_code.is_some_and(|code| code != STILL_ACTIVE) {
+        Ok(())
+    } else {
+        Err(terminate_error)
+    }
+}
+
 /// Build a ConPTY [`COORD`] from a `(cols, rows)` window size. `COORD`'s fields
 /// are signed 16-bit, so a size beyond `i16::MAX` (far past any real terminal) is
 /// clamped rather than wrapped negative — a defensive cap, never hit in practice.
@@ -266,17 +277,25 @@ impl PtyChild {
     }
 
     /// Terminate the child through the owned handle (no raw pid kill needed).
-    /// Best-effort and idempotent: terminating an already-exited process fails
-    /// with access-denied, which is treated as a successful no-op.
+    /// Idempotent for an already-exited process; every other OS rejection is
+    /// surfaced to the caller.
     pub(crate) fn start_kill(&mut self) -> io::Result<()> {
         // SAFETY: a valid process handle; exit code 1 for a forced termination.
         let ok = unsafe { TerminateProcess(self.process.0, 1) };
-        if ok == 0 {
-            // Already gone → nothing to kill; any other failure is best-effort
-            // here (teardown also reaps and the job kill-on-close backstops it).
+        if ok != 0 {
             return Ok(());
         }
-        Ok(())
+
+        let terminate_error = io::Error::last_os_error();
+        let mut code = 0;
+        // `TerminateProcess` reports access-denied after a process has already
+        // terminated, but that code can also describe a genuine rejection. Query
+        // the owned handle instead of classifying by error number: only a known
+        // non-active process is the documented idempotent no-op.
+        // SAFETY: `self.process.0` remains a valid owned handle; `code` is an
+        // owned out-param.
+        let queried = unsafe { GetExitCodeProcess(self.process.0, &mut code) };
+        classify_terminate_failure(terminate_error, (queried != 0).then_some(code))
     }
 }
 
@@ -970,5 +989,18 @@ mod tests {
         // negative — a defensive guard on the signed `COORD` fields.
         let big = coord(u16::MAX, 40_000);
         assert_eq!((big.X, big.Y), (i16::MAX, i16::MAX));
+    }
+
+    #[test]
+    fn terminate_failure_is_benign_only_for_a_known_exited_process() {
+        assert!(classify_terminate_failure(io::Error::from_raw_os_error(5), Some(0)).is_ok());
+
+        let live = classify_terminate_failure(io::Error::from_raw_os_error(5), Some(STILL_ACTIVE))
+            .expect_err("a live process preserves the termination failure");
+        assert_eq!(live.raw_os_error(), Some(5));
+
+        let unknown = classify_terminate_failure(io::Error::from_raw_os_error(6), None)
+            .expect_err("a failed exit-code query preserves the termination failure");
+        assert_eq!(unknown.raw_os_error(), Some(6));
     }
 }

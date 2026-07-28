@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use processkit::{Command, JobRunner, ProcessRunner};
+use processkit::{Command, JobRunner, ProcessRunner, wait_any};
 
 use crate::common::{completes_within, poll_until};
 
@@ -500,6 +500,25 @@ async fn pty_child_stays_contained_and_is_reaped_on_drop() {
         || !pid_alive(pid),
     )
     .await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns a real Windows pseudo-terminal"]
+async fn pty_start_kill_is_idempotent_after_exit() {
+    let mut proc = Command::new("cmd")
+        .args(["/c", "exit", "0"])
+        .use_pty()
+        .start()
+        .await
+        .expect("start short-lived pty child");
+    let (index, _) = wait_any(&mut [&mut proc])
+        .await
+        .expect("reap short-lived pty child");
+    assert_eq!(index, 0);
+
+    proc.start_kill()
+        .expect("killing an exited PTY child is a successful no-op");
 }
 
 #[tokio::test]
