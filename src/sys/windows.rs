@@ -111,8 +111,9 @@ pub(crate) struct Job {
     /// console-CTRL graceful path (via
     /// [`Command::windows_graceful_ctrl_break`](crate::Command::windows_graceful_ctrl_break)).
     /// Empty unless a child opted in: `graceful_shutdown` takes the CTRL_BREAK →
-    /// grace → `TerminateJobObject` path **iff** this is non-empty, so the default
-    /// atomic-kill behavior is untouched for every other job. Each pid is a console
+    /// grace → `TerminateJobObject` path **iff** this contains a live leader, so
+    /// the default atomic-kill behavior is untouched for every other job. Each pid
+    /// is a console
     /// **process-group id** (equal to the leader's pid) addressable by
     /// `GenerateConsoleCtrlEvent`; a per-leader `IsProcessInJob` re-check at signal
     /// time keeps a recycled pid from diverting the event onto a stranger's group.
@@ -394,9 +395,9 @@ impl Job {
             // pruning it can never cause a future `signal_all` to miss a leader
             // it would otherwise have signalled. Chosen over pruning inside
             // `graceful_shutdown`: it bounds the dominant long-lived-job growth
-            // pattern (repeated opt-in spawns) without adding an extra full
-            // `retain` walk (and its `IsProcessInJob` syscalls) to every
-            // teardown's hot path, on top of `signal_all`'s own per-leader check.
+            // pattern (repeated opt-in spawns). Teardown still performs its own
+            // live-membership scan because the final child may exit after the last
+            // spawn, leaving this bounded snapshot stale.
             leaders.retain(|&leader| process_is_in_job(leader, self.handle));
             // Dedup guard (T-154 R-3): `pid` is the child JUST assigned to this
             // job above, so if the OS recycled a stale leader's freed pid for
@@ -687,7 +688,10 @@ impl Job {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        if !leaders.is_empty() || job_has_windowed_member(self.handle) {
+        let has_live_leader = leaders
+            .iter()
+            .any(|&pid| ctrl_break_leader_is_live(pid, self.handle));
+        if has_live_leader || job_has_windowed_member(self.handle) {
             let target = SoftShutdownTarget { job: self, leaders };
             return super::graceful::run(&target, &self.skip_drop_kill, signal, timeout, escalate)
                 .await;
@@ -2079,14 +2083,11 @@ mod ctrl_break_tests {
         let _ = child.wait().await;
     }
 
-    /// With a recorded leader, `graceful_shutdown` takes the CTRL_BREAK path
-    /// (`graceful::run`), not the atomic branch. The recorded leader here is our
-    /// OWN pid, which is NOT a member of this job — so the per-leader
-    /// `IsProcessInJob` recycle guard must skip it, never delivering a CTRL_BREAK
-    /// that would terminate the (handler-less) test runner. The job being empty,
-    /// the driver's first drain check returns "drained" and it returns Ok promptly
-    /// without a hard kill. The test process surviving to its assertions is the
-    /// proof the membership gate held.
+    /// A recorded pid that is not a live job member cannot manufacture a graceful
+    /// tier. The same recycle-safe membership gate used by `signal` and
+    /// `soft_stop_scope` keeps teardown on the prompt atomic branch and reports the
+    /// soft signal as unsupported. The test process surviving is also proof no
+    /// CTRL_BREAK was sent to our own (handler-less) process.
     #[tokio::test]
     async fn a_recorded_non_member_leader_is_never_signalled() {
         let job = new_job();
@@ -2098,14 +2099,18 @@ mod ctrl_break_tests {
             .push(me);
 
         let start = std::time::Instant::now();
-        job.graceful_shutdown(crate::sys::SIGTERM_RAW, Duration::from_secs(30), true)
+        let outcome = job
+            .graceful_shutdown(crate::sys::SIGTERM_RAW, Duration::from_secs(30), true)
             .await
             .expect("ctrl-break graceful shutdown of an empty job");
-        // The empty job is drained on the first poll, so the driver never waits
-        // out the 30s grace; a bug that signalled/killed us would not get here.
+        assert_eq!(
+            outcome.soft,
+            crate::sys::graceful::SoftDelivery::Unsupported,
+            "a stale leader does not create a soft-shutdown tier"
+        );
         assert!(
             start.elapsed() < Duration::from_secs(5),
-            "a drained job ends the CTRL grace immediately (took {:?})",
+            "a stale leader must not introduce a grace wait (took {:?})",
             start.elapsed()
         );
         assert!(
@@ -2114,14 +2119,12 @@ mod ctrl_break_tests {
         );
     }
 
-    /// The CTRL path honors `escalate = false` sparing exactly as the atomic path
-    /// and the unix backends do: with a leader recorded but the job already
-    /// drained, a non-escalating shutdown latches `skip_drop_kill` so `Drop`
-    /// clears `KILL_ON_JOB_CLOSE`. Reuses the shared `graceful::run` epoch
-    /// handshake, so the documented spawn/adopt re-arm race stays covered by the
-    /// `SkipDropKill` unit tests.
+    /// The atomic path honors `escalate = false` sparing when a stale recorded
+    /// leader is the only putative soft target. It latches `skip_drop_kill` so
+    /// `Drop` clears `KILL_ON_JOB_CLOSE`, while a subsequent spawn/adopt still
+    /// re-arms the backstop.
     #[tokio::test]
-    async fn the_ctrl_path_spares_survivors_when_not_escalating() {
+    async fn a_stale_ctrl_leader_uses_atomic_non_escalating_shutdown() {
         let job = new_job();
         // SAFETY: a plain read of our own pid — a non-member leader (skipped by
         // the recycle guard), so no CTRL_BREAK reaches the test runner.
@@ -2136,7 +2139,7 @@ mod ctrl_break_tests {
             .expect("non-escalating ctrl-break shutdown");
         assert!(
             job.skip_drop_kill.is_set(),
-            "a non-escalating CTRL shutdown spares survivors: Drop clears KILL_ON_JOB_CLOSE"
+            "a non-escalating atomic shutdown spares survivors: Drop clears KILL_ON_JOB_CLOSE"
         );
         // A subsequent spawn/adopt re-arms it, as on every backend.
         job.skip_drop_kill.clear();
