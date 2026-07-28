@@ -28,6 +28,31 @@ async fn wait_for_line_matches_banner_and_leaves_child_running() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real subprocess and waits for its stderr readiness banner"]
+async fn wait_for_stderr_line_matches_while_stdout_is_background_drained() {
+    let mut process = stderr_banner_then_idle().start().await.expect("start");
+    let line = tokio::time::timeout(
+        Duration::from_secs(15),
+        process.wait_for_stderr_line(|line| line.contains("ready"), Duration::from_secs(10)),
+    )
+    .await
+    .expect("probe finished in time")
+    .expect("stderr banner matched");
+    assert!(line.contains("ready"), "line: {line:?}");
+
+    process.start_kill().expect("kill");
+    let result = process
+        .output_string()
+        .await
+        .expect("reap and capture stdout");
+    assert!(
+        result.stdout().contains("retained-out"),
+        "stdout must keep draining while stderr is probed: {:?}",
+        result.stdout()
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a silent subprocess; the probe must give up at its deadline"]
 async fn wait_for_line_not_ready_when_silent() {
     // Genuinely silent: the plain `sleeper()` ping prints lines on Windows.

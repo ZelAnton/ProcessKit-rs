@@ -1,8 +1,7 @@
-//! Readiness probes: `wait_for_line` / `wait_for` / `wait_for_port` /
-//! `wait_for_socket` and their
-//! shared polling loop. All four background-drain stdout/stderr while they
-//! poll, so a chatty child can't stall in `write()` on a full OS pipe buffer;
-//! only `wait_for_line` hands any of the drained stdout back to the caller.
+//! Readiness probes for stdout/stderr lines and partial tails, ports, sockets,
+//! and arbitrary async checks. They background-drain both output streams while
+//! they poll, so a chatty child can't stall in `write()` on a full OS pipe
+//! buffer; the line probes hand back only the selected stream.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -22,6 +21,7 @@ use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
+use crate::buffer::OutputStream;
 use crate::error::{Error, ErrorReason, Result};
 
 use super::RunningProcess;
@@ -89,6 +89,39 @@ impl RunningProcess {
         predicate: impl Fn(&str) -> bool + Send,
         within: Duration,
     ) -> Result<String> {
+        self.wait_for_stream_line(OutputStream::Stdout, predicate, within)
+            .await
+    }
+
+    /// Wait until a stderr line matches `predicate` (returning that line).
+    ///
+    /// This is the stderr counterpart of [`wait_for_line`](Self::wait_for_line):
+    /// it has its own `within` deadline, does not arm or alter the command
+    /// timeout, and leaves the child running after [`ErrorReason::NotReady`]. It
+    /// consumes stderr up to and including the match while stdout is drained in
+    /// the background. A PTY has only one merged output stream, so use
+    /// `wait_for_line` for PTY output.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorReason::NotReady`] when the deadline elapses or stderr closes
+    ///   before a matching line arrives.
+    /// - [`ErrorReason::Io`] when stderr is not piped or was already consumed.
+    pub async fn wait_for_stderr_line(
+        &mut self,
+        predicate: impl Fn(&str) -> bool + Send,
+        within: Duration,
+    ) -> Result<String> {
+        self.wait_for_stream_line(OutputStream::Stderr, predicate, within)
+            .await
+    }
+
+    async fn wait_for_stream_line(
+        &mut self,
+        stream: OutputStream,
+        predicate: impl Fn(&str) -> bool + Send,
+        within: Duration,
+    ) -> Result<String> {
         use tokio_stream::StreamExt;
 
         // `drain_stdout_lines` (not `stdout_lines`) drains stdout WITHOUT arming
@@ -96,7 +129,10 @@ impl RunningProcess {
         // tree or flip the outcome to `TimedOut`. It owns its sink, leaving `self`
         // borrowable after the search, and is fallible (non-piped or
         // already-consumed stdout) rather than forever `NotReady`.
-        let mut lines = self.drain_stdout_lines()?;
+        let mut lines = match stream {
+            OutputStream::Stdout => self.drain_stdout_lines()?,
+            OutputStream::Stderr => self.drain_stderr_lines()?,
+        };
         let search = async {
             while let Some(line) = lines.next().await {
                 if predicate(&line) {
@@ -185,6 +221,45 @@ impl RunningProcess {
         predicate: impl Fn(&str) -> bool + Send,
         within: Duration,
     ) -> Result<String> {
+        self.wait_for_stream_output(OutputStream::Stdout, predicate, within)
+            .await
+    }
+
+    /// Wait until stderr's current un-terminated tail satisfies `predicate`.
+    ///
+    /// This is the stderr counterpart of
+    /// [`wait_for_output`](Self::wait_for_output). It is non-consuming and
+    /// repeatable, observes raw pre-redaction text, drains stdout in the
+    /// background, and is bounded only by `within`; failure never kills the
+    /// child or changes its eventual outcome. A PTY merges stderr into stdout,
+    /// so use `wait_for_output` for PTY prompts.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorReason::NotReady`] when the deadline elapses or stderr closes
+    ///   before a matching tail appears.
+    /// - [`ErrorReason::Io`] when stderr is not piped.
+    pub async fn wait_for_stderr_output(
+        &mut self,
+        predicate: impl Fn(&str) -> bool + Send,
+        within: Duration,
+    ) -> Result<String> {
+        self.wait_for_stream_output(OutputStream::Stderr, predicate, within)
+            .await
+    }
+
+    async fn wait_for_stream_output(
+        &mut self,
+        stream: OutputStream,
+        predicate: impl Fn(&str) -> bool + Send,
+        within: Duration,
+    ) -> Result<String> {
+        if matches!(stream, OutputStream::Stderr) && !self.stderr_piped {
+            return Err(Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("`{}`: stderr is not piped", self.program),
+            )));
+        }
         // Ensure stdout (and stderr) are being background-drained so the pump is
         // publishing the partial tail — WITHOUT taking the stdout stream for
         // ourselves. This is idempotent: a first call installs the pumps; a repeat
@@ -195,13 +270,17 @@ impl RunningProcess {
         // No stdout sink means stdout was not piped (or an earlier consuming verb
         // took it): there is no live tail to watch. Fail loud like `wait_for_line`
         // rather than block forever on a tail that can never appear.
-        let Some(sink) = self.stdout_sink.clone() else {
+        let sink = match stream {
+            OutputStream::Stdout => self.stdout_sink.clone(),
+            OutputStream::Stderr => self.stderr_sink.clone(),
+        };
+        let Some(sink) = sink else {
             return Err(Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "`{}`: stdout is not observable for wait_for_output — it was not piped, \
-                     or a prior stdout_lines/events/wait_for_line already consumed it",
-                    self.program
+                    "`{}`: {} is not observable for readiness probing",
+                    self.program,
+                    stream.name()
                 ),
             )));
         };
@@ -450,7 +529,9 @@ impl RunningProcess {
 fn probe_futures_are_send(rp: &mut RunningProcess) {
     fn assert_send<T: Send>(_: &T) {}
     assert_send(&rp.wait_for_line(|line| line.is_empty(), Duration::ZERO));
+    assert_send(&rp.wait_for_stderr_line(|line| line.is_empty(), Duration::ZERO));
     assert_send(&rp.wait_for_output(|tail| tail.is_empty(), Duration::ZERO));
+    assert_send(&rp.wait_for_stderr_output(|tail| tail.is_empty(), Duration::ZERO));
     assert_send(&rp.wait_for(|| async { true }, Duration::ZERO));
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
     assert_send(&rp.wait_for_port(addr, Duration::ZERO));
@@ -465,6 +546,83 @@ mod tests {
     use crate::doubles::{Reply, ScriptedRunner};
     use crate::error::ErrorReason;
     use crate::runner::ProcessRunner;
+
+    #[tokio::test]
+    async fn wait_for_stderr_line_matches_and_keeps_stdout_draining() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok("out-1\nout-2\n").with_stderr("starting\nready\n"))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+
+        let matched = run
+            .wait_for_stderr_line(|line| line == "ready", Duration::from_secs(1))
+            .await
+            .expect("stderr readiness line");
+        assert_eq!(matched, "ready");
+
+        let result = run
+            .output_string()
+            .await
+            .expect("finish with captured stdout");
+        assert_eq!(result.stdout(), "out-1\nout-2");
+    }
+
+    #[tokio::test]
+    async fn wait_for_stderr_output_matches_unterminated_tail_repeatably() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok("out\n").with_stderr("Password: "))
+            .start(&Command::new("login"))
+            .await
+            .expect("scripted start");
+
+        let first = run
+            .wait_for_stderr_output(|tail| tail == "Password: ", Duration::from_secs(1))
+            .await
+            .expect("stderr prompt tail");
+        let second = run
+            .wait_for_stderr_output(|tail| tail.ends_with(": "), Duration::from_secs(1))
+            .await
+            .expect("repeat stderr prompt tail");
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn stderr_probes_error_when_stderr_is_not_piped() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::pending())
+            .start(&Command::new("tool").stderr(crate::StdioMode::Null))
+            .await
+            .expect("scripted start");
+
+        let line_error = run
+            .wait_for_stderr_line(|_| true, Duration::from_secs(1))
+            .await
+            .expect_err("stderr line probe needs a pipe");
+        assert!(matches!(line_error.reason(), ErrorReason::Io { .. }));
+
+        let output_error = run
+            .wait_for_stderr_output(|_| true, Duration::from_secs(1))
+            .await
+            .expect_err("stderr tail probe needs a pipe");
+        assert!(matches!(output_error.reason(), ErrorReason::Io { .. }));
+    }
+
+    #[cfg(feature = "pty")]
+    #[tokio::test]
+    async fn stderr_probes_reject_a_scripted_pty_merged_stream() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok("merged output\n"))
+            .start(&Command::new("tool").use_pty())
+            .await
+            .expect("scripted PTY start");
+
+        let error = run
+            .wait_for_stderr_line(|_| true, Duration::from_secs(1))
+            .await
+            .expect_err("a PTY has no separate stderr stream");
+        assert!(matches!(error.reason(), ErrorReason::Io { .. }));
+    }
 
     /// T-134: a readiness probe must background-drain piped stderr even when
     /// stdout is not piped (`StdioMode::Null`/`Inherit`). The scripted backend

@@ -103,6 +103,18 @@ pub(crate) fn banner_then_idle() -> Command {
     }
 }
 
+/// A child that emits readiness on stderr, emits a stdout line too, then idles.
+pub(crate) fn stderr_banner_then_idle() -> Command {
+    if cfg!(windows) {
+        Command::new("cmd").args([
+            "/c",
+            "echo retained-out & echo ready 1>&2 & ping -n 30 127.0.0.1 >nul",
+        ])
+    } else {
+        Command::new("sh").args(["-c", "echo retained-out; echo ready >&2; sleep 30"])
+    }
+}
+
 /// An endless line producer, per platform: emits `y` lines until its consumer
 /// goes away. On Unix it then dies of `SIGPIPE` promptly; on Windows
 /// PowerShell may keep buffering without observing the closed pipe, so pair

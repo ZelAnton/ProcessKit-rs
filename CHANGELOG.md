@@ -12,7 +12,9 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+
+- Add stderr line and partial-tail readiness probes with the same non-killing
+  deadline semantics as their stdout counterparts.
 
 ### Changed
 

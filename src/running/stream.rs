@@ -154,6 +154,55 @@ impl RunningProcess {
         })
     }
 
+    /// Set up a one-shot stderr line stream for readiness probing while keeping
+    /// stdout draining in the background. Like `drain_stdout_lines`, this does
+    /// not arm the command timeout watchdog.
+    pub(super) fn drain_stderr_lines(&mut self) -> Result<StdoutLines> {
+        self.ensure_stderr_streamable()?;
+        debug_assert!(
+            self.stderr_sink.is_none(),
+            "ensure_stderr_streamable rejects a previously consumed stderr stream"
+        );
+        self.ensure_stdout_drain();
+
+        let stderr_sink = SharedLines::new(&self.buffer);
+        match self.backend.take_stderr_reader() {
+            Some(pipe) => {
+                self.stderr_pump = Some(tokio::spawn(pump_lines_core(
+                    pipe,
+                    self.stderr_config.clone(),
+                    stderr_sink.clone(),
+                )));
+            }
+            None => stderr_sink.close_now(),
+        }
+        self.stderr_sink = Some(stderr_sink.clone());
+
+        Ok(StdoutLines {
+            sink: stderr_sink,
+            wait: None,
+        })
+    }
+
+    /// Start retaining stdout when another stream is handed to a readiness
+    /// caller. Non-piped or already-draining stdout needs no action.
+    fn ensure_stdout_drain(&mut self) {
+        if !self.stdout_piped || self.stdout_sink.is_some() {
+            return;
+        }
+        let stdout_sink = SharedLines::new(&self.buffer);
+        if let Some(pipe) = self.backend.take_stdout_reader() {
+            self.stdout_pump = Some(tokio::spawn(pump_lines_core(
+                pipe,
+                self.stdout_config.clone(),
+                stdout_sink.clone(),
+            )));
+        } else {
+            stdout_sink.close_now();
+        }
+        self.stdout_sink = Some(stdout_sink);
+    }
+
     /// Background-drain stderr under the caller's
     /// [`OutputBufferPolicy`](crate::OutputBufferPolicy) when it is piped and not
     /// already draining, retaining the sink/pump so [`finish`](Self::finish) can
@@ -175,6 +224,8 @@ impl RunningProcess {
                     self.stderr_config.clone(),
                     stderr_sink.clone(),
                 )));
+            } else {
+                stderr_sink.close_now();
             }
             self.stderr_sink = Some(stderr_sink);
         }

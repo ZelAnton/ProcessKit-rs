@@ -130,6 +130,8 @@ pub(crate) struct Spawned {
     pub ok_codes: Vec<i32>,
     /// Whether stdout is `Piped` (capturable) vs `Inherit`/`Null`.
     pub stdout_piped: bool,
+    /// Whether stderr is `Piped` (observable) vs `Inherit`/`Null`.
+    pub stderr_piped: bool,
     pub cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
@@ -202,6 +204,8 @@ pub struct RunningProcess {
     stdin_error: Option<std::io::Error>,
     // Bulk capture verbs fail loudly on non-piped stdout rather than returning empty.
     stdout_piped: bool,
+    // Stderr readiness probes likewise fail loudly when there is no pipe to observe.
+    stderr_piped: bool,
     // Streaming deadline watchdog; aborted on drop.
     deadline_task: Option<JoinHandle<()>>,
     // Shared (`Arc`) because the watchdog is detached. See `TS_*` constants.
@@ -443,6 +447,7 @@ impl RunningProcess {
             stderr_pump: None,
             stdin_error: None,
             stdout_piped: s.stdout_piped,
+            stderr_piped: s.stderr_piped,
             deadline_task: None,
             timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
             pid_gate: Arc::new(PidGate::new(s.pid)),
@@ -494,6 +499,9 @@ impl RunningProcess {
             stderr_pump: None,
             stdin_error: None,
             stdout_piped: s.stdout_piped,
+            // A PTY exposes one merged stream through stdout; separate stderr is
+            // intentionally unavailable.
+            stderr_piped: false,
             deadline_task: None,
             timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
             pid_gate: Arc::new(PidGate::new(s.pid)),
@@ -815,6 +823,26 @@ impl RunningProcess {
                 format!(
                     "`{}`: stdout was already consumed by an earlier stdout_lines/events \
                      call — stream it once (a second call would yield an empty stream)",
+                    self.program
+                ),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fail loud if a stderr readiness probe cannot take its one-shot stream.
+    fn ensure_stderr_streamable(&self) -> Result<()> {
+        if !self.stderr_piped {
+            return Err(Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("`{}`: stderr is not piped", self.program),
+            )));
+        }
+        if self.stderr_sink.is_some() {
+            return Err(Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "`{}`: stderr was already consumed by an earlier readiness or events call",
                     self.program
                 ),
             )));

@@ -1834,6 +1834,12 @@ impl Command {
         matches!(self.stdout_mode, StdioMode::Piped) && self.stdout_file.is_none()
     }
 
+    /// Whether stderr is observable through a pipe rather than inherited,
+    /// discarded, or redirected directly to a file.
+    pub(crate) fn stderr_is_piped(&self) -> bool {
+        matches!(self.stderr_mode, StdioMode::Piped) && self.stderr_file.is_none()
+    }
+
     pub(crate) fn program_name(&self) -> String {
         self.program.to_string_lossy().into_owned()
     }

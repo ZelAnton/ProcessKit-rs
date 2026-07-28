@@ -41,6 +41,7 @@
 //!   [`Supervisor`] keeps a command *alive* — restarting it per policy with
 //!   backoff — where [`Command::retry`] merely replays one run to success.
 //!   Readiness probes ([`RunningProcess::wait_for_line`] /
+//!   [`RunningProcess::wait_for_stderr_line`] /
 //!   [`wait_for_port`](RunningProcess::wait_for_port) /
 //!   [`wait_for`](RunningProcess::wait_for)) wait until a started child is
 //!   actually *ready* instead of sleeping. A [`Pipeline`]

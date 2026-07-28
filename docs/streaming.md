@@ -625,8 +625,8 @@ per-platform PTY table.
 
 ## Readiness probes
 
-"Start a server, then use it" needs *ready*, not merely *started*. Four probes
-replace the arbitrary sleep, each bounded by its own deadline:
+"Start a server, then use it" needs *ready*, not merely *started*. Readiness
+probes replace the arbitrary sleep, each bounded by its own deadline:
 
 ```rust,no_run
 async fn health_check() -> bool { true }
@@ -660,6 +660,18 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
+If a tool writes its banner to stderr, use the matching counterpart instead:
+
+```rust,ignore
+let banner = run
+    .wait_for_stderr_line(|line| line.contains("backend ready"), Duration::from_secs(10))
+    .await?;
+```
+
+Choose one consuming line probe for a handle: while it hands you the selected
+stream, the other stream is already being drained in the background for
+liveness and later capture.
+
 Probe semantics, deliberately uniform:
 
 - A probe that can't pass within its deadline fails with **`ErrorReason::NotReady`**
@@ -669,10 +681,12 @@ Probe semantics, deliberately uniform:
   deadline on a dead server.
 - A failed probe **never kills the child.** You decide: retry, log and
   continue, or tear down.
-- All four probes background-drain stdout/stderr while they poll, so a
+- All probes background-drain stdout/stderr while they poll, so a
   child with a large startup burst can't stall in `write()` on a full OS pipe
-  buffer. `wait_for_line` consumes stdout up to (and including) the match —
-  continue with `finish`. `wait_for_port` / `wait_for_socket` / `wait_for`
+  buffer. `wait_for_line` and `wait_for_stderr_line` consume the selected stream
+  up to (and including) the match — continue with `finish` (whose stderr omits
+  lines already consumed by `wait_for_stderr_line`). `wait_for_port` /
+  `wait_for_socket` / `wait_for`
   drain the same way but never hand any of it back mid-probe; `wait` /
   `output_string` afterward still see the full captured output, but
   `output_bytes` or a fresh `stdout_lines` / `events` call do not
@@ -691,7 +705,8 @@ waiting for you to answer. Such a prompt never becomes a line, so `wait_for_line
 (and `stdout_lines`) cannot see it until the stream ends — the "wait for the
 prompt, then answer it" dialog can't be expressed line by line.
 
-`wait_for_output(predicate, within)` closes that gap. It is the `expect`-style
+`wait_for_output(predicate, within)` closes that gap. Its stderr counterpart is
+`wait_for_stderr_output`; both are `expect`-style
 primitive (in the spirit of `rexpect`): it matches the child's **current
 un-terminated output tail** — the partial line the pump has decoded but not yet
 split — and hands it back so you can answer over `take_stdin()`. PTY is the
@@ -699,8 +714,9 @@ motivating case (a merged terminal stream is full of un-terminated prompts), but
 it is **not** PTY-specific — a plain piped run benefits too (e.g. a progress
 meter that rewrites one line without a newline).
 
-Unlike `wait_for_line`, it **does not consume stdout** and is **repeatable**: a
-whole session is a sequence of `wait_for_output` → answer turns, one per prompt.
+Unlike the line probes, these methods **do not consume** their selected stream
+and are **repeatable**: a whole session can be a sequence of
+`wait_for_output` → answer turns, one per prompt.
 
 ```rust
 use processkit::{Command, ProcessRunner};
@@ -758,6 +774,10 @@ Semantics, and how it differs from `wait_for_line`:
 - **Same probe deadline.** It fails with `ErrorReason::NotReady` when `within`
   elapses (or stdout closes) with no match, never killing the child or arming the
   run's `timeout` watchdog — exactly like the readiness probes above.
+- **Choose the actual pipe.** Use `wait_for_stderr_line` /
+  `wait_for_stderr_output` when the tool reports readiness on stderr. Both keep
+  stdout draining in the background. A PTY exposes one merged stream, so its
+  stdout methods observe output originally written to either child stream.
 
 ## Racing children with `wait_any`
 

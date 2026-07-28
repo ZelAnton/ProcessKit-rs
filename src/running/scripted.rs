@@ -501,6 +501,9 @@ impl RunningProcess {
             stderr_pump: None,
             stdin_error: None,
             stdout_piped: command.stdout_is_piped(),
+            // PTY mode has one merged output reader exposed as stdout, just like
+            // the real PTY backend; never advertise a separate stderr probe.
+            stderr_piped: command.stderr_is_piped() && !command.wants_pty(),
             deadline_task: None,
             timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
             // A scripted double owns no OS process, so its gate is pid-less: every

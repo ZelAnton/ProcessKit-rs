@@ -941,6 +941,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         buffer: command.output_buffer_policy(),
         ok_codes: command.ok_codes_vec(),
         stdout_piped: command.stdout_is_piped(),
+        stderr_piped: command.stderr_is_piped(),
         cancel_token: command.cancel_token(),
     });
     // Pid-only watchdog; own-group runs re-arm with full group+pid via `attach_group`.
