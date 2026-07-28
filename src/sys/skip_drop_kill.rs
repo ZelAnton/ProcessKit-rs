@@ -6,6 +6,8 @@
 //! race — it uses only the `cfg(loom)`-swappable [`crate::sync`] layer, nothing
 //! from tokio or the platform backends.
 
+use crate::sync::atomic::{AtomicUsize, Ordering};
+
 /// A "don't kill on Drop" latch shared by every backend, hardened against the
 /// spawn/shutdown re-arm race.
 ///
@@ -47,7 +49,7 @@
 // loom's atomics do not guarantee a `Default` impl, and the two are byte-for-byte
 // identical (a zeroed word — generation 0, skip clear). See `crate::sync`.
 #[derive(Debug)]
-pub(crate) struct SkipDropKill(crate::sync::atomic::AtomicUsize);
+pub(crate) struct SkipDropKill(AtomicUsize);
 
 impl Default for SkipDropKill {
     fn default() -> Self {
@@ -73,7 +75,7 @@ impl SkipDropKill {
     /// A fresh latch — generation 0, `Drop` will hard-kill until
     /// [`request`](Self::request).
     pub(crate) fn new() -> Self {
-        Self(crate::sync::atomic::AtomicUsize::new(0))
+        Self(AtomicUsize::new(0))
     }
 
     /// Snapshot the re-arm generation at the **start** of a non-escalating
@@ -87,7 +89,6 @@ impl SkipDropKill {
     /// state at the current generation — precisely the state `request`
     /// compare-exchanges away from. `Acquire` pairs with the `Release` stores.
     pub(crate) fn begin_shutdown(&self) -> ShutdownEpoch {
-        use std::sync::atomic::Ordering;
         ShutdownEpoch(self.0.load(Ordering::Acquire) & !Self::SKIP_BIT)
     }
 
@@ -100,7 +101,6 @@ impl SkipDropKill {
     /// child is still torn down on Drop. `Release` (on success) pairs with the
     /// `Acquire` in [`is_set`](Self::is_set).
     pub(crate) fn request(&self, epoch: ShutdownEpoch) {
-        use std::sync::atomic::Ordering;
         // A failed exchange is the point of the guard (a concurrent re-arm won),
         // so the result is deliberately ignored — on failure the latch is already
         // correct.
@@ -120,7 +120,6 @@ impl SkipDropKill {
     /// latch — a group left with the latch set but never reused keeps its spared
     /// survivors. `Release` pairs with the `Acquire` in [`is_set`](Self::is_set).
     pub(crate) fn clear(&self) {
-        use std::sync::atomic::Ordering;
         // Bump the generation and clear the skip bit as one atomic step. The CAS
         // loop composes with concurrent `clear`s (each retries against the other's
         // bump) and with a racing `request` (whose compare-exchange keys off the
@@ -145,7 +144,6 @@ impl SkipDropKill {
     /// Whether `Drop` should skip the kill. `Acquire` pairs with the `Release`
     /// in [`request`](Self::request) / [`clear`](Self::clear).
     pub(crate) fn is_set(&self) -> bool {
-        use std::sync::atomic::Ordering;
         (self.0.load(Ordering::Acquire) & Self::SKIP_BIT) != 0
     }
 }
