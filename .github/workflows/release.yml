@@ -435,7 +435,7 @@ jobs:
       # bytes equal the uploaded bytes because packaging is deterministic. Uses
       # its own OIDC exchange (independent of the crates.io token minted below).
       - name: Attest build provenance for release artifacts
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             target/package/*.crate
