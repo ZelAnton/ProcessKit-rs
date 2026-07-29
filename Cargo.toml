@@ -150,7 +150,9 @@ encoding_rs = "0.8"
 # Adapt tokio's line and broadcast receivers into `Stream` implementations for
 # process output and supervision lifecycle events. `io-util` gates
 # `LinesStream`; `sync` gates the bounded `BroadcastStream` event adapter.
-tokio-stream = { version = "0.1.1", features = ["io-util", "sync"] }
+# `0.1.3` is the first release that exposes the `sync` feature; an older floor
+# makes direct-minimal-versions fail before dependency resolution can finish.
+tokio-stream = { version = "0.1.3", features = ["io-util", "sync"] }
 # Optional per-run observability (program/exit code/duration — deliberately
 # NOT argv or env, which routinely carry secrets). Off by default; zero cost
 # unless the `tracing` feature is enabled. `0.1.6` floor: below it, the

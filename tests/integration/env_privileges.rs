@@ -239,11 +239,7 @@ async fn rlimits_apply_before_exec() {
         .env("PROCESSKIT_RLIMIT_NOFILE", nofile.to_string())
         .rlimit(RlimitResource::Core, 0, 0)
         .rlimit(RlimitResource::FileSize, 1024, 1024)
-        .rlimit(
-            RlimitResource::NoFile,
-            u64::try_from(nofile).expect("rlim_t fits u64"),
-            u64::try_from(nofile).expect("rlim_t fits u64"),
-        )
+        .rlimit(RlimitResource::NoFile, nofile, nofile)
         .run_unit()
         .await
         .expect("observer sees all requested per-process limits");

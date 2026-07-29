@@ -4457,7 +4457,7 @@ mod tests {
             .build_tokio()
             .expect_err("soft above hard must fail while building");
         assert!(
-            matches!(error.reason(), crate::ErrorReason::Io { source } if source.kind() == std::io::ErrorKind::InvalidInput),
+            matches!(error.reason(), crate::ErrorReason::Io(source) if source.kind() == std::io::ErrorKind::InvalidInput),
             "got {error:?}"
         );
     }
