@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [3.1.0] - 2026-07-29
+
+### Added
 
 - Add per-command CPU affinity on Linux and Windows, applied before child user
   code runs and inherited by its process tree.
@@ -2939,7 +2950,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.0.2...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.0.2...v3.1.0
 [3.0.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.0.1...v3.0.2
 [3.0.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.0.0...v3.0.1
 [3.0.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v2.3.2...v3.0.0
