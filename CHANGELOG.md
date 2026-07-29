@@ -13,6 +13,8 @@ to a dated version section.
 
 ### Added
 
+- Add runnable record/replay and metrics examples with a self-exec child,
+  scrubbed temporary cassette, and a printable in-process metrics snapshot.
 - Add a Unix `Command::arg0` override for multicall binaries and login-shell
   conventions, with loud unsupported behavior on Windows.
 - Add typed Unix per-process `rlimit` builders for CPU, core, data, file-size,

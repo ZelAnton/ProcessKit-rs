@@ -332,6 +332,16 @@ name = "pty_dialog"
 path = "examples/pty_dialog.rs"
 required-features = ["pty"]
 
+[[example]]
+name = "record_replay"
+path = "examples/record_replay.rs"
+required-features = ["record"]
+
+[[example]]
+name = "metrics"
+path = "examples/metrics.rs"
+required-features = ["metrics"]
+
 [target.'cfg(windows)'.dev-dependencies]
 # Liveness probe (OpenProcess) in the integration tests that prove a grandchild is
 # reaped with its job — integration tests can't see the non-dev windows-sys.

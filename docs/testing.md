@@ -311,6 +311,15 @@ With the **`record`** feature, `RecordReplayRunner` closes the loop: record
 real runs to a JSON *cassette* once, then replay them deterministically —
 fast, hermetic, byte-stable, no subprocess in CI:
 
+The runnable
+[`examples/record_replay.rs`](https://github.com/ZelAnton/ProcessKit-rs/blob/main/examples/record_replay.rs)
+does the complete round trip with a self-exec child and a temporary cassette,
+including a scrub hook and a guard proving replay never spawns:
+
+```text
+cargo run --example record_replay --features record
+```
+
 ```rust,no_run
 use processkit::{Command, JobRunner, ProcessRunnerExt};
 use processkit::testing::RecordReplayRunner;

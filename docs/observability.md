@@ -43,6 +43,15 @@ metrics = "0.24"
 Install a recorder once at startup — before you run any commands — and that is
 the entire wiring:
 
+For a dependency-free exporter example, the runnable
+[`examples/metrics.rs`](https://github.com/ZelAnton/ProcessKit-rs/blob/main/examples/metrics.rs)
+installs a tiny in-process recorder, launches two self-exec children, and prints
+the counters and histogram summaries it captured:
+
+```text
+cargo run --example metrics --features metrics
+```
+
 ```text
 // Any `metrics::Recorder` works; a Prometheus exporter is shown for concreteness.
 use metrics_exporter_prometheus::PrometheusBuilder;
