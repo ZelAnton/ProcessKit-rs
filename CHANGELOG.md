@@ -58,6 +58,8 @@ to a dated version section.
 
 ### Fixed
 
+- Include PTY mode and requested dimensions in `Command`'s redacted `Debug`
+  output.
 - Preserve distinct non-ASCII and opaque Windows environment keys when building
   a customized ConPTY environment block.
 - Keep post-spawn `NotFound` diagnostics aligned with the command's effective

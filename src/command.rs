@@ -3374,6 +3374,9 @@ impl fmt::Debug for Command {
                 "windows_graceful_ctrl_break",
                 &self.windows_graceful_ctrl_break,
             );
+        #[cfg(feature = "pty")]
+        d.field("use_pty", &self.use_pty)
+            .field("pty_size", &self.pty_size);
         #[cfg(feature = "process-control")]
         d.field("timeout_signal", &self.timeout_signal);
         d.field("has_cancel_token", &self.cancel_token.is_some());
@@ -5391,6 +5394,23 @@ mod tests {
                 .pty_size(200, 50)
                 .configured_pty_size(),
             Some((200, 50)),
+        );
+    }
+
+    #[cfg(feature = "pty")]
+    #[test]
+    fn debug_surfaces_pty_mode_and_size() {
+        let configured = format!("{:?}", Command::new("agent").use_pty().pty_size(120, 40));
+        assert!(
+            configured.contains("use_pty: true")
+                && configured.contains("pty_size: Some((120, 40))"),
+            "Debug should surface the PTY mode and dimensions: {configured}"
+        );
+
+        let default = format!("{:?}", Command::new("agent"));
+        assert!(
+            default.contains("use_pty: false") && default.contains("pty_size: None"),
+            "Debug should distinguish an ordinary pipe command: {default}"
         );
     }
 
