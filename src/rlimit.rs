@@ -107,9 +107,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prepare_rejects_soft_above_hard_before_fork() {
-        let error = RlimitResource::NoFile
-            .prepare(65, 64)
-            .expect_err("soft cannot exceed hard");
+        let error = match RlimitResource::NoFile.prepare(65, 64) {
+            Ok(_) => panic!("soft cannot exceed hard"),
+            Err(error) => error,
+        };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
