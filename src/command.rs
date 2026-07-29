@@ -2223,11 +2223,13 @@ impl Command {
     /// mirroring the [`env_clear`](Self::env_clear) / [`inherit_env`](Self::inherit_env)
     /// / [`env`](Self::env) / [`env_remove`](Self::env_remove) layering
     /// [`build_tokio`](Self::build_tokio) applies (so a customized-env PTY run
-    /// matches a customized-env pipe run). Keys are folded case-insensitively —
-    /// matching Windows env semantics — and returned in that (sorted) order, which
-    /// `CreateProcessW`'s Unicode env block also requires. Computed cross-platform
-    /// to keep the spawn seam uniform; only the Windows backend consumes it (on
-    /// Unix the pty child keeps `build_tokio`'s env, applied by `std`).
+    /// matches a customized-env pipe run). UTF-8 keys are folded with the same
+    /// ASCII-only case rule as [`env_key_eq`]; opaque keys retain their exact
+    /// encoded bytes. The resulting canonical-key order also supplies the sorted
+    /// Unicode environment block `CreateProcessW` requires. Computed
+    /// cross-platform to keep the spawn seam uniform; only the Windows backend
+    /// consumes it (on Unix the pty child keeps `build_tokio`'s env, applied by
+    /// `std`).
     #[cfg(feature = "pty")]
     pub(crate) fn resolved_pty_env(&self) -> Option<Vec<(OsString, OsString)>> {
         let env_ops = self.spawn_env_ops();
@@ -2235,32 +2237,32 @@ impl Command {
             return None; // no customization → inherit the parent env unchanged
         }
         use std::collections::BTreeMap;
-        // Fold on an upper-cased key so a later `env("path", …)` overrides an
-        // inherited `PATH`, matching Windows' case-insensitive env — and BTreeMap
-        // order gives the case-insensitively sorted block `CreateProcessW` wants.
-        let ci = |k: &OsStr| OsString::from(k.to_string_lossy().to_uppercase());
-        let mut map: BTreeMap<OsString, (OsString, OsString)> = BTreeMap::new();
+        // Canonical keys make a later `env("path", …)` override inherited `PATH`
+        // without conflating non-ASCII case or two opaque keys through lossy
+        // conversion. BTreeMap order supplies the sorted block CreateProcessW
+        // expects.
+        let mut map: BTreeMap<WindowsEnvKey, (OsString, OsString)> = BTreeMap::new();
         // Seed from the parent env only when neither `env_clear` nor `inherit_env`
         // asked for a clean slate — exactly `build_tokio`'s condition.
         if !self.env_clear && self.inherit_env.is_none() {
             for (k, v) in std::env::vars_os() {
-                map.insert(ci(&k), (k, v));
+                map.insert(windows_env_key(&k), (k, v));
             }
         }
         if let Some(names) = &self.inherit_env {
             for name in names {
                 if let Some(v) = std::env::var_os(name) {
-                    map.insert(ci(name), (name.clone(), v));
+                    map.insert(windows_env_key(name), (name.clone(), v));
                 }
             }
         }
         for (k, v) in &env_ops {
             match v {
                 Some(val) => {
-                    map.insert(ci(k), (k.clone(), val.clone()));
+                    map.insert(windows_env_key(k), (k.clone(), val.clone()));
                 }
                 None => {
-                    map.remove(&ci(k));
+                    map.remove(&windows_env_key(k));
                 }
             }
         }
@@ -3394,6 +3396,28 @@ pub(crate) fn redacted_env_names(
     names
 }
 
+/// Canonical identity/order key for Windows environment names. Windows treats
+/// ASCII case variants as the same key throughout the builder; non-ASCII case
+/// and opaque `OsStr` encodings remain distinct so PTY resolution cannot merge
+/// names that [`env_key_eq`] would keep separate.
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+#[cfg(any(windows, feature = "pty"))]
+enum WindowsEnvKey {
+    Utf8(Vec<u8>),
+    Opaque(Vec<u8>),
+}
+
+#[cfg(any(windows, feature = "pty"))]
+fn windows_env_key(key: &OsStr) -> WindowsEnvKey {
+    if let Some(key) = key.to_str() {
+        let mut folded = key.as_bytes().to_vec();
+        folded.make_ascii_uppercase();
+        WindowsEnvKey::Utf8(folded)
+    } else {
+        WindowsEnvKey::Opaque(key.as_encoded_bytes().to_vec())
+    }
+}
+
 /// Compare two environment-variable names with the platform's case rules:
 /// case-insensitive on Windows (where env names are), case-sensitive elsewhere.
 /// Used to decide whether a command already sets a key before filling a client
@@ -3403,10 +3427,7 @@ pub(crate) fn redacted_env_names(
 pub(crate) fn env_key_eq(a: &OsStr, b: &OsStr) -> bool {
     #[cfg(windows)]
     {
-        match (a.to_str(), b.to_str()) {
-            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-            _ => a == b,
-        }
+        windows_env_key(a) == windows_env_key(b)
     }
     #[cfg(not(windows))]
     {
@@ -5396,6 +5417,61 @@ mod tests {
             find("TERM"),
             None,
             "ConPTY exposes terminal capabilities without a synthesized TERM"
+        );
+    }
+
+    #[cfg(all(feature = "pty", windows))]
+    #[test]
+    fn resolved_conpty_env_matches_ascii_only_key_identity() {
+        let env = Command::new("tui")
+            .env_clear()
+            .env("straße", "non-ascii")
+            .env("STRASSE", "ascii")
+            .env("path", "first")
+            .env("PATH", "second")
+            .resolved_pty_env()
+            .expect("customized PTY environment");
+
+        assert!(env.iter().any(|(key, value)| {
+            key == OsStr::new("straße") && value == OsStr::new("non-ascii")
+        }));
+        assert!(
+            env.iter().any(|(key, value)| {
+                key == OsStr::new("STRASSE") && value == OsStr::new("ascii")
+            })
+        );
+        let path_entries: Vec<_> = env
+            .iter()
+            .filter(|(key, _)| super::env_key_eq(key, OsStr::new("PATH")))
+            .collect();
+        assert_eq!(path_entries.len(), 1, "ASCII case variants still collapse");
+        assert_eq!(path_entries[0].1, OsStr::new("second"));
+    }
+
+    #[cfg(all(feature = "pty", windows))]
+    #[test]
+    fn resolved_conpty_env_keeps_opaque_keys_exact() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let first = OsString::from_wide(&[0xd800]);
+        let second = OsString::from_wide(&[0xd801]);
+        assert!(first.to_str().is_none() && second.to_str().is_none());
+        let env = Command::new("tui")
+            .env_clear()
+            .env(&first, "first")
+            .env(&second, "second")
+            .resolved_pty_env()
+            .expect("customized PTY environment");
+
+        assert_eq!(env.len(), 2, "lossy U+FFFD keys must not collide");
+        assert!(
+            env.iter()
+                .any(|(key, value)| key == &first && value == "first")
+        );
+        assert!(
+            env.iter()
+                .any(|(key, value)| key == &second && value == "second")
         );
     }
 }

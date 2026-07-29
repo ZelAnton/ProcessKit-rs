@@ -58,6 +58,8 @@ to a dated version section.
 
 ### Fixed
 
+- Preserve distinct non-ASCII and opaque Windows environment keys when building
+  a customized ConPTY environment block.
 - Keep post-spawn `NotFound` diagnostics aligned with the command's effective
   child `PATH`, matching preflight and launch-time resolution.
 - Bound the in-flight decode buffer when `wait`, `drain`, or `profile` adopts a
