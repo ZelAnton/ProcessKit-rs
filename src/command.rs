@@ -993,7 +993,7 @@ impl Command {
     ///
     /// Supported on Unix and Windows. A pipeline that activates this marker on
     /// another target fails before spawning with
-    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported).
+    /// [`ErrorReason::Unsupported`].
     ///
     /// # Pipefail diagnostic trade-off
     ///
