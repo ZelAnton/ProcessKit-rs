@@ -1,24 +1,26 @@
 # Local task runner mirroring the CI gate (see `.github/workflows/ci.yml`).
 #
 # Requires `just` (https://github.com/casey/just) and, for the `ci` recipe,
-# `cargo-hack` (`cargo install cargo-hack`).
+# `cargo-hack` plus `cargo-nextest`.
 #
 # `just --list` shows all recipes.
 
 # Fast everyday gate: fmt, clippy (all features), tests (all features,
-# including the real-subprocess/`--include-ignored` ones), and the
+# including the ignored real-subprocess ones through nextest), and the
 # `#[cfg(fuzzing)]` type-check. Not a full CI mirror — use `just ci` before
 # opening a PR for that.
 check:
     cargo fmt --all --check
     cargo clippy --all-targets --all-features -- -D warnings
-    cargo test --all-features -- --include-ignored
+    @cargo nextest --version >/dev/null 2>&1 || (echo "cargo-nextest is not installed; see: https://nexte.st/docs/installation/" && exit 1)
+    cargo nextest run --profile ci-all --all-features --run-ignored all
+    cargo test --all-features --doc
     just fuzz-check
 
 # Full local mirror of the CI workflow's stable-toolchain jobs: fmt, clippy in
 # the three feature configurations the CI matrix checks, the feature-powerset
-# build via cargo-hack, tests in the three configurations (with
-# `--include-ignored` so the real-subprocess tests run), and the two stable
+# build via cargo-hack, tests in the three configurations (including the
+# ignored real-subprocess tests), and the two stable
 # doc builds, and the typos spell check. Does not cover the nightly-only CI
 # jobs (docsrs doc, minimal-versions, msrv) or the jobs needing external
 # services/tokens (coverage/coveralls, cargo-deny, public-api diff,
@@ -43,12 +45,17 @@ hack:
     @cargo hack --version >/dev/null 2>&1 || (echo "cargo-hack is not installed; run: cargo install cargo-hack" && exit 1)
     cargo hack --feature-powerset --depth 2 check --all-targets
 
-# Mirrors the CI `test` job's three feature configurations, each with
-# `--include-ignored` so the real-subprocess/kill-on-drop tests run too.
+# Mirrors the CI `test` job's three feature configurations through nextest,
+# including ignored real-subprocess/kill-on-drop tests. Doctests remain
+# separate because nextest does not run them.
 test-all:
-    cargo test --all-features -- --include-ignored
-    cargo test -- --include-ignored
-    cargo test --no-default-features -- --include-ignored
+    @cargo nextest --version >/dev/null 2>&1 || (echo "cargo-nextest is not installed; see: https://nexte.st/docs/installation/" && exit 1)
+    cargo nextest run --profile ci-all --all-features --run-ignored all
+    cargo test --all-features --doc
+    cargo nextest run --profile ci-default --run-ignored all
+    cargo test --doc
+    cargo nextest run --profile ci-minimal --no-default-features --run-ignored all
+    cargo test --no-default-features --doc
 
 # Mirrors the CI `doc` job's two stable-toolchain builds (the nightly
 # `--cfg docsrs` build is `docsrs-doc` below, since it needs a nightly
@@ -88,7 +95,7 @@ msrv:
     cargo +1.88 check --target aarch64-apple-darwin --lib --bins --all-features
 
 # Mirrors the CI `test-musl` job locally: builds and runs the full suite
-# (same three feature configurations, each with `--include-ignored`) inside a
+# (same three feature configurations, including ignored tests) inside a
 # real Alpine/musl container — busybox userland, musl libc — not merely a
 # cross-compiled musl-target binary run under glibc userland tools. Requires
 # Docker. `--init` supplies a real subreaper and `--cap-add=SYS_NICE` restores
@@ -101,16 +108,20 @@ msrv:
 # Git Bash from mangling the `/work`-style container paths below.
 test-musl:
     MSYS_NO_PATHCONV=1 docker run --rm --init --cap-add=SYS_NICE \
-        -v "{{justfile_directory()}}:/work" \
+        -v "{{ justfile_directory() }}:/work" \
         -v processkit-musl-target:/musl-target \
         -w /work \
         -e CARGO_TARGET_DIR=/musl-target \
         rust:alpine sh -c ' \
-            apk add --no-cache procps >/dev/null && \
+            apk add --no-cache curl procps >/dev/null && \
+            curl -LsSf https://get.nexte.st/0.9/linux-musl | tar zxf - -C /usr/local/cargo/bin && \
             cargo build --all-targets --all-features && \
-            cargo test --all-features -- --include-ignored && \
-            cargo test -- --include-ignored && \
-            cargo test --no-default-features -- --include-ignored'
+            cargo nextest run --profile ci-all --all-features --run-ignored all && \
+            cargo test --all-features --doc && \
+            cargo nextest run --profile ci-default --run-ignored all && \
+            cargo test --doc && \
+            cargo nextest run --profile ci-minimal --no-default-features --run-ignored all && \
+            cargo test --no-default-features --doc'
 
 # Mirrors the fuzz-check CI job. Type-checks the `#[cfg(fuzzing)]` code
 # without actually running `cargo-fuzz` or requiring a nightly toolchain.

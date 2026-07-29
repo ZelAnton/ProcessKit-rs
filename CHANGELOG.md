@@ -28,6 +28,8 @@ to a dated version section.
 
 ### Changed
 
+- Run the subprocess-heavy test suite under cargo-nextest with per-test
+  timeouts, explicit flaky retries, isolated processes, and JUnit CI reports.
 - Add a daily Linux/Windows latest-dependencies CI tier that re-resolves the
   allowed dependency ranges before building, testing, and linting all features.
 - Add the CLI runner documentation to the Pages implementation switcher.

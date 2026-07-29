@@ -8,8 +8,7 @@
 
 - [ ] `cargo fmt --all`
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` is clean
-- [ ] `cargo test` passes (and `cargo test --all-features -- --ignored` if you
-      touched spawn / containment / streaming paths)
+- [ ] `just check` passes, including ignored real-subprocess tests
 - [ ] `CHANGELOG.md` `[Unreleased]` updated when the change is user-facing
       (`Added` / `Changed` / `Fixed`)
 - [ ] Docs updated (rustdoc and the `docs/` guide set) if behavior or API changed

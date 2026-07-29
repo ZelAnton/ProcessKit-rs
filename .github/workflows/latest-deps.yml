@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  checks: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,6 +32,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9
       # The checkout is disposable, so updating this lockfile cannot mutate the
       # committed graph. Running this before rust-cache keys the cache to the
       # freshly resolved versions rather than the repository snapshot.
@@ -41,9 +45,28 @@ jobs:
         run: cargo tree --depth 1
       - name: Build
         run: cargo build --all-targets --all-features
-      # Serialize the subprocess-heavy ignored suite: parallel PowerShell/process
-      # startup can exhaust a hosted runner and create false teardown timeouts.
+      # Serialize this early-warning tier: parallel PowerShell/process startup can
+      # exhaust a hosted runner and create false teardown timeouts. The ordinary
+      # matrix still runs four isolated tests at a time.
       - name: Test
-        run: cargo test --all-features -- --include-ignored --test-threads=1
+        run: cargo nextest run --profile ci-all --all-features --run-ignored all --test-threads 1
+      - name: Test doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --all-features --doc
+      - name: Publish nextest report
+        if: ${{ !cancelled() && hashFiles('target/nextest/ci-all/junit.xml') != '' }}
+        uses: mikepenz/action-junit-report@v6
+        with:
+          report_paths: target/nextest/ci-all/junit.xml
+          check_name: nextest latest-deps (${{ matrix.os }})
+      - name: Upload nextest report
+        if: ${{ !cancelled() && hashFiles('target/nextest/ci-all/junit.xml') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-latest-deps-${{ matrix.os }}
+          path: target/nextest/ci-all/junit.xml
+          if-no-files-found: error
+          retention-days: 14
       - name: Clippy
+        if: ${{ !cancelled() }}
         run: cargo clippy --all-targets --all-features -- -D warnings

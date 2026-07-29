@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+  checks: write
+
 # Cancel superseded runs on the same ref so a new push doesn't queue behind stale CI.
 concurrency:
   group: ci-${{ github.ref }}
@@ -85,6 +89,7 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       # macOS exercises the POSIX process-group containment path (unix.rs); the
@@ -101,28 +106,65 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9
       # `--all-features` so the feature-gated tests (stats, limits) still run now
       # that `limits` is off by default.
       - run: cargo build --all-targets --all-features
-      # `--include-ignored` runs the real-subprocess tests too, so kill-on-drop is
-      # actually exercised on each OS — including the macOS process-group teardown.
-      # This step's doctest pass is also where every `docs/*.md` guide's and the
+      # Nextest runs ignored real-subprocess tests too, so kill-on-drop is actually
+      # exercised on each OS — including the macOS process-group teardown. Its
+      # repository profile gives every test its own process, a 120-second hard
+      # ceiling, and two clearly reported retry attempts. Doctests stay on Cargo:
+      # nextest deliberately does not run them. The all-features doctest pass is
+      # where every `docs/*.md` guide's and the
       # root `README.md`'s fenced Rust blocks get compiler-checked (T-047): the
       # hidden `src/doc_examples.rs` harness only builds under `--all-features`
       # (the guides collectively exercise every optional feature). Note
-      # `--include-ignored` still *compiles* an `ignore`-tagged doc block (only
+      # rustdoc still *compiles* an `ignore`-tagged doc block (only
       # `no_run` skips running it, and only a non-`rust` fence like `text` skips
       # compiling it) — see `docs/upgrading.md` for the historical-API snippets
       # that use `text` for exactly that reason.
-      - run: cargo test --all-features -- --include-ignored
+      - name: Test all features
+        run: cargo nextest run --profile ci-all --all-features --run-ignored all
+      - name: Test all-features doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --all-features --doc
       # Also exercise the default configuration (process-control only — stats and
       # limits off) at runtime: it takes the `limits`-free `Job::new()` path — the
       # one every default consumer runs — which `--all-features` alone never executes.
-      - run: cargo test -- --include-ignored
+      - name: Test default features
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --profile ci-default --run-ignored all
+      - name: Test default-feature doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --doc
       # And the bare core (no default features): clippy/doc only compile this
       # configuration — running its tests guards the lean runtime path (and the
       # cfg-gated arms in the suite) against bit-rot.
-      - run: cargo test --no-default-features -- --include-ignored
+      - name: Test without default features
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --profile ci-minimal --no-default-features --run-ignored all
+      - name: Test no-default-feature doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --no-default-features --doc
+      - name: Publish nextest reports
+        if: ${{ !cancelled() && hashFiles('target/nextest/ci-*/junit.xml') != '' }}
+        uses: mikepenz/action-junit-report@v6
+        with:
+          report_paths: target/nextest/ci-*/junit.xml
+          check_name: nextest (${{ matrix.os }})
+          # Fork pull requests cannot write Checks API results, but workflow
+          # command annotations remain available without that permission.
+          annotate_only: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+      - name: Upload nextest reports
+        if: ${{ !cancelled() && hashFiles('target/nextest/ci-*/junit.xml') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-${{ matrix.os }}
+          path: target/nextest/ci-*/junit.xml
+          if-no-files-found: error
+          retention-days: 14
 
   test-musl:
     name: test (musl/Alpine)
@@ -172,12 +214,44 @@ jobs:
         run: apk add --no-cache git procps
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9
       - run: cargo build --all-targets --all-features
       # Same three feature configurations as the `test` job above, each with
-      # `--include-ignored` so the real-subprocess/kill-on-drop tests run.
-      - run: cargo test --all-features -- --include-ignored
-      - run: cargo test -- --include-ignored
-      - run: cargo test --no-default-features -- --include-ignored
+      # ignored tests enabled so the real-subprocess/kill-on-drop tests run.
+      - name: Test all features
+        run: cargo nextest run --profile ci-all --all-features --run-ignored all
+      - name: Test all-features doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --all-features --doc
+      - name: Test default features
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --profile ci-default --run-ignored all
+      - name: Test default-feature doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --doc
+      - name: Test without default features
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --profile ci-minimal --no-default-features --run-ignored all
+      - name: Test no-default-feature doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --no-default-features --doc
+      - name: Publish nextest reports
+        if: ${{ !cancelled() && hashFiles('target/nextest/ci-*/junit.xml') != '' }}
+        uses: mikepenz/action-junit-report@v6
+        with:
+          report_paths: target/nextest/ci-*/junit.xml
+          check_name: nextest (musl/Alpine)
+          annotate_only: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+      - name: Upload nextest reports
+        if: ${{ !cancelled() && hashFiles('target/nextest/ci-*/junit.xml') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-musl
+          path: target/nextest/ci-*/junit.xml
+          if-no-files-found: error
+          retention-days: 14
 
   check-freebsd:
     name: check (FreeBSD cross)
