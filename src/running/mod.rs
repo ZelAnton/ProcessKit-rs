@@ -33,7 +33,7 @@ use crate::buffer::{OutputBufferPolicy, OverflowMode, clamp_dropoldest_tail, pus
 use crate::error::Result;
 use crate::error::{Error, ErrorReason};
 use crate::group::ProcessGroup;
-use crate::pump::{SharedLines, StreamConfig, pump_lines_core};
+use crate::pump::{OutputActivity, SharedLines, StreamConfig, pump_lines_core};
 use crate::result::{Outcome, ProcessResult};
 use crate::stdin::ProcessStdin;
 use crate::sys::pid_gate::PidGate;
@@ -70,6 +70,7 @@ const TS_EXITED: u8 = 1;
 // reading it after the stream closes distinguishes a deadline kill from a natural
 // end race-free.
 pub(crate) const TS_TIMED_OUT: u8 = 2;
+pub(crate) const TS_INACTIVITY_TIMED_OUT: u8 = 3;
 
 /// Why a reap-via-wait ended — the race result, not a post-hoc token read.
 enum ExitCause {
@@ -116,6 +117,7 @@ pub(crate) struct Spawned {
     pub stdin: Option<ChildStdin>,
     pub stdin_task: Option<JoinHandle<std::io::Result<()>>>,
     pub timeout: Option<Duration>,
+    pub inactivity_timeout: Option<Duration>,
     /// Grace window for a graceful timeout (`None` = hard kill at the deadline).
     pub timeout_grace: Option<Duration>,
     /// Raw signal for the graceful-timeout phase (default `SIGTERM`).
@@ -151,6 +153,7 @@ pub(crate) struct PtySpawned {
     pub own_group: Option<ProcessGroup>,
     pub stdin_task: Option<JoinHandle<std::io::Result<()>>>,
     pub timeout: Option<Duration>,
+    pub inactivity_timeout: Option<Duration>,
     pub timeout_grace: Option<Duration>,
     pub timeout_signal: i32,
     pub pid: Option<u32>,
@@ -176,6 +179,7 @@ pub struct RunningProcess {
     /// same pump machinery (see [`Backend`]).
     backend: Backend,
     timeout: Option<Duration>,
+    inactivity_timeout: Option<Duration>,
     timeout_grace: Option<Duration>,
     timeout_signal: i32,
     pid: Option<u32>,
@@ -208,6 +212,11 @@ pub struct RunningProcess {
     stderr_piped: bool,
     // Streaming deadline watchdog; aborted on drop.
     deadline_task: Option<JoinHandle<()>>,
+    // Resettable output-inactivity watchdog for streamed runs; bulk finishers
+    // reclaim it and race their own child-owning arm.
+    inactivity_task: Option<JoinHandle<()>>,
+    // One activity clock shared by stdout/stderr (PTY uses the merged stdout).
+    output_activity: Arc<OutputActivity>,
     // Shared (`Arc`) because the watchdog is detached. See `TS_*` constants.
     timeout_state: Arc<AtomicU8>,
     // The linearizable gate every raw direct-child `kill(pid)` is funneled
@@ -430,6 +439,7 @@ impl RunningProcess {
                 stdin_task: s.stdin_task,
             })),
             timeout: s.timeout,
+            inactivity_timeout: s.inactivity_timeout,
             timeout_grace: s.timeout_grace,
             timeout_signal: s.timeout_signal,
             pid: s.pid,
@@ -449,6 +459,8 @@ impl RunningProcess {
             stdout_piped: s.stdout_piped,
             stderr_piped: s.stderr_piped,
             deadline_task: None,
+            inactivity_task: None,
+            output_activity: Arc::new(OutputActivity::new(tokio::time::Instant::now())),
             timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
             pid_gate: Arc::new(PidGate::new(s.pid)),
             cancel_token: s.cancel_token,
@@ -483,6 +495,7 @@ impl RunningProcess {
                 stdin_task: s.stdin_task,
             })),
             timeout: s.timeout,
+            inactivity_timeout: s.inactivity_timeout,
             timeout_grace: s.timeout_grace,
             timeout_signal: s.timeout_signal,
             pid: s.pid,
@@ -503,6 +516,8 @@ impl RunningProcess {
             // intentionally unavailable.
             stderr_piped: false,
             deadline_task: None,
+            inactivity_task: None,
+            output_activity: Arc::new(OutputActivity::new(tokio::time::Instant::now())),
             timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
             pid_gate: Arc::new(PidGate::new(s.pid)),
             cancel_token: s.cancel_token,
@@ -643,6 +658,12 @@ impl RunningProcess {
     /// means the run was timed out, not a natural end.
     pub(crate) fn deadline_arbiter(&self) -> Arc<AtomicU8> {
         self.timeout_state.clone()
+    }
+
+    /// Share the resettable activity clock with a consuming helper that needs a
+    /// teardown backstop after the stream watchdog fires.
+    pub(crate) fn output_activity(&self) -> Arc<OutputActivity> {
+        self.output_activity.clone()
     }
 
     /// Lines read from stdout so far (counts every line, even ones dropped by an
@@ -908,12 +929,17 @@ impl RunningProcess {
                 (truncated, total_lines, total_bytes, self.started.elapsed())
             }
         };
+        let timeout = if finished.outcome.inactivity_timed_out() {
+            self.inactivity_timeout
+        } else {
+            self.timeout
+        };
         Ok(ProcessResult::new(
             self.program.clone(),
             finished.stdout_lines.join("\n"),
             finished.stderr_lines.join("\n"),
             finished.outcome,
-            self.timeout,
+            timeout,
         )
         .with_duration(duration)
         .with_truncated(truncated)
@@ -966,7 +992,8 @@ impl RunningProcess {
                 ),
             )));
         }
-        let stderr_sink = SharedLines::new(&self.buffer);
+        let stderr_sink =
+            SharedLines::new_with_activity(&self.buffer, self.output_activity.clone());
         self.stderr_pump = self.backend.take_stderr_reader().map(|pipe| {
             tokio::spawn(pump_lines_core(
                 pipe,
@@ -1002,6 +1029,7 @@ impl RunningProcess {
         };
         let stdout_pipe = self.backend.take_stdout_reader();
         let out_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output_activity = self.output_activity.clone();
         self.stdout_pump = stdout_pipe.map(|pipe| {
             tokio::spawn(pump_raw_bytes(
                 pipe,
@@ -1009,6 +1037,7 @@ impl RunningProcess {
                 stdout_cap,
                 stdout_mode,
                 signals.clone(),
+                output_activity,
             ))
         });
 
@@ -1083,12 +1112,17 @@ impl RunningProcess {
         let stderr_lines = stderr_sink.drain();
         let truncated = signals.truncated.load(Ordering::Relaxed) || stderr_sink.dropped() > 0;
         let duration = self.started.elapsed();
+        let timeout = if outcome.inactivity_timed_out() {
+            self.inactivity_timeout
+        } else {
+            self.timeout
+        };
         Ok(ProcessResult::new(
             self.program.clone(),
             stdout,
             stderr_lines.join("\n"),
             outcome,
-            self.timeout,
+            timeout,
         )
         .with_duration(duration)
         .with_truncated(truncated)
@@ -1222,6 +1256,9 @@ impl RunningProcess {
         }
         self.timeout = None;
         if let Some(task) = self.deadline_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.inactivity_task.take() {
             task.abort();
         }
         // Reap concurrently: an unreaped zombie still answers `kill(pgid, 0)`
@@ -1386,14 +1423,12 @@ impl RunningProcess {
             CaptureMode::Lines => self.buffer,
         };
         let discard_in_flight_cap = sink_policy.max_bytes;
-        let stdout_sink = self
-            .stdout_sink
-            .clone()
-            .unwrap_or_else(|| SharedLines::new(&sink_policy));
-        let stderr_sink = self
-            .stderr_sink
-            .clone()
-            .unwrap_or_else(|| SharedLines::new(&sink_policy));
+        let stdout_sink = self.stdout_sink.clone().unwrap_or_else(|| {
+            SharedLines::new_with_activity(&sink_policy, self.output_activity.clone())
+        });
+        let stderr_sink = self.stderr_sink.clone().unwrap_or_else(|| {
+            SharedLines::new_with_activity(&sink_policy, self.output_activity.clone())
+        });
         // The discard verbs must never accumulate a user-policy backlog. A sink
         // adopted from a *dropped* stream is still in the caller's
         // `OutputBufferPolicy` (possibly unbounded); switch it to retain-nothing
@@ -1641,6 +1676,9 @@ impl RunningProcess {
         if let Some(task) = self.deadline_task.take() {
             task.abort();
         }
+        if let Some(task) = self.inactivity_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.cancel_task.take() {
             task.abort();
         }
@@ -1659,7 +1697,7 @@ impl RunningProcess {
             // Moot — `checked_outcome` maps the cancel snapshot to `Err(Cancelled)`.
             ExitCause::Cancelled => Outcome::Signalled(None),
         };
-        let outcome = self.classify_timed_out(outcome);
+        let outcome = self.classify_watchdog_timeout(outcome);
         // Feed a live `events()` lifecycle stream its terminal
         // `ProcessEvent::Exited`. This is the single reap choke point every
         // consuming finisher (`finish`/`wait`/`drain`/…) funnels through, so the
@@ -1723,11 +1761,11 @@ impl RunningProcess {
     /// A fired deadline overrides whatever `backend_wait` observed — a child that
     /// exits cleanly within the grace still timed out. Cancellation is classified
     /// later in `checked_outcome` and always wins over `TimedOut`.
-    fn classify_timed_out(&self, outcome: Outcome) -> Outcome {
-        if self.timeout_state.load(Ordering::Acquire) == TS_TIMED_OUT {
-            Outcome::TimedOut
-        } else {
-            outcome
+    fn classify_watchdog_timeout(&self, outcome: Outcome) -> Outcome {
+        match self.timeout_state.load(Ordering::Acquire) {
+            TS_TIMED_OUT => Outcome::TimedOut,
+            TS_INACTIVITY_TIMED_OUT => Outcome::InactivityTimedOut,
+            _ => outcome,
         }
     }
 
@@ -1819,9 +1857,14 @@ impl RunningProcess {
         if let Some(task) = self.deadline_task.take() {
             task.abort();
         }
+        if let Some(task) = self.inactivity_task.take() {
+            task.abort();
+        }
         // Own the knobs so the helper futures borrow nothing from `self` —
         // only `self.backend_wait()` does, keeping the select! borrows disjoint.
         let limit = self.timeout;
+        let inactivity_limit = self.inactivity_timeout;
+        let output_activity = self.output_activity.clone();
         let token = self.cancel_token.clone();
         // The deadline anchor is on tokio's clock (see the field docs) so the
         // `limit - started.elapsed()` in `wait_deadline_and_claim` counts virtual
@@ -1844,6 +1887,16 @@ impl RunningProcess {
             match limit {
                 Some(limit) => {
                     deadline::wait_deadline_and_claim(started, limit, &timeout_state).await
+                }
+                None => std::future::pending::<bool>().await,
+            }
+        };
+        let inactivity_state = self.timeout_state.clone();
+        let inactivity = async move {
+            match inactivity_limit {
+                Some(limit) => {
+                    output_activity.wait_for_inactivity(limit).await;
+                    deadline::claim_inactivity_timed_out(&inactivity_state)
                 }
                 None => std::future::pending::<bool>().await,
             }
@@ -1871,6 +1924,17 @@ impl RunningProcess {
                 );
                 self.teardown_on_timeout().await;
                 Ok(ExitCause::Exited(Outcome::TimedOut))
+            }
+            _won = inactivity => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    target: "processkit",
+                    program = %self.program,
+                    inactivity_ms = inactivity_limit.map(|l| l.as_millis() as u64).unwrap_or(0),
+                    "output inactivity elapsed; killing the tree"
+                );
+                self.teardown_on_timeout().await;
+                Ok(ExitCause::Exited(Outcome::InactivityTimedOut))
             }
         }
     }
@@ -2126,6 +2190,9 @@ impl Drop for RunningProcess {
         if let Some(task) = self.deadline_task.take() {
             task.abort();
         }
+        if let Some(task) = self.inactivity_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.cancel_task.take() {
             task.abort();
         }
@@ -2180,7 +2247,7 @@ impl Drop for RunningProcess {
                 // fired the handed-off reaper is merely a harmless deterministic
                 // replacement for the orphan reap.
                 if real.own_group.is_none()
-                    && self.timeout.is_some()
+                    && (self.timeout.is_some() || self.inactivity_timeout.is_some())
                     && self.timeout_grace.is_some()
                     && !self.pid_gate.is_retired()
                     && let Ok(handle) = tokio::runtime::Handle::try_current()
@@ -2427,6 +2494,7 @@ async fn pump_raw_bytes<R>(
     cap: Option<usize>,
     mode: OverflowMode,
     signals: RawStdoutSignals,
+    output_activity: Arc<OutputActivity>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -2435,6 +2503,7 @@ async fn pump_raw_bytes<R>(
         match reader.read(&mut chunk).await {
             Ok(0) => break,
             Ok(n) => {
+                output_activity.record();
                 signals.seen.fetch_add(n, Ordering::Relaxed);
                 let mut guard = out_buf.lock().expect("stdout buffer poisoned");
                 push_capped_bytes(
@@ -3442,7 +3511,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            run.classify_timed_out(Outcome::Exited(0)),
+            run.classify_watchdog_timeout(Outcome::Exited(0)),
             Outcome::Exited(0)
         );
     }
@@ -3556,6 +3625,7 @@ mod tests {
             None,
             OverflowMode::DropOldest,
             signals.clone(),
+            Arc::new(OutputActivity::new(tokio::time::Instant::now())),
         )
         .await;
         let bytes = std::mem::take(&mut *out_buf.lock().unwrap());

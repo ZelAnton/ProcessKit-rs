@@ -709,8 +709,9 @@ async fn main() -> processkit::Result<()> {
     result.code();         // Option<i32> — None = killed (timeout/signal), no code
     result.signal();       // Option<i32> — the signal number (Unix), else None
     result.is_success();   // code in ok_codes (default {0})
-    result.timed_out();    // the run's own deadline expired
-    result.outcome();      // the explicit three-way enum behind the accessors above
+    result.timed_out();    // an absolute or inactivity timeout expired
+    result.inactivity_timed_out(); // specifically: stdout/stderr went quiet
+    result.outcome();      // the explicit disposition behind the accessors above
     result.stdout();       // &str (or &[u8] from output_bytes)
     result.stderr();       // &str
     result.combined();     // stdout + stderr concatenated
@@ -725,7 +726,7 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-When the three-way distinction matters, match on `Outcome` instead of
+When the exact disposition matters, match on `Outcome` instead of
 mentally decoding the `code()`/`timed_out()` pair:
 
 ```rust,no_run
@@ -739,6 +740,7 @@ async fn main() -> processkit::Result<()> {
         Outcome::Exited(code) => println!("failed with {code}"),
         Outcome::Signalled(signal) => println!("killed by signal {signal:?}"),
         Outcome::TimedOut => println!("hit its deadline"),
+        Outcome::InactivityTimedOut => println!("stopped producing output"),
         _ => {} // non_exhaustive: future dispositions
     }
     Ok(())
@@ -747,7 +749,8 @@ async fn main() -> processkit::Result<()> {
 
 For a single query you usually don't need the `match` (and its
 `#[non_exhaustive]` wildcard): `Outcome` carries the same `code()` /
-`signal()` / `timed_out()` accessors as `ProcessResult`, so a bare `Outcome`
+`signal()` / `timed_out()` / `inactivity_timed_out()` accessors as
+`ProcessResult`, so a bare `Outcome`
 (from `RunningProcess::wait` or `Finished::outcome`) answers directly —
 `outcome.code()`, `outcome.signal()`, `outcome.timed_out()`. There is no
 `Outcome::is_success` (success is `ok_codes`-aware — use

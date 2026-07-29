@@ -173,6 +173,8 @@ struct Entry {
     code: Option<i32>,
     #[serde(default, skip_serializing_if = "is_false")]
     timed_out: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    inactivity_timed_out: bool,
     // Signal number for Signalled outcomes; absent for Exited/TimedOut and in
     // cassettes written before this field was added (loaded as None).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -872,12 +874,13 @@ impl Entry {
                 |scrub| scrub(CassetteField::Stderr, result.stderr()),
             ),
             code: result.code(),
-            timed_out: result.timed_out(),
+            timed_out: matches!(result.outcome(), Outcome::TimedOut),
+            inactivity_timed_out: result.inactivity_timed_out(),
             // Exhaustive (no wildcard) so a future `Outcome` variant is a compile
             // error here rather than silently recorded as "no signal" (H2).
             signal: match result.outcome() {
                 Outcome::Signalled(s) => s,
-                Outcome::Exited(_) | Outcome::TimedOut => None,
+                Outcome::Exited(_) | Outcome::TimedOut | Outcome::InactivityTimedOut => None,
             },
             truncated: result.truncated(),
             total_lines: result.total_lines(),
@@ -911,6 +914,7 @@ impl Entry {
             stderr: String::new(),
             code: None,
             timed_out: false,
+            inactivity_timed_out: false,
             signal: None,
             truncated: false,
             total_lines: 0,
@@ -927,19 +931,22 @@ impl Entry {
     fn to_result(
         &self,
         timeout: Option<std::time::Duration>,
+        inactivity_timeout: Option<std::time::Duration>,
         ok_codes: Vec<i32>,
     ) -> ProcessResult<String> {
-        let outcome = match (self.code, self.timed_out) {
-            (_, true) => Outcome::TimedOut,
-            (Some(code), false) => Outcome::Exited(code),
-            (None, false) => Outcome::Signalled(self.signal),
-        };
+        let (outcome, winning_timeout) =
+            match (self.code, self.timed_out, self.inactivity_timed_out) {
+                (_, _, true) => (Outcome::InactivityTimedOut, inactivity_timeout),
+                (_, true, false) => (Outcome::TimedOut, timeout),
+                (Some(code), false, false) => (Outcome::Exited(code), timeout),
+                (None, false, false) => (Outcome::Signalled(self.signal), timeout),
+            };
         ProcessResult::new(
             self.program.clone(),
             self.stdout.clone(),
             self.stderr.clone(),
             outcome,
-            timeout,
+            winning_timeout,
         )
         .with_ok_codes(ok_codes)
         .with_truncated(self.truncated)
@@ -1362,8 +1369,8 @@ impl<R: ProcessRunner> RecordReplayRunner<R> {
 
 /// Reject a cassette entry whose outcome fields *contradict* each other.
 /// The decode model is: an `error` entry replays as that `Err` and carries no
-/// outcome at all; otherwise `timed_out` → `TimedOut`; else `code` present →
-/// `Exited`; else → `Signalled(signal)` (with `signal` optionally absent, i.e.
+/// outcome at all; otherwise the timeout flags select their corresponding
+/// outcome; else `code` present → `Exited`; else → `Signalled(signal)` (with `signal` optionally absent, i.e.
 /// "killed, signal unknown"). So an `error` entry must set none of
 /// `code`/`timed_out`/`signal`, and an outcome entry (`error: None`) may set at
 /// most one of them — an entry that sets two or more (e.g. both `code` and
@@ -1374,6 +1381,7 @@ impl<R: ProcessRunner> RecordReplayRunner<R> {
 fn validate_entry_outcome(entry: &Entry) -> Result<()> {
     let indicators = usize::from(entry.code.is_some())
         + usize::from(entry.timed_out)
+        + usize::from(entry.inactivity_timed_out)
         + usize::from(entry.signal.is_some());
     if entry.error.is_some() {
         if indicators > 0 {
@@ -1381,7 +1389,7 @@ fn validate_entry_outcome(entry: &Entry) -> Result<()> {
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "cassette entry for `{}` carries both a recorded `error` and an outcome \
-                     indicator (`code`/`timed_out`/`signal`) — at most one may be set",
+                     indicator (`code`/timeout flag/`signal`) — at most one may be set",
                     entry.program
                 ),
             )));
@@ -1393,7 +1401,7 @@ fn validate_entry_outcome(entry: &Entry) -> Result<()> {
             std::io::ErrorKind::InvalidData,
             format!(
                 "cassette entry for `{}` has a contradictory outcome: at most one of \
-                 `code` (exited), `timed_out`, or `signal` (signalled) may be set — found {indicators}",
+                 `code` (exited), a timeout flag, or `signal` (signalled) may be set — found {indicators}",
                 entry.program
             ),
         )));
@@ -1496,7 +1504,7 @@ pub fn fuzz_cassette_replay(text: &str, calls: &[(String, Vec<String>)]) {
                         .output_string(&command)
                         .await
                         .expect("a matched cassette entry must replay");
-                    let expected_result = entry.to_result(None, Vec::new());
+                    let expected_result = entry.to_result(None, None, Vec::new());
                     assert_eq!(actual.stdout(), expected_result.stdout());
                     assert_eq!(actual.stderr(), expected_result.stderr());
                     assert_eq!(actual.outcome(), expected_result.outcome());
@@ -1652,7 +1660,11 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                     return Err(cassette_err.to_error(&entry.program));
                 }
                 crate::doubles::replay_line_handlers(command, &entry.stdout, &entry.stderr);
-                Ok(entry.to_result(command.configured_timeout(), command.ok_codes_vec()))
+                Ok(entry.to_result(
+                    command.configured_timeout(),
+                    command.configured_inactivity_timeout(),
+                    command.ok_codes_vec(),
+                ))
             }
         }
     }
@@ -1725,10 +1737,13 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                             result.stdout().clone(),
                             result.stderr().to_owned(),
                             result.code(),
-                            result.timed_out(),
+                            matches!(result.outcome(), Outcome::TimedOut),
+                            result.inactivity_timed_out(),
                             match result.outcome() {
                                 Outcome::Signalled(signal) => signal,
-                                Outcome::Exited(_) | Outcome::TimedOut => None,
+                                Outcome::Exited(_)
+                                | Outcome::TimedOut
+                                | Outcome::InactivityTimedOut => None,
                             },
                             result.truncated(),
                             result.total_lines(),
@@ -1802,6 +1817,7 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                     entry.stderr,
                     entry.code,
                     entry.timed_out,
+                    entry.inactivity_timed_out,
                     entry.signal,
                     entry.truncated,
                     entry.total_lines,
@@ -2152,7 +2168,8 @@ mod tests {
             "entries": [
                 { "program": "killed", "args": [], "stdout": "", "stderr": "", "signal": 9 },
                 { "program": "crashed", "args": [], "stdout": "", "stderr": "" },
-                { "program": "slow", "args": [], "stdout": "", "stderr": "", "timed_out": true }
+                { "program": "slow", "args": [], "stdout": "", "stderr": "", "timed_out": true },
+                { "program": "silent", "args": [], "stdout": "", "stderr": "", "inactivity_timed_out": true }
             ]
         });
         std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
@@ -2186,6 +2203,15 @@ mod tests {
             .await
             .expect("wait the timed-out handle");
         assert_eq!(timed_out, Outcome::TimedOut);
+
+        let inactivity_timed_out = replayer
+            .start(&Command::new("silent").inactivity_timeout(std::time::Duration::from_secs(5)))
+            .await
+            .expect("replay an inactivity-timed-out run through start")
+            .wait()
+            .await
+            .expect("wait the inactivity-timed-out handle");
+        assert_eq!(inactivity_timed_out, Outcome::InactivityTimedOut);
     }
 
     #[tokio::test]
@@ -2263,6 +2289,27 @@ mod tests {
         std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
         let err = RecordReplayRunner::replay(&path)
             .expect_err("a contradictory outcome must be rejected");
+        assert!(
+            matches!(err.reason(), ErrorReason::Io(e) if e.kind() == std::io::ErrorKind::InvalidData),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_both_timeout_kinds_on_one_entry() {
+        let (_dir, path) = temp_cassette();
+        let json = serde_json::json!({
+            "version": 1,
+            "entries": [
+                {
+                    "program": "x", "args": [], "stdout": "", "stderr": "",
+                    "timed_out": true, "inactivity_timed_out": true
+                }
+            ]
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        let err = RecordReplayRunner::replay(&path)
+            .expect_err("two timeout dispositions must be rejected");
         assert!(
             matches!(err.reason(), ErrorReason::Io(e) if e.kind() == std::io::ErrorKind::InvalidData),
             "got {err:?}"

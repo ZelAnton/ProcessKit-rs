@@ -4,8 +4,9 @@
 //!
 //! * the [`PidGate`](pid_gate::PidGate) mutex that linearizes a watchdog's raw
 //!   `kill(pid)` against the reap that frees (and lets the OS recycle) the pid;
-//! * the deadline arbiter's `PENDING → TIMED_OUT` / `PENDING → EXITED` CAS
-//!   ([`deadline::claim_timed_out`] / [`deadline::claim_exited`]);
+//! * the watchdog arbiter's absolute-timeout / inactivity-timeout / natural-exit
+//!   CAS ([`deadline::claim_timed_out`] /
+//!   [`deadline::claim_inactivity_timed_out`] / [`deadline::claim_exited`]);
 //! * the [`SkipDropKill`](skip_drop_kill::SkipDropKill) generation latch guarding
 //!   the spawn/shutdown Drop-kill re-arm race.
 //!
@@ -43,11 +44,12 @@ pub(crate) mod sync;
 
 // The timeout-arbiter states the deadline core references as `super::TS_*`. These
 // mirror the (private) constants in `src/running/mod.rs`; they are trivially stable
-// (a single CAS arbiter — PENDING/EXITED/TIMED_OUT). Kept in sync by their meaning,
+// (a single CAS arbiter — PENDING/EXITED/two timeout kinds). Kept in sync by their meaning,
 // not shared, since `running/mod.rs` also drags in tokio.
 const TS_PENDING: u8 = 0;
 const TS_EXITED: u8 = 1;
 const TS_TIMED_OUT: u8 = 2;
+const TS_INACTIVITY_TIMED_OUT: u8 = 3;
 
 // The three pure lock-free cores, pulled straight from the parent crate's source
 // (not copies). Their `#[cfg(all(test, loom))]` suites are what this harness runs.

@@ -325,6 +325,13 @@ impl RunProfile {
         self.outcome.timed_out()
     }
 
+    /// Whether the run was killed specifically by its output-inactivity
+    /// watchdog. Shorthand for
+    /// [`outcome.inactivity_timed_out()`](crate::Outcome::inactivity_timed_out).
+    pub fn inactivity_timed_out(&self) -> bool {
+        self.outcome.inactivity_timed_out()
+    }
+
     /// Build a `RunProfile` from its fields — a `#[doc(hidden)]` insulated
     /// constructor for a wrapper/serialization layer to reconstruct a value
     /// directly, by the same "one insulated constructor instead of a struct

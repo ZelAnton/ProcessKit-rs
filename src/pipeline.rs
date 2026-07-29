@@ -1247,7 +1247,7 @@ fn is_sigpipe(outcome: &Outcome) -> bool {
 fn is_clean_exit(outcome: Outcome, ok_codes: &[i32]) -> bool {
     match outcome {
         Outcome::Exited(code) => ok_codes.contains(&code),
-        Outcome::Signalled(_) | Outcome::TimedOut => false, // kill/timeout → unclean
+        Outcome::Signalled(_) | Outcome::TimedOut | Outcome::InactivityTimedOut => false,
     }
 }
 

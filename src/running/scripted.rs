@@ -163,6 +163,7 @@ pub(crate) struct ScriptedProc {
     exit: ScriptedExit,
     code: Option<i32>,
     timed_out: bool,
+    inactivity_timed_out: bool,
     signal: Option<i32>,
     /// When the scripted child "exits": `Some(at)` resolves at that instant
     /// (now = immediately), `None` never exits on its own (`Reply::pending` and a
@@ -192,6 +193,7 @@ impl ScriptedProc {
         stderr_text: String,
         code: Option<i32>,
         timed_out: bool,
+        inactivity_timed_out: bool,
         signal: Option<i32>,
         lifetime: Option<Duration>,
         line_delay: Option<Duration>,
@@ -237,6 +239,7 @@ impl ScriptedProc {
             exit: ScriptedExit::new(),
             code,
             timed_out,
+            inactivity_timed_out,
             signal,
             exit_at: lifetime.map(|d| tokio::time::Instant::now() + d),
             #[cfg(feature = "pty")]
@@ -312,6 +315,7 @@ impl ScriptedProc {
             exit,
             code: Some(code),
             timed_out: false,
+            inactivity_timed_out: false,
             signal: None,
             // Event-driven exit (via `exit`), so no time-based `exit_at`.
             exit_at: None,
@@ -396,11 +400,17 @@ impl ScriptedProc {
     /// its own [`exit`](Self::exit) signal, which resolves to the canned code just
     /// like a time-based `exit_at` would.
     pub(super) async fn wait_outcome(&mut self) -> Outcome {
-        fn classify(code: Option<i32>, timed_out: bool, signal: Option<i32>) -> Outcome {
-            match (code, timed_out) {
-                (_, true) => Outcome::TimedOut,
-                (Some(code), false) => Outcome::Exited(code),
-                (None, false) => Outcome::Signalled(signal),
+        fn classify(
+            code: Option<i32>,
+            timed_out: bool,
+            inactivity_timed_out: bool,
+            signal: Option<i32>,
+        ) -> Outcome {
+            match (code, timed_out, inactivity_timed_out) {
+                (_, _, true) => Outcome::InactivityTimedOut,
+                (_, true, false) => Outcome::TimedOut,
+                (Some(code), false, false) => Outcome::Exited(code),
+                (None, false, false) => Outcome::Signalled(signal),
             }
         }
 
@@ -411,7 +421,12 @@ impl ScriptedProc {
         } else if already_exited {
             // Cached natural outcome (time- or dialog-driven) even if a kill
             // landed afterwards.
-            classify(self.code, self.timed_out, self.signal)
+            classify(
+                self.code,
+                self.timed_out,
+                self.inactivity_timed_out,
+                self.signal,
+            )
         } else {
             match self.exit_at {
                 // Race so a streaming `deadline_task` can still end this wait.
@@ -419,8 +434,8 @@ impl ScriptedProc {
                     tokio::select! {
                         biased;
                         () = self.kill.signal.notified() => Outcome::Signalled(None),
-                        () = self.exit.signal.notified() => classify(self.code, self.timed_out, self.signal),
-                        () = tokio::time::sleep_until(at) => classify(self.code, self.timed_out, self.signal),
+                        () = self.exit.signal.notified() => classify(self.code, self.timed_out, self.inactivity_timed_out, self.signal),
+                        () = tokio::time::sleep_until(at) => classify(self.code, self.timed_out, self.inactivity_timed_out, self.signal),
                     }
                 }
                 // A `pending` reply parks on kill only; a `dialog` also resolves
@@ -429,7 +444,7 @@ impl ScriptedProc {
                     tokio::select! {
                         biased;
                         () = self.kill.signal.notified() => Outcome::Signalled(None),
-                        () = self.exit.signal.notified() => classify(self.code, self.timed_out, self.signal),
+                        () = self.exit.signal.notified() => classify(self.code, self.timed_out, self.inactivity_timed_out, self.signal),
                     }
                 }
             }
@@ -480,6 +495,7 @@ impl RunningProcess {
             program: command.program_name(),
             backend: Backend::Scripted(Box::new(scripted)),
             timeout: command.configured_timeout(),
+            inactivity_timeout: command.configured_inactivity_timeout(),
             timeout_grace: command.configured_timeout_grace(),
             timeout_signal: command.timeout_signal_raw(),
             pid: None,
@@ -505,6 +521,10 @@ impl RunningProcess {
             // the real PTY backend; never advertise a separate stderr probe.
             stderr_piped: command.stderr_is_piped() && !command.wants_pty(),
             deadline_task: None,
+            inactivity_task: None,
+            output_activity: Arc::new(
+                crate::pump::OutputActivity::new(tokio::time::Instant::now()),
+            ),
             timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
             // A scripted double owns no OS process, so its gate is pid-less: every
             // raw kill through it is a no-op regardless of retirement.
@@ -548,6 +568,27 @@ impl RunningProcess {
                 return; // the script already exited on its own — no kill
             }
             kill.fire();
+        }));
+    }
+
+    /// Scripted counterpart of the streamed output-inactivity watchdog. The
+    /// real line pumps update the same activity clock, so delayed canned output
+    /// exercises the production reset semantics without a subprocess.
+    pub(super) fn arm_scripted_inactivity(&mut self) {
+        if self.inactivity_task.is_some() {
+            return;
+        }
+        let (Some(limit), Some(kill)) = (self.inactivity_timeout, self.backend.scripted_kill())
+        else {
+            return;
+        };
+        let activity = self.output_activity.clone();
+        let timeout_state = self.timeout_state.clone();
+        self.inactivity_task = Some(tokio::spawn(async move {
+            activity.wait_for_inactivity(limit).await;
+            if super::deadline::claim_inactivity_timed_out(&timeout_state) {
+                kill.fire();
+            }
         }));
     }
 }

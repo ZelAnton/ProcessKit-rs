@@ -6,11 +6,11 @@
 //! win (graceful/group/pid/scripted-kill, or `select!` integration) stays at
 //! each call site — that part is genuinely different per site.
 //!
-//! Both sides of the single-word arbiter are funnelled through the two claim
-//! helpers here — [`claim_timed_out`] (a fired deadline) and [`claim_exited`] (a
-//! natural reap) — so the CAS from `TS_PENDING` and its memory ordering live in
-//! one place, and the `loom_model` suite can exhaustively check that the two
-//! can never both win.
+//! Every terminal claimant of the single-word arbiter is funnelled through the
+//! helpers here — [`claim_timed_out`] (absolute deadline),
+//! [`claim_inactivity_timed_out`] (quiet output), and [`claim_exited`] (natural
+//! reap) — so the CAS from `TS_PENDING` and its memory ordering live in one
+//! place, and the `loom_model` suite can exhaustively check that only one wins.
 
 // The arbiter atomic comes from the crate's `cfg(loom)`-swappable sync layer
 // (`std::sync::atomic` in ordinary builds, loom's model under the standalone loom
@@ -35,7 +35,7 @@ use std::time::Duration;
 #[cfg(not(loom))]
 use tokio::time::Instant;
 
-use super::{TS_EXITED, TS_PENDING, TS_TIMED_OUT};
+use super::{TS_EXITED, TS_INACTIVITY_TIMED_OUT, TS_PENDING, TS_TIMED_OUT};
 
 /// Wait out the remaining time until `started + limit`, then try to claim the
 /// timeout arbiter by CASing `flag` from `TS_PENDING` to `TS_TIMED_OUT`.
@@ -81,6 +81,19 @@ pub(super) fn claim_timed_out(flag: &AtomicU8) -> bool {
     .is_ok()
 }
 
+/// Claim the shared watchdog arbiter for a fired output-inactivity deadline.
+/// It races the absolute deadline and natural reap on the same `PENDING` word;
+/// only the first terminal cause may own teardown and classification.
+pub(super) fn claim_inactivity_timed_out(flag: &AtomicU8) -> bool {
+    flag.compare_exchange(
+        TS_PENDING,
+        TS_INACTIVITY_TIMED_OUT,
+        Ordering::AcqRel,
+        Ordering::Relaxed,
+    )
+    .is_ok()
+}
+
 /// Claim the timeout arbiter for a **natural reap**: `compare_exchange` `flag`
 /// from `TS_PENDING` to `TS_EXITED`. Returns `true` when this call won (a clean
 /// exit is recorded); `false` when a fired deadline already claimed
@@ -96,9 +109,9 @@ pub(crate) fn claim_exited(flag: &AtomicU8) -> bool {
 /// Loom model-checking suite for the deadline arbiter (run under `--cfg loom`;
 /// see [`crate::sync`]).
 ///
-/// The arbiter is a single `AtomicU8` two watchdogs and the natural reap race on:
-/// a fired deadline claims `TS_TIMED_OUT`, a clean exit claims `TS_EXITED`, both
-/// from `TS_PENDING`. Loom exhaustively permutes that race and asserts the two
+/// The arbiter is a single `AtomicU8` both watchdogs and the natural reap race on:
+/// each terminal cause claims its own state from `TS_PENDING`. Loom exhaustively
+/// permutes that race and asserts the two
 /// core invariants: **no double claim** (at most one side wins, so exactly one of
 /// "kill + publish TimedOut" and "record a clean exit" ever fires — never both),
 /// and **no missed timeout** (with no reap, the deadline claim always wins, so a
@@ -106,7 +119,10 @@ pub(crate) fn claim_exited(flag: &AtomicU8) -> bool {
 /// `classify`-style acquire load always observes the unique winner's value.
 #[cfg(all(test, loom))]
 mod loom_model {
-    use super::{TS_EXITED, TS_PENDING, TS_TIMED_OUT, claim_exited, claim_timed_out};
+    use super::{
+        TS_EXITED, TS_INACTIVITY_TIMED_OUT, TS_PENDING, TS_TIMED_OUT, claim_exited,
+        claim_inactivity_timed_out, claim_timed_out,
+    };
     use crate::sync::atomic::{AtomicU8, Ordering};
     use loom::sync::Arc;
 
@@ -157,6 +173,52 @@ mod loom_model {
                 "an uncontested deadline claim must win and enforce the timeout"
             );
             assert_eq!(flag.load(Ordering::Acquire), TS_TIMED_OUT);
+        });
+    }
+
+    /// Absolute timeout, inactivity timeout, and natural reap share one winner.
+    /// This is the full production race: no two teardown paths may both publish
+    /// an outcome or act on the same pid.
+    #[test]
+    fn both_watchdogs_and_reap_have_exactly_one_winner() {
+        loom::model(|| {
+            let flag = Arc::new(AtomicU8::new(TS_PENDING));
+            let deadline = {
+                let flag = flag.clone();
+                loom::thread::spawn(move || claim_timed_out(&flag))
+            };
+            let inactivity = {
+                let flag = flag.clone();
+                loom::thread::spawn(move || claim_inactivity_timed_out(&flag))
+            };
+            let exit_won = claim_exited(&flag);
+            let deadline_won = deadline.join().unwrap();
+            let inactivity_won = inactivity.join().unwrap();
+
+            assert_eq!(
+                usize::from(deadline_won)
+                    + usize::from(inactivity_won)
+                    + usize::from(exit_won),
+                1,
+                "exactly one terminal cause must claim the arbiter"
+            );
+            let expected = if deadline_won {
+                TS_TIMED_OUT
+            } else if inactivity_won {
+                TS_INACTIVITY_TIMED_OUT
+            } else {
+                TS_EXITED
+            };
+            assert_eq!(flag.load(Ordering::Acquire), expected);
+        });
+    }
+
+    #[test]
+    fn fired_inactivity_claims_when_uncontested() {
+        loom::model(|| {
+            let flag = AtomicU8::new(TS_PENDING);
+            assert!(claim_inactivity_timed_out(&flag));
+            assert_eq!(flag.load(Ordering::Acquire), TS_INACTIVITY_TIMED_OUT);
         });
     }
 }

@@ -1,5 +1,6 @@
 //! Incremental stdout streaming: [`StdoutLines`], [`ProcessEvents`], the
-//! watchdog tasks that bound a streamed run (deadline/cancel), and the unified
+//! watchdog tasks that bound a streamed run (absolute timeout, output inactivity,
+//! and cancellation), and the unified
 //! `finish`.
 
 use std::future::Future;
@@ -132,7 +133,8 @@ impl RunningProcess {
         // collected stderr.
         self.ensure_stderr_drain();
 
-        let stdout_sink = SharedLines::new(&self.buffer);
+        let stdout_sink =
+            SharedLines::new_with_activity(&self.buffer, self.output_activity.clone());
         match self.backend.take_stdout_reader() {
             Some(pipe) => {
                 self.stdout_pump = Some(tokio::spawn(pump_lines_core(
@@ -164,7 +166,8 @@ impl RunningProcess {
         );
         self.ensure_stdout_drain();
 
-        let stderr_sink = SharedLines::new(&self.buffer);
+        let stderr_sink =
+            SharedLines::new_with_activity(&self.buffer, self.output_activity.clone());
         match self.backend.take_stderr_reader() {
             Some(pipe) => {
                 self.stderr_pump = Some(tokio::spawn(pump_lines_core(
@@ -189,7 +192,8 @@ impl RunningProcess {
         if !self.stdout_piped || self.stdout_sink.is_some() {
             return;
         }
-        let stdout_sink = SharedLines::new(&self.buffer);
+        let stdout_sink =
+            SharedLines::new_with_activity(&self.buffer, self.output_activity.clone());
         if let Some(pipe) = self.backend.take_stdout_reader() {
             self.stdout_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,
@@ -216,7 +220,8 @@ impl RunningProcess {
     /// matching what `finish` expects (empty stderr).
     fn ensure_stderr_drain(&mut self) {
         if self.stderr_sink.is_none() {
-            let stderr_sink = SharedLines::new(&self.buffer);
+            let stderr_sink =
+                SharedLines::new_with_activity(&self.buffer, self.output_activity.clone());
             if let Some(pipe) = self.backend.take_stderr_reader() {
                 self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                     pipe,
@@ -348,6 +353,54 @@ impl RunningProcess {
         }
 
         self.arm_scripted_deadline();
+        self.arm_stream_inactivity();
+        self.arm_scripted_inactivity();
+    }
+
+    /// Arm the resettable stdout/stderr inactivity watchdog for a real streamed
+    /// run. It shares the absolute deadline's arbiter and teardown policy, so a
+    /// simultaneous deadline/reap/inactivity event has one winning cause.
+    fn arm_stream_inactivity(&mut self) {
+        if self.inactivity_task.is_some() {
+            return;
+        }
+        let Some(limit) = self.inactivity_timeout else {
+            return;
+        };
+        let own_group = self.backend.own_group().map(Arc::downgrade);
+        let pid = self.pid;
+        if own_group.is_none() && pid.is_none() {
+            return; // scripted is armed by `arm_scripted_inactivity`
+        }
+        let grace = self.timeout_grace;
+        let signal = self.timeout_signal;
+        let activity = self.output_activity.clone();
+        let timeout_state = self.timeout_state.clone();
+        let gate = self.pid_gate.clone();
+        self.inactivity_task = Some(tokio::spawn(async move {
+            activity.wait_for_inactivity(limit).await;
+            if !super::deadline::claim_inactivity_timed_out(&timeout_state) {
+                return;
+            }
+            if gate.is_retired() {
+                return;
+            }
+            match own_group {
+                Some(group) => match grace {
+                    Some(grace) => match group.upgrade() {
+                        Some(group) => {
+                            let _ = group.graceful_terminate(grace, signal).await;
+                        }
+                        None => force_kill(&gate),
+                    },
+                    None => kill_via_weak(&group, &gate),
+                },
+                None => match grace {
+                    Some(grace) => spawn_graceful_kill_and_reap(gate, grace, signal),
+                    None => force_kill(&gate),
+                },
+            }
+        }));
     }
 
     /// Finish a streamed run: wait for exit and return a [`Finished`]
@@ -388,7 +441,10 @@ impl RunningProcess {
         // stream's user-policy sink stays in place (and is overflow-checked below).
         let mut stdout_discarded = false;
         if let Some(pipe) = self.backend.take_stdout_reader() {
-            let sink = SharedLines::new(&super::discard_sink_policy());
+            let sink = SharedLines::new_with_activity(
+                &super::discard_sink_policy(),
+                self.output_activity.clone(),
+            );
             self.stdout_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,
                 self.stdout_config.clone(),
@@ -400,7 +456,7 @@ impl RunningProcess {
         if self.stderr_pump.is_none()
             && let Some(pipe) = self.backend.take_stderr_reader()
         {
-            let sink = SharedLines::new(&self.buffer);
+            let sink = SharedLines::new_with_activity(&self.buffer, self.output_activity.clone());
             self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,
                 self.stderr_config.clone(),
@@ -541,7 +597,8 @@ impl RunningProcess {
             self.stderr_sink.is_none(),
             "a public output stream consumes stdout before it can arm stderr"
         );
-        let stdout_sink = SharedLines::new(&self.buffer);
+        let stdout_sink =
+            SharedLines::new_with_activity(&self.buffer, self.output_activity.clone());
         match self.backend.take_stdout_reader() {
             Some(pipe) => {
                 self.stdout_pump = Some(tokio::spawn(pump_lines_core(
@@ -554,7 +611,8 @@ impl RunningProcess {
         }
         self.stdout_sink = Some(stdout_sink.clone());
 
-        let stderr_sink = SharedLines::new(&self.buffer);
+        let stderr_sink =
+            SharedLines::new_with_activity(&self.buffer, self.output_activity.clone());
         if let Some(pipe) = self.backend.take_stderr_reader() {
             self.stderr_pump = Some(tokio::spawn(pump_lines_core(
                 pipe,

@@ -122,6 +122,8 @@ pub struct Command {
     /// `no_timeout: bool` pair, so "explicitly unbounded" is modeled at the type
     /// level instead of via a setter-maintained invariant.
     timeout: Timeout,
+    /// Maximum silence between stdout/stderr reads before the run is torn down.
+    inactivity_timeout: Option<Duration>,
     /// Grace window after the deadline before `SIGKILL`; its presence makes the
     /// timeout graceful (see [`Self::timeout_grace`]).
     timeout_grace: Option<Duration>,
@@ -226,6 +228,7 @@ impl Command {
             stdin_inherit: false,
             unchecked: false,
             timeout: Timeout::Unset,
+            inactivity_timeout: None,
             timeout_grace: None,
             #[cfg(feature = "process-control")]
             timeout_signal: None,
@@ -913,6 +916,25 @@ impl Command {
         self
     }
 
+    /// Kill the run when neither stdout nor stderr produces bytes for `idle`.
+    ///
+    /// Unlike [`timeout`](Self::timeout), this is a **resettable** deadline: every
+    /// successful read from either output stream grants a fresh `idle` window.
+    /// The initial window starts when the child is spawned, so a process that
+    /// never writes output is still bounded. Teardown uses the same
+    /// [`timeout_grace`](Self::timeout_grace),
+    /// [`timeout_signal`](Self::timeout_signal), and whole-tree containment path
+    /// as the absolute timeout.
+    ///
+    /// The result is reported as
+    /// [`Outcome::InactivityTimedOut`](crate::Outcome::InactivityTimedOut),
+    /// distinct from [`Outcome::TimedOut`](crate::Outcome::TimedOut). A zero
+    /// duration is valid and expires as soon as the watchdog is polled.
+    pub fn inactivity_timeout(mut self, idle: Duration) -> Self {
+        self.inactivity_timeout = Some(idle);
+        self
+    }
+
     /// Set the timeout from an optional [`Duration`], folding the
     /// [`timeout`](Self::timeout) / [`no_timeout`](Self::no_timeout) split into a
     /// single composable verb for config-driven call sites. `Some(d)` is exactly
@@ -934,11 +956,13 @@ impl Command {
         self
     }
 
-    /// Make the [`timeout`](Self::timeout) **graceful**: at the deadline the run's
+    /// Make either [`timeout`](Self::timeout) or
+    /// [`inactivity_timeout`](Self::inactivity_timeout) **graceful**: when the
+    /// winning watchdog fires the run's
     /// tree is sent `SIGTERM` (or the signal chosen via `timeout_signal`, with the
     /// `process-control` feature), given up to `grace` to exit, then `SIGKILL`ed.
-    /// Without it the deadline hard-kills at once. No effect unless
-    /// [`timeout`](Self::timeout) is also set.
+    /// Without it the watchdog hard-kills at once. No effect unless at least one
+    /// timeout is set.
     ///
     /// **Windows** has no POSIX signal tier, but two best-effort soft triggers run
     /// before the atomic kill when the tree can act on one: `WM_CLOSE` is posted to
@@ -2132,6 +2156,11 @@ impl Command {
         self.timeout.as_duration()
     }
 
+    /// The configured output-inactivity window, if any.
+    pub fn configured_inactivity_timeout(&self) -> Option<Duration> {
+        self.inactivity_timeout
+    }
+
     /// Whether a client-wide [`default_timeout`](crate::CliClient::default_timeout)
     /// may gap-fill this command: only when the timeout is still
     /// [`Unset`](Timeout::Unset). An explicit [`timeout`](Self::timeout)
@@ -2759,6 +2788,9 @@ impl Command {
         if self.configured_timeout().is_some() {
             return refuse("a timeout");
         }
+        if self.inactivity_timeout.is_some() {
+            return refuse("an output-inactivity timeout");
+        }
         if self.timeout_grace.is_some() {
             return refuse("a graceful-timeout window");
         }
@@ -3229,6 +3261,7 @@ impl fmt::Debug for Command {
             .field("stdin_inherit", &self.stdin_inherit)
             .field("unchecked", &self.unchecked)
             .field("timeout", &self.timeout)
+            .field("inactivity_timeout", &self.inactivity_timeout)
             .field("timeout_grace", &self.timeout_grace)
             .field("ok_codes", &self.ok_codes)
             .field("stdout_mode", &self.stdout_mode)
@@ -4069,6 +4102,16 @@ mod tests {
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
+
+        let err = Command::new("x")
+            .inactivity_timeout(std::time::Duration::from_secs(1))
+            .spawn_detached()
+            .expect_err("an inactivity watchdog has no output pump on a detached child");
+        assert!(matches!(
+            err.reason(),
+            crate::ErrorReason::Unsupported { operation }
+                if operation.contains("output-inactivity timeout")
+        ));
     }
 
     #[test]
@@ -5083,6 +5126,20 @@ mod tests {
         let cmd = Command::new("x").timeout_grace(Duration::from_secs(5));
         assert_eq!(cmd.configured_timeout_grace(), Some(Duration::from_secs(5)));
         assert_eq!(Command::new("x").configured_timeout_grace(), None);
+    }
+
+    #[test]
+    fn inactivity_timeout_records_its_value_independently() {
+        use std::time::Duration;
+        let cmd = Command::new("x")
+            .timeout(Duration::from_secs(30))
+            .inactivity_timeout(Duration::from_secs(5));
+        assert_eq!(
+            cmd.configured_inactivity_timeout(),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(cmd.configured_timeout(), Some(Duration::from_secs(30)));
+        assert_eq!(Command::new("x").configured_inactivity_timeout(), None);
     }
 
     #[cfg(all(unix, feature = "process-control"))]

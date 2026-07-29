@@ -5,9 +5,8 @@ crate's three historically race-prone PID-lifecycle lock-free protocols:
 
 - **`PidGate`** (`src/sys/pid_gate.rs`) — linearizes a teardown watchdog's raw
   `kill(pid)` against the reap that frees (and lets the OS recycle) the pid.
-- **the deadline arbiter** (`src/running/deadline.rs`) — the single-word
-  `PENDING → TIMED_OUT` / `PENDING → EXITED` CAS shared by every deadline watchdog
-  and the natural reap.
+- **the watchdog arbiter** (`src/running/deadline.rs`) — the single-word CAS
+  shared by the absolute deadline, output-inactivity watchdog, and natural reap.
 - **`SkipDropKill`** (`src/sys/skip_drop_kill.rs`) — the generation-packed
   "don't kill on Drop" latch guarding the spawn/shutdown re-arm race (T-079).
 

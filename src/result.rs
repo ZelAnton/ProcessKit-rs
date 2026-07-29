@@ -56,6 +56,9 @@ pub enum Outcome {
     Signalled(Option<i32>),
     /// Killed because it exceeded its configured timeout.
     TimedOut,
+    /// Killed because neither stdout nor stderr produced bytes for the
+    /// configured inactivity window.
+    InactivityTimedOut,
 }
 
 impl Outcome {
@@ -73,7 +76,7 @@ impl Outcome {
         // deliberate decision rather than silently returning `None` for it.
         match self {
             Outcome::Exited(code) => Some(*code),
-            Outcome::Signalled(_) | Outcome::TimedOut => None,
+            Outcome::Signalled(_) | Outcome::TimedOut | Outcome::InactivityTimedOut => None,
         }
     }
 
@@ -86,14 +89,19 @@ impl Outcome {
         // here rather than defaulting to `None`.
         match self {
             Outcome::Signalled(signal) => *signal,
-            Outcome::Exited(_) | Outcome::TimedOut => None,
+            Outcome::Exited(_) | Outcome::TimedOut | Outcome::InactivityTimedOut => None,
         }
     }
 
     /// Whether the run was killed because it exceeded its timeout. Mirrors
     /// [`ProcessResult::timed_out`](crate::ProcessResult::timed_out).
     pub fn timed_out(&self) -> bool {
-        matches!(self, Outcome::TimedOut)
+        matches!(self, Outcome::TimedOut | Outcome::InactivityTimedOut)
+    }
+
+    /// Whether the timeout was specifically caused by output inactivity.
+    pub fn inactivity_timed_out(&self) -> bool {
+        matches!(self, Outcome::InactivityTimedOut)
     }
 
     /// This outcome's **stable machine identifier** — the *kind* of
@@ -123,6 +131,7 @@ impl Outcome {
             Outcome::Exited(_) => "exited",
             Outcome::Signalled(_) => "signalled",
             Outcome::TimedOut => "timed_out",
+            Outcome::InactivityTimedOut => "inactivity_timed_out",
         }
     }
 }
@@ -285,7 +294,7 @@ impl<T> ProcessResult<T> {
         &self.stderr
     }
 
-    /// How the run ended, as the explicit three-way [`Outcome`].
+    /// How the run ended, as the explicit [`Outcome`].
     pub fn outcome(&self) -> Outcome {
         self.outcome
     }
@@ -305,6 +314,11 @@ impl<T> ProcessResult<T> {
         self.outcome.timed_out()
     }
 
+    /// Whether the run was killed by its output-inactivity watchdog.
+    pub fn inactivity_timed_out(&self) -> bool {
+        self.outcome.inactivity_timed_out()
+    }
+
     /// The signal number if the process was terminated by a signal with a known
     /// number (**Unix only**; `None` otherwise — a clean exit, a timeout, or a
     /// signal the kernel did not expose). Derived from [`outcome`](Self::outcome);
@@ -313,14 +327,13 @@ impl<T> ProcessResult<T> {
         self.outcome.signal()
     }
 
-    /// The [`Command::timeout`](crate::Command::timeout) this run was launched
-    /// with, if any — carried so [`ensure_success`](Self::ensure_success) /
-    /// `require_code` can build a faithful
-    /// [`ErrorReason::Timeout`]. Participates in this type's [`PartialEq`] (see the
-    /// impl for the full contract): two results with the same visible outcome
-    /// but a different configured timeout are **not** equal, and this accessor
-    /// is what lets a caller (e.g. a serialization wrapper) tell them apart —
-    /// mirrors [`Command::configured_timeout`](crate::Command::configured_timeout).
+    /// The timeout window responsible for this result, if one is relevant. For
+    /// [`Outcome::TimedOut`] this is [`Command::timeout`](crate::Command::timeout);
+    /// for [`Outcome::InactivityTimedOut`] it is
+    /// [`Command::inactivity_timeout`](crate::Command::inactivity_timeout).
+    /// Carried so [`ensure_success`](Self::ensure_success) / `require_code` can
+    /// build a faithful [`ErrorReason::Timeout`]. Participates in this type's
+    /// [`PartialEq`] (see the impl for the full contract).
     pub fn configured_timeout(&self) -> Option<Duration> {
         self.timeout
     }
@@ -366,6 +379,16 @@ impl<T> ProcessResult<T> {
             Outcome::TimedOut => Err(ErrorReason::Timeout {
                 program: self.program.clone(),
                 timeout: self.timeout.unwrap_or_default(),
+                inactivity: false,
+                stdout: self.stdout.as_text(),
+                stderr: self.stderr.clone(),
+                stdout_bytes: self.stdout.into_raw(),
+            }
+            .into()),
+            Outcome::InactivityTimedOut => Err(ErrorReason::Timeout {
+                program: self.program.clone(),
+                timeout: self.timeout.unwrap_or_default(),
+                inactivity: true,
                 stdout: self.stdout.as_text(),
                 stderr: self.stderr.clone(),
                 stdout_bytes: self.stdout.into_raw(),
@@ -406,6 +429,16 @@ impl<T> ProcessResult<T> {
             Outcome::TimedOut => Err(ErrorReason::Timeout {
                 program: self.program.clone(),
                 timeout: self.timeout.unwrap_or_default(),
+                inactivity: false,
+                stdout: self.stdout.as_text(),
+                stderr: self.stderr.clone(),
+                stdout_bytes: self.stdout.into_raw(),
+            }
+            .into()),
+            Outcome::InactivityTimedOut => Err(ErrorReason::Timeout {
+                program: self.program.clone(),
+                timeout: self.timeout.unwrap_or_default(),
+                inactivity: true,
                 stdout: self.stdout.as_text(),
                 stderr: self.stderr.clone(),
                 stdout_bytes: self.stdout.into_raw(),
@@ -816,6 +849,7 @@ mod tests {
             Outcome::Exited(7),
             Outcome::Signalled(None),
             Outcome::TimedOut,
+            Outcome::InactivityTimedOut,
         ] {
             let r = ProcessResult::new("x".into(), String::new(), String::new(), outcome, None);
             match r.outcome() {
@@ -832,6 +866,13 @@ mod tests {
                 Outcome::TimedOut => {
                     assert_eq!(r.code(), None);
                     assert!(r.timed_out());
+                    assert!(!r.inactivity_timed_out());
+                    assert!(!r.is_success());
+                }
+                Outcome::InactivityTimedOut => {
+                    assert_eq!(r.code(), None);
+                    assert!(r.timed_out());
+                    assert!(r.inactivity_timed_out());
                     assert!(!r.is_success());
                 }
             }

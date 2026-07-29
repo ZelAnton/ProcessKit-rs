@@ -66,6 +66,7 @@ pub(crate) fn outcome_label(outcome: &Outcome, cancelled: bool) -> &'static str 
         Outcome::Exited(_) => "exited",
         Outcome::Signalled(_) => "signalled",
         Outcome::TimedOut => "timed_out",
+        Outcome::InactivityTimedOut => "inactivity_timed_out",
     }
 }
 

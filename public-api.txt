@@ -146,6 +146,7 @@ pub struct processkit::testing::Reply
 impl processkit::testing::Reply
 pub fn processkit::testing::Reply::dialog(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn processkit::testing::Reply::fail(i32, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn processkit::testing::Reply::inactivity_timeout() -> Self
 pub fn processkit::testing::Reply::lines<I, S>(I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn processkit::testing::Reply::not_found() -> Self
 pub fn processkit::testing::Reply::ok(impl core::convert::Into<alloc::string::String>) -> Self
@@ -268,6 +269,7 @@ pub processkit::ErrorReason::Spawn::source: core::io::error::Error
 pub processkit::ErrorReason::Stdin::program: alloc::string::String
 pub processkit::ErrorReason::Stdin::source: core::io::error::Error
 #[non_exhaustive] pub processkit::ErrorReason::Timeout
+pub processkit::ErrorReason::Timeout::inactivity: bool
 pub processkit::ErrorReason::Timeout::program: alloc::string::String
 pub processkit::ErrorReason::Timeout::stderr: alloc::string::String
 pub processkit::ErrorReason::Timeout::stdout: alloc::string::String
@@ -438,10 +440,12 @@ impl core::panic::unwind_safe::RefUnwindSafe for processkit::Mechanism
 impl core::panic::unwind_safe::UnwindSafe for processkit::Mechanism
 #[non_exhaustive] pub enum processkit::Outcome
 pub processkit::Outcome::Exited(i32)
+pub processkit::Outcome::InactivityTimedOut
 pub processkit::Outcome::Signalled(core::option::Option<i32>)
 pub processkit::Outcome::TimedOut
 impl processkit::Outcome
 pub fn processkit::Outcome::code(&self) -> core::option::Option<i32>
+pub fn processkit::Outcome::inactivity_timed_out(&self) -> bool
 pub fn processkit::Outcome::name(&self) -> &'static str
 pub fn processkit::Outcome::signal(&self) -> core::option::Option<i32>
 pub fn processkit::Outcome::timed_out(&self) -> bool
@@ -773,6 +777,7 @@ pub fn processkit::Command::cancel_on(self, tokio_util::sync::cancellation_token
 pub fn processkit::Command::capture_policy(self, impl processkit::CapturePolicy + 'static) -> Self
 pub async fn processkit::Command::checked(&self) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
 pub fn processkit::Command::command_line(&self) -> alloc::string::String
+pub fn processkit::Command::configured_inactivity_timeout(&self) -> core::option::Option<core::time::Duration>
 pub fn processkit::Command::configured_ok_codes(&self) -> core::option::Option<&[i32]>
 pub fn processkit::Command::configured_timeout(&self) -> core::option::Option<core::time::Duration>
 pub fn processkit::Command::create_no_window(self) -> Self
@@ -787,6 +792,7 @@ pub async fn processkit::Command::exit_code(&self) -> processkit::Result<i32>
 pub async fn processkit::Command::first_line<F>(&self, F) -> processkit::Result<core::option::Option<alloc::string::String>> where F: core::ops::function::Fn(&str) -> bool + core::marker::Send
 pub fn processkit::Command::gid(self, u32) -> Self
 pub fn processkit::Command::groups(self, impl core::convert::AsRef<[u32]>) -> Self
+pub fn processkit::Command::inactivity_timeout(self, core::time::Duration) -> Self
 pub fn processkit::Command::inherit_env<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub fn processkit::Command::inherit_stdin(self) -> Self
 pub fn processkit::Command::io_priority(self, processkit::IoPriority) -> Self
@@ -1238,6 +1244,7 @@ pub fn processkit::ProcessResult<T>::code(&self) -> core::option::Option<i32>
 pub fn processkit::ProcessResult<T>::configured_timeout(&self) -> core::option::Option<core::time::Duration>
 pub fn processkit::ProcessResult<T>::duration(&self) -> core::time::Duration
 pub fn processkit::ProcessResult<T>::ensure_success(self) -> core::result::Result<Self, processkit::Error> where T: StdoutText
+pub fn processkit::ProcessResult<T>::inactivity_timed_out(&self) -> bool
 pub fn processkit::ProcessResult<T>::into_stdout(self) -> T
 pub fn processkit::ProcessResult<T>::is_success(&self) -> bool
 pub fn processkit::ProcessResult<T>::ok_codes(&self) -> &[i32]
@@ -1341,6 +1348,7 @@ pub processkit::RunProfile::samples: usize
 impl processkit::RunProfile
 pub fn processkit::RunProfile::avg_cpu_cores(&self) -> core::option::Option<f64>
 pub fn processkit::RunProfile::code(&self) -> core::option::Option<i32>
+pub fn processkit::RunProfile::inactivity_timed_out(&self) -> bool
 pub fn processkit::RunProfile::signal(&self) -> core::option::Option<i32>
 pub fn processkit::RunProfile::timed_out(&self) -> bool
 impl core::clone::Clone for processkit::RunProfile

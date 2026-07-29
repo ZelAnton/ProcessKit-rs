@@ -158,13 +158,16 @@ pub enum ErrorReason {
     /// [`diagnostic`](Self::diagnostic), capped at 200 bytes — just like
     /// [`Exit`](ErrorReason::Exit) — so a log line stays actionable without dumping
     /// the captured streams.
-    #[error("{}", display_timeout(program, *timeout, stdout, stderr))]
+    #[error("{}", display_timeout(program, *timeout, *inactivity, stdout, stderr))]
     #[non_exhaustive]
     Timeout {
         /// The program that timed out.
         program: String,
         /// The deadline that elapsed.
         timeout: Duration,
+        /// `true` when `timeout` is an output-inactivity window rather than the
+        /// run's absolute wall-clock deadline.
+        inactivity: bool,
         /// Standard output captured before the kill, in full. Not shown in the
         /// `Display` message (only its bounded diagnostic tail is). Empty when
         /// the path captured nothing. For the raw-bytes helper this is a **lossy
@@ -1434,6 +1437,7 @@ impl Error {
         ErrorReason::Timeout {
             program: program.into(),
             timeout,
+            inactivity: false,
             stdout: stdout.into(),
             stderr: stderr.into(),
             stdout_bytes: None,
@@ -1564,6 +1568,7 @@ impl fmt::Debug for ErrorReason {
             ErrorReason::Timeout {
                 program,
                 timeout,
+                inactivity,
                 stdout,
                 stderr,
                 stdout_bytes,
@@ -1571,6 +1576,7 @@ impl fmt::Debug for ErrorReason {
                 .debug_struct("Timeout")
                 .field("program", program)
                 .field("timeout", timeout)
+                .field("inactivity", inactivity)
                 .field("stdout", &StreamPreview(stdout))
                 .field("stderr", &StreamPreview(stderr))
                 .field("stdout_bytes", &BytesPreview(stdout_bytes.as_deref()))
@@ -1805,9 +1811,21 @@ fn display_signalled(program: &str, signal: Option<i32>, stdout: &str, stderr: &
 /// a `Duration::ZERO` here means the deadline wasn't known to the checking verb
 /// (a scripted / cassette-replayed timeout whose command carried no `timeout`),
 /// not that the run was killed at 0ns — "after 0ns" would be actively misleading.
-fn display_timeout(program: &str, timeout: Duration, stdout: &str, stderr: &str) -> String {
+fn display_timeout(
+    program: &str,
+    timeout: Duration,
+    inactivity: bool,
+    stdout: &str,
+    stderr: &str,
+) -> String {
     let mut message = if timeout.is_zero() {
-        format!("`{program}` timed out")
+        if inactivity {
+            format!("`{program}` timed out from output inactivity")
+        } else {
+            format!("`{program}` timed out")
+        }
+    } else if inactivity {
+        format!("`{program}` produced no output for {timeout:?}")
     } else {
         format!("`{program}` timed out after {timeout:?}")
     };
@@ -2378,6 +2396,7 @@ mod tests {
         let timeout = ErrorReason::Timeout {
             program: "git".into(),
             timeout: Duration::from_secs(1),
+            inactivity: false,
             stdout: String::new(),
             stderr: String::new(),
             stdout_bytes: None,
@@ -2426,6 +2445,7 @@ mod tests {
         let timeout = ErrorReason::Timeout {
             program: "db-migrate".into(),
             timeout: Duration::from_secs(30),
+            inactivity: false,
             stdout: String::new(),
             stderr: "connecting…\nwaiting for lock held by pid 4123\n".into(),
             stdout_bytes: None,
@@ -2462,6 +2482,7 @@ mod tests {
         let timeout = ErrorReason::Timeout {
             program: "t".into(),
             timeout: Duration::from_secs(1),
+            inactivity: false,
             stdout: huge.clone(),
             stderr: huge.clone(),
             stdout_bytes: None,
@@ -2769,6 +2790,7 @@ mod tests {
         let timeout = ErrorReason::Timeout {
             program: "x".into(),
             timeout: Duration::from_secs(1),
+            inactivity: false,
             stdout: String::new(),
             stderr: String::new(),
             stdout_bytes: None,
@@ -3070,6 +3092,7 @@ mod tests {
         let timeout: Error = ErrorReason::Timeout {
             program: "git".into(),
             timeout: Duration::from_secs(2),
+            inactivity: false,
             stdout: String::new(),
             stderr: String::new(),
             stdout_bytes: None,

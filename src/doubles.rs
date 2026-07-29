@@ -59,6 +59,7 @@ pub struct Reply {
     stderr: String,
     code: i32,
     timed_out: bool,
+    inactivity_timed_out: bool,
     /// Set by [`signalled`](Self::signalled): the reply is a signal kill. Kept
     /// separate from `signal` so `signalled(None)` (killed, number unknown) is
     /// distinct from a plain successful reply (both would have `signal: None`).
@@ -113,6 +114,7 @@ impl Reply {
             stderr: String::new(),
             code: 0,
             timed_out: false,
+            inactivity_timed_out: false,
             signalled: false,
             signal: None,
             pending: false,
@@ -131,6 +133,7 @@ impl Reply {
             stderr: stderr.into(),
             code,
             timed_out: false,
+            inactivity_timed_out: false,
             signalled: false,
             signal: None,
             pending: false,
@@ -158,6 +161,30 @@ impl Reply {
             // Unused: a timed-out result carries no code.
             code: 0,
             timed_out: true,
+            inactivity_timed_out: false,
+            signalled: false,
+            signal: None,
+            pending: false,
+            line_delay: None,
+            spawn_error: None,
+            dialog: None,
+        }
+    }
+
+    /// An inactivity-timed-out reply — the process stopped because it produced
+    /// no stdout or stderr for the configured inactivity window.
+    ///
+    /// Like [`timeout`](Self::timeout), this resolves immediately and is useful
+    /// for testing classification. Use [`pending`](Self::pending) with
+    /// [`Command::inactivity_timeout`](crate::Command::inactivity_timeout) to
+    /// exercise the watchdog race itself.
+    pub fn inactivity_timeout() -> Self {
+        Self {
+            stdout: String::new(),
+            stderr: String::new(),
+            code: 0,
+            timed_out: false,
+            inactivity_timed_out: true,
             signalled: false,
             signal: None,
             pending: false,
@@ -177,6 +204,7 @@ impl Reply {
             stderr: String::new(),
             code: 0,
             timed_out: false,
+            inactivity_timed_out: false,
             signalled: true,
             signal,
             pending: false,
@@ -212,6 +240,7 @@ impl Reply {
             stderr: String::new(),
             code: 0,
             timed_out: false,
+            inactivity_timed_out: false,
             signalled: false,
             signal: None,
             pending: true,
@@ -394,6 +423,7 @@ impl Reply {
         stderr: String,
         code: Option<i32>,
         timed_out: bool,
+        inactivity_timed_out: bool,
         signal: Option<i32>,
     ) -> Self {
         Self {
@@ -401,8 +431,9 @@ impl Reply {
             stderr,
             code: code.unwrap_or_default(),
             timed_out,
+            inactivity_timed_out,
             // Signalled iff it neither timed out nor carries an exit code.
-            signalled: !timed_out && code.is_none(),
+            signalled: !timed_out && !inactivity_timed_out && code.is_none(),
             signal,
             pending: false,
             line_delay: None,
@@ -467,7 +498,7 @@ impl Reply {
             // overflow the multiply or the later `Instant + lifetime` deadline.
             Some(per_line.saturating_mul(lines).min(crate::MAX_DEADLINE))
         };
-        let code_for_scripted = if self.timed_out || self.signalled {
+        let code_for_scripted = if self.timed_out || self.inactivity_timed_out || self.signalled {
             None
         } else {
             Some(self.code)
@@ -477,6 +508,7 @@ impl Reply {
             stderr_text,
             code_for_scripted,
             self.timed_out,
+            self.inactivity_timed_out,
             self.signal,
             lifetime,
             self.line_delay,
@@ -498,13 +530,20 @@ impl Reply {
     fn into_result(self, program: String, command: &Command) -> ProcessResult<String> {
         // Carry the command's configured timeout so a timed-out reply surfaces as
         // `ErrorReason::Timeout` with the real deadline, not a zero duration.
-        let timeout = command.configured_timeout();
-        let outcome = if self.timed_out {
-            Outcome::TimedOut
+        let (outcome, timeout) = if self.inactivity_timed_out {
+            (
+                Outcome::InactivityTimedOut,
+                command.configured_inactivity_timeout(),
+            )
+        } else if self.timed_out {
+            (Outcome::TimedOut, command.configured_timeout())
         } else if self.signalled {
-            Outcome::Signalled(self.signal)
+            (
+                Outcome::Signalled(self.signal),
+                command.configured_timeout(),
+            )
         } else {
-            Outcome::Exited(self.code)
+            (Outcome::Exited(self.code), command.configured_timeout())
         };
         // A dialog has no interactive stdin on the bulk path, so it degrades to
         // its `prompt` immediately followed by `response` as ordinary stdout —
@@ -574,6 +613,7 @@ pub(crate) fn scripted_running_from_parts(
     stderr: String,
     code: Option<i32>,
     timed_out: bool,
+    inactivity_timed_out: bool,
     signal: Option<i32>,
     truncated: bool,
     total_lines: usize,
@@ -586,8 +626,15 @@ pub(crate) fn scripted_running_from_parts(
         total_bytes,
         duration,
     };
-    Reply::from_outcome(stdout, stderr, code, timed_out, signal)
-        .into_running(command, Some(recorded))
+    Reply::from_outcome(
+        stdout,
+        stderr,
+        code,
+        timed_out,
+        inactivity_timed_out,
+        signal,
+    )
+    .into_running(command, Some(recorded))
 }
 
 type Predicate = Box<dyn Fn(&Command) -> bool + Send + Sync>;
@@ -1047,9 +1094,9 @@ impl ProcessRunner for ScriptedRunner {
 }
 
 /// Drive a [`Reply::pending`] match on the bulk `output_string` path: race the
-/// command's cancellation token against its configured
-/// [`timeout`](crate::Command::timeout) and resolve exactly as the live bulk
-/// path would for a genuinely hung child.
+/// command's cancellation token against its configured absolute and inactivity
+/// timeouts and resolve exactly as the live bulk path would for a genuinely
+/// hung child.
 ///
 /// - the token fires first → `Err(ErrorReason::Cancelled)`, the mirror of cancelling
 ///   (and cleaning up) a live long-runner;
@@ -1058,6 +1105,8 @@ impl ProcessRunner for ScriptedRunner {
 ///   [`Reply::timeout`] yields on this verb), mirroring a live watchdog killing a
 ///   child that overran its deadline, and matching the scripted `start` path's
 ///   own deadline arbiter (`arm_scripted_deadline` / `drive_to_exit`);
+/// - the `Command::inactivity_timeout` window fires first → the corresponding
+///   inactivity-timed-out result;
 /// - neither knob is set → the call parks forever, like a hung child that no
 ///   token can cancel and no deadline bounds.
 ///
@@ -1066,6 +1115,7 @@ impl ProcessRunner for ScriptedRunner {
 async fn park_until_cancelled(command: &Command, program: String) -> Result<ProcessResult<String>> {
     let token = command.cancel_token();
     let timeout = command.configured_timeout();
+    let inactivity_timeout = command.configured_inactivity_timeout();
     // Unset knobs become never-resolving arms, so a `select!` over both collapses
     // to "park forever" when neither is configured — the documented hung-child case.
     let cancelled = async {
@@ -1082,12 +1132,21 @@ async fn park_until_cancelled(command: &Command, program: String) -> Result<Proc
             None => std::future::pending::<()>().await,
         }
     };
+    let inactivity = async {
+        match inactivity_timeout {
+            Some(limit) => tokio::time::sleep(limit.min(crate::MAX_DEADLINE)).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
     tokio::select! {
         biased;
         () = cancelled => Err(crate::error::ErrorReason::Cancelled { program }.into()),
         // The same construction the bulk verb applies to a `Reply::timeout()`, so a
         // pending-then-timeout result is byte-for-byte a canned timeout on this verb.
         () = deadline => Ok(Reply::timeout()
+            .into_result(program, command)
+            .with_ok_codes(command.ok_codes_vec())),
+        () = inactivity => Ok(Reply::inactivity_timeout()
             .into_result(program, command)
             .with_ok_codes(command.ok_codes_vec())),
     }
@@ -1708,6 +1767,28 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn first_line_reports_output_inactivity_not_a_missing_line() {
+        use crate::runner::ProcessRunnerExt;
+        let runner = ScriptedRunner::new().fallback(
+            Reply::lines(["ready eventually"]).with_line_delay(std::time::Duration::from_secs(10)),
+        );
+        let cmd = Command::new("svc").inactivity_timeout(std::time::Duration::from_secs(3));
+
+        let err = runner
+            .first_line(&cmd, |line| line.contains("ready"))
+            .await
+            .expect_err("the inactivity watchdog fires before the delayed line");
+        assert!(matches!(
+            err.reason(),
+            crate::ErrorReason::Timeout {
+                timeout,
+                inactivity: true,
+                ..
+            } if *timeout == std::time::Duration::from_secs(3)
+        ));
+    }
+
     #[tokio::test]
     async fn scripted_start_streams_canned_lines_through_real_pumps() {
         use tokio_stream::StreamExt;
@@ -2077,6 +2158,71 @@ mod tests {
 
         let finish = run.finish().await.expect("finish");
         assert_eq!(finish.outcome, Outcome::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scripted_stream_inactivity_resets_on_each_output_chunk() {
+        use tokio_stream::StreamExt;
+        let runner = ScriptedRunner::new().fallback(
+            Reply::lines(["one", "two", "three"])
+                .with_line_delay(std::time::Duration::from_secs(2)),
+        );
+        let cmd = Command::new("active").inactivity_timeout(std::time::Duration::from_secs(3));
+        let mut run = runner.start(&cmd).await.expect("scripted start");
+
+        let mut lines = run.stdout_lines().expect("stdout stream");
+        let mut seen = Vec::new();
+        while let Some(line) = lines.next().await {
+            seen.push(line);
+        }
+        assert_eq!(seen, ["one", "two", "three"]);
+        assert_eq!(
+            run.finish().await.expect("finish").outcome,
+            Outcome::Exited(0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scripted_stream_reports_output_inactivity_distinctly() {
+        use tokio_stream::StreamExt;
+        let runner = ScriptedRunner::new().fallback(
+            Reply::lines(["too late"]).with_line_delay(std::time::Duration::from_secs(10)),
+        );
+        let cmd = Command::new("silent").inactivity_timeout(std::time::Duration::from_secs(3));
+        let mut run = runner.start(&cmd).await.expect("scripted start");
+
+        let mut lines = run.stdout_lines().expect("stdout stream");
+        assert_eq!(lines.next().await, None);
+        assert_eq!(
+            run.finish().await.expect("finish").outcome,
+            Outcome::InactivityTimedOut
+        );
+    }
+
+    #[cfg(feature = "pty")]
+    #[tokio::test(start_paused = true)]
+    async fn scripted_pty_output_resets_the_inactivity_watchdog() {
+        use tokio_stream::StreamExt;
+        let runner = ScriptedRunner::new().fallback(
+            Reply::ok("out\n")
+                .with_stderr("err\n")
+                .with_line_delay(std::time::Duration::from_secs(2)),
+        );
+        let cmd = Command::new("active-pty")
+            .use_pty()
+            .inactivity_timeout(std::time::Duration::from_secs(3));
+        let mut run = runner.start(&cmd).await.expect("scripted PTY start");
+
+        let mut lines = run.stdout_lines().expect("PTY stream");
+        let mut seen = Vec::new();
+        while let Some(line) = lines.next().await {
+            seen.push(line);
+        }
+        assert_eq!(seen, ["out", "err"]);
+        assert_eq!(
+            run.finish().await.expect("finish").outcome,
+            Outcome::Exited(0)
+        );
     }
 
     /// A readiness probe must NOT arm the `Command::timeout` watchdog, so
@@ -2907,6 +3053,34 @@ mod tests {
                 assert_eq!(timeout, std::time::Duration::from_secs(3))
             }
             other => panic!("expected ErrorReason::Timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bulk_pending_with_inactivity_timeout_reports_the_winning_watchdog() {
+        use crate::error::ErrorReason;
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let cmd = Command::new("silent")
+            .timeout(std::time::Duration::from_secs(30))
+            .inactivity_timeout(std::time::Duration::from_secs(3));
+
+        let result = runner
+            .output_string(&cmd)
+            .await
+            .expect("the inactivity watchdog bounds a pending capture");
+        assert_eq!(result.outcome(), Outcome::InactivityTimedOut);
+        assert!(result.inactivity_timed_out());
+
+        match runner.run(&cmd).await.unwrap_err().into_reason() {
+            ErrorReason::Timeout {
+                timeout,
+                inactivity,
+                ..
+            } => {
+                assert_eq!(timeout, std::time::Duration::from_secs(3));
+                assert!(inactivity);
+            }
+            other => panic!("expected inactivity timeout, got {other:?}"),
         }
     }
 

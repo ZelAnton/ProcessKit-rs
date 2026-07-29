@@ -20,8 +20,8 @@ Three ways a run ends early, with three different philosophies:
 
 ## Timeouts
 
-`Command::timeout(d)` kills the **whole process tree** at the deadline — not
-just the direct child, so a wrapper script's grandchildren die too.
+`Command::timeout(d)` kills the **whole process tree** at the absolute deadline —
+not just the direct child, so a wrapper script's grandchildren die too.
 
 ```rust,no_run
 use processkit::Command;
@@ -54,22 +54,61 @@ Where each verb lands:
 | Verb | Deadline expiry becomes |
 |---|---|
 | `output_string()` / `output_bytes()` | `Ok` result with `timed_out() == true`, `code() == None`, partial output kept |
-| `run()` / `exit_code()` / `probe()` / `checked()` | `ErrorReason::Timeout { program, timeout, stdout, stderr }` — the partial output captured before the kill is attached (`err.diagnostic()` surfaces a hung tool's last words) |
+| `run()` / `exit_code()` / `probe()` / `checked()` | `ErrorReason::Timeout { program, timeout, inactivity, stdout, stderr, .. }` — the partial output captured before the kill is attached (`err.diagnostic()` surfaces a hung tool's last words) |
 | `first_line(pred)` | `ErrorReason::Timeout` (the line never arrived in time) |
 | `start()` + streaming | the stream **ends** at the deadline (tree killed, pipes closed); `finish` then reports the kill (`outcome == Outcome::TimedOut`) |
 | `ensure_success()` on a captured result | `ErrorReason::Timeout`, checked *before* the exit code |
 | [`Pipeline`](pipelines.md#timeouts) | chain deadline → `timed_out` result; per-stage deadlines fold into pipefail |
 
+### Output-inactivity watchdog
+
+`Command::inactivity_timeout(d)` kills a single run when neither stdout nor
+stderr has produced bytes for `d`. Its clock starts at spawn and resets on every
+successful read from either stream, including merged PTY output:
+
+```rust,no_run
+use processkit::{Command, Outcome};
+use std::time::Duration;
+
+# #[tokio::main]
+# async fn main() -> processkit::Result<()> {
+let result = Command::new("build-tool")
+    .timeout(Duration::from_secs(30 * 60))
+    .inactivity_timeout(Duration::from_secs(5 * 60))
+    .output_string()
+    .await?;
+
+if result.outcome() == Outcome::InactivityTimedOut {
+    eprintln!("build produced no output for five minutes");
+}
+# Ok(())
+# }
+```
+
+The first watchdog to fire wins. Both use the same whole-tree teardown and honor
+`timeout_grace` / `timeout_signal`, but their results remain distinct:
+`Outcome::TimedOut` means the absolute runtime expired;
+`Outcome::InactivityTimedOut` means the output went quiet. `timed_out()` is true
+for either; `inactivity_timed_out()` identifies the latter. Checking verbs turn
+both into `ErrorReason::Timeout`; its `inactivity` field carries the distinction
+and its `timeout` field is the window that fired.
+
+This first iteration applies to individual command runs, including capture,
+streaming, readiness-driven consumption, and PTY mode. Pipeline-wide and
+supervisor-wide inactivity policies are separate concerns; commands they launch
+still keep their own configured watchdog.
+
 Two distinct deadline families to keep apart:
 
-- `Command::timeout` — the run's own contract, this section.
+- `Command::timeout` / `Command::inactivity_timeout` — the run's own contracts,
+  this section.
 - The [readiness probes](streaming.md#readiness-probes)' `within` parameter —
   gives `ErrorReason::NotReady` and **never kills the child**.
 
 ### Graceful timeout
 
-By default the deadline **hard-kills** at once. Add `timeout_grace(d)` to give the
-tree a chance to clean up: at the deadline it is sent `SIGTERM` (or the signal chosen
+By default a watchdog **hard-kills** at once. Add `timeout_grace(d)` to give the
+tree a chance to clean up: when it fires the tree is sent `SIGTERM` (or the signal chosen
 with `timeout_signal`, which needs the `process-control` feature), allowed up to the
 grace window to exit, then `SIGKILL`ed — the same SIGTERM → wait → SIGKILL tier as
 [`ProcessGroup::shutdown`](process-groups.md). A signal-handling child that exits ends

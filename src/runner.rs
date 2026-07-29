@@ -303,6 +303,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
         let mut process = self.start(command).await?;
         let program = command.program_name();
         let timeout = command.configured_timeout();
+        let inactivity_timeout = command.configured_inactivity_timeout();
         let grace = command
             .configured_timeout_grace()
             .unwrap_or(std::time::Duration::ZERO);
@@ -311,6 +312,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
         // `TS_TIMED_OUT` *before* it kills, so reading it once the stream has
         // closed distinguishes a deadline kill from a natural end.
         let arbiter = process.deadline_arbiter();
+        let output_activity = process.output_activity();
         // Drop any open stdin pipe so a stdin-reading child isn't left blocking.
         let _ = process.take_stdin();
         // `stdout_lines` arms the deadline watchdog, which enforces the timeout
@@ -367,42 +369,59 @@ pub trait ProcessRunnerExt: ProcessRunner {
                 None => Ok(search.await),
             }
         };
-        // A firing cancel is already bounded inside `raced` (its drain carries its
-        // own backstop). What remains to bound here is the *deadline* drain: the
-        // watchdog kills at the deadline → the stream closes → the search returns
-        // `None`, EXCEPT on a forking shared-group child whose grandchild holds
-        // stdout open past the watchdog's pid-only kill, so the stream never closes
-        // (the shared-group teardown gap). Only the `Some(limit)` branch has a
-        // natural anchor for that whole-race bound — `limit` (+ its grace + a
-        // teardown margin) sits well past the deadline, so it never preempts a
-        // legitimate slow kill of a single-process child, and it surfaces the stuck
-        // deadline drain as `Timeout`. The `None` branch has no deadline (so no
-        // such drain): an un-cancelled search there is legitimately unbounded and
-        // is left to run — its only bounded exit is the cancel drain above.
-        let found = match timeout {
-            Some(limit) => {
-                let backstop = limit
-                    .saturating_add(grace)
-                    .saturating_add(TEARDOWN_BACKSTOP_MARGIN);
-                match tokio::time::timeout(backstop, raced).await {
-                    Ok(Ok(found)) => found,
-                    Ok(Err(())) => return Err(crate::ErrorReason::Cancelled { program }.into()),
-                    Err(_elapsed) => {
-                        return Err(crate::ErrorReason::Timeout {
-                            program,
-                            timeout: limit,
-                            stdout: String::new(), // streaming probe buffers nothing
-                            stderr: String::new(),
-                            stdout_bytes: None,
-                        }
-                        .into());
-                    }
+        // A firing cancel is already bounded inside `raced`. Backstop either
+        // watchdog's post-kill drain: a shared-group grandchild can inherit stdout
+        // and keep it open after the direct child dies. The inactivity backstop
+        // follows the same resettable activity clock as the real watchdog, so
+        // healthy periodic output never gets bounded by time-since-spawn.
+        let absolute_backstop = async {
+            match timeout {
+                Some(limit) => {
+                    tokio::time::sleep(
+                        limit
+                            .saturating_add(grace)
+                            .saturating_add(TEARDOWN_BACKSTOP_MARGIN),
+                    )
+                    .await
                 }
+                None => std::future::pending::<()>().await,
             }
-            None => match raced.await {
+        };
+        let inactivity_backstop = async {
+            match inactivity_timeout {
+                Some(limit) => {
+                    output_activity.wait_for_inactivity(limit).await;
+                    tokio::time::sleep(grace.saturating_add(TEARDOWN_BACKSTOP_MARGIN)).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let found = tokio::select! {
+            biased;
+            result = raced => match result {
                 Ok(found) => found,
                 Err(()) => return Err(crate::ErrorReason::Cancelled { program }.into()),
             },
+            () = absolute_backstop => {
+                return Err(crate::ErrorReason::Timeout {
+                    program,
+                    timeout: timeout.unwrap_or_default(),
+                    inactivity: false,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    stdout_bytes: None,
+                }.into());
+            }
+            () = inactivity_backstop => {
+                return Err(crate::ErrorReason::Timeout {
+                    program,
+                    timeout: inactivity_timeout.unwrap_or_default(),
+                    inactivity: true,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    stdout_bytes: None,
+                }.into());
+            }
         };
         // Distinguish a deadline kill (arbiter `TS_TIMED_OUT`, set before the kill,
         // so the child is already dead when the stream closed) from a natural end.
@@ -412,12 +431,18 @@ pub trait ProcessRunnerExt: ProcessRunner {
         // `Cancelled` — the arbiter is a committed record of the deadline, whereas
         // re-reading the token would reintroduce the natural-end-vs-late-token race
         // the drain fixed. Both still error; a retry re-hits the cancel short-circuit.
-        if found.is_none()
-            && arbiter.load(std::sync::atomic::Ordering::Acquire) == crate::running::TS_TIMED_OUT
-        {
+        if found.is_none() {
+            let (timeout, inactivity) = match arbiter.load(std::sync::atomic::Ordering::Acquire) {
+                crate::running::TS_TIMED_OUT => (timeout.unwrap_or_default(), false),
+                crate::running::TS_INACTIVITY_TIMED_OUT => {
+                    (inactivity_timeout.unwrap_or_default(), true)
+                }
+                _ => return Ok(found),
+            };
             return Err(crate::ErrorReason::Timeout {
                 program,
-                timeout: timeout.unwrap_or_default(),
+                timeout,
+                inactivity,
                 stdout: String::new(),
                 stderr: String::new(),
                 stdout_bytes: None,
@@ -933,6 +958,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         stdin: stdin_pipe,
         stdin_task,
         timeout: command.configured_timeout(),
+        inactivity_timeout: command.configured_inactivity_timeout(),
         timeout_grace: command.configured_timeout_grace(),
         timeout_signal: command.timeout_signal_raw(),
         pid,
@@ -1066,6 +1092,7 @@ async fn launch_pty(
         own_group: None,
         stdin_task,
         timeout: command.configured_timeout(),
+        inactivity_timeout: command.configured_inactivity_timeout(),
         timeout_grace: command.configured_timeout_grace(),
         timeout_signal: command.timeout_signal_raw(),
         pid,

@@ -16,6 +16,53 @@ use crate::buffer::{
     LineTerminator, OutputBufferPolicy, OutputStream, OverflowMode, SharedCapturePolicy,
 };
 
+/// Shared resettable clock for stdout/stderr activity. Both line pumps (and the
+/// raw stdout path) update one instance, so activity on either stream resets the
+/// same inactivity watchdog.
+pub(crate) struct OutputActivity {
+    last: Mutex<tokio::time::Instant>,
+    changed: Notify,
+}
+
+impl OutputActivity {
+    pub(crate) fn new(started: tokio::time::Instant) -> Self {
+        Self {
+            last: Mutex::new(started),
+            changed: Notify::new(),
+        }
+    }
+
+    pub(crate) fn record(&self) {
+        *self.last.lock().expect("output activity clock poisoned") = tokio::time::Instant::now();
+        self.changed.notify_waiters();
+    }
+
+    /// Wait until a complete `window` passes after the most recent activity.
+    /// Enabling the notification before reading `last` closes both missed-wake
+    /// windows: an earlier write is in the clock snapshot, while a later write
+    /// stores a notification for this waiter and restarts the loop.
+    pub(crate) async fn wait_for_inactivity(&self, window: std::time::Duration) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let remaining = window
+                .checked_sub(
+                    self.last
+                        .lock()
+                        .expect("output activity clock poisoned")
+                        .elapsed(),
+                )
+                .unwrap_or(std::time::Duration::ZERO);
+            tokio::select! {
+                biased;
+                () = &mut changed => continue,
+                () = tokio::time::sleep(remaining) => return,
+            }
+        }
+    }
+}
+
 // The oversized-line paths deliberately discard decoded text before it can
 // accumulate. Unit tests need to observe that internal bound without making it
 // part of the production pump contract; task-local storage keeps parallel tests
@@ -401,6 +448,7 @@ pub(crate) struct SharedLines {
     /// `push` path is untouched; poison is recovered rather than propagated,
     /// matching [`close`](Self::close).
     read_error: Mutex<Option<std::io::Error>>,
+    activity: Arc<OutputActivity>,
 }
 
 struct Inner {
@@ -499,7 +547,18 @@ pub(crate) enum Popped {
 }
 
 impl SharedLines {
+    #[cfg(test)]
     pub(crate) fn new(policy: &OutputBufferPolicy) -> Arc<Self> {
+        Self::new_with_activity(
+            policy,
+            Arc::new(OutputActivity::new(tokio::time::Instant::now())),
+        )
+    }
+
+    pub(crate) fn new_with_activity(
+        policy: &OutputBufferPolicy,
+        activity: Arc<OutputActivity>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 lines: VecDeque::new(),
@@ -518,6 +577,7 @@ impl SharedLines {
             count: AtomicUsize::new(0),
             dropped: AtomicUsize::new(0),
             read_error: Mutex::new(None),
+            activity,
         })
     }
 
@@ -706,6 +766,8 @@ impl SharedLines {
     pub(crate) fn add_seen_bytes(&self, byte_count: usize) {
         let mut inner = self.inner.lock().expect("SharedLines poisoned");
         inner.seen_bytes = inner.seen_bytes.saturating_add(byte_count);
+        drop(inner);
+        self.activity.record();
     }
 
     /// Publish the current **unterminated tail** — the decoded content the pump
