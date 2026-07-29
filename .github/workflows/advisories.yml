@@ -1,0 +1,26 @@
+name: dependency advisories
+
+# A newly published RustSec advisory can affect the unchanged Cargo.lock long
+# after its last push. Keep that signal independent from the ordinary CI audit:
+# bans and licenses only need rechecking when the dependency graph changes.
+on:
+  schedule:
+    # 06:13 UTC daily — off the hour and after the existing 03:17–05:37 tiers.
+    - cron: '13 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: cargo-deny advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      # No continue-on-error: a RustSec match must leave the scheduled workflow
+      # red so GitHub's normal failed-schedule notification is the alert.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

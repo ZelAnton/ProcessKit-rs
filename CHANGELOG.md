@@ -27,7 +27,9 @@ to a dated version section.
   backoff, storm pauses, health checks, give-up decisions, and terminal state.
 
 ### Changed
--
+
+- Run a daily advisory-only cargo-deny workflow so new RustSec findings surface
+  even when `main` and its dependency graph have not changed.
 
 ### Fixed
 
