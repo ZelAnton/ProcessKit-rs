@@ -16,7 +16,9 @@
 
 use std::time::Duration;
 
-use processkit::{Command, JobRunner, ProcessRunner, wait_any};
+#[cfg(windows)]
+use processkit::wait_any;
+use processkit::{Command, JobRunner, ProcessRunner};
 
 use crate::common::{completes_within, poll_until};
 
