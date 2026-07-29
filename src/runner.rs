@@ -750,12 +750,19 @@ fn inherit_stdin_conflict(command: &Command, other: &str) -> crate::Error {
 /// Build the OS command, spawn it into `group`, wire stdin, and wrap everything
 /// in a [`RunningProcess`] (with no owned group).
 pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<RunningProcess> {
-    // A requested privilege drop, session detach, umask, rlimit, or I/O priority must
-    // never be silently skipped: on targets without the relevant primitive,
-    // fail before spawning. (`priority` is deliberately absent here — it is
-    // implemented on both platform families and never gated as Unsupported.)
+    // A requested argv[0] override, privilege drop, session detach, umask,
+    // rlimit, or I/O priority must never be silently skipped: on targets without
+    // the relevant primitive, fail before spawning. (`priority` is deliberately
+    // absent here — it is implemented on both platform families and never gated
+    // as Unsupported.)
     #[cfg(not(unix))]
     {
+        if command.requested_arg0() {
+            return Err(crate::ErrorReason::Unsupported {
+                operation: "arg0 (Unix-only)".into(),
+            }
+            .into());
+        }
         if command.requested_uid().is_some() {
             return Err(crate::ErrorReason::Unsupported {
                 operation: "uid".into(),

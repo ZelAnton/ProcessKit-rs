@@ -13,6 +13,8 @@ to a dated version section.
 
 ### Added
 
+- Add a Unix `Command::arg0` override for multicall binaries and login-shell
+  conventions, with loud unsupported behavior on Windows.
 - Add typed Unix per-process `rlimit` builders for CPU, core, data, file-size,
   open-file, and stack caps, with loud unsupported behavior elsewhere.
 - Add a dependency-free plain-HTTP readiness probe that waits for caller-selected

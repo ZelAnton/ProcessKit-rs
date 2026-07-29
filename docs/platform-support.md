@@ -231,6 +231,7 @@ real client open, treats `ERROR_PIPE_BUSY` as ready, and is unsupported on Unix.
 |---|---|---|
 | `inherit_env` allow-list | ✅ | ✅ |
 | `uid` / `gid` drop | ❌ `Unsupported` | ✅ |
+| `arg0` override | ❌ `Unsupported` | ✅ |
 | `setsid` | ❌ `Unsupported` | ✅ |
 | `create_no_window` | ✅ | no-op |
 | `kill_on_parent_death` | ✅ always on (kernel) | Linux: direct child; macOS/BSD: no-op |

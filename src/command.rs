@@ -100,6 +100,8 @@ impl Timeout {
 #[must_use = "a Command does nothing until it is run or started"]
 pub struct Command {
     program: OsString,
+    /// Unix `argv[0]` override, independent of executable resolution.
+    arg0: Option<OsString>,
     args: Vec<OsString>,
     cwd: Option<OsString>,
     /// Directories to probe (in priority order) before the system `PATH` when
@@ -234,6 +236,7 @@ impl Command {
     pub fn new(program: impl AsRef<OsStr>) -> Self {
         Self {
             program: program.as_ref().to_os_string(),
+            arg0: None,
             args: Vec::new(),
             cwd: None,
             prefer_local: Vec::new(),
@@ -289,6 +292,25 @@ impl Command {
     /// Append a single argument.
     pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
         self.args.push(arg.as_ref().to_os_string());
+        self
+    }
+
+    /// Override the child's `argv[0]` independently of the executable program.
+    ///
+    /// This supports multicall binaries such as BusyBox/Toybox and conventions
+    /// such as a login shell's `-bash`. The override changes only the argument
+    /// vector delivered to the child: program lookup, `prefer_local`, preflight,
+    /// spawn diagnostics, and containment continue to use
+    /// [`program`](Self::program). [`command_line`](Self::command_line) displays
+    /// both the executable and the explicit override.
+    ///
+    /// Unix applies the value through the OS command's `arg0` spawn seam. On
+    /// Windows, which has no separate `argv[0]` contract in tokio/std process
+    /// launching, the run fails with [`ErrorReason::Unsupported`] rather than
+    /// silently passing the executable name instead. Repeated calls are
+    /// last-write-wins.
+    pub fn arg0(mut self, arg0: impl Into<OsString>) -> Self {
+        self.arg0 = Some(arg0.into());
         self
     }
 
@@ -2044,6 +2066,13 @@ impl Command {
         self.setsid
     }
 
+    /// Whether a Unix `argv[0]` override was requested — read only by the
+    /// non-Unix unsupported gate.
+    #[cfg(not(unix))]
+    pub(crate) fn requested_arg0(&self) -> bool {
+        self.arg0.is_some()
+    }
+
     /// Whether [`kill_on_parent_death`](Self::kill_on_parent_death) was
     /// requested (read by the spawn seam).
     pub(crate) fn wants_kill_on_parent_death(&self) -> bool {
@@ -2232,6 +2261,11 @@ impl Command {
     /// opt-in: render it only into a sink you control.
     pub fn command_line(&self) -> String {
         let mut line = quote_arg(&self.program.to_string_lossy());
+        if let Some(arg0) = &self.arg0 {
+            line.push_str(" [argv0=");
+            line.push_str(&quote_arg(&arg0.to_string_lossy()));
+            line.push(']');
+        }
         for arg in &self.args {
             line.push(' ');
             line.push_str(&quote_arg(&arg.to_string_lossy()));
@@ -2458,10 +2492,11 @@ impl Command {
     /// The same preflight failures a normal launch would raise while resolving the
     /// program / opening a `stdout_file` redirect
     /// ([`ErrorReason::Io`]), plus
-    /// [`ErrorReason::Unsupported`] for a
-    /// Linux-only I/O-priority request on another platform, affinity on a target
-    /// other than Linux/Windows, or Windows affinity (which requires the typed
-    /// suspended-child launch seam and cannot be encoded in a raw command).
+    /// [`ErrorReason::Unsupported`] for a Unix-only `arg0`/`rlimit` request on
+    /// another platform, a Linux-only I/O-priority request elsewhere, affinity
+    /// on a target other than Linux/Windows, or Windows affinity (which requires
+    /// the typed suspended-child launch seam and cannot be encoded in a raw
+    /// command).
     pub fn to_tokio_command(&self) -> Result<tokio::process::Command> {
         #[cfg(windows)]
         if self.cpu_affinity.is_some() {
@@ -2476,6 +2511,13 @@ impl Command {
     /// Build the `tokio` command with stdio wired for capture. Containment
     /// (cgroup/job/process-group) is added by the group's `spawn`.
     pub(crate) fn build_tokio(&self) -> Result<tokio::process::Command> {
+        #[cfg(not(unix))]
+        if self.arg0.is_some() {
+            return Err(ErrorReason::Unsupported {
+                operation: "arg0 (Unix-only)".into(),
+            }
+            .into());
+        }
         #[cfg(not(unix))]
         if !self.rlimits.is_empty() {
             return Err(ErrorReason::Unsupported {
@@ -2512,6 +2554,10 @@ impl Command {
             Some(resolved) => tokio::process::Command::new(resolved),
             None => tokio::process::Command::new(&self.program),
         };
+        #[cfg(unix)]
+        if let Some(arg0) = &self.arg0 {
+            cmd.arg0(arg0);
+        }
         cmd.args(&self.args);
         if let Some(cwd) = &self.cwd {
             cmd.current_dir(cwd);
@@ -3486,6 +3532,7 @@ impl fmt::Debug for Command {
         // `command_line()` is the explicit secret-bearing escape hatch for argv.
         let mut d = f.debug_struct("Command");
         d.field("program", &self.program)
+            .field("arg0", &self.arg0)
             .field("args", &self.args.len())
             .field("cwd", &self.cwd)
             .field("prefer_local", &self.prefer_local)
@@ -5489,6 +5536,33 @@ mod tests {
         assert_eq!(cmd.command_line(), "git commit -m 'hello world'");
         #[cfg(not(unix))]
         assert_eq!(cmd.command_line(), "git commit -m \"hello world\"");
+    }
+
+    #[test]
+    fn arg0_is_last_write_wins_and_visible_in_diagnostics() {
+        let command = Command::new("tool")
+            .arg0("first")
+            .arg0("login shell")
+            .arg("work");
+        #[cfg(unix)]
+        assert_eq!(command.command_line(), "tool [argv0='login shell'] work");
+        #[cfg(not(unix))]
+        assert_eq!(command.command_line(), "tool [argv0=\"login shell\"] work");
+        let debug = format!("{command:?}");
+        assert!(debug.contains("arg0: Some(\"login shell\")"), "{debug}");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn arg0_is_unsupported_before_spawn_off_unix() {
+        let error = Command::new("x")
+            .arg0("multicall-mode")
+            .build_tokio()
+            .expect_err("arg0 is Unix-only");
+        assert!(
+            matches!(error.reason(), crate::ErrorReason::Unsupported { operation } if operation.contains("arg0")),
+            "got {error:?}"
+        );
     }
 
     #[cfg(unix)]

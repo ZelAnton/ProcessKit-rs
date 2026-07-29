@@ -199,6 +199,9 @@ async fn main() -> processkit::Result<()> {
         .env_remove("GIT_DIR")           // unset one inherited variable
         .run().await?;
 
+    // Unix: choose a multicall mode without changing executable resolution.
+    Command::new("busybox").arg0("httpd").arg("-f").run().await?;
+
     // Allow-list mode: clear everything, copy only the named parent variables.
     Command::new("sandboxed-tool")
         .inherit_env(["PATH", "HOME", "LANG"])
@@ -532,10 +535,12 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-`uid` / `gid` / `groups` / `setsid` are POSIX-only — on Windows the run
+`uid` / `gid` / `groups` / `setsid` / `arg0` are POSIX-only — on Windows the run
 fails with `ErrorReason::Unsupported` rather than silently skipping a privilege drop.
 A correct drop sets all three of `uid`/`gid`/`groups`: dropping the uid alone
 leaves the child holding the parent's (often root's) supplementary groups.
+`arg0` changes only the value delivered as the child's first argument: lookup,
+preflight, containment, and spawn errors still use `Command::program()`.
 `create_no_window` is a harmless no-op outside Windows.
 `kill_on_parent_death` is best-effort by design: guaranteed on Windows
 (regardless of the knob), direct-child-only on Linux, unavailable on

@@ -152,6 +152,36 @@ async fn priority_and_umask_apply_before_exec() {
 const RLIMIT_HELPER: &str = "PROCESSKIT_RLIMIT_HELPER";
 
 #[cfg(unix)]
+const ARG0_HELPER: &str = "PROCESSKIT_ARG0_HELPER";
+
+#[cfg(unix)]
+#[test]
+#[ignore = "re-exec helper for the argv[0] integration test"]
+fn arg0_observer() {
+    if std::env::var_os(ARG0_HELPER).is_none() {
+        return;
+    }
+    assert_eq!(
+        std::env::args_os().next().as_deref(),
+        Some(std::ffi::OsStr::new("-processkit-helper"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "re-execs the integration binary with an overridden argv[0]"]
+async fn arg0_reaches_child_without_changing_the_executable() {
+    let exe = std::env::current_exe().expect("locate integration test binary");
+    Command::new(exe)
+        .arg0("-processkit-helper")
+        .args(["--ignored", "--exact", "env_privileges::arg0_observer"])
+        .env(ARG0_HELPER, "1")
+        .run_unit()
+        .await
+        .expect("self-reexec observer sees the overridden argv[0]");
+}
+
+#[cfg(unix)]
 #[test]
 #[ignore = "re-exec helper for the per-process rlimit integration test"]
 fn rlimit_observer() {
@@ -467,6 +497,12 @@ async fn windows_unix_only_builders_are_unsupported() {
                 .args(["/c", "exit 0"])
                 .rlimit(RlimitResource::Core, 0, 0),
             "rlimit",
+        ),
+        (
+            Command::new("cmd")
+                .args(["/c", "exit 0"])
+                .arg0("multicall-mode"),
+            "arg0",
         ),
         (
             Command::new("cmd")

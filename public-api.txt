@@ -844,6 +844,7 @@ impl<R> !core::panic::unwind_safe::UnwindSafe for processkit::CliClient<R>
 pub struct processkit::Command
 impl processkit::Command
 pub fn processkit::Command::arg(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
+pub fn processkit::Command::arg0(self, impl core::convert::Into<std::ffi::os_str::OsString>) -> Self
 pub fn processkit::Command::args<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub fn processkit::Command::arguments(&self) -> &[std::ffi::os_str::OsString]
 pub fn processkit::Command::cancel_on(self, tokio_util::sync::cancellation_token::CancellationToken) -> Self
