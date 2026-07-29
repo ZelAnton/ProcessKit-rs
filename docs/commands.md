@@ -562,10 +562,10 @@ Containment is preserved in every combination; the platform fine print
 the pdeathsig thread caveat) is collected in
 [Platform support](platform-support.md#caveats).
 
-### Scheduling: CPU priority, I/O priority, and `umask`
+### Scheduling: CPU priority, affinity, I/O priority, and `umask`
 
-Two more spawn-time knobs, reusing the same seams as the builders above —
-Unix `pre_exec`, Windows `creation_flags` — for background/batch children
+Spawn-time knobs reuse the same seams as the builders above — Unix `pre_exec`
+and Windows' suspended-child configuration — for background/batch children
 that shouldn't starve the foreground, and for controlling the permissions of
 files a child creates:
 
@@ -577,6 +577,11 @@ async fn main() -> processkit::Result<()> {
     // Run at a lower CPU-scheduling priority — supported on BOTH platforms.
     Command::new("batch-job")
         .priority(Priority::BelowNormal)
+        .run().await?;
+
+    // Linux + Windows: keep a noisy worker on logical CPUs 2 and 3.
+    Command::new("compiler")
+        .cpu_affinity([2, 3])
         .run().await?;
 
     // Linux only: yield disk time to foreground users.
@@ -599,6 +604,17 @@ or even requesting `Priority::Normal` under a positively-niced parent (e.g. a
 `nice`d CI/batch launcher) — needs `CAP_SYS_NICE`/root; without it the OS
 rejects the change and the spawn fails loud (`ErrorReason::Spawn`), never silently
 downgrading to a lower priority.
+
+`cpu_affinity` accepts logical CPU indices. Linux applies a `cpu_set_t` with
+`sched_setaffinity` before `exec`; Windows calls `SetProcessAffinityMask` after
+race-free Job assignment while the child is still suspended (the ConPTY launch
+does the same), then resumes it. Descendants inherit the mask, though a child
+with sufficient rights may later change its own. Empty or unrepresentable sets
+fail before user code runs; an OS-rejected processor fails the spawn. macOS/BSD
+return `ErrorReason::Unsupported`. The Windows API is one processor-group mask,
+so indices are limited to the native mask width. `spawn_detached` refuses the
+knob; on Windows `to_tokio_command` does too because a raw command cannot carry
+the required post-spawn configuration seam.
 
 `io_priority` is Linux-only: it calls `ioprio_set(2)` in `pre_exec` before the
 program starts. `BestEffort(7)` is the lowest normal Linux I/O priority; smaller
@@ -786,7 +802,7 @@ dumping multi-KiB streams into it.
 ## Escape hatch: a platform knob the crate doesn't model
 
 `Command` exposes typed builders for the OS knobs that carry their weight —
-`priority`, `io_priority`, `umask`, `create_no_window`, `windows_graceful_ctrl_break`,
+`priority`, `cpu_affinity`, `io_priority`, `umask`, `create_no_window`, `windows_graceful_ctrl_break`,
 `run_as` (uid/gid), `parent_death`, and so on. New *real* needs are added the
 same way: as a typed verb, so the command stays inspectable (its `Debug`, its
 `Clone`, and — with the `record` feature — the cassette it serialises to all
@@ -828,8 +844,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 **What survives, and what you give up.** `to_tokio_command()` carries over
 everything the builder resolves at the OS level (program/args/cwd, the layered
 environment, the Unix `priority`/`umask`/privilege-drop/`setsid` `pre_exec`
-hooks (including Linux-only `io_priority`), Windows creation flags, and stdio wired
-for capture). Spawning the result
+hooks (including Linux-only `io_priority` and `cpu_affinity`), Windows creation
+flags, and stdio wired for capture). Windows `cpu_affinity` is the deliberate
+exception: it needs a live, still-suspended process handle, so lowering such a
+command fails with `Unsupported` instead of dropping the request. Spawning the result
 through [`ProcessGroup::spawn`](process-groups.md) still enrolls the child in the
 group's Job/cgroup/process-group, so **containment is preserved** — kill-on-drop
 and the group-level teardown verbs still reach it. What you leave behind is the

@@ -236,6 +236,7 @@ real client open, treats `ERROR_PIPE_BUSY` as ready, and is unsupported on Unix.
 | `kill_on_parent_death` | ✅ always on (kernel) | Linux: direct child; macOS/BSD: no-op |
 | `kill_on_parent_death_scope()` (abrupt-death reach) | `WholeTree` | Linux: `DirectChildOnly`; macOS/BSD: `Unsupported` |
 | `priority` | ✅ (priority class) | ✅ (`nice`/`setpriority`) |
+| `cpu_affinity` | ✅ (`SetProcessAffinityMask`) | Linux: ✅ (`sched_setaffinity`); macOS/BSD: ❌ `Unsupported` |
 | `io_priority` | ❌ `Unsupported` | Linux: ✅ (`ioprio_set`); macOS/BSD: ❌ `Unsupported` |
 | `umask` | ❌ `Unsupported` | ✅ |
 

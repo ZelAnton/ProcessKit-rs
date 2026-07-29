@@ -288,8 +288,8 @@ What it does, and what it deliberately does **not**:
 - **Incompatible knobs are refused loudly.** A `Command` carrying a timeout,
   capture wiring (`on_stdout_line`/tees/`capture_policy`), an interactive stdin
   (`keep_stdin_open`/`inherit_stdin`/a `stdin` source), `retry`, `cancel_on`,
-  `kill_on_parent_death` (its exact opposite), `windows_graceful_ctrl_break`, or
-  Linux `io_priority` is
+  `kill_on_parent_death` (its exact opposite), `windows_graceful_ctrl_break`,
+  `cpu_affinity`, or Linux `io_priority` is
   rejected with a typed `ErrorReason::Unsupported` naming it — never silently
   ignored. Program/args/env/working-directory and the privilege-drop knobs
   (`uid`/`gid`/`groups`/`umask`/`priority`) **are** honored.

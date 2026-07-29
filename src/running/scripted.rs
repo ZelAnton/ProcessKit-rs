@@ -38,6 +38,16 @@ pub(crate) struct ScriptedResultInfo {
     pub(crate) duration: Duration,
 }
 
+/// Kept together so adding modeled outcomes does not keep widening the scripted
+/// constructor's otherwise unrelated output/lifetime parameters.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScriptedOutcome {
+    pub(crate) code: Option<i32>,
+    pub(crate) timed_out: bool,
+    pub(crate) inactivity_timed_out: bool,
+    pub(crate) signal: Option<i32>,
+}
+
 /// Split already-decoded `text` into the exact lines the streaming pump
 /// ([`pump_lines_core`](crate::pump)) would yield for `terminator` — CRLF/CR
 /// terminators collapsed and stripped, with no trailing empty line for a final
@@ -191,10 +201,7 @@ impl ScriptedProc {
     pub(crate) fn new(
         stdout_text: String,
         stderr_text: String,
-        code: Option<i32>,
-        timed_out: bool,
-        inactivity_timed_out: bool,
-        signal: Option<i32>,
+        outcome: ScriptedOutcome,
         lifetime: Option<Duration>,
         line_delay: Option<Duration>,
     ) -> Self {
@@ -237,10 +244,10 @@ impl ScriptedProc {
                 feeders: Arc::new(feeders),
             },
             exit: ScriptedExit::new(),
-            code,
-            timed_out,
-            inactivity_timed_out,
-            signal,
+            code: outcome.code,
+            timed_out: outcome.timed_out,
+            inactivity_timed_out: outcome.inactivity_timed_out,
+            signal: outcome.signal,
             exit_at: lifetime.map(|d| tokio::time::Instant::now() + d),
             #[cfg(feature = "pty")]
             pty: false,

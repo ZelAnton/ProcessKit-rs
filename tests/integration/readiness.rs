@@ -67,6 +67,34 @@ async fn wait_for_pipe_treats_a_busy_server_as_ready() {
         .expect("ERROR_PIPE_BUSY still proves the server is ready");
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn wait_for_pipe_supports_one_way_servers() {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    for (label, inbound, outbound) in [
+        ("client-writes", true, false),
+        ("client-reads", false, true),
+    ] {
+        let (_bare, path) = unique_pipe_name(label);
+        let _server = ServerOptions::new()
+            .access_inbound(inbound)
+            .access_outbound(outbound)
+            .first_pipe_instance(true)
+            .create(&path)
+            .expect("create one-way named pipe server");
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::pending())
+            .start(&Command::new("service"))
+            .await
+            .expect("scripted service start");
+
+        run.wait_for_pipe(&path, Duration::from_secs(1))
+            .await
+            .expect("a one-way named pipe is ready");
+    }
+}
+
 #[tokio::test]
 #[ignore = "spawns a real subprocess and waits for its readiness banner"]
 async fn wait_for_line_matches_banner_and_leaves_child_running() {

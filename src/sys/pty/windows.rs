@@ -39,7 +39,8 @@ use windows_sys::Win32::System::Threading::{
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    STARTUPINFOEXW, SetProcessAffinityMask, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject,
 };
 
 use crate::sys::SpawnOptions;
@@ -726,8 +727,7 @@ pub(crate) fn spawn_pty(
     // is cleaned up — never an uncontained leak.
     // SAFETY: `pi.hProcess` is the freshly-created (suspended) child; `job` is a
     // valid job handle for the caller's lifetime.
-    if unsafe { AssignProcessToJobObject(job, pi.hProcess) } == 0 {
-        let e = io::Error::last_os_error();
+    let cleanup_created = |error| {
         unsafe {
             TerminateProcess(pi.hProcess, 1);
             close(pi.hProcess);
@@ -736,7 +736,17 @@ pub(crate) fn spawn_pty(
             close(input_write);
             close(output_read);
         }
-        return Err(e);
+        error
+    };
+    if unsafe { AssignProcessToJobObject(job, pi.hProcess) } == 0 {
+        return Err(cleanup_created(io::Error::last_os_error()));
+    }
+    if let Some(mask) = opts.cpu_affinity
+        && unsafe { SetProcessAffinityMask(pi.hProcess, mask) } == 0
+    {
+        // The child is still suspended, so a rejected affinity never becomes a
+        // brief inherited-affinity run and the shared cleanup reaps it.
+        return Err(cleanup_created(io::Error::last_os_error()));
     }
     // A fresh killable member joined the job — re-arm kill-on-close so a prior
     // survivor-sparing shutdown does not spare it (mirrors `Job::spawn`).

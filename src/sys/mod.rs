@@ -195,6 +195,11 @@ pub(crate) struct SpawnOptions {
     /// no-op.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub creation_flags: u32,
+    /// Windows process-affinity mask applied while the freshly-contained child
+    /// is still suspended. Unix applies affinity through the command's pre-exec
+    /// hook, so only the Windows backend consumes this value.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub cpu_affinity: Option<usize>,
     /// Spawn the direct child in its own console process group
     /// (`CREATE_NEW_PROCESS_GROUP`) so the opt-in graceful teardown can address
     /// it with `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` before the

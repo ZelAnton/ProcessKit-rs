@@ -547,7 +547,7 @@ pub(crate) enum Popped {
 }
 
 impl SharedLines {
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn new(policy: &OutputBufferPolicy) -> Arc<Self> {
         Self::new_with_activity(
             policy,

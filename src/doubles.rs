@@ -506,10 +506,12 @@ impl Reply {
         let scripted = crate::running::ScriptedProc::new(
             stdout_text,
             stderr_text,
-            code_for_scripted,
-            self.timed_out,
-            self.inactivity_timed_out,
-            self.signal,
+            crate::running::ScriptedOutcome {
+                code: code_for_scripted,
+                timed_out: self.timed_out,
+                inactivity_timed_out: self.inactivity_timed_out,
+                signal: self.signal,
+            },
             lifetime,
             self.line_delay,
         );

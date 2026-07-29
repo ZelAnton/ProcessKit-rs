@@ -54,7 +54,8 @@
 //!   [`Command::inherit_env`] (env allow-list), [`Command::uid`] /
 //!   [`Command::gid`] (Unix privilege drop), [`Command::setsid`],
 //!   [`Command::create_no_window`], [`Command::priority`] (CPU-scheduling
-//!   priority, both platforms), [`Command::io_priority`] (Linux I/O scheduling),
+//!   priority, both platforms), [`Command::cpu_affinity`] (Linux/Windows CPU
+//!   placement), [`Command::io_priority`] (Linux I/O scheduling),
 //!   [`Command::umask`] (Unix file-creation mask).
 //!
 //! Async throughout (tokio). Errors are the structured [`Error`]; a non-zero
@@ -197,6 +198,7 @@ mod buffer;
 mod cassette;
 mod client;
 mod command;
+mod cpu_affinity;
 // The one deliberate opt-in escape from kill-on-drop containment
 // (`Command::spawn_detached` → `DetachedChild`).
 mod detached;

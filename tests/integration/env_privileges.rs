@@ -168,6 +168,35 @@ async fn io_priority_applies_before_exec() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "spawns a real subprocess to read back sched_setaffinity"]
+async fn linux_cpu_affinity_applies_before_exec() {
+    let mut inherited = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    assert_eq!(
+        unsafe {
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut inherited)
+        },
+        0,
+        "read the test process affinity"
+    );
+    let cpu = (0..libc::CPU_SETSIZE as usize)
+        .find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &inherited) })
+        .expect("the test process must have an allowed CPU");
+
+    let out = Command::new("sh")
+        .args(["-c", "grep '^Cpus_allowed_list:' /proc/self/status"])
+        .cpu_affinity([cpu])
+        .run()
+        .await
+        .expect("run affinity-constrained child");
+    assert_eq!(
+        out.split_once(':').expect("status field").1.trim(),
+        cpu.to_string(),
+        "the child must observe exactly the requested inherited CPU"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "drops privileges; meaningful only as root"]
@@ -393,6 +422,74 @@ async fn windows_priority_is_never_unsupported_and_spawns() {
         .await
         .expect("a requested priority must spawn, not error");
     assert!(result.is_success(), "result: {result:?}");
+}
+
+#[cfg(windows)]
+fn first_allowed_windows_cpu() -> usize {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessAffinityMask};
+
+    let mut process_mask = 0usize;
+    let mut system_mask = 0usize;
+    assert_ne!(
+        unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process_mask, &mut system_mask) },
+        0,
+        "read the test process affinity"
+    );
+    process_mask.trailing_zeros() as usize
+}
+
+#[cfg(windows)]
+fn windows_process_affinity(pid: u32) -> usize {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetProcessAffinityMask, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    assert!(!handle.is_null(), "open child process for affinity query");
+    let mut process_mask = 0usize;
+    let mut system_mask = 0usize;
+    let ok = unsafe { GetProcessAffinityMask(handle, &mut process_mask, &mut system_mask) };
+    unsafe { CloseHandle(handle) };
+    assert_ne!(ok, 0, "read child affinity");
+    process_mask
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns a real suspended child and reads back its process affinity mask"]
+async fn windows_cpu_affinity_applies_before_resume() {
+    let cpu = first_allowed_windows_cpu();
+    let mut process = sleep_secs(30)
+        .cpu_affinity([cpu])
+        .start()
+        .await
+        .expect("spawn affinity-constrained child");
+    let pid = process.pid().expect("child pid");
+    assert_eq!(
+        windows_process_affinity(pid),
+        1usize << cpu,
+        "the resumed child must expose exactly the requested mask"
+    );
+    process.start_kill().expect("kill child");
+    let _ = process.wait().await.expect("reap child");
+}
+
+#[cfg(all(windows, feature = "pty"))]
+#[tokio::test]
+#[ignore = "spawns a real ConPTY child and reads back its process affinity mask"]
+async fn windows_conpty_cpu_affinity_applies_before_resume() {
+    let cpu = first_allowed_windows_cpu();
+    let mut process = sleep_secs(30)
+        .use_pty()
+        .cpu_affinity([cpu])
+        .start()
+        .await
+        .expect("spawn affinity-constrained ConPTY child");
+    let pid = process.pid().expect("child pid");
+    assert_eq!(windows_process_affinity(pid), 1usize << cpu);
+    process.start_kill().expect("kill child");
+    let _ = process.wait().await.expect("reap child");
 }
 
 #[cfg(windows)]

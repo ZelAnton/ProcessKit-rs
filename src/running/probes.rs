@@ -35,6 +35,26 @@ const READINESS_POLL: Duration = Duration::from_millis(50);
 /// remaining budget), so one stalled connect can't overrun the probe deadline.
 const CONNECT_ATTEMPT_CAP: Duration = Duration::from_secs(1);
 
+#[cfg(windows)]
+fn named_pipe_is_ready(path: &Path) -> bool {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+    // A server may expose only one direction. Start with the common duplex
+    // request, then fall back to the two one-way access masks so readiness does
+    // not depend on the server's data-flow contract.
+    [(true, true), (true, false), (false, true)]
+        .into_iter()
+        .any(|(read, write)| {
+            let mut options = ClientOptions::new();
+            options.read(read).write(write);
+            match options.open(path) {
+                Ok(_client) => true,
+                Err(error) => error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32),
+            }
+        })
+}
+
 impl RunningProcess {
     /// Wait until a stdout line matches `predicate` (returning that line), or
     /// fail with [`ErrorReason::NotReady`] when `within` elapses — or immediately
@@ -494,9 +514,6 @@ impl RunningProcess {
 
         #[cfg(windows)]
         {
-            use tokio::net::windows::named_pipe::ClientOptions;
-            use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
-
             let name = name.as_ref();
             let path = if name.is_absolute() {
                 name.to_owned()
@@ -505,10 +522,7 @@ impl RunningProcess {
             };
             self.poll_until(
                 move || {
-                    let ready = match ClientOptions::new().open(&path) {
-                        Ok(_client) => true,
-                        Err(error) => error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32),
-                    };
+                    let ready = named_pipe_is_ready(&path);
                     async move { ready }
                 },
                 within,

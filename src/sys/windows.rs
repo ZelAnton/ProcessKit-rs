@@ -53,7 +53,8 @@ use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS
 #[cfg(any(feature = "stats", feature = "process-control"))]
 use windows_sys::Win32::System::Threading::GetProcessTimes;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenThread, ResumeThread, SetProcessAffinityMask,
+    THREAD_SUSPEND_RESUME,
 };
 #[cfg(feature = "process-control")]
 use windows_sys::Win32::System::Threading::{
@@ -366,6 +367,13 @@ impl Job {
         let ok = unsafe { AssignProcessToJobObject(self.handle, handle as HANDLE) };
         if ok == 0 {
             // The reaper kills the still-suspended child as `guard` drops.
+            return Err(io::Error::last_os_error());
+        }
+        if let Some(mask) = opts.cpu_affinity
+            && unsafe { SetProcessAffinityMask(handle as HANDLE, mask) } == 0
+        {
+            // Still suspended and owned by `guard`; a rejected mask cannot leak
+            // or briefly run with the inherited affinity.
             return Err(io::Error::last_os_error());
         }
         // Contained — release the primary thread. A failure here would strand a

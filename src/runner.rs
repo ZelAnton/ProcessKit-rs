@@ -837,6 +837,20 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     let opts = crate::sys::SpawnOptions {
         setsid: command.wants_setsid(),
         creation_flags: command.extra_creation_flags(),
+        cpu_affinity: {
+            #[cfg(windows)]
+            {
+                command
+                    .configured_cpu_affinity()
+                    .map(crate::cpu_affinity::windows_mask)
+                    .transpose()
+                    .map_err(crate::Error::io)?
+            }
+            #[cfg(not(windows))]
+            {
+                None
+            }
+        },
         kill_on_parent_death: command.wants_kill_on_parent_death(),
         windows_new_process_group: command.wants_windows_graceful_ctrl_break(),
         use_pty: command.wants_pty(),

@@ -167,6 +167,9 @@ pub struct Command {
     /// Unix (`nice`/`setpriority`) and Windows (priority class) — never
     /// gated as `Unsupported`.
     priority: Option<crate::Priority>,
+    /// Logical CPU indices the child and its descendants initially inherit (see
+    /// [`Self::cpu_affinity`]). Linux/Windows only.
+    cpu_affinity: Option<Vec<usize>>,
     /// Linux I/O-scheduling priority (see [`Self::io_priority`]). Unsupported
     /// on every other target.
     io_priority: Option<crate::IoPriority>,
@@ -248,6 +251,7 @@ impl Command {
             groups: None,
             setsid: false,
             priority: None,
+            cpu_affinity: None,
             io_priority: None,
             umask: None,
             kill_on_parent_death: false,
@@ -531,6 +535,34 @@ impl Command {
     /// Last-write-wins with an earlier call, like [`timeout`](Self::timeout).
     pub fn priority(mut self, priority: crate::Priority) -> Self {
         self.priority = Some(priority);
+        self
+    }
+
+    /// Restrict the child to the given logical CPU indices. Descendants inherit
+    /// the mask, so this initially constrains the whole process tree (a child may
+    /// still change its own affinity if the OS permits it).
+    ///
+    /// On Linux the mask is applied with `sched_setaffinity(2)` in the pre-exec
+    /// child, before user code runs. On Windows it is applied with
+    /// `SetProcessAffinityMask` while the child is still suspended between job
+    /// assignment and resume; the ConPTY path uses the same ordering. macOS,
+    /// BSD, and other targets return [`ErrorReason::Unsupported`] rather than
+    /// silently inheriting the parent's mask.
+    ///
+    /// An empty set, a Linux index beyond `cpu_set_t`, or a Windows index beyond
+    /// the process mask width fails before the child runs. Windows' mask API is
+    /// limited to one processor group; indices are therefore bounded by the
+    /// native pointer width, and the OS rejects processors unavailable to the
+    /// current group. Repeated calls are last-write-wins; duplicates are removed
+    /// and indices are stored in ascending order.
+    ///
+    /// This owner-dependent configuration is refused by
+    /// [`spawn_detached`](Self::spawn_detached). On Windows it is also unavailable
+    /// through [`to_tokio_command`](Self::to_tokio_command), because a raw command
+    /// has no post-spawn suspended-child configuration seam; use a high-level run
+    /// verb instead.
+    pub fn cpu_affinity(mut self, cpus: impl IntoIterator<Item = usize>) -> Self {
+        self.cpu_affinity = Some(crate::cpu_affinity::normalize(cpus));
         self
     }
 
@@ -922,9 +954,9 @@ impl Command {
     /// successful read from either output stream grants a fresh `idle` window.
     /// The initial window starts when the child is spawned, so a process that
     /// never writes output is still bounded. Teardown uses the same
-    /// [`timeout_grace`](Self::timeout_grace),
-    /// [`timeout_signal`](Self::timeout_signal), and whole-tree containment path
-    /// as the absolute timeout.
+    /// [`timeout_grace`](Self::timeout_grace), `timeout_signal` (when the
+    /// `process-control` feature is enabled), and whole-tree containment path as
+    /// the absolute timeout.
     ///
     /// The result is reported as
     /// [`Outcome::InactivityTimedOut`](crate::Outcome::InactivityTimedOut),
@@ -2252,6 +2284,14 @@ impl Command {
         self.ok_codes.as_deref()
     }
 
+    /// The canonical logical CPU set configured via
+    /// [`cpu_affinity`](Self::cpu_affinity), if any. The slice is sorted and
+    /// deduplicated; `Some([])` preserves an explicitly empty (invalid) request so
+    /// inspection can distinguish it from an unset affinity before launch.
+    pub fn configured_cpu_affinity(&self) -> Option<&[usize]> {
+        self.cpu_affinity.as_deref()
+    }
+
     /// Lower this builder to a raw [`tokio::process::Command`] — the escape hatch
     /// for a platform knob ProcessKit deliberately doesn't model.
     ///
@@ -2269,8 +2309,8 @@ impl Command {
     /// working directory, the layered environment
     /// ([`env_clear`](Self::env_clear)/[`inherit_env`](Self::inherit_env)/
     /// [`env`](Self::env)/[`env_remove`](Self::env_remove)), the platform launch
-    /// hooks (Unix `priority`/`umask`/privilege-drop/[`setsid`](Self::setsid)
-    /// `pre_exec` hooks; Windows creation flags), and stdio wired to match the
+    /// hooks (Unix `priority`/`cpu_affinity`/`umask`/privilege-drop/
+    /// [`setsid`](Self::setsid) `pre_exec` hooks; Windows creation flags), and stdio wired to match the
     /// builder's [`stdout`](Self::stdout_file)/`stdin` configuration (piped for
     /// capture by default). Mutate the returned command, then hand it to
     /// [`ProcessGroup::spawn`](crate::ProcessGroup::spawn) to keep containment.
@@ -2299,8 +2339,17 @@ impl Command {
     /// program / opening a `stdout_file` redirect
     /// ([`ErrorReason::Io`]), plus
     /// [`ErrorReason::Unsupported`] for a
-    /// Linux-only I/O-priority request on another platform.
+    /// Linux-only I/O-priority request on another platform, affinity on a target
+    /// other than Linux/Windows, or Windows affinity (which requires the typed
+    /// suspended-child launch seam and cannot be encoded in a raw command).
     pub fn to_tokio_command(&self) -> Result<tokio::process::Command> {
+        #[cfg(windows)]
+        if self.cpu_affinity.is_some() {
+            return Err(ErrorReason::Unsupported {
+                operation: "cpu_affinity through to_tokio_command on Windows".into(),
+            }
+            .into());
+        }
         self.build_tokio()
     }
 
@@ -2311,6 +2360,13 @@ impl Command {
         if self.io_priority.is_some() {
             return Err(ErrorReason::Unsupported {
                 operation: "io_priority (Linux-only)".into(),
+            }
+            .into());
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        if self.cpu_affinity.is_some() {
+            return Err(ErrorReason::Unsupported {
+                operation: "cpu_affinity (Linux/Windows only)".into(),
             }
             .into());
         }
@@ -2369,6 +2425,22 @@ impl Command {
                 unsafe {
                     cmd.as_std_mut().pre_exec(move || {
                         if libc::setpriority(libc::PRIO_PROCESS, 0, nice) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(cpus) = &self.cpu_affinity {
+                let set = crate::cpu_affinity::linux_set(cpus).map_err(Error::io)?;
+                // SAFETY: the fixed-size cpu_set_t is built before fork; the
+                // closure performs one syscall over that copied buffer.
+                unsafe {
+                    cmd.as_std_mut().pre_exec(move || {
+                        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
+                            == -1
+                        {
                             return Err(std::io::Error::last_os_error());
                         }
                         Ok(())
@@ -2810,6 +2882,9 @@ impl Command {
         }
         if self.io_priority.is_some() {
             return refuse("io_priority (owner-dependent)");
+        }
+        if self.cpu_affinity.is_some() {
+            return refuse("cpu_affinity (owner-dependent)");
         }
         // stdin can only be null for a detached child.
         if self.keep_stdin_open {
@@ -3295,6 +3370,7 @@ impl fmt::Debug for Command {
             .field("groups", &self.groups)
             .field("setsid", &self.setsid)
             .field("priority", &self.priority)
+            .field("cpu_affinity", &self.cpu_affinity)
             .field("io_priority", &self.io_priority)
             .field("umask", &self.umask)
             .field("kill_on_parent_death", &self.kill_on_parent_death)
@@ -5126,6 +5202,59 @@ mod tests {
         let cmd = Command::new("x").timeout_grace(Duration::from_secs(5));
         assert_eq!(cmd.configured_timeout_grace(), Some(Duration::from_secs(5)));
         assert_eq!(Command::new("x").configured_timeout_grace(), None);
+    }
+
+    #[test]
+    fn cpu_affinity_is_canonical_and_last_write_wins() {
+        let cmd = Command::new("x")
+            .cpu_affinity([3, 1, 3, 2])
+            .cpu_affinity([5, 4, 5]);
+        assert_eq!(cmd.configured_cpu_affinity(), Some(&[4, 5][..]));
+        assert_eq!(
+            Command::new("x")
+                .cpu_affinity(std::iter::empty())
+                .configured_cpu_affinity(),
+            Some(&[][..]),
+            "an explicit invalid empty set remains inspectable until launch"
+        );
+    }
+
+    #[test]
+    fn spawn_detached_refuses_cpu_affinity_loudly() {
+        let err = Command::new("x")
+            .cpu_affinity([0])
+            .spawn_detached()
+            .expect_err("detached spawn cannot honor cross-platform affinity semantics");
+        assert!(matches!(
+            err.reason(),
+            crate::ErrorReason::Unsupported { operation } if operation.contains("cpu_affinity")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn to_tokio_command_refuses_windows_cpu_affinity() {
+        let err = Command::new("x")
+            .cpu_affinity([0])
+            .to_tokio_command()
+            .expect_err("a raw Windows command has no suspended-child configuration seam");
+        assert!(matches!(
+            err.reason(),
+            crate::ErrorReason::Unsupported { operation } if operation.contains("cpu_affinity")
+        ));
+    }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
+    #[test]
+    fn cpu_affinity_is_unsupported_off_linux_and_windows() {
+        let err = Command::new("x")
+            .cpu_affinity([0])
+            .to_tokio_command()
+            .expect_err("unsupported affinity must fail before spawn");
+        assert!(matches!(
+            err.reason(),
+            crate::ErrorReason::Unsupported { operation } if operation.contains("cpu_affinity")
+        ));
     }
 
     #[test]

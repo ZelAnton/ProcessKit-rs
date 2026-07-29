@@ -94,9 +94,11 @@ both into `ErrorReason::Timeout`; its `inactivity` field carries the distinction
 and its `timeout` field is the window that fired.
 
 This first iteration applies to individual command runs, including capture,
-streaming, readiness-driven consumption, and PTY mode. Pipeline-wide and
-supervisor-wide inactivity policies are separate concerns; commands they launch
-still keep their own configured watchdog.
+streaming, first-line consumption, and PTY mode. Readiness probes drain output
+and therefore refresh the activity clock, but do not arm either command
+watchdog themselves. Pipeline-wide and supervisor-wide inactivity policies are
+separate concerns; commands they launch still keep their own configured
+watchdog.
 
 Two distinct deadline families to keep apart:
 

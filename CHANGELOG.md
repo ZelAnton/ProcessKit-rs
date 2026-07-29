@@ -13,6 +13,8 @@ to a dated version section.
 
 ### Added
 
+- Add per-command CPU affinity on Linux and Windows, applied before child user
+  code runs and inherited by its process tree.
 - Add a Windows named-pipe readiness probe with busy-server detection and a
   symmetric `Unsupported` result on other platforms.
 - Add a resettable per-command output-inactivity watchdog with distinct result
