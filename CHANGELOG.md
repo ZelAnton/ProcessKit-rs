@@ -33,8 +33,9 @@ to a dated version section.
 
 ### Fixed
 
-- Keep Unix-only `rlimit` tests compiling and lint-clean, and declare the first
-  `tokio-stream` release that actually provides the enabled `sync` feature.
+- Keep Unix-only `rlimit` tests portable across signed FreeBSD limits and
+  coverage instrumentation, and declare the first `tokio-stream` release that
+  actually provides the enabled `sync` feature.
 - Prevent capture-only supervisors from retrying an unsupported live-handle
   launch forever when stdout is inherited, suppressed, or redirected to a file.
 - Include PTY mode and requested dimensions in `Command`'s redacted `Debug`

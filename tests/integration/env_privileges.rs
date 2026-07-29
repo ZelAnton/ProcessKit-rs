@@ -151,6 +151,27 @@ async fn priority_and_umask_apply_before_exec() {
 #[cfg(unix)]
 const RLIMIT_HELPER: &str = "PROCESSKIT_RLIMIT_HELPER";
 
+// Leave enough headroom for an instrumented test binary to flush its coverage
+// profile while still proving that the requested finite limit reached exec.
+#[cfg(unix)]
+const FILE_SIZE_LIMIT: u64 = 128 * 1024 * 1024;
+
+#[cfg(unix)]
+#[allow(clippy::useless_conversion)]
+fn native_limit(value: u64) -> libc::rlim_t {
+    // `rlim_t` is signed on FreeBSD/DragonFly but unsigned on the other Unix
+    // targets we exercise, so the identity conversion is platform-dependent.
+    libc::rlim_t::try_from(value).expect("test limit fits the platform rlim_t")
+}
+
+#[cfg(unix)]
+#[allow(clippy::useless_conversion)]
+fn command_limit(value: libc::rlim_t) -> u64 {
+    // Keep this fallible for signed `rlim_t` targets rather than masking an
+    // unexpected negative inherited limit with a cast.
+    u64::try_from(value).expect("small inherited limit fits u64")
+}
+
 #[cfg(unix)]
 const ARG0_HELPER: &str = "PROCESSKIT_ARG0_HELPER";
 
@@ -209,7 +230,11 @@ fn rlimit_observer() {
     let core = read(RlimitResource::Core);
     assert_eq!((core.rlim_cur, core.rlim_max), (0, 0));
     let files = read(RlimitResource::FileSize);
-    assert_eq!((files.rlim_cur, files.rlim_max), (1024, 1024));
+    let expected_file_size = native_limit(FILE_SIZE_LIMIT);
+    assert_eq!(
+        (files.rlim_cur, files.rlim_max),
+        (expected_file_size, expected_file_size)
+    );
     let nofile = read(RlimitResource::NoFile);
     let expected: libc::rlim_t = std::env::var("PROCESSKIT_RLIMIT_NOFILE")
         .expect("expected nofile env")
@@ -232,14 +257,19 @@ async fn rlimits_apply_before_exec() {
         0
     );
     let nofile = inherited.rlim_max.min(64);
+    let nofile_for_command = command_limit(nofile);
     let exe = std::env::current_exe().expect("locate integration test binary");
     Command::new(exe)
         .args(["--ignored", "--exact", "env_privileges::rlimit_observer"])
         .env(RLIMIT_HELPER, "1")
         .env("PROCESSKIT_RLIMIT_NOFILE", nofile.to_string())
         .rlimit(RlimitResource::Core, 0, 0)
-        .rlimit(RlimitResource::FileSize, 1024, 1024)
-        .rlimit(RlimitResource::NoFile, nofile, nofile)
+        .rlimit(RlimitResource::FileSize, FILE_SIZE_LIMIT, FILE_SIZE_LIMIT)
+        .rlimit(
+            RlimitResource::NoFile,
+            nofile_for_command,
+            nofile_for_command,
+        )
         .run_unit()
         .await
         .expect("observer sees all requested per-process limits");
