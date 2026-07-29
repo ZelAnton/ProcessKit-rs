@@ -107,6 +107,11 @@ mod guides {
     #[doc = include_str!("../docs/errors.md")]
     mod docs_errors {}
 
+    /// `docs/troubleshooting.md` — symptom-indexed diagnostic routes.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/troubleshooting.md")]
+    mod docs_troubleshooting {}
+
     /// `docs/process-groups.md`.
     #[doc(hidden)]
     #[doc = include_str!("../docs/process-groups.md")]

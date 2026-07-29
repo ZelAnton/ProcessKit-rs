@@ -25,6 +25,8 @@ to a dated version section.
   and captured output before persistence while keeping replay keys symmetric.
 - Add runnable examples for PTY dialogs, lifecycle events, deliberately detached
   children, and completion-ordered batch streaming.
+- Add a symptom-indexed troubleshooting guide for containment, lookup, limits,
+  output, wait, Windows shutdown, and deadline failures.
 
 ### Changed
 
@@ -45,6 +47,14 @@ to a dated version section.
 
 ### Fixed
 
+- Bound the in-flight decode buffer when `wait`, `drain`, or `profile` adopts a
+  dropped stream, including newline-free output that started unbounded.
+- Preserve ConPTY failure diagnostics by decoding Win32-backed HRESULT values
+  without misreporting foreign HRESULT facilities as OS error codes.
+- Attribute stdout ownership conflicts to readiness or streaming consumers
+  instead of inventing an earlier streaming call in diagnostics.
+- Make the Markdown link-check exclusion for the mdBook implementation switcher
+  work with both Unix and Windows path separators.
 - Keep Windows graceful shutdown on its prompt atomic path when all recorded
   CTRL_BREAK leaders are stale.
 - Surface genuine Windows ConPTY termination failures while preserving

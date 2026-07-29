@@ -242,6 +242,7 @@ end to end:
 | [Pipelines](docs/pipelines.md) | Shell-free `a \| b \| c`, pipefail attribution, chain timeouts |
 | [Timeouts, retries & cancellation](docs/timeouts-and-cancellation.md) | Captured vs raised deadlines, retry classifiers, `CancellationToken` |
 | [Errors](docs/errors.md) | The `Error` wrapper and every `ErrorReason` variant → source → recommended reaction, `ErrorKind`, subtle look-alikes, classifiers, and ties to retries & supervision |
+| [Troubleshooting](docs/troubleshooting.md) | Symptom-first diagnosis for containment, lookup, limits, output, waits, Windows graceful stop, and deadline mix-ups |
 | [Supervision](docs/supervision.md) | Restart policies, backoff & jitter, stop conditions, outcomes |
 | [Observability](docs/observability.md) | The `tracing` events and `metrics` counters/histograms over already-computed run data — secret-hygiene (never argv/env), cardinality, wiring an exporter |
 | [Testing your code](docs/testing.md) | The `ProcessRunner` seam, scripted/recording/mock doubles, cassettes, `CliClient` |

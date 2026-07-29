@@ -22,8 +22,9 @@
 //!   caveats the [`ProcessGroup`] /
 //!   [`Mechanism`] docs spell out: the guarantee rides on `Drop` running (a
 //!   `panic = "abort"` process, or a `SIGKILL`/power-loss of the *owner*, skips
-//!   it — the OS-owned Job Object / cgroup still reaps on handle close, the POSIX
-//!   process-group fallback does not), and on the process-group mechanism a child
+//!   it — Windows still reaps through Job Object handle close, while Linux's
+//!   opt-in parent-death signal reaches only the direct child and macOS/BSD have
+//!   no equivalent), and on the process-group mechanism a child
 //!   that calls `setsid` escapes containment. The one *deliberate* way out is
 //!   [`Command::spawn_detached`] — an explicit, loudly-named opt-in that hands
 //!   back a [`DetachedChild`] the crate never kills, reaps, times out, or

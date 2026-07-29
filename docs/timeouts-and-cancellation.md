@@ -142,7 +142,7 @@ it hasn't exited — the same `timeout_grace` window now actually meaning someth
 Windows. It works only for a child that shares this process's console (a
 `create_no_window` / `DETACHED_PROCESS` child never receives the event and rides
 the grace to the hard kill), and sends `CTRL_BREAK` rather than the Unix
-`timeout_signal`. See [Process groups → Windows opt-in](process-groups.md#windows-opt-into-a-graceful-ctrl_break-soft-tier).
+`timeout_signal`. See [Process groups → Windows opt-in](process-groups.md#windows-the-graceful-soft-tier-wm_close-opt-in-ctrl_break).
 
 The explicit [`RunningProcess::shutdown(grace)`](streaming.md) verb (stop a started
 handle on demand) composes with a `Command::timeout`: its own SIGTERM → grace →

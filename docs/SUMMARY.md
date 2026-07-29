@@ -31,6 +31,7 @@
 - [Pipelines](pipelines.md)
 - [Timeouts, retries & cancellation](timeouts-and-cancellation.md)
 - [Errors](errors.md)
+- [Troubleshooting](troubleshooting.md)
 - [Supervision](supervision.md)
 - [Observability](observability.md)
 - [Testing your code](testing.md)

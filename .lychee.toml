@@ -27,9 +27,10 @@ exclude = [
 
 # `docs/SUMMARY.md` deliberately contains empty-href draft entries used by the
 # mdBook sidebar version switcher. mdBook validates its chapter linkage; lychee
-# must skip this input file because empty hrefs cannot be filtered as URLs.
+# must skip this input file because empty hrefs cannot be filtered as URLs. Match
+# both separators so the same local command works on Unix and Windows.
 exclude_path = [
-  '(^|/)docs/SUMMARY\.md$',
+  '(^|[\\/])docs[\\/]SUMMARY\.md$',
 ]
 
 # Retry transient failures (rate limiting, flaky hosts) instead of flaking the
