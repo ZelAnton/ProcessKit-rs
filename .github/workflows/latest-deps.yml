@@ -1,0 +1,49 @@
+name: latest dependencies
+
+# The ordinary CI matrix intentionally consumes the committed Cargo.lock. This
+# separate tier re-resolves every allowed dependency range so an upstream release
+# that breaks library consumers is visible before the next lockfile update.
+on:
+  schedule:
+    # 05:37 UTC daily -- staggered after the 03:17/04:07 heavy scheduled tiers.
+    - cron: '37 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  latest-deps:
+    name: latest-deps (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      # These two legs cover the cgroup/process-group and Job Object backends;
+      # the job is an early-warning tier rather than another full five-OS CI run.
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # The checkout is disposable, so updating this lockfile cannot mutate the
+      # committed graph. Running this before rust-cache keys the cache to the
+      # freshly resolved versions rather than the repository snapshot.
+      - name: Resolve latest allowed dependencies
+        run: cargo update
+      - uses: Swatinem/rust-cache@v2
+      - name: Show resolved direct dependency graph
+        run: cargo tree --depth 1
+      - name: Build
+        run: cargo build --all-targets --all-features
+      # Serialize the subprocess-heavy ignored suite: parallel PowerShell/process
+      # startup can exhaust a hosted runner and create false teardown timeouts.
+      - name: Test
+        run: cargo test --all-features -- --include-ignored --test-threads=1
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings

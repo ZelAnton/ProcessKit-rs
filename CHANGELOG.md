@@ -28,6 +28,8 @@ to a dated version section.
 
 ### Changed
 
+- Add a daily Linux/Windows latest-dependencies CI tier that re-resolves the
+  allowed dependency ranges before building, testing, and linting all features.
 - Add the CLI runner documentation to the Pages implementation switcher.
 - Simplify oversized-line pump tracking by removing unused length accumulation.
 - Add the VT sanitizer to the scheduled fuzz tier and strengthen its property
