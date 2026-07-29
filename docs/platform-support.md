@@ -215,7 +215,7 @@ platform. Gated on the **`process-control`** feature, like `signal`.
 
 | Capability | Windows | Unix |
 |---|---|---|
-| `wait_for_line`, `wait_for_port`, `wait_for` | ✅ | ✅ |
+| `wait_for_line`, `wait_for_port`, `wait_for_http`, `wait_for` | ✅ | ✅ |
 | `wait_for_socket` (AF_UNIX) | ❌ `Unsupported` | ✅ |
 | `wait_for_pipe` (named pipe) | ✅ | ❌ `Unsupported` |
 

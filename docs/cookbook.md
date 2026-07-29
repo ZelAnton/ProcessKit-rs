@@ -706,9 +706,10 @@ async fn main() -> processkit::Result<()> {
     // Pick the probe that matches how the server announces readiness:
     server.wait_for_line(|l| l.contains("listening"), Duration::from_secs(10)).await?;
     // server.wait_for_port("127.0.0.1:8080".parse().unwrap(), Duration::from_secs(10)).await?;
+    // server.wait_for_http("127.0.0.1:8080".parse().unwrap(), "/healthz", |s| (200..300).contains(&s), Duration::from_secs(10)).await?;
     // server.wait_for_socket("/tmp/my-server.sock", Duration::from_secs(10)).await?; // Unix only
     // server.wait_for_pipe("my-server", Duration::from_secs(10)).await?; // Windows only
-    // server.wait_for(|| async { http_health().await }, Duration::from_secs(10)).await?;
+    // server.wait_for(|| async { https_or_body_health().await }, Duration::from_secs(10)).await?;
 
     // …use the server; dropping `server` kills its whole tree.
     Ok(())
@@ -717,6 +718,8 @@ async fn main() -> processkit::Result<()> {
 
 A probe that can't succeed fails fast with `ErrorReason::NotReady` and never kills
 the child — you decide what happens next. No more `sleep(2)` and hoping.
+`wait_for_http` is intentionally plain HTTP and status-only; use the generic
+predicate with your own client when TLS, redirects, or response bodies matter.
 
 *Fine print: [Streaming & interactive I/O → readiness probes](streaming.md).*
 

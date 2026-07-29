@@ -1,13 +1,10 @@
-//! Readiness probes: wait_for_line / wait_for_port / wait_for.
+//! Readiness probes: lines, output tails, TCP/HTTP/local IPC, and predicates.
 
 use std::time::{Duration, Instant};
 
-use processkit::Command;
-
-#[cfg(windows)]
-use processkit::ProcessRunner;
-#[cfg(windows)]
 use processkit::testing::{Reply, ScriptedRunner};
+use processkit::{Command, ProcessRunner};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::common::*;
 
@@ -15,6 +12,48 @@ use crate::common::*;
 fn unique_pipe_name(label: &str) -> (String, String) {
     let bare = format!("processkit-readiness-{label}-{}", std::process::id());
     (bare.clone(), format!(r"\\.\pipe\{bare}"))
+}
+
+#[tokio::test]
+async fn wait_for_http_accepts_an_expected_plain_http_status() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local HTTP listener");
+    let addr = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept probe");
+        let mut request = Vec::new();
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut chunk = [0_u8; 256];
+            let read = stream.read(&mut chunk).await.expect("read probe request");
+            assert!(read > 0, "probe closed before completing its request");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        assert!(
+            request.starts_with(b"GET /healthz HTTP/1.1\r\n"),
+            "unexpected request: {:?}",
+            String::from_utf8_lossy(&request)
+        );
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("write response");
+    });
+
+    let mut run = ScriptedRunner::new()
+        .fallback(Reply::pending())
+        .start(&Command::new("service"))
+        .await
+        .expect("start scripted service");
+    run.wait_for_http(
+        addr,
+        "/healthz",
+        |status| [200, 204].contains(&status),
+        Duration::from_secs(1),
+    )
+    .await
+    .expect("HTTP endpoint is ready");
+    server.await.expect("HTTP listener task");
 }
 
 #[cfg(windows)]

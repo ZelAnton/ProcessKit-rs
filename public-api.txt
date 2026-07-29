@@ -1443,6 +1443,7 @@ pub async fn processkit::RunningProcess::finish(self) -> processkit::Result<proc
 pub fn processkit::RunningProcess::stdout_lines(&mut self) -> processkit::Result<processkit::StdoutLines>
 impl processkit::RunningProcess
 pub async fn processkit::RunningProcess::wait_for<F, Fut>(&mut self, F, core::time::Duration) -> processkit::Result<()> where F: core::ops::function::FnMut() -> Fut + core::marker::Send, Fut: core::future::future::Future<Output = bool> + core::marker::Send
+pub async fn processkit::RunningProcess::wait_for_http<F>(&mut self, core::net::socket_addr::SocketAddr, impl core::convert::AsRef<str>, F, core::time::Duration) -> processkit::Result<()> where F: core::ops::function::Fn(u16) -> bool + core::marker::Send + core::marker::Sync
 pub async fn processkit::RunningProcess::wait_for_line(&mut self, impl core::ops::function::Fn(&str) -> bool + core::marker::Send, core::time::Duration) -> processkit::Result<alloc::string::String>
 pub async fn processkit::RunningProcess::wait_for_output(&mut self, impl core::ops::function::Fn(&str) -> bool + core::marker::Send, core::time::Duration) -> processkit::Result<alloc::string::String>
 pub async fn processkit::RunningProcess::wait_for_pipe(&mut self, impl core::convert::AsRef<std::path::Path>, core::time::Duration) -> processkit::Result<()>

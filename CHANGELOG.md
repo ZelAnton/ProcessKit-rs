@@ -13,6 +13,8 @@ to a dated version section.
 
 ### Added
 
+- Add a dependency-free plain-HTTP readiness probe that waits for caller-selected
+  response status codes without reading bodies or following redirects.
 - Add opt-in per-stage stderr merging for shell-free pipelines, using one
   shared OS-pipe writer to preserve child write order without a userspace merge.
 - Add a bounded typed supervision lifecycle stream covering incarnations,

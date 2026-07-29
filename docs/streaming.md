@@ -653,14 +653,23 @@ async fn main() -> processkit::Result<()> {
     run.wait_for_port("127.0.0.1:8080".parse().unwrap(), Duration::from_secs(10))
         .await?;
 
-    // 3. A Unix domain socket accepting connections (Unix only):
+    // 3. A plain HTTP endpoint returning an expected status:
+    run.wait_for_http(
+        "127.0.0.1:8080".parse().unwrap(),
+        "/healthz",
+        |status| (200..300).contains(&status),
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    // 4. A Unix domain socket accepting connections (Unix only):
     run.wait_for_socket("/tmp/my-server.sock", Duration::from_secs(10))
         .await?;
 
-    // 4. A Windows named pipe accepting clients (Windows only):
+    // 5. A Windows named pipe accepting clients (Windows only):
     run.wait_for_pipe("my-service", Duration::from_secs(10)).await?;
 
-    // 5. Any async predicate (an HTTP /health endpoint, a file appearing, …):
+    // 6. Any async predicate (an HTTPS/body check, a file appearing, …):
     run.wait_for(|| async { health_check().await }, Duration::from_secs(10))
         .await?;
 
@@ -696,7 +705,7 @@ Probe semantics, deliberately uniform:
   buffer. `wait_for_line` and `wait_for_stderr_line` consume the selected stream
   up to (and including) the match — continue with `finish` (whose stderr omits
   lines already consumed by `wait_for_stderr_line`). `wait_for_port` /
-  `wait_for_socket` / `wait_for_pipe` / `wait_for`
+  `wait_for_http` / `wait_for_socket` / `wait_for_pipe` / `wait_for`
   drain the same way but never hand any of it back mid-probe; `wait` /
   `output_string` afterward still see the full captured output, but
   `output_bytes` or a fresh `stdout_lines` / `events` call do not
@@ -708,6 +717,10 @@ Probe semantics, deliberately uniform:
 - `wait_for_pipe` accepts a bare name or a fully-qualified `\\.\pipe\...` path.
   It returns `ErrorReason::Unsupported` off Windows. A busy pipe counts as ready:
   all server instances being occupied still proves the endpoint is serving.
+- `wait_for_http` sends a minimal HTTP/1.1 GET and reads only a bounded status
+  line. It is plain HTTP only: no TLS, redirect following, response bodies, or
+  authentication policy. Redirects count only if your status predicate accepts
+  them; use `wait_for` with your own HTTP client for HTTPS or richer checks.
 
 ## Prompt-aware waiting (`wait_for_output`)
 

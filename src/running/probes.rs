@@ -4,8 +4,10 @@
 //! buffer; the line probes hand back only the selected stream.
 
 use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 // `tokio::time::Instant` (not `std::time::Instant`) for the poll deadlines
@@ -16,6 +18,7 @@ use std::time::Duration;
 // rationale as `running::deadline` and `sys::graceful`.
 use tokio::time::Instant;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 #[cfg(unix)]
@@ -34,6 +37,62 @@ const READINESS_POLL: Duration = Duration::from_millis(50);
 /// Cap on a single TCP or Unix-socket connect attempt (clamped to the
 /// remaining budget), so one stalled connect can't overrun the probe deadline.
 const CONNECT_ATTEMPT_CAP: Duration = Duration::from_secs(1);
+
+/// Bound the only response data this deliberately small HTTP probe reads.
+const HTTP_STATUS_LINE_LIMIT: usize = 1024;
+
+fn validate_http_path(path: &str) -> io::Result<()> {
+    if !path.starts_with('/')
+        || !path.is_ascii()
+        || path
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HTTP readiness path must be an ASCII origin-form path without whitespace",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_http_status_line(line: &[u8]) -> Option<u16> {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let mut fields = line.split(|byte| byte.is_ascii_whitespace());
+    let version = fields.next()?;
+    let status = fields.find(|field| !field.is_empty())?;
+    if !matches!(version, b"HTTP/1.0" | b"HTTP/1.1")
+        || status.len() != 3
+        || !status.iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let status = std::str::from_utf8(status).ok()?.parse().ok()?;
+    (100..=599).contains(&status).then_some(status)
+}
+
+async fn probe_http_status(addr: SocketAddr, request: &[u8]) -> io::Result<Option<u16>> {
+    let mut stream = TcpStream::connect(addr).await?;
+    stream.write_all(request).await?;
+
+    let mut line = Vec::with_capacity(128);
+    let mut chunk = [0_u8; 256];
+    while line.len() < HTTP_STATUS_LINE_LIMIT {
+        let remaining = HTTP_STATUS_LINE_LIMIT - line.len();
+        let read_limit = chunk.len().min(remaining);
+        let read = stream.read(&mut chunk[..read_limit]).await?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if let Some(end) = chunk[..read].iter().position(|byte| *byte == b'\n') {
+            line.extend_from_slice(&chunk[..=end]);
+            return Ok(parse_http_status_line(&line));
+        }
+        line.extend_from_slice(&chunk[..read]);
+    }
+    Ok(None)
+}
 
 #[cfg(windows)]
 fn named_pipe_is_ready(path: &Path) -> bool {
@@ -421,6 +480,70 @@ impl RunningProcess {
         .await
     }
 
+    /// Wait until a plain HTTP endpoint returns a status accepted by
+    /// `expected`, or fail with [`ErrorReason::NotReady`] when `within` elapses
+    /// (or immediately when the child exits first).
+    ///
+    /// The probe sends `GET path HTTP/1.1` to `addr` once per readiness tick and
+    /// reads only the bounded response status line. For a status class use a
+    /// range predicate such as `|status| (200..300).contains(&status)`; an exact
+    /// set can use `|status| [200, 204].contains(&status)`.
+    ///
+    /// This is deliberately a minimal **plain HTTP** probe: it does not perform
+    /// TLS, follow redirects, or read response bodies. A redirect status is
+    /// accepted only when `expected` accepts it. For HTTPS, body-based health
+    /// checks, authentication, or other client policy, use
+    /// [`wait_for`](Self::wait_for) with the HTTP client of your choice. `path`
+    /// must be an ASCII origin-form path beginning with `/`; invalid paths are
+    /// rejected before the first connection attempt. Piped output is drained
+    /// and retained with the same semantics as
+    /// [`wait_for_port`](Self::wait_for_port).
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorReason::NotReady`] when no accepted status arrives within the
+    ///   deadline, or when the child exits first. Connection failures and
+    ///   malformed or oversized status lines are retried until that point.
+    /// - [`ErrorReason::Io`] with `InvalidInput` when `path` is not a safe ASCII
+    ///   origin-form path.
+    pub async fn wait_for_http<F>(
+        &mut self,
+        addr: SocketAddr,
+        path: impl AsRef<str>,
+        expected: F,
+        within: Duration,
+    ) -> Result<()>
+    where
+        F: Fn(u16) -> bool + Send + Sync,
+    {
+        let path = path.as_ref();
+        validate_http_path(path).map_err(Error::io)?;
+        let request = Arc::<[u8]>::from(
+            format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .into_bytes(),
+        );
+        let expected = Arc::new(expected);
+        let deadline = Instant::now() + within.min(crate::MAX_DEADLINE);
+        self.poll_until(
+            move || {
+                let request = Arc::clone(&request);
+                let expected = Arc::clone(&expected);
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                async move {
+                    let cap = CONNECT_ATTEMPT_CAP
+                        .min(remaining)
+                        .max(Duration::from_millis(1));
+                    match tokio::time::timeout(cap, probe_http_status(addr, &request)).await {
+                        Ok(Ok(Some(status))) => expected(status),
+                        _ => false,
+                    }
+                }
+            },
+            within,
+        )
+        .await
+    }
+
     /// Wait until a Unix domain socket at `path` accepts a connection, or fail
     /// with [`ErrorReason::NotReady`] when `within` elapses — or immediately when the
     /// child exits first. The successful connection is dropped immediately;
@@ -604,6 +727,12 @@ fn probe_futures_are_send(rp: &mut RunningProcess) {
     assert_send(&rp.wait_for_pipe("ready", Duration::ZERO));
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
     assert_send(&rp.wait_for_port(addr, Duration::ZERO));
+    assert_send(&rp.wait_for_http(
+        addr,
+        "/healthz",
+        |status| (200..300).contains(&status),
+        Duration::ZERO,
+    ));
     assert_send(&rp.wait_for_socket("socket", Duration::ZERO));
 }
 
@@ -611,10 +740,114 @@ fn probe_futures_are_send(rp: &mut RunningProcess) {
 mod tests {
     use std::time::Duration;
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use crate::command::Command;
     use crate::doubles::{Reply, ScriptedRunner};
     use crate::error::ErrorReason;
     use crate::runner::ProcessRunner;
+
+    use super::{HTTP_STATUS_LINE_LIMIT, parse_http_status_line, validate_http_path};
+
+    #[test]
+    fn http_status_parser_accepts_http_1_status_lines_only() {
+        assert_eq!(
+            parse_http_status_line(b"HTTP/1.1 204 No Content\r\n"),
+            Some(204)
+        );
+        assert_eq!(parse_http_status_line(b"HTTP/1.0 503\n"), Some(503));
+        assert_eq!(parse_http_status_line(b"HTTP/2 200 OK\r\n"), None);
+        assert_eq!(parse_http_status_line(b"HTTP/1.1 20 OK\r\n"), None);
+        assert_eq!(parse_http_status_line(b"HTTP/1.1 999 Nope\r\n"), None);
+        assert_eq!(parse_http_status_line(b"garbage\r\n"), None);
+    }
+
+    #[test]
+    fn http_path_validation_rejects_unsafe_request_targets() {
+        for invalid in ["healthz", "/health check", "/ok\r\nX-Evil: yes", "/café"] {
+            assert!(
+                validate_http_path(invalid).is_err(),
+                "{invalid:?} must not enter an HTTP request"
+            );
+        }
+        validate_http_path("/healthz?deep=1").expect("safe origin-form target");
+    }
+
+    #[tokio::test]
+    async fn wait_for_http_retries_until_expected_status_and_sends_minimal_get() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP probe listener");
+        let addr = listener.local_addr().expect("local address");
+        let server = tokio::spawn(async move {
+            for status in [503, 204] {
+                let (mut stream, _) = listener.accept().await.expect("accept HTTP probe");
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 256];
+                    let read = stream.read(&mut chunk).await.expect("read request");
+                    assert!(read > 0, "probe closed before completing its request");
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).expect("ASCII request");
+                assert!(request.starts_with("GET /healthz?deep=1 HTTP/1.1\r\n"));
+                assert!(request.contains(&format!("\r\nHost: {addr}\r\n")));
+                assert!(request.ends_with("Connection: close\r\n\r\n"));
+                stream
+                    .write_all(format!("HTTP/1.1 {status} Test\r\n\r\nignored").as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::pending().with_stderr("starting\n"))
+            .start(&Command::new("service").stdout(crate::StdioMode::Null))
+            .await
+            .expect("scripted service start");
+        run.wait_for_http(
+            addr,
+            "/healthz?deep=1",
+            |status| (200..300).contains(&status),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("second response is ready");
+        assert!(run.stderr_sink.is_some(), "HTTP probe drains stderr");
+        server.await.expect("HTTP listener task");
+    }
+
+    #[tokio::test]
+    async fn wait_for_http_retries_oversized_status_lines() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP probe listener");
+        let addr = listener.local_addr().expect("local address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept HTTP probe");
+            let response = vec![b'x'; HTTP_STATUS_LINE_LIMIT + 1];
+            stream.write_all(&response).await.expect("write long line");
+        });
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::pending())
+            .start(&Command::new("service"))
+            .await
+            .expect("scripted service start");
+        let error = run
+            .wait_for_http(
+                addr,
+                "/",
+                |status| status == 200,
+                Duration::from_millis(150),
+            )
+            .await
+            .expect_err("oversized response never becomes ready");
+        assert!(matches!(error.reason(), ErrorReason::NotReady { .. }));
+        server.await.expect("HTTP listener task");
+    }
 
     #[tokio::test]
     async fn wait_for_stderr_line_matches_and_keeps_stdout_draining() {
