@@ -264,6 +264,9 @@ println!("detached daemon pid = {}", child.pid());
 # }
 ```
 
+For a safe runnable demonstration whose detached child exits by itself, see
+[`examples/detached.rs`](https://github.com/ZelAnton/ProcessKit-rs/blob/main/examples/detached.rs).
+
 What it does, and what it deliberately does **not**:
 
 - **Detach at birth.** Unix — a **new session** (`setsid`), no controlling

@@ -327,6 +327,11 @@ harness = false
 name = "compare"
 harness = false
 
+[[example]]
+name = "pty_dialog"
+path = "examples/pty_dialog.rs"
+required-features = ["pty"]
+
 [target.'cfg(windows)'.dev-dependencies]
 # Liveness probe (OpenProcess) in the integration tests that prove a grandchild is
 # reaped with its job — integration tests can't see the non-dev windows-sys.

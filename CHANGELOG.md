@@ -17,6 +17,8 @@ to a dated version section.
   deadline semantics as their stdout counterparts.
 - Add an opt-in cassette scrub hook that redacts arguments, working directories,
   and captured output before persistence while keeping replay keys symmetric.
+- Add runnable examples for PTY dialogs, lifecycle events, deliberately detached
+  children, and completion-ordered batch streaming.
 
 ### Changed
 

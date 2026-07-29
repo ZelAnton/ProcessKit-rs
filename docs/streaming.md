@@ -375,10 +375,13 @@ async fn main() -> processkit::Result<()> {
     };
     // Poll the event stream and the reaping `finish()` together.
     let (_, finished) = tokio::join!(render, run.finish());
-    println!("run finished: {:?}", finished?.outcome);
-    Ok(())
+println!("run finished: {:?}", finished?.outcome);
+Ok(())
 }
 ```
+
+Run the same pattern without external dependencies in
+[`examples/lifecycle_events.rs`](https://github.com/ZelAnton/ProcessKit-rs/blob/main/examples/lifecycle_events.rs).
 
 [`OutputLine`]: https://docs.rs/processkit/latest/processkit/struct.OutputLine.html
 [`Outcome`]: https://docs.rs/processkit/latest/processkit/enum.Outcome.html
@@ -472,6 +475,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+The self-contained
+[`examples/pty_dialog.rs`](https://github.com/ZelAnton/ProcessKit-rs/blob/main/examples/pty_dialog.rs)
+also demonstrates live resize; run it with `--features pty`.
 
 On Unix, the PTY slave has echo disabled so the answer is not copied into the
 merged capture. That guarantee is Unix-only; ConPTY offers no portable

@@ -111,6 +111,9 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
+[`examples/batch_stream.rs`](https://github.com/ZelAnton/ProcessKit-rs/blob/main/examples/batch_stream.rs)
+is a self-contained completion-order demo that launches child copies of itself.
+
 Reach for `output_stream` over `output_all` when either of these matters:
 
 - **First result early.** A fast command is handed back immediately instead of
