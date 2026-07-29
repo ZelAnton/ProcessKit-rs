@@ -72,6 +72,80 @@ async fn missing_program_surfaces_not_found_with_searched_path() {
     );
 }
 
+#[tokio::test]
+#[ignore = "exercises the real spawn path with a relocated child PATH"]
+async fn missing_program_reports_the_effective_child_path() {
+    let path_dir = tempfile::tempdir().expect("temp PATH dir");
+    let child_path = std::env::join_paths([path_dir.path()]).expect("single PATH entry");
+    let err = Command::new("processkit-definitely-not-installed-child-path")
+        .env("PATH", &child_path)
+        .output_string()
+        .await
+        .expect_err("an unknown program must error");
+
+    match err.into_reason() {
+        processkit::ErrorReason::NotFound { searched, .. } => assert_eq!(
+            searched,
+            Some(child_path.to_string_lossy().into_owned()),
+            "launch diagnostics must name the same effective child PATH as preflight"
+        ),
+        other => panic!("expected ErrorReason::NotFound, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+fn broken_interpreter_command() -> (tempfile::TempDir, Command) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("temp PATH dir");
+    let name = "processkit-present-with-missing-interpreter";
+    let program = dir.path().join(name);
+    std::fs::write(&program, b"#!/processkit/definitely/missing/interpreter\n")
+        .expect("write executable stub");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("mark stub executable");
+    let child_path = std::env::join_paths([dir.path()]).expect("single PATH entry");
+    (dir, Command::new(name).env("PATH", child_path))
+}
+
+#[cfg(unix)]
+fn assert_located_spawn_error(err: processkit::Error) {
+    assert!(
+        matches!(err.reason(), processkit::ErrorReason::Spawn { .. }),
+        "a program found on the effective child PATH must remain Spawn, not NotFound: {err:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "exercises pipe and detached real-spawn NotFound enrichment"]
+async fn relocated_path_found_program_is_spawn_error_for_pipe_and_detached_launches() {
+    let (_dir, command) = broken_interpreter_command();
+    let err = command
+        .output_string()
+        .await
+        .expect_err("the missing interpreter prevents exec");
+    assert_located_spawn_error(err);
+
+    let err = command
+        .spawn_detached()
+        .expect_err("the missing interpreter prevents detached exec");
+    assert_located_spawn_error(err);
+}
+
+#[cfg(all(unix, feature = "pty"))]
+#[tokio::test]
+#[ignore = "exercises PTY real-spawn NotFound enrichment"]
+async fn relocated_path_found_program_is_spawn_error_for_pty_launch() {
+    let (_dir, command) = broken_interpreter_command();
+    let err = command
+        .use_pty()
+        .output_string()
+        .await
+        .expect_err("the missing interpreter prevents PTY exec");
+    assert_located_spawn_error(err);
+}
+
 // Regression: a bare program name that the OS resolves by a route we don't model
 // must NOT be falsely rejected as `NotFound`. On Windows std also searches the
 // *application directory* (the running exe's dir), not just PATH — a helper

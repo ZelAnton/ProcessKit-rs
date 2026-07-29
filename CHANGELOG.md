@@ -58,6 +58,8 @@ to a dated version section.
 
 ### Fixed
 
+- Keep post-spawn `NotFound` diagnostics aligned with the command's effective
+  child `PATH`, matching preflight and launch-time resolution.
 - Bound the in-flight decode buffer when `wait`, `drain`, or `profile` adopts a
   dropped stream, including newline-free output that started unbounded.
 - Preserve ConPTY failure diagnostics by decoding Win32-backed HRESULT values

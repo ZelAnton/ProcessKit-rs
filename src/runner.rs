@@ -6,7 +6,7 @@
 //! both — its `start` hands back a scripted handle that feeds canned lines
 //! through the same pump machinery a real child uses.
 
-use crate::command::{Command, PathSource, ProgramResolution, is_bare_name, resolve_program};
+use crate::command::{Command, ProgramResolution, is_bare_name, resolve_program};
 use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::result::ProcessResult;
@@ -881,19 +881,14 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
                     // uses (`command::resolve_program`) to enrich the diagnostic —
                     // one decision, so the two can never disagree. `prefer_local`
                     // is parent-side (plain filesystem probes, independent of the
-                    // child env), so it is always searched and always safe to name;
-                    // the process `PATH` is searched only when the command has NOT
-                    // relocated the child `PATH` (`PathSource::Skip` otherwise —
-                    // the process `PATH` would be the wrong list to name there).
-                    let path = if command.customizes_path() {
-                        PathSource::Skip
-                    } else {
-                        PathSource::ProcessPath
-                    };
+                    // child env), so it is always searched and always safe to name.
+                    // The shared path source selects either the process `PATH` or
+                    // the command's effective child `PATH`, matching preflight and
+                    // the launch rewrite exactly.
                     return match resolve_program(
                         command.program(),
                         command.prefer_local_dirs(),
-                        path,
+                        command.resolution_path_source(),
                     ) {
                         // Located parent-side (a `prefer_local` match) or on `PATH`,
                         // yet the OS still refused with NotFound — the program
@@ -1003,12 +998,11 @@ fn map_spawn_error(command: &Command, err: crate::Error) -> crate::Error {
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
             if is_bare_name(command.program()) {
-                let path = if command.customizes_path() {
-                    PathSource::Skip
-                } else {
-                    PathSource::ProcessPath
-                };
-                match resolve_program(command.program(), command.prefer_local_dirs(), path) {
+                match resolve_program(
+                    command.program(),
+                    command.prefer_local_dirs(),
+                    command.resolution_path_source(),
+                ) {
                     ProgramResolution::Found(_) => crate::ErrorReason::Spawn {
                         program: command.program_name(),
                         source,
@@ -1127,6 +1121,28 @@ mod tests {
     use crate::result::Outcome;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
+
+    #[cfg(feature = "pty")]
+    #[test]
+    fn pty_spawn_error_names_the_effective_child_path() {
+        let dir = tempfile::tempdir().expect("temp PATH dir");
+        let child_path = std::env::join_paths([dir.path()]).expect("single PATH entry");
+        let command = Command::new("processkit-missing-pty-path").env("PATH", &child_path);
+        let raw = ErrorReason::Spawn {
+            program: command.program_name(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "synthetic PTY spawn miss"),
+        }
+        .into();
+
+        match map_spawn_error(&command, raw).into_reason() {
+            ErrorReason::NotFound { searched, .. } => assert_eq!(
+                searched,
+                Some(child_path.to_string_lossy().into_owned()),
+                "PTY enrichment must use the effective child PATH"
+            ),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

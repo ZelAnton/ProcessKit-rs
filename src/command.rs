@@ -1909,16 +1909,10 @@ impl Command {
     /// Whether the command customizes the environment in a way that could move
     /// `PATH` away from the process `PATH` — an explicit `PATH` override/removal,
     /// [`env_clear`](Self::env_clear), or [`inherit_env`](Self::inherit_env)
-    /// (which clears the inherited set). When true, the *`PATH`*-directory
-    /// naming in [`ErrorReason::NotFound`] is skipped:
-    /// `find_in_path` reads the *process* `PATH`, so against a custom child
-    /// `PATH` that list would be wrong. [`prefer_local`](Self::prefer_local)
-    /// directories are unaffected by this gate and still get named — they're
-    /// resolved by plain filesystem probes on the parent side, independent of
-    /// the child's environment. A missing program still surfaces as
-    /// `ErrorReason::NotFound` (so [`is_not_found`](crate::Error::is_not_found)
-    /// holds), with `searched: None` only when there are no `prefer_local`
-    /// directories to name either.
+    /// (which clears the inherited set). The shared resolution path uses this to
+    /// choose the command's computed effective child `PATH` instead of the
+    /// process `PATH`, keeping preflight, launch rewriting, and post-spawn
+    /// `NotFound` enrichment in agreement.
     pub(crate) fn customizes_path(&self) -> bool {
         self.env_clear
             || self.inherit_env.is_some()
@@ -2679,7 +2673,7 @@ impl Command {
     /// [`build_tokio`](Self::build_tokio) rewrite, so both resolve a bare name
     /// against the identical `PATH` list — the single source of the parity
     /// between what `which` reports and what a run actually spawns.
-    fn resolution_path_source(&self) -> PathSource {
+    pub(crate) fn resolution_path_source(&self) -> PathSource {
         if self.customizes_path() {
             // The command moves the child's `PATH` away from the process `PATH`,
             // so resolve against the value the child will actually receive.
@@ -2990,12 +2984,11 @@ impl Command {
     /// [`resolve_program`] so the two can't disagree.
     fn detached_not_found(&self, source: std::io::Error) -> Error {
         if is_bare_name(&self.program) {
-            let path = if self.customizes_path() {
-                PathSource::Skip
-            } else {
-                PathSource::ProcessPath
-            };
-            return match resolve_program(&self.program, &self.prefer_local, path) {
+            return match resolve_program(
+                &self.program,
+                &self.prefer_local,
+                self.resolution_path_source(),
+            ) {
                 ProgramResolution::Found(_) => ErrorReason::Spawn {
                     program: self.program_name(),
                     source,
@@ -3571,12 +3564,6 @@ pub(crate) enum PathSource {
     /// when the command relocates `PATH` (`env`/`env_remove`/`env_clear`/
     /// `inherit_env`) so the process `PATH` would be the wrong list.
     Explicit(Option<OsString>),
-    /// Do **not** search a `PATH` — report only the `prefer_local` directories
-    /// in `searched`. Used by the launch-path `NotFound` enrichment for a
-    /// command that relocated its child `PATH`: the OS already searched the
-    /// child `PATH` and came up empty, and the *process* `PATH` (all
-    /// [`find_in_path`] can read) is the wrong list to name here.
-    Skip,
 }
 
 /// The outcome of resolving a command's `program` to a concrete executable path
@@ -3628,18 +3615,6 @@ pub(crate) fn resolve_program(
         return ProgramResolution::Found(found);
     }
     let (found, path_searched) = match path {
-        PathSource::Skip => {
-            // No `PATH` search: only the `prefer_local` directories are safe to
-            // name (the process `PATH` would be the wrong list for a relocated
-            // child `PATH`).
-            let prefer = prepend_prefer_local_to_searched(prefer_local, "");
-            let searched = if prefer.is_empty() {
-                None
-            } else {
-                Some(prefer)
-            };
-            return ProgramResolution::NotFound { searched };
-        }
         PathSource::ProcessPath => find_in_path(program),
         PathSource::Explicit(value) => find_in_path_in(program, value.as_deref()),
     };
@@ -4590,12 +4565,12 @@ mod tests {
     }
 
     #[test]
-    fn customizes_path_gates_the_not_found_enrichment() {
-        // A plain command does not customize PATH — the rich NotFound applies.
+    fn customizes_path_selects_effective_child_path_resolution() {
+        // A plain command does not customize PATH — resolution uses the process
+        // PATH. Any operation that can relocate PATH selects the computed child
+        // value instead.
         assert!(!Command::new("git").customizes_path());
         assert!(!Command::new("git").env("FOO", "1").customizes_path());
-        // Anything that can move PATH away from the process PATH disables the
-        // process-PATH enrichment (else its "searched" list would be wrong).
         assert!(
             Command::new("git")
                 .env("PATH", "/opt/bin")
@@ -5143,6 +5118,26 @@ mod tests {
         let removed = Command::new("x").env_remove("PATH");
         assert_eq!(tokio_path_env(&removed), Some(None));
         assert_eq!(removed.effective_path_value(), None);
+    }
+
+    #[test]
+    fn detached_not_found_names_the_effective_child_path() {
+        let dir = tempfile::tempdir().expect("temp PATH dir");
+        let child_path = std::env::join_paths([dir.path()]).expect("single PATH entry");
+        let command = Command::new("processkit-missing-detached-path").env("PATH", &child_path);
+        let err = command.detached_not_found(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "synthetic spawn miss",
+        ));
+
+        match err.into_reason() {
+            crate::ErrorReason::NotFound { searched, .. } => assert_eq!(
+                searched,
+                Some(child_path.to_string_lossy().into_owned()),
+                "detached enrichment must use the effective child PATH"
+            ),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[test]
