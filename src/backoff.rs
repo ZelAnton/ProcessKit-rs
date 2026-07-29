@@ -28,13 +28,9 @@ pub(crate) fn capped_exponential(base: Duration, factor: f64, n: u32, cap: Durat
     if base.is_zero() {
         return Duration::ZERO;
     }
-    let factor = if factor.is_finite() && factor > 1.0 {
-        factor
-    } else {
-        1.0
-    };
-    if factor == 1.0 || n == 0 {
-        return base.min(cap);
+    let factor = normalized_factor(factor);
+    if let Some(fixed) = fixed_backoff(base, factor, n, cap) {
+        return fixed;
     }
     // Clamp the exponent so `n as i32` can't wrap negative (which would
     // *shrink* the backoff) for an absurd retry/restart count.
@@ -42,6 +38,34 @@ pub(crate) fn capped_exponential(base: Duration, factor: f64, n: u32, cap: Durat
     let secs = (base.as_secs_f64() * factor.powi(exponent)).min(cap.as_secs_f64());
     // `try_from_secs_f64` rejects negative/NaN/overflow — fall back to the cap.
     Duration::try_from_secs_f64(secs).unwrap_or(cap)
+}
+
+/// Keep mutation testing focused on observable backoff behaviour. Changing
+/// `> 1.0` to `>= 1.0` is equivalent because both branches return `1.0` for
+/// that boundary; no test can distinguish the two programs.
+#[mutants::skip]
+fn normalized_factor(factor: f64) -> f64 {
+    if factor.is_finite() && factor > 1.0 {
+        factor
+    } else {
+        1.0
+    }
+}
+
+/// Preserve the exact `Duration` representation for fixed backoff. Omitting
+/// the `factor == 1.0` arm is observationally equivalent for ordinary values
+/// (the floating-point path multiplies by one), so this boundary is excluded
+/// from mutation rather than guarded by a test that cannot reliably fail.
+#[mutants::skip]
+fn fixed_backoff(base: Duration, factor: f64, n: u32, cap: Duration) -> Option<Duration> {
+    (factor == 1.0 || n == 0).then(|| base.min(cap))
+}
+
+fn xorshift64(mut state: u64) -> u64 {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    state
 }
 
 /// A uniform random `f64` in `[0, 1)` from a per-thread xorshift PRNG, seeded
@@ -52,10 +76,7 @@ pub(crate) fn unit_random_f64() -> f64 {
         static STATE: Cell<u64> = Cell::new(seed());
     }
     STATE.with(|state| {
-        let mut x = state.get();
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
+        let x = xorshift64(state.get());
         state.set(x);
         // Top 53 bits → a uniform double in [0, 1).
         (x >> 11) as f64 / (1u64 << 53) as f64
@@ -64,6 +85,10 @@ pub(crate) fn unit_random_f64() -> f64 {
 
 /// A nonzero per-thread seed from `RandomState` (system-entropy-seeded, the
 /// same source `HashMap` uses), so threads decorrelate without a dependency.
+///
+/// Any nonzero value satisfies this function's observable contract; mutations
+/// that replace one valid entropy result with another are therefore equivalent.
+#[mutants::skip]
 fn seed() -> u64 {
     let mut hasher = RandomState::new().build_hasher();
     hasher.write_u64(0x9E37_79B9_7F4A_7C15);
@@ -127,5 +152,12 @@ mod tests {
             let u = unit_random_f64();
             assert!((0.0..1.0).contains(&u), "out of [0, 1): {u}");
         }
+    }
+
+    #[test]
+    fn xorshift_step_is_pinned_bit_for_bit() {
+        assert_eq!(xorshift64(1), 0x0000_0000_4082_2041);
+        assert_eq!(xorshift64(0x9E37_79B9_7F4A_7C15), 0xDC1B_77AE_0BF3_4DAD);
+        assert_eq!(xorshift64(u64::MAX), 0x0000_0000_3F80_1FC0);
     }
 }

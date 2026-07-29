@@ -28,6 +28,8 @@ to a dated version section.
   real-VM smoke tier.
 - Exercise Windows-specific code on hosted ARM64 runners in both clippy and
   real-subprocess test matrices.
+- Expand mutation testing to the hermetic backoff, digest, and resource-limit
+  modules while preserving per-shard runtime with a ten-way matrix.
 
 ### Fixed
 

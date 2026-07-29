@@ -215,7 +215,7 @@ impl LimitReason {
 
 #[cfg(test)]
 mod tests {
-    use super::{LimitKind, LimitReason};
+    use super::{LimitKind, LimitReason, ResourceLimits};
 
     const ALL_KINDS: &[LimitKind] = &[LimitKind::Memory, LimitKind::Processes, LimitKind::Cpu];
     const ALL_REASONS: &[LimitReason] = &[
@@ -254,5 +254,31 @@ mod tests {
         assert_eq!(LimitKind::from_name("ram"), None);
         assert_eq!(LimitReason::from_name(""), None);
         assert_eq!(LimitReason::from_name("unenforced"), None);
+    }
+
+    #[test]
+    fn any_detects_each_limit_axis_independently() {
+        assert!(!ResourceLimits::default().any());
+        assert!(
+            ResourceLimits {
+                max_memory: Some(1),
+                ..ResourceLimits::default()
+            }
+            .any()
+        );
+        assert!(
+            ResourceLimits {
+                max_processes: Some(1),
+                ..ResourceLimits::default()
+            }
+            .any()
+        );
+        assert!(
+            ResourceLimits {
+                cpu_quota: Some(0.5),
+                ..ResourceLimits::default()
+            }
+            .any()
+        );
     }
 }

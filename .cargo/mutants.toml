@@ -9,16 +9,22 @@
 # caught after paying for a real process spawn/kill, which is exactly what
 # makes this tier slow and noisy without adding a useful signal.
 #
-# The starting scope is limited to hermetic, pure-logic modules that are fully
+# The scope is limited to hermetic, pure-logic modules that are fully
 # exercised by fast unit tests with no live subprocess: the line-decode pump
 # (pump.rs), the capture buffer's cap/eviction logic (buffer.rs), the backoff/
 # retry policy (retry.rs), the run outcome classification (result.rs) and the
-# error type (error.rs). Grow this list as more modules gain hermetic coverage
-# (e.g. a standalone backoff.rs, once split out) rather than widening it
-# wholesale.
+# error type (error.rs). The shared backoff math, stable cassette digest and
+# resource-limit value logic are similarly self-contained. command.rs remains
+# deliberately excluded: its ~350 possible mutants span filesystem probing and
+# launch construction, nearly doubling the tier and eroding the 10-shard budget.
+# Grow this list module-by-module as hermetic coverage matures rather than
+# widening it wholesale.
 examine_globs = [
     "src/pump.rs",
     "src/buffer.rs",
+    "src/backoff.rs",
+    "src/digest.rs",
+    "src/limits.rs",
     "src/retry.rs",
     "src/result.rs",
     "src/error.rs",

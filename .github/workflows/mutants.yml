@@ -21,10 +21,9 @@ name: mutants
 # grants, and every scheduled run 2026-07-08..2026-07-11 ended cancelled/failed
 # mid-sweep (run 29144347707 was the latest).
 #
-# Fix: split the mutant list across an 8-way matrix using cargo-mutants' native
-# `--shard k/8`. Sharding deterministically partitions the SAME ~400 mutants
-# (same .cargo/mutants.toml scope, same auto-timeout) into 8 disjoint subsets of
-# ~50 — it does NOT narrow the scope and does NOT shrink the per-mutant timeout,
+# Fix: split the mutant list across a 10-way matrix using cargo-mutants' native
+# `--shard k/10`. The current scope is about 680 mutants, so this partitions it
+# into subsets of about 68. It does NOT narrow the scope or shrink the per-mutant timeout,
 # so total mutation coverage is unchanged and no real MISSED mutant can be
 # hidden by this change. Only the parallelism changes.
 #
@@ -32,14 +31,13 @@ name: mutants
 #
 #     one unmutated baseline build + test, paid once per shard runner
 #         ~2 min warm cache … ~10 min cold cache (first sharded run)
-#   + ~50 mutants × ~1 min                                       ≈ 50 min
+#   + ~68 mutants × ~1 min                                       ≈ 68 min
 #   ------------------------------------------------------------------------
-#     ≈ 52 min warm  …  ≈ 60 min cold, worst case, per shard
+#     ≈ 70 min warm  …  ≈ 78 min cold, worst case, per shard
 #
-# i.e. ~52–60 min against the per-job `timeout-minutes: 90` below — a ~30–38 min
-# (≈1.5–1.7×) headroom that absorbs runner variance, versus the old single job
-# that could not finish at all. If the scope in .cargo/mutants.toml grows enough
-# that ~400 mutants climbs and erodes this headroom, raise the shard count in the
+# i.e. ~70–78 min against the per-job `timeout-minutes: 90` below — a 12–20 min
+# headroom that absorbs runner variance, versus the old single job that could
+# not finish at all. If the scope in .cargo/mutants.toml grows enough to erode this headroom, raise the shard count in the
 # matrix below (keep the `--shard k/N` denominator in step).
 #
 # Single overall verdict, and what "green" means (T-129)
@@ -156,27 +154,27 @@ env:
 
 jobs:
   mutants:
-    name: mutants (shard ${{ matrix.shard }}/8)
+    name: mutants (shard ${{ matrix.shard }}/10)
     runs-on: ubuntu-latest
-    # Generous per-shard ceiling: each shard is estimated at ~52–60 min (see the
-    # budget note above), so 90 min is a ~1.5× backstop that still hard-fails a
+    # Generous per-shard ceiling: each shard is estimated at ~70–78 min (see the
+    # budget note above), so 90 min retains useful headroom and still hard-fails a
     # pathologically slow shard instead of letting it hang the whole tier.
     timeout-minutes: 90
     strategy:
       # Run every shard to its own verdict; one red shard already reds the run.
       fail-fast: false
       matrix:
-        # 8-way split of the ~400-mutant scope (see the header note). Grow this
+        # 10-way split of the ~680-mutant scope (see the header note). Grow this
         # list — and the `--shard k/N` denominator below — together if the mutant
         # count rises enough to erode the per-shard headroom.
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-mutants
       # Scope, exclusions and `--all-features` all come from .cargo/mutants.toml
-      # (auto-loaded by cargo-mutants); `--shard k/8` is the only CLI parameter,
+      # (auto-loaded by cargo-mutants); `--shard k/10` is the only CLI parameter,
       # selecting this job's disjoint subset of that fixed scope.
       #
       # Verdict is decided from mutants.out/{missed,timeout}.txt, not from
@@ -189,7 +187,7 @@ jobs:
       - name: Run mutants shard
         run: |
           set +e
-          cargo mutants --shard ${{ matrix.shard }}/8
+          cargo mutants --shard ${{ matrix.shard }}/10
           status=$?
           set -e
 
@@ -199,22 +197,22 @@ jobs:
           # Exit 2/3 are mutant-outcome verdicts only when cargo-mutants wrote
           # the matching files. A crash or interrupted run must stay red.
           if [ "$status" -eq 3 ] && [ ! -s "$timeout_file" ]; then
-            echo "::error::cargo-mutants exited 3 in shard ${{ matrix.shard }}/8 without a non-empty timeout.txt — treating incomplete output as a hard failure"
+            echo "::error::cargo-mutants exited 3 in shard ${{ matrix.shard }}/10 without a non-empty timeout.txt — treating incomplete output as a hard failure"
             exit 1
           fi
 
           if [ "$status" -eq 2 ] && [ ! -s "$missed_file" ] && [ ! -s "$timeout_file" ]; then
-            echo "::error::cargo-mutants exited 2 in shard ${{ matrix.shard }}/8 without a non-empty missed.txt or timeout.txt — treating incomplete output as a hard failure"
+            echo "::error::cargo-mutants exited 2 in shard ${{ matrix.shard }}/10 without a non-empty missed.txt or timeout.txt — treating incomplete output as a hard failure"
             exit 1
           fi
 
           if [ -s "$timeout_file" ]; then
             count=$(wc -l < "$timeout_file" | tr -d ' ')
-            echo "::warning::${count} mutant(s) timed out in shard ${{ matrix.shard }}/8 (tolerated — hang-by-construction, not a MISSED signal; see workflow header)"
-            echo "--- timeout.txt (shard ${{ matrix.shard }}/8, tolerated) ---"
+            echo "::warning::${count} mutant(s) timed out in shard ${{ matrix.shard }}/10 (tolerated — hang-by-construction, not a MISSED signal; see workflow header)"
+            echo "--- timeout.txt (shard ${{ matrix.shard }}/10, tolerated) ---"
             cat "$timeout_file"
             {
-              echo "### TIMEOUT mutants (tolerated) — shard ${{ matrix.shard }}/8"
+              echo "### TIMEOUT mutants (tolerated) — shard ${{ matrix.shard }}/10"
               echo '```'
               cat "$timeout_file"
               echo '```'
@@ -223,11 +221,11 @@ jobs:
 
           if [ -s "$missed_file" ]; then
             count=$(wc -l < "$missed_file" | tr -d ' ')
-            echo "::error::${count} mutant(s) MISSED in shard ${{ matrix.shard }}/8 — real coverage gap"
-            echo "--- missed.txt (shard ${{ matrix.shard }}/8) ---"
+            echo "::error::${count} mutant(s) MISSED in shard ${{ matrix.shard }}/10 — real coverage gap"
+            echo "--- missed.txt (shard ${{ matrix.shard }}/10) ---"
             cat "$missed_file"
             {
-              echo "### MISSED mutants — shard ${{ matrix.shard }}/8"
+              echo "### MISSED mutants — shard ${{ matrix.shard }}/10"
               echo '```'
               cat "$missed_file"
               echo '```'
@@ -236,8 +234,8 @@ jobs:
           fi
 
           if [ "$status" -ne 0 ] && [ "$status" -ne 2 ] && [ "$status" -ne 3 ]; then
-            echo "::error::cargo-mutants exited ${status} in shard ${{ matrix.shard }}/8 for a reason other than mutant outcomes (no MISSED, mutants.out/missed.txt empty/absent) — treating as a hard failure, not tolerating"
+            echo "::error::cargo-mutants exited ${status} in shard ${{ matrix.shard }}/10 for a reason other than mutant outcomes (no MISSED, mutants.out/missed.txt empty/absent) — treating as a hard failure, not tolerating"
             exit "$status"
           fi
 
-          echo "Shard ${{ matrix.shard }}/8: no MISSED mutants (cargo-mutants exit code was ${status}; TIMEOUT-only outcomes are tolerated per policy — see workflow header)."
+          echo "Shard ${{ matrix.shard }}/10: no MISSED mutants (cargo-mutants exit code was ${status}; TIMEOUT-only outcomes are tolerated per policy — see workflow header)."
