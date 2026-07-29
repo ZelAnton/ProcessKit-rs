@@ -588,7 +588,7 @@ stdout.
 Spawn-time controls for sandboxing and service launch:
 
 ```rust,no_run
-use processkit::Command;
+use processkit::{Command, RlimitResource};
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {
@@ -596,6 +596,7 @@ async fn main() -> processkit::Result<()> {
         .inherit_env(["PATH", "HOME", "LANG"]) // allow-list on a cleared env
         .uid(1000).gid(1000)                   // Unix: drop privileges
         .setsid()                              // Unix: new session
+        .rlimit(RlimitResource::Core, 0, 0)    // Unix: disable child core dumps
         .run()
         .await?;
 

@@ -562,7 +562,7 @@ Containment is preserved in every combination; the platform fine print
 the pdeathsig thread caveat) is collected in
 [Platform support](platform-support.md#caveats).
 
-### Scheduling: CPU priority, affinity, I/O priority, and `umask`
+### Scheduling, `umask`, and per-process rlimits
 
 Spawn-time knobs reuse the same seams as the builders above — Unix `pre_exec`
 and Windows' suspended-child configuration — for background/batch children
@@ -570,7 +570,7 @@ that shouldn't starve the foreground, and for controlling the permissions of
 files a child creates:
 
 ```rust,no_run
-use processkit::{Command, IoPriority, Priority};
+use processkit::{Command, IoPriority, Priority, RlimitResource};
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {
@@ -591,6 +591,12 @@ async fn main() -> processkit::Result<()> {
 
     // Unix only: files this child creates get 0644/0755 instead of 0666/0777.
     Command::new("worker").umask(0o022).run().await?;
+
+    // Unix only: disable core dumps and cap this child's open descriptors.
+    Command::new("secret-worker")
+        .rlimit(RlimitResource::Core, 0, 0)
+        .rlimit(RlimitResource::NoFile, 256, 256)
+        .run().await?;
     Ok(())
 }
 ```

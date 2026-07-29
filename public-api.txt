@@ -607,6 +607,33 @@ impl core::marker::Unpin for processkit::RestartPolicy
 impl core::marker::UnsafeUnpin for processkit::RestartPolicy
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::RestartPolicy
 impl core::panic::unwind_safe::UnwindSafe for processkit::RestartPolicy
+#[non_exhaustive] pub enum processkit::RlimitResource
+pub processkit::RlimitResource::Core
+pub processkit::RlimitResource::Cpu
+pub processkit::RlimitResource::Data
+pub processkit::RlimitResource::FileSize
+pub processkit::RlimitResource::NoFile
+pub processkit::RlimitResource::Stack
+impl processkit::RlimitResource
+pub fn processkit::RlimitResource::name(self) -> &'static str
+impl core::clone::Clone for processkit::RlimitResource
+pub fn processkit::RlimitResource::clone(&self) -> processkit::RlimitResource
+impl core::cmp::Eq for processkit::RlimitResource
+impl core::cmp::PartialEq for processkit::RlimitResource
+pub fn processkit::RlimitResource::eq(&self, &processkit::RlimitResource) -> bool
+impl core::fmt::Debug for processkit::RlimitResource
+pub fn processkit::RlimitResource::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for processkit::RlimitResource
+pub fn processkit::RlimitResource::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for processkit::RlimitResource
+impl core::marker::StructuralPartialEq for processkit::RlimitResource
+impl core::marker::Freeze for processkit::RlimitResource
+impl core::marker::Send for processkit::RlimitResource
+impl core::marker::Sync for processkit::RlimitResource
+impl core::marker::Unpin for processkit::RlimitResource
+impl core::marker::UnsafeUnpin for processkit::RlimitResource
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::RlimitResource
+impl core::panic::unwind_safe::UnwindSafe for processkit::RlimitResource
 #[non_exhaustive] pub enum processkit::Signal
 pub processkit::Signal::Hup
 pub processkit::Signal::Int
@@ -868,6 +895,7 @@ pub fn processkit::Command::resolve_program(&self) -> processkit::Result<std::pa
 pub fn processkit::Command::retry(self, u32, core::time::Duration, impl core::ops::function::Fn(&processkit::Error) -> bool + core::marker::Send + core::marker::Sync + 'static) -> Self
 pub fn processkit::Command::retry_never(self) -> Self
 pub fn processkit::Command::retry_with(self, processkit::RetryPolicy, impl core::ops::function::Fn(&processkit::Error) -> bool + core::marker::Send + core::marker::Sync + 'static) -> Self
+pub fn processkit::Command::rlimit(self, processkit::RlimitResource, u64, u64) -> Self
 pub async fn processkit::Command::run(&self) -> processkit::Result<alloc::string::String>
 pub async fn processkit::Command::run_unit(&self) -> processkit::Result<()>
 pub fn processkit::Command::sanitize_vt(self) -> Self

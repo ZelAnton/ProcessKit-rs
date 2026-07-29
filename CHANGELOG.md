@@ -13,6 +13,8 @@ to a dated version section.
 
 ### Added
 
+- Add typed Unix per-process `rlimit` builders for CPU, core, data, file-size,
+  open-file, and stack caps, with loud unsupported behavior elsewhere.
 - Add a dependency-free plain-HTTP readiness probe that waits for caller-selected
   response status codes without reading bodies or following redirects.
 - Add opt-in per-stage stderr merging for shell-free pipelines, using one

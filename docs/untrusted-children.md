@@ -144,7 +144,7 @@ On Unix, `uid`/`gid`/`groups` drop the child's identity before it ever
 `exec`s; the crate handles the ordering that privilege drop demands:
 
 ```rust,no_run
-use processkit::Command;
+use processkit::{Command, RlimitResource};
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {
@@ -154,6 +154,8 @@ async fn main() -> processkit::Result<()> {
         .uid(1000)            // dropped last
         .setsid()             // new session: detaches from the controlling terminal
         .umask(0o022)          // files the child creates get 0644/0755, not 0666/0777
+        .rlimit(RlimitResource::Core, 0, 0) // never write a secret-bearing core dump
+        .rlimit(RlimitResource::NoFile, 256, 256) // cap this process's open fds
         .run().await?;
     Ok(())
 }
@@ -164,7 +166,7 @@ The OS syscall order is fixed internally regardless of builder call order:
 alone leaves the child holding the *parent's* (often root's) supplementary
 groups, which can still grant access you meant to remove; always pair
 `uid`/`gid` with an explicit `groups()` (or `groups([])` to drop every
-extra). `uid`/`gid`/`groups`/`setsid`/`umask` are Unix-only: on Windows the
+extra). `uid`/`gid`/`groups`/`setsid`/`umask`/`rlimit` are Unix-only: on Windows the
 run fails with `ErrorReason::Unsupported` rather than silently proceeding without
 a drop — a wrapper that must run cross-platform should branch on the
 platform ahead of time rather than assume the drop happened. None of this
@@ -176,6 +178,13 @@ scratch`-style) still drops privileges correctly. Detail: [Running commands
 [Running in containers → minimal images](containers.md#minimal-images-muslalpine-no-shell-no-setpriv),
 platform fine print (the cgroup × `uid` ordering interaction, `setsid` ×
 process-group coordination) in [Platform support → caveats](platform-support.md#caveats).
+
+`rlimit` is per process, not an aggregate substitute for cgroup/Job Object
+limits. It is useful even where whole-tree caps are unavailable: disable core
+dumps, bound descriptors or generated file size, and set a hard ceiling the
+child cannot raise. Descendants inherit the cap but each has its own accounting;
+for a shared tree-wide memory/CPU/process budget, keep using `ResourceLimits`
+where the active containment mechanism can enforce them.
 
 ## 4. Keep the environment hermetic
 

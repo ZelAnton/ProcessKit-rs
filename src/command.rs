@@ -187,6 +187,8 @@ pub struct Command {
     /// File-mode creation mask for the child (Unix `umask(2)`, see
     /// [`Self::umask`]). Unix-only — `Unsupported` elsewhere.
     umask: Option<u32>,
+    /// Per-process Unix resource caps, one last-write-wins entry per resource.
+    rlimits: Vec<(crate::RlimitResource, u64, u64)>,
     /// Kill the direct child if this process dies abruptly (see
     /// [`Self::kill_on_parent_death`]).
     kill_on_parent_death: bool,
@@ -268,6 +270,7 @@ impl Command {
             cpu_affinity: None,
             io_priority: None,
             umask: None,
+            rlimits: Vec::new(),
             kill_on_parent_death: false,
             creation_flags_extra: 0,
             windows_graceful_ctrl_break: false,
@@ -611,6 +614,38 @@ impl Command {
     /// would give the `umask` shell builtin, e.g. `0o022`.
     pub fn umask(mut self, mask: u32) -> Self {
         self.umask = Some(mask);
+        self
+    }
+
+    /// Set a Unix per-process soft and hard resource limit for the child.
+    ///
+    /// The limit is installed with `setrlimit(2)` after `fork` and before
+    /// `exec`, while the child still has its original credentials. It therefore
+    /// works on Linux process-group fallback and macOS/BSD as well as Linux
+    /// cgroup containment, complementing the `limits` feature's whole-tree caps.
+    /// Descendants inherit the values but can lower them; they can raise the
+    /// soft value only as far as `hard`.
+    ///
+    /// Values use the native unit named by [`RlimitResource`](crate::RlimitResource)
+    /// (bytes for size limits, seconds for CPU, a count for open files). `soft`
+    /// must not exceed `hard`; an invalid pair fails before spawning with
+    /// [`ErrorReason::Io`] (`InvalidInput`). Kernel permission or policy refusal
+    /// is reported as [`ErrorReason::Spawn`]. On non-Unix targets launch fails
+    /// with [`ErrorReason::Unsupported`] rather than silently ignoring the cap.
+    ///
+    /// Calls for different resources accumulate. Repeating the same resource is
+    /// last-write-wins, avoiding an earlier hard-limit reduction that would make
+    /// a later replacement impossible in the post-fork child.
+    pub fn rlimit(mut self, resource: crate::RlimitResource, soft: u64, hard: u64) -> Self {
+        if let Some(entry) = self
+            .rlimits
+            .iter_mut()
+            .find(|(configured, _, _)| *configured == resource)
+        {
+            *entry = (resource, soft, hard);
+        } else {
+            self.rlimits.push((resource, soft, hard));
+        }
         self
     }
 
@@ -2156,6 +2191,13 @@ impl Command {
         self.umask
     }
 
+    /// Whether Unix per-process limits were requested — read only by the
+    /// non-Unix unsupported gate.
+    #[cfg(not(unix))]
+    pub(crate) fn requested_rlimits(&self) -> bool {
+        !self.rlimits.is_empty()
+    }
+
     /// The requested Linux I/O priority — read by the non-Linux unsupported gate.
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn requested_io_priority(&self) -> Option<crate::IoPriority> {
@@ -2434,6 +2476,13 @@ impl Command {
     /// Build the `tokio` command with stdio wired for capture. Containment
     /// (cgroup/job/process-group) is added by the group's `spawn`.
     pub(crate) fn build_tokio(&self) -> Result<tokio::process::Command> {
+        #[cfg(not(unix))]
+        if !self.rlimits.is_empty() {
+            return Err(ErrorReason::Unsupported {
+                operation: "rlimit (Unix-only)".into(),
+            }
+            .into());
+        }
         #[cfg(not(target_os = "linux"))]
         if self.io_priority.is_some() {
             return Err(ErrorReason::Unsupported {
@@ -2547,6 +2596,32 @@ impl Command {
                 unsafe {
                     cmd.as_std_mut().pre_exec(move || {
                         libc::umask(mask as libc::mode_t);
+                        Ok(())
+                    });
+                }
+            }
+            if !self.rlimits.is_empty() {
+                let limits = self
+                    .rlimits
+                    .iter()
+                    .map(|&(resource, soft, hard)| {
+                        resource.prepare(soft, hard).map(|limit| (resource, limit))
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .map_err(Error::io)?;
+                // Register before the privilege-drop hooks below: raising a
+                // hard limit may require credentials the requested uid/gid drop
+                // deliberately removes.
+                // SAFETY: all validation and allocation happened in the parent;
+                // the child closure only iterates fixed storage, calls
+                // setrlimit(2), and reads errno on failure.
+                unsafe {
+                    cmd.as_std_mut().pre_exec(move || {
+                        for (resource, limit) in &limits {
+                            if resource.apply(limit) == -1 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                        }
                         Ok(())
                     });
                 }
@@ -3459,6 +3534,7 @@ impl fmt::Debug for Command {
             .field("cpu_affinity", &self.cpu_affinity)
             .field("io_priority", &self.io_priority)
             .field("umask", &self.umask)
+            .field("rlimits", &self.rlimits)
             .field("kill_on_parent_death", &self.kill_on_parent_death)
             .field("creation_flags_extra", &self.creation_flags_extra)
             .field(
@@ -4297,6 +4373,49 @@ mod tests {
         let debug = format!("{cmd:?}");
         assert!(debug.contains("uid: Some(1000)"), "debug: {debug}");
         assert!(debug.contains("gid: Some(1000)"), "debug: {debug}");
+    }
+
+    #[test]
+    fn rlimit_builders_accumulate_and_replace_the_same_resource() {
+        let command = Command::new("x")
+            .rlimit(crate::RlimitResource::Core, 1, 1)
+            .rlimit(crate::RlimitResource::NoFile, 32, 64)
+            .rlimit(crate::RlimitResource::Core, 0, 0);
+        assert_eq!(
+            command.rlimits,
+            vec![
+                (crate::RlimitResource::Core, 0, 0),
+                (crate::RlimitResource::NoFile, 32, 64),
+            ]
+        );
+        let debug = format!("{command:?}");
+        assert!(debug.contains("rlimits: [(Core, 0, 0), (NoFile, 32, 64)]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_rlimit_pair_is_rejected_before_spawn() {
+        let error = Command::new("x")
+            .rlimit(crate::RlimitResource::NoFile, 65, 64)
+            .build_tokio()
+            .expect_err("soft above hard must fail while building");
+        assert!(
+            matches!(error.reason(), crate::ErrorReason::Io { source } if source.kind() == std::io::ErrorKind::InvalidInput),
+            "got {error:?}"
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn rlimit_is_unsupported_before_spawn_off_unix() {
+        let error = Command::new("x")
+            .rlimit(crate::RlimitResource::Core, 0, 0)
+            .build_tokio()
+            .expect_err("rlimit is Unix-only");
+        assert!(
+            matches!(error.reason(), crate::ErrorReason::Unsupported { operation } if operation.contains("rlimit")),
+            "got {error:?}"
+        );
     }
 
     #[test]

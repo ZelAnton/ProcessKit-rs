@@ -1,5 +1,5 @@
 //! Environment and privilege builders: inherit_env, uid/gid, setsid,
-//! CPU/I/O priority, umask, and the Windows-only/unix-only unsupported gates.
+//! CPU/I/O priority, umask, rlimits, and the Windows-only/unix-only unsupported gates.
 
 #[cfg(unix)]
 use std::time::{Duration, Instant};
@@ -11,6 +11,7 @@ use processkit::IoPriority;
 use processkit::Mechanism;
 use processkit::Priority;
 use processkit::ProcessGroup;
+use processkit::RlimitResource;
 
 use crate::common::*;
 
@@ -145,6 +146,77 @@ async fn priority_and_umask_apply_before_exec() {
         0o027,
         "the requested umask must be visible inside the child"
     );
+}
+
+#[cfg(unix)]
+const RLIMIT_HELPER: &str = "PROCESSKIT_RLIMIT_HELPER";
+
+#[cfg(unix)]
+#[test]
+#[ignore = "re-exec helper for the per-process rlimit integration test"]
+fn rlimit_observer() {
+    if std::env::var_os(RLIMIT_HELPER).is_none() {
+        return;
+    }
+    fn read(resource: RlimitResource) -> libc::rlimit {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is a valid out pointer and the resource constants are
+        // supplied by libc for this target.
+        let result = unsafe {
+            match resource {
+                RlimitResource::Core => libc::getrlimit(libc::RLIMIT_CORE, &mut limit),
+                RlimitResource::FileSize => libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit),
+                RlimitResource::NoFile => libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit),
+                other => panic!("unexpected observer resource: {other:?}"),
+            }
+        };
+        assert_eq!(result, 0);
+        limit
+    }
+    let core = read(RlimitResource::Core);
+    assert_eq!((core.rlim_cur, core.rlim_max), (0, 0));
+    let files = read(RlimitResource::FileSize);
+    assert_eq!((files.rlim_cur, files.rlim_max), (1024, 1024));
+    let nofile = read(RlimitResource::NoFile);
+    let expected: libc::rlim_t = std::env::var("PROCESSKIT_RLIMIT_NOFILE")
+        .expect("expected nofile env")
+        .parse()
+        .expect("numeric nofile env");
+    assert_eq!((nofile.rlim_cur, nofile.rlim_max), (expected, expected));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "re-execs the integration binary to inspect setrlimit before user code"]
+async fn rlimits_apply_before_exec() {
+    let mut inherited = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `inherited` is a valid out pointer.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) },
+        0
+    );
+    let nofile = inherited.rlim_max.min(64);
+    let exe = std::env::current_exe().expect("locate integration test binary");
+    Command::new(exe)
+        .args(["--ignored", "--exact", "env_privileges::rlimit_observer"])
+        .env(RLIMIT_HELPER, "1")
+        .env("PROCESSKIT_RLIMIT_NOFILE", nofile.to_string())
+        .rlimit(RlimitResource::Core, 0, 0)
+        .rlimit(RlimitResource::FileSize, 1024, 1024)
+        .rlimit(
+            RlimitResource::NoFile,
+            u64::try_from(nofile).expect("rlim_t fits u64"),
+            u64::try_from(nofile).expect("rlim_t fits u64"),
+        )
+        .run_unit()
+        .await
+        .expect("observer sees all requested per-process limits");
 }
 
 #[cfg(target_os = "linux")]
@@ -389,6 +461,12 @@ async fn windows_unix_only_builders_are_unsupported() {
         (
             Command::new("cmd").args(["/c", "exit 0"]).umask(0o022),
             "umask",
+        ),
+        (
+            Command::new("cmd")
+                .args(["/c", "exit 0"])
+                .rlimit(RlimitResource::Core, 0, 0),
+            "rlimit",
         ),
         (
             Command::new("cmd")

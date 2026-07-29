@@ -239,6 +239,7 @@ real client open, treats `ERROR_PIPE_BUSY` as ready, and is unsupported on Unix.
 | `cpu_affinity` | ✅ (`SetProcessAffinityMask`) | Linux: ✅ (`sched_setaffinity`); macOS/BSD: ❌ `Unsupported` |
 | `io_priority` | ❌ `Unsupported` | Linux: ✅ (`ioprio_set`); macOS/BSD: ❌ `Unsupported` |
 | `umask` | ❌ `Unsupported` | ✅ |
+| `rlimit` (per process) | ❌ `Unsupported` | ✅ (`setrlimit`) |
 
 Everything not listed — capture, streaming, interactive stdin, encodings,
 buffer policies, timeouts, retry, pipelines, supervision, the non-socket
@@ -343,6 +344,15 @@ and
 already-dropped user, who can't write the root-owned `cgroup.procs`. The spawn
 fails with a permission error (never an uncontained child). Privilege drop
 composes cleanly with the process-group mechanism.
+
+**Per-process `rlimit` vs. whole-tree limits.** `Command::rlimit` is applied
+before the uid/gid drop and inherited across `exec`/fork, so it works with every
+Unix containment mechanism, including macOS/BSD and Linux pgroup fallback. It
+is not an aggregate tree counter: descendants share no single byte/file budget,
+and each may lower its own limits or raise its soft value up to the inherited
+hard value. Use the `limits` feature where a cgroup/Job Object can enforce a
+genuine whole-tree cap; use rlimits for per-process hardening such as
+`RLIMIT_CORE=0`, `RLIMIT_NOFILE`, or `RLIMIT_FSIZE`.
 
 **`setsid()` × process groups.** A new session implies a new process group;
 the crate coordinates the two (the containment tracking follows the new

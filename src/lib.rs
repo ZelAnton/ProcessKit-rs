@@ -255,6 +255,7 @@ mod priority;
 mod pump;
 mod result;
 mod retry;
+mod rlimit;
 mod runner;
 mod running;
 // `ShutdownReport` / `SoftSignal` — the observed facts of a graceful
@@ -320,6 +321,7 @@ pub use pump::{fuzz_decode_pump_lines, fuzz_strip_vt};
 pub use cassette::{fuzz_cassette_parse, fuzz_cassette_replay};
 pub use result::{Outcome, ProcessResult};
 pub use retry::RetryPolicy;
+pub use rlimit::RlimitResource;
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
 pub use running::{Finished, OutputLine, ProcessEvent, ProcessEvents, RunningProcess, StdoutLines};
 #[cfg(feature = "process-control")]
