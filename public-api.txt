@@ -848,6 +848,7 @@ pub fn processkit::Command::keep_stdin_open(self) -> Self
 pub fn processkit::Command::kill_on_parent_death(self) -> Self
 pub const fn processkit::Command::kill_on_parent_death_scope() -> processkit::ParentDeathCleanup
 pub fn processkit::Command::line_terminator(self, processkit::LineTerminator) -> Self
+pub fn processkit::Command::merge_stderr_in_pipe(self) -> Self
 pub fn processkit::Command::new(impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
 pub fn processkit::Command::no_timeout(self) -> Self
 pub fn processkit::Command::ok_codes(self, impl core::iter::traits::collect::IntoIterator<Item = i32>) -> Self

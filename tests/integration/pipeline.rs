@@ -17,6 +17,15 @@ fn sort_stage() -> Command {
     }
 }
 
+/// A stage that copies stdin to stdout without reordering it.
+fn passthrough_stage() -> Command {
+    if cfg!(windows) {
+        Command::new("cmd").args(["/d", "/c", "more"])
+    } else {
+        Command::new("cat")
+    }
+}
+
 #[tokio::test]
 #[ignore = "spawns a real two-stage pipeline"]
 async fn pipeline_flows_data_between_stages() {
@@ -40,6 +49,109 @@ async fn pipeline_flows_data_between_stages() {
     let alpha = stdout.find("alpha").expect("alpha in output");
     let delta = stdout.find("delta").expect("delta in output");
     assert!(alpha < delta, "sort should reorder: {stdout:?}");
+}
+
+#[tokio::test]
+#[ignore = "spawns a real pipeline with a shared stdout/stderr writer"]
+async fn pipeline_can_merge_stage_stderr_into_downstream_stdin_in_write_order() {
+    let producer = if cfg!(windows) {
+        Command::new("cmd").args([
+            "/d",
+            "/c",
+            "echo stdout-1& 1>&2 echo stderr-1& echo stdout-2& 1>&2 echo stderr-2",
+        ])
+    } else {
+        Command::new("sh").args([
+            "-c",
+            "printf 'stdout-1\\n'; printf 'stderr-1\\n' >&2; printf 'stdout-2\\n'; printf 'stderr-2\\n' >&2",
+        ])
+    };
+
+    let result = producer
+        .merge_stderr_in_pipe()
+        .pipe(passthrough_stage())
+        .output_string()
+        .await
+        .expect("run merged pipeline");
+    assert!(result.is_success(), "pipeline result: {result:?}");
+
+    let stdout = result.stdout();
+    let stdout_1 = stdout.find("stdout-1").expect("first stdout line");
+    let stderr_1 = stdout.find("stderr-1").expect("first stderr line");
+    let stdout_2 = stdout.find("stdout-2").expect("second stdout line");
+    let stderr_2 = stdout.find("stderr-2").expect("second stderr line");
+    assert!(
+        stdout_1 < stderr_1 && stderr_1 < stdout_2 && stdout_2 < stderr_2,
+        "one shared pipe must preserve the child's write order: {stdout:?}"
+    );
+    assert_eq!(result.stderr(), "", "the last stage emitted no stderr");
+}
+
+#[tokio::test]
+#[ignore = "spawns a real pipeline whose failing stage merges its diagnostic"]
+async fn merged_stage_has_no_separate_pipefail_stderr() {
+    let failing = if cfg!(windows) {
+        Command::new("cmd").args([
+            "/d",
+            "/c",
+            "1>&2 echo merged-diagnostic& ping -n 2 127.0.0.1 >nul& exit /b 3",
+        ])
+    } else {
+        Command::new("sh").args(["-c", "printf 'merged-diagnostic\\n' >&2; sleep 1; exit 3"])
+    };
+
+    let result = failing
+        .merge_stderr_in_pipe()
+        .pipe(passthrough_stage())
+        .output_string()
+        .await
+        .expect("pipeline failures are captured");
+    assert_eq!(result.code(), Some(3), "pipefail result: {result:?}");
+    assert!(
+        result.stdout().contains("merged-diagnostic"),
+        "merged diagnostic must travel through the downstream stage: {result:?}"
+    );
+    assert_eq!(
+        result.stderr(),
+        "",
+        "the attributed stage no longer owns a separate stderr stream"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns real commands to prove final-stage and standalone no-op semantics"]
+async fn stderr_merge_marker_is_a_noop_outside_a_non_final_pipeline_stage() {
+    let standalone = if cfg!(windows) {
+        Command::new("cmd").args(["/d", "/c", "echo solo-out& 1>&2 echo solo-err"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'solo-out\\n'; printf 'solo-err\\n' >&2"])
+    }
+    .merge_stderr_in_pipe()
+    .output_string()
+    .await
+    .expect("run standalone command");
+    assert!(standalone.stdout().contains("solo-out"));
+    assert!(!standalone.stdout().contains("solo-err"));
+    assert!(standalone.stderr().contains("solo-err"));
+
+    let quiet = if cfg!(windows) {
+        Command::new("cmd").args(["/d", "/c", "exit /b 0"])
+    } else {
+        Command::new("sh").args(["-c", "exit 0"])
+    };
+    let final_stage = if cfg!(windows) {
+        Command::new("cmd").args(["/d", "/c", "echo final-out& 1>&2 echo final-err"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'final-out\\n'; printf 'final-err\\n' >&2"])
+    };
+    let result = quiet
+        .pipe(final_stage.merge_stderr_in_pipe())
+        .output_string()
+        .await
+        .expect("run pipeline with a marked final stage");
+    assert!(result.stdout().contains("final-out"));
+    assert!(!result.stdout().contains("final-err"));
+    assert!(result.stderr().contains("final-err"));
 }
 
 #[tokio::test]

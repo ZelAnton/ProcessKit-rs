@@ -60,7 +60,9 @@ use crate::sync::atomic::{AtomicU8, Ordering};
 /// - **Stdin/stdout at the ends** — the *first* stage's configured
 ///   [`stdin`](Command::stdin) is honored; inner stages' stdin is the pipe
 ///   (any configured source is overridden). Inner stages' stderr is captured
-///   per-stage for pipefail diagnostics.
+///   per-stage for pipefail diagnostics unless that stage opts into
+///   [`merge_stderr_in_pipe`](Command::merge_stderr_in_pipe), which sends it
+///   through the downstream pipe and gives up the separate capture.
 /// - A per-stage [`Command::retry`] is **not** applied inside a pipeline;
 ///   wrap the `Pipeline` call to retry the whole chain.
 /// - A one-shot [`Stdin`](crate::Stdin) source on the *first* stage is
@@ -242,6 +244,9 @@ impl Pipeline {
         let mut upstream = None;
         for (index, stage) in self.stages.iter().enumerate() {
             let mut command = stage.clone();
+            if index + 1 < self.stages.len() && stage.wants_stderr_merged_in_pipe() {
+                command.activate_stderr_merge_in_pipe();
+            }
             // Gap-fill: apply the pipeline cancel token only where a stage has no token of its own.
             if let Some(token) = &self.cancel_token
                 && command.cancel_token().is_none()

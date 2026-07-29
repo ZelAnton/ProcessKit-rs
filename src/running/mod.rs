@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::sync::atomic::AtomicU8;
 
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
+use tokio::process::{Child, ChildStdin};
 use tokio::task::JoinHandle;
 
 use crate::buffer::{OutputBufferPolicy, OverflowMode, clamp_dropoldest_tail, push_capped_bytes};
@@ -112,8 +112,8 @@ pub(crate) struct Spawned {
     pub program: String,
     pub child: Child,
     pub own_group: Option<ProcessGroup>,
-    pub stdout: Option<ChildStdout>,
-    pub stderr: Option<ChildStderr>,
+    pub stdout: Option<OutputReader>,
+    pub stderr: Option<OutputReader>,
     pub stdin: Option<ChildStdin>,
     pub stdin_task: Option<JoinHandle<std::io::Result<()>>>,
     pub timeout: Option<Duration>,
@@ -287,7 +287,7 @@ pub struct RunningProcess {
 /// keeps [`RunningProcess`] `Sync` (as it was before the PTY backend stored one on
 /// `PtyProc`); every concrete reader boxed here — `ChildStdout`/`ChildStderr`, the
 /// scripted `DuplexStream`, and the per-platform PTY masters — is `Sync`.
-type OutputReader = Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>;
+pub(crate) type OutputReader = Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>;
 
 /// The I/O-bearing half of a [`RunningProcess`]: a real OS child, a scripted
 /// double that feeds canned bytes through the same pumps/sinks, or a PTY child
@@ -345,8 +345,8 @@ struct RealProc {
     // `Arc` so a streaming deadline timer can hold a `Weak` to kill the tree
     // without keeping the group alive (kill-on-close on drop stays prompt).
     own_group: Option<Arc<ProcessGroup>>,
-    stdout_pipe: Option<ChildStdout>,
-    stderr_pipe: Option<ChildStderr>,
+    stdout_pipe: Option<OutputReader>,
+    stderr_pipe: Option<OutputReader>,
     stdin_pipe: Option<ChildStdin>,
     stdin_task: Option<JoinHandle<std::io::Result<()>>>,
 }
@@ -383,7 +383,7 @@ impl Backend {
 
     fn take_stdout_reader(&mut self) -> Option<OutputReader> {
         match self {
-            Backend::Real(real) => real.stdout_pipe.take().map(|p| Box::new(p) as OutputReader),
+            Backend::Real(real) => real.stdout_pipe.take(),
             Backend::Scripted(s) => s.take_stdout_reader(),
             // The PTY master carries the merged stdout+stderr.
             #[cfg(feature = "pty")]
@@ -393,7 +393,7 @@ impl Backend {
 
     fn take_stderr_reader(&mut self) -> Option<OutputReader> {
         match self {
-            Backend::Real(real) => real.stderr_pipe.take().map(|p| Box::new(p) as OutputReader),
+            Backend::Real(real) => real.stderr_pipe.take(),
             Backend::Scripted(s) => s.take_stderr_reader(),
             // PTY merges stderr into the master, so there is no separate stderr —
             // the `on_stderr_line`/stderr split collapses (documented on `use_pty`).
@@ -591,14 +591,15 @@ impl RunningProcess {
         }
     }
 
-    /// Take the raw stdout pipe for `Pipeline` plumbing. `None` for a scripted
-    /// backend (scripted doubles don't compose into real pipelines).
-    pub(crate) fn take_stdout_pipe(&mut self) -> Option<ChildStdout> {
+    /// Take the raw stdout reader for `Pipeline` plumbing. Usually a child's
+    /// stdout pipe; for a `merge_stderr_in_pipe` stage it is the reader paired
+    /// with the shared stdout/stderr writer. `None` for a scripted backend.
+    pub(crate) fn take_stdout_pipe(&mut self) -> Option<OutputReader> {
         match &mut self.backend {
             Backend::Real(real) => real.stdout_pipe.take(),
             Backend::Scripted(_) => None,
-            // A PTY master is not a `ChildStdout`, and a merged terminal stream
-            // does not compose into a shell-free pipeline — so no pipe to hand off.
+            // A PTY master and its merged terminal stream do not compose into a
+            // shell-free pipeline — so there is no pipe to hand off.
             #[cfg(feature = "pty")]
             Backend::Pty(_) => None,
         }

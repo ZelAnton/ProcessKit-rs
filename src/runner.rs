@@ -10,7 +10,7 @@ use crate::command::{Command, ProgramResolution, is_bare_name, resolve_program};
 use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::result::ProcessResult;
-use crate::running::{RunningProcess, Spawned};
+use crate::running::{OutputReader, RunningProcess, Spawned};
 
 /// Fixed teardown headroom past a streamed run's own deadline/grace before
 /// [`first_line`](ProcessRunnerExt::first_line)'s drain backstop gives up. It sits
@@ -834,6 +834,26 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     let stdin_reservation = take_stdin_for_run(command)?;
 
     let mut tokio_cmd = command.build_tokio()?;
+    let stderr_is_merged = command.stderr_is_merged_in_pipe();
+    let merged_stdout: Option<OutputReader> = if stderr_is_merged {
+        #[cfg(any(unix, windows))]
+        {
+            let (reader, writer) = std::io::pipe().map_err(crate::Error::io)?;
+            let stderr_writer = writer.try_clone().map_err(crate::Error::io)?;
+            tokio_cmd.stdout(writer);
+            tokio_cmd.stderr(stderr_writer);
+            Some(async_pipe_reader(reader))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            return Err(crate::ErrorReason::Unsupported {
+                operation: "merge_stderr_in_pipe (Unix/Windows only)".into(),
+            }
+            .into());
+        }
+    } else {
+        None
+    };
     let opts = crate::sys::SpawnOptions {
         setsid: command.wants_setsid(),
         creation_flags: command.extra_creation_flags(),
@@ -955,8 +975,20 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         }
     };
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let stdout = merged_stdout.or_else(|| {
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as OutputReader)
+    });
+    let stderr = if stderr_is_merged {
+        None
+    } else {
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as OutputReader)
+    };
 
     let mut process = RunningProcess::from_spawned(Spawned {
         program: command.program_name(),
@@ -975,13 +1007,34 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         stderr_config: command.stderr_config(),
         buffer: command.output_buffer_policy(),
         ok_codes: command.ok_codes_vec(),
-        stdout_piped: command.stdout_is_piped(),
-        stderr_piped: command.stderr_is_piped(),
+        stdout_piped: stderr_is_merged || command.stdout_is_piped(),
+        stderr_piped: !stderr_is_merged && command.stderr_is_piped(),
         cancel_token: command.cancel_token(),
     });
     // Pid-only watchdog; own-group runs re-arm with full group+pid via `attach_group`.
     process.arm_cancel_watchdog();
     Ok(process)
+}
+
+/// Turn the parent end of an anonymous pipe into the same boxed async reader
+/// used for child stdout/stderr. `std::io::PipeReader` deliberately exposes its
+/// owned OS object rather than a `File`; the two platform conversions below are
+/// ownership-preserving and add no duplicate handle that could delay EOF.
+#[cfg(any(unix, windows))]
+fn async_pipe_reader(reader: std::io::PipeReader) -> OutputReader {
+    #[cfg(unix)]
+    let file = {
+        use std::os::fd::OwnedFd;
+        let fd: OwnedFd = reader.into();
+        std::fs::File::from(fd)
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::io::OwnedHandle;
+        let handle: OwnedHandle = reader.into();
+        std::fs::File::from(handle)
+    };
+    Box::new(tokio::fs::File::from_std(file))
 }
 
 /// Translate a raw spawn [`Error`](crate::Error) into the crate's launch error, mapping the

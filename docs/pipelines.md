@@ -16,6 +16,7 @@ fails, rather than instantly via `SIGPIPE`.)
 
 - [Building and running](#building-and-running)
 - [Semantics: pipefail and the ends](#semantics-pipefail-and-the-ends)
+- [Merging a stage's stderr into the pipe](#merging-a-stages-stderr-into-the-pipe)
 - [Unchecked stages](#unchecked-stages)
 - [Timeouts](#timeouts)
 - [Streaming a live chain](#streaming-a-live-chain)
@@ -138,7 +139,8 @@ The ends of the chain behave like a single `Command`:
 - **Inner** stages read from the pipe, full stop: any `stdin` source or
   `keep_stdin_open` configured on them is overridden.
 - Inner stages' **stderr** is captured per-stage for pipefail diagnostics;
-  only the last stage's stdout reaches you.
+  only the last stage's stdout reaches you. A stage explicitly marked with
+  `merge_stderr_in_pipe()` is the exception described below.
 
 ```rust,no_run
 use processkit::{Command, Stdin};
@@ -155,6 +157,47 @@ async fn main() -> processkit::Result<()> {
     Ok(())
 }
 ```
+
+## Merging a stage's stderr into the pipe
+
+Mark a non-final stage with `merge_stderr_in_pipe()` for the shell-free
+equivalent of `command 2>&1 | next`:
+
+```rust,no_run
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    // Feed both compiler diagnostics and ordinary output to the filter.
+    let matches = Command::new("cargo").args(["check", "--message-format=short"])
+        .merge_stderr_in_pipe()
+        .pipe(Command::new("grep").arg("warning"))
+        .output_string()
+        .await?;
+    println!("{}", matches.stdout());
+    Ok(())
+}
+```
+
+The child receives two cloned handles to the **same anonymous-pipe writer** for
+stdout and stderr. Their bytes therefore enter one OS pipe in the order the
+child writes them; processkit does not merge two independently-read streams in
+userspace. The normal pipeline boundary still relays that one reader into the
+next stage's stdin, as described at the top of this page.
+
+The marker is opt-in per stage and only applies when that stage has a downstream
+neighbor. It is a no-op on a standalone command and on the final pipeline stage.
+For an affected stage, the downstream pipe overrides its configured stdout and
+stderr destinations. The shared anonymous-pipe wiring is supported on Unix and
+Windows; activating it on another target fails before spawn with
+`ErrorReason::Unsupported`.
+
+This changes pipefail diagnostics deliberately: the merged stage no longer has
+a separate stderr capture. If it is blamed for a failure, the result's `stderr`
+is empty; its diagnostic bytes may instead be present in the final stdout after
+flowing through the remaining stages. Leave the marker off when retaining the
+culprit stage's dedicated stderr is more important than filtering the combined
+stream.
 
 ## Unchecked stages
 

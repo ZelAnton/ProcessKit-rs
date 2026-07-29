@@ -13,6 +13,8 @@ to a dated version section.
 
 ### Added
 
+- Add opt-in per-stage stderr merging for shell-free pipelines, using one
+  shared OS-pipe writer to preserve child write order without a userspace merge.
 - Add a bounded typed supervision lifecycle stream covering incarnations,
   backoff, storm pauses, health checks, give-up decisions, and terminal state.
 

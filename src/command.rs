@@ -117,6 +117,13 @@ pub struct Command {
     stdin_inherit: bool,
     /// Exempt this stage from pipefail attribution (see [`Self::unchecked_in_pipe`]).
     unchecked: bool,
+    /// Opt this stage into shell-like `2>&1 |` pipeline plumbing (see
+    /// [`Self::merge_stderr_in_pipe`]).
+    merge_stderr_in_pipe: bool,
+    /// Internal launch marker set only on a cloned non-final pipeline stage.
+    /// Keeping it separate from the public intent makes the builder a no-op for
+    /// standalone commands and final stages, as documented.
+    pipeline_stderr_merged: bool,
     /// The timeout state — unset, explicitly unbounded, or a deadline (see
     /// [`Timeout`]). This three-case type replaces the old `Option<Duration>` +
     /// `no_timeout: bool` pair, so "explicitly unbounded" is modeled at the type
@@ -230,6 +237,8 @@ impl Command {
             keep_stdin_open: false,
             stdin_inherit: false,
             unchecked: false,
+            merge_stderr_in_pipe: false,
+            pipeline_stderr_merged: false,
             timeout: Timeout::Unset,
             inactivity_timeout: None,
             timeout_grace: None,
@@ -905,9 +914,56 @@ impl Command {
         self
     }
 
+    /// Merge this stage's stderr into its stdout pipe when it is a **non-final**
+    /// [`Pipeline`](crate::Pipeline) stage — the shell-free equivalent of
+    /// `command 2>&1 | next`.
+    ///
+    /// Stdout and stderr receive cloned handles to the same anonymous-pipe
+    /// writer. The operating system therefore preserves the order in which the
+    /// child writes to that shared pipe; processkit does not race or interleave
+    /// two userspace reader tasks. The downstream stage reads the combined byte
+    /// stream from its stdin.
+    ///
+    /// This is opt-in per stage. It has no effect on a standalone command or on
+    /// the final pipeline stage. On an affected stage it overrides that stage's
+    /// configured stdout/stderr destinations because both streams must point at
+    /// the downstream pipe.
+    ///
+    /// Supported on Unix and Windows. A pipeline that activates this marker on
+    /// another target fails before spawning with
+    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported).
+    ///
+    /// # Pipefail diagnostic trade-off
+    ///
+    /// Once stderr enters the downstream pipe it is no longer available as that
+    /// stage's separate stderr capture. If pipefail attributes the result to this
+    /// stage, [`ProcessResult::stderr`](crate::ProcessResult::stderr) is empty;
+    /// the merged bytes may instead appear in the final stage's stdout after
+    /// passing through the rest of the pipeline.
+    pub fn merge_stderr_in_pipe(mut self) -> Self {
+        self.merge_stderr_in_pipe = true;
+        self
+    }
+
     /// Whether this stage opted out of pipefail attribution.
     pub(crate) fn is_unchecked(&self) -> bool {
         self.unchecked
+    }
+
+    /// Whether this stage requested shell-like `2>&1 |` plumbing.
+    pub(crate) fn wants_stderr_merged_in_pipe(&self) -> bool {
+        self.merge_stderr_in_pipe
+    }
+
+    /// Activate the requested plumbing on the pipeline's per-run clone. Only
+    /// [`Pipeline`](crate::Pipeline) calls this, and only for a non-final stage.
+    pub(crate) fn activate_stderr_merge_in_pipe(&mut self) {
+        self.pipeline_stderr_merged = true;
+    }
+
+    /// Whether this per-run clone needs the shared stdout/stderr writer.
+    pub(crate) fn stderr_is_merged_in_pipe(&self) -> bool {
+        self.pipeline_stderr_merged
     }
 
     /// Wire `reader` (the previous pipeline stage's stdout) as this command's
@@ -2566,22 +2622,30 @@ impl Command {
                 cmd.as_std_mut().creation_flags(flags);
             }
         }
-        cmd.stdout(match &self.stdout_file {
-            Some(file) => Stdio::from(file.open().map_err(Error::io)?),
-            None => match self.stdout_mode {
-                StdioMode::Piped => Stdio::piped(),
-                StdioMode::Inherit => Stdio::inherit(),
-                StdioMode::Null => Stdio::null(),
-            },
-        });
-        cmd.stderr(match &self.stderr_file {
-            Some(file) => Stdio::from(file.open().map_err(Error::io)?),
-            None => match self.stderr_mode {
-                StdioMode::Piped => Stdio::piped(),
-                StdioMode::Inherit => Stdio::inherit(),
-                StdioMode::Null => Stdio::null(),
-            },
-        });
+        if self.pipeline_stderr_merged {
+            // `runner::launch` replaces these placeholders with cloned handles
+            // to one anonymous-pipe writer. Avoid opening configured redirect
+            // files here: the pipeline override must not truncate an unused file.
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+        } else {
+            cmd.stdout(match &self.stdout_file {
+                Some(file) => Stdio::from(file.open().map_err(Error::io)?),
+                None => match self.stdout_mode {
+                    StdioMode::Piped => Stdio::piped(),
+                    StdioMode::Inherit => Stdio::inherit(),
+                    StdioMode::Null => Stdio::null(),
+                },
+            });
+            cmd.stderr(match &self.stderr_file {
+                Some(file) => Stdio::from(file.open().map_err(Error::io)?),
+                None => match self.stderr_mode {
+                    StdioMode::Piped => Stdio::piped(),
+                    StdioMode::Inherit => Stdio::inherit(),
+                    StdioMode::Null => Stdio::null(),
+                },
+            });
+        }
         if self.keep_stdin_open {
             cmd.stdin(Stdio::piped());
         } else if self.stdin_inherit {
@@ -3330,6 +3394,7 @@ impl fmt::Debug for Command {
             .field("keep_stdin_open", &self.keep_stdin_open)
             .field("stdin_inherit", &self.stdin_inherit)
             .field("unchecked", &self.unchecked)
+            .field("merge_stderr_in_pipe", &self.merge_stderr_in_pipe)
             .field("timeout", &self.timeout)
             .field("inactivity_timeout", &self.inactivity_timeout)
             .field("timeout_grace", &self.timeout_grace)
@@ -3815,6 +3880,51 @@ mod tests {
     use crate::buffer::LineTerminator;
     use std::ffi::OsStr;
     use std::path::PathBuf;
+
+    #[test]
+    fn stderr_merge_intent_is_distinct_from_pipeline_launch_activation() {
+        let default = Command::new("tool");
+        assert!(!default.wants_stderr_merged_in_pipe());
+        assert!(!default.stderr_is_merged_in_pipe());
+
+        let mut marked = Command::new("tool").merge_stderr_in_pipe();
+        assert!(marked.wants_stderr_merged_in_pipe());
+        assert!(
+            !marked.stderr_is_merged_in_pipe(),
+            "a standalone marked command keeps ordinary split stdio"
+        );
+        assert!(format!("{marked:?}").contains("merge_stderr_in_pipe: true"));
+
+        marked.activate_stderr_merge_in_pipe();
+        assert!(marked.stderr_is_merged_in_pipe());
+    }
+
+    #[test]
+    fn activated_stderr_merge_does_not_open_overridden_redirect_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let stdout = dir.path().join("stdout.log");
+        let stderr = dir.path().join("stderr.log");
+        std::fs::write(&stdout, "stdout-sentinel").expect("seed stdout file");
+        std::fs::write(&stderr, "stderr-sentinel").expect("seed stderr file");
+
+        let mut command = Command::new("tool")
+            .stdout_file(&stdout)
+            .stderr_file(&stderr)
+            .merge_stderr_in_pipe();
+        command.activate_stderr_merge_in_pipe();
+        command
+            .build_tokio()
+            .expect("merged launch builds without opening redirects");
+
+        assert_eq!(
+            std::fs::read_to_string(stdout).expect("read stdout sentinel"),
+            "stdout-sentinel"
+        );
+        assert_eq!(
+            std::fs::read_to_string(stderr).expect("read stderr sentinel"),
+            "stderr-sentinel"
+        );
+    }
 
     #[test]
     fn effective_stdin_source_respects_keep_stdin_open() {
