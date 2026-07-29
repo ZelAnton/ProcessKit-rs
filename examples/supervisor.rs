@@ -1,7 +1,8 @@
 //! Keep a short-lived child alive with policy-driven restarts, exponential
 //! backoff, a restart budget, a `stop_when` condition, and an opt-in liveness
-//! `health_check` — a minimal `runit`/`systemd`-style keeper built on
-//! `Supervisor` (see `src/supervisor.rs`).
+//! `health_check`, and typed lifecycle events — a minimal
+//! `runit`/`systemd`-style keeper built on `Supervisor` (see
+//! `src/supervisor.rs`).
 //!
 //! The supervised child (`cargo --version`) always exits cleanly and
 //! immediately, so `RestartPolicy::Always` — not a crash — is what keeps the
@@ -18,6 +19,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use processkit::prelude::StreamExt;
 use processkit::{Command, RestartPolicy, Supervisor};
 
 #[tokio::main]
@@ -28,7 +30,7 @@ async fn main() -> processkit::Result<()> {
     // is not itself a restart).
     let runs_seen = AtomicU32::new(0);
 
-    let outcome = Supervisor::new(command)
+    let mut session = Supervisor::new(command)
         .restart(RestartPolicy::Always)
         .backoff(Duration::from_millis(50), 2.0)
         .max_backoff(Duration::from_millis(200))
@@ -37,8 +39,16 @@ async fn main() -> processkit::Result<()> {
         // A real server would check a port / health endpoint here.
         .health_check(|| async { true }, Duration::from_secs(1))
         .stop_when(move |_| runs_seen.fetch_add(1, Ordering::SeqCst) == 4)
-        .run()
-        .await?;
+        .start();
+
+    let mut events = session.events()?;
+    let observe = async move {
+        while let Some(event) = events.next().await {
+            println!("event: {} ({event:?})", event.name());
+        }
+    };
+    let ((), outcome) = tokio::join!(observe, session.wait());
+    let outcome = outcome?;
 
     println!("stopped: {:?}", outcome.stopped);
     println!("restarts: {}", outcome.restarts);

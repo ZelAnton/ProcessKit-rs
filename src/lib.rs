@@ -332,8 +332,8 @@ pub use soft_stop::SoftStopScope;
 pub use stats::{OwnedStatsSampler, ProcessGroupStats, RunProfile, StatsSampler};
 pub use stdin::{ProcessStdin, Stdin};
 pub use supervisor::{
-    GiveUpAttempt, RestartPolicy, StopReason, SupervisionOutcome, SupervisionSession,
-    SupervisionStatus, Supervisor,
+    GiveUpAttempt, RestartPolicy, StopReason, SupervisionEvent, SupervisionEvents,
+    SupervisionOutcome, SupervisionSession, SupervisionStatus, Supervisor,
 };
 
 use std::ffi::OsStr;

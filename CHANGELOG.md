@@ -12,7 +12,9 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+
+- Add a bounded typed supervision lifecycle stream covering incarnations,
+  backoff, storm pauses, health checks, give-up decisions, and terminal state.
 
 ### Changed
 -

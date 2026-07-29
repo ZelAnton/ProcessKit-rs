@@ -365,6 +365,13 @@ to supervision running on a background task:
   pause is in effect right now, and the current incarnation's `pid` / start time
   (both `None` between incarnations, during a backoff, or for a capture-only test
   double). Poll it any time; it never races the loop.
+- **`events()`** — take the session's typed, one-consumer `SupervisionEvents`
+  stream. It reports incarnation starts and outcomes, launch-error classes,
+  scheduled backoffs, storm pauses, health-check failures, give-up decisions,
+  and the terminal reason. Each variant has a stable `name()` for structured
+  logs and metrics. The history is bounded at 128 events; a slow consumer gets
+  an explicit `SupervisionEvent::Lagged { skipped }` marker and resumes from the
+  oldest retained event instead of growing the supervisor without limit.
 - **`stop(grace)`** — stop the current child *gracefully* (its normal
   `SIGTERM` → wait `grace` → `SIGKILL` path, under the default own-group
   runner) and end supervision with `StopReason::Stopped` — a deliberate,
@@ -375,14 +382,28 @@ to supervision running on a background task:
   would have returned.
 
 ```rust,no_run
-use processkit::{Command, RestartPolicy, Supervisor};
+use processkit::prelude::StreamExt;
+use processkit::{Command, RestartPolicy, SupervisionEvent, Supervisor};
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> processkit::Result<()> {
-    let session = Supervisor::new(Command::new("my-server"))
+    let mut session = Supervisor::new(Command::new("my-server"))
         .restart(RestartPolicy::Always)
         .start(); // supervision runs in the background from here
+
+    // Take the stream once and drain it independently of the session handle.
+    let mut events = session.events()?;
+    tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            match event {
+                SupervisionEvent::RestartScheduled { restart, delay } => {
+                    println!("restart {restart} after {delay:?}");
+                }
+                other => println!("supervision event: {}", other.name()),
+            }
+        }
+    });
 
     // ... elsewhere: observe it live ...
     let status = session.status();
@@ -395,9 +416,8 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-The live status is an **addition** to the exit-driven policy and callbacks, not
-a replacement — supervision behaves identically to `run()` (which is itself a
-thin wrapper over `start()` + `wait()`). Only a session `stop()` produces
+Live status and events are **additions** to the exit-driven policy and callbacks,
+not replacements — supervision behaves identically to `run()`. Only a session `stop()` produces
 `StopReason::Stopped`; `run()` never does.
 
 Two handle contracts round it out: **dropping** a `SupervisionSession` without

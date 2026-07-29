@@ -731,6 +731,52 @@ impl core::marker::Unpin for processkit::StopReason
 impl core::marker::UnsafeUnpin for processkit::StopReason
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::StopReason
 impl core::panic::unwind_safe::UnwindSafe for processkit::StopReason
+#[non_exhaustive] pub enum processkit::SupervisionEvent
+pub processkit::SupervisionEvent::GaveUp
+pub processkit::SupervisionEvent::GaveUp::attempt: u32
+pub processkit::SupervisionEvent::HealthCheckFailed
+pub processkit::SupervisionEvent::HealthCheckFailed::attempt: u32
+pub processkit::SupervisionEvent::HealthCheckFailed::terminal: bool
+pub processkit::SupervisionEvent::IncarnationFailed
+pub processkit::SupervisionEvent::IncarnationFailed::attempt: u32
+pub processkit::SupervisionEvent::IncarnationFailed::error: processkit::ErrorKind
+pub processkit::SupervisionEvent::IncarnationFinished
+pub processkit::SupervisionEvent::IncarnationFinished::attempt: u32
+pub processkit::SupervisionEvent::IncarnationFinished::duration: core::time::Duration
+pub processkit::SupervisionEvent::IncarnationFinished::outcome: processkit::Outcome
+pub processkit::SupervisionEvent::IncarnationFinished::success: bool
+pub processkit::SupervisionEvent::IncarnationStarted
+pub processkit::SupervisionEvent::IncarnationStarted::attempt: u32
+pub processkit::SupervisionEvent::IncarnationStarted::pid: core::option::Option<u32>
+pub processkit::SupervisionEvent::Lagged
+pub processkit::SupervisionEvent::Lagged::skipped: u64
+pub processkit::SupervisionEvent::RestartScheduled
+pub processkit::SupervisionEvent::RestartScheduled::delay: core::time::Duration
+pub processkit::SupervisionEvent::RestartScheduled::restart: u32
+pub processkit::SupervisionEvent::Stopped
+pub processkit::SupervisionEvent::Stopped::reason: processkit::StopReason
+pub processkit::SupervisionEvent::StormPaused
+pub processkit::SupervisionEvent::StormPaused::delay: core::time::Duration
+pub processkit::SupervisionEvent::StormPaused::pause: u32
+pub processkit::SupervisionEvent::SupervisionFailed
+pub processkit::SupervisionEvent::SupervisionFailed::error: processkit::ErrorKind
+impl processkit::SupervisionEvent
+pub fn processkit::SupervisionEvent::name(&self) -> &'static str
+impl core::clone::Clone for processkit::SupervisionEvent
+pub fn processkit::SupervisionEvent::clone(&self) -> processkit::SupervisionEvent
+impl core::cmp::Eq for processkit::SupervisionEvent
+impl core::cmp::PartialEq for processkit::SupervisionEvent
+pub fn processkit::SupervisionEvent::eq(&self, &processkit::SupervisionEvent) -> bool
+impl core::fmt::Debug for processkit::SupervisionEvent
+pub fn processkit::SupervisionEvent::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for processkit::SupervisionEvent
+impl core::marker::Freeze for processkit::SupervisionEvent
+impl core::marker::Send for processkit::SupervisionEvent
+impl core::marker::Sync for processkit::SupervisionEvent
+impl core::marker::Unpin for processkit::SupervisionEvent
+impl core::marker::UnsafeUnpin for processkit::SupervisionEvent
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::SupervisionEvent
+impl core::panic::unwind_safe::UnwindSafe for processkit::SupervisionEvent
 pub struct processkit::CliClient<R: processkit::ProcessRunner>
 impl processkit::CliClient<processkit::JobRunner>
 pub fn processkit::CliClient<processkit::JobRunner>::new(impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
@@ -1484,6 +1530,19 @@ impl core::marker::Unpin for processkit::StdoutLines
 impl core::marker::UnsafeUnpin for processkit::StdoutLines
 impl !core::panic::unwind_safe::RefUnwindSafe for processkit::StdoutLines
 impl !core::panic::unwind_safe::UnwindSafe for processkit::StdoutLines
+pub struct processkit::SupervisionEvents
+impl core::fmt::Debug for processkit::SupervisionEvents
+pub fn processkit::SupervisionEvents::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl futures_core::stream::Stream for processkit::SupervisionEvents
+pub type processkit::SupervisionEvents::Item = processkit::SupervisionEvent
+pub fn processkit::SupervisionEvents::poll_next(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::option::Option<Self::Item>>
+impl core::marker::Freeze for processkit::SupervisionEvents
+impl core::marker::Send for processkit::SupervisionEvents
+impl core::marker::Sync for processkit::SupervisionEvents
+impl core::marker::Unpin for processkit::SupervisionEvents
+impl core::marker::UnsafeUnpin for processkit::SupervisionEvents
+impl !core::panic::unwind_safe::RefUnwindSafe for processkit::SupervisionEvents
+impl !core::panic::unwind_safe::UnwindSafe for processkit::SupervisionEvents
 #[non_exhaustive] pub struct processkit::SupervisionOutcome
 pub processkit::SupervisionOutcome::final_result: processkit::ProcessResult<alloc::string::String>
 pub processkit::SupervisionOutcome::liveness_kills: u32
@@ -1507,6 +1566,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for processkit::SupervisionOutcome
 impl core::panic::unwind_safe::UnwindSafe for processkit::SupervisionOutcome
 pub struct processkit::SupervisionSession
 impl processkit::SupervisionSession
+pub fn processkit::SupervisionSession::events(&mut self) -> processkit::Result<processkit::SupervisionEvents>
 pub fn processkit::SupervisionSession::status(&self) -> processkit::SupervisionStatus
 pub async fn processkit::SupervisionSession::stop(self, core::time::Duration) -> processkit::Result<processkit::SupervisionOutcome>
 pub async fn processkit::SupervisionSession::wait(self) -> processkit::Result<processkit::SupervisionOutcome>

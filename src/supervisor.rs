@@ -19,9 +19,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
+use tokio_stream::Stream;
+use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::buffer::OutputBufferPolicy;
@@ -36,6 +39,12 @@ use crate::runner::{JobRunner, ProcessRunner};
 /// capturing its *entire* output risks unbounded heap — keep a bounded tail (the
 /// most recent lines, the ones that matter for a crash) by default instead.
 const DEFAULT_SUPERVISION_TAIL: usize = 1000;
+
+/// Retained lifecycle events per session. A bounded broadcast channel keeps a
+/// supervisor that nobody observes from accumulating an unbounded crash-loop
+/// history; a slow consumer receives an explicit [`SupervisionEvent::Lagged`]
+/// marker before continuing from the oldest retained event.
+const SUPERVISION_EVENT_CAPACITY: usize = 128;
 
 /// Default number of *consecutive* failed liveness checks tolerated before the
 /// supervisor force-restarts the current incarnation (see
@@ -501,6 +510,143 @@ impl SupervisionStatus {
     }
 }
 
+/// A typed transition emitted by a live [`SupervisionSession`].
+///
+/// Events contain only bounded, non-secret lifecycle facts. They never include
+/// argv, environment values, or captured output. Incarnation `attempt` numbers
+/// are one-based; `restart` numbers count re-runs, so the first scheduled
+/// restart is `1` and starts attempt `2`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SupervisionEvent {
+    /// A child incarnation successfully started.
+    IncarnationStarted {
+        /// The one-based incarnation number.
+        attempt: u32,
+        /// The OS process id, or `None` when the runner exposes no live handle.
+        pid: Option<u32>,
+    },
+    /// An incarnation produced a process outcome.
+    IncarnationFinished {
+        /// The one-based incarnation number.
+        attempt: u32,
+        /// How the child ended.
+        outcome: Outcome,
+        /// Wall-clock time the incarnation ran.
+        duration: Duration,
+        /// Whether the outcome is accepted by the command's `ok_codes` policy.
+        success: bool,
+    },
+    /// An incarnation ended without producing a [`ProcessResult`].
+    IncarnationFailed {
+        /// The one-based incarnation number.
+        attempt: u32,
+        /// The stable, coarse class of the launch/IO failure.
+        error: crate::ErrorKind,
+    },
+    /// A restart backoff was scheduled.
+    RestartScheduled {
+        /// The one-based restart number about to occur.
+        restart: u32,
+        /// The jittered delay before the next incarnation.
+        delay: Duration,
+    },
+    /// The failure-storm guard paused restarts.
+    StormPaused {
+        /// The one-based storm-pause number.
+        pause: u32,
+        /// The jittered pause duration.
+        delay: Duration,
+    },
+    /// A health check ended the current incarnation.
+    HealthCheckFailed {
+        /// The one-based incarnation number.
+        attempt: u32,
+        /// `true` when the probe itself errored and supervision will terminate;
+        /// `false` when the unhealthy streak tripped and normal crash policy
+        /// still decides whether to restart.
+        terminal: bool,
+    },
+    /// A `give_up_when` classifier declared the failure permanent.
+    GaveUp {
+        /// The one-based incarnation number that was classified permanent.
+        attempt: u32,
+    },
+    /// Supervision produced a normal terminal outcome.
+    Stopped {
+        /// Why policy-driven supervision ended.
+        reason: StopReason,
+    },
+    /// Supervision terminated with an error rather than an outcome.
+    SupervisionFailed {
+        /// The stable, coarse class of the terminal error.
+        error: crate::ErrorKind,
+    },
+    /// The consumer fell behind the session's bounded event history.
+    Lagged {
+        /// How many older events were skipped before delivery resumed.
+        skipped: u64,
+    },
+}
+
+impl SupervisionEvent {
+    /// This event's stable machine identifier.
+    ///
+    /// The lowercase `snake_case` names are suitable for structured logs and
+    /// metrics labels. New variants receive new identifiers; existing names are
+    /// not renamed without a major release.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            SupervisionEvent::IncarnationStarted { .. } => "incarnation_started",
+            SupervisionEvent::IncarnationFinished { .. } => "incarnation_finished",
+            SupervisionEvent::IncarnationFailed { .. } => "incarnation_failed",
+            SupervisionEvent::RestartScheduled { .. } => "restart_scheduled",
+            SupervisionEvent::StormPaused { .. } => "storm_paused",
+            SupervisionEvent::HealthCheckFailed { .. } => "health_check_failed",
+            SupervisionEvent::GaveUp { .. } => "gave_up",
+            SupervisionEvent::Stopped { .. } => "stopped",
+            SupervisionEvent::SupervisionFailed { .. } => "supervision_failed",
+            SupervisionEvent::Lagged { .. } => "lagged",
+        }
+    }
+}
+
+/// A bounded stream of [`SupervisionEvent`] values from one live session.
+///
+/// The stream is lossless while the consumer stays within the retained
+/// 128-event window. If it falls farther behind, the next
+/// item is [`SupervisionEvent::Lagged`] with the exact skipped count, followed by
+/// the oldest event still retained. The stream closes when the supervision task
+/// and its [`SupervisionSession`] handle are both dropped (normally after
+/// [`wait`](SupervisionSession::wait) or [`stop`](SupervisionSession::stop)
+/// completes).
+pub struct SupervisionEvents {
+    inner: BroadcastStream<SupervisionEvent>,
+}
+
+impl std::fmt::Debug for SupervisionEvents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SupervisionEvents").finish_non_exhaustive()
+    }
+}
+
+impl Stream for SupervisionEvents {
+    type Item = SupervisionEvent;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(event))) => Poll::Ready(Some(event)),
+            Poll::Ready(Some(Err(
+                tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(skipped),
+            ))) => Poll::Ready(Some(SupervisionEvent::Lagged { skipped })),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// A live handle to a running supervision, returned by
 /// [`Supervisor::start`]. Unlike [`run`](Supervisor::run) — which only reports
 /// its [`SupervisionOutcome`] at the very end — a session lets a caller watch
@@ -520,6 +666,10 @@ impl SupervisionStatus {
 #[derive(Debug)]
 pub struct SupervisionSession {
     shared: Arc<SessionShared>,
+    /// Receiver created before the loop task starts, so taking the stream after
+    /// [`Supervisor::start`] cannot miss the first incarnation event. `Option`
+    /// enforces the same one-consumer contract as `RunningProcess::events`.
+    events_rx: Option<broadcast::Receiver<SupervisionEvent>>,
     /// The final outcome, delivered once the loop task ends. `Option` so
     /// [`wait`](Self::wait)/[`stop`](Self::stop) can take it out under
     /// `&mut self` without moving a field out of a `Drop` type.
@@ -536,6 +686,28 @@ impl SupervisionSession {
     #[must_use]
     pub fn status(&self) -> SupervisionStatus {
         self.shared.snapshot()
+    }
+
+    /// Take this session's typed lifecycle-event stream.
+    ///
+    /// The receiver is attached before the background task starts, so the first
+    /// incarnation is retained even when it starts before this method is called.
+    /// Call once, then drain the returned stream concurrently with
+    /// [`wait`](Self::wait) or [`stop`](Self::stop). A bounded history prevents an
+    /// unobserved crash loop from growing memory without limit; a slow consumer
+    /// receives [`SupervisionEvent::Lagged`] and then resumes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorReason::Io`](crate::ErrorReason::Io) if the stream was
+    /// already taken from this session.
+    pub fn events(&mut self) -> Result<SupervisionEvents> {
+        let rx = self.events_rx.take().ok_or_else(|| {
+            crate::Error::io(std::io::Error::other("supervision events already taken"))
+        })?;
+        Ok(SupervisionEvents {
+            inner: BroadcastStream::new(rx),
+        })
     }
 
     /// Await the final [`SupervisionOutcome`] (or terminal error) — exactly
@@ -614,6 +786,10 @@ impl Drop for SupervisionSession {
 #[derive(Debug)]
 struct SessionShared {
     state: Mutex<SessionState>,
+    /// Bounded, non-blocking lifecycle fan-out. The original receiver is
+    /// dropped in `new`; sessions subscribe before their loop task starts,
+    /// while inline `run` has no subscriber and every send is a cheap no-op.
+    events: broadcast::Sender<SupervisionEvent>,
     /// Cancelled by [`SupervisionSession::stop`] to cut short a backoff / storm
     /// sleep. Distinct from the command's [`cancel_on`](Command::cancel_on)
     /// token (whose cancellation is an *error*): a stop is not an error.
@@ -675,6 +851,7 @@ impl ChildStopper {
 
 impl SessionShared {
     fn new() -> Self {
+        let (events, _) = broadcast::channel(SUPERVISION_EVENT_CAPACITY);
         SessionShared {
             state: Mutex::new(SessionState {
                 active: true,
@@ -684,8 +861,19 @@ impl SessionShared {
                 stop_grace: Duration::ZERO,
                 current: None,
             }),
+            events,
             stop: CancellationToken::new(),
         }
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<SupervisionEvent> {
+        self.events.subscribe()
+    }
+
+    fn emit(&self, event: SupervisionEvent) {
+        // An inline `Supervisor::run` intentionally has no subscriber; a live
+        // session may also drop its stream early. Neither should affect policy.
+        let _ = self.events.send(event);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SessionState> {
@@ -1464,12 +1652,19 @@ impl<R: ProcessRunner> Supervisor<R> {
                 .cancel_token()
                 .map_or_else(CancellationToken::new, |user| user.child_token());
             let inc_command = command.clone().cancel_on(inc_cancel);
+            let attempt = restarts.saturating_add(1);
 
             match self
-                .run_incarnation(&inc_command, &shared, &spawn_capable)
+                .run_incarnation(&inc_command, &shared, &spawn_capable, attempt)
                 .await
             {
                 Incarnation::Ran(Ok(result)) => {
+                    shared.emit(SupervisionEvent::IncarnationFinished {
+                        attempt,
+                        outcome: result.outcome(),
+                        duration: result.duration(),
+                        success: result.is_success(),
+                    });
                     last_result = Some(result.clone());
                     if shared.is_stopping() {
                         // The current incarnation was gracefully stopped (or
@@ -1535,6 +1730,7 @@ impl<R: ProcessRunner> Supervisor<R> {
                         .await
                     {
                         GateOutcome::GaveUp => {
+                            shared.emit(SupervisionEvent::GaveUp { attempt });
                             return Ok(self.outcome(
                                 result,
                                 restarts,
@@ -1576,6 +1772,12 @@ impl<R: ProcessRunner> Supervisor<R> {
                     // uptime lets the E3 escalation reset for a long-lived child.
                     liveness_kills = liveness_kills.saturating_add(1);
                     let result = self.liveness_kill_result(uptime);
+                    shared.emit(SupervisionEvent::IncarnationFinished {
+                        attempt,
+                        outcome: result.outcome(),
+                        duration: result.duration(),
+                        success: false,
+                    });
                     last_result = Some(result.clone());
                     if shared.is_stopping() {
                         // A stop landed while this incarnation was being force-killed
@@ -1611,6 +1813,7 @@ impl<R: ProcessRunner> Supervisor<R> {
                         .await
                     {
                         GateOutcome::GaveUp => {
+                            shared.emit(SupervisionEvent::GaveUp { attempt });
                             return Ok(self.outcome(
                                 result,
                                 restarts,
@@ -1645,6 +1848,10 @@ impl<R: ProcessRunner> Supervisor<R> {
                     }
                 }
                 Incarnation::LivenessError { source } => {
+                    shared.emit(SupervisionEvent::IncarnationFailed {
+                        attempt,
+                        error: crate::ErrorKind::Predicate,
+                    });
                     // A fallible `try_health_check` probe erred. The losing
                     // `select!` branch already dropped the in-flight run (killing
                     // the child on drop via `run_to_result`'s `CurrentGuard`) — the
@@ -1654,6 +1861,10 @@ impl<R: ProcessRunner> Supervisor<R> {
                     return Err(crate::Error::predicate("health_check", source));
                 }
                 Incarnation::Ran(Err(err)) => {
+                    shared.emit(SupervisionEvent::IncarnationFailed {
+                        attempt,
+                        error: err.kind(),
+                    });
                     if err.is_cancelled() {
                         // A graceful stop of a shared-group / capture-only child
                         // manifests as a `Cancelled` capture (its cancel token is
@@ -1683,7 +1894,10 @@ impl<R: ProcessRunner> Supervisor<R> {
                     if let Some(classifier) = &self.give_up_when {
                         match classifier(&GiveUpAttempt::Failed(&err)) {
                             // Classified permanent: surface the spawn failure.
-                            Ok(true) => return Err(err),
+                            Ok(true) => {
+                                shared.emit(SupervisionEvent::GaveUp { attempt });
+                                return Err(err);
+                            }
                             // Not permanent — retried below, exactly as an
                             // infallible `give_up_when` returning `false` does.
                             Ok(false) => {}
@@ -1747,9 +1961,13 @@ impl<R: ProcessRunner> Supervisor<R> {
         command: &Command,
         shared: &SessionShared,
         spawn_capable: &AtomicBool,
+        attempt: u32,
     ) -> Incarnation {
         let Some(health) = &self.health_check else {
-            return Incarnation::Ran(self.run_to_result(command, shared, spawn_capable).await);
+            return Incarnation::Ran(
+                self.run_to_result(command, shared, spawn_capable, attempt)
+                    .await,
+            );
         };
         // Anchor uptime on tokio's clock (not `std::time::Instant`) so it shares
         // the timer the liveness sleeps and any paused-runtime test run on — the
@@ -1757,14 +1975,26 @@ impl<R: ProcessRunner> Supervisor<R> {
         let started = tokio::time::Instant::now();
         tokio::select! {
             biased;
-            result = self.run_to_result(command, shared, spawn_capable) => Incarnation::Ran(result),
+            result = self.run_to_result(command, shared, spawn_capable, attempt) => Incarnation::Ran(result),
             watch = health.watch(self.health_check_failures) => match watch {
                 // The wedged incarnation: force-restart it. Dropping the losing
                 // `run_to_result` future above kills the child on drop.
-                WatchOutcome::Unhealthy => Incarnation::LivenessFailed { uptime: started.elapsed() },
+                WatchOutcome::Unhealthy => {
+                    shared.emit(SupervisionEvent::HealthCheckFailed {
+                        attempt,
+                        terminal: false,
+                    });
+                    Incarnation::LivenessFailed { uptime: started.elapsed() }
+                },
                 // A fallible probe erred: same drop-kill of the in-flight run, but
                 // supervision aborts with the error (handled in the drive loop).
-                WatchOutcome::Failed(source) => Incarnation::LivenessError { source },
+                WatchOutcome::Failed(source) => {
+                    shared.emit(SupervisionEvent::HealthCheckFailed {
+                        attempt,
+                        terminal: true,
+                    });
+                    Incarnation::LivenessError { source }
+                },
             }
         }
     }
@@ -1907,8 +2137,10 @@ impl<R: ProcessRunner> Supervisor<R> {
         command: &Command,
         shared: &SessionShared,
         spawn_capable: &AtomicBool,
+        attempt: u32,
     ) -> Result<ProcessResult<String>> {
         if !spawn_capable.load(Ordering::Relaxed) {
+            shared.emit(SupervisionEvent::IncarnationStarted { attempt, pid: None });
             return self.capture_only(command).await;
         }
         let started = Instant::now();
@@ -1919,10 +2151,15 @@ impl<R: ProcessRunner> Supervisor<R> {
                 // every later incarnation through the plain capture verb instead —
                 // no live pid / graceful stop, but supervision is unaffected.
                 spawn_capable.store(false, Ordering::Relaxed);
+                shared.emit(SupervisionEvent::IncarnationStarted { attempt, pid: None });
                 return self.capture_only(command).await;
             }
             Err(err) => return Err(err),
         };
+        shared.emit(SupervisionEvent::IncarnationStarted {
+            attempt,
+            pid: handle.pid(),
+        });
 
         // Publish the live child and learn, atomically, whether a graceful stop
         // already landed (the stop-vs-spawn race). Its cancel token is the only
@@ -2121,6 +2358,10 @@ impl<R: ProcessRunner> Supervisor<R> {
             return Wake::Elapsed;
         }
         let pause = apply_jitter(pause, self.jitter);
+        shared.emit(SupervisionEvent::StormPaused {
+            pause: storm.pauses.saturating_add(1),
+            delay: pause,
+        });
         // A plain synchronous emit at a discrete decision point (not on the
         // health-check `select!` path, and holding nothing across the await
         // below) — K-044 is not implicated.
@@ -2153,6 +2394,10 @@ impl<R: ProcessRunner> Supervisor<R> {
     async fn sleep_backoff(&self, restarts: u32, factor: f64, shared: &SessionShared) -> Wake {
         let delay = backoff_delay(self.backoff_base, factor, restarts, self.max_backoff);
         let delay = apply_jitter(delay, self.jitter);
+        shared.emit(SupervisionEvent::RestartScheduled {
+            restart: restarts.saturating_add(1),
+            delay,
+        });
         // Synchronous emit before the backoff await; holds nothing across it.
         #[cfg(feature = "metrics")]
         crate::metrics::record_restart();
@@ -2192,10 +2437,21 @@ impl<R: ProcessRunner + 'static> Supervisor<R> {
     #[must_use = "a dropped SupervisionSession aborts supervision immediately — hold it, then wait()/stop()"]
     pub fn start(self) -> SupervisionSession {
         let shared = Arc::new(SessionShared::new());
+        // Subscribe before spawning so even an immediately-completing first
+        // incarnation is present when the caller later takes `events()`.
+        let events_rx = shared.subscribe();
         let (tx, rx) = oneshot::channel();
         let task_shared = Arc::clone(&shared);
         let handle = tokio::spawn(async move {
             let outcome = self.drive(Arc::clone(&task_shared)).await;
+            match &outcome {
+                Ok(outcome) => task_shared.emit(SupervisionEvent::Stopped {
+                    reason: outcome.stopped,
+                }),
+                Err(err) => {
+                    task_shared.emit(SupervisionEvent::SupervisionFailed { error: err.kind() })
+                }
+            }
             // Flip the live status to inactive before the outcome becomes
             // observable, so an awaiter that then reads `status()` never sees
             // `is_active() == true` on a finished session.
@@ -2204,6 +2460,7 @@ impl<R: ProcessRunner + 'static> Supervisor<R> {
         });
         SupervisionSession {
             shared,
+            events_rx: Some(events_rx),
             completion: Some(rx),
             abort: handle.abort_handle(),
         }
@@ -2325,6 +2582,62 @@ mod tests {
         assert_eq!(RestartPolicy::from_name(""), None);
         assert_eq!(StopReason::from_name("gaveup"), None);
         assert_eq!(StopReason::from_name("exhausted"), None);
+    }
+
+    #[test]
+    fn supervision_event_names_pin_every_variant() {
+        let events = [
+            SupervisionEvent::IncarnationStarted {
+                attempt: 1,
+                pid: Some(7),
+            },
+            SupervisionEvent::IncarnationFinished {
+                attempt: 1,
+                outcome: Outcome::Exited(0),
+                duration: Duration::ZERO,
+                success: true,
+            },
+            SupervisionEvent::IncarnationFailed {
+                attempt: 1,
+                error: crate::ErrorKind::Spawn,
+            },
+            SupervisionEvent::RestartScheduled {
+                restart: 1,
+                delay: Duration::ZERO,
+            },
+            SupervisionEvent::StormPaused {
+                pause: 1,
+                delay: Duration::ZERO,
+            },
+            SupervisionEvent::HealthCheckFailed {
+                attempt: 1,
+                terminal: false,
+            },
+            SupervisionEvent::GaveUp { attempt: 1 },
+            SupervisionEvent::Stopped {
+                reason: StopReason::PolicySatisfied,
+            },
+            SupervisionEvent::SupervisionFailed {
+                error: crate::ErrorKind::Predicate,
+            },
+            SupervisionEvent::Lagged { skipped: 1 },
+        ];
+        let names = events.map(|event| event.name());
+        assert_eq!(
+            names,
+            [
+                "incarnation_started",
+                "incarnation_finished",
+                "incarnation_failed",
+                "restart_scheduled",
+                "storm_paused",
+                "health_check_failed",
+                "gave_up",
+                "stopped",
+                "supervision_failed",
+                "lagged",
+            ]
+        );
     }
 
     /// T-179: a `SupervisionOutcome` built by the `#[doc(hidden)]` `from_parts`
@@ -2531,6 +2844,170 @@ mod tests {
 
         assert_eq!(starts.load(Ordering::SeqCst), 3);
         assert_eq!(captures.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn session_events_report_incarnations_restart_and_terminal_reason_in_order() {
+        use tokio_stream::StreamExt;
+
+        let mut session = supervise(SeqRunner::new(vec![fail(7), ok()])).start();
+        let mut events = session.events().expect("first event stream");
+        let collect = async move {
+            let mut collected = Vec::new();
+            while let Some(event) = events.next().await {
+                collected.push(event);
+            }
+            collected
+        };
+        let (collected, outcome) = tokio::join!(collect, session.wait());
+        let outcome = outcome.expect("supervision outcome");
+
+        assert_eq!(outcome.restarts, 1);
+        assert_eq!(
+            collected,
+            vec![
+                SupervisionEvent::IncarnationStarted {
+                    attempt: 1,
+                    pid: None,
+                },
+                SupervisionEvent::IncarnationFinished {
+                    attempt: 1,
+                    outcome: Outcome::Exited(7),
+                    duration: Duration::ZERO,
+                    success: false,
+                },
+                SupervisionEvent::RestartScheduled {
+                    restart: 1,
+                    delay: Duration::ZERO,
+                },
+                SupervisionEvent::IncarnationStarted {
+                    attempt: 2,
+                    pid: None,
+                },
+                SupervisionEvent::IncarnationFinished {
+                    attempt: 2,
+                    outcome: Outcome::Exited(0),
+                    duration: Duration::ZERO,
+                    success: true,
+                },
+                SupervisionEvent::Stopped {
+                    reason: StopReason::PolicySatisfied,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_events_can_only_be_taken_once() {
+        let mut session = supervise(SeqRunner::new(vec![ok()])).start();
+        let _events = session.events().expect("first event stream");
+        let err = session
+            .events()
+            .expect_err("a second event consumer must be rejected");
+        assert!(matches!(err.reason(), crate::ErrorReason::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn session_events_report_exact_lag_without_unbounded_history() {
+        use tokio_stream::StreamExt;
+
+        let replies = (0..=70).map(|_| ok()).collect();
+        let mut session = supervise(SeqRunner::new(replies))
+            .restart(RestartPolicy::Always)
+            .max_restarts(70)
+            .start();
+        while session.status().is_active() {
+            tokio::task::yield_now().await;
+        }
+
+        let mut events = session.events().expect("event stream after completion");
+        let collect = async move {
+            let mut collected = Vec::new();
+            while let Some(event) = events.next().await {
+                collected.push(event);
+            }
+            collected
+        };
+        let (collected, outcome) = tokio::join!(collect, session.wait());
+        outcome.expect("bounded-history outcome");
+
+        // 71 starts + 71 finishes + 70 scheduled restarts + one terminal event
+        // = 213. The channel retains 128 and reports the skipped 85 exactly.
+        assert_eq!(collected.len(), SUPERVISION_EVENT_CAPACITY + 1);
+        assert_eq!(collected[0], SupervisionEvent::Lagged { skipped: 85 });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_events_report_health_failure_and_give_up() {
+        use tokio_stream::StreamExt;
+
+        let mut session = Supervisor::new(Command::new("server"))
+            .with_runner(ScriptedRunner::new().fallback(Reply::pending()))
+            .health_check(|| async { false }, Duration::from_millis(10))
+            .health_check_failures(1)
+            .give_up_when(|attempt| matches!(attempt, GiveUpAttempt::Crashed(_)))
+            .backoff(Duration::ZERO, 1.0)
+            .jitter(false)
+            .start();
+        let mut events = session.events().expect("event stream");
+        let collect = async move {
+            let mut collected = Vec::new();
+            while let Some(event) = events.next().await {
+                collected.push(event);
+            }
+            collected
+        };
+        let (collected, outcome) = tokio::join!(collect, session.wait());
+        let outcome = outcome.expect("give-up outcome");
+
+        assert_eq!(outcome.stopped, StopReason::GaveUp);
+        assert_eq!(
+            collected
+                .iter()
+                .map(SupervisionEvent::name)
+                .collect::<Vec<_>>(),
+            [
+                "incarnation_started",
+                "health_check_failed",
+                "incarnation_finished",
+                "gave_up",
+                "stopped",
+            ]
+        );
+        assert!(matches!(
+            collected[1],
+            SupervisionEvent::HealthCheckFailed {
+                attempt: 1,
+                terminal: false
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_events_report_storm_pause_with_jittered_delay() {
+        use tokio_stream::StreamExt;
+
+        let mut session = supervise(SeqRunner::new(vec![fail(1), fail(1), fail(1), ok()]))
+            .storm_pause(Duration::from_secs(1))
+            .failure_threshold(2.5)
+            .failure_decay(Duration::from_secs(1000))
+            .start();
+        let mut events = session.events().expect("event stream");
+        let collect = async move {
+            let mut collected = Vec::new();
+            while let Some(event) = events.next().await {
+                collected.push(event);
+            }
+            collected
+        };
+        let (collected, outcome) = tokio::join!(collect, session.wait());
+        let outcome = outcome.expect("storm-guarded outcome");
+
+        assert_eq!(outcome.storm_pauses, 1);
+        assert!(collected.contains(&SupervisionEvent::StormPaused {
+            pause: 1,
+            delay: Duration::from_secs(1),
+        }));
     }
 
     #[test]
