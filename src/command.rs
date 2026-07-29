@@ -2243,6 +2243,16 @@ impl Command {
         &self.program
     }
 
+    /// The explicit Unix `argv[0]` override, if configured.
+    ///
+    /// This exposes the routing input to `ScriptedRunner::when` predicates and
+    /// other command inspection without conflating it with
+    /// [`program`](Self::program), which remains the executable lookup key.
+    /// `Some` is still observable on non-Unix before launch rejects the request.
+    pub fn configured_arg0(&self) -> Option<&OsStr> {
+        self.arg0.as_deref()
+    }
+
     /// The arguments, in order.
     pub fn arguments(&self) -> &[OsString] {
         &self.args
@@ -5544,6 +5554,8 @@ mod tests {
             .arg0("first")
             .arg0("login shell")
             .arg("work");
+        assert_eq!(command.configured_arg0(), Some(OsStr::new("login shell")));
+        assert_eq!(Command::new("tool").configured_arg0(), None);
         #[cfg(unix)]
         assert_eq!(command.command_line(), "tool [argv0='login shell'] work");
         #[cfg(not(unix))]

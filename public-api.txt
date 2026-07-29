@@ -851,6 +851,7 @@ pub fn processkit::Command::cancel_on(self, tokio_util::sync::cancellation_token
 pub fn processkit::Command::capture_policy(self, impl processkit::CapturePolicy + 'static) -> Self
 pub async fn processkit::Command::checked(&self) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
 pub fn processkit::Command::command_line(&self) -> alloc::string::String
+pub fn processkit::Command::configured_arg0(&self) -> core::option::Option<&std::ffi::os_str::OsStr>
 pub fn processkit::Command::configured_cpu_affinity(&self) -> core::option::Option<&[usize]>
 pub fn processkit::Command::configured_inactivity_timeout(&self) -> core::option::Option<core::time::Duration>
 pub fn processkit::Command::configured_ok_codes(&self) -> core::option::Option<&[i32]>
