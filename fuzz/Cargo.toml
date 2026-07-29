@@ -49,3 +49,10 @@ path = "fuzz_targets/fuzz_cassette_replay.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "strip_vt"
+path = "fuzz_targets/strip_vt.rs"
+test = false
+doc = false
+bench = false

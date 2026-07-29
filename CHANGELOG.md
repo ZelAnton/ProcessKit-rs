@@ -22,6 +22,8 @@ to a dated version section.
 
 - Add the CLI runner documentation to the Pages implementation switcher.
 - Simplify oversized-line pump tracking by removing unused length accumulation.
+- Add the VT sanitizer to the scheduled fuzz tier and strengthen its property
+  tests around control removal, idempotence, and output length.
 
 ### Fixed
 

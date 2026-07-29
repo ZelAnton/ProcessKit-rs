@@ -323,6 +323,30 @@ fn strip_vt(line: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// Fuzzing-only entry point for the standalone VT sanitizer target. Lossy UTF-8
+/// admits every byte sequence while still driving `strip_vt` with valid `&str`.
+#[cfg(fuzzing)]
+pub fn fuzz_strip_vt(raw: &[u8]) {
+    let input = String::from_utf8_lossy(raw);
+    let cleaned = strip_vt(&input).into_owned();
+
+    assert!(
+        cleaned.len() <= input.len(),
+        "sanitization expanded its input"
+    );
+    assert!(
+        !cleaned
+            .bytes()
+            .any(|byte| byte == ESC || is_strippable_control(byte)),
+        "sanitized output retained terminal control bytes"
+    );
+    assert_eq!(
+        strip_vt(&cleaned),
+        cleaned,
+        "VT sanitization must be idempotent"
+    );
+}
+
 /// Run the opt-in VT sanitizer over one decoded `line` when
 /// [`sanitize_vt`](StreamConfig::sanitize_vt) is set, returning the text to hand
 /// onward. Off (the default) returns the line untouched with no allocation.
@@ -4409,6 +4433,11 @@ mod tests {
             .prop_map(|chars| chars.into_iter().collect())
         }
 
+        fn arb_printable_ascii_line() -> impl Strategy<Value = String> {
+            prop::collection::vec(0x20u8..=0x7e, 0..128)
+                .prop_map(|bytes| String::from_utf8(bytes).expect("ASCII is UTF-8"))
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -4563,11 +4592,29 @@ mod tests {
             ) {
                 let cleaned = strip_vt(&line).into_owned();
                 let twice = strip_vt(&cleaned).into_owned();
+                prop_assert!(
+                    cleaned.len() <= line.len(),
+                    "strip_vt must never expand its input"
+                );
+                prop_assert!(
+                    !cleaned
+                        .bytes()
+                        .any(|byte| byte == ESC || is_strippable_control(byte)),
+                    "sanitized output retained ESC, C0, or DEL"
+                );
                 prop_assert_eq!(
                     twice,
                     cleaned,
                     "strip_vt must be idempotent (every escape consumed on a char boundary)"
                 );
+            }
+
+            /// Printable text contains no terminal control bytes, so the
+            /// sanitizer's zero-allocation fast path must preserve it exactly.
+            #[test]
+            fn strip_vt_preserves_clean_printable_text(line in arb_printable_ascii_line()) {
+                prop_assert!(matches!(strip_vt(&line), Cow::Borrowed(_)));
+                prop_assert_eq!(strip_vt(&line), line.as_str());
             }
 
             /// The sanitizer-enabled twin of

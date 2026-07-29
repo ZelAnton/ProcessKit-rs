@@ -310,7 +310,7 @@ pub use priority::Priority;
 // never shows up in `cargo public-api`'s (`--all-features`, no `--cfg
 // fuzzing`) surface, and thus never touches `public-api.txt`.
 #[cfg(fuzzing)]
-pub use pump::fuzz_decode_pump_lines;
+pub use pump::{fuzz_decode_pump_lines, fuzz_strip_vt};
 // Fuzzing-only cassette seams keep the ordinary API file-based while letting
 // cargo-fuzz exercise parser and replay state directly from in-memory input.
 #[cfg(all(fuzzing, feature = "record"))]
