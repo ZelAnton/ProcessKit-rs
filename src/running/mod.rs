@@ -814,15 +814,16 @@ impl RunningProcess {
     }
 
     /// Fail loud if streaming is not possible: (a) stdout not piped, or
-    /// (b) a prior streaming verb already consumed stdout on this handle.
+    /// (b) a prior readiness or streaming call already started its one line pump.
     fn ensure_stdout_streamable(&self) -> Result<()> {
         self.ensure_stdout_capturable()?; // (a) non-piped stdout
         if self.stdout_sink.is_some() {
             return Err(Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "`{}`: stdout was already consumed by an earlier stdout_lines/events \
-                     call — stream it once (a second call would yield an empty stream)",
+                    "`{}`: stdout was already consumed by an earlier readiness or streaming \
+                     call — stdout has a single line pump (a second consumer would yield \
+                     empty output)",
                     self.program
                 ),
             )));
@@ -875,8 +876,9 @@ impl RunningProcess {
     ///   exceeded its line or byte ceiling.
     /// - [`ErrorReason::Stdin`] — a configured stdin source failed for a reason other
     ///   than a broken pipe, on an *otherwise-successful* run.
-    /// - [`ErrorReason::Io`] — stdout is not piped, a prior streaming call already
-    ///   consumed it as decoded lines, or waiting on the child failed.
+    /// - [`ErrorReason::Io`] — stdout is not piped, waiting on the child failed,
+    ///   or a pipe pump ended with a read error. A prior line-oriented readiness
+    ///   or streaming call is supported; only its unconsumed tail is returned.
     pub async fn output_string(mut self) -> Result<ProcessResult<String>> {
         let finished = self
             .finish_lines(CaptureMode::Lines, /* expose_counts */ true, || {})
@@ -938,8 +940,8 @@ impl RunningProcess {
     /// # Errors
     ///
     /// Returns [`ErrorReason::Io(InvalidInput)`](std::io::ErrorKind::InvalidInput) if
-    /// stdout is not piped, or if a prior streaming call already consumed stdout
-    /// as decoded lines (the raw bytes cannot be reconstructed). Returns
+    /// stdout is not piped, or if a prior readiness or streaming call already
+    /// started the decoded-line pump (the raw bytes cannot be reconstructed). Returns
     /// [`ErrorReason::OutputTooLarge`] if the byte ceiling is set to
     /// [`OverflowMode::Error`](crate::OverflowMode) and the raw stdout exceeds it.
     /// (A cancelled run is [`ErrorReason::Cancelled`]; a non-zero exit, a timeout, or a
@@ -957,9 +959,9 @@ impl RunningProcess {
             return Err(Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "`{}`: output_bytes cannot follow a streaming call (stdout was already \
-                     consumed as lines) — use output_string to collect the streamed lines, or \
-                     call output_bytes without streaming first",
+                    "`{}`: output_bytes cannot follow a readiness or streaming call (stdout \
+                     was already consumed as decoded lines) — use output_string to collect the \
+                     unconsumed lines, or call output_bytes before line-oriented consumers",
                     self.program
                 ),
             )));
@@ -1368,8 +1370,8 @@ impl RunningProcess {
         if matches!(capture, CaptureMode::Lines) {
             self.ensure_stdout_capturable()?;
         }
-        // Reuse a sink already populated by a prior streaming call so that
-        // output_string after stdout_lines/events sees those lines rather
+        // Reuse a sink already populated by a prior readiness or streaming call
+        // so output_string after stdout_lines/events sees those lines rather
         // than returning empty. For the discard paths use a retain-nothing sink
         // (not the user's retention policy) so a chatty child never accumulates
         // O(total) heap in wait/profile/drain. The byte cap bounds the pump's
@@ -2617,10 +2619,38 @@ mod tests {
             .output_bytes()
             .await
             .expect_err("output_bytes after streaming must error, not return empty");
+        assert!(
+            err.to_string().contains("readiness or streaming call"),
+            "the diagnostic names every line-pump owner: {err}"
+        );
         match err.into_reason() {
             ErrorReason::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
             other => panic!("expected Io(InvalidInput), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn readiness_owned_stdout_is_attributed_to_readiness_not_a_fake_stream_call() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::lines(["ready", "tail"]))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+        assert_eq!(
+            run.wait_for_line(|line| line == "ready", Duration::from_secs(1))
+                .await
+                .expect("readiness line"),
+            "ready"
+        );
+
+        let err = match run.stdout_lines() {
+            Ok(_) => panic!("a second stdout consumer must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("readiness or streaming call"),
+            "the error must not invent an earlier stdout_lines/events call: {err}"
+        );
     }
 
     /// Other direction: a bounded buffer that genuinely discards lines during

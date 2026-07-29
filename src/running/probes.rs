@@ -61,8 +61,8 @@ impl RunningProcess {
     ///
     /// - **Consumes stdout** up to and including the matching line (the same
     ///   one-shot stdout drain [`stdout_lines`](Self::stdout_lines) uses — if
-    ///   stdout was already consumed by an earlier `stdout_lines` /
-    ///   `events` / `wait_for_line`, or was not piped, this returns an
+    ///   stdout already has a line pump from an earlier readiness or streaming
+    ///   call, or was not piped, this returns an
     ///   `Err` rather than a stream that is forever `NotReady`). Continue
     ///   with [`finish`](Self::finish) for the outcome and stderr;
     ///   [`wait_for`](Self::wait_for) / [`wait_for_port`](Self::wait_for_port)
@@ -82,8 +82,8 @@ impl RunningProcess {
     ///   immediately when stdout closes first (no further line can arrive). This
     ///   is a *probe* deadline — distinct from [`ErrorReason::Timeout`], and a failed
     ///   probe neither kills the child nor flips its outcome to `TimedOut`.
-    /// - [`ErrorReason::Io`] when stdout was not piped, or a prior streaming verb
-    ///   already consumed it (so no line stream can be drained).
+    /// - [`ErrorReason::Io`] when stdout was not piped, or a prior readiness or
+    ///   streaming call already started its line pump.
     pub async fn wait_for_line(
         &mut self,
         predicate: impl Fn(&str) -> bool + Send,
@@ -213,9 +213,9 @@ impl RunningProcess {
     ///   when stdout closes first with no match. A *probe* deadline — distinct
     ///   from [`ErrorReason::Timeout`]; the child is neither killed nor flipped to
     ///   `TimedOut`.
-    /// - [`ErrorReason::Io`] when stdout was not piped, or a prior
-    ///   [`stdout_lines`](Self::stdout_lines) / [`events`](Self::events) /
-    ///   `wait_for_line` already consumed it (so there is no live tail to watch).
+    /// - [`ErrorReason::Io`] when stdout was not piped, or a prior readiness or
+    ///   streaming call already started its line pump (so there is no live tail
+    ///   to watch through a second sink).
     pub async fn wait_for_output(
         &mut self,
         predicate: impl Fn(&str) -> bool + Send,

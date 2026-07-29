@@ -102,14 +102,13 @@ impl RunningProcess {
     /// even if the child caught the signal and exited cleanly within the grace.
     ///
     /// Returns `Err` instead of a silently-empty stream when stdout was not piped
-    /// or a streaming verb was already called on this handle.
+    /// or a readiness/streaming call already started its one line pump.
     ///
     /// # Errors
     ///
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) when stdout was not piped, or a prior
-    /// streaming verb ([`stdout_lines`](Self::stdout_lines) /
-    /// [`events`](Self::events) / `wait_for_line`) already consumed
-    /// it — returned instead of a stream that would silently be empty.
+    /// readiness or streaming call already started its line pump — returned
+    /// instead of a stream that would silently be empty.
     pub fn stdout_lines(&mut self) -> Result<StdoutLines> {
         // Drain stdout AND arm the timeout watchdog. `wait_for_line` instead calls
         // `drain_stdout_lines` directly, so a readiness probe never kills the tree.
@@ -530,8 +529,8 @@ impl RunningProcess {
     /// # Errors
     ///
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) when stdout was not piped, or a prior
-    /// streaming verb already consumed it — returned instead of a stream that
-    /// would silently be empty.
+    /// readiness/streaming call already started its line pump — returned instead
+    /// of a stream that would silently be empty.
     pub fn events(&mut self) -> Result<ProcessEvents> {
         self.ensure_stdout_streamable()?;
         debug_assert!(

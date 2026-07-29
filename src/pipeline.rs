@@ -901,9 +901,8 @@ impl PipelineSession {
     /// # Errors
     ///
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) when the last stage's stdout was not piped,
-    /// or a prior streaming verb ([`stdout_lines`](Self::stdout_lines) /
-    /// [`events`](Self::events) / [`wait_for_line`](Self::wait_for_line))
-    /// already consumed it — returned instead of a silently-empty stream.
+    /// or a prior readiness/streaming call already started its one line pump —
+    /// returned instead of a silently-empty stream.
     pub fn stdout_lines(&mut self) -> Result<StdoutLines> {
         self.last_mut().stdout_lines()
     }
@@ -920,7 +919,7 @@ impl PipelineSession {
     /// # Errors
     ///
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) when the last stage's stdout was not piped,
-    /// or a prior streaming verb already consumed it.
+    /// or a prior readiness/streaming call already started its line pump.
     pub fn events(&mut self) -> Result<ProcessEvents> {
         self.last_mut().events()
     }
