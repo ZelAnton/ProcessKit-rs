@@ -4,7 +4,68 @@ use std::time::{Duration, Instant};
 
 use processkit::Command;
 
+#[cfg(windows)]
+use processkit::ProcessRunner;
+#[cfg(windows)]
+use processkit::testing::{Reply, ScriptedRunner};
+
 use crate::common::*;
+
+#[cfg(windows)]
+fn unique_pipe_name(label: &str) -> (String, String) {
+    let bare = format!("processkit-readiness-{label}-{}", std::process::id());
+    (bare.clone(), format!(r"\\.\pipe\{bare}"))
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn wait_for_pipe_accepts_a_bare_name_and_connects() {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let (bare, path) = unique_pipe_name("open");
+    let _server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&path)
+        .expect("create named pipe server");
+    let mut run = ScriptedRunner::new()
+        .fallback(Reply::pending())
+        .start(&Command::new("service"))
+        .await
+        .expect("scripted service start");
+
+    run.wait_for_pipe(&bare, Duration::from_secs(1))
+        .await
+        .expect("a listening named pipe is ready");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn wait_for_pipe_treats_a_busy_server_as_ready() {
+    use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+    let (_bare, path) = unique_pipe_name("busy");
+    let server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .max_instances(1)
+        .create(&path)
+        .expect("create single-instance named pipe server");
+    let _occupied = ClientOptions::new()
+        .open(&path)
+        .expect("occupy the only pipe instance");
+    server
+        .connect()
+        .await
+        .expect("complete the first connection");
+    let mut run = ScriptedRunner::new()
+        .fallback(Reply::pending())
+        .start(&Command::new("service"))
+        .await
+        .expect("scripted service start");
+
+    run.wait_for_pipe(&path, Duration::from_secs(1))
+        .await
+        .expect("ERROR_PIPE_BUSY still proves the server is ready");
+}
 
 #[tokio::test]
 #[ignore = "spawns a real subprocess and waits for its readiness banner"]

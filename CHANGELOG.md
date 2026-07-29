@@ -13,6 +13,8 @@ to a dated version section.
 
 ### Added
 
+- Add a Windows named-pipe readiness probe with busy-server detection and a
+  symmetric `Unsupported` result on other platforms.
 - Add a resettable per-command output-inactivity watchdog with distinct result
   classification across capture, streaming, PTY, doubles, and cassettes.
 - Add stderr line and partial-tail readiness probes with the same non-killing

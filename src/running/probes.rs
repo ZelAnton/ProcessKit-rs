@@ -1,5 +1,5 @@
-//! Readiness probes for stdout/stderr lines and partial tails, ports, sockets,
-//! and arbitrary async checks. They background-drain both output streams while
+//! Readiness probes for stdout/stderr lines and partial tails, TCP ports, local
+//! sockets/pipes, and arbitrary async checks. They background-drain both output streams while
 //! they poll, so a chatty child can't stall in `write()` on a full OS pipe
 //! buffer; the line probes hand back only the selected stream.
 
@@ -463,6 +463,60 @@ impl RunningProcess {
         }
     }
 
+    /// Wait until a Windows named pipe is connectable, or fail with
+    /// [`ErrorReason::NotReady`] when `within` elapses — or immediately when the
+    /// child exits first. The successful probe connection is dropped immediately.
+    /// `ERROR_PIPE_BUSY` also counts as ready: it proves a server has created the
+    /// pipe even though every instance is currently serving another client.
+    ///
+    /// `name` may be a bare pipe name (`"my-service"`) or a fully-qualified path
+    /// (`r"\\.\pipe\my-service"`). Bare names are resolved under `\\.\pipe\`.
+    /// Piped stdout/stderr are background-drained and retained under the caller's
+    /// [`OutputBufferPolicy`](crate::OutputBufferPolicy), like
+    /// [`wait_for_port`](Self::wait_for_port). This probe is available only on
+    /// Windows; other targets return [`ErrorReason::Unsupported`] immediately.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorReason::NotReady`] when `within` elapses before the pipe appears, or
+    /// immediately when the child exits first. This probe deadline never kills the
+    /// child or touches its outcome. [`ErrorReason::Unsupported`] is returned on
+    /// non-Windows platforms.
+    pub async fn wait_for_pipe(&mut self, name: impl AsRef<Path>, within: Duration) -> Result<()> {
+        #[cfg(not(windows))]
+        {
+            let _ = (name, within);
+            Err(ErrorReason::Unsupported {
+                operation: "wait_for_pipe".into(),
+            }
+            .into())
+        }
+
+        #[cfg(windows)]
+        {
+            use tokio::net::windows::named_pipe::ClientOptions;
+            use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+            let name = name.as_ref();
+            let path = if name.is_absolute() {
+                name.to_owned()
+            } else {
+                Path::new(r"\\.\pipe").join(name)
+            };
+            self.poll_until(
+                move || {
+                    let ready = match ClientOptions::new().open(&path) {
+                        Ok(_client) => true,
+                        Err(error) => error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32),
+                    };
+                    async move { ready }
+                },
+                within,
+            )
+            .await
+        }
+    }
+
     /// Re-run `check` on the readiness cadence until it passes, the child
     /// exits, or the deadline elapses.
     async fn poll_until<F, Fut>(&mut self, mut check: F, within: Duration) -> Result<()>
@@ -533,6 +587,7 @@ fn probe_futures_are_send(rp: &mut RunningProcess) {
     assert_send(&rp.wait_for_output(|tail| tail.is_empty(), Duration::ZERO));
     assert_send(&rp.wait_for_stderr_output(|tail| tail.is_empty(), Duration::ZERO));
     assert_send(&rp.wait_for(|| async { true }, Duration::ZERO));
+    assert_send(&rp.wait_for_pipe("ready", Duration::ZERO));
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
     assert_send(&rp.wait_for_port(addr, Duration::ZERO));
     assert_send(&rp.wait_for_socket("socket", Duration::ZERO));
@@ -806,6 +861,25 @@ mod tests {
             .expect_err("Windows has no AF_UNIX readiness probe");
         assert!(
             matches!(error.reason(), ErrorReason::Unsupported { operation } if operation == "wait_for_socket"),
+            "got {error:?}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn wait_for_pipe_is_unsupported_off_windows() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::pending())
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+
+        let error = run
+            .wait_for_pipe("service", Duration::from_secs(30))
+            .await
+            .expect_err("named pipes are a Windows readiness primitive");
+        assert!(
+            matches!(error.reason(), ErrorReason::Unsupported { operation } if operation == "wait_for_pipe"),
             "got {error:?}"
         );
     }

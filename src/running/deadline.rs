@@ -196,9 +196,7 @@ mod loom_model {
             let inactivity_won = inactivity.join().unwrap();
 
             assert_eq!(
-                usize::from(deadline_won)
-                    + usize::from(inactivity_won)
-                    + usize::from(exit_won),
+                usize::from(deadline_won) + usize::from(inactivity_won) + usize::from(exit_won),
                 1,
                 "exactly one terminal cause must claim the arbiter"
             );

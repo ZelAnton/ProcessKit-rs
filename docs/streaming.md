@@ -657,7 +657,10 @@ async fn main() -> processkit::Result<()> {
     run.wait_for_socket("/tmp/my-server.sock", Duration::from_secs(10))
         .await?;
 
-    // 4. Any async predicate (an HTTP /health endpoint, a file appearing, …):
+    // 4. A Windows named pipe accepting clients (Windows only):
+    run.wait_for_pipe("my-service", Duration::from_secs(10)).await?;
+
+    // 5. Any async predicate (an HTTP /health endpoint, a file appearing, …):
     run.wait_for(|| async { health_check().await }, Duration::from_secs(10))
         .await?;
 
@@ -693,15 +696,18 @@ Probe semantics, deliberately uniform:
   buffer. `wait_for_line` and `wait_for_stderr_line` consume the selected stream
   up to (and including) the match — continue with `finish` (whose stderr omits
   lines already consumed by `wait_for_stderr_line`). `wait_for_port` /
-  `wait_for_socket` / `wait_for`
+  `wait_for_socket` / `wait_for_pipe` / `wait_for`
   drain the same way but never hand any of it back mid-probe; `wait` /
   `output_string` afterward still see the full captured output, but
   `output_bytes` or a fresh `stdout_lines` / `events` call do not
-  compose with any of the four probes (same as calling `wait_for_line`
+  compose with any readiness probe that started a line pump (same as calling `wait_for_line`
   first).
 - `wait_for_socket` uses a real connection attempt, not just a socket-file
   existence check, and returns `ErrorReason::Unsupported` immediately on platforms
   without AF_UNIX (including Windows).
+- `wait_for_pipe` accepts a bare name or a fully-qualified `\\.\pipe\...` path.
+  It returns `ErrorReason::Unsupported` off Windows. A busy pipe counts as ready:
+  all server instances being occupied still proves the endpoint is serving.
 
 ## Prompt-aware waiting (`wait_for_output`)
 

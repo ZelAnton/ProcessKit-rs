@@ -217,10 +217,13 @@ platform. Gated on the **`process-control`** feature, like `signal`.
 |---|---|---|
 | `wait_for_line`, `wait_for_port`, `wait_for` | ✅ | ✅ |
 | `wait_for_socket` (AF_UNIX) | ❌ `Unsupported` | ✅ |
+| `wait_for_pipe` (named pipe) | ✅ | ❌ `Unsupported` |
 
 `wait_for_socket` attempts a real Unix domain socket connection, so an orphaned
 socket file does not count as ready. On Windows and any target without AF_UNIX,
 it returns `ErrorReason::Unsupported` immediately.
+`wait_for_pipe` provides the symmetric Windows local-IPC probe: it attempts a
+real client open, treats `ERROR_PIPE_BUSY` as ready, and is unsupported on Unix.
 
 **Spawn-time controls**
 
