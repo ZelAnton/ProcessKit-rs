@@ -1383,6 +1383,7 @@ impl RunningProcess {
             CaptureMode::DrainBounded => drain_sink_policy(&self.buffer),
             CaptureMode::Lines => self.buffer,
         };
+        let discard_in_flight_cap = sink_policy.max_bytes;
         let stdout_sink = self
             .stdout_sink
             .clone()
@@ -1403,8 +1404,10 @@ impl RunningProcess {
         // latch (K-054) single-sourced. The capture path (`output_string`) leaves
         // the sink untouched so it can still hand back the streamed tail.
         if matches!(capture, CaptureMode::Discard | CaptureMode::DrainBounded) {
-            stdout_sink.start_discarding();
-            stderr_sink.start_discarding();
+            let cap = discard_in_flight_cap
+                .expect("discard sink policies always carry an in-flight byte cap");
+            stdout_sink.start_discarding(cap);
+            stderr_sink.start_discarding(cap);
         }
         self.spawn_line_pumps(&stdout_sink, &stderr_sink);
         if expose_counts {

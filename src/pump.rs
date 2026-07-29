@@ -609,8 +609,9 @@ impl SharedLines {
         self.notify.notify_one();
     }
 
-    /// The retained-byte ceiling (`OutputBufferPolicy::max_bytes`), read by the
-    /// pump once at start to bound the in-flight decode buffer.
+    /// The current retained-byte ceiling (`OutputBufferPolicy::max_bytes`). The
+    /// pump re-reads it at every OS-read boundary because an adopting discard
+    /// verb can lower an already-running stream sink's in-flight bound.
     pub(crate) fn byte_cap(&self) -> Option<usize> {
         self.inner.lock().expect("SharedLines poisoned").max_bytes
     }
@@ -669,17 +670,22 @@ impl SharedLines {
         self.close();
     }
 
-    /// Switch the sink to retain nothing and drop its current backlog. A discard
+    /// Switch the sink to retain nothing, apply `in_flight_cap`, and drop its
+    /// current backlog. A discard
     /// verb (`wait`/`profile`) calls this when it adopts a sink a **dropped**
     /// stream left populated under the caller's `OutputBufferPolicy`, so the
     /// still-running pump stops accumulating lines nobody will read. The line
-    /// counter is untouched (it still reflects the total the pump has seen); only
-    /// the retained backlog and future retention are dropped.
-    pub(crate) fn start_discarding(&self) {
+    /// counter is untouched (it still reflects the total the pump has seen).
+    /// Updating `max_bytes` is also load-bearing: the pump may have started under
+    /// an unbounded streaming policy, so it must observe the discard verb's cap
+    /// before decoding the next chunk of a newline-free flood.
+    pub(crate) fn start_discarding(&self, in_flight_cap: usize) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.discarding = true;
+        inner.max_bytes = Some(in_flight_cap);
         inner.lines.clear();
         inner.bytes = 0;
+        inner.partial_tail.clear();
     }
 
     /// Total lines seen by the pump (including dropped ones).
@@ -1219,13 +1225,6 @@ where
 
     // The OS read size.
     const CHUNK: usize = 8192;
-    // The retained-byte ceiling, read once. When set it bounds the *in-flight*
-    // decode buffer too, not just the retained backlog: a line longer than the cap
-    // can never be retained whole, so once `pending` passes the cap we stop
-    // buffering it and skip to its newline — a newline-free flood can no longer
-    // OOM the parent. The bound is `cap + CHUNK` (rechecked once per read, after a
-    // whole chunk decodes in), not exactly `cap`.
-    let cap = sink.0.byte_cap();
     let mut decoder = encoding.new_decoder_with_bom_removal();
     let mut pending = String::new(); // decoded text not yet split into a line
     let mut chunk = [0u8; CHUNK];
@@ -1273,6 +1272,13 @@ where
         let _ = decoder.decode_to_string(&chunk[..n], &mut pending, last);
         #[cfg(test)]
         observe_pending(&pending);
+
+        // Re-read at each OS-read boundary rather than pinning the sink's launch
+        // policy. `wait`/`drain`/`profile` may adopt a dropped stream and lower
+        // an originally unbounded sink to their discard cap while this task is
+        // alive. The bound is `cap + CHUNK` (checked after a whole read decodes),
+        // not exactly `cap`.
+        let cap = sink.0.byte_cap();
 
         // Split out every complete line decoded so far, bounding memory by
         // `cap`. `start` is a byte cursor into `pending`: instead of draining
@@ -1778,7 +1784,7 @@ mod tests {
         let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
         sink.push("a".into());
         sink.push("b".into());
-        sink.start_discarding();
+        sink.start_discarding(3);
         assert!(sink.drain().is_empty(), "the buffered backlog is dropped");
         sink.push("c".into());
         assert!(
@@ -1788,11 +1794,61 @@ mod tests {
         assert_eq!(sink.count(), 3, "every line is still counted");
     }
 
+    #[tokio::test]
+    async fn adopted_unbounded_sink_observes_the_discard_in_flight_cap() {
+        use tokio::io::AsyncWriteExt;
+
+        // Model `stdout_lines()` -> drop -> `wait()`: the pump starts with the
+        // default unbounded streaming sink, then a discard verb adopts that same
+        // live sink while a newline-free stream is still arriving.
+        let (mut writer, reader) = tokio::io::duplex(16 * 1024);
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        let probe = Arc::new(PumpTestProbe::default());
+        let pump = PUMP_TEST_PROBE.scope(
+            probe.clone(),
+            pump_lines(reader, encoding_rs::UTF_8, None, sink.clone()),
+        );
+        let feed = async {
+            writer
+                .write_all(&vec![b'x'; 4096])
+                .await
+                .expect("initial unbounded stream chunk");
+            tokio::task::yield_now().await;
+
+            sink.start_discarding(64);
+            for _ in 0..256 {
+                writer
+                    .write_all(&vec![b'x'; 4096])
+                    .await
+                    .expect("newline-free flood chunk");
+            }
+            writer.shutdown().await.expect("close duplex writer");
+        };
+
+        tokio::join!(pump, feed);
+
+        assert!(
+            probe.max_pending_bytes() <= 16 * 1024,
+            "the adopted sink must switch from unbounded assembly to cap + one read chunk (high-water: {} bytes)",
+            probe.max_pending_bytes()
+        );
+        assert!(
+            probe.guard_entries() >= 1,
+            "the lowered discard cap must engage the over-cap guard"
+        );
+        assert!(sink.drain().is_empty(), "the adopted sink retains nothing");
+        assert_eq!(
+            sink.dropped(),
+            0,
+            "discarding skips user-policy truncation accounting"
+        );
+    }
+
     #[test]
     fn discarding_oversized_line_skips_overflow_bookkeeping() {
         let policy = OutputBufferPolicy::fail_loud(10).with_max_bytes(3);
         let sink = SharedLines::new(&policy);
-        sink.start_discarding();
+        sink.start_discarding(3);
         sink.record_oversized_line();
 
         assert_eq!(sink.count(), 1, "the oversized line is still counted");
