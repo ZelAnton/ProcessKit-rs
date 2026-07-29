@@ -32,9 +32,10 @@ jobs:
       # Lint on every OS so each platform module is actually checked: cgroup /
       # process-group (Linux), Job Object (Windows) and the macOS/BSD process
       # group (macOS). Linting only on Linux would leave windows.rs and unix.rs
-      # unchecked. `ubuntu-24.04-arm` lints the same Linux module on aarch64.
+      # unchecked. The native Arm runners exercise ABI/layout-sensitive sys code
+      # on both Linux and Windows rather than merely cross-checking it.
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -92,8 +93,10 @@ jobs:
       # syscall/layout code (sys/{linux,pgroup,unix,pid_gate}.rs) on aarch64 —
       # the msrv job only `cargo check`s aarch64-apple-darwin, which is Darwin
       # and never executes on real Linux/glibc-aarch64.
+      # `windows-11-arm` executes the Job Object, CTRL-event, per-thread
+      # suspend, and ConPTY bindings under the second Windows ABI.
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

@@ -26,6 +26,8 @@ to a dated version section.
   tests around control removal, idempotence, and output length.
 - Verify the BSD process-group backend with a FreeBSD cross-check and a focused
   real-VM smoke tier.
+- Exercise Windows-specific code on hosted ARM64 runners in both clippy and
+  real-subprocess test matrices.
 
 ### Fixed
 

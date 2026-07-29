@@ -20,7 +20,8 @@ matrices and fine print in one place.
 
 `.github/workflows/ci.yml`'s `test` job runs the full real-subprocess suite
 (`--include-ignored`, so kill-on-drop is actually exercised) on glibc x86_64
-(`ubuntu-latest`), glibc aarch64 (`ubuntu-24.04-arm`), Windows and macOS. The
+(`ubuntu-latest`), glibc aarch64 (`ubuntu-24.04-arm`), Windows x64
+(`windows-latest`), Windows ARM64 (`windows-11-arm`), and macOS. The
 aarch64 leg is the only place the native Linux syscall/layout code
 (`sys/{linux,pgroup,unix,pid_gate}.rs`) actually runs on Linux/glibc-aarch64 —
 elsewhere aarch64 is only `cargo check`-compiled against `aarch64-apple-darwin`
@@ -35,6 +36,12 @@ busybox already covers every external utility the suite spawns (`sh`, `cat`,
 one: its `ps` applet has no `-p PID` filter, so the job installs `procps`
 (`procps-ng`) to get one that does. `gcc`/`musl-dev` (needed to link) already
 ship in the base image.
+
+Both Windows architectures run the same three feature configurations for
+clippy and the same real-subprocess test suite. The ARM64 leg therefore executes
+the crate's most platform-specific surface — Job Objects, CTRL delivery,
+per-thread suspend/resume, and ConPTY — under the ARM64 Windows ABI instead of
+only proving that x64 code compiles.
 
 FreeBSD has two explicit tiers rather than inheriting confidence from macOS:
 `check-freebsd` cross-compiles the library and binaries for
