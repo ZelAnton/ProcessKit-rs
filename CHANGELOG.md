@@ -18,7 +18,15 @@ to a dated version section.
 -
 
 ### Fixed
--
+
+- Prevent capture-only supervisors from retrying an unsupported live-handle
+  launch forever when stdout is inherited, suppressed, or redirected to a file.
+- Include PTY mode and requested dimensions in `Command`'s redacted `Debug`
+  output.
+- Preserve distinct non-ASCII and opaque Windows environment keys when building
+  a customized ConPTY environment block.
+- Keep post-spawn `NotFound` diagnostics aligned with the command's effective
+  child `PATH`, matching preflight and launch-time resolution.
 
 ## [3.1.0] - 2026-07-29
 
@@ -58,12 +66,6 @@ to a dated version section.
 
 ### Fixed
 
-- Include PTY mode and requested dimensions in `Command`'s redacted `Debug`
-  output.
-- Preserve distinct non-ASCII and opaque Windows environment keys when building
-  a customized ConPTY environment block.
-- Keep post-spawn `NotFound` diagnostics aligned with the command's effective
-  child `PATH`, matching preflight and launch-time resolution.
 - Bound the in-flight decode buffer when `wait`, `drain`, or `profile` adopts a
   dropped stream, including newline-free output that started unbounded.
 - Preserve ConPTY failure diagnostics by decoding Win32-backed HRESULT values

@@ -1974,34 +1974,36 @@ impl<R: ProcessRunner> Supervisor<R> {
         }
     }
 
-    /// The classic capture path, unchanged: a piped stdout uses the bulk
-    /// [`output_string`](ProcessRunner::output_string) verb; otherwise a
-    /// [`start`](ProcessRunner::start) + [`finish`](crate::RunningProcess::finish)
-    /// drains only any independently-piped stderr. Reached for a capture-only
-    /// runner (whose `start` is `Unsupported`), where no live handle — hence no
-    /// live pid or graceful child-stop — is available.
+    /// The fallback for a capture-only runner (whose
+    /// [`start`](ProcessRunner::start) is `Unsupported`). A piped stdout uses the
+    /// original command verbatim. For `Inherit`, `Null`, and file-redirection
+    /// configurations, the fallback captures through an internal pipe and
+    /// discards stdout from the returned result: an output-only runner has no
+    /// live handle with which to honour the requested descriptor wiring, but it
+    /// can still produce the exit outcome and stderr needed by supervision.
+    /// This path never calls `start` again, so a deterministic capability miss
+    /// cannot turn into a restart loop.
     async fn capture_only(&self, command: &Command) -> Result<ProcessResult<String>> {
         if command.stdout_is_piped() {
             return self.runner.output_string(command).await;
         }
 
-        let started = Instant::now();
-        let finished = self.runner.start(command).await?.finish().await?;
-        let crate::Finished {
-            outcome,
-            stderr,
-            stderr_truncated,
-        } = finished;
-        Ok(ProcessResult::new(
-            command.program_name(),
+        let captured = self
+            .runner
+            .output_string(&command.clone().stdout(crate::StdioMode::Piped))
+            .await?;
+        Ok(ProcessResult::from_parts(
+            captured.program().to_owned(),
             String::new(),
-            stderr,
-            outcome,
-            command.configured_timeout(),
-        )
-        .with_duration(started.elapsed())
-        .with_truncated(stderr_truncated)
-        .with_ok_codes(command.ok_codes_vec()))
+            captured.stderr().to_owned(),
+            captured.outcome(),
+            captured.configured_timeout(),
+            captured.duration(),
+            captured.truncated(),
+            captured.total_lines(),
+            captured.total_bytes(),
+            captured.ok_codes().to_vec(),
+        ))
     }
 
     /// The terminal `Cancelled` error for supervision cut short by a cancel token
@@ -2464,6 +2466,71 @@ mod tests {
         assert_eq!(outcome.final_result.stdout(), "");
         assert_eq!(outcome.final_result.stderr(), "warn");
         assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
+    }
+
+    #[tokio::test]
+    async fn capture_only_runner_supervises_every_non_piped_stdout_mode() {
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct CaptureOnlyRunner {
+            starts: Arc<AtomicU32>,
+            captures: Arc<AtomicU32>,
+        }
+
+        #[async_trait::async_trait]
+        impl ProcessRunner for CaptureOnlyRunner {
+            async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+                assert!(
+                    command.stdout_is_piped(),
+                    "the capture fallback must supply the pipe required by output_string"
+                );
+                self.captures.fetch_add(1, Ordering::SeqCst);
+                Ok(ProcessResult::new(
+                    command.program_name(),
+                    "discarded".to_owned(),
+                    "warning".to_owned(),
+                    Outcome::Exited(0),
+                    None,
+                ))
+            }
+
+            async fn start(&self, _command: &Command) -> Result<crate::RunningProcess> {
+                self.starts.fetch_add(1, Ordering::SeqCst);
+                Err(crate::ErrorReason::Unsupported {
+                    operation: "start".into(),
+                }
+                .into())
+            }
+        }
+
+        let redirect = std::env::temp_dir().join("processkit-capture-only-supervisor.log");
+        let commands = [
+            Command::new("server").stdout(crate::StdioMode::Null),
+            Command::new("server").stdout(crate::StdioMode::Inherit),
+            Command::new("server").stdout_file(redirect),
+        ];
+        let starts = Arc::new(AtomicU32::new(0));
+        let captures = Arc::new(AtomicU32::new(0));
+
+        for command in commands {
+            let outcome = Supervisor::new(command)
+                .restart(RestartPolicy::Never)
+                .with_runner(CaptureOnlyRunner {
+                    starts: starts.clone(),
+                    captures: captures.clone(),
+                })
+                .run()
+                .await
+                .expect("capture-only supervision must complete without retrying start");
+
+            assert_eq!(outcome.final_result.stdout(), "");
+            assert_eq!(outcome.final_result.stderr(), "warning");
+            assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
+        }
+
+        assert_eq!(starts.load(Ordering::SeqCst), 3);
+        assert_eq!(captures.load(Ordering::SeqCst), 3);
     }
 
     #[test]
