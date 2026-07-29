@@ -146,6 +146,10 @@ pub struct Command {
     /// The connection mode (`Piped`/`Inherit`/`Null`) stays separate below.
     stdout_config: StreamConfig,
     stderr_config: StreamConfig,
+    /// Internal capture-only-supervisor marker: stdout is piped only so it can
+    /// be drained and discarded, so observers that are documented as inert for
+    /// the caller's original non-piped mode must stay inert.
+    suppress_stdout_observers: bool,
     stdout_mode: StdioMode,
     stderr_mode: StdioMode,
     /// Child-owned file destinations stay separate from `StdioMode` so that
@@ -247,6 +251,7 @@ impl Command {
             ok_codes: None,
             stdout_config: StreamConfig::new(),
             stderr_config: StreamConfig::new(),
+            suppress_stdout_observers: false,
             stdout_mode: StdioMode::Piped,
             stderr_mode: StdioMode::Piped,
             stdout_file: None,
@@ -1899,7 +1904,14 @@ impl Command {
     pub(crate) fn stdout_config(&self) -> StreamConfig {
         let mut config = self.stdout_config.clone();
         config.stream = OutputStream::Stdout;
-        config.buffer_policy = self.capture_policy.clone();
+        if self.suppress_stdout_observers {
+            config.handler = None;
+            config.tee = None;
+            config.raw_tee = None;
+            config.buffer_policy = None;
+        } else {
+            config.buffer_policy = self.capture_policy.clone();
+        }
         // A PTY child writes progress as bare `\r` redraws: default the effective
         // terminator to `CarriageReturn` under `use_pty` (unless the caller pinned
         // one) so those frames stream as lines instead of one growing blob. See
@@ -1910,6 +1922,20 @@ impl Command {
             config.terminator = LineTerminator::CarriageReturn;
         }
         config
+    }
+
+    /// Pipe stdout solely so a capture-only supervisor can drain and discard it.
+    ///
+    /// The caller selected `Inherit`, `Null`, or a file redirect, under which
+    /// stdout handlers, tees, and capture policies are documented as inert. The
+    /// internal pipe must not make those user-visible observers fire. Stderr's
+    /// configuration is left untouched because it remains the supervisor's
+    /// diagnostic stream.
+    pub(crate) fn pipe_stdout_for_discard(mut self) -> Self {
+        self.stdout_mode = StdioMode::Piped;
+        self.stdout_file = None;
+        self.suppress_stdout_observers = true;
+        self
     }
 
     /// The stderr stream's pump config — see [`stdout_config`](Self::stdout_config).
@@ -3923,6 +3949,35 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(stderr).expect("read stderr sentinel"),
             "stderr-sentinel"
+        );
+    }
+
+    #[test]
+    fn internal_discard_pipe_suppresses_only_stdout_observers() {
+        let command = Command::new("tool")
+            .stdout(crate::StdioMode::Null)
+            .on_stdout_line(|_| {})
+            .stdout_tee(tokio::io::sink())
+            .stdout_raw_tee(tokio::io::sink())
+            .on_stderr_line(|_| {})
+            .capture_policy(NamedPolicy("redact"));
+
+        let prepared = command.pipe_stdout_for_discard();
+        assert!(prepared.stdout_is_piped());
+        let stdout = prepared.stdout_config();
+        assert!(stdout.handler.is_none());
+        assert!(stdout.tee.is_none());
+        assert!(stdout.raw_tee.is_none());
+        assert!(stdout.buffer_policy.is_none());
+
+        let stderr = prepared.stderr_config();
+        assert!(
+            stderr.handler.is_some(),
+            "stderr diagnostics stay observable"
+        );
+        assert!(
+            stderr.buffer_policy.is_some(),
+            "the whole-command capture policy still protects stderr"
         );
     }
 

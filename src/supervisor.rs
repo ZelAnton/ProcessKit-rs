@@ -2227,7 +2227,7 @@ impl<R: ProcessRunner> Supervisor<R> {
 
         let captured = self
             .runner
-            .output_string(&command.clone().stdout(crate::StdioMode::Piped))
+            .output_string(&command.clone().pipe_stdout_for_discard())
             .await?;
         Ok(ProcessResult::from_parts(
             captured.program().to_owned(),
@@ -2799,6 +2799,7 @@ mod tests {
                     "the capture fallback must supply the pipe required by output_string"
                 );
                 self.captures.fetch_add(1, Ordering::SeqCst);
+                crate::doubles::replay_line_handlers(command, "discarded", "warning");
                 Ok(ProcessResult::new(
                     command.program_name(),
                     "discarded".to_owned(),
@@ -2825,8 +2826,19 @@ mod tests {
         ];
         let starts = Arc::new(AtomicU32::new(0));
         let captures = Arc::new(AtomicU32::new(0));
+        let stdout_observations = Arc::new(AtomicU32::new(0));
+        let stderr_observations = Arc::new(AtomicU32::new(0));
 
         for command in commands {
+            let stdout_seen = stdout_observations.clone();
+            let stderr_seen = stderr_observations.clone();
+            let command = command
+                .on_stdout_line(move |_| {
+                    stdout_seen.fetch_add(1, Ordering::SeqCst);
+                })
+                .on_stderr_line(move |_| {
+                    stderr_seen.fetch_add(1, Ordering::SeqCst);
+                });
             let outcome = Supervisor::new(command)
                 .restart(RestartPolicy::Never)
                 .with_runner(CaptureOnlyRunner {
@@ -2844,6 +2856,16 @@ mod tests {
 
         assert_eq!(starts.load(Ordering::SeqCst), 3);
         assert_eq!(captures.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            stdout_observations.load(Ordering::SeqCst),
+            0,
+            "forcing an internal drain pipe must not activate a suppressed stdout handler"
+        );
+        assert_eq!(
+            stderr_observations.load(Ordering::SeqCst),
+            3,
+            "the supervisor must retain the independently-piped stderr observer"
+        );
     }
 
     #[tokio::test]
