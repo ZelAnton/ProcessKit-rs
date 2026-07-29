@@ -176,6 +176,46 @@ jobs:
       - run: cargo test -- --include-ignored
       - run: cargo test --no-default-features -- --include-ignored
 
+  check-freebsd:
+    name: check (FreeBSD cross)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-freebsd
+      - uses: Swatinem/rust-cache@v2
+      # `cargo check` needs no foreign linker, but still compiles the real BSD
+      # cfg path (`sys/{unix,pgroup,pid_gate}.rs`) instead of relying on macOS as
+      # a proxy for libc constants and target-specific branches.
+      - run: cargo check --target x86_64-unknown-freebsd --lib --bins --all-features
+
+  test-freebsd:
+    name: test (FreeBSD 14.4 VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      # A real VM executes the POSIX process-group backend against FreeBSD's
+      # kernel and userland. Keep the smoke tier focused: hermetic library tests
+      # plus representative real containment/signal/shutdown probes.
+      - name: Test in FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.4"
+          usesh: true
+          copyback: false
+          cache-after-prepare: true
+          envs: CARGO_TERM_COLOR
+          prepare: pkg install -y rust
+          run: |
+            rustc --version
+            cargo test --all-features --lib
+            cargo test --all-features --test integration process_control::unix_ -- --ignored
+            cargo test --all-features --test integration groups::group_reports_the_platforms_mechanism -- --ignored
+            cargo test --all-features --test integration groups::dropping_group_kills_children -- --ignored
+            cargo test --all-features --test integration shutdown::shutdown_lets_a_term_handling_child_end_the_grace_early -- --ignored
+
   loom:
     name: loom (model check)
     runs-on: ubuntu-latest

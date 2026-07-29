@@ -24,6 +24,8 @@ to a dated version section.
 - Simplify oversized-line pump tracking by removing unused length accumulation.
 - Add the VT sanitizer to the scheduled fuzz tier and strengthen its property
   tests around control removal, idempotence, and output length.
+- Verify the BSD process-group backend with a FreeBSD cross-check and a focused
+  real-VM smoke tier.
 
 ### Fixed
 

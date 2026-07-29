@@ -36,6 +36,15 @@ one: its `ps` applet has no `-p PID` filter, so the job installs `procps`
 (`procps-ng`) to get one that does. `gcc`/`musl-dev` (needed to link) already
 ship in the base image.
 
+FreeBSD has two explicit tiers rather than inheriting confidence from macOS:
+`check-freebsd` cross-compiles the library and binaries for
+`x86_64-unknown-freebsd`, while `test-freebsd` boots a real FreeBSD 14.4 VM.
+The VM runs the hermetic library suite plus representative real-subprocess
+checks for mechanism selection, kill-on-drop, Unix signal delivery, and graceful
+TERM shutdown. This directly exercises the shared POSIX process-group backend
+against FreeBSD's kernel and userland without making the already broad full-suite
+matrix depend on an emulated VM.
+
 Two container-runtime quirks — unrelated to musl/Alpine itself, but specific
 to running *any* test suite inside a plain container — need working around,
 via the job's (and the `just test-musl` recipe's) `--init` and
