@@ -49,6 +49,20 @@ use super::{PtyExitStatus, PtyReader, PtySpawn, PtyWriter};
 
 const STILL_ACTIVE: u32 = 259;
 
+/// Preserve the Win32 error carried by `HRESULT_FROM_WIN32`; other HRESULT
+/// facilities have no `std::io::Error` OS-code representation, so keep their
+/// hexadecimal value in an ordinary diagnostic instead of pretending the full
+/// HRESULT is a `GetLastError` code.
+fn hresult_to_io_error(hr: i32) -> io::Error {
+    let bits = hr as u32;
+    const FACILITY_WIN32: u32 = 7;
+    if (bits >> 16) & 0x1fff == FACILITY_WIN32 {
+        io::Error::from_raw_os_error((bits & 0xffff) as i32)
+    } else {
+        io::Error::other(format!("ConPTY call failed with HRESULT 0x{bits:08X}"))
+    }
+}
+
 fn classify_terminate_failure(
     terminate_error: io::Error,
     process_has_exited: bool,
@@ -250,7 +264,7 @@ impl PtyChild {
         // it. `ResizePseudoConsole` returns an `HRESULT`; non-zero is a failure.
         let hr = unsafe { ResizePseudoConsole(self.hpc, coord(cols, rows)) };
         if hr != 0 {
-            return Err(io::Error::from_raw_os_error(hr));
+            return Err(hresult_to_io_error(hr));
         }
         Ok(())
     }
@@ -583,7 +597,7 @@ pub(crate) fn spawn_pty(
             close(output_read);
             close(output_write);
         }
-        return Err(io::Error::from_raw_os_error(hr));
+        return Err(hresult_to_io_error(hr));
     }
     // Close all resources created so far (pseudoconsole + every pipe end) — the
     // cleanup shared by the setup error paths between here and a successful spawn.
@@ -989,6 +1003,21 @@ mod tests {
         // negative — a defensive guard on the signed `COORD` fields.
         let big = coord(u16::MAX, 40_000);
         assert_eq!((big.X, big.Y), (i16::MAX, i16::MAX));
+    }
+
+    #[test]
+    fn hresult_conversion_preserves_win32_codes_and_foreign_facilities() {
+        let access_denied = hresult_to_io_error(0x8007_0005_u32 as i32);
+        assert_eq!(access_denied.raw_os_error(), Some(5));
+        assert_eq!(access_denied.kind(), io::ErrorKind::PermissionDenied);
+
+        let foreign = hresult_to_io_error(0x8000_4005_u32 as i32);
+        assert_eq!(foreign.raw_os_error(), None);
+        assert_eq!(foreign.kind(), io::ErrorKind::Other);
+        assert!(
+            foreign.to_string().contains("HRESULT 0x80004005"),
+            "the original non-Win32 HRESULT stays visible: {foreign}"
+        );
     }
 
     #[test]
