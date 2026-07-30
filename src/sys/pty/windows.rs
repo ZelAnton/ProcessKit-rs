@@ -540,6 +540,19 @@ impl Drop for NulledLauncherStdio {
     }
 }
 
+/// Release a child created with `CREATE_SUSPENDED`, preserving the Win32 error
+/// before any cleanup call can overwrite the thread-local last-error value.
+fn resume_primary_thread(thread: HANDLE) -> io::Result<()> {
+    // SAFETY: the caller supplies the still-open primary thread handle returned
+    // by `CreateProcessW`; `u32::MAX` is the documented failure sentinel.
+    let previous = unsafe { ResumeThread(thread) };
+    if previous == u32::MAX {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Spawn `cmd` under a ConPTY, assigning the child to `job` for containment.
 ///
 /// `env` is the child's resolved environment (see
@@ -749,11 +762,15 @@ pub(crate) fn spawn_pty(
         // brief inherited-affinity run and the shared cleanup reaps it.
         return Err(cleanup_created(io::Error::last_os_error()));
     }
-    // A fresh killable member joined the job — re-arm kill-on-close so a prior
-    // survivor-sparing shutdown does not spare it (mirrors `Job::spawn`).
+    if let Err(error) = resume_primary_thread(pi.hThread) {
+        // A failed resume leaves the child suspended forever. Reuse the complete
+        // post-create cleanup instead of returning a handle that can only hang.
+        return Err(cleanup_created(error));
+    }
+    // A fresh running member joined the job — re-arm kill-on-close so a prior
+    // survivor-sparing shutdown does not spare it (mirrors `Job::spawn`). Do it
+    // only after resume succeeds: a failed launch must not affect old survivors.
     skip_drop_kill.clear();
-    // SAFETY: resuming the primary thread of the now-contained child.
-    unsafe { ResumeThread(pi.hThread) };
     let pid = pi.dwProcessId;
     // `output_read` (merged stdout+stderr) and `input_write` (stdin) are
     // *synchronous* anonymous pipes; tokio has no async adapter for them, so each
@@ -1038,5 +1055,15 @@ mod tests {
         let live = classify_terminate_failure(io::Error::from_raw_os_error(5), false)
             .expect_err("a live process preserves the termination failure");
         assert_eq!(live.raw_os_error(), Some(5));
+    }
+
+    #[test]
+    fn resume_primary_thread_rejects_an_invalid_handle() {
+        let error = resume_primary_thread(std::ptr::null_mut())
+            .expect_err("ResumeThread failure must never look like a launched child");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32)
+        );
     }
 }

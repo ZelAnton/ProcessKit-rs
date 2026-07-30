@@ -33,6 +33,8 @@ to a dated version section.
 
 ### Fixed
 
+- Surface ConPTY primary-thread resume failures and fully clean up the suspended
+  child instead of returning a process that can never run.
 - Let live supervision sessions cancel and promptly stop capture-only runner
   incarnations instead of waiting indefinitely for their natural completion.
 - Serialize headless ConPTY's process-global standard-handle swap with every
