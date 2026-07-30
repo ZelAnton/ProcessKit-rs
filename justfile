@@ -1,9 +1,46 @@
 # Local task runner mirroring the CI gate (see `.github/workflows/ci.yml`).
 #
-# Requires `just` (https://github.com/casey/just) and, for the `ci` recipe,
-# `cargo-hack` plus `cargo-nextest`.
+# Requires `just` (https://github.com/casey/just). `just setup` installs the
+# remaining repository tools; `just doctor` checks them without changing the
+# machine.
 #
 # `just --list` shows all recipes.
+
+# Plain cargo commands run through the system shell. Windows has PowerShell but
+# need not have a POSIX `sh`; environment-sensitive recipes use just attributes
+# below so the same bodies work in both shells.
+set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
+
+# Bootstrap every Rust toolchain/CLI used by the local CI mirrors. Versions are
+# constrained exactly where CI constrains them (notably mdBook 0.4.40 and the
+# nextest 0.9 series); Docker is diagnosed but remains a manual prerequisite
+# because installing a host daemon is outside a repository bootstrap.
+[script('python')]
+[windows]
+setup:
+    import subprocess, sys
+    raise SystemExit(subprocess.call([sys.executable, "tools/dev_tools.py", "setup"]))
+
+[script('python3')]
+[unix]
+setup:
+    import subprocess, sys
+    raise SystemExit(subprocess.call([sys.executable, "tools/dev_tools.py", "setup"]))
+
+# Read-only counterpart to setup: useful before a long gate, or to explain why
+# one stopped early. A missing Docker daemon is a warning limited to test-musl;
+# missing compilers or CLIs fail the recipe.
+[script('python')]
+[windows]
+doctor:
+    import subprocess, sys
+    raise SystemExit(subprocess.call([sys.executable, "tools/dev_tools.py", "doctor"]))
+
+[script('python3')]
+[unix]
+doctor:
+    import subprocess, sys
+    raise SystemExit(subprocess.call([sys.executable, "tools/dev_tools.py", "doctor"]))
 
 # Fast everyday gate: fmt, clippy (all features), tests (all features,
 # including the ignored real-subprocess ones through nextest), and the
@@ -12,7 +49,6 @@
 check:
     cargo fmt --all --check
     cargo clippy --all-targets --all-features -- -D warnings
-    @cargo nextest --version >/dev/null 2>&1 || (echo "cargo-nextest is not installed; see: https://nexte.st/docs/installation/" && exit 1)
     cargo nextest run --profile ci-all --all-features --run-ignored all
     cargo test --all-features --doc
     just fuzz-check
@@ -36,41 +72,43 @@ fmt-check:
 # configuration has a distinct unit hash and is normally compiled only once,
 # so retaining its incremental state grows `target/` without helping the next
 # invocation. The everyday `check` recipe keeps incremental compilation.
+[env("CARGO_INCREMENTAL", "0")]
 clippy-all:
-    CARGO_INCREMENTAL=0 cargo clippy --all-targets --no-default-features -- -D warnings
-    CARGO_INCREMENTAL=0 cargo clippy --all-targets -- -D warnings
-    CARGO_INCREMENTAL=0 cargo clippy --all-targets --all-features -- -D warnings
+    cargo clippy --all-targets --no-default-features -- -D warnings
+    cargo clippy --all-targets -- -D warnings
+    cargo clippy --all-targets --all-features -- -D warnings
 
-# Mirrors the CI `hack` job (feature-powerset build). Requires `cargo-hack`;
-# fails with a clear message instead of a raw "no such command" error if it
-# isn't installed. The powerset creates many one-use unit hashes, so it must
-# not retain an incremental session for every feature/target combination.
+# Mirrors the CI `hack` job (feature-powerset build). The powerset creates many
+# one-use unit hashes, so it must not retain an incremental session for every
+# feature/target combination. `just doctor` diagnoses a missing cargo-hack.
+[env("CARGO_INCREMENTAL", "0")]
 hack:
-    @cargo hack --version >/dev/null 2>&1 || (echo "cargo-hack is not installed; run: cargo install cargo-hack" && exit 1)
-    CARGO_INCREMENTAL=0 cargo hack --feature-powerset --depth 2 check --all-targets
+    cargo hack --feature-powerset --depth 2 check --all-targets
 
 # Mirrors the CI `test` job's three feature configurations through nextest,
 # including ignored real-subprocess/kill-on-drop tests. Doctests remain
 # separate because nextest does not run them. These three cold feature matrices
 # are CI mirrors rather than iterative builds, so their incremental caches are
 # deliberately disabled.
+[env("CARGO_INCREMENTAL", "0")]
 test-all:
-    @cargo nextest --version >/dev/null 2>&1 || (echo "cargo-nextest is not installed; see: https://nexte.st/docs/installation/" && exit 1)
-    CARGO_INCREMENTAL=0 cargo nextest run --profile ci-all --all-features --run-ignored all
-    CARGO_INCREMENTAL=0 cargo test --all-features --doc
-    CARGO_INCREMENTAL=0 cargo nextest run --profile ci-default --run-ignored all
-    CARGO_INCREMENTAL=0 cargo test --doc
-    CARGO_INCREMENTAL=0 cargo nextest run --profile ci-minimal --no-default-features --run-ignored all
-    CARGO_INCREMENTAL=0 cargo test --no-default-features --doc
+    cargo nextest run --profile ci-all --all-features --run-ignored all
+    cargo test --all-features --doc
+    cargo nextest run --profile ci-default --run-ignored all
+    cargo test --doc
+    cargo nextest run --profile ci-minimal --no-default-features --run-ignored all
+    cargo test --no-default-features --doc
 
 # Mirrors the CI `doc` job's two stable-toolchain builds (the nightly
 # `--cfg docsrs` build is `docsrs-doc` below, since it needs a nightly
 # toolchain this recipe doesn't assume is installed). Documentation matrices
 # are one-shot outputs, so their incremental state is pure disk overhead.
+[env("CARGO_INCREMENTAL", "0")]
+[env("RUSTDOCFLAGS", "-D warnings")]
 doc-all:
     @# Restrict --document-private-items to --all-features, just like CI
-    CARGO_INCREMENTAL=0 RUSTDOCFLAGS="-D warnings" cargo doc --document-private-items --no-deps --all-features
-    CARGO_INCREMENTAL=0 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features
+    cargo doc --document-private-items --no-deps --all-features
+    cargo doc --no-deps --no-default-features
 
 # Optional: the two nightly-toolchain CI jobs that don't need external
 # services (docsrs doc, minimal-versions). Requires a nightly toolchain
@@ -83,8 +121,10 @@ ci-nightly: docsrs-doc minimal-versions
 # the two stable builds in `doc-all` leave inert. Requires a nightly toolchain;
 # its separate compiler/configuration hash is not retained after this one-shot
 # compatibility check.
+[env("CARGO_INCREMENTAL", "0")]
+[env("RUSTDOCFLAGS", "--cfg docsrs -D warnings")]
 docsrs-doc:
-    CARGO_INCREMENTAL=0 RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --no-deps --all-features
+    cargo +nightly doc --no-deps --all-features
 
 # Mirrors the CI `minimal-versions` job: re-resolves every direct dependency
 # down to the lowest SemVer-compatible version, in a throwaway lockfile (the
@@ -92,9 +132,10 @@ docsrs-doc:
 # Requires a nightly toolchain. Its throwaway dependency resolution is not
 # reused by normal development, so retaining incremental state only consumes
 # disk.
+[env("CARGO_INCREMENTAL", "0")]
 minimal-versions:
     cargo +nightly -Z direct-minimal-versions generate-lockfile
-    CARGO_INCREMENTAL=0 cargo +nightly check --all-targets --all-features --locked
+    cargo +nightly check --all-targets --all-features --locked
 
 # Optional: mirrors the CI `msrv` job. Requires the toolchain pinned below
 # (kept in sync with `rust-version` in Cargo.toml) plus the
@@ -102,10 +143,11 @@ minimal-versions:
 # `just ci` since most contributors won't have this extra toolchain installed.
 # The pinned compiler and cross-target hashes are single-use compatibility
 # checks, so they do not retain incremental sessions.
+[env("CARGO_INCREMENTAL", "0")]
 msrv:
-    CARGO_INCREMENTAL=0 cargo +1.88 check --all-targets --all-features
-    CARGO_INCREMENTAL=0 cargo +1.88 check --target x86_64-pc-windows-msvc --lib --bins --all-features
-    CARGO_INCREMENTAL=0 cargo +1.88 check --target aarch64-apple-darwin --lib --bins --all-features
+    cargo +1.88 check --all-targets --all-features
+    cargo +1.88 check --target x86_64-pc-windows-msvc --lib --bins --all-features
+    cargo +1.88 check --target aarch64-apple-darwin --lib --bins --all-features
 
 # Mirrors the CI `test-musl` job locally: builds and runs the full suite
 # (same three feature configurations, including ignored tests) inside a
@@ -119,8 +161,10 @@ msrv:
 # never mixes musl-linked artifacts into your native `target/` directory.
 # `MSYS_NO_PATHCONV=1` is a no-op outside Git Bash on Windows; there it stops
 # Git Bash from mangling the `/work`-style container paths below.
+[env("MSYS_NO_PATHCONV", "1")]
+[unix]
 test-musl:
-    MSYS_NO_PATHCONV=1 docker run --rm --init --cap-add=SYS_NICE \
+    docker run --rm --init --cap-add=SYS_NICE \
         -v "{{ justfile_directory() }}:/work" \
         -v processkit-musl-target:/musl-target \
         -w /work \
@@ -136,16 +180,21 @@ test-musl:
             cargo nextest run --profile ci-minimal --no-default-features --run-ignored all && \
             cargo test --no-default-features --doc'
 
+[windows]
+test-musl:
+    docker run --rm --init --cap-add=SYS_NICE -v "{{ justfile_directory() }}:/work" -v processkit-musl-target:/musl-target -w /work -e CARGO_TARGET_DIR=/musl-target rust:alpine sh -c 'apk add --no-cache curl procps >/dev/null && curl -LsSf https://get.nexte.st/0.9/linux-musl | tar zxf - -C /usr/local/cargo/bin && cargo build --all-targets --all-features && cargo nextest run --profile ci-all --all-features --run-ignored all && cargo test --all-features --doc && cargo nextest run --profile ci-default --run-ignored all && cargo test --doc && cargo nextest run --profile ci-minimal --no-default-features --run-ignored all && cargo test --no-default-features --doc'
+
 # Mirrors the fuzz-check CI job. Type-checks the `#[cfg(fuzzing)]` code
 # without actually running `cargo-fuzz` or requiring a nightly toolchain. The
 # custom cfg creates a one-use unit hash, so its incremental state is disabled.
+[env("CARGO_INCREMENTAL", "0")]
+[env("RUSTFLAGS", "--cfg fuzzing")]
 fuzz-check:
-    CARGO_INCREMENTAL=0 RUSTFLAGS="--cfg fuzzing" cargo check --all-features --lib
+    cargo check --all-features --lib
 
 # Mirrors the CI `typos` job. Requires the `typos` CLI
 # (`cargo install typos-cli`). Config/allow-list is `_typos.toml`.
 typos:
-    @typos --version >/dev/null 2>&1 || (echo "typos is not installed; run: cargo install typos-cli" && exit 1)
     typos
 
 # Optional: mirrors the CI `public-api` job. Requires a nightly toolchain and
@@ -153,9 +202,17 @@ typos:
 # crate's current public surface against the committed `public-api.txt`
 # baseline. The nightly/API configuration is a one-shot validation and does
 # not retain an incremental session.
+[env("CARGO_INCREMENTAL", "0")]
+[unix]
 public-api-diff:
-    CARGO_INCREMENTAL=0 cargo +nightly public-api --simplified --all-features > public-api-current.txt
+    cargo +nightly public-api --simplified --all-features > public-api-current.txt
     diff public-api.txt public-api-current.txt && echo "(no changes)"
+
+[env("CARGO_INCREMENTAL", "0")]
+[windows]
+public-api-diff:
+    cargo +nightly public-api --simplified --all-features | Set-Content -Encoding UTF8 public-api-current.txt
+    $difference = Compare-Object (Get-Content public-api.txt) (Get-Content public-api-current.txt) -SyncWindow 0; if ($difference) { $difference; exit 1 } else { Write-Output "(no changes)" }
 
 # Cargo never garbage-collects obsolete incremental unit hashes under a
 # workspace target directory. Remove only those caches (plus disposable

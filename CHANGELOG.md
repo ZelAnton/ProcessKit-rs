@@ -13,6 +13,8 @@ to a dated version section.
 
 ### Added
 
+- Add `just setup` for a CI-aligned developer tool bootstrap and read-only
+  `just doctor` version, toolchain, cross-target, and Docker diagnostics.
 - Add a dedicated typed CLI-client guide covering `CliClient`, `cli_client!`,
   defaults, parsing, error policy, and hermetic/scripted or cassette-backed tests.
 - Add `RunningProcess::wait_for_path` for portable pidfile and filesystem-sentinel
