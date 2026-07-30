@@ -27,6 +27,12 @@ use crate::result::{Outcome, ProcessResult};
 use crate::running::{Finished, ProcessEvents, RunningProcess, StdoutLines};
 use crate::sync::atomic::{AtomicU8, Ordering};
 
+// Once a stage closes its output with a checked failure, downstream stages need
+// one bounded scheduling window to consume the final pipe bytes and EOF. Without
+// it, the proactive whole-chain kill can race a filter that only flushes at EOF
+// and discard the very diagnostic `merge_stderr_in_pipe` was asked to preserve.
+const TEARDOWN_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
 /// A chain of [`Command`]s connected stdout→stdin — built with
 /// [`Command::pipe`], extended with [`pipe`](Self::pipe), driven with the same
 /// verb vocabulary as a single [`Command`]:
@@ -606,10 +612,12 @@ impl Pipeline {
             };
             tokio::select! {
                 collected = gather => collected,
-                // Fires once on the first checked failure, then never resolves —
-                // it only exists for its kill side effect, letting `gather` finish.
+                // Give downstream filters one bounded window to consume the
+                // culprit's final bytes and EOF before killing any stragglers.
+                // `gather` still wins immediately when the chain drains naturally.
                 () = async {
                     teardown.cancelled().await;
+                    tokio::time::sleep(TEARDOWN_DRAIN_GRACE).await;
                     kill_all_stage_groups(&stage_groups);
                     std::future::pending::<()>().await
                 } => unreachable!("the teardown killer pends forever after firing"),
@@ -860,8 +868,9 @@ impl Pipeline {
 /// - [`start_kill`](Self::start_kill) — stop the whole chain now.
 ///
 /// **Teardown is whole-chain.** A stage's checked failure proactively tears every
-/// stage's sub-group down (so a quiet upstream can't hold a failed live chain
-/// open), the chain-wide [`Pipeline::timeout`] / [`Pipeline::cancel_on`] still
+/// stage's sub-group down after a short bounded drain grace (so downstream can
+/// consume final pipe bytes, while a quiet upstream still cannot hold a failed
+/// live chain open), the chain-wide [`Pipeline::timeout`] / [`Pipeline::cancel_on`] still
 /// bound the session, and **dropping** the session hard-kills every stage's tree —
 /// the crate's no-orphan invariant holds for a live chain exactly as it does for a
 /// single [`RunningProcess`]. A partially-started chain (one
@@ -1191,10 +1200,10 @@ fn kill_weak_stage_groups(groups: &[Weak<ProcessGroup>]) {
 }
 
 /// Spawn the standing teardown killer for [`Pipeline::start`]'s live session: it
-/// waits on `teardown` and, the instant it fires, fans a hard kill across every
-/// stage's sub-group (the last stage included) so a failing inner stage tears the
-/// *whole* live chain down even mid-stream. Holds [`Weak`] handles so it never
-/// pins the groups; the session aborts it on `finish`/drop.
+/// waits on `teardown`, gives downstream filters a bounded window to drain final
+/// bytes and EOF, then fans a hard kill across every stage's sub-group (the last
+/// stage included). Holds [`Weak`] handles so it never pins the groups; the
+/// session aborts it on `finish`/drop.
 fn spawn_group_killer(
     teardown: tokio_util::sync::CancellationToken,
     stage_groups: &[Arc<ProcessGroup>],
@@ -1202,6 +1211,7 @@ fn spawn_group_killer(
     let groups: Vec<Weak<ProcessGroup>> = stage_groups.iter().map(Arc::downgrade).collect();
     tokio::spawn(async move {
         teardown.cancelled().await;
+        tokio::time::sleep(TEARDOWN_DRAIN_GRACE).await;
         kill_weak_stage_groups(&groups);
     })
 }

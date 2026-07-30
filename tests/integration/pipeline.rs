@@ -113,13 +113,9 @@ async fn pipeline_can_merge_stage_stderr_into_downstream_stdin_in_write_order() 
 #[ignore = "spawns a real pipeline whose failing stage merges its diagnostic"]
 async fn merged_stage_has_no_separate_pipefail_stderr() {
     let failing = if cfg!(windows) {
-        Command::new("cmd").args([
-            "/d",
-            "/c",
-            "1>&2 echo merged-diagnostic& ping -n 2 127.0.0.1 >nul& exit /b 3",
-        ])
+        Command::new("cmd").args(["/d", "/c", "1>&2 echo merged-diagnostic& exit /b 3"])
     } else {
-        Command::new("sh").args(["-c", "printf 'merged-diagnostic\\n' >&2; sleep 1; exit 3"])
+        Command::new("sh").args(["-c", "printf 'merged-diagnostic\\n' >&2; exit 3"])
     };
 
     let result = failing

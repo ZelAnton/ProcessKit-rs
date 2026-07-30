@@ -37,6 +37,8 @@ to a dated version section.
 
 ### Fixed
 
+- Let downstream pipeline stages drain a failing producer's final merged output
+  before proactive teardown kills stragglers, preserving EOF-flushed diagnostics.
 - Reject non-final PTY pipeline stages before launch instead of silently feeding
   empty stdin downstream, while retaining final-stage PTY capture and streaming.
 - Route ConPTY containment through the owning Windows Job's suspend lock,
