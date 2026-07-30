@@ -649,11 +649,15 @@ async fn main() -> processkit::Result<()> {
         .wait_for_line(|l| l.contains("listening on"), Duration::from_secs(10))
         .await?;
 
-    // 2. A TCP port accepting connections:
+    // 2. A pidfile or readiness sentinel appearing:
+    run.wait_for_path("run/my-server.ready", Duration::from_secs(10))
+        .await?;
+
+    // 3. A TCP port accepting connections:
     run.wait_for_port("127.0.0.1:8080".parse().unwrap(), Duration::from_secs(10))
         .await?;
 
-    // 3. A plain HTTP endpoint returning an expected status:
+    // 4. A plain HTTP endpoint returning an expected status:
     run.wait_for_http(
         "127.0.0.1:8080".parse().unwrap(),
         "/healthz",
@@ -662,14 +666,14 @@ async fn main() -> processkit::Result<()> {
     )
     .await?;
 
-    // 4. A Unix domain socket accepting connections (Unix only):
+    // 5. A Unix domain socket accepting connections (Unix only):
     run.wait_for_socket("/tmp/my-server.sock", Duration::from_secs(10))
         .await?;
 
-    // 5. A Windows named pipe accepting clients (Windows only):
+    // 6. A Windows named pipe accepting clients (Windows only):
     run.wait_for_pipe("my-service", Duration::from_secs(10)).await?;
 
-    // 6. Any async predicate (an HTTPS/body check, a file appearing, …):
+    // 7. Any async predicate (an HTTPS/body or metadata check, …):
     run.wait_for(|| async { health_check().await }, Duration::from_secs(10))
         .await?;
 
@@ -704,8 +708,8 @@ Probe semantics, deliberately uniform:
   child with a large startup burst can't stall in `write()` on a full OS pipe
   buffer. `wait_for_line` and `wait_for_stderr_line` consume the selected stream
   up to (and including) the match — continue with `finish` (whose stderr omits
-  lines already consumed by `wait_for_stderr_line`). `wait_for_port` /
-  `wait_for_http` / `wait_for_socket` / `wait_for_pipe` / `wait_for`
+  lines already consumed by `wait_for_stderr_line`). `wait_for_path` /
+  `wait_for_port` / `wait_for_http` / `wait_for_socket` / `wait_for_pipe` / `wait_for`
   drain the same way but never hand any of it back mid-probe; `wait` /
   `output_string` afterward still see the full captured output, but
   `output_bytes` or a fresh `stdout_lines` / `events` call do not
@@ -714,6 +718,9 @@ Probe semantics, deliberately uniform:
 - `wait_for_socket` uses a real connection attempt, not just a socket-file
   existence check, and returns `ErrorReason::Unsupported` immediately on platforms
   without AF_UNIX (including Windows).
+- `wait_for_path` is deliberately existence-only: a file or directory counts.
+  Use `wait_for` with `tokio::fs::metadata` when readiness also depends on type,
+  size, permissions, or other metadata.
 - `wait_for_pipe` accepts a bare name or a fully-qualified `\\.\pipe\...` path.
   It returns `ErrorReason::Unsupported` off Windows. A busy pipe counts as ready:
   all server instances being occupied still proves the endpoint is serving.

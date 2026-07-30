@@ -1,7 +1,7 @@
-//! Readiness probes for stdout/stderr lines and partial tails, TCP ports, local
-//! sockets/pipes, and arbitrary async checks. They background-drain both output streams while
-//! they poll, so a chatty child can't stall in `write()` on a full OS pipe
-//! buffer; the line probes hand back only the selected stream.
+//! Readiness probes for stdout/stderr lines and partial tails, filesystem paths,
+//! TCP ports, local sockets/pipes, and arbitrary async checks. They background-drain
+//! both output streams while they poll, so a chatty child can't stall in `write()`
+//! on a full OS pipe buffer; the line probes hand back only the selected stream.
 
 use std::future::Future;
 use std::io;
@@ -29,9 +29,10 @@ use crate::error::{Error, ErrorReason, Result};
 
 use super::RunningProcess;
 
-/// How often [`RunningProcess::wait_for`] / [`RunningProcess::wait_for_port`] /
-/// [`RunningProcess::wait_for_socket`] re-check readiness — responsive without
-/// busy-spinning; matches the 50 ms liveness-poll cadence used elsewhere.
+/// How often [`RunningProcess::wait_for`] / [`RunningProcess::wait_for_path`] /
+/// [`RunningProcess::wait_for_port`] / [`RunningProcess::wait_for_socket`]
+/// re-check readiness — responsive without busy-spinning; matches the 50 ms
+/// liveness-poll cadence used elsewhere.
 const READINESS_POLL: Duration = Duration::from_millis(50);
 
 /// Cap on a single TCP or Unix-socket connect attempt (clamped to the
@@ -439,6 +440,42 @@ impl RunningProcess {
         self.poll_until(check, within).await
     }
 
+    /// Wait until `path` exists, or fail with [`ErrorReason::NotReady`] when
+    /// `within` elapses — or immediately when the child exits first.
+    ///
+    /// This is the portable readiness signal used by pidfiles, sentinel files,
+    /// lock paths, and daemons that create a Unix-socket pathname before callers
+    /// should attempt a richer connection probe. It checks existence only: files
+    /// and directories both count. To require metadata such as a regular or
+    /// non-empty file, use [`wait_for`](Self::wait_for) with
+    /// [`tokio::fs::metadata`]. Filesystem lookup errors are treated as "not yet"
+    /// and retried until the deadline, matching connection errors in
+    /// [`wait_for_port`](Self::wait_for_port).
+    ///
+    /// Piped stdout/stderr are background-drained and retained under the caller's
+    /// [`OutputBufferPolicy`](crate::OutputBufferPolicy), like
+    /// [`wait_for`](Self::wait_for) — see its documentation for the same retention
+    /// and composition semantics. A failed probe does not kill the child or arm
+    /// the command timeout.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorReason::NotReady`] when `within` elapses before `path` exists, or
+    /// immediately when the child exits first. This is a *probe* deadline —
+    /// distinct from [`ErrorReason::Timeout`]: a failed probe does not kill the
+    /// child or touch its outcome.
+    pub async fn wait_for_path(&mut self, path: impl AsRef<Path>, within: Duration) -> Result<()> {
+        let path = path.as_ref().to_owned();
+        self.poll_until(
+            move || {
+                let path = path.clone();
+                async move { tokio::fs::try_exists(path).await.unwrap_or(false) }
+            },
+            within,
+        )
+        .await
+    }
+
     /// Wait until a TCP connection to `addr` is accepted, or fail with
     /// [`ErrorReason::NotReady`] when `within` elapses — or immediately when the
     /// child exits first.
@@ -724,6 +761,7 @@ fn probe_futures_are_send(rp: &mut RunningProcess) {
     assert_send(&rp.wait_for_output(|tail| tail.is_empty(), Duration::ZERO));
     assert_send(&rp.wait_for_stderr_output(|tail| tail.is_empty(), Duration::ZERO));
     assert_send(&rp.wait_for(|| async { true }, Duration::ZERO));
+    assert_send(&rp.wait_for_path("ready", Duration::ZERO));
     assert_send(&rp.wait_for_pipe("ready", Duration::ZERO));
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
     assert_send(&rp.wait_for_port(addr, Duration::ZERO));
@@ -771,6 +809,47 @@ mod tests {
             );
         }
         validate_http_path("/healthz?deep=1").expect("safe origin-form target");
+    }
+
+    #[tokio::test]
+    async fn wait_for_path_accepts_an_existing_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::pending().with_stderr("starting\n"))
+            .start(&Command::new("service").stdout(crate::StdioMode::Null))
+            .await
+            .expect("scripted service start");
+
+        run.wait_for_path(dir.path(), Duration::from_secs(1))
+            .await
+            .expect("existence-only readiness accepts directories");
+        assert!(run.stderr_sink.is_some(), "path probe drains stderr");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_path_reports_not_ready_at_its_probe_deadline() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("missing");
+        let within = Duration::from_millis(150);
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::pending())
+            .start(&Command::new("service"))
+            .await
+            .expect("scripted service start");
+
+        let error = run
+            .wait_for_path(&missing, within)
+            .await
+            .expect_err("a missing path never becomes ready");
+        assert!(
+            matches!(
+                error.reason(),
+                ErrorReason::NotReady { program, timeout }
+                    if program == "service" && *timeout == within
+            ),
+            "got {error:?}"
+        );
+        assert!(!error.is_timeout(), "a probe deadline is not a run timeout");
     }
 
     #[tokio::test]

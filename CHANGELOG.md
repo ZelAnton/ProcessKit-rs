@@ -13,6 +13,8 @@ to a dated version section.
 
 ### Added
 
+- Add `RunningProcess::wait_for_path` for portable pidfile and filesystem-sentinel
+  readiness with the same deadline and background-drain contract as other probes.
 - Add an opt-in `json` feature with typed whole-output JSON verbs and line-wise
   NDJSON streaming with bounded, location-rich parse diagnostics.
 - Add runnable record/replay and metrics examples with a self-exec child,

@@ -396,6 +396,35 @@ async fn wait_for_drains_stderr_so_a_large_startup_burst_does_not_block_readines
     .expect("the marker must appear promptly — the stderr burst must not stall the child");
 }
 
+#[tokio::test]
+#[ignore = "spawns a real subprocess and waits for a filesystem sentinel"]
+async fn wait_for_path_observes_a_sentinel_while_draining_startup_output() {
+    const BURST_BYTES: usize = 4 * 1024 * 1024;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let marker = dir.path().join("ready");
+    let mut process = big_stdout_then_marker(BURST_BYTES, &marker)
+        .start()
+        .await
+        .expect("start sentinel writer");
+
+    completes_within(
+        Duration::from_secs(15),
+        "wait_for_path after a large stdout burst",
+        process.wait_for_path(&marker, Duration::from_secs(10)),
+    )
+    .await
+    .expect("the sentinel path must appear without the child blocking on stdout");
+    assert!(marker.exists(), "the successful probe names a real path");
+
+    let result = process
+        .output_string()
+        .await
+        .expect("finish and recover background-drained stdout");
+    assert!(result.is_success(), "sentinel writer failed: {result:?}");
+    assert_eq!(result.total_bytes(), BURST_BYTES);
+}
+
 // Note: R5-1 (a probe reaping a cleanly-exited child must claim the timeout
 // arbiter so a concurrent streaming-deadline watchdog can't misclassify it as
 // TimedOut) is a multi-threaded atomic race between the deadline task and the

@@ -520,6 +520,10 @@ async fn main() -> processkit::Result<()> {
         .await?;
     println!("server says: {banner}");
 
+    // …or for a pidfile/readiness sentinel to appear…
+    run.wait_for_path("run/my-server.ready", Duration::from_secs(10))
+        .await?;
+
     // …or for the port to accept connections…
     let addr = "127.0.0.1:8080".parse().expect("valid socket address");
     run.wait_for_port(addr, Duration::from_secs(10)).await?;
@@ -542,9 +546,9 @@ A probe that doesn't pass within its deadline — or that can no longer pass
 `ErrorReason::NotReady` (distinct from `ErrorReason::Timeout`, which is the run's own
 `Command::timeout`) and **does not kill the child**: the caller decides what
 happens next. `wait_for_line` consumes stdout up to the match
-(continue with `finish`); `wait_for_port` / `wait_for` background-drain and
-discard stdout/stderr (so the child never blocks on a full pipe) but hand
-none of it back.
+(continue with `finish`); `wait_for_path` / `wait_for_port` / `wait_for`
+background-drain and retain stdout/stderr (so the child never blocks on a full
+pipe), but hand none of it back mid-probe.
 
 *Deeper: [Streaming → readiness probes](docs/streaming.md).*
 
