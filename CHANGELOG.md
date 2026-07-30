@@ -34,6 +34,8 @@ to a dated version section.
 
 ### Changed
 
+- Make the scheduled fuzz tier cumulative with per-target corpus caches,
+  bounded corpus minimization, committed cassette seeds, and uploaded crash inputs.
 - Disable incremental compilation for one-shot local validation matrices and
   add junction-safe cleanup for obsolete incremental sessions.
 - Run a daily advisory-only cargo-deny workflow so new RustSec findings surface

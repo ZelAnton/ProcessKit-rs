@@ -1,4 +1,10 @@
 target
-corpus
+corpus/**
+# Keep only small cold-start seeds in git; generated coverage inputs live in
+# the rolling per-target Actions caches.
+!corpus/fuzz_cassette_parse/
+!corpus/fuzz_cassette_parse/v4-empty.json
+!corpus/fuzz_cassette_replay/
+!corpus/fuzz_cassette_replay/empty
 artifacts
 coverage

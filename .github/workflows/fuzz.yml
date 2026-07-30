@@ -18,7 +18,7 @@ jobs:
   fuzz:
     name: fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -32,7 +32,47 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - run: cargo +nightly fuzz build ${{ matrix.target }}
+      # Each target owns an independent rolling corpus. The unique primary key
+      # deliberately misses so the post-run corpus can be saved; restore-keys
+      # picks up the newest prior run (including across harness revisions).
+      - name: Restore fuzz corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ runner.os }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            fuzz-corpus-${{ runner.os }}-${{ matrix.target }}-
       # Bounded wall-clock budget (10 minutes): enough to catch regressions on
       # a schedule without an open-ended job. Run longer locally for a deeper
       # sweep: `cargo +nightly fuzz run <target>`.
-      - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600
+      - name: Fuzz target
+        id: fuzz
+        continue-on-error: true
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600
+      # cargo-fuzz minimizes in place through libFuzzer's merge mode and keeps
+      # the old directory if minimization fails. Bound the maintenance budget:
+      # preserving a larger corpus is preferable to hiding a fuzz result.
+      - name: Minimize accumulated corpus
+        if: ${{ steps.fuzz.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        run: cargo +nightly fuzz cmin ${{ matrix.target }}
+      # Save explicitly rather than relying on actions/cache's success-only
+      # post step: a crashing input may also have expanded useful coverage.
+      - name: Save fuzz corpus
+        if: ${{ !cancelled() && steps.fuzz.outcome != 'skipped' }}
+        uses: actions/cache/save@v6
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ runner.os }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload crash artifacts
+        if: ${{ always() && steps.fuzz.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-${{ matrix.target }}-artifacts
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Report fuzz failure
+        if: ${{ always() && steps.fuzz.outcome == 'failure' }}
+        run: exit 1
