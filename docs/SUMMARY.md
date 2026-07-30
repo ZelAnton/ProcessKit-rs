@@ -24,6 +24,7 @@
 
 - [Cookbook](cookbook.md)
 - [Running commands](commands.md)
+- [Building typed CLI clients](cli-clients.md)
 - [Running many at once](batch.md)
 - [Comparative benchmarks](comparison.md)
 - [Process groups](process-groups.md)

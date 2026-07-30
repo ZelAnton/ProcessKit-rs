@@ -464,6 +464,11 @@ Notes:
 defaults, and the runner; your wrapper contributes only commands and parsers.
 The `cli_client!` macro generates the boilerplate:
 
+For the full design guide — default precedence, dynamic env resolution,
+retry/error policy, typed JSON, and worked wrappers — see
+[Building typed CLI clients](cli-clients.md). This section focuses on the test
+seam.
+
 ```rust,no_run
 use processkit::{cli_client, Error, ProcessRunner, Result};
 use std::path::Path;

@@ -1037,4 +1037,5 @@ The generated struct carries a runner and per-client defaults
 parsers — and because the runner is injectable, the whole wrapper is testable
 with the previous recipe's `ScriptedRunner`.
 
-*Fine print: [Testing your code → CliClient](testing.md).*
+*Deep guide: [Building typed CLI clients](cli-clients.md) · [Testing doubles and
+cassettes](testing.md).*

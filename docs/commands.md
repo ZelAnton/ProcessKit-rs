@@ -183,7 +183,9 @@ fn main() {
 ```
 
 For a tool wrapped behind a `CliClient`, `CliClient::resolve_program()` does the
-same for the client's program, honoring its env defaults.
+same for the client's program, honoring its env defaults. The dedicated
+[typed CLI clients](cli-clients.md) guide covers wrapper structure, shared
+defaults, parsing, and hermetic tests end to end.
 
 ## Environment
 

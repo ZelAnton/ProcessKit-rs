@@ -13,6 +13,8 @@ to a dated version section.
 
 ### Added
 
+- Add a dedicated typed CLI-client guide covering `CliClient`, `cli_client!`,
+  defaults, parsing, error policy, and hermetic/scripted or cassette-backed tests.
 - Add `RunningProcess::wait_for_path` for portable pidfile and filesystem-sentinel
   readiness with the same deadline and background-drain contract as other probes.
 - Add an opt-in `json` feature with typed whole-output JSON verbs and line-wise

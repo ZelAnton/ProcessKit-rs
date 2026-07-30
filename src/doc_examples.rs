@@ -13,9 +13,9 @@
 // on a private, hidden module purely so rustdoc's doctest extractor walks its
 // fenced blocks — the text itself is never published anywhere.
 //
-// The doctest registrations are gated on all eight optional features, including
+// The doctest registrations are gated on all nine optional features, including
 // the default `process-control`, because the guides collectively demonstrate the
-// `process-control`/`stats`/`limits`/`mock`/`tracing`/`metrics`/`record`/`pty`
+// `process-control`/`stats`/`limits`/`mock`/`tracing`/`metrics`/`record`/`pty`/`json`
 // surfaces (`docs/streaming.md`'s interactive-PTY example needs `pty`;
 // `docs/observability.md` covers `tracing`/`metrics`). The test below stays
 // available to ordinary `cargo test`: it makes a new guide fail CI until it is
@@ -30,7 +30,8 @@
     feature = "tracing",
     feature = "metrics",
     feature = "record",
-    feature = "pty"
+    feature = "pty",
+    feature = "json"
 ))]
 // These hidden modules exist only to register fenced examples as doctests. Their
 // mdBook links are ordinary Markdown URLs (and often use downstream
@@ -61,6 +62,11 @@ mod guides {
     #[doc(hidden)]
     #[doc = include_str!("../docs/commands.md")]
     mod docs_commands {}
+
+    /// `docs/cli-clients.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/cli-clients.md")]
+    mod docs_cli_clients {}
 
     /// `docs/batch.md`.
     #[doc(hidden)]

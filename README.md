@@ -236,6 +236,7 @@ end to end:
 |---|---|
 | [Cookbook](docs/cookbook.md) | Task → snippet recipes for everything below; the fastest way in |
 | [Running commands](docs/commands.md) | The full `Command` builder and every consuming verb, with error semantics |
+| [Building typed CLI clients](docs/cli-clients.md) | `CliClient` and `cli_client!`: wrapper structure, shared defaults, typed parsing/JSON, errors, and hermetic test doubles |
 | [Running many at once](docs/batch.md) | Bounded `output_all` / `output_all_bytes` fan-out, containment choices, and `wait_any` / `wait_all` races and joins |
 | [Comparative benchmarks](docs/comparison.md) | End-to-end processkit vs. plain Tokio and standard-library baselines for capture, streaming, and concurrent fan-out |
 | [Process groups](docs/process-groups.md) | Containment, teardown, signals, suspend/resume, members, limits, stats |
@@ -814,7 +815,7 @@ impl<R: ProcessRunner> Git<R> {
 }
 ```
 
-*Deeper: [Testing your code → CliClient](docs/testing.md).*
+*Deeper: [Building typed CLI clients](docs/cli-clients.md).*
 
 ## Recording and replaying runs
 
