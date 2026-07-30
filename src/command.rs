@@ -878,6 +878,15 @@ impl Command {
     /// cancellation behave identically — the pseudo-terminal only changes the
     /// I/O wiring, never the teardown guarantee.
     ///
+    /// # Pipeline placement
+    ///
+    /// PTY mode is supported for the **final** stage of a shell-free
+    /// [`Pipeline`](crate::Pipeline), where its merged terminal stream becomes
+    /// the chain's captured or streamed stdout. A non-final PTY stage is rejected
+    /// with [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) before
+    /// any stage starts: its terminal master cannot serve as the ordinary stdout
+    /// pipe the next stage requires.
+    ///
     /// Available only with the `pty` crate feature. A note for callers who leave
     /// it unset: without this the existing three-pipe behavior — including the
     /// `Newline` framing default — is byte-for-byte unchanged.

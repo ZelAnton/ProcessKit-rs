@@ -33,6 +33,8 @@ to a dated version section.
 
 ### Fixed
 
+- Reject non-final PTY pipeline stages before launch instead of silently feeding
+  empty stdin downstream, while retaining final-stage PTY capture and streaming.
 - Route ConPTY containment through the owning Windows Job's suspend lock,
   full resume loop, kill-on-close latch, and graceful CTRL leader registry.
 - Propagate genuine ConPTY bridge read failures after any captured prefix,

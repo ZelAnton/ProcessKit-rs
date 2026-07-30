@@ -51,6 +51,28 @@ async fn pipeline_flows_data_between_stages() {
     assert!(alpha < delta, "sort should reorder: {stdout:?}");
 }
 
+#[cfg(feature = "pty")]
+#[tokio::test]
+#[ignore = "spawns a real pipeline whose final stage owns a PTY"]
+async fn final_pty_stage_captures_the_upstream_stream() {
+    let producer = if cfg!(windows) {
+        Command::new("cmd").args(["/d", "/c", "echo final-pty-payload"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'final-pty-payload\\n'"])
+    };
+
+    let result = producer
+        .pipe(passthrough_stage().use_pty())
+        .output_string()
+        .await
+        .expect("a final PTY stage is a supported capture surface");
+    assert!(result.is_success(), "pipeline result: {result:?}");
+    assert!(
+        result.stdout().contains("final-pty-payload"),
+        "the final PTY must receive and capture upstream data: {result:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "spawns a real pipeline with a shared stdout/stderr writer"]
 async fn pipeline_can_merge_stage_stderr_into_downstream_stdin_in_write_order() {

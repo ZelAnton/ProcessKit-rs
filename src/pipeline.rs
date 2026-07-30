@@ -63,6 +63,12 @@ use crate::sync::atomic::{AtomicU8, Ordering};
 ///   per-stage for pipefail diagnostics unless that stage opts into
 ///   [`merge_stderr_in_pipe`](Command::merge_stderr_in_pipe), which sends it
 ///   through the downstream pipe and gives up the separate capture.
+/// - **PTY only at the end** — [`Command::use_pty`] is supported on the final
+///   stage, whose merged terminal stream remains the pipeline's captured or
+///   streamed stdout. A PTY on any earlier stage is rejected with
+///   [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) before the
+///   first process starts: a PTY master is a terminal session, not a stdout pipe
+///   that can be handed to the next stage.
 /// - A per-stage [`Command::retry`] is **not** applied inside a pipeline;
 ///   wrap the `Pipeline` call to retry the whole chain.
 /// - A one-shot [`Stdin`](crate::Stdin) source on the *first* stage is
@@ -236,6 +242,15 @@ impl Pipeline {
     /// vectors, so kill-on-drop reaps every already-started stage — a partial chain
     /// never leaks (the "partially poured" teardown invariant).
     async fn launch(&self) -> Result<LaunchedChain> {
+        if let Some(index) = self.stages[..self.stages.len() - 1]
+            .iter()
+            .position(Command::wants_pty)
+        {
+            return Err(crate::ErrorReason::Unsupported {
+                operation: format!("pipeline use_pty on non-final stage {}", index + 1),
+            }
+            .into());
+        }
         // Wall-clock start of the whole chain, before the first spawn.
         let started = std::time::Instant::now();
 
@@ -1457,6 +1472,25 @@ mod tests {
     fn pf(mut inner: Vec<StageOutcome>, last: StageOutcome, stdout: &str) -> ProcessResult<String> {
         inner.push(last);
         pipefail(inner, stdout.to_owned())
+    }
+
+    #[cfg(feature = "pty")]
+    #[tokio::test]
+    async fn non_final_pty_stage_is_rejected_before_any_spawn() {
+        let error = Command::new("never-spawn-first")
+            .use_pty()
+            .pipe(Command::new("never-spawn-second"))
+            .start()
+            .await
+            .expect_err("a PTY cannot provide the next stage's stdin pipe");
+        assert!(
+            matches!(
+                error.reason(),
+                crate::ErrorReason::Unsupported { operation }
+                    if operation.contains("use_pty") && operation.contains("stage 1")
+            ),
+            "the wiring error must be typed and identify the non-final stage: {error:?}"
+        );
     }
 
     fn expect_last(outcome: Outcome, stdout: &str) -> ProcessResult<String> {

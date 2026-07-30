@@ -598,8 +598,8 @@ impl RunningProcess {
         match &mut self.backend {
             Backend::Real(real) => real.stdout_pipe.take(),
             Backend::Scripted(_) => None,
-            // A PTY master and its merged terminal stream do not compose into a
-            // shell-free pipeline — so there is no pipe to hand off.
+            // A PTY master and its merged terminal stream cannot feed a later
+            // shell-free pipeline stage — so there is no stdout pipe to hand off.
             #[cfg(feature = "pty")]
             Backend::Pty(_) => None,
         }
