@@ -28,6 +28,8 @@ to a dated version section.
 
 ### Changed
 
+- Disable incremental compilation for one-shot local validation matrices and
+  add junction-safe cleanup for obsolete incremental sessions.
 - Run a daily advisory-only cargo-deny workflow so new RustSec findings surface
   even when `main` and its dependency graph have not changed.
 

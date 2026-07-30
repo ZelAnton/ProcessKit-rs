@@ -46,6 +46,28 @@ toolchain or extra tools (`test-musl` needs Docker — it runs the
 real-subprocess suite inside a real Alpine/musl container, mirroring the CI
 `test-musl` job; see [platform-support.md](docs/platform-support.md#ci-coverage)).
 
+### Build-disk maintenance
+
+Cargo does not garbage-collect obsolete incremental sessions under `target/`.
+Feature powersets, alternate toolchains, custom `RUSTFLAGS`, and repeated
+integration-test binaries can therefore leave many one-use unit hashes behind.
+The matrix-style `just` recipes disable incremental compilation; ordinary
+`cargo build`, `cargo test`, and `just check` retain it for fast iteration.
+This is intentionally per recipe rather than a global Cargo setting: disabling
+incremental compilation everywhere would slow normal edit/build cycles, while
+using a separate matrix target would duplicate dependency artifacts. CI keeps
+its existing settings because hosted runners and their caches have bounded
+lifetime; the unbounded growth is specific to persistent developer checkouts.
+
+Run `just clean-disk` when old sessions have accumulated. It removes only
+directories named `incremental` beneath the main checkout's `target/` and task
+worktree targets, plus disposable `mutants.out{,.old}` reports. It deliberately
+keeps rust-analyzer caches, local tools, review-specific target directories,
+cross-target artifacts, and other normal build output. The helper deletes
+contents through a configured target path without deleting that root, so a
+symlink or Windows junction used to relocate `target/` remains intact. Inspect
+mutation reports before cleanup if their outcomes are still needed.
+
 ### Mutation testing
 
 The scheduled CI workflow runs the sharded mutation tier and reads
