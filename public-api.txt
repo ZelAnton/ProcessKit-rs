@@ -820,6 +820,7 @@ pub fn processkit::CliClient<R>::default_timeout(self, core::time::Duration) -> 
 pub async fn processkit::CliClient<R>::exit_code(&self, impl processkit::IntoCommand<R>) -> processkit::Result<i32>
 pub async fn processkit::CliClient<R>::first_line<F>(&self, impl processkit::IntoCommand<R>, F) -> processkit::Result<core::option::Option<alloc::string::String>> where F: core::ops::function::Fn(&str) -> bool + core::marker::Send
 pub async fn processkit::CliClient<R>::output_bytes(&self, impl processkit::IntoCommand<R>) -> processkit::Result<processkit::ProcessResult<alloc::vec::Vec<u8>>>
+pub async fn processkit::CliClient<R>::output_json<T>(&self, impl processkit::IntoCommand<R>) -> processkit::Result<T> where T: serde_core::de::DeserializeOwned + core::marker::Send
 pub async fn processkit::CliClient<R>::output_string(&self, impl processkit::IntoCommand<R>) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
 pub async fn processkit::CliClient<R>::parse<T, F>(&self, impl processkit::IntoCommand<R>, F) -> processkit::Result<T> where T: core::marker::Send, F: core::ops::function::FnOnce(&str) -> T + core::marker::Send
 pub async fn processkit::CliClient<R>::probe(&self, impl processkit::IntoCommand<R>) -> processkit::Result<bool>
@@ -885,6 +886,7 @@ pub fn processkit::Command::on_stderr_line<F>(self, F) -> Self where F: core::op
 pub fn processkit::Command::on_stdout_line<F>(self, F) -> Self where F: core::ops::function::Fn(&str) + core::marker::Send + core::marker::Sync + 'static
 pub fn processkit::Command::output_buffer(self, processkit::OutputBufferPolicy) -> Self
 pub async fn processkit::Command::output_bytes(&self) -> processkit::Result<processkit::ProcessResult<alloc::vec::Vec<u8>>>
+pub async fn processkit::Command::output_json<T>(&self) -> processkit::Result<T> where T: serde_core::de::DeserializeOwned + core::marker::Send
 pub async fn processkit::Command::output_string(&self) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
 pub async fn processkit::Command::parse<T, F>(&self, F) -> processkit::Result<T> where T: core::marker::Send, F: core::ops::function::FnOnce(&str) -> T + core::marker::Send
 pub fn processkit::Command::pipe(self, processkit::Command) -> processkit::Pipeline
@@ -1068,6 +1070,19 @@ impl core::marker::Unpin for processkit::JobRunner
 impl core::marker::UnsafeUnpin for processkit::JobRunner
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::JobRunner
 impl core::panic::unwind_safe::UnwindSafe for processkit::JobRunner
+pub struct processkit::JsonLines<T>
+impl<T> core::fmt::Debug for processkit::JsonLines<T>
+pub fn processkit::JsonLines<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<T> futures_core::stream::Stream for processkit::JsonLines<T> where T: serde_core::de::DeserializeOwned
+pub type processkit::JsonLines<T>::Item = core::result::Result<T, processkit::Error>
+pub fn processkit::JsonLines<T>::poll_next(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::option::Option<Self::Item>>
+impl<T> core::marker::Freeze for processkit::JsonLines<T>
+impl<T> core::marker::Send for processkit::JsonLines<T>
+impl<T> !core::marker::Sync for processkit::JsonLines<T>
+impl<T> core::marker::Unpin for processkit::JsonLines<T>
+impl<T> core::marker::UnsafeUnpin for processkit::JsonLines<T>
+impl<T> !core::panic::unwind_safe::RefUnwindSafe for processkit::JsonLines<T>
+impl<T> !core::panic::unwind_safe::UnwindSafe for processkit::JsonLines<T>
 #[non_exhaustive] pub struct processkit::MemberInfo
 impl processkit::MemberInfo
 pub fn processkit::MemberInfo::exe_name(&self) -> core::option::Option<&str>
@@ -1470,6 +1485,7 @@ pub async fn processkit::RunningProcess::wait(self) -> processkit::Result<proces
 impl processkit::RunningProcess
 pub fn processkit::RunningProcess::events(&mut self) -> processkit::Result<processkit::ProcessEvents>
 pub async fn processkit::RunningProcess::finish(self) -> processkit::Result<processkit::Finished>
+pub fn processkit::RunningProcess::stdout_json_lines<T>(&mut self) -> processkit::Result<processkit::JsonLines<T>> where T: serde_core::de::DeserializeOwned
 pub fn processkit::RunningProcess::stdout_lines(&mut self) -> processkit::Result<processkit::StdoutLines>
 impl processkit::RunningProcess
 pub async fn processkit::RunningProcess::wait_for<F, Fut>(&mut self, F, core::time::Duration) -> processkit::Result<()> where F: core::ops::function::FnMut() -> Fut + core::marker::Send, Fut: core::future::future::Future<Output = bool> + core::marker::Send
@@ -1721,6 +1737,7 @@ pub trait processkit::ProcessRunnerExt: processkit::ProcessRunner
 pub fn processkit::ProcessRunnerExt::checked<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn processkit::ProcessRunnerExt::exit_code<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<i32>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn processkit::ProcessRunnerExt::first_line<'life0, 'life1, 'async_trait, F>(&'life0 self, &'life1 processkit::Command, F) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<core::option::Option<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where F: core::ops::function::Fn(&str) -> bool + core::marker::Send + 'async_trait, Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn processkit::ProcessRunnerExt::output_json<'life0, 'life1, 'async_trait, T>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<T>> + core::marker::Send + 'async_trait)>> where T: serde_core::de::DeserializeOwned + core::marker::Send + 'async_trait, Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn processkit::ProcessRunnerExt::parse<'life0, 'life1, 'async_trait, T, F>(&'life0 self, &'life1 processkit::Command, F) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<T>> + core::marker::Send + 'async_trait)>> where T: core::marker::Send + 'async_trait, F: core::ops::function::FnOnce(&str) -> T + core::marker::Send + 'async_trait, Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn processkit::ProcessRunnerExt::probe<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<bool>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn processkit::ProcessRunnerExt::run<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<alloc::string::String>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
@@ -1730,6 +1747,7 @@ impl<T: processkit::ProcessRunner + ?core::marker::Sized> processkit::ProcessRun
 pub fn T::checked<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn T::exit_code<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<i32>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn T::first_line<'life0, 'life1, 'async_trait, F>(&'life0 self, &'life1 processkit::Command, F) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<core::option::Option<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where F: core::ops::function::Fn(&str) -> bool + core::marker::Send + 'async_trait, Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn T::output_json<'life0, 'life1, 'async_trait, T>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<T>> + core::marker::Send + 'async_trait)>> where T: serde_core::de::DeserializeOwned + core::marker::Send + 'async_trait, Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn T::parse<'life0, 'life1, 'async_trait, T, F>(&'life0 self, &'life1 processkit::Command, F) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<T>> + core::marker::Send + 'async_trait)>> where T: core::marker::Send + 'async_trait, F: core::ops::function::FnOnce(&str) -> T + core::marker::Send + 'async_trait, Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn T::probe<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<bool>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn T::run<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<alloc::string::String>> + core::marker::Send + 'async_trait)>> where Self: core::marker::Sync + 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait

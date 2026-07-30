@@ -178,6 +178,7 @@ you get back:
 | just the exit code | `.exit_code()` | `i32` (a timed-out / killed run errors instead of inventing `-1`) |
 | a yes/no answer | `.probe()` | `bool` — exit 0 → `true`, 1 → `false`, anything else errors |
 | a typed value from stdout | `.parse(\|s\| …)` / `.try_parse(\|s\| …)` | `T` — success required; fails loud on a truncated capture |
+| typed JSON / NDJSON (`json` feature) | `.output_json::<T>()` / `.start()` then `.stdout_json_lines::<T>()` | `T` or a stream of per-line `Result<T>` values with bounded parse diagnostics |
 | the first matching output line | `.first_line(\|l\| …)` | `Option<String>` — `None` when stdout closes without a match |
 | a live handle — streaming, stdin, probes | `.start()` | [`RunningProcess`] |
 
@@ -267,6 +268,7 @@ guarantee is unconditional in every configuration.
 | `stats` | — | group/per-run resource measurement, `sample_stats`, `profile` (opt-in — specialized to metrics; adds no extra crate, only a Windows OS-library link for the peak-memory readout) |
 | `limits` | — | whole-tree resource caps (implies `stats`) |
 | `record` | — | record/replay cassettes (pulls `serde`) |
+| `json` | — | typed JSON capture and line-wise NDJSON streaming (pulls `serde`) |
 | `mock` | — | `mockall`-generated `MockRunner` (test-only; its surface is semver-exempt — prefer `ScriptedRunner`/`RecordingRunner`) |
 | `tracing` | — | lifecycle events: spawn/exit, timeout/cancel, teardown, retries, storms (never argv/env) |
 | `metrics` | — | counters/histograms over already-computed run data: run/spawn counters, duration histograms, exit-code/timeout/cancel tally, retry/restart/storm events, into any `metrics` recorder (never argv/env) |

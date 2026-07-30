@@ -249,10 +249,12 @@ pub enum ErrorReason {
     /// [`CliClient`](crate::CliClient), and [`Pipeline`](crate::Pipeline) (or any
     /// parser the caller maps into this variant).
     ///
-    /// `message` is caller-built and routinely embeds the unparsed output in
-    /// full, so — like the [`Exit`](ErrorReason::Exit) streams — both `Display` and
-    /// `Debug` bound it to a 200-byte preview; the complete text stays
-    /// reachable via the public field.
+    /// `message` is caller-built and may embed the unparsed output in full, so —
+    /// like the [`Exit`](ErrorReason::Exit) streams — both `Display` and `Debug`
+    /// bound it to a 200-byte preview; the complete caller-provided text stays
+    /// reachable via the public field. The `json` feature's typed helpers are
+    /// stricter: they cap and control-escape serde detail and raw fragments
+    /// before constructing this variant, so even the public field is bounded.
     #[error("{}", display_parse(program, message))]
     #[non_exhaustive]
     Parse {

@@ -63,7 +63,7 @@ use crate::sync::atomic::{AtomicU8, Ordering};
 ///   per-stage for pipefail diagnostics unless that stage opts into
 ///   [`merge_stderr_in_pipe`](Command::merge_stderr_in_pipe), which sends it
 ///   through the downstream pipe and gives up the separate capture.
-/// - **PTY only at the end** — [`Command::use_pty`] is supported on the final
+/// - **PTY only at the end** — `Command::use_pty` is supported on the final
 ///   stage, whose merged terminal stream remains the pipeline's captured or
 ///   streamed stdout. A PTY on any earlier stage is rejected with
 ///   [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) before the

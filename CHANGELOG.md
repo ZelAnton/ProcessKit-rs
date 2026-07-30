@@ -13,6 +13,8 @@ to a dated version section.
 
 ### Added
 
+- Add an opt-in `json` feature with typed whole-output JSON verbs and line-wise
+  NDJSON streaming with bounded, location-rich parse diagnostics.
 - Add runnable record/replay and metrics examples with a self-exec child,
   scrubbed temporary cassette, and a printable in-process metrics snapshot.
 - Add a Unix `Command::arg0` override for multicall binaries and login-shell

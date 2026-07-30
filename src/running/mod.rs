@@ -10,6 +10,8 @@ mod probes;
 mod scripted;
 mod stream;
 
+#[cfg(feature = "json")]
+pub use stream::JsonLines;
 pub use stream::{Finished, OutputLine, ProcessEvent, ProcessEvents, StdoutLines};
 // Re-exported so `crate::doubles`/`crate::cassette` keep addressing these at
 // `crate::running::...` even though they now live in the `scripted` submodule.

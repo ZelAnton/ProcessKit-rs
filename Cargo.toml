@@ -177,9 +177,10 @@ mockall = { version = "0.15", optional = true }
 # module (where CancellationToken lives) is always compiled in tokio-util — no
 # inner feature needed; default-features = false pulls in nothing else.
 tokio-util = { version = "0.7", default-features = false }
-# Optional serialization for the `record` feature's JSON cassettes
-# (RecordReplayRunner): `derive` for the cassette structs, serde_json for the
-# human-diffable on-disk format. Never in production builds without `record`.
+# Optional serialization for the `record` feature's JSON cassettes and the
+# `json` feature's typed stdout verbs: `derive` for cassette/caller structs,
+# serde_json for the on-disk format and JSON/NDJSON decoding. Never in
+# production builds without one of those opt-in features.
 serde = { version = "1.0.166", features = ["derive"], optional = true }
 serde_json = { version = "1.0.100", optional = true }
 # `#[mutants::skip]`, marking a handful of genuinely equivalent-mutant helpers
@@ -240,6 +241,10 @@ metrics = ["dep:metrics"]
 # records real `Invocation → ProcessResult` pairs to a JSON fixture and replays
 # them hermetically. Off by default; pulls in serde + serde_json.
 record = ["dep:serde", "dep:serde_json"]
+# Typed JSON capture and line-wise NDJSON streaming over the existing runner
+# and live-handle seams. Shares serde + serde_json with `record`, but neither
+# feature implies the other.
+json = ["dep:serde", "dep:serde_json"]
 # Opt-in single-master-fd PTY launch mode (`Command::use_pty`): spawn the child
 # under a pseudo-terminal — `openpty` (Unix) / `CreatePseudoConsole` ConPTY
 # (Windows) — instead of three independent pipes, so tools that demand a

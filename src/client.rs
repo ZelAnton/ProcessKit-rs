@@ -305,7 +305,8 @@ impl<R: ProcessRunner> CliClient<R> {
     /// Honored by the success-checking verbs — [`run`](Self::run) /
     /// [`run_unit`](Self::run_unit) / [`checked`](Self::checked) /
     /// [`exit_code`](Self::exit_code) / [`probe`](Self::probe) /
-    /// [`parse`](Self::parse) / [`try_parse`](Self::try_parse) — the ones that
+    /// [`parse`](Self::parse) / [`try_parse`](Self::try_parse), plus
+    /// `output_json` with the `json` feature — the ones that
     /// surface failure as an [`Error`] the classifier can inspect
     /// (read it via [`is_transient`](crate::Error::is_transient) /
     /// [`is_timeout`](crate::Error::is_timeout) / [`combined`](crate::Error::combined)).
@@ -596,6 +597,27 @@ impl<R: ProcessRunner> CliClient<R> {
     {
         self.runner.try_parse(&call.into_command(self), parse).await
     }
+
+    /// Run to an accepted exit and deserialize the complete stdout as JSON.
+    ///
+    /// Delegates to [`ProcessRunnerExt::output_json`], preserving this client's
+    /// defaults and the command's retry/truncation behavior. Malformed JSON or a
+    /// value that does not match `T` becomes
+    /// [`ErrorReason::Parse`](crate::ErrorReason::Parse) with a bounded raw
+    /// fragment and decoded-output location.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`try_parse`](Self::try_parse) can return, plus
+    /// [`ErrorReason::Parse`](crate::ErrorReason::Parse) for deserialization
+    /// failures. Available with the `json` feature.
+    #[cfg(feature = "json")]
+    pub async fn output_json<T>(&self, call: impl IntoCommand<R>) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned + Send,
+    {
+        self.runner.output_json(&call.into_command(self)).await
+    }
 }
 
 /// Scaffold a typed CLI-wrapper struct around a [`CliClient`].
@@ -828,6 +850,30 @@ mod tests {
         assert!(
             matches!(err.reason(), ErrorReason::Parse { .. }),
             "got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "json")]
+    #[tokio::test]
+    async fn output_json_uses_the_injected_runner() {
+        #[derive(Debug, serde::Deserialize, PartialEq)]
+        struct Release {
+            tag: String,
+        }
+
+        let client = CliClient::with_runner(
+            "gh",
+            ScriptedRunner::new().on(["gh", "release", "view"], Reply::ok("{\"tag\":\"v3.1.0\"}")),
+        );
+        let release: Release = client
+            .output_json(client.command(["release", "view"]))
+            .await
+            .expect("typed client JSON");
+        assert_eq!(
+            release,
+            Release {
+                tag: "v3.1.0".to_owned()
+            }
         );
     }
 

@@ -272,6 +272,31 @@ pub trait ProcessRunnerExt: ProcessRunner {
         parse(out.stdout())
     }
 
+    /// Run `command`, require an accepted exit, and deserialize its complete
+    /// stdout as JSON.
+    ///
+    /// This is the typed counterpart to [`try_parse`](Self::try_parse): it uses
+    /// the same retry and success-checking contract and rejects a truncated
+    /// capture before deserialization. A malformed document becomes
+    /// [`ErrorReason::Parse`](crate::ErrorReason::Parse) whose message identifies
+    /// the program and decoded-output line/column plus zero-based byte offset
+    /// while retaining at most a 160-byte, control-escaped raw fragment.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`try_parse`](Self::try_parse) can return, with
+    /// [`ErrorReason::Parse`](crate::ErrorReason::Parse) added for malformed JSON
+    /// or a value that does not match `T`. Available with the `json` feature.
+    #[cfg(feature = "json")]
+    async fn output_json<T>(&self, command: &Command) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned + Send,
+    {
+        let program = command.program_name();
+        self.try_parse(command, move |stdout| crate::json::decode(&program, stdout))
+            .await
+    }
+
     /// Stream `command`'s stdout and return the first line matching `predicate`
     /// (`None` if the stream ends first), bounded by the command's
     /// [`timeout`](crate::Command::timeout): a `Some` deadline surfaces as
@@ -1634,6 +1659,78 @@ mod tests {
         assert!(
             matches!(err.reason(), ErrorReason::Exit { code: 3, .. }),
             "got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "json")]
+    #[tokio::test]
+    async fn output_json_deserializes_checked_stdout_and_bounds_failures() {
+        use crate::testing::{Reply, ScriptedRunner};
+
+        #[derive(Debug, serde::Deserialize, PartialEq)]
+        struct Payload {
+            value: u32,
+        }
+
+        let runner = ScriptedRunner::new()
+            .on(["tool", "ok"], Reply::ok("{\"value\":42}"))
+            .on(
+                ["tool", "bad"],
+                Reply::ok(format!(
+                    "{{\"padding\":\"{}\",\"value\":nope}}",
+                    "secret".repeat(100)
+                )),
+            );
+        let payload: Payload = runner
+            .output_json(&Command::new("tool").arg("ok"))
+            .await
+            .expect("valid JSON");
+        assert_eq!(payload, Payload { value: 42 });
+
+        let error = runner
+            .output_json::<Payload>(&Command::new("tool").arg("bad"))
+            .await
+            .expect_err("invalid JSON");
+        let ErrorReason::Parse { program, message } = error.reason() else {
+            panic!("expected Parse, got {error:?}");
+        };
+        assert_eq!(program, "tool");
+        assert!(message.contains("line 1"));
+        assert!(message.contains("byte offset"));
+        assert!(message.contains("fragment `…"));
+        assert!(
+            !message.contains(&"secret".repeat(50)),
+            "the public field must not retain the complete child output"
+        );
+    }
+
+    #[cfg(feature = "json")]
+    #[tokio::test]
+    async fn output_json_rejects_a_truncated_capture_before_decoding() {
+        struct TruncatedJsonRunner;
+
+        #[async_trait::async_trait]
+        impl ProcessRunner for TruncatedJsonRunner {
+            async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+                Ok(ProcessResult::new(
+                    command.program().to_string_lossy().into_owned(),
+                    "{\"value\":42}".to_owned(),
+                    String::new(),
+                    crate::result::Outcome::Exited(0),
+                    None,
+                )
+                .with_truncated(true)
+                .with_overflow_totals(2, 4096))
+            }
+        }
+
+        let error = TruncatedJsonRunner
+            .output_json::<serde_json::Value>(&Command::new("tool"))
+            .await
+            .expect_err("a JSON parser must not see an incomplete document");
+        assert!(
+            matches!(error.reason(), ErrorReason::OutputTooLarge { .. }),
+            "got {error:?}"
         );
     }
 

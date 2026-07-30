@@ -4,6 +4,8 @@
 //! `finish`.
 
 use std::future::Future;
+#[cfg(feature = "json")]
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
@@ -116,6 +118,42 @@ impl RunningProcess {
         let lines = self.drain_stdout_lines()?;
         self.arm_stream_deadline();
         Ok(lines)
+    }
+
+    /// Stream stdout as one deserialized JSON value per line. Call this once.
+    ///
+    /// The framing is strict NDJSON over ProcessKit's normalized text lines:
+    /// every line, including an empty one, must independently deserialize as
+    /// `T`. Each item is a [`Result<T>`](crate::Result); a malformed line yields
+    /// [`ErrorReason::Parse`](crate::ErrorReason::Parse) and the stream continues
+    /// with the next line. The error identifies the program, one-based NDJSON
+    /// line and column plus zero-based byte offset in normalized stdout, and
+    /// contains at most a 160-byte, control-escaped fragment of the offending line.
+    ///
+    /// Like [`stdout_lines`](Self::stdout_lines), creating this stream arms the
+    /// command's timeout and leaves stderr draining in the background. Consume
+    /// the stream, then call [`finish`](Self::finish) to observe the process
+    /// outcome and stderr.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io) when stdout was not piped or a
+    /// prior readiness/streaming call already consumed it. Per-line JSON errors
+    /// are stream items, not construction errors. Available with the `json`
+    /// feature.
+    #[cfg(feature = "json")]
+    pub fn stdout_json_lines<T>(&mut self) -> Result<JsonLines<T>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let program = self.program.clone();
+        Ok(JsonLines {
+            inner: self.stdout_lines()?,
+            program,
+            line_number: 0,
+            byte_offset: 0,
+            value: PhantomData,
+        })
     }
 
     /// Set up the stdout and background stderr drains without arming the timeout
@@ -783,6 +821,62 @@ impl Stream for StdoutLines {
     }
 }
 
+/// A typed NDJSON stream returned by
+/// [`RunningProcess::stdout_json_lines`].
+///
+/// Each item corresponds to exactly one normalized stdout line. Malformed
+/// items are returned as [`ErrorReason::Parse`](crate::ErrorReason::Parse) and
+/// do not terminate the stream.
+#[cfg(feature = "json")]
+pub struct JsonLines<T> {
+    inner: StdoutLines,
+    program: String,
+    line_number: usize,
+    byte_offset: usize,
+    value: PhantomData<fn() -> T>,
+}
+
+#[cfg(feature = "json")]
+impl<T> std::fmt::Debug for JsonLines<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonLines")
+            .field("program", &self.program)
+            .field("line_number", &self.line_number)
+            .field("byte_offset", &self.byte_offset)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "json")]
+impl<T> Stream for JsonLines<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    type Item = Result<T>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(line)) => {
+                this.line_number = this.line_number.saturating_add(1);
+                let line_offset = this.byte_offset;
+                this.byte_offset = this
+                    .byte_offset
+                    .saturating_add(line.len())
+                    .saturating_add(1);
+                Poll::Ready(Some(crate::json::decode_line(
+                    &this.program,
+                    this.line_number,
+                    line_offset,
+                    &line,
+                )))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// A lifecycle event produced by a running child process, yielded by
 /// [`RunningProcess::events`], which merges the process's lifecycle transitions
 /// and its two output streams into a **single ordered sequence**:
@@ -1078,6 +1172,58 @@ mod tests {
             Err(crate::ErrorReason::Io(e)) => assert_eq!(e.to_string(), "stream read boom"),
             other => panic!("expected Err(Io) for an incomplete streamed capture, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "json")]
+    #[tokio::test]
+    async fn json_lines_reports_a_bounded_item_error_and_continues() {
+        use crate::command::Command;
+        use crate::doubles::{Reply, ScriptedRunner};
+        use crate::runner::ProcessRunner;
+
+        #[derive(Debug, serde::Deserialize, PartialEq)]
+        struct Row {
+            value: u32,
+        }
+
+        let bad = format!(
+            "{{\"padding\":\"{}\",\"value\":nope}}",
+            "secret".repeat(100)
+        );
+        let output = format!("{{\"value\":1}}\n{bad}\n{{\"value\":3}}");
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok(output))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start");
+        let mut rows = run.stdout_json_lines::<Row>().expect("JSON stream");
+
+        assert_eq!(
+            rows.next().await.expect("row 1").expect("valid row"),
+            Row { value: 1 }
+        );
+        let error = rows
+            .next()
+            .await
+            .expect("row 2")
+            .expect_err("malformed row");
+        let crate::ErrorReason::Parse { program, message } = error.reason() else {
+            panic!("expected Parse, got {error:?}");
+        };
+        assert_eq!(program, "tool");
+        assert!(message.contains("NDJSON decode failed at line 2"));
+        assert!(message.contains("byte offset"));
+        assert!(message.contains("fragment `…"));
+        assert!(!message.contains(&"secret".repeat(50)));
+        assert_eq!(
+            rows.next().await.expect("row 3").expect("valid row"),
+            Row { value: 3 }
+        );
+        assert!(rows.next().await.is_none());
+        drop(rows);
+
+        let finished = run.finish().await.expect("finish");
+        assert_eq!(finished.outcome, Outcome::Exited(0));
     }
 
     /// A `ProcessEvents` built with `started_emitted: true` / `exit_rx: None`

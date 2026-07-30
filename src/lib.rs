@@ -131,6 +131,9 @@
 //!   `Pipeline::try_parse` call into `tokio::spawn`, make sure your closure
 //!   and its output are `Send` yourself; the compiler won't require it for
 //!   you the way it does for `Command`/`CliClient`.
+//! - **`output_json`** *(feature `json`)* — the success-checking typed JSON
+//!   form of `try_parse`; `RunningProcess::stdout_json_lines` provides strict
+//!   line-wise NDJSON without buffering the complete stdout.
 //!
 //! # Features
 //!
@@ -146,7 +149,7 @@
 //!   API — a link to an OS library, *not* an added crate dependency); enable with
 //!   `features = ["stats"]`, or `limits`, which implies it. (The features that do
 //!   pull an extra crate are `mock` → `mockall`, `tracing` → `tracing`, and
-//!   `record` → `serde`/`serde_json`.)
+//!   `record` / `json` → `serde`/`serde_json`.)
 //! - **`process-control`** *(default)* — tree control beyond contain+kill:
 //!   `Signal` and `ProcessGroup::{signal, suspend, resume, members,
 //!   members_info, adopt}`, the enriched `MemberInfo` member snapshot, and the
@@ -180,6 +183,11 @@
 //! - **`record`** — record/replay cassettes over the [`ProcessRunner`] seam:
 //!   `RecordReplayRunner` records real `Invocation → ProcessResult` pairs to a
 //!   JSON fixture once, then replays them hermetically — no subprocess in CI.
+//!   Pulls in `serde` + `serde_json`.
+//! - **`json`** — typed JSON capture through `Command::output_json`,
+//!   `ProcessRunnerExt::output_json`, and `CliClient::output_json`, plus
+//!   line-wise NDJSON through `RunningProcess::stdout_json_lines`. Parse
+//!   failures carry bounded raw fragments and exact decoded-output locations.
 //!   Pulls in `serde` + `serde_json`.
 //!
 //! # Other languages
@@ -220,7 +228,8 @@ mod digest;
         feature = "limits",
         feature = "mock",
         feature = "tracing",
-        feature = "record"
+        feature = "record",
+        feature = "json"
     )
 ))]
 mod doc_examples;
@@ -228,6 +237,8 @@ mod doubles;
 mod error;
 mod group;
 mod io_priority;
+#[cfg(feature = "json")]
+mod json;
 #[cfg(feature = "limits")]
 mod limits;
 // `process_info` / `process_is_alive` — the free-standing identity & reuse-safe
@@ -323,6 +334,8 @@ pub use result::{Outcome, ProcessResult};
 pub use retry::RetryPolicy;
 pub use rlimit::RlimitResource;
 pub use runner::{JobRunner, ProcessRunner, ProcessRunnerExt};
+#[cfg(feature = "json")]
+pub use running::JsonLines;
 pub use running::{Finished, OutputLine, ProcessEvent, ProcessEvents, RunningProcess, StdoutLines};
 #[cfg(feature = "process-control")]
 pub use shutdown_report::{ShutdownReport, SoftSignal};

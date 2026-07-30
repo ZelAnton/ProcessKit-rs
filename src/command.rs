@@ -883,7 +883,7 @@ impl Command {
     /// PTY mode is supported for the **final** stage of a shell-free
     /// [`Pipeline`](crate::Pipeline), where its merged terminal stream becomes
     /// the chain's captured or streamed stdout. A non-final PTY stage is rejected
-    /// with [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) before
+    /// with [`ErrorReason::Unsupported`] before
     /// any stage starts: its terminal master cannot serve as the ordinary stdout
     /// pipe the next stage requires.
     ///
@@ -1236,7 +1236,8 @@ impl Command {
     /// backoff + cap + jitter, use [`retry_with`](Self::retry_with).
     ///
     /// Applies to the **success-checking** helpers —
-    /// `run`/`run_unit`/`checked`/`exit_code`/`probe`/`parse`/`try_parse` — on
+    /// `run`/`run_unit`/`checked`/`exit_code`/`probe`/`parse`/`try_parse` (plus
+    /// `output_json` with the `json` feature) — on
     /// [`Command`](Self::run), on [`ProcessRunnerExt`],
     /// and on [`CliClient`](crate::CliClient): the ones that surface failure as an
     /// [`Error`] the classifier can inspect (e.g. a transient network failure in
@@ -3470,6 +3471,27 @@ impl Command {
         F: FnOnce(&str) -> Result<T> + Send,
     {
         JobRunner::new().try_parse(self, parse).await
+    }
+
+    /// Run to an accepted exit and deserialize the complete stdout as JSON.
+    ///
+    /// Fails loud before parsing when capture was truncated. Malformed JSON or
+    /// a value that does not match `T` becomes [`ErrorReason::Parse`] with the
+    /// decoded-output location and a bounded, control-escaped raw fragment.
+    /// Consistent with [`ProcessRunnerExt::output_json`] and
+    /// [`CliClient::output_json`](crate::CliClient::output_json).
+    ///
+    /// # Errors
+    ///
+    /// The success-checking and truncation failures of [`try_parse`](Self::try_parse),
+    /// plus [`ErrorReason::Parse`] for deserialization failures. Available with
+    /// the `json` feature.
+    #[cfg(feature = "json")]
+    pub async fn output_json<T>(&self) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned + Send,
+    {
+        JobRunner::new().output_json(self).await
     }
 
     /// Return the first stdout line matching `predicate` (or the first line when

@@ -41,9 +41,10 @@ giving ownership away.
 Every runner — real or double — gets the convenience helpers of
 `ProcessRunnerExt` for free: `run` (trimmed stdout, success required),
 `run_unit`, `exit_code`, `probe` (exit code as a boolean), `checked`
-(success-checked full result), and `parse`/`try_parse` (feed stdout to a
-closure). These are all callable on a `&dyn ProcessRunner`; being generic over
-the closure, `parse`/`try_parse`/`first_line` simply can't be dispatched through
+(success-checked full result), `parse`/`try_parse` (feed stdout to a closure),
+and — with `json` — `output_json` (typed deserialization). These are all callable
+on a `&dyn ProcessRunner`; being generic over the closure or output type,
+`parse`/`try_parse`/`output_json`/`first_line` simply can't be dispatched through
 a `dyn ProcessRunnerExt` **object** (the ext trait isn't object-safe). [Retry
 policies](timeouts-and-cancellation.md#retries) work through the seam too, so
 a double exercises your retry handling hermetically.

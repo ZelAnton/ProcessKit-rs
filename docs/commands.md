@@ -427,7 +427,7 @@ cap — even when a streaming consumer is draining lines as they arrive. It boun
 memory, not wall-time, so pair it with `timeout` against a flooding child.
 
 Even under a *drop* policy (`DropOldest`/`DropNewest`), the checking verbs that
-hand back stdout as if complete — `run`, `parse`, `try_parse` — **refuse**
+hand back stdout as if complete — `run`, `parse`, `try_parse`, `output_json` — **refuse**
 silently-truncated output (B12): if the policy dropped lines they fail with
 `ErrorReason::OutputTooLarge` rather than feed a parser a truncated tail. The lenient
 capture verbs (`output_string` / `output_bytes`) are unaffected — they return
@@ -503,7 +503,8 @@ async fn main() -> processkit::Result<()> {
   success-checking verbs it *raises* `ErrorReason::Timeout` — the full decision
   table lives in [Timeouts, retries & cancellation](timeouts-and-cancellation.md).
 - **`retry`** applies to the success-checking verbs only — `run`, `run_unit`,
-  `exit_code`, `probe`, `checked`, `parse`, and `try_parse` (seven in all; each
+  `exit_code`, `probe`, `checked`, `parse`, `try_parse`, and (with `json`)
+  `output_json` (each
   runs through the retry loop). The classifier sees the typed error and decides.
   The non-erroring `output_string`/`output_bytes` paths never retry, and neither
   does `first_line` (its stream search is single-attempt).
@@ -687,6 +688,70 @@ Two ways to satisfy them:
 
 ## Consuming verbs
 
+### Typed JSON and NDJSON
+
+With the additive `json` feature, `output_json::<T>()` runs to an accepted exit
+and deserializes the complete stdout. It is available on `Command`,
+`ProcessRunnerExt`, and `CliClient`, so a typed wrapper keeps the same verb when
+its runner changes from a real process to `ScriptedRunner`:
+
+```rust,no_run
+use processkit::Command;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Release {
+    tag_name: String,
+}
+
+# async fn example() -> processkit::Result<()> {
+let release: Release = Command::new("gh")
+    .args(["release", "view", "--json", "tagName"])
+    .output_json()
+    .await?;
+println!("{}", release.tag_name);
+# Ok(())
+# }
+```
+
+For NDJSON, start the process and take a typed line stream. Each item is its own
+`Result<T>`: a malformed line is reported with its one-based line/column and
+zero-based byte offset, then the stream continues. Empty lines are errors rather than
+being silently skipped.
+
+```rust,no_run
+use processkit::prelude::StreamExt;
+use processkit::Command;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Message {
+    reason: String,
+}
+
+# async fn example() -> processkit::Result<()> {
+let mut process = Command::new("cargo")
+    .args(["check", "--message-format=json"])
+    .start()
+    .await?;
+let mut messages = process.stdout_json_lines::<Message>()?;
+while let Some(message) = messages.next().await {
+    println!("{}", message?.reason);
+}
+let finished = process.finish().await?;
+assert_eq!(finished.outcome.code(), Some(0));
+# Ok(())
+# }
+```
+
+Both verbs reject incomplete data instead of pretending it is valid:
+`output_json` fails before parsing when a bounded capture was truncated, while
+the NDJSON stream inherits `stdout_lines`' fail-loud overflow and timeout
+contracts. JSON parse errors use `ErrorReason::Parse`; their child-controlled
+fragment is capped to 160 input bytes and control-escaped even in the public
+message field. NDJSON offsets refer to ProcessKit's decoded, `\n`-normalized
+stdout.
+
 | Verb | Returns | Non-zero exit | Timeout | Use when |
 |---|---|---|---|---|
 | `output_string()` | `ProcessResult<String>` | captured | captured (`timed_out`) | You want to inspect the outcome yourself |
@@ -694,6 +759,7 @@ Two ways to satisfy them:
 | `run()` | trimmed stdout `String` | `ErrorReason::Exit` | `ErrorReason::Timeout` | "Give me the answer or fail" |
 | `exit_code()` | `i32` | the code, `Ok` | `ErrorReason::Timeout` | The code *is* the answer |
 | `probe()` | `bool` | `0`→`true`, `1`→`false`, else `ErrorReason::Exit` | `ErrorReason::Timeout` | Predicate commands: `git diff --quiet`, `grep -q` |
+| `output_json::<T>()` | `T` | `ErrorReason::Exit` | `ErrorReason::Timeout` | Deserialize one complete JSON document (`json` feature) |
 | `first_line(pred)` | `Option<String>` | — (stream-based) | `ErrorReason::Timeout` | Grab one matching line, kill the rest |
 | `start()` | live `RunningProcess` | — | bounds the stream | [Streaming, interactive I/O, probes](streaming.md) |
 
@@ -794,7 +860,7 @@ The error enum is structured and `#[non_exhaustive]`:
 | `ErrorReason::OutputTooLarge { program, max_lines, max_bytes, total_lines, total_bytes }` | A `fail_loud` buffer's line or byte ceiling was exceeded |
 | `ErrorReason::Timeout { program, timeout, stdout, stderr, stdout_bytes }` | The run's own deadline killed it; whatever the run captured before the kill is attached — a hung tool's last stderr line tails the `Display` and is reachable via `diagnostic()`; `stdout_bytes` as above |
 | `ErrorReason::NotReady { program, timeout }` | A [readiness probe](streaming.md#readiness-probes) gave up |
-| `ErrorReason::Parse { program, message }` | A `try_parse` parser (on `Command`, `ProcessRunnerExt`, `CliClient`, or `Pipeline`) rejected the output (the `Display`/`Debug` of `message` is bounded to a 200-byte preview; the field carries the full text) |
+| `ErrorReason::Parse { program, message }` | A `try_parse` parser (on `Command`, `ProcessRunnerExt`, `CliClient`, or `Pipeline`) or a typed JSON/NDJSON verb rejected the output. Generic callers own the full message; JSON helpers cap and control-escape their child-controlled detail/fragment before storing it, while `Display`/`Debug` additionally use a 200-byte preview. |
 | `ErrorReason::Stdin { program, source }` | Feeding the child's stdin failed for a non-broken-pipe reason on an *otherwise-successful* run (a louder failure — exit/signal/timeout — wins instead); a routine broken pipe never surfaces |
 | `ErrorReason::CassetteMiss { program }` | (`record` feature) a cassette replay found no matching recording (stale/incomplete cassette) — kept distinct from a missing program, so `is_not_found()` is `false` |
 | `ErrorReason::Unsupported { operation }` | The platform can't do what was asked (and silently skipping would be wrong) |
