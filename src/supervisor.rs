@@ -502,8 +502,9 @@ impl SupervisionStatus {
         self.pid
     }
 
-    /// When the current live incarnation started, or `None` when no child is
-    /// alive right now (see [`pid`](Self::pid)).
+    /// When the current live incarnation started, or `None` when no incarnation
+    /// is active right now. A capture-only runner reports a start time while its
+    /// [`pid`](Self::pid) remains `None` because it exposes no live handle.
     #[must_use]
     pub fn started_at(&self) -> Option<SystemTime> {
         self.started_at
@@ -807,8 +808,8 @@ struct SessionState {
     /// [`StopReason::Stopped`] rather than start / restart another incarnation.
     stopping: bool,
     stop_grace: Duration,
-    /// The current live incarnation (pid, start time, and how to stop it), or
-    /// `None` between incarnations / for a capture-only runner.
+    /// The current live incarnation (optional pid, start time, and how to stop
+    /// it), or `None` between incarnations.
     current: Option<CurrentChild>,
 }
 
@@ -1612,8 +1613,8 @@ impl<R: ProcessRunner> Supervisor<R> {
         let command = self.command.clone().output_buffer(self.capture);
         // Latches false the first time the runner proves capture-only (its
         // `start` returns `Unsupported`): the loop then drives incarnations
-        // through the capture verb — no live pid / graceful child-stop, but
-        // supervision itself is unaffected.
+        // through the capture verb — no live pid/group, but the per-incarnation
+        // cancel token remains its session stop lever.
         let spawn_capable = AtomicBool::new(true);
 
         let mut restarts: u32 = 0;
@@ -2125,7 +2126,8 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// independently-piped stderr and preserves the exit outcome. A **capture-only**
     /// runner (whose `start` is [`Unsupported`](crate::ErrorReason::Unsupported)) latches
     /// `spawn_capable` off and falls back to the plain capture verb — verbatim
-    /// classic behavior, minus the live pid / graceful stop. The sole callee of
+    /// classic behavior, with no live pid but with its cancellation token
+    /// published as the session's stop lever. The sole callee of
     /// [`run_incarnation`](Self::run_incarnation), which additionally races this
     /// against the liveness watcher when a [`health_check`](Self::health_check) is
     /// set.
@@ -2140,19 +2142,18 @@ impl<R: ProcessRunner> Supervisor<R> {
         attempt: u32,
     ) -> Result<ProcessResult<String>> {
         if !spawn_capable.load(Ordering::Relaxed) {
-            shared.emit(SupervisionEvent::IncarnationStarted { attempt, pid: None });
-            return self.capture_only(command).await;
+            return self.run_capture_only(command, shared, attempt).await;
         }
         let started = Instant::now();
         let handle = match self.runner.start(command).await {
             Ok(handle) => handle,
             Err(err) if matches!(err.reason(), crate::ErrorReason::Unsupported { .. }) => {
                 // A capture-only runner: it exposes no live handle. Drive this and
-                // every later incarnation through the plain capture verb instead —
-                // no live pid / graceful stop, but supervision is unaffected.
+                // every later incarnation through the plain capture verb instead.
+                // It has no live pid/group, so its cancel token is published as
+                // the session's only stop lever.
                 spawn_capable.store(false, Ordering::Relaxed);
-                shared.emit(SupervisionEvent::IncarnationStarted { attempt, pid: None });
-                return self.capture_only(command).await;
+                return self.run_capture_only(command, shared, attempt).await;
             }
             Err(err) => return Err(err),
         };
@@ -2209,6 +2210,33 @@ impl<R: ProcessRunner> Supervisor<R> {
                 Err(err) => Err(err),
             }
         }
+    }
+
+    /// Publish and drive one capture-only incarnation. Publishing happens before
+    /// entering the runner's bulk verb so [`SupervisionSession::stop`] can always
+    /// reach the command's cancellation token, including when a stop raced the
+    /// `start` capability probe.
+    async fn run_capture_only(
+        &self,
+        command: &Command,
+        shared: &SessionShared,
+        attempt: u32,
+    ) -> Result<ProcessResult<String>> {
+        shared.emit(SupervisionEvent::IncarnationStarted { attempt, pid: None });
+        let stopper = ChildStopper {
+            group: None,
+            inc_cancel: command.cancel_token().unwrap_or_default(),
+        };
+        if shared
+            .publish_current(None, SystemTime::now(), stopper.clone())
+            .is_some()
+        {
+            // A stop won the capability-probe race. Capture-only incarnations
+            // have no graceful group operation, so cancellation is immediate.
+            stopper.inc_cancel.cancel();
+        }
+        let _current_guard = CurrentGuard { shared };
+        self.capture_only(command).await
     }
 
     /// The fallback for a capture-only runner (whose
@@ -4355,6 +4383,104 @@ mod tests {
             "session status condition never held: {:?}",
             session.status()
         );
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_a_pending_capture_only_incarnation() {
+        #[derive(Clone, Copy)]
+        struct CaptureOnlyPending;
+
+        #[async_trait::async_trait]
+        impl ProcessRunner for CaptureOnlyPending {
+            async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+                ScriptedRunner::new()
+                    .fallback(Reply::pending())
+                    .output_string(command)
+                    .await
+            }
+
+            async fn start(&self, _command: &Command) -> Result<crate::RunningProcess> {
+                Err(crate::ErrorReason::Unsupported {
+                    operation: "start".into(),
+                }
+                .into())
+            }
+        }
+
+        let session = Supervisor::new(Command::new("server"))
+            .with_runner(CaptureOnlyPending)
+            .start();
+        let status = yield_until(&session, |s| s.started_at().is_some()).await;
+        assert_eq!(status.pid(), None, "capture-only runners expose no pid");
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            session.stop(Duration::from_secs(60)),
+        )
+        .await
+        .expect("stop must not wait for a pending capture to finish naturally")
+        .expect("a deliberate capture-only stop yields an outcome");
+        assert_eq!(outcome.stopped, StopReason::Stopped);
+        assert_eq!(outcome.final_result.outcome(), Outcome::Signalled(None));
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_a_latched_capture_only_restart() {
+        #[derive(Clone)]
+        struct CaptureOnlySequence {
+            captures: std::sync::Arc<AtomicU32>,
+        }
+
+        #[async_trait::async_trait]
+        impl ProcessRunner for CaptureOnlySequence {
+            async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+                if self.captures.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return ScriptedRunner::new()
+                        .fallback(Reply::fail(1, "restart"))
+                        .output_string(command)
+                        .await;
+                }
+                ScriptedRunner::new()
+                    .fallback(Reply::pending())
+                    .output_string(command)
+                    .await
+            }
+
+            async fn start(&self, _command: &Command) -> Result<crate::RunningProcess> {
+                Err(crate::ErrorReason::Unsupported {
+                    operation: "start".into(),
+                }
+                .into())
+            }
+        }
+
+        let captures = std::sync::Arc::new(AtomicU32::new(0));
+        let session = Supervisor::new(Command::new("server"))
+            .restart(RestartPolicy::Always)
+            .backoff(Duration::ZERO, 1.0)
+            .jitter(false)
+            .with_runner(CaptureOnlySequence {
+                captures: std::sync::Arc::clone(&captures),
+            })
+            .start();
+        for _ in 0..2000 {
+            if captures.load(Ordering::SeqCst) >= 2 && session.status().started_at().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            captures.load(Ordering::SeqCst),
+            2,
+            "the second incarnation must use the latched capture-only path"
+        );
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), session.stop(Duration::ZERO))
+            .await
+            .expect("stop must cancel the latched pending capture")
+            .expect("a deliberate capture-only stop yields an outcome");
+        assert_eq!(outcome.stopped, StopReason::Stopped);
+        assert_eq!(outcome.restarts, 1);
     }
 
     #[tokio::test(start_paused = true)]

@@ -33,6 +33,8 @@ to a dated version section.
 
 ### Fixed
 
+- Let live supervision sessions cancel and promptly stop capture-only runner
+  incarnations instead of waiting indefinitely for their natural completion.
 - Serialize headless ConPTY's process-global standard-handle swap with every
   ProcessKit Windows spawn path, and document the residual foreign-code race.
 - Resolve Windows ConPTY bare-name programs against a customized child `PATH`
