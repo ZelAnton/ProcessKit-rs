@@ -1717,9 +1717,9 @@ impl RunningProcess {
     /// elapse). Returns the [`Outcome`] of the run.
     async fn drive_to_exit(&mut self) -> Result<Outcome> {
         // Close an untaken `keep_stdin_open` writer so a stdin-reading child sees
-        // EOF instead of blocking to its timeout. A Windows ConPTY writer sends
-        // the console EOF gesture while its session-lifetime host pipe stays open;
-        // Unix remains best-effort because a pty master has no half-close.
+        // EOF instead of blocking to its timeout. PTY writers translate close to
+        // the platform terminal gesture (configured VEOF on Unix, Ctrl-Z+Enter on
+        // ConPTY) because a master has no ordinary pipe-style half-close.
         match &mut self.backend {
             Backend::Real(real) => drop(real.stdin_pipe.take()),
             #[cfg(feature = "pty")]

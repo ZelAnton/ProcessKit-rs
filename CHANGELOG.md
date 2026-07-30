@@ -45,6 +45,14 @@ to a dated version section.
 
 ### Fixed
 
+- Keep the local direct-minimal-versions check from rewriting the tracked
+  `Cargo.lock` while it validates dependency floors.
+- Keep local musl nextest reports in the Docker target volume so Windows host
+  filesystem semantics cannot break the containerized test matrix.
+- Recheck external readiness once after child exit so a just-published sentinel
+  cannot be lost behind a slow asynchronous probe observation.
+- Deliver terminal EOF after bulk input to a Unix PTY, including an unterminated
+  final line, so final-stage PTY pipelines do not hang waiting for more stdin.
 - Let downstream pipeline stages drain a failing producer's final merged output
   before proactive teardown kills stragglers, preserving EOF-flushed diagnostics.
 - Reject non-final PTY pipeline stages before launch instead of silently feeding

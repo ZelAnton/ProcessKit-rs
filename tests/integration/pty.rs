@@ -16,6 +16,8 @@
 
 use std::time::Duration;
 
+#[cfg(unix)]
+use processkit::Stdin;
 #[cfg(windows)]
 use processkit::wait_any;
 use processkit::{Command, JobRunner, ProcessRunner};
@@ -279,6 +281,29 @@ async fn pty_finish_sends_console_eof_without_closing_the_session() {
         result.stdout().contains("lines:1"),
         "the child must consume one line and then observe EOF: {:?}",
         result.stdout()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real pseudo-terminal and delivers canonical EOF"]
+async fn pty_bulk_stdin_without_a_newline_finishes_with_terminal_eof() {
+    let result = completes_within(
+        Duration::from_secs(20),
+        "Unix PTY bulk stdin EOF",
+        JobRunner::new().output_string(
+            &Command::new("cat")
+                .stdin(Stdin::from_string("unterminated"))
+                .use_pty(),
+        ),
+    )
+    .await
+    .expect("bulk PTY input must deliver terminal EOF after its final byte");
+
+    assert!(result.is_success(), "cat failed: {result:?}");
+    assert!(
+        result.stdout().contains("unterminated"),
+        "the EOF gesture must not discard the unterminated payload: {result:?}"
     );
 }
 

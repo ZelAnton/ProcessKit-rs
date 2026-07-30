@@ -141,6 +141,19 @@ fn disable_echo(fd: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Read the terminal's configured canonical EOF character instead of assuming
+/// the usual Ctrl-D byte; callers can customize termios defaults system-wide.
+fn terminal_eof(fd: &OwnedFd) -> io::Result<u8> {
+    let raw = fd.as_raw_fd();
+    // SAFETY: `termios` is fully populated by `tcgetattr` before its VEOF slot is
+    // read, and `raw` remains owned for the duration of the call.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(raw, &mut termios) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(termios.c_cc[libc::VEOF])
+}
+
 /// Open a pseudo-terminal sized `cols`×`rows`, returning the (master, slave) fds
 /// as owned handles.
 fn open_pty(cols: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
@@ -225,6 +238,8 @@ fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
 #[derive(Debug)]
 struct AsyncPtyMaster {
     master: AsyncFd<std::fs::File>,
+    eof_byte: Option<u8>,
+    eof_written: usize,
 }
 
 impl AsyncPtyMaster {
@@ -233,11 +248,31 @@ impl AsyncPtyMaster {
     /// Must run inside a tokio runtime — [`AsyncFd::new`] registers the fd with
     /// the current reactor. `spawn_pty` is called from the async launch path, so
     /// that context is always present.
-    fn new(fd: OwnedFd) -> io::Result<Self> {
+    fn new(fd: OwnedFd, eof_byte: Option<u8>) -> io::Result<Self> {
         set_nonblocking(&fd)?;
         Ok(Self {
             master: AsyncFd::new(std::fs::File::from(fd))?,
+            eof_byte,
+            eof_written: 0,
         })
+    }
+
+    fn poll_write_raw(&mut self, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
+        loop {
+            let mut guard = match self.master.poll_write_ready(cx) {
+                Poll::Ready(Ok(guard)) => guard,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
+            match guard.try_io(|inner| {
+                let mut file: &std::fs::File = inner.get_ref();
+                file.write(data)
+            }) {
+                Ok(result) => return Poll::Ready(result),
+                // `WouldBlock`: readiness consumed, loop to re-arm the wait.
+                Err(_would_block) => continue,
+            }
+        }
     }
 }
 
@@ -283,21 +318,13 @@ impl AsyncWrite for AsyncPtyMaster {
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        loop {
-            let mut guard = match this.master.poll_write_ready(cx) {
-                Poll::Ready(Ok(guard)) => guard,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            };
-            match guard.try_io(|inner| {
-                let mut file: &std::fs::File = inner.get_ref();
-                file.write(data)
-            }) {
-                Ok(result) => return Poll::Ready(result),
-                // `WouldBlock`: readiness consumed, loop to re-arm the wait.
-                Err(_would_block) => continue,
-            }
+        if this.eof_written > 0 {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "pty stdin writer closed",
+            )));
         }
+        this.poll_write_raw(cx, data)
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -306,12 +333,45 @@ impl AsyncWrite for AsyncPtyMaster {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // A pty master has no half-close: EOF to the child comes from *closing*
-        // the writer's fd (on drop), not a shutdown gesture. Mirror the previous
-        // `tokio::fs::File` writer, whose shutdown was likewise a no-op (the fd
-        // closes on drop); `finish()` on a Unix PTY stays best-effort.
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let Some(eof) = this.eof_byte else {
+            return Poll::Ready(Ok(()));
+        };
+        // A PTY master has no half-close. Two configured VEOF characters cover
+        // both canonical-mode states: the first flushes an unterminated final
+        // line, and the second arrives at an empty line and yields EOF.
+        let sequence = [eof, eof];
+        while this.eof_written < sequence.len() {
+            let offset = this.eof_written;
+            match this.poll_write_raw(cx, &sequence[offset..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to deliver pty EOF",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => this.eof_written += written,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
         Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for AsyncPtyMaster {
+    fn drop(&mut self) {
+        let Some(eof) = self.eof_byte else {
+            return;
+        };
+        if self.eof_written < 2 {
+            // Drop cannot await readiness. A two-byte non-blocking write normally
+            // succeeds immediately; `finish()`/bulk stdin use poll_shutdown for
+            // the reliable path, while plain drop remains best-effort.
+            let mut file: &std::fs::File = self.master.get_ref();
+            let _ = file.write(&[eof, eof][self.eof_written..]);
+        }
     }
 }
 
@@ -329,6 +389,7 @@ where
     let (cols, rows) = opts.pty_size.unwrap_or(super::DEFAULT_PTY_SIZE);
     let (master, slave) = open_pty(cols, rows)?;
     disable_echo(&slave)?;
+    let eof_byte = terminal_eof(&slave)?;
 
     // The child needs the slave on all three of stdin/stdout/stderr, and
     // `Stdio::from` consumes one owned fd each, so dup the slave twice. All three
@@ -395,8 +456,8 @@ where
     // the master's open file description it inherits the `O_NONBLOCK` the
     // reader/writer set, which is irrelevant to an ioctl.
     let master_resize = master.try_clone()?;
-    let reader: PtyReader = Box::new(EofOnEio(AsyncPtyMaster::new(master)?));
-    let writer: PtyWriter = Box::new(AsyncPtyMaster::new(master_w)?);
+    let reader: PtyReader = Box::new(EofOnEio(AsyncPtyMaster::new(master, None)?));
+    let writer: PtyWriter = Box::new(AsyncPtyMaster::new(master_w, Some(eof_byte))?);
 
     Ok(PtySpawn {
         child: PtyChild {

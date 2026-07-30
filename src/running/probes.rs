@@ -416,6 +416,9 @@ impl RunningProcess {
     /// "Consumes stdout" caveat). A failed probe does not kill the child. The
     /// deadline bounds the polling loop, not an in-flight check: a slow
     /// `check` future can overrun `within` by its own duration.
+    /// If the child exits after a check began but before its `false` result is
+    /// observed, the callback runs once more: readiness published immediately
+    /// before exit wins instead of being lost behind that stale observation.
     ///
     /// `check` and its future are `Send` (matching
     /// [`wait_for_line`](Self::wait_for_line)'s predicate and
@@ -727,7 +730,15 @@ impl RunningProcess {
             // burning the rest of the deadline. (A "couldn't tell" probe keeps
             // polling; the deadline still bounds us.)
             if self.has_exited_now() {
-                return Err(self.not_ready(within));
+                // The first async check may have observed "not ready" and then
+                // yielded long enough for the child to publish readiness and
+                // exit. Give that terminal state one final observation so an
+                // exit cannot erase a sentinel created just before it.
+                return if check().await {
+                    Ok(())
+                } else {
+                    Err(self.not_ready(within))
+                };
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -850,6 +861,27 @@ mod tests {
             "got {error:?}"
         );
         assert!(!error.is_timeout(), "a probe deadline is not a run timeout");
+    }
+
+    #[tokio::test]
+    async fn poll_until_rechecks_readiness_after_observing_exit() {
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok("done"))
+            .start(&Command::new("service"))
+            .await
+            .expect("scripted service start");
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+
+        run.wait_for(
+            || {
+                let ready = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0;
+                async move { ready }
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("readiness published immediately before exit must win");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

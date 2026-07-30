@@ -408,13 +408,23 @@ async fn wait_for_path_observes_a_sentinel_while_draining_startup_output() {
         .await
         .expect("start sentinel writer");
 
-    completes_within(
+    let probe = completes_within(
         Duration::from_secs(15),
         "wait_for_path after a large stdout burst",
         process.wait_for_path(&marker, Duration::from_secs(10)),
     )
-    .await
-    .expect("the sentinel path must appear without the child blocking on stdout");
+    .await;
+    if let Err(probe_error) = probe {
+        let result = process
+            .output_string()
+            .await
+            .expect("recover the exited sentinel writer for diagnostics");
+        panic!(
+            "the sentinel path must appear without the child blocking on stdout: \
+             {probe_error:?}; marker_exists={}; child={result:?}",
+            marker.exists()
+        );
+    }
     assert!(marker.exists(), "the successful probe names a real path");
 
     let result = process

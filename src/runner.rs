@@ -1160,27 +1160,25 @@ async fn launch_pty(
     } = pty;
 
     // Stdin wiring over the single master input side. `keep_stdin_open` keeps the
-    // writer for `take_stdin`; a configured source is driven into it on a
-    // background task (dropping it afterwards, best-effort EOF); otherwise the
-    // writer is dropped.
+    // writer for `take_stdin`; otherwise a background task drives any configured
+    // source and then asks the platform writer to deliver its terminal EOF
+    // gesture. A PTY master has no true half-close, so merely dropping one dup is
+    // insufficient on Unix while the reader/resize dups remain alive.
     let (writer_for_stdin, stdin_task) = if command.keeps_stdin_open() {
         (Some(writer), None)
     } else {
-        match taken_stdin {
-            Some(payload) if !payload.is_empty() => {
-                let mut sink = writer;
-                let task = tokio::spawn(async move {
-                    let result = payload.write_to(&mut sink).await;
-                    drop(sink);
-                    result
-                });
-                (None, Some(task))
+        let mut sink = writer;
+        let task = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+
+            if let Some(payload) = taken_stdin
+                && !payload.is_empty()
+            {
+                payload.write_to(&mut sink).await?;
             }
-            _ => {
-                drop(writer);
-                (None, None)
-            }
-        }
+            sink.shutdown().await
+        });
+        (None, Some(task))
     };
 
     let mut process = RunningProcess::from_pty(crate::running::PtySpawned {

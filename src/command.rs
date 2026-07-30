@@ -844,7 +844,10 @@ impl Command {
     /// **echo is disabled** so a written password is not echoed back into the
     /// merged output (see [`ProcessStdin`](crate::ProcessStdin)); the Windows
     /// ConPTY has no portable per-write echo control, so that guarantee is
-    /// Unix-only.
+    /// Unix-only. Finishing interactive stdin, or completing a bulk stdin source,
+    /// sends the platform's cooked-terminal EOF gesture (the configured VEOF on
+    /// Unix, Ctrl-Z+Enter on ConPTY); this is required because a PTY master has no
+    /// ordinary pipe-style half-close.
     ///
     /// # Line framing default (`\r`-aware) and output hygiene
     ///

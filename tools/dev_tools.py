@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 REPOSITORY = Path(__file__).resolve().parent.parent
@@ -251,10 +253,15 @@ def print_report(report: list[Check]) -> int:
     return 1 if required_failures else 0
 
 
-def run(args: list[str]) -> bool:
+def run(
+    args: list[str],
+    *,
+    cwd: Path = REPOSITORY,
+    env: dict[str, str] | None = None,
+) -> bool:
     print("+ " + " ".join(args), flush=True)
     try:
-        return subprocess.run(args, cwd=REPOSITORY, check=False).returncode == 0
+        return subprocess.run(args, cwd=cwd, env=env, check=False).returncode == 0
     except OSError as error:
         print(f"failed to run {args[0]}: {error}", file=sys.stderr)
         return False
@@ -316,12 +323,41 @@ def setup() -> int:
     return 0 if installed and diagnosed == 0 else 1
 
 
+def minimal_versions() -> int:
+    """Check direct dependency floors without rewriting the working lockfile."""
+
+    # Cargo's direct-minimal resolver only writes Cargo.lock beside the manifest.
+    # Validate a snapshot instead of briefly replacing a contributor's tracked
+    # lockfile; the shared target directory still reuses downloaded dependencies.
+    ignored = shutil.ignore_patterns(
+        ".git",
+        ".jj",
+        ".work",
+        "target",
+        "book",
+        "__pycache__",
+        "*.pyc",
+    )
+    with tempfile.TemporaryDirectory(prefix="processkit-minimal-versions-") as temp:
+        snapshot = Path(temp) / "repository"
+        shutil.copytree(REPOSITORY, snapshot, ignore=ignored)
+        environment = os.environ.copy()
+        environment["CARGO_TARGET_DIR"] = str(REPOSITORY / "target")
+        commands = [
+            ["cargo", "+nightly", "-Z", "direct-minimal-versions", "generate-lockfile"],
+            ["cargo", "+nightly", "check", "--all-targets", "--all-features", "--locked"],
+        ]
+        return 0 if all(run(command, cwd=snapshot, env=environment) for command in commands) else 1
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 2 or argv[1] not in {"doctor", "setup"}:
-        print("usage: dev_tools.py {doctor|setup}", file=sys.stderr)
+    if len(argv) != 2 or argv[1] not in {"doctor", "minimal-versions", "setup"}:
+        print("usage: dev_tools.py {doctor|minimal-versions|setup}", file=sys.stderr)
         return 2
     if argv[1] == "setup":
         return setup()
+    if argv[1] == "minimal-versions":
+        return minimal_versions()
     return print_report(checks())
 
 

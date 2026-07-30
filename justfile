@@ -133,9 +133,18 @@ docsrs-doc:
 # reused by normal development, so retaining incremental state only consumes
 # disk.
 [env("CARGO_INCREMENTAL", "0")]
+[script('python')]
+[windows]
 minimal-versions:
-    cargo +nightly -Z direct-minimal-versions generate-lockfile
-    cargo +nightly check --all-targets --all-features --locked
+    import subprocess, sys
+    raise SystemExit(subprocess.call([sys.executable, "tools/dev_tools.py", "minimal-versions"]))
+
+[env("CARGO_INCREMENTAL", "0")]
+[script('python3')]
+[unix]
+minimal-versions:
+    import subprocess, sys
+    raise SystemExit(subprocess.call([sys.executable, "tools/dev_tools.py", "minimal-versions"]))
 
 # Optional: mirrors the CI `msrv` job. Requires the toolchain pinned below
 # (kept in sync with `rust-version` in Cargo.toml) plus the
@@ -157,8 +166,10 @@ msrv:
 # a capability Docker drops by default; see the CI job's comments in
 # `.github/workflows/ci.yml` for why both are needed. `procps` swaps in a
 # `ps` that supports `-p PID` (busybox's does not), which one test needs.
-# The build output goes to a named Docker volume, not `./target`, so this
-# never mixes musl-linked artifacts into your native `target/` directory.
+# The complete `./target` path is shadowed by a named Docker volume. This keeps
+# both Cargo artifacts and nextest's fixed `target/nextest` report paths off the
+# host filesystem, so musl output never mixes with native artifacts and Docker
+# Desktop never asks nextest to create its store on a bind-mounted NTFS tree.
 # `MSYS_NO_PATHCONV=1` is a no-op outside Git Bash on Windows; there it stops
 # Git Bash from mangling the `/work`-style container paths below.
 [env("MSYS_NO_PATHCONV", "1")]
@@ -166,9 +177,9 @@ msrv:
 test-musl:
     docker run --rm --init --cap-add=SYS_NICE \
         -v "{{ justfile_directory() }}:/work" \
-        -v processkit-musl-target:/musl-target \
+        -v processkit-musl-target:/work/target \
         -w /work \
-        -e CARGO_TARGET_DIR=/musl-target \
+        -e CARGO_TARGET_DIR=/work/target \
         rust:alpine sh -c ' \
             apk add --no-cache curl procps >/dev/null && \
             curl -LsSf https://get.nexte.st/0.9/linux-musl | tar zxf - -C /usr/local/cargo/bin && \
@@ -182,7 +193,7 @@ test-musl:
 
 [windows]
 test-musl:
-    docker run --rm --init --cap-add=SYS_NICE -v "{{ justfile_directory() }}:/work" -v processkit-musl-target:/musl-target -w /work -e CARGO_TARGET_DIR=/musl-target rust:alpine sh -c 'apk add --no-cache curl procps >/dev/null && curl -LsSf https://get.nexte.st/0.9/linux-musl | tar zxf - -C /usr/local/cargo/bin && cargo build --all-targets --all-features && cargo nextest run --profile ci-all --all-features --run-ignored all && cargo test --all-features --doc && cargo nextest run --profile ci-default --run-ignored all && cargo test --doc && cargo nextest run --profile ci-minimal --no-default-features --run-ignored all && cargo test --no-default-features --doc'
+    docker run --rm --init --cap-add=SYS_NICE -v "{{ justfile_directory() }}:/work" -v processkit-musl-target:/work/target -w /work -e CARGO_TARGET_DIR=/work/target rust:alpine sh -c 'apk add --no-cache curl procps >/dev/null && curl -LsSf https://get.nexte.st/0.9/linux-musl | tar zxf - -C /usr/local/cargo/bin && cargo build --all-targets --all-features && cargo nextest run --profile ci-all --all-features --run-ignored all && cargo test --all-features --doc && cargo nextest run --profile ci-default --run-ignored all && cargo test --doc && cargo nextest run --profile ci-minimal --no-default-features --run-ignored all && cargo test --no-default-features --doc'
 
 # Mirrors the fuzz-check CI job. Type-checks the `#[cfg(fuzzing)]` code
 # without actually running `cargo-fuzz` or requiring a nightly toolchain. The
