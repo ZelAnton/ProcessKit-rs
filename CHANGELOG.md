@@ -33,6 +33,8 @@ to a dated version section.
 
 ### Fixed
 
+- Propagate genuine ConPTY bridge read failures after any captured prefix,
+  while retaining broken-pipe closure as a clean end of stream.
 - Surface ConPTY primary-thread resume failures and fully clean up the suspended
   child instead of returning a process that can never run.
 - Let live supervision sessions cancel and promptly stop capture-only runner

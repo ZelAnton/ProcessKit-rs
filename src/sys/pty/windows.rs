@@ -820,10 +820,11 @@ impl SendHandle {
 
 /// Bridge a synchronous read pipe to async: a dedicated OS thread blocking-reads
 /// the pipe and forwards chunks over a bounded channel (whose fullness
-/// backpressures the reader thread, and thus the child). A `0`-length read (EOF,
-/// on pseudoconsole close) or an error ends the thread.
+/// backpressures the reader thread, and thus the child). A `0`-length read or a
+/// broken pipe is normal pseudoconsole EOF; any other read error is forwarded so
+/// the output pump can report an incomplete capture instead of silent truncation.
 fn bridge_reader(handle: HANDLE, output_activity: Arc<OutputActivity>) -> ChannelReader {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<ReaderMessage>(64);
     let h = SendHandle(handle);
     std::thread::spawn(move || {
         use std::io::Read;
@@ -832,12 +833,20 @@ fn bridge_reader(handle: HANDLE, output_activity: Arc<OutputActivity>) -> Channe
         let mut buf = [0u8; 8192];
         loop {
             match file.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(n) => {
                     output_activity.record_chunk();
-                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                    if tx
+                        .blocking_send(ReaderMessage::Chunk(buf[..n].to_vec()))
+                        .is_err()
+                    {
                         break;
                     }
+                }
+                Err(error) if crate::running::is_broken_pipe(&error) => break,
+                Err(error) => {
+                    let _ = tx.blocking_send(ReaderMessage::Error(error));
+                    break;
                 }
             }
         }
@@ -847,6 +856,11 @@ fn bridge_reader(handle: HANDLE, output_activity: Arc<OutputActivity>) -> Channe
         leftover: Vec::new(),
         pos: 0,
     }
+}
+
+enum ReaderMessage {
+    Chunk(Vec<u8>),
+    Error(io::Error),
 }
 
 /// Bridge a synchronous write pipe to async: a dedicated OS thread blocking-writes
@@ -888,7 +902,7 @@ fn bridge_writer(handle: HANDLE) -> (ChannelWriter, tokio::sync::mpsc::Unbounded
 /// `Sync`. The lock is uncontended (only `poll_read` touches it, and a reader is
 /// polled from one task) and never held across an `.await`.
 struct ChannelReader {
-    rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<ReaderMessage>>,
     leftover: Vec<u8>,
     pos: usize,
 }
@@ -913,7 +927,7 @@ impl AsyncRead for ChannelReader {
             .expect("pty reader mutex poisoned")
             .poll_recv(cx);
         match poll {
-            Poll::Ready(Some(chunk)) => {
+            Poll::Ready(Some(ReaderMessage::Chunk(chunk))) => {
                 let n = chunk.len().min(buf.remaining());
                 buf.put_slice(&chunk[..n]);
                 if n < chunk.len() {
@@ -925,6 +939,7 @@ impl AsyncRead for ChannelReader {
                 }
                 Poll::Ready(Ok(()))
             }
+            Poll::Ready(Some(ReaderMessage::Error(error))) => Poll::Ready(Err(error)),
             // The reader thread ended (pipe EOF) — clean end of stream.
             Poll::Ready(None) => Poll::Ready(Ok(())),
             Poll::Pending => Poll::Pending,
@@ -1065,5 +1080,31 @@ mod tests {
             error.raw_os_error(),
             Some(windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32)
         );
+    }
+
+    #[tokio::test]
+    async fn channel_reader_preserves_prefix_then_surfaces_a_read_error() {
+        use tokio::io::AsyncReadExt;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(ReaderMessage::Chunk(b"prefix".to_vec()))
+            .await
+            .expect("queue captured prefix");
+        tx.send(ReaderMessage::Error(io::Error::from_raw_os_error(5)))
+            .await
+            .expect("queue read failure");
+        drop(tx);
+        let mut reader = ChannelReader {
+            rx: std::sync::Mutex::new(rx),
+            leftover: Vec::new(),
+            pos: 0,
+        };
+        let mut captured = Vec::new();
+        let error = reader
+            .read_to_end(&mut captured)
+            .await
+            .expect_err("a genuine bridge read failure must not become EOF");
+        assert_eq!(captured, b"prefix");
+        assert_eq!(error.raw_os_error(), Some(5));
     }
 }
