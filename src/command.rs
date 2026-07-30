@@ -895,6 +895,19 @@ impl Command {
     /// [`env`](Self::env) or [`env_remove`](Self::env_remove) operations for
     /// `TERM`, `COLUMNS`, or `LINES` always win, including with
     /// [`env_clear`](Self::env_clear) or [`inherit_env`](Self::inherit_env).
+    ///
+    /// # Windows headless-launch concurrency
+    ///
+    /// A headless ConPTY launcher must briefly replace the launcher's
+    /// process-global standard-handle slots while it calls `CreateProcessW`.
+    /// ProcessKit serializes that window with all of its own Windows spawn paths,
+    /// so concurrent commands created through this crate cannot inherit the
+    /// temporary null handles. The lock cannot coordinate code outside
+    /// ProcessKit: a concurrent foreign `std::process::Command` using inherited
+    /// stdio, or a write to process stdout/stderr from another thread, can still
+    /// race that short window. Applications that require strict isolation from
+    /// such foreign activity should launch PTY sessions from a dedicated helper
+    /// process.
     #[cfg(feature = "pty")]
     #[cfg_attr(docsrs, doc(cfg(feature = "pty")))]
     pub fn use_pty(mut self) -> Self {
@@ -3060,7 +3073,12 @@ impl Command {
         // handed off. `std::process::Child`'s `Drop` neither kills nor waits the
         // child (the OS reaps it — on Unix, `init` once this process exits), so
         // dropping the handle below leaves the child running.
-        let child = match cmd.as_std_mut().spawn() {
+        let spawned = {
+            #[cfg(windows)]
+            let _spawn_guard = crate::sys::process_spawn_lock();
+            cmd.as_std_mut().spawn()
+        };
+        let child = match spawned {
             Ok(child) => child,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Err(self.detached_not_found(source));

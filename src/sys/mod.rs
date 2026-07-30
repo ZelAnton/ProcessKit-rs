@@ -39,6 +39,25 @@ pub(crate) const SIGTERM_RAW: i32 = libc::SIGTERM;
 #[cfg(not(unix))]
 pub(crate) const SIGTERM_RAW: i32 = 15;
 
+/// Serialize every Windows child-creation call made by ProcessKit.
+///
+/// Headless ConPTY launch briefly replaces this process's standard-handle slots
+/// with null so the pseudoconsole, rather than redirected launcher stdio, owns
+/// the child's handles. Ordinary and detached ProcessKit spawns must not observe
+/// that process-global window. Code outside this crate cannot share this lock;
+/// the remaining limitation is documented on [`crate::Command::use_pty`].
+#[cfg(windows)]
+static PROCESS_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(windows)]
+pub(crate) fn process_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+    // A panic while an OS spawn is in flight gives callers no useful recovery
+    // action; the ConPTY guard still restores stdio during unwinding.
+    PROCESS_SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 // The generation-guarded "don't kill on Drop" latch. Split into its own module so
 // the standalone loom harness (`loom/`) can `#[path]`-include just that pure core
 // and model-check the spawn/shutdown re-arm race (T-079) — see `skip_drop_kill.rs`
@@ -440,4 +459,34 @@ impl Job {
 /// rejects leaf creation (see the Linux backend's `detect_mechanism`).
 pub(crate) fn detect_mechanism() -> Mechanism {
     imp::detect_mechanism()
+}
+
+#[cfg(all(test, windows))]
+mod process_spawn_lock_tests {
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::Duration;
+
+    #[test]
+    fn process_spawn_lock_excludes_a_concurrent_spawn_window() {
+        let first = super::process_spawn_lock();
+        let ready = Arc::new(Barrier::new(2));
+        let worker_ready = Arc::clone(&ready);
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_ready.wait();
+            let _second = super::process_spawn_lock();
+            acquired_tx.send(()).expect("report lock acquisition");
+        });
+
+        ready.wait();
+        assert!(
+            acquired_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "a concurrent Windows spawn must remain outside the guarded window"
+        );
+        drop(first);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the next spawn proceeds once the guarded window closes");
+        worker.join().expect("spawn-lock worker must not panic");
+    }
 }

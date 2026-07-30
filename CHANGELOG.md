@@ -33,6 +33,8 @@ to a dated version section.
 
 ### Fixed
 
+- Serialize headless ConPTY's process-global standard-handle swap with every
+  ProcessKit Windows spawn path, and document the residual foreign-code race.
 - Resolve Windows ConPTY bare-name programs against a customized child `PATH`
   before spawn, preventing fallback to a different executable on the parent
   `PATH` and keeping preflight diagnostics truthful.

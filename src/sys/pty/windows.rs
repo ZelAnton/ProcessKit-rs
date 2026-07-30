@@ -504,18 +504,15 @@ fn conpty_startup_info(
 /// reaches via `STARTF_USESTDHANDLES`, but without the flag that stranded the
 /// child on headless CI.
 ///
-/// A process-wide lock is held for the whole window because `SetStdHandle` mutates
-/// process-global state; the swap is confined to the (fast, synchronous)
-/// `CreateProcessW` call and never spans an `.await`.
+/// The caller holds ProcessKit's process-spawn lock for the whole window because
+/// `SetStdHandle` mutates process-global state; the swap is confined to the
+/// (fast, synchronous) `CreateProcessW` call and never spans an `.await`.
 struct NulledLauncherStdio {
     saved: [(STD_HANDLE, HANDLE); 3],
-    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl NulledLauncherStdio {
-    fn install() -> Self {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn install(_spawn_guard: &std::sync::MutexGuard<'static, ()>) -> Self {
         let mut saved = [
             (STD_INPUT_HANDLE, std::ptr::null_mut()),
             (STD_OUTPUT_HANDLE, std::ptr::null_mut()),
@@ -529,7 +526,7 @@ impl NulledLauncherStdio {
                 SetStdHandle(*which, std::ptr::null_mut());
             }
         }
-        Self { saved, _lock: lock }
+        Self { saved }
     }
 }
 
@@ -679,12 +676,16 @@ pub(crate) fn spawn_pty(
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let created = {
+        // All ProcessKit Windows spawn paths share this lock. Besides protecting
+        // the headless mutation below, it keeps console-attached ConPTY launches
+        // from racing another headless launch while its std handles are null.
+        let _spawn_guard = crate::sys::process_spawn_lock();
         // Headless launcher only: null the launcher's own (possibly redirected)
         // std handles across the spawn so the child does not propagate them and
         // instead binds to the pseudoconsole. Restored the instant this guard drops
         // (end of block); a no-op for a console launcher, which severs via the
         // startup info above instead.
-        let _nulled_stdio = (!has_console).then(NulledLauncherStdio::install);
+        let _nulled_stdio = (!has_console).then(|| NulledLauncherStdio::install(&_spawn_guard));
         // SAFETY: `command_line` is a mutable NUL-terminated wide buffer
         // (CreateProcessW may write to it); the startup info's `cb` and attribute
         // list are set; the env block (when present) is double-NUL terminated with

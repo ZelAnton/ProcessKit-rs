@@ -339,7 +339,14 @@ impl Job {
         // instead fight `graceful_shutdown(escalate=false)` survivor-sparing, and
         // tokio can't toggle it off after spawn.) Arm it *before* reading the
         // fallible `id()`/`raw_handle()` so even their `?` early-returns reap.
-        let guard = UncontainedChildGuard::arm(cmd.spawn()?);
+        let child = {
+            // Headless ConPTY temporarily changes process-global std handles;
+            // use its shared spawn lock so this ordinary child cannot observe
+            // those null slots while std resolves inherited stdio.
+            let _spawn_guard = crate::sys::process_spawn_lock();
+            cmd.spawn()?
+        };
+        let guard = UncontainedChildGuard::arm(child);
         let pid = guard.child().id().ok_or_else(|| {
             io::Error::other("child exited before it could be assigned to the job")
         })?;
