@@ -2558,8 +2558,11 @@ impl Command {
         // `PATH` search would never find. Everything else (a `.exe` `PATH`
         // match, a path-form program, no match) is left untouched — the OS still
         // resolves it against the child's own `PATH`, exactly as before this
-        // builder existed. See `spawn_program_override` for the full rationale.
-        let program = self.spawn_program_override();
+        // builder existed. Windows ConPTY is the exception: raw `CreateProcessW`
+        // would search the launcher's PATH, so a relocated child PATH is resolved
+        // to an absolute executable (or rejected) here. See
+        // `spawn_program_override` for the full rationale.
+        let program = self.spawn_program_override()?;
         let mut cmd = match program {
             Some(resolved) => tokio::process::Command::new(resolved),
             None => tokio::process::Command::new(&self.program),
@@ -2844,19 +2847,25 @@ impl Command {
     ///   (std then routes a `.cmd`/`.bat` through `cmd.exe` with BatBadBut-safe
     ///   quoting, exactly as it already does for a `prefer_local` `.cmd`).
     ///
-    /// A `.exe` `PATH` match is deliberately left as the bare name: the OS
+    /// A `.exe` `PATH` match is normally left as the bare name: the OS
     /// resolves it — and, on Windows, may prefer the application/current/system
     /// directories this `PATH`-only model doesn't touch — exactly as before, so
-    /// that richer OS search is never overridden. A path-form program is never
-    /// rewritten here (the OS receives it verbatim).
+    /// that richer OS search is never overridden. The exception is Windows PTY
+    /// mode with a customized child `PATH`: ConPTY launches through raw
+    /// `CreateProcessW`, whose bare-name search uses the **parent** PATH rather
+    /// than the environment block supplied for the child. That path must be
+    /// resolved eagerly and substituted, and a miss must fail before spawn, so
+    /// the PTY cannot launch a different parent-PATH executable than preflight
+    /// reported. A path-form program is never rewritten here (the OS receives it
+    /// verbatim).
     ///
     /// Inert on non-Windows: the `PATH`-rewrite branch is `#[cfg(windows)]`
     /// (Unix has no PATHEXT), so a Unix bare name yields only a `prefer_local`
     /// match or `None`, byte-for-byte as before.
-    fn spawn_program_override(&self) -> Option<PathBuf> {
+    fn spawn_program_override(&self) -> Result<Option<PathBuf>> {
         let program = self.program.as_os_str();
         if !is_bare_name(program) {
-            return None;
+            return Ok(None);
         }
         // A `prefer_local` match is spawned via its resolved absolute path,
         // always — independent of extension and of the child's `PATH`. The
@@ -2865,7 +2874,7 @@ impl Command {
         if !self.prefer_local.is_empty()
             && let Some(found) = probe_prefer_local(&self.prefer_local, program)
         {
-            return Some(found);
+            return Ok(Some(found));
         }
         // Windows-only: rescue a bare name whose only `PATH` match carries a
         // non-`.exe` PATHEXT extension — the OS's `.exe`-only bare-name search
@@ -2877,14 +2886,24 @@ impl Command {
         // on its own.
         #[cfg(windows)]
         {
-            if let ProgramResolution::Found(found) =
-                resolve_program(program, &self.prefer_local, self.resolution_path_source())
-                && !has_exe_extension(&found)
-            {
-                return Some(found);
+            let pty_needs_child_path = self.wants_pty() && self.customizes_path();
+            match resolve_program(program, &self.prefer_local, self.resolution_path_source()) {
+                ProgramResolution::Found(found)
+                    if !has_exe_extension(&found) || pty_needs_child_path =>
+                {
+                    return Ok(Some(found));
+                }
+                ProgramResolution::NotFound { searched } if pty_needs_child_path => {
+                    return Err(ErrorReason::NotFound {
+                        program: self.program_name(),
+                        searched,
+                    }
+                    .into());
+                }
+                _ => {}
             }
         }
-        None
+        Ok(None)
     }
 
     /// The [`PathSource`] this command's bare-name `program` resolves against —
@@ -5250,6 +5269,50 @@ mod tests {
             tokio_cmd.as_std().get_program(),
             OsStr::new(unique),
             "an .exe PATH match must be left as the bare name for the OS's own search"
+        );
+    }
+
+    #[cfg(all(windows, feature = "pty"))]
+    #[test]
+    fn build_tokio_resolves_a_pty_exe_against_the_effective_child_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let unique = "pk_build_tokio_pty_exe_on_child_path";
+        let exe = write_executable(dir.path(), unique);
+
+        let cmd = Command::new(unique).env("PATH", dir.path()).use_pty();
+        let tokio_cmd = cmd.build_tokio().expect("build PTY command");
+        assert!(
+            tokio_cmd
+                .as_std()
+                .get_program()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&exe.to_string_lossy()),
+            "ConPTY must receive the absolute child-PATH match, got {:?}",
+            tokio_cmd.as_std().get_program()
+        );
+    }
+
+    #[cfg(all(windows, feature = "pty"))]
+    #[test]
+    fn build_tokio_rejects_a_missing_pty_program_on_a_customized_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let error = match Command::new("pk_missing_pty_child_path")
+            .env("PATH", dir.path())
+            .use_pty()
+            .build_tokio()
+        {
+            Ok(_) => panic!("a missing customized-PATH PTY program must fail preflight"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error.reason(),
+                crate::ErrorReason::NotFound {
+                    searched: Some(searched),
+                    ..
+                } if searched.contains(&dir.path().to_string_lossy().into_owned())
+            ),
+            "the error must name the effective child PATH: {error:?}"
         );
     }
 

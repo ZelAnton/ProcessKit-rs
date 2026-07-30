@@ -144,6 +144,39 @@ async fn pty_child_sees_a_tty() {
     );
 }
 
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns a real ConPTY child from a customized PATH"]
+async fn pty_bare_name_uses_the_effective_child_path() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let unique = "pk_pty_child_path_probe";
+    let exe = dir.path().join(format!("{unique}.exe"));
+    std::fs::copy(r"C:\Windows\System32\where.exe", &exe).expect("copy probe executable");
+
+    let command = Command::new(unique)
+        .arg("/?")
+        .env("PATH", dir.path())
+        .use_pty();
+    let resolved = command
+        .resolve_program()
+        .expect("preflight resolves the customized child PATH");
+    assert!(
+        resolved
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&exe.to_string_lossy()),
+        "preflight resolved {resolved:?}, expected {exe:?}"
+    );
+
+    let result = completes_within(
+        Duration::from_secs(20),
+        "ConPTY customized child PATH run",
+        JobRunner::new().output_string(&command),
+    )
+    .await
+    .expect("ConPTY must spawn the same executable preflight resolved");
+    assert!(result.is_success(), "probe failed: {result:?}");
+}
+
 #[tokio::test]
 #[ignore = "spawns a real pseudo-terminal"]
 async fn pty_child_receives_terminal_identity_matching_its_initial_size() {

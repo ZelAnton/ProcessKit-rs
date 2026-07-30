@@ -33,6 +33,9 @@ to a dated version section.
 
 ### Fixed
 
+- Resolve Windows ConPTY bare-name programs against a customized child `PATH`
+  before spawn, preventing fallback to a different executable on the parent
+  `PATH` and keeping preflight diagnostics truthful.
 - Keep Unix-only `rlimit` tests portable across signed FreeBSD limits, coverage
   instrumentation, and the declared `libc` floor; declare the first
   `tokio-stream` release that actually provides the enabled `sync` feature.
