@@ -32,15 +32,13 @@ use windows_sys::Win32::System::Console::{
     ResizePseudoConsole, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     SetStdHandle,
 };
-use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, SetProcessAffinityMask, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use crate::sys::SpawnOptions;
@@ -540,31 +538,17 @@ impl Drop for NulledLauncherStdio {
     }
 }
 
-/// Release a child created with `CREATE_SUSPENDED`, preserving the Win32 error
-/// before any cleanup call can overwrite the thread-local last-error value.
-fn resume_primary_thread(thread: HANDLE) -> io::Result<()> {
-    // SAFETY: the caller supplies the still-open primary thread handle returned
-    // by `CreateProcessW`; `u32::MAX` is the documented failure sentinel.
-    let previous = unsafe { ResumeThread(thread) };
-    if previous == u32::MAX {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
 /// Spawn `cmd` under a ConPTY, assigning the child to `job` for containment.
 ///
 /// `env` is the child's resolved environment (see
-/// [`Command::resolved_pty_env`](crate::Command)); `skip_drop_kill` is the job's
-/// kill-on-close latch, cleared on successful containment so a prior
-/// survivor-sparing shutdown does not spare this fresh child.
+/// [`Command::resolved_pty_env`](crate::Command)). The platform `Job` owns the
+/// assign/resume synchronization and graceful-control bookkeeping, keeping this
+/// raw launch path aligned with ordinary Windows spawn.
 pub(crate) fn spawn_pty(
     cmd: &mut Command,
     opts: &SpawnOptions,
     env: Option<Vec<(OsString, OsString)>>,
-    job: HANDLE,
-    skip_drop_kill: &crate::sys::SkipDropKill,
+    job: &crate::sys::imp::Job,
 ) -> io::Result<PtySpawn> {
     // Two pipes: the child's input (we write `input_write`) and output (we read
     // `output_read`). The ConPTY takes ownership of `input_read`/`output_write`.
@@ -736,11 +720,9 @@ pub(crate) fn spawn_pty(
         close(output_write);
     }
 
-    // Contain before resuming: assign to the same job, then release the primary
-    // thread. On assign failure the suspended child is terminated and everything
-    // is cleaned up — never an uncontained leak.
-    // SAFETY: `pi.hProcess` is the freshly-created (suspended) child; `job` is a
-    // valid job handle for the caller's lifetime.
+    // Contain before resuming. The Job owns the complete assign → affinity →
+    // resume discipline (including suspend-walk exclusion and CTRL leader
+    // registration); this module retains resource ownership for error cleanup.
     let cleanup_created = |error| {
         unsafe {
             TerminateProcess(pi.hProcess, 1);
@@ -752,25 +734,9 @@ pub(crate) fn spawn_pty(
         }
         error
     };
-    if unsafe { AssignProcessToJobObject(job, pi.hProcess) } == 0 {
-        return Err(cleanup_created(io::Error::last_os_error()));
-    }
-    if let Some(mask) = opts.cpu_affinity
-        && unsafe { SetProcessAffinityMask(pi.hProcess, mask) } == 0
-    {
-        // The child is still suspended, so a rejected affinity never becomes a
-        // brief inherited-affinity run and the shared cleanup reaps it.
-        return Err(cleanup_created(io::Error::last_os_error()));
-    }
-    if let Err(error) = resume_primary_thread(pi.hThread) {
-        // A failed resume leaves the child suspended forever. Reuse the complete
-        // post-create cleanup instead of returning a handle that can only hang.
+    if let Err(error) = job.contain_pty_child(pi.hProcess, pi.hThread, pi.dwProcessId, opts) {
         return Err(cleanup_created(error));
     }
-    // A fresh running member joined the job — re-arm kill-on-close so a prior
-    // survivor-sparing shutdown does not spare it (mirrors `Job::spawn`). Do it
-    // only after resume succeeds: a failed launch must not affect old survivors.
-    skip_drop_kill.clear();
     let pid = pi.dwProcessId;
     // `output_read` (merged stdout+stderr) and `input_write` (stdin) are
     // *synchronous* anonymous pipes; tokio has no async adapter for them, so each
@@ -1070,16 +1036,6 @@ mod tests {
         let live = classify_terminate_failure(io::Error::from_raw_os_error(5), false)
             .expect_err("a live process preserves the termination failure");
         assert_eq!(live.raw_os_error(), Some(5));
-    }
-
-    #[test]
-    fn resume_primary_thread_rejects_an_invalid_handle() {
-        let error = resume_primary_thread(std::ptr::null_mut())
-            .expect_err("ResumeThread failure must never look like a launched child");
-        assert_eq!(
-            error.raw_os_error(),
-            Some(windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32)
-        );
     }
 
     #[tokio::test]

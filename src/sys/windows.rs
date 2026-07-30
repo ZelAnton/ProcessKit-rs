@@ -99,11 +99,10 @@ pub(crate) struct Job {
     /// few instructions wide and the orphan is inert (suspended), but it is not
     /// covered by the "kernel kills the tree even on abrupt parent death" headline.
     handle: HANDLE,
-    /// Serializes `spawn`'s create-suspended → assign → resume sequence against
-    /// the `suspend`/`resume` member-thread
-    /// walks. Without it, a walk landing between assign and `spawn`'s resume
-    /// double-suspends the new child's primary thread (per-thread suspend
-    /// *counts*), and `spawn`'s single resume leaves it suspended forever.
+    /// Serializes ordinary and ConPTY create-suspended → assign → resume
+    /// sequences against the `suspend`/`resume` member-thread walks. Without it,
+    /// a walk landing between assign and launch's resume nests the new child's
+    /// per-thread suspend count and can leave it suspended forever.
     suspend_lock: std::sync::Mutex<()>,
     /// Set by `graceful_shutdown(escalate=false)` so `Drop` clears
     /// `KILL_ON_JOB_CLOSE` before closing the handle, leaving survivors alive.
@@ -397,34 +396,61 @@ impl Job {
         // only after successful containment (so a failed spawn tracks nothing) and
         // only when the child was actually spawned into its own process group.
         if opts.windows_new_process_group {
-            let mut leaders = self
-                .ctrl_break_leaders
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // Prune stale entries before recording the new leader (T-154): without
-            // this, a long-lived shared `Job` that repeatedly spawns opt-in
-            // children grows this list for its whole lifetime, even though most
-            // entries are dead. Reuses the exact recycle-safe `process_is_in_job`
-            // check `CtrlBreakTarget::signal_all` applies at teardown time — a
-            // pid it drops here is by construction never a live job member, so
-            // pruning it can never cause a future `signal_all` to miss a leader
-            // it would otherwise have signalled. Chosen over pruning inside
-            // `graceful_shutdown`: it bounds the dominant long-lived-job growth
-            // pattern (repeated opt-in spawns). Teardown still performs its own
-            // live-membership scan because the final child may exit after the last
-            // spawn, leaving this bounded snapshot stale.
-            leaders.retain(|&leader| process_is_in_job(leader, self.handle));
-            // Dedup guard (T-154 R-3): `pid` is the child JUST assigned to this
-            // job above, so if the OS recycled a stale leader's freed pid for
-            // this very child, `retain` above already sees that stale entry as
-            // "live" (it now IS this child) and keeps it — pushing unconditionally
-            // would then record the same pid twice. Skip the push in that case;
-            // the retained entry already correctly identifies this child.
-            if !leaders.contains(&pid) {
-                leaders.push(pid);
-            }
+            self.record_ctrl_break_leader(pid);
         }
         Ok(guard.disarm())
+    }
+
+    /// Complete containment for a raw ConPTY child while applying the same Job
+    /// state disciplines as [`spawn`](Self::spawn): serialize against group
+    /// suspend/resume walks, resume through the full suspend count, re-arm
+    /// kill-on-close, and record an opt-in console process-group leader.
+    #[cfg(feature = "pty")]
+    pub(crate) fn contain_pty_child(
+        &self,
+        process: HANDLE,
+        primary_thread: HANDLE,
+        pid: u32,
+        opts: &crate::sys::SpawnOptions,
+    ) -> io::Result<()> {
+        // Poisoning is unactionable here: the lock protects OS state that still
+        // needs a deterministic assign → resume completion on the next attempt.
+        let _suspend_guard = self
+            .suspend_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: both handles come from the still-live `CreateProcessW` result;
+        // the caller retains ownership and performs complete cleanup on error.
+        if unsafe { AssignProcessToJobObject(self.handle, process) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if let Some(mask) = opts.cpu_affinity
+            && unsafe { SetProcessAffinityMask(process, mask) } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        resume_thread_handle(primary_thread)?;
+
+        self.skip_drop_kill.clear();
+        if opts.windows_new_process_group {
+            self.record_ctrl_break_leader(pid);
+        }
+        Ok(())
+    }
+
+    /// Record a direct child created as a console process-group leader, pruning
+    /// exited entries while remaining safe if Windows recycled a pid.
+    fn record_ctrl_break_leader(&self, pid: u32) {
+        let mut leaders = self
+            .ctrl_break_leaders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Reuse the signal path's recycle-safe membership check. A stale pid
+        // recycled for this new member is retained and then deduplicated below.
+        leaders.retain(|&leader| process_is_in_job(leader, self.handle));
+        if !leaders.contains(&pid) {
+            leaders.push(pid);
+        }
     }
 
     /// Spawn `cmd` under a ConPTY pseudoconsole and assign the child to **this**
@@ -438,7 +464,7 @@ impl Job {
         opts: &crate::sys::SpawnOptions,
         env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
     ) -> io::Result<crate::sys::pty::PtySpawn> {
-        crate::sys::pty::spawn_pty(cmd, opts, env, self.handle, &self.skip_drop_kill)
+        crate::sys::pty::spawn_pty(cmd, opts, env, self)
     }
 
     #[cfg(feature = "process-control")]
@@ -1163,28 +1189,26 @@ fn resume_thread(tid: u32) -> io::Result<()> {
     if thread.is_null() {
         return Err(io::Error::last_os_error());
     }
-    // Resume until the suspend count reaches 0. A `CREATE_SUSPENDED` child's
-    // primary thread is normally at count 1, but a member-walk suspend racing the
-    // spawn (bounded by `suspend_lock`, yet possible) could nest it higher, and a
-    // single decrement would leave it stuck suspended forever. `ResumeThread`
-    // returns the PREVIOUS count and decrements by one each call, so loop until it
-    // reports `<= 1` (now 0); bounded by the suspend depth. The failure is
-    // captured BEFORE `CloseHandle`, which can overwrite the last-error.
-    let err = loop {
-        // SAFETY: valid thread handle; a `u32::MAX` return signals failure.
-        let prev = unsafe { ResumeThread(thread) };
-        if prev == u32::MAX {
-            break Some(io::Error::last_os_error());
-        }
-        if prev <= 1 {
-            break None; // prev == 1 → now 0 (running); prev == 0 → already running
-        }
-    };
+    let result = resume_thread_handle(thread);
     // SAFETY: handle came from OpenThread; closed exactly once.
     unsafe { CloseHandle(thread) };
-    match err {
-        Some(err) => Err(err),
-        None => Ok(()),
+    result
+}
+
+/// Resume a still-open thread handle until its suspend count reaches zero.
+/// Shared by ordinary spawn's snapshot walk and ConPTY's direct primary-thread
+/// handle so their nested-suspend behavior cannot drift apart.
+fn resume_thread_handle(thread: HANDLE) -> io::Result<()> {
+    loop {
+        // SAFETY: the caller supplies a still-open thread handle with resume
+        // rights; `u32::MAX` is the documented failure sentinel.
+        let previous = unsafe { ResumeThread(thread) };
+        if previous == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        if previous <= 1 {
+            return Ok(()); // previous 1 → now running; 0 → already running
+        }
     }
 }
 
@@ -1773,6 +1797,19 @@ mod guard_tests {
         // Clean up the suspended child.
         let _ = kept.start_kill();
         let _ = kept.wait().await;
+    }
+}
+
+#[cfg(test)]
+mod thread_resume_tests {
+    #[test]
+    fn resume_thread_handle_rejects_an_invalid_handle() {
+        let error = super::resume_thread_handle(std::ptr::null_mut())
+            .expect_err("ResumeThread failure must never look like a launched child");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32)
+        );
     }
 }
 

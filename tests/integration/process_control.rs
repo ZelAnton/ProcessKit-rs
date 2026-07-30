@@ -312,6 +312,34 @@ async fn windows_soft_stop_scope_reports_opt_in_members_for_a_live_child() {
     group.kill_all().expect("tear the tree down");
 }
 
+#[cfg(all(windows, feature = "pty"))]
+#[tokio::test]
+#[ignore = "spawns a real opt-in ConPTY child; probes shared Job bookkeeping"]
+async fn windows_conpty_opt_in_child_is_recorded_for_soft_stop() {
+    use processkit::SoftStopScope;
+
+    let group = ProcessGroup::new().expect("create group");
+    let _run = group
+        .start(
+            &Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .windows_graceful_ctrl_break()
+                .use_pty(),
+        )
+        .await
+        .expect("start opt-in ConPTY child");
+
+    assert_eq!(
+        group.soft_stop_scope(),
+        SoftStopScope::OptInMembers,
+        "ConPTY spawn must register its console process-group leader on the Job"
+    );
+    group
+        .signal(Signal::Term)
+        .expect("the registered ConPTY leader must accept the advertised soft stop");
+    group.kill_all().expect("tear the ConPTY tree down");
+}
+
 #[cfg(windows)]
 #[tokio::test]
 #[ignore = "spawns a real subprocess and kills it via Signal::Kill"]

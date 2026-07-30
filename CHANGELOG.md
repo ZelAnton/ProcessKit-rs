@@ -33,6 +33,8 @@ to a dated version section.
 
 ### Fixed
 
+- Route ConPTY containment through the owning Windows Job's suspend lock,
+  full resume loop, kill-on-close latch, and graceful CTRL leader registry.
 - Propagate genuine ConPTY bridge read failures after any captured prefix,
   while retaining broken-pipe closure as a clean end of stream.
 - Surface ConPTY primary-thread resume failures and fully clean up the suspended
