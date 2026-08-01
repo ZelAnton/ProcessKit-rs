@@ -660,6 +660,109 @@ process-group mechanism (macOS/BSD, the Linux fallback) refuses any requested
 cap with `Unsupported` rather than silently dropping it, while lifting *all*
 caps there is a trivial success.
 
+### Did the cap actually fire? (`limit_evidence`)
+
+The caps above answer "may this tree use more?". They don't, by themselves, tell
+you afterwards whether one of them *stopped* something — and a plain exit status
+can't either: a child OOM-killed under `max_memory` and a child that crashed on
+its own both surface as an ordinary non-zero exit (a `SIGKILL` on Unix). `stats`
+reports peak and cumulative samples, which is a measurement, not a verdict.
+
+`ProcessGroup::limit_evidence()` closes that gap. It returns a `LimitEvidence`
+report carrying one `LimitVerdict` per axis, read from the kernel/OS container
+the crate owns:
+
+```rust,no_run
+use processkit::{Command, LimitVerdict, ProcessGroup, ProcessGroupOptions};
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default().max_memory(512 * 1024 * 1024),
+    )?;
+    let outcome = group.start(&Command::new("untrusted-tool")).await?
+        .output_string().await?;
+
+    if !outcome.is_success() {
+        match group.limit_evidence().memory() {
+            LimitVerdict::Tripped => eprintln!("killed by its memory cap"),
+            LimitVerdict::NotTripped => eprintln!("the tool failed on its own"),
+            // `LimitVerdict` is `#[non_exhaustive]`; treat anything new the way
+            // you treat `Unknown` — as "no answer", never as a "no".
+            _ => eprintln!("this platform can't say"),
+        }
+    }
+    Ok(())
+}
+```
+
+**Two different questions.** `ErrorReason::ResourceLimit` is *admission*: "the
+cap you asked for could not be **applied**" (`Invalid` / `Unsupported` /
+`Unenforceable`), returned by `with_options` / `update_limits` before anything
+runs. `limit_evidence` is the other side: the cap **was** applied — did it then
+**fire**? Nothing about the error's behaviour changes; the two never overlap.
+
+**Three-valued on purpose, and never a guess.** `Tripped` is returned *only* on
+authoritative kernel/OS evidence recorded by this group's own container.
+`NotTripped` means the evidence says it did not fire — or that the axis never
+carried a cap, so nothing could. `Unknown` means **no evidence is available**,
+and is deliberately not folded into a "no". Exit codes and signals are never
+consulted: they cannot separate a cap-driven kill from a self-inflicted one.
+
+| Mechanism | Memory | Processes | CPU | Evidence |
+|---|---|---|---|---|
+| Linux cgroup v2 | ✅ | ✅ | ✅ | `memory.events`' `oom`, `pids.events`' `max`, `cpu.stat`'s `nr_throttled` |
+| Windows Job Object | ❓ `Unknown` | ❓ `Unknown` | ❓ `Unknown` | the mechanism keeps no post-mortem record — see below |
+| pgroup / macOS / BSD | ❓ `Unknown` | ❓ `Unknown` | ❓ `Unknown` | no whole-tree resource accounting exists at all |
+
+What "fired" means differs by axis, because the OS's own behaviour does: memory
+means the container hit **its own** cap and the kernel had to OOM inside it;
+processes means a fork was refused; CPU means the quota throttled the tree at
+least once — a CPU cap slows work rather than stopping it, so a `Tripped` CPU
+verdict reads as "the quota bound this workload", not "the quota broke it".
+
+The memory axis keys on cgroup v2's `oom` counter and deliberately **not** on
+`oom_kill`, which the kernel documents as processes of this cgroup killed by
+*any* OOM killer — a host-wide out-of-memory kill would otherwise be reported as
+"your cap killed it".
+
+**A `NotTripped` memory verdict on a host with swap** deserves one caveat, and it
+is the kernel's, not the report's: `memory.max` caps *memory*, not memory + swap.
+Where swap is available to the tree (`memory.swap.max` defaults to `max`, and the
+crate sets no swap cap), the kernel may page a hog out instead of OOM-killing it —
+the cap engages, nothing dies, and `NotTripped` is the truthful answer. If you
+need "over the cap means death", take swap off the tree externally
+(`memory.swap.max`, or a swapless host/container — which is what most containers
+already are).
+
+**Windows is a measured negative, not an oversight.** A Job Object enforces all
+three caps but preserves nothing about them afterwards: the active-process cap
+refuses the offending process without ever counting it as a member (the job
+accounting's "terminated because of a limit violation" tally is measurably
+unmoved by a real violation), the memory cap fails a *commit* rather than
+killing and is surfaced only as a live IO-completion-port notification, and the
+CPU hard cap throttles with no counter at all. Reading any of them would mean
+attaching a completion port and a drain thread to every group — new machinery on
+the containment object itself, purely for reporting — which this crate does not
+do. Inferring from `PeakJobMemoryUsed` or an exit code is refused as a guess, so
+a capped axis reports `Unknown` there. (On the process-group mechanism the
+answer is `Unknown` too, for a different reason: it has no accounting to read —
+and it refuses to carry a cap in the first place.)
+
+**Read it before the group goes away.** The evidence lives in the container, so
+call `limit_evidence()` while the group is still alive; dropping it (or the
+consuming `shutdown()`) removes the cgroup / closes the job handle and takes the
+counters with it. Reading is free of side effects and repeatable: it sends no
+signal, kills nothing, writes nothing, and cannot perturb teardown or
+kill-on-drop whenever you call it. The counters are cumulative and are not reset
+by reading, by a teardown, or by `update_limits` — an axis whose cap was later
+lifted still reports that it fired while the cap was in force. An axis that
+never carried a cap is answered without touching the OS at all, so a group
+created without caps performs no evidence I/O whatsoever.
+
+(`LimitEvidence` and `LimitVerdict` are left as bare code spans, not `docs.rs`
+links: they ship in the next release, so a `docs.rs` URL would 404 until then.)
+
 ## Stats and sampling
 
 Requires the opt-in **`stats`** feature (`features = ["stats"]`, or `limits`).

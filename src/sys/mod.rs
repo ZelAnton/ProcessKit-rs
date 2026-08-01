@@ -24,7 +24,7 @@ use crate::Mechanism;
 #[cfg(feature = "process-control")]
 use crate::Signal;
 #[cfg(feature = "limits")]
-use crate::limits::ResourceLimits;
+use crate::limits::{CappedAxes, LimitEvidence, ResourceLimits};
 #[cfg(feature = "process-control")]
 use crate::member::MemberInfo;
 #[cfg(feature = "stats")]
@@ -303,6 +303,24 @@ impl Job {
     #[cfg(feature = "limits")]
     pub(crate) fn update_limits(&self, limits: &ResourceLimits) -> io::Result<()> {
         self.0.update_limits(limits)
+    }
+
+    /// Post-run evidence about the caps this job carries: did an applied cap
+    /// actually fire? See
+    /// [`ProcessGroup::limit_evidence`](crate::ProcessGroup::limit_evidence) for the
+    /// contract and [`LimitVerdict`](crate::LimitVerdict) for what counts as
+    /// evidence on each axis.
+    ///
+    /// `capped` names the axes that have carried a cap at any point in this job's
+    /// life, so a backend reads **only** those (an uncapped axis is
+    /// `NotTripped` by construction — no cap, nothing to fire — and costs no I/O).
+    /// Infallible by design: an unreadable counter is `Unknown`, never an error,
+    /// because "we could not look" and "it did not fire" must not collapse into one
+    /// answer. Reads only; it never signals, kills, or mutates the container, so it
+    /// leaves teardown/kill-on-drop ordering untouched no matter when it is called.
+    #[cfg(feature = "limits")]
+    pub(crate) fn limit_evidence(&self, capped: CappedAxes) -> LimitEvidence {
+        self.0.limit_evidence(capped)
     }
 
     /// Spawn `cmd` as a member of this job, honoring the per-spawn `opts`.

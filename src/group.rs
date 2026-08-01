@@ -8,7 +8,7 @@ use tokio::process::{Child, Command};
 use crate::error::ErrorReason;
 use crate::error::{Error, Result};
 #[cfg(feature = "limits")]
-use crate::limits::{LimitKind, LimitReason, ResourceLimits};
+use crate::limits::{CappedAxes, LimitEvidence, LimitKind, LimitReason, ResourceLimits};
 use crate::mechanism::Mechanism;
 #[cfg(feature = "process-control")]
 use crate::member::MemberInfo;
@@ -127,6 +127,12 @@ impl ProcessGroupOptions {
 pub struct ProcessGroup {
     job: Job,
     options: ProcessGroupOptions,
+    /// Every limit axis this group has carried a cap on, at any point — sticky, so
+    /// [`limit_evidence`](Self::limit_evidence) still reports a cap that
+    /// [`update_limits`](Self::update_limits) has since lifted (it was in force, and
+    /// it may well have fired), and reads nothing for an axis never capped.
+    #[cfg(feature = "limits")]
+    capped: CappedAxes,
 }
 
 // Manual: `Job` is an opaque OS handle.
@@ -201,7 +207,22 @@ impl ProcessGroup {
         };
         #[cfg(not(feature = "limits"))]
         let job = Job::new().map_err(Error::io)?;
-        Ok(Self { job, options })
+        // Record the axes this group starts out capped on, for the post-run
+        // `limit_evidence` report. Only reached once creation SUCCEEDED, so a
+        // rejected cap (`ErrorReason::ResourceLimit`) never leaves a phantom axis
+        // recorded on a group that was never created.
+        #[cfg(feature = "limits")]
+        let capped = {
+            let mut capped = CappedAxes::default();
+            capped.record(&options.limits);
+            capped
+        };
+        Ok(Self {
+            job,
+            options,
+            #[cfg(feature = "limits")]
+            capped,
+        })
     }
 
     /// Spawn `cmd` as a member of this group.
@@ -933,7 +954,94 @@ impl ProcessGroup {
         // Reflect the applied set so the group's public view (Debug, any future
         // getter) stays honest.
         self.options.limits = limits;
+        // Sticky, unlike `options.limits`: an axis capped here stays on the evidence
+        // record even after a later replacement lifts it, so a cap that fired while
+        // it was in force is never reported as "did not fire". Recorded only on
+        // success — a refused update applied no cap.
+        self.capped.record(&limits);
         Ok(())
+    }
+
+    /// Post-run evidence about this group's resource caps: **did a cap that was in
+    /// force actually fire?** One [`LimitVerdict`](crate::LimitVerdict) per axis, read from the kernel /
+    /// OS container this crate owns.
+    ///
+    /// This closes the gap a plain exit status leaves. A child killed by its memory
+    /// cap and a child that crashed on its own both surface as an ordinary non-zero
+    /// exit (or a `SIGKILL`), and [`stats`](Self::stats) reports only peak/cumulative
+    /// samples, never a verdict. Call this once the run you care about has finished
+    /// and ask the axis you capped:
+    /// [`memory`](LimitEvidence::memory) / [`processes`](LimitEvidence::processes) /
+    /// [`cpu`](LimitEvidence::cpu), or [`verdict(kind)`](LimitEvidence::verdict).
+    ///
+    /// # Not the same question as [`crate::ErrorReason::ResourceLimit`]
+    ///
+    /// That error is **pre-spawn admission**: "the cap you requested could not be
+    /// *applied*" ([`LimitReason::Invalid`] / [`LimitReason::Unsupported`] /
+    /// [`LimitReason::Unenforceable`]), raised by
+    /// [`with_options`](Self::with_options) / [`update_limits`](Self::update_limits)
+    /// before or instead of running anything. This report is the other side: the cap
+    /// **was** applied — did it then *engage*? The two never overlap, and this
+    /// addition changes nothing about that error's behavior.
+    ///
+    /// # Three-valued, and never a guess
+    ///
+    /// [`Tripped`](crate::LimitVerdict::Tripped) is returned only on authoritative
+    /// kernel/OS evidence recorded by this group's own container.
+    /// [`NotTripped`](crate::LimitVerdict::NotTripped) means the evidence says it did not
+    /// fire — or that the axis never carried a cap at all, so nothing could.
+    /// [`Unknown`](crate::LimitVerdict::Unknown) means **no evidence is available**, and is
+    /// deliberately not folded into "no". Exit codes and signals are never
+    /// consulted: they cannot distinguish a cap-driven kill from a self-inflicted
+    /// one, so reading them would be the guess this report exists to avoid.
+    ///
+    /// # What each mechanism can prove
+    ///
+    /// - **Linux cgroup v2** — all three axes, from the kernel's own counters:
+    ///   `memory.events`' `oom` (this cgroup hit *its own* memory cap and had to
+    ///   OOM), `pids.events`' `max` (a fork was refused by the process cap),
+    ///   `cpu.stat`'s `nr_throttled` (the quota throttled the tree). Note the memory
+    ///   axis keys on `oom` and **not** `oom_kill`: the latter also counts a *global*
+    ///   host OOM kill of our child, which would misattribute a system-wide event to
+    ///   your cap.
+    /// - **Windows Job Object** — [`Unknown`](crate::LimitVerdict::Unknown) on every capped
+    ///   axis. Not an omission: a Job Object keeps no post-mortem record that any of
+    ///   these caps fired. Its process cap refuses the offending process *without*
+    ///   ever counting it as an accounted member (the job accounting's
+    ///   "terminated for a limit violation" tally is measurably unmoved by a real
+    ///   violation); its memory cap fails a commit rather than killing, and is
+    ///   surfaced only as a live IO-completion-port notification; its CPU hard cap
+    ///   throttles with no counter at all. Reading any of those would require
+    ///   attaching a completion port and a drain thread to every group — new
+    ///   machinery on the containment object itself, for reporting alone — which
+    ///   this crate deliberately does not do. Inferring from `PeakJobMemoryUsed` or
+    ///   an exit code is refused as a guess. The containers guide records the full
+    ///   reasoning.
+    /// - **POSIX process group** (macOS, the BSDs, and the Linux fallback with no
+    ///   usable cgroup v2) — [`Unknown`](crate::LimitVerdict::Unknown) on every axis: the
+    ///   mechanism has no whole-tree resource accounting to read. It also cannot
+    ///   carry a cap at all (creation fails fast with
+    ///   [`crate::ErrorReason::ResourceLimit`]), so this is "no evidence apparatus
+    ///   here", not "a cap may have fired unseen".
+    ///
+    /// # Lifetime and cost
+    ///
+    /// The evidence lives in the container, so read it **before the group is
+    /// dropped** (or before the consuming [`shutdown`](Self::shutdown)): dropping
+    /// removes the cgroup / closes the job handle and takes the counters with it.
+    /// Any number of reads is fine — the counters are cumulative and are not reset
+    /// by reading, by a teardown, or by [`update_limits`](Self::update_limits); an
+    /// axis whose cap was later lifted still reports the fact that it fired while it
+    /// was in force.
+    ///
+    /// This is a pure read — no signal, no kill, no write — so it cannot perturb
+    /// teardown, kill-on-drop, or the order the container is removed in, whenever it
+    /// is called. It also costs nothing on runs that asked for no caps: an axis that
+    /// never carried one is answered without touching the OS at all, so a group
+    /// created without [`ResourceLimits`] performs no evidence I/O whatsoever.
+    #[cfg(feature = "limits")]
+    pub fn limit_evidence(&self) -> LimitEvidence {
+        self.job.limit_evidence(self.capped)
     }
 
     /// The containment mechanism actually in effect (see [`Mechanism`]).

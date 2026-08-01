@@ -33,6 +33,9 @@ to a dated version section.
   shared OS-pipe writer to preserve child write order without a userspace merge.
 - Add a bounded typed supervision lifecycle stream covering incarnations,
   backoff, storm pauses, health checks, give-up decisions, and terminal state.
+- Add post-run `ProcessGroup::limit_evidence` reporting per-axis `LimitVerdict`
+  (`Tripped`/`NotTripped`/`Unknown`) from authoritative cgroup v2 counters, with
+  explicit unknowns where a mechanism keeps no post-mortem record.
 
 ### Changed
 

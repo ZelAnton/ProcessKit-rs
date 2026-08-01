@@ -16,7 +16,7 @@ use crate::Mechanism;
 #[cfg(feature = "process-control")]
 use crate::Signal;
 #[cfg(feature = "limits")]
-use crate::limits::ResourceLimits;
+use crate::limits::{LimitEvidence, ResourceLimits};
 #[cfg(feature = "process-control")]
 use crate::member::MemberInfo;
 #[cfg(feature = "stats")]
@@ -92,6 +92,18 @@ impl Job {
         } else {
             Ok(())
         }
+    }
+
+    /// A POSIX process group has no whole-tree resource accounting whatsoever — no
+    /// counterpart to cgroup v2's event counters or a Job Object's limit accounting
+    /// — so there is nothing post-mortem to read and every axis is honestly
+    /// `Unknown`. That is the correct answer here, not a degraded one: this
+    /// mechanism also refuses to carry a cap in the first place ([`Job::new`](Self::new)
+    /// fails fast when `limits.any()`), so `Unknown` means "no evidence apparatus
+    /// exists on this mechanism", never "a cap may have fired unseen".
+    #[cfg(feature = "limits")]
+    pub(crate) fn limit_evidence(&self, _capped: crate::limits::CappedAxes) -> LimitEvidence {
+        LimitEvidence::unknown()
     }
 
     #[cfg(feature = "process-control")]

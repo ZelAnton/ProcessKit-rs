@@ -391,6 +391,29 @@ impl core::marker::Unpin for processkit::LimitReason
 impl core::marker::UnsafeUnpin for processkit::LimitReason
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::LimitReason
 impl core::panic::unwind_safe::UnwindSafe for processkit::LimitReason
+#[non_exhaustive] pub enum processkit::LimitVerdict
+pub processkit::LimitVerdict::NotTripped
+pub processkit::LimitVerdict::Tripped
+pub processkit::LimitVerdict::Unknown
+impl processkit::LimitVerdict
+pub fn processkit::LimitVerdict::from_name(&str) -> core::option::Option<Self>
+pub fn processkit::LimitVerdict::name(&self) -> &'static str
+impl core::clone::Clone for processkit::LimitVerdict
+pub fn processkit::LimitVerdict::clone(&self) -> processkit::LimitVerdict
+impl core::cmp::Eq for processkit::LimitVerdict
+impl core::cmp::PartialEq for processkit::LimitVerdict
+pub fn processkit::LimitVerdict::eq(&self, &processkit::LimitVerdict) -> bool
+impl core::fmt::Debug for processkit::LimitVerdict
+pub fn processkit::LimitVerdict::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for processkit::LimitVerdict
+impl core::marker::StructuralPartialEq for processkit::LimitVerdict
+impl core::marker::Freeze for processkit::LimitVerdict
+impl core::marker::Send for processkit::LimitVerdict
+impl core::marker::Sync for processkit::LimitVerdict
+impl core::marker::Unpin for processkit::LimitVerdict
+impl core::marker::UnsafeUnpin for processkit::LimitVerdict
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::LimitVerdict
+impl core::panic::unwind_safe::UnwindSafe for processkit::LimitVerdict
 #[non_exhaustive] pub enum processkit::LineTerminator
 pub processkit::LineTerminator::CarriageReturn
 pub processkit::LineTerminator::Newline
@@ -1083,6 +1106,28 @@ impl<T> core::marker::Unpin for processkit::JsonLines<T>
 impl<T> core::marker::UnsafeUnpin for processkit::JsonLines<T>
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for processkit::JsonLines<T>
 impl<T> !core::panic::unwind_safe::UnwindSafe for processkit::JsonLines<T>
+#[non_exhaustive] pub struct processkit::LimitEvidence
+impl processkit::LimitEvidence
+pub fn processkit::LimitEvidence::cpu(&self) -> processkit::LimitVerdict
+pub fn processkit::LimitEvidence::memory(&self) -> processkit::LimitVerdict
+pub fn processkit::LimitEvidence::processes(&self) -> processkit::LimitVerdict
+pub fn processkit::LimitEvidence::verdict(&self, processkit::LimitKind) -> processkit::LimitVerdict
+impl core::clone::Clone for processkit::LimitEvidence
+pub fn processkit::LimitEvidence::clone(&self) -> processkit::LimitEvidence
+impl core::cmp::Eq for processkit::LimitEvidence
+impl core::cmp::PartialEq for processkit::LimitEvidence
+pub fn processkit::LimitEvidence::eq(&self, &processkit::LimitEvidence) -> bool
+impl core::fmt::Debug for processkit::LimitEvidence
+pub fn processkit::LimitEvidence::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for processkit::LimitEvidence
+impl core::marker::StructuralPartialEq for processkit::LimitEvidence
+impl core::marker::Freeze for processkit::LimitEvidence
+impl core::marker::Send for processkit::LimitEvidence
+impl core::marker::Sync for processkit::LimitEvidence
+impl core::marker::Unpin for processkit::LimitEvidence
+impl core::marker::UnsafeUnpin for processkit::LimitEvidence
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::LimitEvidence
+impl core::panic::unwind_safe::UnwindSafe for processkit::LimitEvidence
 #[non_exhaustive] pub struct processkit::MemberInfo
 impl processkit::MemberInfo
 pub fn processkit::MemberInfo::exe_name(&self) -> core::option::Option<&str>
@@ -1253,6 +1298,7 @@ pub struct processkit::ProcessGroup
 impl processkit::ProcessGroup
 pub fn processkit::ProcessGroup::adopt(&self, &tokio::process::Child) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::kill_all(&self) -> processkit::Result<()>
+pub fn processkit::ProcessGroup::limit_evidence(&self) -> processkit::LimitEvidence
 pub fn processkit::ProcessGroup::mechanism(&self) -> processkit::Mechanism
 pub fn processkit::ProcessGroup::members(&self) -> processkit::Result<alloc::vec::Vec<u32>>
 pub fn processkit::ProcessGroup::members_info(&self) -> processkit::Result<alloc::vec::Vec<processkit::MemberInfo>>

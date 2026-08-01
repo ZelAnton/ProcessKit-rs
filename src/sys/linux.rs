@@ -19,7 +19,7 @@ use crate::Mechanism;
 #[cfg(feature = "process-control")]
 use crate::Signal;
 #[cfg(feature = "limits")]
-use crate::limits::ResourceLimits;
+use crate::limits::{CappedAxes, LimitEvidence, LimitKind, LimitVerdict, ResourceLimits};
 #[cfg(feature = "process-control")]
 use crate::member::MemberInfo;
 #[cfg(feature = "stats")]
@@ -263,6 +263,22 @@ impl Job {
                     Ok(())
                 }
             }
+        }
+    }
+
+    /// Post-run evidence for the caps this job carries.
+    ///
+    /// Only the cgroup backend has whole-tree resource accounting; the POSIX
+    /// process-group fallback has none at all, so it reports an honest all-`Unknown`
+    /// report rather than a "no". (That fallback can never carry a cap in the first
+    /// place — `Job::new` fails fast when `limits.any()` and no cgroup could be
+    /// created — so `Unknown` there means "this mechanism has no evidence apparatus",
+    /// not "a cap may have fired unseen".)
+    #[cfg(feature = "limits")]
+    pub(crate) fn limit_evidence(&self, capped: CappedAxes) -> LimitEvidence {
+        match &self.backend {
+            Backend::Cgroup(cg) => cg.limit_evidence(capped),
+            Backend::ProcessGroup(_) => LimitEvidence::unknown(),
         }
     }
 
@@ -753,6 +769,98 @@ impl Cgroup {
             limits.cpu_quota.map(cpu_max_value),
         )?;
         Ok(())
+    }
+
+    /// Post-run evidence for the caps applied to this cgroup, read from the
+    /// kernel's own event counters — the authoritative answer to "did the cap
+    /// actually fire?", never an inference from an exit code or signal.
+    ///
+    /// Reads only the axes `capped` says have carried a cap (an uncapped axis has
+    /// nothing to fire, so it is `NotTripped` without touching the filesystem), and
+    /// only ever *reads*: no signal, no kill, no write, so calling this cannot
+    /// perturb teardown or kill-on-drop whenever the caller asks. Counters live in
+    /// the cgroup dir, which survives until `Drop` removes it, so the evidence
+    /// outlives the tree that produced it.
+    ///
+    /// Which counter, and why exactly that one:
+    ///
+    /// - **memory** — `memory.events`' `oom`: the number of times *this* cgroup's
+    ///   usage reached **its own** `memory.max` and an allocation was about to fail.
+    ///   Deliberately **not** `oom_kill`, which the kernel documents as processes of
+    ///   this cgroup "killed by **any** kind of OOM killer" — a *global* (host
+    ///   out-of-memory) kill of our child raises `oom_kill` here while our cap never
+    ///   engaged, so keying the verdict on it would manufacture exactly the false
+    ///   "your cap killed it" this type must never produce. `max` alone is also not
+    ///   a trip: it means reclaim absorbed the pressure at the boundary — the cap
+    ///   working *without* stopping anything.
+    /// - **processes** — `pids.events`' `max`: the number of times a fork was
+    ///   refused because the process cap was hit. There is no non-cgroup way for
+    ///   this counter to move.
+    /// - **cpu** — `cpu.stat`'s `nr_throttled`: how many periods the quota made this
+    ///   tree wait. A CPU cap throttles rather than kills, so this *is* the cap
+    ///   engaging.
+    ///
+    /// Each counter is read from the `.local` file first (`memory.events.local`,
+    /// `pids.events.local`, kernels that have them), falling back to the
+    /// hierarchical file. Both are correct here — this cgroup is a leaf with no
+    /// children, and an *ancestor* cap cannot be misattributed to it either, because
+    /// applying a cap at all requires our parent to be the real cgroup-v2 hierarchy
+    /// root (see [`apply_limits`](Self::apply_limits)), which carries no caps of its
+    /// own — but preferring the strictly-local file keeps the verdict sound even if
+    /// a contained child manages to nest a cgroup of its own inside ours.
+    ///
+    /// A file or key that isn't there (an older kernel, a controller without
+    /// bandwidth accounting, an unreadable cgroup) yields `Unknown`, never a "no".
+    #[cfg(feature = "limits")]
+    fn limit_evidence(&self, capped: CappedAxes) -> LimitEvidence {
+        self.limit_evidence_with(capped, |path| std::fs::read_to_string(path))
+    }
+
+    /// [`limit_evidence`](Self::limit_evidence) parametrized over the counter-file
+    /// reader — the injectable seam that lets tests drive every
+    /// present/absent/unparsable combination without a real cgroup v2 mount, in the
+    /// same style as [`members_with`](Self::members_with).
+    #[cfg(feature = "limits")]
+    fn limit_evidence_with(
+        &self,
+        capped: CappedAxes,
+        read: impl Fn(&Path) -> io::Result<String>,
+    ) -> LimitEvidence {
+        let axis = |kind: LimitKind, files: &[&str], key: &str| -> LimitVerdict {
+            // Never capped on this axis: nothing could have fired, and no read is
+            // performed — the cost of evidence stays off groups that asked for no
+            // caps at all.
+            if !capped.has(kind) {
+                return LimitVerdict::NotTripped;
+            }
+            for file in files {
+                // The first file that reads decides: a present-but-zero counter is
+                // an authoritative "did not fire", not a reason to try the next one.
+                if let Ok(text) = read(&self.path.join(file)) {
+                    return match flat_keyed_value(&text, key) {
+                        Some(0) => LimitVerdict::NotTripped,
+                        Some(_) => LimitVerdict::Tripped,
+                        // The file exists but has no such key (a kernel that doesn't
+                        // account it) — an honest gap, not a "no".
+                        None => LimitVerdict::Unknown,
+                    };
+                }
+            }
+            LimitVerdict::Unknown
+        };
+        LimitEvidence::new(
+            axis(
+                LimitKind::Memory,
+                &["memory.events.local", "memory.events"],
+                "oom",
+            ),
+            axis(
+                LimitKind::Processes,
+                &["pids.events.local", "pids.events"],
+                "max",
+            ),
+            axis(LimitKind::Cpu, &["cpu.stat"], "nr_throttled"),
+        )
     }
 
     /// Enable each controller in `needed` that is not already present in `parent`'s
@@ -1587,6 +1695,24 @@ fn cpu_max_value(cores: f64) -> String {
     format!("{quota} {PERIOD}")
 }
 
+/// Read one counter out of a cgroup v2 **flat-keyed** file — the
+/// `"<key> <value>"`-per-line format shared by `memory.events`, `pids.events` and
+/// `cpu.stat` (`"oom 1"`, `"max 3"`, `"nr_throttled 21"`).
+///
+/// `None` when the key is absent or its value doesn't parse as a count, so a caller
+/// can tell "the kernel does not account this" apart from "the kernel accounts it
+/// and it is zero" — the difference between an honest `Unknown` and a decisive
+/// `NotTripped`. Keys are matched whole (`split_whitespace`), never by prefix, so
+/// `oom` can't be satisfied by `oom_kill` / `oom_group_kill` sitting in the same
+/// file.
+#[cfg(feature = "limits")]
+fn flat_keyed_value(text: &str, key: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == key).then(|| fields.next()?.parse::<u64>().ok())?
+    })
+}
+
 /// The cgroup v2 controllers a limit set needs enabled — one per **requested**
 /// (`Some`) axis, in `memory` / `pids` / `cpu` order. A `None` axis needs no
 /// controller (it carries no cap to enforce). Shared by the creation
@@ -1769,6 +1895,210 @@ mod cgroup_read_seam_tests {
             .expect_err("an I/O failure must not look empty");
 
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
+    }
+
+    /// The cgroup evidence reader, driven over the same injectable seam: an axis
+    /// that carried a cap is decided by the kernel counter, an axis that never did
+    /// is `NotTripped` **without any read at all**, and a missing/unparsable counter
+    /// is an honest `Unknown` rather than a "no".
+    #[cfg(feature = "limits")]
+    mod limit_evidence {
+        use std::cell::RefCell;
+        use std::io;
+        use std::path::{Path, PathBuf};
+
+        use crate::limits::{CappedAxes, LimitKind, LimitVerdict, ResourceLimits};
+
+        use super::cgroup;
+
+        /// A `CappedAxes` recording exactly the axes `limits` caps.
+        fn capped(limits: ResourceLimits) -> CappedAxes {
+            let mut axes = CappedAxes::default();
+            axes.record(&limits);
+            axes
+        }
+
+        const ALL_CAPPED: fn() -> CappedAxes = || {
+            capped(ResourceLimits {
+                max_memory: Some(1),
+                max_processes: Some(1),
+                cpu_quota: Some(1.0),
+            })
+        };
+
+        /// Every counter file present and non-zero: all three axes fired.
+        #[test]
+        fn non_zero_counters_trip_each_axis() {
+            let ev = cgroup().limit_evidence_with(ALL_CAPPED(), |path| {
+                Ok(match path.file_name().unwrap().to_str().unwrap() {
+                    // Real kernel spellings, extra keys included: the parser must
+                    // pick `oom` and not the `oom_kill`/`oom_group_kill` siblings.
+                    "memory.events.local" => "low 0\nhigh 0\nmax 50022\noom 1\noom_kill 1\n",
+                    "pids.events.local" => "max 3\n",
+                    "cpu.stat" => {
+                        "usage_usec 105292\nnr_periods 21\nnr_throttled 21\nthrottled_usec 1977211\n"
+                    }
+                    other => panic!("unexpected evidence read: {other}"),
+                }
+                .to_owned())
+            });
+
+            assert_eq!(ev.memory(), LimitVerdict::Tripped);
+            assert_eq!(ev.processes(), LimitVerdict::Tripped);
+            assert_eq!(ev.cpu(), LimitVerdict::Tripped);
+        }
+
+        /// A cap that was in force and provably never engaged: an authoritative
+        /// zero is a decisive "no", never `Unknown`.
+        #[test]
+        fn zero_counters_are_a_decisive_not_tripped() {
+            let ev = cgroup().limit_evidence_with(ALL_CAPPED(), |path| {
+                Ok(match path.file_name().unwrap().to_str().unwrap() {
+                    "memory.events.local" => "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n",
+                    "pids.events.local" => "max 0\n",
+                    "cpu.stat" => "usage_usec 1\nnr_periods 0\nnr_throttled 0\n",
+                    other => panic!("unexpected evidence read: {other}"),
+                }
+                .to_owned())
+            });
+
+            assert_eq!(ev.memory(), LimitVerdict::NotTripped);
+            assert_eq!(ev.processes(), LimitVerdict::NotTripped);
+            assert_eq!(ev.cpu(), LimitVerdict::NotTripped);
+        }
+
+        /// A global (host) OOM kill of our child raises `oom_kill` in our cgroup
+        /// while OUR cap never engaged (`oom` stays 0). Keying the verdict on
+        /// `oom_kill` would manufacture a false "your memory cap killed it"; the
+        /// reader must report `NotTripped` here.
+        #[test]
+        fn an_oom_kill_without_a_local_oom_event_does_not_trip_memory() {
+            let ev = cgroup().limit_evidence_with(
+                capped(ResourceLimits {
+                    max_memory: Some(1),
+                    ..ResourceLimits::default()
+                }),
+                |_| Ok("low 0\nhigh 0\nmax 0\noom 0\noom_kill 4\noom_group_kill 1\n".to_owned()),
+            );
+
+            assert_eq!(
+                ev.memory(),
+                LimitVerdict::NotTripped,
+                "a kill by the GLOBAL oom killer is not evidence that this cgroup's own cap fired"
+            );
+        }
+
+        /// An axis that never carried a cap answers `NotTripped` and performs **no**
+        /// read — the "evidence costs nothing when nothing was capped" guarantee.
+        #[test]
+        fn an_uncapped_axis_is_not_tripped_without_any_read() {
+            let reads: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+            let ev = cgroup().limit_evidence_with(
+                capped(ResourceLimits {
+                    max_processes: Some(4),
+                    ..ResourceLimits::default()
+                }),
+                |path| {
+                    reads.borrow_mut().push(path.to_path_buf());
+                    Ok("max 7\n".to_owned())
+                },
+            );
+
+            assert_eq!(ev.processes(), LimitVerdict::Tripped);
+            assert_eq!(ev.memory(), LimitVerdict::NotTripped);
+            assert_eq!(ev.cpu(), LimitVerdict::NotTripped);
+            assert_eq!(
+                reads.borrow().as_slice(),
+                [PathBuf::from("/mock/processkit/pids.events.local")],
+                "only the capped axis may be read"
+            );
+        }
+
+        /// A group with no caps at all touches the filesystem zero times.
+        #[test]
+        fn an_uncapped_group_performs_no_evidence_io() {
+            let reads = std::cell::Cell::new(0usize);
+            let ev = cgroup().limit_evidence_with(CappedAxes::default(), |_| {
+                reads.set(reads.get() + 1);
+                Ok(String::new())
+            });
+
+            assert_eq!(reads.get(), 0, "an uncapped group must not read anything");
+            for kind in [LimitKind::Memory, LimitKind::Processes, LimitKind::Cpu] {
+                assert_eq!(ev.verdict(kind), LimitVerdict::NotTripped);
+            }
+        }
+
+        /// Kernels without the `.local` files fall back to the hierarchical ones.
+        #[test]
+        fn a_missing_local_file_falls_back_to_the_hierarchical_counter() {
+            let ev = cgroup().limit_evidence_with(ALL_CAPPED(), |path| {
+                match path.file_name().unwrap().to_str().unwrap() {
+                    // Pre-5.2 / pre-6.9 kernels have no `.local` variants.
+                    "memory.events.local" | "pids.events.local" => {
+                        Err(io::Error::from(io::ErrorKind::NotFound))
+                    }
+                    "memory.events" => Ok("max 1\noom 2\noom_kill 2\n".to_owned()),
+                    "pids.events" => Ok("max 0\n".to_owned()),
+                    "cpu.stat" => Ok("nr_throttled 5\n".to_owned()),
+                    other => panic!("unexpected evidence read: {other}"),
+                }
+            });
+
+            assert_eq!(ev.memory(), LimitVerdict::Tripped);
+            assert_eq!(ev.processes(), LimitVerdict::NotTripped);
+            assert_eq!(ev.cpu(), LimitVerdict::Tripped);
+        }
+
+        /// No readable counter file at all (an unreadable cgroup, a kernel that
+        /// accounts none of this): `Unknown` on every capped axis — never a "no".
+        #[test]
+        fn unreadable_counters_are_unknown_not_a_no() {
+            let ev = cgroup().limit_evidence_with(ALL_CAPPED(), |_| {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            });
+
+            for kind in [LimitKind::Memory, LimitKind::Processes, LimitKind::Cpu] {
+                assert_eq!(ev.verdict(kind), LimitVerdict::Unknown, "axis {kind:?}");
+            }
+        }
+
+        /// The file exists but the kernel does not account that key (an older
+        /// kernel, a `cpu.stat` without bandwidth fields): `Unknown`, not zero.
+        #[test]
+        fn a_readable_file_without_the_key_is_unknown() {
+            let ev = cgroup().limit_evidence_with(ALL_CAPPED(), |path| {
+                Ok(match path.file_name().unwrap().to_str().unwrap() {
+                    // Every sibling key present EXCEPT the one that decides.
+                    "memory.events.local" => "low 0\nhigh 0\nmax 3\n",
+                    "pids.events.local" => "not_max 9\n",
+                    "cpu.stat" => "usage_usec 42\nuser_usec 40\nsystem_usec 2\n",
+                    other => panic!("unexpected evidence read: {other}"),
+                }
+                .to_owned())
+            });
+
+            for kind in [LimitKind::Memory, LimitKind::Processes, LimitKind::Cpu] {
+                assert_eq!(ev.verdict(kind), LimitVerdict::Unknown, "axis {kind:?}");
+            }
+        }
+
+        /// The counter paths are read from this cgroup's own directory.
+        #[test]
+        fn counters_are_read_from_this_cgroups_directory() {
+            let ev = cgroup().limit_evidence_with(
+                capped(ResourceLimits {
+                    cpu_quota: Some(0.5),
+                    ..ResourceLimits::default()
+                }),
+                |path| {
+                    assert_eq!(path, Path::new("/mock/processkit/cpu.stat"));
+                    Ok("nr_throttled 1\n".to_owned())
+                },
+            );
+
+            assert_eq!(ev.cpu(), LimitVerdict::Tripped);
+        }
     }
 
     #[test]
@@ -2177,7 +2507,40 @@ mod fail_safe_tests {
 
 #[cfg(all(test, feature = "limits"))]
 mod tests {
-    use super::{controllers_to_enable, cpu_max_value};
+    use super::{controllers_to_enable, cpu_max_value, flat_keyed_value};
+
+    #[test]
+    fn flat_keyed_value_reads_a_counter_by_whole_key() {
+        // Real `memory.events` shape.
+        let events = "low 0\nhigh 0\nmax 50022\noom 1\noom_kill 3\noom_group_kill 0\n";
+        assert_eq!(flat_keyed_value(events, "oom"), Some(1));
+        assert_eq!(flat_keyed_value(events, "oom_kill"), Some(3));
+        assert_eq!(flat_keyed_value(events, "max"), Some(50022));
+        // Whole-key matching: `oom` must not be satisfied by the `oom_kill` /
+        // `oom_group_kill` lines that sit in the same file, in either direction.
+        assert_eq!(flat_keyed_value("oom_kill 3\n", "oom"), None);
+        assert_eq!(flat_keyed_value("oom 1\n", "oom_kill"), None);
+    }
+
+    #[test]
+    fn flat_keyed_value_separates_absent_from_zero() {
+        // The distinction the whole three-valued verdict rests on: a key that is
+        // not accounted (None → Unknown) vs one that is accounted and zero
+        // (Some(0) → a decisive NotTripped).
+        assert_eq!(flat_keyed_value("max 0\n", "max"), Some(0));
+        assert_eq!(flat_keyed_value("", "max"), None);
+        assert_eq!(flat_keyed_value("usage_usec 42\n", "nr_throttled"), None);
+        // Unparsable or truncated values are an honest miss, never a fabricated 0.
+        assert_eq!(flat_keyed_value("max\n", "max"), None);
+        assert_eq!(flat_keyed_value("max nan\n", "max"), None);
+        assert_eq!(flat_keyed_value("max -1\n", "max"), None);
+        // Tolerates the trailing-whitespace / multi-space shapes a sysfs read can
+        // hand back, and finds a key on any line.
+        assert_eq!(
+            flat_keyed_value("a 1\nnr_throttled  21 \n", "nr_throttled"),
+            Some(21)
+        );
+    }
 
     #[test]
     fn cpu_max_formats_quota_and_period() {

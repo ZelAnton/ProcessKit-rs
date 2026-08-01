@@ -338,6 +338,26 @@ moved into a spawned telemetry task without being tied to the borrow's lifetime,
 holds the group only weakly (never pinning a tree that should be torn down), and
 ends its series honestly if the group is ever released.
 
+**"The cap couldn't be applied" and "the cap fired" are different questions.**
+Everything above is about *applying* a cap: `ErrorReason::ResourceLimit` says a
+requested cap could not be put in force, and it is raised before anything runs.
+Once a cap **is** in force, the separate question — did it actually stop this
+tree? — is answered post-run by
+[`ProcessGroup::limit_evidence()`](process-groups.md#did-the-cap-actually-fire-limit_evidence),
+which returns a three-valued verdict per axis (`Tripped` / `NotTripped` /
+`Unknown`) read from the container's own kernel counters. The two never overlap
+and neither one changes the other's meaning: an admission failure is
+`ResourceLimit`, a cap that fired is a `Tripped` verdict, and where no
+authoritative evidence exists the answer is an explicit `Unknown` rather than a
+"no". This matters most in exactly the situation this page is about, because in
+a container the interesting kill usually comes from the *outer* limit: a verdict
+is `Tripped` only when **this crate's own** cgroup recorded hitting **its own**
+cap (`memory.events`' `oom`), so an orchestrator-level OOM kill of the whole
+container is never dressed up as "your `max_memory` killed it". On a Windows Job
+Object and on the process-group fallback every capped axis reports `Unknown` —
+those mechanisms preserve no post-mortem record — which is why the guide states
+the limitation rather than inventing a verdict.
+
 Running something you don't trust inside that container? See [Running
 untrusted children](untrusted-children.md) for the full hardening checklist —
 containment, resource limits, privilege drop, env hygiene, output/wall-time

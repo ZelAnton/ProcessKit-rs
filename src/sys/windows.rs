@@ -75,7 +75,7 @@ use crate::Mechanism;
 #[cfg(feature = "process-control")]
 use crate::Signal;
 #[cfg(feature = "limits")]
-use crate::limits::ResourceLimits;
+use crate::limits::{CappedAxes, LimitEvidence, LimitKind, LimitVerdict, ResourceLimits};
 #[cfg(feature = "process-control")]
 use crate::member::MemberInfo;
 #[cfg(feature = "stats")]
@@ -791,6 +791,73 @@ impl Job {
             escalated,
             elapsed: started.elapsed(),
         })
+    }
+
+    /// Post-run evidence for the caps this Job Object carries: **`Unknown` on every
+    /// capped axis** — a reasoned, measured negative result, deliberately *not*
+    /// derived by analogy with the Linux cgroup backend, which has real counters.
+    ///
+    /// A Job Object simply does not keep a post-mortem record that any of the three
+    /// caps this crate applies actually fired. Axis by axis, what was checked and
+    /// what it turned out to be worth:
+    ///
+    /// - **process count** (`ActiveProcessLimit`). The one plausible counter is
+    ///   `JOBOBJECT_BASIC_ACCOUNTING_INFORMATION`'s `TotalTerminatedProcesses`,
+    ///   documented as "the total number of processes terminated because of a limit
+    ///   violation". **Measured on Windows 11 (26200): it stays 0** across both ways
+    ///   this cap is actually violated — a fresh child whose
+    ///   `AssignProcessToJobObject` is refused because the job is full, and a job
+    ///   *member* whose own `CreateProcess` is refused (`ERROR_NOT_ENOUGH_QUOTA`)
+    ///   for the same reason. Neither process is ever an accounted member, so
+    ///   nothing is counted as terminated; in practice that field tracks the
+    ///   end-of-job-time terminations (`JOB_OBJECT_LIMIT_JOB_TIME` /
+    ///   `_PROCESS_TIME`), limits this crate never sets. Reporting `NotTripped` off
+    ///   a counter that is provably 0 *after a violation that really happened* would
+    ///   be a fabricated "no" — the worst failure mode for this report — so the
+    ///   honest answer is `Unknown`. (The direct spawn case is not silent either
+    ///   way: the caller already gets a spawn error there.)
+    /// - **memory** (`JOB_OBJECT_LIMIT_JOB_MEMORY`). This cap does not kill: a
+    ///   commit that would exceed it simply *fails* in the child, which then dies
+    ///   (or not) by its own error handling — after the fact indistinguishable from
+    ///   any other allocation failure. The OS reports it only as a live
+    ///   `JOB_OBJECT_MSG_JOB_MEMORY_LIMIT` message on an IO completion port
+    ///   associated with the job: a *push* notification that must be drained while
+    ///   the tree runs, i.e. a completion port plus a drain thread on every group
+    ///   for its whole life — new machinery on the containment object purely for
+    ///   reporting, and a lifecycle change to the very object whose teardown
+    ///   guarantee must not move. Deliberately not taken. (`PeakJobMemoryUsed` is
+    ///   **not** a substitute: a high-water mark landing at or near the cap is an
+    ///   inference about a boundary, not a record that the cap fired — exactly the
+    ///   guess this report refuses to make. It is already exposed, as a
+    ///   measurement, by `stats()`'s `peak_memory_bytes`.)
+    /// - **CPU** (`JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP`). Nothing at all: the hard
+    ///   cap throttles silently and Windows keeps no throttle counter for it (no
+    ///   analogue of cgroup `cpu.stat`'s `nr_throttled`). The
+    ///   `JOB_OBJECT_MSG_NOTIFICATION_LIMIT` message and
+    ///   `JobObjectLimitViolationInformation` belong to the separate *notification*
+    ///   limit API — soft limits this crate does not set, and which would again need
+    ///   a completion port to mean anything.
+    ///
+    /// An axis that never carried a cap is `NotTripped` — nothing was capped, so
+    /// nothing could fire — which needs no query at all. So this reads nothing from
+    /// the OS in any case: no `TerminateJobObject`, no `SetInformationJobObject`,
+    /// not even a query. Teardown and kill-on-drop are untouched.
+    #[cfg(feature = "limits")]
+    pub(crate) fn limit_evidence(&self, capped: CappedAxes) -> LimitEvidence {
+        // A capped axis has no post-mortem evidence on this mechanism (see above) —
+        // `Unknown`, never a guessed "no". An uncapped one had no cap to fire.
+        let verdict = |kind: LimitKind| {
+            if capped.has(kind) {
+                LimitVerdict::Unknown
+            } else {
+                LimitVerdict::NotTripped
+            }
+        };
+        LimitEvidence::new(
+            verdict(LimitKind::Memory),
+            verdict(LimitKind::Processes),
+            verdict(LimitKind::Cpu),
+        )
     }
 
     #[cfg(feature = "stats")]

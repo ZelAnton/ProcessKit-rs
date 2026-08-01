@@ -39,7 +39,7 @@ which variant fires from where, how to classify it, and what to do about it.
 | `ErrorReason::NotReady { program, timeout }` | A [readiness probe](streaming.md#readiness-probes) (`wait_for_line` / `wait_for_port` / `wait_for`) did not pass within its own deadline | Not a run failure — the child is still running (a probe deadline never kills it). Decide whether to keep waiting, `shutdown()` the handle, or surface the failure. |
 | `ErrorReason::Parse { program, message }` | The run succeeded but `try_parse`, a typed JSON/NDJSON verb, or a caller's own parser feeding `Error::parse` could not make sense of the output | Generic `message` values are caller-built and retained in full; JSON helpers store only bounded, control-escaped error detail and raw fragments. `Display`/`Debug` apply an additional preview cap. |
 | `ErrorReason::OutputTooLarge { program, max_lines, max_bytes, total_lines, total_bytes }` | A `fail_loud` capture ceiling (`OutputBufferPolicy::max_lines`/`max_bytes`) was exceeded; the run itself may have succeeded | Raise the ceiling, switch to a lossy/streaming policy, or treat as a genuine failure — the pipe was fully drained either way, so the child never blocked. |
-| `ErrorReason::ResourceLimit { kind, reason, detail }` (`limits` feature) | A requested cap on `ProcessGroupOptions` couldn't be enforced — no whole-tree container on this platform, or the OS rejected it | Read `limit_kind()` / `limit_reason()` rather than parsing `detail`; an unenforced limit is no protection, so treat this as a hard stop, not a warning. |
+| `ErrorReason::ResourceLimit { kind, reason, detail }` (`limits` feature) | A requested cap on `ProcessGroupOptions` couldn't be enforced — no whole-tree container on this platform, or the OS rejected it | Read `limit_kind()` / `limit_reason()` rather than parsing `detail`; an unenforced limit is no protection, so treat this as a hard stop, not a warning. Admission-time only: whether a cap that *was* applied later fired is a separate, post-run question — see [below](#variants-that-look-alike-but-arent). |
 | `ErrorReason::Unsupported { operation }` | An operation isn't supported by the active containment mechanism on this platform (e.g. any `Signal` but `Kill` on Windows Job Objects) | Branch on platform ahead of time (see [Platform support](platform-support.md)), or catch and degrade. |
 | `ErrorReason::Cancelled { program }` | The run's `CancellationToken` fired and its tree was killed | `is_cancelled()`. This is an *abandonment*, not a failure to diagnose — the caller already knows why. Never retried (see [Errors and retries](#errors-and-retries)); terminal under a `Supervisor` too. |
 | `ErrorReason::Signalled { program, signal, stdout, stderr, stdout_bytes }` | The process was killed by a signal (**Unix only**; a `ScriptedRunner`/cassette replay can also report `Signalled(None)`) | `is_signalled()`. No exit code to check — always a failure. `diagnostic()` surfaces whatever was captured before the crash. |
@@ -74,6 +74,25 @@ which variant fires from where, how to classify it, and what to do about it.
   diagnostic tail, but `Exit` has a `code()` and may or may not be a failure
   (`is_success()`/`ok_codes` decide); `Signalled` has no code at all —
   `code()` is `None` — and is always terminal.
+- **`ResourceLimit` means "the cap couldn't be applied", never "the cap
+  fired".** It is an *admission* error, raised by
+  `ProcessGroup::with_options` / `update_limits` **before** anything runs: the
+  requested value was nonsensical (`Invalid`), the platform has no whole-tree
+  mechanism at all (`Unsupported`), or a capable mechanism rejected this request
+  (`Unenforceable`). A cap that *was* applied and then actually stopped the tree
+  produces **no error at all** — the child just exits non-zero (or dies by
+  `SIGKILL`), exactly like a self-inflicted crash. For that question ask the
+  group afterwards:
+  [`ProcessGroup::limit_evidence()`](process-groups.md#did-the-cap-actually-fire-limit_evidence)
+  returns a per-axis `LimitVerdict` — `Tripped` (authoritative kernel/OS
+  evidence that this cap fired), `NotTripped`, or `Unknown` (no evidence
+  available on this mechanism — deliberately not folded into a "no"). Exit codes
+  and signals are never consulted for it, precisely because they cannot tell a
+  cap-driven kill from an ordinary failure. So: `ResourceLimit` on the error
+  path, `limit_evidence` on the result path — the two never overlap, and this
+  error's semantics are unchanged by it. (Left as a bare code span, not a
+  `docs.rs` link: `LimitVerdict` ships in the next release, so a `docs.rs` URL
+  would 404 until then.)
 
 ## Classifiers
 
