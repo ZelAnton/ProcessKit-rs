@@ -359,6 +359,15 @@ pub struct LimitEvidence {
 
 impl LimitEvidence {
     /// Build a report from per-axis verdicts (platform backends only).
+    ///
+    /// Built only by the backends that have a container to read a post-mortem
+    /// from — the Linux cgroup v2 backend and the Windows Job Object backend.
+    /// The POSIX process group (macOS/BSD) has no whole-tree accounting at all
+    /// and answers with `unknown`, which assembles the struct literally, leaving
+    /// this constructor unused on exactly that target; allow it there rather than
+    /// deleting a constructor the other two backends need (mirrors the
+    /// `unknown` allow below and `sys::ProcIdentity`'s per-target allow).
+    #[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
     pub(crate) const fn new(
         memory: LimitVerdict,
         processes: LimitVerdict,
@@ -446,6 +455,15 @@ impl CappedAxes {
     }
 
     /// Whether `kind` has ever carried a cap.
+    ///
+    /// Read only by the backends that gather per-axis evidence and so need to
+    /// know which axes are worth reading — the Linux cgroup v2 backend and the
+    /// Windows Job Object backend. The POSIX process group (macOS/BSD) reports
+    /// every axis `Unknown` and ignores the record entirely, leaving this method
+    /// unused on exactly that target; allow it there rather than deleting a
+    /// method the other two backends need (mirrors `LimitEvidence::new` above
+    /// and `sys::ProcIdentity`'s per-target allow).
+    #[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
     pub(crate) fn has(&self, kind: LimitKind) -> bool {
         match kind {
             LimitKind::Memory => self.memory,

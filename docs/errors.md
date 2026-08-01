@@ -185,9 +185,9 @@ enums carry that table for you:
 
 | Method | On | Direction |
 |---|---|---|
-| `name() -> &'static str` | `Mechanism`, `Outcome`, `ErrorKind`, `ParentDeathCleanup`, `SoftStopScope`, `StopReason`, `LimitKind`, `LimitReason`, `StdioMode`, `LineTerminator`, `OverflowMode`, `Priority`, `RestartPolicy` | A short, lowercase `snake_case` identifier for the variant. |
+| `name() -> &'static str` | `Mechanism`, `Outcome`, `ErrorKind`, `ParentDeathCleanup`, `SoftStopScope`, `StopReason`, `LimitKind`, `LimitReason`, `LimitVerdict`, `StdioMode`, `LineTerminator`, `OverflowMode`, `Priority`, `RestartPolicy` | A short, lowercase `snake_case` identifier for the variant. |
 | `name() -> Option<&'static str>` | `Signal` | `Some(id)` for a curated signal; `None` for the raw-number `Signal::Other` (render its `i32` instead). |
-| `from_name(&str) -> Option<Self>` | every enum above **except** `Outcome` and `ErrorKind` | Parse an identifier back into the value; `None` — not a default — for an unrecognized name. |
+| `from_name(&str) -> Option<Self>` | every enum above **except** `Outcome` and `ErrorKind` — `LimitVerdict` included, so a recorded `tripped` / `not_tripped` / `unknown` parses back | Parse an identifier back into the value; `None` — not a default — for an unrecognized name. |
 
 The identifiers are a **compatibility surface**, held stable like the rest of
 the public API: a **new** variant gets a **new** identifier, and an existing
@@ -200,7 +200,13 @@ already publish (`job_object`/`cgroup_v2`/`process_group`,
 `whole_tree`/`direct_child_only`/`none`), so adopting them needs no migration.
 `SoftStopScope` (the group-axis soft-stop reach, `process-control`) reuses the
 same `whole_tree` and `none` spellings for its shared cases, adding
-`opt_in_members` for the Windows partial-reach case.
+`opt_in_members` for the Windows partial-reach case. `LimitVerdict` (`limits`)
+is the one entry that is not an error classification at all: it is the
+*post-run* answer to "did this cap fire?" (`tripped` / `not_tripped` /
+`unknown`), while `LimitKind` / `LimitReason` describe the admission-time
+`ResourceLimit` failure — the two never overlap (see [Variants that look alike
+but aren't](#variants-that-look-alike-but-arent)), and both carry the same
+stability promise.
 
 ```rust
 use processkit::{Mechanism, Priority};
