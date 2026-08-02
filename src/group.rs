@@ -565,9 +565,11 @@ impl ProcessGroup {
     ///
     /// [`crate::ErrorReason::Unsupported`] if the active mechanism cannot freeze the tree;
     /// otherwise [`crate::ErrorReason::Io`] if the OS rejects the freeze / `SIGSTOP`.
-    /// The freeze loop proceeds until all members are processed, even after an error.
-    /// An error indicates that the OS rejected an operation against at least one member,
-    /// but the group may remain partially suspended.
+    /// On the Linux cgroup mechanism, freezing is one atomic `cgroup.freeze` write: if
+    /// it fails, the cgroup state is unchanged. The POSIX process-group mechanism
+    /// sweeps all members even after an error, while Windows best-effort suspends every
+    /// thread and continues after individual thread failures; either per-member backend
+    /// can therefore leave the group partially suspended when it returns an error.
     #[cfg(feature = "process-control")]
     pub fn suspend(&self) -> Result<()> {
         self.job
@@ -584,9 +586,11 @@ impl ProcessGroup {
     ///
     /// [`crate::ErrorReason::Unsupported`] if the active mechanism cannot thaw the tree;
     /// otherwise [`crate::ErrorReason::Io`] if the OS rejects the resume / `SIGCONT`.
-    /// The resume loop proceeds until all members are processed, even after an error.
-    /// An error indicates that the OS rejected an operation against at least one member,
-    /// but the group may remain partially resumed.
+    /// On the Linux cgroup mechanism, resuming is one atomic `cgroup.freeze` write: if
+    /// it fails, the cgroup state is unchanged. The POSIX process-group mechanism
+    /// sweeps all members even after an error, while Windows best-effort resumes every
+    /// thread and continues after individual thread failures; either per-member backend
+    /// can therefore leave the group partially resumed when it returns an error.
     #[cfg(feature = "process-control")]
     pub fn resume(&self) -> Result<()> {
         self.job
