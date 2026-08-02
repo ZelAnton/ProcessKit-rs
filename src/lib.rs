@@ -655,6 +655,9 @@ pub mod prelude {
 pub use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
+mod identifiers_manifest;
+
+#[cfg(test)]
 mod tests {
     use super::Outcome;
 

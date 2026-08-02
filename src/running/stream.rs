@@ -979,6 +979,11 @@ pub struct OutputLine {
 }
 
 impl OutputLine {
+    #[cfg(test)]
+    pub(crate) fn for_test(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+
     /// The decoded line text (trailing `\n` / CRLF `\r` already stripped).
     pub fn text(&self) -> &str {
         &self.text

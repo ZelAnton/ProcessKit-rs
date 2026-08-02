@@ -229,12 +229,12 @@ public-api-diff:
 # methods and compare it with the committed cross-language baseline.
 [unix]
 identifiers-diff:
-    PROCESSKIT_IDENTIFIERS_OUTPUT=identifiers-current.json cargo test --all-features --test identifiers_manifest write_identifiers_manifest -- --ignored --exact
+    PROCESSKIT_IDENTIFIERS_OUTPUT=identifiers-current.json cargo test --all-features --lib identifiers_manifest::write_identifiers_manifest -- --ignored --exact
     diff spec/identifiers.json identifiers-current.json && echo "(no changes)"
 
 [windows]
 identifiers-diff:
-    $env:PROCESSKIT_IDENTIFIERS_OUTPUT = "identifiers-current.json"; cargo test --all-features --test identifiers_manifest write_identifiers_manifest -- --ignored --exact
+    $env:PROCESSKIT_IDENTIFIERS_OUTPUT = "identifiers-current.json"; cargo test --all-features --lib identifiers_manifest::write_identifiers_manifest -- --ignored --exact
     $difference = Compare-Object (Get-Content spec/identifiers.json) (Get-Content identifiers-current.json) -SyncWindow 0; if ($difference) { $difference; exit 1 } else { Write-Output "(no changes)" }
 
 # Cargo never garbage-collects obsolete incremental unit hashes under a
