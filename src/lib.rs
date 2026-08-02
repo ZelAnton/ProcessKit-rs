@@ -654,7 +654,7 @@ pub mod prelude {
 /// direct `tokio-util` dependency. See [`Command::cancel_on`].
 pub use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "limits", feature = "process-control"))]
 mod identifiers_manifest;
 
 #[cfg(test)]

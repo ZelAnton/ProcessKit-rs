@@ -979,7 +979,7 @@ pub struct OutputLine {
 }
 
 impl OutputLine {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "limits", feature = "process-control"))]
     pub(crate) fn for_test(text: impl Into<String>) -> Self {
         Self { text: text.into() }
     }
