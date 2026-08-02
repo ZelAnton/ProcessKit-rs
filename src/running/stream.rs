@@ -752,7 +752,8 @@ pub(crate) async fn graceful_kill_pid(gate: Arc<PidGate>, grace: std::time::Dura
 /// with `Command::cancel_grace`) reaches the identical situation — its task is
 /// aborted by the same `Drop`, and a signal-catching child can end the stream the
 /// same way — so it arms this same detached primitive rather than forking a second
-/// one, and `Drop`'s child hand-off covers its static shape too.
+/// one, and `Drop`'s child hand-off covers its shape too (there keyed on the
+/// *fired* token, since a merely configured `cancel_grace` arms nothing).
 ///
 /// The reap that frees the pid is **never** left to tokio's orphan reaper (which
 /// would free it without retiring the gate, leaving this task free to probe or

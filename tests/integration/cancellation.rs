@@ -647,6 +647,193 @@ async fn cancel_grace_in_a_shared_group_signals_the_direct_child() {
     drop(sibling);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns real subprocesses and cancels one racing inside wait_any"]
+async fn wait_any_honors_cancel_grace_on_the_cancelled_contender() {
+    use processkit::wait_any;
+
+    // The FOURTH cancellation path (after the two `drive_to_exit_inner` shapes and
+    // the streaming cancel watchdog): the non-consuming `wait_exit`, which
+    // `wait_any`/`wait_all` race. Both the CHANGELOG and the contract table in
+    // `docs/timeouts-and-cancellation.md` promise `cancel_grace` here, so it is
+    // asserted here rather than argued from "it's the same seam".
+    //
+    // Deliberately a SHARED group: that routes the teardown through
+    // `graceful_teardown`'s shared-group branch, whose pid-scoped soft signal is
+    // legal only because `wait_exit`'s cancel arm retires the `PidGate` *before*
+    // calling it (the branch's own retire trails its reap). This test is therefore
+    // also the live exercise of that ordering — the branch now `debug_assert`s it,
+    // and `cargo test` builds with debug assertions on.
+    let group = ProcessGroup::new().expect("create group");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (ready, term) = (dir.path().join("ready"), dir.path().join("term"));
+    let token = CancellationToken::new();
+    let mut trapping = group
+        .start(
+            &term_trapping_child(&ready, &term)
+                .cancel_on(token.clone())
+                .cancel_grace(Duration::from_secs(10)),
+        )
+        .await
+        .expect("start the TERM-trapping contender");
+    // A contender that never finishes on its own, so the race can only be resolved
+    // by the cancellation under test.
+    let mut slow = group
+        .start(&sleep_secs(30))
+        .await
+        .expect("start the slow contender");
+
+    // `wait_any` pumps no output, so wait on the marker (not the banner line) —
+    // and the trap is installed by the time it appears.
+    await_ready_marker(&ready).await;
+    let cancelled_at = Instant::now();
+    token.cancel();
+
+    let err = completes_within(
+        Duration::from_secs(20),
+        "the cancelled wait_any contender",
+        wait_any(&mut [&mut trapping, &mut slow]),
+    )
+    .await
+    .expect_err("a cancelled contender's Err short-circuits the race");
+    assert!(
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+        "expected ErrorReason::Cancelled, got {err:?}"
+    );
+    assert!(
+        term.exists(),
+        "wait_exit's cancel arm must drive the same soft tier as the consuming \
+         finishers — the trap could never have run under a SIGKILL"
+    );
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(5),
+        "a TERM-handling child must end the 10s grace early (took {:?})",
+        cancelled_at.elapsed()
+    );
+    drop(slow);
+    drop(group);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns real subprocesses and cancels one racing inside wait_any (no grace)"]
+async fn wait_any_without_cancel_grace_still_hard_kills() {
+    use processkit::wait_any;
+
+    // The default half of the same path: no `cancel_grace` → `wait_exit`'s cancel arm
+    // is the unchanged immediate `kill_tree`, trap never runs. This also pins the
+    // early `pid_gate.retire()` that arm now performs on the DEFAULT path (where it
+    // only moves `kill_tree`'s own retire a few statements earlier): a regression
+    // there would show up as a wedged or misclassified race here.
+    let group = ProcessGroup::new().expect("create group");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (ready, term) = (dir.path().join("ready"), dir.path().join("term"));
+    let token = CancellationToken::new();
+    let mut trapping = group
+        .start(&term_trapping_child(&ready, &term).cancel_on(token.clone()))
+        .await
+        .expect("start the TERM-trapping contender");
+    let mut slow = group
+        .start(&sleep_secs(30))
+        .await
+        .expect("start the slow contender");
+
+    await_ready_marker(&ready).await;
+    token.cancel();
+
+    let err = completes_within(
+        Duration::from_secs(20),
+        "the hard-cancelled wait_any contender",
+        wait_any(&mut [&mut trapping, &mut slow]),
+    )
+    .await
+    .expect_err("a cancelled contender's Err short-circuits the race");
+    assert!(
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+        "expected ErrorReason::Cancelled, got {err:?}"
+    );
+    assert!(
+        !term.exists(),
+        "without cancel_grace the contender must be SIGKILLed outright — an \
+         uncatchable signal, so the TERM trap must NOT have run"
+    );
+    drop(slow);
+    drop(group);
+}
+
+/// A child that ignores `SIGPIPE`, announces itself via `ready`, then writes to
+/// stdout forever — so it stalls once the (undrained) pipe buffer fills, and only
+/// ever reaches `gone` if the read end is actually closed, which turns the write
+/// into an `EPIPE` failure the loop exits on. The marker is the proof; with the
+/// default `SIGPIPE` disposition the shell would just die silently.
+#[cfg(unix)]
+fn chatty_until_epipe(ready_marker: &Path, gone_marker: &Path) -> Command {
+    Command::new("sh").args([
+        "-c".to_string(),
+        format!(
+            "trap '' PIPE; touch '{ready}'; while echo x; do :; done; touch '{gone}'",
+            ready = ready_marker.display(),
+            gone = gone_marker.display(),
+        ),
+    ])
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess and drops its handle without ever cancelling"]
+async fn dropping_a_cancel_grace_handle_without_cancelling_releases_the_childs_pipes() {
+    // The end-to-end half of "configuring `cancel_grace` changes NOTHING before a
+    // cancellation actually happens": a shared-group handle dropped with an un-fired
+    // token must leave nothing of the library holding the child's stdout, so a chatty
+    // child stalled on a full pipe gets its `EPIPE` and ends.
+    //
+    // Note what this does and does not prove. It is NOT the discriminating witness
+    // for which Drop branch ran: the read ends live in `RealProc::stdout_pipe`, not
+    // inside the `Child` the hand-off moves out (`real.child.take()`), so they are
+    // released either way. The branch itself is pinned hermetically in
+    // `running::tests::dropping_a_cancel_grace_handle_with_an_unfired_token_retires_the_gate`,
+    // where the retired gate makes the choice directly observable. What this test
+    // guards is the *composite* promise that survives any future refactor of that
+    // hand-off — e.g. one that carried the pipes along with the child, which is
+    // precisely how "a dropped handle keeps a chatty child alive forever" would
+    // become real rather than hypothetical.
+    let group = ProcessGroup::new().expect("create group");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (ready, gone) = (dir.path().join("ready"), dir.path().join("gone"));
+    let token = CancellationToken::new();
+    let run = group
+        .start(
+            &chatty_until_epipe(&ready, &gone)
+                .cancel_on(token.clone())
+                .cancel_grace(Duration::from_secs(10)),
+        )
+        .await
+        .expect("start the chatty child");
+
+    poll_until(
+        Duration::from_secs(15),
+        Duration::from_millis(20),
+        "the chatty child to start writing",
+        || ready.exists(),
+    )
+    .await;
+    drop(run); // no cancellation, no finisher — the plain "handle went away" case
+
+    poll_until(
+        Duration::from_secs(15),
+        Duration::from_millis(20),
+        "the child to observe its closed stdout and exit",
+        || gone.exists(),
+    )
+    .await;
+    assert!(
+        !token.is_cancelled(),
+        "the token never fired — this is the pre-cancellation Drop path"
+    );
+    drop(group);
+}
+
 #[tokio::test]
 #[ignore = "spawns a real subprocess and cancels it with a grace window configured"]
 async fn cancel_grace_does_not_change_the_outcome() {
