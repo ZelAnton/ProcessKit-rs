@@ -47,17 +47,23 @@ pub enum Signal {
     /// value:
     /// - **`Other(0)` is not an error.** Signal `0` is the POSIX *existence probe*
     ///   (`kill(pid, 0)` checks whether the target exists and delivers nothing), so
-    ///   it is a no-op "is it alive?" send, not `EINVAL`. On **both** POSIX backends
+    ///   it is a no-op "is it alive?" send, not `EINVAL`. On **every** POSIX backend
     ///   a [`signal(Other(0))`](crate::ProcessGroup::signal) over a group with live
     ///   members returns `Ok` **having delivered nothing** — the `Ok` reports "the
-    ///   probe reached a signalable target", never "a signal was delivered".
+    ///   probe reached a signalable target", never "a signal was delivered" (the
+    ///   FreeBSD reaper has no probe mode, so it routes this one case through the
+    ///   process-group path, which keeps *that* answer identical everywhere — the
+    ///   `EPERM` handling around it is **not** uniform, see
+    ///   [`ProcessGroup::signal`](crate::ProcessGroup::signal)).
     /// - An **out-of-range** number makes the underlying `kill`/`killpg` fail
     ///   `EINVAL`, and that failure is now surfaced as
     ///   [`ErrorReason::Io`](crate::ErrorReason::Io) on **every** Unix backend — the Linux
-    ///   **cgroup** mechanism and the **process-group** mechanism (macOS/BSD and the
-    ///   Linux fallback) agree, so a bad number no longer silently "succeeds" on one
-    ///   and fails on the other. Still, pass a real signal number rather than
-    ///   leaning on the `EINVAL`.
+    ///   **cgroup** mechanism, the **FreeBSD process reaper** (whose
+    ///   `PROC_REAP_KILL` rejects the number the same way) and the
+    ///   **process-group** mechanism (macOS/the other BSDs and the Linux fallback)
+    ///   agree, so a bad number no longer silently "succeeds" on one and fails on
+    ///   another. Still, pass a real signal number rather than leaning on the
+    ///   `EINVAL`.
     Other(i32),
 }
 

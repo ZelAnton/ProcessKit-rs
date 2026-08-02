@@ -1,5 +1,6 @@
-//! Implementation for unix targets without cgroups or Job Objects (macOS, the
-//! BSDs): a [`ProcessGroup`] per the shared POSIX
+//! Implementation for unix targets with no whole-tree containment primitive of
+//! their own (macOS and the BSDs other than FreeBSD, which has the `procctl`
+//! process reaper — see `sys::freebsd`): a [`ProcessGroup`] per the shared POSIX
 //! backend. Every child leads its own process group, so dropping the job
 //! `killpg`s the whole tree — a real kill-on-close guarantee, weaker only
 //! against children that `setsid` away. Surfaced as [`Mechanism::ProcessGroup`].
@@ -11,6 +12,18 @@ use std::io;
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
+
+// The twin of `sys::freebsd`'s guard: this module is the *catch-all* unix arm of
+// the platform dispatcher in `sys/mod.rs`, so it must stay out of the two unix
+// targets that have a backend of their own. Asserting that here turns a
+// cross-target `cargo check` into a proof that adding the FreeBSD arm did not
+// re-route macOS or the other BSDs — and that FreeBSD did not silently keep the
+// weaker, `setsid`-escapable fallback.
+#[cfg(any(not(unix), target_os = "linux", target_os = "freebsd"))]
+compile_error!(
+    "sys::unix is the catch-all POSIX process-group backend; Linux (sys::linux) \
+     and FreeBSD (sys::freebsd) have their own, and non-unix targets have none"
+);
 
 use crate::Mechanism;
 #[cfg(feature = "process-control")]

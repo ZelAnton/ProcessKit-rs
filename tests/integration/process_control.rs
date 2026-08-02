@@ -97,10 +97,10 @@ async fn unix_soft_stop_scope_is_whole_tree_and_matches_signal() {
 
     // The soft-stop capability report must agree with the real `signal` outcome
     // on the SAME group (the honesty contract: what it advertises is what a soft
-    // stop actually reaches). On both Unix mechanisms — cgroup v2 and the POSIX
-    // process-group fallback — a soft `Int`/`Term` reaches the whole tree and
-    // never reports `Unsupported`, so the report is `WholeTree` and a real `Term`
-    // returns `Ok`.
+    // stop actually reaches). On every Unix mechanism — cgroup v2, the POSIX
+    // process-group fallback, and the FreeBSD process reaper — a soft `Int`/`Term`
+    // reaches the whole tree and never reports `Unsupported`, so the report is
+    // `WholeTree` and a real `Term` returns `Ok`.
     let group = ProcessGroup::new().expect("create group");
 
     // Before any member: whole-tree capability, and an empty group accepts a soft

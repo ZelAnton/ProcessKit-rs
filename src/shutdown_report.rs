@@ -69,8 +69,9 @@ pub enum SoftSignal {
 /// [`members_before`](Self::members_before) / [`members_after`](Self::members_after)
 /// count the same member set the group's
 /// [`members`](crate::ProcessGroup::members) reports — the whole tree on the
-/// Windows Job Object and Linux cgroup mechanisms, the tracked group **leaders** on
-/// the POSIX process-group fallback (macOS/BSD and Linux without a usable cgroup).
+/// Windows Job Object, Linux cgroup and FreeBSD process-reaper mechanisms, the
+/// tracked group **leaders** on the POSIX process-group fallback (macOS/the other
+/// BSDs and Linux without a usable cgroup).
 /// Each is `None` only if that membership read failed (an unreadable `cgroup.procs`,
 /// a failed Job Object query), never a fabricated `0`.
 ///
@@ -78,9 +79,10 @@ pub enum SoftSignal {
 /// (its process-group entry survives until the child is `wait`ed), so a tree
 /// hard-killed with `SIGKILL` can still report a non-zero
 /// [`members_after`](Self::members_after) until those exits are reaped — the same
-/// reaping caveat [`shutdown`](crate::ProcessGroup::shutdown) documents. The atomic
-/// mechanisms (`cgroup.procs`, the Job Object) drop a process on exit, before
-/// reaping.
+/// reaping caveat [`shutdown`](crate::ProcessGroup::shutdown) documents. The
+/// mechanisms that see an exit directly (`cgroup.procs`, the Job Object, and the
+/// reaper listing, whose zombie flag this crate never counts as a live member)
+/// drop a process on exit, before reaping.
 ///
 /// # Non-exhaustive, accessor-only
 ///

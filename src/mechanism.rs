@@ -11,10 +11,10 @@ use crate::soft_stop::SoftStopScope;
 /// The containment mechanism actually in effect for a process group.
 ///
 /// Surfaced so callers can tell *how* the no-orphan guarantee is enforced — in
-/// particular when the mechanism is a POSIX process group rather than a cgroup or
-/// Job Object (the primary mechanism on macOS/BSD, and the Linux fallback when no
-/// cgroup is writable), which weakens the guarantee against children that call
-/// `setsid`.
+/// particular when the mechanism is a POSIX process group rather than a cgroup,
+/// Job Object or FreeBSD process reaper (the primary mechanism on macOS and the
+/// non-FreeBSD BSDs, and the Linux fallback when no cgroup is writable), which
+/// weakens the guarantee against children that call `setsid`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Mechanism {
@@ -25,15 +25,25 @@ pub enum Mechanism {
     /// back to sweeping `cgroup.procs` with per-pid `SIGKILL`.
     CgroupV2,
     /// POSIX process group, torn down via `killpg`. The primary mechanism on
-    /// macOS and the BSDs, and the Linux fallback when no cgroup is writable.
-    /// Weaker than a cgroup/Job Object: a child that calls `setsid` escapes it.
+    /// macOS and the BSDs other than FreeBSD, and the Linux fallback when no
+    /// cgroup is writable. Weaker than a cgroup/Job Object: a child that calls
+    /// `setsid` escapes it.
     ProcessGroup,
+    /// FreeBSD **process reaper** — `procctl(2)`'s `PROC_REAP_ACQUIRE`, which makes
+    /// the owning process the reaper of its whole descendant tree. Unlike a POSIX
+    /// process group, a descendant that calls `setsid` (or double-forks) stays in
+    /// the reaper's subtree: it remains visible to `PROC_REAP_GETPIDS` and is torn
+    /// down by `PROC_REAP_KILL`, so the classic `setsid` escape is closed. Whole-tree
+    /// *kill* and *membership*, like a cgroup or Job Object; whole-tree *resource
+    /// accounting* is still absent (the reaper is a process-tree facility, not a
+    /// container), so the `limits` feature stays unsupported here.
+    ProcessReaper,
 }
 
 impl Mechanism {
     /// This mechanism's **stable machine identifier**: a short, lowercase
-    /// `snake_case` string (`"job_object"`, `"cgroup_v2"`, `"process_group"`)
-    /// that is part of the crate's compatibility surface.
+    /// `snake_case` string (`"job_object"`, `"cgroup_v2"`, `"process_group"`,
+    /// `"process_reaper"`) that is part of the crate's compatibility surface.
     ///
     /// Use it for machine-readable output — a CLI's JSONL schema, a
     /// cross-language binding, a structured log field — where a consumer needs
@@ -50,6 +60,7 @@ impl Mechanism {
             Mechanism::JobObject => "job_object",
             Mechanism::CgroupV2 => "cgroup_v2",
             Mechanism::ProcessGroup => "process_group",
+            Mechanism::ProcessReaper => "process_reaper",
         }
     }
 
@@ -66,6 +77,7 @@ impl Mechanism {
             "job_object" => Some(Mechanism::JobObject),
             "cgroup_v2" => Some(Mechanism::CgroupV2),
             "process_group" => Some(Mechanism::ProcessGroup),
+            "process_reaper" => Some(Mechanism::ProcessReaper),
             _ => None,
         }
     }
@@ -77,13 +89,23 @@ impl Mechanism {
     /// [`host_containment`](crate::host_containment) query and the real selection
     /// share one source of truth.
     ///
-    /// A fixed per-target constant on Windows ([`JobObject`](Self::JobObject)) and
-    /// macOS/BSD ([`ProcessGroup`](Self::ProcessGroup)); on Linux a cheap read-only
-    /// probe of cgroup v2 availability and writability. The Linux cgroup answer is
-    /// **best-effort**: it inspects whether a leaf cgroup *could* be created rather
-    /// than creating one, so in the rare window where a writable-looking cgroup then
-    /// rejects creation it can report [`CgroupV2`](Self::CgroupV2) where a real
-    /// `ProcessGroup::new` falls back to [`ProcessGroup`](Self::ProcessGroup).
+    /// A fixed per-target constant on Windows ([`JobObject`](Self::JobObject)),
+    /// FreeBSD ([`ProcessReaper`](Self::ProcessReaper)) and the other unix targets
+    /// ([`ProcessGroup`](Self::ProcessGroup)); on Linux a cheap read-only probe of
+    /// cgroup v2 availability and writability. Two answers are **best-effort**, and
+    /// for the same reason — the prediction must create nothing:
+    ///
+    /// - **Linux** inspects whether a leaf cgroup *could* be created rather than
+    ///   creating one, so in the rare window where a writable-looking cgroup then
+    ///   rejects creation it can report [`CgroupV2`](Self::CgroupV2) where a real
+    ///   `ProcessGroup::new` falls back to [`ProcessGroup`](Self::ProcessGroup).
+    /// - **FreeBSD** reports [`ProcessReaper`](Self::ProcessReaper) without calling
+    ///   `procctl(PROC_REAP_ACQUIRE)` (acquiring reaper status is a side effect a
+    ///   spawn-free query must not have). Acquisition is available on every
+    ///   supported FreeBSD kernel and takes no privilege, so the prediction holds in
+    ///   practice; should it nonetheless fail, a real group degrades to
+    ///   [`ProcessGroup`](Self::ProcessGroup) and says so through
+    ///   [`ProcessGroup::mechanism`](crate::ProcessGroup::mechanism).
     pub(crate) fn detect() -> Mechanism {
         crate::sys::detect_mechanism()
     }
@@ -105,10 +127,12 @@ impl Mechanism {
 /// # What each field means
 ///
 /// - [`mechanism`](Self::mechanism) — the [`Mechanism`] a group created here and now
-///   would use (`Mechanism::detect`). On Linux this is a **best-effort** read-only
-///   probe of cgroup v2 availability/writability (it does not create the cgroup it
-///   would use), so in a rare window it can differ from the mechanism a real
-///   `ProcessGroup::new` falls back to.
+///   would use (`Mechanism::detect`). Two answers are **best-effort**, both because
+///   the query creates nothing: on Linux a read-only probe of cgroup v2
+///   availability/writability (it does not create the cgroup it would use), and on
+///   FreeBSD the process reaper reported without acquiring reaper status. In a rare
+///   window either can differ from the mechanism a real `ProcessGroup::new` falls
+///   back to.
 // The `soft_stop_scope` bullet is split by feature: under `process-control` it keeps
 // the full intra-doc links; without it those items (`SoftStopScope`, `Signal`,
 // `ProcessGroup::signal`/`::soft_stop_scope`, `Self::soft_stop_scope`) are `cfg`-ed out
@@ -183,8 +207,8 @@ impl HostContainment {
 
     /// The containment [`Mechanism`] a [`ProcessGroup`](crate::ProcessGroup) created
     /// here and now would use — see the `mechanism` field note above (via the shared
-    /// `Mechanism::detect` probe) for the per-platform detail and the Linux
-    /// best-effort caveat.
+    /// `Mechanism::detect` probe) for the per-platform detail and the two
+    /// best-effort caveats (Linux, FreeBSD).
     pub fn mechanism(&self) -> Mechanism {
         self.mechanism
     }
@@ -223,21 +247,28 @@ impl HostContainment {
 }
 
 /// The host-level [`SoftStopScope`] a group would achieve on `mechanism` — the
-/// *maximum* reach of a soft `Int`/`Term` stop for that backend. The Unix backends
-/// (cgroup v2 and the POSIX process-group fallback) reach the
-/// [`WholeTree`](SoftStopScope::WholeTree); a Windows Job Object can only ever
-/// soft-stop its [`OptInMembers`](SoftStopScope::OptInMembers) (a console-CTRL leader
-/// or a windowed member). Kept consistent with
+/// *maximum* reach of a soft `Int`/`Term` stop for that backend. Every Unix backend
+/// (cgroup v2, the FreeBSD process reaper, and the POSIX process-group fallback)
+/// reaches the [`WholeTree`](SoftStopScope::WholeTree); a Windows Job Object can only
+/// ever soft-stop its [`OptInMembers`](SoftStopScope::OptInMembers) (a console-CTRL
+/// leader or a windowed member). Kept consistent with
 /// [`ProcessGroup::soft_stop_scope`](crate::ProcessGroup::soft_stop_scope) by
 /// construction: a real group only ever reports this scope or (on Windows, with no
 /// reachable member) the narrower `Unsupported`.
+///
+/// The FreeBSD reaper reaches the whole tree in the strongest sense of the three:
+/// `PROC_REAP_KILL` delivers the soft signal to every descendant the reaper sees,
+/// which — unlike `killpg` — still includes one that `setsid`ed out of its process
+/// group.
 #[cfg(feature = "process-control")]
 fn host_soft_stop_scope(mechanism: Mechanism) -> SoftStopScope {
     // Exhaustive (no `_` arm) though `Mechanism` is `#[non_exhaustive]`: within the
     // defining crate a new variant is a compile error here, so a new mechanism can
     // never silently ship without deciding its host-level soft-stop reach.
     match mechanism {
-        Mechanism::CgroupV2 | Mechanism::ProcessGroup => SoftStopScope::WholeTree,
+        Mechanism::CgroupV2 | Mechanism::ProcessGroup | Mechanism::ProcessReaper => {
+            SoftStopScope::WholeTree
+        }
         Mechanism::JobObject => SoftStopScope::OptInMembers,
     }
 }
@@ -250,6 +281,7 @@ mod tests {
         Mechanism::JobObject,
         Mechanism::CgroupV2,
         Mechanism::ProcessGroup,
+        Mechanism::ProcessReaper,
     ];
 
     #[test]
@@ -259,6 +291,7 @@ mod tests {
         assert_eq!(Mechanism::JobObject.name(), "job_object");
         assert_eq!(Mechanism::CgroupV2.name(), "cgroup_v2");
         assert_eq!(Mechanism::ProcessGroup.name(), "process_group");
+        assert_eq!(Mechanism::ProcessReaper.name(), "process_reaper");
     }
 
     #[test]
@@ -274,6 +307,10 @@ mod tests {
         assert_eq!(Mechanism::from_name("jobobject"), None);
         assert_eq!(Mechanism::from_name(""), None);
         assert_eq!(Mechanism::from_name("cgroup"), None);
+        // A near-miss on the newest identifier must not resolve either: the
+        // dictionary is exact, never a prefix/fuzzy match.
+        assert_eq!(Mechanism::from_name("reaper"), None);
+        assert_eq!(Mechanism::from_name("ProcessReaper"), None);
     }
 
     #[test]
@@ -284,7 +321,10 @@ mod tests {
         assert_eq!(report.mechanism(), Mechanism::detect());
         assert!(matches!(
             report.mechanism(),
-            Mechanism::JobObject | Mechanism::CgroupV2 | Mechanism::ProcessGroup
+            Mechanism::JobObject
+                | Mechanism::CgroupV2
+                | Mechanism::ProcessGroup
+                | Mechanism::ProcessReaper
         ));
     }
 
@@ -324,6 +364,10 @@ mod tests {
         );
         assert_eq!(
             super::host_soft_stop_scope(Mechanism::ProcessGroup),
+            SoftStopScope::WholeTree
+        );
+        assert_eq!(
+            super::host_soft_stop_scope(Mechanism::ProcessReaper),
             SoftStopScope::WholeTree
         );
         assert_eq!(

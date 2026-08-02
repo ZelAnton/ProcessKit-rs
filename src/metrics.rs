@@ -168,6 +168,14 @@ mod tests {
         // passed-in disposition, not the enum, to call it `cancelled`.
         assert_eq!(outcome_label(&Outcome::Signalled(None), true), "cancelled");
         assert_eq!(outcome_label(&Outcome::Exited(0), true), "cancelled");
+        assert_eq!(
+            outcome_label(&Outcome::InactivityTimedOut, false),
+            "inactivity_timed_out"
+        );
+        assert_eq!(
+            outcome_label(&Outcome::InactivityTimedOut, true),
+            "cancelled"
+        );
     }
 }
 

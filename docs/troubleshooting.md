@@ -95,7 +95,9 @@ and [`NotFound` versus `Spawn`](errors.md#variants-that-look-alike-but-arent).
 Do not parse the English detail. Read `limit_kind()` and `limit_reason()`:
 
 - `Invalid` means the requested value itself is invalid;
-- `Unsupported` means there is no whole-tree mechanism for that limit;
+- `Unsupported` means there is no whole-tree resource accounting for that limit
+  (no container at all, or — on FreeBSD — a reaper that contains but does not
+  account);
 - `Unenforceable` means a suitable mechanism exists but this process cannot
   apply the cap.
 

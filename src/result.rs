@@ -106,8 +106,8 @@ impl Outcome {
 
     /// This outcome's **stable machine identifier** — the *kind* of
     /// disposition as a short, lowercase `snake_case` string (`"exited"`,
-    /// `"signalled"`, `"timed_out"`), part of the crate's compatibility
-    /// surface.
+    /// `"signalled"`, `"timed_out"`, `"inactivity_timed_out"`), part of the
+    /// crate's compatibility surface.
     ///
     /// Use it for machine-readable output — a CLI's JSONL schema, a
     /// cross-language binding, a structured log field — where a consumer needs
@@ -781,6 +781,7 @@ mod tests {
         assert_eq!(Outcome::Signalled(Some(9)).name(), "signalled");
         assert_eq!(Outcome::Signalled(None).name(), "signalled");
         assert_eq!(Outcome::TimedOut.name(), "timed_out");
+        assert_eq!(Outcome::InactivityTimedOut.name(), "inactivity_timed_out");
     }
 
     #[test]

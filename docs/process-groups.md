@@ -320,28 +320,40 @@ async fn main() -> processkit::Result<()> {
 
 | Platform | Deliverable signals |
 |---|---|
-| Linux (cgroup or pgroup), macOS/BSD | Any — `Term`, `Kill`, `Int`, `Hup`, `Quit`, `Usr1`, `Usr2`, `Other(n)` |
+| Linux (cgroup or pgroup), FreeBSD reaper, macOS/other BSD | Any — `Term`, `Kill`, `Int`, `Hup`, `Quit`, `Usr1`, `Usr2`, `Other(n)` |
 | Windows | `Kill` (Job Object terminate); `Int`/`Term` as a best-effort soft close (`CTRL_BREAK` to console leaders + `WM_CLOSE` to windowed members) — `ErrorReason::Unsupported` only when neither exists; every other signal → `ErrorReason::Unsupported` |
 
-`Signal::Kill` always takes the same *atomic* whole-tree kill path as
-`kill_all` (`cgroup.kill` / `killpg` / job terminate), so it cannot miss
+`Signal::Kill` always takes the same *atomic* whole-tree kill path as `kill_all`
+(`cgroup.kill` / `PROC_REAP_KILL` / `killpg` / job terminate), so it cannot miss
 a process forked mid-broadcast. Other signals are a per-member broadcast —
 best-effort against a tree that is forking at that exact moment. On Windows,
 `Signal::Int`/`Signal::Term` do not wait or escalate (they only *trigger* a soft
 close — contrast the graceful `shutdown`, which then waits the grace and
 escalates). An empty group accepts any deliverable signal trivially — except
 Windows `Int`/`Term`, which report `Unsupported` on an empty group (no member,
-hence no console or windowed target to soft-close). On **both** Unix mechanisms a
+hence no console or windowed target to soft-close). On **every** Unix mechanism a
 real send failure is surfaced as an `Err` rather than swallowed — an `EINVAL` (an
 out-of-range `Other(n)`) always, and an `EPERM` against a **live, non-zombie**
 member (a `sudo`/setuid child that rejects the signal, or a seccomp/container
-restriction). The **process-group** mechanism (macOS/BSD, Linux-without-cgroup)
-reaches the same verdict as the cgroup one by checking the target's run state
-after an `EPERM`, so a harmless zombie-only `EPERM` — and, on the bare BSDs where
-no state reader exists, every `EPERM` — stays swallowed. An `ESRCH` race (the
+restriction). The **process-group** mechanism (macOS/the other BSDs,
+Linux-without-cgroup) reaches the same verdict as the cgroup one by checking the
+target's run state after an `EPERM`, so a harmless zombie-only `EPERM` — and, on
+the bare BSDs where no state reader exists, every `EPERM` — stays swallowed. The
+**FreeBSD reaper** makes that discrimination too, from the kernel's own zombie flag
+on the member `PROC_REAP_KILL` names as the failing one — so unlike the bare-BSD
+process-group path it does surface a live member's `EPERM`. An `ESRCH` race (the
 member already exited) is still success. `Signal::Other(0)` is the POSIX
 existence probe: it returns `Ok` having **delivered nothing** (a live target was
-reached, not signalled).
+reached, not signalled) — and because that probe never takes a delivery path
+(FreeBSD routes it back through the process group, which has no state reader on
+any BSD but macOS), the `EPERM` rule above does not reach it everywhere: on
+FreeBSD and the bare BSDs a live target that rejects even the null signal still
+answers `Ok`, where Linux and macOS surface the `EPERM`. `suspend`/`resume` on
+the process-group mechanism now use the same honest delivery verdict for
+`SIGSTOP`/`SIGCONT`: a live-member `EPERM` surfaces as an `Err`, while `ESRCH`,
+zombie-only `EPERM`, an empty group, and BSD-without-state-reader `EPERM`
+remain `Ok`. The older-kernel cgroup per-process fallback reports its
+`SIGSTOP`/`SIGCONT` failures the same way.
 
 ## Asking whether a soft stop is available
 
@@ -383,7 +395,8 @@ async fn main() -> processkit::Result<()> {
 
 | Mechanism | `soft_stop_scope()` | Why |
 |---|---|---|
-| Linux cgroup v2, macOS/BSD, Linux pgroup fallback | `WholeTree` | `signal(Int/Term)` reaches every member of the tree (the cgroup, or every tracked process group via `killpg`); never `Unsupported` |
+| Linux cgroup v2, macOS/other BSD, Linux pgroup fallback | `WholeTree` | `signal(Int/Term)` reaches every member of the tree (the cgroup, or every tracked process group via `killpg`); never `Unsupported` |
+| FreeBSD reaper | `WholeTree` | `PROC_REAP_KILL` delivers to every descendant the reaper sees — including one that `setsid`ed out of its process group; never `Unsupported` |
 | Windows, with a live console-CTRL leader (`windows_graceful_ctrl_break`) or a windowed member | `OptInMembers` | a soft close reaches only members it can *trigger* — a curated subset, not the whole tree |
 | Windows, with neither | `Unsupported` | a Job Object has no POSIX signal and there is nothing to soft-close, so `signal(Int/Term)` would return `ErrorReason::Unsupported` |
 
@@ -420,7 +433,8 @@ Per-platform machinery — and its visible differences:
 | Platform | Mechanism | Notes |
 |---|---|---|
 | Linux cgroup | one `cgroup.freeze` write | Atomic over the subtree; freeze is **group state** |
-| Linux pgroup, macOS/BSD | `SIGSTOP` / `SIGCONT` broadcast | Idempotent (level-triggered) |
+| Linux pgroup, macOS/other BSD | `SIGSTOP` / `SIGCONT` broadcast | Idempotent (level-triggered) |
+| FreeBSD reaper | `SIGSTOP` / `SIGCONT` through `PROC_REAP_KILL` | Idempotent; covers the **whole subtree**, a `setsid` escapee included |
 | Windows | per-thread `SuspendThread` walk | **Counted**: N suspends need N resumes; best-effort against mid-walk thread churn |
 
 Two caveats that bite in practice:
@@ -602,11 +616,11 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-| Capability | Windows Job Object | Linux cgroup v2 | pgroup / macOS / BSD |
-|---|---|---|---|
-| Memory cap | ✅ whole-tree | ✅ whole-tree (`memory.max`) | ❌ |
-| Process-count cap | ✅ | ✅ (`pids.max`) | ❌ |
-| CPU quota | 🟡 approximate (rate vs. total CPU) | ✅ (`cpu.max`) | ❌ |
+| Capability | Windows Job Object | Linux cgroup v2 | pgroup / macOS / other BSD | FreeBSD reaper |
+|---|---|---|---|---|
+| Memory cap | ✅ whole-tree | ✅ whole-tree (`memory.max`) | ❌ | ❌ |
+| Process-count cap | ✅ | ✅ (`pids.max`) | ❌ | ❌ |
+| CPU quota | 🟡 approximate (rate vs. total CPU) | ✅ (`cpu.max`) | ❌ | ❌ |
 
 `cpu_quota` is a fraction of a **single** core (`2.0` = two cores). Limits
 need a real container; when a requested cap can't be enforced — no Job
@@ -614,8 +628,10 @@ Object/cgroup, or a Linux cgroup whose controllers can't be enabled —
 `with_options` returns `ErrorReason::ResourceLimit { kind, reason, detail }` instead
 of handing back a silently-unbounded group: `kind` names the limit
 (`max_memory`/`max_processes`/`cpu_quota`), `reason` says whether the value was
-simply invalid, the platform has no whole-tree mechanism at all
-(`Unsupported`), or a mechanism exists but rejected this request
+simply invalid, no mechanism with whole-tree resource *accounting* exists here
+(`Unsupported` — the pgroup mechanisms, which have no whole-tree container at all,
+and the FreeBSD reaper, which contains a tree without accounting for it), or a
+mechanism exists but rejected this request
 (`Unenforceable`) — branch on these instead of parsing `detail`. On Linux this
 needs the process to run at the
 **real cgroup-v2 root**: the crate enables the controllers in this process's own
@@ -656,9 +672,24 @@ reissued; on Linux cgroup v2 the `memory.max` / `pids.max` / `cpu.max` files are
 rewritten (a removed axis written back to `max`). It routes through the same
 live container the tree-control verbs use, so the same platform matrix and
 `ErrorReason::ResourceLimit { kind, reason, detail }` classification apply — a
-process-group mechanism (macOS/BSD, the Linux fallback) refuses any requested
-cap with `Unsupported` rather than silently dropping it, while lifting *all*
-caps there is a trivial success.
+process-group mechanism (macOS/the other BSDs, the Linux fallback) and the FreeBSD
+reaper refuse any requested cap with `Unsupported` rather than silently dropping
+it, while lifting *all* caps there is a trivial success.
+
+**A failure is not a rollback.** The caps are written axis by axis — on Windows
+one Job Object call for the memory and process caps and a second for the CPU cap,
+on cgroup v2 `memory.max`, then `pids.max`, then `cpu.max` — and nothing about
+that is transactional. A call that fails part-way can leave the container carrying
+a *mix* of old and new caps, including an axis the request meant to lift that has
+already been lifted; only the group's reflected options (what `Debug` shows) stay
+on the previous set, and the error doesn't say how far the write got. Re-issue the
+complete desired set (a full replacement, so retrying is idempotent) or tear the
+group down. An `Invalid` value is the one case guaranteed to change nothing: it is
+rejected before the OS is touched. Evidence stays honest across all of this —
+every axis a request names joins the group's sticky cap record whether the call
+succeeds or fails, so an axis that did land before the failure is still read from
+the kernel's counters by `limit_evidence()` rather than reported `NotTripped` with
+nothing behind it.
 
 ### Did the cap actually fire? (`limit_evidence`)
 
@@ -698,9 +729,15 @@ async fn main() -> processkit::Result<()> {
 
 **Two different questions.** `ErrorReason::ResourceLimit` is *admission*: "the
 cap you asked for could not be **applied**" (`Invalid` / `Unsupported` /
-`Unenforceable`), returned by `with_options` / `update_limits` before anything
-runs. `limit_evidence` is the other side: the cap **was** applied — did it then
-**fire**? Nothing about the error's behaviour changes; the two never overlap.
+`Unenforceable`). `with_options` returns it instead of running anything at all —
+it hands back no group, so there is nothing left to ask. `update_limits` returns
+it against an already-running tree, where it undoes nothing that already landed
+(see [A failure is not a rollback](#updating-a-live-group) above).
+`limit_evidence` is the other side: did a cap on this axis then **fire**?
+Nothing about the error's behaviour changes — but on a live group the two can
+meet on the same axis: after a failed `update_limits` the error says the
+requested set could not be applied whole, while the evidence still answers what
+actually fired, read from the counters rather than assumed away.
 
 **Three-valued on purpose, and never a guess.** `Tripped` is returned *only* on
 authoritative kernel/OS evidence recorded by this group's own container.
@@ -713,7 +750,8 @@ consulted: they cannot separate a cap-driven kill from a self-inflicted one.
 |---|---|---|---|---|
 | Linux cgroup v2 | ✅ | ✅ | ✅ | `memory.events`' `oom`, `pids.events`' `max`, `cpu.stat`'s `nr_throttled` |
 | Windows Job Object | ❓ `Unknown` | ❓ `Unknown` | ❓ `Unknown` | the mechanism keeps no post-mortem record — see below |
-| pgroup / macOS / BSD | ❓ `Unknown` | ❓ `Unknown` | ❓ `Unknown` | no whole-tree resource accounting exists at all |
+| pgroup / macOS / other BSD | ❓ `Unknown` | ❓ `Unknown` | ❓ `Unknown` | no whole-tree resource accounting exists at all |
+| FreeBSD reaper | ❓ `Unknown` | ❓ `Unknown` | ❓ `Unknown` | contains the tree, accounts for nothing in it |
 
 What "fired" means differs by axis, because the OS's own behaviour does: memory
 means the container hit **its own** cap and the kernel had to OOM inside it;
@@ -756,7 +794,9 @@ counters with it. Reading is free of side effects and repeatable: it sends no
 signal, kills nothing, writes nothing, and cannot perturb teardown or
 kill-on-drop whenever you call it. The counters are cumulative and are not reset
 by reading, by a teardown, or by `update_limits` — an axis whose cap was later
-lifted still reports that it fired while the cap was in force. An axis that
+lifted still reports that it fired while the cap was in force, and so does an
+axis named by an `update_limits` call that *failed* (see above: that call is not
+a rollback, so the axis may have been applied before the failure). An axis that
 never carried a cap is answered without touching the OS at all, so a group
 created without caps performs no evidence I/O whatsoever.
 

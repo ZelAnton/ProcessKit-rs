@@ -44,7 +44,8 @@
 /// | Mechanism | Scope | Why |
 /// |---|---|---|
 /// | Linux cgroup v2 | [`WholeTree`](Self::WholeTree) | `signal(Int/Term)` writes to every process in the cgroup — the whole tree receives it. |
-/// | POSIX process group (macOS / the BSDs / Linux cgroup-less fallback) | [`WholeTree`](Self::WholeTree) | `killpg` reaches every tracked group leader **and its descendants** — the whole tracked tree (a child that `setsid`s away escapes, exactly as it does the kill-on-drop guarantee). |
+/// | POSIX process group (macOS / the other BSDs / Linux cgroup-less fallback) | [`WholeTree`](Self::WholeTree) | `killpg` reaches every tracked group leader **and its descendants** — the whole tracked tree (a child that `setsid`s away escapes, exactly as it does the kill-on-drop guarantee). |
+/// | FreeBSD process reaper | [`WholeTree`](Self::WholeTree) | `procctl(PROC_REAP_KILL)` delivers to every descendant the kernel's reaper tree holds — so unlike `killpg`, a child that `setsid`s away does **not** escape. |
 /// | Windows Job Object | [`OptInMembers`](Self::OptInMembers) or [`Unsupported`](Self::Unsupported) | A Job Object has no POSIX signal; a soft stop reaches only members it can *trigger* — a console-CTRL leader (opted in via [`Command::windows_graceful_ctrl_break`](crate::Command::windows_graceful_ctrl_break)) or any live windowed member (`WM_CLOSE`). [`OptInMembers`](Self::OptInMembers) when at least one such member is live, else [`Unsupported`](Self::Unsupported). |
 ///
 /// Consistent with [`signal`](crate::ProcessGroup::signal) by construction: it is
@@ -58,11 +59,13 @@
 pub enum SoftStopScope {
     /// The soft stop reaches **every** process in the tree. The Unix backends:
     /// the Linux cgroup v2 mechanism (the signal is delivered to every member of
-    /// the cgroup) and the POSIX process-group mechanism (`killpg` reaches each
-    /// tracked leader and every descendant in its group). The one documented
-    /// escapee is a child that `setsid`s away from its process group — the same
-    /// weakening that already applies to the kill-on-drop guarantee, not new to
-    /// the soft stop.
+    /// the cgroup), the FreeBSD process reaper (`PROC_REAP_KILL` delivers to
+    /// every descendant the reaper tree holds) and the POSIX process-group
+    /// mechanism (`killpg` reaches each tracked leader and every descendant in
+    /// its group). On the process-group mechanism the one documented escapee is
+    /// a child that `setsid`s away from its process group — the same weakening
+    /// that already applies to the kill-on-drop guarantee, not new to the soft
+    /// stop; the cgroup and reaper mechanisms hold even that child.
     WholeTree,
     /// The soft stop reaches only the members that can *receive* it — a curated
     /// **subset** of the tree, not all of it. Windows: a live console-CTRL
