@@ -15,8 +15,9 @@
 //!   child spawned into the group, and everything those children spawn, dies
 //!   with the group, so an exiting or panicking owner doesn't leak subprocesses.
 //!   Containment is a Windows [Job Object], a Linux [cgroup v2] (with a POSIX
-//!   process-group fallback), or a POSIX process group on macOS/BSD —
-//!   observable via [`Mechanism`]. A spawn-free [`host_containment`] reports
+//!   process-group fallback), a FreeBSD `procctl(2)` process reaper, or a POSIX
+//!   process group on macOS/the other BSDs — observable via [`Mechanism`]. A
+//!   spawn-free [`host_containment`] reports
 //!   which [`Mechanism`] (and the reach of soft stop / abrupt-owner-death
 //!   cleanup) a group *would* get on this host, before any group exists. Two
 //!   caveats the [`ProcessGroup`] /
@@ -441,8 +442,11 @@ pub fn which(program: impl AsRef<OsStr>) -> Result<std::path::PathBuf> {
 ///
 /// See [`HostContainment`] for the full contract of each field. In particular the
 /// [`mechanism`](HostContainment::mechanism) is determined by a read-only probe
-/// (the shared `Mechanism::detect`) that on Linux is **best-effort**: it inspects whether
-/// a cgroup could be created rather than creating one, so in a rare window it can
+/// (the shared `Mechanism::detect`) that is **best-effort** on two targets, both
+/// because the query must create nothing: on **Linux** it inspects whether a cgroup
+/// could be created rather than creating one, and on **FreeBSD** it reports the
+/// process reaper without acquiring reaper status (acquiring it is a real,
+/// permanent side effect). In either case a rare window can make it
 /// differ from the mechanism a real [`ProcessGroup::new`](ProcessGroup::new) falls
 /// back to. Like [`which`], no async runtime is required.
 ///

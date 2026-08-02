@@ -77,12 +77,12 @@ which variant fires from where, how to classify it, and what to do about it.
 - **`ResourceLimit` means "the cap couldn't be applied", never "the cap
   fired".** It is an *admission* error, raised by
   `ProcessGroup::with_options` / `update_limits` **before** anything runs: the
-  requested value was nonsensical (`Invalid`), the platform has no whole-tree
-  mechanism at all (`Unsupported`), or a capable mechanism rejected this request
-  (`Unenforceable`). A cap that *was* applied and then actually stopped the tree
-  produces **no error at all** — the child just exits non-zero (or dies by
-  `SIGKILL`), exactly like a self-inflicted crash. For that question ask the
-  group afterwards:
+  requested value was nonsensical (`Invalid`), the platform has no mechanism
+  with whole-tree resource accounting (`Unsupported`), or a capable mechanism
+  rejected this request (`Unenforceable`). A cap that *was* applied and then
+  actually stopped the tree produces **no error at all** — the child just exits
+  non-zero (or dies by `SIGKILL`), exactly like a self-inflicted crash. For that
+  question ask the group afterwards:
   [`ProcessGroup::limit_evidence()`](process-groups.md#did-the-cap-actually-fire-limit_evidence)
   returns a per-axis `LimitVerdict` — `Tripped` (authoritative kernel/OS
   evidence that this cap fired), `NotTripped`, or `Unknown` (no evidence

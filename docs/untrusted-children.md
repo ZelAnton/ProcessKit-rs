@@ -124,9 +124,11 @@ async fn main() -> processkit::Result<()> {
 `ProcessGroup::new` if any limit was requested) returns
 `ErrorReason::ResourceLimit { kind, reason, detail }` instead of handing back a
 group that looks capped but isn't — an unenforced limit is no protection for
-an untrusted child. `reason` tells you *why*: `Unsupported` means no
-whole-tree mechanism exists at all here (macOS/the BSDs, or a Linux host
-with no cgroup v2 mounted); `Unenforceable` means a mechanism exists but this
+an untrusted child. `reason` tells you *why*: `Unsupported` means no mechanism
+with whole-tree resource *accounting* exists here — macOS/the other BSDs and a
+Linux host with no cgroup v2 mounted have no whole-tree container at all, and
+FreeBSD's process reaper contains a tree without accounting for it;
+`Unenforceable` means a mechanism exists but this
 particular request was rejected (most commonly: this process isn't at the
 **real** cgroup-v2 hierarchy root — true of essentially every ordinary
 container, privileged or not, and every systemd session/scope/service). Only

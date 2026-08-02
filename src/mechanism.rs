@@ -127,10 +127,12 @@ impl Mechanism {
 /// # What each field means
 ///
 /// - [`mechanism`](Self::mechanism) — the [`Mechanism`] a group created here and now
-///   would use (`Mechanism::detect`). On Linux this is a **best-effort** read-only
-///   probe of cgroup v2 availability/writability (it does not create the cgroup it
-///   would use), so in a rare window it can differ from the mechanism a real
-///   `ProcessGroup::new` falls back to.
+///   would use (`Mechanism::detect`). Two answers are **best-effort**, both because
+///   the query creates nothing: on Linux a read-only probe of cgroup v2
+///   availability/writability (it does not create the cgroup it would use), and on
+///   FreeBSD the process reaper reported without acquiring reaper status. In a rare
+///   window either can differ from the mechanism a real `ProcessGroup::new` falls
+///   back to.
 // The `soft_stop_scope` bullet is split by feature: under `process-control` it keeps
 // the full intra-doc links; without it those items (`SoftStopScope`, `Signal`,
 // `ProcessGroup::signal`/`::soft_stop_scope`, `Self::soft_stop_scope`) are `cfg`-ed out
@@ -205,8 +207,8 @@ impl HostContainment {
 
     /// The containment [`Mechanism`] a [`ProcessGroup`](crate::ProcessGroup) created
     /// here and now would use — see the `mechanism` field note above (via the shared
-    /// `Mechanism::detect` probe) for the per-platform detail and the Linux
-    /// best-effort caveat.
+    /// `Mechanism::detect` probe) for the per-platform detail and the two
+    /// best-effort caveats (Linux, FreeBSD).
     pub fn mechanism(&self) -> Mechanism {
         self.mechanism
     }

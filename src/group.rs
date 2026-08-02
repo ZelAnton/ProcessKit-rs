@@ -181,9 +181,11 @@ impl ProcessGroup {
                 if options.limits.any() {
                     // A real signal from the backend, not a guess: every
                     // backend reports `ErrorKind::Unsupported` exactly when no
-                    // whole-tree container mechanism exists at all on this
-                    // platform (macOS/BSD's POSIX-only fallback, a Linux host
-                    // with no cgroup v2 mounted) — the same convention
+                    // mechanism with whole-tree resource *accounting* exists on
+                    // this platform (macOS/BSD's POSIX-only fallback and a Linux
+                    // host with no cgroup v2 mounted, which have no whole-tree
+                    // container at all; FreeBSD's reaper, which contains a tree
+                    // but accounts for nothing) — the same convention
                     // `map_unsupported` relies on for the signal/suspend/resume
                     // paths. Every other failure (Linux delegation/
                     // subtree_control rejected, a Windows Job Object call
@@ -359,7 +361,8 @@ impl ProcessGroup {
     /// rather than a false success; the atomic backends (`cgroup.kill`, Windows
     /// Job Object) don't need to.
     ///
-    /// **Process-group mechanism (macOS/BSD, Linux process-group fallback).** A
+    /// **Process-group mechanism (macOS/the other BSDs, Linux process-group
+    /// fallback), and the FreeBSD process reaper.** A
     /// member that changed its real/saved uid (a `sudo`/setuid child) and rejects
     /// `SIGKILL` with `EPERM` while still **alive** is surfaced as an `Err` — the
     /// containment gap is reported, not hidden. The one `EPERM` that is *not*
@@ -368,9 +371,13 @@ impl ProcessGroup {
     /// the two are indistinguishable from the errno alone, so the target's actual
     /// run state is checked after the `EPERM` (`proc_pidinfo` on macOS, the
     /// `/proc/<pid>/stat` state field on the Linux fallback) and only a
-    /// genuinely-alive, non-zombie member fails the call. On the **BSDs**, where no
+    /// genuinely-alive, non-zombie member fails the call. On the **BSDs other than
+    /// FreeBSD**, where no
     /// process-state reader is wired up, a delivery `EPERM` stays swallowed
-    /// (best-effort), so a privileged child can still outlive `kill_all` there — the
+    /// (best-effort), so a privileged child can still outlive `kill_all` there.
+    /// **FreeBSD** does make the discrimination: `PROC_REAP_KILL` reports which member
+    /// the delivery failed for and the reaper's own listing carries the kernel's
+    /// zombie flag for it, so a live rejecting member is surfaced there as well. The
     /// atomic mechanisms (`cgroup.kill`, Job Object) have no such gap.
     ///
     /// # Errors
@@ -399,8 +406,8 @@ impl ProcessGroup {
     ///
     /// # Platform support
     ///
-    /// - **Linux (cgroup or process-group fallback), macOS/BSD** — any signal,
-    ///   attempted for every live member of the tree.
+    /// - **Linux (cgroup or process-group fallback), FreeBSD reaper, macOS/the
+    ///   other BSDs** — any signal, attempted for every live member of the tree.
     /// - **Windows** — [`Signal::Kill`] (the atomic Job Object terminate) always;
     ///   [`Signal::Int`] / [`Signal::Term`] as a best-effort **soft close** —
     ///   `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` to any child spawned with
@@ -432,9 +439,11 @@ impl ProcessGroup {
     ///   is the harmless zombie-only case;
     /// - an **`ESRCH`** (the member already exited) is always a benign no-op success.
     ///
-    /// On the **BSDs**, where no process-state reader is wired up, a delivery
-    /// `EPERM` stays swallowed (best-effort) — the same residual gap
-    /// [`kill_all`](Self::kill_all) documents. `SIGKILL` here goes through the same
+    /// On the **BSDs other than FreeBSD**, where no process-state reader is wired up,
+    /// a delivery `EPERM` stays swallowed (best-effort) — the same residual gap
+    /// [`kill_all`](Self::kill_all) documents; on **FreeBSD** the reaper reads the
+    /// kernel's zombie flag for the member `PROC_REAP_KILL` blames, so a live
+    /// rejecting member is surfaced there too. `SIGKILL` here goes through the same
     /// whole-tree hard kill as [`kill_all`](Self::kill_all), so a rejected hard kill
     /// surfaces identically whichever verb you call.
     ///
@@ -489,10 +498,14 @@ impl ProcessGroup {
     ///
     /// # Platform reach
     ///
-    /// - **Linux cgroup v2, macOS/BSD, Linux process-group fallback** —
+    /// - **Linux cgroup v2, macOS/the other BSDs, Linux process-group fallback** —
     ///   [`SoftStopScope::WholeTree`]: `signal(Int/Term)` reaches every member of
     ///   the tree (the cgroup, or every tracked process group via `killpg`), so a
     ///   soft stop is always available and never `Unsupported` here.
+    /// - **FreeBSD process reaper** — [`SoftStopScope::WholeTree`] in the strongest
+    ///   sense: `PROC_REAP_KILL` delivers the soft signal to every descendant the
+    ///   reaper sees, which — unlike `killpg` — includes one that `setsid`ed out of
+    ///   its process group.
     /// - **Windows** — [`SoftStopScope::OptInMembers`] when the group holds a live
     ///   console-CTRL leader (a child spawned with
     ///   [`Command::windows_graceful_ctrl_break`](crate::Command::windows_graceful_ctrl_break))
@@ -519,10 +532,13 @@ impl ProcessGroup {
     ///   (kernel ≥ 5.2; older kernels fall back to per-process `SIGSTOP`). The
     ///   freeze is applied by the kernel shortly after the write returns, not
     ///   instantaneously.
-    /// - **Linux process-group fallback, macOS/BSD** — `SIGSTOP` to every
+    /// - **Linux process-group fallback, macOS/the other BSDs** — `SIGSTOP` to every
     ///   group; an individually-tracked adopted child (see
     ///   [`adopt`](Self::adopt)) is frozen alone — its own descendants keep
     ///   running.
+    /// - **FreeBSD process reaper** — `SIGSTOP` through `PROC_REAP_KILL` to the whole
+    ///   subtree of every spawned or adopted child, a `setsid` escapee included, so an
+    ///   adopted child's descendants are frozen with it.
     /// - **Windows** — suspends every thread of every member process. Best-effort
     ///   and not atomic: threads spawned mid-walk can be missed, and Windows keeps
     ///   per-thread suspend *counts*, so nested `suspend` calls stack — N suspends
@@ -599,8 +615,16 @@ impl ProcessGroup {
     ///
     /// - **Windows** — every pid assigned to the Job Object (the whole tree).
     /// - **Linux cgroup** — every pid in the cgroup (`cgroup.procs`, whole tree).
-    /// - **Linux process-group fallback, macOS/BSD** — the tracked **group
-    ///   leaders**, plus any individually-tracked adopted child (one pid per
+    /// - **FreeBSD process reaper** — the **whole tree**: every live descendant of
+    ///   every child this group spawned or adopted, one pid per process
+    ///   (`PROC_REAP_GETPIDS`), a `setsid` escapee included. An exited child that
+    ///   has not been reaped is **not** listed — the kernel flags a corpse as a
+    ///   zombie and this crate never counts one as a live member. (The one
+    ///   exception to "whole tree" is an [`adopt`](Self::adopt)ed child that was
+    ///   forked *before* this process became a reaper: it is unreachable through
+    ///   the reaper, so it is tracked individually like a process-group member.)
+    /// - **Linux process-group fallback, macOS/the other BSDs** — the tracked
+    ///   **group leaders**, plus any individually-tracked adopted child (one pid per
     ///   spawned/adopted child); descendants inside the groups are contained
     ///   but not enumerated. An exited child still counts as a member until it
     ///   is reaped (awaited): the liveness probe sees the not-yet-collected
@@ -638,9 +662,12 @@ impl ProcessGroup {
     ///   [`members`](Self::members)), enriched from `/proc` the same way.
     /// - **macOS** — the tracked leaders; ppid / image name / start time via
     ///   `proc_pidinfo`.
-    /// - **the BSDs** — the tracked leaders with every enriching field `None` (no
-    ///   wired-up per-process reader — see [`MemberInfo::start_time`]); the pid is
-    ///   still reported, which is a correct result, not an error.
+    /// - **FreeBSD process reaper** — the **whole tree** (as
+    ///   [`members`](Self::members)) with every enriching field `None` (no
+    ///   wired-up per-process reader — see [`MemberInfo::start_time`]); the pids
+    ///   are still reported, which is a correct result, not an error.
+    /// - **the other BSDs** — the tracked leaders with every enriching field `None`,
+    ///   for the same reason.
     ///
     /// # Racing a member that exits
     ///
@@ -678,7 +705,7 @@ impl ProcessGroup {
     ///
     /// **Reap your children, or the grace is wasted (POSIX process-group
     /// mechanism only).** On the [`Mechanism::ProcessGroup`](crate::Mechanism)
-    /// fallback (macOS/the BSDs, and Linux without a usable cgroup), liveness is
+    /// fallback (macOS/the other BSDs, and Linux without a usable cgroup), liveness is
     /// probed by signalling the group id, and an **unreaped zombie still answers**
     /// — its process-group entry survives until the child is `wait`ed. So a child
     /// that exits promptly on `SIGTERM` but whose [`RunningProcess`](crate::RunningProcess)
@@ -1020,9 +1047,11 @@ impl ProcessGroup {
     ///   this crate deliberately does not do. Inferring from `PeakJobMemoryUsed` or
     ///   an exit code is refused as a guess. The containers guide records the full
     ///   reasoning.
-    /// - **POSIX process group** (macOS, the BSDs, and the Linux fallback with no
-    ///   usable cgroup v2) — [`Unknown`](crate::LimitVerdict::Unknown) on every axis: the
-    ///   mechanism has no whole-tree resource accounting to read. It also cannot
+    /// - **POSIX process group** (macOS, the other BSDs, and the Linux fallback with
+    ///   no usable cgroup v2) **and the FreeBSD process reaper** —
+    ///   [`Unknown`](crate::LimitVerdict::Unknown) on every axis: neither mechanism
+    ///   has any whole-tree resource accounting to read (a reaper contains a tree
+    ///   without accounting for it). Neither can
     ///   carry a cap at all (creation fails fast with
     ///   [`crate::ErrorReason::ResourceLimit`]), so this is "no evidence apparatus
     ///   here", not "a cap may have fired unseen".

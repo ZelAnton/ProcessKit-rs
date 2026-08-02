@@ -162,9 +162,10 @@ pub enum LimitReason {
     /// ever touched.
     Invalid,
     /// The active containment mechanism has **no whole-tree resource
-    /// accounting at all** on this platform — macOS/the BSDs (a POSIX process
-    /// group only), or a Linux host with no cgroup v2 mounted. No container
-    /// capable of carrying the cap exists here, full stop.
+    /// accounting at all** on this platform — macOS/the other BSDs (a POSIX
+    /// process group only), FreeBSD (a process reaper: it contains a tree without
+    /// accounting for it), or a Linux host with no cgroup v2 mounted. No
+    /// mechanism capable of carrying the cap exists here, full stop.
     Unsupported,
     /// A capable mechanism **exists**, but this particular request could not
     /// be applied to it — e.g. a Linux cgroup whose controllers can't be
@@ -281,8 +282,9 @@ pub enum LimitVerdict {
     /// **No authoritative evidence is available**, so the crate refuses to answer.
     /// Not a "no": the cap may or may not have fired. Reported when the group runs
     /// on a mechanism with no whole-tree resource accounting at all (the POSIX
-    /// process-group mechanism — macOS, the BSDs, and the Linux fallback with no
-    /// usable cgroup v2), when the platform's container records nothing post-mortem
+    /// process-group mechanism — macOS, the other BSDs, and the Linux fallback with
+    /// no usable cgroup v2 — or the FreeBSD process reaper, which contains a tree
+    /// without accounting for it), when the platform's container records nothing post-mortem
     /// for a cap it does enforce (**every** cap on a Windows Job Object — see
     /// [`ProcessGroup::limit_evidence`](crate::ProcessGroup::limit_evidence)), or
     /// when the evidence file/counter could not be read.

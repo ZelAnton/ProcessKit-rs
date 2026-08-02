@@ -57,9 +57,10 @@
 //! pi_pid`, i.e. processes this process did **not** fork itself. (The kernel's
 //! `REAPER_PIDINFO_CHILD` flag is *not* the right test — it means "is currently a
 //! direct child", which a re-parented orphan also is.) The sweep runs on every
-//! reaper read and on teardown, plus a short bounded drain
-//! ([`Reaper::drain_dead`]) after a hard kill so a caller that tears a tree down
-//! and immediately probes the pids does not see corpses.
+//! reaper read — membership, delivery, teardown — so an ordinary job discharges the
+//! duty as a side effect of being used. `Drop` adds a short bounded drain
+//! ([`Reaper::drain_dead`]) on top, because it is the one moment after which no
+//! later read will ever come.
 //!
 //! # What is still *not* provided
 //!
@@ -298,9 +299,11 @@ const GETPIDS_SLACK: usize = 16;
 
 /// How many times the descendant listing may double its buffer before settling for
 /// what it got. A tree that keeps outgrowing four doublings is being forked into
-/// faster than it can be read; a truncated list only under-reports membership (the
-/// kill path addresses subtrees through the kernel and never enumerates), so a
-/// best-effort answer beats failing the read.
+/// faster than it can be read, so a best-effort answer beats failing the read — but
+/// that answer is **marked** ([`Listing::truncated`]) rather than passed off as
+/// complete: under-reporting membership is harmless, while letting a partial list
+/// drive [`Reaper::prune`] would read "no entry names this root" as "that subtree is
+/// empty" and forget a live subtree the listing never reached.
 const GETPIDS_GROW_ATTEMPTS: u32 = 4;
 
 /// Ceiling on a single listing, so a runaway `rs_descendants` cannot turn into an
@@ -308,18 +311,42 @@ const GETPIDS_GROW_ATTEMPTS: u32 = 4;
 /// system-wide process limit is well under this.
 const GETPIDS_MAX: usize = 1 << 20;
 
+/// One `PROC_REAP_GETPIDS` answer: the descendants the kernel reported, plus whether
+/// it may have had more to say than the buffer could hold.
+///
+/// The flag is load-bearing, not diagnostic — see [`GETPIDS_GROW_ATTEMPTS`] and
+/// [`Reaper::prune`], which is a no-op on a truncated listing. Every *reader* of the
+/// entries (membership, the zombie sweep, the liveness probe behind the `EPERM`
+/// discrimination) is safe with a partial list: each of them fails towards
+/// "fewer members / cannot prove liveness", never towards forgetting containment.
+struct Listing {
+    entries: Vec<ReaperPidInfo>,
+    /// The kernel filled the buffer exactly, with no growth attempts left, so there
+    /// may be descendants it could not report.
+    truncated: bool,
+}
+
+impl Listing {
+    /// The listing of a process the kernel says has no descendants at all — complete
+    /// by construction.
+    const EMPTY: Self = Self {
+        entries: Vec::new(),
+        truncated: false,
+    };
+}
+
 /// Every descendant of this process, as the kernel's reaper tree sees it —
 /// including ones that `setsid`ed away, ones re-parented to us, and zombies.
 ///
 /// `PROC_REAP_GETPIDS` reports no element count, so the returned prefix is
 /// delimited by [`REAPER_PIDINFO_VALID`]: the buffer is zeroed up front and the
 /// kernel sets that bit on every slot it writes.
-fn descendants() -> io::Result<Vec<ReaperPidInfo>> {
+fn descendants() -> io::Result<Listing> {
     // The status read is one cheap syscall that both sizes the buffer and lets a
     // childless process skip the listing (and its allocation) entirely.
     let status = reap_status()?;
     if status.rs_descendants == 0 {
-        return Ok(Vec::new());
+        return Ok(Listing::EMPTY);
     }
     let mut capacity = (status.rs_descendants as usize)
         .saturating_add(GETPIDS_SLACK)
@@ -337,12 +364,22 @@ fn descendants() -> io::Result<Vec<ReaperPidInfo>> {
             std::ptr::addr_of_mut!(request).cast::<libc::c_void>(),
         )?;
         let filled = buf.iter().take_while(|entry| entry.is_valid()).count();
+        buf.truncate(filled);
         // A filled prefix shorter than the buffer proves the listing is complete;
-        // an exactly-full buffer may have been truncated, so grow and re-read.
+        // an exactly-full buffer may have been truncated, so grow and re-read —
+        // and, once the attempts are spent, say so instead of pretending.
         attempt += 1;
-        if filled < capacity || attempt >= GETPIDS_GROW_ATTEMPTS || capacity >= GETPIDS_MAX {
-            buf.truncate(filled);
-            return Ok(buf);
+        if filled < capacity {
+            return Ok(Listing {
+                entries: buf,
+                truncated: false,
+            });
+        }
+        if attempt >= GETPIDS_GROW_ATTEMPTS || capacity >= GETPIDS_MAX {
+            return Ok(Listing {
+                entries: buf,
+                truncated: true,
+            });
         }
         capacity = capacity.saturating_mul(2).min(GETPIDS_MAX);
     }
@@ -400,37 +437,54 @@ fn reap_stray_zombies(all: &[ReaperPidInfo]) {
 /// The reaper listing supplies here what a bare BSD cannot: the kernel's own
 /// zombie flag for a process we can positively identify as ours. Anything less than
 /// a positive live answer — an unreadable listing, a pid the tree no longer knows,
-/// a kernel too old to report `REAPER_PIDINFO_ZOMBIE` for a corpse — reports
+/// a pid a truncated listing did not reach, a kernel too old to report
+/// `REAPER_PIDINFO_ZOMBIE` for a corpse — reports
 /// `false` and the error stays swallowed, which is the fail-safe direction and
 /// exactly the pre-existing behavior on this target.
 fn is_live_descendant(pid: libc::pid_t) -> bool {
     if pid <= 0 {
         return false;
     }
-    descendants().is_ok_and(|all| {
-        all.iter()
+    descendants().is_ok_and(|listing| {
+        listing
+            .entries
+            .iter()
             .any(|entry| entry.pi_pid == pid && entry.is_valid() && !entry.is_zombie())
     })
 }
 
-/// How long a hard teardown may block waiting for the tree it just `SIGKILL`ed to
-/// actually die, so the re-parented corpses can be collected before the caller
-/// looks.
+/// How long [`Drop`](Job::drop) may block waiting for the tree it just `SIGKILL`ed
+/// to actually die, so the re-parented corpses can be collected before the last
+/// sweeper — this `Job` — is gone.
 ///
-/// This wait is what makes "the tree is gone once teardown returns" true on this
+/// This wait is what makes "the tree is gone once the job is dropped" true on this
 /// backend rather than nearly true: an orphan the reaper inherited stays visible to
 /// `kill(pid, 0)` until *this* process `wait`s for it, and after a `Drop` there is
 /// no later call to sweep it. A killed process has no handler to run and dies as
 /// soon as it is scheduled, so the loop normally ends within a poll or two; the
 /// budget caps only pathological cases (a member wedged in uninterruptible sleep,
-/// or one that genuinely rejects the kill). It is generous rather than tight
-/// because exceeding it leaks a corpse, while merely *reaching* it requires a tree
-/// that will not die — and the loop is not entered at all unless the job really has
-/// descendants below its roots, which the ordinary one-child job does not.
-const DRAIN_BUDGET: Duration = Duration::from_millis(500);
+/// or one that genuinely rejects the kill), and it is not entered at all unless the
+/// job really has descendants below its roots, which the ordinary one-child job
+/// does not.
+///
+/// **The number is the project's accepted ceiling, not a fresh judgement.** `Drop`
+/// cannot await, so this runs synchronously wherever the job is dropped — often a
+/// tokio worker thread. The Linux cgroup backend blocks the same way and for the
+/// same reason (`src/sys/linux.rs`: 50 polls × 2 ms while `cgroup.procs` drains),
+/// and ~100 ms is the bound the crate documents wherever a teardown may stall a
+/// worker thread. A
+/// larger budget here would buy nothing measurable — a `SIGKILL`ed tree dies within
+/// a poll or two, and anything that outlasts 100 ms of polling is a tree that will
+/// not die within 500 ms either — while costing five times the worst-case stall on
+/// an executor thread. The verbs reachable from async code (`kill_all`,
+/// `GracefulTarget::hard_kill`) deliberately do **not** drain at all: they leave a
+/// live `Job` behind, and every later reaper read sweeps the corpses anyway.
+const DRAIN_BUDGET: Duration = Duration::from_millis(100);
 
-/// Poll interval for that drain.
-const DRAIN_POLL: Duration = Duration::from_millis(1);
+/// Poll interval for that drain — mirroring the Linux loop's 2 ms rather than
+/// spinning twice as fast, since each poll here costs two syscalls and a killed
+/// tree is gone long before the difference shows.
+const DRAIN_POLL: Duration = Duration::from_millis(2);
 
 /// One subtree root: the pid of a child this job started, plus the order in which
 /// it was recorded. See [`Reaper::prune`] for what the sequence number is for.
@@ -472,8 +526,10 @@ struct Reaper {
     /// pruned as soon as its *process group* drains: that is precisely the moment a
     /// `setsid` escapee stops being reachable through `killpg`, so pruning on it
     /// would forget the subtree exactly when the reaper is the only thing that can
-    /// still reach into it. A root is dropped only when the kernel positively
-    /// reports its subtree empty ([`Reaper::prune`]).
+    /// still reach into it. A root is dropped only on the kernel's own positive
+    /// answer that its subtree holds nothing — an empty descendant listing
+    /// ([`Reaper::prune`]) or an `ESRCH` from `PROC_REAP_KILL`
+    /// ([`Reaper::signal_tree`]) — and never merely because time passed.
     roots: Mutex<RootSet>,
 }
 
@@ -508,22 +564,55 @@ impl Reaper {
     /// forked before it (not ours to reach).
     #[cfg(feature = "process-control")]
     fn covers(&self, pid: libc::pid_t) -> bool {
-        descendants().is_ok_and(|all| {
-            all.iter()
+        descendants().is_ok_and(|listing| {
+            listing
+                .entries
+                .iter()
                 .any(|entry| entry.pi_pid == pid && entry.is_valid())
         })
     }
 
-    /// Record a freshly-started child as a subtree root. De-duplicated, so
-    /// re-adopting a child this job already owns cannot double-count it.
+    /// Record a freshly-started child as a subtree root, **after** forgetting the
+    /// roots the kernel reports as empty — the "prune, then track" order
+    /// `pgroup::Tracked::track` uses, and for the same reason. A spawn is precisely
+    /// the moment a pid this job still remembers can be handed out again, so it is
+    /// the moment a stale root is most expensive to keep (see [`prune`](Self::prune)).
+    ///
+    /// De-duplicated by pid — re-adopting a child this job already owns cannot
+    /// double-count it — with the *fresh* entry winning; see
+    /// [`insert_root`](Self::insert_root).
     fn record(&self, pid: libc::pid_t) {
         if !self.active || pid <= 0 {
             return;
         }
+        // Stamp first, then read, then lock — the ordering every pruning caller
+        // here uses, so a root recorded by another thread meanwhile is never judged
+        // by a listing that could not have contained it.
+        let since = self.seq_mark();
+        let listing = descendants().ok();
+        self.insert_root(pid, listing.as_ref(), since);
+    }
+
+    /// The bookkeeping half of [`record`](Self::record), split out so the unit tests
+    /// can drive it with a synthetic listing instead of the live kernel.
+    ///
+    /// `listing` is `None` when the tree could not be read at all; nothing is pruned
+    /// then, because under-pruning merely keeps a stale root while over-pruning
+    /// drops containment.
+    ///
+    /// A new entry always **replaces** an existing one for the same pid instead of
+    /// deferring to it, which matters for one specific race: if this job still holds
+    /// a stale root for a number the OS has just recycled into this very child, the
+    /// old entry would keep its old stamp — and a concurrent membership read whose
+    /// [`seq_mark`](Self::seq_mark) predates this call would then prune that root as
+    /// "empty", forgetting the child that was just started. A fresh stamp is exactly
+    /// what tells such a reader "recorded after your listing; keep it".
+    fn insert_root(&self, pid: libc::pid_t, listing: Option<&Listing>, since: u64) {
         let mut roots = self.lock_roots();
-        if roots.items.iter().any(|root| root.pid == pid) {
-            return;
+        if let Some(listing) = listing {
+            Self::prune_locked(&mut roots, listing, since);
         }
+        roots.items.retain(|root| root.pid != pid);
         let seq = roots.next_seq;
         roots.next_seq += 1;
         roots.items.push(Root { pid, seq });
@@ -543,6 +632,20 @@ impl Reaper {
             .collect()
     }
 
+    /// The roots *with* their stamps — what a delivery sweep iterates, so that a
+    /// root it drops afterwards can be matched by identity and not merely by number
+    /// (see [`forget`](Self::forget)).
+    fn root_snapshot(&self) -> Vec<Root> {
+        self.lock_roots().items.clone()
+    }
+
+    /// Forget one specific root, matched by its stamp as well as its pid: if a
+    /// concurrent [`record`](Self::record) replaced the entry in between — a new
+    /// child that inherited the recycled number — the replacement stays.
+    fn forget(&self, root: Root) {
+        self.lock_roots().items.retain(|item| *item != root);
+    }
+
     /// The stamp a root recorded from now on will carry — read **before** a
     /// descendant listing so [`prune`](Self::prune) can tell which roots that
     /// listing had a chance to see.
@@ -553,26 +656,53 @@ impl Reaper {
     /// Forget every root whose subtree the kernel no longer knows anything about —
     /// no live member, no zombie, nothing.
     ///
-    /// This is the recycled-number defence. A subtree is named by a pid, and once
-    /// that pid has been reaped the number can eventually be handed to a new child
-    /// of this same process; a root kept past the death of everything under it would
-    /// then alias that newcomer's subtree. Pruning on the kernel's own "this subtree
-    /// is empty" answer closes that as tightly as this platform allows: the window
-    /// left needs the root pid to be recycled *while* the old subtree still holds a
-    /// survivor, and even then the mistake is confined to another tree of this same
-    /// process (a `PROC_REAP_KILL` can only ever reach our own descendants), never
-    /// to an unrelated process the way a recycled *pgid* could.
+    /// This is the recycled-number defence, and it is the *only* one this platform
+    /// offers: `pgroup::Tracked` can additionally identity-gate an id before
+    /// signalling it, but `read_identity` is `None` on the BSDs, so here promptness
+    /// is the whole mitigation. A subtree is named by a pid; once everything under
+    /// that pid is gone and the number is reaped, the OS can hand it to a new child
+    /// of this same process — another job's, or one the embedding application forked
+    /// for itself — and a root kept past that point would alias the newcomer's
+    /// subtree, so a later `PROC_REAP_KILL` would walk into a tree that is not this
+    /// job's.
     ///
-    /// `since` is the [`seq_mark`](Self::seq_mark) taken before `all` was read. A
-    /// root stamped at or after it was recorded by a concurrent `spawn`/`adopt`
-    /// that the listing could not possibly contain, so it is kept unconditionally —
-    /// without that guard a membership read racing a spawn on another thread would
-    /// drop the brand-new child's subtree and silently narrow this job's teardown to
-    /// what `killpg` can reach.
-    fn prune(&self, all: &[ReaperPidInfo], since: u64) {
-        let mut roots = self.lock_roots();
+    /// The defence is therefore run at every point that could make a root stale or
+    /// act on one: on every `spawn`/`adopt` ([`record`](Self::record)), on every
+    /// membership read ([`tree`](Self::tree)), immediately before every delivery
+    /// sweep and again on its `ESRCH`es ([`signal_tree`](Self::signal_tree)), and
+    /// throughout the teardown drain ([`drain_dead`](Self::drain_dead)). What
+    /// remains is a genuine but narrow window: the root's subtree must drain **and**
+    /// its number be recycled between two of this job's reaper calls, with no spawn,
+    /// membership read or delivery in between. Even then the mistake is confined to
+    /// another tree of this same process (a `PROC_REAP_KILL` can only ever reach our
+    /// own descendants), never to an unrelated process the way a recycled *pgid*
+    /// could.
+    ///
+    /// Two things deliberately do **not** prune:
+    ///
+    /// - a **truncated** listing ([`Listing::truncated`]) — it proves nothing about
+    ///   the roots it never reached, and treating its silence as "empty" would drop
+    ///   live subtrees precisely when the tree is forking fastest;
+    /// - a root stamped at or after `since`, the [`seq_mark`](Self::seq_mark) taken
+    ///   before `listing` was read. Such a root was recorded by a concurrent
+    ///   `spawn`/`adopt` the listing could not possibly contain, so pruning it would
+    ///   drop the brand-new child's subtree and silently narrow this job's teardown
+    ///   to what `killpg` can reach.
+    fn prune(&self, listing: &Listing, since: u64) {
+        Self::prune_locked(&mut self.lock_roots(), listing, since);
+    }
+
+    /// [`prune`](Self::prune)'s body, for the callers that already hold the lock.
+    fn prune_locked(roots: &mut RootSet, listing: &Listing, since: u64) {
+        if listing.truncated {
+            return;
+        }
         roots.items.retain(|root| {
-            root.seq >= since || all.iter().any(|entry| entry.pi_subtree == root.pid)
+            root.seq >= since
+                || listing
+                    .entries
+                    .iter()
+                    .any(|entry| entry.pi_subtree == root.pid)
         });
     }
 
@@ -598,17 +728,32 @@ impl Reaper {
     }
 
     fn read_tree(&self, prune: bool) -> io::Result<Vec<ReaperPidInfo>> {
-        let since = self.seq_mark();
-        let all = descendants()?;
-        reap_stray_zombies(&all);
-        if prune {
-            self.prune(&all, since);
-        }
+        let listing = self.read_listing(prune)?;
         let roots = self.roots();
-        Ok(all
+        Ok(listing
+            .entries
             .into_iter()
             .filter(|entry| is_member(entry, &roots))
             .collect())
+    }
+
+    /// One reaper read: collect the re-parented corpses it exposes and, unless the
+    /// caller is bound by the probe-only contract, prune the roots it proves empty.
+    fn read_listing(&self, prune: bool) -> io::Result<Listing> {
+        let since = self.seq_mark();
+        let listing = descendants()?;
+        reap_stray_zombies(&listing.entries);
+        if prune {
+            self.prune(&listing, since);
+        }
+        Ok(listing)
+    }
+
+    /// Drop the roots the kernel has forgotten, discarding the listing — the
+    /// pre-delivery half of the defence described on [`prune`](Self::prune).
+    /// Best-effort: an unreadable (or truncated) listing prunes nothing.
+    fn prune_stale_roots(&self) {
+        let _ = self.read_listing(true);
     }
 
     /// Deliver `sig` to every process in this job's subtrees — the whole tree, each
@@ -619,13 +764,22 @@ impl Reaper {
     /// the subtree) is success, an `EPERM` is surfaced only when it hit a positively
     /// live member, and every sweep visits **all** roots before returning so one
     /// failing subtree never leaves another unsignalled.
+    ///
+    /// Pruning brackets the delivery, exactly as `pgroup::Tracked::signal_all`'s
+    /// does: the roots are refreshed against the kernel immediately *before* the
+    /// sweep, and a root the kernel answers `ESRCH` for during it is dropped there
+    /// and then. Delivery is the one operation where a stale root is actually
+    /// dangerous — a recycled number would aim `PROC_REAP_KILL` at a subtree this
+    /// job does not own (see [`prune`](Self::prune)) — so it is the one operation
+    /// that pays for a fresh read.
     fn signal_tree(&self, sig: libc::c_int) -> io::Result<()> {
+        self.prune_stale_roots();
         let mut surfaced: Option<io::Error> = None;
-        for root in self.roots() {
+        for root in self.root_snapshot() {
             let mut request = ReaperKill {
                 rk_sig: sig,
                 rk_flags: REAPER_KILL_SUBTREE,
-                rk_subtree: root,
+                rk_subtree: root.pid,
                 rk_killed: 0,
                 rk_fpid: 0,
                 rk_pad0: [0; 15],
@@ -636,6 +790,13 @@ impl Reaper {
             ) else {
                 continue;
             };
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                // The kernel matched nothing in this subtree: it drained between the
+                // prune above and this call. Forget it now rather than at the next
+                // read — the same terminal `ESRCH` pruning `Tracked::signal_all`
+                // does — and by identity, so a root re-recorded meanwhile survives.
+                self.forget(root);
+            }
             if surfaced.is_none() && is_honest_failure(&err, request.rk_fpid) {
                 surfaced = Some(err);
             }
@@ -655,14 +816,13 @@ impl Reaper {
         // be paused (a hermetic test) and would never advance past the deadline.
         let deadline = Instant::now() + budget;
         loop {
-            let since = self.seq_mark();
-            let Ok(all) = descendants() else { return };
-            reap_stray_zombies(&all);
-            self.prune(&all, since);
-            // Zombies are excluded on purpose: the sweep above already `wait`ed for
+            let Ok(listing) = self.read_listing(true) else {
+                return;
+            };
+            // Zombies are excluded on purpose: the read above already `wait`ed for
             // the ones that are ours, and the rest belong to a live parent still
             // counted here in its own right.
-            if !has_live_descendant(&all, &self.roots()) || Instant::now() >= deadline {
+            if !has_live_descendant(&listing.entries, &self.roots()) || Instant::now() >= deadline {
                 return;
             }
             std::thread::sleep(DRAIN_POLL);
@@ -807,9 +967,15 @@ impl Job {
         // blocked or counted, so a process the first sweep killed simply is not
         // there for the second. `signal` — whose signal a child can observe — never
         // does this.
+        //
+        // No corpse drain (unlike `Drop`, see `DRAIN_BUDGET`): this verb is called
+        // from cancel/deadline watchdogs and from `RunningProcess`/`Pipeline`
+        // teardown, i.e. from tokio worker threads, and it leaves a live `Job`
+        // behind — the very next reaper read (`members`, `stats`, `is_drained`, the
+        // job's own `Drop`) collects what the kill produced. Blocking an executor
+        // thread to do it a few hundred microseconds earlier is not worth it.
         let reaper = self.reaper.signal_tree(libc::SIGKILL);
         let group = self.group.kill_all();
-        self.reaper.drain_dead(DRAIN_BUDGET);
         reaper.and(group)
     }
 
@@ -1092,8 +1258,8 @@ impl Drop for Job {
             // Survivors were deliberately spared by a `graceful_shutdown(escalate =
             // false)`. Kill nothing — but still collect any corpse already
             // re-parented to us, which sparing the living says nothing about.
-            if let Ok(all) = descendants() {
-                reap_stray_zombies(&all);
+            if let Ok(listing) = descendants() {
+                reap_stray_zombies(&listing.entries);
             }
             return;
         }
@@ -1165,6 +1331,32 @@ mod tests {
             pi_flags: REAPER_PIDINFO_VALID | if zombie { REAPER_PIDINFO_ZOMBIE } else { 0 },
             pi_pad0: [0; 15],
         }
+    }
+
+    /// A listing the kernel reported in full.
+    fn listing(entries: &[ReaperPidInfo]) -> Listing {
+        Listing {
+            entries: entries.to_vec(),
+            truncated: false,
+        }
+    }
+
+    /// A listing that ran out of buffer — the entries are real, their *absence* is
+    /// not evidence of anything.
+    fn cut_short(entries: &[ReaperPidInfo]) -> Listing {
+        Listing {
+            entries: entries.to_vec(),
+            truncated: true,
+        }
+    }
+
+    /// The bookkeeping half of a [`Reaper::record`], with no kernel read. The real
+    /// `record` is exactly this plus one `PROC_REAP_GETPIDS`, whose pruning is
+    /// covered by `recording_forgets_the_roots_the_kernel_has_forgotten` below;
+    /// stubbing the read out keeps these tests hermetic (a live listing on the test
+    /// host would prune the synthetic roots they are built from).
+    fn record(reaper: &Reaper, pid: libc::pid_t) {
+        reaper.insert_root(pid, None, reaper.seq_mark());
     }
 
     /// The four `<sys/procctl.h>` structures are hand-mirrored (`libc` declares only
@@ -1301,33 +1493,39 @@ mod tests {
         assert!(reaper.has_outside_members());
         // One-way: a later ordinary adopt must not switch the process-group layer
         // back off while the unreachable member is still there.
-        reaper.record(100);
+        record(&reaper, 100);
         assert!(reaper.has_outside_members());
     }
 
     #[test]
     fn roots_are_recorded_once_and_pruned_only_when_the_subtree_is_empty() {
         let reaper = reaper(true);
-        reaper.record(100);
-        reaper.record(100); // a re-adopt must not double-count
-        reaper.record(200);
-        assert_eq!(reaper.roots(), vec![100, 200]);
-        // A pid that cannot name a process is never recorded.
-        reaper.record(0);
-        reaper.record(-5);
+        record(&reaper, 100);
+        record(&reaper, 100); // a re-adopt must not double-count
+        record(&reaper, 200);
         assert_eq!(reaper.roots(), vec![100, 200]);
 
         let mark = reaper.seq_mark();
         // Subtree 100 still holds an escapee (its own root is long reaped); subtree
         // 200 holds nothing at all, so only 200 is forgotten.
-        reaper.prune(&[entry(101, 100, false)], mark);
+        reaper.prune(&listing(&[entry(101, 100, false)]), mark);
         assert_eq!(reaper.roots(), vec![100]);
         // Even a lone corpse keeps a subtree occupied — it has not been collected
         // yet, so the root must stay addressable.
-        reaper.prune(&[entry(101, 100, true)], mark);
+        reaper.prune(&listing(&[entry(101, 100, true)]), mark);
         assert_eq!(reaper.roots(), vec![100]);
         // Empty at last.
-        reaper.prune(&[], mark);
+        reaper.prune(&listing(&[]), mark);
+        assert!(reaper.roots().is_empty());
+    }
+
+    #[test]
+    fn a_pid_that_cannot_name_a_process_is_never_recorded() {
+        // The real entry point, guards included — both rejections short-circuit
+        // before any kernel read, so this stays hermetic.
+        let reaper = reaper(true);
+        reaper.record(0);
+        reaper.record(-5);
         assert!(reaper.roots().is_empty());
     }
 
@@ -1339,11 +1537,87 @@ mod tests {
         // brand-new subtree would be dropped on the floor and this job's teardown
         // would silently narrow to whatever `killpg` can still reach.
         let reaper = reaper(true);
-        reaper.record(100);
+        record(&reaper, 100);
         let mark = reaper.seq_mark(); // taken before the (empty) listing below
-        reaper.record(200); // the concurrent spawn
-        reaper.prune(&[], mark);
+        record(&reaper, 200); // the concurrent spawn
+        reaper.prune(&listing(&[]), mark);
         assert_eq!(reaper.roots(), vec![200]);
+    }
+
+    #[test]
+    fn a_truncated_listing_prunes_nothing() {
+        // A listing cut short by the buffer says nothing about the subtrees it never
+        // reached — and the kernel prepends new processes, so what it drops first is
+        // the *oldest* subtrees. Treating that silence as "empty" would let a job
+        // that is forking hard make a quiet neighbour job forget its roots, after
+        // which its teardown reaches nothing and still reports success.
+        let reaper = reaper(true);
+        record(&reaper, 100);
+        record(&reaper, 200);
+        let mark = reaper.seq_mark();
+        reaper.prune(&cut_short(&[entry(301, 300, false)]), mark);
+        assert_eq!(reaper.roots(), vec![100, 200]);
+        // The very same listing, known complete, does prune: the difference is the
+        // flag, not the entries.
+        reaper.prune(&listing(&[entry(301, 300, false)]), mark);
+        assert!(reaper.roots().is_empty());
+    }
+
+    #[test]
+    fn recording_forgets_the_roots_the_kernel_has_forgotten() {
+        // "Prune, then track", like `pgroup::Tracked::track`: a spawn is the moment
+        // a number this job still remembers can be handed to a new process, so the
+        // stale roots go first.
+        let reaper = reaper(true);
+        record(&reaper, 100);
+        record(&reaper, 200);
+        let mark = reaper.seq_mark();
+        // Only subtree 200 is still populated when the next child is recorded.
+        reaper.insert_root(300, Some(&listing(&[entry(201, 200, false)])), mark);
+        assert_eq!(reaper.roots(), vec![200, 300]);
+    }
+
+    #[test]
+    fn recording_a_recycled_number_replaces_the_stale_root_rather_than_keeping_it() {
+        // The job holds a stale root for pid 100, and the OS hands that very number
+        // to its next child — whose fork also makes subtree 100 look occupied again,
+        // so the prune above cannot tell the two apart. Keeping the old entry would
+        // keep its old stamp, and a membership read already in flight (its mark taken
+        // before this spawn) would then prune the root as "empty" and forget the
+        // child that was just started. The fresh stamp is what survives that read.
+        let reaper = reaper(true);
+        record(&reaper, 100);
+        let in_flight = reaper.seq_mark(); // a concurrent read's mark, taken now
+        record(&reaper, 100); // the recycled number, recorded after it
+        assert_eq!(
+            reaper.roots(),
+            vec![100],
+            "still exactly one root for the pid"
+        );
+        reaper.prune(&listing(&[]), in_flight);
+        assert_eq!(
+            reaper.roots(),
+            vec![100],
+            "the re-recorded root outranks the stale listing"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_root_matches_the_stamp_not_just_the_number() {
+        // `signal_tree` drops a root the kernel answered `ESRCH` for. If a concurrent
+        // `record` replaced that entry in between — a new child on the recycled
+        // number — the replacement must survive: the `ESRCH` was about the subtree
+        // that died, not the one that just started.
+        let reaper = reaper(true);
+        record(&reaper, 100);
+        let stale = reaper.root_snapshot()[0];
+        record(&reaper, 100); // the concurrent re-record
+        reaper.forget(stale);
+        assert_eq!(reaper.roots(), vec![100]);
+        // The current entry, on the other hand, is forgettable.
+        let current = reaper.root_snapshot()[0];
+        reaper.forget(current);
+        assert!(reaper.roots().is_empty());
     }
 
     #[test]

@@ -694,7 +694,10 @@ pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, gate: &PidGate) {
         // On Linux + legacy/restricted cgroup this can synchronously block
         // this worker thread up to ~100ms — accepted, not routed through
         // `spawn_blocking`; see the sweep loop in `Cgroup::kill`
-        // (src/sys/linux.rs) for the full rationale.
+        // (src/sys/linux.rs) for the full rationale. ~100ms is the ceiling for
+        // every backend: FreeBSD's reaper keeps its post-kill corpse drain in
+        // `Drop` alone (see `DRAIN_BUDGET`, src/sys/freebsd.rs), so this call
+        // does not block there at all.
         let _ = group.kill_all();
     }
     force_kill(gate);
