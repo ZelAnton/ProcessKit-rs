@@ -352,7 +352,9 @@ answers `Ok`, where Linux and macOS surface the `EPERM`. `suspend`/`resume` on
 the process-group mechanism now use the same honest delivery verdict for
 `SIGSTOP`/`SIGCONT`: a live-member `EPERM` surfaces as an `Err`, while `ESRCH`,
 zombie-only `EPERM`, an empty group, and BSD-without-state-reader `EPERM`
-remain `Ok`. The older-kernel cgroup per-process fallback reports its
+remain `Ok`. The FreeBSD reaper applies that verdict to freezing and thawing
+too — `SIGSTOP`/`SIGCONT` ride the same `PROC_REAP_KILL` classification as any
+other signal there. The older-kernel cgroup per-process fallback reports its
 `SIGSTOP`/`SIGCONT` failures the same way.
 
 ## Asking whether a soft stop is available
@@ -434,7 +436,7 @@ Per-platform machinery — and its visible differences:
 |---|---|---|
 | Linux cgroup | one `cgroup.freeze` write | Atomic over the subtree; freeze is **group state** |
 | Linux pgroup, macOS/other BSD | `SIGSTOP` / `SIGCONT` broadcast | Idempotent (level-triggered) |
-| FreeBSD reaper | `SIGSTOP` / `SIGCONT` through `PROC_REAP_KILL` | Idempotent; covers the **whole subtree**, a `setsid` escapee included |
+| FreeBSD reaper | `SIGSTOP` / `SIGCONT` through `PROC_REAP_KILL` | Idempotent; covers the **whole subtree**, a `setsid` escapee included; a refused delivery surfaces as an `Err` |
 | Windows | per-thread `SuspendThread` walk | **Counted**: N suspends need N resumes; best-effort against mid-walk thread churn |
 
 Two caveats that bite in practice:

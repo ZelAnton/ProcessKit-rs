@@ -210,7 +210,8 @@ feature that serializes these enums (the string methods already remove the need
 to hand-write conversions, without committing the crate to a second serialized
 shape). `Mechanism` and `ParentDeathCleanup` use the spellings downstream tools
 already publish (`job_object`/`cgroup_v2`/`process_group`,
-`whole_tree`/`direct_child_only`/`none`), so adopting them needs no migration.
+`whole_tree`/`direct_child_only`/`none`), so adopting them needs no migration;
+the FreeBSD reaper mechanism adds `process_reaper` in the same shape.
 `SoftStopScope` (the group-axis soft-stop reach, `process-control`) reuses the
 same `whole_tree` and `none` spellings for its shared cases, adding
 `opt_in_members` for the Windows partial-reach case. `LimitVerdict` (`limits`)

@@ -86,7 +86,7 @@ async fn main() -> processkit::Result<()> {
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `processkit.spawns.total` | counter | `program`, `mechanism` | A child process was launched, under the given containment [mechanism](process-groups.md) (`job_object` / `cgroup_v2` / `process_group`). |
+| `processkit.spawns.total` | counter | `program`, `mechanism` | A child process was launched, under the given containment [mechanism](process-groups.md) (`job_object` / `cgroup_v2` / `process_group` / `process_reaper`). |
 | `processkit.runs.total` | counter | `program`, `outcome` | A run reached a terminal outcome. `outcome` is one of `exited` / `signalled` / `timed_out` / `cancelled` — the timeout/cancel/signal tally. |
 | `processkit.run.duration_seconds` | histogram | `program` | Wall-clock duration of a completed run, taken from the run's own already-measured elapsed time (no extra clock read). |
 | `processkit.exit_code.total` | counter | `program`, `code` | Per-exit-code tally, recorded only for a genuine self-exit (a `signalled`/`timed_out`/`cancelled` run has no exit code). |

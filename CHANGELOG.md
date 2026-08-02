@@ -35,6 +35,12 @@ to a dated version section.
   conventions, with loud unsupported behavior on Windows.
 - Add typed Unix per-process `rlimit` builders for CPU, core, data, file-size,
   open-file, and stack caps, with loud unsupported behavior elsewhere.
+- Add `RlimitResource::from_name`, the inverse of the existing
+  `RlimitResource::name`: it parses a stable identifier (`cpu`, `core`, `data`,
+  `file_size`, `no_file`, `stack`) back into the resource, answering `None` — never
+  a silent default — for an unrecognized name. Round-trips with `name()` for every
+  variant, so a config file, CLI flag or cross-language caller can name an rlimit
+  axis by its documented identifier instead of hand-maintaining a mapping table.
 - Add a dependency-free plain-HTTP readiness probe that waits for caller-selected
   response status codes without reading bodies or following redirects.
 - Add opt-in per-stage stderr merging for shell-free pipelines, using one
@@ -52,6 +58,15 @@ to a dated version section.
   are `wait`ed for by the crate, so they do not accumulate as zombies; children
   this process forked itself are never touched. Resource limits stay
   `Unsupported` — a reaper contains a tree without accounting for it.
+- Ship `spec/identifiers.json`, a language-neutral machine-readable dictionary of
+  every stable identifier the crate publishes — each `name()`/`from_name()` enum
+  with its variants, spelled exactly as the Rust API answers them — so a sibling
+  implementation (F#/Python/Go/Kotlin) or a conformance test can consume the
+  contract without transcribing it from prose. Generated from the live enums with
+  a compile-time completeness guard (a new variant that is not curated into the
+  dictionary fails the build), checked for drift by CI and by the new
+  `just identifiers-diff` recipe, and documented alongside the Rust-side table in
+  the errors guide.
 
 ### Changed
 
@@ -62,7 +77,9 @@ to a dated version section.
   non-zombie member (for example, a uid-changed child that rejects `SIGSTOP`)
   now surfaces instead of being swallowed. An `ESRCH`, a harmless zombie-only
   `EPERM`, an empty group, and every `EPERM` on BSD targets without a process
-  state reader still return `Ok`. Signatures are unchanged; this only makes
+  state reader still return `Ok`. The new FreeBSD reaper mechanism answers the
+  same way through `PROC_REAP_KILL`, so every Unix mechanism now agrees on what
+  a successful freeze or thaw means. Signatures are unchanged; this only makes
   error reporting on these edge inputs truthful (not a breaking API change).
 - Release a freshly contained Windows child through a per-process thread walk
   instead of a system-wide thread snapshot, cutting the crate's fixed start cost

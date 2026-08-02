@@ -1049,32 +1049,46 @@ impl Job {
         crate::SoftStopScope::WholeTree
     }
 
+    /// Freeze the whole tree, reporting the delivery **honestly** — the same verdict
+    /// [`signal`](Self::signal) and [`kill_all`](Self::kill_all) return, and for the
+    /// same reason: `signal_tree` has already classified the failure, so discarding
+    /// it here would throw away the one thing the caller cannot recompute. A live,
+    /// non-zombie member's `EPERM` (a uid-changed child that rejects `SIGSTOP`) and a
+    /// malformed/refused request (`EINVAL`, `ECAPMODE`) surface as `Err`; an `ESRCH`
+    /// and a zombie-only `EPERM` stay `Ok` inside that classification, so an ordinary
+    /// drained or half-reaped tree is still a no-op success.
+    ///
+    /// This matches the process-group backend this job also drives: its
+    /// `Tracked::suspend` propagates its own sweep verdict too, so both of a hybrid
+    /// job's layers — and the `!reaper.active` fallback path above — answer alike.
+    ///
+    /// A doubled `SIGSTOP`/`SIGCONT` is a no-op (both are level-triggered), so the
+    /// hybrid case needs no special care beyond running both layers; `and` keeps the
+    /// reaper's error while still running the process-group sweep.
     #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {
         if !self.reaper.active {
             return self.group.suspend();
         }
-        // Best-effort and idempotent, matching the process-group backend: `SIGSTOP`
-        // is unblockable, so a failed send means the target is already gone. A
-        // doubled `SIGSTOP`/`SIGCONT` is a no-op (they are level-triggered on this
-        // backend), so the hybrid case needs no special care beyond running both.
-        let _ = self.reaper.signal_tree(libc::SIGSTOP);
+        let reaped = self.reaper.signal_tree(libc::SIGSTOP);
         if self.reaper.has_outside_members() {
-            let _ = self.group.suspend();
+            return reaped.and(self.group.suspend());
         }
-        Ok(())
+        reaped
     }
 
+    /// Thaw a tree frozen by [`suspend`](Self::suspend) — its exact mirror, including
+    /// the honest delivery verdict described there.
     #[cfg(feature = "process-control")]
     pub(crate) fn resume(&self) -> io::Result<()> {
         if !self.reaper.active {
             return self.group.resume();
         }
-        let _ = self.reaper.signal_tree(libc::SIGCONT);
+        let reaped = self.reaper.signal_tree(libc::SIGCONT);
         if self.reaper.has_outside_members() {
-            let _ = self.group.resume();
+            return reaped.and(self.group.resume());
         }
-        Ok(())
+        reaped
     }
 
     /// The **whole tree**, not just the tracked group leaders: every live descendant

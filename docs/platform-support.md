@@ -195,7 +195,7 @@ sends a real signal.
 | Arbitrary signal (`Hup`, `Usr1`, `Other(n)`, …) | 🟡 `Kill`, plus `Int`/`Term` as a best-effort soft close (`CTRL_BREAK` + `WM_CLOSE`); others unsupported | ✅ | ✅ | ✅ `PROC_REAP_KILL` | ✅ |
 | Signal reaches a `setsid` escapee | n/a | ✅ | ❌ | ✅ | ❌ |
 | `soft_stop_scope()` (soft `Int`/`Term` reach) | 🟡 `OptInMembers` with a console/windowed member, else `Unsupported` | `WholeTree` | `WholeTree` | `WholeTree` | `WholeTree` |
-| `suspend` / `resume` | 🟡 per-thread counts | ✅ `cgroup.freeze` | ✅ `SIGSTOP`/`CONT` | ✅ `SIGSTOP`/`CONT`, whole subtree | ✅ `SIGSTOP`/`CONT` |
+| `suspend` / `resume` | 🟡 per-thread counts | ✅ `cgroup.freeze` | ✅ `SIGSTOP`/`CONT`, honest verdict | ✅ `SIGSTOP`/`CONT`, whole subtree, honest verdict | ✅ `SIGSTOP`/`CONT`, honest verdict |
 
 On **every** Unix mechanism, a `signal` broadcast surfaces a real send failure as
 an `Err` rather than swallowing it — an `EINVAL` (an out-of-range `Other(n)`) and
@@ -215,7 +215,11 @@ live target that rejects even the null signal is still an `Ok`, where Linux and
 macOS surface it. `suspend`/`resume` on that process-group mechanism now apply
 the same honest verdict to `SIGSTOP`/`SIGCONT`: a live-member `EPERM` is an
 `Err`, while `ESRCH`, zombie-only `EPERM`, an empty group, and
-BSD-without-state-reader `EPERM` remain `Ok`. On the cgroup mechanism the
+BSD-without-state-reader `EPERM` remain `Ok`. The **FreeBSD reaper** freezes and
+thaws with the same honesty — its `SIGSTOP`/`SIGCONT` go out through the very
+`PROC_REAP_KILL` classification described above, so a live member's `EPERM` (and
+an `EINVAL`/`ECAPMODE` that means the request never ran) surfaces, while a
+drained subtree and a zombie-only refusal stay `Ok`. On the cgroup mechanism the
 `SIGSTOP`/`SIGCONT` fallback used on pre-5.2 kernels (no `cgroup.freeze`)
 surfaces failures the same way.
 

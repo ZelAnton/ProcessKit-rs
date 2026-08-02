@@ -24,6 +24,16 @@ caller as `ErrorReason::Io`. In particular, `EPERM` from a live, non-zombie memb
 surfaces; `ESRCH`, harmless zombie-only `EPERM`, an empty group, and `EPERM` on a BSD
 target without a process-state reader remain `Ok`.
 
+**On FreeBSD** the same reporting applies through a *different* mechanism: 3.2.0 moves
+that target off the shared process-group backend onto the new process reaper
+(`Mechanism::ProcessReaper` — see
+[Platform support](platform-support.md)), where `suspend` / `resume` deliver through
+`PROC_REAP_KILL` and surface its refusals — a live, non-zombie member's `EPERM`, and an
+`EINVAL` / `ECAPMODE` meaning the request never ran — with the same `ESRCH` and
+zombie-only-`EPERM` exemptions. Review FreeBSD call sites exactly as below; if the
+reaper cannot be acquired the group falls back to the process-group mechanism and its
+wording applies verbatim.
+
 Before, code could treat a successful call as guaranteed because the backend swallowed
 every send failure:
 

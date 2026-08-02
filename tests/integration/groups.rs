@@ -308,8 +308,11 @@ async fn unix_setsid_child_forks_grandchild_still_contained() {
     let _ = std::fs::remove_file(&pidfile);
 }
 
-/// FreeBSD's `procctl` process reaper ([`Mechanism::ProcessReaper`]) closing the one
-/// hole every POSIX process group has: a descendant that calls `setsid` **itself**.
+/// Tests that only make sense under FreeBSD's `procctl` process reaper
+/// ([`Mechanism::ProcessReaper`]).
+///
+/// The headline case is the reaper closing the one hole every POSIX process group
+/// has: a descendant that calls `setsid` **itself**.
 ///
 /// `unix_setsid_child_forks_grandchild_still_contained` above deliberately stops at
 /// the boundary — its grandchild only *inherits* the tracked session, so `killpg`
@@ -472,6 +475,65 @@ mod freebsd_reaper {
         .await;
 
         let _ = std::fs::remove_file(&pidfile);
+    }
+
+    /// `suspend`/`resume` **propagate** the reaper's `PROC_REAP_KILL` verdict rather
+    /// than discarding it, so the whole tree's freeze is as honest as its signal and
+    /// its kill. This pins the other side of that honesty — that an *ordinary* freeze
+    /// did not acquire a spurious `Err` along the way: a live tree, a doubled freeze
+    /// (`SIGSTOP`/`SIGCONT` are level-triggered), the matching thaw, and a tree that
+    /// has already been torn down all stay `Ok`. Only a genuine refusal surfaces — a
+    /// live, non-zombie member's `EPERM`, or an `EINVAL`/`ECAPMODE` meaning the
+    /// request never ran — and none of those can be staged from an unprivileged test.
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess and freezes it"]
+    async fn suspend_and_resume_stay_ok_for_ordinary_trees() {
+        let group = ProcessGroup::new().expect("create group");
+        assert_eq!(
+            group.mechanism(),
+            Mechanism::ProcessReaper,
+            "this test is about the reaper mechanism; a pgroup here means \
+             PROC_REAP_ACQUIRE failed and there is nothing to assert"
+        );
+
+        // A tree, not a lone process: `sh` re-spawns a `sleep` grandchild, so the
+        // freeze goes out through the reaper's whole-subtree delivery.
+        let child = group
+            .start(&Command::new("sh").args(["-c", "while :; do sleep 1; done"]))
+            .await
+            .expect("start the sleeper tree");
+
+        group
+            .suspend()
+            .expect("freezing a live reaper tree must stay Ok");
+        group
+            .suspend()
+            .expect("SIGSTOP is level-triggered — a doubled freeze must stay Ok");
+        group
+            .resume()
+            .expect("thawing a frozen reaper tree must stay Ok");
+
+        // Tear the tree down and reap our own direct child, so the reaper's roots are
+        // genuinely empty rather than occupied by a corpse.
+        group.kill_all().expect("kill_all");
+        let _ =
+            completes_within(Duration::from_secs(30), "killed sleeper reap", child.wait()).await;
+        poll_until(
+            Duration::from_secs(30),
+            Duration::from_millis(50),
+            "the reaper still reports members after kill_all",
+            || group.members().is_ok_and(|members| members.is_empty()),
+        )
+        .await;
+
+        // Nothing left to freeze is a no-op success, not an error: a drained subtree
+        // stays `Ok` inside the very classification these verbs now propagate.
+        group
+            .suspend()
+            .expect("freezing a drained tree must remain a no-op success");
+        group
+            .resume()
+            .expect("thawing a drained tree must remain a no-op success");
     }
 }
 

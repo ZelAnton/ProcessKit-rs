@@ -88,267 +88,253 @@ where
     }
 }
 
+/// Curate one dictionary enum's variant list **with a compile-time completeness
+/// guard**.
+///
+/// Expands a single list into two things: the `(rust_name, value)` pairs the
+/// generator serializes, and a private `match` over the same enum carrying one arm
+/// per listed variant. Inside the defining crate that `match` is exhaustive
+/// (`#[non_exhaustive]` binds only downstream crates), so adding a variant to a
+/// dictionary enum without listing it here is a **compile error** — the list can no
+/// longer drift silently behind the type it claims to describe.
+///
+/// That drift is exactly what shipped `Mechanism::ProcessReaper` against a
+/// three-mechanism `spec/identifiers.json`: the generator carried a hand-written
+/// array rather than a `match`, so the new variant compiled fine, the generator and
+/// the committed baseline went stale together, and `identifiers_manifest_matches`
+/// stayed green comparing two equally stale artifacts. A hand-written array cannot
+/// fail closed; this one does.
+///
+/// A unit variant is written bare — the manifest value *is* the variant. One
+/// carrying data is written `Variant = <expr>` with a representative value, since
+/// the manifest names variants and cannot invent payloads. A variant that must stay
+/// **out** of the dictionary is listed under `omitted:`: it still has to be
+/// acknowledged here, but contributes no manifest entry.
+macro_rules! curated {
+    (@value $ty:ident, $variant:ident) => { $ty::$variant };
+    (@value $ty:ident, $variant:ident, $value:expr) => { $value };
+    (
+        $ty:ident,
+        [ $( $variant:ident $( = $value:expr )? ),+ $(,)? ]
+        $(, omitted: [ $( $omitted:ident ),+ $(,)? ] )?
+    ) => {{
+        #[allow(dead_code)]
+        fn completeness(value: &$ty) {
+            // Exhaustive on purpose (no `_` arm): a new variant fails to compile
+            // here until it is either curated into the manifest or explicitly
+            // omitted above.
+            match value {
+                $( $ty::$variant { .. } => (), )+
+                $( $( $ty::$omitted { .. } => (), )+ )?
+            }
+        }
+        [ $( (stringify!($variant), curated!(@value $ty, $variant $(, $value)?)) ),+ ]
+    }};
+}
+
 fn dictionary() -> Vec<EnumSpec> {
     vec![
         configurable(
             "processkit::Mechanism",
-            &[
-                ("JobObject", Mechanism::JobObject),
-                ("CgroupV2", Mechanism::CgroupV2),
-                ("ProcessGroup", Mechanism::ProcessGroup),
-            ],
+            &curated!(
+                Mechanism,
+                [JobObject, CgroupV2, ProcessGroup, ProcessReaper]
+            ),
             |value| value.name(),
             Mechanism::from_name,
         ),
         configurable(
             "processkit::ParentDeathCleanup",
-            &[
-                ("WholeTree", ParentDeathCleanup::WholeTree),
-                ("DirectChildOnly", ParentDeathCleanup::DirectChildOnly),
-                ("Unsupported", ParentDeathCleanup::Unsupported),
-            ],
+            &curated!(
+                ParentDeathCleanup,
+                [WholeTree, DirectChildOnly, Unsupported]
+            ),
             |value| value.name(),
             ParentDeathCleanup::from_name,
         ),
         configurable(
             "processkit::SoftStopScope",
-            &[
-                ("WholeTree", SoftStopScope::WholeTree),
-                ("OptInMembers", SoftStopScope::OptInMembers),
-                ("Unsupported", SoftStopScope::Unsupported),
-            ],
+            &curated!(SoftStopScope, [WholeTree, OptInMembers, Unsupported]),
             |value| value.name(),
             SoftStopScope::from_name,
         ),
         configurable(
             "processkit::StopReason",
-            &[
-                ("Predicate", StopReason::Predicate),
-                ("PolicySatisfied", StopReason::PolicySatisfied),
-                ("GaveUp", StopReason::GaveUp),
-                ("RestartsExhausted", StopReason::RestartsExhausted),
-                ("Unhealthy", StopReason::Unhealthy),
-                ("Stopped", StopReason::Stopped),
-            ],
+            &curated!(
+                StopReason,
+                [
+                    Predicate,
+                    PolicySatisfied,
+                    GaveUp,
+                    RestartsExhausted,
+                    Unhealthy,
+                    Stopped
+                ]
+            ),
             |value| value.name(),
             StopReason::from_name,
         ),
         configurable(
             "processkit::LimitKind",
-            &[
-                ("Memory", LimitKind::Memory),
-                ("Processes", LimitKind::Processes),
-                ("Cpu", LimitKind::Cpu),
-            ],
+            &curated!(LimitKind, [Memory, Processes, Cpu]),
             |value| value.name(),
             LimitKind::from_name,
         ),
         configurable(
             "processkit::LimitReason",
-            &[
-                ("Invalid", LimitReason::Invalid),
-                ("Unsupported", LimitReason::Unsupported),
-                ("Unenforceable", LimitReason::Unenforceable),
-            ],
+            &curated!(LimitReason, [Invalid, Unsupported, Unenforceable]),
             |value| value.name(),
             LimitReason::from_name,
         ),
         configurable(
             "processkit::LimitVerdict",
-            &[
-                ("Tripped", LimitVerdict::Tripped),
-                ("NotTripped", LimitVerdict::NotTripped),
-                ("Unknown", LimitVerdict::Unknown),
-            ],
+            &curated!(LimitVerdict, [Tripped, NotTripped, Unknown]),
             |value| value.name(),
             LimitVerdict::from_name,
         ),
         configurable(
             "processkit::StdioMode",
-            &[
-                ("Piped", StdioMode::Piped),
-                ("Inherit", StdioMode::Inherit),
-                ("Null", StdioMode::Null),
-            ],
+            &curated!(StdioMode, [Piped, Inherit, Null]),
             |value| value.name(),
             StdioMode::from_name,
         ),
         configurable(
             "processkit::LineTerminator",
-            &[
-                ("Newline", LineTerminator::Newline),
-                ("CarriageReturn", LineTerminator::CarriageReturn),
-            ],
+            &curated!(LineTerminator, [Newline, CarriageReturn]),
             |value| value.name(),
             LineTerminator::from_name,
         ),
         configurable(
             "processkit::OverflowMode",
-            &[
-                ("DropOldest", OverflowMode::DropOldest),
-                ("DropNewest", OverflowMode::DropNewest),
-                ("Error", OverflowMode::Error),
-            ],
+            &curated!(OverflowMode, [DropOldest, DropNewest, Error]),
             |value| value.name(),
             OverflowMode::from_name,
         ),
         configurable(
             "processkit::OutputStream",
-            &[
-                ("Stdout", OutputStream::Stdout),
-                ("Stderr", OutputStream::Stderr),
-            ],
+            &curated!(OutputStream, [Stdout, Stderr]),
             |value| value.name(),
             OutputStream::from_name,
         ),
         configurable(
             "processkit::Priority",
-            &[
-                ("Idle", Priority::Idle),
-                ("BelowNormal", Priority::BelowNormal),
-                ("Normal", Priority::Normal),
-                ("AboveNormal", Priority::AboveNormal),
-                ("High", Priority::High),
-            ],
+            &curated!(Priority, [Idle, BelowNormal, Normal, AboveNormal, High]),
             |value| value.name(),
             Priority::from_name,
         ),
         configurable(
             "processkit::RestartPolicy",
-            &[
-                ("Always", RestartPolicy::Always),
-                ("OnCrash", RestartPolicy::OnCrash),
-                ("Never", RestartPolicy::Never),
-            ],
+            &curated!(RestartPolicy, [Always, OnCrash, Never]),
             |value| value.name(),
             RestartPolicy::from_name,
         ),
         configurable_optional(
             "processkit::Signal",
-            &[
-                ("Term", Signal::Term),
-                ("Kill", Signal::Kill),
-                ("Int", Signal::Int),
-                ("Hup", Signal::Hup),
-                ("Quit", Signal::Quit),
-                ("Usr1", Signal::Usr1),
-                ("Usr2", Signal::Usr2),
-            ],
+            // `Other(n)` is the raw-number escape hatch: `name()` answers `None`
+            // for it by design (render the `i32`), so it carries no stable
+            // identifier and stays out of the dictionary — deliberately, not by
+            // omission.
+            &curated!(
+                Signal,
+                [Term, Kill, Int, Hup, Quit, Usr1, Usr2],
+                omitted: [Other]
+            ),
             |value| value.name(),
             Signal::from_name,
         ),
         configurable(
             "processkit::RlimitResource",
-            &[
-                ("Cpu", RlimitResource::Cpu),
-                ("Core", RlimitResource::Core),
-                ("Data", RlimitResource::Data),
-                ("FileSize", RlimitResource::FileSize),
-                ("NoFile", RlimitResource::NoFile),
-                ("Stack", RlimitResource::Stack),
-            ],
+            &curated!(RlimitResource, [Cpu, Core, Data, FileSize, NoFile, Stack]),
             RlimitResource::name,
             RlimitResource::from_name,
         ),
         report_only(
             "processkit::Outcome",
-            &[
-                ("Exited", Outcome::Exited(0)),
-                ("Signalled", Outcome::Signalled(None)),
-                ("TimedOut", Outcome::TimedOut),
-                ("InactivityTimedOut", Outcome::InactivityTimedOut),
-            ],
+            &curated!(
+                Outcome,
+                [
+                    Exited = Outcome::Exited(0),
+                    Signalled = Outcome::Signalled(None),
+                    TimedOut,
+                    InactivityTimedOut
+                ]
+            ),
             |value| value.name(),
         ),
         report_only(
             "processkit::ErrorKind",
-            &[
-                ("NotFound", ErrorKind::NotFound),
-                ("Spawn", ErrorKind::Spawn),
-                ("PermissionDenied", ErrorKind::PermissionDenied),
-                ("ResourceLimit", ErrorKind::ResourceLimit),
-                ("Unsupported", ErrorKind::Unsupported),
-                ("Timeout", ErrorKind::Timeout),
-                ("Cancelled", ErrorKind::Cancelled),
-                ("Predicate", ErrorKind::Predicate),
-                ("Exit", ErrorKind::Exit),
-                ("Signalled", ErrorKind::Signalled),
-                ("Other", ErrorKind::Other),
-            ],
+            &curated!(
+                ErrorKind,
+                [
+                    NotFound,
+                    Spawn,
+                    PermissionDenied,
+                    ResourceLimit,
+                    Unsupported,
+                    Timeout,
+                    Cancelled,
+                    Predicate,
+                    Exit,
+                    Signalled,
+                    Other
+                ]
+            ),
             |value| value.name(),
         ),
         report_only(
             "processkit::ProcessEvent",
-            &[
-                ("Started", ProcessEvent::Started { pid: None }),
-                ("Stdout", ProcessEvent::Stdout(OutputLine::for_test(""))),
-                ("Stderr", ProcessEvent::Stderr(OutputLine::for_test(""))),
-                ("Exited", ProcessEvent::Exited(Outcome::Exited(0))),
-            ],
+            &curated!(
+                ProcessEvent,
+                [
+                    Started = ProcessEvent::Started { pid: None },
+                    Stdout = ProcessEvent::Stdout(OutputLine::for_test("")),
+                    Stderr = ProcessEvent::Stderr(OutputLine::for_test("")),
+                    Exited = ProcessEvent::Exited(Outcome::Exited(0))
+                ]
+            ),
             ProcessEvent::name,
         ),
         report_only(
             "processkit::SupervisionEvent",
-            &[
-                (
-                    "IncarnationStarted",
-                    SupervisionEvent::IncarnationStarted {
+            &curated!(
+                SupervisionEvent,
+                [
+                    IncarnationStarted = SupervisionEvent::IncarnationStarted {
                         attempt: 1,
                         pid: None,
                     },
-                ),
-                (
-                    "IncarnationFinished",
-                    SupervisionEvent::IncarnationFinished {
+                    IncarnationFinished = SupervisionEvent::IncarnationFinished {
                         attempt: 1,
                         outcome: Outcome::Exited(0),
                         duration: std::time::Duration::from_secs(0),
                         success: true,
                     },
-                ),
-                (
-                    "IncarnationFailed",
-                    SupervisionEvent::IncarnationFailed {
+                    IncarnationFailed = SupervisionEvent::IncarnationFailed {
                         attempt: 1,
                         error: ErrorKind::Spawn,
                     },
-                ),
-                (
-                    "RestartScheduled",
-                    SupervisionEvent::RestartScheduled {
+                    RestartScheduled = SupervisionEvent::RestartScheduled {
                         restart: 1,
                         delay: std::time::Duration::from_secs(0),
                     },
-                ),
-                (
-                    "StormPaused",
-                    SupervisionEvent::StormPaused {
+                    StormPaused = SupervisionEvent::StormPaused {
                         pause: 1,
                         delay: std::time::Duration::from_secs(0),
                     },
-                ),
-                (
-                    "HealthCheckFailed",
-                    SupervisionEvent::HealthCheckFailed {
+                    HealthCheckFailed = SupervisionEvent::HealthCheckFailed {
                         attempt: 1,
                         terminal: false,
                     },
-                ),
-                ("GaveUp", SupervisionEvent::GaveUp { attempt: 1 }),
-                (
-                    "Stopped",
-                    SupervisionEvent::Stopped {
+                    GaveUp = SupervisionEvent::GaveUp { attempt: 1 },
+                    Stopped = SupervisionEvent::Stopped {
                         reason: StopReason::Stopped,
                     },
-                ),
-                (
-                    "SupervisionFailed",
-                    SupervisionEvent::SupervisionFailed {
+                    SupervisionFailed = SupervisionEvent::SupervisionFailed {
                         error: ErrorKind::Other,
                     },
-                ),
-                ("Lagged", SupervisionEvent::Lagged { skipped: 1 }),
-            ],
+                    Lagged = SupervisionEvent::Lagged { skipped: 1 }
+                ]
+            ),
             |value| value.name(),
         ),
     ]

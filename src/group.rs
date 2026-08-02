@@ -606,6 +606,10 @@ impl ProcessGroup {
     /// sweeps all members even after an error, while Windows best-effort suspends every
     /// thread and continues after individual thread failures; either per-member backend
     /// can therefore leave the group partially suspended when it returns an error.
+    /// The FreeBSD process reaper reports like the process-group mechanism: a
+    /// `PROC_REAP_KILL` refusal that names a live, non-zombie member surfaces as
+    /// [`crate::ErrorReason::Io`], every subtree is still visited, and a drained
+    /// subtree (`ESRCH`) or a zombie-only refusal stays `Ok`.
     #[cfg(feature = "process-control")]
     pub fn suspend(&self) -> Result<()> {
         self.job
@@ -627,6 +631,8 @@ impl ProcessGroup {
     /// sweeps all members even after an error, while Windows best-effort resumes every
     /// thread and continues after individual thread failures; either per-member backend
     /// can therefore leave the group partially resumed when it returns an error.
+    /// The FreeBSD process reaper reports exactly as it does for
+    /// [`suspend`](Self::suspend).
     #[cfg(feature = "process-control")]
     pub fn resume(&self) -> Result<()> {
         self.job
