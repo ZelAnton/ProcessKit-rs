@@ -11,7 +11,9 @@ Three ways a run ends early, with three different philosophies:
   your classifier says the failure is transient;
 - a **cancellation** is an *abandonment* — the caller
   changed its mind, so every path reports an error; there is no result worth
-  inspecting.
+  inspecting. (The abandonment is about the *outcome*, not the manner: the
+  goodbye can be made soft with [`cancel_grace`](#graceful-cancellation), and it
+  is still always an error.)
 
 - [Timeouts](#timeouts)
 - [Retries](#retries)
@@ -160,7 +162,8 @@ one of `drained` (the tree exited in time), `escalated` (the grace elapsed and t
 tree was hard-killed), or `spared` (a non-escalating stop left survivors) — each
 carried in a stable `phase` field and stamped by your subscriber at the instant it
 happens. This is the same soft-signal → grace → drain/kill ladder every graceful
-path drives (`timeout_grace`, `RunningProcess::shutdown`, `ProcessGroup::stop`), so
+path drives (`timeout_grace`, [`cancel_grace`](#graceful-cancellation),
+`RunningProcess::shutdown`, `ProcessGroup::stop`), so
 you get one uniform timeline whichever verb fired it. For the same facts *after* the
 teardown returns — as a typed value rather than log events — reach for
 [`ProcessGroup::stop`'s `ShutdownReport`](process-groups.md#observing-the-teardown-stop-and-shutdownreport).
@@ -259,6 +262,82 @@ The contract, path by path:
 | Under a [`Supervisor`](supervision.md) | terminal — supervision returns `Err(Cancelled)` instead of restarting into a still-cancelled token |
 | `wait_any` mid-run | surfaces `Err(Cancelled)` — each racer's wait path resolves to `Cancelled` when its token fires, the same as a bulk verb (a *pre-cancelled* token still hits the pre-spawn short-circuit) |
 | `first_line` mid-run | surfaces `ErrorReason::Cancelled` once the token fires — a cancelled stream that closes without a match is reported as cancellation, not `Ok(None)` |
+| Teardown manner | hard kill by default; SIGTERM → grace → SIGKILL with [`cancel_grace`](#graceful-cancellation) (the outcome is `Cancelled` either way) |
+
+### Graceful cancellation
+
+By default a cancellation **hard-kills** at once — the mirror image of a bare
+watchdog. Add `cancel_grace(d)` to give the tree a chance to clean up: when the
+token fires the tree is sent `SIGTERM` (or the signal chosen with `cancel_signal`,
+which needs the `process-control` feature), allowed up to the grace window to
+exit, then `SIGKILL`ed. This is the exact same SIGTERM → wait → SIGKILL ladder as
+[`timeout_grace`](#graceful-timeout) — the same driver, the same `phase`
+observability — just fired by the token instead of the deadline. A
+signal-handling child that exits ends the grace early.
+
+```rust,no_run
+use processkit::{CancellationToken, Command};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> processkit::Result<()> {
+    let shutdown = CancellationToken::new();
+
+    let job = tokio::spawn({
+        let token = shutdown.child_token();
+        async move {
+            Command::new("long-export")
+                .cancel_on(token)
+                // SIGTERM, wait up to 5s for a clean shutdown, then SIGKILL
+                .cancel_grace(Duration::from_secs(5))
+                .run()
+                .await
+        }
+    });
+
+    shutdown.cancel(); // Ctrl-C, sibling failure, …
+
+    // Still an error — only the manner of the teardown changed.
+    assert!(matches!(
+        job.await.unwrap().map_err(|e| e.into_reason()),
+        Err(processkit::ErrorReason::Cancelled { .. })
+    ));
+    Ok(())
+}
+```
+
+This is the knob for the recommended "one shared token for the whole app"
+shutdown pattern: without it, a Ctrl-C on the parent `SIGKILL`s every child
+outright, with no chance to flush state, finish a transaction, or remove a
+pidfile. `RunningProcess::shutdown(grace)` already covered that for handles you
+started by hand; `cancel_grace` extends it to the bulk verbs, the streamed runs,
+and the [`Supervisor`](supervision.md) — everything the token reaches.
+
+Ground rules:
+
+- **Opt-in, and inert by default.** Without `cancel_grace` every cancellation
+  path behaves exactly as it always has (immediate hard kill). It also does
+  nothing without a token.
+- **The outcome never changes.** Whether the child exited on the soft signal or
+  was killed after the grace, every consuming path still reports
+  `ErrorReason::Cancelled` — cancellation is still an abandonment, still never
+  retried, still terminal under `Supervisor`.
+- **Independent of the timeout knobs.** `cancel_grace`/`cancel_signal` do not
+  read (and are not filled in by) `timeout_grace`/`timeout_signal`, so a command
+  can say farewell differently for "the caller changed its mind" than for "the
+  deadline expired". `cancel_signal` defaults to `SIGTERM`, like `timeout_signal`.
+- **Same teardown scope as any cancellation.** An own-group run tears down the
+  whole tree; a shared-`ProcessGroup` run reaches only its direct child (its
+  grandchildren remain the documented shared-group gap).
+- **Windows** has no POSIX signal tier — exactly as for `timeout_grace`, the soft
+  tier is the best-effort `WM_CLOSE` post plus the opt-in
+  `windows_graceful_ctrl_break()` console event; a tree with neither is killed
+  atomically and `grace` goes unused.
+- **Cancel racing the deadline.** Cancellation still wins the race (the outcome is
+  `Cancelled`, never `TimedOut`). Which teardown runs follows the *cancellation*
+  policy: without `cancel_grace` that tie hard-kills, as it always did; with
+  `cancel_grace` it takes the graceful ladder, because that is what the caller
+  asked cancellation to do.
 
 ### Client-level default
 
@@ -322,6 +401,7 @@ async fn main() -> processkit::Result<()> {
 | "This run may not take longer than X" | `Command::timeout` |
 | "This operation is flaky, try a few times" | `Command::retry` |
 | "Stop everything when the app shuts down" | `cancel_on` + one shared token |
+| "…and let them shut down cleanly first" | `cancel_grace` alongside it |
 | "Keep this service alive across crashes" | [`Supervisor`](supervision.md) |
 | "Tell me when it's *ready*, don't kill it" | [readiness probes](streaming.md#readiness-probes) |
 

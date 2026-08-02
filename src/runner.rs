@@ -332,6 +332,17 @@ pub trait ProcessRunnerExt: ProcessRunner {
         let grace = command
             .configured_timeout_grace()
             .unwrap_or(std::time::Duration::ZERO);
+        // The teardown a *cancellation* can now legitimately take: with
+        // `Command::cancel_grace` the cancel watchdog drives a soft-signal → grace →
+        // hard-kill ladder instead of killing at once, so the cancel drain below must
+        // outlast the LONGER of the two graces (either teardown may be the one in
+        // flight when the token fires). `ZERO` without the knobs keeps today's bound
+        // byte-identical.
+        let teardown_grace = grace.max(
+            command
+                .configured_cancel_grace()
+                .unwrap_or(std::time::Duration::ZERO),
+        );
         let cancel = command.cancel_token();
         // A race-free record of whether the deadline watchdog fired: it stores
         // `TS_TIMED_OUT` *before* it kills, so reading it once the stream has
@@ -378,15 +389,22 @@ pub trait ProcessRunnerExt: ProcessRunner {
                         // shared-group handle the watchdog's pid-only kill can't
                         // close a stdout that the direct child's grandchild
                         // inherited and holds open, so the pipe never closes and
-                        // the drain would hang forever. `grace` + a fixed margin
-                        // sits past any legitimate teardown, so this backstop only
+                        // the drain would hang forever. The teardown grace + a fixed
+                        // margin sits past any legitimate teardown, so this backstop only
                         // trips in that forking gap — where the kill has already
                         // been attempted, making it safe to stop draining. It
                         // applies in BOTH timeout branches: the `None` branch has
                         // no outer whole-race backstop to lean on, so this is its
                         // only bound. Either way the honest reason is cancellation,
                         // so it stays `Cancelled`, never a false `Timeout`.
-                        let drain_backstop = grace.saturating_add(TEARDOWN_BACKSTOP_MARGIN);
+                        //
+                        // `teardown_grace` (not the deadline's `grace`) is what this
+                        // must clear: a `cancel_grace` run's watchdog only kills after
+                        // its own grace window, and bounding the drain shorter would
+                        // drop `search` — and with it the handle whose Drop aborts the
+                        // (own-group, inline) graceful teardown — mid-grace.
+                        let drain_backstop =
+                            teardown_grace.saturating_add(TEARDOWN_BACKSTOP_MARGIN);
                         let _ = tokio::time::timeout(drain_backstop, &mut search).await;
                         Err(())
                     }
@@ -399,12 +417,18 @@ pub trait ProcessRunnerExt: ProcessRunner {
         // and keep it open after the direct child dies. The inactivity backstop
         // follows the same resettable activity clock as the real watchdog, so
         // healthy periodic output never gets bounded by time-since-spawn.
+        // Both post-kill drain backstops are measured with `teardown_grace` — the
+        // longer of the deadline and cancellation graces — so they still sit past
+        // ANY legitimate teardown once `cancel_grace` can stretch one. Without that
+        // knob it equals the deadline `grace`, leaving these bounds unchanged; with
+        // it, a narrower bound would let this `Timeout` fallback preempt a
+        // still-legitimate cancellation drain and report the wrong disposition.
         let absolute_backstop = async {
             match timeout {
                 Some(limit) => {
                     tokio::time::sleep(
                         limit
-                            .saturating_add(grace)
+                            .saturating_add(teardown_grace)
                             .saturating_add(TEARDOWN_BACKSTOP_MARGIN),
                     )
                     .await
@@ -416,7 +440,8 @@ pub trait ProcessRunnerExt: ProcessRunner {
             match inactivity_timeout {
                 Some(limit) => {
                     output_activity.wait_for_inactivity(limit).await;
-                    tokio::time::sleep(grace.saturating_add(TEARDOWN_BACKSTOP_MARGIN)).await;
+                    tokio::time::sleep(teardown_grace.saturating_add(TEARDOWN_BACKSTOP_MARGIN))
+                        .await;
                 }
                 None => std::future::pending::<()>().await,
             }
@@ -1048,6 +1073,8 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
         stdout_piped: stderr_is_merged || command.stdout_is_piped(),
         stderr_piped: !stderr_is_merged && command.stderr_is_piped(),
         cancel_token: command.cancel_token(),
+        cancel_grace: command.configured_cancel_grace(),
+        cancel_signal: command.cancel_signal_raw(),
     });
     // Pid-only watchdog; own-group runs re-arm with full group+pid via `attach_group`.
     process.arm_cancel_watchdog();
@@ -1198,6 +1225,8 @@ async fn launch_pty(
         ok_codes: command.ok_codes_vec(),
         stdout_piped: command.stdout_is_piped(),
         cancel_token: command.cancel_token(),
+        cancel_grace: command.configured_cancel_grace(),
+        cancel_signal: command.cancel_signal_raw(),
     });
     process.arm_cancel_watchdog();
     Ok(process)

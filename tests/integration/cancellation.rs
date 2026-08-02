@@ -1,5 +1,7 @@
 //! Cancellation: `Command::cancel_on` and token-driven teardown.
 
+#[cfg(unix)]
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use processkit::{CancellationToken, Command, ProcessGroup};
@@ -360,4 +362,330 @@ async fn shared_group_first_line_cancel_without_timeout_is_bounded_on_a_forking_
     // Reap the grandchild the pid-only cancel kill left behind: the shared group
     // still contains it, so dropping the group tears the whole subtree down.
     drop(group);
+}
+
+// --- T-255: graceful cancellation (`cancel_grace` / `cancel_signal`) ------------
+//
+// The cancellation mirror of the `timeout_grace` coverage in `shutdown.rs`, and
+// modelled on it: children busy-wait in the shell (no separate `sleep` child that
+// would defer the trap until it returns), and the proof that the *soft* tier ran is
+// a side-effect only a catchable signal can produce — the TERM trap touching a
+// marker file. A hard `SIGKILL` is uncatchable, so the marker's presence (or
+// absence) separates "graceful" from "hard" without relying on timing alone.
+//
+// Unix-only: the soft tier is a real POSIX signal. The cross-platform half of the
+// contract — the *outcome* is unchanged by the knob — is asserted by
+// `cancel_grace_does_not_change_the_outcome` below, which runs everywhere.
+
+/// A child that installs a `TERM` trap touching `term_marker` and exiting cleanly,
+/// announces itself on stdout *and* by touching `ready_marker` (so both a streaming
+/// and a bulk caller can wait for the trap to be installed before cancelling), then
+/// busy-waits.
+#[cfg(unix)]
+fn term_trapping_child(ready_marker: &Path, term_marker: &Path) -> Command {
+    Command::new("sh").args([
+        "-c".to_string(),
+        format!(
+            "trap \"touch '{term}'; exit 0\" TERM; echo ready; touch '{ready}'; \
+             while :; do :; done",
+            term = term_marker.display(),
+            ready = ready_marker.display(),
+        ),
+    ])
+}
+
+/// The same child, but deaf to `TERM` — it can only be forced down by the grace
+/// window's final `SIGKILL`.
+#[cfg(unix)]
+fn term_ignoring_child(ready_marker: &Path) -> Command {
+    Command::new("sh").args([
+        "-c".to_string(),
+        format!(
+            "trap '' TERM; echo ready; touch '{ready}'; while :; do :; done",
+            ready = ready_marker.display(),
+        ),
+    ])
+}
+
+/// Wait until the child has installed its trap (it touches `ready` immediately
+/// after), so a cancellation provably lands on a child that *could* have caught the
+/// soft signal — otherwise "the trap never ran" would prove nothing.
+#[cfg(unix)]
+async fn await_ready_marker(ready: &Path) {
+    poll_until(
+        Duration::from_secs(15),
+        Duration::from_millis(20),
+        "the child to install its TERM trap",
+        || ready.exists(),
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess and cancels it without a grace window"]
+async fn cancel_without_grace_hard_kills_immediately() {
+    // (a) THE DEFAULT IS UNCHANGED. No `cancel_grace` → the cancel arm hard-kills
+    // at once, so the child's TERM trap never runs and the marker never appears.
+    // This is the regression guard for "the new knobs are inert unless asked for".
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (ready, term) = (dir.path().join("ready"), dir.path().join("term"));
+    let token = CancellationToken::new();
+    let cmd = term_trapping_child(&ready, &term).cancel_on(token.clone());
+
+    let run = tokio::spawn(async move { cmd.output_string().await });
+    await_ready_marker(&ready).await;
+    token.cancel();
+
+    let err = completes_within(Duration::from_secs(15), "hard cancel", run)
+        .await
+        .expect("run task")
+        .expect_err("a cancelled run must error");
+    assert!(
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+        "expected ErrorReason::Cancelled, got {err:?}"
+    );
+    assert!(
+        !term.exists(),
+        "without cancel_grace the tree must be SIGKILLed outright — an uncatchable \
+         signal, so the TERM trap must NOT have run"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess and cancels it gracefully"]
+async fn cancel_grace_lets_a_term_handling_child_exit_cleanly() {
+    // (b) With `cancel_grace`, the cancel arm of `drive_to_exit_inner` drives the
+    // same soft-signal → grace → hard-kill ladder the deadline uses: the child
+    // catches TERM, touches its marker, and exits well inside the long grace (the
+    // concurrent reap ends the window early). The outcome is still `Cancelled`.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (ready, term) = (dir.path().join("ready"), dir.path().join("term"));
+    let token = CancellationToken::new();
+    let cmd = term_trapping_child(&ready, &term)
+        .cancel_on(token.clone())
+        .cancel_grace(Duration::from_secs(10));
+
+    let run = tokio::spawn(async move { cmd.output_string().await });
+    await_ready_marker(&ready).await;
+    let cancelled_at = Instant::now();
+    token.cancel();
+
+    let err = completes_within(Duration::from_secs(20), "graceful cancel", run)
+        .await
+        .expect("run task")
+        .expect_err("a cancelled run must error however gently it was torn down");
+    assert!(
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+        "cancellation stays an error — only the teardown changed; got {err:?}"
+    );
+    assert!(
+        term.exists(),
+        "the graceful cancel must have delivered a catchable SIGTERM (the trap \
+         writes {}, which a SIGKILL could never allow)",
+        term.display()
+    );
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(5),
+        "a TERM-handling child must end the 10s grace early (took {:?})",
+        cancelled_at.elapsed()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a TERM-ignoring subprocess and cancels it; escalates after the grace"]
+async fn cancel_grace_escalates_to_kill_after_the_grace() {
+    // (c) A child that ignores the soft signal still dies — after, and only after,
+    // the grace window elapses. The lower bound is what proves the grace was
+    // actually waited out rather than skipped.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let ready = dir.path().join("ready");
+    let token = CancellationToken::new();
+    let cmd = term_ignoring_child(&ready)
+        .cancel_on(token.clone())
+        .cancel_grace(Duration::from_millis(500));
+
+    let run = tokio::spawn(async move { cmd.output_string().await });
+    await_ready_marker(&ready).await;
+    let cancelled_at = Instant::now();
+    token.cancel();
+
+    let err = completes_within(Duration::from_secs(20), "escalating cancel", run)
+        .await
+        .expect("run task")
+        .expect_err("a cancelled run must error");
+    assert!(
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+        "expected ErrorReason::Cancelled, got {err:?}"
+    );
+    assert!(
+        cancelled_at.elapsed() >= Duration::from_millis(400),
+        "a TERM-ignoring child must ride out the grace before the SIGKILL (took {:?})",
+        cancelled_at.elapsed()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess and cancels a streamed run through the cancel watchdog"]
+async fn cancel_grace_is_honored_by_the_cancel_watchdog_on_a_streamed_run() {
+    use tokio_stream::StreamExt;
+
+    // The `arm_cancel_watchdog` path — the motivating gap. On a live streamed run
+    // no finisher owns the child yet, so the DETACHED cancel watchdog is the only
+    // thing that can tear the tree down when the token fires. Before this change it
+    // unconditionally `kill_all()`ed; it must now drive the group's graceful
+    // terminate instead when `cancel_grace` is set.
+    //
+    // The proof is ordered, not timing-based: the stream can only end once the
+    // child's pipes close, i.e. once the child exited — and the marker is asserted
+    // BEFORE `finish()` is ever called, so it can only have been the watchdog's
+    // signal that produced it.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (ready, term) = (dir.path().join("ready"), dir.path().join("term"));
+    let token = CancellationToken::new();
+    let mut run = term_trapping_child(&ready, &term)
+        .cancel_on(token.clone())
+        .cancel_grace(Duration::from_secs(10))
+        .start()
+        .await
+        .expect("start");
+
+    let mut lines = run.stdout_lines().expect("stream stdout");
+    let first = completes_within(Duration::from_secs(15), "the ready banner", lines.next())
+        .await
+        .expect("banner line");
+    assert_eq!(first, "ready", "the trap is installed before the banner");
+
+    let cancelled_at = Instant::now();
+    token.cancel();
+
+    // The graceful teardown ends the stream: the trap exits the child and its pipes
+    // close. An unwired graceful branch would leave the busy-loop running until the
+    // grace elapsed into a SIGKILL — well past this bound.
+    completes_within(
+        Duration::from_secs(8),
+        "the cancelled stream to end",
+        async { while lines.next().await.is_some() {} },
+    )
+    .await;
+    assert!(
+        term.exists(),
+        "the cancel WATCHDOG (no finisher has run yet) must have delivered the \
+         catchable SIGTERM, not a SIGKILL"
+    );
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(5),
+        "a TERM-handling streamed child must end the 10s grace early (took {:?})",
+        cancelled_at.elapsed()
+    );
+
+    let err = run
+        .finish()
+        .await
+        .expect_err("finishing a cancelled streamed run must error");
+    assert!(
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+        "expected ErrorReason::Cancelled, got {err:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess in a SHARED group and cancels it gracefully"]
+async fn cancel_grace_in_a_shared_group_signals_the_direct_child() {
+    // A shared-group handle owns no group, so the graceful cancellation reaches only
+    // its own direct child — by pid, through the same `PidGate`-scoped ladder the
+    // shared-group graceful *timeout* uses. The sibling must be untouched, exactly
+    // as for a hard cancel.
+    let group = ProcessGroup::new().expect("create group");
+    let sibling = group.start(&sleep_secs(30)).await.expect("start sibling");
+    let sibling_pid = sibling.pid().expect("sibling pid");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (ready, term) = (dir.path().join("ready"), dir.path().join("term"));
+    let token = CancellationToken::new();
+    let run = group
+        .start(
+            &term_trapping_child(&ready, &term)
+                .cancel_on(token.clone())
+                .cancel_grace(Duration::from_secs(10)),
+        )
+        .await
+        .expect("start cancellable child");
+
+    await_ready_marker(&ready).await;
+    let cancelled_at = Instant::now();
+    token.cancel();
+
+    let err = completes_within(
+        Duration::from_secs(20),
+        "shared-group graceful cancel",
+        run.output_string(),
+    )
+    .await
+    .expect_err("a cancelled run must error");
+    assert!(
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+        "expected ErrorReason::Cancelled, got {err:?}"
+    );
+    assert!(
+        term.exists(),
+        "the shared-group graceful cancel must signal the direct child, not SIGKILL it"
+    );
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(5),
+        "a TERM-handling child must end the 10s grace early (took {:?})",
+        cancelled_at.elapsed()
+    );
+    assert!(
+        pid_alive(sibling_pid),
+        "a graceful cancel keeps the same child-only scope as a hard one"
+    );
+    drop(sibling);
+}
+
+#[tokio::test]
+#[ignore = "spawns a real subprocess and cancels it with a grace window configured"]
+async fn cancel_grace_does_not_change_the_outcome() {
+    // The cross-platform half of the contract, and the only graceful-cancellation
+    // test that runs on Windows (where there is no POSIX signal tier, so the ladder
+    // degrades to the atomic Job kill and `grace` goes unused — as documented for
+    // `timeout_grace`). Either way the run must resolve to `Cancelled`, promptly:
+    // riding out the whole grace would fail the bound.
+    let token = CancellationToken::new();
+    let cmd = sleep_secs(30)
+        .cancel_on(token.clone())
+        .cancel_grace(Duration::from_secs(10));
+
+    let canceller = tokio::spawn({
+        let token = token.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            token.cancel();
+        }
+    });
+
+    let start = Instant::now();
+    let err = completes_within(
+        Duration::from_secs(15),
+        "cancel with a grace window",
+        cmd.output_string(),
+    )
+    .await
+    .expect_err("a cancelled run must error, grace window or not");
+    canceller.await.expect("canceller task");
+    assert!(
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+        "expected ErrorReason::Cancelled, got {err:?}"
+    );
+    // A plain sleeper does not catch the soft signal (and Windows kills atomically),
+    // so the grace must end early on every platform rather than being ridden out.
+    assert!(
+        start.elapsed() < Duration::from_secs(8),
+        "the grace must end as soon as the tree drains (took {:?})",
+        start.elapsed()
+    );
 }

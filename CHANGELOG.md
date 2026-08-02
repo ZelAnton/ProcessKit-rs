@@ -13,6 +13,14 @@ to a dated version section.
 
 ### Added
 
+- Add opt-in graceful cancellation: `Command::cancel_grace` and `cancel_signal`
+  route a fired `cancel_on` token through the same soft-signal → grace →
+  hard-kill ladder as `timeout_grace`/`timeout_signal`, on every cancellation
+  path (bulk verbs, streamed runs, `wait_any`, and `Supervisor` incarnations).
+  The default is unchanged — without `cancel_grace` a cancellation is still an
+  immediate hard kill — and the outcome is unchanged either way: cancellation
+  remains `ErrorReason::Cancelled`.
+
 - Add `just setup` for a CI-aligned developer tool bootstrap and read-only
   `just doctor` version, toolchain, cross-target, and Docker diagnostics.
 - Add a dedicated typed CLI-client guide covering `CliClient`, `cli_client!`,

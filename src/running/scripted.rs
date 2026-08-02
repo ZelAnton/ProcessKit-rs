@@ -537,6 +537,8 @@ impl RunningProcess {
             // raw kill through it is a no-op regardless of retirement.
             pid_gate: Arc::new(PidGate::new(None)),
             cancel_token: command.cancel_token(),
+            cancel_grace: command.configured_cancel_grace(),
+            cancel_signal: command.cancel_signal_raw(),
             cancel_task: None,
             cancel_at_exit: None,
             started: Instant::now(),
