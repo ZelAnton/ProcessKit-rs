@@ -439,6 +439,15 @@ impl LimitEvidence {
 /// no longer in force, but it did fire, and reporting `NotTripped` there would be a
 /// lie. It also keeps the evidence read off the axes that were never capped, so a
 /// group created without limits performs **no** evidence I/O at all.
+///
+/// Recorded **conservatively** for the same reason: every axis an `update_limits`
+/// request names goes on the record once the request reaches the OS, whether that
+/// call then succeeds or fails. A failed update is not a rollback — the backends
+/// write the axes one at a time — so an axis of a failed request may well be in
+/// force, and leaving it off the record would make `limit_evidence` answer
+/// `NotTripped` for it without reading a single counter. Erring towards a read (or,
+/// where the mechanism keeps no record, towards `Unknown`) can only cost an extra
+/// file read; erring the other way manufactures a verdict.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CappedAxes {
     memory: bool,
