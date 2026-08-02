@@ -212,9 +212,12 @@ probe). That probe never takes a delivery path — FreeBSD routes it back throug
 the process group, which has no state reader on any BSD but macOS — so the
 `EPERM` rule above does not extend to it there: on FreeBSD and the bare BSDs a
 live target that rejects even the null signal is still an `Ok`, where Linux and
-macOS surface it. On the cgroup mechanism the `SIGSTOP`/`SIGCONT` fallback used for
-`suspend`/`resume` on pre-5.2 kernels (no `cgroup.freeze`) surfaces failures the
-same way.
+macOS surface it. `suspend`/`resume` on that process-group mechanism now apply
+the same honest verdict to `SIGSTOP`/`SIGCONT`: a live-member `EPERM` is an
+`Err`, while `ESRCH`, zombie-only `EPERM`, an empty group, and
+BSD-without-state-reader `EPERM` remain `Ok`. On the cgroup mechanism the
+`SIGSTOP`/`SIGCONT` fallback used on pre-5.2 kernels (no `cgroup.freeze`)
+surfaces failures the same way.
 
 `soft_stop_scope()` answers, *before* you attempt a soft `Int`/`Term`, which
 members it would reach — a side-effect-free `SoftStopScope` capability report read

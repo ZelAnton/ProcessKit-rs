@@ -47,6 +47,15 @@ to a dated version section.
 
 ### Changed
 
+- `ProcessGroup::suspend` / `resume` on the POSIX process-group mechanism
+  (macOS/BSD and the Linux process-group fallback) now report a genuinely
+  failed `SIGSTOP` / `SIGCONT` delivery as `ErrorReason::Io`, matching the earlier
+  truthful reporting for `ProcessGroup::signal`: an `EPERM` from a live,
+  non-zombie member (for example, a uid-changed child that rejects `SIGSTOP`)
+  now surfaces instead of being swallowed. An `ESRCH`, a harmless zombie-only
+  `EPERM`, an empty group, and every `EPERM` on BSD targets without a process
+  state reader still return `Ok`. Signatures are unchanged; this only makes
+  error reporting on these edge inputs truthful (not a breaking API change).
 - Release a freshly contained Windows child through a per-process thread walk
   instead of a system-wide thread snapshot, cutting the crate's fixed start cost
   for a short-lived child to within noise of a plain unguarded spawn; the
@@ -64,6 +73,10 @@ to a dated version section.
 
 ### Fixed
 
+- Record every axis an `update_limits` request names on the group's cap ledger
+  even when applying it fails, so a cap that landed before a part-way failure can
+  no longer be reported as `NotTripped` by `limit_evidence` without reading a
+  counter; document that a failed update is not a rollback of the OS container.
 - Keep the local direct-minimal-versions check from rewriting the tracked
   `Cargo.lock` while it validates dependency floors.
 - Keep local musl nextest reports in the Docker target volume so Windows host

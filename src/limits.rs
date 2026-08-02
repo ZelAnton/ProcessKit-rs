@@ -214,18 +214,29 @@ impl LimitReason {
     }
 }
 
-/// The post-run verdict for **one** limit axis — did the cap that was in force
+/// The post-run verdict for **one** limit axis — did a cap this group carried
 /// actually engage while the tree ran?
 ///
-/// This is the **opposite side** of [`ErrorReason::ResourceLimit`](crate::ErrorReason::ResourceLimit)
-/// and its [`LimitReason`]. That error answers a *pre-spawn admission* question —
+/// This is the **other side** of [`ErrorReason::ResourceLimit`](crate::ErrorReason::ResourceLimit)
+/// and its [`LimitReason`]. That error answers an *admission* question —
 /// "why could the cap you asked for not be **applied**?" ([`Invalid`](LimitReason::Invalid) /
 /// [`Unsupported`](LimitReason::Unsupported) / [`Unenforceable`](LimitReason::Unenforceable)).
 /// This verdict answers the *post-run* question that only the container itself can
-/// answer — "the cap **was** applied; did it then actually **fire**?" — read from
+/// answer — "did a cap on this axis then actually **fire**?" — read from
 /// [`ProcessGroup::limit_evidence`](crate::ProcessGroup::limit_evidence). Neither
 /// replaces the other, and the error's semantics are unchanged by this type's
 /// existence.
+///
+/// Different questions, but on a *live* group they can meet on the same axis. A
+/// failed [`ProcessGroup::update_limits`](crate::ProcessGroup::update_limits) is
+/// not a rollback — the backends write the axes one at a time — so an axis of a
+/// rejected request may well be in force, and it stays on the group's cap record
+/// either way. The error then says "the set you asked for could not be applied
+/// whole"; this verdict still answers "and what actually fired?" from the kernel's
+/// own counters, rather than assuming the axis innocent. Only
+/// [`ProcessGroup::with_options`](crate::ProcessGroup::with_options) fails strictly
+/// before anything runs: it hands back no group at all, so there is nothing left to
+/// ask.
 ///
 /// # Never a guess
 ///
@@ -444,6 +455,15 @@ impl LimitEvidence {
 /// no longer in force, but it did fire, and reporting `NotTripped` there would be a
 /// lie. It also keeps the evidence read off the axes that were never capped, so a
 /// group created without limits performs **no** evidence I/O at all.
+///
+/// Recorded **conservatively** for the same reason: every axis an `update_limits`
+/// request names goes on the record once the request reaches the OS, whether that
+/// call then succeeds or fails. A failed update is not a rollback — the backends
+/// write the axes one at a time — so an axis of a failed request may well be in
+/// force, and leaving it off the record would make `limit_evidence` answer
+/// `NotTripped` for it without reading a single counter. Erring towards a read (or,
+/// where the mechanism keeps no record, towards `Unknown`) can only cost an extra
+/// file read; erring the other way manufactures a verdict.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CappedAxes {
     memory: bool,
