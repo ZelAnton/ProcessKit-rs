@@ -39,6 +39,15 @@ to a dated version section.
 
 ### Changed
 
+- `ProcessGroup::suspend` / `resume` on the POSIX process-group mechanism
+  (macOS/BSD and the Linux process-group fallback) now report a genuinely
+  failed `SIGSTOP` / `SIGCONT` delivery as `ErrorReason::Io`, matching the earlier
+  truthful reporting for `ProcessGroup::signal`: an `EPERM` from a live,
+  non-zombie member (for example, a uid-changed child that rejects `SIGSTOP`)
+  now surfaces instead of being swallowed. An `ESRCH`, a harmless zombie-only
+  `EPERM`, an empty group, and every `EPERM` on BSD targets without a process
+  state reader still return `Ok`. Signatures are unchanged; this only makes
+  error reporting on these edge inputs truthful (not a breaking API change).
 - Release a freshly contained Windows child through a per-process thread walk
   instead of a system-wide thread snapshot, cutting the crate's fixed start cost
   for a short-lived child to within noise of a plain unguarded spawn; the

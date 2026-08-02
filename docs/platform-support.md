@@ -176,9 +176,11 @@ cgroup verdict by checking the target's run state after an `EPERM`, so a harmles
 zombie-only `EPERM` — and every `EPERM` on the bare BSDs (no state reader) —
 stays swallowed; an `ESRCH` race (the member already exited) is still success,
 and `Signal::Other(0)` returns `Ok` having delivered nothing (the POSIX existence
-probe). On the cgroup mechanism the `SIGSTOP`/`SIGCONT` fallback used for
-`suspend`/`resume` on pre-5.2 kernels (no `cgroup.freeze`) surfaces failures the
-same way.
+probe). `suspend`/`resume` on that process-group mechanism now apply the same
+honest verdict to `SIGSTOP`/`SIGCONT`: a live-member `EPERM` is an `Err`, while
+`ESRCH`, zombie-only `EPERM`, an empty group, and BSD-without-state-reader
+`EPERM` remain `Ok`. On the cgroup mechanism the `SIGSTOP`/`SIGCONT` fallback
+used on pre-5.2 kernels (no `cgroup.freeze`) surfaces failures the same way.
 
 `soft_stop_scope()` answers, *before* you attempt a soft `Int`/`Term`, which
 members it would reach — a side-effect-free `SoftStopScope` capability report read

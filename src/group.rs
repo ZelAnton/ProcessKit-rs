@@ -565,6 +565,9 @@ impl ProcessGroup {
     ///
     /// [`crate::ErrorReason::Unsupported`] if the active mechanism cannot freeze the tree;
     /// otherwise [`crate::ErrorReason::Io`] if the OS rejects the freeze / `SIGSTOP`.
+    /// The freeze loop proceeds until all members are processed, even after an error.
+    /// An error indicates that the OS rejected an operation against at least one member,
+    /// but the group may remain partially suspended.
     #[cfg(feature = "process-control")]
     pub fn suspend(&self) -> Result<()> {
         self.job
@@ -581,6 +584,9 @@ impl ProcessGroup {
     ///
     /// [`crate::ErrorReason::Unsupported`] if the active mechanism cannot thaw the tree;
     /// otherwise [`crate::ErrorReason::Io`] if the OS rejects the resume / `SIGCONT`.
+    /// The resume loop proceeds until all members are processed, even after an error.
+    /// An error indicates that the OS rejected an operation against at least one member,
+    /// but the group may remain partially resumed.
     #[cfg(feature = "process-control")]
     pub fn resume(&self) -> Result<()> {
         self.job

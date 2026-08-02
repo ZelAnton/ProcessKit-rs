@@ -341,7 +341,11 @@ after an `EPERM`, so a harmless zombie-only `EPERM` — and, on the bare BSDs wh
 no state reader exists, every `EPERM` — stays swallowed. An `ESRCH` race (the
 member already exited) is still success. `Signal::Other(0)` is the POSIX
 existence probe: it returns `Ok` having **delivered nothing** (a live target was
-reached, not signalled).
+reached, not signalled). `suspend`/`resume` on the process-group mechanism now
+use the same honest delivery verdict for `SIGSTOP`/`SIGCONT`: a live-member
+`EPERM` surfaces as an `Err`, while `ESRCH`, zombie-only `EPERM`, an empty group,
+and BSD-without-state-reader `EPERM` remain `Ok`. The older-kernel cgroup
+per-process fallback reports its `SIGSTOP`/`SIGCONT` failures the same way.
 
 ## Asking whether a soft stop is available
 

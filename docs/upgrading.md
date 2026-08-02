@@ -193,6 +193,49 @@ compiler-caught (the signature is unchanged, `Result<()>`):
   probe still report `Ok`. A caller that ignored the return value is unaffected; one
   that inspects it now sees these real failures.
 
+### `ProcessGroup::suspend` / `resume` report POSIX delivery failures (not compiler-caught)
+
+This behavior change is **not compiler-caught**: both methods still return the same
+`Result<()>`, but on the POSIX process-group mechanism (macOS/BSD and the Linux
+process-group fallback) a real `SIGSTOP` / `SIGCONT` delivery failure now reaches the
+caller as `ErrorReason::Io`. In particular, `EPERM` from a live, non-zombie member now
+surfaces; `ESRCH`, harmless zombie-only `EPERM`, an empty group, and `EPERM` on a BSD
+target without a process-state reader remain `Ok`.
+
+Before, code could treat a successful call as guaranteed because the backend swallowed
+every send failure:
+
+```rust,no_run
+# use processkit::ProcessGroup;
+# fn pause(group: &ProcessGroup) -> processkit::Result<()> {
+group.suspend()?; // POSIX pgroup used to return Ok even when SIGSTOP was rejected.
+// Work that assumes the whole tree is frozen.
+group.resume()?;
+# Ok(())
+# }
+```
+
+After, review those call sites and handle a delivery error explicitly before assuming
+the whole tree reached the requested state:
+
+```rust,no_run
+# use processkit::ProcessGroup;
+# fn pause(group: &ProcessGroup) -> processkit::Result<()> {
+if let Err(err) = group.suspend() {
+    // The sweep still visited every member, so some members may be suspended.
+    return Err(err);
+}
+// Work that requires the tree to be frozen.
+group.resume()?; // Review and handle a partial-resume error here as well.
+# Ok(())
+# }
+```
+
+This requires a **code review, not just a rebuild**, for callers that assumed `Ok(())`
+meant every member was suspended or resumed. The sweep continues after a rejected
+operation, so `Err` does not mean that nothing changed: the group can be partially
+suspended or resumed.
+
 ### PTY support is now available (additive)
 
 3.0 adds an opt-in real pseudo-terminal backend for tools that require a
