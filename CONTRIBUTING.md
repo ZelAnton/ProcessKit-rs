@@ -43,10 +43,17 @@ once to install the repository's CI-aligned toolchains and CLIs, then `just
 doctor` for a read-only version/status report; Docker remains a manual
 prerequisite and is reported separately. Run `just --list` to see the optional
 recipes (`just ci-nightly`, `just msrv`, `just public-api-diff`, `just
-test-musl`) that mirror
+identifiers-diff`, `just test-musl`) that mirror
 the remaining CI jobs (`test-musl` uses Docker to run the
 real-subprocess suite inside a real Alpine/musl container, mirroring the CI
 `test-musl` job; see [platform-support.md](docs/platform-support.md#ci-coverage)).
+
+When a stable `name()` / `from_name()` dictionary changes, update the canonical
+[`spec/identifiers.json`](spec/identifiers.json) and the explanatory table in
+[`docs/errors.md`](docs/errors.md#stable-machine-identifiers) together, then run
+`just identifiers-diff`. The recipe independently rebuilds the all-features
+dictionary from the public enum methods and byte-compares it with the committed
+manifest.
 
 ### Build-disk maintenance
 

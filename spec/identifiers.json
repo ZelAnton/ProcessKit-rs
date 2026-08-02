@@ -1,0 +1,170 @@
+{
+  "schema_version": 1,
+  "maintenance": "Canonical stable-identifier dictionary; update docs/errors.md together with this manifest.",
+  "enums": [
+    {
+      "path": "processkit::Mechanism",
+      "class": "configurable",
+      "variants": [
+        { "variant": "JobObject", "identifier": "job_object" },
+        { "variant": "CgroupV2", "identifier": "cgroup_v2" },
+        { "variant": "ProcessGroup", "identifier": "process_group" }
+      ]
+    },
+    {
+      "path": "processkit::ParentDeathCleanup",
+      "class": "configurable",
+      "variants": [
+        { "variant": "WholeTree", "identifier": "whole_tree" },
+        { "variant": "DirectChildOnly", "identifier": "direct_child_only" },
+        { "variant": "Unsupported", "identifier": "none" }
+      ]
+    },
+    {
+      "path": "processkit::SoftStopScope",
+      "class": "configurable",
+      "variants": [
+        { "variant": "WholeTree", "identifier": "whole_tree" },
+        { "variant": "OptInMembers", "identifier": "opt_in_members" },
+        { "variant": "Unsupported", "identifier": "none" }
+      ]
+    },
+    {
+      "path": "processkit::StopReason",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Predicate", "identifier": "predicate" },
+        { "variant": "PolicySatisfied", "identifier": "policy_satisfied" },
+        { "variant": "GaveUp", "identifier": "gave_up" },
+        { "variant": "RestartsExhausted", "identifier": "restarts_exhausted" },
+        { "variant": "Unhealthy", "identifier": "unhealthy" },
+        { "variant": "Stopped", "identifier": "stopped" }
+      ]
+    },
+    {
+      "path": "processkit::LimitKind",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Memory", "identifier": "memory" },
+        { "variant": "Processes", "identifier": "processes" },
+        { "variant": "Cpu", "identifier": "cpu" }
+      ]
+    },
+    {
+      "path": "processkit::LimitReason",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Invalid", "identifier": "invalid" },
+        { "variant": "Unsupported", "identifier": "unsupported" },
+        { "variant": "Unenforceable", "identifier": "unenforceable" }
+      ]
+    },
+    {
+      "path": "processkit::LimitVerdict",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Tripped", "identifier": "tripped" },
+        { "variant": "NotTripped", "identifier": "not_tripped" },
+        { "variant": "Unknown", "identifier": "unknown" }
+      ]
+    },
+    {
+      "path": "processkit::StdioMode",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Piped", "identifier": "piped" },
+        { "variant": "Inherit", "identifier": "inherit" },
+        { "variant": "Null", "identifier": "null" }
+      ]
+    },
+    {
+      "path": "processkit::LineTerminator",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Newline", "identifier": "newline" },
+        { "variant": "CarriageReturn", "identifier": "carriage_return" }
+      ]
+    },
+    {
+      "path": "processkit::OverflowMode",
+      "class": "configurable",
+      "variants": [
+        { "variant": "DropOldest", "identifier": "drop_oldest" },
+        { "variant": "DropNewest", "identifier": "drop_newest" },
+        { "variant": "Error", "identifier": "error" }
+      ]
+    },
+    {
+      "path": "processkit::Priority",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Idle", "identifier": "idle" },
+        { "variant": "BelowNormal", "identifier": "below_normal" },
+        { "variant": "Normal", "identifier": "normal" },
+        { "variant": "AboveNormal", "identifier": "above_normal" },
+        { "variant": "High", "identifier": "high" }
+      ]
+    },
+    {
+      "path": "processkit::RestartPolicy",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Always", "identifier": "always" },
+        { "variant": "OnCrash", "identifier": "on_crash" },
+        { "variant": "Never", "identifier": "never" }
+      ]
+    },
+    {
+      "path": "processkit::Signal",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Term", "identifier": "term" },
+        { "variant": "Kill", "identifier": "kill" },
+        { "variant": "Int", "identifier": "int" },
+        { "variant": "Hup", "identifier": "hup" },
+        { "variant": "Quit", "identifier": "quit" },
+        { "variant": "Usr1", "identifier": "usr1" },
+        { "variant": "Usr2", "identifier": "usr2" }
+      ]
+    },
+    {
+      "path": "processkit::RlimitResource",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Cpu", "identifier": "cpu" },
+        { "variant": "Core", "identifier": "core" },
+        { "variant": "Data", "identifier": "data" },
+        { "variant": "FileSize", "identifier": "file_size" },
+        { "variant": "NoFile", "identifier": "no_file" },
+        { "variant": "Stack", "identifier": "stack" }
+      ]
+    },
+    {
+      "path": "processkit::Outcome",
+      "class": "report_only",
+      "variants": [
+        { "variant": "Exited", "identifier": "exited" },
+        { "variant": "Signalled", "identifier": "signalled" },
+        { "variant": "TimedOut", "identifier": "timed_out" },
+        { "variant": "InactivityTimedOut", "identifier": "inactivity_timed_out" }
+      ]
+    },
+    {
+      "path": "processkit::ErrorKind",
+      "class": "report_only",
+      "variants": [
+        { "variant": "NotFound", "identifier": "not_found" },
+        { "variant": "Spawn", "identifier": "spawn" },
+        { "variant": "PermissionDenied", "identifier": "permission_denied" },
+        { "variant": "ResourceLimit", "identifier": "resource_limit" },
+        { "variant": "Unsupported", "identifier": "unsupported" },
+        { "variant": "Timeout", "identifier": "timeout" },
+        { "variant": "Cancelled", "identifier": "cancelled" },
+        { "variant": "Predicate", "identifier": "predicate" },
+        { "variant": "Exit", "identifier": "exit" },
+        { "variant": "Signalled", "identifier": "signalled" },
+        { "variant": "Other", "identifier": "other" }
+      ]
+    }
+  ]
+}

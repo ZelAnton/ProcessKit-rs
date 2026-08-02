@@ -43,6 +43,22 @@ impl RlimitResource {
         }
     }
 
+    /// Parse a [`name`](Self::name) identifier back into an `RlimitResource`.
+    ///
+    /// Returns `None` for any string that is not exactly one of the stable
+    /// identifiers, so an unknown resource is never silently substituted.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "cpu" => Some(Self::Cpu),
+            "core" => Some(Self::Core),
+            "data" => Some(Self::Data),
+            "file_size" => Some(Self::FileSize),
+            "no_file" => Some(Self::NoFile),
+            "stack" => Some(Self::Stack),
+            _ => None,
+        }
+    }
+
     #[cfg(unix)]
     pub(crate) fn prepare(self, soft: u64, hard: u64) -> io::Result<libc::rlimit> {
         if soft > hard {
@@ -96,12 +112,17 @@ mod tests {
 
     #[test]
     fn stable_names_cover_every_resource() {
-        assert_eq!(RlimitResource::Cpu.name(), "cpu");
-        assert_eq!(RlimitResource::Core.name(), "core");
-        assert_eq!(RlimitResource::Data.name(), "data");
-        assert_eq!(RlimitResource::FileSize.name(), "file_size");
-        assert_eq!(RlimitResource::NoFile.name(), "no_file");
-        assert_eq!(RlimitResource::Stack.name(), "stack");
+        for resource in [
+            RlimitResource::Cpu,
+            RlimitResource::Core,
+            RlimitResource::Data,
+            RlimitResource::FileSize,
+            RlimitResource::NoFile,
+            RlimitResource::Stack,
+        ] {
+            assert_eq!(RlimitResource::from_name(resource.name()), Some(resource));
+        }
+        assert_eq!(RlimitResource::from_name("nofile"), None);
     }
 
     #[cfg(unix)]

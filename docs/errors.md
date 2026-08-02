@@ -183,9 +183,14 @@ one canonical string per enum variant, not a table you hand-maintain (and that
 silently mislabels a new variant as "unknown"). The reporting and configuration
 enums carry that table for you:
 
+The language-neutral, canonical dictionary is
+[`spec/identifiers.json`](../spec/identifiers.json). The table below explains
+the Rust API that produces it; both shapes describe the same contract and must
+change together.
+
 | Method | On | Direction |
 |---|---|---|
-| `name() -> &'static str` | `Mechanism`, `Outcome`, `ErrorKind`, `ParentDeathCleanup`, `SoftStopScope`, `StopReason`, `LimitKind`, `LimitReason`, `LimitVerdict`, `StdioMode`, `LineTerminator`, `OverflowMode`, `Priority`, `RestartPolicy` | A short, lowercase `snake_case` identifier for the variant. |
+| `name() -> &'static str` | `Mechanism`, `Outcome`, `ErrorKind`, `ParentDeathCleanup`, `SoftStopScope`, `StopReason`, `LimitKind`, `LimitReason`, `LimitVerdict`, `StdioMode`, `LineTerminator`, `OverflowMode`, `Priority`, `RestartPolicy`, `RlimitResource` | A short, lowercase `snake_case` identifier for the variant. |
 | `name() -> Option<&'static str>` | `Signal` | `Some(id)` for a curated signal; `None` for the raw-number `Signal::Other` (render its `i32` instead). |
 | `from_name(&str) -> Option<Self>` | every enum above **except** `Outcome` and `ErrorKind` — `LimitVerdict` included, so a recorded `tripped` / `not_tripped` / `unknown` parses back | Parse an identifier back into the value; `None` — not a default — for an unrecognized name. |
 

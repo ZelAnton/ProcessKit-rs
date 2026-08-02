@@ -503,6 +503,11 @@ jobs:
       # every run for a toolchain reason, not on actual API drift.
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
+      # The committed JSON is the cross-language form of the same stable names
+      # exposed by Rust. The integration test rebuilds it from the enum values
+      # and compares bytes, so identifier drift must update both contracts.
+      - name: Diff stable identifiers vs manifest
+        run: cargo +stable test --all-features --test identifiers_manifest identifiers_manifest_matches -- --exact
       - name: Install cargo-public-api
         run: cargo install cargo-public-api --locked
       # Real gate: the crate is past 1.0, so any public-surface change is a
