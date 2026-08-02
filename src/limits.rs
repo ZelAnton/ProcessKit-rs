@@ -364,11 +364,12 @@ impl LimitEvidence {
     ///
     /// Built only by the backends that have a container to read a post-mortem
     /// from — the Linux cgroup v2 backend and the Windows Job Object backend.
-    /// The POSIX process group (macOS/BSD) has no whole-tree accounting at all
-    /// and answers with `unknown`, which assembles the struct literally, leaving
-    /// this constructor unused on exactly that target; allow it there rather than
-    /// deleting a constructor the other two backends need (mirrors the
-    /// `unknown` allow below and `sys::ProcIdentity`'s per-target allow).
+    /// The POSIX process group (macOS/the other BSDs) and the FreeBSD process
+    /// reaper have no whole-tree accounting at all and answer with `unknown`, which
+    /// assembles the struct literally, leaving this constructor unused on exactly
+    /// those targets; allow it there rather than deleting a constructor the other
+    /// two backends need (mirrors the `unknown` allow below and
+    /// `sys::ProcIdentity`'s per-target allow).
     #[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
     pub(crate) const fn new(
         memory: LimitVerdict,
@@ -386,10 +387,12 @@ impl LimitEvidence {
     /// mechanism with no whole-tree resource accounting at all.
     ///
     /// Built only by the backends that *have* such a mechanism to fall back from —
-    /// the POSIX process group (macOS/BSD, and the Linux cgroup-less fallback).
-    /// Windows always has a Job Object and answers per axis, leaving this unused
-    /// there; allow it on exactly that target rather than deleting a constructor the
-    /// other two backends need (mirrors `sys::ProcIdentity`'s per-target allow).
+    /// the POSIX process group (macOS/the other BSDs, and the Linux cgroup-less
+    /// fallback) and the FreeBSD process reaper, which contains a tree without
+    /// accounting for it. Windows always has a Job Object and answers per axis,
+    /// leaving this unused there; allow it on exactly that target rather than
+    /// deleting a constructor the other backends need (mirrors
+    /// `sys::ProcIdentity`'s per-target allow).
     #[cfg_attr(windows, allow(dead_code))]
     pub(crate) const fn unknown() -> Self {
         Self {
@@ -460,11 +463,11 @@ impl CappedAxes {
     ///
     /// Read only by the backends that gather per-axis evidence and so need to
     /// know which axes are worth reading — the Linux cgroup v2 backend and the
-    /// Windows Job Object backend. The POSIX process group (macOS/BSD) reports
-    /// every axis `Unknown` and ignores the record entirely, leaving this method
-    /// unused on exactly that target; allow it there rather than deleting a
-    /// method the other two backends need (mirrors `LimitEvidence::new` above
-    /// and `sys::ProcIdentity`'s per-target allow).
+    /// Windows Job Object backend. The POSIX process group (macOS/the other BSDs)
+    /// and the FreeBSD process reaper report every axis `Unknown` and ignore the
+    /// record entirely, leaving this method unused on exactly those targets; allow
+    /// it there rather than deleting a method the other two backends need (mirrors
+    /// `LimitEvidence::new` above and `sys::ProcIdentity`'s per-target allow).
     #[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
     pub(crate) fn has(&self, kind: LimitKind) -> bool {
         match kind {

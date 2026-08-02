@@ -323,15 +323,15 @@ async fn main() -> processkit::Result<()> {
 | Linux (cgroup or pgroup), FreeBSD reaper, macOS/other BSD | Any — `Term`, `Kill`, `Int`, `Hup`, `Quit`, `Usr1`, `Usr2`, `Other(n)` |
 | Windows | `Kill` (Job Object terminate); `Int`/`Term` as a best-effort soft close (`CTRL_BREAK` to console leaders + `WM_CLOSE` to windowed members) — `ErrorReason::Unsupported` only when neither exists; every other signal → `ErrorReason::Unsupported` |
 
-`Signal::Kill` always takes the same *atomic* whole-tree kill path as
-`kill_all` (`cgroup.kill` / `killpg` / job terminate), so it cannot miss
+`Signal::Kill` always takes the same *atomic* whole-tree kill path as `kill_all`
+(`cgroup.kill` / `PROC_REAP_KILL` / `killpg` / job terminate), so it cannot miss
 a process forked mid-broadcast. Other signals are a per-member broadcast —
 best-effort against a tree that is forking at that exact moment. On Windows,
 `Signal::Int`/`Signal::Term` do not wait or escalate (they only *trigger* a soft
 close — contrast the graceful `shutdown`, which then waits the grace and
 escalates). An empty group accepts any deliverable signal trivially — except
 Windows `Int`/`Term`, which report `Unsupported` on an empty group (no member,
-hence no console or windowed target to soft-close). On **both** Unix mechanisms a
+hence no console or windowed target to soft-close). On **every** Unix mechanism a
 real send failure is surfaced as an `Err` rather than swallowed — an `EINVAL` (an
 out-of-range `Other(n)`) always, and an `EPERM` against a **live, non-zombie**
 member (a `sudo`/setuid child that rejects the signal, or a seccomp/container

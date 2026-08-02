@@ -382,12 +382,16 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`crate::ErrorReason::Io`] in two cases, both on the non-atomic Unix backends: the legacy
-    /// per-pid kill fallback (a pre-5.14 Linux kernel without `cgroup.kill`) when
-    /// the tree won't drain within the bounded sweep, and the process-group
-    /// mechanism (macOS/Linux fallback) when a live, non-zombie member rejects
-    /// `SIGKILL` with `EPERM` (a uid-changed child — see above). The atomic backends
-    /// (`cgroup.kill`, Windows Job Object) never fail here.
+    /// [`crate::ErrorReason::Io`] on the non-atomic Unix backends only, in three cases: the
+    /// legacy per-pid kill fallback (a pre-5.14 Linux kernel without `cgroup.kill`)
+    /// when the tree won't drain within the bounded sweep; the process-group
+    /// mechanism (macOS/the other BSDs, and the Linux fallback) when a live,
+    /// non-zombie member rejects `SIGKILL` with `EPERM` (a uid-changed child — see
+    /// above); and the FreeBSD process reaper, both for that same live-`EPERM` (which
+    /// it discriminates from its own listing) and for any unexpected errno from
+    /// `PROC_REAP_KILL` — `ECAPMODE` in a Capsicum sandbox, say — which means the tree
+    /// was not signalled at all. The atomic backends (`cgroup.kill`, Windows Job
+    /// Object) never fail here.
     pub fn kill_all(&self) -> Result<()> {
         #[cfg(feature = "tracing")]
         tracing::debug!(
@@ -422,21 +426,22 @@ impl ProcessGroup {
     ///
     /// `SIGKILL` ([`Signal::Kill`], or `Other(libc::SIGKILL)`) is routed through
     /// the same whole-tree hard kill as [`kill_all`](Self::kill_all)
-    /// on every backend (`cgroup.kill` / `killpg` / Job Object terminate), so it
-    /// cannot miss a process forked mid-broadcast. Other signals are a per-member
-    /// broadcast.
+    /// on every backend (`cgroup.kill` / `PROC_REAP_KILL` / `killpg` / Job Object
+    /// terminate), so it cannot miss a process forked mid-broadcast. Other signals
+    /// are a per-member broadcast.
     ///
     /// **Honest send failures (every Unix backend).** A genuinely failed send is
-    /// reported as [`crate::ErrorReason::Io`], not hidden behind a false `Ok`, and the two POSIX
+    /// reported as [`crate::ErrorReason::Io`], not hidden behind a false `Ok`, and the POSIX
     /// mechanisms agree on which failures those are:
     /// - an **`EINVAL`** (an out-of-range [`Signal::Other`] number) always surfaces;
     /// - an **`EPERM`** surfaces when it hit a **live, non-zombie** member (a
     ///   `sudo`/setuid child that rejects the signal — the genuine containment gap),
-    ///   on both the cgroup mechanism and the process-group mechanism (which checks
-    ///   the target's run state — `proc_pidinfo` on macOS, the `/proc/<pid>/stat`
-    ///   state field on the Linux fallback — after the `EPERM`, exactly as
-    ///   [`kill_all`](Self::kill_all) does). The one `EPERM` deliberately swallowed
-    ///   is the harmless zombie-only case;
+    ///   on the cgroup mechanism, the process-group mechanism and the FreeBSD process
+    ///   reaper alike (the latter two check the target's run state after the `EPERM` —
+    ///   `proc_pidinfo` on macOS, the `/proc/<pid>/stat` state field on the Linux
+    ///   fallback, the kernel's zombie flag in the reaper's `PROC_REAP_GETPIDS`
+    ///   listing on FreeBSD — exactly as [`kill_all`](Self::kill_all) does). The one
+    ///   `EPERM` deliberately swallowed is the harmless zombie-only case;
     /// - an **`ESRCH`** (the member already exited) is always a benign no-op success.
     ///
     /// On the **BSDs other than FreeBSD**, where no process-state reader is wired up,
@@ -452,7 +457,9 @@ impl ProcessGroup {
     /// `signal(Other(0))` over a group with live members therefore returns `Ok`
     /// **having sent no signal** — the `Ok` means "a signalable target was reached",
     /// not "a signal was delivered". It can still surface an `EPERM` against a live
-    /// target that rejects even the null signal, identically on both POSIX backends.
+    /// target that rejects even the null signal, identically on **every** POSIX
+    /// backend (the FreeBSD reaper has no probe mode, so it routes this one case
+    /// through the process-group path to keep the answer identical).
     ///
     /// # Errors
     ///
@@ -460,12 +467,13 @@ impl ProcessGroup {
     /// only when the group has no console-CTRL leader and no windowed member (see
     /// Platform support above), and for every other non-[`Kill`](Signal::Kill)
     /// signal unconditionally (a Job Object has no POSIX signals). On **every** Unix
-    /// backend (cgroup and process-group alike), [`crate::ErrorReason::Io`] if the OS honestly
-    /// rejects the send — an `EINVAL` (a bad [`Signal::Other`] number) or an `EPERM`
-    /// against a live, non-zombie member (see above); an `ESRCH` (member already
-    /// gone) and a harmless zombie-only `EPERM` are not errors. The Windows soft
-    /// close is likewise best-effort (an enumeration / post failure never fails a
-    /// call that reached a target).
+    /// backend (cgroup, process-group and FreeBSD process reaper alike),
+    /// [`crate::ErrorReason::Io`] if the OS honestly rejects the send — an `EINVAL`
+    /// (a bad [`Signal::Other`] number) or an `EPERM` against a live, non-zombie
+    /// member (see above); an `ESRCH` (member already gone) and a harmless
+    /// zombie-only `EPERM` are not errors. The Windows soft close is likewise
+    /// best-effort (an enumeration / post failure never fails a call that reached
+    /// a target).
     #[cfg(feature = "process-control")]
     pub fn signal(&self, sig: Signal) -> Result<()> {
         self.job

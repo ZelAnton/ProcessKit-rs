@@ -84,7 +84,8 @@ pub(crate) struct ProcMetrics {
 /// was reaped. Only ever compared for equality, never interpreted: the units are
 /// platform-specific — Windows uses the process-creation `FILETIME` (100 ns units)
 /// and Linux uses `/proc/<pid>/stat` field 22 (`starttime`, clock ticks since
-/// boot); the POSIX fallback (macOS/BSD) reports none. This is the per-process
+/// boot); the `/proc`-less POSIX targets (macOS and the BSDs, FreeBSD's reaper
+/// included) report none. This is the per-process
 /// analogue of the pgroup backend's start-time identity token (see
 /// `pgroup::read_identity`); it exists to keep a pid-reuse
 /// race from folding an unrelated process's CPU/memory into a sample.
@@ -93,10 +94,11 @@ pub(crate) struct ProcMetrics {
 pub(crate) struct ProcIdentity(u64);
 
 // Constructed and read only by the Linux (`/proc` starttime) and Windows
-// (creation `FILETIME`) backends; the POSIX fallback (macOS/BSD, `unix.rs`)
-// reports no identity and ignores the anchor, leaving both associated items
-// unused there — allow it on exactly that target rather than deleting methods
-// the other two backends need (mirrors the `SpawnOptions` field pattern above).
+// (creation `FILETIME`) backends; the `/proc`-less POSIX targets (macOS and the
+// other BSDs in `unix.rs`, FreeBSD in `freebsd.rs`) report no identity and
+// ignore the anchor, leaving both associated items unused there — allow it on
+// exactly those targets rather than deleting methods the other two backends
+// need (mirrors the `SpawnOptions` field pattern above).
 #[cfg(feature = "stats")]
 #[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
 impl ProcIdentity {
@@ -160,7 +162,8 @@ pub(crate) fn process_info(pid: u32) -> io::Result<Option<crate::member::MemberI
     imp::process_info(pid)
 }
 
-// Shared POSIX process-group backend for both the Linux fallback and macOS/BSD.
+// Shared POSIX process-group backend: the Linux fallback, macOS/the other BSDs,
+// and the bookkeeping substrate the FreeBSD reaper layers on.
 #[cfg(unix)]
 pub(crate) mod pgroup;
 
@@ -176,13 +179,14 @@ pub(crate) mod procfs;
 
 // Shared graceful-shutdown escalation driver. The whole-tree
 // signal → poll → escalate loop ([`graceful::run`]) and its [`GracefulTarget`]
-// trait are cross-platform: both unix backends drive it (SIGTERM → grace →
-// SIGKILL), and the Windows Job Object drives it too for the opt-in
-// console-CTRL graceful path (CTRL_BREAK → grace → `TerminateJobObject`). The
-// single-child kill-and-reap primitive ([`graceful::run_pid`]/[`PidTarget`]/
-// [`UnixChild`]) stays unix-only — it leans on `PidGate`/`libc` and drives the
-// shared-group streaming-timeout teardown from `crate::running`. `pub(crate)`
-// so both are reachable from those callers.
+// trait are cross-platform: all three unix mechanisms drive it (the cgroup, the
+// process group and the FreeBSD reaper: SIGTERM → grace → SIGKILL), and the
+// Windows Job Object drives it too for the opt-in console-CTRL graceful path
+// (CTRL_BREAK → grace → `TerminateJobObject`). The single-child kill-and-reap
+// primitive ([`graceful::run_pid`]/[`PidTarget`]/[`UnixChild`]) stays unix-only
+// — it leans on `PidGate`/`libc` and drives the shared-group streaming-timeout
+// teardown from `crate::running`. `pub(crate)` so both are reachable from those
+// callers.
 pub(crate) mod graceful;
 
 // The linearizable pid gate: serializes every raw direct-child kill a detached

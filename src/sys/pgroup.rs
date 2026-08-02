@@ -2,17 +2,21 @@
 //!
 //! Each spawned child becomes the leader of its own process group, so signalling
 //! the negative group id (`killpg`) reaps the child *and* every descendant it
-//! forked. This backs two callers:
+//! forked. This backs three callers:
 //!
 //! - **Linux** — the fallback when no writable cgroup is available (e.g. a CI
 //!   runner without cgroup delegation).
-//! - **macOS / the BSDs** — the primary mechanism, since those targets have
-//!   neither cgroups nor Job Objects.
+//! - **macOS / the BSDs other than FreeBSD** — the primary mechanism, since those
+//!   targets have neither cgroups nor Job Objects.
+//! - **FreeBSD** — the spawn coordination, tracked-id bookkeeping and signalling
+//!   substrate underneath the `procctl` process reaper, which layers whole-tree
+//!   containment on top of it (see `sys::freebsd`).
 //!
 //! Weaker than a cgroup or Job Object: a child that calls `setsid` starts a new
-//! session and escapes the group. Callers surface this as
-//! [`Mechanism::ProcessGroup`](crate::Mechanism::ProcessGroup) so it is never a
-//! silent downgrade.
+//! session and escapes the group. Wherever this module *is* the mechanism, callers
+//! surface it as [`Mechanism::ProcessGroup`](crate::Mechanism::ProcessGroup) so it
+//! is never a silent downgrade; on FreeBSD the reaper layer closes that escape and
+//! reports [`Mechanism::ProcessReaper`](crate::Mechanism::ProcessReaper) instead.
 
 use std::io;
 use std::os::unix::process::CommandExt;

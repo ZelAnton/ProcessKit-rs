@@ -197,7 +197,7 @@ sends a real signal.
 | `soft_stop_scope()` (soft `Int`/`Term` reach) | 🟡 `OptInMembers` with a console/windowed member, else `Unsupported` | `WholeTree` | `WholeTree` | `WholeTree` | `WholeTree` |
 | `suspend` / `resume` | 🟡 per-thread counts | ✅ `cgroup.freeze` | ✅ `SIGSTOP`/`CONT` | ✅ `SIGSTOP`/`CONT`, whole subtree | ✅ `SIGSTOP`/`CONT` |
 
-On **both** Unix mechanisms, a `signal` broadcast surfaces a real send failure as
+On **every** Unix mechanism, a `signal` broadcast surfaces a real send failure as
 an `Err` rather than swallowing it — an `EINVAL` (an out-of-range `Other(n)`) and
 an `EPERM` against a **live, non-zombie** member (a uid-changed child, or a
 seccomp/container restriction) — consistent with the "never silently skipped"

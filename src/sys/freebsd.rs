@@ -760,7 +760,7 @@ impl Reaper {
     /// process exactly once, `setsid` escapees included.
     ///
     /// Honest failure reporting mirrors the process-group backend's contract
-    /// (K-055) so the two Unix mechanisms answer alike: an `ESRCH` (nothing left in
+    /// (K-055) so every Unix mechanism answers alike: an `ESRCH` (nothing left in
     /// the subtree) is success, an `EPERM` is surfaced only when it hit a positively
     /// live member, and every sweep visits **all** roots before returning so one
     /// failing subtree never leaves another unsignalled.
@@ -1012,9 +1012,10 @@ impl Job {
         // `Signal::Other(0)` is the POSIX *existence probe*: it delivers nothing and
         // must answer `Ok` when it reaches a signalable live target. `PROC_REAP_KILL`
         // has no such mode — the kernel rejects any signal number below 1 with
-        // `EINVAL` — so the probe (and any other non-positive request, which both
-        // backends reject identically) stays on the process-group path, keeping the
-        // documented behavior byte-for-byte the same as every other Unix backend.
+        // `EINVAL` — so the probe (and any other non-positive request, which this
+        // job's two delivery paths reject identically) stays on the process-group
+        // path, keeping the documented behavior byte-for-byte the same as every
+        // other Unix backend.
         if !self.reaper.active || raw <= 0 {
             return self.group.signal(raw);
         }
