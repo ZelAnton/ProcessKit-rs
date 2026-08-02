@@ -585,9 +585,10 @@ impl Tracked {
     /// since-reaped pid, and every target without a state reader (the BSDs) — stays
     /// `Ok`, while a genuinely-alive rejecting member is reported. The sweep always
     /// visits every entry before returning, so one member's live-`EPERM` never
-    /// skips signalling the rest of the tree. Callers that must stay best-effort
-    /// (`Drop`, the graceful soft-signal, `signal`/`suspend`/`resume`) discard the
-    /// result; `kill_all`/`hard_kill` propagate it.
+    /// skips signalling the rest of the tree. The best-effort callers (`Drop` and
+    /// `GracefulTarget::signal_all`) consume the result without returning an I/O
+    /// error; explicit `kill_all`/`hard_kill`/`signal`/`suspend`/`resume` calls
+    /// propagate it.
     fn signal_all(&self, sig: i32) -> io::Result<()> {
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
         // The first *surfaceable* send error seen this sweep, returned after every
@@ -850,22 +851,21 @@ impl ProcessGroup {
     /// Freeze every tracked group (`SIGSTOP` — unblockable, idempotent).
     #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {
-        let _ = self.broadcast(libc::SIGSTOP);
-        Ok(())
+        self.broadcast(libc::SIGSTOP)
     }
 
     /// Thaw every tracked group (`SIGCONT`).
     #[cfg(feature = "process-control")]
     pub(crate) fn resume(&self) -> io::Result<()> {
-        let _ = self.broadcast(libc::SIGCONT);
-        Ok(())
+        self.broadcast(libc::SIGCONT)
     }
 
     /// One signal sweep over both tracking sets. Both sets are always signalled;
     /// the first surfaceable send error either raises — an `EINVAL` (a bad signal
     /// number) or a live-non-zombie `EPERM` — is returned (see
-    /// [`Tracked::signal_all`]). Best-effort callers (`Drop`, the graceful
-    /// soft-signal, `suspend`/`resume`) discard the result.
+    /// [`Tracked::signal_all`]). The best-effort callers (`Drop` and
+    /// `GracefulTarget::signal_all`) consume the result; explicit control operations
+    /// propagate it.
     fn broadcast(&self, sig: i32) -> io::Result<()> {
         let groups = self.groups.signal_all(sig);
         let solos = self.solos.signal_all(sig);
