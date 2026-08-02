@@ -75,12 +75,17 @@ which variant fires from where, how to classify it, and what to do about it.
   (`is_success()`/`ok_codes` decide); `Signalled` has no code at all —
   `code()` is `None` — and is always terminal.
 - **`ResourceLimit` means "the cap couldn't be applied", never "the cap
-  fired".** It is an *admission* error, raised by
-  `ProcessGroup::with_options` / `update_limits` **before** anything runs: the
-  requested value was nonsensical (`Invalid`), the platform has no whole-tree
-  mechanism at all (`Unsupported`), or a capable mechanism rejected this request
-  (`Unenforceable`). A cap that *was* applied and then actually stopped the tree
-  produces **no error at all** — the child just exits non-zero (or dies by
+  fired".** It is an *admission* error: the requested value was nonsensical
+  (`Invalid`), the platform has no whole-tree mechanism at all (`Unsupported`),
+  or a capable mechanism rejected this request (`Unenforceable`).
+  `ProcessGroup::with_options` raises it **before** anything runs and hands
+  back no group. `ProcessGroup::update_limits` raises it against an
+  **already-running** group, where it does *not* mean "nothing changed": the
+  caps are written axis by axis, so a part-way failure can leave a mix of old
+  and new in force — see
+  [updating a live group](process-groups.md#updating-a-live-group).
+  A cap that *was* applied and then actually stopped the tree produces
+  **no error at all** — the child just exits non-zero (or dies by
   `SIGKILL`), exactly like a self-inflicted crash. For that question ask the
   group afterwards:
   [`ProcessGroup::limit_evidence()`](process-groups.md#did-the-cap-actually-fire-limit_evidence)
@@ -89,10 +94,12 @@ which variant fires from where, how to classify it, and what to do about it.
   available on this mechanism — deliberately not folded into a "no"). Exit codes
   and signals are never consulted for it, precisely because they cannot tell a
   cap-driven kill from an ordinary failure. So: `ResourceLimit` on the error
-  path, `limit_evidence` on the result path — the two never overlap, and this
-  error's semantics are unchanged by it. (Left as a bare code span, not a
-  `docs.rs` link: `LimitVerdict` ships in the next release, so a `docs.rs` URL
-  would 404 until then.)
+  path, `limit_evidence` on the result path — two different questions, and this
+  error's semantics are unchanged by it. They can land on the same axis on a
+  live group, though: an axis named by a *failed* `update_limits` is still read
+  from the counters, because that failure is not a rollback. (Left as a bare
+  code span, not a `docs.rs` link: `LimitVerdict` ships in the next release, so
+  a `docs.rs` URL would 404 until then.)
 
 ## Classifiers
 
@@ -204,7 +211,8 @@ same `whole_tree` and `none` spellings for its shared cases, adding
 is the one entry that is not an error classification at all: it is the
 *post-run* answer to "did this cap fire?" (`tripped` / `not_tripped` /
 `unknown`), while `LimitKind` / `LimitReason` describe the admission-time
-`ResourceLimit` failure — the two never overlap (see [Variants that look alike
+`ResourceLimit` failure — two different questions, never two spellings of one
+answer (see [Variants that look alike
 but aren't](#variants-that-look-alike-but-arent)), and both carry the same
 stability promise.
 

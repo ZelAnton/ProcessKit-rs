@@ -660,6 +660,21 @@ process-group mechanism (macOS/BSD, the Linux fallback) refuses any requested
 cap with `Unsupported` rather than silently dropping it, while lifting *all*
 caps there is a trivial success.
 
+**A failure is not a rollback.** The caps are written axis by axis — on Windows
+one Job Object call for the memory and process caps and a second for the CPU cap,
+on cgroup v2 `memory.max`, then `pids.max`, then `cpu.max` — and nothing about
+that is transactional. A call that fails part-way can leave the container carrying
+a *mix* of old and new caps, including an axis the request meant to lift that has
+already been lifted; only the group's reflected options (what `Debug` shows) stay
+on the previous set, and the error doesn't say how far the write got. Re-issue the
+complete desired set (a full replacement, so retrying is idempotent) or tear the
+group down. An `Invalid` value is the one case guaranteed to change nothing: it is
+rejected before the OS is touched. Evidence stays honest across all of this —
+every axis a request names joins the group's sticky cap record whether the call
+succeeds or fails, so an axis that did land before the failure is still read from
+the kernel's counters by `limit_evidence()` rather than reported `NotTripped` with
+nothing behind it.
+
 ### Did the cap actually fire? (`limit_evidence`)
 
 The caps above answer "may this tree use more?". They don't, by themselves, tell
@@ -698,9 +713,15 @@ async fn main() -> processkit::Result<()> {
 
 **Two different questions.** `ErrorReason::ResourceLimit` is *admission*: "the
 cap you asked for could not be **applied**" (`Invalid` / `Unsupported` /
-`Unenforceable`), returned by `with_options` / `update_limits` before anything
-runs. `limit_evidence` is the other side: the cap **was** applied — did it then
-**fire**? Nothing about the error's behaviour changes; the two never overlap.
+`Unenforceable`). `with_options` returns it instead of running anything at all —
+it hands back no group, so there is nothing left to ask. `update_limits` returns
+it against an already-running tree, where it undoes nothing that already landed
+(see [A failure is not a rollback](#updating-a-live-group) above).
+`limit_evidence` is the other side: did a cap on this axis then **fire**?
+Nothing about the error's behaviour changes — but on a live group the two can
+meet on the same axis: after a failed `update_limits` the error says the
+requested set could not be applied whole, while the evidence still answers what
+actually fired, read from the counters rather than assumed away.
 
 **Three-valued on purpose, and never a guess.** `Tripped` is returned *only* on
 authoritative kernel/OS evidence recorded by this group's own container.
@@ -756,7 +777,9 @@ counters with it. Reading is free of side effects and repeatable: it sends no
 signal, kills nothing, writes nothing, and cannot perturb teardown or
 kill-on-drop whenever you call it. The counters are cumulative and are not reset
 by reading, by a teardown, or by `update_limits` — an axis whose cap was later
-lifted still reports that it fired while the cap was in force. An axis that
+lifted still reports that it fired while the cap was in force, and so does an
+axis named by an `update_limits` call that *failed* (see above: that call is not
+a rollback, so the axis may have been applied before the failure). An axis that
 never carried a cap is answered without touching the OS at all, so a group
 created without caps performs no evidence I/O whatsoever.
 

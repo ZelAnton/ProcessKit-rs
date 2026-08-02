@@ -340,16 +340,21 @@ ends its series honestly if the group is ever released.
 
 **"The cap couldn't be applied" and "the cap fired" are different questions.**
 Everything above is about *applying* a cap: `ErrorReason::ResourceLimit` says a
-requested cap could not be put in force, and it is raised before anything runs.
-Once a cap **is** in force, the separate question — did it actually stop this
-tree? — is answered post-run by
+requested cap could not be put in force. `with_options` raises it before
+anything runs at all; `update_limits` raises it against an already-running tree,
+where it does **not** mean "nothing changed" — that call is
+[not a rollback](process-groups.md#updating-a-live-group), so part of the
+requested set may already be in force. The separate question — did a cap
+actually stop this tree? — is answered post-run by
 [`ProcessGroup::limit_evidence()`](process-groups.md#did-the-cap-actually-fire-limit_evidence),
 which returns a three-valued verdict per axis (`Tripped` / `NotTripped` /
-`Unknown`) read from the container's own kernel counters. The two never overlap
-and neither one changes the other's meaning: an admission failure is
-`ResourceLimit`, a cap that fired is a `Tripped` verdict, and where no
-authoritative evidence exists the answer is an explicit `Unknown` rather than a
-"no". This matters most in exactly the situation this page is about, because in
+`Unknown`) read from the container's own kernel counters. Neither one changes
+the other's meaning: an admission failure is `ResourceLimit`, a cap that fired
+is a `Tripped` verdict, and where no authoritative evidence exists the answer is
+an explicit `Unknown` rather than a "no". They stay separable even where they
+meet — every axis a failed `update_limits` named is still read from the
+counters, never quietly reported as `NotTripped`.
+This matters most in exactly the situation this page is about, because in
 a container the interesting kill usually comes from the *outer* limit: a verdict
 is `Tripped` only when **this crate's own** cgroup recorded hitting **its own**
 cap (`memory.events`' `oom`), so an orchestrator-level OOM kill of the whole
