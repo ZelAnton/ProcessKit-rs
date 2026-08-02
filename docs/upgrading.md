@@ -63,6 +63,24 @@ The `#[doc(hidden)]` constructors (`Error::exit`/`timeout`/`signalled`/`spawn`/
 `not_found`/`stdin`) and the public `Error::parse(..)` are unchanged and still
 return an `Error`.
 
+To construct an `Error` from a directly constructible `ErrorReason` variant,
+wrap the variant literal with the `From` implementation:
+
+```rust,no_run
+use processkit::{Error, ErrorReason};
+
+let err = Error::from(ErrorReason::Unsupported {
+    operation: "custom soft stop".into(),
+});
+let _ = err;
+```
+
+`Error`, `ErrorReason`, and `ErrorKind` are three separate public names, all
+re-exported from the crate root. If your crate previously re-exported only
+`Error`, decide whether its public surface should now also expose `ErrorReason`
+(and `ErrorKind` if it exposes classification), so your consumers can still
+inspect failure reasons through your API.
+
 ### The merged output stream is now a process-lifecycle stream (`output_events()` → `events()`, `OutputEvent` → `ProcessEvent`)
 
 The merged output-event stream widened from "which output line" to "an event in the
@@ -145,8 +163,11 @@ non-UTF-8 bytes, where the raw count is slightly higher.
 **Who it affects:** a caller that set a byte cap (`with_max_bytes`) and depends on the
 *exact* threshold at which capture truncates/errors, or that reads
 `OutputOverflow::total_bytes()` / the `total_bytes` field and compares it against a
-precise expected value. Fix: re-check those thresholds/assertions against the raw-byte
-count. If you set no byte cap, nothing changes.
+precise expected value. It also affects a downstream crate that documented the prior
+decoded-line-content meaning of `total_bytes` as part of its own public contract: for
+that consumer, the documented contract exposed to its customers has changed, not just
+an internal capture threshold. Fix: re-check those thresholds/assertions against the
+raw-byte count. If you set no byte cap, nothing changes.
 
 ### `ProcessGroup::signal` reports the soft-stop outcome more truthfully
 
@@ -158,7 +179,12 @@ compiler-caught (the signature is unchanged, `Result<()>`):
   returns `Ok` when it had something to signal, instead of *always* returning
   `ErrorReason::Unsupported`. It still returns `Unsupported` only when the group has neither
   a console-CTRL leader nor a windowed member. A caller that treated the old blanket
-  `Unsupported` as "Windows never soft-stops" should stop assuming that.
+  `Unsupported` as "Windows never soft-stops" should stop assuming that. This change is
+  confined to `ProcessGroup::signal(Signal::Int | Signal::Term)`; it does not change
+  `ProcessGroup::soft_stop_scope()` / `SoftStopScope`, the separate side-effect-free
+  capability probe. Nor does it affect `ProcessGroup::kill_all()` or drop: those remain
+  unconditional whole-tree hard kills (through the Job Object on Windows), unchanged
+  on every platform.
 - **POSIX process-group mechanism (macOS/BSD, and the Linux process-group fallback):**
   a genuinely failed send now surfaces as `ErrorReason::Io` instead of being swallowed behind
   a false `Ok` — an `EINVAL` (an out-of-range `Signal::Other(n)`) or an `EPERM` from a
