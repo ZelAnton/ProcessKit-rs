@@ -208,7 +208,11 @@ stays swallowed; the FreeBSD reaper makes the same discrimination from the
 kernel's own zombie flag on the failing member, which `PROC_REAP_KILL` names
 explicitly; an `ESRCH` race (the member already exited) is still success,
 and `Signal::Other(0)` returns `Ok` having delivered nothing (the POSIX existence
-probe). On the cgroup mechanism the `SIGSTOP`/`SIGCONT` fallback used for
+probe). That probe never takes a delivery path — FreeBSD routes it back through
+the process group, which has no state reader on any BSD but macOS — so the
+`EPERM` rule above does not extend to it there: on FreeBSD and the bare BSDs a
+live target that rejects even the null signal is still an `Ok`, where Linux and
+macOS surface it. On the cgroup mechanism the `SIGSTOP`/`SIGCONT` fallback used for
 `suspend`/`resume` on pre-5.2 kernels (no `cgroup.freeze`) surfaces failures the
 same way.
 

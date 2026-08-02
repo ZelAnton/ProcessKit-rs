@@ -1014,8 +1014,13 @@ impl Job {
         // has no such mode — the kernel rejects any signal number below 1 with
         // `EINVAL` — so the probe (and any other non-positive request, which this
         // job's two delivery paths reject identically) stays on the process-group
-        // path, keeping the documented behavior byte-for-byte the same as every
-        // other Unix backend.
+        // path. What that keeps identical to every other Unix backend is the `Ok`
+        // having delivered nothing; it does NOT carry the reaper's `EPERM`
+        // discrimination over, since `pgroup::is_live_non_zombie` has no state
+        // reader on this target — a live member that rejects even the null signal
+        // answers `Ok` here, exactly as on the bare BSDs. Documented as the one
+        // probe-path exception on `ProcessGroup::signal`; do not restate the
+        // reaper's `PROC_REAP_GETPIDS` discrimination as covering this path.
         if !self.reaper.active || raw <= 0 {
             return self.group.signal(raw);
         }

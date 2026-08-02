@@ -344,7 +344,11 @@ on the member `PROC_REAP_KILL` names as the failing one — so unlike the bare-B
 process-group path it does surface a live member's `EPERM`. An `ESRCH` race (the
 member already exited) is still success. `Signal::Other(0)` is the POSIX
 existence probe: it returns `Ok` having **delivered nothing** (a live target was
-reached, not signalled).
+reached, not signalled) — and because that probe never takes a delivery path
+(FreeBSD routes it back through the process group, which has no state reader on
+any BSD but macOS), the `EPERM` rule above does not reach it everywhere: on
+FreeBSD and the bare BSDs a live target that rejects even the null signal still
+answers `Ok`, where Linux and macOS surface the `EPERM`.
 
 ## Asking whether a soft stop is available
 

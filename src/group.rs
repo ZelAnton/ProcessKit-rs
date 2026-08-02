@@ -456,10 +456,20 @@ impl ProcessGroup {
     /// Signal `0` checks whether targets exist and delivers nothing; a
     /// `signal(Other(0))` over a group with live members therefore returns `Ok`
     /// **having sent no signal** — the `Ok` means "a signalable target was reached",
-    /// not "a signal was delivered". It can still surface an `EPERM` against a live
-    /// target that rejects even the null signal, identically on **every** POSIX
-    /// backend (the FreeBSD reaper has no probe mode, so it routes this one case
-    /// through the process-group path to keep the answer identical).
+    /// not "a signal was delivered". *That* answer is identical on every backend;
+    /// the `EPERM` discrimination above is **not**, because the null signal never
+    /// takes a delivery path. Against a live target that rejects even the probe it
+    /// surfaces [`crate::ErrorReason::Io`] on Linux (the cgroup mechanism raises any
+    /// `EPERM`; the process-group fallback confirms liveness through
+    /// `/proc/<pid>/stat`) and on macOS (`proc_pidinfo`), and it stays **swallowed —
+    /// a plain `Ok` — on FreeBSD and the bare BSDs**. `PROC_REAP_KILL` has no probe
+    /// mode (the kernel rejects any signal number below `1` with `EINVAL`), so
+    /// FreeBSD routes this one case back through the process-group path, and that
+    /// path has no process-state reader on any BSD but macOS; the reaper's
+    /// `PROC_REAP_GETPIDS` zombie discrimination belongs to its delivery paths and
+    /// does not extend to the probe. What the routing keeps identical across
+    /// backends is therefore the `Ok`-having-delivered-nothing contract, not the
+    /// error.
     ///
     /// # Errors
     ///
@@ -469,9 +479,11 @@ impl ProcessGroup {
     /// signal unconditionally (a Job Object has no POSIX signals). On **every** Unix
     /// backend (cgroup, process-group and FreeBSD process reaper alike),
     /// [`crate::ErrorReason::Io`] if the OS honestly rejects the send — an `EINVAL`
-    /// (a bad [`Signal::Other`] number) or an `EPERM` against a live, non-zombie
-    /// member (see above); an `ESRCH` (member already gone) and a harmless
-    /// zombie-only `EPERM` are not errors. The Windows soft close is likewise
+    /// (a bad [`Signal::Other`] number) always, or an `EPERM` against a member the
+    /// backend can establish is live and non-zombie (see above: the bare BSDs have
+    /// no state reader, and neither does the `Other(0)` probe path on any BSD but
+    /// macOS, so those `EPERM`s stay swallowed); an `ESRCH` (member already gone)
+    /// and a harmless zombie-only `EPERM` are not errors. The Windows soft close is likewise
     /// best-effort (an enumeration / post failure never fails a call that reached
     /// a target).
     #[cfg(feature = "process-control")]

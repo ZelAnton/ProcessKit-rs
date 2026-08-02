@@ -52,7 +52,9 @@ pub enum Signal {
     ///   members returns `Ok` **having delivered nothing** — the `Ok` reports "the
     ///   probe reached a signalable target", never "a signal was delivered" (the
     ///   FreeBSD reaper has no probe mode, so it routes this one case through the
-    ///   process-group path to keep the answer identical).
+    ///   process-group path, which keeps *that* answer identical everywhere — the
+    ///   `EPERM` handling around it is **not** uniform, see
+    ///   [`ProcessGroup::signal`](crate::ProcessGroup::signal)).
     /// - An **out-of-range** number makes the underlying `kill`/`killpg` fail
     ///   `EINVAL`, and that failure is now surfaced as
     ///   [`ErrorReason::Io`](crate::ErrorReason::Io) on **every** Unix backend — the Linux
