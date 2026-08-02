@@ -585,9 +585,10 @@ impl Tracked {
     /// since-reaped pid, and every target without a state reader (the BSDs) — stays
     /// `Ok`, while a genuinely-alive rejecting member is reported. The sweep always
     /// visits every entry before returning, so one member's live-`EPERM` never
-    /// skips signalling the rest of the tree. Callers that must stay best-effort
-    /// (`Drop`, the graceful soft-signal, `signal`/`suspend`/`resume`) discard the
-    /// result; `kill_all`/`hard_kill` propagate it.
+    /// skips signalling the rest of the tree. The best-effort callers (`Drop` and
+    /// `GracefulTarget::signal_all`) consume the result without returning an I/O
+    /// error; explicit `kill_all`/`hard_kill`/`signal`/`suspend`/`resume` calls
+    /// propagate it.
     fn signal_all(&self, sig: i32) -> io::Result<()> {
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
         // The first *surfaceable* send error seen this sweep, returned after every
@@ -850,22 +851,21 @@ impl ProcessGroup {
     /// Freeze every tracked group (`SIGSTOP` — unblockable, idempotent).
     #[cfg(feature = "process-control")]
     pub(crate) fn suspend(&self) -> io::Result<()> {
-        let _ = self.broadcast(libc::SIGSTOP);
-        Ok(())
+        self.broadcast(libc::SIGSTOP)
     }
 
     /// Thaw every tracked group (`SIGCONT`).
     #[cfg(feature = "process-control")]
     pub(crate) fn resume(&self) -> io::Result<()> {
-        let _ = self.broadcast(libc::SIGCONT);
-        Ok(())
+        self.broadcast(libc::SIGCONT)
     }
 
     /// One signal sweep over both tracking sets. Both sets are always signalled;
     /// the first surfaceable send error either raises — an `EINVAL` (a bad signal
     /// number) or a live-non-zombie `EPERM` — is returned (see
-    /// [`Tracked::signal_all`]). Best-effort callers (`Drop`, the graceful
-    /// soft-signal, `suspend`/`resume`) discard the result.
+    /// [`Tracked::signal_all`]). The best-effort callers (`Drop` and
+    /// `GracefulTarget::signal_all`) consume the result; explicit control operations
+    /// propagate it.
     fn broadcast(&self, sig: i32) -> io::Result<()> {
         let groups = self.groups.signal_all(sig);
         let solos = self.solos.signal_all(sig);
@@ -1727,6 +1727,134 @@ mod tests {
         outcome.expect(
             "a zombie-only group's killpg EPERM must be swallowed, not surfaced — \
              surfacing it is the false positive that reverted the first attempt",
+        );
+    }
+
+    /// `suspend` and `resume` share teardown's zombie-EPERM discrimination. A
+    /// group whose only member is an unreaped zombie has nothing left to freeze
+    /// or thaw, so both operations must remain successful even on kernels where
+    /// `killpg(SIGSTOP/SIGCONT)` reports `EPERM` for that group.
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess and leaves it an unreaped zombie"]
+    async fn suspend_resume_zombie_only_group_reports_success() {
+        use std::os::unix::process::CommandExt as _;
+
+        let pg = ProcessGroup::new();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("exit 0");
+        cmd.kill_on_drop(true);
+        cmd.as_std_mut().process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id().unwrap() as i32;
+
+        // Hold the Child unpolled and use the same state oracle as the teardown
+        // regression: a not-live process that still answers signal 0 is an
+        // unreaped zombie, not a process that has disappeared.
+        let mut became_zombie = false;
+        for _ in 0..500 {
+            if !is_live_non_zombie(pid) {
+                became_zombie = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(became_zombie, "the child never became an observable zombie");
+        // SAFETY: signal 0 is a sound existence probe and delivers no signal.
+        assert!(
+            unsafe { libc::kill(pid, 0) } == 0,
+            "the exited-but-unreaped child must still exist as a zombie"
+        );
+
+        // Seed the group as already observed so both calls exercise killpg and
+        // its zombie-only EPERM handling rather than the pre-setpgid pid fallback.
+        pg.groups.track(pid, true);
+        let suspend_outcome = pg.suspend();
+        let resume_outcome = pg.resume();
+
+        // Reap before asserting so a failure never leaks the zombie.
+        let _ = child.wait().await;
+
+        suspend_outcome.expect("suspending a zombie-only group must remain a no-op success");
+        resume_outcome.expect("resuming a zombie-only group must remain a no-op success");
+    }
+
+    /// Positive pin for the public control path: successful `SIGSTOP` and
+    /// `SIGCONT` broadcasts must reach a live tracked group, not merely return
+    /// `Ok`. `waitpid` stop/continue notifications observe both state changes
+    /// without reaping the child.
+    #[cfg(feature = "process-control")]
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn suspend_resume_on_live_group_succeeds() {
+        let pg = ProcessGroup::new();
+        let opts = crate::sys::SpawnOptions::default();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("while :; do :; done");
+        cmd.kill_on_drop(true);
+        let mut child = pg.spawn(&mut cmd, &opts).unwrap();
+        let pid = child.id().unwrap() as i32;
+        // Let the child complete setpgid/exec before exercising the group path.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let suspend_outcome = pg.suspend();
+        let mut observed_stop = false;
+        for _ in 0..500 {
+            let mut status = 0;
+            // SAFETY: `pid` is our live child and `status` is valid writable
+            // storage. WNOHANG keeps this poll non-blocking; WUNTRACED reports
+            // the stop without reaping the process.
+            let waited = unsafe {
+                libc::waitpid(
+                    pid,
+                    std::ptr::addr_of_mut!(status),
+                    libc::WNOHANG | libc::WUNTRACED,
+                )
+            };
+            if waited == pid && libc::WIFSTOPPED(status) {
+                observed_stop = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let resume_outcome = pg.resume();
+        let mut observed_continue = false;
+        for _ in 0..500 {
+            let mut status = 0;
+            // SAFETY: as above; WCONTINUED observes the resume transition
+            // without reaping the still-live child.
+            let waited = unsafe {
+                libc::waitpid(
+                    pid,
+                    std::ptr::addr_of_mut!(status),
+                    libc::WNOHANG | libc::WCONTINUED,
+                )
+            };
+            if waited == pid && libc::WIFCONTINUED(status) {
+                observed_continue = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Clean up before asserting so every failure path reaps the subprocess.
+        let _ = unsafe { libc::killpg(pid, libc::SIGKILL) };
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait().await;
+
+        suspend_outcome.expect("SIGSTOP delivery to a live group must return Ok");
+        assert!(
+            observed_stop,
+            "the live group never entered a waitpid-observable stopped state"
+        );
+        resume_outcome.expect("SIGCONT delivery to a live group must return Ok");
+        assert!(
+            observed_continue,
+            "the live group never produced a waitpid-observable continued state"
         );
     }
 
