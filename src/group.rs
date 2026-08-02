@@ -977,13 +977,21 @@ impl ProcessGroup {
     ///
     /// # Not the same question as [`crate::ErrorReason::ResourceLimit`]
     ///
-    /// That error is **pre-spawn admission**: "the cap you requested could not be
-    /// *applied*" ([`LimitReason::Invalid`] / [`LimitReason::Unsupported`] /
-    /// [`LimitReason::Unenforceable`]), raised by
-    /// [`with_options`](Self::with_options) / [`update_limits`](Self::update_limits)
-    /// before or instead of running anything. This report is the other side: the cap
-    /// **was** applied — did it then *engage*? The two never overlap, and this
-    /// addition changes nothing about that error's behavior.
+    /// That error is **admission**: "the cap you requested could not be *applied*"
+    /// ([`LimitReason::Invalid`] / [`LimitReason::Unsupported`] /
+    /// [`LimitReason::Unenforceable`]). From
+    /// [`with_options`](Self::with_options) it is raised instead of running anything
+    /// at all — no group is handed back, so there is nothing left to ask. From
+    /// [`update_limits`](Self::update_limits) it is raised against an
+    /// **already-running** tree, and it is *not* a rollback. This report is the other
+    /// side: did a cap on this axis then *engage*?
+    ///
+    /// Different questions — and this addition changes nothing about that error's
+    /// behavior — but on a live group they can meet on the same axis. After a failed
+    /// `update_limits` the error says the requested set could not be applied whole,
+    /// while this report still answers what actually fired, reading the counters for
+    /// every axis that request named (see *A failure is not a rollback* on
+    /// [`update_limits`](Self::update_limits), and *Lifetime and cost* below).
     ///
     /// # Three-valued, and never a guess
     ///

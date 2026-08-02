@@ -713,9 +713,15 @@ async fn main() -> processkit::Result<()> {
 
 **Two different questions.** `ErrorReason::ResourceLimit` is *admission*: "the
 cap you asked for could not be **applied**" (`Invalid` / `Unsupported` /
-`Unenforceable`), returned by `with_options` / `update_limits` before anything
-runs. `limit_evidence` is the other side: the cap **was** applied — did it then
-**fire**? Nothing about the error's behaviour changes; the two never overlap.
+`Unenforceable`). `with_options` returns it instead of running anything at all —
+it hands back no group, so there is nothing left to ask. `update_limits` returns
+it against an already-running tree, where it undoes nothing that already landed
+(see [A failure is not a rollback](#updating-a-live-group) above).
+`limit_evidence` is the other side: did a cap on this axis then **fire**?
+Nothing about the error's behaviour changes — but on a live group the two can
+meet on the same axis: after a failed `update_limits` the error says the
+requested set could not be applied whole, while the evidence still answers what
+actually fired, read from the counters rather than assumed away.
 
 **Three-valued on purpose, and never a guess.** `Tripped` is returned *only* on
 authoritative kernel/OS evidence recorded by this group's own container.
