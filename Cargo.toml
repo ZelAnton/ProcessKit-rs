@@ -280,8 +280,16 @@ windows-sys = { version = "0.61", features = [
   # enabled by the `stats` feature above — it serves only the metrics readout.
   # Thread snapshot (CreateToolhelp32Snapshot / Thread32First/Next) to find a
   # suspended child's primary thread for ResumeThread — std/tokio expose only
-  # the process handle, not the PROCESS_INFORMATION thread handle.
+  # the process handle, not the PROCESS_INFORMATION thread handle. Since T-244
+  # this is the FALLBACK for the spawn path (the snapshot is system-wide and
+  # measured at ~81 ms on a 7761-thread host); it still backs the group-wide
+  # suspend/resume walks, which genuinely need every member's threads.
   "Win32_System_Diagnostics_ToolHelp",
+  # GetModuleHandleW + GetProcAddress resolve `ntdll!NtGetNextThread` at runtime
+  # — the per-process thread walk the spawn path uses instead of that
+  # system-wide snapshot. Runtime resolution (not a link import) keeps a host
+  # without the export working, just slower. See src/sys/windows.rs.
+  "Win32_System_LibraryLoader",
   # GenerateConsoleCtrlEvent + CTRL_BREAK_EVENT for the opt-in graceful
   # teardown: a direct child spawned CREATE_NEW_PROCESS_GROUP is sent a console
   # CTRL_BREAK before the grace window, so a console child can shut down softly
@@ -334,6 +342,15 @@ harness = false
 name = "compare"
 harness = false
 
+# Windows start-cost attribution (`benches/win_spawn_phases.rs`): splits the
+# fixed start path into phases — plain `CreateProcess`, the CREATE_SUSPENDED +
+# thread-snapshot resume cycle, and Job Object creation/assignment — so a
+# Windows consumer can tell ProcessKit's share of a slow start from the OS's.
+# Compiles to a stub `main` off Windows so `--all-targets` stays green there.
+[[bench]]
+name = "win_spawn_phases"
+harness = false
+
 [[example]]
 name = "pty_dialog"
 path = "examples/pty_dialog.rs"
@@ -369,6 +386,10 @@ windows-sys = { version = "0.61", features = [
   # CreateJobObjectW's signature references SECURITY_ATTRIBUTES — same reason the
   # non-dev windows-sys enables this above.
   "Win32_Security",
+  # `benches/win_spawn_phases.rs` reproduces the spawn path's thread-snapshot
+  # resume walk (CreateToolhelp32Snapshot / Thread32First / Thread32Next) to
+  # measure what it costs; same reason the non-dev windows-sys enables it above.
+  "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 [target.'cfg(unix)'.dev-dependencies]

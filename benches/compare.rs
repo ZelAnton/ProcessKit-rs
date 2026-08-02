@@ -41,6 +41,30 @@ fn processkit_passthrough(payload: &[u8]) -> Command {
     command.stdin(Stdin::from_bytes(payload.to_vec()))
 }
 
+/// The same passthrough child named by an **absolute** path instead of a bare
+/// name. `processkit` resolves a bare name itself (`PATH` x PATHEXT, so the
+/// launch spawns exactly what the spawn-free `resolve_program` preflight
+/// reports); the plain baselines hand the bare name to the OS, whose own search
+/// runs inside the kernel. Comparing this series with `processkit` in the same
+/// group therefore attributes that lookup, instead of leaving it inside an
+/// unexplained "the crate is slower" delta.
+fn processkit_passthrough_resolved(program: &std::path::Path, payload: &[u8]) -> Command {
+    let command = if cfg!(windows) {
+        Command::new(program).args(["/c", "findstr", "^^"])
+    } else {
+        Command::new(program)
+    };
+    command.stdin(Stdin::from_bytes(payload.to_vec()))
+}
+
+/// Resolve the passthrough child's absolute path once, outside every timed
+/// section, using the crate's own spawn-free lookup.
+fn resolved_passthrough_program() -> std::path::PathBuf {
+    processkit_passthrough(b"")
+        .resolve_program()
+        .expect("resolve the passthrough child's absolute path")
+}
+
 fn tokio_passthrough() -> TokioCommand {
     let mut command = if cfg!(windows) {
         let mut command = TokioCommand::new("cmd");
@@ -208,8 +232,64 @@ fn std_fan_out(payload: &[u8]) {
     });
 }
 
+/// Spawn children until process creation reaches a steady state, recording
+/// nothing.
+///
+/// A Windows host with real-time behavioural monitoring throttles a process that
+/// abruptly starts creating children, and only settles tens of seconds later —
+/// well past criterion's per-series warm-up, which is scoped to one series and
+/// cannot be made long enough without multiplying the whole run's duration by the
+/// number of series. Left alone, that entire penalty lands on whichever series
+/// criterion measures first; observed here as the first contender reading two to
+/// four times its own value from a later run, while every other series stayed
+/// stable. That is an artefact of measurement order, not a property of any
+/// contender, so it is removed rather than reported.
+///
+/// Batches of real runs are timed until several consecutive batches land close to
+/// the best batch seen, or the budget runs out. The run of stable batches is
+/// deliberately long: while the host is still settling, batch times fall
+/// unevenly, and a short run of "close enough" batches is reached by noise well
+/// before the cost has actually bottomed out. On a host that does not throttle,
+/// this costs the handful of seconds those batches take.
+fn prime_process_creation(rt: &Runtime) {
+    const BATCH: usize = 16;
+    const BUDGET: Duration = Duration::from_secs(240);
+    const STABLE_ROUNDS: u32 = 5;
+    const STABLE_FACTOR: f64 = 1.10;
+    let started = std::time::Instant::now();
+    let mut best = Duration::MAX;
+    let mut stable = 0;
+    while started.elapsed() < BUDGET {
+        let round = std::time::Instant::now();
+        rt.block_on(async {
+            for _ in 0..BATCH {
+                let result = processkit_passthrough(SMALL_PAYLOAD)
+                    .output_string()
+                    .await
+                    .expect("processkit priming run");
+                assert!(result.is_success());
+            }
+        });
+        let elapsed = round.elapsed();
+        if elapsed < best {
+            best = elapsed;
+            stable = 0;
+        } else if elapsed <= best.mul_f64(STABLE_FACTOR) {
+            stable += 1;
+            if stable >= STABLE_ROUNDS {
+                return;
+            }
+        } else {
+            stable = 0;
+        }
+    }
+}
+
 fn bench_spawn_capture(c: &mut Criterion) {
     let rt = Runtime::new().expect("build benchmark runtime");
+    // Runs before the first series of the first group, so every contender in
+    // every group is measured from the same steady state.
+    prime_process_creation(&rt);
     let mut group = c.benchmark_group("spawn_capture_small");
     group.bench_function("processkit", |b| {
         b.to_async(&rt).iter(|| async {
@@ -219,6 +299,20 @@ fn bench_spawn_capture(c: &mut Criterion) {
                 .expect("processkit capture");
             assert!(result.is_success());
             let _ = std::hint::black_box(result);
+        });
+    });
+    group.bench_function("processkit_resolved_program", |b| {
+        let program = resolved_passthrough_program();
+        b.to_async(&rt).iter(|| {
+            let program = program.clone();
+            async move {
+                let result = processkit_passthrough_resolved(&program, SMALL_PAYLOAD)
+                    .output_string()
+                    .await
+                    .expect("processkit capture");
+                assert!(result.is_success());
+                let _ = std::hint::black_box(result);
+            }
         });
     });
     group.bench_function("processkit_discard_stdout", |b| {
@@ -299,9 +393,14 @@ fn bench_concurrent_fan_out(c: &mut Criterion) {
     group.finish();
 }
 
+/// The warm-up is deliberately longer than criterion's default: on a Windows host
+/// with a real-time scanner the first seconds of a run cost visibly more than the
+/// rest, and without a warm-up long enough to absorb that, the whole penalty
+/// lands on whichever contender criterion happens to measure first.
 fn configure() -> Criterion {
     Criterion::default()
         .sample_size(20)
+        .warm_up_time(Duration::from_secs(10))
         .measurement_time(Duration::from_secs(5))
 }
 

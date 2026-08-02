@@ -39,6 +39,14 @@ to a dated version section.
 
 ### Changed
 
+- Release a freshly contained Windows child through a per-process thread walk
+  instead of a system-wide thread snapshot, cutting the crate's fixed start cost
+  for a short-lived child to within noise of a plain unguarded spawn; the
+  snapshot remains the fallback and containment is unchanged.
+- Attribute the Windows fixed start cost between the crate and the OS with a new
+  `win_spawn_phases` benchmark, a bare-name-versus-absolute-path contender in
+  `spawn_capture_small`, and measured phase and primitive tables in the
+  comparative-benchmarks guide.
 - Make the scheduled fuzz tier cumulative with per-target corpus caches,
   bounded corpus minimization, committed cassette seeds, and uploaded crash inputs.
 - Disable incremental compilation for one-shot local validation matrices and

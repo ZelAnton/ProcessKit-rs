@@ -243,3 +243,10 @@ clean-disk:
 # the OS, scheduler, toolchain, and machine, and are not a CI gate.
 bench-compare:
     cargo bench --bench compare
+
+# Attribute the fixed Windows start cost between processkit and the OS: the
+# phases of the containment sequence (suspended spawn, thread-snapshot resume,
+# Job Object create/assign), the primitives behind them, and the program lookup.
+# Local-only for the same reason as `bench-compare`; a no-op off Windows.
+bench-win-phases:
+    cargo bench --bench win_spawn_phases

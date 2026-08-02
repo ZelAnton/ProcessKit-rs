@@ -48,6 +48,11 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_BASIC_PROCESS_ID_LIST, JobObjectBasicProcessIdList,
 };
+// Runtime resolution of `ntdll!NtGetNextThread`, the per-process thread walk that
+// replaces the system-wide ToolHelp snapshot on the spawn path (see
+// `resume_process_threads`). Resolved rather than link-imported so a host without
+// the export degrades to the snapshot instead of failing to start.
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 #[cfg(feature = "stats")]
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 #[cfg(any(feature = "stats", feature = "process-control"))]
@@ -384,7 +389,7 @@ impl Job {
         }
         // Contained — release the primary thread. A failure here would strand a
         // suspended-but-contained process; the reaper kills it as `guard` drops.
-        resume_process_threads(pid)?;
+        resume_process_threads(pid, handle as HANDLE)?;
         // Re-arm the kill-on-drop backstop now the child is contained: a prior
         // graceful_shutdown(escalate=false) latched skip_drop_kill to spare
         // survivors; a fresh member must not be spared by that stale latch on
@@ -648,6 +653,13 @@ impl Job {
     /// that the live owner is *still a member of this job* (`IsProcessInJob`)
     /// before touching it, so a recycled pid can never divert a suspend/resume
     /// onto an unrelated process.
+    ///
+    /// Deliberately still the system-wide ToolHelp snapshot, unlike the launch
+    /// path's resume (see [`resume_process_threads`], T-244): this walk covers
+    /// **every member** of the job, so one snapshot is amortised over all of them
+    /// rather than paid per child — and the recycle guards above are built around
+    /// the tid list it yields. It is also an explicit, opt-in group operation, not
+    /// part of the fixed per-run start cost the launch path optimises.
     #[cfg(feature = "process-control")]
     fn for_each_member_thread(&self, suspend: bool) -> io::Result<()> {
         // Mutually exclusive with `spawn`'s assign → resume window (see the
@@ -1209,11 +1221,146 @@ impl Drop for UncontainedChildGuard {
     }
 }
 
-/// Resume every thread of `pid`. A child spawned `CREATE_SUSPENDED` has exactly
-/// one thread (its primary); we walk a thread snapshot because std/tokio surface
-/// only the process handle, not the `PROCESS_INFORMATION` thread handle returned
-/// by `CreateProcess`.
-fn resume_process_threads(pid: u32) -> io::Result<()> {
+/// Resume every thread of the freshly-contained child. A child spawned
+/// `CREATE_SUSPENDED` has exactly one thread (its primary), but std/tokio surface
+/// only the process handle, never the `PROCESS_INFORMATION` thread handle
+/// `CreateProcess` returned — so the thread has to be *found* before it can be
+/// resumed.
+///
+/// Two ways to find it, in cost order (T-244):
+///
+/// 1. `ntdll!NtGetNextThread`, which walks the threads of **one** process from
+///    its process handle. Measured on a 514-process / 7761-thread Windows 11
+///    host: a few microseconds.
+/// 2. The `TH32CS_SNAPTHREAD` ToolHelp snapshot, the only *documented* way to map
+///    a pid to its thread ids — but the snapshot is **system-wide** (the pid
+///    argument is documented as ignored for thread lists), so it materialises
+///    every thread on the machine to find the one we just created. Measured on
+///    the same host: **74 ms**, roughly 3.3x the cost of the `CreateProcess`
+///    call it follows, and the single dominant consumer of ProcessKit's fixed
+///    Windows start cost. `benches/win_spawn_phases.rs` reproduces both numbers.
+///
+/// The snapshot is kept as the fallback, so an unavailable or uncooperative
+/// entry point costs performance and nothing else. Containment is unaffected
+/// either way: this runs *after* `AssignProcessToJobObject` has succeeded, and
+/// the child stays suspended (and reaped by `UncontainedChildGuard`) if both
+/// paths fail.
+fn resume_process_threads(pid: u32, process: HANDLE) -> io::Result<()> {
+    if resume_process_threads_direct(process) {
+        return Ok(());
+    }
+    resume_process_threads_via_snapshot(pid)
+}
+
+/// `ntdll!NtGetNextThread` — enumerate the threads of one process directly from
+/// its handle.
+///
+/// Undocumented but exported since Windows Vista, and the only way to reach a
+/// specific process's threads without materialising every thread on the machine.
+/// Deliberately resolved at runtime rather than link-imported: a missing export
+/// must degrade to the snapshot walk, never keep the process from starting.
+type NtGetNextThread = unsafe extern "system" fn(
+    process: HANDLE,
+    thread: HANDLE,
+    desired_access: u32,
+    handle_attributes: u32,
+    flags: u32,
+    new_thread: *mut HANDLE,
+) -> i32;
+
+/// `ntdll.dll`, NUL-terminated UTF-16 for `GetModuleHandleW`.
+const NTDLL_UTF16: &[u16] = &[
+    b'n' as u16,
+    b't' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
+    0,
+];
+
+/// Resolve `ntdll!NtGetNextThread` once per process. `None` means "unavailable —
+/// use the snapshot", and is cached just like a hit so a host without the export
+/// pays the failed lookup once rather than per spawn.
+fn nt_get_next_thread() -> Option<NtGetNextThread> {
+    static ENTRY: std::sync::OnceLock<Option<NtGetNextThread>> = std::sync::OnceLock::new();
+    *ENTRY.get_or_init(|| {
+        // SAFETY: `ntdll.dll` is mapped into every Win32 process before any user
+        // code runs. `GetModuleHandleW` takes no reference on the module, so the
+        // returned handle needs no release and stays valid for the process
+        // lifetime (ntdll is never unloaded).
+        let ntdll = unsafe { GetModuleHandleW(NTDLL_UTF16.as_ptr()) };
+        if ntdll.is_null() {
+            return None;
+        }
+        // SAFETY: `ntdll` is a live module handle and the name is a
+        // NUL-terminated ASCII literal.
+        let symbol =
+            unsafe { GetProcAddress(ntdll, c"NtGetNextThread".to_bytes_with_nul().as_ptr()) };
+        symbol.map(|symbol| {
+            // SAFETY: the resolved export has exactly this signature (it is
+            // stable across every Windows release that exports it), and ntdll
+            // stays mapped for the process lifetime so the pointer never
+            // dangles.
+            unsafe {
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, NtGetNextThread>(symbol)
+            }
+        })
+    })
+}
+
+/// Resume the child's threads through `NtGetNextThread`. Reports whether at
+/// least one thread was actually resumed; anything else (no export, a refused
+/// enumeration, a `ResumeThread` failure) reports `false` so the caller can fall
+/// back to the documented snapshot walk. Over-resuming is harmless — the shared
+/// [`resume_thread_handle`] stops as soon as the suspend count reaches zero — so
+/// the fallback is safe even after a partially-applied fast path.
+fn resume_process_threads_direct(process: HANDLE) -> bool {
+    let Some(next_thread) = nt_get_next_thread() else {
+        return false;
+    };
+    let mut resumed = 0u32;
+    // The enumeration cursor: `null` asks for the first thread, and each later
+    // call passes the handle the previous one returned. Every returned handle is
+    // ours to close, which happens on the following iteration — after it has
+    // been consumed as the cursor.
+    let mut cursor: HANDLE = std::ptr::null_mut();
+    loop {
+        let mut thread: HANDLE = std::ptr::null_mut();
+        // SAFETY: `process` is the live child's handle (created by
+        // `CreateProcess`, so it carries PROCESS_QUERY_INFORMATION), `cursor` is
+        // either null or a handle this loop obtained from the same call, and
+        // `thread` is an owned out-param.
+        let status =
+            unsafe { next_thread(process, cursor, THREAD_SUSPEND_RESUME, 0, 0, &mut thread) };
+        if !cursor.is_null() {
+            // SAFETY: obtained from a previous NtGetNextThread call; closed once.
+            // Every path below either overwrites `cursor` with the freshly
+            // returned handle or leaves the loop, so the closed value is never
+            // passed to a second call.
+            unsafe { CloseHandle(cursor) };
+        }
+        // Any non-success NTSTATUS ends the walk: STATUS_NO_MORE_ENTRIES is the
+        // normal terminator, and every other failure is handled by the caller's
+        // fallback (or, once a thread has been resumed, is simply the end).
+        if status < 0 || thread.is_null() {
+            break;
+        }
+        if resume_thread_handle(thread).is_ok() {
+            resumed += 1;
+        }
+        cursor = thread;
+    }
+    resumed > 0
+}
+
+/// The documented fallback: find the child's threads in a system-wide
+/// `TH32CS_SNAPTHREAD` snapshot. See [`resume_process_threads`] for why this is
+/// no longer the first choice.
+fn resume_process_threads_via_snapshot(pid: u32) -> io::Result<()> {
     // SAFETY: TH32CS_SNAPTHREAD always snapshots all threads system-wide (the
     // pid argument is ignored for the thread list); returns INVALID_HANDLE_VALUE
     // on failure.
@@ -1869,6 +2016,34 @@ mod guard_tests {
 
 #[cfg(test)]
 mod thread_resume_tests {
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+    /// The exit code the fixture child reports once it is actually resumed. A
+    /// still-suspended child never exits at all, so observing this code is proof
+    /// the resume reached the primary thread.
+    const RESUMED_EXIT_CODE: i32 = 7;
+
+    fn spawn_suspended_fixture() -> tokio::process::Child {
+        tokio::process::Command::new("cmd")
+            .args(["/C", "exit 7"])
+            .creation_flags(CREATE_SUSPENDED)
+            .spawn()
+            .expect("spawn the suspended fixture child")
+    }
+
+    /// Wait for the resumed child, failing loudly rather than hanging if the
+    /// resume silently did nothing.
+    async fn expect_resumed(child: &mut tokio::process::Child) {
+        let status = tokio::time::timeout(Duration::from_secs(30), child.wait())
+            .await
+            .expect("a resumed child must exit; a hang means it is still suspended")
+            .expect("wait for the resumed child");
+        assert_eq!(status.code(), Some(RESUMED_EXIT_CODE));
+    }
+
     #[test]
     fn resume_thread_handle_rejects_an_invalid_handle() {
         let error = super::resume_thread_handle(std::ptr::null_mut())
@@ -1877,6 +2052,53 @@ mod thread_resume_tests {
             error.raw_os_error(),
             Some(windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32)
         );
+    }
+
+    #[test]
+    fn the_direct_thread_walk_reports_failure_for_an_unusable_process_handle() {
+        // The whole point of the bool return: an entry point that cannot
+        // enumerate must hand the caller back to the snapshot walk instead of
+        // claiming the child was released.
+        assert!(
+            !super::resume_process_threads_direct(std::ptr::null_mut()),
+            "a refused enumeration must not be reported as a resumed child"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn the_direct_thread_walk_releases_a_suspended_child() {
+        let mut child = spawn_suspended_fixture();
+        let handle = child.raw_handle().expect("the child has a handle") as HANDLE;
+        assert!(
+            super::resume_process_threads_direct(handle),
+            "ntdll!NtGetNextThread must release the primary thread of a freshly \
+             suspended child; if this host lacks the export the spawn path still \
+             works through the snapshot fallback, but the fast path is gone"
+        );
+        expect_resumed(&mut child).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn the_snapshot_fallback_still_releases_a_suspended_child() {
+        // The documented fallback must stay correct on its own: it is what runs
+        // on any host where the ntdll entry point is unavailable.
+        let mut child = spawn_suspended_fixture();
+        let pid = child.id().expect("the child has a pid");
+        super::resume_process_threads_via_snapshot(pid).expect("the snapshot walk resumes");
+        expect_resumed(&mut child).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn the_combined_resume_releases_a_suspended_child() {
+        // The seam `Job::spawn` actually calls, whichever path it takes inside.
+        let mut child = spawn_suspended_fixture();
+        let pid = child.id().expect("the child has a pid");
+        let handle = child.raw_handle().expect("the child has a handle") as HANDLE;
+        super::resume_process_threads(pid, handle).expect("the contained child is resumed");
+        expect_resumed(&mut child).await;
     }
 }
 
