@@ -920,8 +920,34 @@ impl ProcessGroup {
     /// `Drop`, the group is gone by ownership and cannot be reconfigured at all.
     ///
     /// On success the group's stored options reflect the new set (observable via the
-    /// group's [`Debug`](std::fmt::Debug)); a failure leaves the previous caps in
-    /// force.
+    /// group's [`Debug`](std::fmt::Debug)).
+    ///
+    /// # A failure is not a rollback
+    ///
+    /// A failed call leaves the group's *reflected* options describing the previous
+    /// set — but that is this handle's bookkeeping, not a statement about the OS
+    /// container. Neither backend applies the set atomically: Windows writes the
+    /// memory and process caps in one `SetInformationJobObject` call and the CPU cap
+    /// in a second, and the cgroup v2 backend writes `memory.max`, `pids.max` and
+    /// `cpu.max` in turn. A call that fails part-way can therefore leave the
+    /// container carrying a **mix** of old and new caps — including an axis this
+    /// request meant to *lift*, already lifted. Nothing is undone, and the error does
+    /// not say how far the write got. Recover by re-issuing the complete desired set
+    /// (this is a full replacement, so the retry is idempotent) or by tearing the
+    /// group down. Only a value rejected by validation
+    /// ([`LimitReason::Invalid`]) is guaranteed to have changed nothing: it fails
+    /// before the OS is touched at all.
+    ///
+    /// What stays exact through this is the post-run evidence.
+    /// [`limit_evidence`](Self::limit_evidence) is the authoritative answer to what
+    /// actually *fired*, and a partial update cannot fool it: every axis this call
+    /// requests joins the group's sticky cap record as soon as the request reaches
+    /// the OS — on failure exactly as on success — so an axis that did land before
+    /// the failure is still answered from the kernel's own counters instead of being
+    /// reported [`NotTripped`](crate::LimitVerdict::NotTripped) with nothing read.
+    /// The cost of that conservatism is at most an extra counter read, or an honest
+    /// [`Unknown`](crate::LimitVerdict::Unknown) where a cap was in fact never
+    /// applied — never an invented verdict.
     ///
     /// # Errors
     ///
@@ -934,42 +960,17 @@ impl ProcessGroup {
     /// enabled off the real hierarchy root, or a Job Object call the OS rejected).
     #[cfg(feature = "limits")]
     pub fn update_limits(&mut self, limits: ResourceLimits) -> Result<()> {
-        // Same validation the creation path runs — an invalid value is rejected
-        // before the OS is touched, with the specific offending axis.
-        validate_limits(&limits)?;
-        self.job.update_limits(&limits).map_err(|source| {
-            if limits.any() {
-                // Mirror `with_options`'s classification exactly: the backends
-                // report `ErrorKind::Unsupported` precisely when no whole-tree
-                // container mechanism exists at all; every other failure means a
-                // capable mechanism exists but this request could not be applied.
-                let reason = if source.kind() == std::io::ErrorKind::Unsupported {
-                    LimitReason::Unsupported
-                } else {
-                    LimitReason::Unenforceable
-                };
-                ErrorReason::ResourceLimit {
-                    kind: first_requested_kind(&limits),
-                    reason,
-                    detail: source.to_string(),
-                }
-                .into()
-            } else {
-                // No cap requested (a pure "lift everything") that still failed —
-                // a plain I/O failure on the reset write, not a limit-capability
-                // problem.
-                Error::io(source)
-            }
-        })?;
-        // Reflect the applied set so the group's public view (Debug, any future
-        // getter) stays honest.
-        self.options.limits = limits;
-        // Sticky, unlike `options.limits`: an axis capped here stays on the evidence
-        // record even after a later replacement lifts it, so a cap that fired while
-        // it was in force is never reported as "did not fire". Recorded only on
-        // success — a refused update applied no cap.
-        self.capped.record(&limits);
-        Ok(())
+        // Destructured for disjoint field borrows: the shared core takes the
+        // evidence record and the reflected options mutably while the apply closure
+        // still borrows the live job handle.
+        let Self {
+            job,
+            options,
+            capped,
+        } = self;
+        update_limits_with(capped, &mut options.limits, limits, |limits| {
+            job.update_limits(limits)
+        })
     }
 
     /// Post-run evidence about this group's resource caps: **did a cap that was in
@@ -986,13 +987,21 @@ impl ProcessGroup {
     ///
     /// # Not the same question as [`crate::ErrorReason::ResourceLimit`]
     ///
-    /// That error is **pre-spawn admission**: "the cap you requested could not be
-    /// *applied*" ([`LimitReason::Invalid`] / [`LimitReason::Unsupported`] /
-    /// [`LimitReason::Unenforceable`]), raised by
-    /// [`with_options`](Self::with_options) / [`update_limits`](Self::update_limits)
-    /// before or instead of running anything. This report is the other side: the cap
-    /// **was** applied — did it then *engage*? The two never overlap, and this
-    /// addition changes nothing about that error's behavior.
+    /// That error is **admission**: "the cap you requested could not be *applied*"
+    /// ([`LimitReason::Invalid`] / [`LimitReason::Unsupported`] /
+    /// [`LimitReason::Unenforceable`]). From
+    /// [`with_options`](Self::with_options) it is raised instead of running anything
+    /// at all — no group is handed back, so there is nothing left to ask. From
+    /// [`update_limits`](Self::update_limits) it is raised against an
+    /// **already-running** tree, and it is *not* a rollback. This report is the other
+    /// side: did a cap on this axis then *engage*?
+    ///
+    /// Different questions — and this addition changes nothing about that error's
+    /// behavior — but on a live group they can meet on the same axis. After a failed
+    /// `update_limits` the error says the requested set could not be applied whole,
+    /// while this report still answers what actually fired, reading the counters for
+    /// every axis that request named (see *A failure is not a rollback* on
+    /// [`update_limits`](Self::update_limits), and *Lifetime and cost* below).
     ///
     /// # Three-valued, and never a guess
     ///
@@ -1042,7 +1051,10 @@ impl ProcessGroup {
     /// Any number of reads is fine — the counters are cumulative and are not reset
     /// by reading, by a teardown, or by [`update_limits`](Self::update_limits); an
     /// axis whose cap was later lifted still reports the fact that it fired while it
-    /// was in force.
+    /// was in force. An axis named by an `update_limits` call that *failed* counts as
+    /// capped too: that call is not a rollback, so the axis may have been applied
+    /// before the failure, and it is read from the counters rather than assumed
+    /// innocent.
     ///
     /// This is a pure read — no signal, no kill, no write — so it cannot perturb
     /// teardown, kill-on-drop, or the order the container is removed in, whenever it
@@ -1112,6 +1124,75 @@ fn validate_limits(limits: &ResourceLimits) -> Result<()> {
         }
         .into());
     }
+    Ok(())
+}
+
+/// The shared core of [`ProcessGroup::update_limits`], parametrized over the
+/// backend call — the injectable seam that lets tests drive a *failed* application
+/// without an OS primitive that can be made to fail on demand, in the same style as
+/// the cgroup backend's `limit_evidence_with`.
+///
+/// The order of the three steps is the contract, not an implementation detail:
+///
+/// 1. **Validate first.** A value rejected here never reaches the OS, so nothing is
+///    recorded for it — mirroring `with_options`, which records only for a group
+///    that was actually created, and leaving no phantom axis behind a typo.
+/// 2. **Record before applying**, so the record happens whatever the outcome.
+///    Neither backend applies the set atomically (Windows writes the memory and
+///    process caps in one `SetInformationJobObject` call and the CPU cap in a
+///    second; the cgroup backend writes `memory.max`, `pids.max` and `cpu.max` in
+///    turn), so a failure part-way through can leave an axis of *this* request
+///    already in force. Recording only on success would let `limit_evidence` answer
+///    `NotTripped` for such an axis **without reading any counter** — precisely the
+///    fabricated "it did not fire" that `LimitVerdict` exists to rule out. Over-
+///    recording is the safe direction: at worst it costs one extra counter read
+///    (Linux) or turns a would-be `NotTripped` into an honest `Unknown` (Windows),
+///    neither of which can invent a verdict.
+/// 3. **Reflect only on success.** The whole new set demonstrably did not take
+///    effect, so updating the group's `Debug`-visible options would be the opposite
+///    lie — claiming caps that may never have been written.
+#[cfg(feature = "limits")]
+fn update_limits_with(
+    capped: &mut CappedAxes,
+    reflected: &mut ResourceLimits,
+    limits: ResourceLimits,
+    apply: impl FnOnce(&ResourceLimits) -> std::io::Result<()>,
+) -> Result<()> {
+    // Same validation the creation path runs — an invalid value is rejected
+    // before the OS is touched, with the specific offending axis.
+    validate_limits(&limits)?;
+    // Sticky, unlike `reflected`: an axis capped here stays on the evidence record
+    // even after a later replacement lifts it, so a cap that fired while it was in
+    // force is never reported as "did not fire". Deliberately recorded up front
+    // rather than on success — see step 2 above.
+    capped.record(&limits);
+    apply(&limits).map_err(|source| {
+        if limits.any() {
+            // Mirror `with_options`'s classification exactly: the backends
+            // report `ErrorKind::Unsupported` precisely when no whole-tree
+            // container mechanism exists at all; every other failure means a
+            // capable mechanism exists but this request could not be applied.
+            let reason = if source.kind() == std::io::ErrorKind::Unsupported {
+                LimitReason::Unsupported
+            } else {
+                LimitReason::Unenforceable
+            };
+            ErrorReason::ResourceLimit {
+                kind: first_requested_kind(&limits),
+                reason,
+                detail: source.to_string(),
+            }
+            .into()
+        } else {
+            // No cap requested (a pure "lift everything") that still failed —
+            // a plain I/O failure on the reset write, not a limit-capability
+            // problem.
+            Error::io(source)
+        }
+    })?;
+    // Reflect the applied set so the group's public view (Debug, any future
+    // getter) stays honest.
+    *reflected = limits;
     Ok(())
 }
 
@@ -1200,6 +1281,190 @@ mod tests {
                 }
                 other => panic!("expected ResourceLimit, got {other:?}"),
             }
+        }
+    }
+
+    /// Every axis, for the "and nothing else was touched" half of each assertion.
+    const ALL_KINDS: [LimitKind; 3] = [LimitKind::Memory, LimitKind::Processes, LimitKind::Cpu];
+
+    fn resource_limit_of(err: &Error) -> (LimitKind, LimitReason) {
+        match err.reason() {
+            ErrorReason::ResourceLimit { kind, reason, .. } => (*kind, *reason),
+            other => panic!("expected ResourceLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_update_still_records_every_requested_axis() {
+        // The regression this pins. Both backends write the axes one at a time
+        // (Windows: extended-limit struct, then CPU rate; cgroup v2: memory.max,
+        // pids.max, cpu.max), so a failure part-way through can leave an axis of
+        // *this* request already in force. Recording only on success used to skip
+        // that axis, and `limit_evidence` would then answer `NotTripped` for it
+        // without reading a single counter — the fabricated "it did not fire" that
+        // `LimitVerdict` exists to rule out, on an axis whose cap may really have
+        // killed the tree.
+        //
+        // A genuine mid-sequence OS failure can't be provoked from a unit test (no
+        // fault-injection seam exists in the backends), so the backend call is
+        // stubbed at `update_limits_with`'s seam — which is exactly where the
+        // ordering under test lives.
+        let mut capped = CappedAxes::default();
+        let mut reflected = ResourceLimits::default();
+        let requested = ResourceLimits {
+            max_memory: Some(64 * 1024 * 1024),
+            max_processes: Some(4),
+            cpu_quota: None,
+        };
+
+        let err = update_limits_with(&mut capped, &mut reflected, requested, |_| {
+            // The shape of a real Windows failure here: the extended-limit write
+            // (memory + processes) landed, the separate CPU-rate write did not.
+            Err(std::io::Error::other("cpu-rate reissue: boom"))
+        })
+        .unwrap_err();
+
+        // Both requested axes may have landed before the failure, so both must be on
+        // the record even though the call returned `Err`.
+        assert!(capped.has(LimitKind::Memory));
+        assert!(capped.has(LimitKind::Processes));
+        // Honest in the other direction too: an axis the caller never named stays
+        // off the record, so evidence still costs nothing on axes that had no cap.
+        assert!(!capped.has(LimitKind::Cpu));
+        // Unchanged behaviour, deliberately: the whole new set demonstrably did not
+        // take effect, so the group's Debug-visible options must not claim it did.
+        assert_eq!(reflected, ResourceLimits::default());
+        assert_eq!(
+            resource_limit_of(&err),
+            (LimitKind::Memory, LimitReason::Unenforceable)
+        );
+    }
+
+    #[test]
+    fn a_failed_update_records_even_where_no_container_exists() {
+        // A process-group mechanism refuses any cap outright, so nothing was applied
+        // — yet the record is still written, because "how far did the backend get?"
+        // is precisely what the caller cannot know. Over-recording is the safe
+        // direction: this mechanism reports `Unknown` for every axis anyway, and a
+        // capable one reads a counter rather than guessing.
+        let mut capped = CappedAxes::default();
+        let mut reflected = ResourceLimits::default();
+        let requested = ResourceLimits {
+            max_memory: None,
+            max_processes: None,
+            cpu_quota: Some(0.5),
+        };
+
+        let err = update_limits_with(&mut capped, &mut reflected, requested, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no whole-tree limit mechanism",
+            ))
+        })
+        .unwrap_err();
+
+        assert!(capped.has(LimitKind::Cpu));
+        assert!(!capped.has(LimitKind::Memory));
+        assert!(!capped.has(LimitKind::Processes));
+        // Classified exactly as `with_options` classifies the same backend signal.
+        assert_eq!(
+            resource_limit_of(&err),
+            (LimitKind::Cpu, LimitReason::Unsupported)
+        );
+    }
+
+    #[test]
+    fn an_invalid_request_records_nothing_and_never_reaches_the_backend() {
+        // The one failure that *is* a guarantee of "nothing changed": validation runs
+        // before the OS is touched. Recording there would leave a phantom axis behind
+        // a typo, exactly what `with_options` avoids by recording only for a group
+        // that was really created.
+        let mut capped = CappedAxes::default();
+        let mut reflected = ResourceLimits::default();
+        let mut reached_backend = false;
+        let err = update_limits_with(
+            &mut capped,
+            &mut reflected,
+            ResourceLimits {
+                max_memory: Some(0),
+                max_processes: Some(4),
+                cpu_quota: None,
+            },
+            |_| {
+                reached_backend = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(!reached_backend, "an invalid value must not reach the OS");
+        for k in ALL_KINDS {
+            assert!(!capped.has(k), "axis {k:?} must stay unrecorded");
+        }
+        assert_eq!(reflected, ResourceLimits::default());
+        assert_eq!(
+            resource_limit_of(&err),
+            (LimitKind::Memory, LimitReason::Invalid)
+        );
+    }
+
+    #[test]
+    fn a_failed_lift_everything_is_a_plain_io_error_with_nothing_to_record() {
+        // No cap requested at all: there is no axis to record, and the failure is an
+        // I/O problem on the reset write rather than a limit-capability verdict. The
+        // previously-reflected set stays — those caps may well still be in force.
+        let mut capped = CappedAxes::default();
+        let previous = ResourceLimits {
+            max_memory: Some(1024),
+            ..ResourceLimits::default()
+        };
+        capped.record(&previous);
+        let mut reflected = previous;
+
+        let err = update_limits_with(
+            &mut capped,
+            &mut reflected,
+            ResourceLimits::default(),
+            |_| Err(std::io::Error::other("reset write failed")),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err.reason(), ErrorReason::Io(_)), "{err:?}");
+        // Sticky: the earlier cap stays on the record, and no new axis appears.
+        assert!(capped.has(LimitKind::Memory));
+        assert!(!capped.has(LimitKind::Processes));
+        assert!(!capped.has(LimitKind::Cpu));
+        assert_eq!(reflected, previous);
+    }
+
+    #[test]
+    fn a_successful_update_records_the_new_axes_and_reflects_the_whole_set() {
+        // The success path is unchanged, and stickiness still holds through the seam:
+        // a replacement that LIFTS memory must not erase it from the record.
+        let mut capped = CappedAxes::default();
+        let previous = ResourceLimits {
+            max_memory: Some(64 * 1024 * 1024),
+            ..ResourceLimits::default()
+        };
+        capped.record(&previous); // what `with_options` does at creation
+        let mut reflected = previous;
+        let requested = ResourceLimits {
+            max_memory: None,
+            max_processes: Some(4),
+            cpu_quota: Some(0.5),
+        };
+
+        update_limits_with(&mut capped, &mut reflected, requested, |limits| {
+            // The backend is handed the caller's whole set, verbatim — a full
+            // replacement, never a merge with what was reflected before.
+            assert_eq!(*limits, requested);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(reflected, requested);
+        for k in ALL_KINDS {
+            assert!(capped.has(k), "axis {k:?}");
         }
     }
 

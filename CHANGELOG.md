@@ -65,6 +65,10 @@ to a dated version section.
 
 ### Fixed
 
+- Record every axis an `update_limits` request names on the group's cap ledger
+  even when applying it fails, so a cap that landed before a part-way failure can
+  no longer be reported as `NotTripped` by `limit_evidence` without reading a
+  counter; document that a failed update is not a rollback of the OS container.
 - Keep the local direct-minimal-versions check from rewriting the tracked
   `Cargo.lock` while it validates dependency floors.
 - Keep local musl nextest reports in the Docker target volume so Windows host
