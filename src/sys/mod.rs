@@ -305,15 +305,17 @@ impl Job {
         self.0.update_limits(limits)
     }
 
-    /// Post-run evidence about the caps this job carries: did an applied cap
-    /// actually fire? See
+    /// Post-run evidence about this job's caps: did a cap on this axis actually
+    /// fire? See
     /// [`ProcessGroup::limit_evidence`](crate::ProcessGroup::limit_evidence) for the
     /// contract and [`LimitVerdict`](crate::LimitVerdict) for what counts as
     /// evidence on each axis.
     ///
-    /// `capped` names the axes that have carried a cap at any point in this job's
-    /// life, so a backend reads **only** those (an uncapped axis is
-    /// `NotTripped` by construction — no cap, nothing to fire — and costs no I/O).
+    /// `capped` names the axes a cap request has named at any point in this job's
+    /// life — conservatively, so an axis of a *failed* `update_limits` counts too
+    /// (that call is no rollback, and the axis may well be in force). A backend
+    /// reads **only** those (an axis never named is `NotTripped` by construction —
+    /// no cap was ever asked for, nothing to fire — and costs no I/O).
     /// Infallible by design: an unreadable counter is `Unknown`, never an error,
     /// because "we could not look" and "it did not fire" must not collapse into one
     /// answer. Reads only; it never signals, kills, or mutates the container, so it
