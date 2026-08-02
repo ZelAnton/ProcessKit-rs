@@ -47,10 +47,14 @@ FreeBSD has two explicit tiers rather than inheriting confidence from macOS:
 `check-freebsd` cross-compiles the library and binaries for
 `x86_64-unknown-freebsd`, while `test-freebsd` boots a real FreeBSD 14.4 VM.
 The VM runs the hermetic library suite plus representative real-subprocess
-checks for mechanism selection, kill-on-drop, Unix signal delivery, and graceful
-TERM shutdown. This directly exercises the shared POSIX process-group backend
-against FreeBSD's kernel and userland without making the already broad full-suite
-matrix depend on an emulated VM.
+checks for mechanism selection, kill-on-drop, Unix signal delivery, graceful
+TERM shutdown, and — since FreeBSD has a containment backend of its own — the
+`procctl` reaper's resistance to a `setsid` escapee. This directly exercises the
+FreeBSD reaper backend and the process-group machinery underneath it against
+FreeBSD's kernel and userland without making the already broad full-suite matrix
+depend on an emulated VM. It is also the *only* place that backend runs at all:
+the `procctl` code cannot execute on any other host, so a change to it that
+passes `check-freebsd` is compiled, not tested, until this job says otherwise.
 
 Two container-runtime quirks — unrelated to musl/Alpine itself, but specific
 to running *any* test suite inside a plain container — need working around,
@@ -84,7 +88,28 @@ recipe in `justfile` for details.
 |---|---|---|
 | `JobObject` | Windows | A Job Object with kill-on-close; children are created suspended, assigned to the job, then resumed — so even a grandchild forked in the first instant is contained |
 | `CgroupV2` | Linux (with delegation) | A private cgroup; children join in `pre_exec`, before `exec`, so descendants can never escape; teardown is `cgroup.kill` |
-| `ProcessGroup` | macOS, BSDs, Linux fallback | POSIX process groups (`setpgid`); teardown is `killpg`; tracked per started/adopted child |
+| `ProcessReaper` | FreeBSD | The `procctl(2)` process reaper (`PROC_REAP_ACQUIRE`); every descendant stays in the reaper's subtree from `fork` on, listed by `PROC_REAP_GETPIDS` and torn down by `PROC_REAP_KILL` — a child that `setsid`s away does not escape |
+| `ProcessGroup` | macOS, the other BSDs, Linux fallback | POSIX process groups (`setpgid`); teardown is `killpg`; tracked per started/adopted child |
+
+**FreeBSD is not "macOS with a different name".** It is the only non-Linux unix
+with a real whole-tree containment primitive, so it gets its own mechanism rather
+than the process-group fallback the other BSDs use. Three consequences are worth
+knowing up front:
+
+- **A `setsid` escapee stays contained.** The classic escape — a descendant that
+  starts its own session, including the daemonising double-fork — leaves the
+  process group but not the reaper's subtree. `members()`, `signal`, `shutdown`
+  and kill-on-drop all still reach it.
+- **`members()` is the whole tree**, one entry per process, not one per contained
+  child (see the [inspection matrix](#capability-matrices)).
+- **Orphans re-parent to this process, not to `init`.** That is inherent to being
+  the reaper, and this crate takes on the duty that comes with it: a re-parented
+  descendant that exits is `wait`ed for by the crate itself, so it does not
+  accumulate as a zombie. Children *this process forked itself* are never touched
+  by that sweep — their exit status belongs to whoever spawned them, processkit or
+  not. Reaper status is acquired lazily (on the first `ProcessGroup`), never
+  released while the process lives, and is shared harmlessly with an application
+  that acquired it first.
 
 To learn which mechanism you *would* get **without creating a group** — for a
 spawn-free preflight / host-check that must have no side effects — call
@@ -92,10 +117,13 @@ spawn-free preflight / host-check that must have no side effects — call
 which returns a `HostContainment` (`mechanism()`, plus `soft_stop_scope()`,
 `parent_death_cleanup()`, and `crate_version()`) from read-only checks that create
 no container and spawn no process (on Linux: no cgroup directory). The predicted
-mechanism matches a real `ProcessGroup::new` on the same host; the Linux cgroup
-answer is best-effort (it probes whether a cgroup *could* be created rather than
-creating one), so a live `ProcessGroup::mechanism()` remains the final word in the
-rare window where a writable-looking cgroup then rejects creation. See [Running in
+mechanism matches a real `ProcessGroup::new` on the same host; two answers are
+best-effort, both because the query must create nothing. The Linux cgroup answer
+probes whether a cgroup *could* be created rather than creating one, and the
+FreeBSD answer reports `ProcessReaper` without acquiring reaper status (acquiring
+it is a real, permanent side effect on the process — available unprivileged on
+every supported kernel, so the prediction holds in practice). Either way a live
+`ProcessGroup::mechanism()` remains the final word. See [Running in
 containers → Which containment mechanism you get](containers.md#which-containment-mechanism-you-get).
 
 On Linux the cgroup backend requires controller **delegation**, and resource
@@ -120,11 +148,12 @@ otherwise rejected the request.
 
 **Teardown & containment**
 
-| Capability | Windows JobObject | Linux cgroup | Linux pgroup | macOS/BSD |
-|---|---|---|---|---|
-| Kill-on-drop, whole tree | ✅ | ✅ | ✅ groups-based | ✅ groups-based |
-| Graceful `shutdown` (TERM → grace → KILL) | 🟡 auto `WM_CLOSE` soft tier for windowed children; opt-in `CTRL_BREAK` for console children; else atomic kill | ✅ | ✅ | ✅ |
-| `adopt` an external child | ✅ (future forks contained) | ✅ (future forks contained) | 🟡 exec'd child tracked individually | 🟡 same |
+| Capability | Windows JobObject | Linux cgroup | Linux pgroup | FreeBSD reaper | macOS/other BSD |
+|---|---|---|---|---|---|
+| Kill-on-drop, whole tree | ✅ | ✅ | ✅ groups-based | ✅ subtree-based | ✅ groups-based |
+| Survives a descendant's `setsid` / double-fork | ✅ | ✅ | ❌ escapes | ✅ | ❌ escapes |
+| Graceful `shutdown` (TERM → grace → KILL) | 🟡 auto `WM_CLOSE` soft tier for windowed children; opt-in `CTRL_BREAK` for console children; else atomic kill | ✅ | ✅ | ✅ | ✅ |
+| `adopt` an external child | ✅ (future forks contained) | ✅ (future forks contained) | 🟡 exec'd child tracked individually | ✅ (future forks contained) | 🟡 exec'd child tracked individually |
 
 Windows has no POSIX signal tier, so for a **windowless** child with no opt-in a
 graceful `shutdown` collapses to the atomic Job kill — but it still honors
@@ -161,11 +190,12 @@ sends a real signal.
 
 **Signals & freezing**
 
-| Capability | Windows | Linux cgroup | Linux pgroup | macOS/BSD |
-|---|---|---|---|---|
-| Arbitrary signal (`Hup`, `Usr1`, `Other(n)`, …) | 🟡 `Kill`, plus `Int`/`Term` as a best-effort soft close (`CTRL_BREAK` + `WM_CLOSE`); others unsupported | ✅ | ✅ | ✅ |
-| `soft_stop_scope()` (soft `Int`/`Term` reach) | 🟡 `OptInMembers` with a console/windowed member, else `Unsupported` | `WholeTree` | `WholeTree` | `WholeTree` |
-| `suspend` / `resume` | 🟡 per-thread counts | ✅ `cgroup.freeze` | ✅ `SIGSTOP`/`CONT` | ✅ `SIGSTOP`/`CONT` |
+| Capability | Windows | Linux cgroup | Linux pgroup | FreeBSD reaper | macOS/other BSD |
+|---|---|---|---|---|---|
+| Arbitrary signal (`Hup`, `Usr1`, `Other(n)`, …) | 🟡 `Kill`, plus `Int`/`Term` as a best-effort soft close (`CTRL_BREAK` + `WM_CLOSE`); others unsupported | ✅ | ✅ | ✅ `PROC_REAP_KILL` | ✅ |
+| Signal reaches a `setsid` escapee | n/a | ✅ | ❌ | ✅ | ❌ |
+| `soft_stop_scope()` (soft `Int`/`Term` reach) | 🟡 `OptInMembers` with a console/windowed member, else `Unsupported` | `WholeTree` | `WholeTree` | `WholeTree` | `WholeTree` |
+| `suspend` / `resume` | 🟡 per-thread counts | ✅ `cgroup.freeze` | ✅ `SIGSTOP`/`CONT` | ✅ `SIGSTOP`/`CONT`, whole subtree | ✅ `SIGSTOP`/`CONT` |
 
 On **both** Unix mechanisms, a `signal` broadcast surfaces a real send failure as
 an `Err` rather than swallowing it — an `EINVAL` (an out-of-range `Other(n)`) and
@@ -174,7 +204,9 @@ seccomp/container restriction) — consistent with the "never silently skipped"
 philosophy. The process-group backend (macOS/BSD, Linux fallback) matches the
 cgroup verdict by checking the target's run state after an `EPERM`, so a harmless
 zombie-only `EPERM` — and every `EPERM` on the bare BSDs (no state reader) —
-stays swallowed; an `ESRCH` race (the member already exited) is still success,
+stays swallowed; the FreeBSD reaper makes the same discrimination from the
+kernel's own zombie flag on the failing member, which `PROC_REAP_KILL` names
+explicitly; an `ESRCH` race (the member already exited) is still success,
 and `Signal::Other(0)` returns `Ok` having delivered nothing (the POSIX existence
 probe). On the cgroup mechanism the `SIGSTOP`/`SIGCONT` fallback used for
 `suspend`/`resume` on pre-5.2 kernels (no `cgroup.freeze`) surfaces failures the
@@ -194,22 +226,23 @@ platform. Gated on the **`process-control`** feature, like `signal`.
 
 **Inspection & accounting**
 
-| Capability | Windows | Linux cgroup | Linux pgroup | macOS/BSD |
-|---|---|---|---|---|
-| `members()` | ✅ whole tree | ✅ whole tree | 🟡 leaders only | 🟡 leaders only |
-| Group CPU / peak memory | ✅ | ✅ | ❌ count only | ❌ count only |
-| Per-run `cpu_time` / `peak_memory_bytes` / `profile` | ✅ | ✅ | ✅ (`/proc`) | ❌ `None` |
+| Capability | Windows | Linux cgroup | Linux pgroup | FreeBSD reaper | macOS/other BSD |
+|---|---|---|---|---|---|
+| `members()` | ✅ whole tree | ✅ whole tree | 🟡 leaders only | ✅ whole tree | 🟡 leaders only |
+| `members_info()` ppid / image / start time | ✅ | ✅ | ✅ (`/proc`) | ❌ all `None` | 🟡 macOS ✅, other BSDs all `None` |
+| Group CPU / peak memory | ✅ | ✅ | ❌ count only | ❌ count only | ❌ count only |
+| Per-run `cpu_time` / `peak_memory_bytes` / `profile` | ✅ | ✅ | ✅ (`/proc`) | ❌ `None` | ❌ `None` |
 
 `members()` is gated on the **`process-control`** feature; the CPU / memory /
 `profile` rows are gated on the **`stats`** feature.
 
 **Resource limits** (`limits` feature)
 
-| Capability | Windows | Linux cgroup | Linux pgroup | macOS/BSD |
-|---|---|---|---|---|
-| `max_memory` (whole tree) | ✅ | ✅ | ❌ | ❌ |
-| `max_processes` | ✅ | ✅ | ❌ | ❌ |
-| `cpu_quota` | 🟡 approximate | ✅ | ❌ | ❌ |
+| Capability | Windows | Linux cgroup | Linux pgroup | FreeBSD reaper | macOS/other BSD |
+|---|---|---|---|---|---|
+| `max_memory` (whole tree) | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `max_processes` | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `cpu_quota` | 🟡 approximate | ✅ | ❌ | ❌ | ❌ |
 
 **Readiness probes**
 
@@ -234,8 +267,8 @@ real client open, treats `ERROR_PIPE_BUSY` as ready, and is unsupported on Unix.
 | `arg0` override | ❌ `Unsupported` | ✅ |
 | `setsid` | ❌ `Unsupported` | ✅ |
 | `create_no_window` | ✅ | no-op |
-| `kill_on_parent_death` | ✅ always on (kernel) | Linux: direct child; macOS/BSD: no-op |
-| `kill_on_parent_death_scope()` (abrupt-death reach) | `WholeTree` | Linux: `DirectChildOnly`; macOS/BSD: `Unsupported` |
+| `kill_on_parent_death` | ✅ always on (kernel) | Linux: direct child; macOS/BSD (incl. FreeBSD): no-op |
+| `kill_on_parent_death_scope()` (abrupt-death reach) | `WholeTree` | Linux: `DirectChildOnly`; macOS/BSD (incl. FreeBSD): `Unsupported` |
 | `priority` | ✅ (priority class) | ✅ (`nice`/`setpriority`) |
 | `cpu_affinity` | ✅ (`SetProcessAffinityMask`) | Linux: ✅ (`sched_setaffinity`); macOS/BSD: ❌ `Unsupported` |
 | `io_priority` | ❌ `Unsupported` | Linux: ✅ (`ioprio_set`); macOS/BSD: ❌ `Unsupported` |
@@ -348,7 +381,8 @@ composes cleanly with the process-group mechanism.
 
 **Per-process `rlimit` vs. whole-tree limits.** `Command::rlimit` is applied
 before the uid/gid drop and inherited across `exec`/fork, so it works with every
-Unix containment mechanism, including macOS/BSD and Linux pgroup fallback. It
+Unix containment mechanism, including the FreeBSD reaper, macOS/BSD and the Linux
+pgroup fallback. It
 is not an aggregate tree counter: descendants share no single byte/file budget,
 and each may lower its own limits or raise its soft value up to the inherited
 hard value. Use the `limits` feature where a cgroup/Job Object can enforce a
@@ -357,8 +391,14 @@ genuine whole-tree cap; use rlimits for per-process hardening such as
 
 **`setsid()` × process groups.** A new session implies a new process group;
 the crate coordinates the two (the containment tracking follows the new
-session's group), so `setsid` keeps the kill-on-drop guarantee instead of
-breaking out of it.
+session's group), so a child started with `Command::setsid()` keeps the
+kill-on-drop guarantee instead of breaking out of it. What that coordination
+cannot cover is a *descendant* calling `setsid` on its own — the crate never sees
+it happen, and on the process-group mechanism the escapee is then outside every
+group being tracked. That gap is real on macOS and the other BSDs (and on Linux
+without a usable cgroup); it does not exist under a Job Object, a cgroup, or
+FreeBSD's `ProcessReaper`, all of which track descent rather than group
+membership.
 
 **`kill_on_parent_death()` is thread-scoped on Linux.** `PR_SET_PDEATHSIG`
 fires when the spawning *thread* dies, not only the process. On a

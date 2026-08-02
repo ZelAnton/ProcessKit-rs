@@ -686,8 +686,10 @@ impl ProcessGroup {
     /// as alive for the full `shutdown_timeout`, and `shutdown` then burns the
     /// whole grace plus a pointless `SIGKILL` escalation. Await each child you
     /// start into the group (any consuming verb, or `wait`) so its handle reaps it.
-    /// The Windows Job Object and Linux cgroup mechanisms are immune (a process
-    /// leaves `cgroup.procs` / the job on *exit*, before reaping).
+    /// The Windows Job Object, Linux cgroup and FreeBSD process-reaper mechanisms
+    /// are immune (a process leaves `cgroup.procs` / the job on *exit*, before
+    /// reaping; the reaper's listing flags a zombie as such, and this crate does
+    /// not count one as a live member).
     ///
     /// When `escalate_to_kill` is set, the final hard kill can surface the same
     /// errors as [`kill_all`](Self::kill_all): the undrained-tree `Err` on the
@@ -813,7 +815,8 @@ impl ProcessGroup {
     /// still reads as alive, so a child that exits on `SIGTERM` but whose handle was
     /// never awaited reads live for the full `grace` and inflates
     /// [`members_after`](ShutdownReport::members_after). Await each child you start
-    /// into the group. The Windows Job Object and Linux cgroup mechanisms are immune.
+    /// into the group. The Windows Job Object, Linux cgroup and FreeBSD
+    /// process-reaper mechanisms are immune.
     ///
     /// # Errors
     ///

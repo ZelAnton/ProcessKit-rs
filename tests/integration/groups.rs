@@ -23,7 +23,17 @@ async fn group_reports_the_platforms_mechanism() {
         matches!(mechanism, Mechanism::CgroupV2 | Mechanism::ProcessGroup),
         "linux is cgroup v2 or its pgroup fallback, got {mechanism:?}"
     );
-    #[cfg(all(unix, not(target_os = "linux")))]
+    // FreeBSD has a real whole-tree primitive of its own (`procctl`'s process
+    // reaper) and must actually get it: a `ProcessGroup` here would mean
+    // `PROC_REAP_ACQUIRE` failed and containment quietly fell back to the weaker,
+    // `setsid`-escapable mechanism.
+    #[cfg(target_os = "freebsd")]
+    assert_eq!(
+        mechanism,
+        Mechanism::ProcessReaper,
+        "FreeBSD must acquire the procctl process reaper, not degrade to a pgroup"
+    );
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
     assert_eq!(mechanism, Mechanism::ProcessGroup);
 }
 
@@ -227,9 +237,12 @@ async fn unix_setsid_child_forks_grandchild_still_contained() {
     // away itself — so `killpg(pgid)` on drop still reaches it even after the
     // direct child is gone. The documented pgroup escape hatch is a process that
     // calls `setsid` *itself*, not one that merely inherits the session. (Under
-    // the Linux cgroup mechanism the grandchild is contained a fortiori — it
-    // never leaves the cgroup — so this asserts the *weaker* fallback's boundary
-    // explicitly, and holds on every unix backend.)
+    // the Linux cgroup mechanism, and under the FreeBSD process reaper, the
+    // grandchild is contained a fortiori — it never leaves the cgroup / the
+    // reaper's subtree — so this asserts the *weaker* fallback's boundary
+    // explicitly, and holds on every unix backend. The FreeBSD-only test that
+    // covers the case this one deliberately excludes — a grandchild that calls
+    // `setsid` itself — is `freebsd_reaper::a_setsid_escapee_stays_contained`.)
     let tmp = std::env::temp_dir();
     let pidfile = tmp.join(format!("processkit_setsid_gc_{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&pidfile);
@@ -281,7 +294,9 @@ async fn unix_setsid_child_forks_grandchild_still_contained() {
     drop(group); // killpg the session pgroup — must reach the inherited grandchild
 
     // The grandchild must die: poll until its pid stops answering the liveness
-    // probe (SIGKILL'd, then reaped by init as an orphan).
+    // probe — SIGKILL'd, then reaped as an orphan by init (or, on FreeBSD, by
+    // this process, which the reaper backend made the orphan's new parent and
+    // which therefore collects the corpse itself before `Drop` returns).
     poll_until(
         Duration::from_secs(5),
         Duration::from_millis(50),
@@ -291,6 +306,173 @@ async fn unix_setsid_child_forks_grandchild_still_contained() {
     )
     .await;
     let _ = std::fs::remove_file(&pidfile);
+}
+
+/// FreeBSD's `procctl` process reaper ([`Mechanism::ProcessReaper`]) closing the one
+/// hole every POSIX process group has: a descendant that calls `setsid` **itself**.
+///
+/// `unix_setsid_child_forks_grandchild_still_contained` above deliberately stops at
+/// the boundary — its grandchild only *inherits* the tracked session, so `killpg`
+/// still reaches it. This is the case on the other side of that boundary: a
+/// grandchild that leaves the session under its own power, which `killpg` provably
+/// cannot address (the test asserts the escape happened before asserting it was
+/// contained anyway, so a regression that merely fails to escape cannot pass as a
+/// success).
+///
+/// Shape (the self-re-exec helper pattern, as in `nested_job` below and
+/// `stdin_inherit.rs`): the job starts `sh`, `sh` backgrounds this very
+/// integration-test binary in "escapee mode" — a grandchild, so it is not a process
+/// group leader and its `setsid` can succeed — and exits at once. The escapee
+/// `setsid`s, publishes its pid, and idles. Only the reaper can then see or kill it.
+#[cfg(all(target_os = "freebsd", feature = "process-control"))]
+mod freebsd_reaper {
+    use std::time::Duration;
+
+    use processkit::{Command, Mechanism, ProcessGroup};
+
+    use crate::common::{completes_within, poll_until};
+
+    /// Marker env var: set only on the re-exec'd escapee, so the helper test below
+    /// is an immediate no-op pass in an ordinary `--include-ignored` suite run.
+    const ESCAPEE_FLAG: &str = "PK_FREEBSD_REAPER_ESCAPEE";
+    /// Where the escapee publishes its pid (and, on failure, why it could not).
+    const ESCAPEE_PIDFILE: &str = "PK_FREEBSD_REAPER_PIDFILE";
+    /// This binary's own path, handed to `sh` rather than interpolated into the
+    /// script text.
+    const ESCAPEE_EXE: &str = "PK_FREEBSD_REAPER_EXE";
+    /// The libtest name the harness re-execs (positional filter + `--exact`). Keep
+    /// in sync with the module path and `fn setsid_escapee_process` below — a
+    /// mismatch surfaces as the pid poll timing out with no pidfile.
+    const ESCAPEE_TEST: &str = "groups::freebsd_reaper::setsid_escapee_process";
+
+    /// Escapee mode: leave the spawning session entirely, say so, then idle until
+    /// the harness tears the tree down. A plain no-op unless re-exec'd.
+    #[tokio::test]
+    #[ignore = "helper process for the reaper containment test; a no-op unless re-exec'd"]
+    async fn setsid_escapee_process() {
+        let (Ok(_), Ok(pidfile)) = (std::env::var(ESCAPEE_FLAG), std::env::var(ESCAPEE_PIDFILE))
+        else {
+            return;
+        };
+        // SAFETY: `setsid` takes no arguments and only ever affects the caller. It
+        // succeeds here because this process is a *grandchild* of the job — `sh`
+        // leads the process group, we do not.
+        let sid = unsafe { libc::setsid() };
+        if sid == -1 {
+            let err = std::io::Error::last_os_error();
+            let _ = std::fs::write(&pidfile, format!("error: setsid failed: {err}"));
+            return;
+        }
+        let _ = std::fs::write(&pidfile, std::process::id().to_string());
+        // Comfortably longer than the harness's own polls (60s for the pid, then
+        // 30s for the teardown), so only the containment under test ends this
+        // process — but still bounded, because a harness that fails early cannot
+        // reach an escapee that has, by design, left its session.
+        tokio::time::sleep(Duration::from_secs(300)).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns a grandchild that setsids out of the job's process group"]
+    async fn a_setsid_escapee_stays_contained() {
+        let group = ProcessGroup::new().expect("create group");
+        assert_eq!(
+            group.mechanism(),
+            Mechanism::ProcessReaper,
+            "this test is about the reaper mechanism; a pgroup here means \
+             PROC_REAP_ACQUIRE failed and there is nothing to assert"
+        );
+
+        let exe = std::env::current_exe().expect("locate the integration-test binary");
+        let pidfile = std::env::temp_dir().join(format!(
+            "processkit_reaper_escapee_{}.pid",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&pidfile);
+
+        // `sh` backgrounds the escapee and exits immediately, orphaning it. Its
+        // stdio goes to /dev/null so the escapee never holds the job's pipes open.
+        let script = format!(
+            "\"${ESCAPEE_EXE}\" {ESCAPEE_TEST} --exact --ignored </dev/null >/dev/null 2>&1 & exit 0"
+        );
+        let child = group
+            .start(
+                &Command::new("sh")
+                    .args(["-c", &script])
+                    .env(ESCAPEE_EXE, &exe)
+                    .env(ESCAPEE_FLAG, "1")
+                    .env(ESCAPEE_PIDFILE, &pidfile),
+            )
+            .await
+            .expect("launch the escapee's parent shell");
+        // Reap the direct child, so the escapee is a genuine orphan whose only
+        // remaining tie to this job is the reaper's subtree tag.
+        completes_within(Duration::from_secs(30), "parent shell exit", child.wait())
+            .await
+            .expect("parent shell waits");
+
+        let mut published = None;
+        poll_until(
+            Duration::from_secs(60),
+            Duration::from_millis(50),
+            "escapee never published its pid (did the re-exec filter match?)",
+            || {
+                if let Ok(text) = std::fs::read_to_string(&pidfile)
+                    && !text.trim().is_empty()
+                {
+                    published = Some(text.trim().to_string());
+                    true
+                } else {
+                    false
+                }
+            },
+        )
+        .await;
+        let published = published.expect("escapee published something");
+        let escapee: i32 = published
+            .parse()
+            .unwrap_or_else(|_| panic!("escapee reported a failure instead of a pid: {published}"));
+
+        // It really did escape: it now leads its own session, so its process group
+        // is no longer the one the pgroup backend tracked for this job — `killpg`
+        // on that group cannot reach it, and `members()` on the pgroup backend
+        // would not list it either.
+        // SAFETY: `getsid` only reads the target's session id.
+        assert_eq!(
+            unsafe { libc::getsid(escapee) },
+            escapee,
+            "escapee {escapee} did not become a session leader — the test would \
+             prove nothing about the reaper"
+        );
+
+        // The reaper sees it regardless: `PROC_REAP_GETPIDS` reports the whole
+        // subtree, session boundaries and all.
+        let members = group.members().expect("read the job's members");
+        assert!(
+            members.contains(&(escapee as u32)),
+            "the reaper must still count the setsid escapee {escapee} as a member \
+             (members: {members:?})"
+        );
+
+        // ...and `PROC_REAP_KILL` reaches it.
+        group.kill_all().expect("kill_all");
+        poll_until(
+            Duration::from_secs(30),
+            Duration::from_millis(50),
+            "the setsid escapee outlived kill_all — reaper containment leaked",
+            || {
+                // Each probe also drives a reaper read, which is what collects the
+                // corpse: as the escapee's new parent (it was re-parented to us when
+                // `sh` died) this process owes it a `wait`, and until that happens a
+                // liveness probe still answers for the zombie.
+                let alive_members = group.members().unwrap_or_default();
+                // SAFETY: signal 0 is a sound liveness probe.
+                !alive_members.contains(&(escapee as u32)) && unsafe { libc::kill(escapee, 0) } != 0
+            },
+        )
+        .await;
+
+        let _ = std::fs::remove_file(&pidfile);
+    }
 }
 
 #[tokio::test]

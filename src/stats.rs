@@ -14,7 +14,8 @@ use crate::result::Outcome;
 ///
 /// `total_cpu_time` and `peak_memory_bytes` are `None` when the platform can't
 /// report them — notably the POSIX process-group mechanism (no cgroup
-/// accounting), i.e. macOS/BSD and the Linux fallback.
+/// accounting), i.e. macOS/BSD and the Linux fallback, and the FreeBSD process
+/// reaper, which contains a tree without accounting for it.
 ///
 /// Non-exhaustive: a read-only snapshot the crate produces — new metrics can
 /// be added without a breaking change.
@@ -24,12 +25,14 @@ pub struct ProcessGroupStats {
     /// Number of live processes currently in the group.
     ///
     /// Under the POSIX process-group mechanism ([`Mechanism::ProcessGroup`]
-    /// — macOS/BSD and the Linux fallback) this counts live process *groups*
-    /// rather than individual processes: a contained child that itself forks
-    /// helpers still counts once. With a cgroup or Job Object it is the exact
+    /// — macOS/the non-FreeBSD BSDs and the Linux fallback) this counts live
+    /// process *groups* rather than individual processes: a contained child that
+    /// itself forks helpers still counts once. With a cgroup, a Job Object or the
+    /// FreeBSD process reaper ([`Mechanism::ProcessReaper`]) it is the exact
     /// process count.
     ///
     /// [`Mechanism::ProcessGroup`]: crate::Mechanism::ProcessGroup
+    /// [`Mechanism::ProcessReaper`]: crate::Mechanism::ProcessReaper
     pub active_process_count: usize,
     /// Total CPU time (user + kernel) accumulated by the group, if available.
     ///
@@ -40,8 +43,9 @@ pub struct ProcessGroupStats {
     /// - **Linux cgroup v2** — sum of `/proc/<pid>/stat` times for *currently
     ///   live* members only; terminated processes are not accounted once they
     ///   leave the cgroup.
-    /// - **POSIX process-group / macOS** — always `None`; no kernel accumulator
-    ///   is available without a cgroup or Job Object.
+    /// - **POSIX process-group / macOS, and the FreeBSD process reaper** — always
+    ///   `None`; no kernel accumulator is available without a cgroup or Job Object,
+    ///   and a reaper contains a tree without accounting for it.
     pub total_cpu_time: Option<Duration>,
     /// Peak memory used by the group in bytes, if available. This is the OS's
     /// own group-wide measure; its exact meaning differs by platform and it is
@@ -52,7 +56,8 @@ pub struct ProcessGroupStats {
     ///   memory (commit charge) charged to the job, not a working-set figure.
     /// - **Linux cgroup v2** — the sum of currently-live members' peak resident
     ///   sets (`VmHWM`); members that already exited are not counted.
-    /// - **POSIX process-group / macOS** — always `None`; no kernel accumulator.
+    /// - **POSIX process-group / macOS, and the FreeBSD process reaper** — always
+    ///   `None`; no kernel accumulator.
     pub peak_memory_bytes: Option<u64>,
 }
 

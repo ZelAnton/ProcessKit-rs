@@ -262,9 +262,12 @@ jobs:
         with:
           targets: x86_64-unknown-freebsd
       - uses: Swatinem/rust-cache@v2
-      # `cargo check` needs no foreign linker, but still compiles the real BSD
-      # cfg path (`sys/{unix,pgroup,pid_gate}.rs`) instead of relying on macOS as
-      # a proxy for libc constants and target-specific branches.
+      # `cargo check` needs no foreign linker, but still compiles the real FreeBSD
+      # cfg path (`sys/{freebsd,pgroup,pid_gate}.rs`, including the `procctl`
+      # reaper backend and its hand-mirrored `<sys/procctl.h>` structs) instead of
+      # relying on macOS as a proxy for libc constants and target-specific
+      # branches. The backend's `compile_error!` platform guards make this a proof
+      # that the dispatcher routes FreeBSD here and macOS/other BSDs to `unix.rs`.
       - run: cargo check --target x86_64-unknown-freebsd --lib --bins --all-features
 
   test-freebsd:
@@ -273,9 +276,11 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      # A real VM executes the POSIX process-group backend against FreeBSD's
-      # kernel and userland. Keep the smoke tier focused: hermetic library tests
-      # plus representative real containment/signal/shutdown probes.
+      # A real VM executes the FreeBSD `procctl` reaper backend (and the
+      # process-group machinery under it) against FreeBSD's kernel and userland —
+      # the only place that backend runs at all, since `check-freebsd` merely
+      # compiles it. Keep the smoke tier focused: hermetic library tests plus
+      # representative real containment/signal/shutdown probes.
       - name: Test in FreeBSD
         uses: vmactions/freebsd-vm@v1
         with:
@@ -291,6 +296,8 @@ jobs:
             cargo test --all-features --test integration process_control::unix_ -- --ignored
             cargo test --all-features --test integration groups::group_reports_the_platforms_mechanism -- --ignored
             cargo test --all-features --test integration groups::dropping_group_kills_children -- --ignored
+            cargo test --all-features --test integration groups::unix_setsid_child_forks_grandchild_still_contained -- --ignored
+            cargo test --all-features --test integration groups::freebsd_reaper -- --ignored
             cargo test --all-features --test integration shutdown::shutdown_lets_a_term_handling_child_end_the_grace_early -- --ignored
 
   loom:

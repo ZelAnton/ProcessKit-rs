@@ -912,6 +912,24 @@ impl ProcessGroup {
         super::graceful::run(self, &self.skip_drop_kill, signal, timeout, escalate).await
     }
 
+    /// This group's "don't kill on `Drop`" latch, for a backend that **wraps**
+    /// `ProcessGroup` and drives the shared graceful loop against its own
+    /// [`GracefulTarget`](super::graceful::GracefulTarget) rather than this one —
+    /// today only the FreeBSD reaper backend (`sys::freebsd`), whose teardown must
+    /// reach descendants a `killpg` cannot see.
+    ///
+    /// Handing back the *same* latch (rather than the wrapper owning a second one)
+    /// is what keeps the spare coherent: a `graceful_shutdown(escalate = false)`
+    /// driven by the wrapper must suppress **both** the wrapper's reaper kill and
+    /// this `ProcessGroup`'s own `Drop` backstop, and a later `spawn`/`adopt` here
+    /// must re-arm both at once. Read-only — the caller only observes
+    /// ([`is_set`](super::SkipDropKill::is_set)) or hands it to
+    /// [`graceful::run`](super::graceful::run), which owns the epoch protocol.
+    #[cfg(target_os = "freebsd")]
+    pub(crate) fn skip_drop_kill(&self) -> &super::SkipDropKill {
+        &self.skip_drop_kill
+    }
+
     #[cfg(feature = "stats")]
     pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
         // We track group ids (plus solo-adopted pids), not every individual

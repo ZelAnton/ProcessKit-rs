@@ -6,14 +6,19 @@
 //! - **Windows** — a [Job Object] with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
 //! - **Linux** — a [cgroup v2] killed via `cgroup.kill`, falling back to a POSIX
 //!   process group when no writable cgroup is available.
-//! - **macOS / the BSDs** — a POSIX process group (`killpg` the tree on drop);
-//!   no cgroups or Job Objects exist there. See `pgroup`.
+//! - **FreeBSD** — a [process reaper] (`procctl(PROC_REAP_ACQUIRE)`) layered over
+//!   the same process-group bookkeeping: the tree is enumerated with
+//!   `PROC_REAP_GETPIDS` and torn down with `PROC_REAP_KILL`, so a descendant that
+//!   `setsid`s away is still contained. See `freebsd`.
+//! - **macOS / the other BSDs** — a POSIX process group (`killpg` the tree on
+//!   drop); no cgroups, Job Objects or reapers exist there. See `pgroup`.
 //!
 //! Only Unix and Windows are supported; other targets fail to compile (see the
 //! `compile_error!` below).
 //!
 //! [Job Object]: https://learn.microsoft.com/windows/win32/procthread/job-objects
 //! [cgroup v2]: https://docs.kernel.org/admin-guide/cgroup-v2.html
+//! [process reaper]: https://man.freebsd.org/cgi/man.cgi?query=procctl&sektion=2
 
 use std::io;
 use std::time::Duration;
@@ -265,9 +270,21 @@ compile_error!(
 
 // Exactly one platform module is compiled per target. Each defines an `imp::Job`
 // with the same inherent methods plus a kill-on-close `Drop`.
+//
+// The arms are mutually exclusive by construction, so at most one `path` ever
+// applies: `windows` and `unix` are disjoint, `target_os = "freebsd"` implies
+// `unix` and excludes `linux`, and the final catch-all subtracts both
+// target-specific unix arms. Adding a target-specific backend therefore means
+// adding its arm AND narrowing the catch-all in the same edit — otherwise two
+// `path`s would apply at once. Only the FreeBSD arm is new: Windows, Linux, macOS
+// and every other BSD resolve exactly where they did before.
 #[cfg_attr(windows, path = "windows.rs")]
 #[cfg_attr(target_os = "linux", path = "linux.rs")]
-#[cfg_attr(all(unix, not(target_os = "linux")), path = "unix.rs")]
+#[cfg_attr(target_os = "freebsd", path = "freebsd.rs")]
+#[cfg_attr(
+    all(unix, not(any(target_os = "linux", target_os = "freebsd"))),
+    path = "unix.rs"
+)]
 mod imp;
 
 /// A handle to an OS job owning a tree of child processes.
@@ -470,11 +487,15 @@ impl Job {
 /// a process — the detection extracted from the group-creation path so it can back
 /// the public `host_containment()` query as well.
 ///
-/// A fixed constant on Windows ([`Mechanism::JobObject`]) and macOS/BSD
+/// A fixed constant on Windows ([`Mechanism::JobObject`]), FreeBSD
+/// ([`Mechanism::ProcessReaper`]) and macOS/the other BSDs
 /// ([`Mechanism::ProcessGroup`]); on Linux a best-effort read-only probe of cgroup
 /// v2 availability and writability that agrees with [`Job::new`]'s selection on any
 /// real host, differing only in the rare window where a writable-looking cgroup then
-/// rejects leaf creation (see the Linux backend's `detect_mechanism`).
+/// rejects leaf creation (see the Linux backend's `detect_mechanism`). The FreeBSD
+/// constant carries an analogous — but far narrower — caveat, since acquiring reaper
+/// status is a side effect this query must not have: see the FreeBSD backend's
+/// `detect_mechanism`.
 pub(crate) fn detect_mechanism() -> Mechanism {
     imp::detect_mechanism()
 }

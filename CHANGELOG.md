@@ -36,6 +36,14 @@ to a dated version section.
 - Add post-run `ProcessGroup::limit_evidence` reporting per-axis `LimitVerdict`
   (`Tripped`/`NotTripped`/`Unknown`) from authoritative cgroup v2 counters, with
   explicit unknowns where a mechanism keeps no post-mortem record.
+- Add a FreeBSD containment backend built on the `procctl(2)` process reaper,
+  reported as the new `Mechanism::ProcessReaper` (`"process_reaper"`): whole-tree
+  membership, signalling, graceful shutdown and kill-on-drop now follow a
+  descendant that calls `setsid`, which the POSIX process-group fallback FreeBSD
+  previously shared with macOS could not. Re-parented orphans the reaper inherits
+  are `wait`ed for by the crate, so they do not accumulate as zombies; children
+  this process forked itself are never touched. Resource limits stay
+  `Unsupported` — a reaper contains a tree without accounting for it.
 
 ### Changed
 

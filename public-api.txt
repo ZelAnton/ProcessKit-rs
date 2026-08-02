@@ -442,6 +442,7 @@ impl core::panic::unwind_safe::UnwindSafe for processkit::LineTerminator
 pub processkit::Mechanism::CgroupV2
 pub processkit::Mechanism::JobObject
 pub processkit::Mechanism::ProcessGroup
+pub processkit::Mechanism::ProcessReaper
 impl processkit::Mechanism
 pub fn processkit::Mechanism::from_name(&str) -> core::option::Option<Self>
 pub fn processkit::Mechanism::name(&self) -> &'static str
