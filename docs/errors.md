@@ -190,9 +190,9 @@ change together.
 
 | Method | On | Direction |
 |---|---|---|
-| `name() -> &'static str` | `Mechanism`, `Outcome`, `ErrorKind`, `ParentDeathCleanup`, `SoftStopScope`, `StopReason`, `LimitKind`, `LimitReason`, `LimitVerdict`, `StdioMode`, `LineTerminator`, `OverflowMode`, `Priority`, `RestartPolicy`, `RlimitResource` | A short, lowercase `snake_case` identifier for the variant. |
+| `name() -> &'static str` | `Mechanism`, `Outcome`, `ErrorKind`, `ParentDeathCleanup`, `SoftStopScope`, `StopReason`, `LimitKind`, `LimitReason`, `LimitVerdict`, `StdioMode`, `LineTerminator`, `OverflowMode`, `OutputStream`, `Priority`, `RestartPolicy`, `RlimitResource`, `ProcessEvent`, `SupervisionEvent` | A short, lowercase `snake_case` identifier for the variant. |
 | `name() -> Option<&'static str>` | `Signal` | `Some(id)` for a curated signal; `None` for the raw-number `Signal::Other` (render its `i32` instead). |
-| `from_name(&str) -> Option<Self>` | every enum above **except** `Outcome` and `ErrorKind` — `LimitVerdict` included, so a recorded `tripped` / `not_tripped` / `unknown` parses back | Parse an identifier back into the value; `None` — not a default — for an unrecognized name. |
+| `from_name(&str) -> Option<Self>` | every enum above **except** `Outcome`, `ErrorKind`, `ProcessEvent`, and `SupervisionEvent` — `LimitVerdict` included, so a recorded `tripped` / `not_tripped` / `unknown` parses back | Parse an identifier back into the value; `None` — not a default — for an unrecognized name. |
 
 The identifiers are a **compatibility surface**, held stable like the rest of
 the public API: a **new** variant gets a **new** identifier, and an existing
@@ -226,8 +226,8 @@ assert_eq!(Priority::from_name("below_normal"), Some(Priority::BelowNormal));
 assert_eq!(Priority::from_name("turbo"), None);
 ```
 
-Two enums report a `name()` but take **no** `from_name`, because both are
-classifications the crate *reports* and never accepts back. `Outcome::name()`
+Four enums report a `name()` but take **no** `from_name`, because they are
+classifications or events the crate *reports* and never accepts back. `Outcome::name()`
 reports the *disposition* only (`exited` / `signalled` / `timed_out`) — the name
 alone can't carry the exit code or signal number (read those from
 [`code()`](https://docs.rs/processkit/latest/processkit/struct.ProcessResult.html#method.code)
@@ -235,6 +235,8 @@ alone can't carry the exit code or signal number (read those from
 is the same: a total failure classification the crate hands you via
 [`Error::kind()`](processkit::Error::kind), never one you supply back in. Read
 the fuller payload from the [`ErrorReason`] variant when a name isn't enough.
+`ProcessEvent` and `SupervisionEvent` similarly identify lifecycle event kinds;
+their payloads carry the process output, outcome, timing, or supervision detail.
 `Signal::name()` returns `Option` because the `Other(i32)` escape hatch has no
 curated name (it still has a `from_name`).
 

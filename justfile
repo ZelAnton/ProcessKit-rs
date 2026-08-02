@@ -235,7 +235,7 @@ identifiers-diff:
 [windows]
 identifiers-diff:
     $env:PROCESSKIT_IDENTIFIERS_OUTPUT = "identifiers-current.json"; cargo test --all-features --test identifiers_manifest write_identifiers_manifest -- --ignored --exact
-    $expected = [IO.File]::ReadAllBytes("spec/identifiers.json"); $actual = [IO.File]::ReadAllBytes("identifiers-current.json"); if (-not [Linq.Enumerable]::SequenceEqual[byte]($expected, $actual)) { Compare-Object (Get-Content spec/identifiers.json) (Get-Content identifiers-current.json) -SyncWindow 0; exit 1 } else { Write-Output "(no changes)" }
+    $difference = Compare-Object (Get-Content spec/identifiers.json) (Get-Content identifiers-current.json) -SyncWindow 0; if ($difference) { $difference; exit 1 } else { Write-Output "(no changes)" }
 
 # Cargo never garbage-collects obsolete incremental unit hashes under a
 # workspace target directory. Remove only those caches (plus disposable

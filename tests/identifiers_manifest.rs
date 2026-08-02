@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use processkit::{
     ErrorKind, LimitKind, LimitReason, LimitVerdict, LineTerminator, Mechanism, Outcome,
-    OverflowMode, ParentDeathCleanup, Priority, RestartPolicy, RlimitResource, Signal,
-    SoftStopScope, StdioMode, StopReason,
+    OutputStream, OverflowMode, ParentDeathCleanup, Priority, RestartPolicy, RlimitResource,
+    Signal, SoftStopScope, StdioMode, StopReason, SupervisionEvent,
 };
 
 struct Variant {
@@ -73,8 +73,7 @@ where
 
 fn report_only<T, N>(path: &'static str, values: &[(&'static str, T)], name: N) -> EnumSpec
 where
-    T: Copy,
-    N: Fn(T) -> &'static str,
+    N: Fn(&T) -> &'static str,
 {
     EnumSpec {
         path,
@@ -83,7 +82,24 @@ where
             .iter()
             .map(|(rust_name, value)| Variant {
                 rust_name,
-                identifier: name(*value),
+                identifier: name(value),
+            })
+            .collect(),
+    }
+}
+
+fn report_only_identifiers(
+    path: &'static str,
+    values: &[(&'static str, &'static str)],
+) -> EnumSpec {
+    EnumSpec {
+        path,
+        class: "report_only",
+        variants: values
+            .iter()
+            .map(|(rust_name, identifier)| Variant {
+                rust_name,
+                identifier,
             })
             .collect(),
     }
@@ -194,6 +210,15 @@ fn dictionary() -> Vec<EnumSpec> {
             OverflowMode::from_name,
         ),
         configurable(
+            "processkit::OutputStream",
+            &[
+                ("Stdout", OutputStream::Stdout),
+                ("Stderr", OutputStream::Stderr),
+            ],
+            |value| value.name(),
+            OutputStream::from_name,
+        ),
+        configurable(
             "processkit::Priority",
             &[
                 ("Idle", Priority::Idle),
@@ -266,6 +291,81 @@ fn dictionary() -> Vec<EnumSpec> {
                 ("Exit", ErrorKind::Exit),
                 ("Signalled", ErrorKind::Signalled),
                 ("Other", ErrorKind::Other),
+            ],
+            |value| value.name(),
+        ),
+        // OutputLine deliberately has no public constructor, so an external
+        // contract test cannot construct the two line-carrying variants.
+        report_only_identifiers(
+            "processkit::ProcessEvent",
+            &[
+                ("Started", "started"),
+                ("Stdout", "stdout"),
+                ("Stderr", "stderr"),
+                ("Exited", "exited"),
+            ],
+        ),
+        report_only(
+            "processkit::SupervisionEvent",
+            &[
+                (
+                    "IncarnationStarted",
+                    SupervisionEvent::IncarnationStarted {
+                        attempt: 1,
+                        pid: None,
+                    },
+                ),
+                (
+                    "IncarnationFinished",
+                    SupervisionEvent::IncarnationFinished {
+                        attempt: 1,
+                        outcome: Outcome::Exited(0),
+                        duration: std::time::Duration::from_secs(0),
+                        success: true,
+                    },
+                ),
+                (
+                    "IncarnationFailed",
+                    SupervisionEvent::IncarnationFailed {
+                        attempt: 1,
+                        error: ErrorKind::Spawn,
+                    },
+                ),
+                (
+                    "RestartScheduled",
+                    SupervisionEvent::RestartScheduled {
+                        restart: 1,
+                        delay: std::time::Duration::from_secs(0),
+                    },
+                ),
+                (
+                    "StormPaused",
+                    SupervisionEvent::StormPaused {
+                        pause: 1,
+                        delay: std::time::Duration::from_secs(0),
+                    },
+                ),
+                (
+                    "HealthCheckFailed",
+                    SupervisionEvent::HealthCheckFailed {
+                        attempt: 1,
+                        terminal: false,
+                    },
+                ),
+                ("GaveUp", SupervisionEvent::GaveUp { attempt: 1 }),
+                (
+                    "Stopped",
+                    SupervisionEvent::Stopped {
+                        reason: StopReason::Stopped,
+                    },
+                ),
+                (
+                    "SupervisionFailed",
+                    SupervisionEvent::SupervisionFailed {
+                        error: ErrorKind::Other,
+                    },
+                ),
+                ("Lagged", SupervisionEvent::Lagged { skipped: 1 }),
             ],
             |value| value.name(),
         ),
@@ -351,8 +451,8 @@ fn identifiers_manifest_matches() {
 #[test]
 #[ignore = "used by the identifiers-diff recipe"]
 fn write_identifiers_manifest() {
-    let output = std::env::var_os("PROCESSKIT_IDENTIFIERS_OUTPUT")
-        .map(PathBuf::from)
-        .expect("PROCESSKIT_IDENTIFIERS_OUTPUT must name the generated file");
+    let Some(output) = std::env::var_os("PROCESSKIT_IDENTIFIERS_OUTPUT").map(PathBuf::from) else {
+        return;
+    };
     std::fs::write(output, generated_manifest()).expect("write generated identifier manifest");
 }

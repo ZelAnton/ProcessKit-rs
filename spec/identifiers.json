@@ -95,6 +95,14 @@
       ]
     },
     {
+      "path": "processkit::OutputStream",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Stdout", "identifier": "stdout" },
+        { "variant": "Stderr", "identifier": "stderr" }
+      ]
+    },
+    {
       "path": "processkit::Priority",
       "class": "configurable",
       "variants": [
@@ -164,6 +172,32 @@
         { "variant": "Exit", "identifier": "exit" },
         { "variant": "Signalled", "identifier": "signalled" },
         { "variant": "Other", "identifier": "other" }
+      ]
+    },
+    {
+      "path": "processkit::ProcessEvent",
+      "class": "report_only",
+      "variants": [
+        { "variant": "Started", "identifier": "started" },
+        { "variant": "Stdout", "identifier": "stdout" },
+        { "variant": "Stderr", "identifier": "stderr" },
+        { "variant": "Exited", "identifier": "exited" }
+      ]
+    },
+    {
+      "path": "processkit::SupervisionEvent",
+      "class": "report_only",
+      "variants": [
+        { "variant": "IncarnationStarted", "identifier": "incarnation_started" },
+        { "variant": "IncarnationFinished", "identifier": "incarnation_finished" },
+        { "variant": "IncarnationFailed", "identifier": "incarnation_failed" },
+        { "variant": "RestartScheduled", "identifier": "restart_scheduled" },
+        { "variant": "StormPaused", "identifier": "storm_paused" },
+        { "variant": "HealthCheckFailed", "identifier": "health_check_failed" },
+        { "variant": "GaveUp", "identifier": "gave_up" },
+        { "variant": "Stopped", "identifier": "stopped" },
+        { "variant": "SupervisionFailed", "identifier": "supervision_failed" },
+        { "variant": "Lagged", "identifier": "lagged" }
       ]
     }
   ]
