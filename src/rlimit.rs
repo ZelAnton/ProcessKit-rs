@@ -31,8 +31,20 @@ pub enum RlimitResource {
 }
 
 impl RlimitResource {
-    /// This resource's stable lowercase identifier.
+    /// This resource's **stable machine identifier**: a short, lowercase
+    /// `snake_case` string, part of the crate's compatibility surface.
+    ///
+    /// Use it for machine-readable output — a CLI's config schema, a
+    /// cross-language binding, a structured log field — where a consumer needs
+    /// one canonical spelling per variant instead of hand-maintaining its own
+    /// mapping table. It is a *diagnostic* name, **not** a wire/serialization
+    /// format, but it is held stable all the same: a **new** variant gets a
+    /// **new** identifier, and an existing identifier is **never renamed**
+    /// without a major release. [`from_name`](Self::from_name) parses it back.
     pub fn name(self) -> &'static str {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never silently ship without a stable identifier.
         match self {
             Self::Cpu => "cpu",
             Self::Core => "core",
@@ -43,11 +55,15 @@ impl RlimitResource {
         }
     }
 
-    /// Parse a [`name`](Self::name) identifier back into an `RlimitResource`.
+    /// Parse a stable [`name`](Self::name) identifier back into a resource.
     ///
     /// Returns `None` for any string that is not exactly one of the stable
-    /// identifiers, so an unknown resource is never silently substituted.
+    /// identifiers — an honest miss, never a silent default. Round-trips with
+    /// [`name`](Self::name): `RlimitResource::from_name(v.name()) == Some(v)`
+    /// for every variant.
     pub fn from_name(name: &str) -> Option<Self> {
+        // Add an explicit branch here for every new variant; `_` rejects only
+        // unknown input and must not stand in for a resource's stable name.
         match name {
             "cpu" => Some(Self::Cpu),
             "core" => Some(Self::Core),
@@ -123,6 +139,29 @@ mod tests {
             assert_eq!(RlimitResource::from_name(resource.name()), Some(resource));
         }
         assert_eq!(RlimitResource::from_name("nofile"), None);
+    }
+
+    #[test]
+    fn name_from_name_round_trips_every_resource() {
+        let resources = [
+            RlimitResource::Cpu,
+            RlimitResource::Core,
+            RlimitResource::Data,
+            RlimitResource::FileSize,
+            RlimitResource::NoFile,
+            RlimitResource::Stack,
+        ];
+
+        for resource in resources {
+            assert_eq!(RlimitResource::from_name(resource.name()), Some(resource));
+        }
+    }
+
+    #[test]
+    fn from_name_rejects_unknown_and_bad_case() {
+        assert_eq!(RlimitResource::from_name("Cpu"), None);
+        assert_eq!(RlimitResource::from_name("unknown"), None);
+        assert_eq!(RlimitResource::from_name(""), None);
     }
 
     #[cfg(unix)]

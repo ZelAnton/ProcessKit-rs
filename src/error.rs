@@ -268,8 +268,10 @@ pub enum ErrorReason {
     ///
     /// Produced by [`ProcessGroup::with_options`](crate::ProcessGroup::with_options)
     /// when a [`ResourceLimits`](crate::ResourceLimits) cap was set but the active
-    /// mechanism can't honor it — either the platform has no whole-tree container
-    /// (macOS/BSD, the Linux process-group fallback), or
+    /// mechanism can't honor it — either the mechanism has no whole-tree resource
+    /// *accounting* (macOS/the other BSDs and the Linux process-group fallback, which
+    /// have no whole-tree container at all, and FreeBSD's process reaper, which
+    /// contains a tree without accounting for it), or
     /// the OS rejected the request (on Linux, the cgroup controllers can't be
     /// enabled — see [`ResourceLimits`](crate::ResourceLimits) for the cgroup-v2
     /// "real root only" requirement). An unenforced limit is no protection, so this

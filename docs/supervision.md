@@ -377,7 +377,12 @@ to supervision running on a background task:
   runner) and end supervision with `StopReason::Stopped` — a deliberate,
   honest reason distinct from a crash, an exhausted budget, a cancellation, or a
   `stop_when` match. A stop taken *during a backoff* (no child alive right now)
-  cuts the sleep short and ends at once, launching no further incarnation.
+  cuts the sleep short and ends at once, launching no further incarnation. An
+  incarnation with **no own group** to shut down (a shared-`ProcessGroup` or a
+  capture-only child) is stopped by firing its cancel token instead — so give the
+  supervised command a
+  [`cancel_grace`](timeouts-and-cancellation.md#graceful-cancellation) if that
+  child, too, should get a soft signal and a window rather than an outright kill.
 - **`wait()`** — await the final `SupervisionOutcome`, exactly what `run()`
   would have returned.
 

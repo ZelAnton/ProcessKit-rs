@@ -13,6 +13,14 @@ to a dated version section.
 
 ### Added
 
+- Add opt-in graceful cancellation: `Command::cancel_grace` and `cancel_signal`
+  route a fired `cancel_on` token through the same soft-signal → grace →
+  hard-kill ladder as `timeout_grace`/`timeout_signal`, on every cancellation
+  path (bulk verbs, streamed runs, `wait_any`, and `Supervisor` incarnations).
+  The default is unchanged — without `cancel_grace` a cancellation is still an
+  immediate hard kill — and the outcome is unchanged either way: cancellation
+  remains `ErrorReason::Cancelled`.
+
 - Add `just setup` for a CI-aligned developer tool bootstrap and read-only
   `just doctor` version, toolchain, cross-target, and Docker diagnostics.
 - Add a dedicated typed CLI-client guide covering `CliClient`, `cli_client!`,
@@ -36,9 +44,26 @@ to a dated version section.
 - Add post-run `ProcessGroup::limit_evidence` reporting per-axis `LimitVerdict`
   (`Tripped`/`NotTripped`/`Unknown`) from authoritative cgroup v2 counters, with
   explicit unknowns where a mechanism keeps no post-mortem record.
+- Add a FreeBSD containment backend built on the `procctl(2)` process reaper,
+  reported as the new `Mechanism::ProcessReaper` (`"process_reaper"`): whole-tree
+  membership, signalling, graceful shutdown and kill-on-drop now follow a
+  descendant that calls `setsid`, which the POSIX process-group fallback FreeBSD
+  previously shared with macOS could not. Re-parented orphans the reaper inherits
+  are `wait`ed for by the crate, so they do not accumulate as zombies; children
+  this process forked itself are never touched. Resource limits stay
+  `Unsupported` — a reaper contains a tree without accounting for it.
 
 ### Changed
 
+- `ProcessGroup::suspend` / `resume` on the POSIX process-group mechanism
+  (macOS/BSD and the Linux process-group fallback) now report a genuinely
+  failed `SIGSTOP` / `SIGCONT` delivery as `ErrorReason::Io`, matching the earlier
+  truthful reporting for `ProcessGroup::signal`: an `EPERM` from a live,
+  non-zombie member (for example, a uid-changed child that rejects `SIGSTOP`)
+  now surfaces instead of being swallowed. An `ESRCH`, a harmless zombie-only
+  `EPERM`, an empty group, and every `EPERM` on BSD targets without a process
+  state reader still return `Ok`. Signatures are unchanged; this only makes
+  error reporting on these edge inputs truthful (not a breaking API change).
 - Release a freshly contained Windows child through a per-process thread walk
   instead of a system-wide thread snapshot, cutting the crate's fixed start cost
   for a short-lived child to within noise of a plain unguarded spawn; the
@@ -56,6 +81,10 @@ to a dated version section.
 
 ### Fixed
 
+- Record every axis an `update_limits` request names on the group's cap ledger
+  even when applying it fails, so a cap that landed before a part-way failure can
+  no longer be reported as `NotTripped` by `limit_evidence` without reading a
+  counter; document that a failed update is not a rollback of the OS container.
 - Keep the local direct-minimal-versions check from rewriting the tracked
   `Cargo.lock` while it validates dependency floors.
 - Keep local musl nextest reports in the Docker target volume so Windows host

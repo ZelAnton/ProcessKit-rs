@@ -162,9 +162,10 @@ pub enum LimitReason {
     /// ever touched.
     Invalid,
     /// The active containment mechanism has **no whole-tree resource
-    /// accounting at all** on this platform — macOS/the BSDs (a POSIX process
-    /// group only), or a Linux host with no cgroup v2 mounted. No container
-    /// capable of carrying the cap exists here, full stop.
+    /// accounting at all** on this platform — macOS/the other BSDs (a POSIX
+    /// process group only), FreeBSD (a process reaper: it contains a tree without
+    /// accounting for it), or a Linux host with no cgroup v2 mounted. No
+    /// mechanism capable of carrying the cap exists here, full stop.
     Unsupported,
     /// A capable mechanism **exists**, but this particular request could not
     /// be applied to it — e.g. a Linux cgroup whose controllers can't be
@@ -213,18 +214,29 @@ impl LimitReason {
     }
 }
 
-/// The post-run verdict for **one** limit axis — did the cap that was in force
+/// The post-run verdict for **one** limit axis — did a cap this group carried
 /// actually engage while the tree ran?
 ///
-/// This is the **opposite side** of [`ErrorReason::ResourceLimit`](crate::ErrorReason::ResourceLimit)
-/// and its [`LimitReason`]. That error answers a *pre-spawn admission* question —
+/// This is the **other side** of [`ErrorReason::ResourceLimit`](crate::ErrorReason::ResourceLimit)
+/// and its [`LimitReason`]. That error answers an *admission* question —
 /// "why could the cap you asked for not be **applied**?" ([`Invalid`](LimitReason::Invalid) /
 /// [`Unsupported`](LimitReason::Unsupported) / [`Unenforceable`](LimitReason::Unenforceable)).
 /// This verdict answers the *post-run* question that only the container itself can
-/// answer — "the cap **was** applied; did it then actually **fire**?" — read from
+/// answer — "did a cap on this axis then actually **fire**?" — read from
 /// [`ProcessGroup::limit_evidence`](crate::ProcessGroup::limit_evidence). Neither
 /// replaces the other, and the error's semantics are unchanged by this type's
 /// existence.
+///
+/// Different questions, but on a *live* group they can meet on the same axis. A
+/// failed [`ProcessGroup::update_limits`](crate::ProcessGroup::update_limits) is
+/// not a rollback — the backends write the axes one at a time — so an axis of a
+/// rejected request may well be in force, and it stays on the group's cap record
+/// either way. The error then says "the set you asked for could not be applied
+/// whole"; this verdict still answers "and what actually fired?" from the kernel's
+/// own counters, rather than assuming the axis innocent. Only
+/// [`ProcessGroup::with_options`](crate::ProcessGroup::with_options) fails strictly
+/// before anything runs: it hands back no group at all, so there is nothing left to
+/// ask.
 ///
 /// # Never a guess
 ///
@@ -281,8 +293,9 @@ pub enum LimitVerdict {
     /// **No authoritative evidence is available**, so the crate refuses to answer.
     /// Not a "no": the cap may or may not have fired. Reported when the group runs
     /// on a mechanism with no whole-tree resource accounting at all (the POSIX
-    /// process-group mechanism — macOS, the BSDs, and the Linux fallback with no
-    /// usable cgroup v2), when the platform's container records nothing post-mortem
+    /// process-group mechanism — macOS, the other BSDs, and the Linux fallback with
+    /// no usable cgroup v2 — or the FreeBSD process reaper, which contains a tree
+    /// without accounting for it), when the platform's container records nothing post-mortem
     /// for a cap it does enforce (**every** cap on a Windows Job Object — see
     /// [`ProcessGroup::limit_evidence`](crate::ProcessGroup::limit_evidence)), or
     /// when the evidence file/counter could not be read.
@@ -362,11 +375,12 @@ impl LimitEvidence {
     ///
     /// Built only by the backends that have a container to read a post-mortem
     /// from — the Linux cgroup v2 backend and the Windows Job Object backend.
-    /// The POSIX process group (macOS/BSD) has no whole-tree accounting at all
-    /// and answers with `unknown`, which assembles the struct literally, leaving
-    /// this constructor unused on exactly that target; allow it there rather than
-    /// deleting a constructor the other two backends need (mirrors the
-    /// `unknown` allow below and `sys::ProcIdentity`'s per-target allow).
+    /// The POSIX process group (macOS/the other BSDs) and the FreeBSD process
+    /// reaper have no whole-tree accounting at all and answer with `unknown`, which
+    /// assembles the struct literally, leaving this constructor unused on exactly
+    /// those targets; allow it there rather than deleting a constructor the other
+    /// two backends need (mirrors the `unknown` allow below and
+    /// `sys::ProcIdentity`'s per-target allow).
     #[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
     pub(crate) const fn new(
         memory: LimitVerdict,
@@ -384,10 +398,12 @@ impl LimitEvidence {
     /// mechanism with no whole-tree resource accounting at all.
     ///
     /// Built only by the backends that *have* such a mechanism to fall back from —
-    /// the POSIX process group (macOS/BSD, and the Linux cgroup-less fallback).
-    /// Windows always has a Job Object and answers per axis, leaving this unused
-    /// there; allow it on exactly that target rather than deleting a constructor the
-    /// other two backends need (mirrors `sys::ProcIdentity`'s per-target allow).
+    /// the POSIX process group (macOS/the other BSDs, and the Linux cgroup-less
+    /// fallback) and the FreeBSD process reaper, which contains a tree without
+    /// accounting for it. Windows always has a Job Object and answers per axis,
+    /// leaving this unused there; allow it on exactly that target rather than
+    /// deleting a constructor the other backends need (mirrors
+    /// `sys::ProcIdentity`'s per-target allow).
     #[cfg_attr(windows, allow(dead_code))]
     pub(crate) const fn unknown() -> Self {
         Self {
@@ -439,6 +455,15 @@ impl LimitEvidence {
 /// no longer in force, but it did fire, and reporting `NotTripped` there would be a
 /// lie. It also keeps the evidence read off the axes that were never capped, so a
 /// group created without limits performs **no** evidence I/O at all.
+///
+/// Recorded **conservatively** for the same reason: every axis an `update_limits`
+/// request names goes on the record once the request reaches the OS, whether that
+/// call then succeeds or fails. A failed update is not a rollback — the backends
+/// write the axes one at a time — so an axis of a failed request may well be in
+/// force, and leaving it off the record would make `limit_evidence` answer
+/// `NotTripped` for it without reading a single counter. Erring towards a read (or,
+/// where the mechanism keeps no record, towards `Unknown`) can only cost an extra
+/// file read; erring the other way manufactures a verdict.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CappedAxes {
     memory: bool,
@@ -458,11 +483,11 @@ impl CappedAxes {
     ///
     /// Read only by the backends that gather per-axis evidence and so need to
     /// know which axes are worth reading — the Linux cgroup v2 backend and the
-    /// Windows Job Object backend. The POSIX process group (macOS/BSD) reports
-    /// every axis `Unknown` and ignores the record entirely, leaving this method
-    /// unused on exactly that target; allow it there rather than deleting a
-    /// method the other two backends need (mirrors `LimitEvidence::new` above
-    /// and `sys::ProcIdentity`'s per-target allow).
+    /// Windows Job Object backend. The POSIX process group (macOS/the other BSDs)
+    /// and the FreeBSD process reaper report every axis `Unknown` and ignore the
+    /// record entirely, leaving this method unused on exactly those targets; allow
+    /// it there rather than deleting a method the other two backends need (mirrors
+    /// `LimitEvidence::new` above and `sys::ProcIdentity`'s per-target allow).
     #[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
     pub(crate) fn has(&self, kind: LimitKind) -> bool {
         match kind {

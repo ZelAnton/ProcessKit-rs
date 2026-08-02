@@ -137,6 +137,10 @@ pub(crate) struct Spawned {
     /// Whether stderr is `Piped` (observable) vs `Inherit`/`Null`.
     pub stderr_piped: bool,
     pub cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Grace window for a graceful cancellation (`None` = hard kill on the token).
+    pub cancel_grace: Option<Duration>,
+    /// Raw signal for the graceful-cancellation phase (default `SIGTERM`).
+    pub cancel_signal: i32,
 }
 
 /// The fields produced by a PTY spawn, handed to [`RunningProcess::from_pty`].
@@ -165,6 +169,8 @@ pub(crate) struct PtySpawned {
     pub ok_codes: Vec<i32>,
     pub stdout_piped: bool,
     pub cancel_token: Option<tokio_util::sync::CancellationToken>,
+    pub cancel_grace: Option<Duration>,
+    pub cancel_signal: i32,
 }
 
 /// A handle to a process spawned by a runner.
@@ -243,6 +249,16 @@ pub struct RunningProcess {
     // detached.
     pid_gate: Arc<PidGate>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
+    // The cancellation teardown policy — the exact mirror of
+    // `timeout_grace`/`timeout_signal` for the token path (`Command::cancel_grace`/
+    // `cancel_signal`). `None` (the default) keeps a cancellation an immediate hard
+    // kill, byte-identically to before the knobs existed; `Some(grace)` routes EVERY
+    // cancellation path this handle has — the consuming finishers'
+    // `drive_to_exit_inner`, the borrowed `wait_exit` (`wait_any`/`wait_all`), and
+    // the detached `cancel_task` watchdog that bounds bulk verbs and live streams —
+    // through the same soft-signal → grace → hard-kill ladder the deadline uses.
+    cancel_grace: Option<Duration>,
+    cancel_signal: i32,
     // Armed at spawn time so every consuming path kills the tree when the token
     // fires, not just `drive_to_exit`.
     cancel_task: Option<JoinHandle<()>>,
@@ -466,6 +482,8 @@ impl RunningProcess {
             timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
             pid_gate: Arc::new(PidGate::new(s.pid)),
             cancel_token: s.cancel_token,
+            cancel_grace: s.cancel_grace,
+            cancel_signal: s.cancel_signal,
             cancel_task: None,
             cancel_at_exit: None,
             started: Instant::now(),
@@ -523,6 +541,8 @@ impl RunningProcess {
             timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
             pid_gate: Arc::new(PidGate::new(s.pid)),
             cancel_token: s.cancel_token,
+            cancel_grace: s.cancel_grace,
+            cancel_signal: s.cancel_signal,
             cancel_task: None,
             cancel_at_exit: None,
             started: Instant::now(),
@@ -558,6 +578,25 @@ impl RunningProcess {
 
     /// Arm (or re-arm) the cancel kill task. Aborts any existing task first so
     /// `attach_group` upgrades from pid-only to group+pid. No-op without a token.
+    ///
+    /// This is the watchdog that bounds every cancellation the consuming
+    /// `drive_to_exit_inner` isn't already driving — the bulk verbs on a
+    /// [`ProcessGroup`], a `Supervisor` incarnation, a live
+    /// streamed run whose consumer is still reading. Its teardown mirrors the
+    /// streaming *deadline* watchdog's (`stream::arm_stream_deadline`) branch for
+    /// branch, reading the cancellation knobs instead of the deadline ones:
+    ///
+    /// - **No `cancel_grace` (the default):** unchanged — group `kill_all` (when a
+    ///   group is still reachable) plus the gated raw `force_kill` backstop for the
+    ///   direct child, i.e. an immediate hard kill.
+    /// - **With `cancel_grace`:** the whole-tree case hands off to
+    ///   `ProcessGroup::graceful_terminate` (the crate's single `sys::graceful::run`
+    ///   escalation driver) instead of `kill_all`; the shared-group case — which owns
+    ///   no group and reaches only its direct child — hands off to the same
+    ///   **detached** `stream::spawn_graceful_kill_and_reap` the deadline watchdog
+    ///   uses, so the final `SIGKILL` still lands if this (abortable) task is aborted
+    ///   by `RunningProcess::Drop` mid-grace. Every raw op stays gated, so the
+    ///   `PidGate` remains the stand-down and the recycled-pid backstop.
     pub(crate) fn arm_cancel_watchdog(&mut self) {
         {
             if let Some(old) = self.cancel_task.take() {
@@ -568,6 +607,8 @@ impl RunningProcess {
             };
             let group_weak = self.backend.own_group().map(Arc::downgrade);
             let gate = self.pid_gate.clone();
+            let grace = self.cancel_grace;
+            let signal = self.cancel_signal;
             self.cancel_task = Some(tokio::spawn(async move {
                 token.cancelled().await;
                 // Stand down if a `Child`-owning finisher has taken over teardown:
@@ -581,14 +622,34 @@ impl RunningProcess {
                 if gate.is_retired() {
                     return;
                 }
-                if let Some(g) = group_weak.and_then(|w| w.upgrade()) {
-                    // On Linux + legacy/restricted cgroup this can synchronously
-                    // block this worker thread up to ~100ms — accepted, not
-                    // routed through `spawn_blocking`; see the sweep loop in
-                    // `Cgroup::kill` (src/sys/linux.rs) for the full rationale.
-                    let _ = g.kill_all();
+                match group_weak {
+                    Some(group) => match grace {
+                        // Whole tree, gracefully: signal → grace → hard kill, driven
+                        // by the shared escalation driver. Like the deadline
+                        // watchdog, this task cannot reap the child, so a child that
+                        // exits on the signal is only observed as gone once whoever
+                        // owns the `Child` reaps it.
+                        Some(grace) => match group.upgrade() {
+                            Some(group) => {
+                                let _ = group.graceful_terminate(grace, signal).await;
+                            }
+                            None => crate::sys::pid_gate::force_kill(&gate), // group gone
+                        },
+                        // The unchanged default: `kill_all` on a still-reachable
+                        // group, then the gated raw kill of the direct child.
+                        None => stream::kill_via_weak(&group, &gate),
+                    },
+                    // Shared group: pid-only teardown (a forking child's
+                    // grandchildren are the documented shared-group teardown gap).
+                    None => match grace {
+                        // Detached on purpose — see `spawn_graceful_kill_and_reap`:
+                        // this watchdog is aborted by `RunningProcess::Drop`, and a
+                        // child that catches the signal, closes stdout and keeps
+                        // running must still be forced down when the grace elapses.
+                        Some(grace) => stream::spawn_graceful_kill_and_reap(gate, grace, signal),
+                        None => crate::sys::pid_gate::force_kill(&gate),
+                    },
                 }
-                crate::sys::pid_gate::force_kill(&gate);
             }));
         }
     }
@@ -1299,7 +1360,25 @@ impl RunningProcess {
             tokio::select! {
                 biased; // cancel arm first: a cancel that fires mid-wait wins
                 () = cancelled => {
-                    self.kill_tree().await;
+                    // Take teardown over from the detached cancel watchdog BEFORE
+                    // driving it, exactly as `drive_to_exit_inner` does: this arm
+                    // owns the `Child` and reaps through it, and the graceful branch
+                    // frees the pid part-way (its own `retire` comes after the reap,
+                    // which is safe only because its `drive_to_exit_inner` caller
+                    // already retired). Retiring here first closes that window —
+                    // the watchdog (and any detached pid-scoped grace killer it
+                    // spawned on this same token) is linearized to either land
+                    // entirely before this retire or be skipped, never onto the pid
+                    // this teardown's reap is about to free. `retire` is idempotent,
+                    // so the `kill_tree` default's own retire still stands; the only
+                    // change on that default path is that it now happens a few
+                    // statements earlier, which strictly widens the stand-down.
+                    self.pid_gate.retire();
+                    // The same teardown seam the consuming finishers use, so
+                    // `wait_any`/`wait_all` honor `cancel_grace` too instead of
+                    // silently hard-killing a run that opted into a graceful
+                    // goodbye. Unset (the default) → the unchanged `kill_tree`.
+                    self.teardown_on_cancel().await;
                     ExitCause::Cancelled
                 }
                 outcome = self.backend_wait() => ExitCause::Exited(outcome?),
@@ -1839,15 +1918,32 @@ impl RunningProcess {
     }
 
     /// Race the cancel token against the deadline-bounded wait. Unset knobs
-    /// become never-resolving arms. `biased` with cancel first so a simultaneous
-    /// cancel+deadline always hard-kills rather than routing through the graceful
-    /// teardown tier.
+    /// become never-resolving arms. `biased` with cancel first, so a simultaneous
+    /// cancel+deadline is always resolved **as a cancellation** — the winner picks
+    /// the teardown, and the run reports `Cancelled` (never `TimedOut`).
+    ///
+    /// What that tie means for the *manner* of the teardown follows the cancel
+    /// path's own policy, and is deliberately documented here rather than left to
+    /// drift (T-255):
+    ///
+    /// - **Without `cancel_grace` (the default, unchanged):** the cancel arm hard-
+    ///   kills, so a simultaneous cancel+deadline still bypasses the graceful tier
+    ///   entirely — exactly as before these knobs existed, even when `timeout_grace`
+    ///   is configured.
+    /// - **With `cancel_grace`:** the cancel arm runs *its own* soft-signal → grace
+    ///   → hard-kill ladder, so the tie is now graceful too. This is a deliberate
+    ///   change from "a tie always hard-kills": the caller explicitly asked
+    ///   cancellation to be graceful, and making the goodbye hinge on whether the
+    ///   deadline happened to land in the same poll would be a scheduling-dependent
+    ///   surprise (and would hard-kill even a run that set *both* graces). The
+    ///   outcome remains `ErrorReason::Cancelled` either way.
     async fn drive_to_exit_inner(&mut self) -> Result<ExitCause> {
         // Reclaim teardown from the streaming deadline watchdog before reaping.
         // This future owns the `Child` and drives BOTH kills through it — the
-        // deadline via `teardown_on_timeout` and cancel via `kill_tree`, whose
-        // `start_kill` is a no-op once the child is reaped and so can never signal
-        // a recycled pid. `retire` the gate FIRST (so a watchdog racing us stands
+        // deadline via `teardown_on_timeout` and cancel via `teardown_on_cancel`
+        // (`kill_tree` by default, the shared graceful ladder with `cancel_grace`),
+        // whose `start_kill` is a no-op once the child is reaped and so can never
+        // signal a recycled pid. `retire` the gate FIRST (so a watchdog racing us stands
         // down its raw-pid kill), THEN abort the deadline watchdog so only our own
         // arm fires the graceful teardown. Retiring *before* the reap is what
         // fully closes the window: a racing watchdog's raw kill runs under the gate
@@ -1911,9 +2007,12 @@ impl RunningProcess {
                 tracing::debug!(
                     target: "processkit",
                     program = %self.program,
-                    "cancellation fired; killing the tree"
+                    cancel_grace_ms = self.cancel_grace.map(|g| g.as_millis() as u64),
+                    "cancellation fired; tearing the tree down"
                 );
-                self.kill_tree().await;
+                // `cancel_grace` unset (the default) → the unchanged immediate hard
+                // kill; set → the same graceful ladder the deadline arm drives.
+                self.teardown_on_cancel().await;
                 Ok(ExitCause::Cancelled)
             }
             outcome = self.backend_wait() => outcome.map(ExitCause::Exited),
@@ -1958,6 +2057,10 @@ impl RunningProcess {
                     // block this worker thread up to ~100ms — accepted, not
                     // routed through `spawn_blocking`; see the sweep loop in
                     // `Cgroup::kill` (src/sys/linux.rs) for the full rationale.
+                    // ~100ms is the ceiling for every backend: FreeBSD's reaper
+                    // keeps its post-kill corpse drain in `Drop` alone (see
+                    // `DRAIN_BUDGET`, src/sys/freebsd.rs), so this call does not
+                    // block there at all.
                     let _ = group.kill_all();
                 }
                 // Bound the reap: a D-state child can ignore SIGKILL until I/O
@@ -1984,11 +2087,40 @@ impl RunningProcess {
     /// grace: hard `kill_tree`. Windows has no signal tier; graceful degrades to
     /// the atomic kill.
     async fn teardown_on_timeout(&mut self) {
-        let Some(grace) = self.timeout_grace else {
-            self.kill_tree().await;
-            return;
-        };
-        let signal = self.timeout_signal;
+        match self.timeout_grace {
+            Some(grace) => self.graceful_teardown(grace, self.timeout_signal).await,
+            None => self.kill_tree().await,
+        }
+    }
+
+    /// Teardown when the **cancel token** fires — the exact mirror of
+    /// [`teardown_on_timeout`](Self::teardown_on_timeout), reading the cancellation
+    /// knobs instead of the deadline ones. With
+    /// [`Command::cancel_grace`](crate::Command::cancel_grace) it drives the SAME
+    /// soft-signal → grace → hard-kill ladder (one seam, not a second cancellation
+    /// driver); without it — the default — it is the unchanged immediate
+    /// `kill_tree`, so a run that never opts in behaves exactly as before.
+    ///
+    /// The *outcome* is unaffected: the caller still reports `ExitCause::Cancelled`
+    /// (and so `ErrorReason::Cancelled`) whichever branch ran — cancellation remains
+    /// an error, only the manner of the teardown changes.
+    async fn teardown_on_cancel(&mut self) {
+        match self.cancel_grace {
+            Some(grace) => self.graceful_teardown(grace, self.cancel_signal).await,
+            None => self.kill_tree().await,
+        }
+    }
+
+    /// The shared graceful teardown both the deadline and the cancellation paths
+    /// drive: send `signal` to the tree, give it up to `grace` to drain, then hard
+    /// kill — reaping concurrently so a signal-handling child ends the grace early.
+    /// Windows has no signal tier; the graceful branch degrades to the atomic kill.
+    ///
+    /// Whole-tree work is delegated to
+    /// [`ProcessGroup::graceful_terminate`](crate::ProcessGroup::graceful_terminate)
+    /// (and so to the crate's single `sys::graceful::run` escalation driver); a
+    /// shared-group handle owns no group and so reaches only its own direct child.
+    async fn graceful_teardown(&mut self, grace: Duration, signal: i32) {
         let gate = self.pid_gate.clone();
         match &mut self.backend {
             Backend::Real(real) => match real.own_group.clone() {
@@ -2022,10 +2154,37 @@ impl RunningProcess {
                 // recycled-pid hazard the pid-only path guards with the gate is
                 // simply absent here. Only the graceful signal is sent by pid, and
                 // only while the child is provably un-reaped: this teardown is the
-                // sole reaper (the deadline arm won `drive_to_exit_inner`'s
-                // `select!`, so `backend_wait` never ran and no watchdog is racing —
-                // `drive_to_exit_inner` retired the gate to stand them down).
+                // sole reaper — the arm that called us won its `select!`, so
+                // `backend_wait` never ran — and EVERY caller retired the gate before
+                // reaching us (`drive_to_exit_inner` up front for the deadline,
+                // inactivity and cancel arms; `wait_exit`'s cancel arm likewise), so
+                // no detached watchdog can still be racing the reap below with a raw
+                // pid kill. That ordering is load-bearing here, because the trailing
+                // `gate.retire()` in this branch runs only AFTER the reap has already
+                // freed the pid — so it is `debug_assert`ed below rather than left to
+                // this comment. `Child::id()` is additionally `None` once the child
+                // has been reaped, so the pid-scoped signal below degrades to a no-op
+                // rather than a stray signal even if it were reached late.
                 None => {
+                    // The invariant the paragraph above rests on, made enforceable
+                    // instead of merely documented: every caller must have retired
+                    // the gate BEFORE reaching this branch, because the trailing
+                    // `gate.retire()` here runs only after the reap has already freed
+                    // the pid. A future third caller that forgets trips this in debug
+                    // and under `cargo test` rather than shipping a silent SIGKILL on
+                    // a recycled pid (the K-044 / T-093 class). Debug-only on purpose:
+                    // this is an internal call-ordering contract, not user input, and
+                    // a hard `assert!` would abort a *teardown* in release — turning a
+                    // caller's ordering slip into a child left un-reaped, which is the
+                    // worse failure. Every build that could introduce such a caller
+                    // (`cargo test`, CI, the debug profile) carries the check.
+                    debug_assert!(
+                        gate.is_retired(),
+                        "graceful_teardown's shared-group branch requires the caller \
+                         to have retired the PidGate first — it retires only after \
+                         its own reap has freed the pid, so an un-retired gate would \
+                         leave a detached watchdog free to raw-kill a recycled pid"
+                    );
                     #[cfg(unix)]
                     {
                         stream::signal_direct_child(real.child_mut().id(), signal);
@@ -2081,6 +2240,13 @@ impl RunningProcess {
                     let _ = tokio::join!(teardown, reap);
                 }
                 None => {
+                    // Same caller contract as the `Real` shared-group branch above,
+                    // for the same reason (the retire below trails the reap).
+                    debug_assert!(
+                        gate.is_retired(),
+                        "graceful_teardown's shared-group PTY branch requires the \
+                         caller to have retired the PidGate first"
+                    );
                     #[cfg(unix)]
                     {
                         stream::signal_direct_child(pty.child_mut().id(), signal);
@@ -2213,7 +2379,8 @@ impl Drop for RunningProcess {
                     task.abort();
                 }
                 // Window: a *shared-group* streamed run whose graceful-timeout
-                // deadline fired leaves a DETACHED pid-only kill-and-reap
+                // deadline (or, with `cancel_grace`, whose cancel token) fired leaves
+                // a DETACHED pid-only kill-and-reap
                 // (`stream::spawn_graceful_kill_and_reap`) running past this handle.
                 // If we let the owned child drop here, tokio's orphan reaper would
                 // reap it — freeing (and letting the OS recycle) the pid — WITHOUT
@@ -2226,15 +2393,49 @@ impl Drop for RunningProcess {
                 // un-reaped (this reaper owns the sole `Child`), so a survivor that
                 // rode out the grace is not stranded.
                 //
-                // Scoped to the exact *static* preconditions of that detached task —
-                // a shared group (`own_group` is `None`) with both a timeout and a
-                // grace window — which are all read from `self` here, so there is no
-                // race with the watchdog that arms it (unlike a "deadline fired"
-                // flag the watchdog would set concurrently). An own-group handle tears
-                // its whole tree down on drop and arms no detached pid-killer; a
-                // shared handle without a graceful timeout never spawns one either, so
-                // neither needs this hand-off — they fall through to the `else` and
-                // retire the gate synchronously instead (see below).
+                // Scoped to the exact preconditions of that detached task — a shared
+                // group (`own_group` is `None`) plus EITHER a deadline with a
+                // `timeout_grace` window OR a cancel token that has ALREADY FIRED
+                // with a `cancel_grace` window (the two arming sites: the streaming
+                // deadline/inactivity watchdogs and the cancel watchdog). An
+                // own-group handle tears its whole tree down on drop and arms no
+                // detached pid-killer; a shared handle with neither graceful window
+                // never spawns one either, so neither needs this hand-off — they
+                // fall through to the `else` and retire the gate synchronously
+                // instead (see below).
+                //
+                // The two halves are deliberately asymmetric:
+                //
+                //   * the deadline half is purely *static* — `timeout` /
+                //     `inactivity_timeout` / `timeout_grace` are read from `self`,
+                //     so there is no race with the watchdog that arms the detached
+                //     task (a "deadline fired" flag would be set by that very
+                //     watchdog, concurrently with this read);
+                //   * the cancel half also reads the token's `is_cancelled()`, which
+                //     is dynamic but **monotone** (`false` → `true`, never back), so
+                //     it is race-free here all the same. `true` means a cancel
+                //     watchdog may already have armed the detached killer, so hand
+                //     the child off. `false` is read *before* the `else`'s
+                //     synchronous `retire()`, which linearizes every watchdog that
+                //     fires afterwards behind it: such a watchdog either stands down
+                //     at its own `is_retired()` check or spawns a grace killer whose
+                //     every raw op is suppressed under the now-retired gate — in
+                //     neither case can it touch a recycled pid. Reading `true` may
+                //     over-approximate (the watchdog can have been aborted at the top
+                //     of this `drop()` before it ever ran), which is the safe
+                //     direction: at worst a deterministic gated reap instead of the
+                //     orphan reap, never a missing one.
+                //
+                // The cancel half must NOT use the deadline half's static form
+                // ("a token is configured"). `cancel_grace` needs no deadline, so
+                // that form is true for a handle whose token may never fire at all:
+                // every dropped handle of the very shape the docs recommend (one
+                // shared token for the whole app + `cancel_grace` on the bulk verbs)
+                // would then park a detached reaper on `child.wait()` — and leave its
+                // `PidGate` un-retired — for the child's entire, unbounded life,
+                // without a single cancellation having happened. Gating on the fired
+                // token keeps the hand-off where its reason to exist is: an
+                // actually-armable detached killer.
                 //
                 // The hand-off ALSO needs two *dynamic* conditions, and the `else`
                 // now covers every case where one of them fails (this is what closes
@@ -2246,12 +2447,18 @@ impl Drop for RunningProcess {
                 // child is still owned by `real` when the `else` retires the gate,
                 // preserving the "retire before the pid is freed" ordering (the child's
                 // pid is freed only as `real` drops at the end of this `drop()`, after
-                // the retire — never before it). When the deadline had not actually
-                // fired the handed-off reaper is merely a harmless deterministic
-                // replacement for the orphan reap.
+                // the retire — never before it). On the *deadline* half, when the
+                // deadline had not actually fired, the handed-off reaper is merely a
+                // harmless deterministic replacement for the orphan reap: that half is
+                // over-approximate only for as long as the deadline itself, which is
+                // configured and will fire. That bound is exactly what the cancel half
+                // lacks — hence its fired-token gate above, without which "harmless"
+                // would have meant "for the child's entire life".
                 if real.own_group.is_none()
-                    && (self.timeout.is_some() || self.inactivity_timeout.is_some())
-                    && self.timeout_grace.is_some()
+                    && (((self.timeout.is_some() || self.inactivity_timeout.is_some())
+                        && self.timeout_grace.is_some())
+                        || (self.cancel_grace.is_some()
+                            && self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled())))
                     && !self.pid_gate.is_retired()
                     && let Ok(handle) = tokio::runtime::Handle::try_current()
                     && let Some(child) = real.child.take()
@@ -2266,17 +2473,23 @@ impl Drop for RunningProcess {
                     // leaves a detached grace kill-and-reap that a retire could strand:
                     //
                     //   * own-group / shared-without-grace never arm that detached task
-                    //     at all — it needs `own_group.is_none() && timeout.is_some()
-                    //     && timeout_grace.is_some()`, precisely the config we are NOT
-                    //     in on those shapes;
+                    //     at all — it needs `own_group.is_none()` plus one of the two
+                    //     graceful shapes (`timeout`/`inactivity_timeout` +
+                    //     `timeout_grace`, or an already-fired `cancel_token` +
+                    //     `cancel_grace`), precisely the config we are NOT in on those
+                    //     shapes. A `cancel_grace` handle whose token has NOT fired
+                    //     lands here on purpose (see the monotone-read rationale
+                    //     above): nothing detached exists yet, and this retire is what
+                    //     stands down anything the token could still arm;
                     //   * a shared-group+grace handle dropped with NO runtime current
                     //     never armed it *from a live path here* either — the grace
-                    //     kill-and-reap is spawned by the streaming deadline watchdog,
-                    //     which itself needs a runtime, so with none current the
-                    //     hand-off is simply unavailable and retiring is the only way
-                    //     to close the window (a deadline/cancel watchdog mid-poll on
-                    //     another worker/runtime could otherwise outlive an un-retired
-                    //     gate onto a recycled pid — the T-093 gap this branch closes);
+                    //     kill-and-reap is spawned by the streaming deadline or cancel
+                    //     watchdog, each of which itself needs a runtime, so with none
+                    //     current the hand-off is simply unavailable and retiring is
+                    //     the only way to close the window (a deadline/cancel watchdog
+                    //     mid-poll on another worker/runtime could otherwise outlive an
+                    //     un-retired gate onto a recycled pid — the T-093 gap this
+                    //     branch closes);
                     //   * an already-retired gate means a consuming reap already ran.
                     //
                     // `PidGate::retire` is idempotent, so retiring an already-retired
@@ -3370,6 +3583,97 @@ mod tests {
         );
         // The shared group still owns the child's teardown; drop it to tear the
         // (orphan-reaped) child down and keep the test process-clean.
+        drop(group);
+    }
+
+    /// R-01/T-255: a shared-group handle that merely *configures* `cancel_grace`,
+    /// with a token that has NOT fired, must take the same synchronous
+    /// retire-and-structurally-drop `else` branch — NOT the detached child hand-off.
+    ///
+    /// The hand-off exists solely to keep tokio's orphan reaper from freeing the pid
+    /// behind a detached `spawn_graceful_kill_and_reap`, and only a *fired* token can
+    /// have armed one. Keyed on the static "a token is configured" shape instead, this
+    /// handle — the shape the cancellation docs recommend (one shared app-wide token
+    /// plus `cancel_grace`) — would park a detached reaper on `child.wait()` and leave
+    /// its `PidGate` un-retired for the child's entire, unbounded life, with no
+    /// cancellation having happened at all.
+    ///
+    /// Deterministic, no timing: `drop()` retires the gate *synchronously*, so the
+    /// assertion turns on the branch taken, not on the child's exit (a 30-second
+    /// sleeper outlives the whole test). Real subprocess — hence `#[ignore]` — because
+    /// a scripted double is pid-less and takes the `Scripted` Drop arm.
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess (shared-group + cancel_grace, un-fired token, Drop)"]
+    async fn dropping_a_cancel_grace_handle_with_an_unfired_token_retires_the_gate() {
+        let group = crate::group::ProcessGroup::new().expect("a shared process group");
+        let token = tokio_util::sync::CancellationToken::new();
+        // No timeout at all: `cancel_grace` needs none, which is exactly why the
+        // static form has no upper bound to fall back on.
+        let cmd = sleeper_cmd()
+            .cancel_on(token.clone())
+            .cancel_grace(Duration::from_secs(5));
+        let run = crate::runner::launch(&group, &cmd)
+            .await
+            .expect("launch into the shared group");
+        assert!(
+            !run.kills_tree_on_drop(),
+            "a shared-group handle owns no tree — its group does"
+        );
+        assert!(
+            run.timeout.is_none() && run.inactivity_timeout.is_none(),
+            "the shape under test is cancellation-only: no deadline bounds the hold"
+        );
+        let gate = run.pid_gate.clone();
+        assert!(
+            !token.is_cancelled(),
+            "the token under test has NOT fired, so no detached killer can exist"
+        );
+        assert!(
+            !gate.is_retired(),
+            "a fresh live handle's gate is not retired"
+        );
+        drop(run); // exercises Drop with the cancel half's dynamic read = false
+        assert!(
+            gate.is_retired(),
+            "an un-fired cancel token must not divert Drop into the detached \
+             hand-off: the gate has to be retired synchronously, as it was before \
+             cancel_grace existed"
+        );
+        drop(group);
+    }
+
+    /// The positive counterpart: once the token HAS fired, the same shared-group +
+    /// `cancel_grace` handle still hands its child to the gated reaper, because a
+    /// cancel watchdog may already have armed the detached `graceful_kill_pid` — the
+    /// pid must then be freed only *under* the gate.
+    ///
+    /// Deterministic without timing games: `#[tokio::test]` is a current-thread
+    /// runtime, so no spawned task can run between `token.cancel()` and the assertion
+    /// (there is no `.await` between them) — the observed state is exactly the branch
+    /// Drop took. Reading a fired token is deliberately conservative: it also covers
+    /// the case where `Drop` aborted the watchdog before it ever armed anything.
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess (shared-group + cancel_grace, fired token, Drop)"]
+    async fn dropping_a_cancel_grace_handle_with_a_fired_token_hands_the_child_off() {
+        let group = crate::group::ProcessGroup::new().expect("a shared process group");
+        let token = tokio_util::sync::CancellationToken::new();
+        let cmd = sleeper_cmd()
+            .cancel_on(token.clone())
+            .cancel_grace(Duration::from_secs(5));
+        let run = crate::runner::launch(&group, &cmd)
+            .await
+            .expect("launch into the shared group");
+        let gate = run.pid_gate.clone();
+        token.cancel();
+        drop(run); // exercises Drop with the cancel half's dynamic read = true
+        assert!(
+            !gate.is_retired(),
+            "a fired cancel token keeps the hand-off: the gate must stay live until \
+             the detached gated reaper retires it atomically with the reap, so a \
+             detached grace killer can never outlive it onto a recycled pid"
+        );
+        // The shared group owns the teardown; dropping it kills the child, which the
+        // handed-off reaper then reaps under the gate.
         drop(group);
     }
 

@@ -442,6 +442,7 @@ impl core::panic::unwind_safe::UnwindSafe for processkit::LineTerminator
 pub processkit::Mechanism::CgroupV2
 pub processkit::Mechanism::JobObject
 pub processkit::Mechanism::ProcessGroup
+pub processkit::Mechanism::ProcessReaper
 impl processkit::Mechanism
 pub fn processkit::Mechanism::from_name(&str) -> core::option::Option<Self>
 pub fn processkit::Mechanism::name(&self) -> &'static str
@@ -872,7 +873,9 @@ pub fn processkit::Command::arg(self, impl core::convert::AsRef<std::ffi::os_str
 pub fn processkit::Command::arg0(self, impl core::convert::Into<std::ffi::os_str::OsString>) -> Self
 pub fn processkit::Command::args<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub fn processkit::Command::arguments(&self) -> &[std::ffi::os_str::OsString]
+pub fn processkit::Command::cancel_grace(self, core::time::Duration) -> Self
 pub fn processkit::Command::cancel_on(self, tokio_util::sync::cancellation_token::CancellationToken) -> Self
+pub fn processkit::Command::cancel_signal(self, processkit::Signal) -> Self
 pub fn processkit::Command::capture_policy(self, impl processkit::CapturePolicy + 'static) -> Self
 pub async fn processkit::Command::checked(&self) -> processkit::Result<processkit::ProcessResult<alloc::string::String>>
 pub fn processkit::Command::command_line(&self) -> alloc::string::String

@@ -694,7 +694,10 @@ pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, gate: &PidGate) {
         // On Linux + legacy/restricted cgroup this can synchronously block
         // this worker thread up to ~100ms — accepted, not routed through
         // `spawn_blocking`; see the sweep loop in `Cgroup::kill`
-        // (src/sys/linux.rs) for the full rationale.
+        // (src/sys/linux.rs) for the full rationale. ~100ms is the ceiling for
+        // every backend: FreeBSD's reaper keeps its post-kill corpse drain in
+        // `Drop` alone (see `DRAIN_BUDGET`, src/sys/freebsd.rs), so this call
+        // does not block there at all.
         let _ = group.kill_all();
     }
     force_kill(gate);
@@ -748,6 +751,13 @@ pub(crate) async fn graceful_kill_pid(gate: Arc<PidGate>, grace: std::time::Dura
 /// shared-group child carries no `kill_on_drop`, so this kill never races a
 /// Drop-triggered kill+reap of a recycled pid.
 ///
+/// The graceful **cancellation** watchdog (`RunningProcess::arm_cancel_watchdog`,
+/// with `Command::cancel_grace`) reaches the identical situation — its task is
+/// aborted by the same `Drop`, and a signal-catching child can end the stream the
+/// same way — so it arms this same detached primitive rather than forking a second
+/// one, and `Drop`'s child hand-off covers its shape too (there keyed on the
+/// *fired* token, since a merely configured `cancel_grace` arms nothing).
+///
 /// The reap that frees the pid is **never** left to tokio's orphan reaper (which
 /// would free it without retiring the gate, leaving this task free to probe or
 /// SIGKILL whatever recycled it). It is owned by whoever owns the `Child`: a
@@ -758,7 +768,11 @@ pub(crate) async fn graceful_kill_pid(gate: Arc<PidGate>, grace: std::time::Dura
 /// atomically. Either way the shared [`PidGate`] is the [`graceful_kill_pid`]
 /// stand-down: once the pid's owner retires it, this task's liveness poll reports
 /// "gone", its `SIGKILL` is suppressed, and it can never fire on a recycled pid.
-fn spawn_graceful_kill_and_reap(gate: Arc<PidGate>, grace: std::time::Duration, signal: i32) {
+pub(super) fn spawn_graceful_kill_and_reap(
+    gate: Arc<PidGate>,
+    grace: std::time::Duration,
+    signal: i32,
+) {
     // Detached on purpose: dropping the handle lets it outlive the (abortable)
     // deadline watchdog that spawned it.
     drop(tokio::spawn(graceful_kill_pid(gate, grace, signal)));

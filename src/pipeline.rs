@@ -1177,9 +1177,11 @@ impl Drop for PipelineSession {
 ///
 /// Called synchronously from a spawned async task (both the timeout branch and
 /// the cancellation killer above), so on a cgroup backend it is one of the four
-/// async call sites of the accepted bounded blocking sweep documented on
+/// async call sites of the accepted bounded blocking sweep (~100 ms) documented on
 /// `Cgroup::kill` (`src/sys/linux.rs`) — see that comment for the pre-5.14/
-/// restricted-cgroup tradeoff.
+/// restricted-cgroup tradeoff. That ~100 ms is the ceiling for every backend:
+/// FreeBSD's reaper keeps its post-kill corpse drain in `Drop` alone (see
+/// `DRAIN_BUDGET`, `src/sys/freebsd.rs`), so this path does not block there.
 fn kill_all_stage_groups(groups: &[Arc<ProcessGroup>]) {
     for group in groups {
         let _ = group.kill_all();

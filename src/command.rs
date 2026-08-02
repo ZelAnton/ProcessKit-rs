@@ -229,6 +229,15 @@ pub struct Command {
     /// a `Command` clone — including each `Pipeline` stage and each
     /// `Supervisor` incarnation — shares the same cancel state.
     cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Grace window after a cancellation before the hard kill; its presence makes
+    /// the cancellation teardown graceful (see [`Self::cancel_grace`]). The
+    /// cancellation mirror of [`timeout_grace`](Self::timeout_grace) — `None`
+    /// (the default) keeps cancellation an immediate hard kill.
+    cancel_grace: Option<Duration>,
+    /// Signal sent at the start of a graceful cancellation (default `SIGTERM`) —
+    /// the cancellation mirror of [`timeout_signal`](Self::timeout_signal).
+    #[cfg(feature = "process-control")]
+    cancel_signal: Option<crate::Signal>,
 }
 
 impl Command {
@@ -286,6 +295,9 @@ impl Command {
             #[cfg(feature = "pty")]
             stderr_terminator_explicit: false,
             cancel_token: None,
+            cancel_grace: None,
+            #[cfg(feature = "process-control")]
+            cancel_signal: None,
         }
     }
 
@@ -1224,6 +1236,14 @@ impl Command {
     /// `ErrorReason::Cancelled` as terminal — the token stays cancelled forever, so
     /// another attempt could only fail the same way.
     ///
+    /// The teardown is an **immediate hard kill** by default. Add
+    /// [`cancel_grace`](Self::cancel_grace) (and optionally `cancel_signal`, with
+    /// the `process-control` feature) to route it through the same
+    /// `SIGTERM` → grace → `SIGKILL` ladder as
+    /// [`timeout_grace`](Self::timeout_grace) instead, giving the child a chance to
+    /// flush state. The *outcome* is unchanged either way — cancellation stays an
+    /// error on every path; only the manner of the goodbye becomes gentler.
+    ///
     /// On a `Command` this **replaces** any previously set token (last write
     /// wins) — contrast the *gap-fill* containers
     /// [`Pipeline::cancel_on`](crate::Pipeline::cancel_on) and
@@ -1231,6 +1251,67 @@ impl Command {
     /// which leave an explicit per-element token intact.
     pub fn cancel_on(mut self, token: tokio_util::sync::CancellationToken) -> Self {
         self.cancel_token = Some(token);
+        self
+    }
+
+    /// Make [`cancel_on`](Self::cancel_on) **graceful**: when the token fires, the
+    /// run's tree is sent `SIGTERM` (or the signal chosen via `cancel_signal`, with
+    /// the `process-control` feature), given up to `grace` to exit, then `SIGKILL`ed
+    /// — the cancellation mirror of [`timeout_grace`](Self::timeout_grace), driving
+    /// the very same soft-signal → grace → hard-kill ladder.
+    ///
+    /// **Opt-in, and off by default.** Without it a cancellation hard-kills the tree
+    /// at once, exactly as before; no effect unless a token is set (via
+    /// [`cancel_on`](Self::cancel_on), [`Pipeline::cancel_on`](crate::Pipeline::cancel_on),
+    /// or [`CliClient::default_cancel_on`](crate::CliClient::default_cancel_on)).
+    ///
+    /// **The outcome does not change: cancellation is still always an error.** Every
+    /// consuming path still resolves to
+    /// [`ErrorReason::Cancelled`] — whether the child
+    /// exited on the soft signal or was killed after the grace — only the *manner* of
+    /// the teardown becomes gentler, so a child that must flush state, remove a
+    /// pidfile, or finish a transaction gets the chance to. This is the knob for the
+    /// "one shared token, cancelled on Ctrl-C" application-shutdown pattern, where
+    /// every child would otherwise be `SIGKILL`ed outright.
+    ///
+    /// Applies to every cancellation path a run has — the bulk finishers
+    /// (`run`/`output_string`/`wait`/…), a live streamed run (`start()` + the cancel
+    /// watchdog), the bulk verbs on a [`ProcessGroup`](crate::ProcessGroup), and a
+    /// [`Supervisor`](crate::Supervisor) incarnation (which cancels through a child
+    /// of this command's token) — all of them share one teardown seam.
+    ///
+    /// **Scope, like the rest of cancellation:** an own-group run tears down the
+    /// whole tree; a shared-[`ProcessGroup`](crate::ProcessGroup) run reaches only its
+    /// own direct child (its descendants are the documented shared-group teardown
+    /// gap). **Windows** has no POSIX signal tier: as with
+    /// [`timeout_grace`](Self::timeout_grace), the soft tier is the best-effort
+    /// `WM_CLOSE` / opt-in
+    /// [`windows_graceful_ctrl_break`](Self::windows_graceful_ctrl_break) pair, and a
+    /// tree with neither is hard-killed at once with `grace` unused.
+    pub fn cancel_grace(mut self, grace: Duration) -> Self {
+        self.cancel_grace = Some(grace);
+        self
+    }
+
+    /// The signal sent at the start of a graceful
+    /// [`cancel_grace`](Self::cancel_grace) window (default
+    /// [`Signal::Term`](crate::Signal::Term)) — the cancellation mirror of
+    /// [`timeout_signal`](Self::timeout_signal). Unix-only in effect; ignored on
+    /// Windows (no signal tier).
+    ///
+    /// Independent of [`timeout_signal`](Self::timeout_signal): a command may
+    /// deliberately ask for a different farewell on "the caller changed its mind"
+    /// than on "the deadline expired", and neither knob gap-fills the other. Inert
+    /// without [`cancel_grace`](Self::cancel_grace) (there is no soft tier to send it
+    /// on).
+    ///
+    /// This builder lives behind the `process-control` feature because the
+    /// [`Signal`](crate::Signal) type does. Without `process-control` a graceful
+    /// cancellation always uses `SIGTERM` (the default); the feature is only needed
+    /// to *choose a different* teardown signal.
+    #[cfg(feature = "process-control")]
+    pub fn cancel_signal(mut self, signal: crate::Signal) -> Self {
+        self.cancel_signal = Some(signal);
         self
     }
 
@@ -2404,6 +2485,24 @@ impl Command {
         crate::sys::SIGTERM_RAW
     }
 
+    /// The graceful-cancellation grace window, if set. `None` (the default) keeps
+    /// cancellation an immediate hard kill.
+    pub(crate) fn configured_cancel_grace(&self) -> Option<Duration> {
+        self.cancel_grace
+    }
+
+    /// The raw signal for the graceful-cancellation phase (default `SIGTERM`),
+    /// resolved exactly like [`timeout_signal_raw`](Self::timeout_signal_raw) — the
+    /// same fallback, on the same feature/platform gates — so the two graceful tiers
+    /// can never disagree on what "the default soft signal" means.
+    pub(crate) fn cancel_signal_raw(&self) -> i32 {
+        #[cfg(all(unix, feature = "process-control"))]
+        if let Some(sig) = self.cancel_signal {
+            return sig.raw();
+        }
+        crate::sys::SIGTERM_RAW
+    }
+
     /// The exit codes this command treats as success (defaults to `[0]`).
     pub(crate) fn ok_codes_vec(&self) -> Vec<i32> {
         self.ok_codes.clone().unwrap_or_else(|| vec![0])
@@ -3012,7 +3111,7 @@ impl Command {
     /// requested behavior" contract as `uid`/`gid`/`umask` off Unix). The refused
     /// knobs are: [`timeout`](Self::timeout)/[`timeout_grace`](Self::timeout_grace),
     /// [`retry`](Self::retry)/[`retry_with`](Self::retry_with),
-    /// [`cancel_on`](Self::cancel_on),
+    /// [`cancel_on`](Self::cancel_on)/[`cancel_grace`](Self::cancel_grace),
     /// [`kill_on_parent_death`](Self::kill_on_parent_death) (its exact opposite),
     /// [`windows_graceful_ctrl_break`](Self::windows_graceful_ctrl_break),
     /// [`keep_stdin_open`](Self::keep_stdin_open)/[`inherit_stdin`](Self::inherit_stdin)/
@@ -3138,6 +3237,14 @@ impl Command {
         }
         if self.cancel_token.is_some() {
             return refuse("a cancellation token");
+        }
+        // Refused for the same reason as `timeout_grace`: a detached child has no
+        // owner left to drive the soft-signal → grace → hard-kill ladder, so honoring
+        // the knob is impossible and silently dropping it is not this crate's
+        // contract. (`cancel_on` is already refused just above; this covers the grace
+        // window configured without — or before — a token.)
+        if self.cancel_grace.is_some() {
+            return refuse("a graceful-cancellation window");
         }
         if self.kill_on_parent_death {
             // The exact inverse of detach — it would kill the child when the owner
@@ -3673,8 +3780,10 @@ impl fmt::Debug for Command {
         d.field("use_pty", &self.use_pty)
             .field("pty_size", &self.pty_size);
         #[cfg(feature = "process-control")]
-        d.field("timeout_signal", &self.timeout_signal);
-        d.field("has_cancel_token", &self.cancel_token.is_some());
+        d.field("timeout_signal", &self.timeout_signal)
+            .field("cancel_signal", &self.cancel_signal);
+        d.field("has_cancel_token", &self.cancel_token.is_some())
+            .field("cancel_grace", &self.cancel_grace);
         d.finish_non_exhaustive()
     }
 }
@@ -5791,6 +5900,92 @@ mod tests {
                 .timeout_signal_raw(),
             Signal::Int.raw(),
         );
+    }
+
+    // --- T-255: the graceful-cancellation knobs, mirroring the two above --------
+
+    #[test]
+    fn cancel_grace_records_its_value_and_defaults_to_none() {
+        use std::time::Duration;
+        let cmd = Command::new("x").cancel_grace(Duration::from_secs(5));
+        assert_eq!(cmd.configured_cancel_grace(), Some(Duration::from_secs(5)));
+        // The default must stay `None`: that is what keeps cancellation an
+        // immediate hard kill for every command that never opts in.
+        assert_eq!(Command::new("x").configured_cancel_grace(), None);
+        // Independent of the timeout mirror — neither knob gap-fills the other.
+        assert_eq!(cmd.configured_timeout_grace(), None);
+        assert_eq!(
+            Command::new("x")
+                .timeout_grace(Duration::from_secs(9))
+                .configured_cancel_grace(),
+            None,
+            "timeout_grace must not imply a graceful cancellation"
+        );
+    }
+
+    #[test]
+    fn cancel_grace_is_last_write_wins() {
+        use std::time::Duration;
+        let cmd = Command::new("x")
+            .cancel_grace(Duration::from_secs(1))
+            .cancel_grace(Duration::from_secs(7));
+        assert_eq!(cmd.configured_cancel_grace(), Some(Duration::from_secs(7)));
+    }
+
+    #[cfg(all(unix, feature = "process-control"))]
+    #[test]
+    fn cancel_signal_defaults_to_term_and_is_configurable() {
+        use crate::Signal;
+        // Default (no `cancel_signal`) resolves to SIGTERM, exactly like
+        // `timeout_signal_raw`…
+        assert_eq!(
+            Command::new("x").cancel_signal_raw(),
+            crate::sys::SIGTERM_RAW
+        );
+        // …and an explicit signal overrides it.
+        assert_eq!(
+            Command::new("x")
+                .cancel_signal(Signal::Int)
+                .cancel_signal_raw(),
+            Signal::Int.raw(),
+        );
+        // The two signal knobs are independent in both directions.
+        let cmd = Command::new("x").timeout_signal(Signal::Hup);
+        assert_eq!(cmd.timeout_signal_raw(), Signal::Hup.raw());
+        assert_eq!(
+            cmd.cancel_signal_raw(),
+            crate::sys::SIGTERM_RAW,
+            "timeout_signal must not gap-fill the cancellation signal"
+        );
+        let cmd = Command::new("x").cancel_signal(Signal::Hup);
+        assert_eq!(cmd.cancel_signal_raw(), Signal::Hup.raw());
+        assert_eq!(
+            cmd.timeout_signal_raw(),
+            crate::sys::SIGTERM_RAW,
+            "cancel_signal must not gap-fill the timeout signal"
+        );
+    }
+
+    #[test]
+    fn spawn_detached_refuses_a_cancel_grace_window_loudly() {
+        use std::time::Duration;
+        let err = Command::new("x")
+            .cancel_grace(Duration::from_secs(1))
+            .spawn_detached()
+            .expect_err("a detached child has no owner to drive a graceful cancellation");
+        assert!(matches!(
+            err.reason(),
+            crate::ErrorReason::Unsupported { operation }
+                if operation.contains("graceful-cancellation window")
+        ));
+    }
+
+    #[test]
+    fn debug_renders_the_cancellation_grace_knob() {
+        use std::time::Duration;
+        let with = Command::new("x").cancel_grace(Duration::from_millis(250));
+        assert!(format!("{with:?}").contains("cancel_grace: Some(250ms)"));
+        assert!(format!("{:?}", Command::new("x")).contains("cancel_grace: None"));
     }
 
     // T-041: a same-named file with no recognized executable extension (e.g.

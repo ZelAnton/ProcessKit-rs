@@ -6,14 +6,19 @@
 //! - **Windows** — a [Job Object] with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
 //! - **Linux** — a [cgroup v2] killed via `cgroup.kill`, falling back to a POSIX
 //!   process group when no writable cgroup is available.
-//! - **macOS / the BSDs** — a POSIX process group (`killpg` the tree on drop);
-//!   no cgroups or Job Objects exist there. See `pgroup`.
+//! - **FreeBSD** — a [process reaper] (`procctl(PROC_REAP_ACQUIRE)`) layered over
+//!   the same process-group bookkeeping: the tree is enumerated with
+//!   `PROC_REAP_GETPIDS` and torn down with `PROC_REAP_KILL`, so a descendant that
+//!   `setsid`s away is still contained. See `freebsd`.
+//! - **macOS / the other BSDs** — a POSIX process group (`killpg` the tree on
+//!   drop); no cgroups, Job Objects or reapers exist there. See `pgroup`.
 //!
 //! Only Unix and Windows are supported; other targets fail to compile (see the
 //! `compile_error!` below).
 //!
 //! [Job Object]: https://learn.microsoft.com/windows/win32/procthread/job-objects
 //! [cgroup v2]: https://docs.kernel.org/admin-guide/cgroup-v2.html
+//! [process reaper]: https://man.freebsd.org/cgi/man.cgi?query=procctl&sektion=2
 
 use std::io;
 use std::time::Duration;
@@ -79,7 +84,8 @@ pub(crate) struct ProcMetrics {
 /// was reaped. Only ever compared for equality, never interpreted: the units are
 /// platform-specific — Windows uses the process-creation `FILETIME` (100 ns units)
 /// and Linux uses `/proc/<pid>/stat` field 22 (`starttime`, clock ticks since
-/// boot); the POSIX fallback (macOS/BSD) reports none. This is the per-process
+/// boot); the `/proc`-less POSIX targets (macOS and the BSDs, FreeBSD's reaper
+/// included) report none. This is the per-process
 /// analogue of the pgroup backend's start-time identity token (see
 /// `pgroup::read_identity`); it exists to keep a pid-reuse
 /// race from folding an unrelated process's CPU/memory into a sample.
@@ -88,10 +94,11 @@ pub(crate) struct ProcMetrics {
 pub(crate) struct ProcIdentity(u64);
 
 // Constructed and read only by the Linux (`/proc` starttime) and Windows
-// (creation `FILETIME`) backends; the POSIX fallback (macOS/BSD, `unix.rs`)
-// reports no identity and ignores the anchor, leaving both associated items
-// unused there — allow it on exactly that target rather than deleting methods
-// the other two backends need (mirrors the `SpawnOptions` field pattern above).
+// (creation `FILETIME`) backends; the `/proc`-less POSIX targets (macOS and the
+// other BSDs in `unix.rs`, FreeBSD in `freebsd.rs`) report no identity and
+// ignore the anchor, leaving both associated items unused there — allow it on
+// exactly those targets rather than deleting methods the other two backends
+// need (mirrors the `SpawnOptions` field pattern above).
 #[cfg(feature = "stats")]
 #[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
 impl ProcIdentity {
@@ -155,7 +162,8 @@ pub(crate) fn process_info(pid: u32) -> io::Result<Option<crate::member::MemberI
     imp::process_info(pid)
 }
 
-// Shared POSIX process-group backend for both the Linux fallback and macOS/BSD.
+// Shared POSIX process-group backend: the Linux fallback, macOS/the other BSDs,
+// and the bookkeeping substrate the FreeBSD reaper layers on.
 #[cfg(unix)]
 pub(crate) mod pgroup;
 
@@ -171,13 +179,14 @@ pub(crate) mod procfs;
 
 // Shared graceful-shutdown escalation driver. The whole-tree
 // signal → poll → escalate loop ([`graceful::run`]) and its [`GracefulTarget`]
-// trait are cross-platform: both unix backends drive it (SIGTERM → grace →
-// SIGKILL), and the Windows Job Object drives it too for the opt-in
-// console-CTRL graceful path (CTRL_BREAK → grace → `TerminateJobObject`). The
-// single-child kill-and-reap primitive ([`graceful::run_pid`]/[`PidTarget`]/
-// [`UnixChild`]) stays unix-only — it leans on `PidGate`/`libc` and drives the
-// shared-group streaming-timeout teardown from `crate::running`. `pub(crate)`
-// so both are reachable from those callers.
+// trait are cross-platform: all three unix mechanisms drive it (the cgroup, the
+// process group and the FreeBSD reaper: SIGTERM → grace → SIGKILL), and the
+// Windows Job Object drives it too for the opt-in console-CTRL graceful path
+// (CTRL_BREAK → grace → `TerminateJobObject`). The single-child kill-and-reap
+// primitive ([`graceful::run_pid`]/[`PidTarget`]/[`UnixChild`]) stays unix-only
+// — it leans on `PidGate`/`libc` and drives the shared-group streaming-timeout
+// teardown from `crate::running`. `pub(crate)` so both are reachable from those
+// callers.
 pub(crate) mod graceful;
 
 // The linearizable pid gate: serializes every raw direct-child kill a detached
@@ -265,9 +274,21 @@ compile_error!(
 
 // Exactly one platform module is compiled per target. Each defines an `imp::Job`
 // with the same inherent methods plus a kill-on-close `Drop`.
+//
+// The arms are mutually exclusive by construction, so at most one `path` ever
+// applies: `windows` and `unix` are disjoint, `target_os = "freebsd"` implies
+// `unix` and excludes `linux`, and the final catch-all subtracts both
+// target-specific unix arms. Adding a target-specific backend therefore means
+// adding its arm AND narrowing the catch-all in the same edit — otherwise two
+// `path`s would apply at once. Only the FreeBSD arm is new: Windows, Linux, macOS
+// and every other BSD resolve exactly where they did before.
 #[cfg_attr(windows, path = "windows.rs")]
 #[cfg_attr(target_os = "linux", path = "linux.rs")]
-#[cfg_attr(all(unix, not(target_os = "linux")), path = "unix.rs")]
+#[cfg_attr(target_os = "freebsd", path = "freebsd.rs")]
+#[cfg_attr(
+    all(unix, not(any(target_os = "linux", target_os = "freebsd"))),
+    path = "unix.rs"
+)]
 mod imp;
 
 /// A handle to an OS job owning a tree of child processes.
@@ -305,15 +326,17 @@ impl Job {
         self.0.update_limits(limits)
     }
 
-    /// Post-run evidence about the caps this job carries: did an applied cap
-    /// actually fire? See
+    /// Post-run evidence about this job's caps: did a cap on this axis actually
+    /// fire? See
     /// [`ProcessGroup::limit_evidence`](crate::ProcessGroup::limit_evidence) for the
     /// contract and [`LimitVerdict`](crate::LimitVerdict) for what counts as
     /// evidence on each axis.
     ///
-    /// `capped` names the axes that have carried a cap at any point in this job's
-    /// life, so a backend reads **only** those (an uncapped axis is
-    /// `NotTripped` by construction — no cap, nothing to fire — and costs no I/O).
+    /// `capped` names the axes a cap request has named at any point in this job's
+    /// life — conservatively, so an axis of a *failed* `update_limits` counts too
+    /// (that call is no rollback, and the axis may well be in force). A backend
+    /// reads **only** those (an axis never named is `NotTripped` by construction —
+    /// no cap was ever asked for, nothing to fire — and costs no I/O).
     /// Infallible by design: an unreadable counter is `Unknown`, never an error,
     /// because "we could not look" and "it did not fire" must not collapse into one
     /// answer. Reads only; it never signals, kills, or mutates the container, so it
@@ -470,11 +493,15 @@ impl Job {
 /// a process — the detection extracted from the group-creation path so it can back
 /// the public `host_containment()` query as well.
 ///
-/// A fixed constant on Windows ([`Mechanism::JobObject`]) and macOS/BSD
+/// A fixed constant on Windows ([`Mechanism::JobObject`]), FreeBSD
+/// ([`Mechanism::ProcessReaper`]) and macOS/the other BSDs
 /// ([`Mechanism::ProcessGroup`]); on Linux a best-effort read-only probe of cgroup
 /// v2 availability and writability that agrees with [`Job::new`]'s selection on any
 /// real host, differing only in the rare window where a writable-looking cgroup then
-/// rejects leaf creation (see the Linux backend's `detect_mechanism`).
+/// rejects leaf creation (see the Linux backend's `detect_mechanism`). The FreeBSD
+/// constant carries an analogous — but far narrower — caveat, since acquiring reaper
+/// status is a side effect this query must not have: see the FreeBSD backend's
+/// `detect_mechanism`.
 pub(crate) fn detect_mechanism() -> Mechanism {
     imp::detect_mechanism()
 }

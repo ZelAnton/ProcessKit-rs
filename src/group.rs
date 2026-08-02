@@ -181,9 +181,11 @@ impl ProcessGroup {
                 if options.limits.any() {
                     // A real signal from the backend, not a guess: every
                     // backend reports `ErrorKind::Unsupported` exactly when no
-                    // whole-tree container mechanism exists at all on this
-                    // platform (macOS/BSD's POSIX-only fallback, a Linux host
-                    // with no cgroup v2 mounted) — the same convention
+                    // mechanism with whole-tree resource *accounting* exists on
+                    // this platform (macOS/BSD's POSIX-only fallback and a Linux
+                    // host with no cgroup v2 mounted, which have no whole-tree
+                    // container at all; FreeBSD's reaper, which contains a tree
+                    // but accounts for nothing) — the same convention
                     // `map_unsupported` relies on for the signal/suspend/resume
                     // paths. Every other failure (Linux delegation/
                     // subtree_control rejected, a Windows Job Object call
@@ -359,7 +361,8 @@ impl ProcessGroup {
     /// rather than a false success; the atomic backends (`cgroup.kill`, Windows
     /// Job Object) don't need to.
     ///
-    /// **Process-group mechanism (macOS/BSD, Linux process-group fallback).** A
+    /// **Process-group mechanism (macOS/the other BSDs, Linux process-group
+    /// fallback), and the FreeBSD process reaper.** A
     /// member that changed its real/saved uid (a `sudo`/setuid child) and rejects
     /// `SIGKILL` with `EPERM` while still **alive** is surfaced as an `Err` — the
     /// containment gap is reported, not hidden. The one `EPERM` that is *not*
@@ -368,19 +371,27 @@ impl ProcessGroup {
     /// the two are indistinguishable from the errno alone, so the target's actual
     /// run state is checked after the `EPERM` (`proc_pidinfo` on macOS, the
     /// `/proc/<pid>/stat` state field on the Linux fallback) and only a
-    /// genuinely-alive, non-zombie member fails the call. On the **BSDs**, where no
+    /// genuinely-alive, non-zombie member fails the call. On the **BSDs other than
+    /// FreeBSD**, where no
     /// process-state reader is wired up, a delivery `EPERM` stays swallowed
-    /// (best-effort), so a privileged child can still outlive `kill_all` there — the
+    /// (best-effort), so a privileged child can still outlive `kill_all` there.
+    /// **FreeBSD** does make the discrimination: `PROC_REAP_KILL` reports which member
+    /// the delivery failed for and the reaper's own listing carries the kernel's
+    /// zombie flag for it, so a live rejecting member is surfaced there as well. The
     /// atomic mechanisms (`cgroup.kill`, Job Object) have no such gap.
     ///
     /// # Errors
     ///
-    /// [`crate::ErrorReason::Io`] in two cases, both on the non-atomic Unix backends: the legacy
-    /// per-pid kill fallback (a pre-5.14 Linux kernel without `cgroup.kill`) when
-    /// the tree won't drain within the bounded sweep, and the process-group
-    /// mechanism (macOS/Linux fallback) when a live, non-zombie member rejects
-    /// `SIGKILL` with `EPERM` (a uid-changed child — see above). The atomic backends
-    /// (`cgroup.kill`, Windows Job Object) never fail here.
+    /// [`crate::ErrorReason::Io`] on the non-atomic Unix backends only, in three cases: the
+    /// legacy per-pid kill fallback (a pre-5.14 Linux kernel without `cgroup.kill`)
+    /// when the tree won't drain within the bounded sweep; the process-group
+    /// mechanism (macOS/the other BSDs, and the Linux fallback) when a live,
+    /// non-zombie member rejects `SIGKILL` with `EPERM` (a uid-changed child — see
+    /// above); and the FreeBSD process reaper, both for that same live-`EPERM` (which
+    /// it discriminates from its own listing) and for any unexpected errno from
+    /// `PROC_REAP_KILL` — `ECAPMODE` in a Capsicum sandbox, say — which means the tree
+    /// was not signalled at all. The atomic backends (`cgroup.kill`, Windows Job
+    /// Object) never fail here.
     pub fn kill_all(&self) -> Result<()> {
         #[cfg(feature = "tracing")]
         tracing::debug!(
@@ -399,8 +410,8 @@ impl ProcessGroup {
     ///
     /// # Platform support
     ///
-    /// - **Linux (cgroup or process-group fallback), macOS/BSD** — any signal,
-    ///   attempted for every live member of the tree.
+    /// - **Linux (cgroup or process-group fallback), FreeBSD reaper, macOS/the
+    ///   other BSDs** — any signal, attempted for every live member of the tree.
     /// - **Windows** — [`Signal::Kill`] (the atomic Job Object terminate) always;
     ///   [`Signal::Int`] / [`Signal::Term`] as a best-effort **soft close** —
     ///   `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` to any child spawned with
@@ -415,26 +426,29 @@ impl ProcessGroup {
     ///
     /// `SIGKILL` ([`Signal::Kill`], or `Other(libc::SIGKILL)`) is routed through
     /// the same whole-tree hard kill as [`kill_all`](Self::kill_all)
-    /// on every backend (`cgroup.kill` / `killpg` / Job Object terminate), so it
-    /// cannot miss a process forked mid-broadcast. Other signals are a per-member
-    /// broadcast.
+    /// on every backend (`cgroup.kill` / `PROC_REAP_KILL` / `killpg` / Job Object
+    /// terminate), so it cannot miss a process forked mid-broadcast. Other signals
+    /// are a per-member broadcast.
     ///
     /// **Honest send failures (every Unix backend).** A genuinely failed send is
-    /// reported as [`crate::ErrorReason::Io`], not hidden behind a false `Ok`, and the two POSIX
+    /// reported as [`crate::ErrorReason::Io`], not hidden behind a false `Ok`, and the POSIX
     /// mechanisms agree on which failures those are:
     /// - an **`EINVAL`** (an out-of-range [`Signal::Other`] number) always surfaces;
     /// - an **`EPERM`** surfaces when it hit a **live, non-zombie** member (a
     ///   `sudo`/setuid child that rejects the signal — the genuine containment gap),
-    ///   on both the cgroup mechanism and the process-group mechanism (which checks
-    ///   the target's run state — `proc_pidinfo` on macOS, the `/proc/<pid>/stat`
-    ///   state field on the Linux fallback — after the `EPERM`, exactly as
-    ///   [`kill_all`](Self::kill_all) does). The one `EPERM` deliberately swallowed
-    ///   is the harmless zombie-only case;
+    ///   on the cgroup mechanism, the process-group mechanism and the FreeBSD process
+    ///   reaper alike (the latter two check the target's run state after the `EPERM` —
+    ///   `proc_pidinfo` on macOS, the `/proc/<pid>/stat` state field on the Linux
+    ///   fallback, the kernel's zombie flag in the reaper's `PROC_REAP_GETPIDS`
+    ///   listing on FreeBSD — exactly as [`kill_all`](Self::kill_all) does). The one
+    ///   `EPERM` deliberately swallowed is the harmless zombie-only case;
     /// - an **`ESRCH`** (the member already exited) is always a benign no-op success.
     ///
-    /// On the **BSDs**, where no process-state reader is wired up, a delivery
-    /// `EPERM` stays swallowed (best-effort) — the same residual gap
-    /// [`kill_all`](Self::kill_all) documents. `SIGKILL` here goes through the same
+    /// On the **BSDs other than FreeBSD**, where no process-state reader is wired up,
+    /// a delivery `EPERM` stays swallowed (best-effort) — the same residual gap
+    /// [`kill_all`](Self::kill_all) documents; on **FreeBSD** the reaper reads the
+    /// kernel's zombie flag for the member `PROC_REAP_KILL` blames, so a live
+    /// rejecting member is surfaced there too. `SIGKILL` here goes through the same
     /// whole-tree hard kill as [`kill_all`](Self::kill_all), so a rejected hard kill
     /// surfaces identically whichever verb you call.
     ///
@@ -442,8 +456,20 @@ impl ProcessGroup {
     /// Signal `0` checks whether targets exist and delivers nothing; a
     /// `signal(Other(0))` over a group with live members therefore returns `Ok`
     /// **having sent no signal** — the `Ok` means "a signalable target was reached",
-    /// not "a signal was delivered". It can still surface an `EPERM` against a live
-    /// target that rejects even the null signal, identically on both POSIX backends.
+    /// not "a signal was delivered". *That* answer is identical on every backend;
+    /// the `EPERM` discrimination above is **not**, because the null signal never
+    /// takes a delivery path. Against a live target that rejects even the probe it
+    /// surfaces [`crate::ErrorReason::Io`] on Linux (the cgroup mechanism raises any
+    /// `EPERM`; the process-group fallback confirms liveness through
+    /// `/proc/<pid>/stat`) and on macOS (`proc_pidinfo`), and it stays **swallowed —
+    /// a plain `Ok` — on FreeBSD and the bare BSDs**. `PROC_REAP_KILL` has no probe
+    /// mode (the kernel rejects any signal number below `1` with `EINVAL`), so
+    /// FreeBSD routes this one case back through the process-group path, and that
+    /// path has no process-state reader on any BSD but macOS; the reaper's
+    /// `PROC_REAP_GETPIDS` zombie discrimination belongs to its delivery paths and
+    /// does not extend to the probe. What the routing keeps identical across
+    /// backends is therefore the `Ok`-having-delivered-nothing contract, not the
+    /// error.
     ///
     /// # Errors
     ///
@@ -451,12 +477,15 @@ impl ProcessGroup {
     /// only when the group has no console-CTRL leader and no windowed member (see
     /// Platform support above), and for every other non-[`Kill`](Signal::Kill)
     /// signal unconditionally (a Job Object has no POSIX signals). On **every** Unix
-    /// backend (cgroup and process-group alike), [`crate::ErrorReason::Io`] if the OS honestly
-    /// rejects the send — an `EINVAL` (a bad [`Signal::Other`] number) or an `EPERM`
-    /// against a live, non-zombie member (see above); an `ESRCH` (member already
-    /// gone) and a harmless zombie-only `EPERM` are not errors. The Windows soft
-    /// close is likewise best-effort (an enumeration / post failure never fails a
-    /// call that reached a target).
+    /// backend (cgroup, process-group and FreeBSD process reaper alike),
+    /// [`crate::ErrorReason::Io`] if the OS honestly rejects the send — an `EINVAL`
+    /// (a bad [`Signal::Other`] number) always, or an `EPERM` against a member the
+    /// backend can establish is live and non-zombie (see above: the bare BSDs have
+    /// no state reader, and neither does the `Other(0)` probe path on any BSD but
+    /// macOS, so those `EPERM`s stay swallowed); an `ESRCH` (member already gone)
+    /// and a harmless zombie-only `EPERM` are not errors. The Windows soft close is likewise
+    /// best-effort (an enumeration / post failure never fails a call that reached
+    /// a target).
     #[cfg(feature = "process-control")]
     pub fn signal(&self, sig: Signal) -> Result<()> {
         self.job
@@ -489,10 +518,14 @@ impl ProcessGroup {
     ///
     /// # Platform reach
     ///
-    /// - **Linux cgroup v2, macOS/BSD, Linux process-group fallback** —
+    /// - **Linux cgroup v2, macOS/the other BSDs, Linux process-group fallback** —
     ///   [`SoftStopScope::WholeTree`]: `signal(Int/Term)` reaches every member of
     ///   the tree (the cgroup, or every tracked process group via `killpg`), so a
     ///   soft stop is always available and never `Unsupported` here.
+    /// - **FreeBSD process reaper** — [`SoftStopScope::WholeTree`] in the strongest
+    ///   sense: `PROC_REAP_KILL` delivers the soft signal to every descendant the
+    ///   reaper sees, which — unlike `killpg` — includes one that `setsid`ed out of
+    ///   its process group.
     /// - **Windows** — [`SoftStopScope::OptInMembers`] when the group holds a live
     ///   console-CTRL leader (a child spawned with
     ///   [`Command::windows_graceful_ctrl_break`](crate::Command::windows_graceful_ctrl_break))
@@ -519,10 +552,13 @@ impl ProcessGroup {
     ///   (kernel ≥ 5.2; older kernels fall back to per-process `SIGSTOP`). The
     ///   freeze is applied by the kernel shortly after the write returns, not
     ///   instantaneously.
-    /// - **Linux process-group fallback, macOS/BSD** — `SIGSTOP` to every
+    /// - **Linux process-group fallback, macOS/the other BSDs** — `SIGSTOP` to every
     ///   group; an individually-tracked adopted child (see
     ///   [`adopt`](Self::adopt)) is frozen alone — its own descendants keep
     ///   running.
+    /// - **FreeBSD process reaper** — `SIGSTOP` through `PROC_REAP_KILL` to the whole
+    ///   subtree of every spawned or adopted child, a `setsid` escapee included, so an
+    ///   adopted child's descendants are frozen with it.
     /// - **Windows** — suspends every thread of every member process. Best-effort
     ///   and not atomic: threads spawned mid-walk can be missed, and Windows keeps
     ///   per-thread suspend *counts*, so nested `suspend` calls stack — N suspends
@@ -565,6 +601,11 @@ impl ProcessGroup {
     ///
     /// [`crate::ErrorReason::Unsupported`] if the active mechanism cannot freeze the tree;
     /// otherwise [`crate::ErrorReason::Io`] if the OS rejects the freeze / `SIGSTOP`.
+    /// On the Linux cgroup mechanism, freezing is one atomic `cgroup.freeze` write: if
+    /// it fails, the cgroup state is unchanged. The POSIX process-group mechanism
+    /// sweeps all members even after an error, while Windows best-effort suspends every
+    /// thread and continues after individual thread failures; either per-member backend
+    /// can therefore leave the group partially suspended when it returns an error.
     #[cfg(feature = "process-control")]
     pub fn suspend(&self) -> Result<()> {
         self.job
@@ -581,6 +622,11 @@ impl ProcessGroup {
     ///
     /// [`crate::ErrorReason::Unsupported`] if the active mechanism cannot thaw the tree;
     /// otherwise [`crate::ErrorReason::Io`] if the OS rejects the resume / `SIGCONT`.
+    /// On the Linux cgroup mechanism, resuming is one atomic `cgroup.freeze` write: if
+    /// it fails, the cgroup state is unchanged. The POSIX process-group mechanism
+    /// sweeps all members even after an error, while Windows best-effort resumes every
+    /// thread and continues after individual thread failures; either per-member backend
+    /// can therefore leave the group partially resumed when it returns an error.
     #[cfg(feature = "process-control")]
     pub fn resume(&self) -> Result<()> {
         self.job
@@ -599,8 +645,16 @@ impl ProcessGroup {
     ///
     /// - **Windows** — every pid assigned to the Job Object (the whole tree).
     /// - **Linux cgroup** — every pid in the cgroup (`cgroup.procs`, whole tree).
-    /// - **Linux process-group fallback, macOS/BSD** — the tracked **group
-    ///   leaders**, plus any individually-tracked adopted child (one pid per
+    /// - **FreeBSD process reaper** — the **whole tree**: every live descendant of
+    ///   every child this group spawned or adopted, one pid per process
+    ///   (`PROC_REAP_GETPIDS`), a `setsid` escapee included. An exited child that
+    ///   has not been reaped is **not** listed — the kernel flags a corpse as a
+    ///   zombie and this crate never counts one as a live member. (The one
+    ///   exception to "whole tree" is an [`adopt`](Self::adopt)ed child that was
+    ///   forked *before* this process became a reaper: it is unreachable through
+    ///   the reaper, so it is tracked individually like a process-group member.)
+    /// - **Linux process-group fallback, macOS/the other BSDs** — the tracked
+    ///   **group leaders**, plus any individually-tracked adopted child (one pid per
     ///   spawned/adopted child); descendants inside the groups are contained
     ///   but not enumerated. An exited child still counts as a member until it
     ///   is reaped (awaited): the liveness probe sees the not-yet-collected
@@ -638,9 +692,12 @@ impl ProcessGroup {
     ///   [`members`](Self::members)), enriched from `/proc` the same way.
     /// - **macOS** — the tracked leaders; ppid / image name / start time via
     ///   `proc_pidinfo`.
-    /// - **the BSDs** — the tracked leaders with every enriching field `None` (no
-    ///   wired-up per-process reader — see [`MemberInfo::start_time`]); the pid is
-    ///   still reported, which is a correct result, not an error.
+    /// - **FreeBSD process reaper** — the **whole tree** (as
+    ///   [`members`](Self::members)) with every enriching field `None` (no
+    ///   wired-up per-process reader — see [`MemberInfo::start_time`]); the pids
+    ///   are still reported, which is a correct result, not an error.
+    /// - **the other BSDs** — the tracked leaders with every enriching field `None`,
+    ///   for the same reason.
     ///
     /// # Racing a member that exits
     ///
@@ -678,7 +735,7 @@ impl ProcessGroup {
     ///
     /// **Reap your children, or the grace is wasted (POSIX process-group
     /// mechanism only).** On the [`Mechanism::ProcessGroup`](crate::Mechanism)
-    /// fallback (macOS/the BSDs, and Linux without a usable cgroup), liveness is
+    /// fallback (macOS/the other BSDs, and Linux without a usable cgroup), liveness is
     /// probed by signalling the group id, and an **unreaped zombie still answers**
     /// — its process-group entry survives until the child is `wait`ed. So a child
     /// that exits promptly on `SIGTERM` but whose [`RunningProcess`](crate::RunningProcess)
@@ -686,8 +743,10 @@ impl ProcessGroup {
     /// as alive for the full `shutdown_timeout`, and `shutdown` then burns the
     /// whole grace plus a pointless `SIGKILL` escalation. Await each child you
     /// start into the group (any consuming verb, or `wait`) so its handle reaps it.
-    /// The Windows Job Object and Linux cgroup mechanisms are immune (a process
-    /// leaves `cgroup.procs` / the job on *exit*, before reaping).
+    /// The Windows Job Object, Linux cgroup and FreeBSD process-reaper mechanisms
+    /// are immune (a process leaves `cgroup.procs` / the job on *exit*, before
+    /// reaping; the reaper's listing flags a zombie as such, and this crate does
+    /// not count one as a live member).
     ///
     /// When `escalate_to_kill` is set, the final hard kill can surface the same
     /// errors as [`kill_all`](Self::kill_all): the undrained-tree `Err` on the
@@ -813,7 +872,8 @@ impl ProcessGroup {
     /// still reads as alive, so a child that exits on `SIGTERM` but whose handle was
     /// never awaited reads live for the full `grace` and inflates
     /// [`members_after`](ShutdownReport::members_after). Await each child you start
-    /// into the group. The Windows Job Object and Linux cgroup mechanisms are immune.
+    /// into the group. The Windows Job Object, Linux cgroup and FreeBSD
+    /// process-reaper mechanisms are immune.
     ///
     /// # Errors
     ///
@@ -910,8 +970,34 @@ impl ProcessGroup {
     /// `Drop`, the group is gone by ownership and cannot be reconfigured at all.
     ///
     /// On success the group's stored options reflect the new set (observable via the
-    /// group's [`Debug`](std::fmt::Debug)); a failure leaves the previous caps in
-    /// force.
+    /// group's [`Debug`](std::fmt::Debug)).
+    ///
+    /// # A failure is not a rollback
+    ///
+    /// A failed call leaves the group's *reflected* options describing the previous
+    /// set — but that is this handle's bookkeeping, not a statement about the OS
+    /// container. Neither backend applies the set atomically: Windows writes the
+    /// memory and process caps in one `SetInformationJobObject` call and the CPU cap
+    /// in a second, and the cgroup v2 backend writes `memory.max`, `pids.max` and
+    /// `cpu.max` in turn. A call that fails part-way can therefore leave the
+    /// container carrying a **mix** of old and new caps — including an axis this
+    /// request meant to *lift*, already lifted. Nothing is undone, and the error does
+    /// not say how far the write got. Recover by re-issuing the complete desired set
+    /// (this is a full replacement, so the retry is idempotent) or by tearing the
+    /// group down. Only a value rejected by validation
+    /// ([`LimitReason::Invalid`]) is guaranteed to have changed nothing: it fails
+    /// before the OS is touched at all.
+    ///
+    /// What stays exact through this is the post-run evidence.
+    /// [`limit_evidence`](Self::limit_evidence) is the authoritative answer to what
+    /// actually *fired*, and a partial update cannot fool it: every axis this call
+    /// requests joins the group's sticky cap record as soon as the request reaches
+    /// the OS — on failure exactly as on success — so an axis that did land before
+    /// the failure is still answered from the kernel's own counters instead of being
+    /// reported [`NotTripped`](crate::LimitVerdict::NotTripped) with nothing read.
+    /// The cost of that conservatism is at most an extra counter read, or an honest
+    /// [`Unknown`](crate::LimitVerdict::Unknown) where a cap was in fact never
+    /// applied — never an invented verdict.
     ///
     /// # Errors
     ///
@@ -924,42 +1010,17 @@ impl ProcessGroup {
     /// enabled off the real hierarchy root, or a Job Object call the OS rejected).
     #[cfg(feature = "limits")]
     pub fn update_limits(&mut self, limits: ResourceLimits) -> Result<()> {
-        // Same validation the creation path runs — an invalid value is rejected
-        // before the OS is touched, with the specific offending axis.
-        validate_limits(&limits)?;
-        self.job.update_limits(&limits).map_err(|source| {
-            if limits.any() {
-                // Mirror `with_options`'s classification exactly: the backends
-                // report `ErrorKind::Unsupported` precisely when no whole-tree
-                // container mechanism exists at all; every other failure means a
-                // capable mechanism exists but this request could not be applied.
-                let reason = if source.kind() == std::io::ErrorKind::Unsupported {
-                    LimitReason::Unsupported
-                } else {
-                    LimitReason::Unenforceable
-                };
-                ErrorReason::ResourceLimit {
-                    kind: first_requested_kind(&limits),
-                    reason,
-                    detail: source.to_string(),
-                }
-                .into()
-            } else {
-                // No cap requested (a pure "lift everything") that still failed —
-                // a plain I/O failure on the reset write, not a limit-capability
-                // problem.
-                Error::io(source)
-            }
-        })?;
-        // Reflect the applied set so the group's public view (Debug, any future
-        // getter) stays honest.
-        self.options.limits = limits;
-        // Sticky, unlike `options.limits`: an axis capped here stays on the evidence
-        // record even after a later replacement lifts it, so a cap that fired while
-        // it was in force is never reported as "did not fire". Recorded only on
-        // success — a refused update applied no cap.
-        self.capped.record(&limits);
-        Ok(())
+        // Destructured for disjoint field borrows: the shared core takes the
+        // evidence record and the reflected options mutably while the apply closure
+        // still borrows the live job handle.
+        let Self {
+            job,
+            options,
+            capped,
+        } = self;
+        update_limits_with(capped, &mut options.limits, limits, |limits| {
+            job.update_limits(limits)
+        })
     }
 
     /// Post-run evidence about this group's resource caps: **did a cap that was in
@@ -976,13 +1037,21 @@ impl ProcessGroup {
     ///
     /// # Not the same question as [`crate::ErrorReason::ResourceLimit`]
     ///
-    /// That error is **pre-spawn admission**: "the cap you requested could not be
-    /// *applied*" ([`LimitReason::Invalid`] / [`LimitReason::Unsupported`] /
-    /// [`LimitReason::Unenforceable`]), raised by
-    /// [`with_options`](Self::with_options) / [`update_limits`](Self::update_limits)
-    /// before or instead of running anything. This report is the other side: the cap
-    /// **was** applied — did it then *engage*? The two never overlap, and this
-    /// addition changes nothing about that error's behavior.
+    /// That error is **admission**: "the cap you requested could not be *applied*"
+    /// ([`LimitReason::Invalid`] / [`LimitReason::Unsupported`] /
+    /// [`LimitReason::Unenforceable`]). From
+    /// [`with_options`](Self::with_options) it is raised instead of running anything
+    /// at all — no group is handed back, so there is nothing left to ask. From
+    /// [`update_limits`](Self::update_limits) it is raised against an
+    /// **already-running** tree, and it is *not* a rollback. This report is the other
+    /// side: did a cap on this axis then *engage*?
+    ///
+    /// Different questions — and this addition changes nothing about that error's
+    /// behavior — but on a live group they can meet on the same axis. After a failed
+    /// `update_limits` the error says the requested set could not be applied whole,
+    /// while this report still answers what actually fired, reading the counters for
+    /// every axis that request named (see *A failure is not a rollback* on
+    /// [`update_limits`](Self::update_limits), and *Lifetime and cost* below).
     ///
     /// # Three-valued, and never a guess
     ///
@@ -1017,9 +1086,11 @@ impl ProcessGroup {
     ///   this crate deliberately does not do. Inferring from `PeakJobMemoryUsed` or
     ///   an exit code is refused as a guess. The containers guide records the full
     ///   reasoning.
-    /// - **POSIX process group** (macOS, the BSDs, and the Linux fallback with no
-    ///   usable cgroup v2) — [`Unknown`](crate::LimitVerdict::Unknown) on every axis: the
-    ///   mechanism has no whole-tree resource accounting to read. It also cannot
+    /// - **POSIX process group** (macOS, the other BSDs, and the Linux fallback with
+    ///   no usable cgroup v2) **and the FreeBSD process reaper** —
+    ///   [`Unknown`](crate::LimitVerdict::Unknown) on every axis: neither mechanism
+    ///   has any whole-tree resource accounting to read (a reaper contains a tree
+    ///   without accounting for it). Neither can
     ///   carry a cap at all (creation fails fast with
     ///   [`crate::ErrorReason::ResourceLimit`]), so this is "no evidence apparatus
     ///   here", not "a cap may have fired unseen".
@@ -1032,7 +1103,10 @@ impl ProcessGroup {
     /// Any number of reads is fine — the counters are cumulative and are not reset
     /// by reading, by a teardown, or by [`update_limits`](Self::update_limits); an
     /// axis whose cap was later lifted still reports the fact that it fired while it
-    /// was in force.
+    /// was in force. An axis named by an `update_limits` call that *failed* counts as
+    /// capped too: that call is not a rollback, so the axis may have been applied
+    /// before the failure, and it is read from the counters rather than assumed
+    /// innocent.
     ///
     /// This is a pure read — no signal, no kill, no write — so it cannot perturb
     /// teardown, kill-on-drop, or the order the container is removed in, whenever it
@@ -1102,6 +1176,75 @@ fn validate_limits(limits: &ResourceLimits) -> Result<()> {
         }
         .into());
     }
+    Ok(())
+}
+
+/// The shared core of [`ProcessGroup::update_limits`], parametrized over the
+/// backend call — the injectable seam that lets tests drive a *failed* application
+/// without an OS primitive that can be made to fail on demand, in the same style as
+/// the cgroup backend's `limit_evidence_with`.
+///
+/// The order of the three steps is the contract, not an implementation detail:
+///
+/// 1. **Validate first.** A value rejected here never reaches the OS, so nothing is
+///    recorded for it — mirroring `with_options`, which records only for a group
+///    that was actually created, and leaving no phantom axis behind a typo.
+/// 2. **Record before applying**, so the record happens whatever the outcome.
+///    Neither backend applies the set atomically (Windows writes the memory and
+///    process caps in one `SetInformationJobObject` call and the CPU cap in a
+///    second; the cgroup backend writes `memory.max`, `pids.max` and `cpu.max` in
+///    turn), so a failure part-way through can leave an axis of *this* request
+///    already in force. Recording only on success would let `limit_evidence` answer
+///    `NotTripped` for such an axis **without reading any counter** — precisely the
+///    fabricated "it did not fire" that `LimitVerdict` exists to rule out. Over-
+///    recording is the safe direction: at worst it costs one extra counter read
+///    (Linux) or turns a would-be `NotTripped` into an honest `Unknown` (Windows),
+///    neither of which can invent a verdict.
+/// 3. **Reflect only on success.** The whole new set demonstrably did not take
+///    effect, so updating the group's `Debug`-visible options would be the opposite
+///    lie — claiming caps that may never have been written.
+#[cfg(feature = "limits")]
+fn update_limits_with(
+    capped: &mut CappedAxes,
+    reflected: &mut ResourceLimits,
+    limits: ResourceLimits,
+    apply: impl FnOnce(&ResourceLimits) -> std::io::Result<()>,
+) -> Result<()> {
+    // Same validation the creation path runs — an invalid value is rejected
+    // before the OS is touched, with the specific offending axis.
+    validate_limits(&limits)?;
+    // Sticky, unlike `reflected`: an axis capped here stays on the evidence record
+    // even after a later replacement lifts it, so a cap that fired while it was in
+    // force is never reported as "did not fire". Deliberately recorded up front
+    // rather than on success — see step 2 above.
+    capped.record(&limits);
+    apply(&limits).map_err(|source| {
+        if limits.any() {
+            // Mirror `with_options`'s classification exactly: the backends
+            // report `ErrorKind::Unsupported` precisely when no whole-tree
+            // container mechanism exists at all; every other failure means a
+            // capable mechanism exists but this request could not be applied.
+            let reason = if source.kind() == std::io::ErrorKind::Unsupported {
+                LimitReason::Unsupported
+            } else {
+                LimitReason::Unenforceable
+            };
+            ErrorReason::ResourceLimit {
+                kind: first_requested_kind(&limits),
+                reason,
+                detail: source.to_string(),
+            }
+            .into()
+        } else {
+            // No cap requested (a pure "lift everything") that still failed —
+            // a plain I/O failure on the reset write, not a limit-capability
+            // problem.
+            Error::io(source)
+        }
+    })?;
+    // Reflect the applied set so the group's public view (Debug, any future
+    // getter) stays honest.
+    *reflected = limits;
     Ok(())
 }
 
@@ -1190,6 +1333,190 @@ mod tests {
                 }
                 other => panic!("expected ResourceLimit, got {other:?}"),
             }
+        }
+    }
+
+    /// Every axis, for the "and nothing else was touched" half of each assertion.
+    const ALL_KINDS: [LimitKind; 3] = [LimitKind::Memory, LimitKind::Processes, LimitKind::Cpu];
+
+    fn resource_limit_of(err: &Error) -> (LimitKind, LimitReason) {
+        match err.reason() {
+            ErrorReason::ResourceLimit { kind, reason, .. } => (*kind, *reason),
+            other => panic!("expected ResourceLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_update_still_records_every_requested_axis() {
+        // The regression this pins. Both backends write the axes one at a time
+        // (Windows: extended-limit struct, then CPU rate; cgroup v2: memory.max,
+        // pids.max, cpu.max), so a failure part-way through can leave an axis of
+        // *this* request already in force. Recording only on success used to skip
+        // that axis, and `limit_evidence` would then answer `NotTripped` for it
+        // without reading a single counter — the fabricated "it did not fire" that
+        // `LimitVerdict` exists to rule out, on an axis whose cap may really have
+        // killed the tree.
+        //
+        // A genuine mid-sequence OS failure can't be provoked from a unit test (no
+        // fault-injection seam exists in the backends), so the backend call is
+        // stubbed at `update_limits_with`'s seam — which is exactly where the
+        // ordering under test lives.
+        let mut capped = CappedAxes::default();
+        let mut reflected = ResourceLimits::default();
+        let requested = ResourceLimits {
+            max_memory: Some(64 * 1024 * 1024),
+            max_processes: Some(4),
+            cpu_quota: None,
+        };
+
+        let err = update_limits_with(&mut capped, &mut reflected, requested, |_| {
+            // The shape of a real Windows failure here: the extended-limit write
+            // (memory + processes) landed, the separate CPU-rate write did not.
+            Err(std::io::Error::other("cpu-rate reissue: boom"))
+        })
+        .unwrap_err();
+
+        // Both requested axes may have landed before the failure, so both must be on
+        // the record even though the call returned `Err`.
+        assert!(capped.has(LimitKind::Memory));
+        assert!(capped.has(LimitKind::Processes));
+        // Honest in the other direction too: an axis the caller never named stays
+        // off the record, so evidence still costs nothing on axes that had no cap.
+        assert!(!capped.has(LimitKind::Cpu));
+        // Unchanged behaviour, deliberately: the whole new set demonstrably did not
+        // take effect, so the group's Debug-visible options must not claim it did.
+        assert_eq!(reflected, ResourceLimits::default());
+        assert_eq!(
+            resource_limit_of(&err),
+            (LimitKind::Memory, LimitReason::Unenforceable)
+        );
+    }
+
+    #[test]
+    fn a_failed_update_records_even_where_no_container_exists() {
+        // A process-group mechanism refuses any cap outright, so nothing was applied
+        // — yet the record is still written, because "how far did the backend get?"
+        // is precisely what the caller cannot know. Over-recording is the safe
+        // direction: this mechanism reports `Unknown` for every axis anyway, and a
+        // capable one reads a counter rather than guessing.
+        let mut capped = CappedAxes::default();
+        let mut reflected = ResourceLimits::default();
+        let requested = ResourceLimits {
+            max_memory: None,
+            max_processes: None,
+            cpu_quota: Some(0.5),
+        };
+
+        let err = update_limits_with(&mut capped, &mut reflected, requested, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no whole-tree limit mechanism",
+            ))
+        })
+        .unwrap_err();
+
+        assert!(capped.has(LimitKind::Cpu));
+        assert!(!capped.has(LimitKind::Memory));
+        assert!(!capped.has(LimitKind::Processes));
+        // Classified exactly as `with_options` classifies the same backend signal.
+        assert_eq!(
+            resource_limit_of(&err),
+            (LimitKind::Cpu, LimitReason::Unsupported)
+        );
+    }
+
+    #[test]
+    fn an_invalid_request_records_nothing_and_never_reaches_the_backend() {
+        // The one failure that *is* a guarantee of "nothing changed": validation runs
+        // before the OS is touched. Recording there would leave a phantom axis behind
+        // a typo, exactly what `with_options` avoids by recording only for a group
+        // that was really created.
+        let mut capped = CappedAxes::default();
+        let mut reflected = ResourceLimits::default();
+        let mut reached_backend = false;
+        let err = update_limits_with(
+            &mut capped,
+            &mut reflected,
+            ResourceLimits {
+                max_memory: Some(0),
+                max_processes: Some(4),
+                cpu_quota: None,
+            },
+            |_| {
+                reached_backend = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(!reached_backend, "an invalid value must not reach the OS");
+        for k in ALL_KINDS {
+            assert!(!capped.has(k), "axis {k:?} must stay unrecorded");
+        }
+        assert_eq!(reflected, ResourceLimits::default());
+        assert_eq!(
+            resource_limit_of(&err),
+            (LimitKind::Memory, LimitReason::Invalid)
+        );
+    }
+
+    #[test]
+    fn a_failed_lift_everything_is_a_plain_io_error_with_nothing_to_record() {
+        // No cap requested at all: there is no axis to record, and the failure is an
+        // I/O problem on the reset write rather than a limit-capability verdict. The
+        // previously-reflected set stays — those caps may well still be in force.
+        let mut capped = CappedAxes::default();
+        let previous = ResourceLimits {
+            max_memory: Some(1024),
+            ..ResourceLimits::default()
+        };
+        capped.record(&previous);
+        let mut reflected = previous;
+
+        let err = update_limits_with(
+            &mut capped,
+            &mut reflected,
+            ResourceLimits::default(),
+            |_| Err(std::io::Error::other("reset write failed")),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err.reason(), ErrorReason::Io(_)), "{err:?}");
+        // Sticky: the earlier cap stays on the record, and no new axis appears.
+        assert!(capped.has(LimitKind::Memory));
+        assert!(!capped.has(LimitKind::Processes));
+        assert!(!capped.has(LimitKind::Cpu));
+        assert_eq!(reflected, previous);
+    }
+
+    #[test]
+    fn a_successful_update_records_the_new_axes_and_reflects_the_whole_set() {
+        // The success path is unchanged, and stickiness still holds through the seam:
+        // a replacement that LIFTS memory must not erase it from the record.
+        let mut capped = CappedAxes::default();
+        let previous = ResourceLimits {
+            max_memory: Some(64 * 1024 * 1024),
+            ..ResourceLimits::default()
+        };
+        capped.record(&previous); // what `with_options` does at creation
+        let mut reflected = previous;
+        let requested = ResourceLimits {
+            max_memory: None,
+            max_processes: Some(4),
+            cpu_quota: Some(0.5),
+        };
+
+        update_limits_with(&mut capped, &mut reflected, requested, |limits| {
+            // The backend is handed the caller's whole set, verbatim — a full
+            // replacement, never a merge with what was reflected before.
+            assert_eq!(*limits, requested);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(reflected, requested);
+        for k in ALL_KINDS {
+            assert!(capped.has(k), "axis {k:?}");
         }
     }
 
