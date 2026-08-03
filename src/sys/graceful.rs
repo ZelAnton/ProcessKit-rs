@@ -1107,7 +1107,7 @@ mod tests {
         capture.phases()
     }
 
-    // The headline: a штатный graceful teardown narrates the FULL transition
+    // The headline: a routine graceful teardown narrates the FULL transition
     // sequence live — soft signal → grace window → drained — in order.
     #[cfg(feature = "tracing")]
     #[test]
