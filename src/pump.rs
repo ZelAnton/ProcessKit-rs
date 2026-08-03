@@ -488,8 +488,9 @@ struct Inner {
     /// This is the *live partial line* — an interactive prompt like `Password: `
     /// that the child writes without a trailing newline and then blocks on,
     /// which the line-oriented backlog (and so `wait_for_line`/`stdout_lines`)
-    /// never sees until the stream ends. It exists **only** to back
-    /// [`RunningProcess::wait_for_output`](crate::RunningProcess::wait_for_output);
+    /// never sees until the stream ends. It backs
+    /// [`RunningProcess::wait_for_output`](crate::RunningProcess::wait_for_output)
+    /// and timeout salvage;
     /// it is a *side view* of what is otherwise the pump's local `pending`
     /// buffer, and is deliberately **independent** of every retention/overflow
     /// counter beside it: the pump updates it via
@@ -500,6 +501,16 @@ struct Inner {
     /// is **raw** — pre-`capture_policy` — mirroring `handler`/`tee`/`raw_tee`'s
     /// observation category (see `pump_lines_core`'s `emit`).
     partial_tail: String,
+    /// Whether `partial_tail` currently represents an unfinished line. An
+    /// over-cap unfinished line has an empty tail but remains pending so a
+    /// timeout salvage can count it as dropped.
+    partial_tail_pending: bool,
+    /// Whether the pending line was already rejected by the in-flight byte cap.
+    partial_tail_oversized: bool,
+    /// EOF finalization keeps the tail visible to `wait_for_output`; this flag
+    /// prevents a later timeout snapshot from appending that already-emitted
+    /// final line a second time.
+    partial_tail_finalized: bool,
 }
 
 impl Inner {
@@ -572,6 +583,9 @@ impl SharedLines {
                 discarding: false,
                 dropnewest_sealed: false,
                 partial_tail: String::new(),
+                partial_tail_pending: false,
+                partial_tail_oversized: false,
+                partial_tail_finalized: false,
             }),
             notify: Notify::new(),
             count: AtomicUsize::new(0),
@@ -746,6 +760,9 @@ impl SharedLines {
         inner.lines.clear();
         inner.bytes = 0;
         inner.partial_tail.clear();
+        inner.partial_tail_pending = false;
+        inner.partial_tail_oversized = false;
+        inner.partial_tail_finalized = false;
     }
 
     /// Total lines seen by the pump (including dropped ones).
@@ -787,16 +804,56 @@ impl SharedLines {
     /// (the child now blocking on input) is published exactly once and then left
     /// stable for the observer to match.
     pub(crate) fn set_partial_tail(&self, tail: &str) {
+        self.set_partial_tail_state(tail, false);
+    }
+
+    /// Publish the current partial-line state, including an over-cap line that
+    /// cannot be retained. The separate marker keeps timeout salvage from
+    /// mistaking an empty, intentionally skipped tail for a line boundary.
+    pub(crate) fn set_partial_tail_state(&self, tail: &str, oversized: bool) {
         let mut inner = self.inner.lock().expect("SharedLines poisoned");
-        if inner.partial_tail != tail {
+        let pending = oversized || !tail.is_empty();
+        if inner.partial_tail != tail
+            || inner.partial_tail_pending != pending
+            || inner.partial_tail_oversized != oversized
+        {
             inner.partial_tail.clear();
             inner.partial_tail.push_str(tail);
+            inner.partial_tail_pending = pending;
+            inner.partial_tail_oversized = oversized;
+            inner.partial_tail_finalized = false;
             drop(inner);
             // A tail update is a buffer change like a `push`: wake a parked
             // `wait_for_output` (the stored permit covers a waiter that registers
             // just after this).
             self.notify.notify_one();
         }
+    }
+
+    /// Mark the pending tail as emitted by the normal EOF finalizer while
+    /// leaving its side-view text available to `wait_for_output`.
+    pub(crate) fn mark_partial_tail_finalized(&self) {
+        let mut inner = self.inner.lock().expect("SharedLines poisoned");
+        if inner.partial_tail_pending {
+            inner.partial_tail_finalized = true;
+        }
+    }
+
+    /// Take an unfinished tail for a cancelled capture and make the operation
+    /// idempotent. The caller applies the stream's normal capture shaping and
+    /// buffer policy; `seen_bytes` remains untouched because the pump already
+    /// accounted for the raw bytes at its read boundary.
+    pub(crate) fn take_partial_tail_for_capture(&self) -> Option<(String, bool)> {
+        let mut inner = self.inner.lock().expect("SharedLines poisoned");
+        if !inner.partial_tail_pending || inner.partial_tail_finalized {
+            return None;
+        }
+        inner.partial_tail_pending = false;
+        inner.partial_tail_finalized = true;
+        Some((
+            std::mem::take(&mut inner.partial_tail),
+            inner.partial_tail_oversized,
+        ))
     }
 
     /// Snapshot the current unterminated tail (cloned so the predicate runs off
@@ -980,6 +1037,22 @@ impl StreamConfig {
         self.encoding = encoding;
         self
     }
+
+    /// Apply the same capture-only shaping used by a completed line. Timeout
+    /// salvage calls this after recovering the pump's decoded pending tail;
+    /// handlers and tees remain observation-only and are not replayed.
+    pub(crate) fn shape_capture_line(&self, line: String) -> String {
+        shape_capture_line(&self.buffer_policy, self.sanitize_vt, self.stream, line)
+    }
+}
+
+fn shape_capture_line(
+    buffer_policy: &Option<SharedCapturePolicy>,
+    sanitize_vt: bool,
+    stream: OutputStream,
+    line: String,
+) -> String {
+    apply_capture_policy(buffer_policy, stream, apply_vt_sanitize(sanitize_vt, line))
 }
 
 /// The no-tee, `\n`-only shorthand over [`pump_lines_core`] — used by this
@@ -1177,11 +1250,7 @@ where
                 );
             }
         }
-        sink.push(apply_capture_policy(
-            buffer_policy,
-            stream,
-            apply_vt_sanitize(sanitize_vt, line),
-        ));
+        sink.push(shape_capture_line(buffer_policy, sanitize_vt, stream, line));
     }
 
     // Where the next complete line ends within `pending`.
@@ -1431,7 +1500,7 @@ where
         // last published tail stays visible so a final un-terminated prompt is
         // matchable right up to and including close.
         if oversized {
-            sink.0.set_partial_tail("");
+            sink.0.set_partial_tail_state("", true);
         } else {
             sink.0.set_partial_tail(&pending);
         }
@@ -1446,6 +1515,7 @@ where
                 // mode a trailing `\r` is content; in `\r`-aware mode none remains).
                 pending.clear();
                 sink.0.record_oversized_line();
+                sink.0.mark_partial_tail_finalized();
             } else if !pending.is_empty() {
                 // An un-terminated final line: `pending` is all content (in
                 // `Newline` mode a trailing `\r` is content). Re-apply the byte cap:
@@ -1456,6 +1526,7 @@ where
                 let line = std::mem::take(&mut pending);
                 if cap.is_some_and(|c| line.len() > c) {
                     sink.0.record_oversized_line();
+                    sink.0.mark_partial_tail_finalized();
                 } else {
                     emit(
                         &mut handler,
@@ -1467,6 +1538,7 @@ where
                         line,
                     )
                     .await;
+                    sink.0.mark_partial_tail_finalized();
                 }
             }
             // Flush the tee once at stream end (best-effort).

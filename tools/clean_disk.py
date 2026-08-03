@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 
 
@@ -46,11 +47,39 @@ def target_roots() -> list[Path]:
     return [root for root in roots if root.is_dir()]
 
 
+def _retry_readonly_operation(func, path: str) -> None:
+    """Retry an rmtree operation after making its path writable."""
+
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def _rmtree_onexc(func, path: str, _exc: BaseException) -> None:
+    _retry_readonly_operation(func, path)
+
+
+def _rmtree_onerror(func, path: str, _exc_info) -> None:
+    _retry_readonly_operation(func, path)
+
+
+def _rmtree(path: Path) -> None:
+    """Remove a tree, retrying read-only paths on platforms that support it."""
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_rmtree_onexc)
+    else:
+        shutil.rmtree(path, onerror=_rmtree_onerror)
+
+
 def remove_tree(path: Path) -> bool:
     if is_link(path):
         print(f"skip linked path: {path}", file=sys.stderr)
         return False
-    shutil.rmtree(path)
+    try:
+        _rmtree(path)
+    except OSError as error:
+        print(f"skip tree after error: {path}: {error}", file=sys.stderr)
+        return False
     print(f"removed {path}")
     return True
 

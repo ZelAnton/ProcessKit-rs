@@ -358,6 +358,20 @@ pub(crate) async fn run_pid(target: &impl PidTarget, signal: i32, grace: Duratio
         // relative to the remaining grace.
         sleep(POLL_INTERVAL.min(deadline - now)).await;
     }
+    // The final sleep can reach the deadline at the same instant the child
+    // exits. Re-check before escalating so that race is reported as a drain,
+    // matching the whole-tree driver's post-loop observation.
+    if !target.is_alive() {
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_teardown("drained");
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            target: "processkit",
+            phase = "drained",
+            "graceful child teardown: child exited within grace"
+        );
+        return;
+    }
     #[cfg(feature = "metrics")]
     crate::metrics::record_teardown("escalated");
     #[cfg(feature = "tracing")]
@@ -815,6 +829,21 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn pid_child_that_exits_at_grace_deadline_skips_the_hard_kill() {
+        // Zero grace exits the poll loop before its first liveness check. The
+        // final check must still observe the gone child and avoid a recycled-pid
+        // SIGKILL.
+        let target = FakePid::new(0);
+        run_pid(&target, 15, Duration::ZERO).await;
+        assert_eq!(
+            target.hard_kills.load(Ordering::Relaxed),
+            0,
+            "a child gone at the deadline is not force-killed"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn pid_saturating_grace_does_not_panic() {
         // Duration::MAX must be clamped before the `Instant + Duration` add.
@@ -1107,7 +1136,7 @@ mod tests {
         capture.phases()
     }
 
-    // The headline: a штатный graceful teardown narrates the FULL transition
+    // The headline: a routine graceful teardown narrates the FULL transition
     // sequence live — soft signal → grace window → drained — in order.
     #[cfg(feature = "tracing")]
     #[test]
@@ -1178,6 +1207,25 @@ mod tests {
             phases,
             vec!["soft_signal", "grace_started", "drained"],
             "a child gone within the grace narrates the same drain transition"
+        );
+    }
+
+    #[cfg(all(unix, feature = "tracing"))]
+    #[test]
+    fn pid_teardown_narrates_a_clean_exit_on_the_final_deadline_check() {
+        let phases = capture_teardown_phases(|| async {
+            let target = FakePid::new(0); // gone when the post-deadline check runs
+            run_pid(&target, 15, Duration::ZERO).await;
+            assert_eq!(
+                target.hard_kills.load(Ordering::Relaxed),
+                0,
+                "the final drain check suppresses the hard kill"
+            );
+        });
+        assert_eq!(
+            phases,
+            vec!["soft_signal", "grace_started", "drained"],
+            "a child gone at the deadline narrates the drain transition"
         );
     }
 

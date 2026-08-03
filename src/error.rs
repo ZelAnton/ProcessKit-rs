@@ -2975,7 +2975,7 @@ mod tests {
     fn kind_matches_what_every_crate_error_constructor_produces() {
         use std::io::ErrorKind as IoKind;
 
-        // The crate's own error factories each land in the expected род.
+        // The crate's own error factories each land in the expected kind.
         assert_eq!(Error::exit("git", 2, "o", "e").kind(), ErrorKind::Exit);
         assert_eq!(
             Error::timeout("git", Duration::from_secs(3), "o", "e").kind(),
@@ -3019,7 +3019,7 @@ mod tests {
     fn kind_stays_consistent_with_the_is_classifiers() {
         use std::io::ErrorKind as IoKind;
 
-        // The new total род must agree with the existing point classifiers — a
+        // The new total kind must agree with the existing point classifiers — a
         // regression that drifts one from the other is caught here.
         let cases: [Error; 6] = [
             Error::not_found("x", None),
