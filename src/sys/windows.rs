@@ -765,9 +765,9 @@ impl Job {
         //
         // Report facts for the atomic branch, which bypasses the shared driver: no
         // soft-signal tier exists here (`Unsupported`), the tree was never given a
-        // grace window to drain in, and the elapsed is just the synchronous
-        // kill/spare below.
-        let started = std::time::Instant::now();
+        // grace window to drain in, and elapsed is the tokio-clock time spent in the
+        // synchronous kill/spare below (zero while that clock is paused).
+        let started = tokio::time::Instant::now();
         let members_before = job_active_count(self.handle);
         // Snapshot the re-arm generation up front — before the branch — so a
         // `spawn`/`adopt` that re-arms the backstop concurrently with this shutdown
@@ -2158,6 +2158,27 @@ mod rearm_race_tests {
             !job.skip_drop_kill.is_set(),
             "a member that joined after the spare re-arms Drop's kill-on-close"
         );
+    }
+
+    /// The atomic path bypasses the shared graceful driver but must retain its
+    /// tokio-clock reporting contract. Advancing a paused clock between calls does
+    /// not add wall-clock time to either synchronous operation.
+    #[tokio::test(start_paused = true)]
+    async fn atomic_shutdown_elapsed_uses_tokio_clock() {
+        let job = new_job();
+
+        let before_advance = job
+            .graceful_shutdown(0, Duration::ZERO, true)
+            .await
+            .expect("atomic shutdown before clock advance");
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let after_advance = job
+            .graceful_shutdown(0, Duration::ZERO, true)
+            .await
+            .expect("atomic shutdown after clock advance");
+
+        assert_eq!(before_advance.elapsed, Duration::ZERO);
+        assert_eq!(after_advance.elapsed, Duration::ZERO);
     }
 
     /// T-079 (Windows job re-arm race): a spawn/adopt that re-arms the backstop

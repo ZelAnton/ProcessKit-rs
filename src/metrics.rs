@@ -51,22 +51,19 @@ const TEARDOWN_DURATION: &str = "processkit.teardown.duration_seconds";
 
 /// The bounded outcome-class token for the `outcome` label of a completed run.
 ///
+/// The metrics `outcome` dictionary is exactly [`Outcome::name()`] plus the
+/// separate `"cancelled"` disjunct; it is not an independently maintained
+/// mapping.
+///
 /// `cancelled` is distinguished from a plain signal kill by the run's cancel
 /// disposition, which the reap path resolves first-observation-wins and passes in
 /// (a cancelled run is reported as `Signalled(None)` by the reaper, so the raw
 /// outcome alone cannot tell the two apart).
 pub(crate) fn outcome_label(outcome: &Outcome, cancelled: bool) -> &'static str {
     if cancelled {
-        return "cancelled";
-    }
-    // Exhaustive (no `_` arm) though `Outcome` is `#[non_exhaustive]`: within the
-    // defining crate a new variant is a compile error here, forcing a deliberate
-    // decision on its label rather than silently bucketing it as "unknown".
-    match outcome {
-        Outcome::Exited(_) => "exited",
-        Outcome::Signalled(_) => "signalled",
-        Outcome::TimedOut => "timed_out",
-        Outcome::InactivityTimedOut => "inactivity_timed_out",
+        "cancelled"
+    } else {
+        outcome.name()
     }
 }
 

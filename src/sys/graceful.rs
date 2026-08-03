@@ -89,7 +89,8 @@ pub(crate) struct GracefulOutcome {
     pub escalated: bool,
     /// How long the teardown actually took. Measured on the tokio clock, so the
     /// hermetic paused-clock tests observe virtual time (an early drain reports a
-    /// short duration, not the whole grace).
+    /// short duration, not the whole grace; the synchronous Windows atomic path
+    /// reports zero while that clock is paused).
     pub elapsed: Duration,
 }
 
