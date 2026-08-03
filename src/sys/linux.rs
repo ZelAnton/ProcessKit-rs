@@ -1313,6 +1313,20 @@ impl Cgroup {
     /// empty member list, so it runs to the deadline and the final drain check
     /// below propagates that error instead of a false `Ok(())`.
     fn kill_with(&self, read: impl Fn(&Path) -> io::Result<String>) -> io::Result<()> {
+        self.kill_with_seams(read, pidfd_open, pidfd_send_signal)
+    }
+
+    /// The legacy/restricted fallback factored over the pidfd seams so its
+    /// destructive SIGKILL path uses the same identity-safe gate as the
+    /// graceful per-member signal path. A raw `kill(pid, SIGKILL)` is not a
+    /// safe fallback here: the pid may have been recycled after the initial
+    /// `cgroup.procs` snapshot.
+    fn kill_with_seams<H>(
+        &self,
+        read: impl Fn(&Path) -> io::Result<String>,
+        open: impl Fn(i32) -> io::Result<H>,
+        send: impl Fn(&H, i32) -> io::Result<()>,
+    ) -> io::Result<()> {
         // `cgroup.kill` (kernel ≥ 5.14): write "1" to SIGKILL the whole subtree
         // atomically.
         //
@@ -1373,16 +1387,17 @@ impl Cgroup {
         // legacy/restricted-cgroup deployment reports worker-thread starvation
         // under load.
         let _ = cgroup_write(&self.path.join("cgroup.freeze"), b"1");
+        let mut last_delivery_error = None;
         for _ in 0..50 {
+            if let Err(err) = self.signal_with_seams(libc::SIGKILL, &read, &open, &send) {
+                // Keep trying: a member can disappear while another delivery
+                // fails, and the final membership read remains authoritative
+                // about whether teardown actually completed.
+                last_delivery_error = Some(err);
+            }
             if let Ok(members) = self.members_with(&read) {
                 if members.is_empty() {
                     break;
-                }
-                for pid in members {
-                    // SAFETY: see signal.
-                    unsafe {
-                        libc::kill(pid, libc::SIGKILL);
-                    }
                 }
             }
             // `Err(_)`: unknown state must not look drained. Continue the
@@ -1402,6 +1417,7 @@ impl Cgroup {
         // un-reapable zombies (a D-state task ignores SIGKILL until it unblocks).
         match self.members_with(&read) {
             Ok(members) if members.is_empty() => Ok(()),
+            Ok(_) if let Some(err) = last_delivery_error => Err(err),
             Ok(_) => Err(io::Error::other(
                 "cgroup did not drain after the bounded SIGKILL sweep (kernel < 5.14 fallback)",
             )),
@@ -2172,6 +2188,78 @@ mod cgroup_read_seam_tests {
         cgroup()
             .kill_with(|_| Ok(String::new()))
             .expect("an already-empty cgroup is reported as drained by the fallback sweep");
+    }
+
+    #[test]
+    fn kill_with_skips_a_pid_recycled_between_snapshot_and_kill() {
+        struct Handle(i32);
+
+        let reads = Cell::new(0usize);
+        let opened = std::cell::RefCell::new(Vec::new());
+        let signalled = std::cell::RefCell::new(Vec::new());
+        cgroup()
+            .kill_with_seams(
+                |_: &Path| {
+                    let read = reads.get() + 1;
+                    reads.set(read);
+                    Ok(match read {
+                        1 => "1001\n1002\n",
+                        // 1002 left the cgroup and its pid was recycled outside
+                        // it before the identity-safe delivery step.
+                        2 => "1001\n",
+                        3 | 4 => "",
+                        other => panic!("unexpected cgroup.procs read {other}"),
+                    }
+                    .to_owned())
+                },
+                |pid| {
+                    opened.borrow_mut().push(pid);
+                    Ok(Handle(pid))
+                },
+                |handle: &Handle, signal| {
+                    assert_eq!(signal, libc::SIGKILL);
+                    signalled.borrow_mut().push(handle.0);
+                    Ok(())
+                },
+            )
+            .expect("a recycled member is a benign skip when the cgroup drains");
+
+        assert_eq!(*opened.borrow(), vec![1001, 1002]);
+        assert_eq!(
+            *signalled.borrow(),
+            vec![1001],
+            "the pid absent from the post-pin membership snapshot must not be signalled"
+        );
+    }
+
+    #[test]
+    fn kill_with_delivers_sigkill_to_a_confirmed_member() {
+        struct Handle(i32);
+
+        let reads = Cell::new(0usize);
+        let signalled = std::cell::RefCell::new(Vec::new());
+        cgroup()
+            .kill_with_seams(
+                |_: &Path| {
+                    let read = reads.get() + 1;
+                    reads.set(read);
+                    Ok(match read {
+                        1 | 2 => "1001\n",
+                        3 | 4 => "",
+                        other => panic!("unexpected cgroup.procs read {other}"),
+                    }
+                    .to_owned())
+                },
+                |pid| Ok(Handle(pid)),
+                |handle: &Handle, signal| {
+                    assert_eq!(signal, libc::SIGKILL);
+                    signalled.borrow_mut().push(handle.0);
+                    Ok(())
+                },
+            )
+            .expect("a confirmed member must receive SIGKILL through its pinned handle");
+
+        assert_eq!(*signalled.borrow(), vec![1001]);
     }
 
     #[cfg(feature = "stats")]
