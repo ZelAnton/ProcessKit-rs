@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [3.2.0] - 2026-08-03
+
+### Added
 
 - Add an opt-in `report-serde` feature: `serde::Serialize` for the crate's
   report types — `ProcessResult`, `RunProfile`, `ProcessGroupStats`,
@@ -3097,7 +3108,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.1.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.2.0...HEAD
+[3.2.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.1.0...v3.2.0
 [3.1.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.0.2...v3.1.0
 [3.0.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.0.1...v3.0.2
 [3.0.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.0.0...v3.0.1
