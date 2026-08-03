@@ -96,10 +96,24 @@ struct FinishedLines {
 pub(crate) struct LineCapture {
     stdout: Arc<SharedLines>,
     stderr: Arc<SharedLines>,
+    stdout_config: StreamConfig,
+    stderr_config: StreamConfig,
 }
 
 impl LineCapture {
     pub(crate) fn snapshot(&self) -> (String, String, bool, usize, usize) {
+        for (sink, config) in [
+            (&self.stdout, &self.stdout_config),
+            (&self.stderr, &self.stderr_config),
+        ] {
+            if let Some((tail, oversized)) = sink.take_partial_tail_for_capture() {
+                if oversized {
+                    sink.record_oversized_line();
+                } else {
+                    sink.push(config.shape_capture_line(tail));
+                }
+            }
+        }
         let truncated = self.stdout.dropped() > 0 || self.stderr.dropped() > 0;
         let total_lines = self.stdout.count().saturating_add(self.stderr.count());
         let total_bytes = self
@@ -946,6 +960,8 @@ impl RunningProcess {
         Ok(LineCapture {
             stdout: stdout_sink,
             stderr: stderr_sink,
+            stdout_config: self.stdout_config.clone(),
+            stderr_config: self.stderr_config.clone(),
         })
     }
 
@@ -1008,6 +1024,7 @@ impl RunningProcess {
             signals,
             stdout_cap,
             stdout_mode,
+            stderr_config: self.stderr_config.clone(),
         };
         self.raw_capture = Some(capture.clone());
         Ok(capture)
@@ -1170,6 +1187,7 @@ impl RunningProcess {
             signals,
             stdout_cap,
             stdout_mode,
+            ..
         } = capture;
 
         let outcome = self.drive_to_exit().await?;
@@ -2769,6 +2787,7 @@ struct RawStdoutSignals {
 pub(crate) struct RawCapture {
     out_buf: Arc<std::sync::Mutex<Vec<u8>>>,
     stderr_sink: Arc<SharedLines>,
+    stderr_config: StreamConfig,
     signals: RawStdoutSignals,
     stdout_cap: Option<usize>,
     stdout_mode: OverflowMode,
@@ -2778,6 +2797,14 @@ impl RawCapture {
     pub(crate) fn snapshot(&self) -> (Vec<u8>, String, bool, usize, usize) {
         let mut stdout = self.out_buf.lock().expect("stdout buffer poisoned").clone();
         clamp_dropoldest_tail(&mut stdout, self.stdout_cap, self.stdout_mode);
+        if let Some((tail, oversized)) = self.stderr_sink.take_partial_tail_for_capture() {
+            if oversized {
+                self.stderr_sink.record_oversized_line();
+            } else {
+                self.stderr_sink
+                    .push(self.stderr_config.shape_capture_line(tail));
+            }
+        }
         let truncated =
             self.signals.truncated.load(Ordering::Relaxed) || self.stderr_sink.dropped() > 0;
         let total_lines = self.stderr_sink.count();
