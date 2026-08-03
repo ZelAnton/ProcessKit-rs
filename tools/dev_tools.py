@@ -323,13 +323,10 @@ def setup() -> int:
     return 0 if installed and diagnosed == 0 else 1
 
 
-def minimal_versions() -> int:
-    """Check direct dependency floors without rewriting the working lockfile."""
+def snapshot_ignore(repository: Path):
+    """Return the ignore callback for a minimal-versions repository snapshot."""
 
-    # Cargo's direct-minimal resolver only writes Cargo.lock beside the manifest.
-    # Validate a snapshot instead of briefly replacing a contributor's tracked
-    # lockfile; the shared target directory still reuses downloaded dependencies.
-    ignored = shutil.ignore_patterns(
+    ignored_by_name = shutil.ignore_patterns(
         ".git",
         ".jj",
         ".work",
@@ -337,7 +334,26 @@ def minimal_versions() -> int:
         "book",
         "__pycache__",
         "*.pyc",
+        "mutants.out*",
     )
+
+    def ignore(path: str, names: list[str]) -> list[str]:
+        ignored = set(ignored_by_name(path, names))
+        relative = Path(path).resolve().relative_to(repository.resolve())
+        if relative == Path("fuzz"):
+            ignored.update(name for name in names if name in {"artifacts", "corpus"})
+        return sorted(ignored)
+
+    return ignore
+
+
+def minimal_versions() -> int:
+    """Check direct dependency floors without rewriting the working lockfile."""
+
+    # Cargo's direct-minimal resolver only writes Cargo.lock beside the manifest.
+    # Validate a snapshot instead of briefly replacing a contributor's tracked
+    # lockfile; the shared target directory still reuses downloaded dependencies.
+    ignored = snapshot_ignore(REPOSITORY)
     with tempfile.TemporaryDirectory(prefix="processkit-minimal-versions-") as temp:
         snapshot = Path(temp) / "repository"
         shutil.copytree(REPOSITORY, snapshot, ignore=ignored)
