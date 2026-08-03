@@ -11,10 +11,25 @@
 //!   always the type's own `name()`, never a serde-derived variant tag, so the
 //!   wire spelling is the same dictionary `spec/identifiers.json` publishes and
 //!   cannot drift from it.
+//! - **Every impl is mechanically bound to its type's fields**, not merely
+//!   written beside them: an enum impl matches exhaustively (no `_` arm), and a
+//!   struct impl opens with `let Self { … } = self;`. Either way a field or
+//!   variant added tomorrow is a *compile error* in the impl, so no fact can
+//!   ship silently unserialized, and a deliberate omission (a `ProcessResult`'s
+//!   captured streams) is named in the pattern rather than left to prose. The
+//!   `serialize_struct(…, N)` length beside it counts the keys *emitted* (not
+//!   the fields held), so it is adjusted in the same edit the compiler forces.
 //! - **Every time value is a number of seconds** ([`secs`]): a [`Duration`] as
 //!   fractional seconds, a `SystemTime` as fractional seconds since the Unix
 //!   epoch. The same unit the `metrics` seam records, so a duration means the
 //!   same thing whichever of the two a consumer reads.
+//! - **One key, one domain.** A key's value type never depends on which report
+//!   it turned up in: `signal` is always a [`Signal`](crate::Signal) — its
+//!   identifier string, or a bare number for the uncurated `Signal::Other` —
+//!   and the raw OS number an [`Outcome`](crate::Outcome) reports is the
+//!   separate key `signal_number`. (The crate-root `report-serde` section, rule
+//!   1, is the normative statement; this is the reminder for whoever writes the
+//!   next impl.)
 //! - **Reports about processes, never what a process produced.** No impl in
 //!   this feature serializes captured stdout/stderr content, argv, or
 //!   environment values — see the crate-root `report-serde` section for the
@@ -112,9 +127,16 @@ mod tests {
                 "for {outcome:?}"
             );
             assert_eq!(
-                value["signal"],
+                value["signal_number"],
                 outcome.signal().map_or(Value::Null, Value::from),
                 "for {outcome:?}"
+            );
+            // …under `signal_number`, never `signal`: that key belongs to the
+            // `Signal` domain (an identifier string, see `SoftSignal` below),
+            // and one key carries one type across the whole schema.
+            assert!(
+                value.get("signal").is_none(),
+                "the raw number must not claim the `signal` key, got {value}"
             );
         }
     }
@@ -213,7 +235,7 @@ mod tests {
         let value = json(&timed_out);
         assert_eq!(kind(&value["outcome"]), "timed_out");
         assert_eq!(value["outcome"]["code"], Value::Null);
-        assert_eq!(value["outcome"]["signal"], Value::Null);
+        assert_eq!(value["outcome"]["signal_number"], Value::Null);
         assert_eq!(value["success"], false);
         assert_eq!(value["configured_timeout_secs"], 0.5);
     }
@@ -352,7 +374,7 @@ mod tests {
         );
         let value = json(&profile);
         assert_eq!(kind(&value["outcome"]), "signalled");
-        assert_eq!(value["outcome"]["signal"], 9);
+        assert_eq!(value["outcome"]["signal_number"], 9);
         assert_eq!(value["duration_secs"], 2.0);
         assert_eq!(value["cpu_time_secs"], 1.0);
         assert_eq!(value["peak_memory_bytes"], 4096);
@@ -447,6 +469,28 @@ mod tests {
         // The raw-number escape hatch has no curated identifier, so it renders
         // as its `i32` — exactly what `Signal::name()`'s `None` prescribes.
         assert_eq!(json(&crate::Signal::Other(37)), Value::from(37));
+    }
+
+    #[cfg(feature = "process-control")]
+    #[test]
+    fn the_signal_key_and_the_raw_number_key_stay_separate_domains() {
+        // The schema's named exception (crate-root rule 1) pinned end to end: a
+        // `Signal` is a union of an identifier string and a raw number, and it
+        // owns the `signal` key alone. A consumer folding both report types into
+        // one JSONL table must never meet a string and an integer under one
+        // column, which is what a shared key would have guaranteed.
+        let soft = json(&crate::SoftSignal::Sent(crate::Signal::Term));
+        assert_eq!(soft["signal"], Value::String("term".to_owned()));
+        let soft_uncurated = json(&crate::SoftSignal::Sent(crate::Signal::Other(37)));
+        assert_eq!(soft_uncurated["signal"], Value::from(37));
+
+        let signalled = json(&Outcome::Signalled(Some(9)));
+        assert_eq!(signalled["signal_number"], 9);
+        assert!(signalled.get("signal").is_none(), "got {signalled}");
+        assert!(
+            soft.get("signal_number").is_none(),
+            "the `Signal` domain must not claim the raw-number key, got {soft}"
+        );
     }
 
     #[cfg(feature = "process-control")]

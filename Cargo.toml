@@ -257,9 +257,13 @@ json = ["dep:serde", "dep:serde_json"]
 # that same optional dependency for other purposes, so the flag names the
 # surface it exposes, not the crate it pulls. Reuses the optional `serde`
 # already declared above — no new dependency, no version bump — and pulls **no**
-# JSON codec: the impls are format-agnostic (pick `serde_json`, `serde_yaml`, a
-# binary codec, … yourself). Off by default; with the feature off nothing but
-# the impls disappears, so it is purely additive.
+# codec: pick `serde_json`, `serde_yaml`, `ciborium`, … yourself. The schema
+# targets *self-describing* formats (its forward-compatibility rule is "ignore
+# keys you don't know", and a `Signal` is an identifier string or a raw number);
+# a non-self-describing binary codec will encode these values, but nothing pins
+# their layout across a minor release — see the crate-root `report-serde`
+# section, rules 1 and 4. Off by default; with the feature off nothing but the
+# impls disappears, so it is purely additive.
 report-serde = ["dep:serde"]
 # Opt-in single-master-fd PTY launch mode (`Command::use_pty`): spawn the child
 # under a pseudo-terminal — `openpty` (Unix) / `CreatePseudoConsole` ConPTY

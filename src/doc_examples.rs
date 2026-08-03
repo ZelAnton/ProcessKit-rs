@@ -13,11 +13,15 @@
 // on a private, hidden module purely so rustdoc's doctest extractor walks its
 // fenced blocks — the text itself is never published anywhere.
 //
-// The doctest registrations are gated on all nine optional features, including
-// the default `process-control`, because the guides collectively demonstrate the
+// The doctest registrations are gated on the optional features the guides
+// demonstrate, including the default `process-control`, because they
+// collectively reach the
 // `process-control`/`stats`/`limits`/`mock`/`tracing`/`metrics`/`record`/`pty`/`json`
 // surfaces (`docs/streaming.md`'s interactive-PTY example needs `pty`;
-// `docs/observability.md` covers `tracing`/`metrics`). The test below stays
+// `docs/observability.md` covers `tracing`/`metrics`). The `cfg` below is the
+// exact gate, and deliberately not "every optional feature": a feature no guide
+// demonstrates (`report-serde`) would only narrow this pass for nothing.
+// The test below stays
 // available to ordinary `cargo test`: it makes a new guide fail CI until it is
 // explicitly registered here.
 #![allow(dead_code)]

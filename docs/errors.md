@@ -209,15 +209,21 @@ names — a stable **vocabulary**, not a frozen record schema — and the opt-in
 `report-serde` feature puts that very vocabulary on the wire rather than
 minting a second one: it implements `serde::Serialize` for the crate's report
 types, and every enum in them serializes as its `name()`
-(`{"kind": "exited", "code": 0, "signal": null}`, never serde's derived
+(`{"kind": "exited", "code": 0, "signal_number": null}`, never serde's derived
 `{"Exited": 0}`), so a consumer that adopted the dictionary and a consumer that
-serializes a report read the same strings. That feature is `Serialize`-only
-(these values are reported, never supplied back — see the four enums below), it
-never puts captured output, argv or environment values on the wire, and it
-promises the *spelling* of what it emits, not a frozen field set: the report
-types are `#[non_exhaustive]`, so a minor release may add a key — never rename
-one — and a consumer must ignore unknown keys. See the crate-root
-`report-serde` section for the full rules.
+serializes a report read the same strings. The single exception is the one the
+table above already records: `Signal::Other` has no curated identifier, so a
+`Signal` travels as its identifier string when curated and as a bare `i32` when
+not — confined to the `signal` key, while the raw exit-signal number an
+`Outcome` carries is the separate key `signal_number`. That feature is
+`Serialize`-only
+(these values are reported, never supplied back — see the report-only enums
+listed below), it never puts captured output, argv or environment values on the
+wire, and it promises the *spelling* of what it emits, not a frozen field set:
+every report type is `#[non_exhaustive]`, keeps its fields private, or both —
+grown, not frozen — so a minor release may add a key, never rename one, and a
+consumer must ignore unknown keys. See the crate-root `report-serde` section
+for the full rules.
 `Mechanism` and `ParentDeathCleanup` use the spellings downstream tools
 already publish (`job_object`/`cgroup_v2`/`process_group`,
 `whole_tree`/`direct_child_only`/`none`), so adopting them needs no migration;
@@ -246,8 +252,9 @@ assert_eq!(Priority::from_name("below_normal"), Some(Priority::BelowNormal));
 assert_eq!(Priority::from_name("turbo"), None);
 ```
 
-Five enums report a `name()` but take **no** `from_name`, because they are
-classifications, events or fates the crate *reports* and never accepts back. `Outcome::name()`
+The enums the table above lists as `from_name` exceptions report a `name()` but
+take **no** inverse, because they are classifications, events or fates the crate
+*reports* and never accepts back. `Outcome::name()`
 reports the *disposition* only (`exited` / `signalled` / `timed_out`) — the name
 alone can't carry the exit code or signal number (read those from
 [`code()`](https://docs.rs/processkit/latest/processkit/struct.ProcessResult.html#method.code)

@@ -199,22 +199,36 @@
 //!   Pulls in `serde` + `serde_json`.
 //! - **`report-serde`** — `serde::Serialize` for the crate's *report* types, so
 //!   a finished run, a graceful teardown, a stats tick or a supervision event
-//!   can be emitted as one JSONL line (or any other serde format) without
-//!   hand-copying fields and hand-calling `name()` per enum: `ProcessResult`,
-//!   `RunProfile`, `ProcessGroupStats`, `ShutdownReport`, `MemberInfo`,
-//!   `LimitEvidence`, `SupervisionEvent` / `SupervisionOutcome` /
+//!   can be emitted as one JSONL line (or any other self-describing serde
+//!   format) without hand-copying fields and hand-calling `name()` per enum:
+//!   `ProcessResult`, `RunProfile`, `ProcessGroupStats`, `ShutdownReport`,
+//!   `MemberInfo`, `LimitEvidence`, `SupervisionEvent` / `SupervisionOutcome` /
 //!   `SupervisionStatus`, and the enums those carry. Reuses the optional
-//!   `serde` dependency `record` / `json` already pull, and pulls **no** JSON
-//!   codec of its own — the impls are format-agnostic. Four rules define the
+//!   `serde` dependency `record` / `json` already pull, and pulls **no** codec
+//!   of its own — pick `serde_json`, `serde_yaml`, `ciborium`, … yourself. The
+//!   schema targets *self-describing* formats; rule 4 says why a
+//!   non-self-describing binary codec is out of scope. Four rules define the
 //!   shape:
 //!
 //!   1. **Every enum travels as its stable `name()` identifier**, never a
-//!      serde-derived variant tag: `{"kind": "exited", "code": 0, "signal":
-//!      null}`, not `{"Exited": 0}`. An enum carrying a payload is an object
-//!      tagged under `"kind"`; one without is the bare identifier string
-//!      (`"restarts_exhausted"`). The wire vocabulary is therefore exactly the
-//!      dictionary described under *Stable machine identifiers* above — the
-//!      same one `spec/identifiers.json` publishes — never a second spelling.
+//!      serde-derived variant tag: `{"kind": "exited", "code": 0,
+//!      "signal_number": null}`, not `{"Exited": 0}`. An enum carrying a
+//!      payload is an object tagged under `"kind"`; one without is the bare
+//!      identifier string (`"restarts_exhausted"`). The wire vocabulary is
+//!      therefore exactly the dictionary described under *Stable machine
+//!      identifiers* above — the same one `spec/identifiers.json` publishes —
+//!      never a second spelling. **`Signal` is the one named exception**, with
+//!      a third form: `Signal::Other(i32)` is a raw OS number that deliberately
+//!      has no curated identifier (`Signal::name()` answers `None` there rather
+//!      than minting a spelling no dictionary defines and no `from_name` parses
+//!      back), so a signal travels as its identifier string when curated
+//!      (`"term"`) and as that bare number when not (`37`). The union stops
+//!      there, because **a key names one domain**: `signal` is always a
+//!      `Signal` (a `ShutdownReport`'s soft tier), while the raw OS number an
+//!      `Outcome` carries is a different fact under its own key,
+//!      `signal_number` — always a number or `null`. Two keys, so a consumer
+//!      folding both into one JSONL table never reconciles a string with an
+//!      integer under one column.
 //!   2. **`Serialize` only — deliberately no `Deserialize`.** These types are
 //!      *reported* by the crate and never supplied back to it: the same
 //!      asymmetry that leaves `Outcome` / `ErrorKind` / `SupervisionEvent`
@@ -233,15 +247,22 @@
 //!      `ErrorKind` and attach whatever bounded, redacted detail your own
 //!      contract calls for.
 //!   4. **The set of fields is not frozen; the spelling of each field is.**
-//!      These types are `#[non_exhaustive]` precisely so a new fact can be
-//!      added in a minor release, and that stays true on the wire: a future
-//!      minor may add a key, so a consumer must ignore unknown ones (the same
-//!      discipline any JSONL reader already needs). What *is* held stable, like
-//!      the rest of the public API, is everything already there — an identifier
-//!      or a key is never renamed or repurposed without a major release. Time
-//!      is always a number of seconds (`duration_secs`, `elapsed_secs`,
-//!      `delay_secs`, …), the unit the `metrics` histograms record; a
-//!      measurement a platform cannot report is `null`, never a fabricated `0`.
+//!      Every one of these types is `#[non_exhaustive]`, keeps its fields
+//!      private, or both — they are grown, not frozen, and no downstream
+//!      struct literal pins today's set — and that stays true on the wire: a
+//!      future minor may add a key, so a consumer must ignore unknown ones (the
+//!      same discipline any JSONL reader already needs). That promise is also
+//!      why the schema targets **self-describing** formats: "ignore the keys
+//!      you don't know", and rule 1's identifier-or-number `Signal`, both need
+//!      an encoding that carries names and types, which `bincode` / `postcard`
+//!      deliberately do not — they will happily encode these values, but
+//!      nothing here pins their layout across a minor release. What *is* held
+//!      stable, like the rest of the public API, is everything already there —
+//!      an identifier or a key is never renamed or repurposed without a major
+//!      release. Time is always a number of seconds (`duration_secs`,
+//!      `elapsed_secs`, `delay_secs`, …), the unit the `metrics` histograms
+//!      record; a measurement a platform cannot report is `null`, never a
+//!      fabricated `0`.
 //!
 //! # Other languages
 //!

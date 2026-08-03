@@ -290,13 +290,25 @@ impl Serialize for ShutdownReport {
     where
         S: Serializer,
     {
+        // Destructured rather than read accessor by accessor: a fact added to
+        // this report is a compile error here, so it can never silently miss
+        // the wire — the same mechanical link `SoftSignal`'s exhaustive matches
+        // give the enum beside it.
+        let Self {
+            soft_signal,
+            members_before,
+            members_after,
+            drained_within_grace,
+            escalated,
+            elapsed,
+        } = self;
         let mut state = serializer.serialize_struct("ShutdownReport", 6)?;
-        state.serialize_field("soft_signal", &self.soft_signal())?;
-        state.serialize_field("members_before", &self.members_before())?;
-        state.serialize_field("members_after", &self.members_after())?;
-        state.serialize_field("drained_within_grace", &self.drained_within_grace())?;
-        state.serialize_field("escalated", &self.escalated())?;
-        state.serialize_field("elapsed_secs", &crate::report_serde::secs(self.elapsed()))?;
+        state.serialize_field("soft_signal", soft_signal)?;
+        state.serialize_field("members_before", members_before)?;
+        state.serialize_field("members_after", members_after)?;
+        state.serialize_field("drained_within_grace", drained_within_grace)?;
+        state.serialize_field("escalated", escalated)?;
+        state.serialize_field("elapsed_secs", &crate::report_serde::secs(*elapsed))?;
         state.end()
     }
 }

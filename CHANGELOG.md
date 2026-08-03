@@ -20,15 +20,20 @@ to a dated version section.
   run, a graceful teardown, a stats tick or a supervision event can be emitted
   as one JSONL line without hand-copying fields. Every enum serializes as the
   stable `name()` identifier it already publishes (`{"kind": "exited", "code":
-  0, "signal": null}`, never serde's derived `{"Exited": 0}`), so the wire
-  vocabulary *is* the documented dictionary. Deliberately `Serialize` only —
+  0, "signal_number": null}`, never serde's derived `{"Exited": 0}`), so the
+  wire vocabulary *is* the documented dictionary; the one named exception is
+  `Signal`, whose uncurated `Other(i32)` has no identifier and travels as a bare
+  number under the `signal` key (an `Outcome`'s raw exit-signal number is the
+  separate `signal_number`, so no key carries two types). Deliberately
+  `Serialize` only —
   these values are reported, never supplied back, the same asymmetry that
   leaves `Outcome`/`ErrorKind` without a `from_name` — and deliberately free of
   captured stdout/stderr, argv and environment values, the same secret hygiene
-  the `tracing`/`metrics` seams keep. The report types stay
-  `#[non_exhaustive]`, so a later minor may add a key (never rename one) and a
-  consumer must ignore unknown keys. Reuses the optional `serde` dependency and
-  pulls no JSON codec of its own.
+  the `tracing`/`metrics` seams keep. Every report type is `#[non_exhaustive]`,
+  keeps its fields private, or both, so a later minor may add a key (never
+  rename one) and a consumer must ignore unknown keys — the schema therefore
+  targets self-describing formats. Reuses the optional `serde` dependency and
+  pulls no codec of its own.
 
 - Add `SoftSignal::name()` — the stable machine identifier (`sent` /
   `unsupported` / `failed`) for the fate of a graceful teardown's soft-signal

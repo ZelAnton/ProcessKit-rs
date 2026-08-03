@@ -173,11 +173,22 @@ impl Serialize for MemberInfo {
     where
         S: Serializer,
     {
+        // Destructured rather than read accessor by accessor: a field added to
+        // this snapshot is a compile error here, so it can never silently miss
+        // the wire — and the type's "No command line" rule stays a decision
+        // made in view, since a future argv/env field would have to be named
+        // right here before it could reach (or be kept off) the wire.
+        let Self {
+            pid,
+            ppid,
+            exe_name,
+            start_time,
+        } = self;
         let mut state = serializer.serialize_struct("MemberInfo", 4)?;
-        state.serialize_field("pid", &self.pid())?;
-        state.serialize_field("ppid", &self.ppid())?;
-        state.serialize_field("exe_name", &self.exe_name())?;
-        state.serialize_field("start_time", &self.start_time())?;
+        state.serialize_field("pid", pid)?;
+        state.serialize_field("ppid", ppid)?;
+        state.serialize_field("exe_name", exe_name)?;
+        state.serialize_field("start_time", start_time)?;
         state.end()
     }
 }

@@ -486,10 +486,19 @@ impl Serialize for LimitEvidence {
     where
         S: Serializer,
     {
+        // Destructured rather than read accessor by accessor: a new limit axis
+        // on this report is a compile error here, so it can never silently miss
+        // the wire — the same mechanical link `verdict`'s exhaustive `match`
+        // over `LimitKind` gives the axis set above.
+        let Self {
+            memory,
+            processes,
+            cpu,
+        } = self;
         let mut state = serializer.serialize_struct("LimitEvidence", 3)?;
-        state.serialize_field("memory", &self.memory())?;
-        state.serialize_field("processes", &self.processes())?;
-        state.serialize_field("cpu", &self.cpu())?;
+        state.serialize_field("memory", memory)?;
+        state.serialize_field("processes", processes)?;
+        state.serialize_field("cpu", cpu)?;
         state.end()
     }
 }

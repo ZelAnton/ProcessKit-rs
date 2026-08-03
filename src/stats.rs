@@ -84,13 +84,22 @@ impl Serialize for ProcessGroupStats {
     where
         S: Serializer,
     {
+        // Destructured rather than read field by field: a metric added to this
+        // snapshot is a compile error here, so it can never silently miss the
+        // wire — the mechanical counterpart of the exhaustive `match` the enum
+        // impls in this feature use.
+        let Self {
+            active_process_count,
+            total_cpu_time,
+            peak_memory_bytes,
+        } = self;
         let mut state = serializer.serialize_struct("ProcessGroupStats", 3)?;
-        state.serialize_field("active_process_count", &self.active_process_count)?;
+        state.serialize_field("active_process_count", active_process_count)?;
         state.serialize_field(
             "total_cpu_time_secs",
-            &crate::report_serde::secs_opt(self.total_cpu_time),
+            &crate::report_serde::secs_opt(*total_cpu_time),
         )?;
-        state.serialize_field("peak_memory_bytes", &self.peak_memory_bytes)?;
+        state.serialize_field("peak_memory_bytes", peak_memory_bytes)?;
         state.end()
     }
 }
@@ -411,7 +420,7 @@ impl RunProfile {
 ///
 /// ```json
 /// {
-///   "outcome": {"kind": "exited", "code": 0, "signal": null},
+///   "outcome": {"kind": "exited", "code": 0, "signal_number": null},
 ///   "duration_secs": 2.0,
 ///   "cpu_time_secs": 1.0,
 ///   "peak_memory_bytes": 4096,
@@ -433,15 +442,24 @@ impl Serialize for RunProfile {
     where
         S: Serializer,
     {
+        // Destructured rather than read field by field: a fact added to this
+        // summary is a compile error here, so it can never silently miss the
+        // wire — the mechanical counterpart of the exhaustive `match` the enum
+        // impls in this feature use. (`avg_cpu_cores` is not a field and stays
+        // off the wire deliberately — see the doc above.)
+        let Self {
+            outcome,
+            duration,
+            cpu_time,
+            peak_memory_bytes,
+            samples,
+        } = self;
         let mut state = serializer.serialize_struct("RunProfile", 5)?;
-        state.serialize_field("outcome", &self.outcome)?;
-        state.serialize_field("duration_secs", &crate::report_serde::secs(self.duration))?;
-        state.serialize_field(
-            "cpu_time_secs",
-            &crate::report_serde::secs_opt(self.cpu_time),
-        )?;
-        state.serialize_field("peak_memory_bytes", &self.peak_memory_bytes)?;
-        state.serialize_field("samples", &self.samples)?;
+        state.serialize_field("outcome", outcome)?;
+        state.serialize_field("duration_secs", &crate::report_serde::secs(*duration))?;
+        state.serialize_field("cpu_time_secs", &crate::report_serde::secs_opt(*cpu_time))?;
+        state.serialize_field("peak_memory_bytes", peak_memory_bytes)?;
+        state.serialize_field("samples", samples)?;
         state.end()
     }
 }

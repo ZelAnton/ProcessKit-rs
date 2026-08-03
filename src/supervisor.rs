@@ -490,12 +490,23 @@ impl Serialize for SupervisionOutcome {
     where
         S: Serializer,
     {
+        // Destructured rather than read field by field: telemetry added to this
+        // report is a compile error here, so it can never silently miss the
+        // wire — the same mechanical link the exhaustive `match` in
+        // `SupervisionEvent`'s impl below gives that enum.
+        let Self {
+            final_result,
+            restarts,
+            stopped,
+            storm_pauses,
+            liveness_kills,
+        } = self;
         let mut state = serializer.serialize_struct("SupervisionOutcome", 5)?;
-        state.serialize_field("final_result", &self.final_result)?;
-        state.serialize_field("restarts", &self.restarts)?;
-        state.serialize_field("stopped", &self.stopped)?;
-        state.serialize_field("storm_pauses", &self.storm_pauses)?;
-        state.serialize_field("liveness_kills", &self.liveness_kills)?;
+        state.serialize_field("final_result", final_result)?;
+        state.serialize_field("restarts", restarts)?;
+        state.serialize_field("stopped", stopped)?;
+        state.serialize_field("storm_pauses", storm_pauses)?;
+        state.serialize_field("liveness_kills", liveness_kills)?;
         state.end()
     }
 }
@@ -592,15 +603,27 @@ impl Serialize for SupervisionStatus {
     where
         S: Serializer,
     {
-        let started_at = self
-            .started_at()
+        // Destructured rather than read accessor by accessor: a fact added to
+        // this snapshot is a compile error here, so it can never silently miss
+        // the wire — the same mechanical link the exhaustive `match` in
+        // `SupervisionEvent`'s impl below gives that enum. It is also where the
+        // type's "only non-secret facts" rule would have to be re-decided for a
+        // new field rather than inherited.
+        let Self {
+            active,
+            restarts,
+            storm_paused,
+            pid,
+            started_at,
+        } = self;
+        let started_at = started_at
             .and_then(|started| started.duration_since(SystemTime::UNIX_EPOCH).ok())
             .map(crate::report_serde::secs);
         let mut state = serializer.serialize_struct("SupervisionStatus", 5)?;
-        state.serialize_field("active", &self.is_active())?;
-        state.serialize_field("restarts", &self.restarts())?;
-        state.serialize_field("storm_paused", &self.is_storm_paused())?;
-        state.serialize_field("pid", &self.pid())?;
+        state.serialize_field("active", active)?;
+        state.serialize_field("restarts", restarts)?;
+        state.serialize_field("storm_paused", storm_paused)?;
+        state.serialize_field("pid", pid)?;
         state.serialize_field("started_at_unix_secs", &started_at)?;
         state.end()
     }
@@ -714,7 +737,7 @@ impl SupervisionEvent {
 ///
 /// ```json
 /// {"kind": "incarnation_started",  "attempt": 1, "pid": 4242}
-/// {"kind": "incarnation_finished", "attempt": 1, "outcome": {"kind": "exited", "code": 1, "signal": null}, "duration_secs": 1.25, "success": false}
+/// {"kind": "incarnation_finished", "attempt": 1, "outcome": {"kind": "exited", "code": 1, "signal_number": null}, "duration_secs": 1.25, "success": false}
 /// {"kind": "incarnation_failed",   "attempt": 2, "error": "spawn"}
 /// {"kind": "restart_scheduled",    "restart": 1, "delay_secs": 0.5}
 /// {"kind": "storm_paused",         "pause": 1, "delay_secs": 30.0}

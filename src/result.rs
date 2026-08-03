@@ -146,12 +146,12 @@ impl Outcome {
 /// identifier deliberately does *not* carry:
 ///
 /// ```json
-/// {"kind": "exited",   "code": 0,    "signal": null}
-/// {"kind": "signalled","code": null, "signal": 9}
-/// {"kind": "timed_out","code": null, "signal": null}
+/// {"kind": "exited",   "code": 0,    "signal_number": null}
+/// {"kind": "signalled","code": null, "signal_number": 9}
+/// {"kind": "timed_out","code": null, "signal_number": null}
 /// ```
 ///
-/// All three values come straight from the accessors of the same name
+/// All three values come straight from the accessors
 /// ([`name`](Self::name) / [`code`](Self::code) / [`signal`](Self::signal)), so
 /// the wire spelling is the identifier this crate already publishes and can
 /// never drift from it — a serde-derived tag (`{"Exited": 0}`) would be a
@@ -161,6 +161,19 @@ impl Outcome {
 /// `Deserialize`, for the same reason there is no `from_name` inverse — the
 /// name alone cannot rebuild the payload, and an `Outcome` is always *reported*
 /// by the crate, never supplied to it.
+///
+/// # Why `signal_number`, not `signal`
+///
+/// A key in this schema names the **domain** of its value, not the getter it
+/// came from (the same reason a `Duration` accessor becomes `…_secs`): what
+/// [`signal`](Self::signal) returns here is the raw OS number the exit
+/// reported, while the schema's `signal` key — a
+/// [`ShutdownReport`](crate::ShutdownReport)'s soft tier — is a
+/// [`Signal`](crate::Signal), which travels as its identifier string (`"term"`)
+/// and falls back to a bare number only for `Signal::Other`. Spelling the raw
+/// one `signal_number` keeps each key a single type: a consumer folding both
+/// into one JSONL table never reconciles a string with an integer under one
+/// column. See the crate-root `report-serde` rule 1.
 #[cfg(feature = "report-serde")]
 #[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
 impl Serialize for Outcome {
@@ -171,7 +184,7 @@ impl Serialize for Outcome {
         let mut state = serializer.serialize_struct("Outcome", 3)?;
         state.serialize_field(crate::report_serde::KIND, self.name())?;
         state.serialize_field("code", &self.code())?;
-        state.serialize_field("signal", &self.signal())?;
+        state.serialize_field("signal_number", &self.signal())?;
         state.end()
     }
 }
@@ -633,7 +646,7 @@ impl<T> ProcessResult<T> {
 /// ```json
 /// {
 ///   "program": "git",
-///   "outcome": {"kind": "exited", "code": 1, "signal": null},
+///   "outcome": {"kind": "exited", "code": 1, "signal_number": null},
 ///   "success": false,
 ///   "duration_secs": 0.412,
 ///   "configured_timeout_secs": 30.0,
@@ -682,19 +695,39 @@ impl<T> Serialize for ProcessResult<T> {
     where
         S: Serializer,
     {
+        // Destructured rather than read field by field: a field added to this
+        // struct is a compile error here, so it can never silently miss the
+        // wire — the same mechanical link the enum impls get from an exhaustive
+        // `match`. It also makes the two deliberate omissions checkable rather
+        // than prose: `stdout`/`stderr` are named and dropped right here, so a
+        // future author meets the decision instead of inheriting it.
+        let Self {
+            program,
+            stdout: _,
+            stderr: _,
+            outcome,
+            timeout,
+            duration,
+            truncated,
+            total_lines,
+            total_bytes,
+            ok_codes,
+        } = self;
         let mut state = serializer.serialize_struct("ProcessResult", 9)?;
-        state.serialize_field("program", self.program())?;
-        state.serialize_field("outcome", &self.outcome())?;
+        state.serialize_field("program", program)?;
+        state.serialize_field("outcome", outcome)?;
+        // Not a field: the crate's own accepted-exit policy over `outcome` +
+        // `ok_codes`, reported rather than left for a consumer to re-derive.
         state.serialize_field("success", &self.is_success())?;
-        state.serialize_field("duration_secs", &crate::report_serde::secs(self.duration()))?;
+        state.serialize_field("duration_secs", &crate::report_serde::secs(*duration))?;
         state.serialize_field(
             "configured_timeout_secs",
-            &crate::report_serde::secs_opt(self.configured_timeout()),
+            &crate::report_serde::secs_opt(*timeout),
         )?;
-        state.serialize_field("truncated", &self.truncated())?;
-        state.serialize_field("total_lines", &self.total_lines())?;
-        state.serialize_field("total_bytes", &self.total_bytes())?;
-        state.serialize_field("ok_codes", self.ok_codes())?;
+        state.serialize_field("truncated", truncated)?;
+        state.serialize_field("total_lines", total_lines)?;
+        state.serialize_field("total_bytes", total_bytes)?;
+        state.serialize_field("ok_codes", ok_codes)?;
         state.end()
     }
 }
