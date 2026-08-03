@@ -2429,16 +2429,26 @@ impl<R: ProcessRunner> Supervisor<R> {
                     outcome,
                     stderr,
                     stderr_truncated,
-                }) => Ok(ProcessResult::new(
-                    command.program_name(),
-                    String::new(),
-                    stderr,
-                    outcome,
-                    command.configured_timeout(),
-                )
-                .with_duration(started.elapsed())
-                .with_truncated(stderr_truncated)
-                .with_ok_codes(command.ok_codes_vec())),
+                }) => {
+                    // The result's timeout metadata feeds its public error
+                    // diagnostics, so retain the limit that actually ended
+                    // the run when both watchdogs are configured.
+                    let timeout = if outcome.inactivity_timed_out() {
+                        command.configured_inactivity_timeout()
+                    } else {
+                        command.configured_timeout()
+                    };
+                    Ok(ProcessResult::new(
+                        command.program_name(),
+                        String::new(),
+                        stderr,
+                        outcome,
+                        timeout,
+                    )
+                    .with_duration(started.elapsed())
+                    .with_truncated(stderr_truncated)
+                    .with_ok_codes(command.ok_codes_vec()))
+                }
                 Err(err) => Err(err),
             }
         }
@@ -3077,6 +3087,124 @@ mod tests {
         assert_eq!(outcome.final_result.stdout(), "");
         assert_eq!(outcome.final_result.stderr(), "warn");
         assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
+    }
+
+    fn non_piped_command(timeout: Duration, inactivity: Option<Duration>) -> Command {
+        let command = Command::new("server")
+            .stdout_file("processkit-supervisor-timeout-metadata.log")
+            .timeout(timeout);
+        match inactivity {
+            Some(idle) => command.inactivity_timeout(idle),
+            None => command,
+        }
+    }
+
+    fn assert_timeout_reason(error: &crate::Error, expected: Duration, inactivity: bool) {
+        match error.reason() {
+            crate::ErrorReason::Timeout {
+                timeout: actual,
+                inactivity: actual_inactivity,
+                ..
+            } => {
+                assert_eq!(*actual, expected);
+                assert_eq!(*actual_inactivity, inactivity);
+            }
+            other => panic!("expected timeout error, got {other:?}"),
+        }
+    }
+
+    async fn run_non_piped(reply: Reply, command: Command) -> ProcessResult<String> {
+        Supervisor::new(command)
+            .restart(RestartPolicy::Never)
+            .with_runner(ScriptedRunner::new().fallback(reply))
+            .run()
+            .await
+            .expect("non-piped supervision completes")
+            .final_result
+    }
+
+    #[tokio::test]
+    async fn non_piped_supervision_uses_the_winning_timeout_metadata() {
+        let absolute = Duration::from_secs(30);
+        let inactivity = Duration::from_secs(7);
+
+        let inactivity_result = run_non_piped(
+            Reply::inactivity_timeout(),
+            non_piped_command(absolute, Some(inactivity)),
+        )
+        .await;
+        assert_eq!(inactivity_result.outcome(), Outcome::InactivityTimedOut);
+        assert_eq!(inactivity_result.configured_timeout(), Some(inactivity));
+        let ensure_error = inactivity_result
+            .clone()
+            .ensure_success()
+            .expect_err("an inactivity timeout is not successful");
+        assert_timeout_reason(&ensure_error, inactivity, true);
+        let code_error = inactivity_result
+            .require_code()
+            .expect_err("an inactivity timeout has no exit code");
+        assert_timeout_reason(&code_error, inactivity, true);
+
+        let timed_out_result = run_non_piped(
+            Reply::timeout(),
+            non_piped_command(absolute, Some(inactivity)),
+        )
+        .await;
+        assert_eq!(timed_out_result.outcome(), Outcome::TimedOut);
+        assert_eq!(timed_out_result.configured_timeout(), Some(absolute));
+        let error = timed_out_result
+            .ensure_success()
+            .expect_err("an absolute timeout is not successful");
+        assert_timeout_reason(&error, absolute, false);
+
+        let exited_result = run_non_piped(
+            Reply::ok("done"),
+            non_piped_command(absolute, Some(inactivity)),
+        )
+        .await;
+        assert_eq!(exited_result.outcome(), Outcome::Exited(0));
+        assert_eq!(exited_result.configured_timeout(), Some(absolute));
+    }
+
+    #[tokio::test]
+    async fn non_piped_inactivity_timeout_without_a_limit_keeps_metadata_absent() {
+        let result = run_non_piped(
+            Reply::inactivity_timeout(),
+            non_piped_command(Duration::from_secs(30), None),
+        )
+        .await;
+        assert_eq!(result.outcome(), Outcome::InactivityTimedOut);
+        assert_eq!(result.configured_timeout(), None);
+
+        let ensure_error = result
+            .clone()
+            .ensure_success()
+            .expect_err("an inactivity timeout is not successful");
+        assert_timeout_reason(&ensure_error, Duration::ZERO, true);
+        let code_error = result
+            .require_code()
+            .expect_err("an inactivity timeout has no exit code");
+        assert_timeout_reason(&code_error, Duration::ZERO, true);
+    }
+
+    #[tokio::test]
+    async fn piped_supervision_keeps_output_string_timeout_metadata() {
+        let absolute = Duration::from_secs(30);
+        let inactivity = Duration::from_secs(7);
+        let result = Supervisor::new(
+            Command::new("server")
+                .timeout(absolute)
+                .inactivity_timeout(inactivity),
+        )
+        .restart(RestartPolicy::Never)
+        .with_runner(ScriptedRunner::new().fallback(Reply::inactivity_timeout()))
+        .run()
+        .await
+        .expect("piped supervision completes")
+        .final_result;
+
+        assert_eq!(result.outcome(), Outcome::InactivityTimedOut);
+        assert_eq!(result.configured_timeout(), Some(inactivity));
     }
 
     #[tokio::test]
