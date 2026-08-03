@@ -1,5 +1,8 @@
 //! [`Signal`] — a portable signal to broadcast to a whole process tree.
 
+#[cfg(feature = "report-serde")]
+use serde::ser::{Serialize, Serializer};
+
 /// A signal to broadcast to every process in a
 /// [`ProcessGroup`](crate::ProcessGroup) via
 /// [`signal`](crate::ProcessGroup::signal).
@@ -76,8 +79,10 @@ impl Signal {
     /// Use it for machine-readable output — a CLI's JSONL schema, a
     /// cross-language binding, a structured log field — where a consumer needs
     /// one canonical spelling per variant instead of hand-maintaining its own
-    /// mapping table. It is a *diagnostic* name, **not** a wire/serialization
-    /// format, but it is held stable all the same: a **new** curated variant
+    /// mapping table. It is a *diagnostic* name — a stable **vocabulary**
+    /// rather than a frozen record schema — and the exact string the opt-in
+    /// `report-serde` feature serializes a curated signal as. It is held stable
+    /// either way: a **new** curated variant
     /// gets a **new** identifier, and an existing identifier is **never
     /// renamed** without a major release.
     ///
@@ -120,6 +125,50 @@ impl Signal {
             "usr1" => Some(Signal::Usr1),
             "usr2" => Some(Signal::Usr2),
             _ => None,
+        }
+    }
+}
+
+/// *(feature `report-serde`)* Serialized as the stable
+/// [`name()`](Signal::name) identifier — `"term"`, `"kill"`, … — or, for the
+/// raw-number escape hatch [`Other`](Signal::Other), as that bare `i32`:
+///
+/// ```json
+/// "term"
+/// 37
+/// ```
+///
+/// The union of shapes is deliberate and is exactly what
+/// [`name()`](Signal::name) already prescribes by answering `None` there
+/// ("render its `i32` instead"): inventing an identifier for an arbitrary
+/// number would put a spelling on the wire that no dictionary defines. A signal
+/// appears here because a *report* carries it (`ShutdownReport`'s soft tier);
+/// the direction a caller supplies one — a config value, a CLI flag — stays
+/// [`from_name`](Signal::from_name), which parses the very same identifiers, so
+/// the missing `Deserialize` leaves no gap.
+#[cfg(feature = "report-serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
+impl Serialize for Signal {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never silently inherit a wire form that was decided for another.
+        match self {
+            Signal::Other(number) => serializer.serialize_i32(*number),
+            curated @ (Signal::Term
+            | Signal::Kill
+            | Signal::Int
+            | Signal::Hup
+            | Signal::Quit
+            | Signal::Usr1
+            | Signal::Usr2) => serializer.serialize_str(
+                curated
+                    .name()
+                    .expect("every curated signal has a stable identifier"),
+            ),
         }
     }
 }

@@ -3,6 +3,9 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "report-serde")]
+use serde::ser::{Serialize, SerializeStruct as _, Serializer};
+
 use crate::signal::Signal;
 use crate::sys::graceful::{GracefulOutcome, SoftDelivery};
 
@@ -17,11 +20,12 @@ use crate::sys::graceful::{GracefulOutcome, SoftDelivery};
 /// `cgroup.kill` / `TerminateJobObject` is reported separately by
 /// [`ShutdownReport::escalated`].
 ///
-/// # No string format
+/// # No rendered string format
 ///
-/// This is an accessor/variant type, not a rendered string — match on it (or read
+/// This is an accessor/variant type — match on it (or read
 /// [`ShutdownReport::attempted_signal`]) rather than parsing a `Debug`/`Display`
-/// form, which is not a stability contract.
+/// form, which is not a stability contract. Its **stable machine identifier**
+/// for machine-readable output is [`name`](Self::name), which *is* one.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoftSignal {
@@ -48,6 +52,83 @@ pub enum SoftSignal {
     /// Carries the [`Signal`] that could not be delivered. The teardown proceeded to
     /// its grace/escalation regardless.
     Failed(Signal),
+}
+
+impl SoftSignal {
+    /// This fate's **stable machine identifier** — a short, lowercase
+    /// `snake_case` string (`"sent"`, `"unsupported"`, `"failed"`), part of the
+    /// crate's compatibility surface.
+    ///
+    /// Use it for machine-readable output — a CLI's JSONL schema, a
+    /// cross-language binding, a structured log field — where a consumer needs
+    /// one canonical spelling per fate instead of hand-maintaining its own
+    /// mapping table. It is a *diagnostic* name — a stable **vocabulary**
+    /// rather than a frozen record schema — and the exact string the opt-in
+    /// `report-serde` feature serializes this fate as. It is held stable
+    /// either way: a **new** variant gets a **new**
+    /// identifier, and an existing identifier is **never renamed** without a
+    /// major release.
+    ///
+    /// This names the fate **only**; the [`Signal`] a
+    /// [`Sent`](Self::Sent)/[`Failed`](Self::Failed) attempt carries travels
+    /// separately (via [`ShutdownReport::attempted_signal`], or the variant's
+    /// own field). There is deliberately no `from_name` inverse — like
+    /// [`Outcome::name`](crate::Outcome::name), this is a fate the crate
+    /// *reports* after a teardown, never one supplied to it from outside.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never silently ship without a stable identifier.
+        match self {
+            SoftSignal::Sent(_) => "sent",
+            SoftSignal::Unsupported => "unsupported",
+            SoftSignal::Failed(_) => "failed",
+        }
+    }
+
+    /// The [`Signal`] this fate concerns — `Some` for both a delivered and a
+    /// failed attempt, `None` for [`Unsupported`](Self::Unsupported), where
+    /// nothing soft could be sent at all.
+    ///
+    /// The single source behind [`ShutdownReport::attempted_signal`] (and the
+    /// `report-serde` wire form), so the two can never disagree about which
+    /// attempt a fate describes.
+    pub(crate) fn signal(&self) -> Option<Signal> {
+        // Exhaustive (no `_` arm), same reasoning as `name`.
+        match self {
+            SoftSignal::Sent(signal) | SoftSignal::Failed(signal) => Some(*signal),
+            SoftSignal::Unsupported => None,
+        }
+    }
+}
+
+/// *(feature `report-serde`)* Serialized as a tagged object — the stable
+/// [`name()`](SoftSignal::name) identifier under `"kind"`, plus the [`Signal`]
+/// the fate concerns:
+///
+/// ```json
+/// {"kind": "sent",        "signal": "term"}
+/// {"kind": "failed",      "signal": "term"}
+/// {"kind": "unsupported", "signal": null}
+/// ```
+///
+/// The tag is the published identifier, not a serde-derived variant tag; the
+/// signal is `null` exactly where the platform had no soft tier to attempt one
+/// on, never a fabricated default. See [`Outcome`](crate::Outcome)'s impl for
+/// why this feature is `Serialize`-only.
+#[cfg(feature = "report-serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
+impl Serialize for SoftSignal {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("SoftSignal", 2)?;
+        state.serialize_field(crate::report_serde::KIND, self.name())?;
+        state.serialize_field("signal", &self.signal())?;
+        state.end()
+    }
 }
 
 /// The observed facts of one graceful group teardown, returned by
@@ -137,10 +218,7 @@ impl ShutdownReport {
     /// attempt (use [`soft_signal`](Self::soft_signal) to tell those apart), `None`
     /// only when nothing soft could be sent at all.
     pub fn attempted_signal(&self) -> Option<Signal> {
-        match self.soft_signal {
-            SoftSignal::Sent(signal) | SoftSignal::Failed(signal) => Some(signal),
-            SoftSignal::Unsupported => None,
-        }
+        self.soft_signal.signal()
     }
 
     /// How many members were alive **before** the soft signal, or `None` if the
@@ -184,5 +262,41 @@ impl ShutdownReport {
     /// test runtime it tracks virtual time.
     pub fn elapsed(&self) -> Duration {
         self.elapsed
+    }
+}
+
+/// *(feature `report-serde`)* The observed teardown facts, field for field:
+///
+/// ```json
+/// {
+///   "soft_signal": {"kind": "sent", "signal": "term"},
+///   "members_before": 3,
+///   "members_after": 0,
+///   "drained_within_grace": true,
+///   "escalated": false,
+///   "elapsed_secs": 0.118
+/// }
+/// ```
+///
+/// Every value comes from the accessor of the same name; the member counts stay
+/// `null` where the membership could not be read, never a fabricated `0` (the
+/// same honesty the accessors keep). `attempted_signal` is not a separate key —
+/// it is the `soft_signal` object's own `signal`. There is deliberately no
+/// `Deserialize` (see [`Outcome`](crate::Outcome)'s impl).
+#[cfg(feature = "report-serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
+impl Serialize for ShutdownReport {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("ShutdownReport", 6)?;
+        state.serialize_field("soft_signal", &self.soft_signal())?;
+        state.serialize_field("members_before", &self.members_before())?;
+        state.serialize_field("members_after", &self.members_after())?;
+        state.serialize_field("drained_within_grace", &self.drained_within_grace())?;
+        state.serialize_field("escalated", &self.escalated())?;
+        state.serialize_field("elapsed_secs", &crate::report_serde::secs(self.elapsed()))?;
+        state.end()
     }
 }

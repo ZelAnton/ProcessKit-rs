@@ -562,8 +562,10 @@ impl ErrorKind {
     /// Use it for machine-readable output — a CLI's JSONL schema, a
     /// cross-language binding, a structured log field — where a consumer needs
     /// one canonical spelling per kind instead of hand-maintaining its own
-    /// mapping table. It is a *diagnostic* name, **not** a wire/serialization
-    /// format, but it is held stable all the same: a **new** kind gets a **new**
+    /// mapping table. It is a *diagnostic* name — a stable **vocabulary**
+    /// rather than a frozen record schema — and the exact string the opt-in
+    /// `report-serde` feature serializes an `ErrorKind` as. It is held stable
+    /// either way: a **new** kind gets a **new**
     /// identifier, and an existing identifier is **never renamed** without a
     /// major release.
     ///
@@ -588,6 +590,30 @@ impl ErrorKind {
             #[cfg(feature = "limits")]
             ErrorKind::ResourceLimit => "resource_limit",
         }
+    }
+}
+
+/// *(feature `report-serde`)* Serialized as the bare stable
+/// [`name()`](ErrorKind::name) identifier — `"not_found"`,
+/// `"permission_denied"`, … — with no wrapping object, since the classification
+/// carries no payload beside it.
+///
+/// [`Error`] and [`ErrorReason`] themselves deliberately have **no** impl: their
+/// variants carry the captured stdout/stderr of the failing run and the `PATH`
+/// directories a lookup searched, none of which this feature puts on the wire
+/// (see [`ProcessResult`](crate::ProcessResult)'s impl for the rule). Report the
+/// coarse `kind`, and attach whatever bounded, redacted detail your own contract
+/// calls for from [`Error::diagnostic`] / the [`ErrorReason`] variant.
+#[cfg(feature = "report-serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
+impl serde::ser::Serialize for ErrorKind {
+    // `std::result::Result` spelled out: this module also defines the crate's
+    // single-parameter `Result` alias.
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        serializer.serialize_str(self.name())
     }
 }
 

@@ -7,6 +7,9 @@ use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+#[cfg(feature = "report-serde")]
+use serde::ser::{Serialize, SerializeStruct as _, Serializer};
+
 use crate::group::ProcessGroup;
 use crate::result::Outcome;
 
@@ -59,6 +62,37 @@ pub struct ProcessGroupStats {
     /// - **POSIX process-group / macOS, and the FreeBSD process reaper** — always
     ///   `None`; no kernel accumulator.
     pub peak_memory_bytes: Option<u64>,
+}
+
+/// *(feature `report-serde`)* The snapshot, field for field — a sampler tick as
+/// one report line:
+///
+/// ```json
+/// {"active_process_count": 3, "total_cpu_time_secs": 1.5, "peak_memory_bytes": 65536}
+/// ```
+///
+/// Both measurements stay `null` on a mechanism that keeps no whole-tree
+/// accounting (the POSIX process group and the FreeBSD reaper), never a
+/// plausible-looking `0` — the `Option`'s honesty carried onto the wire. The
+/// per-backend meaning of each number is unchanged and still documented on the
+/// fields themselves; a consumer comparing series across platforms must read
+/// those caveats, the wire form cannot make them comparable.
+#[cfg(feature = "report-serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
+impl Serialize for ProcessGroupStats {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("ProcessGroupStats", 3)?;
+        state.serialize_field("active_process_count", &self.active_process_count)?;
+        state.serialize_field(
+            "total_cpu_time_secs",
+            &crate::report_serde::secs_opt(self.total_cpu_time),
+        )?;
+        state.serialize_field("peak_memory_bytes", &self.peak_memory_bytes)?;
+        state.end()
+    }
 }
 
 /// The shared cadence-and-fuse engine behind both stats samplers.
@@ -370,6 +404,45 @@ impl RunProfile {
             peak_memory_bytes,
             samples,
         }
+    }
+}
+
+/// *(feature `report-serde`)* The run summary, field for field:
+///
+/// ```json
+/// {
+///   "outcome": {"kind": "exited", "code": 0, "signal": null},
+///   "duration_secs": 2.0,
+///   "cpu_time_secs": 1.0,
+///   "peak_memory_bytes": 4096,
+///   "samples": 8
+/// }
+/// ```
+///
+/// `cpu_time_secs` / `peak_memory_bytes` are `null` wherever the platform could
+/// not measure them or the run ended before the first sample landed — the same
+/// honest gap the `Option` fields carry. [`avg_cpu_cores`](Self::avg_cpu_cores)
+/// is deliberately **not** a key: it is arithmetic over two fields already
+/// here, and this schema reports facts rather than restating derivations (the
+/// one exception, `ProcessResult`'s `success`, exists because accepted-exit
+/// policy is the *crate's*, not the consumer's).
+#[cfg(feature = "report-serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
+impl Serialize for RunProfile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("RunProfile", 5)?;
+        state.serialize_field("outcome", &self.outcome)?;
+        state.serialize_field("duration_secs", &crate::report_serde::secs(self.duration))?;
+        state.serialize_field(
+            "cpu_time_secs",
+            &crate::report_serde::secs_opt(self.cpu_time),
+        )?;
+        state.serialize_field("peak_memory_bytes", &self.peak_memory_bytes)?;
+        state.serialize_field("samples", &self.samples)?;
+        state.end()
     }
 }
 

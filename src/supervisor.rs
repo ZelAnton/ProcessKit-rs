@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(feature = "report-serde")]
+use serde::ser::{Serialize, SerializeStruct as _, Serializer};
 use tokio::sync::{broadcast, oneshot};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::BroadcastStream;
@@ -328,8 +330,10 @@ impl StopReason {
     /// Use it for machine-readable output — a CLI's JSONL schema, a
     /// cross-language binding, a structured log field — where a consumer needs
     /// one canonical spelling per variant instead of hand-maintaining its own
-    /// mapping table. It is a *diagnostic* name, **not** a wire/serialization
-    /// format, but it is held stable all the same: a **new** variant gets a
+    /// mapping table. It is a *diagnostic* name — a stable **vocabulary**
+    /// rather than a frozen record schema — and the exact string the opt-in
+    /// `report-serde` feature serializes a stop reason as. It is held stable
+    /// either way: a **new** variant gets a
     /// **new** identifier, and an existing identifier is **never renamed**
     /// without a major release. [`from_name`](Self::from_name) parses it back.
     pub fn name(&self) -> &'static str {
@@ -362,6 +366,24 @@ impl StopReason {
             "stopped" => Some(StopReason::Stopped),
             _ => None,
         }
+    }
+}
+
+/// *(feature `report-serde`)* Serialized as the bare stable
+/// [`name()`](StopReason::name) identifier — `"policy_satisfied"`,
+/// `"restarts_exhausted"`, … — with no wrapping object, since the reason
+/// carries no payload beside it. [`from_name`](StopReason::from_name) parses
+/// the same string back.
+#[cfg(feature = "report-serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
+impl Serialize for StopReason {
+    // `std::result::Result` spelled out: this module's `Result` is the crate's
+    // single-parameter alias (`crate::error::Result`).
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.name())
     }
 }
 
@@ -447,6 +469,37 @@ impl SupervisionOutcome {
     }
 }
 
+/// *(feature `report-serde`)* The finished supervision, field for field:
+///
+/// ```json
+/// {
+///   "final_result": {"program": "worker", "outcome": {"kind": "exited", …}, …},
+///   "restarts": 2,
+///   "stopped": "restarts_exhausted",
+///   "storm_pauses": 0,
+///   "liveness_kills": 0
+/// }
+/// ```
+///
+/// `final_result` is a nested [`ProcessResult`] report, which — see that type's
+/// own impl — describes the last run without carrying its captured output.
+#[cfg(feature = "report-serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
+impl Serialize for SupervisionOutcome {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("SupervisionOutcome", 5)?;
+        state.serialize_field("final_result", &self.final_result)?;
+        state.serialize_field("restarts", &self.restarts)?;
+        state.serialize_field("stopped", &self.stopped)?;
+        state.serialize_field("storm_pauses", &self.storm_pauses)?;
+        state.serialize_field("liveness_kills", &self.liveness_kills)?;
+        state.end()
+    }
+}
+
 /// A consistent, point-in-time snapshot of a live [`SupervisionSession`]'s
 /// state — read atomically under the same lock the supervision loop publishes
 /// each change under, so every field agrees with the others (no torn read).
@@ -508,6 +561,48 @@ impl SupervisionStatus {
     #[must_use]
     pub fn started_at(&self) -> Option<SystemTime> {
         self.started_at
+    }
+}
+
+/// *(feature `report-serde`)* The live snapshot, field for field — a
+/// supervisor's `/status` line:
+///
+/// ```json
+/// {
+///   "active": true,
+///   "restarts": 1,
+///   "storm_paused": false,
+///   "pid": 4242,
+///   "started_at_unix_secs": 1785312000.25
+/// }
+/// ```
+///
+/// `active` / `storm_paused` are [`is_active`](Self::is_active) /
+/// [`is_storm_paused`](Self::is_storm_paused) — the `is_` prefix is a Rust
+/// naming convention, not part of the fact being reported. `pid` is `null`
+/// between incarnations or under a runner that exposes no live handle, and
+/// `started_at_unix_secs` is `null` when no incarnation is running (and, for
+/// completeness, for a start time a broken clock places before the Unix epoch —
+/// never a negative fabrication). The type's existing rule holds on the wire:
+/// only non-secret facts appear, never argv or environment values.
+#[cfg(feature = "report-serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
+impl Serialize for SupervisionStatus {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let started_at = self
+            .started_at()
+            .and_then(|started| started.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(crate::report_serde::secs);
+        let mut state = serializer.serialize_struct("SupervisionStatus", 5)?;
+        state.serialize_field("active", &self.is_active())?;
+        state.serialize_field("restarts", &self.restarts())?;
+        state.serialize_field("storm_paused", &self.is_storm_paused())?;
+        state.serialize_field("pid", &self.pid())?;
+        state.serialize_field("started_at_unix_secs", &started_at)?;
+        state.end()
     }
 }
 
@@ -609,6 +704,120 @@ impl SupervisionEvent {
             SupervisionEvent::Stopped { .. } => "stopped",
             SupervisionEvent::SupervisionFailed { .. } => "supervision_failed",
             SupervisionEvent::Lagged { .. } => "lagged",
+        }
+    }
+}
+
+/// *(feature `report-serde`)* Serialized as a tagged object — the stable
+/// [`name()`](SupervisionEvent::name) identifier under `"kind"`, then this
+/// event's own payload:
+///
+/// ```json
+/// {"kind": "incarnation_started",  "attempt": 1, "pid": 4242}
+/// {"kind": "incarnation_finished", "attempt": 1, "outcome": {"kind": "exited", "code": 1, "signal": null}, "duration_secs": 1.25, "success": false}
+/// {"kind": "incarnation_failed",   "attempt": 2, "error": "spawn"}
+/// {"kind": "restart_scheduled",    "restart": 1, "delay_secs": 0.5}
+/// {"kind": "storm_paused",         "pause": 1, "delay_secs": 30.0}
+/// {"kind": "health_check_failed",  "attempt": 3, "terminal": false}
+/// {"kind": "gave_up",              "attempt": 3}
+/// {"kind": "stopped",              "reason": "stopped"}
+/// {"kind": "supervision_failed",   "error": "other"}
+/// {"kind": "lagged",               "skipped": 7}
+/// ```
+///
+/// The tag is the identifier this crate already publishes, never a
+/// serde-derived variant tag; the nested `outcome` / `error` / `reason` values
+/// are likewise the identifiers of [`Outcome`], [`ErrorKind`](crate::ErrorKind)
+/// and [`StopReason`]. The payload keys differ per event — a stream of these is
+/// a tagged union, not a fixed row — so read `kind` first. What an event never
+/// carries is unchanged on the wire: no argv, no environment values, no
+/// captured output.
+#[cfg(feature = "report-serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
+impl Serialize for SupervisionEvent {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // One source for the tag: this event's own stable identifier.
+        let kind = self.name();
+        // Exhaustive (no `_` arm) though the enum is `#[non_exhaustive]`: within
+        // the defining crate a new variant is a compile error here, so it can
+        // never ship with its payload silently unserialized.
+        match self {
+            SupervisionEvent::IncarnationStarted { attempt, pid } => {
+                let mut state = serializer.serialize_struct("SupervisionEvent", 3)?;
+                state.serialize_field(crate::report_serde::KIND, kind)?;
+                state.serialize_field("attempt", attempt)?;
+                state.serialize_field("pid", pid)?;
+                state.end()
+            }
+            SupervisionEvent::IncarnationFinished {
+                attempt,
+                outcome,
+                duration,
+                success,
+            } => {
+                let mut state = serializer.serialize_struct("SupervisionEvent", 5)?;
+                state.serialize_field(crate::report_serde::KIND, kind)?;
+                state.serialize_field("attempt", attempt)?;
+                state.serialize_field("outcome", outcome)?;
+                state.serialize_field("duration_secs", &crate::report_serde::secs(*duration))?;
+                state.serialize_field("success", success)?;
+                state.end()
+            }
+            SupervisionEvent::IncarnationFailed { attempt, error } => {
+                let mut state = serializer.serialize_struct("SupervisionEvent", 3)?;
+                state.serialize_field(crate::report_serde::KIND, kind)?;
+                state.serialize_field("attempt", attempt)?;
+                state.serialize_field("error", error)?;
+                state.end()
+            }
+            SupervisionEvent::RestartScheduled { restart, delay } => {
+                let mut state = serializer.serialize_struct("SupervisionEvent", 3)?;
+                state.serialize_field(crate::report_serde::KIND, kind)?;
+                state.serialize_field("restart", restart)?;
+                state.serialize_field("delay_secs", &crate::report_serde::secs(*delay))?;
+                state.end()
+            }
+            SupervisionEvent::StormPaused { pause, delay } => {
+                let mut state = serializer.serialize_struct("SupervisionEvent", 3)?;
+                state.serialize_field(crate::report_serde::KIND, kind)?;
+                state.serialize_field("pause", pause)?;
+                state.serialize_field("delay_secs", &crate::report_serde::secs(*delay))?;
+                state.end()
+            }
+            SupervisionEvent::HealthCheckFailed { attempt, terminal } => {
+                let mut state = serializer.serialize_struct("SupervisionEvent", 3)?;
+                state.serialize_field(crate::report_serde::KIND, kind)?;
+                state.serialize_field("attempt", attempt)?;
+                state.serialize_field("terminal", terminal)?;
+                state.end()
+            }
+            SupervisionEvent::GaveUp { attempt } => {
+                let mut state = serializer.serialize_struct("SupervisionEvent", 2)?;
+                state.serialize_field(crate::report_serde::KIND, kind)?;
+                state.serialize_field("attempt", attempt)?;
+                state.end()
+            }
+            SupervisionEvent::Stopped { reason } => {
+                let mut state = serializer.serialize_struct("SupervisionEvent", 2)?;
+                state.serialize_field(crate::report_serde::KIND, kind)?;
+                state.serialize_field("reason", reason)?;
+                state.end()
+            }
+            SupervisionEvent::SupervisionFailed { error } => {
+                let mut state = serializer.serialize_struct("SupervisionEvent", 2)?;
+                state.serialize_field(crate::report_serde::KIND, kind)?;
+                state.serialize_field("error", error)?;
+                state.end()
+            }
+            SupervisionEvent::Lagged { skipped } => {
+                let mut state = serializer.serialize_struct("SupervisionEvent", 2)?;
+                state.serialize_field(crate::report_serde::KIND, kind)?;
+                state.serialize_field("skipped", skipped)?;
+                state.end()
+            }
         }
     }
 }
@@ -2581,6 +2790,44 @@ mod tests {
         assert_eq!(RestartPolicy::Always.name(), "always");
         assert_eq!(RestartPolicy::OnCrash.name(), "on_crash");
         assert_eq!(RestartPolicy::Never.name(), "never");
+    }
+
+    /// T-256: the live-status wire form. It lives here rather than beside the
+    /// other `report-serde` schema tests because `SupervisionStatus` has no
+    /// constructor outside this module — only a live session publishes one.
+    #[cfg(feature = "report-serde")]
+    #[test]
+    fn supervision_status_reports_the_live_snapshot() {
+        let started = SystemTime::UNIX_EPOCH + Duration::from_millis(1_785_312_000_250);
+        let status = SupervisionStatus {
+            active: true,
+            restarts: 2,
+            storm_paused: false,
+            pid: Some(4242),
+            started_at: Some(started),
+        };
+        let value: serde_json::Value =
+            serde_json::to_value(&status).expect("a SupervisionStatus serializes");
+        assert_eq!(value["active"], true);
+        assert_eq!(value["restarts"], 2);
+        assert_eq!(value["storm_paused"], false);
+        assert_eq!(value["pid"], 4242);
+        assert_eq!(value["started_at_unix_secs"], 1_785_312_000.25);
+
+        // Between incarnations there is no live child: `null`, never a `0` pid
+        // or a fabricated timestamp.
+        let idle = SupervisionStatus {
+            active: true,
+            restarts: 2,
+            storm_paused: true,
+            pid: None,
+            started_at: None,
+        };
+        let value: serde_json::Value =
+            serde_json::to_value(&idle).expect("a SupervisionStatus serializes");
+        assert_eq!(value["storm_paused"], true);
+        assert_eq!(value["pid"], serde_json::Value::Null);
+        assert_eq!(value["started_at_unix_secs"], serde_json::Value::Null);
     }
 
     #[test]

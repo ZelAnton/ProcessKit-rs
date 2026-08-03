@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use crate::{
     ErrorKind, LimitKind, LimitReason, LimitVerdict, LineTerminator, Mechanism, Outcome,
     OutputLine, OutputStream, OverflowMode, ParentDeathCleanup, Priority, ProcessEvent,
-    RestartPolicy, RlimitResource, Signal, SoftStopScope, StdioMode, StopReason, SupervisionEvent,
+    RestartPolicy, RlimitResource, Signal, SoftSignal, SoftStopScope, StdioMode, StopReason,
+    SupervisionEvent,
 };
 
 struct Variant {
@@ -333,6 +334,18 @@ fn dictionary() -> Vec<EnumSpec> {
                         error: ErrorKind::Other,
                     },
                     Lagged = SupervisionEvent::Lagged { skipped: 1 }
+                ]
+            ),
+            |value| value.name(),
+        ),
+        report_only(
+            "processkit::SoftSignal",
+            &curated!(
+                SoftSignal,
+                [
+                    Sent = SoftSignal::Sent(Signal::Term),
+                    Unsupported,
+                    Failed = SoftSignal::Failed(Signal::Term)
                 ]
             ),
             |value| value.name(),

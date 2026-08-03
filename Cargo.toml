@@ -245,6 +245,22 @@ record = ["dep:serde", "dep:serde_json"]
 # and live-handle seams. Shares serde + serde_json with `record`, but neither
 # feature implies the other.
 json = ["dep:serde", "dep:serde_json"]
+# `serde::Serialize` for the crate's *report* types — the run / teardown /
+# supervision / limit snapshots a consumer emits as a JSONL line or a structured
+# log field (`ProcessResult`, `RunProfile`, `ProcessGroupStats`,
+# `ShutdownReport`, `MemberInfo`, `LimitEvidence`, `SupervisionEvent` /
+# `SupervisionOutcome` / `SupervisionStatus`), with every enum tagged by the
+# stable `name()` identifier it already publishes rather than a serde-derived
+# variant tag. Deliberately `Serialize` only (these types are *reported*, never
+# supplied back — the same reason `Outcome`/`ErrorKind` ship no `from_name`),
+# and deliberately *not* named `serde`: `record` and `json` above already pull
+# that same optional dependency for other purposes, so the flag names the
+# surface it exposes, not the crate it pulls. Reuses the optional `serde`
+# already declared above — no new dependency, no version bump — and pulls **no**
+# JSON codec: the impls are format-agnostic (pick `serde_json`, `serde_yaml`, a
+# binary codec, … yourself). Off by default; with the feature off nothing but
+# the impls disappears, so it is purely additive.
+report-serde = ["dep:serde"]
 # Opt-in single-master-fd PTY launch mode (`Command::use_pty`): spawn the child
 # under a pseudo-terminal — `openpty` (Unix) / `CreatePseudoConsole` ConPTY
 # (Windows) — instead of three independent pipes, so tools that demand a
@@ -322,6 +338,15 @@ tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "time", "io
 # Auto-cleaned, parallel-safe temp files for the `record` cassette round-trip
 # tests (hand-rolled temp_dir paths leak and race under parallel test runs).
 tempfile = "3"
+# Drives the `report-serde` schema tests: serialize a report type, decode the
+# bytes back into a `serde_json::Value`, and assert each enum field carries its
+# stable `name()` identifier (and that no captured output / argv / env reaches
+# the wire). A dev-dependency rather than a `report-serde` implication because
+# the feature itself deliberately pulls no JSON codec — this way those tests
+# still compile and run under a plain `cargo test --features report-serde`.
+# Same crate and floor as the optional `serde_json` above, so the lockfile keeps
+# a single copy.
+serde_json = "1.0.100"
 # Property-based tests over the line pump + `encoding_rs` decoder
 # (`src/pump.rs`): generates arbitrary byte streams chunked at arbitrary read
 # boundaries to check line/byte counters and multibyte reassembly hold for

@@ -151,6 +151,8 @@ guarantee is unconditional in every configuration.
 | `tracing` | off | Events on the `processkit` target: spawn/exit, timeout & cancel firing, per-transition graceful teardown (`soft_signal` → `grace_started` → `drained`/`escalated`/`spared`), retries, supervisor storms, teardown anomalies (never argv/env) | `tracing` |
 | `metrics` | off | Counters/histograms over already-computed run data: run/spawn counters, run-duration histograms, an exit-code/timeout/cancel tally, retry/restart/storm events — into any `metrics` recorder you install (never argv/env). See [Observability](observability.md) | `metrics` |
 | `record` | off | `RecordReplayRunner` JSON cassettes over the runner seam | `serde`, `serde_json` |
+| `json` | off | Typed whole-output JSON verbs (`Command::output_json`, …) and line-wise NDJSON streaming (`RunningProcess::stdout_json_lines`), with bounded, location-rich parse diagnostics | `serde`, `serde_json` |
+| `report-serde` | off | `serde::Serialize` for the report types (`ProcessResult`, `RunProfile`, `ProcessGroupStats`, `ShutdownReport`, `MemberInfo`, `LimitEvidence`, supervision events/outcome/status), every enum tagged by its stable `name()` identifier. `Serialize` only, and never captured output/argv/env — see [Errors](errors.md#stable-machine-identifiers) | `serde` |
 | `pty` | off | Real pseudo-terminal launch mode (`openpty` on Unix, ConPTY on Windows), interactive master input, merged output, initial/live window sizing | `windows-sys/Win32_System_Pipes` (Windows) |
 
 ```toml

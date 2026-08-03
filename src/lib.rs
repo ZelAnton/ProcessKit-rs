@@ -77,15 +77,18 @@
 //! [`StdioMode`], [`LineTerminator`], [`OverflowMode`], [`Priority`],
 //! [`RestartPolicy`], plus the feature-gated `LimitKind` / `LimitReason` /
 //! `LimitVerdict`
-//! (`limits`) and `Signal` / `SoftStopScope` (`process-control`), given as bare
+//! (`limits`) and `Signal` / `SoftStopScope` / `SoftSignal`
+//! (`process-control`), given as bare
 //! names here since this crate-root doc also builds with those features off —
 //! each
 //! expose a `name()` that returns a short, lowercase `snake_case` identifier
 //! for machine-readable output (a CLI's JSONL schema, a cross-language binding,
 //! a structured log field), so a consumer publishing a contract over these
 //! types has one canonical spelling per variant instead of a hand-maintained
-//! table. These identifiers are a *diagnostic* surface, **not** a wire format,
-//! but they carry the same stability promise as the rest of the public API: a
+//! table. These identifiers are a *diagnostic* surface — a stable **vocabulary**
+//! rather than a frozen wire schema (see the `report-serde` feature below,
+//! which puts exactly these identifiers on the wire) — and they carry the same
+//! stability promise as the rest of the public API: a
 //! new variant gets a new identifier, and an existing identifier is never
 //! renamed without a major release. Every enum whose value can arrive from
 //! outside (config, CLI, another language) also has a `from_name(&str)` inverse
@@ -194,6 +197,51 @@
 //!   line-wise NDJSON through `RunningProcess::stdout_json_lines`. Parse
 //!   failures carry bounded raw fragments and exact decoded-output locations.
 //!   Pulls in `serde` + `serde_json`.
+//! - **`report-serde`** — `serde::Serialize` for the crate's *report* types, so
+//!   a finished run, a graceful teardown, a stats tick or a supervision event
+//!   can be emitted as one JSONL line (or any other serde format) without
+//!   hand-copying fields and hand-calling `name()` per enum: `ProcessResult`,
+//!   `RunProfile`, `ProcessGroupStats`, `ShutdownReport`, `MemberInfo`,
+//!   `LimitEvidence`, `SupervisionEvent` / `SupervisionOutcome` /
+//!   `SupervisionStatus`, and the enums those carry. Reuses the optional
+//!   `serde` dependency `record` / `json` already pull, and pulls **no** JSON
+//!   codec of its own — the impls are format-agnostic. Four rules define the
+//!   shape:
+//!
+//!   1. **Every enum travels as its stable `name()` identifier**, never a
+//!      serde-derived variant tag: `{"kind": "exited", "code": 0, "signal":
+//!      null}`, not `{"Exited": 0}`. An enum carrying a payload is an object
+//!      tagged under `"kind"`; one without is the bare identifier string
+//!      (`"restarts_exhausted"`). The wire vocabulary is therefore exactly the
+//!      dictionary described under *Stable machine identifiers* above — the
+//!      same one `spec/identifiers.json` publishes — never a second spelling.
+//!   2. **`Serialize` only — deliberately no `Deserialize`.** These types are
+//!      *reported* by the crate and never supplied back to it: the same
+//!      asymmetry that leaves `Outcome` / `ErrorKind` / `SupervisionEvent`
+//!      without a `from_name` inverse. Enums a caller genuinely does supply
+//!      (`Signal`, `RestartPolicy`, `Priority`, …) keep their `from_name`, so
+//!      the missing direction leaves no gap.
+//!   3. **Reports *about* processes — never what a process produced.** Nothing
+//!      here serializes captured stdout/stderr content, argv, or environment
+//!      values, the same secret hygiene the `tracing` and `metrics` seams keep
+//!      (a child's output routinely carries tokens, and a capture can be
+//!      multi-megabyte). `ProcessResult` reports the run — program name,
+//!      outcome, timings, truncation totals — and leaves the streams to the
+//!      caller, who already holds them. For the same reason `Error` /
+//!      `ErrorReason` (captured streams, the searched `PATH`), `ProcessEvent`
+//!      and `Finished` (captured output) deliberately have **no** impl: report
+//!      `ErrorKind` and attach whatever bounded, redacted detail your own
+//!      contract calls for.
+//!   4. **The set of fields is not frozen; the spelling of each field is.**
+//!      These types are `#[non_exhaustive]` precisely so a new fact can be
+//!      added in a minor release, and that stays true on the wire: a future
+//!      minor may add a key, so a consumer must ignore unknown ones (the same
+//!      discipline any JSONL reader already needs). What *is* held stable, like
+//!      the rest of the public API, is everything already there — an identifier
+//!      or a key is never renamed or repurposed without a major release. Time
+//!      is always a number of seconds (`duration_secs`, `elapsed_secs`,
+//!      `delay_secs`, …), the unit the `metrics` histograms record; a
+//!      measurement a platform cannot report is `null`, never a fabricated `0`.
 //!
 //! # Other languages
 //!
@@ -269,6 +317,11 @@ mod parent_death;
 mod pipeline;
 mod priority;
 mod pump;
+// Rules shared by the `report-serde` `Serialize` impls (the `"kind"` tag key,
+// the seconds time unit) plus their schema tests; the impls themselves live
+// beside the types they serialize.
+#[cfg(feature = "report-serde")]
+mod report_serde;
 mod result;
 mod retry;
 mod rlimit;

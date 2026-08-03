@@ -200,6 +200,15 @@
         { "variant": "SupervisionFailed", "identifier": "supervision_failed" },
         { "variant": "Lagged", "identifier": "lagged" }
       ]
+    },
+    {
+      "path": "processkit::SoftSignal",
+      "class": "report_only",
+      "variants": [
+        { "variant": "Sent", "identifier": "sent" },
+        { "variant": "Unsupported", "identifier": "unsupported" },
+        { "variant": "Failed", "identifier": "failed" }
+      ]
     }
   ]
 }

@@ -3,6 +3,9 @@
 use std::fmt;
 use std::time::Duration;
 
+#[cfg(feature = "report-serde")]
+use serde::ser::{Serialize, SerializeStruct as _, Serializer};
+
 use crate::error::{Error, ErrorReason};
 
 /// How a run ended — the explicit form of the `code()`/`timed_out()` pair.
@@ -112,8 +115,10 @@ impl Outcome {
     /// Use it for machine-readable output — a CLI's JSONL schema, a
     /// cross-language binding, a structured log field — where a consumer needs
     /// one canonical spelling per disposition instead of hand-maintaining its
-    /// own mapping table. It is a *diagnostic* name, **not** a wire format, but
-    /// it is held stable all the same: a **new** variant gets a **new**
+    /// own mapping table. It is a *diagnostic* name — a stable **vocabulary**
+    /// rather than a frozen record schema — and the exact string the opt-in
+    /// `report-serde` feature serializes this value as. It is held stable
+    /// either way: a **new** variant gets a **new**
     /// identifier, and an existing identifier is **never renamed** without a
     /// major release.
     ///
@@ -133,6 +138,41 @@ impl Outcome {
             Outcome::TimedOut => "timed_out",
             Outcome::InactivityTimedOut => "inactivity_timed_out",
         }
+    }
+}
+
+/// *(feature `report-serde`)* Serialized as a tagged object — the stable
+/// [`name()`](Self::name) identifier under `"kind"`, plus the payload that
+/// identifier deliberately does *not* carry:
+///
+/// ```json
+/// {"kind": "exited",   "code": 0,    "signal": null}
+/// {"kind": "signalled","code": null, "signal": 9}
+/// {"kind": "timed_out","code": null, "signal": null}
+/// ```
+///
+/// All three values come straight from the accessors of the same name
+/// ([`name`](Self::name) / [`code`](Self::code) / [`signal`](Self::signal)), so
+/// the wire spelling is the identifier this crate already publishes and can
+/// never drift from it — a serde-derived tag (`{"Exited": 0}`) would be a
+/// second, unpublished vocabulary. Both payload keys are always present, `null`
+/// where this disposition has none, so a consumer's field access never depends
+/// on which variant arrived. Serialization is deliberately one-way: there is no
+/// `Deserialize`, for the same reason there is no `from_name` inverse — the
+/// name alone cannot rebuild the payload, and an `Outcome` is always *reported*
+/// by the crate, never supplied to it.
+#[cfg(feature = "report-serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
+impl Serialize for Outcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("Outcome", 3)?;
+        state.serialize_field(crate::report_serde::KIND, self.name())?;
+        state.serialize_field("code", &self.code())?;
+        state.serialize_field("signal", &self.signal())?;
+        state.end()
     }
 }
 
@@ -584,6 +624,78 @@ impl<T> ProcessResult<T> {
             .with_truncated(truncated)
             .with_overflow_totals(total_lines, total_bytes)
             .with_ok_codes(ok_codes)
+    }
+}
+
+/// *(feature `report-serde`)* A **report of the run** — deliberately *not* the
+/// captured output:
+///
+/// ```json
+/// {
+///   "program": "git",
+///   "outcome": {"kind": "exited", "code": 1, "signal": null},
+///   "success": false,
+///   "duration_secs": 0.412,
+///   "configured_timeout_secs": 30.0,
+///   "truncated": false,
+///   "total_lines": 0,
+///   "total_bytes": 0,
+///   "ok_codes": [0]
+/// }
+/// ```
+///
+/// # The captured streams are not serialized
+///
+/// `stdout` and `stderr` are **never** written, on purpose, and that is why
+/// this impl carries no `T: Serialize` bound — the text and the raw-bytes
+/// payloads report identically:
+///
+/// - **Secret hygiene.** A child's output routinely carries tokens — the reason
+///   [`Command::capture_policy`](crate::Command::capture_policy) exists — and a
+///   report line pushed into a log pipeline is exactly where it must not land.
+///   The same rule the `tracing` and `metrics` seams keep for argv/env, and the
+///   reason [`Debug`](fmt::Debug) prints a bounded preview here rather than the
+///   whole capture.
+/// - **Bounded output.** A capture can be multi-megabyte; a diagnostic record
+///   should stay one line.
+/// - **Payload honesty.** `ProcessResult<Vec<u8>>` holds arbitrary bytes, which
+///   no text format can encode and which JSON would render as an array of
+///   integers — reporting *about* the capture instead keeps one meaningful
+///   shape for every payload type.
+///
+/// The caller already holds the streams ([`stdout`](Self::stdout) /
+/// [`stderr`](Self::stderr)) and can attach whatever bounded, redacted form
+/// their own contract calls for. What *is* reported about them is the
+/// crate-owned bookkeeping: [`truncated`](Self::truncated) and the
+/// [`total_lines`](Self::total_lines) / [`total_bytes`](Self::total_bytes)
+/// totals behind it.
+///
+/// `success` is [`is_success`](Self::is_success) — the crate's own
+/// accepted-exit policy (`ok_codes`), reported rather than left for a consumer
+/// to re-derive; `program` is the program *name* the error variants carry,
+/// never the argv. There is deliberately no `Deserialize` (see
+/// [`Outcome`]'s impl).
+#[cfg(feature = "report-serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
+impl<T> Serialize for ProcessResult<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("ProcessResult", 9)?;
+        state.serialize_field("program", self.program())?;
+        state.serialize_field("outcome", &self.outcome())?;
+        state.serialize_field("success", &self.is_success())?;
+        state.serialize_field("duration_secs", &crate::report_serde::secs(self.duration()))?;
+        state.serialize_field(
+            "configured_timeout_secs",
+            &crate::report_serde::secs_opt(self.configured_timeout()),
+        )?;
+        state.serialize_field("truncated", &self.truncated())?;
+        state.serialize_field("total_lines", &self.total_lines())?;
+        state.serialize_field("total_bytes", &self.total_bytes())?;
+        state.serialize_field("ok_codes", self.ok_codes())?;
+        state.end()
     }
 }
 

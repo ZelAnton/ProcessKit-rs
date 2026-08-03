@@ -198,17 +198,27 @@ change together.
 
 | Method | On | Direction |
 |---|---|---|
-| `name() -> &'static str` | `Mechanism`, `Outcome`, `ErrorKind`, `ParentDeathCleanup`, `SoftStopScope`, `StopReason`, `LimitKind`, `LimitReason`, `LimitVerdict`, `StdioMode`, `LineTerminator`, `OverflowMode`, `OutputStream`, `Priority`, `RestartPolicy`, `RlimitResource`, `ProcessEvent`, `SupervisionEvent` | A short, lowercase `snake_case` identifier for the variant. |
+| `name() -> &'static str` | `Mechanism`, `Outcome`, `ErrorKind`, `ParentDeathCleanup`, `SoftStopScope`, `SoftSignal`, `StopReason`, `LimitKind`, `LimitReason`, `LimitVerdict`, `StdioMode`, `LineTerminator`, `OverflowMode`, `OutputStream`, `Priority`, `RestartPolicy`, `RlimitResource`, `ProcessEvent`, `SupervisionEvent` | A short, lowercase `snake_case` identifier for the variant. |
 | `name() -> Option<&'static str>` | `Signal` | `Some(id)` for a curated signal; `None` for the raw-number `Signal::Other` (render its `i32` instead). |
-| `from_name(&str) -> Option<Self>` | every enum above **except** `Outcome`, `ErrorKind`, `ProcessEvent`, and `SupervisionEvent` — `LimitVerdict` included, so a recorded `tripped` / `not_tripped` / `unknown` parses back | Parse an identifier back into the value; `None` — not a default — for an unrecognized name. |
+| `from_name(&str) -> Option<Self>` | every enum above **except** `Outcome`, `ErrorKind`, `ProcessEvent`, `SupervisionEvent`, and `SoftSignal` — `LimitVerdict` included, so a recorded `tripped` / `not_tripped` / `unknown` parses back | Parse an identifier back into the value; `None` — not a default — for an unrecognized name. |
 
 The identifiers are a **compatibility surface**, held stable like the rest of
 the public API: a **new** variant gets a **new** identifier, and an existing
 identifier is **never renamed** without a major release. They are *diagnostic*
-names, deliberately **not** a wire/serialization format — there is no `serde`
-feature that serializes these enums (the string methods already remove the need
-to hand-write conversions, without committing the crate to a second serialized
-shape). `Mechanism` and `ParentDeathCleanup` use the spellings downstream tools
+names — a stable **vocabulary**, not a frozen record schema — and the opt-in
+`report-serde` feature puts that very vocabulary on the wire rather than
+minting a second one: it implements `serde::Serialize` for the crate's report
+types, and every enum in them serializes as its `name()`
+(`{"kind": "exited", "code": 0, "signal": null}`, never serde's derived
+`{"Exited": 0}`), so a consumer that adopted the dictionary and a consumer that
+serializes a report read the same strings. That feature is `Serialize`-only
+(these values are reported, never supplied back — see the four enums below), it
+never puts captured output, argv or environment values on the wire, and it
+promises the *spelling* of what it emits, not a frozen field set: the report
+types are `#[non_exhaustive]`, so a minor release may add a key — never rename
+one — and a consumer must ignore unknown keys. See the crate-root
+`report-serde` section for the full rules.
+`Mechanism` and `ParentDeathCleanup` use the spellings downstream tools
 already publish (`job_object`/`cgroup_v2`/`process_group`,
 `whole_tree`/`direct_child_only`/`none`), so adopting them needs no migration;
 the FreeBSD reaper mechanism adds `process_reaper` in the same shape.
@@ -236,8 +246,8 @@ assert_eq!(Priority::from_name("below_normal"), Some(Priority::BelowNormal));
 assert_eq!(Priority::from_name("turbo"), None);
 ```
 
-Four enums report a `name()` but take **no** `from_name`, because they are
-classifications or events the crate *reports* and never accepts back. `Outcome::name()`
+Five enums report a `name()` but take **no** `from_name`, because they are
+classifications, events or fates the crate *reports* and never accepts back. `Outcome::name()`
 reports the *disposition* only (`exited` / `signalled` / `timed_out`) — the name
 alone can't carry the exit code or signal number (read those from
 [`code()`](https://docs.rs/processkit/latest/processkit/struct.ProcessResult.html#method.code)
@@ -247,6 +257,10 @@ is the same: a total failure classification the crate hands you via
 the fuller payload from the [`ErrorReason`] variant when a name isn't enough.
 `ProcessEvent` and `SupervisionEvent` similarly identify lifecycle event kinds;
 their payloads carry the process output, outcome, timing, or supervision detail.
+`SoftSignal` (`process-control`) names which fate a graceful stop's best-effort
+soft-signal tier met — `sent` / `unsupported` / `failed` — an observation made
+*after* a teardown, never a request; the `Signal` it concerns travels separately
+(`ShutdownReport::attempted_signal`).
 `Signal::name()` returns `Option` because the `Other(i32)` escape hatch has no
 curated name (it still has a `from_name`).
 

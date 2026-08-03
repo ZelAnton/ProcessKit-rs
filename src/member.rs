@@ -1,6 +1,9 @@
 //! [`MemberInfo`] — an enriched, point-in-time snapshot of one process in a
 //! [`ProcessGroup`](crate::ProcessGroup)'s tree.
 
+#[cfg(feature = "report-serde")]
+use serde::ser::{Serialize, SerializeStruct as _, Serializer};
+
 /// An enriched snapshot of one member of a [`ProcessGroup`](crate::ProcessGroup)
 /// — its pid plus best-effort metadata (parent pid, image name, start time).
 ///
@@ -143,5 +146,38 @@ impl MemberInfo {
     ///   token there).
     pub fn start_time(&self) -> Option<u64> {
         self.start_time
+    }
+}
+
+/// *(feature `report-serde`)* The snapshot, field for field:
+///
+/// ```json
+/// {"pid": 4242, "ppid": 1, "exe_name": "worker", "start_time": 8407251}
+/// ```
+///
+/// Each enriching field is `null` exactly where the platform could not report
+/// it (see the field-availability matrix above) — never a fabricated value —
+/// and the type's **"No command line"** rule reaches the wire form unchanged:
+/// there is no argv/environment key here, on any platform, for the same reason
+/// the crate never logs one.
+///
+/// `start_time` is the opaque platform token described on
+/// [`start_time`](Self::start_time), serialized verbatim as the `u64` it is. On
+/// Windows that token is a `FILETIME` well above `2^53`, so read it as an exact
+/// integer (a JSON parser that decodes every number as a double will round it,
+/// and this is a field compared for *equality*).
+#[cfg(feature = "report-serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
+impl Serialize for MemberInfo {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("MemberInfo", 4)?;
+        state.serialize_field("pid", &self.pid())?;
+        state.serialize_field("ppid", &self.ppid())?;
+        state.serialize_field("exe_name", &self.exe_name())?;
+        state.serialize_field("start_time", &self.start_time())?;
+        state.end()
     }
 }

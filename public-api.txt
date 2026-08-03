@@ -215,6 +215,8 @@ impl core::fmt::Debug for processkit::ErrorKind
 pub fn processkit::ErrorKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for processkit::ErrorKind
 impl core::marker::StructuralPartialEq for processkit::ErrorKind
+impl serde_core::ser::Serialize for processkit::ErrorKind
+pub fn processkit::ErrorKind::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl core::marker::Freeze for processkit::ErrorKind
 impl core::marker::Send for processkit::ErrorKind
 impl core::marker::Sync for processkit::ErrorKind
@@ -407,6 +409,8 @@ impl core::fmt::Debug for processkit::LimitVerdict
 pub fn processkit::LimitVerdict::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for processkit::LimitVerdict
 impl core::marker::StructuralPartialEq for processkit::LimitVerdict
+impl serde_core::ser::Serialize for processkit::LimitVerdict
+pub fn processkit::LimitVerdict::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl core::marker::Freeze for processkit::LimitVerdict
 impl core::marker::Send for processkit::LimitVerdict
 impl core::marker::Sync for processkit::LimitVerdict
@@ -482,6 +486,8 @@ impl core::fmt::Debug for processkit::Outcome
 pub fn processkit::Outcome::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for processkit::Outcome
 impl core::marker::StructuralPartialEq for processkit::Outcome
+impl serde_core::ser::Serialize for processkit::Outcome
+pub fn processkit::Outcome::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl core::marker::Freeze for processkit::Outcome
 impl core::marker::Send for processkit::Outcome
 impl core::marker::Sync for processkit::Outcome
@@ -682,6 +688,8 @@ impl core::hash::Hash for processkit::Signal
 pub fn processkit::Signal::hash<__H: core::hash::Hasher>(&self, &mut __H)
 impl core::marker::Copy for processkit::Signal
 impl core::marker::StructuralPartialEq for processkit::Signal
+impl serde_core::ser::Serialize for processkit::Signal
+pub fn processkit::Signal::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl core::marker::Freeze for processkit::Signal
 impl core::marker::Send for processkit::Signal
 impl core::marker::Sync for processkit::Signal
@@ -693,6 +701,8 @@ impl core::panic::unwind_safe::UnwindSafe for processkit::Signal
 pub processkit::SoftSignal::Failed(processkit::Signal)
 pub processkit::SoftSignal::Sent(processkit::Signal)
 pub processkit::SoftSignal::Unsupported
+impl processkit::SoftSignal
+pub fn processkit::SoftSignal::name(&self) -> &'static str
 impl core::clone::Clone for processkit::SoftSignal
 pub fn processkit::SoftSignal::clone(&self) -> processkit::SoftSignal
 impl core::cmp::Eq for processkit::SoftSignal
@@ -702,6 +712,8 @@ impl core::fmt::Debug for processkit::SoftSignal
 pub fn processkit::SoftSignal::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for processkit::SoftSignal
 impl core::marker::StructuralPartialEq for processkit::SoftSignal
+impl serde_core::ser::Serialize for processkit::SoftSignal
+pub fn processkit::SoftSignal::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl core::marker::Freeze for processkit::SoftSignal
 impl core::marker::Send for processkit::SoftSignal
 impl core::marker::Sync for processkit::SoftSignal
@@ -776,6 +788,8 @@ impl core::fmt::Debug for processkit::StopReason
 pub fn processkit::StopReason::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for processkit::StopReason
 impl core::marker::StructuralPartialEq for processkit::StopReason
+impl serde_core::ser::Serialize for processkit::StopReason
+pub fn processkit::StopReason::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl core::marker::Freeze for processkit::StopReason
 impl core::marker::Send for processkit::StopReason
 impl core::marker::Sync for processkit::StopReason
@@ -822,6 +836,8 @@ pub fn processkit::SupervisionEvent::eq(&self, &processkit::SupervisionEvent) ->
 impl core::fmt::Debug for processkit::SupervisionEvent
 pub fn processkit::SupervisionEvent::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for processkit::SupervisionEvent
+impl serde_core::ser::Serialize for processkit::SupervisionEvent
+pub fn processkit::SupervisionEvent::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl core::marker::Freeze for processkit::SupervisionEvent
 impl core::marker::Send for processkit::SupervisionEvent
 impl core::marker::Sync for processkit::SupervisionEvent
@@ -1125,6 +1141,8 @@ impl core::fmt::Debug for processkit::LimitEvidence
 pub fn processkit::LimitEvidence::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for processkit::LimitEvidence
 impl core::marker::StructuralPartialEq for processkit::LimitEvidence
+impl serde_core::ser::Serialize for processkit::LimitEvidence
+pub fn processkit::LimitEvidence::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl core::marker::Freeze for processkit::LimitEvidence
 impl core::marker::Send for processkit::LimitEvidence
 impl core::marker::Sync for processkit::LimitEvidence
@@ -1146,6 +1164,8 @@ pub fn processkit::MemberInfo::eq(&self, &processkit::MemberInfo) -> bool
 impl core::fmt::Debug for processkit::MemberInfo
 pub fn processkit::MemberInfo::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for processkit::MemberInfo
+impl serde_core::ser::Serialize for processkit::MemberInfo
+pub fn processkit::MemberInfo::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl core::marker::Freeze for processkit::MemberInfo
 impl core::marker::Send for processkit::MemberInfo
 impl core::marker::Sync for processkit::MemberInfo
@@ -1371,6 +1391,8 @@ impl core::fmt::Debug for processkit::ProcessGroupStats
 pub fn processkit::ProcessGroupStats::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for processkit::ProcessGroupStats
 impl core::marker::StructuralPartialEq for processkit::ProcessGroupStats
+impl serde_core::ser::Serialize for processkit::ProcessGroupStats
+pub fn processkit::ProcessGroupStats::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl core::marker::Freeze for processkit::ProcessGroupStats
 impl core::marker::Send for processkit::ProcessGroupStats
 impl core::marker::Sync for processkit::ProcessGroupStats
@@ -1410,6 +1432,8 @@ pub fn processkit::ProcessResult<T>::clone(&self) -> processkit::ProcessResult<T
 impl<T: core::cmp::Eq> core::cmp::Eq for processkit::ProcessResult<T>
 impl<T: core::cmp::PartialEq> core::cmp::PartialEq for processkit::ProcessResult<T>
 pub fn processkit::ProcessResult<T>::eq(&self, &Self) -> bool
+impl<T> serde_core::ser::Serialize for processkit::ProcessResult<T>
+pub fn processkit::ProcessResult<T>::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl<T> core::marker::Freeze for processkit::ProcessResult<T> where T: core::marker::Freeze
 impl<T> core::marker::Send for processkit::ProcessResult<T> where T: core::marker::Send
 impl<T> core::marker::Sync for processkit::ProcessResult<T> where T: core::marker::Sync
@@ -1504,6 +1528,8 @@ impl core::fmt::Debug for processkit::RunProfile
 pub fn processkit::RunProfile::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for processkit::RunProfile
 impl core::marker::StructuralPartialEq for processkit::RunProfile
+impl serde_core::ser::Serialize for processkit::RunProfile
+pub fn processkit::RunProfile::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl core::marker::Freeze for processkit::RunProfile
 impl core::marker::Send for processkit::RunProfile
 impl core::marker::Sync for processkit::RunProfile
@@ -1576,6 +1602,8 @@ pub fn processkit::ShutdownReport::eq(&self, &processkit::ShutdownReport) -> boo
 impl core::fmt::Debug for processkit::ShutdownReport
 pub fn processkit::ShutdownReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for processkit::ShutdownReport
+impl serde_core::ser::Serialize for processkit::ShutdownReport
+pub fn processkit::ShutdownReport::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl core::marker::Freeze for processkit::ShutdownReport
 impl core::marker::Send for processkit::ShutdownReport
 impl core::marker::Sync for processkit::ShutdownReport
@@ -1656,6 +1684,8 @@ pub fn processkit::SupervisionOutcome::eq(&self, &processkit::SupervisionOutcome
 impl core::fmt::Debug for processkit::SupervisionOutcome
 pub fn processkit::SupervisionOutcome::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for processkit::SupervisionOutcome
+impl serde_core::ser::Serialize for processkit::SupervisionOutcome
+pub fn processkit::SupervisionOutcome::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl core::marker::Freeze for processkit::SupervisionOutcome
 impl core::marker::Send for processkit::SupervisionOutcome
 impl core::marker::Sync for processkit::SupervisionOutcome
@@ -1691,6 +1721,8 @@ impl core::clone::Clone for processkit::SupervisionStatus
 pub fn processkit::SupervisionStatus::clone(&self) -> processkit::SupervisionStatus
 impl core::fmt::Debug for processkit::SupervisionStatus
 pub fn processkit::SupervisionStatus::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for processkit::SupervisionStatus
+pub fn processkit::SupervisionStatus::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl core::marker::Freeze for processkit::SupervisionStatus
 impl core::marker::Send for processkit::SupervisionStatus
 impl core::marker::Sync for processkit::SupervisionStatus

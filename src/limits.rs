@@ -1,5 +1,8 @@
 //! Resource caps applied to a [`ProcessGroup`](crate::ProcessGroup).
 
+#[cfg(feature = "report-serde")]
+use serde::ser::{Serialize, SerializeStruct as _, Serializer};
+
 /// Resource limits enforced on a process group as a whole.
 ///
 /// Set these via [`ProcessGroupOptions`](crate::ProcessGroupOptions) (the
@@ -310,8 +313,10 @@ impl LimitVerdict {
     /// Use it for machine-readable output — a CLI's JSONL schema, a cross-language
     /// binding, a structured log field — where a consumer needs one canonical
     /// spelling per variant instead of hand-maintaining its own mapping table. It is
-    /// a *diagnostic* name, **not** a wire/serialization format, but it is held
-    /// stable all the same: a **new** variant gets a **new** identifier, and an
+    /// a *diagnostic* name — a stable **vocabulary** rather than a frozen record
+    /// schema — and the exact string the opt-in `report-serde` feature serializes a
+    /// verdict as (each axis of a [`LimitEvidence`] report). It is held
+    /// stable either way: a **new** variant gets a **new** identifier, and an
     /// existing identifier is **never renamed** without a major release.
     /// [`from_name`](Self::from_name) parses it back.
     pub fn name(&self) -> &'static str {
@@ -340,6 +345,23 @@ impl LimitVerdict {
             "unknown" => Some(LimitVerdict::Unknown),
             _ => None,
         }
+    }
+}
+
+/// *(feature `report-serde`)* Serialized as the bare stable
+/// [`name()`](LimitVerdict::name) identifier — `"tripped"`, `"not_tripped"`,
+/// `"unknown"` — with no wrapping object, since the verdict carries no payload
+/// beside it. [`from_name`](LimitVerdict::from_name) parses the same string
+/// back, so a recorded verdict round-trips through the identifier rather than
+/// through a `Deserialize` this feature deliberately does not ship.
+#[cfg(feature = "report-serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
+impl Serialize for LimitVerdict {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.name())
     }
 }
 
@@ -442,6 +464,33 @@ impl LimitEvidence {
             LimitKind::Processes => self.processes,
             LimitKind::Cpu => self.cpu,
         }
+    }
+}
+
+/// *(feature `report-serde`)* One verdict identifier per axis, keyed by the
+/// accessor of the same name:
+///
+/// ```json
+/// {"memory": "tripped", "processes": "not_tripped", "cpu": "unknown"}
+/// ```
+///
+/// Per axis deliberately, exactly as the type itself is: there is no
+/// whole-report "did anything trip?" key, because producing one would have to
+/// fold [`Unknown`](LimitVerdict::Unknown) ("no evidence") together with
+/// [`NotTripped`](LimitVerdict::NotTripped) ("evidence of no") — the very
+/// collapse this type exists to avoid.
+#[cfg(feature = "report-serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
+impl Serialize for LimitEvidence {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("LimitEvidence", 3)?;
+        state.serialize_field("memory", &self.memory())?;
+        state.serialize_field("processes", &self.processes())?;
+        state.serialize_field("cpu", &self.cpu())?;
+        state.end()
     }
 }
 

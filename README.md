@@ -271,6 +271,7 @@ guarantee is unconditional in every configuration.
 | `limits` | — | whole-tree resource caps (implies `stats`) |
 | `record` | — | record/replay cassettes (pulls `serde`) |
 | `json` | — | typed JSON capture and line-wise NDJSON streaming (pulls `serde`) |
+| `report-serde` | — | `serde::Serialize` for the report types (`ProcessResult`, `RunProfile`, `ProcessGroupStats`, `ShutdownReport`, `MemberInfo`, `LimitEvidence`, supervision events/outcome/status), each enum tagged by its stable `name()` identifier. `Serialize` only — no `Deserialize` — and never captured output/argv/env (pulls `serde`, no JSON codec) |
 | `mock` | — | `mockall`-generated `MockRunner` (test-only; its surface is semver-exempt — prefer `ScriptedRunner`/`RecordingRunner`) |
 | `tracing` | — | lifecycle events: spawn/exit, timeout/cancel, teardown, retries, storms (never argv/env) |
 | `metrics` | — | counters/histograms over already-computed run data: run/spawn counters, duration histograms, exit-code/timeout/cancel tally, retry/restart/storm events, into any `metrics` recorder (never argv/env) |

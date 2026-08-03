@@ -23,6 +23,12 @@ childs = "childs"
 # "look-alikes" (plural of "look-alike") is correct; `typos` only recognizes
 # the singular `alike`/`likes`.
 alikes = "alikes"
+# `ser` is serde's own module path (`serde_core::ser::Serializer`), which the
+# generated `public-api.txt` baseline records verbatim for every `report-serde`
+# `Serialize` impl; split at the `::`, the fragment reads as a misspelling of
+# `set`. Whitelisted rather than excluding the whole baseline from the spell
+# check — a typo in a real public identifier there is worth catching.
+ser = "ser"
 
 [default.extend-identifiers]
 # `cliff.toml`'s commit-parser regex `^[Rr]elease v?\d` is flagged because the

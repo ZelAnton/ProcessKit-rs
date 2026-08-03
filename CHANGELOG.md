@@ -13,6 +13,29 @@ to a dated version section.
 
 ### Added
 
+- Add an opt-in `report-serde` feature: `serde::Serialize` for the crate's
+  report types — `ProcessResult`, `RunProfile`, `ProcessGroupStats`,
+  `ShutdownReport`, `MemberInfo`, `LimitEvidence`, and
+  `SupervisionEvent`/`SupervisionOutcome`/`SupervisionStatus` — so a finished
+  run, a graceful teardown, a stats tick or a supervision event can be emitted
+  as one JSONL line without hand-copying fields. Every enum serializes as the
+  stable `name()` identifier it already publishes (`{"kind": "exited", "code":
+  0, "signal": null}`, never serde's derived `{"Exited": 0}`), so the wire
+  vocabulary *is* the documented dictionary. Deliberately `Serialize` only —
+  these values are reported, never supplied back, the same asymmetry that
+  leaves `Outcome`/`ErrorKind` without a `from_name` — and deliberately free of
+  captured stdout/stderr, argv and environment values, the same secret hygiene
+  the `tracing`/`metrics` seams keep. The report types stay
+  `#[non_exhaustive]`, so a later minor may add a key (never rename one) and a
+  consumer must ignore unknown keys. Reuses the optional `serde` dependency and
+  pulls no JSON codec of its own.
+
+- Add `SoftSignal::name()` — the stable machine identifier (`sent` /
+  `unsupported` / `failed`) for the fate of a graceful teardown's soft-signal
+  tier, now part of the published dictionary (`spec/identifiers.json`,
+  `docs/errors.md`). Report-only, so deliberately no `from_name` inverse,
+  mirroring `Outcome::name`/`ErrorKind::name`.
+
 - Add opt-in graceful cancellation: `Command::cancel_grace` and `cancel_signal`
   route a fired `cancel_on` token through the same soft-signal → grace →
   hard-kill ladder as `timeout_grace`/`timeout_signal`, on every cancellation
