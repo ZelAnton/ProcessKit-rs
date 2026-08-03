@@ -400,6 +400,61 @@ struct Entry {
     identity: Option<u64>,
 }
 
+/// Which POSIX primitive one sweep send uses: `killpg(2)` for a whole process
+/// group (the leader and every descendant) or `kill(2)` for a single pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalTarget {
+    Group,
+    Pid,
+}
+
+/// The single boundary every real signal **delivery** of the tracked sweep
+/// ([`Tracked::signal_all`]) passes through — the backend's one "actually send it"
+/// primitive.
+///
+/// Behaviorally it is the bare `killpg`/`kill` plus this backend's usual
+/// `-1`→[`io::Error::last_os_error`] conversion, so the caller reads the errno from
+/// the returned error instead of a separate `last_os_error()` read. Funnelling the
+/// sweep's three sends through one place is what lets a `cfg(test)` rule order a
+/// specific delivery to fail with a specific errno — the `EPERM` a live,
+/// uid-changed member raises is otherwise reachable only on a host built to have
+/// one. A faulted call never reaches the kernel, so such a test can also name a
+/// signal it must not actually deliver. See the `sys::fault_injection` module (test
+/// builds only, hence the bare reference — an intra-doc link to a `cfg(test)` item
+/// breaks the rustdoc build).
+///
+/// The existence **probes** ([`Tracked::probe_raw`]) deliberately stay raw: they are
+/// signal-`0` queries, not deliveries, and keeping them real means a fault-injected
+/// delivery test still exercises the genuine liveness/identity gate ahead of it.
+/// [`UntrackedChildGuard`]'s emergency `SIGKILL` stays raw for the same reason in
+/// reverse — it is the leak backstop for a child nothing else owns yet, so it must
+/// not be interposable at all.
+fn deliver_signal(id: i32, sig: i32, target: SignalTarget) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(injected) = crate::sys::fault_injection::check(
+        crate::sys::fault_injection::Site::PgroupSignalDelivery,
+        match target {
+            SignalTarget::Group => "killpg",
+            SignalTarget::Pid => "kill",
+        },
+    ) {
+        return Err(injected);
+    }
+    // SAFETY: killpg/kill to a probed-existing id; an exit between the probe and
+    // here just yields ESRCH, which the caller classifies.
+    let rc = unsafe {
+        match target {
+            SignalTarget::Group => libc::killpg(id, sig),
+            SignalTarget::Pid => libc::kill(id, sig),
+        }
+    };
+    if rc == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// One tracked id-set with its probe/signal primitives — either process
 /// **groups** (each id is a leader child's pid, probed and signalled
 /// negatively: `kill(-id, 0)` / `killpg`) or **solo** pids (adopted children
@@ -608,37 +663,27 @@ impl Tracked {
                 return false; // gone — forget it.
             }
             let id = e.id;
-            // SAFETY: killpg/kill to a probed-existing id; an exit between the
-            // probe and here just yields ESRCH and the sweep continues.
-            let delivery = unsafe {
-                if self.group {
-                    // killpg reaches the leader and every descendant. While the
-                    // group has never been seen alive (a forked-but-not-yet-
-                    // `setpgid`'d child), killpg yields ESRCH; fall back to a
-                    // direct pid signal so the entry drains. ONCE `group_seen`
-                    // latched (`probe_entry` set it above), an ESRCH means the
-                    // group is genuinely gone — do NOT direct-signal, or that
-                    // would SIGKILL a process that recycled the pid.
-                    if libc::killpg(id, sig) == -1 {
-                        let err = io::Error::last_os_error();
-                        if err.raw_os_error() == Some(libc::ESRCH) && !e.group_seen {
-                            // Direct-pid fallback: report its own failure, if any.
-                            if libc::kill(id, sig) == -1 {
-                                Some(io::Error::last_os_error())
-                            } else {
-                                None
-                            }
-                        } else {
-                            Some(err)
-                        }
-                    } else {
-                        None
+            // Every send goes through `deliver_signal` (the sweep's one delivery
+            // primitive); an exit between the probe and here just yields ESRCH and
+            // the sweep continues.
+            let delivery = if self.group {
+                // killpg reaches the leader and every descendant. While the
+                // group has never been seen alive (a forked-but-not-yet-
+                // `setpgid`'d child), killpg yields ESRCH; fall back to a
+                // direct pid signal so the entry drains. ONCE `group_seen`
+                // latched (`probe_entry` set it above), an ESRCH means the
+                // group is genuinely gone — do NOT direct-signal, or that
+                // would SIGKILL a process that recycled the pid.
+                match deliver_signal(id, sig, SignalTarget::Group) {
+                    Ok(()) => None,
+                    Err(err) if err.raw_os_error() == Some(libc::ESRCH) && !e.group_seen => {
+                        // Direct-pid fallback: report its own failure, if any.
+                        deliver_signal(id, sig, SignalTarget::Pid).err()
                     }
-                } else if libc::kill(id, sig) == -1 {
-                    Some(io::Error::last_os_error())
-                } else {
-                    None
+                    Err(err) => Some(err),
                 }
+            } else {
+                deliver_signal(id, sig, SignalTarget::Pid).err()
             };
             // Surface a real send failure — an `EINVAL` (a malformed request: a bad
             // signal number, which fails uniformly for every target) or an `EPERM`
@@ -1983,5 +2028,149 @@ mod tests {
         Tracked::new(false)
             .signal_all(BOGUS_SIGNAL)
             .expect("an empty solo set signals nothing either — still a no-op Ok");
+    }
+}
+
+/// Error paths of the tracked sweep's **delivery** primitive, driven with one
+/// `killpg`/`kill` made to fail on demand (`crate::sys::fault_injection`).
+///
+/// The scenario these exist for — a member that is genuinely alive and not a zombie
+/// yet rejects our signal (the `sudo`/setuid child that changed uid) — is the one
+/// case this backend must report rather than swallow, and the one that previously
+/// needed a privileged host to reproduce at all: every existing test of that
+/// discrimination either spawns a real child and settles for the *swallowed*
+/// direction, or is `#[ignore]`d behind a real subprocess.
+///
+/// The tracked member here is **this very process**, so the existence probe, the
+/// recycled-pid identity gate and the live/zombie classification of the `EPERM` all
+/// run for real against a real, live, identity-stable process; only the delivery
+/// itself is injected — and an injected delivery never reaches the kernel, which is
+/// what makes it safe to name `SIGSTOP` against our own pid.
+///
+/// Gated to the targets that *have* a run-state reader: on the BSDs
+/// `is_live_non_zombie` is always `false` by design, so a delivery `EPERM` keeps its
+/// documented swallowed behavior and there is no discrimination to exercise — the
+/// same gating shape the zombie-`EPERM` regression test uses.
+#[cfg(all(
+    test,
+    feature = "process-control",
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+))]
+mod delivery_error_paths {
+    use super::ProcessGroup;
+    use crate::sys::fault_injection::{Faults, Site};
+
+    const SITE: Site = Site::PgroupSignalDelivery;
+
+    /// Arm the faults, build a group whose only tracked member is this process, and
+    /// disarm its kill-on-drop backstop.
+    ///
+    /// Ordering is load-bearing twice over. The faults are armed **first** so they
+    /// are still armed when the group drops (locals drop in reverse order), and the
+    /// backstop is disarmed **before** anything can panic — between them, no path
+    /// out of these tests can deliver a real signal to this process's own group.
+    ///
+    /// For the same reason every rule passed here must name **no** target, so it
+    /// covers both delivery syscalls: a `killpg` that fails `ESRCH` falls back to a
+    /// direct `kill`, and a rule narrowed to `killpg` alone would let that fallback
+    /// send a real `SIGSTOP` to the test runner.
+    fn group_tracking_this_process(
+        faults: Faults,
+    ) -> (super::super::fault_injection::Armed, ProcessGroup) {
+        let armed = faults.arm();
+        let group = ProcessGroup::new();
+        let epoch = group.skip_drop_kill.begin_shutdown();
+        group.skip_drop_kill.request(epoch);
+        group
+            .groups
+            .track(std::process::id() as i32, /* group_seen */ false);
+        (armed, group)
+    }
+
+    /// A live, non-zombie member that refuses the broadcast is a genuine containment
+    /// gap: `suspend` must report it, not answer `Ok` for a tree it never froze.
+    #[test]
+    fn a_live_member_rejecting_the_broadcast_makes_suspend_fail() {
+        let (faults, group) =
+            group_tracking_this_process(Faults::new().fail_every(SITE, None, libc::EPERM));
+
+        let err = group
+            .suspend()
+            .expect_err("a live member that rejects SIGSTOP is a gap, not a success");
+
+        assert!(faults.fired(SITE) >= 1, "the delivery really was refused");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EPERM),
+            "the refusal reaches the caller as itself"
+        );
+
+        // What `ProcessGroup::suspend` publishes for it, through the same mapping
+        // the public verb applies.
+        let public = crate::group::map_unsupported(err, "suspend");
+        assert_eq!(
+            public.kind(),
+            crate::ErrorKind::PermissionDenied,
+            "a refused signal is a permission problem — never `Unsupported`, which \
+             would claim the mechanism cannot suspend at all"
+        );
+        match public.reason() {
+            crate::ErrorReason::Io(source) => assert_eq!(
+                source.raw_os_error(),
+                Some(libc::EPERM),
+                "the errno survives the public mapping"
+            ),
+            other => panic!("expected a plain Io failure, got {other:?}"),
+        }
+    }
+
+    /// `resume` is the twin of `suspend` and must be exactly as honest: the
+    /// concurrently-developed backend that quietly returned `Ok` from both is the
+    /// regression this pins.
+    #[test]
+    fn a_live_member_rejecting_the_broadcast_makes_resume_fail() {
+        let (faults, group) =
+            group_tracking_this_process(Faults::new().fail_every(SITE, None, libc::EPERM));
+
+        let err = group
+            .resume()
+            .expect_err("a live member that rejects SIGCONT is a gap, not a success");
+
+        assert!(faults.fired(SITE) >= 1);
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+    }
+
+    /// The fail-safe direction, and why the `EPERM` above cannot simply be surfaced
+    /// on errno alone: a member that has already exited (`ESRCH`) is **not** a
+    /// failure — a normal teardown of a drained tree must stay `Ok`.
+    #[test]
+    fn an_already_exited_member_keeps_the_broadcast_successful() {
+        let (faults, group) =
+            group_tracking_this_process(Faults::new().fail_every(SITE, None, libc::ESRCH));
+
+        group
+            .suspend()
+            .expect("a target that is already gone is nothing to report");
+
+        assert!(
+            faults.fired(SITE) >= 1,
+            "the delivery was attempted and refused — the Ok is the classification"
+        );
+    }
+
+    /// A malformed request (a bad signal number, `EINVAL`) surfaces whatever the
+    /// target's state is — the asymmetry with `EPERM`, which is only surfaced
+    /// against a positively live member.
+    #[test]
+    fn a_malformed_request_surfaces_regardless_of_the_targets_state() {
+        let (faults, group) =
+            group_tracking_this_process(Faults::new().fail_every(SITE, None, libc::EINVAL));
+
+        let err = group
+            .suspend()
+            .expect_err("a bad signal number is a malformed request, always reported");
+
+        assert!(faults.fired(SITE) >= 1);
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
     }
 }

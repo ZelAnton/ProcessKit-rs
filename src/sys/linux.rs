@@ -212,7 +212,7 @@ impl Job {
                 // Moving a pid into the cgroup is a single write to cgroup.procs;
                 // the kernel re-parents that process (its existing descendants are
                 // not retroactively pulled in — only future forks).
-                match std::fs::write(cg.path.join("cgroup.procs"), pid.to_string().as_bytes()) {
+                match cgroup_write(&cg.path.join("cgroup.procs"), pid.to_string().as_bytes()) {
                     Ok(()) => {
                         // A new killable member joined the cgroup — re-arm Drop's
                         // backstop so a prior graceful_shutdown(escalate=false)
@@ -624,6 +624,37 @@ pub(crate) fn detect_mechanism() -> Mechanism {
     }
 }
 
+/// The single boundary every cgroup interface-file write in this backend passes
+/// through — the one primitive by which this backend changes kernel state
+/// (`memory.max`, `pids.max`, `cpu.max`, `cgroup.procs`, `cgroup.freeze`,
+/// `cgroup.kill`, and the parent's `cgroup.subtree_control`).
+///
+/// Behaviorally it is exactly [`std::fs::write`]. Funnelling every write through one
+/// place is what lets a `cfg(test)` rule order the write of *one named* control file
+/// to fail with a specific errno: "the second of the three sequential limit writes
+/// fails" and "`cgroup.freeze` is rejected on a kernel that *has* the file" become
+/// deterministic unit tests instead of states only a delegated, restricted or
+/// otherwise degraded cgroup host produces. The target label is the file name.
+///
+/// Reads deliberately keep their existing `*_with(read: impl Fn(&Path) -> …)`
+/// closure seams ([`Cgroup::members_with`] and friends) — that is the right tool
+/// where the primitive is already a parameter. See the `sys::fault_injection`
+/// module (test builds only, hence the bare reference — an intra-doc link to a
+/// `cfg(test)` item breaks the rustdoc build) for why the write side needed a
+/// different one.
+fn cgroup_write(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(injected) = crate::sys::fault_injection::check(
+        crate::sys::fault_injection::Site::CgroupWrite,
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default(),
+    ) {
+        return Err(injected);
+    }
+    std::fs::write(path, contents)
+}
+
 struct Cgroup {
     path: PathBuf,
 }
@@ -717,13 +748,13 @@ impl Cgroup {
         // Some axes are written; the None-axis reset lives in `update_limits`.
         self.enable_controllers(parent, &needed_controllers(limits))?;
         if let Some(bytes) = limits.max_memory {
-            std::fs::write(self.path.join("memory.max"), bytes.to_string())?;
+            cgroup_write(&self.path.join("memory.max"), bytes.to_string())?;
         }
         if let Some(n) = limits.max_processes {
-            std::fs::write(self.path.join("pids.max"), n.to_string())?;
+            cgroup_write(&self.path.join("pids.max"), n.to_string())?;
         }
         if let Some(cores) = limits.cpu_quota {
-            std::fs::write(self.path.join("cpu.max"), cpu_max_value(cores))?;
+            cgroup_write(&self.path.join("cpu.max"), cpu_max_value(cores))?;
         }
         Ok(())
     }
@@ -895,7 +926,7 @@ impl Cgroup {
                 .collect::<Vec<_>>()
                 .join(" ");
             let file = parent.join("cgroup.subtree_control");
-            std::fs::write(&file, &spec).map_err(|e| {
+            cgroup_write(&file, &spec).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!(
@@ -1258,7 +1289,7 @@ impl Cgroup {
     #[cfg(feature = "process-control")]
     fn freeze(&self, frozen: bool) -> io::Result<()> {
         let val: &[u8] = if frozen { b"1" } else { b"0" };
-        match std::fs::write(self.path.join("cgroup.freeze"), val) {
+        match cgroup_write(&self.path.join("cgroup.freeze"), val) {
             Ok(()) => return Ok(()),
             // Only the file being ABSENT means "kernel < 5.2" → fall back to the
             // per-pid SIGSTOP/SIGCONT path. Any other error (EACCES/EBUSY on a
@@ -1294,7 +1325,7 @@ impl Cgroup {
         // attempting the sweep maximizes the chance of actually killing the tree,
         // and a truly un-killable tree is still reported by the drain check — there
         // is no silent degrade to document away.
-        if std::fs::write(self.path.join("cgroup.kill"), b"1").is_ok() {
+        if cgroup_write(&self.path.join("cgroup.kill"), b"1").is_ok() {
             return Ok(());
         }
         // Older kernels (no `cgroup.kill`): a per-pid SIGKILL sweep. First FREEZE
@@ -1341,7 +1372,7 @@ impl Cgroup {
         // like `Job::drop`'s. Revisit (route through `spawn_blocking`) if a
         // legacy/restricted-cgroup deployment reports worker-thread starvation
         // under load.
-        let _ = std::fs::write(self.path.join("cgroup.freeze"), b"1");
+        let _ = cgroup_write(&self.path.join("cgroup.freeze"), b"1");
         for _ in 0..50 {
             if let Ok(members) = self.members_with(&read) {
                 if members.is_empty() {
@@ -1365,7 +1396,7 @@ impl Cgroup {
         // SIGKILL'd-but-frozen straggler can run its pending fatal signal and exit.
         // (This unconditionally clears any freeze a prior `suspend()` set; a kill
         // verb resurrecting-then-killing a deliberately-suspended group is benign.)
-        let _ = std::fs::write(self.path.join("cgroup.freeze"), b"0");
+        let _ = cgroup_write(&self.path.join("cgroup.freeze"), b"0");
         // Report a real drain failure instead of a false success, so the caller
         // knows the tree may still be alive — a fork bomb still out-spawning, or
         // un-reapable zombies (a D-state task ignores SIGKILL until it unblocks).
@@ -1741,8 +1772,8 @@ fn needed_controllers(limits: &ResourceLimits) -> Vec<&'static str> {
 #[cfg(feature = "limits")]
 fn write_limit_reset(path: &Path, value: Option<String>) -> io::Result<()> {
     match value {
-        Some(v) => std::fs::write(path, v),
-        None if path.exists() => std::fs::write(path, "max"),
+        Some(v) => cgroup_write(path, v),
+        None if path.exists() => cgroup_write(path, "max"),
         None => Ok(()),
     }
 }
@@ -2406,6 +2437,177 @@ mod cgroup_read_seam_tests {
             reads.get(),
             2,
             "still exactly two reads for the whole batch"
+        );
+    }
+}
+
+/// Error paths of the cgroup **write** primitive — the side the `_with` read seams
+/// above cannot reach. Each test builds a real temporary directory shaped like a
+/// cgroup (so an unfaulted write genuinely lands and can be read back) and makes one
+/// named control file's write fail on demand via `crate::sys::fault_injection`. All
+/// of these states — a limit write rejected part-way through a sequence, a
+/// `cgroup.freeze` refused on a kernel that *has* the file — otherwise need a
+/// delegated, restricted or ancient cgroup host, which is why none of them had a
+/// regression test before.
+// Gated on the union of the features its cases need, so the module (and its
+// helpers) vanishes rather than sitting unused in a build that has neither.
+#[cfg(all(test, any(feature = "limits", feature = "process-control")))]
+mod cgroup_write_seam_tests {
+    use super::Cgroup;
+    use crate::sys::fault_injection::{Faults, Site};
+
+    const SITE: Site = Site::CgroupWrite;
+
+    /// A stand-in cgroup on a real temporary directory: the parent already
+    /// delegates every controller (so `enable_controllers` writes nothing and the
+    /// tests exercise only the limit writes), the three limit interface files exist
+    /// at their kernel default `max`, and `cgroup.procs` is present and empty so the
+    /// per-pid fallback paths have an honest, drained member list to read.
+    fn temp_cgroup() -> (tempfile::TempDir, Cgroup) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let parent = dir.path().join("parent");
+        let leaf = parent.join("leaf");
+        std::fs::create_dir_all(&leaf).expect("create the cgroup dirs");
+        std::fs::write(parent.join("cgroup.subtree_control"), "cpu memory pids\n")
+            .expect("seed the parent's delegated controllers");
+        for file in ["memory.max", "pids.max", "cpu.max"] {
+            std::fs::write(leaf.join(file), "max\n").expect("seed a limit interface file");
+        }
+        std::fs::write(leaf.join("cgroup.procs"), "").expect("seed an empty member list");
+        (dir, Cgroup { path: leaf })
+    }
+
+    /// Read a control file back to prove which writes actually landed.
+    #[cfg(feature = "limits")]
+    fn read(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).expect("read back a control file")
+    }
+
+    /// The limits are applied as three **sequential** writes, so a failure on the
+    /// second leaves the first already in force in the kernel and the third never
+    /// attempted. The failure must surface with its errno intact — reporting the
+    /// update as applied would hand back a group capped differently than asked.
+    #[cfg(feature = "limits")]
+    #[test]
+    fn a_rejected_limit_write_surfaces_and_leaves_the_later_axes_untouched() {
+        use crate::limits::{CappedAxes, ResourceLimits};
+        use crate::{ErrorKind, ErrorReason, LimitKind, LimitReason};
+
+        let (_dir, cgroup) = temp_cgroup();
+        let limits = ResourceLimits {
+            max_memory: Some(64 << 20),
+            max_processes: Some(16),
+            cpu_quota: Some(0.5),
+            ..ResourceLimits::default()
+        };
+
+        // `memory.max` (write 1) lands for real; `pids.max` (write 2) is rejected
+        // the way a restricted delegated cgroup rejects it.
+        let faults = Faults::new()
+            .fail_every(SITE, Some("pids.max"), libc::EIO)
+            .arm();
+
+        // Driven through the crate's own shared `update_limits` core — the exact
+        // classification `ProcessGroup::update_limits` applies — so this asserts the
+        // public error contract, not a hand-rolled equivalent of it.
+        let mut capped = CappedAxes::default();
+        let mut reflected = ResourceLimits::default();
+        let err = crate::group::update_limits_with(&mut capped, &mut reflected, limits, |limits| {
+            cgroup.update_limits(limits)
+        })
+        .expect_err("an EIO half-way through must not report the caps as applied");
+
+        assert_eq!(faults.fired(SITE), 1, "exactly one write was failed");
+        assert_eq!(err.kind(), ErrorKind::ResourceLimit);
+        match err.reason() {
+            ErrorReason::ResourceLimit {
+                kind,
+                reason,
+                detail,
+            } => {
+                assert_eq!(*kind, LimitKind::Memory, "the first requested axis");
+                assert_eq!(
+                    *reason,
+                    LimitReason::Unenforceable,
+                    "a cgroup exists and refused the write — not `Unsupported`"
+                );
+                assert!(
+                    detail.contains(&format!("os error {}", libc::EIO)),
+                    "the OS errno must reach the caller: {detail}"
+                );
+            }
+            other => panic!("expected a ResourceLimit failure, got {other:?}"),
+        }
+
+        // The partial application is real, and is exactly why `update_limits`
+        // records the capped axes before applying rather than after succeeding.
+        assert_eq!(
+            read(&cgroup.path.join("memory.max")),
+            (64u64 << 20).to_string(),
+            "the write before the failure really reached the kernel"
+        );
+        assert_eq!(
+            read(&cgroup.path.join("cpu.max")),
+            "max\n",
+            "the write after the failure was never attempted"
+        );
+    }
+
+    /// `freeze` may degrade to the per-pid `SIGSTOP`/`SIGCONT` sweep for exactly one
+    /// reason: the `cgroup.freeze` file is **absent** (kernel < 5.2). A write that is
+    /// *refused* — a restricted delegated cgroup, an I/O error — happens on a file
+    /// that exists, so it must surface instead of silently downgrading a suspend to
+    /// the racy per-pid path on a modern kernel.
+    #[cfg(feature = "process-control")]
+    #[test]
+    fn a_refused_cgroup_freeze_write_surfaces_instead_of_degrading() {
+        let (_dir, cgroup) = temp_cgroup();
+        let faults = Faults::new()
+            .fail_every(SITE, Some("cgroup.freeze"), libc::EACCES)
+            .arm();
+
+        let err = cgroup
+            .freeze(true)
+            .expect_err("a refused freeze on a modern kernel must not look like a suspend");
+
+        assert_eq!(faults.fired(SITE), 1);
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EACCES),
+            "the refusal reaches the caller as itself, not as some fallback's error"
+        );
+
+        // And what `ProcessGroup::suspend` publishes for it — the same mapping the
+        // public verb applies to its backend's `io::Error`.
+        let public = crate::group::map_unsupported(err, "suspend");
+        assert_eq!(
+            public.kind(),
+            crate::ErrorKind::PermissionDenied,
+            "an EACCES from the freeze write is a permission problem, never a \
+             silent success and never `Unsupported`"
+        );
+    }
+
+    /// The other half of that discrimination: an **absent** `cgroup.freeze` (the
+    /// pre-5.2 kernel case, `ENOENT`) is the one write failure that *may* fall back,
+    /// and it does — the empty member list then makes the per-pid sweep a trivially
+    /// successful no-op.
+    #[cfg(feature = "process-control")]
+    #[test]
+    fn an_absent_cgroup_freeze_file_falls_back_to_the_per_pid_sweep() {
+        let (_dir, cgroup) = temp_cgroup();
+        let faults = Faults::new()
+            .fail_every(SITE, Some("cgroup.freeze"), libc::ENOENT)
+            .arm();
+
+        cgroup
+            .freeze(true)
+            .expect("a missing cgroup.freeze falls back to the per-pid signal path");
+
+        assert_eq!(
+            faults.fired(SITE),
+            1,
+            "the freeze write was attempted first"
         );
     }
 }

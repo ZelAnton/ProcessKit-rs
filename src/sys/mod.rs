@@ -70,6 +70,14 @@ pub(crate) fn process_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
 mod skip_drop_kill;
 pub(crate) use skip_drop_kill::SkipDropKill;
 
+// Test-only fault injection at the OS-primitive boundary of the platform backends:
+// a unit test arms "this cgroup write / this Job Object info class / this signal
+// delivery fails with this errno" and asserts what the crate reports, without a
+// privileged or degraded host. Absent from every non-test build — see the module
+// doc for why this shape was chosen over a trait layer at the same boundary.
+#[cfg(test)]
+pub(crate) mod fault_injection;
+
 /// Per-process resource metrics sampled from the OS.
 #[cfg(feature = "stats")]
 #[derive(Debug, Clone, Copy, Default)]

@@ -1139,8 +1139,13 @@ fn program_name(cmd: &Command) -> String {
 /// passing every other IO failure through unchanged. Unambiguous here: on the
 /// signal/suspend/resume paths the only producer of `Unsupported` is the
 /// backends' own "this platform can't do that" reporting.
+///
+/// `pub(crate)` so a backend's own error-path unit test can assert what the crate
+/// *publicly* reports for an injected OS failure by running it through this exact
+/// mapping — the one the public verbs use — instead of re-deriving an equivalent of
+/// it in the test and pinning a lookalike.
 #[cfg(feature = "process-control")]
-fn map_unsupported(source: std::io::Error, operation: impl Into<String>) -> Error {
+pub(crate) fn map_unsupported(source: std::io::Error, operation: impl Into<String>) -> Error {
     if source.kind() == std::io::ErrorKind::Unsupported {
         ErrorReason::Unsupported {
             operation: operation.into(),
@@ -1209,8 +1214,13 @@ fn validate_limits(limits: &ResourceLimits) -> Result<()> {
 /// 3. **Reflect only on success.** The whole new set demonstrably did not take
 ///    effect, so updating the group's `Debug`-visible options would be the opposite
 ///    lie — claiming caps that may never have been written.
+///
+/// `pub(crate)` so a backend's own error-path unit test can drive a real backend
+/// call whose OS primitive was made to fail (see `crate::sys::fault_injection`)
+/// through the *same* classification `ProcessGroup::update_limits` applies, rather
+/// than re-deriving an equivalent mapping in the test and pinning a lookalike.
 #[cfg(feature = "limits")]
-fn update_limits_with(
+pub(crate) fn update_limits_with(
     capped: &mut CappedAxes,
     reflected: &mut ResourceLimits,
     limits: ResourceLimits,

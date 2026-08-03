@@ -32,7 +32,7 @@ use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::JobObjects::QueryInformationJobObject;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOBOBJECTINFOCLASS, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
 #[cfg(feature = "limits")]
@@ -140,6 +140,64 @@ pub(crate) struct Job {
 unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
+/// The fault-injection axis label of the extended-limit info class — the flags +
+/// memory/process caps written by `Job::new`, `update_limits` and `Drop`.
+const EXTENDED_LIMIT_AXIS: &str = "extended-limit";
+/// The fault-injection axis label of the CPU-rate-control info class — the separate
+/// info class carrying the CPU hard cap.
+#[cfg(feature = "limits")]
+const CPU_RATE_AXIS: &str = "cpu-rate";
+
+/// The single boundary every `SetInformationJobObject` call in this backend passes
+/// through — the Job Object's one "apply this limit/flag set" primitive.
+///
+/// Behaviorally it is the bare Win32 call plus the usual `BOOL`→[`io::Result`]
+/// conversion, with the buffer pointer and length *derived from `info`'s type* so no
+/// call site can pass a size that disagrees with what it hands over. `axis` names
+/// which info class is being written (see [`EXTENDED_LIMIT_AXIS`] /
+/// [`CPU_RATE_AXIS`]) solely so a `cfg(test)` rule can address one of them;
+/// production ignores it.
+///
+/// Funnelling all five call sites through here is also what makes "the second axis
+/// fails after the first one really applied" a deterministic unit test rather than a
+/// hand-built host — see the `sys::fault_injection` module (test builds only, hence
+/// the bare reference — an intra-doc link to a `cfg(test)` item breaks the rustdoc
+/// build) for why the seam has this shape.
+fn set_information_job_object<T>(
+    handle: HANDLE,
+    class: JOBOBJECTINFOCLASS,
+    info: &T,
+    axis: &'static str,
+) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(injected) = crate::sys::fault_injection::check(
+        crate::sys::fault_injection::Site::JobObjectSetInformation,
+        axis,
+    ) {
+        return Err(injected);
+    }
+    #[cfg(not(test))]
+    let _ = axis;
+    // SAFETY: `info` is a live, fully-initialised `T` and the length passed is
+    // exactly its size, so the kernel reads only initialised memory that stays
+    // valid for the duration of the call. Handing over a `T` that matches `class`
+    // is a domain invariant of the caller, not a memory-safety one — a mismatch is
+    // rejected by the OS (`ERROR_INVALID_PARAMETER`).
+    let ok = unsafe {
+        SetInformationJobObject(
+            handle,
+            class,
+            std::ptr::from_ref(info).cast(),
+            std::mem::size_of::<T>() as u32,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 impl Job {
     pub(crate) fn new(#[cfg(feature = "limits")] limits: &ResourceLimits) -> io::Result<Self> {
         // SAFETY: null name/attributes request an unnamed job with defaults.
@@ -172,20 +230,13 @@ impl Job {
                 info.BasicLimitInformation.ActiveProcessLimit = n;
             }
         }
-        // SAFETY: `info` is a fully-initialised struct matching the info class and
-        // its size is passed explicitly.
-        let ok = unsafe {
-            SetInformationJobObject(
-                job.handle,
-                JobObjectExtendedLimitInformation,
-                std::ptr::from_ref(&info).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if ok == 0 {
-            // `job` drops here, closing the handle — no leak.
-            return Err(io::Error::last_os_error());
-        }
+        // On failure `job` drops here, closing the handle — no leak.
+        set_information_job_object(
+            job.handle,
+            JobObjectExtendedLimitInformation,
+            &info,
+            EXTENDED_LIMIT_AXIS,
+        )?;
 
         // CPU quota is a separate info class. The hard cap is expressed in 1/100 of
         // a percent of *total* system CPU (1..=10000), so convert our per-core
@@ -198,19 +249,13 @@ impl Job {
             cpu.ControlFlags =
                 JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
             cpu.Anonymous.CpuRate = rate;
-            // SAFETY: fully-initialised struct matching the CPU-rate info class; size
-            // passed explicitly. `job` drops (closing the handle) on the error path.
-            let ok = unsafe {
-                SetInformationJobObject(
-                    job.handle,
-                    JobObjectCpuRateControlInformation,
-                    std::ptr::from_ref(&cpu).cast(),
-                    std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
-                )
-            };
-            if ok == 0 {
-                return Err(io::Error::last_os_error());
-            }
+            // `job` drops (closing the handle) on the error path.
+            set_information_job_object(
+                job.handle,
+                JobObjectCpuRateControlInformation,
+                &cpu,
+                CPU_RATE_AXIS,
+            )?;
         }
 
         Ok(job)
@@ -249,22 +294,15 @@ impl Job {
             info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
             info.BasicLimitInformation.ActiveProcessLimit = n;
         }
-        // SAFETY: `info` is a fully-initialised struct matching the info class and
-        // its size is passed explicitly. The handle is valid for the lifetime of
-        // self.
-        let ok = unsafe {
-            SetInformationJobObject(
-                self.handle,
-                JobObjectExtendedLimitInformation,
-                std::ptr::from_ref(&info).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if ok == 0 {
-            let err = io::Error::last_os_error();
+        if let Err(err) = set_information_job_object(
+            self.handle,
+            JobObjectExtendedLimitInformation,
+            &info,
+            EXTENDED_LIMIT_AXIS,
+        ) {
             return Err(io::Error::new(
                 err.kind(),
-                format!("extended-limit reissue: {err}"),
+                format!("{EXTENDED_LIMIT_AXIS} reissue: {err}"),
             ));
         }
 
@@ -279,19 +317,14 @@ impl Job {
                 JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
             cpu.Anonymous.CpuRate = cpu_hard_cap_rate(cores, cpus);
         }
-        // SAFETY: fully-initialised struct matching the CPU-rate info class; size
-        // passed explicitly. A zeroed struct (ControlFlags = 0) is the documented
-        // way to disable rate control.
-        let ok = unsafe {
-            SetInformationJobObject(
-                self.handle,
-                JobObjectCpuRateControlInformation,
-                std::ptr::from_ref(&cpu).cast(),
-                std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
-            )
-        };
-        if ok == 0 {
-            let err = io::Error::last_os_error();
+        // A zeroed struct (ControlFlags = 0) is the documented way to disable rate
+        // control.
+        if let Err(err) = set_information_job_object(
+            self.handle,
+            JobObjectCpuRateControlInformation,
+            &cpu,
+            CPU_RATE_AXIS,
+        ) {
             // Clearing a CPU cap (cpu_quota == None → ControlFlags = 0) on a job
             // that never had rate control enabled is rejected with
             // `ERROR_INVALID_PARAMETER` — there is nothing to disable. The desired
@@ -304,7 +337,7 @@ impl Job {
             if !benign_clear {
                 return Err(io::Error::new(
                     err.kind(),
-                    format!("cpu-rate reissue: {err}"),
+                    format!("{CPU_RATE_AXIS} reissue: {err}"),
                 ));
             }
         }
@@ -1846,14 +1879,12 @@ impl Drop for Job {
             let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
             // Best-effort: if clearing fails the handle close will still kill —
             // a safe fallback (unexpected kill is better than orphaning ambiguity).
-            let _ = unsafe {
-                SetInformationJobObject(
-                    self.handle,
-                    JobObjectExtendedLimitInformation,
-                    std::ptr::from_ref(&info).cast(),
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )
-            };
+            let _ = set_information_job_object(
+                self.handle,
+                JobObjectExtendedLimitInformation,
+                &info,
+                EXTENDED_LIMIT_AXIS,
+            );
             // The CPU hard cap lives in a SEPARATE info class, so zeroing the
             // extended-limit struct above does NOT lift it. Clear it too (zeroed
             // `ControlFlags` = disabled) or orphaned survivors stay CPU-throttled
@@ -1862,14 +1893,12 @@ impl Drop for Job {
             #[cfg(feature = "limits")]
             {
                 let cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
-                let _ = unsafe {
-                    SetInformationJobObject(
-                        self.handle,
-                        JobObjectCpuRateControlInformation,
-                        std::ptr::from_ref(&cpu).cast(),
-                        std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
-                    )
-                };
+                let _ = set_information_job_object(
+                    self.handle,
+                    JobObjectCpuRateControlInformation,
+                    &cpu,
+                    CPU_RATE_AXIS,
+                );
             }
         }
         // Closing the last handle triggers KILL_ON_JOB_CLOSE → the tree is reaped
@@ -1934,6 +1963,137 @@ mod thread_tests {
 
         // SAFETY: handle came from CreateJobObjectW; closed exactly once.
         unsafe { CloseHandle(job) };
+    }
+}
+
+// Error paths of the Job Object limit primitive, driven through the crate's own
+// public verbs with one `SetInformationJobObject` call made to fail on demand (see
+// `crate::sys::fault_injection`). Every case here is otherwise reachable only on a
+// host where the OS genuinely rejects one of the two info-class writes — which is
+// why none of them had a regression test before.
+#[cfg(all(test, feature = "limits"))]
+mod job_limit_error_paths {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+
+    use super::{CPU_RATE_AXIS, EXTENDED_LIMIT_AXIS};
+    use crate::sys::fault_injection::{Faults, Site};
+    use crate::{ErrorKind, ErrorReason, LimitKind, LimitReason, ProcessGroup, ResourceLimits};
+
+    const SITE: Site = Site::JobObjectSetInformation;
+
+    /// `update_limits` applies the caps as **two** info-class writes: the extended
+    /// limits (flags + memory/process caps) and then the separate CPU-rate class. A
+    /// rejection of the *second* — after the first has really been applied by the
+    /// kernel — must be reported, not swallowed because "most of it worked": the
+    /// group is left in a partially-applied state and the caller has to know.
+    #[test]
+    fn a_cpu_rate_rejection_after_the_extended_limit_axis_applied_is_reported() {
+        let mut group = ProcessGroup::new().expect("an uncapped Job Object group");
+
+        // Let call 1 (extended limits) reach the OS for real; fail call 2
+        // (CPU rate) the way a Job Object with a policy-restricted rate control
+        // would.
+        let faults = Faults::new()
+            .fail_from_nth(SITE, None, 2, ERROR_ACCESS_DENIED as i32)
+            .arm();
+
+        let err = group
+            .update_limits(ResourceLimits {
+                cpu_quota: Some(0.5),
+                ..ResourceLimits::default()
+            })
+            .expect_err("a rejected CPU-rate write must not report the caps as applied");
+
+        assert_eq!(
+            faults.matched(SITE),
+            2,
+            "both axes must be attempted — the first for real, the second faulted"
+        );
+        assert_eq!(faults.fired(SITE), 1, "exactly the second axis was failed");
+
+        // The public contract for a cap that a capable mechanism could not apply.
+        assert_eq!(err.kind(), ErrorKind::ResourceLimit);
+        match err.reason() {
+            ErrorReason::ResourceLimit {
+                kind,
+                reason,
+                detail,
+            } => {
+                assert_eq!(*kind, LimitKind::Cpu, "the only requested axis");
+                assert_eq!(
+                    *reason,
+                    LimitReason::Unenforceable,
+                    "a Job Object exists and refused the request — not `Unsupported`"
+                );
+                assert!(
+                    detail.contains(CPU_RATE_AXIS),
+                    "the detail must name which axis was rejected: {detail}"
+                );
+                assert!(
+                    !detail.contains(EXTENDED_LIMIT_AXIS),
+                    "the axis that succeeded must not be blamed: {detail}"
+                );
+            }
+            other => panic!("expected a ResourceLimit failure, got {other:?}"),
+        }
+    }
+
+    /// Clearing a CPU cap that was never enabled is rejected with
+    /// `ERROR_INVALID_PARAMETER` ("there is nothing to disable"), and `update_limits`
+    /// deliberately treats *that* as success. The allowance must stay narrow: the
+    /// same clear rejected for any other reason is a real failure. With no cap
+    /// requested it is a plain I/O error, not a limit-capability verdict.
+    #[test]
+    fn a_cpu_rate_clear_rejected_for_another_reason_still_fails() {
+        let mut group = ProcessGroup::new().expect("an uncapped Job Object group");
+        let faults = Faults::new()
+            .fail_every(SITE, Some(CPU_RATE_AXIS), ERROR_ACCESS_DENIED as i32)
+            .arm();
+
+        let err = group
+            .update_limits(ResourceLimits::default())
+            .expect_err("only ERROR_INVALID_PARAMETER is the benign 'nothing to disable' case");
+
+        assert_eq!(faults.fired(SITE), 1);
+        assert_eq!(
+            err.kind(),
+            ErrorKind::PermissionDenied,
+            "no cap was requested, so this is the OS refusal itself — not a \
+             ResourceLimit verdict"
+        );
+        match err.reason() {
+            ErrorReason::Io(source) => {
+                // `update_limits` re-wraps the OS failure to name the axis, which
+                // keeps `kind()` (asserted above) but not the raw errno — so the
+                // axis name is what the caller has to go on, and it must be there.
+                assert!(
+                    source.to_string().contains(CPU_RATE_AXIS),
+                    "the refusal must say which axis it was: {source}"
+                );
+            }
+            other => panic!("expected a plain Io failure, got {other:?}"),
+        }
+    }
+
+    /// The other half of that discrimination, and the one impossible to schedule
+    /// without this seam: the *documented* benign rejection really is waved through,
+    /// so lifting caps on a group that never carried a CPU cap succeeds.
+    #[test]
+    fn a_cpu_rate_clear_rejected_as_never_enabled_is_a_success() {
+        let mut group = ProcessGroup::new().expect("an uncapped Job Object group");
+        let faults = Faults::new()
+            .fail_every(SITE, Some(CPU_RATE_AXIS), ERROR_INVALID_PARAMETER as i32)
+            .arm();
+
+        group
+            .update_limits(ResourceLimits::default())
+            .expect("clearing a cap that was never enabled leaves the desired state in force");
+
+        assert_eq!(
+            faults.fired(SITE),
+            1,
+            "the clear really was rejected — the success is the crate's classification of it"
+        );
     }
 }
 
