@@ -89,6 +89,43 @@ struct FinishedLines {
     stderr_lines: Vec<String>,
 }
 
+/// The line sinks prepared before a pipeline moves its last stage into a task.
+/// Keeping these `Arc`s outside the task frame lets the chain-wide timeout
+/// salvage the prefix that the pump had retained when the task is cancelled.
+#[derive(Clone)]
+pub(crate) struct LineCapture {
+    stdout: Arc<SharedLines>,
+    stderr: Arc<SharedLines>,
+    stdout_config: StreamConfig,
+    stderr_config: StreamConfig,
+}
+
+impl LineCapture {
+    pub(crate) fn snapshot(&self) -> (String, String, bool, usize, usize) {
+        for (sink, config) in [
+            (&self.stdout, &self.stdout_config),
+            (&self.stderr, &self.stderr_config),
+        ] {
+            if let Some((tail, oversized)) = sink.take_partial_tail_for_capture() {
+                if oversized {
+                    sink.record_oversized_line();
+                } else {
+                    sink.push(config.shape_capture_line(tail));
+                }
+            }
+        }
+        let truncated = self.stdout.dropped() > 0 || self.stderr.dropped() > 0;
+        let total_lines = self.stdout.count().saturating_add(self.stderr.count());
+        let total_bytes = self
+            .stdout
+            .seen_bytes()
+            .saturating_add(self.stderr.seen_bytes());
+        let stdout = self.stdout.drain().join("\n");
+        let stderr = self.stderr.drain().join("\n");
+        (stdout, stderr, truncated, total_lines, total_bytes)
+    }
+}
+
 /// How [`RunningProcess::finish_lines`] treats the pumped lines.
 #[derive(Clone, Copy)]
 enum CaptureMode {
@@ -208,6 +245,10 @@ pub struct RunningProcess {
     ok_codes: Vec<i32>,
     stdout_sink: Option<Arc<SharedLines>>,
     stderr_sink: Option<Arc<SharedLines>>,
+    // Shared raw-capture state prepared by a pipeline before its last stage is
+    // moved into the capture task. The task takes this state at the start of
+    // `output_bytes`; the pipeline keeps a clone for timeout salvage.
+    raw_capture: Option<RawCapture>,
     // Joined before the overflow check so the last lines are visible.
     stdout_pump: Option<JoinHandle<()>>,
     stderr_pump: Option<JoinHandle<()>>,
@@ -471,6 +512,7 @@ impl RunningProcess {
             ok_codes: s.ok_codes,
             stdout_sink: None,
             stderr_sink: None,
+            raw_capture: None,
             stdout_pump: None,
             stderr_pump: None,
             stdin_error: None,
@@ -528,6 +570,7 @@ impl RunningProcess {
             ok_codes: s.ok_codes,
             stdout_sink: None,
             stderr_sink: None,
+            raw_capture: None,
             stdout_pump: None,
             stderr_pump: None,
             stdin_error: None,
@@ -898,6 +941,95 @@ impl RunningProcess {
         Err(crate::error::stdout_not_piped_error(&self.program))
     }
 
+    /// Prepare the line pumps before a caller moves this handle into a task.
+    ///
+    /// Pipeline capture needs the sinks to outlive that task: a chain-wide
+    /// timeout drops the task frame, but must still be able to return the lines
+    /// the pumps retained before the deadline.
+    pub(crate) fn prepare_line_capture(&mut self) -> Result<LineCapture> {
+        self.ensure_stdout_capturable()?;
+        let stdout_sink = self.stdout_sink.clone().unwrap_or_else(|| {
+            SharedLines::new_with_activity(&self.buffer, self.output_activity.clone())
+        });
+        let stderr_sink = self.stderr_sink.clone().unwrap_or_else(|| {
+            SharedLines::new_with_activity(&self.buffer, self.output_activity.clone())
+        });
+        self.spawn_line_pumps(&stdout_sink, &stderr_sink);
+        self.stdout_sink = Some(stdout_sink.clone());
+        self.stderr_sink = Some(stderr_sink.clone());
+        Ok(LineCapture {
+            stdout: stdout_sink,
+            stderr: stderr_sink,
+            stdout_config: self.stdout_config.clone(),
+            stderr_config: self.stderr_config.clone(),
+        })
+    }
+
+    /// Prepare raw stdout plus line-oriented stderr capture before a caller
+    /// moves this handle into a task. See [`Self::prepare_line_capture`] for
+    /// why the returned state must be independently owned by the caller.
+    pub(crate) fn prepare_raw_capture(&mut self) -> Result<RawCapture> {
+        if let Some(capture) = &self.raw_capture {
+            return Ok(capture.clone());
+        }
+        self.ensure_stdout_capturable()?;
+        if self.stdout_sink.is_some() || self.stderr_sink.is_some() {
+            return Err(Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "`{}`: output_bytes cannot follow a readiness or streaming call (stdout \
+                     was already consumed as decoded lines) — use output_string to collect the \
+                     unconsumed lines, or call output_bytes before line-oriented consumers",
+                    self.program
+                ),
+            )));
+        }
+
+        let stderr_sink =
+            SharedLines::new_with_activity(&self.buffer, self.output_activity.clone());
+        self.stderr_pump = self.backend.take_stderr_reader().map(|pipe| {
+            tokio::spawn(pump_lines_core(
+                pipe,
+                self.stderr_config.clone(),
+                stderr_sink.clone(),
+            ))
+        });
+        self.stderr_sink = Some(stderr_sink.clone());
+
+        let stdout_cap = self.buffer.max_bytes;
+        let stdout_mode = self.buffer.overflow;
+        let signals = RawStdoutSignals {
+            seen: Arc::new(AtomicUsize::new(0)),
+            overflowed: Arc::new(AtomicBool::new(false)),
+            truncated: Arc::new(AtomicBool::new(false)),
+            read_error: Arc::new(std::sync::Mutex::new(None)),
+        };
+        let stdout_pipe = self.backend.take_stdout_reader();
+        let out_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output_activity = self.output_activity.clone();
+        self.stdout_pump = stdout_pipe.map(|pipe| {
+            tokio::spawn(pump_raw_bytes(
+                pipe,
+                out_buf.clone(),
+                stdout_cap,
+                stdout_mode,
+                signals.clone(),
+                output_activity,
+            ))
+        });
+
+        let capture = RawCapture {
+            out_buf,
+            stderr_sink,
+            signals,
+            stdout_cap,
+            stdout_mode,
+            stderr_config: self.stderr_config.clone(),
+        };
+        self.raw_capture = Some(capture.clone());
+        Ok(capture)
+    }
+
     /// Fail loud if streaming is not possible: (a) stdout not piped, or
     /// (b) a prior readiness or streaming call already started its one line pump.
     fn ensure_stdout_streamable(&self) -> Result<()> {
@@ -1044,66 +1176,19 @@ impl RunningProcess {
     /// which happens only if a pump task previously panicked while holding it (a
     /// crate bug), never from any caller input.
     pub async fn output_bytes(mut self) -> Result<ProcessResult<Vec<u8>>> {
-        self.ensure_stdout_capturable()?;
-        if self.stdout_sink.is_some() || self.stderr_sink.is_some() {
-            return Err(Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "`{}`: output_bytes cannot follow a readiness or streaming call (stdout \
-                     was already consumed as decoded lines) — use output_string to collect the \
-                     unconsumed lines, or call output_bytes before line-oriented consumers",
-                    self.program
-                ),
-            )));
-        }
-        let stderr_sink =
-            SharedLines::new_with_activity(&self.buffer, self.output_activity.clone());
-        self.stderr_pump = self.backend.take_stderr_reader().map(|pipe| {
-            tokio::spawn(pump_lines_core(
-                pipe,
-                self.stderr_config.clone(),
-                stderr_sink.clone(),
-            ))
-        });
-        self.stderr_sink = Some(stderr_sink.clone());
-
-        // Read stdout raw, concurrently, so it never blocks the child. Bytes
-        // accumulate in a shared buffer (not the task's return value) so the
-        // bounded teardown below can salvage a partial read. Stored on `self` (not
-        // a frame-local) so a `drive_to_exit` error aborts it via `Drop` instead
-        // of leaving it to grow `out_buf` unboundedly on a shared-group handle.
-        //
-        // Honor the byte ceiling (`max_bytes`) on the raw stdout capture so a
-        // caller that set `with_max_bytes(..)` / `fail_loud(..).with_max_bytes(..)`
-        // is bounded rather than OOM'd by a flooding child; `max_lines` does not
-        // apply to a non-line stream. `None` cap keeps the exact old (unbounded)
-        // behavior. The signals are shared (not the task's return value) so the
-        // bounded teardown below can read them even if it has to abort the task.
-        let stdout_cap = self.buffer.max_bytes;
-        let stdout_mode = self.buffer.overflow;
-        // Shared signals the raw drain writes and the bounded teardown reads even if
-        // it has to abort the task — including the first non-broken-pipe OS read
-        // error, so an incomplete byte capture surfaces as `ErrorReason::Io` below rather
-        // than a silently-truncated `Ok(ProcessResult)` prefix.
-        let signals = RawStdoutSignals {
-            seen: Arc::new(AtomicUsize::new(0)),
-            overflowed: Arc::new(AtomicBool::new(false)),
-            truncated: Arc::new(AtomicBool::new(false)),
-            read_error: Arc::new(std::sync::Mutex::new(None)),
+        let capture = if let Some(capture) = self.raw_capture.take() {
+            capture
+        } else {
+            self.prepare_raw_capture()?
         };
-        let stdout_pipe = self.backend.take_stdout_reader();
-        let out_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let output_activity = self.output_activity.clone();
-        self.stdout_pump = stdout_pipe.map(|pipe| {
-            tokio::spawn(pump_raw_bytes(
-                pipe,
-                out_buf.clone(),
-                stdout_cap,
-                stdout_mode,
-                signals.clone(),
-                output_activity,
-            ))
-        });
+        let RawCapture {
+            out_buf,
+            stderr_sink,
+            signals,
+            stdout_cap,
+            stdout_mode,
+            ..
+        } = capture;
 
         let outcome = self.drive_to_exit().await?;
         self.observe_stdin_task().await;
@@ -2693,6 +2778,44 @@ struct RawStdoutSignals {
     truncated: Arc<AtomicBool>,
     /// The first non-broken-pipe OS read error, surfaced as [`ErrorReason::Io`].
     read_error: Arc<std::sync::Mutex<Option<std::io::Error>>>,
+}
+
+/// Shared state for a raw stdout capture and line-oriented stderr capture.
+/// The pipeline keeps a clone so a timeout can salvage the bytes that the raw
+/// pump had appended before the consuming task was dropped.
+#[derive(Clone)]
+pub(crate) struct RawCapture {
+    out_buf: Arc<std::sync::Mutex<Vec<u8>>>,
+    stderr_sink: Arc<SharedLines>,
+    stderr_config: StreamConfig,
+    signals: RawStdoutSignals,
+    stdout_cap: Option<usize>,
+    stdout_mode: OverflowMode,
+}
+
+impl RawCapture {
+    pub(crate) fn snapshot(&self) -> (Vec<u8>, String, bool, usize, usize) {
+        let mut stdout = self.out_buf.lock().expect("stdout buffer poisoned").clone();
+        clamp_dropoldest_tail(&mut stdout, self.stdout_cap, self.stdout_mode);
+        if let Some((tail, oversized)) = self.stderr_sink.take_partial_tail_for_capture() {
+            if oversized {
+                self.stderr_sink.record_oversized_line();
+            } else {
+                self.stderr_sink
+                    .push(self.stderr_config.shape_capture_line(tail));
+            }
+        }
+        let truncated =
+            self.signals.truncated.load(Ordering::Relaxed) || self.stderr_sink.dropped() > 0;
+        let total_lines = self.stderr_sink.count();
+        let total_bytes = self
+            .signals
+            .seen
+            .load(Ordering::Relaxed)
+            .saturating_add(self.stderr_sink.seen_bytes());
+        let stderr = self.stderr_sink.drain().join("\n");
+        (stdout, stderr, truncated, total_lines, total_bytes)
+    }
 }
 
 /// Drain a child's **raw** stdout bytes into `out_buf`, honoring the byte
