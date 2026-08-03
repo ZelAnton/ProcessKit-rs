@@ -263,8 +263,10 @@ async fn main() -> processkit::Result<()> {
 ```
 
 - **`Pipeline::timeout`** bounds the whole chain: at the deadline every
-  stage's sub-group is torn down and the result reports `timed_out` (no
-  partial stdout — unlike a single command's captured timeout).
+  stage's sub-group is torn down and the result reports `timed_out`. The
+  result keeps best-effort stdout and stderr already captured by the final
+  stage before teardown, subject to the same buffer/truncation policy as a
+  normal capture.
 - A **per-stage `Command::timeout`** kills that stage's *whole subtree* — its
   own sub-group, grandchildren of a forking `sh -c …` included, not just its
   direct child. Every stage is evaluated by the same pipefail rule (D14): a

@@ -24,7 +24,9 @@ use crate::command::Command;
 use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::result::{Outcome, ProcessResult};
-use crate::running::{Finished, ProcessEvents, RunningProcess, StdoutLines};
+use crate::running::{
+    Finished, LineCapture, ProcessEvents, RawCapture, RunningProcess, StdoutLines,
+};
 use crate::sync::atomic::{AtomicU8, Ordering};
 
 // Once a stage closes its output with a checked failure, downstream stages need
@@ -134,6 +136,73 @@ enum Joined<T> {
     Last(ProcessResult<T>, bool),
 }
 
+struct Captured<T> {
+    stdout: T,
+    stderr: String,
+    truncated: bool,
+    total_lines: usize,
+    total_bytes: usize,
+}
+
+trait PipelineCapture: Default + Send + Clone + 'static {
+    type Tracker: Clone;
+
+    fn prepare(process: &mut RunningProcess) -> Result<Self::Tracker>;
+    fn snapshot(tracker: &Self::Tracker) -> Captured<Self>;
+}
+
+impl PipelineCapture for String {
+    type Tracker = LineCapture;
+
+    fn prepare(process: &mut RunningProcess) -> Result<Self::Tracker> {
+        process.prepare_line_capture()
+    }
+
+    fn snapshot(tracker: &Self::Tracker) -> Captured<Self> {
+        let (stdout, stderr, truncated, total_lines, total_bytes) = tracker.snapshot();
+        Captured {
+            stdout,
+            stderr,
+            truncated,
+            total_lines,
+            total_bytes,
+        }
+    }
+}
+
+impl PipelineCapture for Vec<u8> {
+    type Tracker = RawCapture;
+
+    fn prepare(process: &mut RunningProcess) -> Result<Self::Tracker> {
+        process.prepare_raw_capture()
+    }
+
+    fn snapshot(tracker: &Self::Tracker) -> Captured<Self> {
+        let (stdout, stderr, truncated, total_lines, total_bytes) = tracker.snapshot();
+        Captured {
+            stdout,
+            stderr,
+            truncated,
+            total_lines,
+            total_bytes,
+        }
+    }
+}
+
+fn captured_result<T>(result: ProcessResult<T>) -> Captured<T> {
+    let stderr = result.stderr().to_owned();
+    let truncated = result.truncated();
+    let total_lines = result.total_lines();
+    let total_bytes = result.total_bytes();
+    Captured {
+        stdout: result.into_stdout(),
+        stderr,
+        truncated,
+        total_lines,
+        total_bytes,
+    }
+}
+
 /// A launched chain, before the last stage is split off — the shared product of
 /// [`Pipeline::launch`], consumed by the buffering [`capture`](Pipeline::capture)
 /// path and the streaming [`start`](Pipeline::start) path alike. Holding it keeps
@@ -179,9 +248,9 @@ impl Pipeline {
     }
 
     /// Kill the **whole chain** if it exceeds `timeout` (every stage's sub-group
-    /// is torn down; the result reports `timed_out`). Unlike a single
-    /// [`Command::timeout`] capture, no partial stdout is reported for a
-    /// timed-out chain.
+    /// is torn down; the result reports `timed_out`). The result keeps the
+    /// best-effort stdout and stderr already captured by the last stage before
+    /// the deadline, using the same buffer policy as a normal capture.
     ///
     /// This is the chain-wide backstop. A **per-stage** [`Command::timeout`] now
     /// also bounds a forking stage on its own: each stage runs in its own
@@ -462,6 +531,8 @@ impl Pipeline {
     /// failing stage is **not** an `Err` here — it is reported in the result
     /// (pipefail attribution, see the type docs); `Err` means a stage could not
     /// be started or driven at all.
+    /// A chain-wide timeout is likewise captured in the result and retains the
+    /// best-effort stdout and stderr already read before teardown.
     ///
     /// # Errors
     ///
@@ -500,7 +571,7 @@ impl Pipeline {
     /// outcome. `capture_last` decides how the last stage's stdout is captured.
     async fn capture<T, C, F>(&self, capture_last: C) -> Result<ProcessResult<T>>
     where
-        T: Default + Send + 'static,
+        T: PipelineCapture,
         C: FnOnce(crate::running::RunningProcess) -> F,
         F: std::future::Future<Output = Result<ProcessResult<T>>> + Send + 'static,
     {
@@ -527,13 +598,19 @@ impl Pipeline {
         let teardown = tokio_util::sync::CancellationToken::new();
 
         // Drain concurrently: a stderr-chatty inner stage must not block on a full pipe.
-        let (last, last_unchecked) = running.pop().expect("a pipeline has at least two stages");
+        let (mut last, last_unchecked) = running.pop().expect("a pipeline has at least two stages");
         let last_stage = self
             .stages
             .last()
             .expect("a pipeline has at least two stages");
         let last_ok_codes = last_stage.ok_codes_vec();
         let last_timeout = last_stage.configured_timeout();
+        // Prepare the last stage's capture before moving it into a task. The
+        // tracker remains in this future's frame, so a chain-wide timeout can
+        // salvage its retained prefix after the task is dropped.
+        let capture = T::prepare(&mut last)?;
+        let completed: Arc<std::sync::Mutex<Option<ProcessResult<T>>>> =
+            Arc::new(std::sync::Mutex::new(None));
         // Drive every stage's task through one `JoinSet`, drained by
         // `drain_unordered` below: a stage's raw `Err` (`Cancelled` / `Stdin` /
         // `Io` / `OutputTooLarge`) or a task panic never reaches the
@@ -569,8 +646,10 @@ impl Pipeline {
         {
             let teardown = teardown.clone();
             let last_ok_codes = last_ok_codes.clone();
+            let completed = completed.clone();
             tasks.spawn(async move {
                 let result = last_future.await?;
+                *completed.lock().expect("pipeline capture result poisoned") = Some(result.clone());
                 // The last stage triggers teardown too (a failing last stage should
                 // not wait on a quiet upstream either); torn if a sibling already did.
                 let torn_down = teardown.is_cancelled();
@@ -629,20 +708,34 @@ impl Pipeline {
             Some(limit) => match tokio::time::timeout(limit, collect).await {
                 Ok(collected) => collected?,
                 Err(_elapsed) => {
-                    // Kill every stage's subtree; `tasks` was moved into `gather`
-                    // (via `drain_unordered`), which `collect` (and so this
-                    // `tokio::time::timeout`) just dropped — the `JoinSet`'s own
-                    // drop aborts every drain task still in flight, the same
-                    // guarantee the old explicit abort-on-drop guard gave.
+                    // `collect` was dropped with the timeout future, so the
+                    // `JoinSet` aborted the capture tasks. The last stage's
+                    // tracker is deliberately outside that task frame and still
+                    // contains the best-effort data read before cancellation.
                     kill_all_stage_groups(&stage_groups);
+                    let captured = completed
+                        .lock()
+                        .expect("pipeline capture result poisoned")
+                        .take()
+                        .map(captured_result)
+                        .unwrap_or_else(|| T::snapshot(&capture));
+                    let Captured {
+                        stdout,
+                        stderr,
+                        truncated,
+                        total_lines,
+                        total_bytes,
+                    } = captured;
                     return Ok(ProcessResult::new(
                         self.pipeline_name(),
-                        T::default(),
-                        String::new(),
+                        stdout,
+                        stderr,
                         Outcome::TimedOut,
                         Some(limit),
                     )
-                    .with_duration(started.elapsed()));
+                    .with_duration(started.elapsed())
+                    .with_truncated(truncated)
+                    .with_overflow_totals(total_lines, total_bytes));
                 }
             },
         };

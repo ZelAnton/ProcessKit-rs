@@ -520,6 +520,7 @@ impl RunningProcess {
             ok_codes: command.ok_codes_vec(),
             stdout_sink: None,
             stderr_sink: None,
+            raw_capture: None,
             stdout_pump: None,
             stderr_pump: None,
             stdin_error: None,

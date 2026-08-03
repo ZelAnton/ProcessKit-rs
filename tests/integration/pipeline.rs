@@ -469,6 +469,44 @@ async fn pipeline_timeout_kills_the_whole_chain() {
     );
 }
 
+#[tokio::test]
+#[ignore = "spawns a real pipeline that emits diagnostics before a chain-wide timeout"]
+async fn pipeline_timeout_keeps_output_read_before_the_deadline() {
+    let producer = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo input"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'input\\n'"])
+    };
+    let partial_then_idle = if cfg!(windows) {
+        Command::new("powershell").args([
+            "-NoProfile",
+            "-Command",
+            "[Console]::Out.WriteLine('partial-stdout'); [Console]::Error.WriteLine('partial-stderr'); Start-Sleep -Seconds 30",
+        ])
+    } else {
+        Command::new("sh").args([
+            "-c",
+            "printf 'partial-stdout\\n'; printf 'partial-stderr\\n' >&2; sleep 30",
+        ])
+    };
+
+    let result = producer
+        .pipe(partial_then_idle)
+        .timeout(Duration::from_secs(2))
+        .output_string()
+        .await
+        .expect("a timed-out pipeline still reports a result");
+
+    assert!(result.timed_out(), "result: {result:?}");
+    assert_eq!(result.stdout(), "partial-stdout", "result: {result:?}");
+    assert_eq!(result.stderr(), "partial-stderr", "result: {result:?}");
+    assert_eq!(result.configured_timeout(), Some(Duration::from_secs(2)));
+    assert!(
+        result.duration() > Duration::ZERO,
+        "chain timeout must retain its measured duration: {result:?}"
+    );
+}
+
 /// Whether a process with `pid` is still alive (Unix `kill(pid, 0)` probe:
 /// succeeds while it lives or is an unreaped zombie, fails `ESRCH` once gone).
 #[cfg(unix)]
