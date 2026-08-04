@@ -403,7 +403,7 @@ jobs:
       # docs.rs or the published mdBook site; lychee above only checks that
       # links resolve, it doesn't check spelling. Config/allow-list lives in
       # `_typos.toml`; `just typos` runs the same check locally.
-      - uses: crate-ci/typos@v1
+      - uses: crate-ci/typos@v1.48.0
 
   linkcheck:
     name: markdown links (lychee)
