@@ -646,6 +646,84 @@ impl Reaper {
         self.lock_roots().items.retain(|item| *item != root);
     }
 
+    /// `SIGKILL` everything under one root — the containment-scoped teardown a
+    /// failed PTY setup rolls back with, i.e. [`signal_tree`](Self::signal_tree)'s
+    /// `PROC_REAP_KILL`/[`REAPER_KILL_SUBTREE`] delivery aimed at a single subtree
+    /// instead of every root this job owns (a failed spawn must not touch the rest
+    /// of the job).
+    ///
+    /// This is what makes the rollback's reach the mechanism's maximum rather than
+    /// `killpg`'s: a descendant that forked and called `setsid` inside the setup
+    /// window has left the process group but not the reaper's subtree, and the
+    /// kernel walks it here.
+    ///
+    /// # A root that is already dead, and why nothing is forgotten afterwards
+    ///
+    /// The rollback runs because the *master wiring* failed, not because the child
+    /// misbehaved, so nothing guarantees the child is still alive when it runs: if
+    /// it exited on its own first, this call aims at a zombie root (its number
+    /// pinned by the un-reaped `Child` the guard still owns). That does **not**
+    /// narrow the walk. A subtree is not looked up through its root process — the
+    /// kernel tags every descendant with the pid of the reaper's direct child that
+    /// began its subtree (`p_reapsubtree`), a tag that outlives the root: an orphan
+    /// simply re-parents onto this process, *its reaper*, carrying the tag with it.
+    /// This is executed on every FreeBSD CI run, not merely read out of
+    /// `kern_procctl.c` —
+    /// `groups::freebsd_reaper::a_setsid_escapee_stays_contained` orphans a `setsid`
+    /// escapee, **reaps** its parent (a stronger state than the zombie here: the
+    /// number is fully released), and then asserts both that `PROC_REAP_GETPIDS`
+    /// still reports the escapee under that dead root and that a `PROC_REAP_KILL`
+    /// aimed at it still kills the escapee.
+    ///
+    /// Even so, this call's result decides **no bookkeeping**: it forgets no root,
+    /// and neither does its caller. The reason is the outcomes it cannot rule out —
+    /// an `EPERM` from a member this job may not signal, an unexpected refusal, or
+    /// an `ESRCH` that means "the subtree already drained" and cannot be told apart
+    /// from a hypothetical "the walk found nothing to walk". A root is instead
+    /// released only by the ordinary [`prune`](Self::prune), i.e. only once the
+    /// kernel itself reports nothing left under it — which is the rule the `roots`
+    /// field states for every root, and which a `forget` on this path would have
+    /// been the sole exception to. The cost is a root that may linger until the next
+    /// prune (every spawn, every membership read, every delivery sweep); the
+    /// alternative — dropping a root while a `setsid` escapee still lives under it —
+    /// would put that escapee permanently beyond `kill_all`/`Drop`, and no
+    /// error-path tidiness is worth a leaked live process.
+    ///
+    /// What is left is therefore bounded on both sides: the walk reaches this
+    /// spawn's whole subtree, and anything it *fails* to kill stays reachable to the
+    /// job's own teardown. An ordinary (non-`setsid`) descendant has a third layer
+    /// besides: the process-group layer's `killpg` runs right after this, and a
+    /// process group outlives its leader.
+    ///
+    /// Deliberately unbracketed by the pruning [`signal_tree`](Self::signal_tree)
+    /// pays for: the caller holds the child's un-reaped `Child`, so this root
+    /// cannot have been recycled and the recycled-number hazard that prune defends
+    /// against does not exist on this path.
+    #[cfg(feature = "pty")]
+    fn hard_kill_subtree(&self, root: libc::pid_t) {
+        if !self.active {
+            return; // no reaper status: the process-group layer is the mechanism.
+        }
+        let mut request = ReaperKill {
+            rk_sig: libc::SIGKILL,
+            rk_flags: REAPER_KILL_SUBTREE,
+            rk_subtree: root,
+            rk_killed: 0,
+            rk_fpid: 0,
+            rk_pad0: [0; 15],
+        };
+        // Every outcome is swallowed *because* none of them is actionable here, not
+        // for convenience: an `ESRCH` means the subtree held nothing to signal, and
+        // an `EPERM` (a member this job may not signal) or any other refusal leaves
+        // survivors — and in every case the response is the one this method already
+        // commits to, namely keeping the root so the job's own teardown still
+        // reaches whatever is left.
+        let _ = procctl_self(
+            libc::PROC_REAP_KILL,
+            std::ptr::addr_of_mut!(request).cast::<libc::c_void>(),
+        );
+    }
+
     /// The stamp a root recorded from now on will carry — read **before** a
     /// descendant listing so [`prune`](Self::prune) can tell which roots that
     /// listing had a chance to see.
@@ -900,11 +978,55 @@ impl Job {
         opts: &crate::sys::SpawnOptions,
         _env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
     ) -> io::Result<crate::sys::pty::PtySpawn> {
-        crate::sys::pty::spawn_pty(cmd, opts, |c, o| {
-            let child = self.group.spawn(c, o)?;
-            self.record_root(&child);
-            Ok(child)
-        })
+        crate::sys::pty::spawn_pty(
+            cmd,
+            opts,
+            |c, o| {
+                let child = self.group.spawn(c, o)?;
+                self.record_root(&child);
+                Ok(child)
+            },
+            |pid| self.rollback_pty_spawn(pid),
+        )
+    }
+
+    /// Undo a PTY spawn whose master setup failed — both containment layers:
+    /// **kill within the containment, and forget nothing this mechanism still needs
+    /// afterwards**.
+    ///
+    /// The subtree kill goes first, and its reach is this mechanism's whole-subtree
+    /// maximum: `setsid` escapees included, the same reach `kill_all` has for this
+    /// root. Note what carries that reach, because the wrong reading of it is easy
+    /// and expensive: `PROC_REAP_KILL` is aimed by the pid handed to
+    /// [`Reaper::hard_kill_subtree`](Reaper), *not* by a lookup in this job's root
+    /// set, so no bookkeeping order could have made this one call miss. What the
+    /// bookkeeping decides is every kill *after* it — `kill_all`/`Drop` sweep the
+    /// recorded roots, and a subtree this job has forgotten is one nothing it owns
+    /// can ever aim at again. That, not this call, is what a `forget` here would
+    /// have cost: a descendant that forked and `setsid`'d inside the setup window
+    /// and survived the kill for any reason would be beyond `killpg` *and* beyond
+    /// every later reaper sweep.
+    ///
+    /// Then the process-group layer runs its own kill-then-forget — load-bearing,
+    /// not redundant, for a job whose `PROC_REAP_ACQUIRE` failed: the reaper is
+    /// inactive there and `killpg` is the whole mechanism. A doubled `SIGKILL` when
+    /// both layers are live is harmless for the same reason
+    /// [`kill_all`](Self::kill_all) accepts it — the signal cannot be handled,
+    /// blocked or counted.
+    ///
+    /// The reaper root is deliberately **not** dropped afterwards, which is the
+    /// asymmetry between the two layers. The process-group layer's tracked id is a
+    /// *pgid*, and the only thing it could still reach after `killpg` is a member
+    /// that refused the signal — while a stale pgid is this platform's sharpest
+    /// recycling hazard, able to alias a process group of an unrelated process. The
+    /// reaper root aliases only another tree of *this* process, and it is the sole
+    /// handle by which this job can ever reach a `setsid` escapee again. So the
+    /// first is released here and the second is left to the ordinary pruning, on the
+    /// kernel's own positive answer that nothing is left under it.
+    #[cfg(feature = "pty")]
+    pub(crate) fn rollback_pty_spawn(&self, pid: u32) {
+        self.reaper.hard_kill_subtree(pid as libc::pid_t);
+        self.group.rollback_pty_spawn(pid);
     }
 
     /// Register a just-started child as one of this job's subtree roots. Called

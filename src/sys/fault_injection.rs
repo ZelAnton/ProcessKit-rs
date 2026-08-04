@@ -72,6 +72,11 @@
 //!   call; the target label is the info-class axis (`extended-limit`, `cpu-rate`).
 //! - `sys::pgroup::deliver_signal` — every real signal *delivery* in the tracked
 //!   sweep; the target label is the syscall (`killpg`, `kill`).
+//! - `sys::pty::unix::{clone_master, AsyncPtyMaster::new}` — each fallible step
+//!   that runs *after* a PTY child already exists and is contained (a master
+//!   `dup`, a reactor registration); the target label names the owner of the fd
+//!   (`reader`, `writer`, `resize`). This is what makes the post-spawn rollback
+//!   path — otherwise reachable only on an fd-exhausted host — testable.
 //!
 //! A faulted call never reaches the OS at all, which is also what makes a test able
 //! to name a signal it must not actually send.
@@ -99,6 +104,14 @@ pub(crate) enum Site {
     /// syscall name.
     #[cfg(unix)]
     PgroupSignalDelivery,
+    /// Unix PTY: one `dup(2)` of the master fd, through
+    /// `sys::pty::unix::clone_master`. Target label: `writer` or `resize`.
+    #[cfg(all(unix, feature = "pty"))]
+    PtyMasterClone,
+    /// Unix PTY: one `AsyncFd::new` reactor registration, through
+    /// `sys::pty::unix::AsyncPtyMaster::new`. Target label: `reader` or `writer`.
+    #[cfg(all(unix, feature = "pty"))]
+    PtyAsyncFdRegistration,
 }
 
 /// One armed fault: which primitive to fail, which of its calls, and with what.

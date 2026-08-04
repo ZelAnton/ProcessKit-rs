@@ -380,6 +380,21 @@ impl Job {
         self.0.spawn_pty(cmd, opts, env)
     }
 
+    /// The undo [`spawn_pty`](Self::spawn_pty) hands its guard, exposed so the
+    /// shared Unix rollback tests can drive it against a **real** contained child
+    /// on whichever backend the host actually selected (cgroup, process group, or
+    /// FreeBSD reaper) — production reaches it only through that guard.
+    ///
+    /// Test-only, and used two ways there: called directly, it isolates one
+    /// backend's per-mechanism *reach* with a live descendant; wrapped in a test's
+    /// own closure and handed to `sys::pty::spawn_pty`, it also lets a test hold the
+    /// production guard still mid-rollback and assert the *order* of the guard's two
+    /// kills (see the guard's docs in `sys::pty::unix`).
+    #[cfg(all(test, unix, feature = "pty"))]
+    pub(crate) fn rollback_pty_spawn(&self, pid: u32) {
+        self.0.rollback_pty_spawn(pid);
+    }
+
     /// Attach an already-started child to this job.
     ///
     /// Only the child itself is moved into the job; descendants it already

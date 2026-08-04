@@ -198,7 +198,41 @@ impl Job {
         opts: &crate::sys::SpawnOptions,
         _env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
     ) -> io::Result<crate::sys::pty::PtySpawn> {
-        crate::sys::pty::spawn_pty(cmd, opts, |c, o| self.spawn(c, o))
+        crate::sys::pty::spawn_pty(
+            cmd,
+            opts,
+            |c, o| self.spawn(c, o),
+            |pid| self.rollback_pty_spawn(pid),
+        )
+    }
+
+    /// Undo a PTY spawn whose master setup failed, **killing before dropping any
+    /// bookkeeping** — the contract the shared `sys::pty::spawn_pty` rollback guard
+    /// states in full.
+    ///
+    /// The process-group fallback delegates to the shared backend's own
+    /// kill-then-forget. The cgroup backend has no per-child Rust registration to
+    /// undo, so the rollback is purely the kill — `killpg` over the pty child's
+    /// session (it is a session leader, pgid == pid) with the usual direct-pid
+    /// fallback, reaching this spawn's descendants without touching the rest of the
+    /// job.
+    ///
+    /// Honest about what that leaves: a descendant that forked and called `setsid`
+    /// inside the setup window is out of `killpg`'s reach, but it has **not** left
+    /// the cgroup — membership is inherited across `fork` and `setsid` does not
+    /// change it — so it stays a member, is still reported by `members()`, and is
+    /// killed by this job's `kill_all`/`Drop` (`cgroup.kill`, whole-subtree and
+    /// atomic). The no-orphan guarantee therefore holds at the job's scope, which
+    /// is the scope this mechanism has ever promised. Firing `cgroup.kill` from
+    /// here to close that microsecond instead is deliberately rejected: it kills
+    /// **every** member of the cgroup, i.e. unrelated runs of the same
+    /// `ProcessGroup`, which a single failed spawn must not do.
+    #[cfg(feature = "pty")]
+    pub(crate) fn rollback_pty_spawn(&self, pid: u32) {
+        match &self.backend {
+            Backend::Cgroup(_) => crate::sys::pgroup::hard_kill_fresh_spawn(pid as i32),
+            Backend::ProcessGroup(pg) => pg.rollback_pty_spawn(pid),
+        }
     }
 
     #[cfg(feature = "process-control")]

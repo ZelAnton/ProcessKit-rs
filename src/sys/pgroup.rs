@@ -727,6 +727,21 @@ impl Tracked {
         ids.iter().map(|e| e.id).collect()
     }
 
+    /// Drop a just-spawned entry whose child a higher-level constructor is
+    /// rolling back, **after** that child's tree has already been killed (see
+    /// [`ProcessGroup::rollback_pty_spawn`]). Bookkeeping only, deliberately: the
+    /// tracked id names a *shared* process group, so anything broader here would
+    /// broadcast to members this failed spawn does not own.
+    #[cfg(feature = "pty")]
+    fn remove(&self, id: i32) {
+        // Rollback runs from a synchronous `Drop`, where a poisoned tracker is
+        // unactionable — recover it rather than panic mid-teardown.
+        self.ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|entry| entry.id != id);
+    }
+
     /// How many tracked entries still exist (probe-only; no pruning — `stats` and
     /// the graceful teardown report's before/after member counts must not mutate the
     /// *set* of tracked ids, though it may refresh the `group_seen` latch, which is a
@@ -773,6 +788,38 @@ impl ProcessGroup {
             solos: Tracked::new(false),
             skip_drop_kill: super::SkipDropKill::new(),
         }
+    }
+
+    /// Undo the registration [`spawn`](Self::spawn) made, when the PTY setup that
+    /// follows it fails before the child can be handed to a `RunningProcess`.
+    ///
+    /// **Kill first, forget second.** [`hard_kill_fresh_spawn`] reaches this spawn's
+    /// whole process group (the pty child is a session leader, so its pgid is its
+    /// pid) while the entry is still tracked, and only then is the pid dropped. The
+    /// kill itself is aimed by the pid passed in rather than by the tracked set, so
+    /// the order is not what makes it land; what the order preserves is the state
+    /// this group can still act on if the kill does *not* land, since a tracked id
+    /// is what [`Tracked::signal_all`] later sweeps.
+    ///
+    /// Dropping the id afterwards is right *here* and would be wrong on the FreeBSD
+    /// reaper (see `freebsd::Job::rollback_pty_spawn`), because the two ids are not
+    /// alike: after `killpg` this one can only still reach a member that refused the
+    /// signal, while a stale **pgid** is this platform's sharpest recycling hazard —
+    /// it can come to name a process group of an unrelated process, which a reaper
+    /// root (always within this process's own tree) never can.
+    ///
+    /// The reach is `killpg`'s — this mechanism's own whole-tree maximum, and a
+    /// superset of the per-child teardown a successful run would get. A descendant
+    /// that calls `setsid` itself escapes it, exactly as it escapes `kill_all` /
+    /// `shutdown` / `signal` on this backend (the documented
+    /// [`Mechanism::ProcessGroup`](crate::Mechanism::ProcessGroup) limit).
+    ///
+    /// The caller still owns the child's un-reaped `Child`, so `pid` cannot have
+    /// been recycled between the spawn and this call.
+    #[cfg(feature = "pty")]
+    pub(crate) fn rollback_pty_spawn(&self, pid: u32) {
+        hard_kill_fresh_spawn(pid as i32);
+        self.groups.remove(pid as i32);
     }
 
     pub(crate) fn spawn(
@@ -1084,25 +1131,39 @@ impl Drop for UntrackedChildGuard {
             return; // disarmed — the child is tracked, teardown is owned elsewhere.
         };
         if let Some(pid) = child.id() {
-            let pid = pid as i32;
-            // Best-effort hard kill of the still-untracked child. It is its own
-            // group leader (or, on the `setsid` path, a session leader), so killpg
-            // reaps it *and* any descendant it forked in this tiny window; if it
-            // has not `setpgid`'d yet the group id does not exist (killpg → ESRCH),
-            // so fall back to a direct pid kill. `pid` was just spawned — never a
-            // recycled alias — so the kill is safe.
-            // SAFETY: killpg/kill delivering SIGKILL to a freshly-spawned id.
-            unsafe {
-                if libc::killpg(pid, libc::SIGKILL) == -1
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-                {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-            }
+            hard_kill_fresh_spawn(pid as i32);
         }
         // Dropping the tokio `Child` hands the killed process to tokio's orphan
         // reaper, so it is waited (no zombie leak) without this guard blocking.
         drop(child);
+    }
+}
+
+/// Best-effort `SIGKILL` of a **freshly-spawned, still-owned** child's whole
+/// process group, with a direct-pid fallback for the window in which it may not
+/// have run its `setpgid`/`setsid` yet (`killpg` → `ESRCH`, because that group id
+/// does not exist). The child is its own group leader (or, on the `setsid` path, a
+/// session leader), so the `killpg` reaps it *and* any descendant it forked in
+/// that window.
+///
+/// Both callers hold the child's `Child` un-reaped across the call, so `pid` can
+/// never be a recycled alias and the kill needs no identity gate: the
+/// [`UntrackedChildGuard`] leak backstop, and the PTY rollback
+/// ([`ProcessGroup::rollback_pty_spawn`]), which must land *before* the tracked id
+/// is dropped.
+///
+/// Deliberately raw rather than routed through [`deliver_signal`], for the reason
+/// documented there: these are the last-resort backstops for a child nothing else
+/// owns yet, so they must not be interposable by a fault-injection rule.
+pub(crate) fn hard_kill_fresh_spawn(pid: i32) {
+    // SAFETY: killpg/kill delivering SIGKILL to a freshly-spawned id the caller
+    // still owns; `ESRCH` (nothing under that id) is the classified benign case.
+    unsafe {
+        if libc::killpg(pid, libc::SIGKILL) == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            libc::kill(pid, libc::SIGKILL);
+        }
     }
 }
 

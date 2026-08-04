@@ -18,7 +18,21 @@ to a dated version section.
 -
 
 ### Fixed
--
+
+- Fix a leak of live processes when a Unix PTY launch fails *after* its child
+  already exists (a failed `dup` of the pty master, a failed reactor
+  registration): the rollback now hard-kills through the backend's own
+  containment — `killpg` over the child's session, or `PROC_REAP_KILL` over the
+  FreeBSD reaper subtree — **before** any of that spawn's bookkeeping is
+  released, and never releases bookkeeping the kill's reach rests on. Previously
+  the child's registration could be dropped while a descendant it had forked in
+  the setup window was still alive, putting that descendant permanently out of
+  reach of the job's own `kill_all`/`Drop`. The rollback's guarantee is now
+  stated per mechanism: it reaches as far as that mechanism's whole-tree teardown
+  does, and whatever it cannot reach (a `setsid` escapee on the process-group
+  backend, or one still inside the cgroup) is left contained by the job rather
+  than orphaned. A one-shot stdin source reserved for the failed launch is still
+  released for the next one.
 
 ## [3.2.0] - 2026-08-03
 

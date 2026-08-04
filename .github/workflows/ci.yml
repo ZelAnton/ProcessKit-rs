@@ -293,6 +293,14 @@ jobs:
           run: |
             rustc --version
             cargo test --all-features --lib
+            # The `#[ignore]`d library tests of the PTY rollback guard. `--lib`
+            # above runs the hermetic ones only, so without this line the
+            # `Mechanism::ProcessReaper` arms — the sole execution anywhere of the
+            # reaper's containment-scoped rollback, since Linux/macOS select
+            # cgroup/pgroup — would merely compile here. They spawn real pty
+            # children and a setsid escapee, so they belong in the VM tier next to
+            # the integration probes below rather than in the hermetic run.
+            cargo test --all-features --lib sys::pty::imp::tests -- --ignored
             cargo test --all-features --test integration process_control::unix_ -- --ignored
             cargo test --all-features --test integration groups::group_reports_the_platforms_mechanism -- --ignored
             cargo test --all-features --test integration groups::dropping_group_kills_children -- --ignored
