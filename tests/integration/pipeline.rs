@@ -1304,3 +1304,133 @@ async fn pipeline_start_reaps_a_partially_started_chain() {
     }
     let _ = std::fs::remove_file(&pidfile);
 }
+
+// ---------------------------------------------------------------------------
+// T-271: the parent-side reader of a `merge_stderr_in_pipe` stage's shared
+// stdout+stderr pipe (`sys::merge_pipe`), exercised through a real chain.
+//
+// Both tests are Unix-only. Unix is the platform whose reader moved from the
+// runtime's shared blocking pool onto the reactor: Windows still wraps the pipe
+// handle in `tokio::fs::File`, whose reads do occupy a pool thread while the
+// pipe is open, so the pool assertions in the second test would fail there by
+// design; the first test's producer is a `sh`/`seq` one-liner with no cheap
+// Windows equivalent (a `cmd` loop of this size takes seconds). The
+// cross-platform behaviour of a merged stage — write order, the pipefail
+// stderr trade-off, the final-stage no-op — is covered by the tests near the
+// top of this file, and the reader's own error branch (nothing a test can do to
+// the pipe from outside makes its `read(2)` fail, so it needs a substituted
+// source) by the unit tests in `src/sys/merge_pipe.rs`.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real merged-stderr chain whose payload outgrows the OS pipe buffer"]
+async fn merged_stage_delivers_a_multi_read_payload_and_its_eof() {
+    // Over 200 KiB across the two merged streams (~112 KiB each), several times
+    // the ~64 KiB pipe buffer: the parent-side reader has to park on readiness
+    // and reassemble
+    // many partial reads instead of taking the whole payload in one. It then has
+    // to see the pipe's EOF once the child exits and no one else holds the write
+    // end — without it the downstream `cat` would never reach EOF on its stdin
+    // and this chain would hang rather than finish.
+    const LINES: usize = 20_000;
+    let producer = Command::new("sh").args(["-c", &format!("seq 1 {LINES}; seq 1 {LINES} >&2")]);
+
+    let result = completes_within(
+        Duration::from_secs(60),
+        "a bulk merged-stderr chain",
+        producer
+            .merge_stderr_in_pipe()
+            .pipe(passthrough_stage())
+            .output_string(),
+    )
+    .await
+    .expect("run merged pipeline");
+
+    assert!(result.is_success(), "pipeline result: {result:?}");
+    assert_eq!(
+        result.stdout().lines().count(),
+        LINES * 2,
+        "every merged line must survive the reader's partial reads"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "spawns a real merged-stderr chain plus a grandchild that holds the pipe open"]
+fn merged_stage_reader_parks_no_blocking_pool_thread_for_a_quiet_grandchild() {
+    // The regression this is the guard for: the merged pipe's parent end used to
+    // be a `tokio::fs::File`, so a read with nothing to read sat on a thread of
+    // the runtime's *shared* blocking pool until the pipe closed — and a
+    // grandchild that inherited the write end keeps it open long after the
+    // direct child is gone, torn-down run or not. Giving the runtime exactly one
+    // blocking thread turns that into a hard, deterministic assertion: the probe
+    // below can only run if the merged reader is not holding it.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let holding = dir.path().join("holding");
+
+        // The stage exits at once but leaves a grandchild holding the merge
+        // pipe's write end (inherited stdout *and* stderr) and writing nothing
+        // to it, so the parent-side read stays pending with no EOF in sight. The
+        // marker is created by that grandchild, so waiting for it is a fact
+        // about the process tree, not a guess about timing.
+        let producer = Command::new("sh").args([
+            "-c",
+            &format!("(touch '{}'; sleep 30) & exit 0", holding.display()),
+        ]);
+        let token = tokio_util::sync::CancellationToken::new();
+        let chain = producer
+            .merge_stderr_in_pipe()
+            .pipe(passthrough_stage())
+            .cancel_on(token.clone());
+        let run = tokio::spawn(async move { chain.output_string().await });
+
+        poll_until(
+            Duration::from_secs(30),
+            Duration::from_millis(25),
+            "the grandchild to take over the merge pipe",
+            || holding.exists(),
+        )
+        .await;
+
+        // While that read is pending, the one blocking thread must still be
+        // free. (`spawn_blocking` would queue behind the old implementation's
+        // parked read, and nothing here is going to end it — the grandchild
+        // writes nothing and outlives the whole run.)
+        completes_within(
+            Duration::from_secs(10),
+            "a blocking-pool probe while the merged reader waits",
+            tokio::task::spawn_blocking(|| {}),
+        )
+        .await
+        .expect("blocking probe");
+
+        // Teardown resolves in bounded time rather than waiting out the
+        // grandchild's own lifetime.
+        token.cancel();
+        let err = completes_within(Duration::from_secs(30), "the cancelled chain", run)
+            .await
+            .expect("run task")
+            .expect_err("a cancelled chain errors");
+        assert!(
+            matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+            "expected Cancelled, got {err:?}"
+        );
+
+        // ...and the pool is still free afterwards: the torn-down run left
+        // nothing of its own running there.
+        completes_within(
+            Duration::from_secs(10),
+            "a blocking-pool probe after the chain was torn down",
+            tokio::task::spawn_blocking(|| {}),
+        )
+        .await
+        .expect("blocking probe");
+    });
+}

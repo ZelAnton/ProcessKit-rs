@@ -216,6 +216,16 @@ pub(crate) mod pid_gate;
 #[cfg(feature = "pty")]
 pub(crate) mod pty;
 
+// The parent-side reader for a `merge_stderr_in_pipe` stage's shared
+// stdout+stderr pipe, per platform: Unix drives the read end through tokio's
+// reactor (`AsyncFd`), Windows keeps the blocking-pool `tokio::fs::File`
+// wrapper because an anonymous pipe handle cannot be registered with that
+// reactor. Compiled on the two OS families that support the marker at all —
+// `runner::launch` rejects it as `Unsupported` anywhere else, before a pipe
+// exists.
+#[cfg(any(unix, windows))]
+pub(crate) mod merge_pipe;
+
 /// Per-spawn knobs that must reach the platform backend (the
 /// `tokio::process::Command` can't carry them: creation flags have no getter,
 /// and the pgroup backend must know about `setsid` *before* it sets a process

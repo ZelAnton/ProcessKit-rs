@@ -905,7 +905,7 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
             let stderr_writer = writer.try_clone().map_err(crate::Error::io)?;
             tokio_cmd.stdout(writer);
             tokio_cmd.stderr(stderr_writer);
-            Some(async_pipe_reader(reader))
+            Some(crate::sys::merge_pipe::reader(reader).map_err(crate::Error::io)?)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -1079,27 +1079,6 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     // Pid-only watchdog; own-group runs re-arm with full group+pid via `attach_group`.
     process.arm_cancel_watchdog();
     Ok(process)
-}
-
-/// Turn the parent end of an anonymous pipe into the same boxed async reader
-/// used for child stdout/stderr. `std::io::PipeReader` deliberately exposes its
-/// owned OS object rather than a `File`; the two platform conversions below are
-/// ownership-preserving and add no duplicate handle that could delay EOF.
-#[cfg(any(unix, windows))]
-fn async_pipe_reader(reader: std::io::PipeReader) -> OutputReader {
-    #[cfg(unix)]
-    let file = {
-        use std::os::fd::OwnedFd;
-        let fd: OwnedFd = reader.into();
-        std::fs::File::from(fd)
-    };
-    #[cfg(windows)]
-    let file = {
-        use std::os::windows::io::OwnedHandle;
-        let handle: OwnedHandle = reader.into();
-        std::fs::File::from(handle)
-    };
-    Box::new(tokio::fs::File::from_std(file))
 }
 
 /// Translate a raw spawn [`Error`](crate::Error) into the crate's launch error, mapping the
