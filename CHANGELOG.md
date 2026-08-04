@@ -16,34 +16,51 @@ to a dated version section.
 
 ### Changed
 
-- **Documentation:** `ProcessGroup::adopt` rustdoc now accurately describes
-  platform-specific guarantees against pid-reuse hazards: on Linux and macOS,
-  when a start-time identity token could be captured on both sides, a recycled
-  pid is recognized as a stranger and is not signalled; when it couldn't (a
-  failed best-effort read — e.g. no `/proc` access, or `EPERM` against another
-  uid — or other BSDs, where no start-time reader exists at all), the crate
-  falls back to the legacy number-only liveness check. The reap-promptly
-  guidance no longer claims the group reaps an adopted zombie for you or that
-  `escalate_to_kill`'s hard kill removes one, and its "tear the group down"
-  alternative is stated as an actionable timing (do it when done with the
-  child) rather than a self-contradictory one.
+- **Documentation:** `ProcessGroup::adopt`'s pid-reuse guidance now matches what
+  the crate actually does. It stated flatly that the crate "has no start-time
+  identity to detect the reuse"; in fact, on Linux and macOS an individually
+  tracked pid's start-time identity is captured when it is tracked and re-read
+  before every probe and signal delivery, so a recycled pid is recognized as a
+  stranger and is not signalled. The rustdoc now states that protection together
+  with its real conditions: it holds only where a token could be read on *both*
+  sides, and where one could not — `/proc` unavailable or hidden, a permission
+  denial when the adopted child belongs to another uid on macOS, or the BSDs,
+  which have no start-time reader at all — the crate falls back to checking
+  liveness by pid number alone, and a recycled pid can still be signalled. The
+  guidance also now separates the zombie case from the reuse hazard: an
+  exited-but-unreaped child cannot have its pid recycled, but the group does not
+  reap it for you and `escalate_to_kill`'s hard kill cannot clear it either —
+  only awaiting the child does. Documentation only; no behavior change.
 
 ### Fixed
 
-- Fix a leak of live processes when a Unix PTY launch fails *after* its child
-  already exists (a failed `dup` of the pty master, a failed reactor
-  registration): the rollback now hard-kills through the backend's own
-  containment — `killpg` over the child's session, or `PROC_REAP_KILL` over the
-  FreeBSD reaper subtree — **before** any of that spawn's bookkeeping is
-  released, and never releases bookkeeping the kill's reach rests on. Previously
-  the child's registration could be dropped while a descendant it had forked in
-  the setup window was still alive, putting that descendant permanently out of
-  reach of the job's own `kill_all`/`Drop`. The rollback's guarantee is now
-  stated per mechanism: it reaches as far as that mechanism's whole-tree teardown
-  does, and whatever it cannot reach (a `setsid` escapee on the process-group
-  backend, or one still inside the cgroup) is left contained by the job rather
-  than orphaned. A one-shot stdin source reserved for the failed launch is still
-  released for the next one.
+- Tear down the child of a Unix PTY launch (`Command::use_pty`) that fails
+  *after* that child already exists — a failed `dup` of the pty master, a failed
+  reactor registration — as part of the failed launch. Previously the launch
+  returned its error while the child, and anything it had forked, kept running
+  unattended until the owning group's own later `kill_all`/`shutdown`/`Drop`
+  swept it up, so a long-lived group accumulated one live process per failed PTY
+  launch. The rollback hard-kills through the backend's own containment first —
+  `PROC_REAP_KILL` over the FreeBSD reaper subtree, or `killpg` over the child's
+  session on the cgroup and process-group backends — and only then releases that
+  spawn's bookkeeping, never releasing a registration the kill's reach rests on.
+  Its reach is that mechanism's own whole-tree reach and nothing beyond it: a
+  descendant that `setsid`s out during the setup window is still inside the
+  cgroup, and still outside a bare process group, exactly as it would be for that
+  mechanism's `kill_all` — and no survivor is moved out of the job's reach, so
+  the group's own teardown still owns it. The error returned to the caller is
+  unchanged.
+- Stop a `Pipeline`'s chain-wide `timeout` from duplicating the tail of the last
+  line in the output it salvages. Dropping the capture task only *requests* the
+  pumps' abort, and the salvage folded the last stage's still-pending partial
+  line into the backlog and drained it in two separate critical sections — so a
+  pump still running in between could complete and push exactly that line, and
+  the timed-out `ProcessResult` then carried the completed line plus its prefix
+  again as an extra trailing line, with the reported line total counting that
+  phantom line. Both steps now happen in one critical section, for
+  `output_string`'s two line captures and for `output_bytes`'s line-oriented
+  stderr (its raw stdout has no line framing to duplicate). A tail the pump
+  genuinely had not completed is still salvaged, unchanged.
 
 ## [3.2.0] - 2026-08-03
 
