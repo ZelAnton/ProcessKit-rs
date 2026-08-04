@@ -15,7 +15,18 @@ to a dated version section.
 -
 
 ### Changed
--
+
+- **Documentation:** `ProcessGroup::adopt` rustdoc now accurately describes
+  platform-specific guarantees against pid-reuse hazards: on Linux and macOS,
+  when a start-time identity token could be captured on both sides, a recycled
+  pid is recognized as a stranger and is not signalled; when it couldn't (a
+  failed best-effort read — e.g. no `/proc` access, or `EPERM` against another
+  uid — or other BSDs, where no start-time reader exists at all), the crate
+  falls back to the legacy number-only liveness check. The reap-promptly
+  guidance no longer claims the group reaps an adopted zombie for you or that
+  `escalate_to_kill`'s hard kill removes one, and its "tear the group down"
+  alternative is stated as an actionable timing (do it when done with the
+  child) rather than a self-contradictory one.
 
 ### Fixed
 

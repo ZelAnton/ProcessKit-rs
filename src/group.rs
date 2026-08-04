@@ -316,11 +316,39 @@ impl ProcessGroup {
     /// **Reap promptly (pid-reuse hazard).** An individually-tracked adopted child
     /// is remembered by **pid**. If you let it exit *and be reaped* elsewhere
     /// without dropping/tearing down this group, that pid can be recycled by the OS
-    /// to an **unrelated** process — and this group's later teardown would then
-    /// signal that stranger. The crate has no start-time identity to detect the
-    /// reuse (and macOS's small pid space makes it likelier). Reap an adopted child
-    /// through this group's lifetime, or tear the group down when done, so a stale
-    /// pid is never carried across a reuse.
+    /// to an **unrelated** process.
+    ///
+    /// The risk of signalling an unrelated process depends on the platform — and,
+    /// on Linux/macOS, on whether a start-time identity could be captured:
+    ///
+    /// - **Linux and macOS, when identity is available:** the crate captures the
+    ///   process's start-time identity (best-effort) at track time and re-reads it
+    ///   before every probe and signal delivery. When a token was captured on
+    ///   *both* sides, a recycled pid — a live number whose current identity
+    ///   differs from the captured one — is recognized as a **stranger and is not
+    ///   signalled** during teardown.
+    /// - **Linux and macOS, when identity could not be captured** — e.g. `/proc` is
+    ///   unavailable or hidden (`hidepid`, a container), or, since an adopted child
+    ///   may belong to another uid, a permission denial from `proc_pidinfo` on
+    ///   macOS — **and other BSDs**, where no start-time reader exists at all: a
+    ///   missing token on either side is never treated as proof of anything (see
+    ///   [`process_is_alive`](crate::process_is_alive)'s "degrades honestly" note),
+    ///   so the crate falls back to verifying liveness by pid number alone. A
+    ///   recycled pid **can be signalled** if it is misidentified as the original
+    ///   process during group teardown — the same small-pid-space exposure macOS
+    ///   is more prone to than Linux.
+    ///
+    /// To close this hazard: reap an adopted child through this group's lifetime
+    /// before the group is torn down, or tear the group down when done with it, so
+    /// a stale tracked pid cannot outlive the process it named. An unreap-ed
+    /// **zombie** (exited but not yet awaited) does not pose the reuse hazard — its
+    /// pid isn't released for reuse until reaped, so it keeps probing as alive
+    /// rather than being mistaken for a stranger — but it is *not* reaped by the
+    /// group either: the caller remains responsible for that (see above), and
+    /// until it is, the zombie degrades graceful shutdown by probing alive for the
+    /// full grace window; a subsequent `escalate_to_kill` hard-kill cannot remove
+    /// it either, since the process is already dead and only `wait`ing its parent
+    /// clears the record.
     ///
     /// On the containment backends, adopting a child that has already **exited
     /// but not yet been reaped** is a successful no-op (`Ok`) — there is nothing
