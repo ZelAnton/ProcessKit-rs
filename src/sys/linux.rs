@@ -1395,10 +1395,10 @@ impl Cgroup {
                 // about whether teardown actually completed.
                 last_delivery_error = Some(err);
             }
-            if let Ok(members) = self.members_with(&read) {
-                if members.is_empty() {
-                    break;
-                }
+            if let Ok(members) = self.members_with(&read)
+                && members.is_empty()
+            {
+                break;
             }
             // `Err(_)`: unknown state must not look drained. Continue the
             // bounded fallback in case the read failure is transient.
@@ -1417,10 +1417,16 @@ impl Cgroup {
         // un-reapable zombies (a D-state task ignores SIGKILL until it unblocks).
         match self.members_with(&read) {
             Ok(members) if members.is_empty() => Ok(()),
-            Ok(_) if let Some(err) = last_delivery_error => Err(err),
-            Ok(_) => Err(io::Error::other(
-                "cgroup did not drain after the bounded SIGKILL sweep (kernel < 5.14 fallback)",
-            )),
+            // The two "still populated" cases share one arm: an `if let` guard
+            // would read more directly, but `if_let_guard` is unstable on this
+            // crate's MSRV (`rust-version = "1.88"`), and the floor is verified
+            // by the `msrv` CI job. Surface the last real delivery failure when
+            // the sweep hit one, and the generic drain failure otherwise.
+            Ok(_) => Err(last_delivery_error.unwrap_or_else(|| {
+                io::Error::other(
+                    "cgroup did not drain after the bounded SIGKILL sweep (kernel < 5.14 fallback)",
+                )
+            })),
             Err(e) => Err(e),
         }
     }
