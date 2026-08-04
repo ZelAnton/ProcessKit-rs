@@ -101,28 +101,38 @@ pub(crate) struct LineCapture {
 }
 
 impl LineCapture {
+    /// The best-effort capture a chain-wide timeout salvages: each stream's
+    /// still-pending partial tail folded into its backlog, and the backlog taken.
+    ///
+    /// The pumps may still be alive here — dropping the capture task only
+    /// *requests* their abort — so each stream does both steps in **one**
+    /// critical section ([`SharedLines::drain_with_partial_tail`]). Folding and
+    /// draining separately let a live pump push the completed line whose prefix
+    /// this tail is, in between, and the salvaged output then repeated that
+    /// prefix. A push that lands after the drain is still lost (the documented
+    /// best-effort degradation) — but never duplicated.
     pub(crate) fn snapshot(&self) -> (String, String, bool, usize, usize) {
-        for (sink, config) in [
-            (&self.stdout, &self.stdout_config),
-            (&self.stderr, &self.stderr_config),
-        ] {
-            if let Some((tail, oversized)) = sink.take_partial_tail_for_capture() {
-                if oversized {
-                    sink.record_oversized_line();
-                } else {
-                    sink.push(config.shape_capture_line(tail));
-                }
-            }
-        }
+        let stdout_lines = self
+            .stdout
+            .drain_with_partial_tail(|tail| self.stdout_config.shape_capture_line(tail));
+        let stderr_lines = self
+            .stderr
+            .drain_with_partial_tail(|tail| self.stderr_config.shape_capture_line(tail));
+        // Read the totals after the folds: a salvaged tail counts as a line, and
+        // an over-cap one as a drop, exactly like a line the pump completed.
         let truncated = self.stdout.dropped() > 0 || self.stderr.dropped() > 0;
         let total_lines = self.stdout.count().saturating_add(self.stderr.count());
         let total_bytes = self
             .stdout
             .seen_bytes()
             .saturating_add(self.stderr.seen_bytes());
-        let stdout = self.stdout.drain().join("\n");
-        let stderr = self.stderr.drain().join("\n");
-        (stdout, stderr, truncated, total_lines, total_bytes)
+        (
+            stdout_lines.join("\n"),
+            stderr_lines.join("\n"),
+            truncated,
+            total_lines,
+            total_bytes,
+        )
     }
 }
 
@@ -2794,17 +2804,19 @@ pub(crate) struct RawCapture {
 }
 
 impl RawCapture {
+    /// The raw analogue of [`LineCapture::snapshot`]: the stdout bytes the raw
+    /// pump had appended, plus the line-oriented stderr salvage. Stdout needs no
+    /// tail handling (raw bytes have no line framing, and the mutex orders every
+    /// whole chunk write); stderr folds its still-pending tail in and drains in
+    /// the same **single** critical section, so a still-live stderr pump cannot
+    /// slip the tail's own completed line in between and duplicate the prefix.
     pub(crate) fn snapshot(&self) -> (Vec<u8>, String, bool, usize, usize) {
         let mut stdout = self.out_buf.lock().expect("stdout buffer poisoned").clone();
         clamp_dropoldest_tail(&mut stdout, self.stdout_cap, self.stdout_mode);
-        if let Some((tail, oversized)) = self.stderr_sink.take_partial_tail_for_capture() {
-            if oversized {
-                self.stderr_sink.record_oversized_line();
-            } else {
-                self.stderr_sink
-                    .push(self.stderr_config.shape_capture_line(tail));
-            }
-        }
+        let stderr_lines = self
+            .stderr_sink
+            .drain_with_partial_tail(|tail| self.stderr_config.shape_capture_line(tail));
+        // Read the totals after the fold, like `LineCapture::snapshot`.
         let truncated =
             self.signals.truncated.load(Ordering::Relaxed) || self.stderr_sink.dropped() > 0;
         let total_lines = self.stderr_sink.count();
@@ -2813,8 +2825,13 @@ impl RawCapture {
             .seen
             .load(Ordering::Relaxed)
             .saturating_add(self.stderr_sink.seen_bytes());
-        let stderr = self.stderr_sink.drain().join("\n");
-        (stdout, stderr, truncated, total_lines, total_bytes)
+        (
+            stdout,
+            stderr_lines.join("\n"),
+            truncated,
+            total_lines,
+            total_bytes,
+        )
     }
 }
 
@@ -2923,6 +2940,115 @@ mod tests {
             .start(&cmd)
             .await
             .expect("scripted start")
+    }
+
+    /// The shape `prepare_line_capture` hands the pipeline — two fresh unbounded
+    /// sinks plus their stream configs — without a live child, so the salvage
+    /// snapshot can be driven through an exact pump interleaving.
+    fn line_capture() -> LineCapture {
+        let policy = OutputBufferPolicy::unbounded();
+        LineCapture {
+            stdout: SharedLines::new(&policy),
+            stderr: SharedLines::new(&policy),
+            stdout_config: StreamConfig::new(),
+            stderr_config: StreamConfig::new(),
+        }
+    }
+
+    /// The `prepare_raw_capture` analogue of [`line_capture`].
+    fn raw_capture() -> RawCapture {
+        RawCapture {
+            out_buf: Arc::new(std::sync::Mutex::new(Vec::new())),
+            stderr_sink: SharedLines::new(&OutputBufferPolicy::unbounded()),
+            stderr_config: StreamConfig::new(),
+            signals: RawStdoutSignals {
+                seen: Arc::new(AtomicUsize::new(0)),
+                overflowed: Arc::new(AtomicBool::new(false)),
+                truncated: Arc::new(AtomicBool::new(false)),
+                read_error: Arc::new(std::sync::Mutex::new(None)),
+            },
+            stdout_cap: None,
+            stdout_mode: OverflowMode::DropOldest,
+        }
+    }
+
+    /// A chain-wide timeout snapshots the last stage's capture while its pumps
+    /// may still be running — dropping the capture task only *requests* their
+    /// abort, and a pump stops at its next await. `pump_lines_core` pushes a
+    /// completed line and publishes the replacement tail under two separate
+    /// locks, so the snapshot can land between them; there it used to take the
+    /// stale tail — the prefix of the line it then drained — and repeat it in the
+    /// salvaged output.
+    #[test]
+    fn timeout_salvage_does_not_repeat_a_line_the_pump_just_completed() {
+        let capture = line_capture();
+        // Each stream's previous read published an un-terminated prefix…
+        capture.stdout.set_partial_tail("ab");
+        capture.stderr.set_partial_tail("xy");
+        // …and the next read completed it into a line. The line is pushed, the
+        // replacement tail is not published yet — the deadline fires exactly here.
+        capture.stdout.push("abcd".to_owned());
+        capture.stderr.push("xyz".to_owned());
+
+        let (stdout, stderr, truncated, total_lines, _total_bytes) = capture.snapshot();
+
+        assert_eq!(
+            stdout, "abcd",
+            "the tail is the head of this line, not a second line"
+        );
+        assert_eq!(stderr, "xyz");
+        assert!(!truncated, "the policy dropped nothing");
+        assert_eq!(total_lines, 2, "one completed line per stream");
+    }
+
+    /// …while a tail the pump genuinely had *not* completed is still salvaged —
+    /// the whole reason the timeout path snapshots instead of just draining.
+    #[test]
+    fn timeout_salvage_still_recovers_a_live_partial_tail() {
+        let capture = line_capture();
+        capture.stdout.push("first".to_owned());
+        capture.stdout.set_partial_tail("prompt: ");
+        capture.stderr.set_partial_tail("warn");
+
+        let (stdout, stderr, _truncated, total_lines, _total_bytes) = capture.snapshot();
+
+        assert_eq!(stdout, "first\nprompt: ");
+        assert_eq!(stderr, "warn");
+        assert_eq!(total_lines, 3, "two stdout lines plus the stderr tail");
+    }
+
+    /// The same race through the *raw* capture's line-oriented stderr (its
+    /// `Vec<u8>` stdout has no line framing to duplicate).
+    #[test]
+    fn raw_timeout_salvage_does_not_repeat_a_stderr_line_the_pump_just_completed() {
+        let capture = raw_capture();
+        capture
+            .out_buf
+            .lock()
+            .expect("stdout buffer")
+            .extend_from_slice(b"raw bytes");
+        capture.stderr_sink.set_partial_tail("bo");
+        capture.stderr_sink.push("boom".to_owned());
+
+        let (stdout, stderr, truncated, total_lines, _total_bytes) = capture.snapshot();
+
+        assert_eq!(stdout, b"raw bytes".to_vec());
+        assert_eq!(stderr, "boom", "not \"boom\\nbo\"");
+        assert!(!truncated);
+        assert_eq!(total_lines, 1);
+    }
+
+    /// …and the raw capture likewise still salvages a live stderr tail.
+    #[test]
+    fn raw_timeout_salvage_still_recovers_a_live_stderr_tail() {
+        let capture = raw_capture();
+        capture.stderr_sink.push("warning:".to_owned());
+        capture.stderr_sink.set_partial_tail("no newline yet");
+
+        let (_stdout, stderr, _truncated, total_lines, _total_bytes) = capture.snapshot();
+
+        assert_eq!(stderr, "warning:\nno newline yet");
+        assert_eq!(total_lines, 2);
     }
 
     /// A stashed non-broken-pipe stdin failure surfaces as `ErrorReason::Stdin` only on

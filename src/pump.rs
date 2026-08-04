@@ -507,9 +507,16 @@ struct Inner {
     partial_tail_pending: bool,
     /// Whether the pending line was already rejected by the in-flight byte cap.
     partial_tail_oversized: bool,
-    /// EOF finalization keeps the tail visible to `wait_for_output`; this flag
-    /// prevents a later timeout snapshot from appending that already-emitted
-    /// final line a second time.
+    /// Whether the published tail's text has already reached the backlog as part
+    /// of a completed line. Every completed-line path sets it in its own critical
+    /// section (`SharedLines::supersede_partial_tail_locked`), which covers both
+    /// EOF finalization — where the tail *is* the final line, kept visible to
+    /// `wait_for_output` — and mid-stream lines, where the pump publishes the
+    /// replacement tail only one lock acquisition later. Without that seal a
+    /// timeout snapshot landing in between would append an already-drained line's
+    /// prefix a second time. Cleared by every fresh publish
+    /// (`set_partial_tail_state`), including one whose text repeats the sealed
+    /// tail verbatim.
     partial_tail_finalized: bool,
 }
 
@@ -600,87 +607,111 @@ impl SharedLines {
         let total_lines = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         // Whether the policy discarded a line here — distinct from a streaming
         // consumer's pop, so the truncation signal ignores consumed lines.
-        let mut policy_dropped = false;
-        {
+        let policy_dropped = {
             let mut inner = self.inner.lock().expect("SharedLines poisoned");
-            // A dropped streaming consumer flips `discarding` on (via
-            // `start_discarding`): keep counting/draining, but skip all
-            // retention and overflow bookkeeping so an adopting discard verb
-            // (wait/profile) can't grow O(total) heap.
-            if inner.discarding {
-                // Retain nothing.
-            } else {
-                match inner.mode {
-                    // Fires on the CUMULATIVE total seen, not the current backlog: a
-                    // streaming consumer draining lines frees space but must not reset
-                    // the ceiling. With neither cap set it is a ceiling with no
-                    // ceiling — a misconfiguration treated as zero-tolerance. The pipe
-                    // is still drained so the child never blocks; the consuming verb
-                    // turns `overflowed` into `ErrorReason::OutputTooLarge`.
-                    OverflowMode::Error => {
-                        let over = match (inner.max_lines, inner.max_bytes) {
-                            (None, None) => true,
-                            (lines_cap, bytes_cap) => {
-                                lines_cap.is_some_and(|n| total_lines > n)
-                                    || bytes_cap.is_some_and(|b| {
-                                        // Raw pipe-byte total, plus the same
-                                        // derived line-count bound `over_backlog`
-                                        // uses. The latter keeps this cumulative
-                                        // ceiling aligned with the retained
-                                        // backlog's minimum per-line footprint.
-                                        inner.seen_bytes > b || total_lines > b
-                                    })
-                            }
-                        };
-                        if over {
-                            inner.overflowed = true;
-                            policy_dropped = true;
-                        } else {
-                            inner.bytes += line.len();
-                            inner.lines.push_back(line);
-                        }
-                    }
-                    // Ring-buffer "tail": append, then evict the oldest until the
-                    // backlog is back within both ceilings (a single line larger than
-                    // `max_bytes` is evicted whole).
-                    OverflowMode::DropOldest => {
-                        inner.bytes += line.len();
-                        inner.lines.push_back(line);
-                        while inner.over_backlog() {
-                            match inner.lines.pop_front() {
-                                Some(old) => {
-                                    inner.bytes = inner.bytes.saturating_sub(old.len());
-                                    policy_dropped = true;
-                                }
-                                None => break,
-                            }
-                        }
-                    }
-                    // "Head": keep a contiguous *prefix* of the output. Retain the
-                    // line only while the head is unsealed AND it fits both
-                    // ceilings; the first line that does not fit seals the head, so
-                    // every later line is dropped too. Without the seal an
-                    // over-budget long line would be dropped while a shorter line
-                    // after it still fit and got retained — the buffer would skip a
-                    // line and stop being a true prefix of the process's output.
-                    OverflowMode::DropNewest => {
-                        if !inner.dropnewest_sealed && inner.would_fit(line.len()) {
-                            inner.bytes += line.len();
-                            inner.lines.push_back(line);
-                        } else {
-                            inner.dropnewest_sealed = true;
-                            policy_dropped = true;
-                        }
-                    }
-                }
-            }
-        }
+            Self::retain_line_locked(&mut inner, line, total_lines)
+        };
         if policy_dropped {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
         // `notify_one` stores a permit if no consumer is waiting yet, so a
         // streaming consumer that registers just after this can't miss it.
         self.notify.notify_one();
+    }
+
+    /// The locked half of [`push`](Self::push): supersede the published partial
+    /// tail and apply the buffer policy to one completed line, in a **single**
+    /// critical section. Returns whether the *policy* dropped the line (the
+    /// caller bumps the `dropped` counter off the lock).
+    ///
+    /// Shared with [`drain_with_partial_tail`](Self::drain_with_partial_tail),
+    /// which retains a salvaged tail through exactly this path so a recovered
+    /// tail obeys the same ceilings, seal, and accounting as a completed line.
+    fn retain_line_locked(inner: &mut Inner, line: String, total_lines: usize) -> bool {
+        // A completed line entering the backlog **supersedes** whatever
+        // unterminated tail was last published: that text is the head of *this*
+        // line, so a timeout-salvage snapshot must not fold it in a second time.
+        // Doing it here — under the same lock as the retention decision, rather
+        // than leaving it to the pump's separate `set_partial_tail` call one
+        // await later — is what makes "the line is in the backlog" and "the old
+        // tail is no longer salvageable" one atomic step. Without it, a snapshot
+        // landing in that gap took the stale tail *and* drained the full line,
+        // repeating the prefix in the salvaged output.
+        Self::supersede_partial_tail_locked(inner);
+        // Whether the policy discarded this line.
+        let mut policy_dropped = false;
+        // A dropped streaming consumer flips `discarding` on (via
+        // `start_discarding`): keep counting/draining, but skip all
+        // retention and overflow bookkeeping so an adopting discard verb
+        // (wait/profile) can't grow O(total) heap.
+        if inner.discarding {
+            // Retain nothing.
+        } else {
+            match inner.mode {
+                // Fires on the CUMULATIVE total seen, not the current backlog: a
+                // streaming consumer draining lines frees space but must not reset
+                // the ceiling. With neither cap set it is a ceiling with no
+                // ceiling — a misconfiguration treated as zero-tolerance. The pipe
+                // is still drained so the child never blocks; the consuming verb
+                // turns `overflowed` into `ErrorReason::OutputTooLarge`.
+                OverflowMode::Error => {
+                    let over = match (inner.max_lines, inner.max_bytes) {
+                        (None, None) => true,
+                        (lines_cap, bytes_cap) => {
+                            lines_cap.is_some_and(|n| total_lines > n)
+                                || bytes_cap.is_some_and(|b| {
+                                    // Raw pipe-byte total, plus the same
+                                    // derived line-count bound `over_backlog`
+                                    // uses. The latter keeps this cumulative
+                                    // ceiling aligned with the retained
+                                    // backlog's minimum per-line footprint.
+                                    inner.seen_bytes > b || total_lines > b
+                                })
+                        }
+                    };
+                    if over {
+                        inner.overflowed = true;
+                        policy_dropped = true;
+                    } else {
+                        inner.bytes += line.len();
+                        inner.lines.push_back(line);
+                    }
+                }
+                // Ring-buffer "tail": append, then evict the oldest until the
+                // backlog is back within both ceilings (a single line larger than
+                // `max_bytes` is evicted whole).
+                OverflowMode::DropOldest => {
+                    inner.bytes += line.len();
+                    inner.lines.push_back(line);
+                    while inner.over_backlog() {
+                        match inner.lines.pop_front() {
+                            Some(old) => {
+                                inner.bytes = inner.bytes.saturating_sub(old.len());
+                                policy_dropped = true;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+                // "Head": keep a contiguous *prefix* of the output. Retain the
+                // line only while the head is unsealed AND it fits both
+                // ceilings; the first line that does not fit seals the head, so
+                // every later line is dropped too. Without the seal an
+                // over-budget long line would be dropped while a shorter line
+                // after it still fit and got retained — the buffer would skip a
+                // line and stop being a true prefix of the process's output.
+                OverflowMode::DropNewest => {
+                    if !inner.dropnewest_sealed && inner.would_fit(line.len()) {
+                        inner.bytes += line.len();
+                        inner.lines.push_back(line);
+                    } else {
+                        inner.dropnewest_sealed = true;
+                        policy_dropped = true;
+                    }
+                }
+            }
+        }
+        policy_dropped
     }
 
     /// The current retained-byte ceiling (`OutputBufferPolicy::max_bytes`). The
@@ -701,29 +732,44 @@ impl SharedLines {
     /// it is also not delivered to the per-line handler or tee).
     pub(crate) fn record_oversized_line(&self) {
         self.count.fetch_add(1, Ordering::Relaxed);
-        let mut policy_dropped = false;
-        {
+        let policy_dropped = {
             let mut inner = self.inner.lock().expect("SharedLines poisoned");
-            // A discarded streaming consumer retains nothing and skips all
-            // overflow bookkeeping, even for an over-cap line the pump skipped.
-            if !inner.discarding {
-                match inner.mode {
-                    // The over-cap line trips the fail-loud ceiling.
-                    OverflowMode::Error => inner.overflowed = true,
-                    // An over-cap line can never fit the head, so it seals the
-                    // contiguous prefix: no later (shorter) line may be retained,
-                    // or the retained buffer would no longer be a prefix of the
-                    // output. Mirrors the seal in [`push`](Self::push).
-                    OverflowMode::DropNewest => inner.dropnewest_sealed = true,
-                    OverflowMode::DropOldest => {}
-                }
-                policy_dropped = true;
-            }
-        }
+            Self::record_oversized_locked(&mut inner)
+        };
         if policy_dropped {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
         self.notify.notify_one();
+    }
+
+    /// The locked half of
+    /// [`record_oversized_line`](Self::record_oversized_line), mirroring
+    /// [`retain_line_locked`](Self::retain_line_locked) for a line that is
+    /// counted but never buffered. Returns whether the policy dropped it.
+    fn record_oversized_locked(inner: &mut Inner) -> bool {
+        // A skipped over-cap line still *completes* the line whose prefix was
+        // last published, so the published tail stops being salvageable in the
+        // same critical section — see `retain_line_locked`. Without it a
+        // snapshot landing between this call and the pump's next
+        // `set_partial_tail_state` would count the very same skipped line a
+        // second time (inflating `count` and `dropped`).
+        Self::supersede_partial_tail_locked(inner);
+        // A discarded streaming consumer retains nothing and skips all
+        // overflow bookkeeping, even for an over-cap line the pump skipped.
+        if inner.discarding {
+            return false;
+        }
+        match inner.mode {
+            // The over-cap line trips the fail-loud ceiling.
+            OverflowMode::Error => inner.overflowed = true,
+            // An over-cap line can never fit the head, so it seals the
+            // contiguous prefix: no later (shorter) line may be retained,
+            // or the retained buffer would no longer be a prefix of the
+            // output. Mirrors the seal in [`push`](Self::push).
+            OverflowMode::DropNewest => inner.dropnewest_sealed = true,
+            OverflowMode::DropOldest => {}
+        }
+        true
     }
 
     fn close(&self) {
@@ -813,15 +859,24 @@ impl SharedLines {
     pub(crate) fn set_partial_tail_state(&self, tail: &str, oversized: bool) {
         let mut inner = self.inner.lock().expect("SharedLines poisoned");
         let pending = oversized || !tail.is_empty();
-        if inner.partial_tail != tail
+        let changed = inner.partial_tail != tail
             || inner.partial_tail_pending != pending
-            || inner.partial_tail_oversized != oversized
-        {
+            || inner.partial_tail_oversized != oversized;
+        if changed {
             inner.partial_tail.clear();
             inner.partial_tail.push_str(tail);
             inner.partial_tail_pending = pending;
             inner.partial_tail_oversized = oversized;
-            inner.partial_tail_finalized = false;
+        }
+        // Publishing always clears the "already emitted" seal, even when the text
+        // is byte-identical to what is already there. Once a completed line
+        // supersedes the tail (see `retain_line_locked`), the pump's next publish
+        // is a genuinely *new* live tail — and it may legitimately repeat the
+        // previous text (a repeated line prefix, `a\na…`), which the change check
+        // above cannot tell apart from "nothing happened". Leaving the seal on
+        // would silently cost that new tail its timeout salvage.
+        inner.partial_tail_finalized = false;
+        if changed {
             drop(inner);
             // A tail update is a buffer change like a `push`: wake a parked
             // `wait_for_output` (the stored permit covers a waiter that registers
@@ -830,30 +885,97 @@ impl SharedLines {
         }
     }
 
-    /// Mark the pending tail as emitted by the normal EOF finalizer while
-    /// leaving its side-view text available to `wait_for_output`.
-    pub(crate) fn mark_partial_tail_finalized(&self) {
-        let mut inner = self.inner.lock().expect("SharedLines poisoned");
+    /// Mark the currently published partial tail as already emitted: its text
+    /// stays visible to [`partial_tail_snapshot`](Self::partial_tail_snapshot)
+    /// (so a final un-terminated prompt remains matchable by `wait_for_output`
+    /// right up to close), but a timeout-salvage snapshot no longer folds it into
+    /// the backlog.
+    ///
+    /// Called from every completed-line path
+    /// ([`retain_line_locked`](Self::retain_line_locked) /
+    /// [`record_oversized_locked`](Self::record_oversized_locked)) *inside* that
+    /// path's own critical section, so "the line is recorded" and "the tail it
+    /// completes is no longer salvageable" are one atomic step. That covers the
+    /// pump's EOF finalizer too — finalizing means emitting the tail as a line,
+    /// which takes exactly those paths.
+    fn supersede_partial_tail_locked(inner: &mut Inner) {
         if inner.partial_tail_pending {
             inner.partial_tail_finalized = true;
         }
     }
 
-    /// Take an unfinished tail for a cancelled capture and make the operation
-    /// idempotent. The caller applies the stream's normal capture shaping and
-    /// buffer policy; `seen_bytes` remains untouched because the pump already
-    /// accounted for the raw bytes at its read boundary.
-    pub(crate) fn take_partial_tail_for_capture(&self) -> Option<(String, bool)> {
+    /// Fold a still-pending partial tail into the backlog and take every retained
+    /// line — the timeout-salvage snapshot's **single** sink operation
+    /// (`LineCapture::snapshot` / `RawCapture::snapshot`).
+    ///
+    /// Salvage runs while the last stage's pump may still be alive: dropping the
+    /// capture task only *requests* an abort, and the pump stops at its next
+    /// await. So this cannot be take-tail → push → drain as three separate lock
+    /// acquisitions. In the gap between the take and the drain a live pump can
+    /// push the very line the taken tail is the prefix of, and the drain then
+    /// returns both — the tail repeated ahead of its own completed line. Holding
+    /// the lock across the whole fold closes that direction;
+    /// [`retain_line_locked`](Self::retain_line_locked) superseding the published
+    /// tail closes the other (a push that already happened leaves nothing stale to
+    /// salvage). What remains is the accepted best-effort degradation of a
+    /// torn-down capture: a push that lands *after* this returns is lost, never
+    /// duplicated.
+    ///
+    /// The recovered tail is retained through the same
+    /// [`retain_line_locked`](Self::retain_line_locked) /
+    /// [`record_oversized_locked`](Self::record_oversized_locked) paths a
+    /// completed line takes, so it obeys the buffer policy's ceilings and seal and
+    /// updates `count`/`dropped` identically. Taking it is idempotent (a second
+    /// snapshot recovers nothing), and `seen_bytes` stays untouched because the
+    /// pump already accounted for the raw bytes at its read boundary.
+    ///
+    /// `shape` — the stream's capture shaping
+    /// ([`StreamConfig::shape_capture_line`]) — runs with the lock held, so the
+    /// tail is shaped exactly like a completed line yet cannot be overtaken
+    /// between shaping and retention. It is panic-isolated (see
+    /// [`apply_capture_policy`]) and has no route back into this sink, so the
+    /// hold is bounded by one line's redaction.
+    pub(crate) fn drain_with_partial_tail(
+        &self,
+        shape: impl FnOnce(String) -> String,
+    ) -> Vec<String> {
         let mut inner = self.inner.lock().expect("SharedLines poisoned");
-        if !inner.partial_tail_pending || inner.partial_tail_finalized {
-            return None;
+        let mut salvaged = false;
+        let mut policy_dropped = false;
+        if inner.partial_tail_pending && !inner.partial_tail_finalized {
+            inner.partial_tail_pending = false;
+            inner.partial_tail_finalized = true;
+            let oversized = inner.partial_tail_oversized;
+            let tail = std::mem::take(&mut inner.partial_tail);
+            let total_lines = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+            salvaged = true;
+            policy_dropped = if oversized {
+                Self::record_oversized_locked(&mut inner)
+            } else {
+                Self::retain_line_locked(&mut inner, shape(tail), total_lines)
+            };
         }
-        inner.partial_tail_pending = false;
-        inner.partial_tail_finalized = true;
-        Some((
-            std::mem::take(&mut inner.partial_tail),
-            inner.partial_tail_oversized,
-        ))
+        let lines = Self::drain_locked(&mut inner);
+        drop(inner);
+        if policy_dropped {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        if salvaged {
+            self.notify.notify_one();
+        }
+        lines
+    }
+
+    /// Whether this sink's state lock is currently held by *someone else* — a
+    /// test-only probe. It lets a racing thread prove, without any wall-clock
+    /// wait, that a critical section it was released from really is still holding
+    /// the lock (see `the_salvage_fold_and_drain_are_one_critical_section`).
+    #[cfg(test)]
+    pub(crate) fn is_locked_by_another_thread(&self) -> bool {
+        matches!(
+            self.inner.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
     }
 
     /// Snapshot the current unterminated tail (cloned so the predicate runs off
@@ -913,9 +1035,16 @@ impl SharedLines {
     }
 
     /// Take all currently-retained lines (used by the bulk collectors once the
-    /// pump has finished).
+    /// pump has finished). A capture salvaging a still-live pump's tail uses
+    /// [`drain_with_partial_tail`](Self::drain_with_partial_tail) instead, which
+    /// folds the tail in under this same single lock.
     pub(crate) fn drain(&self) -> Vec<String> {
         let mut inner = self.inner.lock().expect("SharedLines poisoned");
+        Self::drain_locked(&mut inner)
+    }
+
+    /// The locked half of [`drain`](Self::drain).
+    fn drain_locked(inner: &mut Inner) -> Vec<String> {
         inner.bytes = 0;
         inner.lines.drain(..).collect()
     }
@@ -1510,12 +1639,20 @@ where
             // split loop above ran with `eof = true`, so in `\r`-aware mode a
             // trailing `\r` was already resolved as a frame terminator; whatever
             // remains in `pending` here is pure content with no terminator.
+            //
+            // Turning the tail into a completed line (`emit`'s push, or
+            // `record_oversized_line` for one the cap rejects) is itself what marks
+            // the published tail as already emitted — `SharedLines` seals it inside
+            // the very critical section that records the line
+            // (`supersede_partial_tail_locked`). So no separate finalize call is
+            // needed here, and a timeout snapshot racing this finalizer can never
+            // append the same text twice: it either sees the tail still live (and
+            // salvages it) or sees the completed line (and the tail sealed).
             if oversized {
                 // An un-terminated tail: `pending` is all content (in `Newline`
                 // mode a trailing `\r` is content; in `\r`-aware mode none remains).
                 pending.clear();
                 sink.0.record_oversized_line();
-                sink.0.mark_partial_tail_finalized();
             } else if !pending.is_empty() {
                 // An un-terminated final line: `pending` is all content (in
                 // `Newline` mode a trailing `\r` is content). Re-apply the byte cap:
@@ -1526,7 +1663,6 @@ where
                 let line = std::mem::take(&mut pending);
                 if cap.is_some_and(|c| line.len() > c) {
                     sink.0.record_oversized_line();
-                    sink.0.mark_partial_tail_finalized();
                 } else {
                     emit(
                         &mut handler,
@@ -1538,7 +1674,6 @@ where
                         line,
                     )
                     .await;
-                    sink.0.mark_partial_tail_finalized();
                 }
             }
             // Flush the tee once at stream end (best-effort).
@@ -1908,6 +2043,123 @@ mod tests {
         assert_eq!(sink.dropped(), 0, "nothing was dropped");
         let (tail, _) = sink.partial_tail_snapshot();
         assert_eq!(tail.as_deref(), Some("tail-without-newline"));
+    }
+
+    /// A completed line and the pump's replacement tail are published under two
+    /// *separate* locks, an await apart, so a timeout-salvage snapshot can land
+    /// between them. Pushing the line seals the tail it completed inside the
+    /// push's own critical section, so a snapshot in that window sees "the line,
+    /// no live tail" instead of the stale prefix on top of its own finished line.
+    #[test]
+    fn a_pushed_line_seals_the_tail_it_completed() {
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        // The previous read published the un-terminated prefix…
+        sink.set_partial_tail("ab");
+        // …and this read completed it, pushing the whole line. The replacement
+        // tail has not been published yet.
+        sink.push("abcd".to_owned());
+
+        let salvaged = sink.drain_with_partial_tail(|tail| tail);
+
+        assert_eq!(
+            salvaged,
+            vec!["abcd".to_owned()],
+            "the salvage must not repeat the prefix of the line it drained"
+        );
+        assert_eq!(sink.count(), 1, "the sealed tail is not counted as a line");
+        assert_eq!(
+            sink.partial_tail_snapshot().0.as_deref(),
+            Some("ab"),
+            "the seal blocks salvage only; the side view stays readable"
+        );
+    }
+
+    /// The seal must not outlive the tail it sealed. After a completed line the
+    /// pump publishes a genuinely *new* live tail, and it may repeat the sealed
+    /// text verbatim (`ab` completing `abab`, then `ab` again) — which the
+    /// publish's own change check cannot tell from "nothing happened", so the
+    /// publish clears the seal unconditionally.
+    #[test]
+    fn a_republished_identical_tail_is_salvageable_again() {
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        sink.set_partial_tail("ab");
+        sink.push("abab".to_owned()); // seals the published tail
+        sink.set_partial_tail("ab"); // the next read's tail, same text, new line
+
+        assert_eq!(
+            sink.drain_with_partial_tail(|tail| tail),
+            vec!["abab".to_owned(), "ab".to_owned()],
+        );
+    }
+
+    /// The same seal covers an over-cap line the pump *skipped*: without it, a
+    /// snapshot between `record_oversized_line` and the pump's next publish would
+    /// count — and charge as dropped — the very same skipped line a second time.
+    #[test]
+    fn a_skipped_over_cap_line_is_not_counted_twice_by_salvage() {
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded().with_max_bytes(2));
+        // Mid-skip the tail is published as "empty but pending" (oversized), so a
+        // salvage can still charge the unfinished over-cap line as dropped.
+        sink.set_partial_tail_state("", true);
+        // Its terminator arrived: counted and charged exactly once, here.
+        sink.record_oversized_line();
+
+        assert!(sink.drain_with_partial_tail(|tail| tail).is_empty());
+        assert_eq!(sink.count(), 1, "one skipped line, counted once");
+        assert_eq!(sink.dropped(), 1, "…and charged as dropped once");
+    }
+
+    /// Folding the pending tail in and draining the backlog is **one** critical
+    /// section. A pump that concurrently pushes the tail's own completed line is
+    /// therefore ordered either wholly before the fold (which then finds the tail
+    /// sealed and salvages nothing) or wholly after the drain (its line stays in
+    /// the sink, lost from the salvage — the accepted best-effort degradation of a
+    /// torn-down capture). It can never land in between, where a split
+    /// take-then-drain returned both and repeated the prefix.
+    ///
+    /// Deterministic without a wall-clock wait (K-017): the racing thread is
+    /// released from *inside* the fold and hands back a lock observation the fold
+    /// blocks on, so "the sink is locked while the racing push starts" is a
+    /// checked fact rather than a scheduling hope — and the push is provably
+    /// ordered after the drain. Split the fold and the drain again and the
+    /// observation comes back `false`, failing the test outright.
+    #[test]
+    fn the_salvage_fold_and_drain_are_one_critical_section() {
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        sink.set_partial_tail("ab");
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (observed, observation) = std::sync::mpsc::channel::<bool>();
+        let pump = {
+            let sink = sink.clone();
+            std::thread::spawn(move || {
+                released.recv().expect("released from inside the fold");
+                // Report the fold's lock as seen from the outside (a non-blocking
+                // probe), then race it: this push blocks until the fold ends.
+                observed
+                    .send(sink.is_locked_by_another_thread())
+                    .expect("the fold is waiting for the observation");
+                sink.push("abcd".to_owned());
+            })
+        };
+
+        let salvaged = sink.drain_with_partial_tail(|tail| {
+            release.send(()).expect("the racing pump thread is alive");
+            assert!(
+                observation
+                    .recv()
+                    .expect("the racing pump thread reported its observation"),
+                "the fold must still hold the sink lock while a racing push starts"
+            );
+            tail
+        });
+        pump.join().expect("racing pump thread");
+
+        assert_eq!(salvaged, vec!["ab".to_owned()], "the tail, exactly once");
+        assert_eq!(
+            sink.drain(),
+            vec!["abcd".to_owned()],
+            "the racing line landed after the drain: lost from the salvage, never repeated in it"
+        );
     }
 
     #[tokio::test]

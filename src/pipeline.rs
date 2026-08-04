@@ -144,7 +144,13 @@ struct Captured<T> {
     total_bytes: usize,
 }
 
-trait PipelineCapture: Default + Send + Clone + 'static {
+/// The two capture shapes `capture` is generic over — `String` (decoded lines)
+/// and `Vec<u8>` (raw stdout bytes) — behind one seam: how to prepare the last
+/// stage's sinks before it moves into a task, and how to snapshot whatever they
+/// hold when a chain-wide timeout drops that task. No `Default` bound: the
+/// timeout path salvages a real snapshot (`T::snapshot`), never an empty
+/// placeholder.
+trait PipelineCapture: Send + Clone + 'static {
     type Tracker: Clone;
 
     fn prepare(process: &mut RunningProcess) -> Result<Self::Tracker>;

@@ -490,9 +490,23 @@ async fn pipeline_timeout_keeps_output_read_before_the_deadline() {
         ])
     };
 
+    // The deadline has to outlast the second stage's *interpreter start-up*, not
+    // just its write: what is asserted below is that output the pumps had already
+    // read is salvaged, and a deadline that fires before the child writes at all
+    // leaves nothing to salvage (an empty result with `total_bytes: 0`, not a
+    // duplication or loss bug). A cold Windows PowerShell start on a loaded host
+    // routinely eats more than two seconds, so give that platform room; every
+    // budget here stays far below the stage's own 30s idle sleep, so the chain
+    // still times out on the deadline rather than on the child exiting.
+    let chain_timeout = if cfg!(windows) {
+        Duration::from_secs(8)
+    } else {
+        Duration::from_secs(2)
+    };
+
     let result = producer
         .pipe(partial_then_idle)
-        .timeout(Duration::from_secs(2))
+        .timeout(chain_timeout)
         .output_string()
         .await
         .expect("a timed-out pipeline still reports a result");
@@ -500,7 +514,7 @@ async fn pipeline_timeout_keeps_output_read_before_the_deadline() {
     assert!(result.timed_out(), "result: {result:?}");
     assert_eq!(result.stdout(), "partial-stdout", "result: {result:?}");
     assert_eq!(result.stderr(), "partial-stderr", "result: {result:?}");
-    assert_eq!(result.configured_timeout(), Some(Duration::from_secs(2)));
+    assert_eq!(result.configured_timeout(), Some(chain_timeout));
     assert!(
         result.duration() > Duration::ZERO,
         "chain timeout must retain its measured duration: {result:?}"
