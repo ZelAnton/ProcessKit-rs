@@ -134,6 +134,24 @@ impl Job {
         cmd: &mut Command,
         opts: &crate::sys::SpawnOptions,
     ) -> io::Result<Child> {
+        // The spare the re-arm below displaces interests only a launch that can
+        // still be undone; a spawn that hands back a live child never puts it back.
+        self.spawn_displacing_spare(cmd, opts)
+            .map(|(child, _displaced)| child)
+    }
+
+    /// [`spawn`](Self::spawn), also handing back the [`DisplacedSpare`](super::DisplacedSpare)
+    /// its kill-on-drop re-arm took away — the token
+    /// [`rollback_pty_spawn`](Self::rollback_pty_spawn) needs if the PTY setup that
+    /// follows this spawn fails. One body serves both, so the re-arm cannot drift
+    /// between the plain and the undoable launch path; the cgroup arm re-arms this
+    /// `Job`'s own latch, while the fallback arm's token comes from the
+    /// `ProcessGroup`'s (each backend owns exactly the latch its `Drop` reads).
+    pub(crate) fn spawn_displacing_spare(
+        &self,
+        cmd: &mut Command,
+        opts: &crate::sys::SpawnOptions,
+    ) -> io::Result<(Child, super::DisplacedSpare)> {
         // Arm the parent-death signal last, after containment hooks: pre-exec
         // hooks run in registration order, and a child that dies unprotected
         // inside its container beats one protected outside it. The spawner's
@@ -177,13 +195,16 @@ impl Job {
                 // prior graceful_shutdown(escalate=false) latched this flag to
                 // spare survivors; a fresh member must not be spared by it. Done
                 // after the spawn so a failed spawn leaves the survivors alone.
-                self.skip_drop_kill.clear();
-                Ok(child)
+                // What the re-arm displaced travels back with the child, for the
+                // one caller that may still have to undo this spawn.
+                let displaced = self.skip_drop_kill.clear();
+                Ok((child, displaced))
             }
             Backend::ProcessGroup(pg) => {
                 arm(cmd);
-                // `pg.spawn` re-arms the ProcessGroup's own latch on success.
-                pg.spawn(cmd, opts)
+                // `pg.spawn_displacing_spare` re-arms the ProcessGroup's own latch
+                // on success, and reports what that re-arm displaced there.
+                pg.spawn_displacing_spare(cmd, opts)
             }
         }
     }
@@ -198,11 +219,21 @@ impl Job {
         opts: &crate::sys::SpawnOptions,
         _env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
     ) -> io::Result<crate::sys::pty::PtySpawn> {
+        // Carries the spare the spawn's kill-on-drop re-arm displaced over to the
+        // rollback. Both closures run inside this one call, on this thread, and the
+        // rollback only ever runs after the spawn returned — so a `Cell` is the
+        // whole hand-off, and an untouched one ("nothing to restore") is exactly
+        // right when the spawn never ran.
+        let displaced = std::cell::Cell::new(super::DisplacedSpare::default());
         crate::sys::pty::spawn_pty(
             cmd,
             opts,
-            |c, o| self.spawn(c, o),
-            |pid| self.rollback_pty_spawn(pid),
+            |c, o| {
+                let (child, spare) = self.spawn_displacing_spare(c, o)?;
+                displaced.set(spare);
+                Ok(child)
+            },
+            |pid| self.rollback_pty_spawn(pid, displaced.take()),
         )
     }
 
@@ -220,18 +251,45 @@ impl Job {
     /// Honest about what that leaves: a descendant that forked and called `setsid`
     /// inside the setup window is out of `killpg`'s reach, but it has **not** left
     /// the cgroup — membership is inherited across `fork` and `setsid` does not
-    /// change it — so it stays a member, is still reported by `members()`, and is
-    /// killed by this job's `kill_all`/`Drop` (`cgroup.kill`, whole-subtree and
-    /// atomic). The no-orphan guarantee therefore holds at the job's scope, which
-    /// is the scope this mechanism has ever promised. Firing `cgroup.kill` from
-    /// here to close that microsecond instead is deliberately rejected: it kills
-    /// **every** member of the cgroup, i.e. unrelated runs of the same
-    /// `ProcessGroup`, which a single failed spawn must not do.
+    /// change it — so it stays a member and is still reported by `members()`.
+    /// Nothing on this failure path moves it out of the cgroup this job holds, so
+    /// every kill this job *does* perform reaches it (`cgroup.kill`, whole-subtree
+    /// and atomic). But the two entry points do not perform the same kills:
+    /// `kill_all` performs one whenever it is called, for as long as the job is
+    /// alive, while `Drop` performs one only while the kill-on-drop backstop is
+    /// armed — and the restore below is entitled to leave it disarmed. Firing
+    /// `cgroup.kill` from here to close that microsecond instead is deliberately
+    /// rejected: it kills **every** member of the cgroup, i.e. unrelated runs of the
+    /// same `ProcessGroup`, which a single failed spawn must not do.
+    ///
+    /// Either way the kill-on-drop backstop comes last: `displaced` is the spare
+    /// this spawn's own re-arm took away, and putting it back leaves the latch as a
+    /// `graceful_shutdown(escalate = false)` had left it, so a launch that failed
+    /// after its child existed does not hand `Drop` a licence to kill survivors the
+    /// caller deliberately spared. It takes only while no other `spawn`/`adopt` has
+    /// re-armed the backstop since (see
+    /// [`SkipDropKill::restore`](super::SkipDropKill::restore)); each arm restores
+    /// on the latch its own `Drop` reads.
+    ///
+    /// A restore that takes is what narrows the paragraph above, and it narrows it
+    /// for the whole cgroup: as long as that spare stands (no later `spawn`/`adopt`
+    /// re-arms the backstop), `Drop` runs no `cgroup.kill` at all — so a `setsid`
+    /// escapee of this very spawn is not killed there either. It is left running
+    /// inside the cgroup dir `Drop` then leaves behind (that `rmdir` fails `EBUSY`
+    /// while members remain), on the same terms as the survivors the caller chose
+    /// not to escalate against, and `kill_all` is what still kills it while the job
+    /// lives. Re-arming the backstop here to catch it would revoke the
+    /// `escalate = false` decision for every other member too — a failed spawn
+    /// overturning a shutdown call that was not its to make, which is the trade this
+    /// rollback declines.
     #[cfg(feature = "pty")]
-    pub(crate) fn rollback_pty_spawn(&self, pid: u32) {
+    pub(crate) fn rollback_pty_spawn(&self, pid: u32, displaced: super::DisplacedSpare) {
         match &self.backend {
-            Backend::Cgroup(_) => crate::sys::pgroup::hard_kill_fresh_spawn(pid as i32),
-            Backend::ProcessGroup(pg) => pg.rollback_pty_spawn(pid),
+            Backend::Cgroup(_) => {
+                crate::sys::pgroup::hard_kill_fresh_spawn(pid as i32);
+                self.skip_drop_kill.restore(displaced);
+            }
+            Backend::ProcessGroup(pg) => pg.rollback_pty_spawn(pid, displaced),
         }
     }
 
@@ -3440,5 +3498,168 @@ mod detect_mechanism_tests {
             job.mechanism(),
             "the read-only mechanism query must match a really-created group's mechanism"
         );
+    }
+}
+
+/// T-270 (the cgroup arm). This backend re-arms and reads the `skip_drop_kill`
+/// latch on the `Job` itself, while the process-group fallback uses the one inside
+/// its own `ProcessGroup` — two different objects — so the cgroup arm's PTY rollback
+/// has to restore the spare its own spawn displaced on *that* latch.
+///
+/// Both tests build a `Job` over a throwaway directory standing in for a cgroup,
+/// which is enough because the rollback path under test (`hard_kill_fresh_spawn` +
+/// restore) reads no cgroup file at all, and the latch is precisely what
+/// `Job::drop` consults before killing. What a stand-in directory cannot show is a
+/// real cgroup tearing a survivor down, so these assert the latch; the end-to-end
+/// "the spared survivor outlives a failed PTY launch" run lives in
+/// `sys::pty::imp::tests` and picks up whichever mechanism the host really provides.
+#[cfg(all(test, feature = "pty"))]
+mod pty_rollback_spare_tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use tokio::process::{Child, Command};
+
+    use super::{Backend, Cgroup, Job};
+    use crate::sys::fault_injection::{Faults, Site};
+    use crate::sys::{SkipDropKill, SpawnOptions};
+
+    /// A cgroup-arm `Job` over a throwaway directory carrying the one interface file
+    /// this backend's spawn path writes (`cgroup.procs`), plus that directory so the
+    /// test can remove it — `Job::drop`'s own `rmdir` cannot, the file being there.
+    fn cgroup_job(tag: &str) -> (Job, PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-pty-spare-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create the stand-in cgroup dir");
+        std::fs::write(dir.join("cgroup.procs"), b"").expect("create cgroup.procs");
+        let job = Job {
+            backend: Backend::Cgroup(Cgroup { path: dir.clone() }),
+            skip_drop_kill: SkipDropKill::new(),
+        };
+        (job, dir)
+    }
+
+    /// A child that ignores the graceful signal, standing in for a member the
+    /// shutdown leaves running. Its liveness is not what these tests read — a
+    /// stand-in directory's `cgroup.procs` never drains, so the non-escalating
+    /// shutdown reaches its deadline and spares whether or not this child is still
+    /// there — it is here so the shutdown has a member to be about at all.
+    fn survivor_command() -> Command {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "trap '' TERM; while :; do sleep 60; done"])
+            .kill_on_drop(true);
+        command
+    }
+
+    /// A pty child that stays alive until the rollback kills it.
+    fn idle_command() -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", "while :; do sleep 60; done"]);
+        command
+    }
+
+    /// A stand-in cgroup contains nothing, so every child this module starts is this
+    /// module's to end.
+    async fn reap(mut child: Child) {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+
+    /// A PTY launch that fails after its child exists must leave a
+    /// `graceful_shutdown(escalate = false)` standing: its spawn re-armed the
+    /// kill-on-drop backstop, and only the rollback can undo that. Driven through
+    /// the production wiring (`Job::spawn_pty` threads the token from its spawn
+    /// closure to its rollback closure) with the master `dup` fault-injected.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns real subprocesses"]
+    async fn a_failed_pty_launch_restores_the_cgroup_arms_spare() {
+        let (job, dir) = cgroup_job("restore");
+        let survivor = job
+            .spawn(&mut survivor_command(), &SpawnOptions::default())
+            .expect("spawn a cgroup member");
+
+        job.graceful_shutdown(libc::SIGTERM, Duration::from_millis(100), false)
+            .await
+            .expect("graceful shutdown");
+        assert!(
+            job.skip_drop_kill.is_set(),
+            "precondition: a non-escalating shutdown spares the survivors"
+        );
+
+        {
+            let _fault = Faults::new()
+                .fail_every(Site::PtyMasterClone, Some("writer"), libc::EIO)
+                .arm();
+            let result = job.spawn_pty(&mut idle_command(), &pty_options(), None);
+            assert!(
+                result.is_err(),
+                "the injected master-clone fault must surface as an error"
+            );
+        }
+
+        assert!(
+            job.skip_drop_kill.is_set(),
+            "the rollback must restore the spare its own spawn displaced — otherwise \
+             Job::drop hard-kills survivors the caller chose not to escalate against"
+        );
+
+        drop(job);
+        reap(survivor).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The transactional half: a `spawn` joined the same job between the rolled-back
+    /// spawn's re-arm and its rollback. That newcomer is a live member nothing chose
+    /// to spare, so the restore must lose and the backstop must stay armed.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns real subprocesses"]
+    async fn a_spawn_between_the_pty_spawn_and_its_rollback_keeps_the_backstop_armed() {
+        let (job, dir) = cgroup_job("newcomer");
+        let survivor = job
+            .spawn(&mut survivor_command(), &SpawnOptions::default())
+            .expect("spawn a cgroup member");
+
+        job.graceful_shutdown(libc::SIGTERM, Duration::from_millis(100), false)
+            .await
+            .expect("graceful shutdown");
+
+        // The launch that will be rolled back: its spawn re-arms the backstop and
+        // hands back the spare it displaced.
+        let (pty_child, displaced) = job
+            .spawn_displacing_spare(&mut idle_command(), &SpawnOptions::default())
+            .expect("spawn the pty child");
+        let pty_pid = pty_child.id().expect("the pty child reports a pid");
+        // …and a fresh member joins before that launch is undone.
+        let newcomer = job
+            .spawn(&mut survivor_command(), &SpawnOptions::default())
+            .expect("spawn the newcomer");
+
+        job.rollback_pty_spawn(pty_pid, displaced);
+        assert!(
+            !job.skip_drop_kill.is_set(),
+            "a member that joined after the rolled-back spawn must keep its \
+             kill-on-drop backstop — restoring the older spare would strip it"
+        );
+
+        drop(job);
+        reap(pty_child).await;
+        reap(newcomer).await;
+        reap(survivor).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pty spawn's options — the launch seam sets nothing else for these tests.
+    fn pty_options() -> SpawnOptions {
+        SpawnOptions {
+            use_pty: true,
+            ..SpawnOptions::default()
+        }
     }
 }

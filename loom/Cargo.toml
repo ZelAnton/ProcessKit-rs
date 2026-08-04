@@ -6,8 +6,15 @@ edition = "2024"
 
 # The `#[path]`-included cores carry `cfg(loom)` gates; declare the cfg (as the
 # parent crate's Cargo.toml does) so rustc's `unexpected_cfgs` lint stays quiet.
+# `feature = "pty"` is declared for the same reason and is *not* a feature of this
+# harness: `sys/skip_drop_kill.rs` carries one `cfg_attr(…, allow(dead_code))` keyed
+# to the parent crate's `pty` feature (the latch's rollback-restore is uncalled with
+# PTY support off), and this harness compiles that file verbatim.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(loom)",
+    'cfg(feature, values("pty"))',
+] }
 
 [dev-dependencies]
 # The model checker. This harness exists solely to run loom over the three pure

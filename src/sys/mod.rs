@@ -69,6 +69,11 @@ pub(crate) fn process_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
 // and `crate::sync`.
 mod skip_drop_kill;
 pub(crate) use skip_drop_kill::SkipDropKill;
+// The token a spawn's re-arm of that latch hands its own rollback. Only the Unix
+// backends undo a spawn that way (`rollback_pty_spawn`), so only they name the type
+// — re-exporting it unconditionally would be an unused import on Windows.
+#[cfg(unix)]
+pub(crate) use skip_drop_kill::DisplacedSpare;
 
 // Test-only fault injection at the OS-primitive boundary of the platform backends:
 // a unit test arms "this cgroup write / this Job Object info class / this signal
@@ -390,9 +395,14 @@ impl Job {
     /// own closure and handed to `sys::pty::spawn_pty`, it also lets a test hold the
     /// production guard still mid-rollback and assert the *order* of the guard's two
     /// kills (see the guard's docs in `sys::pty::unix`).
+    ///
+    /// `displaced` is what the rolled-back spawn's own re-arm of the kill-on-drop
+    /// backstop took away; production threads it from the spawn closure, and a test
+    /// that is not exercising the latch passes `DisplacedSpare::default()` ("nothing
+    /// to restore").
     #[cfg(all(test, unix, feature = "pty"))]
-    pub(crate) fn rollback_pty_spawn(&self, pid: u32) {
-        self.0.rollback_pty_spawn(pid);
+    pub(crate) fn rollback_pty_spawn(&self, pid: u32, displaced: DisplacedSpare) {
+        self.0.rollback_pty_spawn(pid, displaced);
     }
 
     /// Attach an already-started child to this job.

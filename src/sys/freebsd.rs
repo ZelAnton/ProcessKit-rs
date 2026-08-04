@@ -978,15 +978,22 @@ impl Job {
         opts: &crate::sys::SpawnOptions,
         _env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
     ) -> io::Result<crate::sys::pty::PtySpawn> {
+        // Carries the spare the spawn's kill-on-drop re-arm displaced over to the
+        // rollback. Both closures run inside this one call, on this thread, and the
+        // rollback only ever runs after the spawn returned — so a `Cell` is the
+        // whole hand-off, and an untouched one ("nothing to restore") is exactly
+        // right when the spawn never ran.
+        let displaced = std::cell::Cell::new(crate::sys::DisplacedSpare::default());
         crate::sys::pty::spawn_pty(
             cmd,
             opts,
             |c, o| {
-                let child = self.group.spawn(c, o)?;
+                let (child, spare) = self.group.spawn_displacing_spare(c, o)?;
                 self.record_root(&child);
+                displaced.set(spare);
                 Ok(child)
             },
-            |pid| self.rollback_pty_spawn(pid),
+            |pid| self.rollback_pty_spawn(pid, displaced.take()),
         )
     }
 
@@ -1023,10 +1030,14 @@ impl Job {
     /// handle by which this job can ever reach a `setsid` escapee again. So the
     /// first is released here and the second is left to the ordinary pruning, on the
     /// kernel's own positive answer that nothing is left under it.
+    ///
+    /// The process-group layer also restores `displaced` — the spare this spawn's
+    /// own kill-on-drop re-arm took away — since both layers read the one latch this
+    /// `Job` shares with its embedded [`ProcessGroup`].
     #[cfg(feature = "pty")]
-    pub(crate) fn rollback_pty_spawn(&self, pid: u32) {
+    pub(crate) fn rollback_pty_spawn(&self, pid: u32, displaced: crate::sys::DisplacedSpare) {
         self.reaper.hard_kill_subtree(pid as libc::pid_t);
-        self.group.rollback_pty_spawn(pid);
+        self.group.rollback_pty_spawn(pid, displaced);
     }
 
     /// Register a just-started child as one of this job's subtree roots. Called

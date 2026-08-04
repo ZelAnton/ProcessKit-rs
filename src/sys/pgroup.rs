@@ -816,17 +816,51 @@ impl ProcessGroup {
     ///
     /// The caller still owns the child's un-reaped `Child`, so `pid` cannot have
     /// been recycled between the spawn and this call.
+    ///
+    /// **Then the kill-on-drop backstop.** `displaced` is the spare this spawn's own
+    /// re-arm took away (see [`spawn_displacing_spare`](Self::spawn_displacing_spare)):
+    /// putting it back returns the latch to the state a
+    /// `graceful_shutdown(escalate = false)` had left it in, so a launch that failed
+    /// after its child existed does not hand `Drop` a licence to kill survivors the
+    /// caller deliberately spared. It takes only while no other `spawn`/`adopt` has
+    /// re-armed the backstop since — that newcomer wins and stays killable (see
+    /// [`SkipDropKill::restore`](super::SkipDropKill::restore)).
     #[cfg(feature = "pty")]
-    pub(crate) fn rollback_pty_spawn(&self, pid: u32) {
+    pub(crate) fn rollback_pty_spawn(&self, pid: u32, displaced: super::DisplacedSpare) {
         hard_kill_fresh_spawn(pid as i32);
         self.groups.remove(pid as i32);
+        self.skip_drop_kill.restore(displaced);
     }
 
+    // The plain shape, for a backend that only wants the child: `sys::unix`
+    // (macOS/the other BSDs) and `sys::freebsd` call it. Linux does not — its `Job`
+    // routes both of its arms through `spawn_displacing_spare`, so the cgroup arm
+    // and this fallback re-arm the backstop through one body — which leaves this
+    // method dead on the Linux `--lib` build alone (the K-092 asymmetric-backend
+    // shape). Allowed on exactly that target rather than pushing a tuple onto every
+    // caller that has no use for one.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(crate) fn spawn(
         &self,
         cmd: &mut Command,
         opts: &crate::sys::SpawnOptions,
     ) -> io::Result<Child> {
+        // The spare the re-arm below displaces interests only a launch that can
+        // still be undone; a spawn that hands back a live child never puts it back.
+        self.spawn_displacing_spare(cmd, opts)
+            .map(|(child, _displaced)| child)
+    }
+
+    /// [`spawn`](Self::spawn), also handing back the [`DisplacedSpare`](super::DisplacedSpare)
+    /// its kill-on-drop re-arm took away — the token
+    /// [`rollback_pty_spawn`](Self::rollback_pty_spawn) needs if the PTY setup that
+    /// follows this spawn fails. One body serves both, so the re-arm cannot drift
+    /// between the plain and the undoable launch path.
+    pub(crate) fn spawn_displacing_spare(
+        &self,
+        cmd: &mut Command,
+        opts: &crate::sys::SpawnOptions,
+    ) -> io::Result<(Child, super::DisplacedSpare)> {
         // Own process group per child → killpg reaps it and its descendants.
         // `process_group(0)` == setpgid(0, 0): the child becomes its own group
         // leader. EXCEPT when the command carries a `setsid()` pre-exec hook:
@@ -867,9 +901,10 @@ impl ProcessGroup {
         // skip_drop_kill to spare survivors; a fresh member must not be spared by
         // that stale latch. Done *after* tracking (and after spawn) so a failed
         // spawn — whose guard reaps the child, adding no member — leaves the
-        // spared survivors untouched.
-        self.skip_drop_kill.clear();
-        Ok(guard.disarm())
+        // spared survivors untouched. What the re-arm displaced travels back with
+        // the child, for the one caller that may still have to undo this spawn.
+        let displaced = self.skip_drop_kill.clear();
+        Ok((guard.disarm(), displaced))
     }
 
     #[cfg(feature = "process-control")]
@@ -1208,6 +1243,180 @@ mod tests {
         let _ = child.wait().await;
 
         assert!(alive, "child must survive when escalate_to_kill=false");
+    }
+
+    /// A child of this group that outlives the test, plus the un-reaped handle that
+    /// keeps its pid pinned: `sh` ignoring `SIGTERM`, so a non-escalating shutdown
+    /// really does leave it running.
+    ///
+    /// It publishes a marker file only *after* installing the trap, and this waits
+    /// for that rather than sleeping a guessed interval: until the trap exists the
+    /// child would die of the graceful `SIGTERM` like any other, which would make
+    /// the caller's "the survivor was spared" reading meaningless.
+    #[cfg(feature = "pty")]
+    async fn spawn_survivor(pg: &ProcessGroup, tag: &str) -> (Child, i32) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let marker = std::env::temp_dir().join(format!(
+            "processkit_pgroup_survivor_{tag}_{}_{nanos}.ready",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("trap '' TERM; echo ready > \"$PK_READY\"; while :; do sleep 60; done")
+            .env("PK_READY", &marker);
+        // Reap the child on any early panic path so the test never orphans it.
+        cmd.kill_on_drop(true);
+        let child = pg
+            .spawn(&mut cmd, &crate::sys::SpawnOptions::default())
+            .expect("spawn a group member");
+        let pid = child.id().expect("the member reports a pid") as i32;
+        for _ in 0..600 {
+            if marker.exists() {
+                let _ = std::fs::remove_file(&marker);
+                return (child, pid);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the survivor never reported that its SIGTERM trap was installed");
+    }
+
+    /// Whether `pid` still names a **live** process, reaping it first if it is one of
+    /// ours that already exited — an un-reaped corpse answers a bare `kill(pid, 0)`
+    /// as "alive", which would let a group that wrongly killed its survivor pass.
+    #[cfg(feature = "pty")]
+    fn is_live_child(pid: i32) -> bool {
+        let mut status = 0;
+        // SAFETY: a non-blocking wait for one specific pid, then the signal-`0`
+        // existence probe; neither touches memory beyond `status`.
+        unsafe {
+            if libc::waitpid(pid, &raw mut status, libc::WNOHANG) == pid {
+                return false; // just reaped by us — definitively gone
+            }
+            libc::kill(pid, 0) == 0
+        }
+    }
+
+    /// T-270: a PTY launch that fails *after* its child exists must leave a
+    /// `graceful_shutdown(escalate = false)` decision standing. Its spawn re-armed
+    /// the kill-on-drop backstop (every spawn does), so without a restore the
+    /// group's `Drop` would `SIGKILL` survivors the caller chose to leave running —
+    /// a launch failure silently overriding the caller's stop policy.
+    ///
+    /// The spawn/rollback pair is driven directly here (the shared PTY seam wires
+    /// the same two calls together — see `Job::spawn_pty` on each Unix backend, and
+    /// `sys::pty::imp::tests` for the end-to-end run through the real guard), which
+    /// is what lets this pin the ProcessGroup backend specifically on any host.
+    #[cfg(feature = "pty")]
+    #[tokio::test]
+    #[ignore = "spawns real subprocesses"]
+    async fn a_rolled_back_pty_spawn_restores_the_spare_it_displaced() {
+        let pg = ProcessGroup::new();
+        let (mut survivor, survivor_pid) = spawn_survivor(&pg, "restore").await;
+
+        pg.graceful_shutdown(libc::SIGTERM, Duration::from_millis(100), false)
+            .await
+            .unwrap();
+        assert!(
+            pg.skip_drop_kill.is_set(),
+            "precondition: a non-escalating shutdown spares the survivors"
+        );
+
+        // The PTY launch: its spawn joins the group and re-arms the backstop…
+        let mut pty_cmd = Command::new("sh");
+        pty_cmd.arg("-c").arg("sleep 60");
+        pty_cmd.kill_on_drop(true);
+        let (mut pty_child, displaced) = pg
+            .spawn_displacing_spare(&mut pty_cmd, &crate::sys::SpawnOptions::default())
+            .unwrap();
+        let pty_pid = pty_child.id().expect("the pty child reports a pid");
+        assert!(
+            !pg.skip_drop_kill.is_set(),
+            "precondition: the spawn re-arms the backstop for its new member"
+        );
+        // …and the master wiring then fails, so the whole spawn is undone.
+        pg.rollback_pty_spawn(pty_pid, displaced);
+        assert!(
+            pg.skip_drop_kill.is_set(),
+            "the rollback must restore the spare its own spawn displaced"
+        );
+
+        drop(pg);
+        // A `Drop` that killed the survivor issued an unblockable `SIGKILL` before
+        // returning; give the kernel a moment to retire it before reading liveness.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let spared = is_live_child(survivor_pid);
+
+        // Whichever way the assertion goes, leave nothing behind.
+        let _ = unsafe { libc::kill(survivor_pid, libc::SIGKILL) };
+        let _ = survivor.wait().await;
+        let _ = pty_child.wait().await;
+
+        assert!(
+            spared,
+            "the survivor a non-escalating shutdown spared must outlive a failed \
+             PTY launch and the group's Drop"
+        );
+    }
+
+    /// The transactional half of the same fix: a `spawn` landed in the same group
+    /// between the rolled-back spawn's re-arm and its rollback. That newcomer is a
+    /// live member nothing chose to spare, so the restore must lose and `Drop` must
+    /// still kill — restoring the older spare here would re-open exactly the
+    /// orphan-leak class the latch's generation guard exists for (T-079).
+    #[cfg(feature = "pty")]
+    #[tokio::test]
+    #[ignore = "spawns real subprocesses"]
+    async fn a_spawn_between_the_pty_spawn_and_its_rollback_keeps_the_backstop_armed() {
+        let pg = ProcessGroup::new();
+        let (mut survivor, survivor_pid) = spawn_survivor(&pg, "raced").await;
+
+        pg.graceful_shutdown(libc::SIGTERM, Duration::from_millis(100), false)
+            .await
+            .unwrap();
+
+        let mut pty_cmd = Command::new("sh");
+        pty_cmd.arg("-c").arg("sleep 60");
+        pty_cmd.kill_on_drop(true);
+        let (mut pty_child, displaced) = pg
+            .spawn_displacing_spare(&mut pty_cmd, &crate::sys::SpawnOptions::default())
+            .unwrap();
+        let pty_pid = pty_child.id().expect("the pty child reports a pid");
+
+        // A fresh member joins before the failed launch is undone.
+        let (mut newcomer, newcomer_pid) = spawn_survivor(&pg, "newcomer").await;
+        pg.rollback_pty_spawn(pty_pid, displaced);
+        assert!(
+            !pg.skip_drop_kill.is_set(),
+            "a spawn after the rolled-back one must keep the backstop armed"
+        );
+
+        drop(pg);
+        // `Drop`'s `SIGKILL` is asynchronous; poll for the newcomer's death rather
+        // than assuming it has already landed.
+        let mut killed = false;
+        for _ in 0..100 {
+            if !is_live_child(newcomer_pid) {
+                killed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let _ = unsafe { libc::kill(newcomer_pid, libc::SIGKILL) };
+        let _ = unsafe { libc::kill(survivor_pid, libc::SIGKILL) };
+        let _ = newcomer.wait().await;
+        let _ = survivor.wait().await;
+        let _ = pty_child.wait().await;
+
+        assert!(
+            killed,
+            "a member that joined after the rolled-back spawn must keep its \
+             kill-on-drop backstop — the restore must not spare it"
+        );
     }
 
     /// T-079 (pgroup re-arm race): a `spawn`/`adopt` that re-arms the backstop

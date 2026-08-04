@@ -46,6 +46,25 @@ to a dated version section.
   backends — aimed at that spawn alone, not at the rest of the job. It is a
   best-effort teardown on a failure path, not a new containment guarantee. The
   error returned to the caller is unchanged.
+- Keep that same failed Unix PTY launch from overriding a stop the caller made
+  without escalation (`escalate_to_kill = false`, or `ProcessGroup::stop`'s
+  `escalate` argument). Every successful spawn re-arms the group's kill-on-drop
+  backstop, so a child joining a group whose survivors were deliberately left
+  running is not silently spared by that earlier decision — but the rollback of a
+  launch that failed after its child existed left the re-arm standing, so dropping
+  the group hard-killed the very survivors the caller had chosen not to escalate
+  against, a launch error quietly rewriting an already-taken stop decision. The
+  rollback now restores exactly the state its own spawn displaced, and only while
+  no other spawn or `adopt` has re-armed the backstop since — such a newcomer wins
+  and keeps its own kill-on-drop teardown, since nothing ever chose to spare it.
+  With the spare back in place, dropping the group hard-kills nothing, which is
+  what the non-escalating stop asked for and also means the drop no longer sweeps
+  up what the rollback's own teardown could not reach: on the Linux cgroup backend
+  a descendant of the failed launch that had escaped the rollback's `killpg` by
+  calling `setsid` is now left running, contained in the group's cgroup, instead of
+  being killed on drop. `kill_all` still reaches it while the group is alive.
+  Internal bookkeeping only: no public API change, and the error returned from the
+  failed launch is unchanged.
 - Stop a `Pipeline`'s chain-wide `timeout` from duplicating the tail of the last
   line in the output it salvages. Dropping the capture task only *requests* the
   pumps' abort, and the salvage folded the last stage's still-pending partial

@@ -672,9 +672,9 @@ mod tests {
     use super::*;
     use crate::Mechanism;
     use crate::runner::ProcessRunner;
-    use crate::sys::SpawnOptions;
     use crate::sys::fault_injection::{Faults, Site};
     use crate::sys::pgroup::ProcessGroup;
+    use crate::sys::{DisplacedSpare, SpawnOptions};
 
     /// Marker env var set only on the re-exec'd escapee, so
     /// [`setsid_escapee_process`] is an immediate no-op pass in an ordinary
@@ -867,7 +867,11 @@ mod tests {
             |cmd, opts| job.spawn(cmd, opts),
             |pid| {
                 observe(pid);
-                job.rollback_pty_spawn(pid);
+                // These tests are about the guard's kills and their order, not the
+                // kill-on-drop latch: nothing here armed a spare, so there is none
+                // to restore (the production wiring threads the real token from its
+                // own spawn closure — see `Job::spawn_pty`).
+                job.rollback_pty_spawn(pid, DisplacedSpare::default());
             },
         );
         assert!(
@@ -903,7 +907,7 @@ mod tests {
                 |cmd, opts| group.spawn(cmd, opts),
                 |pid| {
                     rollback_pid_for_callback.store(pid, Ordering::SeqCst);
-                    group.rollback_pty_spawn(pid);
+                    group.rollback_pty_spawn(pid, DisplacedSpare::default());
                 },
             );
             assert!(result.is_err(), "fault at {site:?}/{target:?} must surface");
@@ -920,6 +924,88 @@ mod tests {
             );
             wait_until_gone(pid, &format!("fault at {site:?}/{target:?}")).await;
         }
+    }
+
+    /// T-270, end to end through the production wiring (`Job::spawn_pty`, which
+    /// threads the spawn's displaced spare to its own rollback): a caller stops a
+    /// group *without* escalating — survivors deliberately left running, the
+    /// kill-on-drop backstop spared — and a later PTY launch then fails after its
+    /// child already exists. The failed launch re-armed that backstop on the way in,
+    /// as every spawn does; its rollback must put the spare back, or dropping the
+    /// job hard-kills processes the caller had decided not to escalate against.
+    ///
+    /// Deterministic: the master `dup` is fault-injected, and the survivor ignores
+    /// `SIGTERM` so the non-escalating shutdown really does leave it running.
+    /// Whichever mechanism this host selects is the one exercised (cgroup, POSIX
+    /// process group, or the FreeBSD reaper — each consults its own
+    /// `skip_drop_kill` latch before killing on `Drop`).
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns real Unix PTY children"]
+    async fn a_failed_pty_launch_leaves_a_non_escalated_spare_in_place() {
+        let job = platform_job();
+        let file = pidfile("spare_survivor");
+
+        // A survivor that will not die of the graceful signal. It publishes its pid
+        // only *after* installing the trap, and the wait below is on that: until the
+        // trap exists the survivor would die of the graceful `SIGTERM` like any other
+        // child, and "the survivor was spared" would read the wrong thing.
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "trap '' TERM; echo $$ > \"$PK_PIDFILE\"; while :; do sleep 60; done",
+            ])
+            .env("PK_PIDFILE", &file);
+        let mut survivor = job
+            .spawn(&mut command, &SpawnOptions::default())
+            .expect("spawn the survivor");
+        let survivor_pid = survivor.id().expect("the survivor reports a pid");
+        assert_eq!(
+            published_pid(&file, "the survivor").await,
+            survivor_pid,
+            "the trap-installing shell must be the child this group tracks"
+        );
+
+        // The caller stops without escalating: the survivor stays alive, and the
+        // latch is what will keep `Drop` from killing it.
+        job.graceful_shutdown(libc::SIGTERM, Duration::from_millis(100), false)
+            .await
+            .expect("graceful shutdown");
+        assert!(
+            is_alive(survivor_pid),
+            "a non-escalating shutdown must leave the survivor running"
+        );
+
+        // A PTY launch into the same job, failing after its child exists.
+        {
+            let _fault = Faults::new()
+                .fail_every(Site::PtyMasterClone, Some("writer"), libc::EIO)
+                .arm();
+            let result = job.spawn_pty(&mut idle_command(), &pty_options(), None);
+            assert!(
+                result.is_err(),
+                "the injected master-clone fault must surface as an error"
+            );
+        }
+
+        drop(job);
+        // A `Drop` that killed the survivor does so with an unblockable `SIGKILL`
+        // issued before `drop` returned; give the kernel a moment to retire it, then
+        // read the state that decides this test.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let spared = is_alive(survivor_pid);
+
+        // Whichever way the assertion goes, take the survivor down with us.
+        // SAFETY: a best-effort kill of a pid this test started.
+        unsafe { libc::kill(survivor_pid as libc::pid_t, libc::SIGKILL) };
+        let _ = survivor.wait().await;
+        let _ = std::fs::remove_file(&file);
+
+        assert!(
+            spared,
+            "a failed PTY launch must not undo a graceful_shutdown(escalate = false): \
+             the rollback has to restore the spare its own spawn displaced"
+        );
     }
 
     /// The runner reserves a one-shot stdin source *before* the PTY setup and
@@ -978,7 +1064,7 @@ mod tests {
 
         // The guard's step, with the child still owned — so the pid cannot have
         // been recycled, exactly as in the real rollback.
-        job.rollback_pty_spawn(pid);
+        job.rollback_pty_spawn(pid, DisplacedSpare::default());
 
         wait_until_gone(
             descendant,
@@ -1038,7 +1124,7 @@ mod tests {
             "escapee {escapee} never became a session leader — the test would prove nothing"
         );
 
-        job.rollback_pty_spawn(pid);
+        job.rollback_pty_spawn(pid, DisplacedSpare::default());
 
         match mechanism {
             Mechanism::ProcessReaper => {

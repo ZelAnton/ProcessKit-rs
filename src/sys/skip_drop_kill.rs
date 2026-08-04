@@ -15,7 +15,11 @@ use crate::sync::atomic::{AtomicUsize, Ordering};
 /// spare the survivors the caller chose to leave running; each backend's `Drop`
 /// [reads](Self::is_set) it and skips the hard kill when the latch is set.
 /// Spawning or adopting a fresh child into a reused group [`clear`](Self::clear)s
-/// the latch so the newcomer is not silently spared.
+/// the latch so the newcomer is not silently spared. A spawn that is afterwards
+/// *undone* — a Unix PTY launch whose master wiring fails once the child exists —
+/// hands the [`DisplacedSpare`] that `clear` returned to [`restore`](Self::restore),
+/// which puts the spare back only while no other spawn/adopt has re-armed the
+/// backstop since.
 ///
 /// # The re-arm race this guards
 ///
@@ -64,6 +68,21 @@ impl Default for SkipDropKill {
 /// [`request`](SkipDropKill::request) consumes it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ShutdownEpoch(usize);
+
+/// What one [`clear`](SkipDropKill::clear) took away: the spare it displaced — if
+/// the latch carried one — pinned to the generation that same `clear` installed.
+///
+/// Handed to [`restore`](SkipDropKill::restore) by a spawn that is being undone (the
+/// Unix PTY launch whose master wiring fails after the child already exists), so the
+/// failed launch does not leave the backstop re-armed for a member that never
+/// joined. Both halves are read out of the one successful compare-exchange inside
+/// `clear`, which is what makes the pair transactional: a second `clear` racing this
+/// one cannot hand *its* caller a spare the first had already displaced.
+///
+/// The default — also what a `clear` of an already-armed latch returns — is
+/// "nothing to restore", so restoring it is a no-op rather than a fabricated spare.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DisplacedSpare(Option<ShutdownEpoch>);
 
 impl SkipDropKill {
     /// Bit 0 of the packed word: set means `Drop` must skip its hard kill.
@@ -119,7 +138,12 @@ impl SkipDropKill {
     /// child (and the rest of the reused group) is not silently spared by a stale
     /// latch — a group left with the latch set but never reused keeps its spared
     /// survivors. `Release` pairs with the `Acquire` in [`is_set`](Self::is_set).
-    pub(crate) fn clear(&self) {
+    ///
+    /// Returns the [`DisplacedSpare`] this re-arm took away. Callers whose
+    /// spawn/adopt stands ignore it — a member that joined is a member the backstop
+    /// is now correctly armed for. It is read only where the spawn can still be
+    /// undone (the Unix PTY rollback), which hands it to [`restore`](Self::restore).
+    pub(crate) fn clear(&self) -> DisplacedSpare {
         // Bump the generation and clear the skip bit as one atomic step. The CAS
         // loop composes with concurrent `clear`s (each retries against the other's
         // bump) and with a racing `request` (whose compare-exchange keys off the
@@ -135,9 +159,40 @@ impl SkipDropKill {
                 .0
                 .compare_exchange_weak(cur, next, Ordering::Release, Ordering::Relaxed)
             {
-                Ok(_) => return,
+                // The exchange that succeeded knows both halves of the token at
+                // once: whether the word it replaced still carried a spare, and the
+                // exact generation it installed. Sampling either separately (an
+                // `is_set()` just before, a load just after) would leave a window
+                // for another `clear`, and the restore built on it could then
+                // re-spare *that* spawn's fresh member.
+                Ok(_) => {
+                    let displaced = (cur & Self::SKIP_BIT) != 0;
+                    return DisplacedSpare(displaced.then_some(ShutdownEpoch(next)));
+                }
                 Err(actual) => cur = actual,
             }
+        }
+    }
+
+    /// Put back the spare a [`clear`](Self::clear) displaced — the undo half of a
+    /// spawn that is being rolled back, so a launch failure does not silently
+    /// convert a `graceful_shutdown(escalate = false)` into a `Drop` hard kill of
+    /// the survivors the caller chose to leave running.
+    ///
+    /// Race-free relative to a concurrent `spawn`/`adopt` on the same latch in
+    /// exactly the sense a shutdown's own spare is, and by the same code:
+    /// [`request`](Self::request)'s compare-exchange keys off the generation
+    /// `displaced` carries, so a `clear` that landed in between bumped it, the
+    /// exchange fails, and the newcomer keeps its Drop-kill backstop. A
+    /// `DisplacedSpare` that displaced nothing restores nothing.
+    // Dead on Windows — no caller there undoes a spawn through this latch — and
+    // with the `pty` feature off, the K-092 asymmetric-backend shape. Allowed on
+    // exactly those builds rather than cfg'd out, so the latch's protocol stays
+    // readable in one piece.
+    #[cfg_attr(any(windows, not(feature = "pty")), allow(dead_code))]
+    pub(crate) fn restore(&self, displaced: DisplacedSpare) {
+        if let Some(epoch) = displaced.0 {
+            self.request(epoch);
         }
     }
 
@@ -215,6 +270,81 @@ mod skip_drop_kill_tests {
         );
     }
 
+    // The rollback restore (T-270): a spawn re-arms the backstop as usual, then the
+    // launch that spawn belongs to fails and is undone. Putting the displaced spare
+    // back is what keeps a launch failure from silently overriding a
+    // `graceful_shutdown(escalate = false)` and letting `Drop` kill the survivors
+    // the caller chose to leave running.
+    #[test]
+    fn a_rolled_back_spawn_restores_the_spare_its_clear_displaced() {
+        let latch = SkipDropKill::new();
+        let epoch = latch.begin_shutdown();
+        latch.request(epoch); // graceful_shutdown(escalate = false)
+        let displaced = latch.clear(); // the spawn re-arms the backstop
+        assert!(!latch.is_set(), "the spawn's re-arm displaces the spare");
+        latch.restore(displaced); // …and its rollback puts the spare back
+        assert!(
+            latch.is_set(),
+            "a rolled-back spawn must restore the spare its re-arm displaced"
+        );
+    }
+
+    // The other side of the same rule: a rollback restores only what its own clear
+    // took away, so undoing a spawn into an ordinary (never-spared) group leaves
+    // Drop's kill armed rather than inventing a spare.
+    #[test]
+    fn a_rollback_creates_no_spare_its_clear_never_displaced() {
+        let latch = SkipDropKill::new();
+        let displaced = latch.clear(); // a spawn into a group nothing had spared
+        latch.restore(displaced);
+        assert!(
+            !latch.is_set(),
+            "a rollback must not spare a group no shutdown ever spared"
+        );
+    }
+
+    // The transactional half (the race the generation guard is reused for): another
+    // spawn/adopt joined the same group between the rolled-back spawn's `clear` and
+    // its `restore`. That newcomer is a live member nothing chose to spare, so the
+    // restore must lose — exactly as a stale shutdown `request` does.
+    #[test]
+    fn a_spawn_between_the_clear_and_the_restore_defeats_it() {
+        let latch = SkipDropKill::new();
+        let epoch = latch.begin_shutdown();
+        latch.request(epoch);
+        let displaced = latch.clear(); // the spawn that is about to be rolled back
+        latch.clear(); // a second spawn/adopt joins the same group
+        latch.restore(displaced);
+        assert!(
+            !latch.is_set(),
+            "a spawn that re-armed the backstop after the rolled-back one must keep \
+             it armed — restoring the older spare would silently strip the newcomer"
+        );
+    }
+
+    // Why the token is minted *by* the clear rather than read around it: only the
+    // clear that actually displaced the spare carries one. A second clear (the
+    // shape two concurrent spawns take) gets an empty token, so it can never put a
+    // spare back over the member the first one re-armed for.
+    #[test]
+    fn only_the_clear_that_displaced_the_spare_carries_it() {
+        let latch = SkipDropKill::new();
+        let epoch = latch.begin_shutdown();
+        latch.request(epoch);
+        let first = latch.clear();
+        let second = latch.clear();
+        latch.restore(second);
+        assert!(
+            !latch.is_set(),
+            "a clear that displaced no spare must restore none"
+        );
+        latch.restore(first);
+        assert!(
+            !latch.is_set(),
+            "and the clear that did displace it is by then out of date"
+        );
+    }
+
     // Generations are monotonic: an epoch captured before a `clear` can never
     // match again, so its request stays a no-op even as a *fresh* epoch at the new
     // generation spares normally.
@@ -289,6 +419,38 @@ mod skip_drop_kill_loom_model {
             assert!(
                 !latch.is_set(),
                 "the freshly re-armed backstop must survive the stale request"
+            );
+        });
+    }
+
+    /// The rolled-back spawn's restore under the same race (T-270): one spawn
+    /// re-armed the backstop and is now being undone, while a second `spawn`/`adopt`
+    /// joins the same group concurrently. Across every interleaving the group must
+    /// end with the backstop **armed** — the newcomer is a live member nothing chose
+    /// to spare, and the restore may only take while the generation it captured
+    /// still stands.
+    #[test]
+    fn a_concurrent_spawn_defeats_a_rolled_back_spawns_restore() {
+        loom::model(|| {
+            let latch = Arc::new(SkipDropKill::new());
+            // A group a non-escalating shutdown spared…
+            let epoch = latch.begin_shutdown();
+            latch.request(epoch);
+            // …then the spawn that is about to be rolled back re-arms the backstop.
+            let displaced = latch.clear();
+
+            // Its rollback's restore races a fresh spawn/adopt into the same group.
+            let rollback = {
+                let latch = latch.clone();
+                loom::thread::spawn(move || latch.restore(displaced))
+            };
+            latch.clear();
+            rollback.join().unwrap();
+
+            assert!(
+                !latch.is_set(),
+                "a rolled-back spawn's restore re-spared a group a concurrent \
+                 spawn/adopt had already re-armed the backstop for"
             );
         });
     }

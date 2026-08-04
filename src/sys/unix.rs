@@ -77,24 +77,34 @@ impl Job {
         opts: &crate::sys::SpawnOptions,
         _env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
     ) -> io::Result<crate::sys::pty::PtySpawn> {
+        // Carries the spare the spawn's kill-on-drop re-arm displaced over to the
+        // rollback. Both closures run inside this one call, on this thread, and the
+        // rollback only ever runs after the spawn returned — so a `Cell` is the
+        // whole hand-off, and an untouched one ("nothing to restore") is exactly
+        // right when the spawn never ran.
+        let displaced = std::cell::Cell::new(crate::sys::DisplacedSpare::default());
         crate::sys::pty::spawn_pty(
             cmd,
             opts,
-            |c, o| self.group.spawn(c, o),
-            |pid| self.rollback_pty_spawn(pid),
+            |c, o| {
+                let (child, spare) = self.group.spawn_displacing_spare(c, o)?;
+                displaced.set(spare);
+                Ok(child)
+            },
+            |pid| self.rollback_pty_spawn(pid, displaced.take()),
         )
     }
 
     /// Undo a PTY spawn whose master setup failed: this backend *is* the process
-    /// group, so the whole rollback is the group's own kill-then-forget (see
-    /// [`ProcessGroup::rollback_pty_spawn`](crate::sys::pgroup::ProcessGroup::rollback_pty_spawn)) —
-    /// `killpg` over the child's session while it is still tracked, then the
-    /// tracked id. A descendant that `setsid`s away is outside `killpg`'s reach
-    /// here, the standing [`Mechanism::ProcessGroup`] limit rather than anything
-    /// this path adds.
+    /// group, so the whole rollback is the group's own kill-then-forget-then-restore
+    /// (see [`ProcessGroup::rollback_pty_spawn`](crate::sys::pgroup::ProcessGroup::rollback_pty_spawn)) —
+    /// `killpg` over the child's session while it is still tracked, then the tracked
+    /// id, then the spare that spawn's own re-arm displaced. A descendant that
+    /// `setsid`s away is outside `killpg`'s reach here, the standing
+    /// [`Mechanism::ProcessGroup`] limit rather than anything this path adds.
     #[cfg(feature = "pty")]
-    pub(crate) fn rollback_pty_spawn(&self, pid: u32) {
-        self.group.rollback_pty_spawn(pid);
+    pub(crate) fn rollback_pty_spawn(&self, pid: u32, displaced: crate::sys::DisplacedSpare) {
+        self.group.rollback_pty_spawn(pid, displaced);
     }
 
     #[cfg(feature = "process-control")]
