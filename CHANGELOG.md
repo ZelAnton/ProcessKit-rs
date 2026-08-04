@@ -34,22 +34,18 @@ to a dated version section.
 
 ### Fixed
 
-- Tear down the child of a Unix PTY launch (`Command::use_pty`) that fails
-  *after* that child already exists — a failed `dup` of the pty master, a failed
-  reactor registration — as part of the failed launch. Previously the launch
-  returned its error while the child, and anything it had forked, kept running
-  unattended until the owning group's own later `kill_all`/`shutdown`/`Drop`
-  swept it up, so a long-lived group accumulated one live process per failed PTY
-  launch. The rollback hard-kills through the backend's own containment first —
-  `PROC_REAP_KILL` over the FreeBSD reaper subtree, or `killpg` over the child's
-  session on the cgroup and process-group backends — and only then releases that
-  spawn's bookkeeping, never releasing a registration the kill's reach rests on.
-  Its reach is that mechanism's own whole-tree reach and nothing beyond it: a
-  descendant that `setsid`s out during the setup window is still inside the
-  cgroup, and still outside a bare process group, exactly as it would be for that
-  mechanism's `kill_all` — and no survivor is moved out of the job's reach, so
-  the group's own teardown still owns it. The error returned to the caller is
-  unchanged.
+- Tear down the child of a failed Unix PTY launch (`Command::use_pty`).
+  Such a launch can fail *after* that child already exists — a failed `dup` of
+  the pty master, a failed reactor registration — and previously it returned its
+  error while the child, and anything it had forked, kept running unattended
+  until the owning group's own later `kill_all`/`shutdown`/`Drop` swept it up,
+  so a long-lived group accumulated one live process per failed PTY launch. The
+  rollback now hard-kills that child through the backend's own containment as
+  part of the failed launch — `PROC_REAP_KILL` over the FreeBSD reaper subtree,
+  or `killpg` over the child's session on the cgroup and process-group
+  backends — aimed at that spawn alone, not at the rest of the job. It is a
+  best-effort teardown on a failure path, not a new containment guarantee. The
+  error returned to the caller is unchanged.
 - Stop a `Pipeline`'s chain-wide `timeout` from duplicating the tail of the last
   line in the output it salvages. Dropping the capture task only *requests* the
   pumps' abort, and the salvage folded the last stage's still-pending partial
