@@ -686,10 +686,12 @@ impl Tracked {
     }
 
     /// Whether this set already tracks **the very process instance** `id` names,
-    /// `identity` being the start-time token just read for it — the de-dup gate the
-    /// two adoption entries ([`ProcessGroup::adopt`], [`ProcessGroup::adopt_external`])
-    /// ask before adding a solo entry for a pid that may already be tracked here as
-    /// a group leader.
+    /// `identity` being the start-time token just read for it — the de-dup gate
+    /// [`ProcessGroup::adopt`] asks before adding a solo entry for a pid that may
+    /// already be tracked here as a group leader. Identity-anchored external
+    /// adoption uses [`prepare_identity_adoption`](Self::prepare_identity_adoption)
+    /// instead, because it must also remove stale same-pid group entries before
+    /// publishing the solo entry.
     ///
     /// Two properties carry the weight, and a plain membership scan has neither:
     ///
@@ -718,6 +720,41 @@ impl Tracked {
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
         ids.retain_mut(|e| self.probe_entry(e));
         ids.iter().any(|e| e.id == id && e.identity == identity)
+    }
+
+    /// Reconcile an identity-anchored external adoption without adding an entry.
+    ///
+    /// The failed-`setpgid` path moves a pid from the group table's semantics to
+    /// the solo table's semantics. A stale group entry with no identity cannot be
+    /// pruned by [`probe_entry`](Self::probe_entry), so merely asking
+    /// [`holds_same_process`](Self::holds_same_process) whether the group already
+    /// owns this process would leave that bare pid in the table beside the fresh
+    /// solo entry. Remove every same-pid entry that does not carry this anchor,
+    /// retain one matching entry for the same-process fast path, and report whether
+    /// that matching entry was already present. The caller publishes the solo entry
+    /// only after this cleanup, so a broadcast cannot observe both representations.
+    #[cfg(feature = "process-control")]
+    fn prepare_identity_adoption(&self, id: i32, identity: u64) -> bool {
+        let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
+        ids.retain_mut(|e| self.probe_entry(e));
+
+        let mut same_process = false;
+        ids.retain(|entry| {
+            if entry.id != id {
+                return true;
+            }
+            if entry.identity == Some(identity) {
+                if same_process {
+                    false
+                } else {
+                    same_process = true;
+                    true
+                }
+            } else {
+                false
+            }
+        });
+        same_process
     }
 
     /// Track `id`, pruning drained entries and de-duplicating (re-adopting a
@@ -1216,12 +1253,15 @@ impl ProcessGroup {
                     // (that would double-count in `members()`/`stats()` and
                     // double-deliver every broadcast). The de-dup is decided on the
                     // anchor this call just captured, against the tracked entry's own
-                    // token and only after a sweep — a bare "is the number on the
-                    // books" test would let an entry whose process was reaped, and
-                    // whose number the OS has since reassigned, skip the tracking
-                    // and return an `Ok` that contains nothing
-                    // ([`Tracked::holds_same_process`]).
-                    if !self.groups.holds_same_process(pid, Some(anchor)) {
+                    // token and only after a sweep. The reconciliation also removes
+                    // same-pid group entries that cannot prove this identity,
+                    // including a stale bare-pid entry, before the fresh solo entry
+                    // is published. A bare "is the number on the books" test would
+                    // otherwise let an entry whose process was reaped, and whose
+                    // number the OS has since been reassigned, skip the tracking and
+                    // return an `Ok` that contains nothing
+                    // ([`Tracked::prepare_identity_adoption`]).
+                    if !self.groups.prepare_identity_adoption(pid, anchor) {
                         self.skip_drop_kill.clear();
                         self.solos.track_with(pid, false, Some(anchor));
                     }
@@ -2077,18 +2117,35 @@ mod tests {
         feature = "process-control",
         any(target_os = "linux", target_os = "android", target_vendor = "apple")
     ))]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[ignore = "spawns a real subprocess"]
     async fn adopt_external_is_not_silenced_by_a_stale_entry_for_the_same_number() {
-        for stale_carries_a_token in [true, false] {
+        for (case, stale_carries_a_token) in [("anchored", true), ("bare", false)] {
             let pg = ProcessGroup::new();
+            let ready = std::env::temp_dir().join(format!(
+                "processkit_pgroup_adopt_external_{case}_{}.ready",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&ready);
             let mut child = Command::new("sh")
                 .arg("-c")
-                .arg("sleep 60")
+                .arg("echo ready > \"$PK_ADOPT_READY\"; exec sleep 60")
+                .env("PK_ADOPT_READY", &ready)
                 .kill_on_drop(true)
                 .spawn()
                 .unwrap();
             let pid = child.id().unwrap() as i32;
+            for _ in 0..200 {
+                if ready.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                ready.exists(),
+                "the child must reach the post-exec adoption point"
+            );
+            let _ = std::fs::remove_file(&ready);
             let real = read_identity(pid).expect("this target reports a start-time identity");
 
             // The books as the reaped child left them: the number tracked as a group
@@ -2101,33 +2158,59 @@ mod tests {
             pg.adopt_external(pid as u32)
                 .expect("a live process is adoptable by pid on this target");
 
-            // Wherever it landed (solo is the ordinary outcome — this process forked
-            // it and it has exec'd, so `setpgid` is refused), an entry for it must
-            // exist carrying the identity captured during the call.
-            let tracked = {
+            // The child has already exec'd, so setpgid is refused and the adoption
+            // must move the pid from the group table to the solo table. In
+            // particular, the stale group entry must not remain beside the anchor.
+            let (group_count, solo_count, solo_identity) = {
                 let solos = pg.solos.ids.lock().unwrap_or_else(|e| e.into_inner());
                 let groups = pg.groups.ids.lock().unwrap_or_else(|e| e.into_inner());
-                solos
-                    .iter()
-                    .chain(groups.iter())
-                    .any(|e| e.id == pid && e.identity == Some(real))
+                (
+                    groups.iter().filter(|e| e.id == pid).count(),
+                    solos.iter().filter(|e| e.id == pid).count(),
+                    solos.iter().find(|e| e.id == pid).map(|e| e.identity),
+                )
             };
+
+            assert_eq!(group_count, 0, "the stale group entry must be removed");
+            assert_eq!(
+                solo_count, 1,
+                "the adopted pid must be tracked once as a solo"
+            );
+            assert_eq!(solo_identity, Some(Some(real)));
+
+            // Fault every delivery so this regression can observe the number of
+            // targets without signalling the live holder. A clean cross-table move
+            // has one solo delivery; leaving the stale group entry would make the
+            // broadcast attempt both killpg and kill.
+            let faults = crate::sys::fault_injection::Faults::new()
+                .fail_every(
+                    crate::sys::fault_injection::Site::PgroupSignalDelivery,
+                    None,
+                    libc::EINVAL,
+                )
+                .arm();
+            let outcome = pg.kill_all();
+            assert_eq!(
+                faults.fired(crate::sys::fault_injection::Site::PgroupSignalDelivery),
+                1
+            );
+            assert_eq!(
+                outcome
+                    .expect_err("the injected delivery failure must reach kill_all")
+                    .raw_os_error(),
+                Some(libc::EINVAL)
+            );
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                0,
+                "the holder was not signalled"
+            );
+            drop(faults);
 
             drop(pg);
             // SAFETY: a best-effort kill of a child this test started.
             let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
             let _ = child.wait().await;
-
-            assert!(
-                tracked,
-                "an entry left over from a reaped process (token: {}) must not make \
-                 the adoption of the number's new holder a silent no-op",
-                if stale_carries_a_token {
-                    "stale"
-                } else {
-                    "none"
-                },
-            );
         }
     }
 
