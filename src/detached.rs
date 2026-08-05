@@ -37,27 +37,57 @@ mod reaper {
         sender().map(|_| ())
     }
 
+    /// Wait for a child without ever dropping it after a failed wait attempt.
+    ///
+    /// `Child::wait` normally retries interruption internally, but retaining the
+    /// handle here also covers a handoff failure that leaves this thread as the
+    /// last possible owner. The child is dropped only after a successful wait.
+    fn wait_until_reaped(mut child: Child) -> Option<io::Error> {
+        let mut first_error = None;
+        loop {
+            match child.wait() {
+                Ok(_) => return first_error,
+                Err(source) => {
+                    first_error.get_or_insert(source);
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+            }
+        }
+    }
+
+    /// Preserve a handoff error after synchronously reclaiming the wait owner.
+    ///
+    /// The fallback intentionally does not return until `child.wait()` succeeds:
+    /// returning while retaining no `Child` would make Unix process reaping a
+    /// best-effort operation and could leave a zombie behind. A transient wait
+    /// error is included in the returned error after the child is eventually
+    /// reaped, so callers do not mistake a failed handoff for a successful spawn.
+    fn finish_failed_handoff(child: Child, handoff_error: io::Error) -> io::Error {
+        match wait_until_reaped(child) {
+            None => handoff_error,
+            Some(wait_error) => io::Error::other(format!(
+                "{handoff_error}; fallback wait initially failed: {wait_error}"
+            )),
+        }
+    }
+
     /// Transfer the only `Child` handle to the manager. The synchronous fallback
     /// is defensive: `prepare` makes this path unreachable unless the manager
     /// unexpectedly stops after initialization, but it still prevents a zombie
     /// if that invariant is ever broken.
-    pub(super) fn handoff(mut child: Child) -> io::Result<()> {
+    pub(super) fn handoff(child: Child) -> io::Result<()> {
         let sender = match sender() {
             Ok(sender) => sender,
             Err(source) => {
-                let _ = child.wait();
-                return Err(source);
+                return Err(finish_failed_handoff(child, source));
             }
         };
         match sender.send(child) {
             Ok(()) => Ok(()),
-            Err(mpsc::SendError(mut child)) => {
-                let wait = child.wait();
-                match wait {
-                    Ok(_) => Err(io::Error::other("detached reaper stopped unexpectedly")),
-                    Err(source) => Err(source),
-                }
-            }
+            Err(mpsc::SendError(child)) => Err(finish_failed_handoff(
+                child,
+                io::Error::other("detached reaper stopped unexpectedly"),
+            )),
         }
     }
 
@@ -77,8 +107,8 @@ mod reaper {
                         // The sender is process-global and normally never drops;
                         // if that invariant changes, finish every owned child
                         // before the manager exits.
-                        for mut child in children {
-                            let _ = child.wait();
+                        for child in children {
+                            let _ = wait_until_reaped(child);
                         }
                         return;
                     }
@@ -103,6 +133,16 @@ mod reaper {
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn prepare_reaper() -> std::io::Result<()> {
+    reaper::prepare()
+}
+
+#[cfg(unix)]
+pub(crate) fn handoff_reaper(child: std::process::Child) -> std::io::Result<()> {
+    reaper::handoff(child)
+}
+
 /// A minimal handle to a child spawned **outside** this crate's kill-on-drop
 /// containment via [`Command::spawn_detached`](crate::Command::spawn_detached).
 ///
@@ -117,8 +157,8 @@ mod reaper {
 /// yours to manage.
 ///
 /// That is why this is a **separate, non-interchangeable type**, not a
-/// [`RunningProcess`](crate::RunningProcess): it deliberately offers **no**
-/// `kill`, no `wait`, no timeout, no output capture, and no teardown verbs. All
+/// [`RunningProcess`](crate::RunningProcess): it deliberately exposes **no**
+/// public `kill`, `wait`, timeout, output capture, or teardown/control verbs. All
 /// it carries is the child's [`pid`](Self::pid). On Unix, a private background
 /// reaper owns the OS child handle and collects its exit status; this public
 /// handle still exposes none of those operations. If you need any of those, you
@@ -142,16 +182,6 @@ impl DetachedChild {
     /// [`Command::spawn_detached`](crate::Command::spawn_detached).
     pub(crate) fn new(pid: u32) -> Self {
         Self { pid }
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn prepare_reaper() -> std::io::Result<()> {
-        reaper::prepare()
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn handoff_reaper(child: std::process::Child) -> std::io::Result<()> {
-        reaper::handoff(child)
     }
 
     /// The OS process id of the detached child, as reported at spawn.

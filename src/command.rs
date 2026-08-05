@@ -3056,9 +3056,9 @@ impl Command {
 
     /// Spawn the child **deliberately released from this crate's kill-on-drop
     /// containment**, handing back a [`DetachedChild`] whose lifetime is entirely
-    /// yours: the crate will never kill, time out, capture, or expose a wait
-    /// operation for it. On Unix an internal background owner reaps its exit
-    /// status so a short-lived detached child does not become a zombie.
+    /// yours: the crate exposes no public kill, wait, timeout, capture, or
+    /// control operation for it. On Unix an internal background owner reaps its
+    /// exit status so a short-lived detached child does not become a zombie.
     ///
     /// # Warning — this inverts the crate's headline guarantee
     ///

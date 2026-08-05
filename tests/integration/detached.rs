@@ -13,6 +13,8 @@
 //! children are self-terminating with a bounded lifetime, and every one is killed
 //! before the test returns; on Unix the library's private reaper owns the wait.
 
+#[cfg(unix)]
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::common::{poll_until, sleep_secs, sleeper, two_line_echo};
@@ -33,11 +35,11 @@ fn pid_alive(pid: u32) -> bool {
     crate::common::windows_pid_alive(pid)
 }
 
-/// Kill a detached child and wait until the library's private reaper has made it
-/// disappear. This deliberately observes liveness instead of calling `waitpid`:
-/// the reaper owns the only wait-capable child handle on Unix.
+/// Terminate a detached child and observe it disappearing. This deliberately
+/// observes liveness instead of calling `waitpid`: the reaper owns the only
+/// wait-capable child handle on Unix.
 #[cfg(unix)]
-async fn kill_and_reap(pid: u32) {
+async fn terminate_and_observe_exit(pid: u32) {
     // SAFETY: `pid` came from a child spawned by this test; SIGKILL is used only
     // for bounded cleanup and has no effect once the child is gone.
     unsafe {
@@ -53,7 +55,7 @@ async fn kill_and_reap(pid: u32) {
 }
 
 #[cfg(windows)]
-async fn kill_and_reap(pid: u32) {
+async fn terminate_and_observe_exit(pid: u32) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
     // SAFETY: terminate access only; a null handle means the pid is already gone.
@@ -99,7 +101,39 @@ async fn detached_child_survives_dropping_its_handle() {
         "detached child {pid} must survive dropping its DetachedChild handle"
     );
 
-    kill_and_reap(pid).await;
+    terminate_and_observe_exit(pid).await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+#[ignore = "spawns repeated real detached children to prove Unix reaping"]
+async fn repeated_short_lived_detached_children_are_reaped_while_owner_lives() {
+    const CHILDREN: usize = 32;
+    let mut pids = HashSet::with_capacity(CHILDREN);
+
+    // The integration-test process stays alive for the complete loop. Each
+    // child exits immediately, while the private reaper—not this test—owns the
+    // wait operation. kill(pid, 0) reports zombies as existing, so observing
+    // ESRCH after every launch proves the child was actually reaped.
+    for index in 0..CHILDREN {
+        let detached = crate::common::failing_exit(0)
+            .spawn_detached()
+            .unwrap_or_else(|error| panic!("spawn short-lived child {index}: {error}"));
+        let pid = detached.pid();
+        assert!(
+            pids.insert(pid),
+            "pid {pid} was reused during the reaping loop"
+        );
+        drop(detached);
+
+        poll_until(
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+            "short-lived detached child to be reaped",
+            || !pid_alive(pid),
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
@@ -159,5 +193,5 @@ async fn detached_child_can_redirect_stdout_to_a_file() {
     )
     .await;
 
-    kill_and_reap(pid).await; // no-op if exited; the library reaps it
+    terminate_and_observe_exit(pid).await; // no-op if exited; the library reaps it
 }
