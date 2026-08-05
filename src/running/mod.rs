@@ -1793,38 +1793,48 @@ impl RunningProcess {
     /// case the writer already finished (the pre-pump peek took it, or it wraps
     /// up during pump teardown), so the timeout resolves immediately.
     async fn finalize_stdin_task(&mut self) {
-        #[cfg(test)]
-        let task = self
-            .test_stdin_task
-            .take()
-            .or_else(|| match &mut self.backend {
-                Backend::Real(real) => real.stdin_task.take(),
-                #[cfg(feature = "pty")]
-                Backend::Pty(pty) => pty.stdin_task.take(),
-                Backend::Scripted(_) => None,
-            });
-        #[cfg(not(test))]
-        let task = match &mut self.backend {
-            Backend::Real(real) => real.stdin_task.take(),
-            #[cfg(feature = "pty")]
-            Backend::Pty(pty) => pty.stdin_task.take(),
-            Backend::Scripted(_) => None,
-        };
-        let Some(task) = task else {
-            return;
-        };
-        let abort = task.abort_handle();
-        let observed = match tokio::time::timeout(PUMP_TEARDOWN, task).await {
-            Ok(joined) => Self::classify_stdin_join(joined),
-            // Still writing after the teardown grace — a hung source. Abort it
-            // (a dropped `timeout` future only detaches the handle) and move on
-            // unreported, never blocking the caller unboundedly.
-            Err(_elapsed) => {
-                abort.abort();
-                None
+        // Keep the JoinHandle in its owning slot while waiting. If the borrowed
+        // wait is cancelled after the child reap, dropping a timeout around an
+        // owned JoinHandle would detach the writer and make the next wait unable
+        // to observe its source error. Borrowing the handle leaves it available
+        // for that next wait; only a completed or explicitly-aborted task is
+        // removed below.
+        let observed = {
+            let Some(slot) = self.stdin_task_slot() else {
+                return;
+            };
+            let Some(task) = slot.as_mut() else {
+                return;
+            };
+            let abort = task.abort_handle();
+            match tokio::time::timeout(PUMP_TEARDOWN, &mut *task).await {
+                Ok(joined) => Self::classify_stdin_join(joined),
+                // Still writing after the teardown grace — a hung source. Abort
+                // it and remove the handle, never blocking the caller forever.
+                Err(_elapsed) => {
+                    abort.abort();
+                    None
+                }
             }
         };
+        let _ = self.stdin_task_slot().and_then(Option::take);
         self.record_stdin_error(observed);
+    }
+
+    /// Return the owning slot for the background stdin writer, if this backend
+    /// has one. The test-only slot takes precedence so scripted handles exercise
+    /// the same cancellation boundary as real and PTY handles.
+    fn stdin_task_slot(&mut self) -> Option<&mut Option<JoinHandle<std::io::Result<()>>>> {
+        #[cfg(test)]
+        if self.test_stdin_task.is_some() {
+            return Some(&mut self.test_stdin_task);
+        }
+        match &mut self.backend {
+            Backend::Real(real) => Some(&mut real.stdin_task),
+            #[cfg(feature = "pty")]
+            Backend::Pty(pty) => Some(&mut pty.stdin_task),
+            Backend::Scripted(_) => None,
+        }
     }
 
     /// Classify a finished stdin-writer join into a recordable failure, if any.
@@ -3880,6 +3890,159 @@ mod tests {
                 .expect("a repeated borrowed wait remains usable"),
             (0, Outcome::Exited(0))
         );
+    }
+
+    /// Dropping the losing `wait_any` future after it has reaped its child must
+    /// leave the stdin writer available for a later borrowed wait.
+    #[tokio::test]
+    async fn wait_any_loser_keeps_a_post_reap_stdin_error() {
+        let mut loser = scripted_handle(&[0]).await;
+        delayed_stdin_task(
+            &mut loser,
+            Duration::from_millis(100),
+            Err(std::io::Error::other("loser stdin failure")),
+        );
+        let mut winner = scripted_handle(&[0]).await;
+
+        let (index, outcome) = crate::wait_any(&mut [&mut loser, &mut winner])
+            .await
+            .expect("the winner exits cleanly");
+        assert_eq!((index, outcome), (1, Outcome::Exited(0)));
+        assert_eq!(
+            loser.cancel_at_exit,
+            Some(false),
+            "the loser must have been reaped before wait_any cancelled its wait"
+        );
+
+        let err = crate::wait_any(&mut [&mut loser])
+            .await
+            .expect_err("the cancelled loser wait must retain its stdin error");
+        assert!(
+            matches!(err.reason(), ErrorReason::Stdin { .. }),
+            "got: {err:?}"
+        );
+        assert!(
+            loser.stdin_error.is_none(),
+            "the source error is consumed exactly once"
+        );
+        assert_eq!(
+            crate::wait_any(&mut [&mut loser])
+                .await
+                .expect("a repeated wait remains usable"),
+            (0, Outcome::Exited(0))
+        );
+    }
+
+    /// When `wait_all` short-circuits on another contender's error, a contender
+    /// suspended in post-reap stdin finalization must remain re-awaitable too.
+    #[tokio::test]
+    async fn wait_all_loser_keeps_a_post_reap_stdin_error() {
+        let mut loser = scripted_handle(&[0]).await;
+        delayed_stdin_task(
+            &mut loser,
+            Duration::from_millis(100),
+            Err(std::io::Error::other("wait_all loser stdin failure")),
+        );
+        let mut failing = scripted_handle(&[0]).await;
+        let task = tokio::spawn(async {
+            Err::<(), std::io::Error>(std::io::Error::other("join short-circuit"))
+        });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        failing.set_test_stdin_task(task);
+
+        let err = crate::wait_all(&mut [&mut loser, &mut failing])
+            .await
+            .expect_err("the finished stdin error must short-circuit wait_all");
+        assert!(
+            matches!(err.reason(), ErrorReason::Stdin { .. }),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            loser.cancel_at_exit,
+            Some(false),
+            "the loser must have been reaped before wait_all short-circuited"
+        );
+
+        let err = crate::wait_any(&mut [&mut loser])
+            .await
+            .expect_err("the cancelled wait_all loser must retain its stdin error");
+        assert!(
+            matches!(err.reason(), ErrorReason::Stdin { .. }),
+            "got: {err:?}"
+        );
+        assert!(
+            loser.stdin_error.is_none(),
+            "the source error is observed once"
+        );
+        assert_eq!(
+            crate::wait_any(&mut [&mut loser])
+                .await
+                .expect("a repeated wait remains usable"),
+            (0, Outcome::Exited(0))
+        );
+    }
+
+    /// An external timeout can cancel the borrowed wait while its post-reap
+    /// finalization is pending; the next wait must still classify the source.
+    #[tokio::test]
+    async fn externally_cancelled_wait_all_keeps_a_post_reap_stdin_error() {
+        let mut run = scripted_handle(&[0]).await;
+        delayed_stdin_task(
+            &mut run,
+            Duration::from_millis(100),
+            Err(std::io::Error::other("externally cancelled stdin failure")),
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), crate::wait_all(&mut [&mut run]))
+                .await
+                .is_err(),
+            "the outer timeout must cancel while stdin finalization is pending"
+        );
+        assert_eq!(
+            run.cancel_at_exit,
+            Some(false),
+            "the external cancellation must happen after the child reap"
+        );
+
+        let err = crate::wait_any(&mut [&mut run])
+            .await
+            .expect_err("the re-await must classify the retained stdin error");
+        assert!(
+            matches!(err.reason(), ErrorReason::Stdin { .. }),
+            "got: {err:?}"
+        );
+        assert!(
+            run.stdin_error.is_none(),
+            "the source error is observed once"
+        );
+        assert_eq!(
+            crate::wait_all(&mut [&mut run])
+                .await
+                .expect("a repeated wait remains usable"),
+            vec![Outcome::Exited(0)]
+        );
+    }
+
+    /// Finalizing a borrowed wait still filters the routine broken-pipe result.
+    #[tokio::test]
+    async fn borrowed_wait_keeps_broken_pipe_as_a_clean_exit() {
+        let mut run = scripted_handle(&[0]).await;
+        delayed_stdin_task(
+            &mut run,
+            Duration::from_millis(10),
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        );
+
+        assert_eq!(
+            crate::wait_any(&mut [&mut run])
+                .await
+                .expect("a broken pipe is normal stdin closure"),
+            (0, Outcome::Exited(0))
+        );
+        assert!(run.stdin_error.is_none());
     }
 
     #[tokio::test]
