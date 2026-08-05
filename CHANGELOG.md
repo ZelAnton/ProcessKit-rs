@@ -35,24 +35,27 @@ to a dated version section.
 ### Fixed
 
 - Stop a `Command::merge_stderr_in_pipe` stage from parking a thread of the
-  runtime's shared blocking pool on Unix. The parent end of that stage's shared
-  stdout+stderr pipe was wrapped in a `tokio::fs::File`, so each read ran on a
-  blocking-pool thread — and dropping the future awaiting it (the downstream
-  stage's relay, which teardown aborts once its grace expires) cancels only the
-  wait, never the `read(2)` itself. A grandchild that inherited the write end
-  (the `sh -c '… &'` shape) holds that pipe open long after the direct child
+  runtime's shared blocking pool, on both Unix and Windows. The parent end of
+  that stage's shared stdout+stderr pipe was wrapped in a `tokio::fs::File`, so
+  each read ran on a blocking-pool thread — and dropping the future awaiting it
+  (the downstream stage's relay, which teardown aborts once its grace expires)
+  cancels only the wait, never the read itself. A grandchild that inherited the
+  write end (the `sh -c '… &'` shape on Unix, anything the stage launched with
+  inherited handles on Windows) holds that pipe open long after the direct child
   exits, so a cancelled or timed-out chain could leave one pool thread parked —
   and the pipe's read end open with it — for as long as that grandchild lived,
-  one per such run. That end is now driven through tokio's reactor
+  one per such run. Unix now drives that end through tokio's reactor
   (`O_NONBLOCK` + `AsyncFd`), the same move the Unix PTY master fd already made:
   a read with nothing to read holds no thread, and dropping the reader closes
-  the fd there and then. What a merged stage delivers downstream — the child's
-  own write order across both streams, its EOF, the pipefail stderr trade-off —
-  is unchanged, as is the public API. Windows still wraps the pipe handle in a
-  `tokio::fs::File`: an anonymous pipe handle cannot be registered with that
-  reactor, and cancelling a read on it needs a dedicated bridge thread with its
-  own ownership contract, so reads there still occupy a pool thread while the
-  pipe is open.
+  the fd there and then. Windows cannot register an anonymous pipe handle with
+  that reactor, so its read blocks on a bridge thread belonging to the merge
+  pipe alone rather than on a thread shared with the rest of the runtime, and
+  dropping the reader interrupts that read (`CancelSynchronousIo`) so the thread
+  closes the pipe's read end and ends — with the drop waiting a bounded moment
+  for it, instead of leaving it parked behind a grandchild's silence. What a
+  merged stage delivers downstream — the child's own write order across both
+  streams, its EOF, the pipefail stderr trade-off — is unchanged on both
+  platforms, as is the public API.
 - Tear down the child of a failed Unix PTY launch (`Command::use_pty`).
   Such a launch can fail *after* that child already exists — a failed `dup` of
   the pty master, a failed reactor registration — and previously it returned its

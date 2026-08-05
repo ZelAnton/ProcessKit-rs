@@ -1306,20 +1306,24 @@ async fn pipeline_start_reaps_a_partially_started_chain() {
 }
 
 // ---------------------------------------------------------------------------
-// T-271: the parent-side reader of a `merge_stderr_in_pipe` stage's shared
-// stdout+stderr pipe (`sys::merge_pipe`), exercised through a real chain.
+// T-271 / T-272: the parent-side reader of a `merge_stderr_in_pipe` stage's
+// shared stdout+stderr pipe (`sys::merge_pipe`), exercised through a real chain.
 //
-// Both tests are Unix-only. Unix is the platform whose reader moved from the
-// runtime's shared blocking pool onto the reactor: Windows still wraps the pipe
-// handle in `tokio::fs::File`, whose reads do occupy a pool thread while the
-// pipe is open, so the pool assertions in the second test would fail there by
-// design; the first test's producer is a `sh`/`seq` one-liner with no cheap
-// Windows equivalent (a `cmd` loop of this size takes seconds). The
-// cross-platform behaviour of a merged stage — write order, the pipefail
-// stderr trade-off, the final-stage no-op — is covered by the tests near the
-// top of this file, and the reader's own error branch (nothing a test can do to
-// the pipe from outside makes its `read(2)` fail, so it needs a substituted
-// source) by the unit tests in `src/sys/merge_pipe.rs`.
+// The quiet-grandchild test below exists once per platform, because the two
+// readers keep that read off the runtime's shared blocking pool by different
+// means: Unix drives the fd through the reactor, Windows blocks on a bridge
+// thread of the module's own and interrupts it when the reader is dropped. Each
+// version therefore builds its grandchild the way its own platform can — a
+// forking `sh -c '… &'` on Unix, a re-exec of this test binary on Windows, whose
+// `Stdio::inherit` hands the launched process the merge pipe's write end.
+//
+// The bulk-payload test is Unix-only: its producer is a `sh`/`seq` one-liner
+// with no cheap Windows equivalent (a `cmd` loop of this size takes seconds).
+// The cross-platform behaviour of a merged stage — write order, the pipefail
+// stderr trade-off, the final-stage no-op — is covered by the tests near the top
+// of this file, and the reader's own chunking, EOF and error branches (nothing a
+// test can do to the pipe from outside makes its read fail, so that one needs a
+// substituted source) by the unit tests in `src/sys/merge_pipe.rs`.
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -1433,4 +1437,157 @@ fn merged_stage_reader_parks_no_blocking_pool_thread_for_a_quiet_grandchild() {
         .await
         .expect("blocking probe");
     });
+}
+
+/// Set on the middle process of the Windows test below — the merged stage
+/// itself, which launches the grandchild and exits at once. Its value is the
+/// marker path that grandchild creates.
+#[cfg(windows)]
+const MERGE_PIPE_STAGE: &str = "PK_T272_MERGE_PIPE_STAGE";
+/// Set on the innermost process: the grandchild that inherits the merge pipe's
+/// write end, records that it has it, and then holds it in silence. Its value is
+/// that same marker path.
+#[cfg(windows)]
+const MERGE_PIPE_HOLDER: &str = "PK_T272_MERGE_PIPE_HOLDER";
+/// The libtest name of the test below, used to re-invoke it as its own stage and
+/// grandchild.
+#[cfg(windows)]
+const MERGE_PIPE_TEST: &str = "pipeline::merged_stage_with_a_quiet_grandchild_tears_down_promptly";
+
+/// A merged stage whose grandchild keeps the pipe open and silent: the chain
+/// stays alive on it (no premature EOF), and cancelling then tears the chain
+/// down promptly instead of waiting for that grandchild to go away by itself.
+///
+/// The teardown half is what covers the Windows reader's bridge thread through a
+/// real run: cancelling drops the parent-side reader while its thread is parked
+/// in a read nothing is going to complete, so a teardown that joined that thread
+/// without interrupting it first would take the grandchild's whole lifetime —
+/// measured below, because a `Drop` blocking a runtime thread also stops the
+/// timer that would otherwise cut the wait short.
+///
+/// Deliberately *not* asserted here, unlike the Unix version above: that the
+/// runtime's shared blocking pool stays free. On Windows `tokio::process`'s own
+/// `ChildStdio` is `Blocking<ArcFile>` — every read of a child's stdout takes a
+/// pool thread — so a chain occupies that pool whatever this module does, and a
+/// pool probe would say nothing about the merge pipe's reader. Nor does this
+/// prove the bridge thread ends at all: the chain's containment reaps the
+/// grandchild at teardown, which ends any read on that pipe by itself. Both of
+/// those are asserted where they can be: `src/sys/merge_pipe.rs`'s unit tests
+/// hold the write end open past the drop and watch the thread go.
+///
+/// The runtime is deliberately the default single-threaded one: it is what makes
+/// the measurement above discriminating. Given a second worker, the teardown
+/// that a blocking `Drop` is stalling would simply carry on there, reach the
+/// containment kill, and end the grandchild — and with it the read — inside the
+/// budget, which is not the property this test is trying to pin.
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "re-execs the test binary as a merged-stderr chain plus a grandchild that holds the pipe open"]
+async fn merged_stage_with_a_quiet_grandchild_tears_down_promptly() {
+    // Three processes, all of them this binary running this one test, told apart
+    // by the two env markers above:
+    //
+    //   driver (here)  → the merged chain's parent, holding the pipe's read end
+    //     stage        → the chain's first stage; launches the holder, exits
+    //       holder     → inherited the pipe's write end; records that, then
+    //                    sleeps, writing nothing and never closing it
+    if let Some(marker) = std::env::var_os(MERGE_PIPE_HOLDER) {
+        hold_the_merge_pipe(marker.as_ref());
+        return;
+    }
+    if let Some(marker) = std::env::var_os(MERGE_PIPE_STAGE) {
+        launch_the_merge_pipe_holder(marker.as_ref());
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let holding = dir.path().join("holding");
+    let exe = std::env::current_exe().expect("locate the integration-test binary");
+
+    let producer = Command::new(exe)
+        .args([MERGE_PIPE_TEST, "--exact", "--ignored"])
+        .env(MERGE_PIPE_STAGE, holding.to_string_lossy().as_ref());
+    let token = tokio_util::sync::CancellationToken::new();
+    let chain = producer
+        .merge_stderr_in_pipe()
+        .pipe(passthrough_stage())
+        .cancel_on(token.clone());
+    let run = tokio::spawn(async move { chain.output_string().await });
+
+    // The marker is written by the grandchild itself, so waiting for it is a
+    // fact about the process tree, not a guess about timing.
+    poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(25),
+        "the grandchild to take over the merge pipe",
+        || holding.exists(),
+    )
+    .await;
+
+    // The chain is still running, which is what proves the shape this test
+    // needs: the last stage is waiting for an EOF only the grandchild's copy of
+    // the write end can deliver, and it is not writing one.
+    assert!(
+        !run.is_finished(),
+        "the grandchild must still be holding the merge pipe open"
+    );
+
+    // Teardown resolves in bounded time rather than waiting out the grandchild's
+    // own lifetime (`HOLD`, far longer than either bound below).
+    let cancelled_at = Instant::now();
+    token.cancel();
+    let err = completes_within(Duration::from_secs(20), "the cancelled chain", run)
+        .await
+        .expect("run task")
+        .expect_err("a cancelled chain errors");
+    let teardown = cancelled_at.elapsed();
+    assert!(
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+        "expected Cancelled, got {err:?}"
+    );
+    // Measured rather than left to the timeout above: the wait this guards
+    // against blocks a runtime thread, and the elapsed reading survives that
+    // where a timer may not. The margin is an order of magnitude, not a tight
+    // budget — a prompt teardown here takes milliseconds.
+    assert!(
+        teardown < HOLD / 2,
+        "tearing the chain down must not wait out the grandchild: took {teardown:?}"
+    );
+}
+
+/// How long the grandchild holds the merge pipe: long enough that a teardown
+/// waiting it out could not be mistaken for a prompt one.
+#[cfg(windows)]
+const HOLD: Duration = Duration::from_secs(60);
+
+/// The middle process of the test above: launch the grandchild and exit, leaving
+/// it with the merge pipe.
+///
+/// `std::process::Command` inherits our stdout and stderr — which are the merged
+/// pipe's write end — by duplicating them into the new process as inheritable
+/// handles, so the grandchild keeps that end open after this process is gone.
+// Waiting for the grandchild is exactly what this must not do: this process has
+// to exit while that one still holds the pipe. Nothing here outlives it to be
+// troubled by an unreaped child either — the chain's containment reaps the whole
+// tree at teardown, and on Windows a dropped `Child` leaves no zombie to collect.
+#[allow(clippy::zombie_processes)]
+#[cfg(windows)]
+fn launch_the_merge_pipe_holder(marker: &std::ffi::OsStr) {
+    let exe = std::env::current_exe().expect("locate the integration-test binary");
+    std::process::Command::new(exe)
+        .args([MERGE_PIPE_TEST, "--exact", "--ignored"])
+        .env(MERGE_PIPE_HOLDER, marker)
+        .env_remove(MERGE_PIPE_STAGE)
+        .spawn()
+        .expect("launch the grandchild that holds the merge pipe");
+}
+
+/// The innermost process of the test above: announce that this process holds the
+/// merge pipe's write end, then hold it in silence for longer than the test
+/// needs it. The chain's own containment reaps this process at teardown, well
+/// before the sleep ends.
+#[cfg(windows)]
+fn hold_the_merge_pipe(marker: &std::ffi::OsStr) {
+    std::fs::write(marker, b"held").expect("record that the grandchild holds the merge pipe");
+    std::thread::sleep(HOLD);
 }

@@ -218,9 +218,11 @@ pub(crate) mod pty;
 
 // The parent-side reader for a `merge_stderr_in_pipe` stage's shared
 // stdout+stderr pipe, per platform: Unix drives the read end through tokio's
-// reactor (`AsyncFd`), Windows keeps the blocking-pool `tokio::fs::File`
-// wrapper because an anonymous pipe handle cannot be registered with that
-// reactor. Compiled on the two OS families that support the marker at all —
+// reactor (`AsyncFd`); Windows, whose anonymous pipe handle cannot be registered
+// with that reactor, blocks on a bridge thread of the module's own and
+// interrupts it when the reader is dropped. Neither holds a thread of the
+// runtime's shared blocking pool. Compiled on the two OS families that support
+// the marker at all —
 // `runner::launch` rejects it as `Unsupported` anywhere else, before a pipe
 // exists.
 #[cfg(any(unix, windows))]

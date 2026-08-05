@@ -315,6 +315,11 @@ windows-sys = { version = "0.61", features = [
   # CTRL_BREAK before the grace window, so a console child can shut down softly
   # (Command::windows_graceful_ctrl_break). See src/sys/windows.rs.
   "Win32_System_Console",
+  # CancelSynchronousIo interrupts the blocking `ReadFile` the merge-pipe bridge
+  # thread parks in, so dropping the parent-side reader ends that thread instead
+  # of leaving it (and the pipe handle) alive for as long as some grandchild
+  # holds the write end. See src/sys/merge_pipe.rs.
+  "Win32_System_IO",
   # EnumWindows + GetWindowThreadProcessId + PostMessageW + WM_CLOSE for the
   # best-effort GUI-graceful tier: before the hard TerminateJobObject, every
   # top-level window owned by a live job member is sent WM_CLOSE (posted, never
