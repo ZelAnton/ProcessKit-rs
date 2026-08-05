@@ -350,8 +350,10 @@ impl Job {
                 // not retroactively pulled in — only future forks).
                 //
                 // Into the job's own cgroup, not a per-spawn leaf of its own: a leaf
-                // buys selectivity for an *undo*, and there is no undo of an adopt —
-                // nothing ever aims a kill at one adopted child alone. The job cgroup
+                // buys selectivity for an undo that KILLS, and nothing ever aims a
+                // kill at one adopted child alone. (`adopt_external` does have an
+                // undo, but it moves the number back out rather than killing it, and
+                // that works from the job's own cgroup just as well.) The job cgroup
                 // may hold these members and the leaf directories at once because
                 // this backend never enables controllers in its **own**
                 // `cgroup.subtree_control` (see `Cgroup::create`), which is the only
@@ -374,6 +376,93 @@ impl Job {
             }
             // `pg.adopt` re-arms the ProcessGroup's own latch on success.
             Backend::ProcessGroup(pg) => pg.adopt(child),
+        }
+    }
+
+    /// Adopt an **external** process named only by `pid` — the Linux backend of
+    /// [`ProcessGroup::adopt_external`](crate::ProcessGroup::adopt_external).
+    ///
+    /// The cgroup arm is the same single `cgroup.procs` write [`adopt`](Self::adopt)
+    /// makes, with the identity work a bare number needs around it:
+    ///
+    /// 1. **Anchor first** ([`capture_adoption_anchor`]): one `/proc/<pid>/stat`
+    ///    read yields the process's `starttime` token and, in the same read, proves
+    ///    the process exists — an `ENOENT` is the honest "no such pid" and any other
+    ///    read failure (a `hidepid` mount) is surfaced, never mistaken for "dead".
+    /// 2. **The migration.** The kernel re-parents *that task* into this job's
+    ///    cgroup; its existing descendants are not pulled in, only future forks.
+    ///    It also takes the task **out** of the cgroup it was in — v2 membership is
+    ///    exclusive — so whatever teardown and limits that cgroup carried stop
+    ///    applying to it; the kernel does not report what it left, and nothing here
+    ///    can put it back. An `ESRCH` means the process was exiting or gone by the
+    ///    time the write landed — nothing left to contain, so `Ok`, exactly as
+    ///    [`adopt`](Self::adopt) answers for a zombie.
+    /// 3. **Re-read the anchor, and undo the migration if it moved.** A `starttime`
+    ///    that has positively changed means the number was recycled inside this
+    ///    call's own window. Detecting that is not the same as undoing it here: the
+    ///    write has already put whoever held the number into the cgroup this job
+    ///    kills, so the call runs the best-effort undo
+    ///    ([`Cgroup::evict_recycled`]) — which first establishes whether the number
+    ///    is a member at all, since the recycle may equally have happened *after* a
+    ///    correct migration — and reports what that undo left behind
+    ///    ([`recycled_during_cgroup_adoption`]). The kill-on-drop backstop is not
+    ///    re-armed on this path, for the plain reason that no member the caller
+    ///    asked for joined; that is bookkeeping, not a mitigation — an un-latched
+    ///    backstop (the normal state) kills the cgroup's members on `Drop` whether
+    ///    or not this path touched it, which is exactly why the undo above has to
+    ///    do the real work.
+    ///
+    /// After a successful write there is no number-keyed bookkeeping to poison:
+    /// membership is the kernel's own, per task, and every later verb — `members`,
+    /// the graceful tier, `cgroup.kill`, `Drop` — reads or acts on *that*. A number
+    /// recycled later cannot appear in this cgroup unless the kernel put the task
+    /// there, and the per-pid delivery path pins each member with a pidfd and
+    /// reconfirms its membership before sending (see
+    /// [`deliver_pinned`]).
+    ///
+    /// Into the job's own cgroup, not a per-spawn leaf, as [`adopt`](Self::adopt)
+    /// also does. A leaf exists to make a *selective kill* expressible (a
+    /// `cgroup.kill` aimed at one spawn's subtree), and the one undo this path can
+    /// need is not a kill but a move back out — which works from the job's own
+    /// cgroup exactly as it would from a leaf, and costs no directory per adoption.
+    #[cfg(feature = "process-control")]
+    pub(crate) fn adopt_external(&self, pid: u32) -> io::Result<()> {
+        match &self.backend {
+            Backend::Cgroup(cg) => {
+                let anchor = capture_adoption_anchor(pid)?;
+                match cgroup_write(&cg.path.join("cgroup.procs"), pid.to_string().as_bytes()) {
+                    Ok(()) => {
+                        // The same "positive proof of a recycle" rule the pgroup
+                        // backend gates every probe on, not a second comparison of
+                        // this backend's own.
+                        if crate::sys::pgroup::is_recycled(
+                            Some(anchor),
+                            crate::sys::procfs::read_starttime(pid),
+                        ) {
+                            // The write is already in the kernel, so this path owes
+                            // the caller an attempt to take it back out — and an
+                            // honest report of what that attempt achieved.
+                            return Err(recycled_during_cgroup_adoption(
+                                pid,
+                                cg.evict_recycled(pid),
+                            ));
+                        }
+                        // A new killable member joined the cgroup — re-arm Drop's
+                        // backstop so a prior graceful_shutdown(escalate=false)
+                        // latch doesn't spare it.
+                        self.skip_drop_kill.clear();
+                        Ok(())
+                    }
+                    // The process exited between the anchor read and the write (a
+                    // zombie, or gone): nothing to contain, so `Ok` — the same
+                    // answer `adopt` gives for an exited-but-unreaped child.
+                    Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            }
+            // `pg.adopt_external` captures its own anchor and re-arms the
+            // ProcessGroup's own latch on success.
+            Backend::ProcessGroup(pg) => pg.adopt_external(pid),
         }
     }
 
@@ -544,6 +633,91 @@ impl Job {
 pub(crate) fn process_info(pid: u32) -> io::Result<Option<MemberInfo>> {
     Ok(crate::sys::procfs::read_stat_meta_checked(pid)?
         .map(|m| MemberInfo::new(pid, m.ppid, m.comm, m.starttime)))
+}
+
+/// Capture the start-time identity anchor of the live process at `pid` for a
+/// **bare-pid adoption** into a cgroup ([`Job::adopt_external`]), from a single
+/// `/proc/<pid>/stat` read.
+///
+/// The same `starttime` token [`process_info`] reports and the pgroup backend
+/// anchors its entries on, read through the same shared parser — but *required*
+/// rather than best-effort, because a bare number with no `Child` behind it has
+/// nothing else that could tell the named process apart from a later occupant of
+/// the number. The read doubles as the existence check, and keeps
+/// [`read_stat_meta_checked`](crate::sys::procfs::read_stat_meta_checked)'s
+/// distinction intact: `ENOENT` is the honest "no such pid" (`NotFound`), any
+/// other failure means the process may well exist but could not be looked at
+/// (a `hidepid` mount) and is surfaced as itself, never as "dead".
+#[cfg(feature = "process-control")]
+fn capture_adoption_anchor(pid: u32) -> io::Result<u64> {
+    match crate::sys::procfs::read_stat_meta_checked(pid)? {
+        None => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no process with pid {pid} to adopt"),
+        )),
+        Some(meta) => meta.starttime.ok_or_else(|| {
+            io::Error::other(format!(
+                "cannot adopt pid {pid}: /proc/{pid}/stat yielded no start-time identity, and \
+                 this group will not track an external process by number alone"
+            ))
+        }),
+    }
+}
+
+/// What the best-effort undo of a recycled bare-pid adoption found and did — the
+/// outcome of [`Cgroup::evict_recycled`], reported to the caller rather than
+/// collapsed, because the three states differ in the one way a caller has to know
+/// about: whether this group's teardown still reaches whoever holds the number.
+#[cfg(feature = "process-control")]
+enum RecycleUndo {
+    /// The number is **not** a member of this job's cgroup — either the process the
+    /// call migrated has since exited (the recycle happened after the write) or the
+    /// number names nothing at all now. Nothing to undo, and nothing here for this
+    /// group's teardown to reach.
+    NotAMember,
+    /// The number **was** a member and was moved back out, into the cgroup this
+    /// job's own directory lives in. This group's teardown no longer reaches it.
+    Evicted,
+    /// The number could not be shown to be out of this job's cgroup: the membership
+    /// read failed, or the move-out write was refused. Whoever holds the number may
+    /// still be a member of this job, and this group's teardown would kill it.
+    Stuck(io::Error),
+}
+
+/// The verdict a cgroup-arm bare-pid adoption reports when its closing identity
+/// re-read proves the number was recycled while the call ran.
+///
+/// It states the **aftermath**, not a single sweeping claim, because this arm's
+/// state after the error genuinely varies: the migration had already happened, so
+/// what the caller is left with depends on whether it could be reversed
+/// ([`Cgroup::evict_recycled`]). That is also where this arm parts company with the
+/// process-group one, whose after-error state is uniform (an entry that its own
+/// identity gate prunes without ever signalling it — see
+/// `sys::pgroup::recycled_during_adoption`).
+#[cfg(feature = "process-control")]
+fn recycled_during_cgroup_adoption(pid: u32, undo: RecycleUndo) -> io::Error {
+    let aftermath = match undo {
+        RecycleUndo::NotAMember => "the number is not a member of this group's cgroup, so this \
+                                    group's teardown will not reach whoever holds it now"
+            .to_string(),
+        RecycleUndo::Evicted => "the migration was undone — the number was moved back out of this \
+                                 group's cgroup, into the cgroup this group's own directory lives \
+                                 in — so this group's teardown will not reach it; the cgroup it \
+                                 was in before this call is NOT restored, because cgroup v2 \
+                                 membership is exclusive and the kernel does not report what a \
+                                 task left behind"
+            .to_string(),
+        RecycleUndo::Stuck(e) => format!(
+            "the number could NOT be moved back out of this group's cgroup ({e}), so whoever \
+             holds it is a member of this group and this group's teardown — kill_all, shutdown, \
+             Drop — will kill it"
+        ),
+    };
+    io::Error::other(format!(
+        "pid {pid} was recycled while it was being adopted: its start-time identity differs from \
+         the one captured at the start of the call, so the process the caller named is not the \
+         one this call acted on — {aftermath}"
+    ))
 }
 
 /// Read `/proc/<pid>/stat`'s `starttime` (field 22) — the process's start-time
@@ -1154,6 +1328,89 @@ impl Cgroup {
     /// for why that is the only condition under which one is dropped.
     fn reclaim_leaves(&self) {
         self.leaves().reclaim();
+    }
+
+    /// Best-effort undo of the `cgroup.procs` write a bare-pid adoption made, run
+    /// only once the closing identity re-read has *proved* the number was recycled
+    /// somewhere inside that call ([`Job::adopt_external`]).
+    ///
+    /// **Why an undo is needed here and not on the process-group arm.** That arm's
+    /// only durable trace is an entry carrying the captured token, which the
+    /// identity gate prunes unsignalled — detection is enough there. Here the write
+    /// has already changed kernel state that outlives the call: membership of *this
+    /// job's cgroup* is precisely where `kill_all`, the graceful tier and `Drop`
+    /// aim, so a stranger the write pulled in would be SIGKILLed later by a group
+    /// that was never given it. Reporting the recycle without moving it back out
+    /// would be reporting a state this call created and left in place.
+    ///
+    /// **The membership pass comes first, and it is not a formality.** A recycle
+    /// detected *after* the write has two shapes the tokens alone cannot tell apart,
+    /// and they want opposite actions:
+    ///
+    /// - the number changed hands **before** the write, so the write moved a
+    ///   stranger in — it is a member here now, and moving it out is the fix;
+    /// - the number changed hands **after** the write, i.e. the process the caller
+    ///   named really was migrated here and then exited, was reaped, and its number
+    ///   was handed on. Nothing of this job's remains (an exited task leaves the
+    ///   cgroup), and the number now names a process this call never touched.
+    ///   Moving *that* one out would take an innocent process out of its own
+    ///   cgroup — the same harm, aimed the other way.
+    ///
+    /// Reading this cgroup's own `cgroup.procs` separates them: the number is listed
+    /// only in the first shape. The read is one pass and the write that follows is
+    /// again by number, so a further recycle in between is possible and irreducible
+    /// (`cgroup.procs` accepts numbers, and no pinning primitive changes what a
+    /// *write* resolves); the residue is bounded to moving some process out of its
+    /// cgroup rather than into a group that kills it, which is the direction this
+    /// backend errs in everywhere else. The same bound covers the one other way a
+    /// listed number can be a member honestly — a descendant the adopted process
+    /// forked here, which then took the freed number: it is moved out and this group
+    /// loses containment of that one process, which is a loss the caller is told
+    /// about, not a stranger killed silently.
+    ///
+    /// **Destination.** The directory this job's cgroup was created under — this
+    /// process's own cgroup ([`cgroup2_self_dir`]), which is where a member of this
+    /// group would have lived had the crate never made a sub-cgroup for it. It is
+    /// the one destination this call can name without guessing, it exists (the job's
+    /// own directory was created inside it), and it is outside everything this job
+    /// kills. Two things it is **not**: a promise that the write is permitted there
+    /// (`mkdir` rights on a directory are not write rights on its `cgroup.procs` —
+    /// hence the outcome below), and the cgroup the process came from, which v2's
+    /// exclusive membership has already discarded and the kernel does not report.
+    /// On a host where this process itself lives in the hierarchy root, that
+    /// destination *is* the root, with the weaker containment that implies.
+    ///
+    /// **What it cannot promise.** The move-out is a write like any other and can be
+    /// refused (a delegated cgroup that will not take it, an `EBUSY` from the "no
+    /// internal processes" rule where the destination distributes resources). The
+    /// caller is told which of the three outcomes it got, because they differ in the
+    /// only way that matters: whether this group's teardown still reaches the number.
+    #[cfg(feature = "process-control")]
+    fn evict_recycled(&self, pid: u32) -> RecycleUndo {
+        let members = match read_member_pids(&self.path, |path| std::fs::read_to_string(path)) {
+            Ok(members) => members,
+            // Membership unreadable: nothing here can show the number is out, so say
+            // so rather than act on a guess in either direction.
+            Err(e) => return RecycleUndo::Stuck(e),
+        };
+        if !members
+            .iter()
+            .any(|&member| u32::try_from(member).is_ok_and(|member| member == pid))
+        {
+            return RecycleUndo::NotAMember;
+        }
+        let Some(parent) = self.path.parent() else {
+            return RecycleUndo::Stuck(io::Error::other(
+                "this group's cgroup has no parent directory to move the number back out into",
+            ));
+        };
+        match cgroup_write(&parent.join("cgroup.procs"), pid.to_string().as_bytes()) {
+            Ok(()) => RecycleUndo::Evicted,
+            // The number names nothing any more, so it is a member of nothing —
+            // including this cgroup.
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => RecycleUndo::NotAMember,
+            Err(e) => RecycleUndo::Stuck(e),
+        }
     }
 
     fn create(#[cfg(feature = "limits")] limits: &ResourceLimits) -> io::Result<Self> {
@@ -3097,6 +3354,97 @@ mod cgroup_write_seam_tests {
         std::fs::read_to_string(path).expect("read back a control file")
     }
 
+    /// The undo a recycled bare-pid adoption runs: a number this job's cgroup lists
+    /// is written back into the directory the job's cgroup lives in, so the group's
+    /// teardown — which aims at its own cgroup — stops covering it.
+    ///
+    /// On a real hierarchy the kernel performs the move and both files change; on a
+    /// stand-in directory only the destination write is observable, and that is
+    /// exactly the decision this code owns: *which* `cgroup.procs` the number is
+    /// handed to, and whether it is handed to one at all. Whether a host then
+    /// permits the move is its own policy, and is what the real-cgroup test
+    /// (`real_cgroup_adopt_tests`) exists to answer.
+    #[cfg(feature = "process-control")]
+    #[test]
+    fn a_recycled_adoption_hands_the_number_back_to_the_parent_cgroup() {
+        let (_dir, cgroup) = temp_cgroup();
+        let parent = cgroup
+            .path
+            .parent()
+            .expect("the stand-in cgroup has a parent")
+            .to_path_buf();
+        std::fs::write(cgroup.path.join("cgroup.procs"), "4321\n").expect("seed the member list");
+
+        assert!(
+            matches!(cgroup.evict_recycled(4321), super::RecycleUndo::Evicted),
+            "a number this cgroup holds must be moved back out"
+        );
+        assert_eq!(
+            std::fs::read_to_string(parent.join("cgroup.procs"))
+                .expect("the destination member list"),
+            "4321",
+            "the number must be handed to the cgroup this job's directory lives in"
+        );
+    }
+
+    /// The other shape of a detected recycle: the migration was correct and the
+    /// process it moved has since exited, so the number now names a process this
+    /// call never touched. Moving *that* one would take an innocent process out of
+    /// its own cgroup — the same harm the undo exists to prevent, aimed the other
+    /// way — so the membership pass has to stop it.
+    #[cfg(feature = "process-control")]
+    #[test]
+    fn a_recycle_after_a_correct_migration_moves_nobody() {
+        let (_dir, cgroup) = temp_cgroup();
+        let parent = cgroup
+            .path
+            .parent()
+            .expect("the stand-in cgroup has a parent")
+            .to_path_buf();
+        // Seeded empty by `temp_cgroup`: nothing of this job's is left.
+        assert!(
+            matches!(cgroup.evict_recycled(4321), super::RecycleUndo::NotAMember),
+            "a number this cgroup does not hold is nothing to undo"
+        );
+        assert!(
+            !parent.join("cgroup.procs").exists(),
+            "a number this call never migrated must not be written anywhere"
+        );
+    }
+
+    /// The undo is a write like any other and a host may refuse it (a delegated
+    /// cgroup that will not take the number back, an `EBUSY` from the "no internal
+    /// processes" rule). That leaves whoever holds the number a member of this
+    /// group — the fail-lethal residue — and the error must say so instead of
+    /// claiming the group has no claim on it.
+    #[cfg(feature = "process-control")]
+    #[test]
+    fn an_undo_the_host_refuses_is_reported_as_still_this_groups_to_kill() {
+        let (_dir, cgroup) = temp_cgroup();
+        std::fs::write(cgroup.path.join("cgroup.procs"), "4321\n").expect("seed the member list");
+
+        let faults = Faults::new()
+            .fail_every(SITE, Some("cgroup.procs"), libc::EPERM)
+            .arm();
+        let undo = cgroup.evict_recycled(4321);
+        assert_eq!(
+            faults.fired(SITE),
+            1,
+            "exactly the move-out write was failed"
+        );
+        assert!(matches!(undo, super::RecycleUndo::Stuck(_)));
+
+        let text = super::recycled_during_cgroup_adoption(4321, undo).to_string();
+        assert!(
+            text.contains("could NOT be moved back out") && text.contains("will kill it"),
+            "the caller must be told the number is still this group's to kill: {text}"
+        );
+        assert!(
+            text.contains(&format!("os error {}", libc::EPERM)),
+            "the refusal's own errno must reach the caller: {text}"
+        );
+    }
+
     /// The limits are applied as three **sequential** writes, so a failure on the
     /// second leaves the first already in force in the kernel and the third never
     /// attempted. The failure must surface with its errno intact — reporting the
@@ -4969,5 +5317,223 @@ mod real_cgroup_leaf_tests {
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
+    }
+}
+
+/// Bare-pid adoption (`Job::adopt_external`) against a **real cgroup v2
+/// hierarchy** — the arm whose anchor is the kernel's own membership rather than a
+/// tracked number, so nothing below it can be shown with a stand-in directory.
+///
+/// Each test skips — with a note, never a false pass — when this host hands
+/// `Job::new` the process-group fallback (that arm is covered by the shared
+/// backend's own tests in `sys::pgroup`). Run them as a user who can create
+/// cgroups: `cargo test --lib --all-features -- --include-ignored
+/// real_cgroup_adopt`.
+#[cfg(all(test, feature = "process-control"))]
+mod real_cgroup_adopt_tests {
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use super::{Backend, Job};
+    use crate::sys::fault_injection::{Faults, Site};
+
+    /// A real `Job` on this host plus its cgroup directory, or `None` (with a note)
+    /// when the host gave the process-group fallback.
+    fn cgroup_job() -> Option<(Job, PathBuf)> {
+        #[cfg(feature = "limits")]
+        let job = Job::new(&crate::limits::ResourceLimits::default()).expect("create a job");
+        #[cfg(not(feature = "limits"))]
+        let job = Job::new().expect("create a job");
+        match &job.backend {
+            Backend::Cgroup(cg) => {
+                let path = cg.path.clone();
+                Some((job, path))
+            }
+            Backend::ProcessGroup(_) => {
+                eprintln!(
+                    "skipping: this host has no writable cgroup v2 (Job::new fell back to the \
+                     process-group backend) — the cgroup adoption path is not reachable here"
+                );
+                None
+            }
+        }
+    }
+
+    /// The pids a cgroup directory lists as its own members.
+    fn procs_of(dir: &Path) -> Vec<u32> {
+        std::fs::read_to_string(dir.join("cgroup.procs"))
+            .expect("read a cgroup.procs")
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
+    }
+
+    /// Start a process genuinely **foreign** to this one: a shell backgrounds it
+    /// and exits, so `init` adopts it and no handle to it exists here — the state
+    /// an FFI caller's pid arrives in.
+    ///
+    /// The backgrounded process gets its own `/dev/null` stdio: inheriting the
+    /// launcher's captured pipe would keep it open, and `output()` waits for EOF —
+    /// i.e. for the "orphan" to exit — before this function could even return.
+    fn spawn_orphan() -> u32 {
+        let out = std::process::Command::new("sh")
+            .args(["-c", "sleep 60 >/dev/null 2>&1 </dev/null & echo $!"])
+            .output()
+            .expect("launch the orphan's launcher");
+        assert!(out.status.success(), "the orphan's launcher failed");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("the launcher prints the orphan's pid")
+    }
+
+    /// Whether `pid` still names a live process. Only asked about an orphan, which
+    /// `init` reaps the moment it dies, so no zombie can be misread as alive.
+    fn is_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 is a pure existence probe.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    async fn wait_until_gone(pid: u32, what: &str) {
+        for _ in 0..600 {
+            if !is_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // SAFETY: a best-effort kill of a pid this test started.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        panic!("{what}: pid {pid} was still alive after the bounded wait");
+    }
+
+    /// The positive path: a process this job never started, and holds no handle
+    /// for, becomes a member of the job's own cgroup — and the job's teardown
+    /// really reaches it.
+    #[tokio::test]
+    #[ignore = "needs a writable cgroup v2 and spawns a real subprocess"]
+    async fn adopt_external_makes_a_foreign_process_a_cgroup_member() {
+        let Some((job, dir)) = cgroup_job() else {
+            return;
+        };
+        let pid = spawn_orphan();
+
+        job.adopt_external(pid).expect("adopt a foreign pid");
+        assert!(
+            procs_of(&dir).contains(&pid),
+            "the adopted process must be a member of the job's own cgroup"
+        );
+
+        job.kill_all().expect("kill the job");
+        wait_until_gone(pid, "the adopted foreign process dies with the job").await;
+    }
+
+    /// The Linux failure branch the platform matrix names: the `cgroup.procs` write
+    /// refused (a process this one may not move, a restricted delegated cgroup).
+    /// Injected rather than staged, since reproducing it for real needs a
+    /// hand-built host — the assertion is that it surfaces as an error instead of
+    /// being reported as containment.
+    #[tokio::test]
+    #[ignore = "needs a writable cgroup v2 and spawns a real subprocess"]
+    async fn a_refused_cgroup_procs_write_is_not_reported_as_containment() {
+        let Some((job, dir)) = cgroup_job() else {
+            return;
+        };
+        let pid = spawn_orphan();
+
+        let err = {
+            let _faults = Faults::new()
+                .fail_every(Site::CgroupWrite, Some("cgroup.procs"), libc::EACCES)
+                .arm();
+            job.adopt_external(pid)
+                .expect_err("a refused cgroup.procs write must fail the adoption")
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES), "{err:?}");
+        assert!(
+            !procs_of(&dir).contains(&pid),
+            "a refused adoption must not leave the pid a member"
+        );
+        assert!(
+            is_alive(pid),
+            "a refused adoption must leave the process alone"
+        );
+
+        // SAFETY: a best-effort kill of a pid this test started.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        drop(job);
+    }
+
+    /// The undo the recycle path leans on, against the real kernel: a process this
+    /// job's cgroup really holds is moved back out into the cgroup the job's own
+    /// directory lives in, and the job's teardown then does not reach it.
+    ///
+    /// A real recycle cannot be staged — the pid space would have to wrap inside one
+    /// call — so this drives `evict_recycled` directly. What only a real hierarchy
+    /// can answer is the part that decides whether the fix is a fix at all: whether
+    /// the kernel *permits* the move-out (delegation rules, the "no internal
+    /// processes" constraint on the destination), and whether the number really
+    /// stops being a member. A stand-in directory can show neither.
+    #[tokio::test]
+    #[ignore = "needs a writable cgroup v2 and spawns a real subprocess"]
+    async fn a_recycled_adoption_is_taken_back_out_of_the_job_cgroup() {
+        let Some((job, dir)) = cgroup_job() else {
+            return;
+        };
+        let pid = spawn_orphan();
+        job.adopt_external(pid).expect("adopt a foreign pid");
+        assert!(
+            procs_of(&dir).contains(&pid),
+            "the adopted process must be a member before the undo has anything to do"
+        );
+
+        let Backend::Cgroup(cg) = &job.backend else {
+            unreachable!("cgroup_job only returns the cgroup backend");
+        };
+        match cg.evict_recycled(pid) {
+            super::RecycleUndo::Evicted => {}
+            super::RecycleUndo::NotAMember => panic!("the pid was a member a moment ago"),
+            super::RecycleUndo::Stuck(e) => {
+                // A host that refuses the move-out is a real outcome, not a test
+                // failure — but it is the one where the contract's fail-lethal
+                // wording applies, so it must be visible rather than silently
+                // passing as a green run.
+                // SAFETY: a best-effort kill of a pid this test started.
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                panic!(
+                    "this host refuses to move an adopted pid back out of the job's cgroup \
+                     ({e}) — the undo degrades to the documented 'still a member' outcome here"
+                );
+            }
+        }
+        assert!(
+            !procs_of(&dir).contains(&pid),
+            "an evicted number must no longer be a member of the job's cgroup"
+        );
+
+        job.kill_all().expect("kill the job");
+        // The whole point of the undo: the group's teardown no longer covers it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let survived = is_alive(pid);
+        // SAFETY: a best-effort kill of a pid this test started.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        assert!(
+            survived,
+            "a process taken back out of the job's cgroup must not die with the job"
+        );
+        drop(job);
+    }
+
+    /// A number that names nothing is refused by the anchor read, before any write
+    /// — the same `NotFound` the pgroup arm gives, so the two arms answer a caller
+    /// identically.
+    #[tokio::test]
+    #[ignore = "needs a writable cgroup v2"]
+    async fn adopt_external_of_a_pid_that_names_nothing_is_not_found() {
+        let Some((job, _dir)) = cgroup_job() else {
+            return;
+        };
+        let err = job
+            .adopt_external(2_000_000_000)
+            .expect_err("a pid that names nothing is not adoptable");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err:?}");
     }
 }

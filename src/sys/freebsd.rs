@@ -1088,6 +1088,29 @@ impl Job {
         Ok(())
     }
 
+    /// Adopting an external process by **bare pid** is refused on FreeBSD, and the
+    /// refusal comes straight from the shared process-group layer, whose
+    /// [`read_identity`](crate::sys::pgroup) is `None` on this target.
+    ///
+    /// The reaper does not change that answer, because it is not an identity
+    /// mechanism: `procctl(PROC_REAP_*)` gives *membership* of this process's own
+    /// descendant subtree, kernel-maintained and precise for a process this job
+    /// started — but a process an outside supervisor started is not a descendant at
+    /// all ([`Reaper::covers`] is false for it), so no `PROC_REAP_*` call of ours
+    /// can reach it and the reaper contributes nothing to a bare-pid adoption. What
+    /// would be left is the process-group layer tracking a bare number with no
+    /// start-time token behind it, which is exactly what
+    /// [`adopt_external`](ProcessGroup::adopt_external) refuses to do — see its
+    /// `capture_adoption_anchor`.
+    ///
+    /// [`adopt`](Self::adopt) is unaffected: there the caller's own un-reaped
+    /// [`Child`] is what keeps the number from being recycled, and an adopted child
+    /// of this process *does* root a reaper subtree.
+    #[cfg(feature = "process-control")]
+    pub(crate) fn adopt_external(&self, pid: u32) -> io::Result<()> {
+        self.group.adopt_external(pid)
+    }
+
     pub(crate) fn kill_all(&self) -> io::Result<()> {
         if !self.reaper.active {
             return self.group.kill_all();

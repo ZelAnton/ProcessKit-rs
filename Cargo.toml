@@ -218,8 +218,8 @@ stats = ["windows-sys/Win32_System_ProcessStatus"]
 # possible `processkit-resource` split (see ideas/) — not as a code dependency.
 limits = ["stats"]
 # Tree control beyond contain+kill: `Signal` and
-# `ProcessGroup::{signal, suspend, resume, members, adopt}`. Gated because it
-# matches the layer a future `processkit-sys` split would carve out — assessed at
+# `ProcessGroup::{signal, suspend, resume, members, adopt, adopt_external}`. Gated
+# because it matches the layer a future `processkit-sys` split would carve out — assessed at
 # the 3.0-planning prompt and deferred (no concrete consumer; a layered split is
 # additive/non-breaking, so it needs no major and stays consumer-gated, not
 # window-gated): decisions/sync-core-processkit-sys-split.md.

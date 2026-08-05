@@ -952,7 +952,40 @@ tree joins; on the POSIX process-group backends an exec'd child is contained
 individually (its *future* forks too, where it could be re-grouped). The guide
 spells out exactly what each mechanism can promise.
 
+**Only a pid to go on?** When the process is not yours to hold a `Child` for — an
+outside supervisor started it, the number came from a pidfile, or the caller is
+an FFI binding that cannot build a `Child` at all — use `adopt_external(pid)`:
+
+```rust,no_run
+use processkit::ProcessGroup;
+
+fn main() -> processkit::Result<()> {
+    let pid: u32 = std::env::var("HELPER_PID").unwrap().parse().unwrap();
+    let group = ProcessGroup::new()?;
+    group.adopt_external(pid)?; // the crate takes its own identity anchor here
+    // The group's teardown now covers it — but nothing here will ever reap it,
+    // and no exit status for it appears in this API.
+    Ok(())
+}
+```
+
+The number is an address, not a handle: the crate anchors on the process the pid
+names *at that moment* (the process object on Windows, cgroup membership on
+Linux, the start-time token on the POSIX process-group backends), so a later
+recycle of the number is not signalled. It cannot check the window before the
+call, so look the pid up as late as you can. FreeBSD and the other BSDs have no
+start-time reader and return `Unsupported` rather than tracking a bare number.
+
+Adopting a process another supervisor already contains has a side effect that
+outlives the group, in opposite directions per platform: on Windows this group's
+job is nested *under* the job the process was already in (so that outer job then
+reaches this group's members, later-started ones included — and an adoption into a
+group that already has its own members may simply be refused, so adopt before you
+start); on Linux cgroup v2 the process is taken *out of* its previous cgroup, which
+disables that supervisor's teardown and limits for it.
+
 *Fine print: [Process groups → adopt](process-groups.md) ·
+[Adopting by pid](process-groups.md#adopting-by-pid-adopt_external) ·
 [Platform support](platform-support.md).*
 
 ## Test code that runs processes — without processes

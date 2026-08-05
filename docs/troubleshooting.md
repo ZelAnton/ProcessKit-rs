@@ -39,10 +39,32 @@ First identify **what was dropped** and who owns containment:
 - `spawn_detached()` is the deliberate exception. Dropping `DetachedChild`
   does nothing because the child was explicitly launched to outlive this
   process.
-- A process spawned outside processkit is outside the boundary until `adopt()`.
+- A process spawned outside processkit is outside the boundary until `adopt()`
+  (with its `Child` handle) or `adopt_external()` (with only its pid).
   Adoption moves the named process, not descendants it already created; the
   POSIX process-group backend can only track an already-executed adopted child
-  individually.
+  individually. `adopt_external` additionally reports `Unsupported` on FreeBSD
+  and the other BSDs, where the crate has no start-time reader to anchor the pid
+  on — a refusal, so a process left running there was never contained.
+- **A group whose members die to a teardown it never ran, or whose `start` suddenly
+  fails "job is full" (Windows).** Adopting a pid that already belonged to another
+  Job Object nests this crate's job under that one, so the outer job's terminate or
+  close reaches these members (later-started ones included) and its limits bind them.
+  The mirror image on Linux cgroup v2: adopting a process takes it **out of** its
+  previous cgroup, so an outside supervisor's teardown and limits stop applying to
+  the process it thought it held. Neither is reverted on drop — see
+  [platform support](platform-support.md#capability-matrices).
+- **`adopt_external` returned "pid … was recycled while it was being adopted".** The
+  number changed hands inside the call, so nothing was adopted. Read the rest of that
+  message before retrying: on Linux cgroup v2 it also says whether the number could
+  be moved back out of this group's cgroup, and in the case where it could not, the
+  process now holding the number is a member of this group and will be killed by its
+  teardown — drop or tear down that group promptly if that is not acceptable.
+- Nothing reaps a process adopted by pid. No exit status for it appears anywhere
+  in this API, so a `wait`-shaped answer for it has to come from whoever is its
+  actual parent; on the POSIX process-group backends an exited one that nobody
+  reaps stays a zombie, keeps probing alive through a graceful shutdown's whole
+  grace, and cannot be cleared by `escalate_to_kill`.
 - A command reached through `ssh` is local containment only: the local `ssh`
   client dies, but the remote command needs remote-side containment.
 

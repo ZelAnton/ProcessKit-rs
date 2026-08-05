@@ -157,9 +157,10 @@
 //!   `record` / `json` → `serde`/`serde_json`.)
 //! - **`process-control`** *(default)* — tree control beyond contain+kill:
 //!   `Signal` and `ProcessGroup::{signal, suspend, resume, members,
-//!   members_info, adopt}`, the enriched `MemberInfo` member snapshot, and the
-//!   free-standing `process_info` / `process_is_alive` queries for a pid held
-//!   *outside* any group (reuse-safe liveness by the `(pid, start time)` pair).
+//!   members_info, adopt, adopt_external}`, the enriched `MemberInfo` member
+//!   snapshot, and the free-standing `process_info` / `process_is_alive` queries
+//!   for a pid held *outside* any group (reuse-safe liveness by the
+//!   `(pid, start time)` pair).
 //! - **`limits`** — whole-tree resource caps: `ResourceLimits`, the
 //!   `max_memory`/`max_processes`/`cpu_quota` builders on
 //!   [`ProcessGroupOptions`], `ErrorReason::ResourceLimit` (why a requested cap

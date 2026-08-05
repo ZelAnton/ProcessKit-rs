@@ -12,7 +12,57 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+
+- `ProcessGroup::adopt_external(pid)` (`process-control`): bring an
+  already-running process under a group's containment when all you have is its
+  pid — a process an outside supervisor started, one whose number came from a
+  pidfile, or one this process forked but never handed to the crate. Until now
+  the only adoption door was `adopt(&Child)`, and a non-Rust consumer cannot
+  construct a `tokio::process::Child` at all.
+
+  The pid is treated as an address, not as a handle. The crate captures an
+  identity anchor of its own for the process the number names, during the call —
+  the process object behind an `OpenProcess` on Windows, kernel cgroup membership
+  (with a `/proc` start-time read on either side of the write) on Linux cgroup v2,
+  the same start-time token `adopt`'s individual tracking uses on the POSIX
+  process-group backends — and the group's later probes, signals and teardown are
+  bound to that, so a process that recycles the number afterwards is not a member
+  and is not signalled. The window *before* the call, between the caller reading a
+  pid and passing it, is not something the crate can check, and the rustdoc says so
+  rather than implying otherwise.
+
+  A number recycled *during* the call is detected by the closing read and reported,
+  and the mechanisms are left in states honest enough to differ: the process-group
+  backends have nothing to undo (the entry they made is identity-gated and pruned
+  unsignalled), while Linux cgroup v2 has already migrated a task and therefore
+  attempts to move the number back out of the group's cgroup — the error says
+  whether that succeeded, and where a host refuses it, that whoever holds the number
+  is a member of the group and will be killed by its teardown.
+
+  Adoption also has a side effect on containment the process is *already* under, in
+  opposite directions per platform, and the contract states both: on Windows the
+  process keeps its job and this crate's job becomes a **child** of it, so that
+  outer job's terminate/close reaches the group's members — including ones started
+  after the adoption — and its limits bind them (whether the assign succeeds depends
+  on the group's own state: an empty group takes such a process in, a group that
+  already holds its own member was refused `ERROR_ACCESS_DENIED` in testing, so
+  adopt before you start); on Linux cgroup v2, membership is exclusive, so the
+  process is taken **out of** its previous cgroup and that supervisor's teardown and
+  limits stop applying to it.
+
+  Two limits are part of the contract, not caveats to it. **Nothing reaps an
+  adopted-by-pid process:** no exit status for it ever appears through this API,
+  and the group can only signal and list it — narrower than `adopt`, where the
+  caller keeps the `Child` and reaps it. And **FreeBSD and the other BSDs return
+  `ErrorReason::Unsupported`:** no start-time reader is wired up there, so there
+  is no anchor to capture, and the call refuses rather than tracking a bare
+  number it would later `SIGKILL`. FreeBSD's process reaper does not change that
+  — it contains this process's own descendants, which a process started by an
+  outside supervisor is not. `adopt` is unaffected on every target.
+
+  `pid == 0` and the calling process's own pid are refused everywhere
+  (`ErrorKind::InvalidInput`): either would point the group's own teardown at the
+  caller.
 
 ### Changed
 

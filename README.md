@@ -266,7 +266,7 @@ guarantee is unconditional in every configuration.
 
 | Feature | Default | Adds |
 |---|---|---|
-| `process-control` | ✅ | `Signal`, `ProcessGroup::{signal, suspend, resume, members, adopt}` |
+| `process-control` | ✅ | `Signal`, `ProcessGroup::{signal, suspend, resume, members, adopt, adopt_external}` |
 | `stats` | — | group/per-run resource measurement, `sample_stats`, `profile` (opt-in — specialized to metrics; adds no extra crate, only a Windows OS-library link for the peak-memory readout) |
 | `limits` | — | whole-tree resource caps (implies `stats`) |
 | `record` | — | record/replay cassettes (pulls `serde`) |

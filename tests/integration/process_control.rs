@@ -418,6 +418,568 @@ async fn adopt_brings_an_external_child_under_containment() {
     let _ = completes_within(Duration::from_secs(5), "adopted child reap", child.wait()).await;
 }
 
+/// Whether `pid` still names a **running** process, asked about a process this
+/// test is not the parent of (so `Child::wait` is unavailable — exactly the
+/// position `adopt_external`'s caller is in).
+///
+/// On Windows a terminated process stays *openable* while any handle to it is held
+/// anywhere, so liveness has to be read from the exit code rather than from
+/// `OpenProcess` succeeding.
+#[cfg(windows)]
+fn foreign_pid_running(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    // SAFETY: limited-information access; null when the pid is gone.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut code: u32 = 0;
+    // SAFETY: valid handle; `code` is an owned local.
+    let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
+    // SAFETY: handle came from OpenProcess; closed exactly once.
+    unsafe { CloseHandle(handle) };
+    ok != 0 && code == STILL_ACTIVE
+}
+
+/// The unix twin. An orphan is reaped by `init` the moment it dies, so it cannot
+/// linger as a zombie this probe would misread as alive.
+#[cfg(unix)]
+fn foreign_pid_running(pid: u32) -> bool {
+    // SAFETY: signal 0 is a pure existence probe and delivers nothing.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// Start a process that is genuinely **foreign** to this one — an intermediate
+/// launches it and exits, so nothing this test holds is its parent and no handle to
+/// it exists here. The `(b)` half of what `adopt_external` has to cover: a process
+/// this crate has no `Child` for and never could have.
+async fn spawn_orphan() -> u32 {
+    let mut cmd = if cfg!(windows) {
+        // `Start-Process -PassThru` prints the new process's id; the launching
+        // PowerShell then exits, leaving `ping` running with a stale parent id.
+        let mut c = tokio::process::Command::new("powershell");
+        c.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Start-Process -FilePath ping -ArgumentList '-n','120','127.0.0.1' \
+             -WindowStyle Hidden -PassThru).Id",
+        ]);
+        c
+    } else {
+        // The shell backgrounds `sleep` and exits, so `init` adopts it. The
+        // background process gets its own `/dev/null` stdio: inheriting the
+        // launcher's captured pipe would keep it open, and `output()` waits for
+        // EOF — i.e. for the whole 120 seconds — before returning.
+        let mut c = tokio::process::Command::new("sh");
+        c.args(["-c", "sleep 120 >/dev/null 2>&1 </dev/null & echo $!"]);
+        c
+    };
+    let out = cmd.output().await.expect("launch the orphan's launcher");
+    assert!(
+        out.status.success(),
+        "the orphan's launcher failed: {out:?}"
+    );
+    let pid: u32 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("the launcher prints the orphan's pid");
+    // The launcher is gone by construction; wait for the orphan to really be up.
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+        "the orphan starts",
+        || foreign_pid_running(pid),
+    )
+    .await;
+    pid
+}
+
+/// Best-effort teardown for an orphan a test may have left running.
+fn kill_orphan(pid: u32) {
+    #[cfg(unix)]
+    // SAFETY: a best-effort SIGKILL of a pid this test itself created.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .output();
+    }
+}
+
+/// Whether this target refuses bare-pid adoption outright for want of a start-time
+/// identity reader (FreeBSD and the other BSDs — see `adopt_external`'s platform
+/// section). Windows, Linux and macOS all have one.
+fn adoption_by_pid_is_unsupported_here() -> bool {
+    cfg!(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple"
+        ))
+    ))
+}
+
+#[tokio::test]
+#[ignore = "spawns a process outside this one's tree and adopts it by pid"]
+async fn adopt_external_contains_a_truly_foreign_process() {
+    let pid = spawn_orphan().await;
+    let group = ProcessGroup::new().expect("create group");
+
+    match group.adopt_external(pid) {
+        Ok(()) => {}
+        Err(err) if adoption_by_pid_is_unsupported_here() => {
+            assert!(
+                matches!(err.reason(), processkit::ErrorReason::Unsupported { .. }),
+                "a target with no identity reader must refuse with Unsupported, got {err:?}",
+            );
+            kill_orphan(pid);
+            return;
+        }
+        Err(err) => {
+            kill_orphan(pid);
+            panic!("adopt_external of a live foreign process failed: {err:?}");
+        }
+    }
+
+    group.kill_all().expect("hard-kill the adopted tree");
+    // Nothing here can reap it (it is not our child) — poll it down instead.
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+        "the adopted foreign process dies with the group",
+        || !foreign_pid_running(pid),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "spawns an untracked child of this process and adopts it by pid"]
+async fn adopt_external_contains_an_untracked_child_of_this_process() {
+    // The `(a)` half of the contract: a process this one forked itself but never
+    // handed to the crate. The same call covers it — nothing about the adoption
+    // depends on who the parent is — and the exit status stays with whoever *is*
+    // the parent, which here is this test.
+    let mut cmd = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("ping");
+        c.args(["-n", "120", "127.0.0.1"]);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sleep");
+        c.arg("120");
+        c
+    };
+    cmd.stdout(std::process::Stdio::null());
+    let mut child = cmd.spawn().expect("spawn an untracked child");
+    let pid = child.id().expect("a live child has a pid");
+
+    let group = ProcessGroup::new().expect("create group");
+    match group.adopt_external(pid) {
+        Ok(()) => {}
+        Err(err) if adoption_by_pid_is_unsupported_here() => {
+            assert!(
+                matches!(err.reason(), processkit::ErrorReason::Unsupported { .. }),
+                "a target with no identity reader must refuse with Unsupported, got {err:?}",
+            );
+            let _ = child.kill().await;
+            return;
+        }
+        Err(err) => {
+            let _ = child.kill().await;
+            panic!("adopt_external of an untracked child failed: {err:?}");
+        }
+    }
+
+    group.kill_all().expect("hard-kill the adopted tree");
+    // The group killed it; reaping is still ours, and no exit status for it ever
+    // came through the group.
+    let _ = completes_within(
+        Duration::from_secs(10),
+        "the adopted child is killed by the group",
+        child.wait(),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "creates an OS job/cgroup"]
+async fn adopt_external_refuses_pid_zero_and_this_process() {
+    let group = ProcessGroup::new().expect("create group");
+
+    // Both are refused before any backend call: pid 0 is "the caller's own process
+    // group" to `kill` and "self" to `setpgid`, and adopting this very process
+    // would point the group's own teardown at the caller. Neither must reach a
+    // backend on any platform — including the ones where bare-pid adoption is
+    // otherwise Unsupported.
+    for pid in [0, std::process::id()] {
+        let err = group
+            .adopt_external(pid)
+            .expect_err("pid 0 and this process's own pid are not adoptable");
+        match err.reason() {
+            processkit::ErrorReason::Io(source) => assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "expected InvalidInput for pid {pid}, got {err:?}",
+            ),
+            other => panic!("expected an Io(InvalidInput) refusal for pid {pid}, got {other:?}"),
+        }
+    }
+
+    // The refusal is a rejection, not a side effect: the group is untouched and
+    // still empty.
+    assert!(
+        group.members().expect("members").is_empty(),
+        "a refused adoption must not have tracked anything",
+    );
+}
+
+#[tokio::test]
+#[ignore = "queries a pid past any valid range"]
+async fn adopt_external_of_a_pid_that_names_nothing_is_not_found() {
+    let group = ProcessGroup::new().expect("create group");
+    // ~2e9 is far above any OS's pid_max yet still fits `pid_t`, so each backend's
+    // real "not found" path runs rather than a range guard.
+    let err = group
+        .adopt_external(2_000_000_000)
+        .expect_err("a pid that names nothing must not be adoptable");
+
+    if adoption_by_pid_is_unsupported_here() {
+        assert!(
+            matches!(err.reason(), processkit::ErrorReason::Unsupported { .. }),
+            "a target with no identity reader refuses before looking, got {err:?}",
+        );
+        return;
+    }
+    match err.reason() {
+        processkit::ErrorReason::Io(source) => assert_eq!(
+            source.kind(),
+            std::io::ErrorKind::NotFound,
+            "a pid naming nothing must be NotFound, not {err:?}",
+        ),
+        other => panic!("expected Io(NotFound), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "spawns a short subprocess and adopts its pid after reaping"]
+async fn adopt_external_of_a_reaped_pid_is_not_found() {
+    // The bare-pid counterpart of `adopt_of_a_reaped_child_errors_instead_of_
+    // tracking_nothing`: with a `Child` the crate can see the handle is spent, but
+    // a number carries no such evidence — the identity anchor is what refuses it.
+    let mut cmd = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.args(["/c", "exit", "0"]);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.args(["-c", "exit 0"]);
+        c
+    };
+    let mut child = cmd.spawn().expect("spawn short child");
+    let pid = child.id().expect("a live child has a pid");
+    let _ = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("short child exits");
+    drop(child); // release this process's own handle on Windows.
+
+    if processkit::process_info(pid).is_ok_and(|info| info.is_some()) {
+        // The OS handed the number to someone else already (or a third-party
+        // handle keeps it openable). Asserting "gone" would be asserting about a
+        // stranger, so skip rather than flake.
+        eprintln!("skipping: pid {pid} was no longer a clean negative after the reap");
+        return;
+    }
+
+    let group = ProcessGroup::new().expect("create group");
+    let err = group
+        .adopt_external(pid)
+        .expect_err("a reaped pid must not be adoptable");
+    if adoption_by_pid_is_unsupported_here() {
+        assert!(matches!(
+            err.reason(),
+            processkit::ErrorReason::Unsupported { .. }
+        ));
+        return;
+    }
+    match err.reason() {
+        processkit::ErrorReason::Io(source) => assert_eq!(
+            source.kind(),
+            std::io::ErrorKind::NotFound,
+            "a reaped pid must be NotFound, not {err:?}",
+        ),
+        other => panic!("expected Io(NotFound), got {other:?}"),
+    }
+}
+
+/// What `adopt_external` does with a process that already belongs to **another**
+/// Job Object — the case a Windows caller most plausibly hits (an orchestrator's
+/// own job, a CI agent's job) and the one whose answer must be observed rather
+/// than assumed: since Windows 8 a process may belong to several *nested* jobs, so
+/// "already in a job" is not by itself a refusal.
+///
+/// Observed on Windows 10/11: the adoption **succeeds** (the crate's job becomes a
+/// nested job of the outer one) and this group's teardown reaches the process. The
+/// test accepts a refusal too, since the kernel owns the nesting rules and a host
+/// may reject a particular pairing — but either way the group must be honest: an
+/// `Ok` must mean teardown really reaches it, and an `Err` must leave it alone
+/// rather than be reported as containment.
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "creates a second Job Object and adopts a member of it"]
+async fn windows_adopt_external_of_a_process_already_in_another_job() {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    let mut cmd = tokio::process::Command::new("ping");
+    cmd.args(["-n", "120", "127.0.0.1"]);
+    cmd.stdout(std::process::Stdio::null());
+    let mut child = cmd.spawn().expect("spawn a child to put in the outer job");
+    let pid = child.id().expect("a live child has a pid");
+
+    // An outer job with no limits of its own, so nothing but membership can make
+    // the crate's assign fail.
+    // SAFETY: null name/attributes request an unnamed job with defaults.
+    let outer: HANDLE = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    assert!(!outer.is_null(), "CreateJobObjectW failed");
+    // SAFETY: opens the child by pid with the rights an assign needs.
+    let target = unsafe {
+        OpenProcess(
+            PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        )
+    };
+    assert!(!target.is_null(), "OpenProcess of our own child failed");
+    // SAFETY: both handles are valid for the call.
+    let assigned = unsafe { AssignProcessToJobObject(outer, target) != 0 };
+    assert!(assigned, "could not put the child into the outer job");
+    let mut in_outer: i32 = 0;
+    // SAFETY: valid handles; `in_outer` is a valid BOOL out-param.
+    unsafe { IsProcessInJob(target, outer, &mut in_outer) };
+    assert!(in_outer != 0, "the child must be in the outer job");
+
+    let group = ProcessGroup::new().expect("create group");
+    let adopted = group.adopt_external(pid);
+    // Recorded rather than asserted: this is one half of the observation the
+    // contract's wording about order-dependence rests on (the other half is the
+    // already-non-empty group, in the test below).
+    eprintln!("adopt_external of another job's member, group still empty: {adopted:?}");
+
+    if adopted.is_ok() {
+        // An `Ok` claims containment, so teardown must really reach it.
+        group.kill_all().expect("hard-kill the adopted tree");
+        poll_until(
+            Duration::from_secs(10),
+            Duration::from_millis(20),
+            "a process adopted out of another job dies with this group",
+            || !foreign_pid_running(pid),
+        )
+        .await;
+    } else {
+        // A refusal is fine — but it must be a refusal, not a silent no-op: the
+        // process stays alive and unowned by this group.
+        assert!(
+            foreign_pid_running(pid),
+            "a refused adoption must leave the process alone",
+        );
+    }
+
+    // SAFETY: both handles came from Create/OpenProcess; closed exactly once.
+    unsafe {
+        CloseHandle(target);
+        CloseHandle(outer);
+    }
+    let _ = child.kill().await;
+}
+
+/// The **other side of a successful nesting adoption**: once this group's job has
+/// been nested under an outer job, does that outer job reach members this group
+/// spawns *afterwards*?
+///
+/// This is the half a caller cannot see and the contract now states, so it is
+/// observed here rather than reasoned about: the group adopts a member of an outer
+/// job (the empty-group order, the one that succeeds), then starts a child of its
+/// own, and the **outer** job is terminated. Observed on Windows 11 (26200): the
+/// child started after the adoption dies with the outer job — an unrelated job now
+/// reaches processes this group started, which is exactly what
+/// `escalate_to_kill(false)`'s "spares the survivors" cannot promise across that
+/// boundary.
+///
+/// The test skips itself if the adoption is refused on the host running it (the
+/// pairing's verdict is the kernel's, and the sibling test above owns that
+/// question); it asserts nothing about the adopted process, only about the member
+/// this group started afterwards.
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "creates a second Job Object, nests this group under it and terminates it"]
+async fn windows_an_outer_job_reaches_members_spawned_after_a_nesting_adoption() {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    let mut cmd = tokio::process::Command::new("ping");
+    cmd.args(["-n", "120", "127.0.0.1"]);
+    cmd.stdout(std::process::Stdio::null());
+    let mut child = cmd.spawn().expect("spawn a child to put in the outer job");
+    let pid = child.id().expect("a live child has a pid");
+
+    // SAFETY: null name/attributes request an unnamed job with defaults.
+    let outer: HANDLE = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    assert!(!outer.is_null(), "CreateJobObjectW failed");
+    // SAFETY: opens the child by pid with the rights an assign needs.
+    let target = unsafe {
+        OpenProcess(
+            PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        )
+    };
+    assert!(!target.is_null(), "OpenProcess of our own child failed");
+    // SAFETY: both handles are valid for the call.
+    assert!(
+        unsafe { AssignProcessToJobObject(outer, target) != 0 },
+        "could not put the child into the outer job"
+    );
+
+    let group = ProcessGroup::new().expect("create group");
+    let nested = group.adopt_external(pid).is_ok();
+    let ours = group.start(&sleeper()).await.expect("start our own member");
+    let our_pid = ours.pid().expect("a live child has a pid");
+
+    if nested {
+        // SAFETY: a valid job handle; terminates the outer job's whole hierarchy.
+        assert!(
+            unsafe { TerminateJobObject(outer, 1) != 0 },
+            "TerminateJobObject of the outer job failed"
+        );
+        poll_until(
+            Duration::from_secs(10),
+            Duration::from_millis(20),
+            "a member started AFTER the nesting adoption dies with the OUTER job",
+            || !foreign_pid_running(our_pid),
+        )
+        .await;
+    } else {
+        eprintln!("skipping: this host refused the nesting adoption, so no nesting to observe");
+    }
+
+    // SAFETY: both handles came from Create/OpenProcess; closed exactly once.
+    unsafe {
+        CloseHandle(target);
+        CloseHandle(outer);
+    }
+    let _ = child.kill().await;
+}
+
+/// The same pairing in the **other order**: this group already has a member of its
+/// own — one that is *not* in the outer job's hierarchy — before it adopts a member
+/// of that outer job. Nesting is a property of the two jobs, not of the one process,
+/// so the answer need not be the one the empty-group case gives, and a caller's
+/// spawn/adopt order is the difference.
+///
+/// Observed on Windows 11 (26200), reproducibly, and it is the **opposite** of the
+/// empty-group case: the adoption is refused with `ERROR_ACCESS_DENIED`, where the
+/// same pairing on an empty group succeeds. So "already in another job is not a
+/// refusal" is true of one order and false of the other, which is why the public
+/// contract states the dependence instead of the winning half.
+///
+/// Neither verdict is asserted as the general rule — the kernel owns the nesting
+/// rules and this is one host — so what the test enforces is the honesty invariant
+/// that holds whatever the verdict: an `Ok` must mean teardown really reaches it, an
+/// `Err` must leave it alone, and either way the group's **own** member must still
+/// die with the group.
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "creates a second Job Object and adopts a member of it"]
+async fn windows_adopt_external_of_a_process_already_in_another_job_after_our_own_spawn() {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    // This group's own member first — the whole point of the ordering.
+    let group = ProcessGroup::new().expect("create group");
+    let ours = group.start(&sleeper()).await.expect("start our own member");
+    let our_pid = ours.pid().expect("a live child has a pid");
+
+    let mut cmd = tokio::process::Command::new("ping");
+    cmd.args(["-n", "120", "127.0.0.1"]);
+    cmd.stdout(std::process::Stdio::null());
+    let mut child = cmd.spawn().expect("spawn a child to put in the outer job");
+    let pid = child.id().expect("a live child has a pid");
+
+    // SAFETY: null name/attributes request an unnamed job with defaults.
+    let outer: HANDLE = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    assert!(!outer.is_null(), "CreateJobObjectW failed");
+    // SAFETY: opens the child by pid with the rights an assign needs.
+    let target = unsafe {
+        OpenProcess(
+            PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        )
+    };
+    assert!(!target.is_null(), "OpenProcess of our own child failed");
+    // SAFETY: both handles are valid for the call.
+    let assigned = unsafe { AssignProcessToJobObject(outer, target) != 0 };
+    assert!(assigned, "could not put the child into the outer job");
+
+    let adopted = group.adopt_external(pid);
+    // Recorded rather than asserted: this is the observation the contract's wording
+    // about order-dependence rests on.
+    eprintln!("adopt_external of another job's member, group already non-empty: {adopted:?}");
+
+    if adopted.is_ok() {
+        group.kill_all().expect("hard-kill the adopted tree");
+        poll_until(
+            Duration::from_secs(10),
+            Duration::from_millis(20),
+            "a process adopted out of another job dies with this group",
+            || !foreign_pid_running(pid),
+        )
+        .await;
+    } else {
+        assert!(
+            foreign_pid_running(pid),
+            "a refused adoption must leave the process alone",
+        );
+        group.kill_all().expect("hard-kill this group's own tree");
+    }
+    // Either way the group's own member is the group's to kill.
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+        "this group's own member dies with the group",
+        || !foreign_pid_running(our_pid),
+    )
+    .await;
+
+    // SAFETY: both handles came from Create/OpenProcess; closed exactly once.
+    unsafe {
+        CloseHandle(target);
+        CloseHandle(outer);
+    }
+    let _ = child.kill().await;
+}
+
 #[tokio::test]
 #[ignore = "spawns real subprocesses and lists the group's members"]
 async fn members_lists_live_children() {

@@ -1321,6 +1321,7 @@ impl !core::panic::unwind_safe::UnwindSafe for processkit::ProcessEvents
 pub struct processkit::ProcessGroup
 impl processkit::ProcessGroup
 pub fn processkit::ProcessGroup::adopt(&self, &tokio::process::Child) -> processkit::Result<()>
+pub fn processkit::ProcessGroup::adopt_external(&self, u32) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::kill_all(&self) -> processkit::Result<()>
 pub fn processkit::ProcessGroup::limit_evidence(&self) -> processkit::LimitEvidence
 pub fn processkit::ProcessGroup::mechanism(&self) -> processkit::Mechanism

@@ -154,12 +154,39 @@ otherwise rejected the request.
 | Survives a descendant's `setsid` / double-fork | ✅ | ✅ | ❌ escapes | ✅ | ❌ escapes |
 | Graceful `shutdown` (TERM → grace → KILL) | 🟡 auto `WM_CLOSE` soft tier for windowed children; opt-in `CTRL_BREAK` for console children; else atomic kill | ✅ | ✅ | ✅ | ✅ |
 | `adopt` an external child | ✅ (future forks contained) | ✅ (future forks contained) | 🟡 exec'd child tracked individually | ✅ (future forks contained) | 🟡 exec'd child tracked individually |
+| `adopt_external` a process by **pid** | ✅ (anchored on the process object; future forks contained) · ⚠️ a target already in another job nests **this** group under that job | ✅ (anchored on cgroup membership; future forks contained) · ⚠️ takes the process **out of** its previous cgroup | 🟡 anchored on the start-time token, tracked individually | ❌ `Unsupported` — no start-time reader to anchor on | 🟡 macOS: anchored, tracked individually · ❌ other BSDs: `Unsupported` |
+
+**Adopting by pid is not neutral for containment the process already has.** The two
+⚠️ cells above point opposite ways, and neither is undone when the group is dropped:
+
+- **Windows** — a process may belong to several nested jobs (Windows 8+), so a
+  target already in an orchestrator's or CI agent's job is not refused for that
+  reason alone; the assign that succeeds makes *this crate's* job a **child** of
+  that outer job. Membership of a child job is membership of every job above it, so
+  from then on the outer job's terminate/close reaches this group's members —
+  including ones started after the adoption — and the outer job's limits bound them.
+  Whether the assign succeeds also depends on this group's own state: observed on
+  Windows 11, an **empty** group takes such a process in, while a group that already
+  holds a member outside that outer job's hierarchy is refused
+  `ERROR_ACCESS_DENIED`. Adopt first, then start.
+- **Linux cgroup v2** — membership is exclusive, so the write that moves the process
+  into this group's cgroup takes it **out of** the cgroup it was in: the teardown and
+  limits of whoever contained it before stop applying. The kernel does not report
+  what a task left behind, so nothing restores it.
+- **Process-group backends** — nothing is taken away: containment there is tracking,
+  not moving. The `setpgid` the call attempts is permitted only for a not-yet-`exec`'d
+  child of this process; where it does apply, the process becomes a group leader of
+  its own.
 
 Windows has no POSIX signal tier, so for a **windowless** child with no opt-in a
 graceful `shutdown` collapses to the atomic Job kill — but it still honors
 `escalate_to_kill`: `false` **spares** the survivors (closes the Job handle
 without `KILL_ON_JOB_CLOSE`) rather than killing them, so the Windows column is
-"atomic kill *when it kills*", not an unconditional kill.
+"atomic kill *when it kills*", not an unconditional kill. That promise covers what
+*this* group does; it cannot bind a job above it. A group that adopted a process
+already belonging to another Job Object is nested under that job (see the
+`adopt_external` note above), and the outer job's own terminate or close still
+reaches these survivors.
 
 **Automatic soft tier for windowed children (Windows).** Before the atomic kill,
 a graceful `shutdown` posts `WM_CLOSE` to every top-level window owned by a live

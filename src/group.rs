@@ -374,6 +374,253 @@ impl ProcessGroup {
         Ok(())
     }
 
+    /// Bring an **already-running external process** under this group's
+    /// containment, naming it by pid.
+    ///
+    /// The door for a process this crate did not start and holds no [`Child`] for:
+    /// one an outside supervisor launched, one whose id came from a pidfile or a
+    /// registry, or one this process forked itself but never handed to this crate.
+    /// [`adopt`](Self::adopt) covers only the last of those, and only while the
+    /// `tokio::process::Child` is still in hand — which a non-Rust consumer cannot
+    /// construct at all. This takes the one identifier every such caller does have.
+    ///
+    /// # A pid is an address, not a handle
+    ///
+    /// The number is used to *find* the process; it is not what the group keeps
+    /// afterwards. Once a process has been reaped the OS may give its number to an
+    /// unrelated one, so this crate captures an **identity anchor of its own** for
+    /// the process the number currently names, while the adoption runs, and binds
+    /// the group to that:
+    ///
+    /// | Mechanism | What the group holds afterwards |
+    /// |---|---|
+    /// | [`Mechanism::JobObject`] | The process **object**. The number is used exactly once, by this call's `OpenProcess`; `AssignProcessToJobObject` puts the object into the job, and the kernel keeps membership per object. |
+    /// | [`Mechanism::CgroupV2`] | Kernel-maintained **cgroup membership**, per task. A `/proc/<pid>/stat` start-time read on either side of the write that moves the process in *detects* a number that changed hands across it — detection, not prevention; the recycle entry under **Errors** below says what the call then does about it. |
+    /// | [`Mechanism::ProcessGroup`] | The tracked pid **plus** the start-time token read here, re-read before every probe and every delivery. |
+    ///
+    /// On each of them every probe, signal and teardown the group later performs is
+    /// gated on that anchor rather than on the bare number, so a process that
+    /// recycles the number *after* this call is rejected rather than signalled. The
+    /// token row carries one residual the other two do not: its resolution (a clock
+    /// tick on Linux, a microsecond on macOS) means two processes that occupied the
+    /// number within the same tick are indistinguishable.
+    ///
+    /// What no crate can check for you is the window *before* the call — whether
+    /// `pid` still named the process you meant by the time you passed it. Look the
+    /// number up as late as you can, and to ask later whether the process you
+    /// adopted is still the one running, pair the pid with the start time from
+    /// [`process_info`](crate::process_info) and use
+    /// [`process_is_alive`](crate::process_is_alive).
+    ///
+    /// # Ownership: this group never reaps it
+    ///
+    /// An adopted-by-pid process is not this crate's child in any sense it can act
+    /// on: nothing here waits for it, and **no exit status for it ever appears
+    /// through this API** — there is no [`Child`], no
+    /// [`RunningProcess`](crate::RunningProcess), and no report that carries one.
+    /// The group can *signal* it (including the hard kill of
+    /// [`kill_all`](Self::kill_all) and `Drop`) and *list* it
+    /// ([`members`](Self::members), [`members_info`](Self::members_info)). That is
+    /// the whole of what it can do.
+    ///
+    /// This is deliberately a narrower contract than [`adopt`](Self::adopt)'s,
+    /// where the caller keeps the `Child` and reaps it. Here the exit status
+    /// belongs to whoever is the process's actual parent — this process, an outside
+    /// supervisor, or `init` after a re-parenting — and reaping stays entirely
+    /// their business.
+    ///
+    /// One consequence to plan for on [`Mechanism::ProcessGroup`]: a process that
+    /// exits and is *not* reaped by its own parent becomes a zombie, and a zombie
+    /// still answers the liveness probe. A graceful [`shutdown`](Self::shutdown)
+    /// then waits out its full grace on it, and the `escalate_to_kill` hard kill
+    /// cannot clear it either — only its parent's `wait` can. (The same caveat
+    /// [`adopt`](Self::adopt) carries for an unreaped child.)
+    ///
+    /// # What the group covers
+    ///
+    /// Processes the adopted one had **already** spawned keep their original
+    /// containment. What happens to the ones it spawns *afterwards* follows the
+    /// mechanism, which [`mechanism`](Self::mechanism) reports:
+    ///
+    /// - [`Mechanism::JobObject`], [`Mechanism::CgroupV2`] — a future fork joins
+    ///   the job/cgroup with its parent, so the subtree grown from here is
+    ///   contained.
+    /// - [`Mechanism::ProcessGroup`] — the process is tracked **individually**:
+    ///   POSIX lets this process re-group only a child of its own that has not yet
+    ///   `exec`'d, which a process worth adopting by pid is not in practice. So it
+    ///   is signalled and killed with the group, but its future forks are not —
+    ///   the same individual tracking [`adopt`](Self::adopt) documents for an
+    ///   already-`exec`'d child.
+    ///
+    /// # What it does to containment the process is already under
+    ///
+    /// Adopting a process that some *other* supervisor already contains is not a
+    /// neutral act, and the three mechanisms push in different directions. None of
+    /// this is reverted when the group is dropped.
+    ///
+    /// - [`Mechanism::JobObject`] — the process **keeps** its existing job, and this
+    ///   group's job is nested *under* it. Since Windows 8 a process may belong to
+    ///   several jobs, so a successful assign does not take it out of the
+    ///   orchestrator's or CI agent's job; it makes this crate's job a child of that
+    ///   one. The consequence runs the opposite way from what "adopting" suggests:
+    ///   from then on the **outer** job reaches this group. Terminating it kills
+    ///   this group's members, including ones started *after* the adoption (observed
+    ///   on Windows 11); closing it while it kills on close reaches them through the
+    ///   same membership, and by the platform's nested-job rules its limits
+    ///   (`ActiveProcessLimit` and the rest) apply to them as well, so a later
+    ///   [`start`](Self::start)/[`adopt`](Self::adopt) can fail for reasons
+    ///   belonging to a job this crate never created. `escalate_to_kill(false)`'s
+    ///   promise to spare the survivors governs what *this* group does at shutdown;
+    ///   it cannot bind an enclosing job.
+    /// - [`Mechanism::CgroupV2`] — the process **loses** its previous cgroup. v2
+    ///   membership is exclusive, so the write that puts it into this group's cgroup
+    ///   takes it out of the one it was in, and whatever teardown and limits that
+    ///   cgroup carried stop applying to it. The kernel does not report what a task
+    ///   left behind, so nothing here can put it back — not on `Drop`, and not on
+    ///   the recycle path under **Errors** below.
+    /// - [`Mechanism::ProcessGroup`] — nothing is taken away, because this fallback
+    ///   contains by *tracking* rather than by moving. The `setpgid` it attempts is
+    ///   permitted only against a child of this process that has not yet `exec`'d,
+    ///   which an external process in practice is not — so the ordinary outcome
+    ///   changes nothing about the process itself. Where it *is* permitted it makes
+    ///   the process a process-group leader of its own, which changes where a
+    ///   terminal's job-control signals reach it.
+    ///
+    /// # Platform support
+    ///
+    /// - **Windows, Linux (cgroup v2 or the process-group fallback) and macOS** —
+    ///   supported; each offers an anchor this call can take for itself (a held
+    ///   process handle on Windows, a start-time reader on the others).
+    /// - **FreeBSD and the other BSDs** — [`crate::ErrorReason::Unsupported`]. No
+    ///   start-time reader is wired up there (the crate ships none it cannot
+    ///   verify), so there is no anchor to capture, and tracking a bare number
+    ///   would mean signalling whatever holds it at teardown. FreeBSD's process
+    ///   reaper does not change that: it contains this process's own *descendants*,
+    ///   and a process an outside supervisor started is not one.
+    ///   [`adopt`](Self::adopt) is unaffected on all of these targets — the `Child`
+    ///   the caller holds un-reaped is what keeps its number from being recycled.
+    ///
+    /// # Why this shape
+    ///
+    /// The request behind this asked for `adopt_pid(pid: u32)`, and the signature
+    /// is exactly that — a bare number is all an FFI caller can pass. What the
+    /// name would have promised is what changed: the guarantee comes from the
+    /// anchor the crate takes for itself, not from the number. Two richer shapes
+    /// were declined for that reason. Taking an identity *from* the caller (a pid
+    /// plus a token they read earlier) widens the window instead of closing it —
+    /// their token is older than the call — and makes every binding reimplement a
+    /// per-platform reader this crate already has. Handing *back* a token type has
+    /// nowhere to be used: teardown, signalling and listing are all whole-group
+    /// verbs, so it would be public surface with no call to pass it to. The name
+    /// says `external` rather than `pid` because the ownership difference from
+    /// [`adopt`](Self::adopt) — nothing here is ever reaped by this crate — is what
+    /// a caller most needs to notice.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::ErrorReason::Unsupported`] on FreeBSD and the other BSDs (see
+    /// Platform support above). Otherwise [`crate::ErrorReason::Io`], carrying an
+    /// [`std::io::Error`] — the OS's own where there was one — in these cases:
+    ///
+    /// - [`std::io::ErrorKind::InvalidInput`] for `pid == 0` and for this process's
+    ///   own pid. Neither is adoptable, and both are actively dangerous as a
+    ///   number: `0` means "the caller's own process group" to `kill` and "self" to
+    ///   `setpgid`, and adopting this very process would enlist the caller in its
+    ///   own group's teardown.
+    /// - [`std::io::ErrorKind::NotFound`] when the number names no process at the
+    ///   moment of the call — including a process that had already been reaped, the
+    ///   case [`adopt`](Self::adopt) reports for a `wait`ed `Child`.
+    /// - The process exists but the adoption could not be completed. This is where
+    ///   the per-platform failures land: on **Windows**, an `OpenProcess` for the
+    ///   rights the assign needs (`PROCESS_SET_QUOTA | PROCESS_TERMINATE`, plus
+    ///   `PROCESS_QUERY_LIMITED_INFORMATION`) denied — another user, a higher
+    ///   integrity level, a protected process — or an `AssignProcessToJobObject`
+    ///   the kernel rejects for a still-live process; on **Linux (cgroup v2)**, the
+    ///   `cgroup.procs` write denied (a process this one may not move, or a
+    ///   restricted delegated cgroup); on **Linux/macOS (process group)**, a live
+    ///   process whose start-time identity cannot be read (a `hidepid` `/proc`
+    ///   mount, a `proc_pidinfo` denial for another uid's process on macOS), which
+    ///   is refused rather than downgraded to tracking by number alone.
+    /// - The number was recycled *while this call ran* — the start-time read that
+    ///   closes the adoption differs from the one that opened it, so the process you
+    ///   named is not the one the call acted on. What that leaves behind is not the
+    ///   same on every mechanism, and the error message names the case:
+    ///   - [`Mechanism::ProcessGroup`] — there is nothing to undo. The entry the
+    ///     call made carries the identity captured at its start, and an entry whose
+    ///     number now answers with a different identity is dropped at the group's
+    ///     next sweep without ever being signalled.
+    ///   - [`Mechanism::CgroupV2`] — the write that moves a process into this
+    ///     group's cgroup has already happened, so the call tries to take it back
+    ///     out: where the number is a member of this group's cgroup it is moved to
+    ///     the cgroup this group's own directory lives in, and this group's teardown
+    ///     no longer reaches it. Where that move-out is refused — a delegated cgroup
+    ///     that will not accept it, a destination that may not hold processes — the
+    ///     process holding the number **stays a member of this group, and this
+    ///     group's teardown (including `Drop`) will kill it**. Even where the
+    ///     move-out succeeds it does not restore the cgroup the process was in
+    ///     before (see the section above).
+    ///   - [`Mechanism::JobObject`] — cannot reach this state at all: the number is
+    ///     used once, by `OpenProcess`, and everything after is that handle.
+    ///
+    /// Two outcomes are deliberately **not** errors, matching
+    /// [`adopt`](Self::adopt) rather than introducing a second vocabulary: a
+    /// `setpgid` this process is not permitted to make (the ordinary case on
+    /// [`Mechanism::ProcessGroup`] — it becomes the individual tracking described
+    /// above), and a process that exits *during* the call, which leaves nothing to
+    /// contain and returns `Ok`.
+    ///
+    /// A third is worth naming because it is easy to assume otherwise: on Windows a
+    /// process **already in another Job Object** is not refused for that reason
+    /// alone — Windows 8 and later allow a process to belong to several nested jobs.
+    /// But whether a given assign succeeds is the kernel's decision, and it turns on
+    /// more than the target: with this group still **empty**, adopting a member of
+    /// an outer job succeeds (and nests this group under that job — see the section
+    /// on containment the process is already under); with a member this group
+    /// started already in it, and so outside that outer job's hierarchy, the same
+    /// adoption is refused with `ERROR_ACCESS_DENIED`. Both were observed on Windows
+    /// 11, which makes the **order of your calls** part of the outcome: adopt first,
+    /// then start. Neither verdict is promised here — the rule is the kernel's and
+    /// that is one host's answer. What the crate promises is that a refusal is
+    /// reported as the error above rather than as containment, and that a success
+    /// really does put the process under this group's teardown.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn main() -> processkit::Result<()> {
+    /// let group = processkit::ProcessGroup::new()?;
+    /// // A pid from outside this process — a pidfile, a registry, an FFI caller.
+    /// let pid: u32 = 4321;
+    /// group.adopt_external(pid)?;
+    /// // From here the group's teardown covers it; nothing here will ever reap it.
+    /// group.kill_all()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "process-control")]
+    pub fn adopt_external(&self, pid: u32) -> Result<()> {
+        if pid == 0 || pid == std::process::id() {
+            return Err(Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to adopt pid {pid}: pid 0 and this process's own pid are not \
+                     adoptable targets — either would point this group's teardown at the caller"
+                ),
+            )));
+        }
+        self.job
+            .adopt_external(pid)
+            .map_err(|source| map_unsupported(source, format!("adopt_external({pid})")))?;
+        #[cfg(feature = "tracing")]
+        tracing::trace!(
+            target: "processkit",
+            mechanism = ?self.mechanism(),
+            pid,
+            "adopted an external process by pid"
+        );
+        Ok(())
+    }
+
     /// Immediately hard-kill every process currently in the group. Idempotent;
     /// the group remains usable for further spawns afterwards.
     ///

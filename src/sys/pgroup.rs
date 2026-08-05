@@ -115,8 +115,114 @@ fn read_identity(_pid: i32) -> Option<u64> {
 /// they *differ*. A `None` on either side is never proof — the caller then
 /// defers to the liveness probe, so a target without an identity reader (the
 /// BSDs) is not weakened.
-fn is_recycled(tracked: Option<u64>, current: Option<u64>) -> bool {
+///
+/// `pub(crate)` for one caller outside this module: the Linux cgroup backend's
+/// bare-pid adoption, which brackets its `cgroup.procs` write with the same
+/// start-time token and must decide "recycled?" by exactly this rule rather than
+/// a second, subtly different comparison of its own.
+pub(crate) fn is_recycled(tracked: Option<u64>, current: Option<u64>) -> bool {
     matches!((tracked, current), (Some(a), Some(b)) if a != b)
+}
+
+/// Capture the start-time identity anchor of the live process at `pid` for a
+/// **bare-pid adoption** ([`ProcessGroup::adopt_external`]) — the targets that
+/// have a reader ([`read_identity`]).
+///
+/// Unlike the best-effort [`read_identity`] this is *required* to succeed: an
+/// entry created from a bare number, with no `Child` the caller keeps un-reaped
+/// behind it, has nothing else that could tell the tracked process apart from a
+/// later occupant of the number. So "no token" is refused here rather than
+/// degraded to number-only tracking, and the two ways it can happen are told
+/// apart for the caller:
+///
+/// - the pid names **no process** (`ESRCH` from a null-signal probe, which
+///   delivers nothing) → `NotFound`, the honest negative;
+/// - the process is there but its identity could not be read (a `hidepid` `/proc`
+///   mount; a `proc_pidinfo` denial for another uid's process on macOS) → a plain
+///   error, never mistaken for "dead".
+#[cfg(all(
+    feature = "process-control",
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+))]
+fn capture_adoption_anchor(pid: i32) -> io::Result<u64> {
+    if let Some(token) = read_identity(pid) {
+        return Ok(token);
+    }
+    // SAFETY: signal 0 is a sound existence probe and delivers nothing.
+    if unsafe { libc::kill(pid, 0) } != 0
+        && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return Err(no_such_process(pid));
+    }
+    Err(io::Error::other(format!(
+        "cannot adopt pid {pid}: its start-time identity could not be read (a hidepid /proc \
+         mount, or a proc_pidinfo denial for another uid's process on macOS), and this group \
+         will not track an external process by number alone"
+    )))
+}
+
+/// The BSDs (and any other unix): no start-time reader is wired up here — see the
+/// identity-token doc above the Linux [`read_identity`] for why none is shipped —
+/// so there is no anchor to capture and a bare-pid adoption is refused outright.
+///
+/// This is the deliberate line: [`adopt`](ProcessGroup::adopt) still works on
+/// these targets, because the caller's own un-reaped [`Child`] is what keeps the
+/// number from being recycled. A bare number has no such backing, so accepting it
+/// here would mean tracking — and eventually `SIGKILL`ing — whatever process holds
+/// the number at teardown time.
+#[cfg(all(
+    feature = "process-control",
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn capture_adoption_anchor(pid: i32) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "adopting pid {pid} by number needs a start-time identity reader, and none is wired \
+             up on this target (the BSDs other than macOS); adopt a Child you hold instead"
+        ),
+    ))
+}
+
+/// The honest negative for a bare-pid adoption: the number names no process.
+/// Gated with its only caller, [`capture_adoption_anchor`]'s reader-bearing arm —
+/// the targets without a reader refuse before they ever look for the process.
+#[cfg(all(
+    feature = "process-control",
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+))]
+fn no_such_process(pid: i32) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("no process with pid {pid} to adopt"),
+    )
+}
+
+/// The verdict of **this backend's** bare-pid adoption when its closing identity
+/// re-read shows the number was recycled while the call ran.
+///
+/// It can state the after-error condition flatly, which is what makes this arm the
+/// fail-safe one: everything the call added is an [`Entry`] carrying the token
+/// captured at the start, and [`Tracked::probe_entry`] reports any entry whose
+/// number now answers with a different token as gone — so it is pruned at the next
+/// sweep without ever being signalled. The one kernel-visible thing this arm can
+/// have done is a `setpgid`, which the kernel permits only against a not-yet-
+/// `exec`'d child of this process; where it does apply it changes which process
+/// group leads the number and nothing else.
+///
+/// The other two backends deliberately do **not** share this wording, because their
+/// states differ: the Linux cgroup arm has already moved a task between cgroups and
+/// reports what its undo achieved (`sys::imp::recycled_during_cgroup_adoption`),
+/// and the Windows backend cannot reach this state at all — it uses the number once,
+/// for `OpenProcess`, and everything after is that kernel object.
+#[cfg(feature = "process-control")]
+fn recycled_during_adoption(pid: i32) -> io::Error {
+    io::Error::other(format!(
+        "pid {pid} was recycled while it was being adopted: its start-time identity differs \
+         from the one captured at the start of the call, so the process the caller named is \
+         not the one this call acted on; the entry this call left behind carries that identity, \
+         so this group prunes it unsignalled rather than tearing it down"
+    ))
 }
 
 /// Positive proof that `pid` names a **live, non-zombie** process — the sole state
@@ -579,15 +685,39 @@ impl Tracked {
         alive
     }
 
-    /// Whether `id` is currently tracked (cheap membership check — no probe/prune).
-    /// Only the `process-control`-gated `adopt` de-dup uses this.
+    /// Whether this set already tracks **the very process instance** `id` names,
+    /// `identity` being the start-time token just read for it — the de-dup gate the
+    /// two adoption entries ([`ProcessGroup::adopt`], [`ProcessGroup::adopt_external`])
+    /// ask before adding a solo entry for a pid that may already be tracked here as
+    /// a group leader.
+    ///
+    /// Two properties carry the weight, and a plain membership scan has neither:
+    ///
+    /// - **It sweeps before it answers.** Entries leave this set only during a sweep
+    ///   ([`probe_entry`](Self::probe_entry)); nothing deregisters one when the
+    ///   process behind it is reaped, so from that reap until the next sweep the set
+    ///   still holds the bare *number*. Answering from that stale entry would let it
+    ///   speak for a number the OS has since handed to somebody else, and the
+    ///   adoption of the new holder would be skipped — reporting containment while
+    ///   tracking nothing at all. Sweeping first is the same prune-then-decide order
+    ///   [`track_with`](Self::track_with) uses, and the sweep's identity gate is
+    ///   what drops the stale entry.
+    /// - **It compares identities, not numbers.** A surviving entry de-dups only
+    ///   when its token is the one just captured for this pid. That closes the
+    ///   residue the sweep cannot: an entry carrying *no* token (a track-time read
+    ///   that failed) is un-prunable by identity, probes alive on the number alone,
+    ///   and would otherwise silently answer for whoever holds the number now.
+    ///   Two entries that cannot be proven to be the same instance are therefore
+    ///   treated as different — over-tracking (a pid listed twice, a signal
+    ///   delivered twice, both harmless) rather than reporting containment that was
+    ///   never established. Where neither side has a token at all (the BSDs), the
+    ///   comparison degrades to the number-only de-dup that has always applied
+    ///   there, with no change.
     #[cfg(feature = "process-control")]
-    fn contains(&self, id: i32) -> bool {
-        self.ids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .any(|e| e.id == id)
+    fn holds_same_process(&self, id: i32, identity: Option<u64>) -> bool {
+        let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
+        ids.retain_mut(|e| self.probe_entry(e));
+        ids.iter().any(|e| e.id == id && e.identity == identity)
     }
 
     /// Track `id`, pruning drained entries and de-duplicating (re-adopting a
@@ -600,22 +730,37 @@ impl Tracked {
     /// fallback must stay armed across the not-yet-`setpgid`'d window (for the
     /// non-`setsid` fork path too — see `ProcessGroup::spawn`).
     fn track(&self, id: i32, group_seen: bool) {
+        // Capture the start-time identity now, while `id` is freshly live, so a
+        // later probe can tell the tracked process apart from any process that
+        // recycles the number.
+        self.track_with(id, group_seen, read_identity(id));
+    }
+
+    /// [`track`](Self::track) with the start-time identity supplied by the caller
+    /// instead of read here.
+    ///
+    /// One body serves both, so the pruning and de-dup rules cannot drift between
+    /// them. The caller-supplied form exists for
+    /// [`adopt_external`](ProcessGroup::adopt_external), whose whole contract is
+    /// that the token was captured *before* the adoption's own syscalls rather than
+    /// after them: re-reading it here could hand back `None` for a process that
+    /// exited in between, leaving a number-only entry on a path that promises an
+    /// anchored one.
+    fn track_with(&self, id: i32, group_seen: bool, identity: Option<u64>) {
         // Recover a poisoned lock instead of dropping the child from tracking,
         // which would void the kill-on-drop guarantee.
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
         ids.retain_mut(|e| self.probe_entry(e));
         if !ids.iter().any(|e| e.id == id) {
-            // Capture the start-time identity now, while `id` is freshly live, so
-            // a later probe can tell the tracked process apart from any process
-            // that recycles the number. A de-dup (re-adopt of an id still present
-            // above) keeps the existing entry's identity untouched; had the number
-            // been recycled since, `probe_entry` would already have pruned the
-            // stale entry in the `retain` above, so this pushes a fresh entry
-            // carrying the new identity.
+            // A de-dup (re-adopt of an id still present above) keeps the existing
+            // entry's identity untouched; had the number been recycled since,
+            // `probe_entry` would already have pruned the stale entry in the
+            // `retain` above, so this pushes a fresh entry carrying the new
+            // identity.
             ids.push(Entry {
                 id,
                 group_seen,
-                identity: read_identity(id),
+                identity,
             });
         }
     }
@@ -944,15 +1089,120 @@ impl ProcessGroup {
                 // also solo-track it (that would double-count in `members()`/
                 // `stats()` and double-deliver every broadcast) — only solo-track a
                 // genuinely external child.
-                if !self.groups.contains(pid) {
+                //
+                // The de-dup asks whether the tracked entry is this very process
+                // instance ([`Tracked::holds_same_process`]), not merely whether the
+                // number is on the books. The caller's un-reaped `Child` keeps *this*
+                // number from being recycled during the call, but it says nothing
+                // about an entry left over from an *earlier* process that held the
+                // same number and was reaped — precisely how the number became free
+                // for this child. That stale entry answering the de-dup would skip
+                // the tracking and report containment the group does not have, so
+                // the identity read here (once, and handed to both the check and the
+                // entry, so they cannot disagree) is what it is decided on.
+                let identity = read_identity(pid);
+                if !self.groups.holds_same_process(pid, identity) {
                     // A new killable solo member joined — re-arm Drop's backstop.
                     self.skip_drop_kill.clear();
-                    self.solos.track(pid, false);
+                    self.solos.track_with(pid, false, identity);
                 }
                 Ok(())
             }
             _ => Err(err),
         }
+    }
+
+    /// Adopt an **external** process named only by `pid` — the backend of
+    /// [`ProcessGroup::adopt_external`](crate::ProcessGroup::adopt_external).
+    ///
+    /// Same three steps as [`adopt`](Self::adopt), with the identity work a bare
+    /// number needs wrapped around them:
+    ///
+    /// 1. **Anchor first.** [`capture_adoption_anchor`] reads the process's
+    ///    start-time token *before* anything is tracked. It doubles as the
+    ///    existence check — a token can only be read for a process that is there —
+    ///    so a number that names nothing is refused here, not later, and a target
+    ///    without a readable token is refused rather than tracked by number alone.
+    /// 2. **`setpgid`, then track.** Unchanged from [`adopt`](Self::adopt) except
+    ///    for how `ESRCH` is read. For a `Child` an `ESRCH` means "already exited";
+    ///    for a bare pid it is the *ordinary* answer for a process that is not this
+    ///    process's own child at all (the kernel reports `ESRCH` for a `setpgid`
+    ///    target that is neither the caller nor one of its children), which is the
+    ///    normal case here — and step 1 has just proved the process exists. So it
+    ///    joins `EACCES`/`EPERM` on the solo-tracking path instead of being read as
+    ///    "gone".
+    /// 3. **Re-read the anchor.** A token that has positively changed means the
+    ///    number was recycled inside this call's own window, so no claim on the
+    ///    process the caller named was established; that is reported rather than
+    ///    passed off as containment. The entry pushed in step 2 is deliberately
+    ///    *left in place*: its captured token no longer matches the number, so
+    ///    [`Tracked::probe_entry`] reports it gone and prunes it at the next sweep
+    ///    without ever signalling it — dropping bookkeeping on an unproven guess is
+    ///    the direction that loses a live member, not this one.
+    ///
+    /// From step 2 on, every probe, signal and teardown for the entry runs through
+    /// the same identity gate the rest of this module uses ([`Tracked::probe_entry`]),
+    /// and — unlike an [`adopt`](Self::adopt)ed entry, whose token is best-effort —
+    /// this entry's token is always present, because step 1 refuses the adoption
+    /// otherwise.
+    #[cfg(feature = "process-control")]
+    pub(crate) fn adopt_external(&self, pid: u32) -> io::Result<()> {
+        // A number that does not fit `pid_t` cannot name a process — and casting it
+        // would turn the `kill` probes below into *process-group* signals.
+        let Ok(pid) = i32::try_from(pid) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no process with pid {pid} to adopt"),
+            ));
+        };
+        let anchor = capture_adoption_anchor(pid)?;
+        // Try to make the external process its own group leader. Only the process
+        // itself is moved — already running descendants keep their group.
+        // SAFETY: setpgid on a pid is a sound call, and it can never re-group *us*:
+        // `ProcessGroup::adopt_external` (src/group.rs) refuses pid 0 and this
+        // process's own pid before any backend is reached — the one guard for that,
+        // and the reason this line does not repeat the check.
+        let rc = unsafe { libc::setpgid(pid, 0) };
+        if rc == 0 {
+            // It now leads group `pid` — track the group; future forks inherit it
+            // and are reaped with it. The group exists (setpgid succeeded), so seed
+            // the latch true. A new killable member joined — re-arm Drop's backstop
+            // so a prior graceful_shutdown(escalate=false) latch doesn't spare it.
+            self.skip_drop_kill.clear();
+            self.groups.track_with(pid, true, Some(anchor));
+        } else {
+            let err = io::Error::last_os_error();
+            match err.raw_os_error().unwrap_or(0) {
+                // ESRCH: not this process's child (the normal answer for a truly
+                // foreign process — and NOT proof it is gone, which the anchor
+                // above has just disproved). EACCES: it has already `exec`'d.
+                // EPERM: it is a session leader, or lives in another session.
+                // Recording `pid` as a *group* id would make teardown a silent
+                // no-op (no group `pid` exists); track it individually instead:
+                // the process is contained, its future forks are not.
+                code if code == libc::EACCES || code == libc::EPERM || code == libc::ESRCH => {
+                    // A process this group already spawned is tracked as a group
+                    // leader; re-adopting it by number must not also solo-track it
+                    // (that would double-count in `members()`/`stats()` and
+                    // double-deliver every broadcast). The de-dup is decided on the
+                    // anchor this call just captured, against the tracked entry's own
+                    // token and only after a sweep — a bare "is the number on the
+                    // books" test would let an entry whose process was reaped, and
+                    // whose number the OS has since reassigned, skip the tracking
+                    // and return an `Ok` that contains nothing
+                    // ([`Tracked::holds_same_process`]).
+                    if !self.groups.holds_same_process(pid, Some(anchor)) {
+                        self.skip_drop_kill.clear();
+                        self.solos.track_with(pid, false, Some(anchor));
+                    }
+                }
+                _ => return Err(err),
+            }
+        }
+        if is_recycled(Some(anchor), read_identity(pid)) {
+            return Err(recycled_during_adoption(pid));
+        }
+        Ok(())
     }
 
     /// Hard-kill every tracked group and solo child. Surfaces a genuine delivery
@@ -1599,6 +1849,243 @@ mod tests {
         drop(pg);
         let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
         let _ = child.wait().await;
+    }
+
+    /// A bare-pid adoption must leave an entry that is **identity-anchored**, not a
+    /// number-only one: that token is the whole of what stands between a later
+    /// recycle of the number and a `SIGKILL` aimed at whoever holds it, since no
+    /// `Child` is kept un-reaped behind an external process.
+    ///
+    /// The load-bearing assertion is `identity.is_some()`. Neutralize the anchor
+    /// capture — have `adopt_external` track through the plain `track` (whose read
+    /// is best-effort and can legitimately answer `None`) or push `identity: None`
+    /// — and this fails on exactly the platforms where the protection is claimed.
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn adopt_external_anchors_the_tracked_entry_on_an_identity() {
+        let pg = ProcessGroup::new();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap() as i32;
+        let real = read_identity(pid).expect("this target reports a start-time identity");
+
+        pg.adopt_external(pid as u32)
+            .expect("a live process is adoptable by pid on this target");
+
+        // Wherever it landed (solo is the ordinary outcome — this process forked it
+        // and it has exec'd, so `setpgid` is refused), the entry carries the token.
+        let anchored = {
+            let solos = pg.solos.ids.lock().unwrap_or_else(|e| e.into_inner());
+            let groups = pg.groups.ids.lock().unwrap_or_else(|e| e.into_inner());
+            solos
+                .iter()
+                .chain(groups.iter())
+                .find(|e| e.id == pid)
+                .map(|e| e.identity)
+        };
+
+        drop(pg);
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait().await;
+
+        assert_eq!(
+            anchored,
+            Some(Some(real)),
+            "a bare-pid adoption must track the pid, anchored on the identity read \
+             during the call — never a number-only entry"
+        );
+    }
+
+    /// The negative control for the entry above: once the number no longer names
+    /// the process the anchor was taken from, the group must not kill whoever holds
+    /// it now. Modelled by poisoning the stored token — the same shape
+    /// `solo_pid_reuse_without_esrch_is_not_signalled` uses, but driven through
+    /// `adopt_external` end-to-end and asserting on the *process*, not on pruning.
+    ///
+    /// Neutralize the identity gate (make `is_recycled` return `false`, or drop the
+    /// `probe_entry` check) and this test's stand-in is SIGKILLed by `kill_all` —
+    /// the exact defect the anchor exists to prevent.
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn a_recycled_number_is_not_killed_by_the_group_that_adopted_it() {
+        let pg = ProcessGroup::new();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap() as i32;
+
+        pg.adopt_external(pid as u32).expect("adopt by pid");
+
+        // Stand in for "this number was reaped and handed to a stranger": the live
+        // process at `pid` is now a different instance than the anchored one. A
+        // real recycle needs the pid space to wrap; the entry's view of it is
+        // identical, and this is the state the gate must act on.
+        for set in [&pg.solos, &pg.groups] {
+            let mut ids = set.ids.lock().unwrap_or_else(|e| e.into_inner());
+            for entry in ids.iter_mut().filter(|e| e.id == pid) {
+                entry.identity = entry.identity.map(|token| token ^ 1);
+            }
+        }
+
+        pg.kill_all().expect("kill_all over a recycled entry");
+        // A `SIGKILL` that must never have been sent — and liveness has to be read
+        // as *live and non-zombie*, not as `kill(pid, 0) == 0`: the stand-in is a
+        // direct child this test has not awaited, so a delivered `SIGKILL` would
+        // leave a zombie that still answers the bare existence probe. Poll across a
+        // window several times longer than delivery takes, so the neutralized-gate
+        // case fails here instead of racing.
+        let mut survived = true;
+        for _ in 0..50 {
+            if !is_live_non_zombie(pid) {
+                survived = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        drop(pg);
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait().await;
+
+        assert!(
+            survived,
+            "kill_all must not signal a number whose identity no longer matches the \
+             one captured when it was adopted"
+        );
+    }
+
+    /// A **leftover entry for a number that has since changed hands** must not
+    /// answer the adoption's de-dup: `adopt_external` has to track the process it
+    /// was given, not skip it and hand back an `Ok` that contains nothing.
+    ///
+    /// The sequence this models is reachable and not micro-second wide: this group
+    /// spawned a child, the child exited and was reaped (nothing deregisters an
+    /// entry at reap — only a sweep prunes, and a passive group may not sweep for
+    /// minutes), the OS handed the number on, and *that* number is what arrives
+    /// here. Both shapes the leftover entry can have are exercised, because only the
+    /// first is prunable:
+    ///
+    /// - it carries a token that no longer matches the number's occupant — the
+    ///   sweep's own identity gate drops it;
+    /// - it carries **no** token (a track-time identity read that failed), so no
+    ///   sweep can drop it: it probes alive on the number alone. Only comparing it
+    ///   against the anchor this call captured tells it apart from the real process.
+    ///
+    /// The load-bearing assertion is that the pid ends up tracked *with the token
+    /// read during the call*. Neutralize the fix — de-dup on a bare "is this number
+    /// on the books" scan, as `Tracked::contains` did — and both shapes fail here:
+    /// the call returns `Ok` having tracked nothing at all.
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn adopt_external_is_not_silenced_by_a_stale_entry_for_the_same_number() {
+        for stale_carries_a_token in [true, false] {
+            let pg = ProcessGroup::new();
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg("sleep 60")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let pid = child.id().unwrap() as i32;
+            let real = read_identity(pid).expect("this target reports a start-time identity");
+
+            // The books as the reaped child left them: the number tracked as a group
+            // leader, seeded `false` exactly as `spawn` seeds it (so the direct-pid
+            // fallback keeps the entry alive on the number alone), with either the
+            // dead process's token or none at all.
+            pg.groups
+                .track_with(pid, false, stale_carries_a_token.then_some(real ^ 1));
+
+            pg.adopt_external(pid as u32)
+                .expect("a live process is adoptable by pid on this target");
+
+            // Wherever it landed (solo is the ordinary outcome — this process forked
+            // it and it has exec'd, so `setpgid` is refused), an entry for it must
+            // exist carrying the identity captured during the call.
+            let tracked = {
+                let solos = pg.solos.ids.lock().unwrap_or_else(|e| e.into_inner());
+                let groups = pg.groups.ids.lock().unwrap_or_else(|e| e.into_inner());
+                solos
+                    .iter()
+                    .chain(groups.iter())
+                    .any(|e| e.id == pid && e.identity == Some(real))
+            };
+
+            drop(pg);
+            // SAFETY: a best-effort kill of a child this test started.
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = child.wait().await;
+
+            assert!(
+                tracked,
+                "an entry left over from a reaped process (token: {}) must not make \
+                 the adoption of the number's new holder a silent no-op",
+                if stale_carries_a_token {
+                    "stale"
+                } else {
+                    "none"
+                },
+            );
+        }
+    }
+
+    /// A number that names no process is refused by the anchor capture — the bare-pid
+    /// counterpart of `adopt`'s "an already-reaped child errors instead of tracking
+    /// nothing", which a bare number carries no evidence for on its own.
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[tokio::test]
+    async fn adopt_external_of_a_pid_that_names_nothing_is_not_found() {
+        let pg = ProcessGroup::new();
+        // Far above any pid_max, still inside `pid_t`.
+        let err = pg
+            .adopt_external(2_000_000_000)
+            .expect_err("a pid that names nothing is not adoptable");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err:?}");
+        assert!(
+            pg.members().is_empty(),
+            "a refused adoption must track nothing"
+        );
+    }
+
+    /// The BSD arm of the same call: no start-time reader, so the refusal is
+    /// `Unsupported` and comes before any syscall against the target.
+    #[cfg(all(
+        feature = "process-control",
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+    ))]
+    #[tokio::test]
+    async fn adopt_external_is_unsupported_without_an_identity_reader() {
+        let pg = ProcessGroup::new();
+        let err = pg
+            .adopt_external(std::process::id())
+            .expect_err("no identity reader here, so nothing is adoptable by pid");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err:?}");
+        assert!(
+            pg.members().is_empty(),
+            "a refused adoption must track nothing"
+        );
     }
 
     /// Every `spawn` seeds the group-liveness latch `false` — on the non-`setsid`

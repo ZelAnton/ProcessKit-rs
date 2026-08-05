@@ -112,6 +112,21 @@ impl Job {
         self.group.adopt(child)
     }
 
+    /// Adopt an external process by bare pid — the shared POSIX backend's
+    /// [`adopt_external`](ProcessGroup::adopt_external), which is the whole
+    /// implementation here (this backend *is* the process group).
+    ///
+    /// Its outcome splits by target on this arm, and only because of what the
+    /// platform can read: **macOS** has the `proc_pidinfo` start-time reader the
+    /// anchor needs, so the adoption succeeds — as solo tracking, since `setpgid`
+    /// cannot re-group a process this one did not fork; the **other BSDs** have no
+    /// such reader wired up, so it is refused as `Unsupported` rather than tracked
+    /// by number alone.
+    #[cfg(feature = "process-control")]
+    pub(crate) fn adopt_external(&self, pid: u32) -> io::Result<()> {
+        self.group.adopt_external(pid)
+    }
+
     pub(crate) fn kill_all(&self) -> io::Result<()> {
         self.group.kill_all()
     }

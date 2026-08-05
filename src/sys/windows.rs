@@ -66,6 +66,11 @@ use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessIdOfThread, SuspendThread, THREAD_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+// The two rights `AssignProcessToJobObject` requires of its target, needed only by
+// the bare-pid adoption path (`adopt(&Child)` borrows a handle the caller already
+// holds, so it opens nothing).
+#[cfg(feature = "process-control")]
+use windows_sys::Win32::System::Threading::{PROCESS_SET_QUOTA, PROCESS_TERMINATE};
 // EnumWindows + PostMessageW(WM_CLOSE) for the best-effort GUI-graceful tier: a
 // windowed member (Electron/desktop tool/windowed service) receives no console
 // CTRL event, so WM_CLOSE is the only soft "please close" it can act on before the
@@ -519,6 +524,104 @@ impl Job {
             // pgroup/cgroup backends); a genuine failure on a still-LIVE process
             // still propagates.
             if process_has_exited(handle as HANDLE) {
+                return Ok(());
+            }
+            return Err(err);
+        }
+        // A new killable member joined the job — re-arm the kill-on-drop backstop
+        // so a prior graceful_shutdown(escalate=false) latch doesn't spare it.
+        self.skip_drop_kill.clear();
+        Ok(())
+    }
+
+    /// Adopt an **external** process named only by `pid` — the Windows backend of
+    /// [`ProcessGroup::adopt_external`](crate::ProcessGroup::adopt_external).
+    ///
+    /// The number is used **exactly once**, by the `OpenProcess` below; from there
+    /// on the whole adoption runs on the returned handle, which is a reference to
+    /// the process *object* rather than to the number. That is what the other
+    /// backends have to approximate with a start-time token: there is no second
+    /// number lookup to straddle a recycle, and `AssignProcessToJobObject` puts the
+    /// object — not the number — into the job, so every later verb
+    /// (`TerminateJobObject`, the member list, `Drop`'s kill-on-close) acts on job
+    /// membership the kernel maintains per process object.
+    ///
+    /// The open asks for exactly the three rights this needs and no more:
+    /// `PROCESS_SET_QUOTA | PROCESS_TERMINATE` are what
+    /// [`AssignProcessToJobObject`] requires of its target, and
+    /// `PROCESS_QUERY_LIMITED_INFORMATION` is what tells a rejected assign apart
+    /// from an already-terminated one ([`process_has_exited`]). A process the
+    /// caller may not open that widely — one running as another user, at a higher
+    /// integrity level, or protected — fails here rather than half-way through.
+    ///
+    /// The `# Errors` mapping mirrors [`process_info`]'s existence oracle:
+    /// `ERROR_INVALID_PARAMETER` from `OpenProcess` is the sole "no such pid"
+    /// answer and becomes `NotFound`; every other open failure (notably
+    /// `ERROR_ACCESS_DENIED`) is surfaced as itself, never as "dead".
+    ///
+    /// **A target already in another job, and what that costs.** Since Windows 8 a
+    /// process may belong to several nested jobs, so "already in a job" is not by
+    /// itself a refusal — but the assign that succeeds makes **this job a child job
+    /// of the one the process was already in**, and membership of a child job is
+    /// membership of every job above it. From then on the outer job's terminate (or
+    /// its close, while it kills on close) reaches this job's members, including
+    /// ones spawned after the adoption, and the outer job's limits apply to them —
+    /// neither of which this crate can revoke, and both of which the public contract
+    /// on [`ProcessGroup::adopt_external`](crate::ProcessGroup::adopt_external)
+    /// therefore states rather than leaves to be discovered.
+    ///
+    /// Whether the assign succeeds is not a property of the target alone. Observed
+    /// on Windows 11 (both cases live in `tests/integration/process_control.rs`):
+    /// with this job still **empty** it succeeds; with a process this job already
+    /// holds — one outside the outer job's hierarchy — the same call is refused
+    /// `ERROR_ACCESS_DENIED`. The kernel owns that rule, so nothing here predicts
+    /// it: a refusal is surfaced as the error it is, never as containment.
+    #[cfg(feature = "process-control")]
+    pub(crate) fn adopt_external(&self, pid: u32) -> io::Result<()> {
+        // SAFETY: opens by pid with exactly the rights the assign and the
+        // exited-check need; null on failure.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no process with pid {pid} to adopt"),
+                ));
+            }
+            return Err(err);
+        }
+        let outcome = self.assign_opened_process(handle);
+        // SAFETY: handle came from OpenProcess and is closed exactly once. The job
+        // holds its own reference to any process it took in, so closing this one
+        // does not release the membership.
+        unsafe { CloseHandle(handle) };
+        outcome
+    }
+
+    /// The assign step of [`adopt_external`](Self::adopt_external), split out so the
+    /// handle it borrows is closed on every path out (a `?` in the caller would
+    /// leak it).
+    ///
+    /// `handle` must be open with `PROCESS_SET_QUOTA | PROCESS_TERMINATE` (the
+    /// assign) and `PROCESS_QUERY_LIMITED_INFORMATION` (the exited-check).
+    #[cfg(feature = "process-control")]
+    fn assign_opened_process(&self, handle: HANDLE) -> io::Result<()> {
+        // SAFETY: `self.handle` is a valid job handle and `handle` a valid,
+        // caller-owned process handle for the duration of the call.
+        if unsafe { AssignProcessToJobObject(self.handle, handle) } == 0 {
+            let err = io::Error::last_os_error();
+            // The assign fails for an already-terminated process. If it has in fact
+            // exited there is nothing to contain — return Ok, exactly as `adopt`
+            // and the unix backends answer for an exited-but-unreaped target; a
+            // genuine failure on a still-LIVE process still propagates.
+            if process_has_exited(handle) {
                 return Ok(());
             }
             return Err(err);

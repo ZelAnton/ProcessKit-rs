@@ -426,6 +426,42 @@ impl Job {
         self.0.adopt(child)
     }
 
+    /// Attach an already-running **external** process, named only by `pid`, to this
+    /// job — the backend of
+    /// [`ProcessGroup::adopt_external`](crate::ProcessGroup::adopt_external). As
+    /// with [`adopt`](Self::adopt), only that process is moved; descendants it
+    /// already spawned keep their original containment.
+    ///
+    /// The contract every backend upholds, whatever it anchors on:
+    ///
+    /// - an **identity anchor is captured by this crate**, during the call, for the
+    ///   process the number currently names — a held process handle on Windows,
+    ///   kernel cgroup membership plus a `/proc` `starttime` read on either side of
+    ///   the write on Linux, the `read_identity` start-time token on the POSIX
+    ///   process-group backends. From then on the job's probes, signals and teardown
+    ///   are bound to *that*, so a number recycled afterwards is rejected rather
+    ///   than signalled;
+    /// - a backend that **cannot** capture one refuses with
+    ///   `ErrorKind::Unsupported` instead of tracking a bare number (the BSDs,
+    ///   which have no start-time reader — see `pgroup::read_identity`);
+    /// - the existence dictionary is [`adopt`](Self::adopt)'s, unchanged: a target
+    ///   that exits during the call is `Ok` (nothing left to contain), while a
+    ///   number that named nothing when the call started is `Err`;
+    /// - a number recycled **inside** the call is reported, and each backend leaves
+    ///   the state its own mechanism implies rather than a shared claim: the
+    ///   process-group arms have only an identity-gated entry to leave (pruned
+    ///   unsignalled), the Linux cgroup arm has already migrated a task and attempts
+    ///   to move it back out, and Windows never reaches the state because it uses
+    ///   the number once. The public contract carries the per-mechanism wording;
+    /// - adoption is **not neutral** for containment the target already had, again
+    ///   per mechanism: Windows nests this job under the job the process was in,
+    ///   the Linux cgroup write takes the task out of its previous cgroup (v2
+    ///   membership is exclusive), and the process-group arms move nothing.
+    #[cfg(feature = "process-control")]
+    pub(crate) fn adopt_external(&self, pid: u32) -> io::Result<()> {
+        self.0.adopt_external(pid)
+    }
+
     /// Immediately hard-kill every process in the job. Idempotent.
     pub(crate) fn kill_all(&self) -> io::Result<()> {
         self.0.kill_all()

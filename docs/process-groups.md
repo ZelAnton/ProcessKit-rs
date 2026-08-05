@@ -55,7 +55,7 @@ the group verbs below.
 
 ## Putting processes in
 
-Three doors, in order of preference:
+Four doors, in order of preference:
 
 ```rust,no_run
 use processkit::{Command, ProcessGroup};
@@ -75,17 +75,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw = tokio::process::Command::new("background-helper");
     let child = group.spawn(raw)?;
 
-    // 3. adopt(): contain a child that was spawned OUTSIDE the group.
+    // 3. adopt(): contain a child that was spawned OUTSIDE the group, while you
+    //    still hold its Child handle (and stay responsible for reaping it).
     let external = tokio::process::Command::new("legacy-launcher").spawn()?;
     group.adopt(&external)?;
+
+    // 4. adopt_external(): contain a process you have only a pid for — one an
+    //    outside supervisor started, or one you forked but never handed over.
+    //    Nothing here will ever reap it; the group can only signal it.
+    let pid_from_elsewhere: u32 = 4321;
+    let _ = group.adopt_external(pid_from_elsewhere);
     let _ = (server, child);
     Ok(())
 }
 ```
 
-`adopt` moves only the named process: descendants it *already* has keep their
-old containment (future forks are captured — on Windows/cgroup). A few sharp
-edges worth knowing:
+Both adoption doors move only the named process: descendants it *already* has
+keep their old containment (future forks are captured — on Windows/cgroup). A few
+sharp edges worth knowing:
 
 - A child that already exited **but has not been reaped** (no `wait()` yet — a
   zombie whose pid/handle is still valid) is a successful **no-op**: there is
@@ -96,6 +103,53 @@ edges worth knowing:
   can't be re-grouped (POSIX forbids it), so it is tracked *individually*: the
   child itself is signalled/killed with the group, but its future forks are
   not. The caller keeps the `Child` handle and is responsible for reaping.
+
+### Adopting by pid (`adopt_external`)
+
+`adopt` needs a live `tokio::process::Child`, which a non-Rust consumer cannot
+construct at all. `adopt_external(pid)` takes the one identifier such a caller
+does have — and treats it as an *address*, not as a handle, because the OS may
+give a reaped process's number to an unrelated one:
+
+- the crate captures an **identity anchor of its own** for the process the number
+  currently names, during the call: the process **object** behind an `OpenProcess`
+  on Windows, kernel cgroup membership (plus a `/proc` start-time read on either
+  side of the write) on Linux cgroup v2, the start-time token on the POSIX
+  process-group backends. From then on the group's probes, signals and teardown are
+  bound to that, so a process that recycles the number afterwards is not a member
+  and is not signalled;
+- a number recycled **during the call itself** is detected by that closing read and
+  reported as an error — but the two unix mechanisms are left in different states,
+  which the error message spells out. The process-group backends have nothing to
+  undo (the entry they made is identity-gated and is pruned unsignalled). Linux
+  cgroup v2 has already migrated a task, so the call tries to move the number back
+  out into the cgroup this group's own directory lives in; where a host refuses that
+  move, the process holding the number stays a member of this group and this group's
+  teardown will kill it. Windows cannot reach this state — it uses the number once,
+  for `OpenProcess`;
+- **adoption is not neutral for containment the process already has**, and the
+  direction differs per mechanism: on Windows the process keeps its existing job and
+  *this* group's job becomes a child of it (so the outer job's terminate/close then
+  reaches this group's members, including ones started later, and its limits bind
+  them — and whether the assign succeeds at all depends on this group's own state,
+  so adopt before you start); on Linux cgroup v2 the process **loses** its previous
+  cgroup, since v2 membership is exclusive and nothing can restore it; on the
+  process-group backends nothing is taken away. See
+  [platform support](platform-support.md#capability-matrices) for the full note;
+- what no crate can check is the window *before* the call — whether the pid still
+  named the process you meant when you looked it up. Look it up as late as you
+  can, and use `process_is_alive(pid, start_time)` to re-check an instance later;
+- **nothing here ever reaps it.** No exit status for an adopted-by-pid process
+  appears anywhere in this API; the group can signal it and list it, and that is
+  all. Reaping stays with whoever is its actual parent — this process, an outside
+  supervisor, or `init`;
+- **FreeBSD and the other BSDs return `Unsupported`.** No start-time reader is
+  wired up there, so there is no anchor to capture, and the crate refuses rather
+  than tracking a bare number it would later `SIGKILL`. `adopt` is unaffected —
+  the `Child` you hold un-reaped is what keeps its number from being recycled.
+
+`pid == 0` and this process's own pid are refused everywhere: both would point
+the group's own teardown at the caller.
 
 ## Tearing down: drop, terminate, shutdown
 
