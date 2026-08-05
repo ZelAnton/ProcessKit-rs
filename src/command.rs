@@ -3056,7 +3056,9 @@ impl Command {
 
     /// Spawn the child **deliberately released from this crate's kill-on-drop
     /// containment**, handing back a [`DetachedChild`] whose lifetime is entirely
-    /// yours: the crate will never kill, reap, time out, or capture it.
+    /// yours: the crate will never kill, time out, capture, or expose a wait
+    /// operation for it. On Unix an internal background owner reaps its exit
+    /// status so a short-lived detached child does not become a zombie.
     ///
     /// # Warning — this inverts the crate's headline guarantee
     ///
@@ -3180,11 +3182,17 @@ impl Command {
         }
 
         let mut cmd = self.build_detached_tokio()?;
+        // The Unix manager must exist before spawn: if thread creation is refused,
+        // return before creating a child that could not be reaped by this owner.
+        #[cfg(unix)]
+        crate::detached::prepare_reaper().map_err(|source| ErrorReason::Spawn {
+            program: self.program_name(),
+            source,
+        })?;
         // Spawn via `std` directly: a detached child is deliberately NOT registered
         // with the tokio reactor or assigned to any group of ours — it is fully
-        // handed off. `std::process::Child`'s `Drop` neither kills nor waits the
-        // child (the OS reaps it — on Unix, `init` once this process exits), so
-        // dropping the handle below leaves the child running.
+        // handed off. On Unix the std handle is transferred to the private reaper;
+        // elsewhere its existing drop semantics remain unchanged.
         let spawned = {
             #[cfg(windows)]
             let _spawn_guard = crate::sys::process_spawn_lock();
@@ -3204,7 +3212,12 @@ impl Command {
             }
         };
         let pid = child.id();
-        // Detach: dropping the `std` handle neither kills nor reaps it.
+        #[cfg(unix)]
+        crate::detached::handoff_reaper(child).map_err(|source| ErrorReason::Spawn {
+            program: self.program_name(),
+            source,
+        })?;
+        #[cfg(not(unix))]
         drop(child);
         Ok(DetachedChild::new(pid))
     }

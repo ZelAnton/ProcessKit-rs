@@ -11,7 +11,7 @@
 //!
 //! Real subprocesses, so `#[ignore]`d like the rest of this suite. The detached
 //! children are self-terminating with a bounded lifetime, and every one is killed
-//! + reaped before the test returns, so nothing is leaked on CI.
+//! before the test returns; on Unix the library's private reaper owns the wait.
 
 use std::time::Duration;
 
@@ -33,23 +33,27 @@ fn pid_alive(pid: u32) -> bool {
     crate::common::windows_pid_alive(pid)
 }
 
-/// Kill + reap a detached child we spawned. Its handle is not tokio-owned, so on
-/// Unix a bare kill would leave a zombie for this test process's lifetime (the
-/// child is still our child — `setsid` does not reparent it). Safe to call on an
-/// already-exited child (kill is then a no-op; the reap collects the zombie).
+/// Kill a detached child and wait until the library's private reaper has made it
+/// disappear. This deliberately observes liveness instead of calling `waitpid`:
+/// the reaper owns the only wait-capable child handle on Unix.
 #[cfg(unix)]
-fn kill_and_reap(pid: u32) {
-    // SAFETY: `pid` is a child we spawned; a blocking `waitpid` returns at once
-    // once it is dead, and `WUNTRACED`-free plain wait reaps the zombie.
+async fn kill_and_reap(pid: u32) {
+    // SAFETY: `pid` came from a child spawned by this test; SIGKILL is used only
+    // for bounded cleanup and has no effect once the child is gone.
     unsafe {
         libc::kill(pid as i32, libc::SIGKILL);
-        let mut status = 0i32;
-        libc::waitpid(pid as i32, &mut status, 0);
     }
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        "detached child cleanup",
+        || !pid_alive(pid),
+    )
+    .await;
 }
 
 #[cfg(windows)]
-fn kill_and_reap(pid: u32) {
+async fn kill_and_reap(pid: u32) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
     // SAFETY: terminate access only; a null handle means the pid is already gone.
@@ -61,6 +65,13 @@ fn kill_and_reap(pid: u32) {
             CloseHandle(handle);
         }
     }
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        "detached child cleanup",
+        || !pid_alive(pid),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -88,7 +99,7 @@ async fn detached_child_survives_dropping_its_handle() {
         "detached child {pid} must survive dropping its DetachedChild handle"
     );
 
-    kill_and_reap(pid);
+    kill_and_reap(pid).await;
 }
 
 #[tokio::test]
@@ -148,5 +159,5 @@ async fn detached_child_can_redirect_stdout_to_a_file() {
     )
     .await;
 
-    kill_and_reap(pid); // no-op if it already exited; reaps any zombie
+    kill_and_reap(pid).await; // no-op if exited; the library reaps it
 }

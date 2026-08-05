@@ -28,8 +28,9 @@
 //!   no equivalent), and on the process-group mechanism a child
 //!   that calls `setsid` escapes containment. The one *deliberate* way out is
 //!   [`Command::spawn_detached`] — an explicit, loudly-named opt-in that hands
-//!   back a [`DetachedChild`] the crate never kills, reaps, times out, or
-//!   contains (it inverts this guarantee on purpose; see its docs). The whole
+//!   back a [`DetachedChild`] the crate never kills, times out, captures, or
+//!   exposes for waiting (Unix still reaps it in a private background owner),
+//!   and never contains (it inverts this guarantee on purpose; see its docs). The whole
 //!   tree can be
 //!   signalled (`ProcessGroup::signal`, see `Signal`), paused/resumed
 //!   (`ProcessGroup::suspend` / `ProcessGroup::resume`), and inspected
