@@ -583,13 +583,21 @@ where
 ///   refused, so the rollback additionally releases **no** root: anything the walk
 ///   leaves behind is still the job's to kill and dies with its `kill_all`/`Drop`.
 ///   See `Reaper::hard_kill_subtree` in `sys::freebsd`.
-/// - **Linux cgroup** — `killpg` over the pty child's session plus the direct
-///   child. A descendant that `setsid`s in the setup window leaves the process
-///   group but **not** the cgroup (membership is inherited across `fork` and
-///   untouched by `setsid`), so it stays contained and dies with the job's
-///   `kill_all`/`Drop` (`cgroup.kill`). Calling that here instead is deliberately
-///   rejected: it is whole-cgroup and would kill every unrelated member of the
-///   same job, which a failed spawn has no business doing.
+/// - **Linux cgroup** — `cgroup.kill` over the **per-spawn leaf sub-cgroup this
+///   spawn was given**: that leaf's whole subtree at once, `setsid` escapees
+///   included (cgroup membership is inherited across `fork` and untouched by
+///   `setsid`), and nothing belonging to another spawn, each of which has a leaf of
+///   its own. Writing that same file in the job's *own* cgroup is still deliberately
+///   rejected: there it kills every member of the job, which a failed spawn has no
+///   business doing. Two conditions gate the selective kill — that this spawn has a
+///   leaf at all (a host can refuse the `mkdir`) and that the write is accepted (a
+///   kernel < 5.14 has no `cgroup.kill`; a restricted delegated cgroup can refuse
+///   it) — and failing either falls back to `killpg` over the pty child's session
+///   plus the direct child. A descendant that `setsid`s in the setup window survives
+///   *that* fallback, but it has not left the job's cgroup tree, so it stays
+///   contained and the job's own `kill_all` still ends it while the job lives. See
+///   `Job::rollback_pty_spawn` in `sys::linux` for what `Drop` does and does not add
+///   to that.
 /// - **POSIX process group** (macOS, the BSDs other than FreeBSD, and the Linux
 ///   cgroup fallback) — `killpg` over the session, which is this mechanism's own
 ///   whole-tree maximum. A descendant that `setsid`s away escapes it: the standing
@@ -599,9 +607,11 @@ where
 ///
 /// In every case the reach is a **superset** of the single-child teardown the same
 /// child would receive had the launch succeeded and later timed out
-/// (`graceful::run_pid`, which reaches the direct child by pid and nothing else),
-/// and in none of them does the rollback narrow what the *job* can still reach:
-/// every survivor named above is one the job's own teardown still owns.
+/// (`graceful::run_pid`, which reaches the direct child by pid and nothing else).
+/// What each mechanism releases afterwards, and what becomes of anything its kill
+/// did not reach, is stated in that mechanism's bullet above and in its own
+/// `rollback_pty_spawn` — deliberately not summarized into one sentence here, since
+/// the three do not share one answer.
 struct PtySpawnRollback<R: FnOnce(u32)> {
     /// `None` only after [`disarm`](Self::disarm) has taken the child.
     child: Option<Child>,
@@ -778,6 +788,76 @@ mod tests {
         // SAFETY: a best-effort `SIGKILL` to the pid this test itself started.
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         panic!("{what}: pid {pid} was still alive after the bounded wait");
+    }
+
+    /// Whether the Linux cgroup backend can give the spawn `pid` belongs to the
+    /// **selective, leaf-scoped** kill its rollback prefers — decided from host
+    /// facts, not from the crate's own bookkeeping: the process lives in a per-spawn
+    /// leaf (a `spawn-*` directory, the one `sys::linux` creates per launch) and the
+    /// kernel provides that leaf's `cgroup.kill` (>= 5.14). The cgroup path is
+    /// resolved the way the backend itself resolves one — `/proc/<pid>/cgroup`'s
+    /// `0::` line joined onto the v2 mount root.
+    ///
+    /// Both conditions can genuinely be absent (a host that refuses the `mkdir`, an
+    /// older kernel), and the rollback then falls back to `killpg`, whose reach a
+    /// `setsid` escapee escapes — two different contracts, so the caller has to know
+    /// which one this host is under.
+    #[cfg(target_os = "linux")]
+    fn selective_leaf_kill_available(pid: u32) -> bool {
+        let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
+            return false;
+        };
+        let Some(rel) = text.lines().find_map(|line| line.strip_prefix("0::")) else {
+            return false;
+        };
+        let dir = Path::new("/sys/fs/cgroup").join(rel.trim().trim_start_matches('/'));
+        dir.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("spawn-"))
+            && dir.join("cgroup.kill").exists()
+    }
+
+    /// [`Mechanism::CgroupV2`] is a Linux-only verdict, so everywhere else that arm
+    /// is unreachable and this is a constant.
+    #[cfg(not(target_os = "linux"))]
+    fn selective_leaf_kill_available(_pid: u32) -> bool {
+        false
+    }
+
+    /// What the cgroup backend's rollback owes a `setsid` escapee of the spawn it
+    /// just undid — one of two contracts, chosen by the host fact
+    /// [`selective_leaf_kill_available`] sampled **before** the rollback ran:
+    ///
+    /// - with a leaf-scoped `cgroup.kill`, that escapee is this spawn's own to kill
+    ///   and must be gone;
+    /// - without one the rollback is session-scoped and the escapee survives it, so
+    ///   what must hold instead is that it never left the job — still a member, and
+    ///   ended by the job's own `kill_all`.
+    async fn assert_cgroup_escapee_scope(job: &crate::sys::Job, escapee: u32, selective: bool) {
+        if selective {
+            wait_until_gone(
+                escapee,
+                "the rollback's leaf-scoped cgroup.kill must reach a setsid escapee of \
+                 the spawn it is undoing",
+            )
+            .await;
+            return;
+        }
+        assert!(
+            is_alive(escapee),
+            "without a per-spawn leaf the cgroup rollback is session-scoped by design; \
+             the escapee is the job's to kill, not this spawn's"
+        );
+        #[cfg(feature = "process-control")]
+        assert!(
+            job.members()
+                .expect("read the cgroup's members")
+                .contains(&escapee),
+            "the escapee must still be a cgroup member — neither setsid nor losing its \
+             parent takes a process out of a cgroup, which is why no orphan escapes the job"
+        );
+        job.kill_all().expect("the job's own teardown");
+        wait_until_gone(escapee, "the job's cgroup.kill must reach the escapee").await;
     }
 
     /// Wait (bounded) for a helper to publish its pid into `path`.
@@ -1084,10 +1164,14 @@ mod tests {
     ///   session boundary, which is what makes a selective per-spawn cleanup
     ///   possible here at all. The root is left recorded, so anything the walk does
     ///   not take is still the job's (the R-02 fix).
-    /// - **Linux cgroup** — alive, but never out of containment: `setsid` does not
-    ///   change cgroup membership, so the job still lists it and `kill_all` ends it.
-    ///   Firing `cgroup.kill` from a rollback instead would take down every
-    ///   unrelated member of the same job.
+    /// - **Linux cgroup** — dead where this host grants the spawn a leaf sub-cgroup
+    ///   whose `cgroup.kill` the kernel provides: that write kills the leaf's whole
+    ///   subtree, across the session boundary, without touching another spawn.
+    ///   Where it does not (see [`selective_leaf_kill_available`]), the rollback
+    ///   falls back to `killpg` and the escapee is alive but never out of
+    ///   containment: `setsid` does not change cgroup membership, so the job still
+    ///   lists it and `kill_all` ends it. Firing `cgroup.kill` in the job's *own*
+    ///   cgroup instead would take down every unrelated member of the same job.
     /// - **POSIX process group** — alive and gone from containment: the standing
     ///   `Mechanism::ProcessGroup` escape hatch, identical for `kill_all` /
     ///   `shutdown` / `signal`, not something the rollback introduces.
@@ -1124,6 +1208,10 @@ mod tests {
             "escapee {escapee} never became a session leader — the test would prove nothing"
         );
 
+        // Sampled before the rollback: once it has run, the escapee's own cgroup is
+        // no longer there to be read.
+        let selective = selective_leaf_kill_available(escapee);
+
         job.rollback_pty_spawn(pid, DisplacedSpare::default());
 
         match mechanism {
@@ -1135,21 +1223,7 @@ mod tests {
                 .await;
             }
             Mechanism::CgroupV2 => {
-                assert!(
-                    is_alive(escapee),
-                    "a cgroup rollback is session-scoped by design; the escapee is \
-                     the job's to kill, not this spawn's"
-                );
-                #[cfg(feature = "process-control")]
-                assert!(
-                    job.members()
-                        .expect("read the cgroup's members")
-                        .contains(&escapee),
-                    "the escapee must still be a cgroup member — setsid does not \
-                     leave a cgroup, which is why no orphan escapes the job"
-                );
-                job.kill_all().expect("the job's own teardown");
-                wait_until_gone(escapee, "the job's cgroup.kill must reach the escapee").await;
+                assert_cgroup_escapee_scope(&job, escapee, selective).await;
             }
             Mechanism::ProcessGroup => {
                 assert!(
@@ -1236,9 +1310,12 @@ mod tests {
     ///   keeps it when orphaned onto the reaper, so `PROC_REAP_KILL` walks it all
     ///   the same (`groups::freebsd_reaper::a_setsid_escapee_stays_contained` proves
     ///   the same property against a root that is not merely dead but reaped).
-    /// - **Linux cgroup** — alive, and still a cgroup member: `setsid` does not
-    ///   leave a cgroup and neither does losing a parent, so the job's `kill_all`
-    ///   ends it.
+    /// - **Linux cgroup** — same as with a live root, and for the same reason: the
+    ///   rollback's leaf-scoped `cgroup.kill` is aimed at a *directory*, not looked
+    ///   up through the pty child, and a dead root leaves its leaf's other members
+    ///   where they were. So dead where this host grants that leaf, and otherwise
+    ///   alive and still a cgroup member — `setsid` does not leave a cgroup and
+    ///   neither does losing a parent, so the job's `kill_all` ends it.
     /// - **POSIX process group** — alive and escaped, the standing
     ///   `Mechanism::ProcessGroup` limit.
     #[tokio::test]
@@ -1274,11 +1351,19 @@ mod tests {
             .env(ESCAPEE_PIDFILE, &file);
 
         let published = RefCell::new(None);
+        let selective = Cell::new(false);
         rolled_back_pty_spawn(&job, &mut command, |_pid| {
             // Deliberately no liveness probe on the root here: `is_alive` reaps, and
             // reaping would unpin the very number the rollback is about to hand to
             // the kernel. The escapee's publication is the proof of the state.
-            *published.borrow_mut() = published_blocking(&file, PUBLISH_BUDGET);
+            let text = published_blocking(&file, PUBLISH_BUDGET);
+            // Which cgroup contract this host is under, sampled here — inside the
+            // guard, before the backend rollback runs — because a leaf the rollback
+            // kills and reclaims is no longer there to be read afterwards.
+            if let Some(pid) = text.as_deref().and_then(|t| t.trim().parse::<u32>().ok()) {
+                selective.set(selective_leaf_kill_available(pid));
+            }
+            *published.borrow_mut() = text;
         });
 
         let escapee = parse_published(published.into_inner(), "the orphaned setsid escapee");
@@ -1292,21 +1377,7 @@ mod tests {
                 .await;
             }
             Mechanism::CgroupV2 => {
-                assert!(
-                    is_alive(escapee),
-                    "a cgroup rollback is session-scoped by design; the escapee is \
-                     the job's to kill, not this spawn's"
-                );
-                #[cfg(feature = "process-control")]
-                assert!(
-                    job.members()
-                        .expect("read the cgroup's members")
-                        .contains(&escapee),
-                    "the escapee must still be a cgroup member — neither setsid nor \
-                     losing its parent takes a process out of a cgroup"
-                );
-                job.kill_all().expect("the job's own teardown");
-                wait_until_gone(escapee, "the job's cgroup.kill must reach the escapee").await;
+                assert_cgroup_escapee_scope(&job, escapee, selective.get()).await;
             }
             Mechanism::ProcessGroup => {
                 assert!(

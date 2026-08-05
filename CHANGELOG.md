@@ -64,10 +64,12 @@ to a dated version section.
   so a long-lived group accumulated one live process per failed PTY launch. The
   rollback now hard-kills that child through the backend's own containment as
   part of the failed launch — `PROC_REAP_KILL` over the FreeBSD reaper subtree,
-  or `killpg` over the child's session on the cgroup and process-group
-  backends — aimed at that spawn alone, not at the rest of the job. It is a
-  best-effort teardown on a failure path, not a new containment guarantee. The
-  error returned to the caller is unchanged.
+  `cgroup.kill` over that spawn's own leaf sub-cgroup on the Linux cgroup
+  backend (falling back to `killpg` over the child's session where no leaf could
+  be made or the write is refused), or `killpg` over that session on the
+  process-group backend — aimed at that spawn alone, not at the rest of the job.
+  It is a best-effort teardown on a failure path, not a new containment
+  guarantee. The error returned to the caller is unchanged.
 - Keep that same failed Unix PTY launch from overriding a stop the caller made
   without escalation (`escalate_to_kill = false`, or `ProcessGroup::stop`'s
   `escalate` argument). Every successful spawn re-arms the group's kill-on-drop
@@ -81,10 +83,17 @@ to a dated version section.
   and keeps its own kill-on-drop teardown, since nothing ever chose to spare it.
   With the spare back in place, dropping the group hard-kills nothing, which is
   what the non-escalating stop asked for and also means the drop no longer sweeps
-  up what the rollback's own teardown could not reach: on the Linux cgroup backend
-  a descendant of the failed launch that had escaped the rollback's `killpg` by
-  calling `setsid` is now left running, contained in the group's cgroup, instead of
-  being killed on drop. `kill_all` still reaches it while the group is alive.
+  up what the rollback's own teardown could not reach. On the Linux cgroup backend
+  that leaves something behind only where the rollback had to fall back to
+  `killpg`: where the failed launch had a leaf sub-cgroup of its own and the
+  `cgroup.kill` written there was accepted, the rollback has already SIGKILLed that
+  spawn's whole subtree — including a descendant that called `setsid`, which does
+  not move it out of the leaf — so the drop has nothing of it left to spare. Where
+  it did not (the host made no leaf for that spawn, or the write was refused by a
+  kernel < 5.14 or a restricted delegated cgroup), such a descendant is out of the
+  `killpg`'s reach and is now left running, contained in the group's cgroup,
+  instead of being killed on drop. `kill_all` still reaches it while the group is
+  alive.
   Internal bookkeeping only: no public API change, and the error returned from the
   failed launch is unchanged.
 - Stop a `Pipeline`'s chain-wide `timeout` from duplicating the tail of the last

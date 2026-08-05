@@ -2,6 +2,12 @@
 //! process-group fallback when no writable cgroup is available (e.g. a CI runner
 //! without cgroup delegation).
 //!
+//! Each spawn is routed into a **per-spawn leaf sub-cgroup** of that cgroup where
+//! the host allows one, which is what makes a selective "kill exactly this spawn's
+//! tree" possible at all (see [`Leaves`]); the job's own cgroup remains the
+//! whole-job handle, since `cgroup.kill`/`cgroup.freeze` written there act on it
+//! *and* every descendant.
+//!
 //! [cgroup v2]: https://docs.kernel.org/admin-guide/cgroup-v2.html
 
 use std::ffi::{CStr, CString};
@@ -10,6 +16,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -48,7 +55,10 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 /// salt keeps these leftovers from ever affecting a *future* run. A startup sweep
 /// is deliberately NOT done: it would have to scan the delegated hierarchy and
 /// could race another live ProcessKit instance's dirs. Operators who churn through
-/// many crashes can reclaim stale `processkit-*` dirs out of band.
+/// many crashes can reclaim stale `processkit-*` dirs out of band — depth-first,
+/// since such a directory holds the per-spawn leaf sub-cgroups ([`Leaves`]) of the
+/// spawns that were live when the host died, and a cgroup directory with children
+/// cannot be `rmdir`ed before them.
 fn cgroup_name_salt() -> u64 {
     static SALT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *SALT.get_or_init(|| {
@@ -177,8 +187,15 @@ impl Job {
             Backend::Cgroup(cg) => {
                 // The cgroup path never touches process groups, so a setsid
                 // pre-exec hook needs no coordination here.
-                let procs = CString::new(cg.path.join("cgroup.procs").into_os_string().into_vec())
-                    .map_err(|_| {
+                //
+                // Reserve this spawn's own leaf sub-cgroup, so a later rollback can
+                // kill exactly this tree (see `Leaves`). The slot removes the
+                // directory again on every path out of here that never produces a
+                // child, and hands back the job's own `cgroup.procs` on a host where
+                // no leaf could be made — the child is contained either way.
+                let leaf = cg.open_leaf();
+                let procs =
+                    CString::new(leaf.procs_path().into_os_string().into_vec()).map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidInput, "cgroup path contains NUL")
                     })?;
                 // Join the cgroup in the forked child *before* exec, so there is
@@ -191,6 +208,10 @@ impl Job {
                 }
                 arm(cmd);
                 let child = cmd.spawn()?;
+                // The launch produced a child, so the leaf is now this job's to
+                // enumerate, kill and reclaim; keyed by the pid a rollback would
+                // name it with.
+                leaf.commit(child.id().map(|pid| pid as i32));
                 // Re-arm the kill-on-drop backstop now a child has joined: a
                 // prior graceful_shutdown(escalate=false) latched this flag to
                 // spare survivors; a fresh member must not be spared by it. Done
@@ -242,25 +263,44 @@ impl Job {
     /// states in full.
     ///
     /// The process-group fallback delegates to the shared backend's own
-    /// kill-then-forget. The cgroup backend has no per-child Rust registration to
-    /// undo, so the rollback is purely the kill — `killpg` over the pty child's
-    /// session (it is a session leader, pgid == pid) with the usual direct-pid
-    /// fallback, reaching this spawn's descendants without touching the rest of the
-    /// job.
+    /// kill-then-forget. The cgroup backend aims at **this spawn's own leaf
+    /// sub-cgroup** (see [`Leaves`]): `cgroup.kill` written there SIGKILLs that
+    /// leaf's whole subtree atomically — the direct child, whatever it forked in
+    /// the setup window, and a descendant that `setsid`'d away too, since cgroup
+    /// membership is inherited across `fork` and `setsid` does not change it —
+    /// while the rest of the job, living in its own leaves, is untouched. That is
+    /// the selective subtree kill cgroup v2 has no other way to express: written in
+    /// the job's own cgroup the same file kills **every** member, i.e. unrelated
+    /// runs of the same `ProcessGroup`, which a single failed spawn must not do.
     ///
-    /// Honest about what that leaves: a descendant that forked and called `setsid`
-    /// inside the setup window is out of `killpg`'s reach, but it has **not** left
-    /// the cgroup — membership is inherited across `fork` and `setsid` does not
-    /// change it — so it stays a member and is still reported by `members()`.
-    /// Nothing on this failure path moves it out of the cgroup this job holds, so
-    /// every kill this job *does* perform reaches it (`cgroup.kill`, whole-subtree
-    /// and atomic). But the two entry points do not perform the same kills:
-    /// `kill_all` performs one whenever it is called, for as long as the job is
-    /// alive, while `Drop` performs one only while the kill-on-drop backstop is
-    /// armed — and the restore below is entitled to leave it disarmed. Firing
-    /// `cgroup.kill` from here to close that microsecond instead is deliberately
-    /// rejected: it kills **every** member of the cgroup, i.e. unrelated runs of the
-    /// same `ProcessGroup`, which a single failed spawn must not do.
+    /// It is aimed by the pid this spawn returned, which the caller still owns
+    /// un-reaped, so no number recycled since can steer it: registering a leaf
+    /// retires any older one still claiming the same pid, this call retires the pid
+    /// it consumes, and a leaf leaves the registry only once the kernel has
+    /// confirmed its directory is gone (see [`Cgroup::kill_leaf_of`]).
+    ///
+    /// **The two conditions that gate that kill** — neither of which gates the
+    /// job's own whole-tree teardown:
+    ///
+    /// - this spawn has **a leaf at all**: a host that refused the `mkdir`, or a
+    ///   fresh directory the child could not have joined, makes the spawn join the
+    ///   job's own cgroup instead ([`Cgroup::open_leaf`]);
+    /// - the `cgroup.kill` write is **accepted**: a kernel < 5.14 has no such file,
+    ///   and a restricted delegated cgroup may refuse the write.
+    ///
+    /// Failing either, this falls back to what this arm did before leaves existed:
+    /// `killpg` over the pty child's session (it is a session leader, pgid == pid)
+    /// with the usual direct-pid fallback, reaching this spawn's descendants without
+    /// touching the rest of the job. Honest about what *that* leaves: a descendant
+    /// that forked and called `setsid` inside the setup window is out of `killpg`'s
+    /// reach, but it has **not** left the cgroup, so it stays a member and is still
+    /// reported by `members()`. Nothing on this failure path moves it out of the
+    /// cgroup tree this job holds — a leaf is a *descendant* of the job's cgroup, so
+    /// a whole-job `cgroup.kill` still covers it — and every kill this job *does*
+    /// perform therefore reaches it. But the two entry points do not perform the
+    /// same kills: `kill_all` performs one whenever it is called, for as long as the
+    /// job is alive, while `Drop` performs one only while the kill-on-drop backstop
+    /// is armed — and the restore below is entitled to leave it disarmed.
     ///
     /// Either way the kill-on-drop backstop comes last: `displaced` is the spare
     /// this spawn's own re-arm took away, and putting it back leaves the latch as a
@@ -271,22 +311,26 @@ impl Job {
     /// [`SkipDropKill::restore`](super::SkipDropKill::restore)); each arm restores
     /// on the latch its own `Drop` reads.
     ///
-    /// A restore that takes is what narrows the paragraph above, and it narrows it
-    /// for the whole cgroup: as long as that spare stands (no later `spawn`/`adopt`
-    /// re-arms the backstop), `Drop` runs no `cgroup.kill` at all — so a `setsid`
-    /// escapee of this very spawn is not killed there either. It is left running
-    /// inside the cgroup dir `Drop` then leaves behind (that `rmdir` fails `EBUSY`
-    /// while members remain), on the same terms as the survivors the caller chose
-    /// not to escalate against, and `kill_all` is what still kills it while the job
-    /// lives. Re-arming the backstop here to catch it would revoke the
-    /// `escalate = false` decision for every other member too — a failed spawn
-    /// overturning a shutdown call that was not its to make, which is the trade this
-    /// rollback declines.
+    /// A restore that takes is what narrows the **fallback** paragraph above, and it
+    /// narrows it for the whole cgroup tree: as long as that spare stands (no later
+    /// `spawn`/`adopt` re-arms the backstop), `Drop` runs no `cgroup.kill` at all —
+    /// so a `setsid` escapee the fallback could not reach is not killed there
+    /// either. It is left running inside the cgroup dirs `Drop` then leaves behind
+    /// (that `rmdir` fails `EBUSY` while members remain), on the same terms as the
+    /// survivors the caller chose not to escalate against, and `kill_all` is what
+    /// still kills it while the job lives. Where the leaf kill *did* run, this
+    /// spawn's whole subtree was SIGKILLed before the restore, so the spare is not
+    /// what leaves any of it running. Re-arming the backstop here to catch what the
+    /// fallback missed would revoke the `escalate = false` decision for every other
+    /// member too — a failed spawn overturning a shutdown call that was not its to
+    /// make, which is the trade this rollback declines.
     #[cfg(feature = "pty")]
     pub(crate) fn rollback_pty_spawn(&self, pid: u32, displaced: super::DisplacedSpare) {
         match &self.backend {
-            Backend::Cgroup(_) => {
-                crate::sys::pgroup::hard_kill_fresh_spawn(pid as i32);
+            Backend::Cgroup(cg) => {
+                if !cg.kill_leaf_of(pid as i32) {
+                    crate::sys::pgroup::hard_kill_fresh_spawn(pid as i32);
+                }
                 self.skip_drop_kill.restore(displaced);
             }
             Backend::ProcessGroup(pg) => pg.rollback_pty_spawn(pid, displaced),
@@ -304,6 +348,15 @@ impl Job {
                 // Moving a pid into the cgroup is a single write to cgroup.procs;
                 // the kernel re-parents that process (its existing descendants are
                 // not retroactively pulled in — only future forks).
+                //
+                // Into the job's own cgroup, not a per-spawn leaf of its own: a leaf
+                // buys selectivity for an *undo*, and there is no undo of an adopt —
+                // nothing ever aims a kill at one adopted child alone. The job cgroup
+                // may hold these members and the leaf directories at once because
+                // this backend never enables controllers in its **own**
+                // `cgroup.subtree_control` (see `Cgroup::create`), which is the only
+                // thing cgroup v2's "no internal processes" rule forbids combining
+                // with child cgroups.
                 match cgroup_write(&cg.path.join("cgroup.procs"), pid.to_string().as_bytes()) {
                     Ok(()) => {
                         // A new killable member joined the cgroup — re-arm Drop's
@@ -416,7 +469,8 @@ impl Job {
     #[cfg(feature = "process-control")]
     pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
         let pids = match &self.backend {
-            // Whole tree: every pid in cgroup.procs.
+            // Whole tree: every pid in the job's own `cgroup.procs` and in each of
+            // its per-spawn leaves' (`Leaves`).
             Backend::Cgroup(cg) => cg.members()?,
             // Fallback tracks group leaders only.
             Backend::ProcessGroup(pg) => pg.members(),
@@ -624,6 +678,17 @@ impl Drop for Job {
                 // already gone. That permanent empty-dir leak is the accepted cost
                 // of choosing not to escalate — symmetric with the Windows backend
                 // deliberately orphaning its survivors.
+                //
+                // The per-spawn leaves go first and unconditionally: a cgroup
+                // directory that still has child directories cannot be removed at
+                // all (`rmdir` answers `ENOTEMPTY`), so an unreclaimed leaf would
+                // leak the whole job directory rather than just itself. On the
+                // escalate=false path the leaves that *are* empty are still worth
+                // reclaiming even though their parent must stay — and the one a
+                // spared survivor lives in stays too (`EBUSY`), so that documented
+                // leak is now the job dir plus one leaf per spared spawn: the same
+                // accepted cost, one level deeper, bounded by what was spared.
+                cg.reclaim_leaves();
                 let _ = std::fs::remove_dir(&cg.path);
             }
             // The `ProcessGroup` field hard-kills its tracked groups in its own
@@ -676,20 +741,25 @@ fn cgroup2_self_dir(root: &Path) -> io::Result<PathBuf> {
 /// rejects creation (a race, an LSM policy) is where [`detect_mechanism`]'s
 /// prediction may differ from the mechanism `Job::new` ultimately falls back to.
 fn dir_allows_subdir_creation(dir: &Path) -> bool {
-    let Ok(c_path) = CString::new(dir.as_os_str().as_bytes()) else {
+    access_ok(dir, libc::W_OK | libc::X_OK)
+}
+
+/// Whether `path` exists and grants `mode` (`W_OK`, `X_OK`, …) to the **effective**
+/// ids right now — the shared `faccessat(…, AT_EACCESS)` primitive behind
+/// [`dir_allows_subdir_creation`] and the leaf-joinability probe in
+/// [`Cgroup::open_leaf`]. Creates and modifies nothing, and is best-effort by
+/// nature: a `false` (including a path that is simply not there) is what both
+/// callers act on, and neither treats a `true` as a promise that the real
+/// `mkdir`/`write` cannot still be refused.
+fn access_ok(path: &Path, mode: libc::c_int) -> bool {
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
         return false;
     };
     // SAFETY: `faccessat` is a pure permission query — it creates and modifies
     // nothing. `c_path` is a valid NUL-terminated path; the mode/flags are
-    // constants. `AT_EACCESS` checks the effective uid/gid, matching `mkdir`.
-    let rc = unsafe {
-        libc::faccessat(
-            libc::AT_FDCWD,
-            c_path.as_ptr(),
-            libc::W_OK | libc::X_OK,
-            libc::AT_EACCESS,
-        )
-    };
+    // constants. `AT_EACCESS` checks the effective uid/gid, matching the real
+    // `mkdir`/`open` the caller is predicting.
+    let rc = unsafe { libc::faccessat(libc::AT_FDCWD, c_path.as_ptr(), mode, libc::AT_EACCESS) };
     rc == 0
 }
 
@@ -747,11 +817,345 @@ fn cgroup_write(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
     std::fs::write(path, contents)
 }
 
+/// The live member pids listed by **one** cgroup directory's own `cgroup.procs`,
+/// through the caller's reader seam. The building block of
+/// [`Cgroup::members_with`], which folds the job's cgroup and each of its per-spawn
+/// leaves ([`Leaves`]) into one set.
+///
+/// A directory that is gone is empty (`NotFound` → no members — a removed cgroup
+/// holds nothing); any other read failure leaves its membership unknown and is
+/// surfaced to the caller rather than silently shortening the job's.
+fn read_member_pids(
+    dir: &Path,
+    read: impl Fn(&Path) -> io::Result<String>,
+) -> io::Result<Vec<i32>> {
+    match read(&dir.join("cgroup.procs")) {
+        Ok(procs) => Ok(procs
+            .lines()
+            // Keep only real pids: a `0`/negative line would otherwise reach
+            // `kill(pid, …)` as "the caller's whole process group" (0) or "a
+            // process group" (negative) — never a single tracked member. Note
+            // a `0` here is not only the (never-emitted) kernel guard: a member
+            // living in a **nested PID namespace** not mapped into the reader's
+            // namespace reads as `0` in `cgroup.procs`, so it is dropped here
+            // and thus skips the per-pid graceful `SIGTERM` tier (C8) — the
+            // final `cgroup.kill`, which acts on the whole cgroup regardless of
+            // pid visibility, still reaps it.
+            .filter_map(|l| l.trim().parse::<i32>().ok())
+            .filter(|&pid| pid > 0)
+            .collect()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
 struct Cgroup {
     path: PathBuf,
+    /// The per-spawn leaf sub-cgroups created under [`path`](Self::path).
+    leaves: Mutex<Leaves>,
+}
+
+/// The per-spawn **leaf sub-cgroups** of one job, and when to next reclaim their
+/// directories.
+///
+/// cgroup v2 offers no way to kill *part* of a cgroup: `cgroup.kill` takes the
+/// whole subtree of the directory it is written in. Giving every spawn a leaf
+/// directory of its own under the job's cgroup is therefore what turns "kill
+/// exactly this spawn's tree, and nothing else of the job" into a single atomic
+/// kernel operation — [`Job::rollback_pty_spawn`] is its one user today. It is also
+/// the canonical cgroup v2 shape: the "no internal processes" rule wants processes
+/// in leaves as soon as a cgroup distributes resources to children.
+///
+/// What does **not** change shape: the job's own cgroup stays the whole-job handle.
+/// `cgroup.kill` and `cgroup.freeze` written there act on it *and every descendant*,
+/// so `kill_all`, the graceful tier, `suspend`/`resume` and `Drop` each reach every
+/// leaf with the same single write they already made — none of them gained a
+/// per-leaf walk, and none of them changed *when* it writes (`Drop` still writes only
+/// while the kill-on-drop backstop is armed, as before). `cgroup.procs`, in contrast,
+/// lists only the directory's **own** members and never a descendant's, so membership
+/// enumeration — and everything built on it — reads the job's cgroup plus each live
+/// leaf ([`Cgroup::members_with`]).
+///
+/// Resource limits stay on the job's cgroup and are inherited: this backend never
+/// writes its **own** `cgroup.subtree_control` (only the *parent*'s, to make the
+/// limit interface files appear — see [`Cgroup::enable_controllers`]), so no
+/// controller is enabled *in* a leaf, and a leaf is transparent for accounting — the
+/// charges of its members land on the job cgroup's own counters, which is what the
+/// caps there constrain and what [`Cgroup::limit_evidence`] reads back.
+///
+/// A `Job` never learns that a child exited (the `Child` handles belong to the
+/// caller), so a leaf outlives the process that lived in it and its directory is
+/// reclaimed lazily: [`Cgroup::reclaim_leaves`] `rmdir`s every leaf the kernel lets
+/// go of, from teardown, from a selective kill, and opportunistically from a launch
+/// once [`reclaim_at`](Self::reclaim_at) is reached.
+struct Leaves {
+    /// One entry per leaf directory this job has created and not seen removed.
+    live: Vec<Leaf>,
+    /// The `live.len()` at which the next launch pays for a reclaim pass. Each pass
+    /// costs one `rmdir` per live leaf and then re-arms this at twice what it left
+    /// behind (never below [`LEAF_RECLAIM_FLOOR`]), which keeps the reclaim
+    /// amortized O(1) per spawn while bounding the leftover directories to roughly
+    /// twice the job's peak concurrency.
+    reclaim_at: usize,
+}
+
+/// One per-spawn leaf: the directory a single launch routed its child into.
+struct Leaf {
+    /// The pid that launch returned, while this leaf is still the one that pid
+    /// names. `None` once that spawn is over — its rollback consumed it, or a later
+    /// spawn was handed the same number — or when the launch never returned a pid at
+    /// all and its leaf was registered by [`LeafSlot`]'s drop instead. Either way it
+    /// leaves a directory to reclaim and members to enumerate, but nothing a selective
+    /// kill may aim at: a pid the kernel has since recycled, or one this job never
+    /// held, must never steer a kill at a leaf.
+    pid: Option<i32>,
+    dir: PathBuf,
+}
+
+/// The smallest number of leaf directories a job keeps before a launch pays for a
+/// reclaim pass — see [`Leaves::reclaim_at`].
+const LEAF_RECLAIM_FLOOR: usize = 16;
+
+impl Leaves {
+    const fn new() -> Self {
+        Leaves {
+            live: Vec::new(),
+            reclaim_at: LEAF_RECLAIM_FLOOR,
+        }
+    }
+
+    /// `rmdir` every leaf directory the kernel lets go of, dropping exactly those
+    /// entries. A directory that is *not* removable still holds members (cgroup v2
+    /// answers `EBUSY` while it does, `ENOTEMPTY` while it has children of its own),
+    /// so its entry stays — an entry is released only on the kernel's own
+    /// confirmation that there is nothing left to enumerate or kill there, never on
+    /// an assumption, which is what keeps a reclaim from narrowing what the job can
+    /// still reach. A directory already gone (`NotFound`) is equally confirmed.
+    fn reclaim(&mut self) {
+        self.live
+            .retain(|leaf| match std::fs::remove_dir(&leaf.dir) {
+                Ok(()) => false,
+                Err(e) => e.kind() != io::ErrorKind::NotFound,
+            });
+        self.reclaim_at = self.live.len().saturating_mul(2).max(LEAF_RECLAIM_FLOOR);
+    }
+}
+
+/// The leaf sub-cgroup reserved for a launch that has not happened yet, handed out
+/// by [`Cgroup::open_leaf`] and turned over to the job's registry by
+/// [`commit`](Self::commit) once a child exists.
+///
+/// Its `Drop` is what keeps a launch that never reached `commit` — a `cgroup.procs`
+/// path that cannot be a `CString`, a `Command::spawn` that fails, a panic — from
+/// leaving the directory it reserved behind: it `rmdir`s it. Until then nothing else
+/// can be looking at that directory, since a leaf becomes visible to the rest of this
+/// backend only once it is registered.
+///
+/// **A launch that fails can still have left a child in it**, so it is that `rmdir`'s
+/// answer — not the failure — that decides the leaf's fate. `Ok`/`NotFound` is the
+/// kernel's own confirmation that there is nothing in there, and releases it; any
+/// other answer (`EBUSY` while it holds members, `ENOTEMPTY` while it has children of
+/// its own) hands the directory to the registry instead
+/// ([`register_leaf`](Cgroup::register_leaf)) — the same "release only on a confirmed
+/// answer" rule [`Leaves::reclaim`] follows. What this must not do is *forget* a
+/// directory the kernel refused to take: the registry is what
+/// [`members_with`](Cgroup::members_with) reads and what
+/// [`reclaim_leaves`](Cgroup::reclaim_leaves) revisits, so a forgotten leaf would take
+/// a live member out of every whole-job verb that enumerates — `members`, `stats`,
+/// `is_empty`, the graceful tier, and the per-pid sweep the pre-5.14 teardown falls
+/// back to ([`kill_with_seams`](Cgroup::kill_with_seams), which would then report a
+/// job drained that it never killed) — and would leak both directories, since a job
+/// cgroup that still has a child directory cannot be removed at all.
+///
+/// That a failed launch can leave a live child is tokio's post-fork setup:
+/// `Command::spawn` there is `std::process::Command::spawn` followed by steps that can
+/// fail *after* it — registering the child's stdio with the reactor, opening its pidfd
+/// — and those return the error while dropping the `std::process::Child`, which does
+/// not kill it. The pre-exec hook put that child in the leaf before its `exec`, so it
+/// is alive and contained there, with the launch reporting only an `Err`.
+///
+/// Such a leaf is registered with **no pid**: the launch returned none, and a
+/// selective kill may never be aimed at a leaf on a number nothing can vouch for
+/// (see [`Leaf::pid`]). Enumerating it, killing the whole job, and reclaiming it once
+/// it drains need no pid — and are exactly what registering it preserves.
+struct LeafSlot<'a> {
+    cg: &'a Cgroup,
+    /// `None` when no leaf could be reserved (the launch joins the job's own cgroup)
+    /// or once [`commit`](Self::commit) has handed it over.
+    dir: Option<PathBuf>,
+}
+
+impl LeafSlot<'_> {
+    /// The `cgroup.procs` the child must write itself into: the reserved leaf's, or
+    /// the job cgroup's own when there is no leaf.
+    fn procs_path(&self) -> PathBuf {
+        self.dir
+            .as_deref()
+            .unwrap_or(&self.cg.path)
+            .join("cgroup.procs")
+    }
+
+    /// The launch produced a child (`pid`, or `None` if it was already gone by the
+    /// time the spawn returned): hand the leaf to the job's registry, where it is
+    /// enumerated, selectively killable and eventually reclaimed.
+    fn commit(mut self, pid: Option<i32>) {
+        if let Some(dir) = self.dir.take() {
+            self.cg.register_leaf(pid, dir);
+        }
+    }
+}
+
+impl Drop for LeafSlot<'_> {
+    fn drop(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            match std::fs::remove_dir(&dir) {
+                // Confirmed empty (or already gone): there is nothing left to
+                // enumerate, kill or reclaim, so the job need never hear of it.
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                // Refused: something is in there — a child of a launch that failed
+                // after its fork. Hand it over, pid-less, rather than forget it.
+                Err(_) => self.cg.register_leaf(None, dir),
+            }
+        }
+    }
 }
 
 impl Cgroup {
+    /// A handle over an existing cgroup directory, with no leaves yet.
+    fn at(path: PathBuf) -> Self {
+        Cgroup {
+            path,
+            leaves: Mutex::new(Leaves::new()),
+        }
+    }
+
+    /// The lock over this job's leaf registry, recovered rather than propagated if a
+    /// panic poisoned it: every path that takes it is a short, allocation-light
+    /// critical section, and the ones that matter run inside `Drop` and a rollback,
+    /// where dropping the registry would leak directories or void a kill.
+    fn leaves(&self) -> std::sync::MutexGuard<'_, Leaves> {
+        self.leaves.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The live leaf directories, snapshotted so the membership reads that follow
+    /// hold no lock while they touch the filesystem.
+    fn leaf_dirs(&self) -> Vec<PathBuf> {
+        self.leaves()
+            .live
+            .iter()
+            .map(|leaf| leaf.dir.clone())
+            .collect()
+    }
+
+    /// Reserve the leaf sub-cgroup for one launch — the `mkdir`, and the check that
+    /// a child could actually join what it created.
+    ///
+    /// Best-effort by design: a host that refuses the `mkdir` (a `cgroup.max.depth`
+    /// or `cgroup.max.descendants` cap on the delegated subtree, a filesystem
+    /// remounted read-only since the job was created) hands back a slot with no leaf,
+    /// and the launch joins the job's own cgroup exactly as it did before leaves
+    /// existed. Containment is identical either way — only the *selectivity* of a
+    /// later rollback is lost (see [`Job::rollback_pty_spawn`]).
+    ///
+    /// The joinability probe is the reason this cannot cost a spawn: the child joins
+    /// by writing its own pid to `cgroup.procs` **after** the fork, where a failure
+    /// can do nothing but fail the whole launch, so the parent asks here — while
+    /// falling back to the job's cgroup is still possible — whether that file is
+    /// there and writable. On cgroupfs the kernel populates a fresh cgroup with its
+    /// interface files, so this passes whenever the `mkdir` did; what it rules out is
+    /// routing a child into a directory that is not a cgroup at all.
+    fn open_leaf(&self) -> LeafSlot<'_> {
+        // The job dir is fresh (`create` retries a name collision away), and the
+        // counter is process-wide and monotonic, so a name collision inside it is
+        // not a case to retry — an error here simply means no leaf for this spawn.
+        let dir = self
+            .path
+            .join(format!("spawn-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed)));
+        if std::fs::create_dir(&dir).is_err() {
+            return LeafSlot {
+                cg: self,
+                dir: None,
+            };
+        }
+        if !access_ok(&dir.join("cgroup.procs"), libc::W_OK) {
+            let _ = std::fs::remove_dir(&dir);
+            return LeafSlot {
+                cg: self,
+                dir: None,
+            };
+        }
+        LeafSlot {
+            cg: self,
+            dir: Some(dir),
+        }
+    }
+
+    /// Take `dir` into the registry as the leaf of the spawn that returned `pid`,
+    /// and pay for a reclaim pass if enough leaves have accumulated.
+    ///
+    /// A pid the kernel recycled onto this new spawn cannot leave two leaves
+    /// answering to one number: any older entry still claiming it is retired here
+    /// (its directory stays registered until the kernel confirms it is gone — see
+    /// [`Leaves::reclaim`]), so a lookup by pid can only ever find this one.
+    fn register_leaf(&self, pid: Option<i32>, dir: PathBuf) {
+        let mut leaves = self.leaves();
+        if let Some(pid) = pid {
+            for leaf in &mut leaves.live {
+                if leaf.pid == Some(pid) {
+                    leaf.pid = None;
+                }
+            }
+        }
+        leaves.live.push(Leaf { pid, dir });
+        if leaves.live.len() >= leaves.reclaim_at {
+            leaves.reclaim();
+        }
+    }
+
+    /// SIGKILL the subtree of the spawn that returned `pid` — that spawn's leaf and
+    /// nothing else of this job — reporting whether that kill was performed.
+    ///
+    /// `false` means no selective kill happened and the caller must fall back to its
+    /// own (see [`Job::rollback_pty_spawn`]), for one of two reasons kept
+    /// deliberately distinct from anything about the job's whole-tree teardown: the
+    /// spawn has no leaf (this job never made one for that pid, or the pid was
+    /// retired), or the `cgroup.kill` write was refused (a kernel < 5.14 has no such
+    /// file; a restricted delegated cgroup can reject the write). In the second case
+    /// the leaf keeps holding whatever it held, still enumerated by
+    /// [`members`](Self::members) and still covered by the job's own recursive
+    /// `cgroup.kill`.
+    ///
+    /// The pid is retired either way: the spawn it named is over, and letting a
+    /// number the kernel may recycle keep steering a kill here would be strictly
+    /// worse than the fallback. The directory is *not* released on that account —
+    /// only [`Leaves::reclaim`]'s `rmdir` releases one, and `cgroup.kill` is
+    /// asynchronous (the kernel has delivered SIGKILL when the write returns; the
+    /// members leave `cgroup.procs` as they exit), so a leaf that is still draining
+    /// simply survives this reclaim and is taken by the next one, or by `Drop`.
+    #[cfg(feature = "pty")]
+    fn kill_leaf_of(&self, pid: i32) -> bool {
+        let dir = {
+            let mut leaves = self.leaves();
+            let Some(leaf) = leaves.live.iter_mut().find(|leaf| leaf.pid == Some(pid)) else {
+                return false;
+            };
+            leaf.pid = None;
+            leaf.dir.clone()
+        };
+        if cgroup_write(&dir.join("cgroup.kill"), b"1").is_err() {
+            return false;
+        }
+        self.reclaim_leaves();
+        true
+    }
+
+    /// Reclaim every leaf directory the kernel lets go of — see [`Leaves::reclaim`]
+    /// for why that is the only condition under which one is dropped.
+    fn reclaim_leaves(&self) {
+        self.leaves().reclaim();
+    }
+
     fn create(#[cfg(feature = "limits")] limits: &ResourceLimits) -> io::Result<Self> {
         // Locate the cgroup v2 (unified) mount root. The common case is
         // `/sys/fs/cgroup` (pure v2), but a systemd **hybrid** host mounts the v2
@@ -767,9 +1171,13 @@ impl Cgroup {
         let parent = cgroup2_self_dir(root)?;
 
         // Without limits, no controllers are enabled — `cgroup.kill` needs none,
-        // and that sidesteps the "no internal processes" rule. mkdir is the
-        // permission gate that triggers the process-group fallback when delegation
-        // is absent.
+        // and that sidesteps the "no internal processes" rule. Even *with* limits,
+        // the controllers are enabled in the PARENT's `cgroup.subtree_control` (see
+        // `enable_controllers`), never in this cgroup's own, which is what lets it
+        // hold adopted members and the per-spawn leaf directories (`Leaves`) at the
+        // same time: the rule forbids only distributing resources to children while
+        // holding processes. mkdir is the permission gate that triggers the
+        // process-group fallback when delegation is absent.
         //
         // Retry with a fresh counter when the dir already exists — a leftover from
         // a crashed run whose pid was recycled, or two crate versions sharing the
@@ -803,7 +1211,7 @@ impl Cgroup {
                 "could not create a unique cgroup directory after retries",
             )
         })?;
-        let cg = Cgroup { path };
+        let cg = Cgroup::at(path);
 
         // With limits, enable the matching controllers and write the caps. If that
         // fails (no delegation, or the parent holds processes so it can't carry
@@ -925,12 +1333,17 @@ impl Cgroup {
     ///
     /// Each counter is read from the `.local` file first (`memory.events.local`,
     /// `pids.events.local`, kernels that have them), falling back to the
-    /// hierarchical file. Both are correct here — this cgroup is a leaf with no
-    /// children, and an *ancestor* cap cannot be misattributed to it either, because
-    /// applying a cap at all requires our parent to be the real cgroup-v2 hierarchy
-    /// root (see [`apply_limits`](Self::apply_limits)), which carries no caps of its
-    /// own — but preferring the strictly-local file keeps the verdict sound even if
-    /// a contained child manages to nest a cgroup of its own inside ours.
+    /// hierarchical file. Both are correct here. The per-spawn leaf sub-cgroups
+    /// below this one ([`Leaves`]) do not change that: this backend enables no
+    /// controller *in* them (it writes only its **parent**'s `subtree_control`, see
+    /// [`enable_controllers`](Self::enable_controllers)), so a leaf carries no
+    /// counters of its own and its members' charges — and the events they raise —
+    /// land on this cgroup, which is exactly what the `.local` file reports. An
+    /// *ancestor* cap cannot be misattributed to it either, because applying a cap at
+    /// all requires our parent to be the real cgroup-v2 hierarchy root (see
+    /// [`apply_limits`](Self::apply_limits)), which carries no caps of its own — but
+    /// preferring the strictly-local file keeps the verdict sound even if a contained
+    /// child manages to nest a cgroup of its own, with controllers, inside ours.
     ///
     /// A file or key that isn't there (an older kernel, a controller without
     /// bandwidth accounting, an unreadable cgroup) yields `Unknown`, never a "no".
@@ -1041,8 +1454,10 @@ impl Cgroup {
         Ok(())
     }
 
-    /// Read the live member pids. A removed cgroup is empty; other read failures
-    /// leave its state unknown and are surfaced to the caller.
+    /// Read the live member pids of the **whole job** — this cgroup's own members
+    /// plus those of every live per-spawn leaf under it ([`Leaves`]). A removed
+    /// cgroup is empty; other read failures leave its state unknown and are surfaced
+    /// to the caller.
     fn members(&self) -> io::Result<Vec<i32>> {
         self.members_with(|path| std::fs::read_to_string(path))
     }
@@ -1053,25 +1468,32 @@ impl Cgroup {
     /// (`is_empty`, `signal`, `kill`, `stats`) is threaded through so *their* tests
     /// can drive the same error paths without a real cgroup filesystem. `Fn` (not
     /// `FnOnce`): the legacy kill sweep below calls this in a bounded retry loop.
+    ///
+    /// **One pass over the whole job.** `cgroup.procs` lists a cgroup's *own*
+    /// members and never a descendant's, so the job's membership is the union of its
+    /// own file and one per live per-spawn leaf ([`Leaves`]) — one read per cgroup
+    /// of the job, for the whole snapshot. That keeps the batched identity-safe
+    /// disciplines built on this (pin every member, then take **one** membership
+    /// pass, then reconfirm each pinned member against it — see
+    /// [`signal_with_seams`](Self::signal_with_seams) and
+    /// [`stats_with_seams`](Self::stats_with_seams)) at two passes for a whole
+    /// broadcast rather than two per pid, and rescans nothing per pid.
+    ///
+    /// The result is a **set**: sorted, and de-duplicated because the union is
+    /// several files read in sequence rather than one atomic snapshot, so a member
+    /// that moves between two of this job's own cgroups mid-pass must not be folded
+    /// twice by `stats` or signalled twice by a broadcast. A leaf whose directory is
+    /// already gone reads as empty (`NotFound`), exactly as a removed job cgroup
+    /// does; any other read failure propagates, since an unreadable membership is
+    /// unknown, not "no processes".
     fn members_with(&self, read: impl Fn(&Path) -> io::Result<String>) -> io::Result<Vec<i32>> {
-        match read(&self.path.join("cgroup.procs")) {
-            Ok(procs) => Ok(procs
-                .lines()
-                // Keep only real pids: a `0`/negative line would otherwise reach
-                // `kill(pid, …)` as "the caller's whole process group" (0) or "a
-                // process group" (negative) — never a single tracked member. Note
-                // a `0` here is not only the (never-emitted) kernel guard: a member
-                // living in a **nested PID namespace** not mapped into the reader's
-                // namespace reads as `0` in `cgroup.procs`, so it is dropped here
-                // and thus skips the per-pid graceful `SIGTERM` tier (C8) — the
-                // final `cgroup.kill`, which acts on the whole cgroup regardless of
-                // pid visibility, still reaps it.
-                .filter_map(|l| l.trim().parse::<i32>().ok())
-                .filter(|&pid| pid > 0)
-                .collect()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(e),
+        let mut pids = read_member_pids(&self.path, &read)?;
+        for dir in self.leaf_dirs() {
+            pids.extend(read_member_pids(&dir, &read)?);
         }
+        pids.sort_unstable();
+        pids.dedup();
+        Ok(pids)
     }
 
     /// The live members enriched with ppid / `comm` / start time, each read from a
@@ -1166,13 +1588,15 @@ impl Cgroup {
     /// without a real `/proc` or cgroup.
     ///
     /// Batched exactly like [`signal_with_seams`](Self::signal_with_seams): pin
-    /// (capture the start-time identity of) **every** member first, then read
-    /// `cgroup.procs` exactly **once**, then reconfirm each pinned member against
-    /// that single snapshot and read its counters gated on the pinned identity
-    /// (`sample_pinned`). The lone reconfirm read lands after every capture, so it
-    /// is after *each* member's pin — the same race-freedom order the per-member
-    /// [`sample_member_identity_safe`] enforces, now at O(1) reads of an
-    /// O(n)-line file instead of O(n).
+    /// (capture the start-time identity of) **every** member first, then take
+    /// exactly **one** membership pass ([`members_with`](Self::members_with) — one
+    /// `cgroup.procs` read per cgroup of the job, its own plus each live per-spawn
+    /// leaf), then reconfirm each pinned member against that single snapshot and read
+    /// its counters gated on the pinned identity (`sample_pinned`). The lone
+    /// reconfirm pass lands after every capture, so it is after *each* member's pin —
+    /// the same race-freedom order the per-member [`sample_member_identity_safe`]
+    /// enforces, now at a constant number of passes over the membership instead of
+    /// one per pid.
     ///
     /// `active_process_count` reflects the *initial* member list, as before: a
     /// member that later turns out gone/recycled still counted as live at snapshot
@@ -1201,9 +1625,9 @@ impl Cgroup {
         let mut mem = 0u64;
         let mut have_mem = false;
         let mut last_err = None;
-        // 2. One reconfirm read for the whole fold — O(1), not O(n) — taken after
-        //    every capture above. Skipped when nothing was pinned (an all-gone or
-        //    empty group), matching the old per-member path.
+        // 2. One reconfirm pass for the whole fold — one per batch, not one per
+        //    pinned pid — taken after every capture above. Skipped when nothing was
+        //    pinned (an all-gone or empty group), matching the old per-member path.
         if !pinned.is_empty() {
             match self.members_with(&read) {
                 Ok(snapshot) => {
@@ -1289,17 +1713,20 @@ impl Cgroup {
     /// *before* anything is pinned, so no signal is ever sent when the initial
     /// membership is unknown.
     ///
-    /// **Why one read for the whole batch, not one per pid.** The identity-safe
-    /// argument (see [`deliver_identity_safe`]) needs only that each pid's
-    /// membership reconfirm happens *after* that pid was pinned — not that every
-    /// pid gets its own fresh read. So this pins **every** current member first
-    /// (`pin_member`/`pidfd_open`), then reads `cgroup.procs` exactly **once**, and
-    /// reconfirms each pinned pid against that single snapshot before sending
-    /// (`deliver_pinned`/`pidfd_send_signal`). The lone reconfirm read lands strictly
+    /// **Why one membership pass for the whole batch, not one per pid.** The
+    /// identity-safe argument (see [`deliver_identity_safe`]) needs only that each
+    /// pid's membership reconfirm happens *after* that pid was pinned — not that
+    /// every pid gets its own fresh read. So this pins **every** current member first
+    /// (`pin_member`/`pidfd_open`), then takes exactly **one** membership pass
+    /// ([`members_with`](Self::members_with) — one `cgroup.procs` read per cgroup of
+    /// the job, its own plus each live per-spawn leaf), and reconfirms each pinned
+    /// pid against that single snapshot before sending
+    /// (`deliver_pinned`/`pidfd_send_signal`). The lone reconfirm pass lands strictly
     /// after every pin, so it is after *each* pid's pin — the race-freedom order is
-    /// preserved verbatim, at O(1) reads of an O(n)-line file instead of O(n).
+    /// preserved verbatim, at a constant number of passes over an O(n)-pid membership
+    /// instead of one pass per pid.
     ///
-    /// Holding all N pidfds open across the single read (rather than one at a time)
+    /// Holding all N pidfds open across the single pass (rather than one at a time)
     /// is the deliberate cost of that ordering: a recycled pid must not be pinnable
     /// between the read and the send, so the pin has to precede the shared read.
     /// A process tree's N is bounded by `pids.max`, well under `RLIMIT_NOFILE`.
@@ -1326,10 +1753,10 @@ impl Cgroup {
                 Pinned::Failed(err) => last_err = Some(err),
             }
         }
-        // 2. One reconfirm read of `cgroup.procs` for the whole batch — O(1), not
-        //    O(n) — taken after every pin above. Skipped when nothing was pinned
-        //    (an all-gone or empty group), matching the old per-pid path, which
-        //    only re-read once it had a live pin to reconfirm.
+        // 2. One reconfirm membership pass for the whole batch — one per batch, not
+        //    one per pinned pid — taken after every pin above. Skipped when nothing
+        //    was pinned (an all-gone or empty group), matching the old per-pid path,
+        //    which only re-read once it had a live pin to reconfirm.
         if !pinned.is_empty() {
             match self.members_with(&read) {
                 Ok(snapshot) => {
@@ -1365,11 +1792,12 @@ impl Cgroup {
 
     /// Freeze (`true`) or thaw (`false`) the whole subtree.
     ///
-    /// Prefers `cgroup.freeze` (cgroup v2 core file, kernel ≥ 5.2): one write
-    /// covers the whole subtree (the kernel applies the freeze shortly after the
-    /// write returns) and needs no controllers — the same family as the
-    /// `cgroup.kill` file used for teardown. On kernels without it, fall back to
-    /// per-pid `SIGSTOP`/`SIGCONT`, mirroring the `cgroup.kill` fallback idiom.
+    /// Prefers `cgroup.freeze` (cgroup v2 core file, kernel ≥ 5.2): one write covers
+    /// the whole subtree — this cgroup *and every descendant*, so the per-spawn
+    /// leaves ([`Leaves`]) need no write of their own — and needs no controllers, the
+    /// same family as the `cgroup.kill` file used for teardown. (The kernel applies
+    /// the freeze shortly after the write returns.) On kernels without it, fall back
+    /// to per-pid `SIGSTOP`/`SIGCONT`, mirroring the `cgroup.kill` fallback idiom.
     ///
     /// The fallback routes through [`signal`](Self::signal), so it inherits the
     /// same identity-safe pidfd delivery — a recycled pid outside the cgroup is
@@ -1420,7 +1848,9 @@ impl Cgroup {
         send: impl Fn(&H, i32) -> io::Result<()>,
     ) -> io::Result<()> {
         // `cgroup.kill` (kernel ≥ 5.14): write "1" to SIGKILL the whole subtree
-        // atomically.
+        // atomically — this cgroup *and every descendant*, so one write covers every
+        // per-spawn leaf (`Leaves`) as well, which is why the whole-job verbs never
+        // walk them.
         //
         // Unlike `freeze` (which surfaces a non-`NotFound` write error rather than
         // silently degrading a *suspend* to the racy per-pid path), `kill` falls
@@ -1541,10 +1971,10 @@ impl super::graceful::GracefulTarget for Cgroup {
     }
 
     fn alive_count(&self) -> Option<usize> {
-        // The whole tree's live members (`cgroup.procs`), matching `members()`. A
-        // removed cgroup reads empty (`Some(0)`); an unreadable membership is
-        // unknown, reported `None` rather than a false 0 — the same fail-safe
-        // `is_drained` applies (there mapped to "not drained").
+        // The whole tree's live members (the job's `cgroup.procs` plus each leaf's),
+        // matching `members()`. A removed cgroup reads empty (`Some(0)`); an
+        // unreadable membership is unknown, reported `None` rather than a false 0 —
+        // the same fail-safe `is_drained` applies (there mapped to "not drained").
         self.members().ok().map(|members| members.len())
     }
 
@@ -1998,9 +2428,7 @@ mod cgroup_read_seam_tests {
     use super::{Cgroup, Delivery, deliver_identity_safe};
 
     fn cgroup() -> Cgroup {
-        Cgroup {
-            path: PathBuf::from("/mock/processkit"),
-        }
+        Cgroup::at(PathBuf::from("/mock/processkit"))
     }
 
     #[test]
@@ -2660,7 +3088,7 @@ mod cgroup_write_seam_tests {
             std::fs::write(leaf.join(file), "max\n").expect("seed a limit interface file");
         }
         std::fs::write(leaf.join("cgroup.procs"), "").expect("seed an empty member list");
-        (dir, Cgroup { path: leaf })
+        (dir, Cgroup::at(leaf))
     }
 
     /// Read a control file back to prove which writes actually landed.
@@ -2837,7 +3265,7 @@ mod fail_safe_tests {
         std::fs::set_permissions(&procs, std::fs::Permissions::from_mode(0o000))
             .expect("revoke read permission on cgroup.procs");
 
-        let cg = Cgroup { path: dir.clone() };
+        let cg = Cgroup::at(dir.clone());
         if cg.is_empty().is_ok() {
             let _ = std::fs::remove_dir_all(&dir);
             eprintln!(
@@ -3157,9 +3585,7 @@ mod member_sample_tests {
     /// A mock cgroup whose `cgroup.procs` reads come from an injected seam, so the
     /// batched `stats_with_seams` fold can be driven without a real cgroup mount.
     fn cgroup() -> Cgroup {
-        Cgroup {
-            path: std::path::PathBuf::from("/mock/processkit"),
-        }
+        Cgroup::at(std::path::PathBuf::from("/mock/processkit"))
     }
 
     /// A non-empty reading, so a fold that reaches it is observable.
@@ -3539,7 +3965,7 @@ mod pty_rollback_spare_tests {
         std::fs::create_dir_all(&dir).expect("create the stand-in cgroup dir");
         std::fs::write(dir.join("cgroup.procs"), b"").expect("create cgroup.procs");
         let job = Job {
-            backend: Backend::Cgroup(Cgroup { path: dir.clone() }),
+            backend: Backend::Cgroup(Cgroup::at(dir.clone())),
             skip_drop_kill: SkipDropKill::new(),
         };
         (job, dir)
@@ -3661,5 +4087,887 @@ mod pty_rollback_spare_tests {
             use_pty: true,
             ..SpawnOptions::default()
         }
+    }
+}
+
+/// T-273 (per-spawn leaf sub-cgroups), driven against **real directories** rather
+/// than a mocked filesystem: every `mkdir`/`rmdir`/interface-file write these tests
+/// assert on is one the backend really performs, on a temporary directory shaped
+/// like a job cgroup.
+///
+/// What such a directory cannot be is a *cgroup*: the kernel populates a real one
+/// with its interface files at `mkdir` time, and a plain directory has none — which
+/// is exactly the state [`Cgroup::open_leaf`]'s joinability probe declines to route
+/// a child into (asserted below), and why the leaves here are seeded by hand
+/// instead. The end-to-end path — a spawn landing in a leaf the kernel made, a
+/// rollback killing that leaf's subtree, the directories going away — needs a real
+/// cgroup v2 hierarchy and lives in `real_cgroup_leaf_tests`.
+#[cfg(test)]
+mod leaf_cgroup_tests {
+    use std::cell::Cell;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    use super::{Backend, Cgroup, Job, LEAF_RECLAIM_FLOOR, LeafSlot};
+    use crate::sys::SkipDropKill;
+
+    /// A stand-in job cgroup on a real temporary directory, carrying the two
+    /// interface files this backend writes on it (`cgroup.procs` for an adopted
+    /// member, `cgroup.kill` for the whole-job teardown), both empty.
+    fn job_cgroup() -> (tempfile::TempDir, Cgroup) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("processkit-job");
+        std::fs::create_dir(&path).expect("create the stand-in job cgroup dir");
+        write_procs(&path, &[]);
+        std::fs::write(path.join("cgroup.kill"), "").expect("seed the whole-job kill file");
+        (dir, Cgroup::at(path))
+    }
+
+    /// Add a leaf to `cg` by hand — shaped the way the kernel shapes a real one (a
+    /// `cgroup.procs` listing `members`, a writable `cgroup.kill`) — and register it
+    /// as the leaf of the spawn that returned `pid`.
+    fn seed_leaf(cg: &Cgroup, name: &str, pid: Option<i32>, members: &[i32]) -> PathBuf {
+        let dir = cg.path.join(name);
+        std::fs::create_dir(&dir).expect("create the stand-in leaf dir");
+        write_procs(&dir, members);
+        std::fs::write(dir.join("cgroup.kill"), "").expect("seed the leaf kill file");
+        cg.register_leaf(pid, dir.clone());
+        dir
+    }
+
+    fn write_procs(dir: &Path, pids: &[i32]) {
+        let text: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+        std::fs::write(dir.join("cgroup.procs"), text).expect("seed a member list");
+    }
+
+    #[cfg(feature = "pty")]
+    fn read_back(path: &Path) -> String {
+        std::fs::read_to_string(path).expect("read back a control file")
+    }
+
+    /// The whole job's membership is the union of its own `cgroup.procs` and every
+    /// leaf's — the reason every whole-job verb keeps its reach once spawns stop
+    /// landing in the job cgroup itself.
+    #[test]
+    fn membership_is_the_union_of_the_job_cgroup_and_every_leaf() {
+        let (_tmp, cg) = job_cgroup();
+        // An adopted member lives in the job cgroup itself; spawns live in leaves.
+        write_procs(&cg.path, &[11]);
+        seed_leaf(&cg, "spawn-a", Some(101), &[101, 1011]);
+        seed_leaf(&cg, "spawn-b", Some(102), &[102]);
+
+        assert_eq!(
+            cg.members().expect("read the job's membership"),
+            [11, 101, 102, 1011],
+            "a whole-job membership read must see every leaf's members, not just the \
+             job cgroup's own"
+        );
+    }
+
+    /// The two ways a leaf's `cgroup.procs` can fail to read, kept apart: a leaf
+    /// whose directory is already gone holds nothing (a removed cgroup is empty),
+    /// while an unreadable one makes the *job's* membership unknown rather than
+    /// silently short — the fail-safe every kill/signal decision rests on.
+    #[test]
+    fn a_gone_leaf_is_empty_and_an_unreadable_one_is_unknown() {
+        let (_tmp, cg) = job_cgroup();
+        let gone = seed_leaf(&cg, "spawn-gone", Some(1), &[]);
+        std::fs::remove_dir_all(&gone).expect("remove the leaf directory");
+        seed_leaf(&cg, "spawn-live", Some(2), &[42]);
+
+        assert_eq!(cg.members().expect("a removed leaf is not a failure"), [42]);
+
+        let err = cg
+            .members_with(|path| {
+                if path.starts_with(&gone) {
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                } else {
+                    std::fs::read_to_string(path)
+                }
+            })
+            .expect_err("an unreadable leaf must not look like a job without those members");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// The batched identity-safe broadcast still costs a **constant number of
+    /// membership passes** — one `cgroup.procs` read per cgroup of the job, twice
+    /// (pin pass, reconfirm pass) — however many pids those cgroups hold. Leaves add
+    /// a read per leaf to a pass; what they must not add is a pass, or a rescan per
+    /// pid (K-010's pin-before-reconfirm ordering is per pid, the reads are not).
+    #[test]
+    fn membership_costs_one_read_per_cgroup_per_pass_whatever_the_pid_count() {
+        /// A stand-in for a pidfd: this test counts membership reads, and nothing
+        /// here needs to know which pid a pin belongs to.
+        struct Handle;
+
+        let (_tmp, cg) = job_cgroup();
+        seed_leaf(&cg, "spawn-a", Some(101), &[]);
+        seed_leaf(&cg, "spawn-b", Some(102), &[]);
+
+        let reads_for = |pids: &[i32]| -> usize {
+            let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+            let reads = Cell::new(0usize);
+            cg.signal_with_seams(
+                libc::SIGTERM,
+                |_: &Path| {
+                    reads.set(reads.get() + 1);
+                    Ok(listing.clone())
+                },
+                |_pid| Ok(Handle),
+                |_: &Handle, _| Ok(()),
+            )
+            .expect("a broadcast over confirmed members");
+            reads.get()
+        };
+
+        // 3 cgroups (the job's own plus two leaves) x 2 passes.
+        assert_eq!(reads_for(&[1001, 1002, 1003, 1004]), 6);
+        assert_eq!(
+            reads_for(&[1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]),
+            6,
+            "twice the members must not cost a single extra read"
+        );
+    }
+
+    /// The point of the whole mechanism: the selective kill lands in the leaf of the
+    /// spawn it names, and in no other cgroup of the job — not a sibling spawn's
+    /// leaf, and not the job's own cgroup, where the same write would take down
+    /// every member of every spawn.
+    #[cfg(feature = "pty")]
+    #[test]
+    fn a_selective_kill_reaches_only_the_leaf_of_the_spawn_it_names() {
+        let (_tmp, cg) = job_cgroup();
+        let a = seed_leaf(&cg, "spawn-a", Some(101), &[101]);
+        let b = seed_leaf(&cg, "spawn-b", Some(102), &[102]);
+
+        assert!(
+            cg.kill_leaf_of(101),
+            "the spawn's leaf is there to be killed"
+        );
+
+        assert_eq!(read_back(&a.join("cgroup.kill")), "1");
+        assert_eq!(
+            read_back(&b.join("cgroup.kill")),
+            "",
+            "another spawn's leaf must not be touched by this spawn's rollback"
+        );
+        assert_eq!(
+            read_back(&cg.path.join("cgroup.kill")),
+            "",
+            "the whole-job kill file must not be written by a per-spawn rollback"
+        );
+        assert!(
+            !cg.kill_leaf_of(101),
+            "the pid is consumed: a number the kernel may recycle must not aim a \
+             second kill at a leaf that is no longer its spawn's"
+        );
+    }
+
+    /// A refused `cgroup.kill` (a kernel < 5.14 has no such file; a restricted
+    /// delegated cgroup can reject the write) is reported as "no selective kill
+    /// happened", which is what makes the caller fall back to `killpg` — and the
+    /// leaf stays registered, so what it holds is still the job's to enumerate and
+    /// to kill.
+    #[cfg(feature = "pty")]
+    #[test]
+    fn a_refused_leaf_kill_reports_no_kill_and_keeps_the_leaf() {
+        use crate::sys::fault_injection::{Faults, Site};
+
+        let (_tmp, cg) = job_cgroup();
+        let leaf = seed_leaf(&cg, "spawn-a", Some(101), &[101]);
+
+        let faults = Faults::new()
+            .fail_every(Site::CgroupWrite, Some("cgroup.kill"), libc::EACCES)
+            .arm();
+        let killed = cg.kill_leaf_of(101);
+        assert_eq!(faults.fired(Site::CgroupWrite), 1);
+        drop(faults);
+
+        assert!(
+            !killed,
+            "a refused write is not a kill — the caller must fall back rather than \
+             believe this spawn's tree is gone"
+        );
+        assert!(leaf.exists(), "the leaf must not be reclaimed unkilled");
+        assert_eq!(
+            cg.members().expect("read the job's membership"),
+            [101],
+            "what the selective kill could not reach is still a member of the job"
+        );
+    }
+
+    /// A reclaim releases exactly the leaves the kernel lets go of. One it cannot
+    /// remove still holds something, so its entry stays — an entry is dropped only
+    /// on the kernel's own confirmation, which is what keeps a reclaim from
+    /// narrowing what the job can enumerate and kill.
+    #[test]
+    fn a_reclaim_releases_only_the_directories_the_kernel_lets_go_of() {
+        let (_tmp, cg) = job_cgroup();
+        // A drained leaf: the kernel removes a cgroup's interface files with it, so
+        // an empty directory stands in for one that has nothing left in it.
+        let drained = cg.path.join("spawn-drained");
+        std::fs::create_dir(&drained).expect("create the drained leaf dir");
+        cg.register_leaf(Some(1), drained.clone());
+        let busy = seed_leaf(&cg, "spawn-busy", Some(2), &[7]);
+
+        cg.reclaim_leaves();
+
+        assert!(!drained.exists(), "a removable leaf directory is reclaimed");
+        assert!(busy.exists(), "a leaf that still holds something is kept");
+        assert_eq!(cg.leaf_dirs(), [busy], "and only that one stays registered");
+        assert_eq!(
+            cg.members().expect("read the job's membership"),
+            [7],
+            "the kept leaf's members are still enumerated"
+        );
+    }
+
+    /// A long-lived job does not accumulate the directories of spawns that have
+    /// finished. The launches themselves pay for that, without any teardown, and
+    /// what they leave behind is **bounded by the job's live leaves** rather than by
+    /// how many launches it has made — the amortized reclaim keeps some (that is the
+    /// point of not sweeping on every launch), but never a number that grows with
+    /// the run. What is still in use survives every one of those passes.
+    #[test]
+    fn finished_leaves_do_not_pile_up_between_teardowns() {
+        let (_tmp, cg) = job_cgroup();
+        let busy = seed_leaf(&cg, "spawn-busy", Some(0), &[7]);
+
+        // One live leaf throughout, so the bound stays the floor: anything above it
+        // would mean the leftovers track the launch count.
+        let register_drained_leaves = |count: usize, tag: &str| {
+            for n in 0..count {
+                let dir = cg.path.join(format!("spawn-{tag}-{n}"));
+                std::fs::create_dir(&dir).expect("create a drained leaf dir");
+                cg.register_leaf(Some(n as i32 + 1), dir);
+            }
+            let registered = cg.leaf_dirs();
+            let on_disk = std::fs::read_dir(&cg.path)
+                .expect("read the job cgroup dir")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_dir())
+                .count();
+            (registered, on_disk)
+        };
+
+        let (registered, on_disk) = register_drained_leaves(2 * LEAF_RECLAIM_FLOOR, "a");
+        assert!(
+            registered.len() <= LEAF_RECLAIM_FLOOR && on_disk == registered.len(),
+            "after {} launches: {registered:?} registered, {on_disk} directories",
+            2 * LEAF_RECLAIM_FLOOR
+        );
+        assert!(
+            registered.contains(&busy),
+            "the live leaf is never reclaimed"
+        );
+
+        // Twice as many launches again must not leave twice as much behind.
+        let (later, later_on_disk) = register_drained_leaves(4 * LEAF_RECLAIM_FLOOR, "b");
+        assert!(
+            later.len() <= LEAF_RECLAIM_FLOOR && later_on_disk == later.len(),
+            "after {} more launches: {later:?} registered, {later_on_disk} directories — \
+             the leftovers must not grow with the number of launches",
+            4 * LEAF_RECLAIM_FLOOR
+        );
+        assert!(later.contains(&busy), "and it still is not");
+        assert!(busy.exists());
+    }
+
+    /// A directory that cannot host a leaf (no `cgroup.procs` appeared in it, so no
+    /// child could join it) is not one this backend routes a child into: the launch
+    /// falls back to the job's own cgroup, and the directory it tried is removed
+    /// rather than left behind. Losing the leaf costs a later rollback its
+    /// selectivity — never the containment of the spawn.
+    #[test]
+    fn a_directory_that_cannot_host_a_leaf_falls_back_to_the_job_cgroup() {
+        let (_tmp, cg) = job_cgroup();
+
+        let slot = cg.open_leaf();
+        assert_eq!(
+            slot.procs_path(),
+            cg.path.join("cgroup.procs"),
+            "the child must still join the job's own cgroup"
+        );
+        drop(slot);
+
+        let leftovers: Vec<_> = std::fs::read_dir(&cg.path)
+            .expect("read the job cgroup dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the directory reserved for a leaf that could not be used must be removed"
+        );
+        assert!(
+            cg.leaf_dirs().is_empty(),
+            "and nothing must be registered for it"
+        );
+    }
+
+    /// The other way a launch ends without committing its leaf: it fails **after** its
+    /// child exists (tokio's `Command::spawn` returns `Err` from steps that run after
+    /// the fork), so the `rmdir` the slot's drop attempts is refused — the leaf holds a
+    /// live member. The record must survive that refusal: a forgotten leaf takes its
+    /// member out of the job's membership altogether, and with it out of the per-pid
+    /// sweep the pre-5.14 teardown falls back to, which would then call a job drained
+    /// that it never killed.
+    ///
+    /// An un-removable directory is the stand-in here for a populated cgroup: the
+    /// kernel answers `EBUSY` for one that still holds members, and `remove_dir`
+    /// answers `ENOTEMPTY` for one that still holds this stand-in's `cgroup.procs`.
+    #[test]
+    fn a_leaf_the_kernel_refuses_to_remove_stays_the_jobs_to_enumerate() {
+        let (_tmp, cg) = job_cgroup();
+        let dir = cg.path.join("spawn-failed-after-fork");
+        std::fs::create_dir(&dir).expect("create the reserved leaf dir");
+        write_procs(&dir, &[4242]);
+
+        let slot = LeafSlot {
+            cg: &cg,
+            dir: Some(dir.clone()),
+        };
+        assert_eq!(
+            slot.procs_path(),
+            dir.join("cgroup.procs"),
+            "precondition: this launch's child joined the leaf, not the job cgroup"
+        );
+        // The launch reports `Err`: no `commit`, no pid — and a live member in there.
+        drop(slot);
+
+        assert!(
+            dir.exists(),
+            "the kernel refused the rmdir, so the leaf is still standing"
+        );
+        assert_eq!(
+            cg.leaf_dirs(),
+            std::slice::from_ref(&dir),
+            "and the job must still know about it"
+        );
+        assert_eq!(
+            cg.members().expect("read the job's membership"),
+            [4242],
+            "a member the job cannot enumerate is one no per-pid kill can reach — and \
+             one that makes an unkilled job look drained"
+        );
+        #[cfg(feature = "pty")]
+        assert!(
+            !cg.kill_leaf_of(4242),
+            "no pid may steer a selective kill at a leaf this job never got one for"
+        );
+
+        // Once that member really is gone — the kernel takes a cgroup's interface
+        // files with it, so an empty directory is one with nothing left in it — the
+        // leaf is removable again, and the job's teardown is what takes it. A job that
+        // had forgotten this leaf could not, and would leak its own directory too.
+        std::fs::remove_file(dir.join("cgroup.procs")).expect("drain the leaf");
+        drop(Job {
+            backend: Backend::Cgroup(cg),
+            skip_drop_kill: SkipDropKill::new(),
+        });
+        assert!(
+            !dir.exists(),
+            "a drained leaf must not outlive the job that took it back"
+        );
+    }
+
+    /// Dropping a job reclaims its leaf directories, and does so **before** trying
+    /// its own: a cgroup directory that still has child directories cannot be
+    /// removed at all, so a leaf left behind would leak the whole job directory with
+    /// it. A leaf the kernel does not let go of is kept, exactly as the job's own
+    /// directory is when survivors remain.
+    #[test]
+    fn dropping_a_job_reclaims_its_leaf_directories_first() {
+        let (tmp, cg) = job_cgroup();
+        let path = cg.path.clone();
+        let drained = path.join("spawn-drained");
+        std::fs::create_dir(&drained).expect("create the drained leaf dir");
+        cg.register_leaf(Some(1), drained.clone());
+        // A leaf the kernel would answer `ENOTEMPTY` for: a cgroup a contained child
+        // nested inside ours, which no `rmdir` of ours can take.
+        let nested = path.join("spawn-nested");
+        std::fs::create_dir(&nested).expect("create the nested leaf dir");
+        std::fs::create_dir(nested.join("child-of-a-child")).expect("nest a cgroup inside it");
+        cg.register_leaf(Some(2), nested.clone());
+
+        drop(Job {
+            backend: Backend::Cgroup(cg),
+            skip_drop_kill: SkipDropKill::new(),
+        });
+
+        assert!(!drained.exists(), "an empty leaf must not outlive the job");
+        assert!(
+            nested.exists(),
+            "a leaf the kernel refuses to remove is left standing, like the job dir itself"
+        );
+        drop(tmp);
+    }
+}
+
+/// T-273's leaf machinery against a **real cgroup v2 hierarchy** — the half of the
+/// contract a stand-in directory cannot show: a spawn landing in a leaf the kernel
+/// created, `cgroup.kill` on that leaf really killing its subtree (and nothing
+/// else), and the directories really going away.
+///
+/// Each test skips — with a note, never a false pass — when this host hands
+/// `Job::new` the process-group fallback instead of a delegated cgroup v2 (an
+/// unprivileged container, no delegation, a read-only `/sys/fs/cgroup`), since none
+/// of it is reachable there. Run them as a user who can create cgroups:
+/// `cargo test --lib --all-features -- --include-ignored real_cgroup_leaf`.
+#[cfg(test)]
+mod real_cgroup_leaf_tests {
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use tokio::process::{Child, Command};
+
+    use super::{Backend, Job};
+    use crate::sys::SpawnOptions;
+
+    /// A real `Job` on this host plus its cgroup directory, or `None` (with a note)
+    /// when the host gave the process-group fallback.
+    fn cgroup_job() -> Option<(Job, PathBuf)> {
+        #[cfg(feature = "limits")]
+        let job = Job::new(&crate::limits::ResourceLimits::default()).expect("create a job");
+        #[cfg(not(feature = "limits"))]
+        let job = Job::new().expect("create a job");
+        let path = match &job.backend {
+            Backend::Cgroup(cg) => cg.path.clone(),
+            Backend::ProcessGroup(_) => {
+                eprintln!(
+                    "skipping: this host has no writable cgroup v2 (Job::new fell back to the \
+                     process-group backend) — the per-spawn leaf contract is not reachable here"
+                );
+                return None;
+            }
+        };
+        Some((job, path))
+    }
+
+    /// A child that stays alive until something kills it.
+    fn sleeper() -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", "while :; do sleep 60; done"]);
+        command
+    }
+
+    /// The `spawn-*` sub-directories of a job cgroup, sorted — the leaves as the
+    /// kernel's own directory listing sees them, not as the registry believes.
+    fn leaf_dirs_on_disk(job_dir: &Path) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(job_dir)
+            .expect("read the job cgroup dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("spawn-"))
+            })
+            .collect();
+        dirs.sort();
+        dirs
+    }
+
+    /// The pids a cgroup directory lists as its own members.
+    fn procs_of(dir: &Path) -> Vec<u32> {
+        std::fs::read_to_string(dir.join("cgroup.procs"))
+            .expect("read a cgroup.procs")
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
+    }
+
+    /// Whether `pid` still names a live process. Only ever asked about a pid this
+    /// process is **not** the parent of (the escapee below, a grandchild that left
+    /// our session — init's to reap, not ours) or about one that is expected to be
+    /// alive, so `kill(pid, 0)` is the whole probe: a killed *direct* child would
+    /// answer this "alive" as an un-reaped zombie, and is waited on through its own
+    /// `Child` handle instead.
+    #[cfg(feature = "pty")]
+    fn is_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 is a pure existence probe.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    #[cfg(feature = "pty")]
+    async fn wait_until_gone(pid: u32, what: &str) {
+        for _ in 0..600 {
+            if !is_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // SAFETY: a best-effort kill of a pid this test started.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        panic!("{what}: pid {pid} was still alive after the bounded wait");
+    }
+
+    /// Wait (bounded) for a helper to publish its pid into `path`.
+    #[cfg(feature = "pty")]
+    async fn published_pid(path: &Path) -> u32 {
+        for _ in 0..600 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                let text = text.trim().to_owned();
+                if !text.is_empty() {
+                    return text.parse().expect("the helper publishes a pid");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the helper never published its pid");
+    }
+
+    /// A unique-per-process temp path for a helper to publish a pid through.
+    #[cfg(feature = "pty")]
+    fn pidfile(tag: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("processkit_leaf_{tag}_{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    async fn reap(mut child: Child) {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+
+    /// Every spawn lands in a leaf of its **own**, and the whole job still sees all
+    /// of them: two spawns never share a leaf (which is what makes a per-spawn kill
+    /// selective at all), the job's own cgroup holds none of them, and `members()`
+    /// reports the union across the leaves.
+    ///
+    /// What a leaf holds beyond its spawn is the spawn's *descendants* — a shell's
+    /// `sleep`, anything either forks — since cgroup membership is inherited; that is
+    /// the subtree a selective kill is meant to take, so this asserts where each
+    /// spawn is, not that it is alone there.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "creates real cgroups and spawns real subprocesses"]
+    async fn every_spawn_lands_in_its_own_leaf_and_the_job_lists_them_all() {
+        let Some((job, dir)) = cgroup_job() else {
+            return;
+        };
+        let first = job
+            .spawn(&mut sleeper(), &SpawnOptions::default())
+            .expect("spawn the first child");
+        let second = job
+            .spawn(&mut sleeper(), &SpawnOptions::default())
+            .expect("spawn the second child");
+        let (first_pid, second_pid) = (first.id().expect("a pid"), second.id().expect("a pid"));
+
+        let leaves = leaf_dirs_on_disk(&dir);
+        assert_eq!(leaves.len(), 2, "one leaf per spawn, in {dir:?}");
+        let leaf_of = |pid: u32| -> PathBuf {
+            let mut holding = leaves
+                .iter()
+                .filter(|leaf| procs_of(leaf).contains(&pid))
+                .cloned();
+            let leaf = holding
+                .next()
+                .unwrap_or_else(|| panic!("pid {pid} is in none of the job's leaves: {leaves:?}"));
+            assert!(holding.next().is_none(), "a pid is in exactly one cgroup");
+            leaf
+        };
+        assert_ne!(
+            leaf_of(first_pid),
+            leaf_of(second_pid),
+            "two spawns sharing a leaf would make a per-spawn kill hit them both"
+        );
+        assert!(
+            procs_of(&dir).is_empty(),
+            "the job's own cgroup holds no spawned member once every spawn has a leaf"
+        );
+
+        #[cfg(feature = "process-control")]
+        {
+            let members = job.members().expect("read the job's members");
+            assert!(
+                members.contains(&first_pid) && members.contains(&second_pid),
+                "a membership read must aggregate the leaves: {members:?}"
+            );
+        }
+
+        drop(job);
+        reap(first).await;
+        reap(second).await;
+    }
+
+    /// Dropping the job takes every leaf directory with it, and then the job's own —
+    /// which cannot happen in the other order, since a cgroup directory with
+    /// children cannot be removed at all.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "creates real cgroups and spawns real subprocesses"]
+    async fn dropping_a_job_leaves_no_leaf_directory_behind() {
+        let Some((job, dir)) = cgroup_job() else {
+            return;
+        };
+        let first = job
+            .spawn(&mut sleeper(), &SpawnOptions::default())
+            .expect("spawn the first child");
+        let second = job
+            .spawn(&mut sleeper(), &SpawnOptions::default())
+            .expect("spawn the second child");
+        assert_eq!(leaf_dirs_on_disk(&dir).len(), 2);
+
+        drop(job);
+
+        assert!(
+            !dir.exists(),
+            "the job directory must be gone — a leaf left behind would keep it \
+             (`rmdir` answers ENOTEMPTY) and leak both"
+        );
+        reap(first).await;
+        reap(second).await;
+    }
+
+    /// A launch that never produces a child leaves no leaf directory behind, so a
+    /// job that fails to spawn repeatedly does not fill its cgroup with empty ones.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "creates real cgroups"]
+    async fn a_launch_that_never_started_leaves_no_leaf_behind() {
+        let Some((job, dir)) = cgroup_job() else {
+            return;
+        };
+        let mut command = Command::new("/nonexistent/processkit-no-such-program");
+        job.spawn(&mut command, &SpawnOptions::default())
+            .expect_err("the launch itself must fail");
+
+        assert!(
+            leaf_dirs_on_disk(&dir).is_empty(),
+            "the leaf reserved for a launch that never happened must be removed"
+        );
+        drop(job);
+    }
+
+    /// A launch that fails **after** its child exists keeps that child reachable — the
+    /// case a launch failing *before* its fork (above) does not cover, and the one the
+    /// leaf directory makes delicate. tokio's `Command::spawn` is
+    /// `std::process::Command::spawn` plus post-fork steps (registering the child's
+    /// stdio with the reactor, opening its pidfd) that can return `Err` while dropping
+    /// the `std::process::Child`, which does not kill it: the child is alive, it has
+    /// been in the leaf since before its `exec`, the launch commits nothing and hands
+    /// back no pid, and the `rmdir` the slot's drop attempts is refused `EBUSY`.
+    ///
+    /// The leaf must not be forgotten there. What that would cost is asserted rather
+    /// than argued: the member disappears from `members()`, and the pre-5.14 teardown
+    /// — a per-pid SIGKILL sweep over exactly that membership, ending in a drain check
+    /// over it — reports a drained job while the process runs on.
+    ///
+    /// The state is built from the backend's own primitives (reserve a leaf, fork a
+    /// child that joins it in its own pre-exec, drop the slot uncommitted), which is
+    /// precisely what `?` on `cmd.spawn()` leaves behind in `spawn_displacing_spare`.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "creates real cgroups and spawns real subprocesses"]
+    async fn a_launch_that_failed_after_forking_keeps_its_child_enumerable_and_killable() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::process::CommandExt;
+
+        use crate::sys::fault_injection::{Faults, Site};
+
+        let Some((job, dir)) = cgroup_job() else {
+            return;
+        };
+        let Backend::Cgroup(cg) = &job.backend else {
+            unreachable!("cgroup_job hands back the cgroup backend or nothing");
+        };
+
+        let slot = cg.open_leaf();
+        let leaf = slot
+            .procs_path()
+            .parent()
+            .expect("a cgroup.procs has a directory")
+            .to_path_buf();
+        assert_ne!(
+            leaf, dir,
+            "precondition: this host let the launch reserve a leaf of its own"
+        );
+        let procs = CString::new(slot.procs_path().into_os_string().into_vec())
+            .expect("a NUL-free cgroup path");
+        let mut command = sleeper();
+        // SAFETY: `write_self_pid` makes only async-signal-safe calls — this is the
+        // very hook `Job::spawn` installs, on the very path it installs it on.
+        unsafe {
+            command
+                .as_std_mut()
+                .pre_exec(move || super::write_self_pid(procs.as_c_str()));
+        }
+        let mut child = command.spawn().expect("the fork itself succeeds");
+        let pid = child.id().expect("a pid") as i32;
+        // …and here tokio's post-fork setup fails: the `Child` is dropped unkilled,
+        // `commit` never runs, and the slot goes out of scope over a populated leaf.
+        drop(slot);
+
+        assert!(
+            procs_of(&leaf).contains(&(pid as u32)),
+            "precondition: the child of the failed launch is in the leaf, not the job \
+             cgroup — the whole point of the leaf being the one thing that could lose it"
+        );
+        assert_eq!(
+            cg.leaf_dirs(),
+            std::slice::from_ref(&leaf),
+            "a leaf the kernel refused to remove must stay the job's"
+        );
+        assert!(
+            cg.members()
+                .expect("read the job's membership")
+                .contains(&pid),
+            "and its member must still be one of the job's"
+        );
+        #[cfg(feature = "process-control")]
+        assert!(
+            job.members()
+                .expect("read the job's members")
+                .contains(&(pid as u32)),
+            "as seen through the whole-job verb the caller actually has"
+        );
+
+        // The teardown with no atomic `cgroup.kill` to lean on — a kernel < 5.14, or a
+        // delegated cgroup that refuses the write — falls back to the per-pid sweep
+        // over that membership. It must kill this child, and must not report a drained
+        // job without having done so.
+        let faults = Faults::new()
+            .fail_every(Site::CgroupWrite, Some("cgroup.kill"), libc::EACCES)
+            .arm();
+        let swept = job.kill_all();
+        assert_eq!(faults.fired(Site::CgroupWrite), 1);
+        drop(faults);
+        swept.expect("the per-pid sweep must drain the job");
+
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("the child of the failed launch must be killed by that sweep")
+            .expect("wait for the child of the failed launch");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "killed by the sweep, not left to exit on its own: {status:?}"
+        );
+
+        // Drained at last, the leaf goes with the job — and takes the job's own
+        // directory with it, which a job that had forgotten the leaf could not do
+        // (`rmdir` answers ENOTEMPTY while a child directory is there).
+        drop(job);
+        assert!(
+            !dir.exists(),
+            "the job directory must be gone, leaf and all"
+        );
+    }
+
+    /// The guarantee this whole mechanism exists for: rolling back one spawn kills
+    /// **that spawn's** subtree — including a descendant that `setsid`'d out of its
+    /// session, which no `killpg` can reach — while another spawn of the same job
+    /// keeps running. The rolled-back spawn's leaf is then reclaimed and the
+    /// survivor's is not.
+    #[cfg(feature = "pty")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "creates real cgroups and spawns real subprocesses incl. a setsid escapee"]
+    async fn a_rollback_kills_this_spawns_setsid_escapee_and_spares_the_other_spawns() {
+        let Some((job, dir)) = cgroup_job() else {
+            return;
+        };
+        if !has_setsid() {
+            eprintln!("skipping: no setsid(1) on this host to build a session escapee with");
+            return;
+        }
+        let file = pidfile("escapee");
+
+        // The spawn that must survive its neighbour's rollback.
+        let survivor = job
+            .spawn(&mut sleeper(), &SpawnOptions::default())
+            .expect("spawn the survivor");
+        let survivor_pid = survivor.id().expect("a pid");
+
+        // The spawn to be rolled back: a shell that forks a descendant into a
+        // session of its own (so `killpg` over the shell's group cannot reach it)
+        // and then stays alive, as the pty child of a failing launch would.
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "setsid sh -c 'echo $$ > \"$PK_PIDFILE\"; exec sleep 300' </dev/null \
+                 >/dev/null 2>&1 & while :; do sleep 60; done",
+            ])
+            .env("PK_PIDFILE", &file);
+        let mut victim = job
+            .spawn(&mut command, &SpawnOptions::default())
+            .expect("spawn the launch that will be rolled back");
+        let victim_pid = victim.id().expect("a pid");
+        let escapee = published_pid(&file).await;
+        // SAFETY: `getsid` only reads the target's session id.
+        assert_eq!(
+            unsafe { libc::getsid(escapee as libc::pid_t) },
+            escapee as libc::pid_t,
+            "escapee {escapee} never became a session leader — the test would prove nothing"
+        );
+        assert_eq!(
+            leaf_dirs_on_disk(&dir).len(),
+            2,
+            "precondition: two spawns, two leaves"
+        );
+
+        job.rollback_pty_spawn(victim_pid, crate::sys::DisplacedSpare::default());
+
+        wait_until_gone(
+            escapee,
+            "the rollback's leaf-scoped cgroup.kill must reach a setsid escapee of \
+             the spawn it undoes",
+        )
+        .await;
+        // The rolled-back spawn's own child is a direct child of this process, so it
+        // is waited on rather than probed: a `SIGKILL`ed child is an un-reaped zombie
+        // until then, and would answer an existence probe "alive".
+        let status = tokio::time::timeout(Duration::from_secs(10), victim.wait())
+            .await
+            .expect("the rolled-back spawn's own child must be killed by the leaf kill")
+            .expect("wait for the rolled-back child");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "and killed by the leaf's SIGKILL, not left to exit on its own: {status:?}"
+        );
+        assert!(
+            is_alive(survivor_pid),
+            "another spawn of the same job must not be touched by this spawn's rollback"
+        );
+        #[cfg(feature = "process-control")]
+        assert!(
+            job.members()
+                .expect("read the job's members")
+                .contains(&survivor_pid),
+            "and it must still be a member of the job"
+        );
+        // `cgroup.kill` is asynchronous, so the reclaim the rollback itself runs can
+        // still find the leaf draining; the next pass — here, an explicit one, in
+        // production the next launch or the teardown — takes it once it has drained,
+        // and takes only it.
+        if let Backend::Cgroup(cg) = &job.backend {
+            cg.reclaim_leaves();
+        }
+        assert_eq!(
+            leaf_dirs_on_disk(&dir).len(),
+            1,
+            "the killed spawn's leaf is reclaimed; the survivor's stays"
+        );
+
+        drop(job);
+        reap(survivor).await;
+        let _ = std::fs::remove_file(&file);
+        // Belt and braces: no path may leave the escapee running.
+        // SAFETY: a best-effort kill of a pid this test started.
+        unsafe { libc::kill(escapee as libc::pid_t, libc::SIGKILL) };
+    }
+
+    /// Whether this host has `setsid(1)` for the escapee helper above.
+    #[cfg(feature = "pty")]
+    fn has_setsid() -> bool {
+        std::process::Command::new("sh")
+            .args(["-c", "command -v setsid"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 }
