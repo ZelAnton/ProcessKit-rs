@@ -1197,7 +1197,7 @@ impl ProcessGroup {
     /// the solo entry is published; without an anchor, preserve the historical
     /// number-only fast path. The ownership lock is held across both tables and
     /// every cross-table observer uses the same lock.
-    #[cfg(feature = "process-control")]
+    #[cfg(all(feature = "process-control", test))]
     fn reconcile_solo_adoption(&self, pid: i32, identity: Option<u64>) {
         // Recover a poisoned lock rather than allowing a concurrent teardown to
         // observe or leave a split ownership transition.
@@ -1236,6 +1236,15 @@ impl ProcessGroup {
             .id()
             .ok_or_else(|| io::Error::other("child has no pid (already exited?)"))?
             as i32;
+
+        // Serialize the setpgid outcome with its ownership publication. A concurrent
+        // bare-pid adoption can otherwise publish a solo entry after this syscall
+        // succeeds but before the group entry is recorded.
+        let _ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         // Try to make the external child its own group leader. Only the child
         // itself is moved — already running descendants keep their group.
         // SAFETY: setpgid on a live pid is a sound call.
@@ -1247,6 +1256,10 @@ impl ProcessGroup {
             // A new killable member joined — re-arm Drop's backstop so a prior
             // graceful_shutdown(escalate=false) latch doesn't spare it.
             self.skip_drop_kill.clear();
+            #[cfg(test)]
+            if let Some(pause) = &self.group_adoption_pause {
+                pause.pause();
+            }
             self.groups.track(pid, true);
             return Ok(());
         }
@@ -1279,7 +1292,7 @@ impl ProcessGroup {
                 // the identity read here (once, and handed to both the check and the
                 // entry, so they cannot disagree) is what it is decided on.
                 let identity = read_identity(pid);
-                self.reconcile_solo_adoption(pid, identity);
+                self.reconcile_solo_adoption_locked(pid, identity);
                 Ok(())
             }
             _ => Err(err),
@@ -2768,7 +2781,10 @@ mod tests {
 
         group_pause.release();
         let successful_result = successful.join().expect("successful adoption thread");
-        let failed_result = failed.join().expect("failed adoption thread");
+        let failed_result = finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("failed adoption result receiver");
+        failed.join().expect("failed adoption thread");
         assert!(
             successful_result.is_ok(),
             "successful adoption: {successful_result:?}"
@@ -2794,6 +2810,182 @@ mod tests {
             solos.iter().filter(|entry| entry.id == pid).count(),
             0,
             "failed reconciliation must not split the adopted process into solos"
+        );
+        drop(solos);
+        drop(groups);
+        drop(pg);
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+
+    /// A successful `adopt(&Child)` must keep the ownership transaction held from
+    /// `setpgid` through group publication. The first adopter pauses after the
+    /// successful syscall; a concurrent bare-pid adopter therefore waits until the
+    /// group entry exists and de-duplicates against it instead of publishing a solo.
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real subprocess"]
+    async fn adopt_child_group_publication_serializes_with_external_adoption() {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+
+        fn make_pipe() -> [libc::c_int; 2] {
+            let mut fds = [0; 2];
+            // SAFETY: `pipe` initializes both elements of this valid array.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            fds
+        }
+
+        let group_pause = Arc::new(AdoptionPause::new());
+        let mut process_group = ProcessGroup::new();
+        process_group.group_adoption_pause = Some(Arc::clone(&group_pause));
+        let pg = Arc::new(process_group);
+
+        let [ready_read, ready_write] = make_pipe();
+        let [release_read, release_write] = make_pipe();
+        let [exec_ready_read, exec_ready_write] = make_pipe();
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf x >&3; exec sleep 60");
+        cmd.kill_on_drop(true);
+        let child_ready_write = ready_write;
+        let child_release_read = release_read;
+        let child_exec_ready_write = exec_ready_write;
+        // SAFETY: the hook only uses async-signal-safe fd operations between
+        // fork and exec. fd 3 is intentionally inherited by the shell so the
+        // parent can distinguish the pre-exec and post-exec phases.
+        unsafe {
+            cmd.as_std_mut().pre_exec(move || {
+                if libc::dup2(child_exec_ready_write, 3) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let ready = [1u8];
+                if libc::write(child_ready_write, ready.as_ptr().cast(), ready.len())
+                    != ready.len() as isize
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut release = [0u8];
+                if libc::read(
+                    child_release_read,
+                    release.as_mut_ptr().cast(),
+                    release.len(),
+                ) != release.len() as isize
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().expect("spawn child adoption race");
+        // The parent retains only the read ends and the release write end.
+        // SAFETY: these are the child-side descriptors created above.
+        unsafe {
+            libc::close(ready_write);
+            libc::close(release_read);
+            libc::close(exec_ready_write);
+        }
+        let mut release = unsafe { std::fs::File::from_raw_fd(release_write) };
+
+        let ready_wait = tokio::task::spawn_blocking(move || {
+            let mut file = unsafe { std::fs::File::from_raw_fd(ready_read) };
+            let mut byte = [0u8];
+            file.read_exact(&mut byte)
+        });
+        tokio::time::timeout(Duration::from_secs(1), ready_wait)
+            .await
+            .expect("pre-exec readiness must not hang")
+            .expect("pre-exec readiness waiter must not panic")
+            .expect("child must reach the pre-exec barrier");
+
+        let pid = child.id().expect("race child pid") as i32;
+        let anchor = read_identity(pid).expect("this target reports a start-time identity");
+
+        let adopter_pg = Arc::clone(&pg);
+        let successful = std::thread::spawn(move || {
+            let result = adopter_pg.adopt(&child);
+            (result, child)
+        });
+        assert!(
+            group_pause.wait_until_entered(Duration::from_secs(1)),
+            "successful child adoption must pause after taking ownership"
+        );
+
+        // Let the child exec while the successful adoption still owns the
+        // transaction. The second adopter must wait for the group publication.
+        release
+            .write_all(&[1])
+            .expect("release the pre-exec barrier");
+        drop(release);
+        let exec_ready_wait = tokio::task::spawn_blocking(move || {
+            let mut file = unsafe { std::fs::File::from_raw_fd(exec_ready_read) };
+            let mut byte = [0u8];
+            file.read_exact(&mut byte)
+        });
+        tokio::time::timeout(Duration::from_secs(1), exec_ready_wait)
+            .await
+            .expect("post-exec readiness must not hang")
+            .expect("post-exec readiness waiter must not panic")
+            .expect("child must reach the post-exec barrier");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let failed_pg = Arc::clone(&pg);
+        let failed = std::thread::spawn(move || {
+            started_tx
+                .send(())
+                .expect("external adoption start receiver");
+            finished_tx
+                .send(failed_pg.adopt_external(pid as u32))
+                .expect("external adoption result receiver");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("external adoption thread started");
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "external adoption must wait for successful child publication"
+        );
+
+        group_pause.release();
+        let (successful_result, mut child) = successful.join().expect("child adoption thread");
+        let failed_result = finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("external adoption result receiver");
+        failed.join().expect("external adoption thread");
+        assert!(
+            successful_result.is_ok(),
+            "successful child adoption: {successful_result:?}"
+        );
+        assert!(
+            failed_result.is_ok(),
+            "external adoption: {failed_result:?}"
+        );
+
+        let groups = pg.groups.ids.lock().unwrap_or_else(|e| e.into_inner());
+        let solos = pg.solos.ids.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            groups.iter().filter(|entry| entry.id == pid).count(),
+            1,
+            "successful child adoption must publish one group entry"
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .find(|entry| entry.id == pid)
+                .map(|entry| entry.identity),
+            Some(Some(anchor)),
+            "the group entry must retain the adoption anchor"
+        );
+        assert_eq!(
+            solos.iter().filter(|entry| entry.id == pid).count(),
+            0,
+            "external adoption must not split the child into solos"
         );
         drop(solos);
         drop(groups);
