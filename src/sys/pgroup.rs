@@ -745,24 +745,54 @@ impl Tracked {
     /// that the token was captured *before* the adoption's own syscalls rather than
     /// after them: re-reading it here could hand back `None` for a process that
     /// exited in between, leaving a number-only entry on a path that promises an
-    /// anchored one.
+    /// anchored one. A matching anchor preserves the existing entry; a different
+    /// anchor replaces same-pid entries, including an unanchored stale record that
+    /// cannot be pruned by the identity gate. With no anchor, the existing
+    /// number-only de-dup remains in effect for targets without an identity reader.
     fn track_with(&self, id: i32, group_seen: bool, identity: Option<u64>) {
         // Recover a poisoned lock instead of dropping the child from tracking,
         // which would void the kill-on-drop guarantee.
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
         ids.retain_mut(|e| self.probe_entry(e));
-        if !ids.iter().any(|e| e.id == id) {
-            // A de-dup (re-adopt of an id still present above) keeps the existing
-            // entry's identity untouched; had the number been recycled since,
-            // `probe_entry` would already have pruned the stale entry in the
-            // `retain` above, so this pushes a fresh entry carrying the new
-            // identity.
-            ids.push(Entry {
-                id,
-                group_seen,
-                identity,
+
+        if let Some(identity) = identity {
+            // A number-only entry cannot prove that it is this identity: it may
+            // be the residue of a process that was reaped before the number was
+            // recycled. Replace every same-pid entry that is not this anchor so a
+            // stale solo record cannot mask a fresh adoption or keep a bare pid
+            // alive beside its identity-anchored replacement.
+            let mut same_process = false;
+            ids.retain(|entry| {
+                if entry.id != id {
+                    return true;
+                }
+                if entry.identity == Some(identity) {
+                    if same_process {
+                        false
+                    } else {
+                        same_process = true;
+                        true
+                    }
+                } else {
+                    false
+                }
             });
+            if same_process {
+                return;
+            }
+        } else if ids.iter().any(|entry| entry.id == id) {
+            // Preserve the long-standing number-only de-dup on targets without
+            // an identity reader. If an anchored entry already exists but this
+            // best-effort read failed, retaining the anchored entry also avoids
+            // downgrading the protection it already provides.
+            return;
         }
+
+        ids.push(Entry {
+            id,
+            group_seen,
+            identity,
+        });
     }
 
     /// Send `sig` to every still-existing entry, pruning the drained ones.
@@ -1902,6 +1932,59 @@ mod tests {
             "a bare-pid adoption must track the pid, anchored on the identity read \
              during the call — never a number-only entry"
         );
+    }
+
+    /// A stale solo entry without an identity must not mask a fresh anchored
+    /// entry for the same number. This uses the current test process as the live
+    /// holder, so it models the recycled-pid table state without depending on pid
+    /// allocation or subprocess timing; the old entry is never signalled because
+    /// only the replacement remains in the solo table.
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[test]
+    fn solo_track_with_replaces_a_stale_unanchored_entry() {
+        let solos = Tracked::new(false);
+        let pid = std::process::id() as i32;
+        let anchor = read_identity(pid).expect("this target reports a start-time identity");
+
+        solos.track_with(pid, false, None);
+        solos.track_with(pid, false, Some(anchor));
+        solos.track_with(pid, false, Some(anchor));
+
+        let ids = solos.ids.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            ids.len(),
+            1,
+            "the same anchored process must remain deduplicated"
+        );
+        assert_eq!(ids[0].id, pid);
+        assert_eq!(ids[0].identity, Some(anchor));
+    }
+
+    /// The same shared `Tracked` path keeps its historical numeric de-dup when
+    /// the target has no identity reader (the BSD fallback).
+    #[cfg(all(
+        feature = "process-control",
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+    ))]
+    #[test]
+    fn solo_track_with_keeps_number_only_dedup_without_identity_reader() {
+        let solos = Tracked::new(false);
+        let pid = std::process::id() as i32;
+
+        solos.track_with(pid, false, None);
+        solos.track_with(pid, false, None);
+
+        let ids = solos.ids.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            ids.len(),
+            1,
+            "number-only targets must retain numeric de-dup"
+        );
+        assert_eq!(ids[0].id, pid);
+        assert_eq!(ids[0].identity, None);
     }
 
     /// The negative control for the entry above: once the number no longer names
