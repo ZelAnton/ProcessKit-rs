@@ -119,7 +119,10 @@ mod reaper {
             while index < children.len() {
                 match children[index].try_wait() {
                     Ok(Some(_)) => {
-                        children.swap_remove(index);
+                        // `try_wait` has already reaped the child on Unix. Calling
+                        // `wait` on this same owner observes that completed status
+                        // and makes the ownership handoff explicit to Clippy.
+                        let _ = children.swap_remove(index).wait();
                     }
                     Ok(None) | Err(_) => {
                         // A transient wait error must not transfer ownership or
