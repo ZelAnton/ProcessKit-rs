@@ -1,0 +1,789 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Upgrading - ProcessKit</title>
+
+
+        <!-- Custom HTML head -->
+        <meta property="og:title" content="ProcessKit — async child-process management for Rust" />
+        <meta property="og:description" content="Kernel-backed whole-tree kill-on-drop for tokio. Job Object on Windows, cgroup v2 on Linux, POSIX process group on macOS. Streaming, pipelines, supervision, hermetic testing." />
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content="https://zelanton.github.io/ProcessKit-rs/" />
+        <meta property="og:image" content="https://zelanton.github.io/ProcessKit-rs/processkit-cover-social.jpg" />
+        <meta property="og:image:type" content="image/jpeg" />
+        <meta property="og:site_name" content="ProcessKit" />
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta name="twitter:title" content="ProcessKit — async child-process management for Rust" />
+        <meta name="twitter:description" content="Kernel-backed whole-tree kill-on-drop for tokio. No orphan processes, ever." />
+        <meta name="twitter:image" content="https://zelanton.github.io/ProcessKit-rs/processkit-cover-social.jpg" />
+
+        <meta name="description" content="Async child-process management — Rust · Go · F# · Kotlin">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="theme/custom-883d6c86.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-03d2395f.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-9a8459aa.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ProcessKit</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/ZelAnton/ProcessKit-rs" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/ZelAnton/ProcessKit-rs/edit/main/docs/docs/upgrading.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="upgrading-processkit"><a class="header" href="#upgrading-processkit">Upgrading processkit</a></h1>
+<p>Per-version notes for <strong>consumers</strong> moving their dependency forward: what breaks,
+who it affects, and the exact change to make. The <a href="../CHANGELOG.html">CHANGELOG</a> is
+the full record; this page is the “I depend on it, what do I do” view.</p>
+<blockquote>
+<p><strong>Versioning.</strong> From 1.0.0 onward <code>processkit</code> follows
+<a href="https://semver.org/spec/v2.0.0.html">Semantic Versioning</a>: the public API is
+stable, and any breaking change lands only in a new <strong>major</strong> version. The
+current line is <strong>3.x</strong>: <code>processkit = "3"</code> accepts compatible <code>3.*</code> upgrades
+but not a future <code>4.0</code>. A consumer still declaring <code>processkit = "2"</code> remains
+on 2.x until it deliberately changes the requirement and applies the migration
+below. (The <code>mock</code> feature’s <code>mockall</code>-generated <code>expect_*</code> surface stays
+semver-exempt — it tracks the <code>mockall</code> version.)</p>
+</blockquote>
+<h2 id="320-from-31x"><a class="header" href="#320-from-31x">3.2.0 (from 3.1.x)</a></h2>
+<h3 id="processgroupsuspend--resume-report-posix-delivery-failures-not-compiler-caught"><a class="header" href="#processgroupsuspend--resume-report-posix-delivery-failures-not-compiler-caught"><code>ProcessGroup::suspend</code> / <code>resume</code> report POSIX delivery failures (not compiler-caught)</a></h3>
+<p>This behavior change is <strong>not compiler-caught</strong>: both methods still return the same
+<code>Result&lt;()&gt;</code>, but on the POSIX process-group mechanism (macOS/BSD and the Linux
+process-group fallback) a real <code>SIGSTOP</code> / <code>SIGCONT</code> delivery failure now reaches the
+caller as <code>ErrorReason::Io</code>. In particular, <code>EPERM</code> from a live, non-zombie member now
+surfaces; <code>ESRCH</code>, harmless zombie-only <code>EPERM</code>, an empty group, and <code>EPERM</code> on a BSD
+target without a process-state reader remain <code>Ok</code>.</p>
+<p><strong>On FreeBSD</strong> the same reporting applies through a <em>different</em> mechanism: 3.2.0 moves
+that target off the shared process-group backend onto the new process reaper
+(<code>Mechanism::ProcessReaper</code> — see
+<a href="platform-support.html">Platform support</a>), where <code>suspend</code> / <code>resume</code> deliver through
+<code>PROC_REAP_KILL</code> and surface its refusals — a live, non-zombie member’s <code>EPERM</code>, and an
+<code>EINVAL</code> / <code>ECAPMODE</code> meaning the request never ran — with the same <code>ESRCH</code> and
+zombie-only-<code>EPERM</code> exemptions. Review FreeBSD call sites exactly as below; if the
+reaper cannot be acquired the group falls back to the process-group mechanism and its
+wording applies verbatim.</p>
+<p>Before, code could treat a successful call as guaranteed because the backend swallowed
+every send failure:</p>
+<pre class="playground"><code class="language-rust no_run"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span><span class="boring">use processkit::ProcessGroup;
+</span><span class="boring">fn pause(group: &amp;ProcessGroup) -&gt; processkit::Result&lt;()&gt; {
+</span>group.suspend()?; // POSIX pgroup used to return Ok even when SIGSTOP was rejected.
+// Work that assumes the whole tree is frozen.
+group.resume()?;
+<span class="boring">Ok(())
+</span><span class="boring">}
+</span><span class="boring">}</span></code></pre>
+<p>After, review those call sites and handle a delivery error explicitly before assuming
+the whole tree reached the requested state:</p>
+<pre class="playground"><code class="language-rust no_run"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span><span class="boring">use processkit::ProcessGroup;
+</span><span class="boring">fn pause(group: &amp;ProcessGroup) -&gt; processkit::Result&lt;()&gt; {
+</span>if let Err(err) = group.suspend() {
+    // The sweep still visited every member, so some members may be suspended.
+    return Err(err);
+}
+// Work that requires the tree to be frozen.
+group.resume()?; // Review and handle a partial-resume error here as well.
+<span class="boring">Ok(())
+</span><span class="boring">}
+</span><span class="boring">}</span></code></pre>
+<p>This requires a <strong>code review, not just a rebuild</strong>, for callers that assumed <code>Ok(())</code>
+meant every member was suspended or resumed. The sweep continues after a rejected
+operation, so <code>Err</code> does not mean that nothing changed: the group can be partially
+suspended or resumed.</p>
+<h2 id="300-from-2x"><a class="header" href="#300-from-2x">3.0.0 (from 2.x)</a></h2>
+<h3 id="error-is-now-a-pointer-sized-wrapper-over-errorreason"><a class="header" href="#error-is-now-a-pointer-sized-wrapper-over-errorreason"><code>Error</code> is now a pointer-sized wrapper over <code>ErrorReason</code></a></h3>
+<p><code>Error</code> changed from an enum into a thin <code>struct Error { .. }</code> holding a
+<code>Box&lt;ErrorReason&gt;</code>, so it is one pointer wide instead of ~100 bytes. This
+shrinks every <code>Result&lt;T, Error&gt;</code> on the run path (and any enum that embeds one)
+and silences the default <code>result_large_err</code> / <code>large_enum_variant</code> clippy lints.
+The former enum — with <strong>all</strong> its variants and fields unchanged — is now the
+re-exported [<code>ErrorReason</code>], reached through <code>err.reason()</code>.</p>
+<p><strong>Who it affects:</strong> anyone that pattern-matches an <code>Error</code> by variant. The read
+accessors (<code>code()</code>, <code>program()</code>, <code>diagnostic()</code>, <code>is_timeout()</code>,
+<code>stdout_bytes()</code>, …), <code>Display</code>, <code>Debug</code>, and <code>source()</code> are <strong>unchanged</strong> and
+still work on <code>Error</code> directly — only direct variant matches need a fix.</p>
+<p>Fix: reach the variant through <code>reason()</code> (borrow) or <code>into_reason()</code> (own).</p>
+<p>Before:</p>
+<!-- `text`, not `rust`: the pre-3.0 enum-variant match no longer compiles now
+     that `Error` is a struct — this crate's CI runs doctests, which would
+     reject it as `rust`. -->
+<pre><code class="language-text">match err {
+    Error::Exit { code, .. } =&gt; eprintln!("exit {code}"),
+    Error::Timeout { .. } =&gt; eprintln!("timed out"),
+    _ =&gt; {}
+}
+</code></pre>
+<p>After:</p>
+<pre class="playground"><code class="language-rust no_run"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use processkit::{Error, ErrorReason};
+fn handle(err: Error) {
+    match err.reason() {
+        ErrorReason::Exit { code, .. } =&gt; eprintln!("exit {code}"),
+        ErrorReason::Timeout { .. } =&gt; eprintln!("timed out"),
+        _ =&gt; {}
+    }
+    // To move a captured stream or the owned `io::Error` out of the reason,
+    // consume the wrapper instead: `match err.into_reason() { .. }`.
+}
+<span class="boring">}</span></code></pre>
+<p>The <code>#[doc(hidden)]</code> constructors (<code>Error::exit</code>/<code>timeout</code>/<code>signalled</code>/<code>spawn</code>/
+<code>not_found</code>/<code>stdin</code>) and the public <code>Error::parse(..)</code> are unchanged and still
+return an <code>Error</code>.</p>
+<p>To construct an <code>Error</code> from a directly constructible <code>ErrorReason</code> variant,
+wrap the variant literal with the <code>From</code> implementation:</p>
+<pre class="playground"><code class="language-rust no_run"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use processkit::{Error, ErrorReason};
+
+let err = Error::from(ErrorReason::Unsupported {
+    operation: "custom soft stop".into(),
+});
+let _ = err;
+<span class="boring">}</span></code></pre>
+<p><code>Error</code>, <code>ErrorReason</code>, and <code>ErrorKind</code> are three separate public names, all
+re-exported from the crate root. If your crate previously re-exported only
+<code>Error</code>, decide whether its public surface should now also expose <code>ErrorReason</code>
+(and <code>ErrorKind</code> if it exposes classification), so your consumers can still
+inspect failure reasons through your API.</p>
+<h3 id="the-merged-output-stream-is-now-a-process-lifecycle-stream-output_events--events-outputevent--processevent"><a class="header" href="#the-merged-output-stream-is-now-a-process-lifecycle-stream-output_events--events-outputevent--processevent">The merged output stream is now a process-lifecycle stream (<code>output_events()</code> → <code>events()</code>, <code>OutputEvent</code> → <code>ProcessEvent</code>)</a></h3>
+<p>The merged output-event stream widened from “which output line” to “an event in the
+process’s life”, so the verb and its enum are renamed to match — a deliberate 3.0
+break with <strong>no</strong> deprecated alias:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Before</th><th>After</th></tr>
+</thead>
+<tbody>
+<tr><td><code>RunningProcess::output_events()</code> (verb)</td><td><code>RunningProcess::events()</code></td></tr>
+<tr><td><code>PipelineSession::output_events()</code> (verb)</td><td><code>PipelineSession::events()</code></td></tr>
+<tr><td><code>OutputEvent</code> (event enum)</td><td><code>ProcessEvent</code></td></tr>
+<tr><td><code>OutputEvents</code> (stream type)</td><td><code>ProcessEvents</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Who it affects:</strong> anyone that calls <code>output_events()</code> or matches an <code>OutputEvent</code>.
+The rename is <strong>compiler-caught</strong> — a build after the bump flags every site (<em>“no
+method named <code>output_events</code>”</em> / <em>“cannot find type <code>OutputEvent</code>”</em>).
+<code>ProcessEvent::Stdout</code>/<code>Stderr</code> carry the same <code>OutputLine</code> payload with unchanged
+semantics, and <code>ProcessEvent::text()</code> still returns <code>Some</code> for a line event and
+<code>None</code> otherwise. The stream also gained two <strong>lifecycle</strong> variants —
+<code>ProcessEvent::Started { pid }</code> (leads the stream) and <code>ProcessEvent::Exited(Outcome)</code>
+(ends it) — so one stream now carries <code>Started</code> → <code>Stdout</code>/<code>Stderr</code> → <code>Exited</code>. The
+enum stays <code>#[non_exhaustive]</code>, so a <code>_</code> arm covers them (and any future kind).</p>
+<p>Fix — rename the verb and the type, and add a <code>_</code> arm.</p>
+<p>Before:</p>
+<!-- `text`, not `rust`: `output_events()`/`OutputEvent` no longer exist (renamed,
+     no alias), and `running`/`events` are free variables with no async subprocess
+     context here — so this can't compile. This crate's CI runs the doctests in
+     this file (`src/doc_examples.rs` includes it), so a `rust` fence would fail. -->
+<pre><code class="language-text">use processkit::OutputEvent;
+
+let mut events = running.output_events()?;
+while let Some(ev) = events.next().await {
+    match ev {
+        OutputEvent::Stdout(line) =&gt; println!("out: {}", line.text()),
+        OutputEvent::Stderr(line) =&gt; eprintln!("err: {}", line.text()),
+        _ =&gt; {}
+    }
+}
+</code></pre>
+<p>After — the verb is <code>events()</code>, the enum is <code>ProcessEvent</code>, and the new lifecycle
+variants are handled (or fall through the <code>_</code> arm):</p>
+<pre class="playground"><code class="language-rust no_run"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use processkit::ProcessEvent;
+fn handle(ev: ProcessEvent) {
+    match ev {
+        ProcessEvent::Stdout(line) =&gt; println!("out: {}", line.text()),
+        ProcessEvent::Stderr(line) =&gt; eprintln!("err: {}", line.text()),
+        ProcessEvent::Started { pid, .. } =&gt; eprintln!("started: {pid:?}"),
+        ProcessEvent::Exited(_outcome) =&gt; eprintln!("exited"),
+        _ =&gt; {}
+    }
+}
+<span class="boring">}</span></code></pre>
+<p><strong>Behavior change — drive the stream <em>concurrently</em> with the finisher (not
+compiler-caught).</strong> Because <code>Exited</code> is delivered when the run is reaped, the stream
+now parks after both pipes close and yields its terminal <code>Exited</code> only once the run
+is finished. So the old “drain the stream to its end, <em>then</em> call <code>finish()</code>/<code>wait()</code>”
+shape deadlocks — the stream is waiting for the reap that <code>finish()</code> performs. Drive
+the two <strong>together</strong> instead (e.g. <code>tokio::join!</code> the stream loop and <code>finish()</code>), or
+<code>wait()</code>/<code>finish()</code> on a separate task while you consume the stream. If you only used
+<code>output_events()</code> for its output lines and always <code>finish()</code>ed separately afterward,
+switch to consuming both concurrently.</p>
+<h3 id="output_bytes-and-outputtoolarge-now-count-raw-bytes-read-from-the-pipe"><a class="header" href="#output_bytes-and-outputtoolarge-now-count-raw-bytes-read-from-the-pipe"><code>output_bytes</code> and <code>OutputTooLarge</code> now count <em>raw</em> bytes read from the pipe</a></h3>
+<p>Not compiler-caught. The <code>max_bytes</code> ceiling (<code>OverflowMode::Error</code> and the drop
+modes) and the <code>total_bytes</code> an <code>OutputTooLarge</code> failure reports now count the <strong>raw</strong>
+bytes read off the output pipe — including line terminators and invalid-UTF-8 bytes —
+rather than the decoded line-content bytes they counted before. For typical ASCII/UTF-8
+line output the two are identical; they diverge for output with CRLF terminators or
+non-UTF-8 bytes, where the raw count is slightly higher.</p>
+<p><strong>Who it affects:</strong> a caller that set a byte cap (<code>with_max_bytes</code>) and depends on the
+<em>exact</em> threshold at which capture truncates/errors, or that reads
+<code>OutputOverflow::total_bytes()</code> / the <code>total_bytes</code> field and compares it against a
+precise expected value. It also affects a downstream crate that documented the prior
+decoded-line-content meaning of <code>total_bytes</code> as part of its own public contract: for
+that consumer, the documented contract exposed to its customers has changed, not just
+an internal capture threshold. Fix: re-check those thresholds/assertions against the
+raw-byte count. If you set no byte cap, nothing changes.</p>
+<h3 id="processgroupsignal-reports-the-soft-stop-outcome-more-truthfully"><a class="header" href="#processgroupsignal-reports-the-soft-stop-outcome-more-truthfully"><code>ProcessGroup::signal</code> reports the soft-stop outcome more truthfully</a></h3>
+<p>Two behavior changes to <code>ProcessGroup::signal(Signal::Int | Signal::Term)</code>, neither
+compiler-caught (the signature is unchanged, <code>Result&lt;()&gt;</code>):</p>
+<ul>
+<li><strong>Windows:</strong> it now best-effort soft-closes the tree (a console <code>CTRL_BREAK</code> to
+<code>windows_graceful_ctrl_break</code> leaders plus <code>WM_CLOSE</code> to windowed members) and
+returns <code>Ok</code> when it had something to signal, instead of <em>always</em> returning
+<code>ErrorReason::Unsupported</code>. It still returns <code>Unsupported</code> only when the group has neither
+a console-CTRL leader nor a windowed member. A caller that treated the old blanket
+<code>Unsupported</code> as “Windows never soft-stops” should stop assuming that. This change is
+confined to <code>ProcessGroup::signal(Signal::Int | Signal::Term)</code>; it does not change
+<code>ProcessGroup::soft_stop_scope()</code> / <code>SoftStopScope</code>, the separate side-effect-free
+capability probe. Nor does it affect <code>ProcessGroup::kill_all()</code> or drop: those remain
+unconditional whole-tree hard kills (through the Job Object on Windows), unchanged
+on every platform.</li>
+<li><strong>POSIX process-group mechanism (macOS/BSD, and the Linux process-group fallback):</strong>
+a genuinely failed send now surfaces as <code>ErrorReason::Io</code> instead of being swallowed behind
+a false <code>Ok</code> — an <code>EINVAL</code> (an out-of-range <code>Signal::Other(n)</code>) or an <code>EPERM</code> from a
+live, non-zombie member now reaches the caller. An already-exited member (<code>ESRCH</code>), a
+harmless zombie-only <code>EPERM</code>, an empty group, and the <code>Signal::Other(0)</code> existence
+probe still report <code>Ok</code>. A caller that ignored the return value is unaffected; one
+that inspects it now sees these real failures.</li>
+</ul>
+<h3 id="pty-support-is-now-available-additive"><a class="header" href="#pty-support-is-now-available-additive">PTY support is now available (additive)</a></h3>
+<p>3.0 adds an opt-in real pseudo-terminal backend for tools that require a
+controlling terminal (<code>isatty()</code>-gated CLIs, password prompts, full-screen or
+in-place terminal output):</p>
+<pre><code class="language-toml">[dependencies]
+processkit = { version = "3", features = ["pty"] }
+</code></pre>
+<p><code>Command::use_pty()</code> selects <code>openpty</code> on Unix or <code>CreatePseudoConsole</code> (ConPTY)
+on Windows. It is additive: without the feature, or with the feature enabled but
+<code>use_pty()</code> unset, the existing three-pipe launch path is unchanged. Once selected:</p>
+<ul>
+<li>stdout and stderr are merged onto the terminal master, so
+<code>ProcessResult::stderr</code> is empty;</li>
+<li>interactive input uses <code>keep_stdin_open()</code> + <code>RunningProcess::take_stdin()</code>;</li>
+<li><code>pty_size(cols, rows)</code> sets the initial geometry and <code>resize_pty(cols, rows)</code>
+updates a live session;</li>
+<li>the child stays in the same Job Object, cgroup, or process group, so timeout,
+cancellation, and kill-on-drop retain their whole-tree guarantee.</li>
+</ul>
+<p>This is a terminal transport, not a terminal emulator. Unix and ConPTY differ in
+echo control, Enter/EOF handling, environment, and resize notification; read the
+<a href="streaming.html#pty-dialog-wait-for-a-prompt-then-answer">PTY streaming guide</a> and
+<a href="platform-support.html#pty-mode-use_pty-the-pty-feature">platform matrix</a> before
+building an interactive protocol around it.</p>
+<h3 id="also-new-in-30-additive--nothing-to-migrate"><a class="header" href="#also-new-in-30-additive--nothing-to-migrate">Also new in 3.0 (additive — nothing to migrate)</a></h3>
+<p>These are new capabilities, not migrations — no code changes are forced. Reach for them
+if they help:</p>
+<ul>
+<li><code>Command::spawn_detached()</code> → <code>DetachedChild</code> — the one deliberate, opt-in escape
+from kill-on-drop containment, for a child meant to <em>outlive</em> its launcher
+(daemonize, a <code>nohup</code>-style helper). It <strong>inverts the crate’s headline guarantee on
+purpose</strong>, so it is a separate, minimal type (just the <code>pid</code>) and loudly refuses every
+owner-dependent knob rather than dropping it silently. See its rustdoc before using it.</li>
+<li><code>Command::capture_policy(...)</code> + the <code>CapturePolicy</code> trait and <code>OutputStream</code> enum — a
+typed redaction-at-capture seam: transform each captured line (e.g. scrub a secret)
+<em>before</em> it is retained in the backlog / <code>ProcessResult</code>. The handler/tee/<code>output_bytes</code>
+paths still see the unredacted text — only the retained capture is rewritten — and a
+panicking policy fails closed (the line is dropped, never leaked).</li>
+<li><code>Command::to_tokio_command()</code> is no longer <code>#[doc(hidden)]</code> — it is now a documented,
+honest low-level escape hatch (pair it with <code>ProcessGroup::spawn</code> to keep containment
+while dropping the high-level verbs/pump/capture). See the “Escape hatch” section in
+the commands guide.</li>
+</ul>
+<h3 id="verify-the-upgrade"><a class="header" href="#verify-the-upgrade">Verify the upgrade</a></h3>
+<pre><code class="language-sh">cargo update -p processkit
+cargo build      # the events()/ProcessEvent rename and the Error struct change are compiler-caught
+cargo test       # catches the events()-concurrency, output_bytes byte-count, and signal behavior changes if you rely on them
+</code></pre>
+<h2 id="210-from-12x"><a class="header" href="#210-from-12x">2.1.0 (from 1.2.x)</a></h2>
+<blockquote>
+<p><strong>2.0.0 and 1.3.0 were withdrawn — upgrade straight from 1.2.x to 2.1.0.</strong>
+<code>2.0.0</code> was published in error and yanked; <code>1.3.0</code> accidentally shipped this
+breaking batch under a <em>minor</em> bump and was yanked too. <code>2.1.0</code> is the first
+supported release of the changes below — the crate follows semver, so this
+break lands in a major as intended. There is nothing extra to do for the skip;
+the migration from a <code>1.2.x</code> dependency is exactly the notes here.</p>
+</blockquote>
+<p>Mostly mechanical renames — <strong>caught by the compiler</strong> — plus two
+<code>#[non_exhaustive]</code> tightenings on <code>Error</code> (also compiler-caught, once you stop
+destructuring the affected variants field-exhaustively) and one genuine
+<strong>behavior</strong> change on <code>output_bytes</code> that a build alone won’t surface.</p>
+<h3 id="renames-mechanical--compiler-caught"><a class="header" href="#renames-mechanical--compiler-caught">Renames (mechanical — compiler-caught)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Before</th><th>After</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Error::OutputTooLarge { line_limit, byte_limit, .. }</code></td><td><code>Error::OutputTooLarge { max_lines, max_bytes, .. }</code></td></tr>
+<tr><td><code>ResourceLimits::memory_max</code> (field, <code>limits</code> feature) / <code>.memory_max(n)</code> builder</td><td><code>ResourceLimits::max_memory</code> / <code>.max_memory(n)</code></td></tr>
+<tr><td><code>ProcessGroup::terminate_all()</code></td><td><code>ProcessGroup::kill_all()</code></td></tr>
+<tr><td><code>RunProfile::avg_cpu()</code></td><td><code>RunProfile::avg_cpu_cores()</code></td></tr>
+<tr><td><code>RunProfile::exit_code</code> (field)</td><td><code>profile.code()</code> (method — same <code>Option&lt;i32&gt;</code>)</td></tr>
+<tr><td><code>use processkit::Encoding;</code></td><td><code>use processkit::prelude::Encoding;</code></td></tr>
+<tr><td><code>use processkit::StreamExt;</code></td><td><code>use processkit::prelude::StreamExt;</code></td></tr>
+<tr><td><code>result.output_contains_any(&amp;["a", "b"])</code></td><td><code>result.output_contains_any(["a", "b"])</code> (now <code>impl IntoIterator&lt;Item = impl AsRef&lt;str&gt;&gt;</code> — a bare array, <code>Vec&lt;String&gt;</code>, or slice all work directly, without the <code>&amp;</code>; the old <code>&amp;["a", "b"]</code> call still compiles too)</td></tr>
+</tbody>
+</table>
+</div>
+<p>The <code>terminate_all</code> / <code>avg_cpu</code> entries were deprecated forwarding aliases since
+1.1.0 (see the <a href="../CHANGELOG.html#110---2026-06-28">1.1.0 changelog entry</a>); this
+release removes them outright. <code>RunProfile::exit_code</code> duplicated
+<code>outcome.code()</code>, which <code>RunProfile::code()</code> already exposed — the field is gone,
+the method is the one accessor now.</p>
+<h3 id="errors-data-carrying-variants-are-now-individually-non_exhaustive"><a class="header" href="#errors-data-carrying-variants-are-now-individually-non_exhaustive"><code>Error</code>’s data-carrying variants are now individually <code>#[non_exhaustive]</code></a></h3>
+<p><code>Exit</code>, <code>Timeout</code>, <code>Signalled</code>, <code>Spawn</code>, <code>NotFound</code>, <code>Parse</code>, <code>OutputTooLarge</code>,
+<code>Stdin</code>, and — with the <code>limits</code> feature — <code>ResourceLimit</code> can no longer be
+struct-literal-constructed or field-exhaustively destructured outside the crate.</p>
+<p>Before:</p>
+<!-- `text`, not `rust`: the pre-2.1.0 exhaustive-destructure shape this
+     section is *about* removing no longer compiles against
+     `#[non_exhaustive]` `Error::Exit` — and this crate's CI runs doctests
+     with `--include-ignored`, which still compiles `ignore` blocks (only
+     `text`/non-`rust` fences are exempt). -->
+<pre><code class="language-text">match err {
+    Error::Exit { program, code, stdout, stderr } =&gt; { /* ... */ }
+    _ =&gt; {}
+}
+</code></pre>
+<p>After — add <code>..</code> to the pattern (or, better, use the existing accessors instead
+of destructuring at all):</p>
+<pre class="playground"><code class="language-rust no_run"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use processkit::{Error, ErrorReason};
+fn handle(err: Error) {
+// Since 3.0 the variants live on `ErrorReason`, reached via `err.reason()`.
+match err.reason() {
+    ErrorReason::Exit { program, code, stdout, stderr, .. } =&gt; { let _ = (program, code, stdout, stderr); }
+    _ =&gt; {}
+}
+
+// or, accessor-based and immune to the next field addition:
+if let Some(code) = err.code() {
+    // err.program() / err.stdout() / err.stderr() / err.combined() also work
+    let _ = code;
+}
+}
+<span class="boring">}</span></code></pre>
+<p>This is prep for future field additions to any of these variants without
+another breaking change — the <code>Exit</code>/<code>Timeout</code>/<code>Signalled</code> variants already
+gained one such field this release (next entry).</p>
+<h3 id="errorexit--timeout--signalled-gain-a-stdout_bytes-field"><a class="header" href="#errorexit--timeout--signalled-gain-a-stdout_bytes-field"><code>Error::Exit</code> / <code>Timeout</code> / <code>Signalled</code> gain a <code>stdout_bytes</code> field</a></h3>
+<p>A new field, <code>stdout_bytes: Option&lt;Vec&lt;u8&gt;&gt;</code>, carries the <strong>exact</strong> captured
+stdout bytes for a checking-verb error built over <code>output_bytes</code>
+(e.g. <code>output_bytes().await?.ensure_success()?</code>); read it through
+<code>Error::stdout_bytes() -&gt; Option&lt;&amp;[u8]&gt;</code>, not by destructuring the variant
+directly (they are <code>#[non_exhaustive]</code> — see above). <code>None</code> on the text path
+(<code>output_string</code>/<code>run</code>/<code>checked</code>/…), where the decoded <code>stdout</code> string is
+already the whole story.</p>
+<h3 id="errorresourcelimit-is-restructured-limits-feature"><a class="header" href="#errorresourcelimit-is-restructured-limits-feature"><code>Error::ResourceLimit</code> is restructured (<code>limits</code> feature)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Before</th><th>After</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Error::ResourceLimit { message: String }</code></td><td><code>Error::ResourceLimit { kind: LimitKind, reason: LimitReason, detail: String }</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Fix a match:</p>
+<!-- `text`, not `rust`: bare match arms (no enclosing `match`/subject),
+     mixing the removed pre-2.1.0 `{ message }` shape with the current one —
+     see the note above on why `text` rather than `ignore`. -->
+<pre><code class="language-text">// Before
+Error::ResourceLimit { message } =&gt; warn!("limit rejected: {message}"),
+
+// After
+Error::ResourceLimit { detail, .. } =&gt; warn!("limit rejected: {detail}"),
+
+// or, branch on the structured classification instead of parsing text:
+if let (Some(kind), Some(reason)) = (err.limit_kind(), err.limit_reason()) {
+    match (kind, reason) {
+        (LimitKind::Memory, LimitReason::Unsupported) =&gt; { /* ... */ }
+        _ =&gt; {}
+    }
+}
+</code></pre>
+<h3 id="output_bytes-now-honors-the-byte-cap-on-stdout-too--a-behavior-change"><a class="header" href="#output_bytes-now-honors-the-byte-cap-on-stdout-too--a-behavior-change"><code>output_bytes</code> now honors the byte cap on stdout too — a behavior change</a></h3>
+<p>Not compiler-caught: if you configured an <code>OutputBufferPolicy</code> byte ceiling
+(<code>with_max_bytes</code>) and called <code>output_bytes</code>, the cap previously bounded only
+the line-pumped <strong>stderr</strong>; raw <strong>stdout</strong> capture was unbounded regardless of
+the configured <code>max_bytes</code>. It now applies to both streams:</p>
+<ul>
+<li><code>OverflowMode::Error</code> past the cap now errors on stdout overflow too, with
+<code>Error::OutputTooLarge { max_lines: None, .. }</code> (raw bytes have no lines).</li>
+<li>The drop modes (head/tail) now bound retained stdout bytes the same way they
+already bounded stderr, and set <code>ProcessResult::truncated</code>.</li>
+</ul>
+<p>If nothing sets a byte cap, capture stays unbounded exactly as before — nothing
+to do. If you do set one and rely on <code>output_bytes</code> returning the <strong>full</strong>
+stdout regardless, re-check that call site: it now truncates/errors like every
+other capture path under the same policy.</p>
+<h3 id="cassette-replay-cwd-no-longer-part-of-the-match-key--no-action-needed"><a class="header" href="#cassette-replay-cwd-no-longer-part-of-the-match-key--no-action-needed">Cassette replay: <code>cwd</code> no longer part of the match key — no action needed</a></h3>
+<p><code>RecordReplayRunner</code> (<code>record</code> feature) replays a cassette recorded from one
+absolute working directory against the same invocation run from a different
+one, instead of <code>CassetteMiss</code>ing — <code>cwd</code> is still stored on each entry for
+visibility, it just no longer discriminates two otherwise-identical recorded
+runs. The on-disk format revision bumped to <code>3</code>, but this is not a compatibility
+gate: a cassette written by a 1.x build still loads and replays fine. The one
+edge case: an existing cassette that had two entries differing <em>only</em> in <code>cwd</code>
+now collides on replay, and the first-recorded entry answers for both —
+re-record it if that matters for your fixtures.</p>
+<h3 id="verify-the-upgrade-1"><a class="header" href="#verify-the-upgrade-1">Verify the upgrade</a></h3>
+<pre><code class="language-sh">cargo update -p processkit
+cargo build      # the renames and non_exhaustive tightenings are compiler-caught
+cargo test       # catches the output_bytes byte-cap behavior change if you rely on it
+</code></pre>
+<h2 id="100-from-011x"><a class="header" href="#100-from-011x">1.0.0 (from 0.11.x)</a></h2>
+<p>A few breaking changes, all <strong>caught by the compiler</strong> — if it builds after the
+bump, you’re done.</p>
+<h3 id="outputlinetext-is-now-an-accessor"><a class="header" href="#outputlinetext-is-now-an-accessor"><code>OutputLine.text</code> is now an accessor</a></h3>
+<p><code>OutputLine</code> (the per-line payload of <code>RunningProcess::output_events</code>) no longer
+exposes <code>text</code> as a public field — read it via <code>line.text() -&gt; &amp;str</code> (or
+<code>line.into_text() -&gt; String</code> to take ownership). This frees the line
+representation to evolve. Fix: <code>line.text</code> → <code>line.text()</code>.</p>
+<h3 id="errorresourcelimit-is-now-a-struct-variant"><a class="header" href="#errorresourcelimit-is-now-a-struct-variant"><code>Error::ResourceLimit</code> is now a struct variant</a></h3>
+<p><code>Error::ResourceLimit(String)</code> became <code>Error::ResourceLimit { message: String }</code>
+(parity with the other rich variants, room for structured detail later). Fix a
+match <code>Error::ResourceLimit(m)</code> → <code>Error::ResourceLimit { message: m }</code>.
+(Only relevant with the <code>limits</code> feature.)</p>
+<h3 id="the-text-capture-verb-is-renamed-output--output_string"><a class="header" href="#the-text-capture-verb-is-renamed-output--output_string">The text-capture verb is renamed <code>output</code> → <code>output_string</code></a></h3>
+<p>The verb that runs to completion and returns the full <code>ProcessResult&lt;String&gt;</code>
+is now spelled <strong><code>output_string</code></strong> on every layer, matching <code>output_bytes</code> (and
+the spelling <code>Command</code>/<code>Pipeline</code>/<code>RunningProcess</code> already used). Two reasons:
+the same operation no longer has two names depending on the type, and a bare
+<code>output</code> clashed with <code>std::process::Command::output</code>, which returns <strong>bytes</strong> —
+the explicit name removes that footgun.</p>
+<p><strong>Affected if you call</strong> <code>ProcessRunner::output</code>, <code>CliClient::output</code>, the free
+fn <code>processkit::output</code>, or implement a custom <code>ProcessRunner</code> / use <code>MockRunner</code>.
+The symptom is a build error like <em>“no method named <code>output</code>”</em> /
+<em>“cannot find function <code>output</code> in crate <code>processkit</code>”</em>.</p>
+<p><strong>Fix</strong> — rename the calls (mechanical):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Before</th><th>After</th></tr>
+</thead>
+<tbody>
+<tr><td><code>runner.output(&amp;cmd)</code> / <code>client.output(args)</code></td><td><code>runner.output_string(&amp;cmd)</code> / <code>client.output_string(args)</code></td></tr>
+<tr><td><code>processkit::output(prog, args)</code></td><td><code>processkit::output_string(prog, args)</code></td></tr>
+<tr><td><code>impl ProcessRunner { async fn output(..) }</code></td><td><code>async fn output_string(..)</code> (the required method)</td></tr>
+<tr><td><code>mock.expect_output()</code></td><td><code>mock.expect_output_string()</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>output_bytes</code> is unchanged, and <code>Command</code>/<code>Pipeline</code>/<code>RunningProcess</code> callers
+need no change (those already used <code>output_string</code>).</p>
+<h2 id="0110-from-010x"><a class="header" href="#0110-from-010x">0.11.0 (from 0.10.x)</a></h2>
+<p>Two breaking changes, both small and <strong>caught by the compiler</strong> — if it builds
+after the bump, you’re done. Plus one internal fix that needs no action.</p>
+<h3 id="1-stats-is-now-opt-in--a-cargotoml-change"><a class="header" href="#1-stats-is-now-opt-in--a-cargotoml-change">1. <code>stats</code> is now opt-in — a <code>Cargo.toml</code> change</a></h3>
+<p>The default feature set is now just <code>process-control</code>; <code>stats</code> is no longer on by
+default. (It gates a specialized metrics surface the core never needs; on
+Windows it links an OS library — the <code>ProcessStatus</code> FFI used solely for the
+peak-memory readout — but unlike <code>mock</code>/<code>tracing</code>/<code>record</code> it pulls in no extra
+crate.)</p>
+<p><strong>Affected if you use any metrics API:</strong> <code>ProcessGroup::stats</code> /
+<code>ProcessGroupStats</code>, <code>RunningProcess::cpu_time</code> / <code>peak_memory_bytes</code>, or
+<code>RunProfile</code> / <code>RunningProcess::profile</code>. The symptom is a build error like
+<em>“no method named <code>stats</code> / <code>cpu_time</code> / <code>peak_memory_bytes</code> / <code>profile</code>”</em> or
+<em>“cannot find type <code>ProcessGroupStats</code> / <code>RunProfile</code>”</em>.</p>
+<p><strong>Fix</strong> — add the feature:</p>
+<pre><code class="language-toml">[dependencies]
+processkit = { version = "0.11", features = ["stats"] }
+</code></pre>
+<p>If you already enable <code>limits</code>, do <strong>nothing</strong> — <code>limits</code> still implies <code>stats</code>.</p>
+<p><strong>If you don’t use metrics:</strong> nothing to do. Your default build is now slightly
+leaner (no Windows <code>ProcessStatus</code> dependency).</p>
+<h3 id="2-outputevent-carries-outputline--a-code-change"><a class="header" href="#2-outputevent-carries-outputline--a-code-change">2. <code>OutputEvent</code> carries <code>OutputLine</code> — a code change</a></h3>
+<p>Affects only callers of <code>RunningProcess::output_events</code> (the ordered
+lifecycle+output event stream). The per-line payload changed from a bare <code>String</code>
+to a <code>#[non_exhaustive]</code> <code>OutputLine</code> struct with a public <code>text</code> field.</p>
+<p>Before:</p>
+<!-- `text`, not `rust`: `OutputEvent::Stdout`/`Stderr` carrying a bare
+     `String` is the pre-0.11 shape this section is *about* removing — it no
+     longer matches the crate's current `OutputEvent`/`OutputLine` types
+     (`events` is also a free variable); see the note earlier on why `text`
+     rather than `ignore` (this crate's CI runs doctests with
+     `--include-ignored`, which still compiles `ignore` blocks). -->
+<pre><code class="language-text">use processkit::OutputEvent;
+
+while let Some(ev) = events.next().await {
+    match ev {
+        OutputEvent::Stdout(s) =&gt; println!("out: {s}"),
+        OutputEvent::Stderr(s) =&gt; eprintln!("err: {s}"),
+        _ =&gt; {}
+    }
+}
+</code></pre>
+<p>After — read <code>line.text</code> (in 1.0 this becomes <code>line.text()</code>; see the
+<a href="#100-from-011x">1.0.0 section</a> above):</p>
+<!-- `text`, not `rust`: `line.text` as a public field is itself the
+     0.11-era shape (1.0 turned it into an accessor, `line.text()` — see
+     above); `ev` is a free variable. -->
+<pre><code class="language-text">match ev {
+    OutputEvent::Stdout(line) =&gt; println!("out: {}", line.text),
+    OutputEvent::Stderr(line) =&gt; eprintln!("err: {}", line.text),
+    _ =&gt; {}
+}
+</code></pre>
+<p>Or, when you don’t care which stream produced the line, use the new accessor:</p>
+<!-- `text`, not `rust`: `processkit::OutputEvent` was the 0.11-era name for this
+     enum; 3.0 renamed it to `ProcessEvent` (see that section above), so this
+     historical example no longer compiles against the current type. The
+     `ev.text()` accessor it shows still exists on today's `ProcessEvent`. -->
+<pre><code class="language-text">fn handle(ev: processkit::OutputEvent) {
+if let Some(text) = ev.text() {
+    println!("{text}");
+}
+}
+</code></pre>
+<p><code>OutputLine</code> is <code>#[non_exhaustive]</code>: you receive it from the crate and read its
+fields — you don’t construct it, and a <code>match</code> on it should use <code>..</code>. The change
+exists to reserve room for per-line metadata (e.g. a timestamp or a monotonic line
+index) in a later release without another break.</p>
+<h3 id="3-cancel-precedence-fix-issue-7--no-action"><a class="header" href="#3-cancel-precedence-fix-issue-7--no-action">3. Cancel-precedence fix (“Issue 7”) — no action</a></h3>
+<p>A run that reaps on its own is no longer at risk of being misreported as
+<code>Err(Cancelled)</code> by a cancellation token that fires in the narrow window between
+the reap and the disposition check. This is an internal correctness fix with no
+public-API change. If you carried a workaround that tolerated a spurious
+<code>Cancelled</code> on a self-completing run, you can remove it.</p>
+<h3 id="verify-the-upgrade-2"><a class="header" href="#verify-the-upgrade-2">Verify the upgrade</a></h3>
+<pre><code class="language-sh">cargo update -p processkit
+cargo build      # both breaking changes are compiler-caught
+cargo test
+</code></pre>
+<h2 id="upgrading-from-older-than-010"><a class="header" href="#upgrading-from-older-than-010">Upgrading from older than 0.10</a></h2>
+<p>The jumps below 0.10 predate this guide. Read the dated sections of the
+<a href="../CHANGELOG.html">CHANGELOG</a> for each minor you cross — every breaking entry there
+is marked <strong>Breaking</strong> and carries its own migration note. Notable recent
+non-breaking additions you gain along the way: <code>Command::checked</code> / <code>run_unit</code>
+(0.10.2) and the <code>record</code>-cassette symlink/<code>Display</code>-injection hardening (0.10.2).</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="untrusted-children.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="whats-next.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="untrusted-children.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="whats-next.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-09f2665d.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="theme/nav-links-0c03fceb.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

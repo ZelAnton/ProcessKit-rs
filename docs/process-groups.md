@@ -331,8 +331,12 @@ What it does, and what it deliberately does **not**:
   child escapes **this crate's** per-run containment, not a broader host one it
   inherits.
 - **A separate, non-interchangeable type.** You get a `DetachedChild` carrying
-  only the `pid` — no `kill`, no `wait`, no timeout, no capture, no teardown verbs
-  — because it is no longer contained. Dropping it does nothing to the child.
+  only the `pid` — no public kill, wait, timeout, capture, or control/teardown APIs
+  — because it is no longer contained. Dropping it does nothing to the child. On
+  Unix, a private background reaper owns the detached `Child` and collects its exit
+  status so it does not become a zombie; that bookkeeping is not a public wait or
+  control API. Windows and other non-Unix targets use their normal process-handle
+  cleanup instead.
   (Left as a bare code span, not a `docs.rs` link: this type ships in the next
   release, so a `docs.rs` URL would 404 until then.)
 - **stdio is null, or a file — never a pipe.** With no owner left to drain it, a

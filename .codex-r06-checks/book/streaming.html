@@ -1,0 +1,1039 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Streaming &amp; interactive I/O - ProcessKit</title>
+
+
+        <!-- Custom HTML head -->
+        <meta property="og:title" content="ProcessKit — async child-process management for Rust" />
+        <meta property="og:description" content="Kernel-backed whole-tree kill-on-drop for tokio. Job Object on Windows, cgroup v2 on Linux, POSIX process group on macOS. Streaming, pipelines, supervision, hermetic testing." />
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content="https://zelanton.github.io/ProcessKit-rs/" />
+        <meta property="og:image" content="https://zelanton.github.io/ProcessKit-rs/processkit-cover-social.jpg" />
+        <meta property="og:image:type" content="image/jpeg" />
+        <meta property="og:site_name" content="ProcessKit" />
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta name="twitter:title" content="ProcessKit — async child-process management for Rust" />
+        <meta name="twitter:description" content="Kernel-backed whole-tree kill-on-drop for tokio. No orphan processes, ever." />
+        <meta name="twitter:image" content="https://zelanton.github.io/ProcessKit-rs/processkit-cover-social.jpg" />
+
+        <meta name="description" content="Async child-process management — Rust · Go · F# · Kotlin">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="theme/custom-883d6c86.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-03d2395f.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-9a8459aa.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ProcessKit</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/ZelAnton/ProcessKit-rs" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/ZelAnton/ProcessKit-rs/edit/main/docs/docs/streaming.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="streaming--interactive-io"><a class="header" href="#streaming--interactive-io">Streaming &amp; interactive I/O</a></h1>
+<p><a href="README.html">‹ docs index</a></p>
+<p>The one-shot verbs in <a href="commands.html">Running commands</a> buffer the whole output.
+For long-running or conversational children, <code>Command::start()</code> returns a live
+<code>RunningProcess</code> you drive yourself: stream stdout as it arrives, write stdin
+incrementally, probe for readiness, race several children, or profile a run.</p>
+<p>The same live-handle model extends to <strong>multi-stage chains</strong>:
+<code>Pipeline::start()</code> returns a <code>PipelineSession</code> — the multi-stage analogue of
+<code>RunningProcess</code> — that streams the last stage’s stdout, waits for a readiness
+line, and folds the pipefail outcome at <code>finish()</code>, all while the whole chain is
+bounded and torn down as a unit. See
+<a href="pipelines.html#streaming-a-live-chain">Pipelines → streaming a live chain</a>.</p>
+<ul>
+<li><a href="#lifecycle">Lifecycle</a></li>
+<li><a href="#streaming-stdout">Streaming stdout</a></li>
+<li><a href="#the-full-lifecycle-as-one-stream-events">The full lifecycle as one stream (<code>events()</code>)</a></li>
+<li><a href="#interactive-stdin">Interactive stdin</a></li>
+<li><a href="#readiness-probes">Readiness probes</a></li>
+<li><a href="#prompt-aware-waiting-wait_for_output">Prompt-aware waiting (<code>wait_for_output</code>)</a></li>
+<li><a href="#racing-children-with-wait_any">Racing children with <code>wait_any</code></a></li>
+<li><a href="#per-run-telemetry">Per-run telemetry</a></li>
+</ul>
+<h2 id="lifecycle"><a class="header" href="#lifecycle">Lifecycle</a></h2>
+<pre class="playground"><code class="language-rust no_run">use processkit::Command;
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let mut run = Command::new("dev-server").start().await?;
+
+    run.pid();        // Option&lt;u32&gt; — None once the child is reaped
+    run.elapsed();    // time since spawn
+
+    // Consume the handle exactly one way:
+    //   output_string() / output_bytes()  → capture everything (same as the one-shot verbs)
+    //   wait()                            → just the Outcome; output is discarded
+    //   drain()                           → like wait(), but honors output_buffer's byte cap; feeds tees, retains nothing
+    //   finish()                 → after streaming stdout (below)
+    //   profile(every)                    → resource samples; output discarded, like wait() (stats feature)
+    let outcome = run.wait().await?;   // Outcome: Exited(code) / Signalled(sig) / TimedOut
+    Ok(())
+}</code></pre>
+<h3 id="wait-vs-drain"><a class="header" href="#wait-vs-drain"><code>wait()</code> vs <code>drain()</code></a></h3>
+<p>Both wait for exit while draining stdout/stderr so the child never blocks on a
+full pipe, and both return the same <code>Outcome</code>. They differ only in the in-flight
+memory bound:</p>
+<ul>
+<li><strong><code>wait()</code></strong> ignores <code>output_buffer</code> and pins a large fixed internal cap. Reach
+for it when you just want the exit outcome.</li>
+<li><strong><code>drain()</code></strong> honors the configured
+<a href="commands.html"><code>output_buffer</code></a> <strong>byte cap</strong> (<a href="https://docs.rs/processkit/latest/processkit/struct.OutputBufferPolicy.html#method.with_max_bytes"><code>with_max_bytes</code></a>) for the
+in-flight bound, retaining nothing. Reach for it when the output is already going
+where you want it — a <code>stdout_tee</code>/<code>stderr_tee</code> writing to a file, or an
+<code>on_stdout_line</code>/<code>on_stderr_line</code> handler — and you want held memory bounded by
+<em>your</em> configured limit rather than the child’s output size. Those sinks still
+see every line that fits the cap; a line longer than the byte cap is skipped for
+every sink alike (counted only via the truncation signal), and an unbounded
+<code>output_buffer</code> falls back to the same fixed floor <code>wait</code> uses.</li>
+</ul>
+<pre class="playground"><code class="language-rust no_run">use processkit::{Command, OutputBufferPolicy};
+use tokio::fs::File;
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    // Tee a noisy build to a file, keep only ~1 MiB in flight, capture nothing.
+    let log = File::create("build.log").await?;
+    let outcome = Command::new("cargo")
+        .args(["build", "--release"])
+        .output_buffer(OutputBufferPolicy::unbounded().with_max_bytes(1 &lt;&lt; 20))
+        .stdout_tee(log)
+        .start()
+        .await?
+        .drain()
+        .await?;
+    println!("build finished: {outcome:?}");
+    Ok(())
+}</code></pre>
+<p><code>start()</code> puts the child in a <strong>private group the handle owns</strong>: dropping the
+<code>RunningProcess</code> kills the whole tree, exactly like dropping a one-shot run’s
+future. The shared-group variant — <code>group.start(&amp;cmd)</code> — gives the same handle
+but the <em>group</em> controls the tree’s fate (see
+<a href="process-groups.html#putting-processes-in">Process groups</a>).</p>
+<p>There is also an explicit <code>run.start_kill()</code> for “stop it now, I’ll <code>wait()</code>
+for the code myself”.</p>
+<h2 id="streaming-stdout"><a class="header" href="#streaming-stdout">Streaming stdout</a></h2>
+<p><code>stdout_lines()</code> yields decoded lines as the child produces them — no waiting
+for exit, no full-output buffering. <code>StreamExt</code> (in <code>processkit::prelude</code>,
+re-exported from <code>tokio-stream</code>) provides <code>.next()</code>:</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::prelude::StreamExt;
+use processkit::{Command, Finished, Outcome};
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let mut run = Command::new("cargo")
+        .args(["build", "--release"])
+        .start()
+        .await?;
+
+    let mut lines = run.stdout_lines()?;
+    while let Some(line) = lines.next().await {
+        println!("build: {line}");
+    }
+
+    // The stream ended (stdout closed). Collect the outcome and stderr —
+    // stderr was drained in the background the whole time, so a noisy child
+    // could never block on a full pipe.
+    let Finished { outcome, stderr, .. } = run.finish().await?;
+    if outcome != Outcome::Exited(0) {
+        eprintln!("build failed ({outcome:?}):\n{stderr}");
+    }
+    Ok(())
+}</code></pre>
+<p>Things to know:</p>
+<ul>
+<li><strong>Call <code>stdout_lines()</code> once.</strong> It is fallible: a second <code>stdout_lines</code> /
+<code>events</code> call (stdout is consumed once), or a non-piped stdout
+(<code>StdioMode::Inherit</code>/<code>Null</code> or <code>Command::stdout_file*</code>), returns <code>Err</code> rather than a silently-empty
+stream.</li>
+<li><strong>The command’s <code>timeout</code> bounds the stream</strong>: at the deadline the tree
+(own-group handle) or the direct child (shared-group handle) is killed, the
+pipes close, and the stream ends — a
+streamed run can’t hang past its deadline. A <code>cancel_on</code> token ends it the
+same way; the following
+<code>finish</code> then reports <code>ErrorReason::Cancelled</code>. Details in
+<a href="timeouts-and-cancellation.html">Timeouts &amp; cancellation</a>.</li>
+<li>Line counters tick live: <code>run.stdout_line_count()</code> / <code>stderr_line_count()</code>
+are cheap progress gauges even while you stream.</li>
+<li>Byte counters tick live: <code>run.stdout_bytes_seen()</code> /
+<code>stderr_bytes_seen()</code> count raw bytes read from each pipe before decoding or
+line splitting. They are monotonic and include bytes discarded by the
+buffer policy, including oversized lines, and remain stable after the pump
+completes. A stream that is not pumped (a file redirect or
+<code>StdioMode::Null</code>/<code>Inherit</code>) reports <code>0</code> honestly.</li>
+<li>The <a href="commands.html#output-handling">buffer policy and line handlers</a> apply to
+streamed runs too — a handler sees each line on the pump, in addition to
+your loop.</li>
+<li>The whole streaming surface is <strong>hermetically testable</strong>: a
+<code>ScriptedRunner</code>’s <code>start()</code> returns a handle whose canned lines flow
+through the same pump machinery — <code>stdout_lines</code>, the readiness probes, and
+<code>finish</code> behave identically with no subprocess. See
+<a href="testing.html#scripted-streaming">Testing → scripted streaming</a>.</li>
+</ul>
+<h3 id="carriage-return-progress-output"><a class="header" href="#carriage-return-progress-output">Carriage-return progress output</a></h3>
+<p>Tools like <code>curl</code>, <code>pip</code>, and <code>apt</code> redraw a progress bar <em>in place</em> with a
+carriage return (<code>\rProgress: 50%\rProgress: 100%</code>) and emit no <code>\n</code> until the
+very end. By default the pump splits on <code>\n</code> only, so that whole sequence is a
+single, ever-growing line: nothing streams live, and under a byte cap the one
+over-cap line is dropped whole.</p>
+<p>Set <code>line_terminator(LineTerminator::CarriageReturn)</code> to treat a bare <code>\r</code> as a
+line terminator too. Each carriage-return frame then arrives as its own line —
+live, one at a time:</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::prelude::StreamExt;
+use processkit::{Command, LineTerminator};
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let mut run = Command::new("pip")
+        .args(["install", "big-package"])
+        // Frame the stream you actually consume: `stdout_lines()` surfaces
+        // stdout only (stderr is drained in the background and discarded), so
+        // put the CR framing on stdout. If a tool draws its bar on stderr,
+        // set `line_terminator(..)` for both streams and read `events()`.
+        .stdout_line_terminator(LineTerminator::CarriageReturn)
+        .start()
+        .await?;
+
+    let mut lines = run.stdout_lines()?;
+    while let Some(frame) = lines.next().await {
+        // Overwrite your own display with the latest frame.
+        print!("\r{frame}");
+    }
+    run.finish().await?;
+    Ok(())
+}</code></pre>
+<p>The chosen framing is <strong>one shared definition of a line</strong> for every sink: the
+streaming verbs, the <a href="commands.html#output-handling"><code>on_stdout_line</code>/<code>on_stderr_line</code>
+handlers</a>, a <code>stdout_tee</code>/<code>stderr_tee</code> (which
+writes each frame followed by <code>\n</code>), and <code>output_string</code> all see the same
+per-frame lines. A <code>\r\n</code> pair stays a single terminator (no empty line between
+them), so ordinary CRLF text reads identically to the default; only a <code>\r</code> <em>not</em>
+followed by a <code>\n</code> splits a frame. The <code>OutputBufferPolicy</code> byte cap now bounds
+an individual runaway frame — a frame whose content exceeds the cap is skipped
+as it streams (never assembled whole) — rather than dropping the whole progress
+stream. Use <code>stdout_line_terminator</code> / <code>stderr_line_terminator</code> for one stream,
+or <code>line_terminator</code> for both.</p>
+<h3 id="byte-accurate-raw-output-stdout_raw_tee"><a class="header" href="#byte-accurate-raw-output-stdout_raw_tee">Byte-accurate raw output (<code>stdout_raw_tee</code>)</a></h3>
+<p>Every path above hands you <strong>decoded</strong> text: bytes go through <code>encoding_rs</code>,
+lines are split on the terminator, and CRLF is normalized. That is exactly right
+for text logic — but a <strong>transparent wrapper</strong> needs the child’s bytes <em>unaltered</em>.
+Decoding mangles four things a passthrough must preserve: non-UTF-8 stdout (binary
+from <code>git archive</code>, <code>tar -cz -</code>, <code>ffmpeg … -</code>) becomes U+FFFD; CRLF is rewritten
+and a missing final newline is fabricated; an unterminated prompt (<code>Password: </code>)
+sits in the decode buffer until EOF and reads as a hang; and a line past the byte
+cap vanishes from the transcript entirely.</p>
+<p><code>stdout_raw_tee(writer)</code> / <code>stderr_raw_tee(writer)</code> are the byte plane, orthogonal
+to <code>stdout_tee</code>. Each chunk is written to <code>writer</code> <strong>exactly as read from the
+pipe</strong> — before decoding, before line splitting — so it is byte-for-byte the
+child’s output, in order: non-UTF-8 bytes survive, CRLF is untouched, the tail is
+never padded, an unterminated chunk arrives the instant it is read, and even a
+policy-dropped line is teed whole. It is <strong>strictly additive</strong> — the decoded line
+path (capture, <code>on_*_line</code>, <code>stdout_tee</code>, the buffer policy) is unchanged, and
+both tees can run at once, each seeing its own view. The write is awaited on the
+capture pump, so a slow raw sink applies the same backpressure as the line tee (no
+unbounded in-flight buffer), and it is flushed at stream end.</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::Command;
+use tokio::fs::File;
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    // Transparent passthrough: forward the child's *exact* stdout bytes to a file
+    // (binary-safe — no decoding, no CRLF rewrite, no lost tail), retaining
+    // nothing in memory. `drain` streams the bytes through to the tee and returns
+    // just the classified exit outcome.
+    let exact = File::create("archive.tar").await?;
+    let outcome = Command::new("git")
+        .args(["archive", "HEAD"]) // writes a binary tar to stdout
+        .stdout_raw_tee(exact)
+        .start()
+        .await?
+        .drain()
+        .await?;
+    println!("archive written: {outcome:?}");
+    Ok(())
+}</code></pre>
+<p>The raw tee fires from the line/streaming verbs (<code>output_string</code>, <code>start</code> +
+<code>stdout_lines</code> / <code>events</code>, <code>wait</code> / <code>drain</code>). It is a <strong>no-op</strong> under
+<code>stdout(Inherit)</code> / <code>stdout(Null)</code> / a <code>stdout_file</code> redirect — none run a capture
+pump — and under <code>output_bytes</code>, whose own return value already <em>is</em> the exact raw
+stdout. Reach for it when you need the raw bytes <em>alongside</em> decoded lines.</p>
+<h3 id="redaction-at-capture-capture_policy"><a class="header" href="#redaction-at-capture-capture_policy">Redaction at capture (<code>capture_policy</code>)</a></h3>
+<p>Every plane above either <em>observes</em> a line (<code>on_stdout_line</code>, <code>stdout_tee</code>) or
+returns it verbatim (<code>stdout_raw_tee</code>, <code>output_bytes</code>). None can <em>change what is
+retained</em>: a secret a child echoes — a passphrase prompt from an agent CLI, a
+<code>--token</code> re-printed in a diagnostic — lands in the captured <code>ProcessResult</code>
+word for word. <code>capture_policy</code> is the seam that shapes the backlog <strong>before</strong>
+the line settles:</p>
+<pre class="playground"><code class="language-rust no_run">use std::borrow::Cow;
+use processkit::{Command, CapturePolicy, OutputStream};
+
+// A typed, named policy — introspectable in `Command`'s `Debug`, not an opaque
+// closure. It rewrites secrets as each line is captured.
+struct RedactTokens;
+impl CapturePolicy for RedactTokens {
+    fn name(&amp;self) -&gt; &amp;str { "redact-tokens" }
+    fn on_capture&lt;'a&gt;(&amp;self, _stream: OutputStream, line: &amp;'a str) -&gt; Cow&lt;'a, str&gt; {
+        if let Some(i) = line.find("token=") {
+            Cow::Owned(format!("{}token=[REDACTED]", &amp;line[..i]))
+        } else {
+            Cow::Borrowed(line) // unchanged: retained verbatim, no allocation
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let out = Command::new("agent-cli")
+        .arg("login")
+        .capture_policy(RedactTokens)
+        .output_string()
+        .await?;
+    // `out.stdout()` — and a streamed `stdout_lines` / `events` — carry
+    // the redacted text; the raw secret never reached the buffer.
+    assert!(!out.stdout().contains("token=hunter2"));
+    Ok(())
+}</code></pre>
+<p>Return <code>Cow::Borrowed(line)</code> to keep a line unchanged (no allocation), a
+<code>Cow::Owned</code> to rewrite it, or an empty string to blank the content while
+keeping the line’s slot and the exact line counter. The policy is handed the
+<code>OutputStream</code> each line came from, so one implementation can treat stdout and
+stderr differently. This completes the crate’s secret-hygiene story — a cassette
+stores env <em>names</em> only, <code>Debug</code> redacts env <em>values</em>, and <code>capture_policy</code>
+scrubs secrets a child prints — see
+<a href="untrusted-children.html#4-keep-the-environment-hermetic">Running untrusted children</a>.</p>
+<p><strong>Scope.</strong> The seam shapes the capture backlog only — <code>output_string</code> /
+<code>ProcessResult</code> and the streaming verbs. The observing <code>on_*_line</code> handlers, the
+decoded <code>stdout_tee</code> / <code>stderr_tee</code>, the byte-plane <code>stdout_raw_tee</code>, and the raw
+stdout of <code>output_bytes</code> are <strong>independent</strong> and see the line un-redacted; if you
+also tee to a log, redact in that sink too. A line past an <code>OutputBufferPolicy</code>
+byte cap is never assembled, so — like the handlers/tee — it never reaches the
+policy. <em>How much</em> is retained stays <code>OutputBufferPolicy</code>’s job (the two compose:
+the policy shapes each retained line’s content, the buffer policy bounds how many
+survive). A policy that panics <strong>fails closed</strong> — the offending line is blanked,
+never leaked raw.</p>
+<h2 id="the-full-lifecycle-as-one-stream-events"><a class="header" href="#the-full-lifecycle-as-one-stream-events">The full lifecycle as one stream (<code>events()</code>)</a></h2>
+<p><code>stdout_lines()</code> gives you stdout; <code>events()</code> gives you the child’s <strong>whole
+lifecycle</strong> as one ordered, typed stream — the single asynchronous source a TUI,
+dashboard, or supervisor wants, instead of stitching together separate channels
+for “started”, output, and “exited”:</p>
+<pre><code class="language-text">Started { pid } → interleaved Stdout / Stderr lines → Exited(outcome)
+</code></pre>
+<ul>
+<li><strong><code>ProcessEvent::Started { pid }</code></strong> leads the stream, emitted as soon as the
+pid is known (before any output). <code>pid</code> is <code>None</code> for a scripted double.</li>
+<li><strong><code>ProcessEvent::Stdout(line)</code> / <code>Stderr(line)</code></strong> carry each decoded
+<a href="https://docs.rs/processkit/latest/processkit/struct.OutputLine.html"><code>OutputLine</code></a> (read <code>line.text()</code>), the two streams polled fairly so neither
+starves the other.</li>
+<li><strong><code>ProcessEvent::Exited(outcome)</code></strong> ends the stream, carrying the run’s
+<a href="https://docs.rs/processkit/latest/processkit/enum.Outcome.html"><code>Outcome</code></a> — the same value <code>finish()</code> reports.</li>
+</ul>
+<p>The enum is <code>#[non_exhaustive]</code>: a <code>match</code> needs a <code>_</code> arm, and future kinds
+(e.g. the graceful-teardown transitions) can be added without a breaking change.
+<code>ProcessEvent::name()</code> gives a stable <code>"started"</code> / <code>"stdout"</code> / <code>"stderr"</code> /
+<code>"exited"</code> tag for logging or serialization.</p>
+<p><strong>Drive the stream and the finisher together.</strong> The terminal <code>Exited</code> is
+delivered when the run is <em>reaped</em> — which is what <code>finish()</code> (or <code>wait()</code>) does.
+So poll the stream and that finisher <strong>concurrently</strong> (e.g. with <code>tokio::join!</code>),
+rather than draining the stream to completion first and only then calling
+<code>finish()</code> — the stream would park waiting for an <code>Exited</code> no one is yet
+producing. After the stream ends, <code>finish()</code>’s <code>stderr</code> is empty because stderr
+was delivered to you as <code>Stderr</code> events.</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::prelude::StreamExt;
+use processkit::{Command, ProcessEvent};
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let mut run = Command::new("deploy").start().await?;
+
+    let mut events = run.events()?;
+    let render = async {
+        while let Some(ev) = events.next().await {
+            match ev {
+                ProcessEvent::Started { pid } =&gt; eprintln!("started {pid:?}"),
+                ProcessEvent::Stdout(line) =&gt; println!("{}", line.text()),
+                ProcessEvent::Stderr(line) =&gt; eprintln!("! {}", line.text()),
+                ProcessEvent::Exited(outcome) =&gt; eprintln!("exited {outcome:?}"),
+                _ =&gt; {} // non_exhaustive: future event kinds
+            }
+        }
+    };
+    // Poll the event stream and the reaping `finish()` together.
+    let (_, finished) = tokio::join!(render, run.finish());
+println!("run finished: {:?}", finished?.outcome);
+Ok(())
+}</code></pre>
+<p>Run the same pattern without external dependencies in
+<a href="https://github.com/ZelAnton/ProcessKit-rs/blob/main/examples/lifecycle_events.rs"><code>examples/lifecycle_events.rs</code></a>.</p>
+<h2 id="interactive-stdin"><a class="header" href="#interactive-stdin">Interactive stdin</a></h2>
+<p>Conversational tools — write a request, read the response, repeat. Keep stdin
+open with <code>keep_stdin_open()</code>, take the writer with <code>take_stdin()</code>:</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::prelude::StreamExt;
+use processkit::{Command, Finished, Outcome};
+
+// `ProcessStdin`'s writer methods return `std::io::Result`; `Box&lt;dyn Error&gt;`
+// mixes them with the crate's `Result` (or `.map_err(processkit::ErrorReason::Io)?`).
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    // `bc` evaluates each stdin line and prints the result.
+    let mut run = Command::new("bc").keep_stdin_open().start().await?;
+    let mut stdin = run.take_stdin().expect("stdin was kept open");
+    let mut answers = run.stdout_lines()?;
+
+    stdin.write_line("2 + 2").await?;             // sends a line + Enter, flushed
+    println!("= {}", answers.next().await.unwrap());
+
+    stdin.write_line("6 * 7").await?;
+    println!("= {}", answers.next().await.unwrap());
+
+    stdin.finish().await?;                        // send EOF — bc exits
+    let Finished { outcome, .. } = run.finish().await?;
+    assert_eq!(outcome, Outcome::Exited(0));
+    Ok(())
+}</code></pre>
+<p><code>ProcessStdin</code> offers <code>write(&amp;[u8])</code>, <code>write_line(&amp;str)</code> (terminal Enter + flush),
+<code>flush()</code>, and <code>finish()</code> (EOF). Dropping the writer — or the whole
+<code>RunningProcess</code> — closes stdin too; <code>finish()</code> just makes the EOF explicit
+and awaitable. <code>write_line</code> sends <code>\n</code> to a pipe or Unix PTY and <code>\r</code> to a
+Windows ConPTY, where a lone LF is Ctrl-J rather than the Enter key; use <code>write</code>
+when you need byte-exact input.</p>
+<p><strong>Avoid the full-duplex deadlock.</strong> A child’s stdout pipe has a finite OS
+buffer; once it fills, the child blocks <em>writing</em> stdout until something reads
+it. If you push a large interactive stdin while nothing drains the child’s
+stdout, the child stops reading stdin (blocked on stdout), your <code>write</code> parks
+waiting for stdin buffer space, and neither side progresses. The <code>bc</code> example
+above is safe because it interleaves one write with one read; when you both feed
+a sizable stdin <strong>and</strong> the child produces output, drain <code>stdout_lines</code> from one
+task while writing stdin from another. The same rule applies to a PTY’s
+single, full-duplex master: awaiting one large write while no sink reads merged
+output can deadlock. (The non-interactive <code>Stdin::from_*</code> sources are safe —
+the crate writes them on a background task that runs concurrently with the
+output pumps.)</p>
+<p>For <em>one-directional</em> streamed input (a channel, a file tail) you don’t need
+interactivity — give the command <code>Stdin::from_lines(stream)</code> /
+<code>Stdin::from_reader(reader)</code> and let the background writer feed it; see the
+<a href="commands.html#standard-input">stdin source table</a>.</p>
+<h3 id="pty-dialog-wait-for-a-prompt-then-answer"><a class="header" href="#pty-dialog-wait-for-a-prompt-then-answer">PTY dialog: wait for a prompt, then answer</a></h3>
+<p>A terminal prompt is usually an un-terminated tail (<code>Password: </code>), not a line.
+Combine <code>use_pty</code>, <code>keep_stdin_open</code>, and <code>wait_for_output</code> to drive an
+expect-style exchange without guessing when the child is ready:</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::Command;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let mut run = Command::new("terminal-login")
+        .use_pty()
+        .pty_size(100, 30)
+        .keep_stdin_open()
+        .start()
+        .await?;
+
+    run.wait_for_output(
+        |tail| tail.ends_with("Password: "),
+        Duration::from_secs(10),
+    )
+    .await?;
+    run.take_stdin()
+        .expect("PTY stdin was kept open")
+        .write_line("secret supplied by a protected source")
+        .await?;
+
+    run.finish().await?;
+    Ok(())
+}</code></pre>
+<p>The self-contained
+<a href="https://github.com/ZelAnton/ProcessKit-rs/blob/main/examples/pty_dialog.rs"><code>examples/pty_dialog.rs</code></a>
+also demonstrates live resize; run it with <code>--features pty</code>.</p>
+<p>On Unix, the PTY slave has echo disabled so the answer is not copied into the
+merged capture. That guarantee is Unix-only; ConPTY offers no portable
+equivalent, so a Windows caller sending secrets should avoid retaining or
+logging the transcript. The prompt wait itself is byte-driven on both
+platforms. Signal-driven terminal behavior is separate: on Unix, <code>use_pty</code>
+creates a controlling terminal so terminal signals such as the <code>SIGWINCH</code>
+raised by <code>resize_pty</code> reach the child as described below.</p>
+<h3 id="pty-window-size-and-live-resize"><a class="header" href="#pty-window-size-and-live-resize">PTY window size and live resize</a></h3>
+<p>Under <code>use_pty</code> the child runs on a real pseudo-terminal, and terminal-aware
+tools care about its <strong>size</strong>: it drives line wrapping, TUI/progress layout, and
+pager behavior. Set the initial geometry with <code>pty_size(cols, rows)</code> (default
+80×24), and change it on a <em>running</em> session with
+<code>RunningProcess::resize_pty(cols, rows)</code> — the way you propagate a host window
+resize down to the child. At spawn, <code>COLUMNS</code>/<code>LINES</code> match that initial
+geometry (and Unix defaults <code>TERM=xterm-256color</code>); explicit <code>env</code>/<code>env_remove</code>
+operations override those values:</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::prelude::StreamExt;
+use processkit::Command;
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    // Open the terminal at 120×40 instead of the 80×24 default.
+    let mut run = Command::new("htop").use_pty().pty_size(120, 40).start().await?;
+    let mut screen = run.stdout_lines()?;
+
+    // …later, the host window grows — tell the child so it re-renders.
+    run.resize_pty(160, 50)?;
+
+    while let Some(line) = screen.next().await {
+        // render `line`…
+        let _ = line;
+        break;
+    }
+    Ok(())
+}</code></pre>
+<p><code>resize_pty</code> works while you still hold the handle — typically interleaved with
+driving an owned <code>stdout_lines()</code>/<code>events()</code> stream and the <code>take_stdin()</code> writer
+of a live session. It returns <code>ErrorReason::Unsupported</code>
+— never a panic or a silent no-op — on a run that is <strong>not</strong> <code>use_pty</code> (there is
+no terminal to size) or once the child has <strong>exited</strong>. Platform delivery differs:
+on <strong>Unix</strong> the resize (<code>TIOCSWINSZ</code>) raises <code>SIGWINCH</code> on the child immediately;
+on <strong>Windows</strong> <code>ResizePseudoConsole</code> has no signal, so a console client observes
+the new size on its next console query and conhost may reflow a little later. On a
+non-<code>use_pty</code> command <code>pty_size</code> is a documented no-op (nothing to size). See
+<a href="platform-support.html#pty-mode-use_pty-the-pty-feature">platform support</a>.
+Because a running process’s environment is immutable, live resize does not
+rewrite <code>COLUMNS</code>/<code>LINES</code>; applications learn the new size through the platform
+resize mechanism.</p>
+<h3 id="pty-output-hygiene-line-framing-and-vt-sanitization"><a class="header" href="#pty-output-hygiene-line-framing-and-vt-sanitization">PTY output hygiene: line framing and VT sanitization</a></h3>
+<p>A PTY child writes like a terminal, which two things about <code>use_pty</code> handle so a
+line-oriented consumer gets sensible output — one automatic, one opt-in:</p>
+<ul>
+<li><strong>Framing is <code>\r</code>-aware by default under <code>use_pty</code>.</strong> Terminal tools draw
+progress by redrawing a line in place with a bare <code>\r</code> (no <code>\n</code> until the end).
+Under the default <code>Newline</code> framing that whole progress stream is <em>one</em>
+ever-growing line that only surfaces at EOF; so <code>use_pty</code> makes the <strong>effective</strong>
+default <code>line_terminator</code>
+<code>CarriageReturn</code>, and each redraw becomes its own frame/line live. This only
+changes <em>where</em> lines split (a <code>\r\n</code> still counts as one terminator), so it is
+the safe default for the mode. An explicit <code>line_terminator(...)</code> — even
+<code>Newline</code> — always wins, so you can pin the framing if you need to.</li>
+<li><strong>Escape sanitization is opt-in.</strong> Agentic CLIs spray VT/ANSI escapes (colors,
+cursor moves, alternate-screen switches, OSC window-title/hyperlink codes) into
+their merged output, so <code>output_string</code>, <code>wait_for_line</code>/<code>first_line</code>, and the
+streaming verbs otherwise carry <code>\x1b[31m…</code>-mucked strings. Turn on
+<code>Command::sanitize_vt()</code>
+to strip those sequences (and lone control codes, keeping tabs) from the capture
+backlog. It is opt-in because it is <em>destructive</em> — it removes bytes from the
+captured output — unlike the non-destructive framing default.</li>
+</ul>
+<pre class="playground"><code class="language-rust no_run">use processkit::prelude::StreamExt;
+use processkit::{Command, LineTerminator};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    // A PTY agent CLI: make the progress-frame contract explicit and opt into
+    // de-escaping, so every captured line is readable text.
+    let mut run = Command::new("agent")
+        .use_pty()
+        .pty_size(120, 30)
+        .line_terminator(LineTerminator::CarriageReturn)
+        .sanitize_vt()
+        .start()
+        .await?;
+    let mut lines = run.stdout_lines()?;
+    while let Some(line) = lines.next().await {
+        // `line` is a clean, de-escaped frame — safe for a `contains(...)` probe.
+        let _ = line;
+        break;
+    }
+    Ok(())
+}</code></pre>
+<p>Because a PTY merges both child descriptors into its logical stdout, the
+whole-command setters above are the clearest spelling. For a wrapper that can
+also run over ordinary pipes, the per-stream variants let each real pipe keep
+its own policy:</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::{Command, LineTerminator};
+
+fn command_for_pipes() -&gt; Command {
+    Command::new("agent")
+        .stdout_line_terminator(LineTerminator::CarriageReturn)
+        .stderr_line_terminator(LineTerminator::CarriageReturn)
+        .stdout_sanitize_vt()
+        .stderr_sanitize_vt()
+}
+
+fn command_for_pty() -&gt; Command {
+    Command::new("agent")
+        .use_pty()
+        .pty_size(120, 30)
+        .line_terminator(LineTerminator::CarriageReturn)
+        .sanitize_vt()
+}
+
+fn main() {
+    let _ = (command_for_pipes(), command_for_pty());
+}</code></pre>
+<p>In PTY mode, <code>stderr_line_terminator</code> and <code>stderr_sanitize_vt</code> have no separate
+stream to act on: the child stderr bytes have already joined stdout on the
+master. Likewise, <code>on_stderr_line</code> is not delivered and the final stderr
+capture is empty. Use the stdout/whole-command settings for PTY output, or use
+pipes when preserving stream identity is required.</p>
+<p>Sanitization shapes <strong>only the capture backlog</strong> — exactly the boundary
+<code>capture_policy</code>
+draws. The per-line handlers (<code>on_stdout_line</code>), the decoded <code>stdout_tee</code>, the
+byte-plane <code>stdout_raw_tee</code>, and <code>output_bytes</code> are independent and keep seeing the
+raw, escape-laden bytes; if you also tee to a log and want it clean, sanitize in
+that sink. When combined with <code>capture_policy</code>, sanitization runs <strong>first</strong>, so a
+secret-scrubbing policy matches on already-cleaned text rather than a token a color
+escape could split mid-word. Set it per stream with <code>stdout_sanitize_vt()</code> /
+<code>stderr_sanitize_vt()</code> when only one stream needs it. See
+<a href="platform-support.html#pty-mode-use_pty-the-pty-feature">platform support</a> for the
+per-platform PTY table.</p>
+<h2 id="readiness-probes"><a class="header" href="#readiness-probes">Readiness probes</a></h2>
+<p>“Start a server, then use it” needs <em>ready</em>, not merely <em>started</em>. Readiness
+probes replace the arbitrary sleep, each bounded by its own deadline:</p>
+<pre class="playground"><code class="language-rust no_run">async fn health_check() -&gt; bool { true }
+use processkit::Command;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let mut run = Command::new("my-server").start().await?;
+
+    // 1. A line on stdout (returns the matching line):
+    let banner = run
+        .wait_for_line(|l| l.contains("listening on"), Duration::from_secs(10))
+        .await?;
+
+    // 2. A pidfile or readiness sentinel appearing:
+    run.wait_for_path("run/my-server.ready", Duration::from_secs(10))
+        .await?;
+
+    // 3. A TCP port accepting connections:
+    run.wait_for_port("127.0.0.1:8080".parse().unwrap(), Duration::from_secs(10))
+        .await?;
+
+    // 4. A plain HTTP endpoint returning an expected status:
+    run.wait_for_http(
+        "127.0.0.1:8080".parse().unwrap(),
+        "/healthz",
+        |status| (200..300).contains(&amp;status),
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    // 5. A Unix domain socket accepting connections (Unix only):
+    run.wait_for_socket("/tmp/my-server.sock", Duration::from_secs(10))
+        .await?;
+
+    // 6. A Windows named pipe accepting clients (Windows only):
+    run.wait_for_pipe("my-service", Duration::from_secs(10)).await?;
+
+    // 7. Any async predicate (an HTTPS/body or metadata check, …):
+    run.wait_for(|| async { health_check().await }, Duration::from_secs(10))
+        .await?;
+
+    // ready — use the server…
+    let _ = banner;
+    Ok(())
+}</code></pre>
+<p>If a tool writes its banner to stderr, use the matching counterpart instead:</p>
+<pre><code class="language-rust ignore">let banner = run
+    .wait_for_stderr_line(|line| line.contains("backend ready"), Duration::from_secs(10))
+    .await?;</code></pre>
+<p>Choose one consuming line probe for a handle: while it hands you the selected
+stream, the other stream is already being drained in the background for
+liveness and later capture.</p>
+<p>Probe semantics, deliberately uniform:</p>
+<ul>
+<li>A probe that can’t pass within its deadline fails with <strong><code>ErrorReason::NotReady</code></strong>
+— distinct from <code>ErrorReason::Timeout</code>, which is the run’s own deadline.</li>
+<li>A probe also fails <em>fast</em> once readiness can no longer happen: the child
+exits, or (for <code>wait_for_line</code>) its stdout closes — no waiting out a 30s
+deadline on a dead server.</li>
+<li>A failed probe <strong>never kills the child.</strong> You decide: retry, log and
+continue, or tear down.</li>
+<li>All probes background-drain stdout/stderr while they poll, so a
+child with a large startup burst can’t stall in <code>write()</code> on a full OS pipe
+buffer. <code>wait_for_line</code> and <code>wait_for_stderr_line</code> consume the selected stream
+up to (and including) the match — continue with <code>finish</code> (whose stderr omits
+lines already consumed by <code>wait_for_stderr_line</code>). <code>wait_for_path</code> /
+<code>wait_for_port</code> / <code>wait_for_http</code> / <code>wait_for_socket</code> / <code>wait_for_pipe</code> / <code>wait_for</code>
+drain the same way but never hand any of it back mid-probe; <code>wait</code> /
+<code>output_string</code> afterward still see the full captured output, but
+<code>output_bytes</code> or a fresh <code>stdout_lines</code> / <code>events</code> call do not
+compose with any readiness probe that started a line pump (same as calling <code>wait_for_line</code>
+first).</li>
+<li><code>wait_for_socket</code> uses a real connection attempt, not just a socket-file
+existence check, and returns <code>ErrorReason::Unsupported</code> immediately on platforms
+without AF_UNIX (including Windows).</li>
+<li><code>wait_for_path</code> is deliberately existence-only: a file or directory counts.
+Use <code>wait_for</code> with <code>tokio::fs::metadata</code> when readiness also depends on type,
+size, permissions, or other metadata.</li>
+<li><code>wait_for_pipe</code> accepts a bare name or a fully-qualified <code>\\.\pipe\...</code> path.
+It returns <code>ErrorReason::Unsupported</code> off Windows. A busy pipe counts as ready:
+all server instances being occupied still proves the endpoint is serving.</li>
+<li><code>wait_for_http</code> sends a minimal HTTP/1.1 GET and reads only a bounded status
+line. It is plain HTTP only: no TLS, redirect following, response bodies, or
+authentication policy. Redirects count only if your status predicate accepts
+them; use <code>wait_for</code> with your own HTTP client for HTTPS or richer checks.</li>
+</ul>
+<h2 id="prompt-aware-waiting-wait_for_output"><a class="header" href="#prompt-aware-waiting-wait_for_output">Prompt-aware waiting (<code>wait_for_output</code>)</a></h2>
+<p><code>wait_for_line</code> only ever sees <strong>complete lines</strong> — text with its terminator. An
+interactive prompt is the opposite: <code>Password: </code>, <code>passphrase: </code>, <code>(y/N) </code>, a
+REPL <code>&gt;&gt;&gt; </code> are all written <strong>without</strong> a trailing newline and then <em>blocked on</em>,
+waiting for you to answer. Such a prompt never becomes a line, so <code>wait_for_line</code>
+(and <code>stdout_lines</code>) cannot see it until the stream ends — the “wait for the
+prompt, then answer it” dialog can’t be expressed line by line.</p>
+<p><code>wait_for_output(predicate, within)</code> closes that gap. Its stderr counterpart is
+<code>wait_for_stderr_output</code>; both are <code>expect</code>-style
+primitive (in the spirit of <code>rexpect</code>): it matches the child’s <strong>current
+un-terminated output tail</strong> — the partial line the pump has decoded but not yet
+split — and hands it back so you can answer over <code>take_stdin()</code>. PTY is the
+motivating case (a merged terminal stream is full of un-terminated prompts), but
+it is <strong>not</strong> PTY-specific — a plain piped run benefits too (e.g. a progress
+meter that rewrites one line without a newline).</p>
+<p>Unlike the line probes, these methods <strong>do not consume</strong> their selected stream
+and are <strong>repeatable</strong>: a whole session can be a sequence of
+<code>wait_for_output</code> → answer turns, one per prompt.</p>
+<pre class="playground"><code class="language-rust">use processkit::{Command, ProcessRunner};
+use processkit::testing::{Reply, ScriptedRunner};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    // A hermetic stand-in for a tool that prompts, reads a secret, then
+    // continues — no real subprocess. `Reply::dialog` emits the prompt, waits
+    // for the answer over stdin, then emits the continuation.
+    let runner = ScriptedRunner::new()
+        .fallback(Reply::dialog("Password: ", "granted, welcome&gt; "));
+
+    let mut run = runner
+        .start(&amp;Command::new("login").keep_stdin_open())
+        .await?;
+
+    // Wait for the un-terminated `Password: ` prompt (a whole line never arrives).
+    let prompt = run
+        .wait_for_output(|tail| tail.ends_with("Password: "), Duration::from_secs(5))
+        .await?;
+    assert!(prompt.contains("Password:"));
+
+    // Answer it, then wait for the next (also un-terminated) prompt.
+    run.take_stdin().expect("interactive stdin").write_line("s3cret").await?;
+    let cont = run
+        .wait_for_output(|tail| tail.contains("welcome&gt;"), Duration::from_secs(5))
+        .await?;
+    assert!(cont.contains("welcome&gt;"));
+
+    run.finish().await?;
+    Ok(())
+}</code></pre>
+<p>Semantics, and how it differs from <code>wait_for_line</code>:</p>
+<ul>
+<li><strong>Un-terminated tail, not lines.</strong> <code>wait_for_output</code> matches the live partial
+line; once the child terminates it with a newline it becomes a <em>complete line</em>
+(seen by <code>wait_for_line</code> / <code>stdout_lines</code>, not here). So answer a prompt before
+waiting for the next, and reach for <code>wait_for_line</code> when you want whole lines.</li>
+<li><strong>Non-consuming and repeatable.</strong> It only peeks while the background pump keeps
+draining stdout under your <code>OutputBufferPolicy</code>; the handle stays usable for
+<code>take_stdin</code>, further <code>wait_for_output</code> calls, and <code>finish</code>. <code>wait_for_line</code>
+<em>takes</em> the stdout stream and so is one-shot.</li>
+<li><strong>Raw, not redacted.</strong> The predicate (and the returned fragment) see the tail
+<strong>before</strong> any <code>capture_policy</code> redaction (see <a href="#redaction-at-capture-capture_policy">Redaction at capture</a>) —
+the same observation category as <code>handler</code> / <code>tee</code> / <code>raw_tee</code> / <code>output_bytes</code>,
+not the redacted backlog <code>wait_for_line</code> and <code>ProcessResult</code> draw from. A
+partial line can’t be run through a per-line redactor, and a prompt
+is a synchronization token you match verbatim. The retained/<code>finish</code>ed output
+stays redacted independently — just match on prompts, not on secret-bearing
+partial text.</li>
+<li><strong>Same probe deadline.</strong> It fails with <code>ErrorReason::NotReady</code> when <code>within</code>
+elapses (or stdout closes) with no match, never killing the child or arming the
+run’s <code>timeout</code> watchdog — exactly like the readiness probes above.</li>
+<li><strong>Choose the actual pipe.</strong> Use <code>wait_for_stderr_line</code> /
+<code>wait_for_stderr_output</code> when the tool reports readiness on stderr. Both keep
+stdout draining in the background. A PTY exposes one merged stream, so its
+stdout methods observe output originally written to either child stream.</li>
+</ul>
+<h2 id="racing-children-with-wait_any"><a class="header" href="#racing-children-with-wait_any">Racing children with <code>wait_any</code></a></h2>
+<p>The free function <code>wait_any</code> races several running processes and reports
+whichever exits first — the natural primitive for “restart whatever died” or
+“first answer wins”:</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::{Command, ProcessGroup, wait_any};
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let group = ProcessGroup::new()?;
+    let mut a = group.start(&amp;Command::new("replica-a")).await?;
+    let mut b = group.start(&amp;Command::new("replica-b")).await?;
+
+    let (index, outcome) = wait_any(&amp;mut [&amp;mut a, &amp;mut b]).await?;
+    println!("contender #{index} exited first with {outcome:?}");
+
+    // Only borrows: the loser is still usable.
+    let survivor = if index == 0 { &amp;mut b } else { &amp;mut a };
+    Ok(())
+}</code></pre>
+<p><code>wait_any</code> takes <code>&amp;mut</code> borrows, applies no timeout of its own (wrap it in
+<code>tokio::time::timeout</code> to bound the race), and does no output pumping — drain
+chatty children first or give them bounded
+<a href="commands.html#output-handling">buffer policies</a>.</p>
+<h2 id="per-run-telemetry"><a class="header" href="#per-run-telemetry">Per-run telemetry</a></h2>
+<p>With the opt-in <strong><code>stats</code></strong> feature, a running child reports its own
+resource usage, and <code>profile()</code> turns a whole run into a summary:</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::Command;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let run = Command::new("crunch").start().await?;
+    run.cpu_time();          // Option&lt;Duration&gt; — user+kernel so far
+    run.peak_memory_bytes(); // Option&lt;u64&gt;
+
+    // …or capture + sample on an interval until exit:
+    let profile = Command::new("crunch")
+        .start().await?
+        .profile(Duration::from_millis(100))
+        .await?;
+
+    println!(
+        "outcome={:?} wall={:?} cpu={:?} peak_rss={:?} avg_cpu_cores={:?} ({} samples)",
+        profile.outcome,            // Exited(code) / Signalled(sig) / TimedOut
+        profile.duration,
+        profile.cpu_time,
+        profile.peak_memory_bytes,
+        profile.avg_cpu_cores(),    // cpu / wall — e.g. Some(1.7) ≈ 1.7 cores busy
+        profile.samples,
+    );
+    Ok(())
+}</code></pre>
+<p>These read the <em>child process itself</em> (not a whole tree — that’s
+<a href="process-groups.html#stats-and-sampling"><code>ProcessGroup::stats</code></a>), and
+availability follows the platform: full CPU/memory on Windows and Linux,
+<code>None</code> where the kernel doesn’t account per-process cheaply — see
+<a href="platform-support.html">Platform support</a>.</p>
+<h3 id="lifecycle-narration-tracing"><a class="header" href="#lifecycle-narration-tracing">Lifecycle narration (<code>tracing</code>)</a></h3>
+<p>With the opt-in <strong><code>tracing</code></strong> feature, a run narrates its lifecycle on the
+<code>processkit</code> target — <code>spawn</code> (pid, mechanism), the graceful-teardown transitions
+(<code>soft_signal</code> → <code>grace_started</code> → <code>drained</code> / <code>escalated</code> / <code>spared</code>, each in a
+stable <code>phase</code> field), and <code>exited</code> — so a subscriber can stamp each transition the
+instant the layer that observed it crossed it, and map it to an event of your own
+protocol. The teardown transitions are narrated the same way for a streaming
+handle’s own <code>shutdown(grace)</code> as for a whole-group <code>ProcessGroup::stop</code>, so you get
+one uniform timeline. It is observation only (never a control surface) and never
+carries argv/env; for the same teardown facts as a typed <em>value</em> returned after the
+fact, see
+<a href="process-groups.html#observing-the-teardown-stop-and-shutdownreport"><code>ShutdownReport</code></a>.</p>
+<hr>
+<p>Next: <a href="pipelines.html">Pipelines</a> ·
+<a href="timeouts-and-cancellation.html">Timeouts, retries &amp; cancellation</a> ·
+<a href="supervision.html">Supervision</a></p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="process-groups.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="pipelines.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="process-groups.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="pipelines.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-09f2665d.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="theme/nav-links-0c03fceb.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,1122 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Process groups - ProcessKit</title>
+
+
+        <!-- Custom HTML head -->
+        <meta property="og:title" content="ProcessKit — async child-process management for Rust" />
+        <meta property="og:description" content="Kernel-backed whole-tree kill-on-drop for tokio. Job Object on Windows, cgroup v2 on Linux, POSIX process group on macOS. Streaming, pipelines, supervision, hermetic testing." />
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content="https://zelanton.github.io/ProcessKit-rs/" />
+        <meta property="og:image" content="https://zelanton.github.io/ProcessKit-rs/processkit-cover-social.jpg" />
+        <meta property="og:image:type" content="image/jpeg" />
+        <meta property="og:site_name" content="ProcessKit" />
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta name="twitter:title" content="ProcessKit — async child-process management for Rust" />
+        <meta name="twitter:description" content="Kernel-backed whole-tree kill-on-drop for tokio. No orphan processes, ever." />
+        <meta name="twitter:image" content="https://zelanton.github.io/ProcessKit-rs/processkit-cover-social.jpg" />
+
+        <meta name="description" content="Async child-process management — Rust · Go · F# · Kotlin">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="theme/custom-883d6c86.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-03d2395f.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-9a8459aa.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ProcessKit</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/ZelAnton/ProcessKit-rs" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/ZelAnton/ProcessKit-rs/edit/main/docs/docs/process-groups.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="process-groups"><a class="header" href="#process-groups">Process groups</a></h1>
+<p><a href="README.html">‹ docs index</a></p>
+<p>A <code>ProcessGroup</code> ties the lifetime of a whole child-process <strong>tree</strong> to a Rust
+value: every process spawned into the group — and everything <em>those</em> processes
+spawn — is killed when the group is dropped. An exiting, panicking, or
+<code>?</code>-returning owner never leaks subprocesses; the kernel object enforcing this
+(Job Object / cgroup / POSIX process group) catches even grandchildren you
+never knew about. (Killing grandchildren is the problem <code>duct.py</code>’s gotchas
+list files under “currently unsolved” for pipe-based designs — kernel
+containment is the solution, and the reason this crate exists.)</p>
+<ul>
+<li><a href="#creating-a-group">Creating a group</a></li>
+<li><a href="#putting-processes-in">Putting processes in</a></li>
+<li><a href="#tearing-down-drop-terminate-shutdown">Tearing down: drop, terminate, shutdown</a></li>
+<li><a href="#signalling-the-whole-tree">Signalling the whole tree</a></li>
+<li><a href="#asking-whether-a-soft-stop-is-available">Asking whether a soft stop is available</a></li>
+<li><a href="#suspending-and-resuming">Suspending and resuming</a></li>
+<li><a href="#listing-members">Listing members</a></li>
+<li><a href="#resource-limits">Resource limits</a></li>
+<li><a href="#stats-and-sampling">Stats and sampling</a></li>
+</ul>
+<h2 id="creating-a-group"><a class="header" href="#creating-a-group">Creating a group</a></h2>
+<pre class="playground"><code class="language-rust no_run">use processkit::{ProcessGroup, ProcessGroupOptions};
+use std::time::Duration;
+
+fn main() -&gt; processkit::Result&lt;()&gt; {
+    // Defaults: 2s graceful-shutdown grace, escalate to SIGKILL.
+    let group = ProcessGroup::new()?;
+
+    // Tuned:
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default()
+            .shutdown_timeout(Duration::from_secs(10))
+            .escalate_to_kill(true),
+    )?;
+
+    // Which kernel mechanism is actually containing the tree?
+    println!("{:?}", group.mechanism()); // JobObject | CgroupV2 | ProcessGroup
+    Ok(())
+}</code></pre>
+<p><code>mechanism()</code> reports what you actually got: <code>CgroupV2</code> quietly falls back to
+<code>ProcessGroup</code> on Linux hosts without cgroup delegation (see
+<a href="platform-support.html">Platform support</a>).</p>
+<p>You rarely create a group explicitly for one-shot runs: every
+<code>Command::run()</code>-style call makes a private group automatically. Reach for an
+explicit group when several children should share one fate, or when you need
+the group verbs below.</p>
+<h2 id="putting-processes-in"><a class="header" href="#putting-processes-in">Putting processes in</a></h2>
+<p>Four doors, in order of preference:</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::{Command, ProcessGroup};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let group = ProcessGroup::new()?;
+
+    // 1. start(): the full Command experience (capture, streaming, timeouts) in a
+    //    SHARED group. The handle does not own the group — dropping the handle
+    //    kills that child, dropping the group kills everyone.
+    let server = group.start(&amp;Command::new("dev-server")).await?;
+
+    // 2. spawn(): the raw escape hatch for a tokio::process::Command you already
+    //    have. You get the bare Child back; pipes and reaping are your problem.
+    //    spawn() takes the command BY VALUE (reuse would stack pre-exec hooks).
+    let raw = tokio::process::Command::new("background-helper");
+    let child = group.spawn(raw)?;
+
+    // 3. adopt(): contain a child that was spawned OUTSIDE the group, while you
+    //    still hold its Child handle (and stay responsible for reaping it).
+    let external = tokio::process::Command::new("legacy-launcher").spawn()?;
+    group.adopt(&amp;external)?;
+
+    // 4. adopt_external(): contain a process you have only a pid for — one an
+    //    outside supervisor started, or one you forked but never handed over.
+    //    Nothing here will ever reap it; the group can only signal it.
+    let pid_from_elsewhere: u32 = 4321;
+    let _ = group.adopt_external(pid_from_elsewhere);
+    let _ = (server, child);
+    Ok(())
+}</code></pre>
+<p>Both adoption doors move only the named process: descendants it <em>already</em> has
+keep their old containment (future forks are captured — on Windows/cgroup). A few
+sharp edges worth knowing:</p>
+<ul>
+<li>A child that already exited <strong>but has not been reaped</strong> (no <code>wait()</code> yet — a
+zombie whose pid/handle is still valid) is a successful <strong>no-op</strong>: there is
+nothing left to contain, so <code>adopt</code> returns <code>Ok</code> on the containment backends.</li>
+<li>A child that already exited <strong>and was reaped</strong> (<code>wait()</code>ed) has no pid left —
+<code>adopt</code> returns an error rather than silently tracking nothing.</li>
+<li>On the POSIX process-group mechanism, a child that has already <code>exec</code>’d
+can’t be re-grouped (POSIX forbids it), so it is tracked <em>individually</em>: the
+child itself is signalled/killed with the group, but its future forks are
+not. The caller keeps the <code>Child</code> handle and is responsible for reaping.</li>
+</ul>
+<h3 id="adopting-by-pid-adopt_external"><a class="header" href="#adopting-by-pid-adopt_external">Adopting by pid (<code>adopt_external</code>)</a></h3>
+<p><code>adopt</code> needs a live <code>tokio::process::Child</code>, which a non-Rust consumer cannot
+construct at all. <code>adopt_external(pid)</code> takes the one identifier such a caller
+does have — and treats it as an <em>address</em>, not as a handle, because the OS may
+give a reaped process’s number to an unrelated one:</p>
+<ul>
+<li>the crate captures an <strong>identity anchor of its own</strong> for the process the number
+currently names, during the call: the process <strong>object</strong> behind an <code>OpenProcess</code>
+on Windows, kernel cgroup membership (plus a <code>/proc</code> start-time read on either
+side of the write) on Linux cgroup v2, the start-time token on the POSIX
+process-group backends. From then on the group’s probes, signals and teardown are
+bound to that, so a process that recycles the number afterwards is not a member
+and is not signalled;</li>
+<li>a number recycled <strong>during the call itself</strong> is detected by that closing read and
+reported as an error — but the two unix mechanisms are left in different states,
+which the error message spells out. The process-group backends have nothing to
+undo (the entry they made is identity-gated and is pruned unsignalled). Linux
+cgroup v2 has already migrated a task, so the call tries to move the number back
+out into the cgroup this group’s own directory lives in; where a host refuses that
+move, the process holding the number stays a member of this group and this group’s
+teardown will kill it. Windows cannot reach this state — it uses the number once,
+for <code>OpenProcess</code>;</li>
+<li><strong>adoption is not neutral for containment the process already has</strong>, and the
+direction differs per mechanism: on Windows the process keeps its existing job and
+<em>this</em> group’s job becomes a child of it (so the outer job’s terminate/close then
+reaches this group’s members, including ones started later, and its limits bind
+them — and whether the assign succeeds at all depends on this group’s own state,
+so adopt before you start); on Linux cgroup v2 the process <strong>loses</strong> its previous
+cgroup, since v2 membership is exclusive and nothing can restore it; on the
+process-group backends nothing is taken away. See
+<a href="platform-support.html#capability-matrices">platform support</a> for the full note;</li>
+<li>what no crate can check is the window <em>before</em> the call — whether the pid still
+named the process you meant when you looked it up. Look it up as late as you
+can, and use <code>process_is_alive(pid, start_time)</code> to re-check an instance later;</li>
+<li><strong>nothing here ever reaps it.</strong> No exit status for an adopted-by-pid process
+appears anywhere in this API; the group can signal it and list it, and that is
+all. Reaping stays with whoever is its actual parent — this process, an outside
+supervisor, or <code>init</code>;</li>
+<li><strong>FreeBSD and the other BSDs return <code>Unsupported</code>.</strong> No start-time reader is
+wired up there, so there is no anchor to capture, and the crate refuses rather
+than tracking a bare number it would later <code>SIGKILL</code>. <code>adopt</code> is unaffected —
+the <code>Child</code> you hold un-reaped is what keeps its number from being recycled.</li>
+</ul>
+<p><code>pid == 0</code> and this process’s own pid are refused everywhere: both would point
+the group’s own teardown at the caller.</p>
+<h2 id="tearing-down-drop-terminate-shutdown"><a class="header" href="#tearing-down-drop-terminate-shutdown">Tearing down: drop, terminate, shutdown</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Verb</th><th>What happens</th><th>When</th></tr>
+</thead>
+<tbody>
+<tr><td><code>drop(group)</code></td><td>Immediate <strong>hard kill</strong> of the whole tree (kill-on-close)</td><td>The safety net — always on</td></tr>
+<tr><td><code>group.kill_all()</code></td><td>The same hard kill, group stays usable (cgroup-<code>kill</code> / Job Object / process-group backends). On a <strong>pre-5.14 Linux kernel</strong> lacking <code>cgroup.kill</code>, the per-pid <code>SIGKILL</code> fallback returns <code>Err</code> if the tree doesn’t drain (a fork bomb still out-spawning, or <code>D</code>-state zombies)</td><td>Explicit teardown mid-flight; idempotent</td></tr>
+<tr><td><code>group.shutdown().await</code></td><td>Unix: <code>SIGTERM</code> → wait <code>shutdown_timeout</code> → <code>SIGKILL</code> survivors (if <code>escalate_to_kill</code>); Windows: atomic job kill when <code>escalate_to_kill</code>, else the survivors are <strong>spared</strong> (handle closed without kill-on-close) — unless a child opted into <code>windows_graceful_ctrl_break</code> (see below), which gives Windows a real <code>CTRL_BREAK</code> → wait → kill tier. Consumes the group (<code>shutdown_ref(&amp;self)</code> is the same teardown, borrowing — for a group held behind an <code>Arc</code>/supervisor)</td><td>Graceful service stop</td></tr>
+<tr><td><code>group.stop(grace, escalate).await</code></td><td>The <strong>observable</strong> graceful stop (needs <code>process-control</code>): the <em>same</em> teardown as <code>shutdown_ref</code>, with an explicit <code>grace</code>/<code>escalate</code>, returning a <code>ShutdownReport</code> — the attempted soft signal (and whether it landed), member counts before/after, whether the tree drained within the grace or was hard-killed, and the actual elapsed. Borrows the group (usable afterwards)</td><td>You own the end-of-run race and want the observed facts — or a “kill and wait” via <code>stop(Duration::ZERO, true)</code></td></tr>
+</tbody>
+</table>
+</div>
+<pre class="playground"><code class="language-rust no_run">use processkit::{Command, ProcessGroup, ProcessGroupOptions};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default()
+            .shutdown_timeout(Duration::from_secs(5))
+            .escalate_to_kill(true),
+    )?;
+    let _service = group.start(&amp;Command::new("my-service")).await?;
+
+    // SIGTERM, give it 5s to flush and exit, SIGKILL stragglers:
+    group.shutdown().await?;
+    Ok(())
+}</code></pre>
+<p>A child that handles <code>SIGTERM</code> ends the grace <strong>early</strong> — <code>shutdown</code> returns
+as soon as the tree is empty, not after the full timeout. One subtlety: the
+liveness probe sees an exited-but-unreaped child (a zombie) as alive on the
+process-group backends, so keep <code>wait()</code>ing your handles concurrently if you
+want the early return. <code>Drop</code> can’t <code>await</code>, which is why the graceful tier
+lives in this async method — dropping without calling it performs only the
+hard kill.</p>
+<h3 id="windows-the-graceful-soft-tier-wm_close-opt-in-ctrl_break"><a class="header" href="#windows-the-graceful-soft-tier-wm_close-opt-in-ctrl_break">Windows: the graceful soft tier (<code>WM_CLOSE</code>, opt-in <code>CTRL_BREAK</code>)</a></h3>
+<p>A Windows <code>shutdown</code> has no POSIX <code>SIGTERM</code>, but it still tries to <em>trigger</em> a
+clean exit before the atomic Job Object kill. For a <strong>windowed</strong> child (Electron
+app, desktop tool, windowed service) this is automatic: <code>WM_CLOSE</code> is <em>posted</em>
+(never <em>sent</em>, so a hung window can’t block us) to every top-level window a live
+member owns, then the <em>same</em> signal → wait → escalate ladder runs — the child
+gets the <code>shutdown_timeout</code> to flush and exit, else <code>TerminateJobObject</code>. A
+<strong>console</strong> child has no window, so opt in per child with
+<a href="https://docs.rs/processkit/latest/processkit/struct.Command.html#method.windows_graceful_ctrl_break"><code>Command::windows_graceful_ctrl_break()</code></a>:
+the direct child is spawned in its own console process group
+(<code>CREATE_NEW_PROCESS_GROUP</code>), and <code>shutdown</code> then sends it
+<code>GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)</code>, waits the <code>shutdown_timeout</code>,
+and <code>TerminateJobObject</code>s any survivor — the very same signal → wait → escalate
+ladder as Unix, so a console child that handles <code>CTRL_BREAK</code> shuts down softly.</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::{Command, ProcessGroup, ProcessGroupOptions};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default().shutdown_timeout(Duration::from_secs(5)),
+    )?;
+    // CTRL_BREAK is sent on shutdown; a console child gets 5s to exit, else kill.
+    let _service = group
+        .start(&amp;Command::new("my-service").windows_graceful_ctrl_break())
+        .await?;
+    group.shutdown().await?;
+    Ok(())
+}</code></pre>
+<p>The <code>CTRL_BREAK</code> opt-in is <strong>console-only</strong>: a child spawned
+<a href="https://docs.rs/processkit/latest/processkit/struct.Command.html#method.create_no_window"><code>create_no_window</code></a>
+or <code>DETACHED_PROCESS</code> does not share this process’s console, so it never receives
+the event and rides the grace to the <code>TerminateJobObject</code> fallback. Only the
+<em>direct</em> child is addressed by <code>CTRL_BREAK</code> — an
+<a href="https://docs.rs/processkit/latest/processkit/struct.ProcessGroup.html#method.adopt"><code>adopt</code></a>ed
+child is not — and the event is <code>CTRL_BREAK</code>, not <code>CTRL_C</code> (a new process group
+disables <code>CTRL_C</code>). The automatic <code>WM_CLOSE</code> path is the complement: it reaches
+any live member that owns a top-level window (including forked descendants and
+adopted children), needs no console and no opt-in, but only a member that actually
+has a window. A member with neither a window nor the console opt-in is hard-killed
+promptly at the deadline. Off Windows the builder is a no-op.</p>
+<h3 id="observing-the-teardown-stop-and-shutdownreport"><a class="header" href="#observing-the-teardown-stop-and-shutdownreport">Observing the teardown: <code>stop</code> and <code>ShutdownReport</code></a></h3>
+<blockquote>
+<p>Requires the default-on <strong><code>process-control</code></strong> feature (the report carries a
+<code>Signal</code>).</p>
+</blockquote>
+<p><code>shutdown</code>/<code>shutdown_ref</code> are fire-and-forget — they report only success or an
+error. When you own your <em>own</em> end-of-run race (a timeout ⨯ Ctrl-C ⨯
+control-socket race, not a <code>Command::timeout</code>) you usually want to stop the instant
+the tree is empty rather than always spend the whole grace, and to report the tier
+the kernel <em>observed</em> rather than what you <em>tried</em>. <code>ProcessGroup::stop(grace, escalate)</code> is that verb: the same <code>SIGTERM</code> / <code>CTRL_BREAK</code> / <code>WM_CLOSE</code> → wait →
+escalate ladder, taking <code>grace</code>/<code>escalate</code> explicitly and returning a
+<a href="https://github.com/ZelAnton/ProcessKit-rs/blob/main/src/shutdown_report.rs"><code>ShutdownReport</code></a>.</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::{Command, ProcessGroup};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let group = ProcessGroup::new()?;
+    let _service = group.start(&amp;Command::new("my-service")).await?;
+
+    // SIGTERM, up to 5s to drain, then SIGKILL survivors — and report what happened.
+    let report = group.stop(Duration::from_secs(5), true).await?;
+    if report.drained_within_grace() {
+        println!("clean exit in {:?}", report.elapsed());
+    } else if report.escalated() {
+        let survivors = report.members_after().unwrap_or(0);
+        eprintln!("hard-killed {survivors} survivor(s) after the grace");
+    }
+    if let Some(sig) = report.attempted_signal() {
+        println!("attempted soft signal: {sig:?}");
+    }
+    Ok(())
+}</code></pre>
+<p>The report is honest per platform. <code>members_before</code>/<code>members_after</code> count the same
+member set as <a href="#listing-members"><code>members</code></a> — the whole
+tree on the Job Object / cgroup mechanisms, the tracked group <em>leaders</em> on the
+process-group fallback (where an unreaped zombie still counts, so reap your handles
+for a true <code>members_after</code>). The <code>soft_signal()</code> verdict is three-way —
+<code>SoftSignal::Sent(sig)</code>, <code>SoftSignal::Failed(sig)</code>, or <code>SoftSignal::Unsupported</code>;
+the last arises <strong>only</strong> on a windowless Windows Job Object with no console-CTRL
+leader (every Unix mechanism always has a real <code>SIGTERM</code> tier). <code>stop(Duration::ZERO, true)</code> is the “<strong>kill and wait</strong>” path: it hard-kills at once (a zero grace waits
+not at all) and reports what was still live — where bare <code>kill_all</code> returns as soon
+as the kill is <em>issued</em>. <code>shutdown</code>/<code>shutdown_ref</code> are unchanged; <code>stop</code> is purely
+additive.</p>
+<p><code>ShutdownReport</code> is the teardown facts as a typed value <em>after</em> the teardown
+returns. For the same transitions <strong>live</strong> — stamped the instant each one happens —
+enable the <code>tracing</code> feature: the teardown driver narrates <code>soft_signal → grace_started → drained | escalated | spared</code> (each in a stable <code>phase</code> field) on
+the <code>processkit</code> target, for every graceful path (<code>stop</code>, <code>shutdown</code>, a run-level
+<code>timeout_grace</code>, a supervisor’s graceful stop). The two are one seam read two ways
+(both derive from the same driver outcome); neither can influence the teardown, and
+neither carries argv/env.</p>
+<h2 id="deliberately-detaching-a-child-spawn_detached"><a class="header" href="#deliberately-detaching-a-child-spawn_detached">Deliberately detaching a child (<code>spawn_detached</code>)</a></h2>
+<p><strong>This inverts the crate’s headline guarantee — on purpose.</strong> Everything above is
+about <em>keeping</em> a tree contained so nothing escapes. <code>Command::spawn_detached</code> is
+the crate’s one deliberate escape hatch for the opposite need: a child that
+<strong>must outlive its launcher</strong> — daemonizing, a <code>nohup</code>-style long-lived helper, a
+handoff to a process you want to keep running after this one exits.</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::Command;
+
+<span class="boring">fn main() -&gt; processkit::Result&lt;()&gt; {
+</span>// Launch a helper that survives this process. Its stdout goes to a file — never
+// a pipe, which would deadlock the child once nothing is left to drain it.
+let child = Command::new("my-daemon")
+    .arg("--serve")
+    .stdout_file("/var/log/my-daemon.log")
+    .spawn_detached()?;
+println!("detached daemon pid = {}", child.pid());
+// Dropping `child` does NOT kill the daemon — the crate is done with it.
+<span class="boring">Ok(())
+</span><span class="boring">}</span></code></pre>
+<p>For a safe runnable demonstration whose detached child exits by itself, see
+<a href="https://github.com/ZelAnton/ProcessKit-rs/blob/main/examples/detached.rs"><code>examples/detached.rs</code></a>.</p>
+<p>What it does, and what it deliberately does <strong>not</strong>:</p>
+<ul>
+<li><strong>Detach at birth.</strong> Unix — a <strong>new session</strong> (<code>setsid</code>), no controlling
+terminal. Windows — the child is <strong>not assigned</strong> to this crate’s Job Object.
+It is <em>not</em> made to break away from a Job Object / cgroup the host already put
+<em>your</em> process in (a CI runner, a <code>systemd</code> scope, this crate’s own supervisor):
+that would be hostile to whoever set up the host containment. So a detached
+child escapes <strong>this crate’s</strong> per-run containment, not a broader host one it
+inherits.</li>
+<li><strong>A separate, non-interchangeable type.</strong> You get a <code>DetachedChild</code> carrying
+only the <code>pid</code> — no public kill, wait, timeout, capture, or control/teardown APIs
+— because it is no longer contained. Dropping it does nothing to the child. On
+Unix, a private background reaper owns the detached <code>Child</code> and collects its exit
+status so it does not become a zombie; that bookkeeping is not a public wait or
+control API. Windows and other non-Unix targets use their normal process-handle
+cleanup instead.
+(Left as a bare code span, not a <code>docs.rs</code> link: this type ships in the next
+release, so a <code>docs.rs</code> URL would 404 until then.)</li>
+<li><strong>stdio is null, or a file — never a pipe.</strong> With no owner left to drain it, a
+pipe would deadlock the child the moment its buffer fills. stdout/stderr are
+null by default; the only alternative is a file redirect (<code>stdout_file</code> /
+<code>stderr_file</code>). stdin is always null.</li>
+<li><strong>Incompatible knobs are refused loudly.</strong> A <code>Command</code> carrying a timeout,
+capture wiring (<code>on_stdout_line</code>/tees/<code>capture_policy</code>), an interactive stdin
+(<code>keep_stdin_open</code>/<code>inherit_stdin</code>/a <code>stdin</code> source), <code>retry</code>, <code>cancel_on</code>,
+<code>kill_on_parent_death</code> (its exact opposite), <code>windows_graceful_ctrl_break</code>,
+<code>cpu_affinity</code>, or Linux <code>io_priority</code> is
+rejected with a typed <code>ErrorReason::Unsupported</code> naming it — never silently
+ignored. Program/args/env/working-directory and the privilege-drop knobs
+(<code>uid</code>/<code>gid</code>/<code>groups</code>/<code>umask</code>/<code>priority</code>) <strong>are</strong> honored.</li>
+</ul>
+<p>Reach for <code>spawn_detached</code> <strong>only</strong> when you truly want a child to outlive its
+launcher. For everything else, <code>start</code>/<code>run</code>/<code>output_*</code> keep the child contained.</p>
+<h2 id="signalling-the-whole-tree"><a class="header" href="#signalling-the-whole-tree">Signalling the whole tree</a></h2>
+<blockquote>
+<p><code>signal</code>/<code>suspend</code>/<code>resume</code>/<code>members</code>/<code>adopt</code> — this section and the two
+below — require the default-on <strong><code>process-control</code></strong> feature. The teardown
+verbs above are core and always present.</p>
+</blockquote>
+<pre class="playground"><code class="language-rust no_run">use processkit::{Command, ProcessGroup, Signal};
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let group = ProcessGroup::new()?;
+    let _server = group.start(&amp;Command::new("my-server")).await?;
+
+    group.signal(Signal::Hup)?;        // "reload your configuration"
+    group.signal(Signal::Usr1)?;       // whatever the tool defines
+    group.signal(Signal::Other(34))?;  // raw signal number escape hatch
+    Ok(())
+}</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Platform</th><th>Deliverable signals</th></tr>
+</thead>
+<tbody>
+<tr><td>Linux (cgroup or pgroup), FreeBSD reaper, macOS/other BSD</td><td>Any — <code>Term</code>, <code>Kill</code>, <code>Int</code>, <code>Hup</code>, <code>Quit</code>, <code>Usr1</code>, <code>Usr2</code>, <code>Other(n)</code></td></tr>
+<tr><td>Windows</td><td><code>Kill</code> (Job Object terminate); <code>Int</code>/<code>Term</code> as a best-effort soft close (<code>CTRL_BREAK</code> to console leaders + <code>WM_CLOSE</code> to windowed members) — <code>ErrorReason::Unsupported</code> only when neither exists; every other signal → <code>ErrorReason::Unsupported</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>Signal::Kill</code> always takes the same <em>atomic</em> whole-tree kill path as <code>kill_all</code>
+(<code>cgroup.kill</code> / <code>PROC_REAP_KILL</code> / <code>killpg</code> / job terminate), so it cannot miss
+a process forked mid-broadcast. Other signals are a per-member broadcast —
+best-effort against a tree that is forking at that exact moment. On Windows,
+<code>Signal::Int</code>/<code>Signal::Term</code> do not wait or escalate (they only <em>trigger</em> a soft
+close — contrast the graceful <code>shutdown</code>, which then waits the grace and
+escalates). An empty group accepts any deliverable signal trivially — except
+Windows <code>Int</code>/<code>Term</code>, which report <code>Unsupported</code> on an empty group (no member,
+hence no console or windowed target to soft-close). On <strong>every</strong> Unix mechanism a
+real send failure is surfaced as an <code>Err</code> rather than swallowed — an <code>EINVAL</code> (an
+out-of-range <code>Other(n)</code>) always, and an <code>EPERM</code> against a <strong>live, non-zombie</strong>
+member (a <code>sudo</code>/setuid child that rejects the signal, or a seccomp/container
+restriction). The <strong>process-group</strong> mechanism (macOS/the other BSDs,
+Linux-without-cgroup) reaches the same verdict as the cgroup one by checking the
+target’s run state after an <code>EPERM</code>, so a harmless zombie-only <code>EPERM</code> — and, on
+the bare BSDs where no state reader exists, every <code>EPERM</code> — stays swallowed. The
+<strong>FreeBSD reaper</strong> makes that discrimination too, from the kernel’s own zombie flag
+on the member <code>PROC_REAP_KILL</code> names as the failing one — so unlike the bare-BSD
+process-group path it does surface a live member’s <code>EPERM</code>. An <code>ESRCH</code> race (the
+member already exited) is still success. <code>Signal::Other(0)</code> is the POSIX
+existence probe: it returns <code>Ok</code> having <strong>delivered nothing</strong> (a live target was
+reached, not signalled) — and because that probe never takes a delivery path
+(FreeBSD routes it back through the process group, which has no state reader on
+any BSD but macOS), the <code>EPERM</code> rule above does not reach it everywhere: on
+FreeBSD and the bare BSDs a live target that rejects even the null signal still
+answers <code>Ok</code>, where Linux and macOS surface the <code>EPERM</code>. <code>suspend</code>/<code>resume</code> on
+the process-group mechanism now use the same honest delivery verdict for
+<code>SIGSTOP</code>/<code>SIGCONT</code>: a live-member <code>EPERM</code> surfaces as an <code>Err</code>, while <code>ESRCH</code>,
+zombie-only <code>EPERM</code>, an empty group, and BSD-without-state-reader <code>EPERM</code>
+remain <code>Ok</code>. The FreeBSD reaper applies that verdict to freezing and thawing
+too — <code>SIGSTOP</code>/<code>SIGCONT</code> ride the same <code>PROC_REAP_KILL</code> classification as any
+other signal there. The older-kernel cgroup per-process fallback reports its
+<code>SIGSTOP</code>/<code>SIGCONT</code> failures the same way.</p>
+<h2 id="asking-whether-a-soft-stop-is-available"><a class="header" href="#asking-whether-a-soft-stop-is-available">Asking whether a soft stop is available</a></h2>
+<p>Before you fire a soft stop (<code>signal(Signal::Term)</code> / <code>Signal::Int</code>), you can ask
+the group whether one will actually reach anything — <code>soft_stop_scope()</code> returns a
+<code>SoftStopScope</code> <strong>capability report</strong>, so a caller cancelling a run on <em>its own</em>
+schedule (a UI Cancel, a control-socket command, a timeout it owns) can decide up
+front whether to attempt a graceful stop and can tell its user the real reach,
+instead of firing a <code>signal</code>, catching <code>ErrorReason::Unsupported</code>, and reverse-engineering
+the scope. It is the group-axis sibling of
+<code>Command::kill_on_parent_death_scope() -&gt; ParentDeathCleanup</code>, but read from the
+group’s <strong>live membership</strong> (not fixed per platform) and <strong>side-effect-free</strong> — it
+delivers no signal, posts no <code>WM_CLOSE</code>, spawns nothing, and does not mutate the
+group.</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::{Command, ProcessGroup, Signal, SoftStopScope};
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let group = ProcessGroup::new()?;
+    let _server = group
+        .start(&amp;Command::new("my-server").windows_graceful_ctrl_break())
+        .await?;
+
+    // Decide BEFORE attempting — no ErrorReason::Unsupported to parse back.
+    match group.soft_stop_scope() {
+        SoftStopScope::WholeTree | SoftStopScope::OptInMembers =&gt; {
+            group.signal(Signal::Term)?; // a soft stop will reach a member
+        }
+        SoftStopScope::Unsupported =&gt; {
+            group.kill_all()?; // no soft tier here — go straight to the hard kill
+        }
+        other =&gt; eprintln!("unknown soft-stop scope: {}", other.name()),
+    }
+    Ok(())
+}</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Mechanism</th><th><code>soft_stop_scope()</code></th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td>Linux cgroup v2, macOS/other BSD, Linux pgroup fallback</td><td><code>WholeTree</code></td><td><code>signal(Int/Term)</code> reaches every member of the tree (the cgroup, or every tracked process group via <code>killpg</code>); never <code>Unsupported</code></td></tr>
+<tr><td>FreeBSD reaper</td><td><code>WholeTree</code></td><td><code>PROC_REAP_KILL</code> delivers to every descendant the reaper sees — including one that <code>setsid</code>ed out of its process group; never <code>Unsupported</code></td></tr>
+<tr><td>Windows, with a live console-CTRL leader (<code>windows_graceful_ctrl_break</code>) or a windowed member</td><td><code>OptInMembers</code></td><td>a soft close reaches only members it can <em>trigger</em> — a curated subset, not the whole tree</td></tr>
+<tr><td>Windows, with neither</td><td><code>Unsupported</code></td><td>a Job Object has no POSIX signal and there is nothing to soft-close, so <code>signal(Int/Term)</code> would return <code>ErrorReason::Unsupported</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Consistent with <code>signal</code> by construction: it reads the very same live-membership
+primitives <code>signal(Int/Term)</code> acts on, so what it reports matches what a real soft
+stop would then reach. It describes the <em>soft</em> tier only — the unconditional hard
+kill (<code>Signal::Kill</code>, <code>kill_all</code>, dropping the group) always tears the whole tree
+down regardless. <code>SoftStopScope</code> is <code>#[non_exhaustive]</code> and carries a stable
+<code>name()</code> / <code>from_name()</code> machine identifier (<code>whole_tree</code> / <code>opt_in_members</code> /
+<code>none</code>), like the other reporting enums.</p>
+<h2 id="suspending-and-resuming"><a class="header" href="#suspending-and-resuming">Suspending and resuming</a></h2>
+<p>Freeze a tree (to snapshot it, to starve a runaway while you investigate, to
+pause background work), then thaw it:</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::{Command, ProcessGroup};
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let group = ProcessGroup::new()?;
+    let _cruncher = group.start(&amp;Command::new("cpu-hog")).await?;
+
+    group.suspend()?;   // the whole tree stops consuming CPU
+    // … inspect, snapshot, wait for the user …
+    group.resume()?;
+    Ok(())
+}</code></pre>
+<p>Per-platform machinery — and its visible differences:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Platform</th><th>Mechanism</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td>Linux cgroup</td><td>one <code>cgroup.freeze</code> write</td><td>Atomic over the subtree; freeze is <strong>group state</strong></td></tr>
+<tr><td>Linux pgroup, macOS/other BSD</td><td><code>SIGSTOP</code> / <code>SIGCONT</code> broadcast</td><td>Idempotent (level-triggered)</td></tr>
+<tr><td>FreeBSD reaper</td><td><code>SIGSTOP</code> / <code>SIGCONT</code> through <code>PROC_REAP_KILL</code></td><td>Idempotent; covers the <strong>whole subtree</strong>, a <code>setsid</code> escapee included; a refused delivery surfaces as an <code>Err</code></td></tr>
+<tr><td>Windows</td><td>per-thread <code>SuspendThread</code> walk</td><td><strong>Counted</strong>: N suspends need N resumes; best-effort against mid-walk thread churn</td></tr>
+</tbody>
+</table>
+</div>
+<p>Two caveats that bite in practice:</p>
+<ul>
+<li><strong>Spawning into a suspended group diverges.</strong> Under the cgroup mechanism a
+child spawned or adopted while the group is frozen <strong>starts frozen</strong> — and
+<code>start()</code> <em>may never return</em> until <code>resume</code> (the forked child joins the
+cgroup before <code>exec</code>, so it can freeze before completing the spawn
+handshake). Windows and the pgroup backends freeze only members present at
+the call. Rule of thumb: resume before starting new work.</li>
+<li>A suspended tree can still be <strong>hard-killed</strong> (drop / <code>kill_all</code> /
+<code>Signal::Kill</code> all act on frozen processes), but a graceful <code>shutdown</code>
+starts with a <code>SIGTERM</code> the frozen tree can’t act on — it would wait out the
+whole grace. Resume first for a clean shutdown.</li>
+</ul>
+<h2 id="listing-members"><a class="header" href="#listing-members">Listing members</a></h2>
+<pre class="playground"><code class="language-rust no_run">use processkit::{Command, ProcessGroup};
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let group = ProcessGroup::new()?;
+    let _a = group.start(&amp;Command::new("worker-a")).await?;
+    let _b = group.start(&amp;Command::new("worker-b")).await?;
+
+    let pids: Vec&lt;u32&gt; = group.members()?;
+    println!("live members: {pids:?}");
+    Ok(())
+}</code></pre>
+<p>What “members” means depends on the mechanism: Windows and Linux-cgroup list
+the <strong>whole tree</strong> (every descendant pid); the POSIX process-group backends
+list the tracked group <em>leaders</em> (one pid per started/adopted child) — their
+descendants are contained but not enumerated. An exited child still counts
+until it is reaped. The snapshot is point-in-time: a tree that is forking
+races it.</p>
+<p>To <em>wait</em> on members rather than list them, race the handles with
+<a href="streaming.html#racing-children-with-wait_any"><code>wait_any</code></a>.</p>
+<h3 id="enriched-snapshot-members_info"><a class="header" href="#enriched-snapshot-members_info">Enriched snapshot: <code>members_info</code></a></h3>
+<p>When bare pids aren’t enough — a diagnostic <code>members_snapshot</code> event, a
+process-tree view — <code>members_info</code> returns the same member set as <code>members</code>,
+but each pid comes wrapped in a <code>MemberInfo</code> carrying best-effort <strong>parent
+pid</strong>, <strong>image name</strong>, and <strong>start time</strong>:</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::{Command, ProcessGroup};
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let group = ProcessGroup::new()?;
+    let _a = group.start(&amp;Command::new("worker-a")).await?;
+
+    for m in group.members_info()? {
+        println!(
+            "pid={} ppid={:?} exe={:?} start={:?}",
+            m.pid(),
+            m.ppid(),
+            m.exe_name(),
+            m.start_time(),
+        );
+    }
+    Ok(())
+}</code></pre>
+<p>The fields are read where the platform can report them and are <code>None</code>
+otherwise — never a fabricated value. Windows and Linux (both the cgroup and
+<code>/proc</code> fallback paths) and macOS fill all four; on the bare BSDs only the pid
+is reported and the rest are <code>None</code>. <code>start_time</code> is an <strong>opaque</strong> identity
+anchor (its unit and epoch differ per platform), not a wall-clock timestamp —
+its use is pairing with the pid to tell a recycled number apart from the
+original process, not display. The raw command line is <strong>deliberately never</strong>
+included on any platform: it routinely carries secrets, and redaction is the
+consumer’s policy to own.</p>
+<p>Same point-in-time contract as <code>members</code>, with one addition: if a member exits
+between its pid being enumerated and its metadata being read, that pid is
+<strong>skipped</strong> rather than reported with fabricated fields — a single vanished
+member never fails the whole call.</p>
+<h3 id="identifying-a-process-by-pid-outside-a-group"><a class="header" href="#identifying-a-process-by-pid-outside-a-group">Identifying a process by pid (outside a group)</a></h3>
+<p>Sometimes the pid you care about is <strong>not</strong> a member of any group you own — a pid
+saved to disk between runs, a launch registry checking whether the owner of a
+crash-surviving entry is still alive, an e2e probe watching a process from outside
+its container. For that, the crate publishes the <em>same</em> identity query as a
+free-standing function (needs <code>process-control</code>):</p>
+<pre class="playground"><code class="language-rust no_run"><span class="boring">fn main() -&gt; processkit::Result&lt;()&gt; {
+</span>let pid = 4321;
+
+// Look up an arbitrary pid — the standalone twin of `members_info`, returning the
+// same best-effort `MemberInfo` (parent pid, image name, start time).
+match processkit::process_info(pid)? {
+    Some(info) =&gt; println!(
+        "pid={} ppid={:?} exe={:?} start={:?}",
+        info.pid(), info.ppid(), info.exe_name(), info.start_time(),
+    ),
+    None =&gt; println!("pid {pid} is not running"),
+}
+<span class="boring">Ok(())
+</span><span class="boring">}</span></code></pre>
+<p><code>process_info</code> returns <strong>three</strong> distinct outcomes, and the distinction is the
+point:</p>
+<ul>
+<li><code>Ok(Some(info))</code> — the process exists; fields are best-effort <code>Option</code> exactly as
+in <code>members_info</code>.</li>
+<li><code>Ok(None)</code> — the pid names <strong>no</strong> process: an honest negative, the “it’s gone”
+answer a liveness check wants.</li>
+<li><code>Err</code> — the process may well exist, but you couldn’t inspect it (no permission —
+a Windows protected/<code>System</code> process, a Linux <code>hidepid</code> mount, a macOS restricted
+process — or an OS read error). <strong>Never read this as “dead.”</strong> That is the whole
+reason it is an error rather than <code>Ok(None)</code>.</li>
+</ul>
+<p>It reads no argv/environment, on any platform — the same “never argv/env” stance
+<code>MemberInfo</code> documents.</p>
+<h4 id="reuse-safe-liveness-process_is_alive"><a class="header" href="#reuse-safe-liveness-process_is_alive">Reuse-safe liveness: <code>process_is_alive</code></a></h4>
+<p>Because the OS reuses pid <em>numbers</em>, “is pid N still alive?” is the wrong question
+for a saved pid: a stranger may have recycled the number after your process exited.
+Pair the pid with the <strong>start-time token</strong> and ask instead “is the <em>same</em> process
+still running?”:</p>
+<pre class="playground"><code class="language-rust no_run"><span class="boring">fn main() -&gt; processkit::Result&lt;()&gt; {
+</span>// Earlier: record identity.
+let pid = 4321;
+let saved_start = processkit::process_info(pid)?.and_then(|i| i.start_time());
+
+// Later (perhaps after a restart): is that same process still alive?
+if processkit::process_is_alive(pid, saved_start)? {
+    println!("the original process {pid} is still alive");
+} else {
+    println!("process {pid} is gone (exited, or its number was recycled)");
+}
+<span class="boring">Ok(())
+</span><span class="boring">}</span></code></pre>
+<p><code>process_is_alive</code> is <code>Ok(true)</code> only when the process exists <strong>and</strong> its current
+start time matches the saved one; a <strong>different</strong> start time on the same number
+(the number was recycled) reads as <code>Ok(false)</code>, and so does a nonexistent pid. A
+permission <code>Err</code> propagates just like <code>process_info</code> — again, never “dead”. The
+start time is an opaque identity anchor (unit/epoch differ per platform), used only
+for this pairing, never displayed. Where the platform reports <strong>no</strong> start time
+(the bare BSDs, where <code>start_time()</code> is <code>None</code>), the check degrades to bare-pid
+liveness — exactly the number-only check you’d otherwise write by hand, no weaker,
+and never a false “dead”.</p>
+<h2 id="resource-limits"><a class="header" href="#resource-limits">Resource limits</a></h2>
+<p>Requires the <strong><code>limits</code></strong> feature. Caps are a property of the group, set at
+creation (and adjustable later — see <a href="#updating-a-live-group">Updating a live
+group</a>) and enforced by the same kernel object that
+contains the tree:</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::{Command, ProcessGroup, ProcessGroupOptions};
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default()
+            .max_memory(512 * 1024 * 1024) // bytes, whole tree
+            .max_processes(64)             // fork-bomb ceiling
+            .cpu_quota(0.5),               // half of one core
+    )?;
+    let _sandboxed = group.start(&amp;Command::new("untrusted-tool")).await?;
+    Ok(())
+}</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Capability</th><th>Windows Job Object</th><th>Linux cgroup v2</th><th>pgroup / macOS / other BSD</th><th>FreeBSD reaper</th></tr>
+</thead>
+<tbody>
+<tr><td>Memory cap</td><td>✅ whole-tree</td><td>✅ whole-tree (<code>memory.max</code>)</td><td>❌</td><td>❌</td></tr>
+<tr><td>Process-count cap</td><td>✅</td><td>✅ (<code>pids.max</code>)</td><td>❌</td><td>❌</td></tr>
+<tr><td>CPU quota</td><td>🟡 approximate (rate vs. total CPU)</td><td>✅ (<code>cpu.max</code>)</td><td>❌</td><td>❌</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>cpu_quota</code> is a fraction of a <strong>single</strong> core (<code>2.0</code> = two cores). Limits
+need a real container; when a requested cap can’t be enforced — no Job
+Object/cgroup, or a Linux cgroup whose controllers can’t be enabled —
+<code>with_options</code> returns <code>ErrorReason::ResourceLimit { kind, reason, detail }</code> instead
+of handing back a silently-unbounded group: <code>kind</code> names the limit
+(<code>max_memory</code>/<code>max_processes</code>/<code>cpu_quota</code>), <code>reason</code> says whether the value was
+simply invalid, no mechanism with whole-tree resource <em>accounting</em> exists here
+(<code>Unsupported</code> — the pgroup mechanisms, which have no whole-tree container at all,
+and the FreeBSD reaper, which contains a tree without accounting for it), or a
+mechanism exists but rejected this request
+(<code>Unenforceable</code>) — branch on these instead of parsing <code>detail</code>. On Linux this
+needs the process to run at the
+<strong>real cgroup-v2 root</strong>: the crate enables the controllers in this process’s own
+cgroup, which cgroup v2’s “no internal processes” rule allows only for the real
+hierarchy root — <em>not</em> a cgroup-namespace root (so an ordinary container fails
+too), <em>not</em> under systemd — and the crate doesn’t migrate your process. See the
+limits prerequisites in
+<a href="platform-support.html#containment-mechanisms">Platform support</a>. The <code>uid()</code>-drop
+interaction lives under its <a href="platform-support.html#caveats">Caveats</a>.</p>
+<h3 id="updating-a-live-group"><a class="header" href="#updating-a-live-group">Updating a live group</a></h3>
+<p><code>ProcessGroup::update_limits(ResourceLimits)</code> re-applies a fresh set of caps to
+an <strong>already-running</strong> group — without recreating the container or restarting
+its children — for adaptive resource management (tighten a slumping batch’s
+memory, widen a long-lived worker pool’s CPU quota):</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::{ProcessGroup, ResourceLimits};
+
+<span class="boring">fn main() -&gt; processkit::Result&lt;()&gt; {
+</span>let mut group = ProcessGroup::new()?;
+
+// Later, adapt the caps on the already-running group:
+let mut limits = ResourceLimits::default();
+limits.max_memory = Some(256 * 1024 * 1024); // tighten to 256 MiB
+limits.cpu_quota = Some(2.0);                 // widen CPU to two cores
+group.update_limits(limits)?; // max_processes left None → that cap is lifted
+<span class="boring">Ok(())
+</span><span class="boring">}</span></code></pre>
+<p>The new value is a <strong>full replacement</strong>, not a merge: an axis left <code>None</code> is
+lifted back to unbounded — it does <em>not</em> keep its previous cap — so always
+describe the complete desired state (start from <code>ResourceLimits::default()</code> and
+set the axes you want capped). On Windows the live Job Object’s caps are
+reissued; on Linux cgroup v2 the <code>memory.max</code> / <code>pids.max</code> / <code>cpu.max</code> files are
+rewritten (a removed axis written back to <code>max</code>). It routes through the same
+live container the tree-control verbs use, so the same platform matrix and
+<code>ErrorReason::ResourceLimit { kind, reason, detail }</code> classification apply — a
+process-group mechanism (macOS/the other BSDs, the Linux fallback) and the FreeBSD
+reaper refuse any requested cap with <code>Unsupported</code> rather than silently dropping
+it, while lifting <em>all</em> caps there is a trivial success.</p>
+<p><strong>A failure is not a rollback.</strong> The caps are written axis by axis — on Windows
+one Job Object call for the memory and process caps and a second for the CPU cap,
+on cgroup v2 <code>memory.max</code>, then <code>pids.max</code>, then <code>cpu.max</code> — and nothing about
+that is transactional. A call that fails part-way can leave the container carrying
+a <em>mix</em> of old and new caps, including an axis the request meant to lift that has
+already been lifted; only the group’s reflected options (what <code>Debug</code> shows) stay
+on the previous set, and the error doesn’t say how far the write got. Re-issue the
+complete desired set (a full replacement, so retrying is idempotent) or tear the
+group down. An <code>Invalid</code> value is the one case guaranteed to change nothing: it is
+rejected before the OS is touched. Evidence stays honest across all of this —
+every axis a request names joins the group’s sticky cap record whether the call
+succeeds or fails, so an axis that did land before the failure is still read from
+the kernel’s counters by <code>limit_evidence()</code> rather than reported <code>NotTripped</code> with
+nothing behind it.</p>
+<h3 id="did-the-cap-actually-fire-limit_evidence"><a class="header" href="#did-the-cap-actually-fire-limit_evidence">Did the cap actually fire? (<code>limit_evidence</code>)</a></h3>
+<p>The caps above answer “may this tree use more?”. They don’t, by themselves, tell
+you afterwards whether one of them <em>stopped</em> something — and a plain exit status
+can’t either: a child OOM-killed under <code>max_memory</code> and a child that crashed on
+its own both surface as an ordinary non-zero exit (a <code>SIGKILL</code> on Unix). <code>stats</code>
+reports peak and cumulative samples, which is a measurement, not a verdict.</p>
+<p><code>ProcessGroup::limit_evidence()</code> closes that gap. It returns a <code>LimitEvidence</code>
+report carrying one <code>LimitVerdict</code> per axis, read from the kernel/OS container
+the crate owns:</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::{Command, LimitVerdict, ProcessGroup, ProcessGroupOptions};
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let group = ProcessGroup::with_options(
+        ProcessGroupOptions::default().max_memory(512 * 1024 * 1024),
+    )?;
+    let outcome = group.start(&amp;Command::new("untrusted-tool")).await?
+        .output_string().await?;
+
+    if !outcome.is_success() {
+        match group.limit_evidence().memory() {
+            LimitVerdict::Tripped =&gt; eprintln!("killed by its memory cap"),
+            LimitVerdict::NotTripped =&gt; eprintln!("the tool failed on its own"),
+            // `LimitVerdict` is `#[non_exhaustive]`; treat anything new the way
+            // you treat `Unknown` — as "no answer", never as a "no".
+            _ =&gt; eprintln!("this platform can't say"),
+        }
+    }
+    Ok(())
+}</code></pre>
+<p><strong>Two different questions.</strong> <code>ErrorReason::ResourceLimit</code> is <em>admission</em>: “the
+cap you asked for could not be <strong>applied</strong>” (<code>Invalid</code> / <code>Unsupported</code> /
+<code>Unenforceable</code>). <code>with_options</code> returns it instead of running anything at all —
+it hands back no group, so there is nothing left to ask. <code>update_limits</code> returns
+it against an already-running tree, where it undoes nothing that already landed
+(see <a href="#updating-a-live-group">A failure is not a rollback</a> above).
+<code>limit_evidence</code> is the other side: did a cap on this axis then <strong>fire</strong>?
+Nothing about the error’s behaviour changes — but on a live group the two can
+meet on the same axis: after a failed <code>update_limits</code> the error says the
+requested set could not be applied whole, while the evidence still answers what
+actually fired, read from the counters rather than assumed away.</p>
+<p><strong>Three-valued on purpose, and never a guess.</strong> <code>Tripped</code> is returned <em>only</em> on
+authoritative kernel/OS evidence recorded by this group’s own container.
+<code>NotTripped</code> means the evidence says it did not fire — or that the axis never
+carried a cap, so nothing could. <code>Unknown</code> means <strong>no evidence is available</strong>,
+and is deliberately not folded into a “no”. Exit codes and signals are never
+consulted: they cannot separate a cap-driven kill from a self-inflicted one.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Mechanism</th><th>Memory</th><th>Processes</th><th>CPU</th><th>Evidence</th></tr>
+</thead>
+<tbody>
+<tr><td>Linux cgroup v2</td><td>✅</td><td>✅</td><td>✅</td><td><code>memory.events</code>’ <code>oom</code>, <code>pids.events</code>’ <code>max</code>, <code>cpu.stat</code>’s <code>nr_throttled</code></td></tr>
+<tr><td>Windows Job Object</td><td>❓ <code>Unknown</code></td><td>❓ <code>Unknown</code></td><td>❓ <code>Unknown</code></td><td>the mechanism keeps no post-mortem record — see below</td></tr>
+<tr><td>pgroup / macOS / other BSD</td><td>❓ <code>Unknown</code></td><td>❓ <code>Unknown</code></td><td>❓ <code>Unknown</code></td><td>no whole-tree resource accounting exists at all</td></tr>
+<tr><td>FreeBSD reaper</td><td>❓ <code>Unknown</code></td><td>❓ <code>Unknown</code></td><td>❓ <code>Unknown</code></td><td>contains the tree, accounts for nothing in it</td></tr>
+</tbody>
+</table>
+</div>
+<p>What “fired” means differs by axis, because the OS’s own behaviour does: memory
+means the container hit <strong>its own</strong> cap and the kernel had to OOM inside it;
+processes means a fork was refused; CPU means the quota throttled the tree at
+least once — a CPU cap slows work rather than stopping it, so a <code>Tripped</code> CPU
+verdict reads as “the quota bound this workload”, not “the quota broke it”.</p>
+<p>The memory axis keys on cgroup v2’s <code>oom</code> counter and deliberately <strong>not</strong> on
+<code>oom_kill</code>, which the kernel documents as processes of this cgroup killed by
+<em>any</em> OOM killer — a host-wide out-of-memory kill would otherwise be reported as
+“your cap killed it”.</p>
+<p><strong>A <code>NotTripped</code> memory verdict on a host with swap</strong> deserves one caveat, and it
+is the kernel’s, not the report’s: <code>memory.max</code> caps <em>memory</em>, not memory + swap.
+Where swap is available to the tree (<code>memory.swap.max</code> defaults to <code>max</code>, and the
+crate sets no swap cap), the kernel may page a hog out instead of OOM-killing it —
+the cap engages, nothing dies, and <code>NotTripped</code> is the truthful answer. If you
+need “over the cap means death”, take swap off the tree externally
+(<code>memory.swap.max</code>, or a swapless host/container — which is what most containers
+already are).</p>
+<p><strong>Windows is a measured negative, not an oversight.</strong> A Job Object enforces all
+three caps but preserves nothing about them afterwards: the active-process cap
+refuses the offending process without ever counting it as a member (the job
+accounting’s “terminated because of a limit violation” tally is measurably
+unmoved by a real violation), the memory cap fails a <em>commit</em> rather than
+killing and is surfaced only as a live IO-completion-port notification, and the
+CPU hard cap throttles with no counter at all. Reading any of them would mean
+attaching a completion port and a drain thread to every group — new machinery on
+the containment object itself, purely for reporting — which this crate does not
+do. Inferring from <code>PeakJobMemoryUsed</code> or an exit code is refused as a guess, so
+a capped axis reports <code>Unknown</code> there. (On the process-group mechanism the
+answer is <code>Unknown</code> too, for a different reason: it has no accounting to read —
+and it refuses to carry a cap in the first place.)</p>
+<p><strong>Read it before the group goes away.</strong> The evidence lives in the container, so
+call <code>limit_evidence()</code> while the group is still alive; dropping it (or the
+consuming <code>shutdown()</code>) removes the cgroup / closes the job handle and takes the
+counters with it. Reading is free of side effects and repeatable: it sends no
+signal, kills nothing, writes nothing, and cannot perturb teardown or
+kill-on-drop whenever you call it. The counters are cumulative and are not reset
+by reading, by a teardown, or by <code>update_limits</code> — an axis whose cap was later
+lifted still reports that it fired while the cap was in force, and so does an
+axis named by an <code>update_limits</code> call that <em>failed</em> (see above: that call is not
+a rollback, so the axis may have been applied before the failure). An axis that
+never carried a cap is answered without touching the OS at all, so a group
+created without caps performs no evidence I/O whatsoever.</p>
+<p>(<code>LimitEvidence</code> and <code>LimitVerdict</code> are left as bare code spans, not <code>docs.rs</code>
+links: they ship in the next release, so a <code>docs.rs</code> URL would 404 until then.)</p>
+<h2 id="stats-and-sampling"><a class="header" href="#stats-and-sampling">Stats and sampling</a></h2>
+<p>Requires the opt-in <strong><code>stats</code></strong> feature (<code>features = ["stats"]</code>, or <code>limits</code>).</p>
+<pre class="playground"><code class="language-rust no_run">use processkit::prelude::StreamExt;
+use processkit::{Command, ProcessGroup};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let group = ProcessGroup::new()?;
+    let _worker = group.start(&amp;Command::new("worker")).await?;
+
+    // Point-in-time:
+    let snap = group.stats()?;
+    println!(
+        "procs={} cpu={:?} peak_rss={:?}",
+        snap.active_process_count, snap.total_cpu_time, snap.peak_memory_bytes,
+    );
+
+    // …or a series: first sample immediate, then every 250ms; missed ticks are
+    // skipped; the stream ends when the group can no longer report.
+    let mut samples = group.sample_stats(Duration::from_millis(250));
+    while let Some(s) = samples.next().await {
+        println!("rss now: {:?}", s.peak_memory_bytes);
+    }
+    Ok(())
+}</code></pre>
+<p>CPU time and peak memory are available where the kernel accounts for the
+whole tree (Windows, Linux cgroup); the process-group backends report the
+member <strong>count</strong> only — the <code>Option</code> fields stay <code>None</code>. The sampler borrows
+the group, so it can neither outlive it nor keep it (and the kill-on-drop
+guarantee) alive. For a <em>single run’s</em> end-to-end summary, see
+<a href="streaming.html#per-run-telemetry"><code>profile</code></a>.</p>
+<h3 id="an-owning-static-sampler"><a class="header" href="#an-owning-static-sampler">An owning, <code>'static</code> sampler</a></h3>
+<p>Because <code>sample_stats</code> borrows the group, its <code>StatsSampler</code> is tied to that
+borrow — it can’t be moved into a [<code>tokio::spawn</code>]ed task or handed across an FFI
+boundary, both of which need a <code>'static</code> value. When the group already lives
+behind a shared [<code>Arc</code>] (a long-lived service, a supervisor, an FFI wrapper),
+reach instead for <code>OwnedStatsSampler</code>, the owning twin — the sampling analogue of
+how <a href="#tearing-down-drop-terminate-shutdown"><code>shutdown_ref</code></a> is the non-consuming
+twin of <code>shutdown</code>:</p>
+<pre class="playground"><code class="language-rust no_run">use std::sync::Arc;
+use std::time::Duration;
+
+use processkit::prelude::StreamExt;
+use processkit::{Command, OwnedStatsSampler, ProcessGroup};
+
+#[tokio::main]
+async fn main() -&gt; processkit::Result&lt;()&gt; {
+    let group = Arc::new(ProcessGroup::new()?);
+    let _worker = group.start(&amp;Command::new("worker")).await?;
+
+    // `Send + 'static`: build it from `&amp;Arc&lt;…&gt;` (the caller keeps the `Arc`) and
+    // move it into a task. Same cadence as `sample_stats` — first sample
+    // immediate, then one per interval, missed ticks skipped.
+    let mut samples = OwnedStatsSampler::new(&amp;group, Duration::from_millis(250));
+    tokio::spawn(async move {
+        while let Some(s) = samples.next().await {
+            println!("rss now: {:?}", s.peak_memory_bytes);
+        }
+        // The series ended: either the container can no longer report, or every
+        // `Arc` to the group was dropped and the tree is gone.
+    });
+    Ok(())
+}</code></pre>
+<p>It holds the group only <strong>weakly</strong>, so — exactly like the borrowing
+<code>StatsSampler</code> — it never keeps the group or its kill-on-drop guarantee alive; a
+sampler left running in a detached task can’t pin a tree that should have been
+torn down. That makes its behaviour when the group goes away well-defined: the
+stream ends — yields <code>None</code>, and stays ended (it is fused) — on the first tick
+that can’t produce a snapshot, whether because the container was torn down (a
+failed <code>stats()</code>, same as the borrowing sampler) <strong>or</strong> because every strong
+<code>Arc</code> to the group was released while the sampler ran (the weak handle no longer
+upgrades). It never silently repeats the last snapshot and never leaves the task
+awaiting a tick that will never come.</p>
+<hr>
+<p>Next: <a href="streaming.html">Streaming &amp; interactive I/O</a> ·
+<a href="platform-support.html">Platform support</a> ·
+<a href="supervision.html">Supervision</a></p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="comparison.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="streaming.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="comparison.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="streaming.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-09f2665d.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="theme/nav-links-0c03fceb.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

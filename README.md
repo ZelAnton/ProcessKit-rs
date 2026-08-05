@@ -61,12 +61,15 @@ over the whole tree, not a best-effort signal to one pid:
 `nohup`-style helper meant to *outlive* its launcher — `Command::spawn_detached`
 is a single, loudly-named opt-in that spawns a child **outside** this containment
 (a new session on Unix, unassigned to the Job Object on Windows) and hands back a
-`DetachedChild` the crate never kills, reaps, times out, or captures. It inverts
-the headline guarantee *on purpose*, so it is a separate, non-interchangeable
-type, it refuses any owner-dependent knob (a timeout, capture wiring, interactive
-stdin) with a loud typed error rather than ignoring it, and it deliberately does
-**not** break a child out of a *host* Job Object / cgroup it inherits (a CI
-runner, a `systemd` scope) — it escapes only *this crate's* per-run containment.
+`DetachedChild` with no public kill, wait, timeout, capture, or control APIs. On
+Unix, a private background reaper owns the child handle and collects its exit
+status; that internal bookkeeping does not expose any lifecycle operation or
+restore this crate's containment. It inverts the headline guarantee *on purpose*,
+so it is a separate, non-interchangeable type, it refuses any owner-dependent
+knob (a timeout, capture wiring, interactive stdin) with a loud typed error rather
+than ignoring it, and it deliberately does **not** break a child out of a *host*
+Job Object / cgroup it inherits (a CI runner, a `systemd` scope) — it escapes only
+*this crate's* per-run containment.
 
 ### How it compares
 
