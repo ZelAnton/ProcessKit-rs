@@ -524,6 +524,8 @@ impl RunningProcess {
             stdout_pump: None,
             stderr_pump: None,
             stdin_error: None,
+            #[cfg(test)]
+            test_stdin_task: None,
             stdout_piped: command.stdout_is_piped(),
             // PTY mode has one merged output reader exposed as stdout, just like
             // the real PTY backend; never advertise a separate stderr probe.

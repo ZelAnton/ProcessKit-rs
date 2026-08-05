@@ -265,6 +265,10 @@ pub struct RunningProcess {
     // Non-broken-pipe stdin failure stashed by `observe_stdin_task`; surfaced as
     // `ErrorReason::Stdin` by `checked_outcome` only when the run otherwise succeeded.
     stdin_error: Option<std::io::Error>,
+    // Test-only seam for delayed stdin-writer completion on a hermetic scripted
+    // handle. Real and PTY handles keep the task in their backend-specific slot.
+    #[cfg(test)]
+    test_stdin_task: Option<JoinHandle<std::io::Result<()>>>,
     // Bulk capture verbs fail loudly on non-piped stdout rather than returning empty.
     stdout_piped: bool,
     // Stderr readiness probes likewise fail loudly when there is no pipe to observe.
@@ -526,6 +530,8 @@ impl RunningProcess {
             stdout_pump: None,
             stderr_pump: None,
             stdin_error: None,
+            #[cfg(test)]
+            test_stdin_task: None,
             stdout_piped: s.stdout_piped,
             stderr_piped: s.stderr_piped,
             deadline_task: None,
@@ -584,6 +590,8 @@ impl RunningProcess {
             stdout_pump: None,
             stderr_pump: None,
             stdin_error: None,
+            #[cfg(test)]
+            test_stdin_task: None,
             stdout_piped: s.stdout_piped,
             // A PTY exposes one merged stream through stdout; separate stderr is
             // intentionally unavailable.
@@ -1480,7 +1488,12 @@ impl RunningProcess {
             }
         };
         let outcome = self.on_reaped(cause);
-        self.observe_stdin_task().await;
+        // Borrowed waits have no pump-drain window to give a still-running
+        // source a chance to finish. Finalize the writer after the child reap,
+        // bounded like the consuming paths, so a delayed source error cannot be
+        // mistaken for a clean successful exit while a hung source cannot park
+        // wait_any/wait_all forever.
+        self.finalize_stdin_task().await;
         self.checked_outcome(outcome)
     }
 
@@ -1763,9 +1776,9 @@ impl RunningProcess {
         self.record_stdin_error(observed);
     }
 
-    /// Final stdin-writer observation, run after `join_pumps` and before
-    /// `checked_outcome` in every pump-draining consuming path. The pre-pump
-    /// [`observe_stdin_task`](Self::observe_stdin_task) only peeks
+    /// Final stdin-writer observation, run after `join_pumps` (or directly after
+    /// a borrowed wait reaps the child) and before `checked_outcome`. The
+    /// pre-pump [`observe_stdin_task`](Self::observe_stdin_task) only peeks
     /// non-blockingly, so a writer that failed with a non-broken-pipe error
     /// *inside* the `join_pumps` window (up to [`PUMP_TEARDOWN`]) — e.g. a
     /// `from_reader`/`from_file` source that erred while the pumps were still
@@ -1780,6 +1793,17 @@ impl RunningProcess {
     /// case the writer already finished (the pre-pump peek took it, or it wraps
     /// up during pump teardown), so the timeout resolves immediately.
     async fn finalize_stdin_task(&mut self) {
+        #[cfg(test)]
+        let task = self
+            .test_stdin_task
+            .take()
+            .or_else(|| match &mut self.backend {
+                Backend::Real(real) => real.stdin_task.take(),
+                #[cfg(feature = "pty")]
+                Backend::Pty(pty) => pty.stdin_task.take(),
+                Backend::Scripted(_) => None,
+            });
+        #[cfg(not(test))]
         let task = match &mut self.backend {
             Backend::Real(real) => real.stdin_task.take(),
             #[cfg(feature = "pty")]
@@ -1838,6 +1862,11 @@ impl RunningProcess {
             );
             self.stdin_error = Some(e);
         }
+    }
+
+    #[cfg(test)]
+    fn set_test_stdin_task(&mut self, task: JoinHandle<std::io::Result<()>>) {
+        self.test_stdin_task = Some(task);
     }
 
     /// Abort all watchdog tasks and clear the recorded pid after reap.
@@ -2468,6 +2497,10 @@ impl Drop for RunningProcess {
         if let Some(task) = self.stderr_pump.take() {
             task.abort();
         }
+        #[cfg(test)]
+        if let Some(task) = self.test_stdin_task.take() {
+            task.abort();
+        }
         match &mut self.backend {
             Backend::Real(real) => {
                 if let Some(task) = real.stdin_task.take() {
@@ -2940,6 +2973,16 @@ mod tests {
             .start(&cmd)
             .await
             .expect("scripted start")
+    }
+
+    /// Install the task slot a real stdin writer uses, without spawning a
+    /// subprocess. The delayed completion makes the child-reap-before-source
+    /// failure ordering deterministic for borrowed-wait regressions.
+    fn delayed_stdin_task(run: &mut RunningProcess, delay: Duration, result: std::io::Result<()>) {
+        run.set_test_stdin_task(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            result
+        }));
     }
 
     /// The shape `prepare_line_capture` hands the pipeline — two fresh unbounded
@@ -3766,6 +3809,105 @@ mod tests {
         assert!(
             gate.is_retired(),
             "the wait_all reap must retire the gate too"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_any_observes_delayed_stdin_error_after_reap() {
+        let mut run = scripted_handle(&[0]).await;
+        delayed_stdin_task(
+            &mut run,
+            Duration::from_millis(10),
+            Err(std::io::Error::other("delayed stdin failure")),
+        );
+
+        let err = crate::wait_any(&mut [&mut run])
+            .await
+            .expect_err("wait_any must classify a delayed source failure");
+        assert!(
+            matches!(err.reason(), ErrorReason::Stdin { .. }),
+            "got: {err:?}"
+        );
+        assert!(
+            run.stdin_error.is_none(),
+            "checked_outcome must consume the observed source error exactly once"
+        );
+        assert_eq!(
+            run.wait()
+                .await
+                .expect("a repeated wait still returns the cached exit"),
+            Outcome::Exited(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_all_observes_delayed_stdin_error_after_reap() {
+        let mut run = scripted_handle(&[0]).await;
+        delayed_stdin_task(
+            &mut run,
+            Duration::from_millis(10),
+            Err(std::io::Error::other("delayed stdin failure")),
+        );
+
+        let err = crate::wait_all(&mut [&mut run])
+            .await
+            .expect_err("wait_all must classify a delayed source failure");
+        assert!(
+            matches!(err.reason(), ErrorReason::Stdin { .. }),
+            "got: {err:?}"
+        );
+        assert!(
+            run.stdin_error.is_none(),
+            "checked_outcome must consume the observed source error exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn borrowed_wait_preserves_successful_stdin_completion() {
+        let mut run = scripted_handle(&[0]).await;
+        delayed_stdin_task(&mut run, Duration::from_millis(10), Ok(()));
+
+        assert_eq!(
+            crate::wait_all(&mut [&mut run])
+                .await
+                .expect("a successful source must not change the exit result"),
+            vec![Outcome::Exited(0)]
+        );
+        assert!(run.stdin_error.is_none());
+        assert_eq!(
+            crate::wait_any(&mut [&mut run])
+                .await
+                .expect("a repeated borrowed wait remains usable"),
+            (0, Outcome::Exited(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_any_keeps_cancellation_precedence_over_delayed_stdin_error() {
+        let token = crate::CancellationToken::new();
+        let cmd = Command::new("tool").cancel_on(token.clone());
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::pending())
+            .start(&cmd)
+            .await
+            .expect("scripted start");
+        delayed_stdin_task(
+            &mut run,
+            Duration::from_millis(10),
+            Err(std::io::Error::other("delayed stdin failure")),
+        );
+        token.cancel();
+
+        let err = crate::wait_any(&mut [&mut run])
+            .await
+            .expect_err("cancellation must remain the dominant classification");
+        assert!(
+            matches!(err.reason(), ErrorReason::Cancelled { .. }),
+            "got: {err:?}"
+        );
+        assert!(
+            run.test_stdin_task.is_none(),
+            "the source task is finalized once even when cancellation wins"
         );
     }
 
