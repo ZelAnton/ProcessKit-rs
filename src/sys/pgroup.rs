@@ -1645,6 +1645,23 @@ mod tests {
 
     use super::*;
 
+    /// Make a raw tokio command start in its own session for tests that need a
+    /// deterministic `EPERM` from the parent's `setpgid` adoption attempt.
+    fn make_session_leader(command: &mut Command) {
+        // SAFETY: the pre-exec hook calls only `setsid` and reads errno, both of
+        // which are async-signal-safe. It runs in the child after fork and before
+        // exec, where the child is not yet a process-group leader.
+        unsafe {
+            command.as_std_mut().pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+
     /// A signal number well past any real or real-time signal (`SIGRTMAX` is ~64 on
     /// Linux, and macOS/BSD have no RT signals), so `kill`/`killpg` reject it with
     /// `EINVAL` on every POSIX target — the malformed-request case the honesty fix
@@ -2065,7 +2082,7 @@ mod tests {
             .arg("echo ready > \"$PK_ADOPT_CHILD_READY\"; exec sleep 60")
             .env("PK_ADOPT_CHILD_READY", &marker)
             .kill_on_drop(true);
-        cmd.as_std_mut().setsid();
+        make_session_leader(&mut cmd);
         let mut child = cmd.spawn().unwrap();
         let pid = child.id().unwrap() as i32;
         for _ in 0..200 {
@@ -2440,7 +2457,7 @@ mod tests {
             .arg("echo ready > \"$PK_ADOPTION_RACE_READY\"; exec sleep 60")
             .env("PK_ADOPTION_RACE_READY", &marker)
             .kill_on_drop(true);
-        cmd.as_std_mut().setsid();
+        make_session_leader(&mut cmd);
         let mut child = cmd.spawn().unwrap();
         let pid = child.id().unwrap() as i32;
         for _ in 0..200 {
@@ -2474,12 +2491,17 @@ mod tests {
         started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("broadcast thread started");
-        let completed_during_reconcile =
-            finished_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+        let early_broadcast_result = finished_rx.recv_timeout(Duration::from_millis(100)).ok();
+        let completed_during_reconcile = early_broadcast_result.is_some();
 
         pause.release();
         let adoption_result = adopter.join().expect("adoption thread");
-        let broadcast_result = broadcaster.join().expect("broadcast thread");
+        let broadcast_result = early_broadcast_result.unwrap_or_else(|| {
+            finished_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("broadcast result receiver")
+        });
+        broadcaster.join().expect("broadcast thread");
         drop(pg);
         let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
         let _ = child.wait().await;
@@ -2550,8 +2572,12 @@ mod tests {
 
         pause.release();
         adopter.join().expect("adoption thread");
+        let broadcast_result = finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("broadcast result receiver");
+        broadcaster.join().expect("broadcast thread");
         assert!(
-            broadcaster.join().expect("broadcast thread").is_ok(),
+            broadcast_result.is_ok(),
             "signal-0 broadcast should complete after reconciliation"
         );
 
@@ -2561,7 +2587,7 @@ mod tests {
             "stale group entry must not survive the ownership transition"
         );
         drop(groups);
-        let solos = pg.solos.ids.lock().unwrap_or_else(|e| e.into_inner());
+        let mut solos = pg.solos.ids.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             solos.iter().filter(|entry| entry.id == pid).count(),
             1,
@@ -2575,6 +2601,9 @@ mod tests {
             Some(Some(anchor)),
             "the solo entry must retain the identity anchor"
         );
+        // This test models adoption with the test process itself. Remove that
+        // synthetic entry before `ProcessGroup::drop` can signal the current pid.
+        solos.clear();
     }
 
     /// A number that names no process is refused by the anchor capture — the bare-pid
