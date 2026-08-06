@@ -70,7 +70,7 @@ pub struct Reply {
     /// `timeout` deadline elapses (see [`pending`](Self::pending)); the other
     /// fields are unused then.
     pending: bool,
-    /// On a scripted `start`, sleep this long before each stdout line (see
+    /// On a scripted `start`, sleep this long before each output frame (see
     /// [`with_line_delay`](Self::with_line_delay)). Bulk `output_string` ignores it.
     line_delay: Option<std::time::Duration>,
     /// Set by [`not_found`](Self::not_found)/[`spawn_error`](Self::spawn_error): the
@@ -326,7 +326,7 @@ impl Reply {
         Self::ok(text)
     }
 
-    /// On a scripted `start`, sleep `delay` before each stdout line — so a
+    /// On a scripted `start`, sleep `delay` before each output frame — so a
     /// hermetic streaming test can observe genuinely incremental delivery
     /// (deterministic under `#[tokio::test(start_paused = true)]`). The
     /// scripted run "exits" after the last line. Ignored by the bulk `output_string`
@@ -478,6 +478,8 @@ impl Reply {
         // double models that collapse (see `split_pty_streams`), so a hermetic PTY
         // test needs no real tty.
         let (stdout_text, stderr_text) = Self::split_pty_streams(command, self.stdout, self.stderr);
+        let stdout_terminator = command.stdout_config().terminator;
+        let stderr_terminator = command.stderr_config().terminator;
 
         // A pending reply never exits on its own; everything else exits after
         // its (possibly zero) total line-delay budget. A canned timeout exits
@@ -489,10 +491,12 @@ impl Reply {
             // Both streams feed concurrently at `line_delay`, so the scripted
             // "process" only finishes once the LONGER stream has drained — count
             // the max, or a lagging stderr gets truncated at the shorter
-            // stdout-derived lifetime (which a real child never does). `str::lines`
-            // matches the count the pumps actually deliver.
-            let stdout_lines = stdout_text.lines().count() as u32;
-            let stderr_lines = stderr_text.lines().count() as u32;
+            // stdout-derived lifetime (which a real child never does). Count
+            // the same effective per-stream frames the feeders write.
+            let stdout_lines =
+                crate::running::split_pump_frames(&stdout_text, stdout_terminator).len() as u32;
+            let stderr_lines =
+                crate::running::split_pump_frames(&stderr_text, stderr_terminator).len() as u32;
             let lines = stdout_lines.max(stderr_lines);
             // Saturate and clamp so a `Duration::MAX`-ish `line_delay` can't
             // overflow the multiply or the later `Instant + lifetime` deadline.
@@ -506,6 +510,8 @@ impl Reply {
         let scripted = crate::running::ScriptedProc::new(
             stdout_text,
             stderr_text,
+            stdout_terminator,
+            stderr_terminator,
             crate::running::ScriptedOutcome {
                 code: code_for_scripted,
                 timed_out: self.timed_out,
@@ -1833,6 +1839,36 @@ mod tests {
             ["Progress: 0%", "Progress: 50%", "Progress: 100%"],
             "each `\\r` frame streams as its own line"
         );
+        let finish = run.finish().await.expect("finish");
+        assert_eq!(finish.outcome, Outcome::Exited(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scripted_carriage_return_line_delay_paces_each_frame() {
+        use crate::LineTerminator;
+        use tokio_stream::StreamExt;
+
+        let delay = std::time::Duration::from_secs(10);
+        let runner =
+            ScriptedRunner::new().fallback(Reply::ok("f1\rf2\rf3\r").with_line_delay(delay));
+        let cmd = crate::Command::new("dl").line_terminator(LineTerminator::CarriageReturn);
+        let mut run = runner.start(&cmd).await.expect("scripted start");
+        let mut lines = run.stdout_lines().unwrap();
+
+        // The pump may observe adjacent writes in one scheduler turn, so the
+        // stable timing assertion is the complete three-frame lifetime: a
+        // newline-based feeder would finish after one delay instead of three.
+        let started = tokio::time::Instant::now();
+        let mut seen = Vec::new();
+        while let Some(line) = lines.next().await {
+            seen.push(line);
+        }
+        assert_eq!(seen, ["f1", "f2", "f3"]);
+        assert!(
+            tokio::time::Instant::now().duration_since(started) >= delay * 3,
+            "each CR frame must contribute one line_delay"
+        );
+
         let finish = run.finish().await.expect("finish");
         assert_eq!(finish.outcome, Outcome::Exited(0));
     }
