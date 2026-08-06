@@ -1736,8 +1736,8 @@ mod tests {
             let mut fds = [0; 2];
             // SAFETY: `pipe` initializes both elements of this valid array.
             assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-            // Keep the test protocol fds away from fd 3, which is the stable
-            // descriptor the post-exec shell uses for its readiness byte.
+            // Keep the test protocol fds away from the descriptors used by
+            // the process-launching shell.
             for fd in &mut fds {
                 let moved = unsafe { libc::fcntl(*fd, libc::F_DUPFD, 10) };
                 assert!(moved >= 0, "duplicate adoption-race pipe fd");
@@ -1757,6 +1757,14 @@ mod tests {
             let [ready_read, ready_write] = Self::make_pipe();
             let [release_read, release_write] = Self::make_pipe();
             let [exec_ready_read, exec_ready_write] = Self::make_pipe();
+            // An EOF on the read end is the post-exec marker: the write end is
+            // inherited by the child, then closed by the kernel when exec
+            // replaces the pre-exec process image.
+            assert_eq!(
+                unsafe { libc::fcntl(exec_ready_write, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0,
+                "mark adoption-race exec pipe close-on-exec"
+            );
             // SAFETY: the child branch below uses only async-signal-safe fd,
             // process-control, and exec operations before replacing itself.
             let pid = unsafe { libc::fork() };
@@ -1782,12 +1790,6 @@ mod tests {
                     libc::close(ready_read);
                     libc::close(release_write);
                     libc::close(exec_ready_read);
-                    if libc::dup2(exec_ready_write, 3) == -1 {
-                        libc::_exit(127);
-                    }
-                    if exec_ready_write != 3 {
-                        libc::close(exec_ready_write);
-                    }
                     let ready = [1u8];
                     if libc::write(ready_write, ready.as_ptr().cast(), ready.len())
                         != ready.len() as isize
@@ -1802,7 +1804,7 @@ mod tests {
                     }
                     let shell = b"/bin/sh\0";
                     let argv0 = b"sh\0";
-                    let command = b"printf x >&3; exec sleep 60\0";
+                    let command = b"exec sleep 60\0";
                     libc::execl(
                         shell.as_ptr().cast::<libc::c_char>(),
                         argv0.as_ptr().cast::<libc::c_char>(),
@@ -2904,14 +2906,18 @@ mod tests {
         let exec_ready_read = race_child.take_exec_ready();
         let exec_ready_wait = tokio::task::spawn_blocking(move || {
             let mut file = exec_ready_read;
-            let mut byte = [0u8];
-            file.read_exact(&mut byte)
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
         });
-        tokio::time::timeout(Duration::from_secs(1), exec_ready_wait)
+        let exec_ready_bytes = tokio::time::timeout(Duration::from_secs(1), exec_ready_wait)
             .await
             .expect("post-exec readiness must not hang")
             .expect("post-exec readiness waiter must not panic")
-            .expect("child must reach the post-exec barrier");
+            .expect("child must close the post-exec marker on exec");
+        assert!(
+            exec_ready_bytes.is_empty(),
+            "post-exec marker must be EOF-only"
+        );
 
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
@@ -3023,14 +3029,18 @@ mod tests {
         let exec_ready_read = race_child.take_exec_ready();
         let exec_ready_wait = tokio::task::spawn_blocking(move || {
             let mut file = exec_ready_read;
-            let mut byte = [0u8];
-            file.read_exact(&mut byte)
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
         });
-        tokio::time::timeout(Duration::from_secs(1), exec_ready_wait)
+        let exec_ready_bytes = tokio::time::timeout(Duration::from_secs(1), exec_ready_wait)
             .await
             .expect("post-exec readiness must not hang")
             .expect("post-exec readiness waiter must not panic")
-            .expect("child must reach the post-exec barrier");
+            .expect("child must close the post-exec marker on exec");
+        assert!(
+            exec_ready_bytes.is_empty(),
+            "post-exec marker must be EOF-only"
+        );
 
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
