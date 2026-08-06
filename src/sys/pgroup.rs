@@ -2914,10 +2914,7 @@ mod tests {
             .expect("post-exec readiness must not hang")
             .expect("post-exec readiness waiter must not panic")
             .expect("child must close the post-exec marker on exec");
-        assert!(
-            exec_ready_bytes.is_empty(),
-            "post-exec marker must be EOF-only"
-        );
+        assert_eq!(exec_ready_bytes, 0, "post-exec marker must be EOF-only");
 
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
@@ -3037,10 +3034,7 @@ mod tests {
             .expect("post-exec readiness must not hang")
             .expect("post-exec readiness waiter must not panic")
             .expect("child must close the post-exec marker on exec");
-        assert!(
-            exec_ready_bytes.is_empty(),
-            "post-exec marker must be EOF-only"
-        );
+        assert_eq!(exec_ready_bytes, 0, "post-exec marker must be EOF-only");
 
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
