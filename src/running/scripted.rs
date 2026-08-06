@@ -439,33 +439,8 @@ impl ScriptedProc {
     /// its own [`exit`](Self::exit) signal, which resolves to the canned code just
     /// like a time-based `exit_at` would.
     pub(super) async fn wait_outcome(&mut self) -> Outcome {
-        fn classify(
-            code: Option<i32>,
-            timed_out: bool,
-            inactivity_timed_out: bool,
-            signal: Option<i32>,
-        ) -> Outcome {
-            match (code, timed_out, inactivity_timed_out) {
-                (_, _, true) => Outcome::InactivityTimedOut,
-                (_, true, false) => Outcome::TimedOut,
-                (Some(code), false, false) => Outcome::Exited(code),
-                (None, false, false) => Outcome::Signalled(signal),
-            }
-        }
-
-        let already_exited = matches!(self.exit_at, Some(at) if at <= tokio::time::Instant::now())
-            || self.exit.flag.load(Ordering::Acquire);
-        if self.kill.killed.load(Ordering::Acquire) && !already_exited {
-            Outcome::Signalled(None)
-        } else if already_exited {
-            // Cached natural outcome (time- or dialog-driven) even if a kill
-            // landed afterwards.
-            classify(
-                self.code,
-                self.timed_out,
-                self.inactivity_timed_out,
-                self.signal,
-            )
+        if let Some(outcome) = self.outcome_now() {
+            outcome
         } else {
             match self.exit_at {
                 // Race so a streaming `deadline_task` can still end this wait.
@@ -473,8 +448,8 @@ impl ScriptedProc {
                     tokio::select! {
                         biased;
                         () = self.kill.signal.notified() => Outcome::Signalled(None),
-                        () = self.exit.signal.notified() => classify(self.code, self.timed_out, self.inactivity_timed_out, self.signal),
-                        () = tokio::time::sleep_until(at) => classify(self.code, self.timed_out, self.inactivity_timed_out, self.signal),
+                        () = self.exit.signal.notified() => self.classify_natural(),
+                        () = tokio::time::sleep_until(at) => self.classify_natural(),
                     }
                 }
                 // A `pending` reply parks on kill only; a `dialog` also resolves
@@ -483,10 +458,41 @@ impl ScriptedProc {
                     tokio::select! {
                         biased;
                         () = self.kill.signal.notified() => Outcome::Signalled(None),
-                        () = self.exit.signal.notified() => classify(self.code, self.timed_out, self.inactivity_timed_out, self.signal),
+                        () = self.exit.signal.notified() => self.classify_natural(),
                     }
                 }
             }
+        }
+    }
+
+    /// The canned natural-exit outcome: the recorded code, unless the script was
+    /// scripted to time out (whole-run or inactivity) or to be signalled.
+    fn classify_natural(&self) -> Outcome {
+        match (self.code, self.timed_out, self.inactivity_timed_out) {
+            (_, _, true) => Outcome::InactivityTimedOut,
+            (_, true, false) => Outcome::TimedOut,
+            (Some(code), false, false) => Outcome::Exited(code),
+            (None, false, false) => Outcome::Signalled(self.signal),
+        }
+    }
+
+    /// The scripted counterpart of `RunningProcess::exit_outcome_now` — a
+    /// non-blocking poll resolving to the script's terminal [`Outcome`] once it
+    /// has ended (killed, dialog-exited, or past its time-based `exit_at`), and
+    /// `None` while it is still running. Shares the exact branch order
+    /// [`wait_outcome`](Self::wait_outcome) resolves an already-ended script by,
+    /// so the probe and the wait can never disagree.
+    pub(super) fn outcome_now(&self) -> Option<Outcome> {
+        let already_exited = matches!(self.exit_at, Some(at) if at <= tokio::time::Instant::now())
+            || self.exit.flag.load(Ordering::Acquire);
+        if self.kill.killed.load(Ordering::Acquire) && !already_exited {
+            Some(Outcome::Signalled(None))
+        } else if already_exited {
+            // Cached natural outcome (time- or dialog-driven) even if a kill
+            // landed afterwards.
+            Some(self.classify_natural())
+        } else {
+            None
         }
     }
 
@@ -494,11 +500,7 @@ impl ScriptedProc {
     /// non-blocking poll of whether the script has already ended (killed,
     /// dialog-exited, or past its time-based `exit_at`).
     pub(super) fn has_exited_now(&self) -> bool {
-        self.kill.killed.load(Ordering::Acquire)
-            || self.exit.flag.load(Ordering::Acquire)
-            || self
-                .exit_at
-                .is_some_and(|at| tokio::time::Instant::now() >= at)
+        self.outcome_now().is_some()
     }
 }
 

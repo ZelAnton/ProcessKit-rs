@@ -1116,9 +1116,38 @@ impl RunningProcess {
     /// - [`ErrorReason::Io`] — stdout is not piped, waiting on the child failed,
     ///   or a pipe pump ended with a read error. A prior line-oriented readiness
     ///   or streaming call is supported; only its unconsumed tail is returned.
-    pub async fn output_string(mut self) -> Result<ProcessResult<String>> {
+    pub async fn output_string(self) -> Result<ProcessResult<String>> {
+        self.output_string_observing_exit(|| ()).await
+    }
+
+    /// [`output_string`](Self::output_string) with an observation seam at the
+    /// child's **exit**: `at_exit` runs the moment the child has been reaped —
+    /// after the deadline/cancel arbiter settled it, but *before* the output pumps
+    /// are joined. `output_string` is this with a no-op observer.
+    ///
+    /// The buffering counterpart of
+    /// [`finish_observing_exit`](Self::finish_observing_exit), and it exists for the
+    /// same one caller and the same reason: the last stage of a buffering
+    /// [`Pipeline`](crate::Pipeline) capture decides culprit-vs-victim attribution
+    /// by whether the chain's proactive teardown was already in flight *when the
+    /// stage died*, and a stage whose stderr pipe outlives it (a forked grandchild
+    /// inherited the write end) is reaped long before its drain can end. Reading
+    /// that disposition after the drain would blame whoever drained first instead of
+    /// whoever died first; see `pipeline::ExitDisposition`.
+    ///
+    /// The observer is handed **nothing**, unlike `finish_observing_exit`'s
+    /// `FnOnce(Outcome)`: the caller needs the *instant*, not the outcome (which it
+    /// reads off the returned [`ProcessResult`] once the drain is done), and this
+    /// rides on `finish_lines`' shared `on_exit` seam, which also fires on the error
+    /// path — where there is no outcome to hand over. `at_exit` is synchronous and
+    /// must stay cheap: it runs on this future's own poll, between the reap and the
+    /// pump join.
+    pub(crate) async fn output_string_observing_exit(
+        mut self,
+        at_exit: impl FnOnce(),
+    ) -> Result<ProcessResult<String>> {
         let finished = self
-            .finish_lines(CaptureMode::Lines, /* expose_counts */ true, || {})
+            .finish_lines(CaptureMode::Lines, /* expose_counts */ true, at_exit)
             .await?;
         // A cassette `start`-replay carries the recorded truncation/overflow/
         // duration, so a consumed replay agrees with the bulk `Entry::to_result`
@@ -1195,7 +1224,23 @@ impl RunningProcess {
     /// Panics if the internal raw-stdout capture buffer's mutex is poisoned —
     /// which happens only if a pump task previously panicked while holding it (a
     /// crate bug), never from any caller input.
-    pub async fn output_bytes(mut self) -> Result<ProcessResult<Vec<u8>>> {
+    pub async fn output_bytes(self) -> Result<ProcessResult<Vec<u8>>> {
+        self.output_bytes_observing_exit(|| ()).await
+    }
+
+    /// [`output_bytes`](Self::output_bytes) with the same exit-observation seam as
+    /// [`output_string_observing_exit`](Self::output_string_observing_exit) — see
+    /// there for what the seam is for and why the observer is handed nothing.
+    /// `output_bytes` is this with a no-op observer.
+    ///
+    /// # Panics
+    ///
+    /// The same single panic as [`output_bytes`](Self::output_bytes) (a poisoned
+    /// internal raw-stdout buffer, i.e. a crate bug).
+    pub(crate) async fn output_bytes_observing_exit(
+        mut self,
+        at_exit: impl FnOnce(),
+    ) -> Result<ProcessResult<Vec<u8>>> {
         let capture = if let Some(capture) = self.raw_capture.take() {
             capture
         } else {
@@ -1210,7 +1255,14 @@ impl RunningProcess {
             ..
         } = capture;
 
-        let outcome = self.drive_to_exit().await?;
+        // Same seam placement as `finish_lines`: the exit is observable here and
+        // nowhere later that still means "when the child died" — everything below
+        // waits on *output*, which a survivor of the child's own tree can stretch
+        // arbitrarily. Fires on the error path too, for the same reason it does
+        // there: the observation is of the reap attempt, not of a successful one.
+        let outcome = self.drive_to_exit().await;
+        at_exit();
+        let outcome = outcome?;
         self.observe_stdin_task().await;
         // Bound the stdout drain: a surviving grandchild can hold stdout open past
         // the child's death; an unbounded read would park forever.
@@ -2009,18 +2061,7 @@ impl RunningProcess {
                 let status = gated_reap(&gate, real.child_mut())
                     .await
                     .map_err(Error::io)?;
-                match status.code() {
-                    Some(code) => Outcome::Exited(code),
-                    None => {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::process::ExitStatusExt;
-                            Outcome::Signalled(status.signal())
-                        }
-                        #[cfg(not(unix))]
-                        Outcome::Signalled(None)
-                    }
-                }
+                outcome_of_exit_status(&status)
             }
             // The PTY child reaps through the same gate discipline as `Real` (the
             // Unix pty child IS a tokio `Child`; the Windows ConPTY child holds its
@@ -2029,13 +2070,7 @@ impl RunningProcess {
             #[cfg(feature = "pty")]
             Backend::Pty(pty) => {
                 let status = pty.child_mut().reap(&gate).await.map_err(Error::io)?;
-                match status.code() {
-                    Some(code) => Outcome::Exited(code),
-                    #[cfg(unix)]
-                    None => Outcome::Signalled(status.signal()),
-                    #[cfg(not(unix))]
-                    None => Outcome::Signalled(None),
-                }
+                outcome_of_pty_exit_status(&status)
             }
             // A scripted double owns no OS process, so its gate is pid-less: no reap
             // frees an OS pid and every gated kill is a no-op. The `.await` cannot
@@ -2409,19 +2444,52 @@ impl RunningProcess {
         }
     }
 
-    /// Whether the child has already exited, polled without blocking.
+    /// Whether the child has already exited, polled without blocking — the
+    /// discard-the-outcome form of [`exit_outcome_now`](Self::exit_outcome_now),
+    /// which is the single implementation of this probe.
     fn has_exited_now(&mut self) -> bool {
+        self.exit_outcome_now().is_some()
+    }
+
+    /// The child's terminal [`Outcome`] once it has exited, polled **without
+    /// blocking**: `Some` after the reap, `None` while the child still runs.
+    ///
+    /// This is the readiness probe `poll_until` uses (via
+    /// [`has_exited_now`](Self::has_exited_now)) widened to also report *how* the
+    /// child ended, so a caller that observes the exit passively — the pipeline's
+    /// last-stage teardown watcher (`src/pipeline.rs`) — can classify the outcome
+    /// without taking the consuming [`finish`](Self::finish) away from the handle's
+    /// owner. Every observation-time side effect is exactly the one probe's, and
+    /// none of them consume the handle: a following `finish`/`wait` still reports
+    /// the same outcome off tokio's cached exit status.
+    pub(crate) fn exit_outcome_now(&mut self) -> Option<Outcome> {
         let gate = self.pid_gate.clone();
+        let mut observed: Option<Outcome> = None;
         // Reap-and-retire in one critical section: the non-blocking `try_wait`
         // that reaps (and frees) the pid runs under the gate lock and retires it
         // in the same step, so a watchdog's gated raw kill can never observe the
         // pid live after this reap freed it. Being synchronous, this fully closes
         // the window the async `backend_wait` backstop can only bound.
         let exited = gate.reap_under_lock(|| match &mut self.backend {
-            Backend::Real(real) => matches!(real.child_mut().try_wait(), Ok(Some(_))),
+            Backend::Real(real) => match real.child_mut().try_wait() {
+                Ok(Some(status)) => {
+                    observed = Some(outcome_of_exit_status(&status));
+                    true
+                }
+                Ok(None) | Err(_) => false,
+            },
             #[cfg(feature = "pty")]
-            Backend::Pty(pty) => matches!(pty.child_mut().try_wait(), Ok(Some(_))),
-            Backend::Scripted(s) => s.has_exited_now(),
+            Backend::Pty(pty) => match pty.child_mut().try_wait() {
+                Ok(Some(status)) => {
+                    observed = Some(outcome_of_pty_exit_status(&status));
+                    true
+                }
+                Ok(None) | Err(_) => false,
+            },
+            Backend::Scripted(s) => {
+                observed = s.outcome_now();
+                observed.is_some()
+            }
         });
         if exited {
             // Claim the arbiter: a deadline watchdog racing on another thread could
@@ -2447,8 +2515,19 @@ impl RunningProcess {
                 self.cancel_at_exit =
                     Some(self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()));
             }
+            // Same override, in the same order relative to the claim above, as the
+            // reap choke point `on_reaped` applies: a deadline that won the arbitration
+            // makes this a `TimedOut` run even though the child's own status says it
+            // exited cleanly within the grace. Reading it here is what lets a passive
+            // observer classify a run exactly as the consuming finisher will.
+            observed = observed.map(|outcome| self.classify_watchdog_timeout(outcome));
         }
-        exited
+        debug_assert_eq!(
+            exited,
+            observed.is_some(),
+            "the reap probe and the observed outcome must agree"
+        );
+        observed
     }
 
     /// Send a kill to the process without waiting for it to exit. The owning
@@ -2772,6 +2851,39 @@ async fn run_profile_sampler(
         if let Ok(mut acc) = acc.lock() {
             acc.fold(metrics);
         }
+    }
+}
+
+/// Map a reaped OS child's [`ExitStatus`](std::process::ExitStatus) to this
+/// crate's [`Outcome`] — the code when there is one, else the Unix signal number
+/// (never available off Unix). Shared by the async reap (`backend_wait`) and the
+/// synchronous exit probe (`exit_outcome_now`) so the two can never classify the
+/// same status differently.
+fn outcome_of_exit_status(status: &std::process::ExitStatus) -> Outcome {
+    match status.code() {
+        Some(code) => Outcome::Exited(code),
+        None => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                Outcome::Signalled(status.signal())
+            }
+            #[cfg(not(unix))]
+            Outcome::Signalled(None)
+        }
+    }
+}
+
+/// The PTY analogue of [`outcome_of_exit_status`]: the platform PTY child reports
+/// its status through its own type, carrying the same code and (Unix) signal.
+#[cfg(feature = "pty")]
+fn outcome_of_pty_exit_status(status: &crate::sys::pty::PtyExitStatus) -> Outcome {
+    match status.code() {
+        Some(code) => Outcome::Exited(code),
+        #[cfg(unix)]
+        None => Outcome::Signalled(status.signal()),
+        #[cfg(not(unix))]
+        None => Outcome::Signalled(None),
     }
 }
 
@@ -3729,6 +3841,80 @@ mod tests {
             Err(ErrorReason::Cancelled { .. }) => {}
             other => panic!("expected Err(Cancelled), got {other:?}"),
         }
+    }
+
+    /// The blind spot first-observation-wins leaves, pinned because both the
+    /// `Command::cancel_on` rustdoc and the cancellation guide now promise exactly
+    /// this: a held run that **nobody observed** has no earlier observation for a
+    /// late token to lose to, so the consuming finisher *is* the first observation —
+    /// and a token fired before it reports `Cancelled` even though the child had
+    /// already exited on its own (the `biased` cancel arm in `drive_to_exit_inner`
+    /// wins the race by design). Probing first is what buys the real outcome, which
+    /// is `a_probe_reap_is_not_flipped_by_a_later_cancel` above; this is its
+    /// counterpart, and the two together are the whole contract.
+    #[tokio::test]
+    async fn an_unobserved_exit_is_cancelled_by_a_token_fired_before_the_finisher() {
+        let token = crate::CancellationToken::new();
+        let run = ScriptedRunner::new()
+            .fallback(Reply::ok("done\n"))
+            .start(&Command::new("tool").cancel_on(token.clone()))
+            .await
+            .expect("scripted start");
+        // `Reply::ok` gives the scripted child a zero lifetime: it has already
+        // "exited" here — and nothing has looked at it. Fire the token, then look
+        // for the very first time.
+        token.cancel();
+        match run.finish().await.map_err(|e| e.into_reason()) {
+            Err(ErrorReason::Cancelled { .. }) => {}
+            other => panic!("expected Err(Cancelled), got {other:?}"),
+        }
+    }
+
+    /// The buffering verbs' exit seam (`output_string_observing_exit` /
+    /// `output_bytes_observing_exit`) must actually fire, exactly once. A seam that
+    /// silently never fired would not fail loudly anywhere: the pipeline's last
+    /// stage would just fall back to reading the teardown token *after* its drain —
+    /// the very attribution bug the latch exists to prevent — so nothing but this
+    /// test stands between that regression and a green run.
+    #[tokio::test]
+    async fn the_buffering_verbs_fire_their_exit_seam_exactly_once() {
+        let observed = Arc::new(AtomicUsize::new(0));
+        let counter = observed.clone();
+        let result = ScriptedRunner::new()
+            .fallback(Reply::ok("done\n"))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start")
+            .output_string_observing_exit(move || {
+                counter.fetch_add(1, Ordering::Release);
+            })
+            .await
+            .expect("output_string_observing_exit");
+        assert_eq!(result.outcome(), Outcome::Exited(0));
+        assert_eq!(
+            observed.load(Ordering::Acquire),
+            1,
+            "output_string's seam fires once for the one exit it observes"
+        );
+
+        let observed = Arc::new(AtomicUsize::new(0));
+        let counter = observed.clone();
+        let result = ScriptedRunner::new()
+            .fallback(Reply::ok("raw"))
+            .start(&Command::new("tool"))
+            .await
+            .expect("scripted start")
+            .output_bytes_observing_exit(move || {
+                counter.fetch_add(1, Ordering::Release);
+            })
+            .await
+            .expect("output_bytes_observing_exit");
+        assert_eq!(result.outcome(), Outcome::Exited(0));
+        assert_eq!(
+            observed.load(Ordering::Acquire),
+            1,
+            "and so does output_bytes', which drives its own teardown spine"
+        );
     }
 
     /// T-078: every consuming reap retires the shared `PidGate`, so the detached

@@ -35,6 +35,13 @@ use crate::sync::atomic::{AtomicU8, Ordering};
 // and discard the very diagnostic `merge_stderr_in_pipe` was asked to preserve.
 const TEARDOWN_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
+// The cadence bounds of `spawn_last_stage_watcher`'s exit probe: it starts at the
+// first and backs off by doubling to the second, so a chain whose last stage fails
+// right after `start` is torn down quickly, while a healthy long-lived session
+// settles at one non-blocking `try_wait` every `LAST_STAGE_PROBE_MAX`.
+const LAST_STAGE_PROBE_MIN: Duration = Duration::from_millis(25);
+const LAST_STAGE_PROBE_MAX: Duration = Duration::from_millis(500);
+
 /// A chain of [`Command`]s connected stdout→stdin — built with
 /// [`Command::pipe`], extended with [`pipe`](Self::pipe), driven with the same
 /// verb vocabulary as a single [`Command`]:
@@ -195,6 +202,15 @@ impl PipelineCapture for Vec<u8> {
     }
 }
 
+/// The at-exit observer [`capture`](Pipeline::capture) hands to its `capture_last`
+/// closure, to be armed on the capture verb it picks
+/// (`output_string_observing_exit`/`output_bytes_observing_exit`): it latches the
+/// last stage's [`ExitDisposition`] the moment that stage is reaped, before its
+/// output has finished draining. Boxed because `capture_last` is generic over the
+/// capture shape and the observer has to be a *nameable* parameter of it; `Send`
+/// because the future it ends up inside is spawned onto the chain's `JoinSet`.
+type LastExitObserver = Box<dyn FnOnce() + Send>;
+
 fn captured_result<T>(result: ProcessResult<T>) -> Captured<T> {
     let stderr = result.stderr().to_owned();
     let truncated = result.truncated();
@@ -285,7 +301,11 @@ impl Pipeline {
     /// and so never dies of a broken pipe — cannot hold the run open. The failure
     /// still keeps its **pipefail** attribution: the stage that triggered teardown
     /// is blamed, while the siblings the teardown killed are treated as victims
-    /// (like a downstream `SIGPIPE` death), never stealing the blame. The one
+    /// (like a downstream `SIGPIPE` death), never stealing the blame. A stage is a
+    /// victim by *when it died*, not by when the last of its output arrived — one
+    /// that had already exited on its own before the teardown fired stays the
+    /// culprit even if a grandchild it forked holds its stderr pipe open long
+    /// afterwards. The one
     /// death that does *not* trigger teardown is an
     /// [`unchecked_in_pipe`](Command::unchecked_in_pipe) stage's — its unclean exit
     /// is forgiven, so it leaves the rest of the chain running.
@@ -497,6 +517,24 @@ impl Pipeline {
         // `finish`/drop.
         let killer = spawn_group_killer(teardown.clone(), &stage_groups);
 
+        // The last stage is the caller's to stream, so it gets no `inner_tasks`-style
+        // drain that could fire `teardown` from its failure. Without an observer its
+        // failure would only be classified at `finish` — leaving the upstream stages
+        // (classically a quiet producer that never writes, so never dies of a broken
+        // pipe against the closed stdin of the dead last stage) running for as long
+        // as the caller holds the session unfinished. The standing watcher below
+        // closes exactly that gap, sharing the handle with the caller rather than
+        // taking it over.
+        let last: SharedLast = Arc::new(std::sync::Mutex::new(Some(last)));
+        let last_disposition = ExitDisposition::unobserved();
+        let last_watch = spawn_last_stage_watcher(
+            &last,
+            last_ok_codes.clone(),
+            last_unchecked,
+            teardown.clone(),
+            last_disposition.clone(),
+        );
+
         // Chain-wide `Pipeline::timeout` on the live session: a background watchdog
         // reusing the shared deadline arbiter (no second implementation — K-034/K-007).
         // At the deadline it claims a fresh chain arbiter and hard-kills every
@@ -517,11 +555,13 @@ impl Pipeline {
         });
 
         Ok(PipelineSession {
-            last: Some(last),
+            last,
             last_program,
             last_ok_codes,
             last_unchecked,
             last_timeout,
+            last_disposition,
+            last_watch: Some(last_watch),
             inner_tasks: Some(inner_tasks),
             inner_count,
             stage_groups,
@@ -553,8 +593,10 @@ impl Pipeline {
     /// overflow of the last stage), [`ErrorReason::Stdin`](crate::ErrorReason::Stdin), or
     /// [`ErrorReason::Io`](crate::ErrorReason::Io).
     pub async fn output_string(&self) -> Result<ProcessResult<String>> {
-        self.capture(|last| async move { last.output_string().await })
-            .await
+        self.capture(
+            |last, at_exit| async move { last.output_string_observing_exit(at_exit).await },
+        )
+        .await
     }
 
     /// Run the chain to completion and capture the last stage's stdout as **raw
@@ -569,16 +611,18 @@ impl Pipeline {
     /// stage (and a timeout) is captured, not raised — with the last stage's
     /// stdout captured as raw bytes.
     pub async fn output_bytes(&self) -> Result<ProcessResult<Vec<u8>>> {
-        self.capture(|last| async move { last.output_bytes().await })
+        self.capture(|last, at_exit| async move { last.output_bytes_observing_exit(at_exit).await })
             .await
     }
 
     /// Start and chain every stage, drain concurrently, and fold the pipefail
-    /// outcome. `capture_last` decides how the last stage's stdout is captured.
+    /// outcome. `capture_last` decides how the last stage's stdout is captured; it
+    /// is handed the [`LastExitObserver`] it must arm on that capture, so the last
+    /// stage's disposition is latched at its exit like every other stage's.
     async fn capture<T, C, F>(&self, capture_last: C) -> Result<ProcessResult<T>>
     where
         T: PipelineCapture,
-        C: FnOnce(crate::running::RunningProcess) -> F,
+        C: FnOnce(crate::running::RunningProcess, LastExitObserver) -> F,
         F: std::future::Future<Output = Result<ProcessResult<T>>> + Send + 'static,
     {
         // Launch the whole chain (shared with `start`'s streaming path): every
@@ -645,10 +689,25 @@ impl Pipeline {
                 Ok(Joined::Inner(index, outcome))
             });
         }
+        // The last stage of a buffering capture is driven by its own drain, exactly
+        // like an inner stage — so it gets the same latch, armed at its *exit*
+        // through the capture's `at_exit` seam. Nothing else observes it here (this
+        // path has no standing watcher), so the latch has one writer; it is here to
+        // read the teardown at the right *instant*. Without it a last stage whose
+        // stderr a forked grandchild holds open would be read as `torn_down` after
+        // its drain — demoting the stage that died first to the victim of a teardown
+        // that only fired afterwards. See [`ExitDisposition`].
+        let last_disposition = ExitDisposition::unobserved();
         // Call `capture_last` here (not inside the spawned future): it yields a
         // `Send` future `F`, whereas the closure `C` itself is not `Send` and must
         // not be captured across the `tokio::spawn` boundary.
-        let last_future = capture_last(last);
+        let last_future = capture_last(last, {
+            let disposition = last_disposition.clone();
+            let teardown = teardown.clone();
+            Box::new(move || {
+                disposition.latch(teardown.is_cancelled());
+            })
+        });
         {
             let teardown = teardown.clone();
             let last_ok_codes = last_ok_codes.clone();
@@ -657,8 +716,10 @@ impl Pipeline {
                 let result = last_future.await?;
                 *completed.lock().expect("pipeline capture result poisoned") = Some(result.clone());
                 // The last stage triggers teardown too (a failing last stage should
-                // not wait on a quiet upstream either); torn if a sibling already did.
-                let torn_down = teardown.is_cancelled();
+                // not wait on a quiet upstream either); torn if a sibling's teardown
+                // was already in flight when it *died* — the verdict the seam above
+                // latched, not a post-drain read of the token.
+                let torn_down = last_disposition.latch(teardown.is_cancelled());
                 if !torn_down
                     && is_checked_failure(result.outcome(), &last_ok_codes, last_unchecked)
                 {
@@ -977,17 +1038,42 @@ impl Pipeline {
 /// single [`RunningProcess`]. A partially-started chain (one
 /// stage up, the next failing to spawn) is torn down before [`start`](Pipeline::start)
 /// even returns its error.
+///
+/// That applies to the **last** stage's own checked failure too, and without
+/// waiting for [`finish`](Self::finish): a standing watcher re-probes the last
+/// stage for a terminal outcome on a bounded, backing-off cadence and fires the
+/// same teardown, so an unfinished session is not a way for a failed chain's
+/// upstream to keep running. The teardown is therefore prompt but not
+/// instantaneous — it lands within one probe interval of the failure plus the
+/// drain grace. Only the last stage's *process outcome* is watched this way; a
+/// non-outcome failure of that stage ([`ErrorReason::Stdin`](crate::ErrorReason::Stdin),
+/// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge), …) still
+/// surfaces at `finish`, and a last stage that exits *cleanly* deliberately fires
+/// no teardown — a chain whose stages all succeed is not a failed chain, and
+/// `finish` still waits for the rest of it.
 #[must_use = "a PipelineSession streams a live chain; drop it and the whole chain is killed unread"]
 pub struct PipelineSession {
-    /// The last stage's live handle — the streaming surface the caller drives.
-    /// `Option` so [`finish`](Self::finish) can move it out without a partial move
-    /// (the session has a `Drop`); `None` only after `finish` consumed it.
-    last: Option<RunningProcess>,
+    /// The last stage's live handle — the streaming surface the caller drives —
+    /// shared with the standing last-stage watcher (see
+    /// [`spawn_last_stage_watcher`]). `Option` so [`finish`](Self::finish) can move
+    /// it out without a partial move (the session has a `Drop`) and so an `async`
+    /// session call can lend it out ([`LastBorrow`]); `None` only while borrowed,
+    /// or for good once `finish` consumed it. The watcher observes it through a
+    /// [`Weak`], so dropping the session drops the handle — and fires its
+    /// kill-on-drop — without waiting for that task to be reclaimed.
+    last: SharedLast,
     /// The last stage's pipefail metadata, kept so `finish` can fold it into place.
     last_program: String,
     last_ok_codes: Vec<i32>,
     last_unchecked: bool,
     last_timeout: Option<Duration>,
+    /// The last stage's culprit-vs-victim disposition, latched by whichever of the
+    /// watcher and `finish` observes its exit first. Without it `finish` would read
+    /// a teardown the *last stage's own* failure fired as a sibling's and demote the
+    /// culprit to a victim — see [`ExitDisposition`] and `finish`.
+    last_disposition: ExitDisposition,
+    /// The standing last-stage exit watcher, aborted on `finish`/drop.
+    last_watch: Option<JoinHandle<()>>,
     /// Background drains of every inner (non-last) stage — each an index-tagged
     /// [`StageOutcome`] once its stage exits, sorted back into left-to-right order
     /// by `finish`. `Option`, taken by `finish`.
@@ -1034,7 +1120,7 @@ impl PipelineSession {
     /// or a prior readiness/streaming call already started its one line pump —
     /// returned instead of a silently-empty stream.
     pub fn stdout_lines(&mut self) -> Result<StdoutLines> {
-        self.last_mut().stdout_lines()
+        self.with_last(RunningProcess::stdout_lines)
     }
 
     /// Stream the **last** stage's full lifecycle as one ordered sequence of
@@ -1051,7 +1137,7 @@ impl PipelineSession {
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) when the last stage's stdout was not piped,
     /// or a prior readiness/streaming call already started its line pump.
     pub fn events(&mut self) -> Result<ProcessEvents> {
-        self.last_mut().events()
+        self.with_last(RunningProcess::events)
     }
 
     /// Wait until a line on the **last** stage's stdout matches `predicate`
@@ -1072,14 +1158,23 @@ impl PipelineSession {
         predicate: impl Fn(&str) -> bool + Send,
         within: Duration,
     ) -> Result<String> {
-        self.last_mut().wait_for_line(predicate, within).await
+        // Borrowed out of the shared slot for the call: holding the slot's guard
+        // across this `.await` would make the returned future `!Send`.
+        let mut last = self.borrow_last();
+        last.get().wait_for_line(predicate, within).await
     }
 
     /// The OS process id of the **last** stage, or `None` once it has been reaped —
     /// the stage whose stdout you stream. The inner stages' pids are not surfaced;
     /// the chain is driven and torn down as a unit.
+    ///
+    /// The reap that clears it is not only [`finish`](Self::finish)'s: a readiness
+    /// probe ([`wait_for_line`](Self::wait_for_line)) and the session's own
+    /// last-stage watcher both reap an exited child where they find one, so a live
+    /// session reports `None` here shortly after the last stage exits. Treat it as
+    /// "the last stage's pid while it runs", not as a session-lifetime handle.
     pub fn pid(&self) -> Option<u32> {
-        self.last.as_ref().and_then(RunningProcess::pid)
+        lock_last(&self.last).as_ref().and_then(RunningProcess::pid)
     }
 
     /// Stop the **whole chain** now: fan a hard kill across every stage's sub-group.
@@ -1123,6 +1218,15 @@ impl PipelineSession {
     /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) (a fail-loud buffer
     /// overflowed on a stage), [`ErrorReason::Stdin`](crate::ErrorReason::Stdin), or
     /// [`ErrorReason::Io`](crate::ErrorReason::Io).
+    ///
+    /// As for a single [`Command::cancel_on`](crate::Command::cancel_on), each stage's
+    /// cancellation is decided by whoever first *observes* that stage's exit: a token
+    /// fired after a stage had already ended does not turn that stage's real outcome
+    /// into [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled). Both ends of the
+    /// chain are observed while it is live — every inner stage by its background drain,
+    /// the last stage by the session's own watcher — so a chain that ran to completion
+    /// before the token fired reports how it actually ended, even when `finish` is
+    /// called afterwards.
     pub async fn finish(mut self) -> Result<Finished> {
         // The consume-once `take`s live in `take_live_parts` (this method takes
         // `self` by value, so they are always `Some` here), keeping the panic path
@@ -1139,12 +1243,29 @@ impl PipelineSession {
         // wedge the finalize; the killer then tears the chain down.
         let last_fut = {
             let teardown = teardown.clone();
+            let disposition = self.last_disposition.clone();
             async move {
-                let result = last.finish().await;
-                // Snapshot `torn_down` *before* the last stage might fire teardown —
-                // a teardown already in flight makes it a victim; a last stage that
-                // fails on its own fires teardown yet stays the (non-torn) culprit.
-                let torn_down = teardown.is_cancelled();
+                // Same shape as `finish_inner_stage`: latch `torn_down` at the
+                // stage's *exit* — a teardown already in flight then makes it a
+                // victim; a last stage that fails on its own stays the (non-torn)
+                // culprit even though its own failure fires the teardown.
+                //
+                // The standing watcher may have observed that same exit first and
+                // latched it already; the read below then returns *its* verdict.
+                // That is the whole point of watching the stage — to reach the
+                // identical attribution sooner, not a different one — and it is what
+                // keeps the last stage from reading the teardown its own failure
+                // fired as evidence that a sibling killed it.
+                let result = last
+                    .finish_observing_exit({
+                        let disposition = disposition.clone();
+                        let teardown = teardown.clone();
+                        move |_outcome| {
+                            disposition.latch(teardown.is_cancelled());
+                        }
+                    })
+                    .await;
+                let torn_down = disposition.latch(teardown.is_cancelled());
                 match &result {
                     Ok(finished) => {
                         if !torn_down
@@ -1212,10 +1333,30 @@ impl PipelineSession {
         })
     }
 
-    fn last_mut(&mut self) -> &mut RunningProcess {
-        self.last
+    /// Run `f` against the last stage's handle under the shared slot's lock — the
+    /// synchronous counterpart of [`borrow_last`](Self::borrow_last), for the session
+    /// methods that need `&mut RunningProcess` for the length of one non-`async`
+    /// call. The lock is never held across an `.await` here or in the watcher, so
+    /// the only thing it can ever wait on is one non-blocking exit probe.
+    fn with_last<R>(&mut self, f: impl FnOnce(&mut RunningProcess) -> R) -> R {
+        let mut slot = lock_last(&self.last);
+        f(slot
             .as_mut()
-            .expect("the last stage is live until finish consumes the session")
+            .expect("the last stage is live until finish consumes the session"))
+    }
+
+    /// Lend the last stage's handle out of the shared slot for the length of one
+    /// `async` session call — see [`LastBorrow`]. `&mut self` is what makes a second
+    /// concurrent borrow impossible, so the only observer that can find the slot
+    /// empty is the watcher, which simply skips that probe round.
+    fn borrow_last(&mut self) -> LastBorrow<'_> {
+        let handle = lock_last(&self.last)
+            .take()
+            .expect("the last stage is live until finish consumes the session");
+        LastBorrow {
+            slot: &self.last,
+            handle: Some(handle),
+        }
     }
 
     /// Take the last stage handle and the inner-stage drains out of the session for
@@ -1229,8 +1370,13 @@ impl PipelineSession {
         RunningProcess,
         tokio::task::JoinSet<Result<(usize, StageOutcome)>>,
     ) {
-        let last = self
-            .last
+        // `finish` takes the last stage's classification over from here, so stand the
+        // watcher down before the handle leaves the shared slot: from this point on
+        // exactly one observer decides whether the last stage fires `teardown`.
+        if let Some(task) = self.last_watch.take() {
+            task.abort();
+        }
+        let last = lock_last(&self.last)
             .take()
             .expect("finish consumes the session exactly once");
         let inner_tasks = self
@@ -1249,14 +1395,18 @@ impl PipelineSession {
             && self.chain_state.load(Ordering::Acquire) == crate::running::TS_TIMED_OUT
     }
 
-    /// Abort the standing background watchdog tasks (deadline + teardown killer).
-    /// Idempotent — `finish` calls it once the chain has settled, and `Drop` calls
-    /// it for the drop-without-finish path.
+    /// Abort the standing background tasks (deadline watchdog, teardown killer, and
+    /// the last-stage exit watcher). Idempotent — `finish` calls it once the chain
+    /// has settled (having already stood the watcher down in `take_live_parts`), and
+    /// `Drop` calls it for the drop-without-finish path.
     fn abort_background(&mut self) {
         if let Some(task) = self.deadline_task.take() {
             task.abort();
         }
         if let Some(task) = self.killer.take() {
+            task.abort();
+        }
+        if let Some(task) = self.last_watch.take() {
             task.abort();
         }
     }
@@ -1265,12 +1415,63 @@ impl PipelineSession {
 impl Drop for PipelineSession {
     fn drop(&mut self) {
         // Abort the detached watchdogs so a session dropped unfinished leaves no
-        // parked killer/deadline task behind. The chain itself is torn down by
-        // kill-on-drop as the fields fall: the last stage's `RunningProcess::drop`
-        // kills its own tree, every inner stage's handle (moved into the aborted
-        // `inner_tasks`) does the same as the `JoinSet` drops, and the retained
-        // `stage_groups` are the kill-on-drop backstop for any straggler.
+        // parked killer/deadline/watcher task behind. The chain itself is torn down
+        // by kill-on-drop as the fields fall: the last stage's `RunningProcess::drop`
+        // kills its own tree (the watcher holds only a `Weak` on the shared slot,
+        // upgraded for one non-blocking probe at a time, so an aborted task parked at
+        // its sleep cannot defer that drop), every inner stage's handle (moved into
+        // the aborted `inner_tasks`) does the same as the `JoinSet` drops, and the
+        // retained `stage_groups` are the kill-on-drop backstop for any straggler.
         self.abort_background();
+    }
+}
+
+/// The last stage's live handle as [`Pipeline::start`] shares it: held by the
+/// [`PipelineSession`], lent to the caller's own session calls, and observed by the
+/// standing last-stage watcher through a [`Weak`] it upgrades only for the length
+/// of one non-blocking probe — never across an `.await` — so the session's is the
+/// only strong reference that outlives a scheduling point. `Option` because an
+/// `async` session call moves the handle out for its duration ([`LastBorrow`]) and
+/// `finish` moves it out for good.
+type SharedLast = Arc<std::sync::Mutex<Option<RunningProcess>>>;
+
+/// Lock the shared last-stage slot, recovering the guard from a poisoned mutex
+/// rather than panicking. The only work done under this lock is a `take`/put-back
+/// or one non-blocking exit probe, so poisoning cannot happen in practice;
+/// recovering keeps a hypothetical panic in the detached watcher from turning
+/// every session method into a panic (the same reasoning as `PidGate::lock`).
+fn lock_last(slot: &std::sync::Mutex<Option<RunningProcess>>) -> LastGuard<'_> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+type LastGuard<'a> = std::sync::MutexGuard<'a, Option<RunningProcess>>;
+
+/// A scoped move-out borrow of the last stage's handle, for an `async`
+/// [`PipelineSession`] call that must hold `&mut RunningProcess` across an
+/// `.await` ([`wait_for_line`](PipelineSession::wait_for_line)). Holding the
+/// slot's `MutexGuard` across that await would make the returned future `!Send`
+/// — a public regression — so the handle is moved *out* of the slot instead and
+/// put back by `Drop`, including when the future itself is dropped mid-await, so
+/// a cancelled readiness probe can never lose the chain's last stage.
+struct LastBorrow<'a> {
+    slot: &'a std::sync::Mutex<Option<RunningProcess>>,
+    handle: Option<RunningProcess>,
+}
+
+impl LastBorrow<'_> {
+    fn get(&mut self) -> &mut RunningProcess {
+        self.handle
+            .as_mut()
+            .expect("a borrowed last stage is put back only by Drop")
+    }
+}
+
+impl Drop for LastBorrow<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            *lock_last(self.slot) = Some(handle);
+        }
     }
 }
 
@@ -1323,6 +1524,174 @@ fn spawn_group_killer(
     })
 }
 
+/// Which side of the chain's proactive teardown one stage was on **when its exit
+/// was first observed**: no teardown in flight yet, so its own failure is a
+/// genuine *culprit* (`torn_down == false`), or a sibling's teardown had already
+/// fired, making it a *victim* the pipefail fold de-prioritizes
+/// (`torn_down == true`).
+///
+/// Latched once — by whichever observer reaches the stage's exit first — and never
+/// moved afterwards. That is the same first-observation-wins rule the runner
+/// already applies to a run's *cancel* disposition (`cancel_at_exit`, snapshotted
+/// at the reap), and two properties of the chain depend on it:
+///
+/// - **Which observer looked doesn't matter.** The last stage has two possible
+///   observers — [`spawn_last_stage_watcher`]'s probe and
+///   [`finish`](PipelineSession::finish)'s own drive to [`Finished`] — and
+///   whichever gets there first has to reach the *same* verdict, or watching the
+///   stage would silently change the attribution instead of merely reaching it
+///   sooner.
+/// - **Draining doesn't matter.** A stage is reaped when it exits, but its drain
+///   ends only once the last writer of its pipes is gone — a grandchild it forked
+///   (`sh -c '… &'`) that inherited the write end can hold stderr open long after.
+///   Latching at the exit keeps such a stage the culprit it actually was, instead
+///   of demoting it to the victim of a teardown that only fired *after* it had
+///   already died (and letting a later, downstream failure inherit the blame, and
+///   with it the reported exit code and stderr).
+///
+/// **Firing** the teardown is a separate question from latching it, and the two
+/// kinds of driver answer it differently — deliberately, because they exist for
+/// different reasons:
+///
+/// - A stage driven by **its own drain** — every inner stage
+///   ([`finish_inner_stage`], on both paths), and the last stage once
+///   [`finish`](PipelineSession::finish) or a buffering [`capture`](Pipeline::capture)
+///   drives it — fires the teardown only once its own output is collected, so the
+///   killer's drain grace cannot cut that culprit's diagnostics short. A wedged
+///   drain therefore still delays the teardown such a stage owes; the crate's
+///   answer to a stage whose forked grandchild wedges it remains a per-stage
+///   [`Command::timeout`] (see [`Pipeline::timeout`]).
+/// - The last stage's **watcher** ([`spawn_last_stage_watcher`], live sessions
+///   only) fires on the exit it observes, with no drain to wait for — which is the
+///   entire point of watching it. A failing last stage has to tear its upstream
+///   down while the caller is still streaming; deferring that to the caller's
+///   eventual `finish()` is the leak the watcher exists to close, so here a wedged
+///   drain delays nothing.
+///
+/// The price of that second bullet, accepted knowingly rather than by default: for
+/// the last stage of a live session the killer's [`TEARDOWN_DRAIN_GRACE`] starts at
+/// the stage's exit, i.e. *before* its own stderr has finished draining, and the
+/// killer's fan covers that stage's sub-group too — so a grandchild still writing
+/// into its stderr pipe past the grace is killed mid-sentence. What can be lost is
+/// only that survivor's *remaining* output: the bytes the stage itself already
+/// emitted sit in the pipe and are still read out after the writer dies. Waiting
+/// for the drain instead would reopen exactly the unbounded-upstream leak above.
+#[derive(Clone, Debug)]
+struct ExitDisposition(Arc<AtomicU8>);
+
+/// Nobody has observed this stage's exit yet.
+const DISPOSITION_UNOBSERVED: u8 = 0;
+/// Observed exiting with no teardown in flight — a genuine culprit.
+const DISPOSITION_CULPRIT: u8 = 1;
+/// Observed exiting into a teardown a sibling had already fired — a victim.
+const DISPOSITION_VICTIM: u8 = 2;
+
+impl ExitDisposition {
+    fn unobserved() -> Self {
+        Self(Arc::new(AtomicU8::new(DISPOSITION_UNOBSERVED)))
+    }
+
+    /// Record `torn_down` as this stage's disposition and return the one that
+    /// *counts*: `torn_down` when this call was the first observation of the
+    /// stage's exit, the earlier observer's verdict when it was not.
+    ///
+    /// Idempotent, so a later observer calls it as a plain read-with-fallback —
+    /// including the case where no earlier observer exists at all (nothing watches
+    /// an inner stage but its own drain), which is why the fallback is the
+    /// caller's freshly read `torn_down` rather than an arbitrary default.
+    ///
+    /// `AcqRel`/`Acquire`: a winning observer publishes the disposition *before*
+    /// cancelling the teardown token, so anyone who sees the fired token also sees
+    /// who fired it.
+    fn latch(&self, torn_down: bool) -> bool {
+        let observed = if torn_down {
+            DISPOSITION_VICTIM
+        } else {
+            DISPOSITION_CULPRIT
+        };
+        match self.0.compare_exchange(
+            DISPOSITION_UNOBSERVED,
+            observed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => torn_down,
+            Err(first) => first == DISPOSITION_VICTIM,
+        }
+    }
+}
+
+/// Spawn the standing **last-stage watcher** for [`Pipeline::start`]'s live
+/// session — the last stage's stand-in for the `inner_tasks` drains, which fire
+/// proactive teardown from the *checked* failure of the stage each one drives.
+///
+/// The last stage cannot be driven that way: the caller streams it and
+/// [`finish`](PipelineSession::finish) consumes it, so nothing may take it over.
+/// This task instead **observes** it — a non-blocking
+/// [`exit_outcome_now`](RunningProcess::exit_outcome_now) probe under the shared
+/// slot's lock, which neither consumes the handle nor touches its streams, so the
+/// consume-once contract of
+/// [`stdout_lines`](PipelineSession::stdout_lines)/[`events`](PipelineSession::events)
+/// is untouched — and then applies `finish_inner_stage`'s rule to what it sees:
+/// latch the stage's [`ExitDisposition`] against the teardown in flight (if any),
+/// and fire `teardown` only for a checked failure that no sibling's teardown
+/// preceded. Both drives observe the same thing — the stage's *exit* — so this
+/// watcher reaches the attribution `finish` would have reached, sooner; it does not
+/// reach a different one. The latch is also what stops `finish` from reading the
+/// teardown *this* stage triggered as evidence that a sibling killed it.
+///
+/// The observation is a **poll**: a passive observer cannot await a child it does
+/// not own. The cadence backs off from [`LAST_STAGE_PROBE_MIN`] to
+/// [`LAST_STAGE_PROBE_MAX`], so a failed chain's upstream outlives the failure by at
+/// most one probe interval plus the killer's [`TEARDOWN_DRAIN_GRACE`], and the task
+/// then ends — a terminal outcome is the last thing there is to observe. A [`Weak`]
+/// slot handle, exactly like [`spawn_group_killer`]'s groups, so a session dropped
+/// mid-stream frees the last stage's handle (and fires its kill-on-drop) without
+/// waiting for this task to be reclaimed; the session also aborts it on
+/// `finish`/drop.
+fn spawn_last_stage_watcher(
+    last: &SharedLast,
+    ok_codes: Vec<i32>,
+    unchecked: bool,
+    teardown: tokio_util::sync::CancellationToken,
+    disposition: ExitDisposition,
+) -> JoinHandle<()> {
+    let slot = Arc::downgrade(last);
+    tokio::spawn(async move {
+        let mut delay = LAST_STAGE_PROBE_MIN;
+        loop {
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(LAST_STAGE_PROBE_MAX);
+            // No strong reference is ever held across the sleep above: a dropped
+            // session must be free to reap its chain the instant it falls.
+            let Some(slot) = slot.upgrade() else {
+                return;
+            };
+            // An empty slot means an `async` session call holds the handle right now
+            // (`wait_for_line`); skip this round rather than making the caller wait.
+            let observed = lock_last(&slot)
+                .as_mut()
+                .and_then(RunningProcess::exit_outcome_now);
+            drop(slot);
+            let Some(outcome) = observed else {
+                continue;
+            };
+            // Same rule and same order as `finish_inner_stage`: latch the stage's
+            // disposition against the exit just observed — a teardown already in
+            // flight makes it a victim of a sibling's failure — and only then fire
+            // the teardown its own checked failure calls for. Latching first is what
+            // makes the fired token safe to read: anything that observes the teardown
+            // also observes who fired it.
+            if !disposition.latch(teardown.is_cancelled())
+                && is_checked_failure(outcome, &ok_codes, unchecked)
+            {
+                teardown.cancel();
+            }
+            return;
+        }
+    })
+}
+
 /// Drive one already-launched **non-last** stage to its [`Finished`] and fold it
 /// into a positioned [`StageOutcome`], firing `teardown` on its first *checked*
 /// failure (the proactive-teardown trigger). The shared classify-and-teardown body
@@ -1330,10 +1699,12 @@ fn spawn_group_killer(
 /// [`start`](Pipeline::start) session's inner drains, so both blame a stage — and
 /// decide whether it is a teardown victim — by exactly the same rule.
 ///
-/// The `torn_down` snapshot is taken *before* this stage might fire `teardown`: a
-/// teardown already in flight when the stage ended marks it a victim (de-prioritized
-/// in the pipefail fold), while the first genuine failure sees no teardown yet, so
-/// it fires it and stays the (non-torn) culprit.
+/// The `torn_down` disposition is latched at the stage's **exit**, before it can
+/// fire `teardown` itself: a teardown already in flight when the stage *died* marks
+/// it a victim (de-prioritized in the pipefail fold), while the first genuine
+/// failure sees no teardown yet and stays the (non-torn) culprit. Reading it at the
+/// exit rather than after the stage's output drained is what makes a slow drain a
+/// latency question instead of an attribution one — see [`ExitDisposition`].
 #[allow(clippy::too_many_arguments)]
 async fn finish_inner_stage(
     process: RunningProcess,
@@ -1344,12 +1715,26 @@ async fn finish_inner_stage(
     unchecked: bool,
     teardown: tokio_util::sync::CancellationToken,
 ) -> Result<(usize, StageOutcome)> {
+    // Nothing else observes an inner stage, so this latch has exactly one writer —
+    // it is here to read the teardown at the right *instant*, not to arbitrate
+    // between observers the way the last stage's shared one does.
+    let disposition = ExitDisposition::unobserved();
     let Finished {
         outcome,
         stderr,
         stderr_truncated,
-    } = process.finish().await?;
-    let torn_down = teardown.is_cancelled();
+    } = process
+        .finish_observing_exit({
+            let disposition = disposition.clone();
+            let teardown = teardown.clone();
+            move |_outcome| {
+                disposition.latch(teardown.is_cancelled());
+            }
+        })
+        .await?;
+    // Fire only now: the stage's own stderr is fully collected, so the killer's
+    // drain grace can't cut the culprit's diagnostics short.
+    let torn_down = disposition.latch(teardown.is_cancelled());
     if !torn_down && is_checked_failure(outcome, &ok_codes, unchecked) {
         teardown.cancel();
     }
@@ -1609,6 +1994,25 @@ async fn drain_unordered<Item: 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compile-time proof that sharing the last stage's handle with the standing
+    /// watcher did not cost the session any auto trait: a [`PipelineSession`] is
+    /// still `Send + Sync`, and its readiness probe's future is still `Send`.
+    ///
+    /// Both are load-bearing and neither is observable from this crate's own
+    /// `#[tokio::test]`s (a current-thread runtime never requires `Send`), so they
+    /// would otherwise regress silently in a downstream `tokio::spawn`. The shape
+    /// that would break them is holding the shared slot's `MutexGuard` across the
+    /// `.await` instead of moving the handle out for the call — see [`LastBorrow`].
+    /// Never called: constructing a session needs a real chain, and the assertion
+    /// is discharged by type-checking this body.
+    #[allow(dead_code)]
+    fn session_and_its_probe_future_stay_send(session: &mut PipelineSession) {
+        fn assert_send<T: Send>(_: &T) {}
+        fn assert_send_sync<T: Send + Sync>(_: &T) {}
+        assert_send_sync(session);
+        assert_send(&session.wait_for_line(|line| line.is_empty(), Duration::ZERO));
+    }
 
     fn stage(program: &str, outcome: Outcome) -> StageOutcome {
         StageOutcome {
@@ -2060,6 +2464,104 @@ mod tests {
             "leftmost victim when all are torn down"
         );
         assert!(!result.is_success());
+    }
+
+    #[test]
+    fn a_stage_disposition_is_the_first_observers_and_stays_it() {
+        // The last stage has two possible observers of one exit — the standing
+        // watcher's probe and `finish`'s own drive — and the second one always looks
+        // later, once the teardown the *first* one fired is already in flight. If the
+        // later read won, the stage would read its own teardown as a sibling's and
+        // demote itself from culprit to victim.
+        let culprit = ExitDisposition::unobserved();
+        assert!(
+            !culprit.latch(false),
+            "no teardown in flight at the exit: a culprit"
+        );
+        assert!(
+            !culprit.latch(true),
+            "a later observer reads the latched verdict, it never overwrites it"
+        );
+
+        // And symmetrically: a stage that died into a sibling's teardown stays a
+        // victim even if the token were somehow read as clear afterwards.
+        let victim = ExitDisposition::unobserved();
+        assert!(victim.latch(true), "a teardown was already in flight");
+        assert!(victim.latch(false), "still a victim on a later read");
+    }
+
+    #[test]
+    fn a_slow_draining_culprit_is_not_demoted_by_a_later_failure() {
+        // The fold half of the same rule. An inner stage exits non-zero first, but a
+        // grandchild it forked inherited its stderr pipe, so its drain only ends long
+        // after the last stage has failed too. Latched at their exits, neither stage
+        // saw a teardown in flight, so neither is a victim and the leftmost genuine
+        // failure is blamed — the attribution an all-fast chain would have reached.
+        // Reading `torn_down` after the drain instead would mark the upstream a
+        // victim and hand the chain's exit code and stderr to the downstream failure.
+        let slow_draining_culprit = unclean("upstream", Outcome::Exited(3), "the real failure");
+        let later_failure = last(Outcome::Exited(5), false);
+        let result = pf(vec![slow_draining_culprit], later_failure, "");
+        assert_eq!(
+            result.program(),
+            "upstream",
+            "the stage that failed first is blamed, however long its drain took"
+        );
+        assert_eq!(result.code(), Some(3));
+        assert_eq!(result.stderr(), "the real failure");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_draining_last_stage_keeps_the_blame_from_a_sigpipe_producer() {
+        // The fold half for the shape where the *last* stage's own latch decides,
+        // which is the buffering `output_string`/`output_bytes` path's canonical
+        // case: the last stage fails first while a grandchild holds its stderr open,
+        // and the producer then dies of SIGPIPE against the pipe that failure
+        // closed. Latched at its exit the last stage saw no teardown in flight, so
+        // it stays a genuine culprit — and the fold prefers it over the SIGPIPE
+        // victim, reporting the failure a user can act on.
+        let result = pf(
+            vec![unclean(
+                "producer",
+                Outcome::Signalled(Some(13)),
+                "producer noise",
+            )],
+            last(Outcome::Exited(3), false),
+            "",
+        );
+        assert_eq!(
+            result.code(),
+            Some(3),
+            "the last stage failed on its own and is not a teardown victim"
+        );
+        assert_eq!(result.stderr(), "last-err", "with its own diagnostics");
+
+        // The counterfactual, i.e. exactly what reading `torn_down` *after* the
+        // drain used to produce here: the producer's SIGPIPE death fires the chain's
+        // teardown while the last stage is still draining, so a post-drain read
+        // demotes the stage that died first to a victim. No un-torn, non-SIGPIPE
+        // candidate is then left and the fold falls back to the leftmost — handing
+        // the user the producer's signal and stderr instead of the real failure.
+        let demoted = StageOutcome {
+            torn_down: true,
+            ..last(Outcome::Exited(3), false)
+        };
+        let regressed = pf(
+            vec![unclean(
+                "producer",
+                Outcome::Signalled(Some(13)),
+                "producer noise",
+            )],
+            demoted,
+            "",
+        );
+        assert!(
+            matches!(regressed.outcome(), Outcome::Signalled(Some(13))),
+            "the demotion is user-visible, not cosmetic: {:?}",
+            regressed.outcome()
+        );
+        assert_eq!(regressed.stderr(), "producer noise");
     }
 
     #[test]

@@ -1162,6 +1162,423 @@ async fn pipeline_session_drop_kills_the_whole_chain() {
     let _ = std::fs::remove_file(&pidfile);
 }
 
+// ---------------------------------------------------------------------------
+// T-283: a live session's LAST stage failing is a whole-chain teardown too, and
+// does not wait for the caller to call `finish`.
+//
+// Every other stage of a `Pipeline::start` chain drains in a background task
+// that fires the chain's proactive teardown on that stage's checked failure. The
+// last stage has none — the caller streams it, `finish` consumes it — so its
+// failure used to be classified only once `finish` ran. A caller holding the
+// session unfinished (here: never even taking the stream) was therefore left with
+// the whole upstream of an already-dead chain still running.
+// ---------------------------------------------------------------------------
+
+/// Long enough for a fired whole-chain teardown to have reached every stage: the
+/// killer's own drain grace plus room for the kill to land on a loaded host. Used
+/// to give a teardown that must *not* have happened every chance to show itself.
+const TEARDOWN_SETTLE: Duration = Duration::from_secs(3);
+
+/// A producer that records its **own** PID to `pidfile`, emits exactly **one**
+/// line, then idles ~30s writing nothing more.
+///
+/// The single line is what lets a downstream stage key its own exit on this
+/// producer having actually run, so a teardown proof does not race a freshly
+/// spawned child's scheduling (see [`assert_pid_reaped`]'s sibling caveat, K-048).
+/// Going quiet immediately afterwards is the leak scenario itself: a producer that
+/// never writes again never learns from a broken pipe that its consumer is gone.
+fn pid_recording_one_line_then_idle(pidfile: &std::path::Path) -> Command {
+    let path = pidfile.display();
+    if cfg!(windows) {
+        Command::new("powershell").args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "$PID | Set-Content -Encoding ascii -Path '{path}'; [Console]::Out.WriteLine('go'); Start-Sleep -Seconds 30"
+            ),
+        ])
+    } else {
+        Command::new("sh").args([
+            "-c",
+            &format!("printf %s \"$$\" > '{path}'; printf 'go\\n'; sleep 30"),
+        ])
+    }
+}
+
+/// A last stage that consumes one line of stdin and then exits with `code`,
+/// writing nothing itself — so its exit is causally *after* its producer's first
+/// write, not merely soon after the chain started.
+fn one_line_then_exit(code: i32) -> Command {
+    if cfg!(windows) {
+        Command::new("powershell").args([
+            "-NoProfile",
+            "-Command",
+            &format!("[Console]::In.ReadLine() | Out-Null; exit {code}"),
+        ])
+    } else {
+        Command::new("sh").args(["-c", &format!("head -n 1 >/dev/null; exit {code}")])
+    }
+}
+
+#[tokio::test]
+#[ignore = "spawns a real live chain whose last stage fails while the session is held unread"]
+async fn pipeline_session_last_stage_failure_tears_down_a_quiet_upstream() {
+    let pidfile = std::env::temp_dir().join(format!(
+        "processkit_t283_last_fail_{}.pid",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&pidfile);
+
+    // A producer that records its pid, writes one line, then idles ~30s writing
+    // nothing, feeding a last stage that exits non-zero as soon as it reads that
+    // line. The producer's pid is therefore on disk before the failure can happen.
+    let mut session = pid_recording_one_line_then_idle(&pidfile)
+        .pipe(one_line_then_exit(7))
+        .start()
+        .await
+        .expect("start the live chain");
+
+    let inner_pid = read_recorded_pid(&pidfile)
+        .await
+        .expect("the producer records its PID before its consumer can read a line");
+
+    // Deliberately no `stdout_lines`/`events`/`wait_for_line`, no `start_kill`, no
+    // `finish` — nothing but holding the session. The chain must still tear itself
+    // down off the last stage's own failure.
+    assert_pid_reaped(inner_pid, "quiet upstream after the last stage failed").await;
+
+    // The session is still alive and usable at this point — that is the whole
+    // point: the teardown happened without the caller doing anything. Taking the
+    // stream is still a first take (the consume-once contract is untouched by the
+    // watcher), and a second take is still the loud error it always was.
+    let lines = session
+        .stdout_lines()
+        .expect("the stream is still the caller's to take");
+    drop(lines);
+    let reused = session
+        .stdout_lines()
+        .expect_err("a second stdout_lines must still be a loud error");
+    assert!(
+        matches!(reused.reason(), processkit::ErrorReason::Io(_)),
+        "expected ErrorReason::Io, got {reused:?}"
+    );
+
+    // And the attribution is the one `finish` would have reached on its own: the
+    // last stage is the culprit, not the upstream its own teardown killed.
+    let processkit::Finished { outcome, .. } = completes_within(
+        Duration::from_secs(15),
+        "finishing after a proactive last-stage teardown",
+        session.finish(),
+    )
+    .await
+    .expect("finish folds a result");
+    assert_eq!(
+        outcome,
+        processkit::Outcome::Exited(7),
+        "pipefail blames the failing LAST stage, not the upstream the teardown killed: {outcome:?}"
+    );
+
+    let _ = std::fs::remove_file(&pidfile);
+}
+
+#[tokio::test]
+#[ignore = "spawns a real live chain whose last stage fails, then takes its event stream"]
+async fn pipeline_session_events_taken_after_a_proactive_teardown_still_end_in_exited() {
+    use processkit::{Outcome, ProcessEvent};
+    use tokio_stream::StreamExt;
+
+    // The watcher reaps the last stage where it finds it exited, so a caller that
+    // takes the lifecycle stream *afterwards* is arming it over an already-reaped
+    // child. The terminal `Exited` is published by the reap choke point every
+    // consuming finisher funnels through — including the short-circuit `finish`
+    // takes once a child is already reaped — so the stream must still end in one.
+    let pidfile =
+        std::env::temp_dir().join(format!("processkit_t283_events_{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pidfile);
+
+    let mut session = pid_recording_one_line_then_idle(&pidfile)
+        .pipe(one_line_then_exit(7))
+        .start()
+        .await
+        .expect("start the live chain");
+
+    for _ in 0..300 {
+        if session.pid().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let mut events = session
+        .events()
+        .expect("the lifecycle stream is still the caller's to take");
+    let render = async {
+        let mut seen = Vec::new();
+        while let Some(event) = events.next().await {
+            seen.push(event);
+        }
+        seen
+    };
+    let (seen, finished) = completes_within(
+        Duration::from_secs(20),
+        "draining a lifecycle stream armed after the last stage was reaped",
+        async { tokio::join!(render, session.finish()) },
+    )
+    .await;
+
+    assert!(
+        matches!(seen.last(), Some(ProcessEvent::Exited(Outcome::Exited(7)))),
+        "the stream must still end in the run's real Exited event: {seen:?}"
+    );
+    let processkit::Finished { outcome, .. } = finished.expect("finish folds a result");
+    assert_eq!(
+        outcome,
+        Outcome::Exited(7),
+        "and finish reports the same failing last stage: {outcome:?}"
+    );
+    let _ = std::fs::remove_file(&pidfile);
+}
+
+#[tokio::test]
+#[ignore = "spawns a real live chain whose last stage exits cleanly while a producer still runs"]
+async fn pipeline_session_clean_last_stage_does_not_tear_the_chain_down() {
+    // The complement of the test above, and the reason the watcher classifies
+    // instead of just noticing an exit: a last stage that exits *cleanly* is not a
+    // failed chain, so it must not kill the rest of it. Otherwise the killed
+    // upstream would enter the pipefail fold as a checked failure and the chain
+    // would report a failure that never happened.
+    let pidfile = std::env::temp_dir().join(format!(
+        "processkit_t283_last_clean_{}.pid",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&pidfile);
+
+    let session = pid_recording_one_line_then_idle(&pidfile)
+        .pipe(one_line_then_exit(0))
+        .start()
+        .await
+        .expect("start the live chain");
+
+    let inner_pid = read_recorded_pid(&pidfile)
+        .await
+        .expect("the producer records its PID before its consumer can read a line");
+
+    // Wait for the clean exit to have been *observed* (the watcher's reap clears the
+    // session's pid), then well past the teardown drain grace: had that clean exit
+    // fired teardown, the producer would be gone by the time we look.
+    for _ in 0..300 {
+        if session.pid().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(TEARDOWN_SETTLE).await;
+    assert!(
+        stage_pid_alive(inner_pid),
+        "a clean last stage must not tear the chain down"
+    );
+
+    // Dropping the session is what finally reaps the producer here; that path has
+    // its own proof in `pipeline_session_drop_kills_the_whole_chain`, so this test
+    // only has to release it, not re-assert a teardown known to be racy to observe
+    // by pid on a loaded Windows host (K-029/K-048).
+    drop(session);
+    let _ = std::fs::remove_file(&pidfile);
+}
+
+#[tokio::test]
+#[ignore = "spawns a real live chain that ends on its own, then cancels the chain token"]
+async fn pipeline_session_cancel_after_the_chain_ended_does_not_rewrite_the_outcome() {
+    use tokio_util::sync::CancellationToken;
+
+    // Every stage's cancel disposition is latched by whoever first observes that
+    // stage's exit, so a token fired *afterwards* cannot rewrite a run that had
+    // already ended (the rule `Command::cancel_on` documents). An inner stage's
+    // background drain does that latching at the moment the stage exits; the last
+    // stage had no observer at all until the session's watcher, so a chain that had
+    // completely finished still reported `Cancelled` if the caller happened to fire
+    // the token before calling `finish`. Both ends of the chain now latch alike.
+    // The producer carries a token of its own that never fires, so the chain token
+    // gap-fills onto the last stage alone (`Pipeline::cancel_on`'s documented rule).
+    // That keeps this test about the *last* stage's disposition instead of also
+    // depending on when the producer's own drain happened to reap it.
+    let producer = if cfg!(windows) {
+        Command::new("cmd").args(["/c", "echo x"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'x\\n'"])
+    }
+    .cancel_on(CancellationToken::new());
+
+    let token = CancellationToken::new();
+    let session = producer
+        .pipe(one_line_then_exit(0))
+        .cancel_on(token.clone())
+        .start()
+        .await
+        .expect("start the live chain");
+
+    // Fire the token only once the last stage has provably exited *and* been
+    // observed — the watcher's reap is exactly what clears the session's pid. A
+    // fixed sleep would instead race a slow interpreter start on a loaded host.
+    let mut observed = false;
+    for _ in 0..300 {
+        if session.pid().is_none() {
+            observed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        observed,
+        "the session's watcher should have reaped the exited last stage"
+    );
+    token.cancel();
+
+    let processkit::Finished { outcome, .. } = completes_within(
+        Duration::from_secs(15),
+        "finishing a chain that ended before its token fired",
+        session.finish(),
+    )
+    .await
+    .expect("a chain that had already ended is not retroactively cancelled");
+    assert_eq!(
+        outcome,
+        processkit::Outcome::Exited(0),
+        "the chain's real outcome survives a token fired after it ended: {outcome:?}"
+    );
+}
+
+/// A producer that fails on its own while a **grandchild** keeps its stderr pipe
+/// open: the shell writes one line to each stream and exits non-zero, but the
+/// `sleep` it backgrounded inherited stderr and holds that pipe for ~30s, so the
+/// stage's stderr drain cannot reach EOF with the shell. The grandchild's *stdout*
+/// is redirected to `/dev/null`, so the stdout pipe still closes when the shell
+/// exits — which is what fixes the chain's failure order.
+#[cfg(unix)]
+fn failing_producer_whose_stderr_outlives_it() -> Command {
+    Command::new("sh").args([
+        "-c",
+        "sleep 30 >/dev/null & printf 'boom\\n' >&2; printf 'go\\n'; exit 3",
+    ])
+}
+
+// Unix-only for the same reason as the forking-stage tests further up: a
+// `sh -c '… &'` is the only cheap way to leave a grandchild holding a stage's
+// stderr pipe open past its own death. The attribution rule it pins is
+// platform-agnostic, and its fold half is covered hermetically by
+// `pipeline::tests::a_slow_draining_culprit_is_not_demoted_by_a_later_failure`.
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real chain whose failing producer leaves a grandchild holding its stderr"]
+async fn a_slow_draining_culprit_keeps_the_blame_from_the_last_stage() {
+    // The failure order is fixed by construction, not by timing: the producer exits
+    // 3 → its stdout pipe closes → `cat` reaches EOF → the last stage exits 5. Two
+    // genuine checked failures, neither of which died into a teardown, so pipefail
+    // blames the leftmost — the producer, with the producer's own stderr.
+    //
+    // The grandchild is what makes this a regression guard. The producer's stderr
+    // drain cannot end until the chain's teardown kills that grandchild, i.e. well
+    // after the last stage has failed and the session's watcher has fired teardown
+    // for it. A `torn_down` read *then* — after the drain instead of at the exit —
+    // marks the producer a teardown victim and hands the chain's exit code and
+    // stderr to the last stage, which is the wrong diagnosis: the producer died
+    // first, and on its own.
+    let session = failing_producer_whose_stderr_outlives_it()
+        .pipe(Command::new("sh").args(["-c", "cat >/dev/null; exit 5"]))
+        .start()
+        .await
+        .expect("start the live chain");
+
+    // Let the standing watcher be the one that observes the last stage's failure
+    // (its reap is what clears the session's pid), so this exercises the watcher's
+    // latch rather than `finish`'s own drive to the same exit.
+    poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(50),
+        "the session's watcher to reap the failed last stage",
+        || session.pid().is_none(),
+    )
+    .await;
+
+    let processkit::Finished {
+        outcome, stderr, ..
+    } = completes_within(
+        Duration::from_secs(30),
+        "finishing a chain whose culprit drains slowly",
+        session.finish(),
+    )
+    .await
+    .expect("finish folds a result");
+
+    assert_eq!(
+        outcome,
+        processkit::Outcome::Exited(3),
+        "the producer failed first and stays the culprit, however long its drain took: {outcome:?}"
+    );
+    assert!(
+        stderr.contains("boom"),
+        "and the chain reports the culprit's own stderr: {stderr:?}"
+    );
+}
+
+/// A **last** stage that fails on its own while a grandchild keeps its stderr pipe
+/// open — the mirror of `failing_producer_whose_stderr_outlives_it`, one stage to
+/// the right. It never reads its stdin, so its exit is what closes the chain's pipe
+/// and kills the producer; the grandchild takes stdin and stdout from `/dev/null`,
+/// so it holds neither that pipe nor this stage's stdout open, only its stderr.
+#[cfg(unix)]
+fn failing_last_stage_whose_stderr_outlives_it() -> Command {
+    Command::new("sh").args([
+        "-c",
+        "sleep 30 </dev/null >/dev/null & printf 'boom\\n' >&2; exit 3",
+    ])
+}
+
+// The buffering counterpart of `a_slow_draining_culprit_keeps_the_blame_from_the_
+// last_stage`, covering the fourth and last drive that latches a disposition: the
+// last stage of `output_string()`. Unix-only for the same two reasons — the forked
+// grandchild and a real `SIGPIPE` — and its fold half is covered hermetically by
+// `pipeline::tests::a_slow_draining_last_stage_keeps_the_blame_from_a_sigpipe_producer`.
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real chain whose failing last stage leaves a grandchild holding its stderr"]
+async fn output_string_blames_a_slow_draining_last_stage_over_a_sigpipe_producer() {
+    // The failure order is fixed by construction, not by timing: the last stage
+    // exits 3 without reading stdin → that closes the pipe → `yes`, blocked writing
+    // into it, dies of SIGPIPE. So the last stage failed *first* and on its own,
+    // while the producer's death is merely its consequence — the canonical shape
+    // where a SIGPIPE victim must not be blamed.
+    //
+    // The grandchild is what makes this a regression guard. The producer's SIGPIPE
+    // death fires the chain's teardown while the last stage's stderr drain is still
+    // wedged on the backgrounded `sleep`, and that drain can only end once the
+    // teardown's killer reaps the grandchild. Reading `torn_down` *then* — after the
+    // drain instead of at the exit — marks the last stage a victim of a teardown
+    // that fired after it had already died, which leaves the fold no genuine culprit
+    // at all: it falls back to the leftmost stage and reports the producer's signal
+    // and stderr instead of the real failure's exit 3.
+    let result = completes_within(
+        Duration::from_secs(30),
+        "capturing a chain whose last stage drains slowly",
+        endless_yes()
+            .pipe(failing_last_stage_whose_stderr_outlives_it())
+            .output_string(),
+    )
+    .await
+    .expect("a failing stage is captured in the result, not raised");
+
+    assert_eq!(
+        result.code(),
+        Some(3),
+        "the last stage died first and on its own, so it stays the culprit: {result:?}"
+    );
+    assert!(
+        result.stderr().contains("boom"),
+        "and the chain reports that stage's own stderr: {:?}",
+        result.stderr()
+    );
+}
+
 #[tokio::test]
 #[ignore = "spawns a real live chain bounded by a chain-wide timeout"]
 async fn pipeline_start_timeout_kills_the_live_chain() {

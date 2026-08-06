@@ -1231,6 +1231,25 @@ impl Command {
     /// [`ErrorReason::NotReady`], not `Cancelled` — the
     /// consuming finisher afterwards still reports `Cancelled`.
     ///
+    /// **A late token is judged at the first *observation* of the exit, not at the
+    /// child's death.** The disposition is snapshotted by whoever observes the reap
+    /// first — a terminal verb's own wait, or a *liveness-polling* readiness probe
+    /// on a handle you hold ([`wait_for`](crate::RunningProcess::wait_for),
+    /// [`wait_for_port`](crate::RunningProcess::wait_for_port) and their siblings,
+    /// which poll whether the child is still alive; the line-oriented
+    /// [`wait_for_line`](crate::RunningProcess::wait_for_line) does *not*, it only
+    /// reads output) — and is never moved afterwards, so a token that fires after an
+    /// *observed* exit cannot rewrite the real outcome. Until something observes it, though,
+    /// there is nothing for the token to be late to: on a [`start`](Self::start)ed
+    /// run nobody probed, the consuming
+    /// [`finish`](crate::RunningProcess::finish) *is* that first observation, and a
+    /// token fired before it reports `Cancelled` even when the child had exited on
+    /// its own long before. Probe the handle (or use a terminal verb) when you need
+    /// the true outcome of a child that may already be gone. A live
+    /// [`Pipeline`](crate::Pipeline) chain has no such blind spot — every stage of
+    /// it is observed while it runs (see
+    /// [`PipelineSession::finish`](crate::PipelineSession::finish)).
+    ///
     /// A cancelled run is never retried: [`retry`](Self::retry) policies and
     /// [`Supervisor`](crate::Supervisor) restarts both treat
     /// `ErrorReason::Cancelled` as terminal — the token stays cancelled forever, so

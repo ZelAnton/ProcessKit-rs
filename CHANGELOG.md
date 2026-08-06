@@ -157,6 +157,64 @@ to a dated version section.
   `output_string`'s two line captures and for `output_bytes`'s line-oriented
   stderr (its raw stdout has no line framing to duplicate). A tail the pump
   genuinely had not completed is still salvaged, unchanged.
+- Tear a live `Pipeline::start` chain down when its **last** stage fails, without
+  waiting for `PipelineSession::finish`. Every other stage of a live chain drains
+  in a background task that fires the chain's proactive teardown on that stage's
+  checked failure; the last stage has no such task, because the caller streams it
+  and `finish` consumes it — so its failure was classified only once `finish` ran.
+  A caller holding a session it had not finished (or not started reading yet) was
+  therefore left with the upstream stages of an already-dead chain still running:
+  their relay stops at the closed stdin of the exited last stage, and a producer
+  that writes nothing never dies of a broken pipe either, so the whole upstream —
+  and the retained process groups containing it — stayed alive until the caller got
+  around to `finish`, `start_kill`, or dropping the session. A standing watcher now
+  observes the last stage for a terminal outcome and applies the same rule the inner
+  stages' drains apply, so a failing last stage tears the chain down on its own. The
+  observation is a bounded, backing-off poll of a non-blocking exit probe rather
+  than a wakeup — the handle belongs to the caller, so nothing may await it — which
+  makes the teardown prompt, not instantaneous: it lands within one probe interval
+  of the failure plus the existing drain grace. Pipefail attribution is unchanged in
+  both directions: the last stage stays the culprit when its own failure fired the
+  teardown, and stays a victim when a sibling's did. A last stage that exits
+  *cleanly* fires no teardown, as before. No public API change.
+
+  Two observable consequences of the last stage now being observed while the
+  session is live, both bringing it in line with what the rest of the crate already
+  did. `PipelineSession::pid()` returns `None` once the last stage has exited and
+  been reaped, rather than reporting a pid until `finish` — which is what its
+  contract ("or `None` once it has been reaped") always said, and what a
+  `wait_for_line` probe already caused. And a chain-wide `cancel_on` token fired
+  *after* the chain had already ended no longer rewrites its outcome to
+  `Cancelled`: as for a single command, a stage's cancellation is decided by
+  whoever first observes that stage's exit, which for every inner stage was already
+  its own background drain and is now the watcher for the last one.
+
+  Pipefail attribution is now decided at each stage's **exit** rather than after
+  its output finished draining, which also settles a race that predates the
+  watcher. A stage is reaped when it dies, but its drain only ends once the last
+  writer of its pipes is gone — a grandchild it forked (`sh -c '… &'`) that
+  inherited the write end can hold stderr open long afterwards. Reading
+  "was a teardown already in flight?" at that later moment demoted such a stage to
+  a *victim* of a teardown that only fired after it had already died on its own,
+  handing the chain's reported exit code and stderr to whichever stage happened to
+  drain first. Each stage's culprit-vs-victim disposition is now latched by whoever
+  first observes its exit — every inner stage of either path, the last stage of a
+  buffering `output_string`/`output_bytes`, and the last stage of a live session
+  (whose two observers, the watcher and `finish`, always agree) — so the leftmost
+  genuine failure is blamed however long its diagnostics take to arrive. In the
+  buffering verbs that shows up in the canonical two-stage shape: the last stage
+  fails on its own while a grandchild holds its stderr open, the producer then dies
+  of `SIGPIPE` against the closed pipe, and `output_string` now reports the last
+  stage's real exit code and stderr instead of the producer's signal. *Firing*
+  the teardown is a separate question, and the two drivers answer it differently:
+  a stage driven by its own drain still fires it after that stage's output is
+  collected, so the killer's drain grace cannot cut the culprit's diagnostics
+  short, while the live session's watcher fires on the exit itself (as the fix
+  above requires — waiting for a drain is what left the upstream running). For the
+  watched last stage that means the killer's drain grace starts at its exit rather
+  than after its diagnostics are collected: a *grandchild* still writing into that
+  stage's stderr pipe past the grace can be cut off, though the bytes the stage
+  itself emitted are still read out.
 
 ## [3.2.0] - 2026-08-03
 

@@ -335,16 +335,27 @@ The session mirrors `RunningProcess`:
 - **`finish()`** — the streaming analogue of `output_string()`: the
   pipefail-attributed stage's `outcome` and *its own* `stderr` in a `Finished`
   (no stdout — you already streamed it). A chain-wide `Pipeline::timeout` that
-  elapsed reports `Outcome::TimedOut`; a `Pipeline::cancel_on` that fired surfaces
-  as `ErrorReason::Cancelled` — exactly as in the buffering verbs.
+  elapsed reports `Outcome::TimedOut`; a `Pipeline::cancel_on` that fired while the
+  chain was still running surfaces as `ErrorReason::Cancelled` — exactly as in the
+  buffering verbs. As for a single `Command::cancel_on`, that disposition is
+  **first-observation-wins**: every stage is observed while the session is live
+  (each inner stage by its background drain, the last stage by the session's own
+  watcher), so a token fired *after* the chain had already ended does not rewrite
+  its real outcome into `Cancelled`, even when `finish()` is called afterwards.
 - **`start_kill()`** and **kill-on-drop** — stop the whole chain now, or drop the
   session and every stage's tree dies. The no-orphan invariant holds for a live
   chain (including a partially-started one) just as it does for a single process.
 
-Whole-chain teardown still applies while streaming: an inner stage's checked
+Whole-chain teardown still applies while streaming: **any** stage's checked
 failure proactively tears the chain down (so a quiet upstream can't hold a failed
 live chain open), and the chain-wide [timeout / cancellation](#timeouts) bounds
-the session regardless of which stage is slow.
+the session regardless of which stage is slow. That includes the **last** stage,
+and without waiting for `finish()` — a standing watcher observes it for a terminal
+outcome, so holding an unfinished session is not a way for a failed chain's
+upstream to keep running. The teardown is prompt rather than instantaneous: it
+lands within one probe interval of the last stage's failure plus the short drain
+grace. A last stage that exits *cleanly* deliberately fires no teardown — a chain
+whose stages all succeed is not a failed chain.
 
 ## Re-running a pipeline
 

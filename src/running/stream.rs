@@ -468,7 +468,30 @@ impl RunningProcess {
     /// and never trips it), [`ErrorReason::Stdin`](crate::ErrorReason::Stdin) (a
     /// non-broken-pipe stdin-source failure on an otherwise-successful run), or
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) (waiting on the child failed).
-    pub async fn finish(mut self) -> Result<Finished> {
+    pub async fn finish(self) -> Result<Finished> {
+        self.finish_observing_exit(|_| ()).await
+    }
+
+    /// [`finish`](Self::finish) with an observation seam at the child's **exit**:
+    /// `at_exit` runs the moment the child has been reaped and its [`Outcome`] is
+    /// known — after the deadline/cancel arbiter settled it, but *before* the
+    /// output pumps are joined. `finish` is this with a no-op observer.
+    ///
+    /// The seam exists because "the child exited" and "this run is finished" are
+    /// not the same instant, and one caller has to distinguish them: a pipeline
+    /// stage decides culprit-vs-victim attribution by whether the chain's
+    /// proactive teardown was already in flight *when the stage died* — the causal
+    /// fact — and a stage whose stderr pipe outlives it (a forked grandchild
+    /// inherited the write end) is reaped long before its drain can end. Reading
+    /// that disposition after the drain would blame whoever drained first instead
+    /// of whoever died first; see `pipeline::ExitDisposition`.
+    ///
+    /// `at_exit` is deliberately synchronous and must stay cheap: it runs on this
+    /// future's own poll, between the reap and the pump join.
+    pub(crate) async fn finish_observing_exit(
+        mut self,
+        at_exit: impl FnOnce(Outcome),
+    ) -> Result<Finished> {
         // A bare `finish()` (no prior `stdout_lines`/`events` took stdout)
         // still has to drain the leftover stdout so the child can't block on a full
         // pipe — but the caller never asked to capture it. Pump it through the
@@ -504,6 +527,10 @@ impl RunningProcess {
         }
 
         let raw_outcome = self.drive_to_exit().await?;
+        // The exit is observable here and nowhere later that still means "when the
+        // child died": everything below waits on *output*, which a survivor of the
+        // child's own tree can stretch arbitrarily.
+        at_exit(raw_outcome);
         self.observe_stdin_task().await;
         let pumps: Vec<_> = [self.stdout_pump.take(), self.stderr_pump.take()]
             .into_iter()
