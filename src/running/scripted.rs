@@ -499,6 +499,7 @@ impl ScriptedProc {
     /// The scripted counterpart of `RunningProcess::has_exited_now` — a
     /// non-blocking poll of whether the script has already ended (killed,
     /// dialog-exited, or past its time-based `exit_at`).
+    #[cfg(feature = "pty")]
     pub(super) fn has_exited_now(&self) -> bool {
         self.outcome_now().is_some()
     }
