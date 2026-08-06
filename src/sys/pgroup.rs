@@ -477,6 +477,9 @@ pub(crate) fn process_info(pid: u32) -> io::Result<Option<MemberInfo>> {
 /// - `ESRCH` → no such process: `Ok(None)`.
 /// - any other errno → a genuine `Err`.
 ///
+/// A pid of zero is rejected as `Ok(None)` before any syscall because
+/// `kill(0, 0)` probes the caller's process group rather than an individual process.
+///
 /// A pid that does not fit `pid_t` (`i32`) cannot name a real process — and casting
 /// it could turn `kill` into a *process-group* signal — so it is an honest
 /// `Ok(None)` before any syscall.
@@ -488,6 +491,9 @@ pub(crate) fn process_info(pid: u32) -> io::Result<Option<MemberInfo>> {
     let Ok(spid) = i32::try_from(pid) else {
         return Ok(None);
     };
+    if spid == 0 {
+        return Ok(None);
+    }
     // SAFETY: the null signal (`0`) delivers nothing; it only probes whether the
     // pid names a live process the caller could signal.
     let rc = unsafe { libc::kill(spid, 0) };
@@ -1692,6 +1698,16 @@ mod tests {
     use tokio::process::Command;
 
     use super::*;
+
+    #[cfg(all(
+        feature = "process-control",
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+    ))]
+    #[test]
+    fn zero_pid_is_not_a_process_lookup() {
+        assert!(process_info(0).expect("zero pid lookup").is_none());
+        assert!(!crate::process_is_alive(0, None).expect("zero pid liveness"));
+    }
 
     /// Make a raw tokio command start in its own session for tests that need a
     /// deterministic `EPERM` from the parent's `setpgid` adoption attempt.
