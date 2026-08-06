@@ -740,6 +740,21 @@ pub(crate) fn process_identity(pid: u32) -> Option<ProcIdentity> {
 
 #[cfg(feature = "stats")]
 pub(crate) fn process_metrics(pid: u32, expected: Option<ProcIdentity>) -> ProcMetrics {
+    process_metrics_with_seams(
+        pid,
+        expected,
+        |pid| std::fs::read_to_string(format!("/proc/{pid}/stat")).ok(),
+        |pid| std::fs::read_to_string(format!("/proc/{pid}/status")).ok(),
+    )
+}
+
+#[cfg(feature = "stats")]
+fn process_metrics_with_seams(
+    pid: u32,
+    expected: Option<ProcIdentity>,
+    mut read_stat: impl FnMut(u32) -> Option<String>,
+    read_status: impl FnOnce(u32) -> Option<String>,
+) -> ProcMetrics {
     let mut metrics = ProcMetrics::default();
 
     // CPU *and* the identity anchor both come from a *single* /proc/<pid>/stat read
@@ -748,7 +763,7 @@ pub(crate) fn process_metrics(pid: u32, expected: Option<ProcIdentity>) -> ProcM
     // the shared `sys::procfs` parser (skip past the comm's last ')', then
     // whitespace index 0 is field 3), so this parse cannot drift from the pgroup
     // liveness path in `sys/pgroup.rs::read_identity` that shares it.
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+    let stat = read_stat(pid);
 
     // Identity gate: compare the captured identity against this read's `starttime`
     // (field 22) via the shared parser. If the caller captured an identity and this
@@ -791,10 +806,22 @@ pub(crate) fn process_metrics(pid: u32, expected: Option<ProcIdentity>) -> ProcM
         }
     }
 
-    // Peak memory: /proc/<pid>/status VmHWM (high-water resident set, in kB). Only
-    // reached once the identity gate above confirmed the pid (or none was demanded),
-    // so this read is bound to the same process the starttime identified.
-    if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+    // Peak memory: /proc/<pid>/status VmHWM (high-water resident set, in kB).
+    if let Some(status) = read_status(pid) {
+        // The process can exit and its pid can be recycled after the first stat
+        // snapshot but before this status snapshot. Reconfirm after the status read
+        // and fail both samples together rather than pairing the original CPU time
+        // with a replacement process's memory. Without a demanded identity, retain
+        // the number-only best-effort behavior and avoid an extra stat read.
+        if let Some(expected) = expected
+            && read_stat(pid)
+                .as_deref()
+                .and_then(crate::sys::procfs::starttime_from_stat)
+                != Some(expected.raw())
+        {
+            return ProcMetrics::default();
+        }
+
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("VmHWM:") {
                 if let Some(kb) = rest
@@ -3925,8 +3952,8 @@ mod member_sample_tests {
     use std::time::Duration;
 
     use super::{
-        Cgroup, MemberSample, ProcIdentity, process_identity, process_metrics, read_proc_starttime,
-        sample_member_identity_safe,
+        Cgroup, MemberSample, ProcIdentity, process_identity, process_metrics,
+        process_metrics_with_seams, read_proc_starttime, sample_member_identity_safe,
     };
     use crate::sys::ProcMetrics;
 
@@ -4153,6 +4180,36 @@ mod member_sample_tests {
         assert!(
             gated.cpu_time.is_some(),
             "an identity-matched read of our own process reports CPU time"
+        );
+    }
+
+    #[test]
+    fn identity_change_after_status_read_discards_both_process_metrics() {
+        fn stat_with_starttime(starttime: u64) -> String {
+            format!("1 (mock) S 0 0 0 0 0 0 0 0 0 0 5 7 0 0 0 0 0 0 {starttime}")
+        }
+
+        let original = ProcIdentity::from_raw(100);
+        let stat_reads = Cell::new(0);
+        let metrics = process_metrics_with_seams(
+            42,
+            Some(original),
+            |_| {
+                let read = stat_reads.get();
+                stat_reads.set(read + 1);
+                Some(stat_with_starttime(if read == 0 { 100 } else { 200 }))
+            },
+            |_| Some("Name:\trecycled\nVmHWM:\t123 kB\n".to_owned()),
+        );
+
+        assert_eq!(
+            stat_reads.get(),
+            2,
+            "identity is checked on both sides of status"
+        );
+        assert!(
+            metrics.cpu_time.is_none() && metrics.peak_memory_bytes.is_none(),
+            "a post-status identity mismatch must discard CPU and the replacement process's memory"
         );
     }
 
