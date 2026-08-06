@@ -1303,8 +1303,8 @@ impl core::marker::Send for processkit::PipelineSession
 impl core::marker::Sync for processkit::PipelineSession
 impl core::marker::Unpin for processkit::PipelineSession
 impl core::marker::UnsafeUnpin for processkit::PipelineSession
-impl !core::panic::unwind_safe::RefUnwindSafe for processkit::PipelineSession
-impl !core::panic::unwind_safe::UnwindSafe for processkit::PipelineSession
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::PipelineSession
+impl core::panic::unwind_safe::UnwindSafe for processkit::PipelineSession
 pub struct processkit::ProcessEvents
 impl core::fmt::Debug for processkit::ProcessEvents
 pub fn processkit::ProcessEvents::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
