@@ -15,7 +15,9 @@ pub use stream::JsonLines;
 pub use stream::{Finished, OutputLine, ProcessEvent, ProcessEvents, StdoutLines};
 // Re-exported so `crate::doubles`/`crate::cassette` keep addressing these at
 // `crate::running::...` even though they now live in the `scripted` submodule.
-pub(crate) use scripted::{ScriptedOutcome, ScriptedProc, ScriptedResultInfo, split_pump_lines};
+pub(crate) use scripted::{
+    ScriptedOutcome, ScriptedProc, ScriptedResultInfo, split_pump_frames, split_pump_lines,
+};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

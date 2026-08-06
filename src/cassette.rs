@@ -1715,10 +1715,61 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
                 let stdin_digest = stdin_digest_of(command);
                 let scrubber = self.scrubber.as_deref();
                 let match_digest = self.policy.digest_of(&invocation, scrubber);
-                match inner
-                    .output_string(&command.without_line_side_effects())
-                    .await
-                {
+                let capture_command = command.without_line_side_effects();
+                let captured = if command.stdout_is_piped() {
+                    inner.output_string(&capture_command).await
+                } else {
+                    // A non-piped stdout has no captured text to obtain from the
+                    // bulk verb. Prefer the real start/finish path so
+                    // file/inherited/null stdout uses the same contract as
+                    // supervision; output-only runners fall back to a private
+                    // capture pipe below while retaining stderr and outcome.
+                    let started = std::time::Instant::now();
+                    match inner.start(&capture_command).await {
+                        Ok(handle) => handle.finish().await.map(|finished| {
+                            let timeout = if finished.outcome.inactivity_timed_out() {
+                                command.configured_inactivity_timeout()
+                            } else {
+                                command.configured_timeout()
+                            };
+                            ProcessResult::new(
+                                command.program_name(),
+                                String::new(),
+                                finished.stderr,
+                                finished.outcome,
+                                timeout,
+                            )
+                            .with_duration(started.elapsed())
+                            .with_truncated(finished.stderr_truncated)
+                            .with_ok_codes(command.ok_codes_vec())
+                        }),
+                        Err(err) if matches!(err.reason(), ErrorReason::Unsupported { .. }) => {
+                            // `start` is optional on the runner seam. Preserve the
+                            // non-piped record contract for output-only runners by
+                            // routing the fallback through the supported capture verb;
+                            // only an explicit capability miss may take this path.
+                            inner
+                                .output_string(&capture_command.pipe_stdout_for_discard())
+                                .await
+                                .map(|captured| {
+                                    ProcessResult::from_parts(
+                                        captured.program().to_owned(),
+                                        String::new(),
+                                        captured.stderr().to_owned(),
+                                        captured.outcome(),
+                                        captured.configured_timeout(),
+                                        captured.duration(),
+                                        captured.truncated(),
+                                        captured.total_lines(),
+                                        captured.total_bytes(),
+                                        captured.ok_codes().to_vec(),
+                                    )
+                                })
+                        }
+                        Err(err) => Err(err),
+                    }
+                };
+                match captured {
                     Ok(result) => {
                         let entry = Entry::from_parts(
                             &invocation,
@@ -2086,6 +2137,123 @@ mod tests {
             Outcome::Exited(0),
             "replay must reproduce the recorded outcome through the streaming path"
         );
+    }
+
+    async fn record_and_replay_non_piped_start(command: Command) {
+        let inner = ScriptedRunner::new().fallback(
+            Reply::fail(7, "warning\n")
+                .with_stdout("discarded\n")
+                .with_line_delay(Duration::from_millis(20)),
+        );
+        record_and_replay_non_piped_start_with(command, inner).await;
+    }
+
+    async fn record_and_replay_non_piped_start_with<R: ProcessRunner>(command: Command, inner: R) {
+        let (_dir, path) = temp_cassette();
+        let recorder = RecordReplayRunner::record(&path, inner);
+
+        let recorded_finished = recorder
+            .start(&command)
+            .await
+            .expect("record non-piped start")
+            .finish()
+            .await
+            .expect("finish recorded non-piped start");
+        assert_eq!(recorded_finished.outcome, Outcome::Exited(7));
+        assert_eq!(recorded_finished.stderr, "warning");
+
+        let entry = match &recorder.mode {
+            Mode::Record { recorded, .. } => recorded
+                .lock()
+                .expect("cassette mutex poisoned")
+                .first()
+                .cloned()
+                .expect("non-piped start was recorded"),
+            Mode::Replay { .. } => panic!("expected a record-mode runner"),
+        };
+        assert!(
+            entry.stdout.is_empty(),
+            "non-piped stdout must not be persisted as captured output"
+        );
+        assert_eq!(entry.stderr, "warning");
+        assert!(
+            entry.duration_ms > 0,
+            "the finish-based record path must persist elapsed time"
+        );
+        recorder.save().expect("save non-piped cassette");
+
+        let replayer = RecordReplayRunner::replay(&path).expect("load cassette");
+        let replayed_finished = replayer
+            .start(&command)
+            .await
+            .expect("replay non-piped start")
+            .finish()
+            .await
+            .expect("finish replayed non-piped start");
+        assert_eq!(replayed_finished.outcome, recorded_finished.outcome);
+        assert_eq!(replayed_finished.stderr, recorded_finished.stderr);
+    }
+
+    struct OutputOnlyInner;
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for OutputOnlyInner {
+        async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+            assert!(
+                command.stdout_is_piped(),
+                "the Unsupported start fallback must pipe stdout for capture"
+            );
+            Ok(ProcessResult::new(
+                command.program_name(),
+                "discarded\n".to_owned(),
+                "warning".to_owned(),
+                Outcome::Exited(7),
+                None,
+            )
+            .with_duration(Duration::from_millis(20)))
+        }
+    }
+
+    #[tokio::test]
+    async fn output_only_runner_falls_back_for_every_non_piped_stdout_mode() {
+        record_and_replay_non_piped_start_with(
+            Command::new("tool").stdout(crate::StdioMode::Null),
+            OutputOnlyInner,
+        )
+        .await;
+        record_and_replay_non_piped_start_with(
+            Command::new("tool").stdout(crate::StdioMode::Inherit),
+            OutputOnlyInner,
+        )
+        .await;
+
+        let dir = tempfile::tempdir().expect("create stdout temp dir");
+        record_and_replay_non_piped_start_with(
+            Command::new("tool").stdout_file(dir.path().join("stdout.log")),
+            OutputOnlyInner,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn non_piped_start_round_trips_null_stdout() {
+        record_and_replay_non_piped_start(Command::new("tool").stdout(crate::StdioMode::Null))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn non_piped_start_round_trips_inherited_stdout() {
+        record_and_replay_non_piped_start(Command::new("tool").stdout(crate::StdioMode::Inherit))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn non_piped_start_round_trips_stdout_file() {
+        let dir = tempfile::tempdir().expect("create stdout temp dir");
+        record_and_replay_non_piped_start(
+            Command::new("tool").stdout_file(dir.path().join("stdout.log")),
+        )
+        .await;
     }
 
     #[tokio::test]
